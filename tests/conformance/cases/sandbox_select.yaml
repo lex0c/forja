@@ -1,0 +1,108 @@
+# Conformance: §6.5 sandbox profile selection (PERMISSION_ENGINE.md §6.5,
+# src/permissions/sandbox-plan.ts).
+#
+# These cases exercise `selectSandboxProfile` directly (engine-bypass
+# mode, same pattern as subagent_intersection cases). The planner is
+# pure: given a resolved capability set + the `host_explicitly_allowed`
+# flag, it picks the most-restrictive viable profile from the fixed
+# order [ro, cwd-rw, cwd-rw-net, home-rw, host] or refuses with
+# `no_viable_sandbox` + the uncovered kinds.
+#
+# Coverage groups (counts per §16.2 minimum of 6):
+#   A. Tier ladder per profile                     (4)   ro, cwd-rw,
+#                                                        cwd-rw-net,
+#                                                        home-rw
+#   B. Host gate                                   (2)   eligible +
+#                                                        blocked
+#
+# Together these pin: (1) the per-kind capability table that decides
+# what each profile covers, (2) the tie-break order (most restrictive
+# wins), (3) the "drop host when alternatives exist" rule, and (4)
+# the dual gate on `host` (operator flag AND `host-passthrough`
+# capability — either missing prunes host).
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Tier ladder (one case per restrictive-side profile)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "sandbox select: read-fs only → ro (most restrictive)"
+  setup:
+    sandbox_capabilities:
+      - "read-fs:**"
+  expect:
+    # ro covers {read-fs, exec}; with read-fs alone every other profile
+    # also covers. Tie-break left-to-right → ro wins.
+    sandbox_profile: "ro"
+
+- name: "sandbox select: read+write+exec under cwd → cwd-rw (drops host as last-resort)"
+  setup:
+    # write-fs eliminates ro (which only allows reads). cwd-rw covers
+    # all three kinds; cwd-rw-net / home-rw / host also cover. host is
+    # dropped because alternatives exist (spec §6.5 "host é sempre
+    # último recurso"). Tie-break: cwd-rw wins among non-host.
+    sandbox_capabilities:
+      - "read-fs:src/**"
+      - "write-fs:src/**"
+      - "exec:shell"
+    host_explicitly_allowed: true
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: net-egress promotes to cwd-rw-net"
+  setup:
+    # net-egress NOT in cwd-rw (write-only without net). cwd-rw-net
+    # is the next viable profile after the tie-break order.
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "write-fs:src/**"
+      - "net-egress:github.com"
+  expect:
+    sandbox_profile: "cwd-rw-net"
+
+- name: "sandbox select: secret-access requires home-rw (cwd-rw-net does NOT cover)"
+  setup:
+    # secret-access only appears in home-rw and host's capability
+    # tables. cwd-rw-net covers net-egress but NOT secret-access; tie-
+    # break walks past it. host is gated (no operator flag + no
+    # host-passthrough cap), so home-rw is the only viable option.
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "secret-access:~/.config/agent"
+  expect:
+    sandbox_profile: "home-rw"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Host gate (dual: operator flag AND host-passthrough cap)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "sandbox select: host eligible (operator flag + host-passthrough cap) → host"
+  setup:
+    # host-passthrough capability is ONLY in host's profile table.
+    # Without the explicit operator flag, host is pruned and nothing
+    # else covers the kind → refuse. With the flag set, host becomes
+    # eligible and is the only viable profile.
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "host-passthrough"
+    host_explicitly_allowed: true
+  expect:
+    sandbox_profile: "host"
+
+- name: "sandbox select: host-passthrough WITHOUT operator flag → no_viable_sandbox"
+  setup:
+    # Same capabilities, but `host_explicitly_allowed` omitted (default
+    # false). host is pruned BEFORE the subset check; no other profile
+    # covers host-passthrough → no candidates → refuse with the
+    # `host-passthrough` kind reported in `uncovered`. Note: read-fs is
+    # also in `uncovered` because the refuse envelope reports EVERY
+    # required kind (per src/permissions/sandbox-plan.ts:151-157, the
+    # refuse path returns `Array.from(requiredKinds).sort()`).
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "host-passthrough"
+  expect:
+    sandbox_refuse: "no_viable_sandbox"
+    # Sorted ascending per the planner's `requiredKinds.sort()`.
+    sandbox_uncovered:
+      - "host-passthrough"
+      - "read-fs"

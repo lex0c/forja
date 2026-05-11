@@ -15,6 +15,50 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 32: conformance suite — sandbox profile selection cases (§16.2 minimum)
+
+**Done.** Thirty-second slice. Fifth conformance top-up: 6 cases pinning §6.5 `selectSandboxProfile` — the function that decides which of the five fixed sandbox profiles (ro / cwd-rw / cwd-rw-net / home-rw / host) covers a given resolved capability set, with the `host` profile dually gated (operator flag AND `host-passthrough` capability). The same engine-bypass dispatch pattern from slice 31 — `setup.sandbox_capabilities` triggers a dedicated runner that invokes the primitive directly, no engine pipeline. Suite grows **109 → 115** (85% of the §16.2 GA bar).
+
+### Why this matters
+
+Slice 10 shipped `selectSandboxProfile` with its per-profile capability tables, the [ro, cwd-rw, cwd-rw-net, home-rw, host] tie-break order, and the "drop host when alternatives exist" rule. Slices 18–21 wired the profiles to bwrap/runner. The selection algorithm is the load-bearing primitive for §6.5: every profile-table edit risks shifting which capabilities each tier admits, and a regression that, say, added `secret-access` to `cwd-rw-net` would silently let an LLM write `~/.ssh/id_rsa` under a profile authorized for code-write workloads. Unit tests cover the primitive in isolation; the conformance suite carries the contract for §16 GA.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/index.ts` | Schema extension: `setup.sandbox_capabilities?` (capability string array) + `setup.host_explicitly_allowed?` (boolean operator flag) + `expect.sandbox_profile?` (profile literal) + `expect.sandbox_refuse?` (refuse reason — currently only `'no_viable_sandbox'`) + `expect.sandbox_uncovered?` (sorted string array of unreachable kinds). New `runSandboxSelectCase` invokes `selectSandboxProfile` and walks every assertion the case carries — supports asserting profile-only, refuse-only, or refuse + uncovered together. `runCase` dispatches on `setup.sandbox_capabilities !== undefined`. YAML loader's `isEngineBypass` predicate now also accepts sandbox-shaped cases. |
+| `tests/conformance/cases/sandbox_select.yaml` (new, ~115 lines) | 6 cases across 2 groups: A. tier ladder one case per restrictive-side profile (4 — ro baseline, cwd-rw with drop-host, cwd-rw-net via net-egress, home-rw via secret-access), B. host gate dual-eligibility (2 — eligible when flag + cap both present, blocked + `no_viable_sandbox` when flag missing). Pins all five profiles' coverage tables, the tie-break order, and the host pruning logic from one file. |
+
+### Decisions
+
+- **Engine-bypass dispatch is now the established pattern.** Slice 31 introduced it for `intersectCapabilities`; slice 32 reuses it for `selectSandboxProfile`. The dispatch lives in `runCase` and is keyed on the presence of a specific `setup` field (`declared_capabilities` or `sandbox_capabilities`). Adding a third bypass shape later (hash chain, ttl) follows the same pattern: new field name + new runner function + new dispatch line. No further schema unification needed.
+- **All 5 profiles covered by the 4 tier-ladder cases + 1 host case.** The minimum for §16.2 is 6, and the surface to test has 5 profiles. Splitting "drop host when alternatives" across cases 2/3 means every non-host profile gets ONE positive case + the negative cases (host blocked) test the host gate from both angles. No case is redundant.
+- **`sandbox_uncovered` assertion is order-sensitive and sorted-ascending.** The planner uses `Array.from(requiredKinds).sort()` for the refuse envelope (sandbox-plan.ts:151-157). Sorting is part of the contract — a regression that left the kinds in iteration order would scramble forensic dumps. The conformance case asserts both the kinds AND their order; pinning `['host-passthrough', 'read-fs']` not `['read-fs', 'host-passthrough']` despite `read-fs` being declared first.
+- **The cwd-rw case explicitly sets `host_explicitly_allowed: true` to demonstrate the drop-host rule.** Without that flag, host wouldn't be a candidate AT ALL (host-passthrough cap missing) — the test would still pass but wouldn't exercise the rule. Setting the flag forces host to be a candidate in principle, then the "drop when alternatives" rule prunes it. Cleaner test that ACTUALLY hits the pruning code path.
+- **Home-rw test uses `secret-access:~/.config/agent` (not `secret-access:/some/other/path`).** The scope is illustrative — secret-access semantics in capability matching are scope-blind for profile selection (only the kind matters per the per-profile table). Using a realistic scope keeps the test legible without affecting the assertion.
+- **No `expect.kind` on any sandbox case.** Sandbox cases don't run the engine and don't produce decisions; the dispatch returns before any engine code. Pinning `kind` in the YAML would be a no-op assertion that confuses readers. The runner's existing `c.expect.kind !== undefined` guard (added in slice 31) means such an assertion would silently pass even if set wrong.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format to merged import group + one-line conditional
+- `bun test` — **5366 pass / 10 skip / 0 fail** (5376 total across 249 files); 6 new conformance tests on top of slice 31's 5360
+- `bun test tests/conformance/` — 116 pass (52 prior + 25 bash adversarial + 16 path traversal + 10 score determinism + 6 subagent intersection + 6 sandbox select + 1 meta-test); suite coverage **115/136 = 85%** of the §16.2 GA bar (up from 80%)
+
+### Next
+
+Successor slices on the conformance trail (largest remaining gaps; each needs infra extension):
+1. **hash_chain** (~8 cases) — requires real audit DB + tampering harness. The current `audit` sink in `runCase` is a fake (in-memory captured rows + fake-hash). Hash-chain conformance needs a real bun:sqlite-backed audit that can be tampered (genesis row corruption, hash mismatch, rotation+quarantine cycle). Heaviest remaining conformance slice.
+2. **ttl_expiry** (~6 cases) — needs grants table + deterministic clock injection in the runner.
+3. **concurrency** (~5 cases) — likely a separate driver outside the YAML harness.
+
+§16.2 GA bar: 115 / 136 = 85%. ~21 cases remain across 3 categories.
+
+Non-conformance: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 31: conformance suite — subagent intersection cases (§16.2 minimum)
 
 **Done.** Thirty-first slice. Fourth conformance top-up: 6 cases pinning the §10.1 `declared ⊆ parent` invariant — the contract that makes subagent inheritance safe by construction. Required a small but real schema extension to `ConformanceCase` (3 new fields) plus a dispatcher in `runCase` so intersection-shaped cases bypass the engine pipeline and exercise `intersectCapabilities` directly. Suite grows **103 → 109** (80% of the §16.2 GA bar).

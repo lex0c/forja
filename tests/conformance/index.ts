@@ -37,6 +37,7 @@ import {
 } from '../../src/permissions/index.ts';
 import { loadPolicyFromString } from '../../src/permissions/index.ts';
 import { resolveCapabilities } from '../../src/permissions/resolvers/index.ts';
+import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 
 // Pre-baked classifier fixtures keyed by name. YAML cases can pin
 // a behavior without needing to express a function inline. Add new
@@ -75,6 +76,13 @@ export interface ConformanceCase {
     // row). `input` is allowed to be omitted on intersection cases.
     parent_capabilities?: readonly string[];
     declared_capabilities?: readonly string[];
+    // §6.5 sandbox profile selection cases (slice 32). When
+    // `sandbox_capabilities` is present, the case runs
+    // `selectSandboxProfile` directly. `host_explicitly_allowed`
+    // gates the `host` profile per spec (CLI `--sandbox-host` flag).
+    // Same engine-bypass pattern as intersection cases.
+    sandbox_capabilities?: readonly string[];
+    host_explicitly_allowed?: boolean;
   };
   // Optional for §10.1 subagent intersection cases (no engine call).
   // Required for every other case shape.
@@ -89,6 +97,12 @@ export interface ConformanceCase {
     // `setup.declared_capabilities`.
     effective?: readonly string[];
     excess?: readonly string[];
+    // §6.5 sandbox cases: `sandbox_profile` pins the chosen profile;
+    // `sandbox_refuse` pins the refuse envelope's reason; `sandbox_uncovered`
+    // pins the kinds that no candidate covered.
+    sandbox_profile?: 'ro' | 'cwd-rw' | 'cwd-rw-net' | 'home-rw' | 'host';
+    sandbox_refuse?: 'no_viable_sandbox';
+    sandbox_uncovered?: readonly string[];
     kind?: 'allow' | 'deny' | 'confirm';
     source_section?: string;
     source_layer?: string;
@@ -133,11 +147,12 @@ export const loadCasesFromYaml = (content: string): ConformanceCase[] => {
     if (typeof obj.setup !== 'object' || obj.setup === null) {
       throw new Error(`conformance: case '${obj.name}' missing setup`);
     }
-    // Intersection cases (slice 31) don't need an `input` block —
-    // the parent/declared capability sets in `setup` are the inputs.
+    // Engine-bypass cases (slices 31/32) don't need an `input` block —
+    // their setup carries the primitive's inputs directly.
     const setupObj = obj.setup as Record<string, unknown>;
-    const isIntersectionCase = Array.isArray(setupObj.declared_capabilities);
-    if (!isIntersectionCase && (typeof obj.input !== 'object' || obj.input === null)) {
+    const isEngineBypass =
+      Array.isArray(setupObj.declared_capabilities) || Array.isArray(setupObj.sandbox_capabilities);
+    if (!isEngineBypass && (typeof obj.input !== 'object' || obj.input === null)) {
       throw new Error(`conformance: case '${obj.name}' missing input`);
     }
     if (typeof obj.expect !== 'object' || obj.expect === null) {
@@ -201,6 +216,60 @@ const runIntersectionCase = (c: ConformanceCase): CaseRunResult => {
   return { case: c, decision: null, ok: reasons.length === 0, reasons };
 };
 
+// §6.5 sandbox profile selection runner. Pure: no engine, no policy.
+// Parses capabilities via `parseCapability`, invokes
+// `selectSandboxProfile`, then asserts the result against
+// `expect.sandbox_profile`, `expect.sandbox_refuse`, and
+// `expect.sandbox_uncovered`. Walks every assertion the case
+// carries; tolerates either ok-shape or refuse-shape on the planner
+// return.
+const runSandboxSelectCase = (c: ConformanceCase): CaseRunResult => {
+  const reasons: string[] = [];
+  let capabilities: ReturnType<typeof parseCapability>[];
+  try {
+    capabilities = (c.setup.sandbox_capabilities ?? []).map(parseCapability);
+  } catch (e) {
+    reasons.push(`capability parse error: ${(e as Error).message}`);
+    return { case: c, decision: null, ok: false, reasons };
+  }
+  const result = selectSandboxProfile({
+    capabilities,
+    hostExplicitlyAllowed: c.setup.host_explicitly_allowed ?? false,
+  });
+  if (c.expect.sandbox_profile !== undefined) {
+    if (result.kind !== 'ok') {
+      reasons.push(
+        `sandbox_profile mismatch: expected ${c.expect.sandbox_profile}, got refuse(${result.reason})`,
+      );
+    } else if (result.profile !== c.expect.sandbox_profile) {
+      reasons.push(
+        `sandbox_profile mismatch: expected ${c.expect.sandbox_profile}, got ${result.profile}`,
+      );
+    }
+  }
+  if (c.expect.sandbox_refuse !== undefined) {
+    if (result.kind !== 'refuse') {
+      reasons.push(
+        `sandbox_refuse mismatch: expected ${c.expect.sandbox_refuse}, got ok(${result.profile})`,
+      );
+    } else if (result.reason !== c.expect.sandbox_refuse) {
+      reasons.push(
+        `sandbox_refuse mismatch: expected ${c.expect.sandbox_refuse}, got ${result.reason}`,
+      );
+    }
+  }
+  if (c.expect.sandbox_uncovered !== undefined) {
+    if (result.kind !== 'refuse') {
+      reasons.push(`sandbox_uncovered set but planner returned ok(${result.profile})`);
+    } else if (!arraysEqual(result.uncovered, c.expect.sandbox_uncovered)) {
+      reasons.push(
+        `sandbox_uncovered mismatch: expected ${JSON.stringify(c.expect.sandbox_uncovered)}, got ${JSON.stringify(result.uncovered)}`,
+      );
+    }
+  }
+  return { case: c, decision: null, ok: reasons.length === 0, reasons };
+};
+
 // Pre-baked classifier fixtures keyed by name. Each is a sync
 // function with the documented shape per §6.4. New shapes plug in
 // here without touching the YAML loader.
@@ -220,6 +289,11 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
   // a `declared_capabilities` set. The engine pipeline is skipped.
   if (c.setup.declared_capabilities !== undefined) {
     return runIntersectionCase(c);
+  }
+  // Dispatch to the §6.5 sandbox planner runner when the case carries
+  // a `sandbox_capabilities` set. Same engine-bypass pattern.
+  if (c.setup.sandbox_capabilities !== undefined) {
+    return runSandboxSelectCase(c);
   }
   // Engine path: input is required (the YAML loader enforces this
   // when declared_capabilities is absent). Narrow the type so the
