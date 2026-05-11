@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 31: conformance suite — subagent intersection cases (§16.2 minimum)
+
+**Done.** Thirty-first slice. Fourth conformance top-up: 6 cases pinning the §10.1 `declared ⊆ parent` invariant — the contract that makes subagent inheritance safe by construction. Required a small but real schema extension to `ConformanceCase` (3 new fields) plus a dispatcher in `runCase` so intersection-shaped cases bypass the engine pipeline and exercise `intersectCapabilities` directly. Suite grows **103 → 109** (80% of the §16.2 GA bar).
+
+### Why this matters
+
+§10.1 is the formal subagent safety property: a child agent's effective capability set is `intersect(parent_caps, declared_caps)`, and any element of `declared` not covered by `parent` IS the subagent escalation signal that the harness must surface. Slices 9, 25, and 26 implemented the primitive, the auto-derivation from policy, and the scope-level narrowing — but every one of those was tested only at the unit level. The conformance suite (which spec §16 makes load-bearing for GA) had ZERO cases for §10.1. A regression that flipped a capability cover from "covered" to "not covered" — or worse, the other direction — would have passed unit tests and slipped into a release.
+
+This slice closes that gap and locks in the contracts that slices 9/25/26 ship.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/index.ts` | Schema extension: `setup.parent_capabilities?` + `setup.declared_capabilities?` (capability-string arrays) + `expect.effective?` + `expect.excess?` (also capability-string arrays). `expect.kind` is now optional (intersection cases don't produce decisions). `input` is now optional (intersection cases have no tool call). `CaseRunResult.decision` is now `Decision \| null`. New `runIntersectionCase` invokes `parseCapability` on both lists, calls `intersectCapabilities`, and checks effective/excess via order-preserving `arraysEqual`. `runCase` dispatches on `setup.declared_capabilities !== undefined`. YAML loader skips the `input`-required check when the case is intersection-shaped. The kind-mismatch assertion now guards on `c.expect.kind !== undefined` so intersection cases don't get a spurious "expected undefined" reason. |
+| `tests/conformance/cases/subagent_intersection.yaml` (new, ~155 lines) | 6 cases across 4 groups: A. identity/subset/superset/cross-kind (3 — subset all-effective, superset split, cross-kind all-excess), B. empty declared → empty result (1 — the pure-LLM signal), C. exec hierarchy `arbitrary` umbrella covers shell/python/node/arbitrary (1), D. path prefix-glob covers descendants but NOT sibling lookalikes that share a textual prefix without the `/` boundary (1). Header documents the dispatch shape and order-preservation contract. |
+
+### Decisions
+
+- **New case shape, single file, no engine path.** Intersection cases are structurally different from engine-decision cases — no policy, no tool call, no audit. Forcing them through the engine path with dummy inputs would obscure what's tested. The dispatch on `setup.declared_capabilities` keeps the YAML self-documenting (a reader sees `declared_capabilities` and knows the case tests §10.1) and the runner small. The YAML format is uniform: same case schema, different fields populated.
+- **Order-preserving equality on effective/excess.** `intersectCapabilities` preserves declared order in both arrays — slice 9 documented that ordering as part of the contract (so audit rendering of `excess` shows caps in the order the model requested them). The assertion uses `arraysEqual` (length + index-wise compare) rather than a set match, so a regression that re-ordered the arrays fails. The cross-kind case (#3) is the smallest test that catches ordering: declaring `[write-fs:X, delete-fs:Y, git-write:Z]` against an unrelated parent must produce `excess` in exactly that order.
+- **Sibling-lookalike case (`srcfoo/x` vs `src/x`) is the highest-value path test.** `<prefix>/**` semantics depend on the `/` boundary — `src/foo.ts` matches `src/**`, `srcfoo/x` does NOT (despite sharing the `src` text prefix). The matching primitive (capabilityCovers, line 195-199) uses `startsWith(\`${prefix}/\`)` specifically to avoid this footgun. The conformance case pins it: a regression that simplified to bare `startsWith(prefix)` would silently start admitting `srcfoo`-shaped neighbors of authorized paths.
+- **`expect.kind` optional + guard at the assertion site.** Previously, the kind assertion ran unconditionally on engine cases (every engine case sets `kind`). After making it optional in the schema, the runner needs `c.expect.kind !== undefined` to gate the comparison — without this guard, an engine case that accidentally omits `kind` would fire `kind mismatch: expected undefined, got allow`, which is true but misleading. The new guard makes the failure mode explicit (the case is silently a no-op on the decision side).
+- **`input` optional at the type level + runtime narrow + reject in dispatch.** Same flavor: intersection cases don't have an `input` block, and forcing one with dummy values would obscure intent. The dispatcher returns the intersection result before the engine path ever accesses `c.input`, and the engine path narrows via `const input = c.input; if (input === undefined) return error;` — both compile-time and runtime safe. Cleaner than a non-null assertion.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5360 pass / 10 skip / 0 fail** (5370 total across 249 files); 6 new conformance tests on top of slice 30's 5354
+- `bun test tests/conformance/` — 110 pass (52 prior + 25 bash adversarial + 16 path traversal + 10 score determinism + 6 subagent intersection + 1 meta-test); suite coverage **109/136 = 80%** of the §16.2 GA bar (up from 76%)
+
+### Next
+
+Successor slices on the conformance trail (largest remaining gaps; each needs infra extension):
+1. **hash_chain** (~8 cases) — requires real audit DB + tampering harness. The current `audit` sink in `runCase` is a fake (in-memory captured rows + fake-hash). Hash-chain conformance needs a real bun:sqlite-backed audit that can be tampered (genesis row corruption, hash mismatch, rotation+quarantine cycle). Heaviest remaining conformance slice.
+2. **ttl_expiry** (~6 cases) — needs grants table + a deterministic clock injection in the runner.
+3. **sandbox_select** (~6 cases) — needs sandbox plan output added to the case shape (a new `expect.sandbox?` field with profile name + arg list).
+4. **concurrency** (~5 cases) — likely a separate driver outside the YAML harness; serializing race-condition scenarios as static cases is awkward.
+
+§16.2 GA bar: 109 / 136 = 80%. ~27 cases remain across 4 categories, none of them small.
+
+Non-conformance: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 30: conformance suite — score determinism cases (§16.2 minimum)
 
 **Done.** Thirtieth slice. Third conformance top-up: 10 cases pinning EXACT score weights per §6.3.1 baseline-v2.0, complementing the existing 9 threshold-shaped cases in `risk_score.yaml`. Every new case asserts `score_gte === score_lte` so the score is locked to the spec's decimal weight values; a regression that drifted any single weight by even 0.05 fails immediately. Suite grows **93 → 103** (76% of the §16.2 GA bar).

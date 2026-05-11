@@ -23,7 +23,11 @@
 // readable diffs.
 
 import { parse as parseYaml } from 'yaml';
-import { formatCapability } from '../../src/permissions/capabilities.ts';
+import {
+  formatCapability,
+  intersectCapabilities,
+  parseCapability,
+} from '../../src/permissions/capabilities.ts';
 import type { Classifier } from '../../src/permissions/classifier.ts';
 import {
   type Decision,
@@ -61,14 +65,31 @@ export interface ConformanceCase {
     // Strict mode toggle — unavailable classifier degrades the
     // engine. Default false (lenient).
     classifier_required?: boolean;
+    // §10.1 subagent intersection cases (slice 31). When
+    // `declared_capabilities` is present, the case runs the
+    // intersection primitive directly INSTEAD of the engine pipeline
+    // — `parent_capabilities` and `declared_capabilities` are parsed
+    // via `parseCapability`, fed to `intersectCapabilities`, and the
+    // result is checked against `expect.effective` / `expect.excess`.
+    // The engine path is skipped (no policy, no decision, no audit
+    // row). `input` is allowed to be omitted on intersection cases.
+    parent_capabilities?: readonly string[];
+    declared_capabilities?: readonly string[];
   };
-  input: {
+  // Optional for §10.1 subagent intersection cases (no engine call).
+  // Required for every other case shape.
+  input?: {
     tool: string;
     category: PolicyCategory;
     args: Record<string, unknown>;
   };
   expect: {
-    kind: 'allow' | 'deny' | 'confirm';
+    // §10.1 intersection cases set `effective` and/or `excess` instead
+    // of `kind`. The driver dispatches on the presence of
+    // `setup.declared_capabilities`.
+    effective?: readonly string[];
+    excess?: readonly string[];
+    kind?: 'allow' | 'deny' | 'confirm';
     source_section?: string;
     source_layer?: string;
     reason_substring?: string;
@@ -112,7 +133,11 @@ export const loadCasesFromYaml = (content: string): ConformanceCase[] => {
     if (typeof obj.setup !== 'object' || obj.setup === null) {
       throw new Error(`conformance: case '${obj.name}' missing setup`);
     }
-    if (typeof obj.input !== 'object' || obj.input === null) {
+    // Intersection cases (slice 31) don't need an `input` block —
+    // the parent/declared capability sets in `setup` are the inputs.
+    const setupObj = obj.setup as Record<string, unknown>;
+    const isIntersectionCase = Array.isArray(setupObj.declared_capabilities);
+    if (!isIntersectionCase && (typeof obj.input !== 'object' || obj.input === null)) {
       throw new Error(`conformance: case '${obj.name}' missing input`);
     }
     if (typeof obj.expect !== 'object' || obj.expect === null) {
@@ -124,10 +149,57 @@ export const loadCasesFromYaml = (content: string): ConformanceCase[] => {
 
 export interface CaseRunResult {
   case: ConformanceCase;
-  decision: Decision;
+  // Null for §10.1 subagent intersection cases (no engine call). Set
+  // for every engine-path case.
+  decision: Decision | null;
   ok: boolean;
   reasons: string[];
 }
+
+// Order-preserving array equality on formatted capability strings.
+// `intersectCapabilities` preserves declared order in both `effective`
+// and `excess`, so order is part of the contract — tests assert it.
+const arraysEqual = (a: readonly string[], b: readonly string[]): boolean => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+// §10.1 subagent intersection runner. Pure: no engine, no policy, no
+// audit. Parses both capability lists with `parseCapability` (the same
+// path the harness uses at spawn time), invokes `intersectCapabilities`,
+// and asserts the resulting `effective` + `excess` arrays match the
+// YAML expectations — order-preserving on both arrays.
+const runIntersectionCase = (c: ConformanceCase): CaseRunResult => {
+  const reasons: string[] = [];
+  let parent: ReturnType<typeof parseCapability>[];
+  let declared: ReturnType<typeof parseCapability>[];
+  try {
+    parent = (c.setup.parent_capabilities ?? []).map(parseCapability);
+    declared = (c.setup.declared_capabilities ?? []).map(parseCapability);
+  } catch (e) {
+    reasons.push(`capability parse error: ${(e as Error).message}`);
+    return { case: c, decision: null, ok: false, reasons };
+  }
+  const { effective, excess } = intersectCapabilities(parent, declared);
+  const effectiveFmt = effective.map(formatCapability);
+  const excessFmt = excess.map(formatCapability);
+  if (c.expect.effective !== undefined) {
+    if (!arraysEqual(effectiveFmt, c.expect.effective)) {
+      reasons.push(
+        `effective mismatch: expected ${JSON.stringify(c.expect.effective)}, got ${JSON.stringify(effectiveFmt)}`,
+      );
+    }
+  }
+  if (c.expect.excess !== undefined) {
+    if (!arraysEqual(excessFmt, c.expect.excess)) {
+      reasons.push(
+        `excess mismatch: expected ${JSON.stringify(c.expect.excess)}, got ${JSON.stringify(excessFmt)}`,
+      );
+    }
+  }
+  return { case: c, decision: null, ok: reasons.length === 0, reasons };
+};
 
 // Pre-baked classifier fixtures keyed by name. Each is a sync
 // function with the documented shape per §6.4. New shapes plug in
@@ -144,6 +216,23 @@ const classifierFixtures: Record<ClassifierFixtureName, Classifier> = {
 };
 
 export const runCase = (c: ConformanceCase): CaseRunResult => {
+  // Dispatch to the §10.1 intersection runner when the case carries
+  // a `declared_capabilities` set. The engine pipeline is skipped.
+  if (c.setup.declared_capabilities !== undefined) {
+    return runIntersectionCase(c);
+  }
+  // Engine path: input is required (the YAML loader enforces this
+  // when declared_capabilities is absent). Narrow the type so the
+  // rest of the function can dereference c.input without guards.
+  const input = c.input;
+  if (input === undefined) {
+    return {
+      case: c,
+      decision: null,
+      ok: false,
+      reasons: ['engine case requires `input` block'],
+    };
+  }
   const cwd = c.setup.cwd ?? '/work/proj';
   const home = c.setup.home ?? '/home/op';
   const policyYaml = c.setup.project_policy ?? '';
@@ -189,9 +278,9 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     ...(c.setup.classifier_required === true ? { classifierRequired: true } : {}),
   });
   const decision = engine.check(
-    c.input.tool,
-    c.input.category,
-    c.input.args as Parameters<typeof engine.check>[2],
+    input.tool,
+    input.category,
+    input.args as Parameters<typeof engine.check>[2],
   );
   const auditRow = captured[0];
 
@@ -202,11 +291,11 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
   const needsResolver =
     c.expect.capabilities_include !== undefined || c.expect.resolver_kind !== undefined;
   const resolverResult = needsResolver
-    ? resolveCapabilities(c.input.tool, c.input.args as Record<string, unknown>, { cwd, home })
+    ? resolveCapabilities(input.tool, input.args as Record<string, unknown>, { cwd, home })
     : null;
 
   const reasons: string[] = [];
-  if (decision.kind !== c.expect.kind) {
+  if (c.expect.kind !== undefined && decision.kind !== c.expect.kind) {
     reasons.push(`kind mismatch: expected ${c.expect.kind}, got ${decision.kind}`);
   }
   if (c.expect.resolver_kind !== undefined && resolverResult !== null) {
