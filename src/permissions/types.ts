@@ -138,12 +138,23 @@ export interface PolicySandbox {
 // `seal` defines the entire config. No partial merge across layers
 // (a mixed config — enterprise sets mode, user sets interval — is
 // usually a mistake; "all-or-nothing" makes intent obvious).
-export type SealMode = 'none' | 'worm-file' | 'git-anchored';
+export type SealMode = 'none' | 'worm-file' | 'git-anchored' | 'rfc3161-tsa';
 export type SealOnFailure = 'degrade' | 'refuse';
 
 export interface SealPolicy {
   mode: SealMode;
+  // Backend-polymorphic storage location.
+  //   - `worm-file`: path to the append-only seal log file
+  //   - `git-anchored`: path to the pre-existing git repo directory
+  //   - `rfc3161-tsa`: path to a directory holding TSR proof tokens
+  //     (one file per seal) AND the seal.log line index
   path?: string;
+  // RFC 3161 Time-Stamp Authority endpoint URL. REQUIRED when
+  // `mode === 'rfc3161-tsa'`. Standard HTTPS endpoint that
+  // accepts `application/timestamp-query` POST bodies and
+  // returns `application/timestamp-reply` (TSR token bytes,
+  // CMS SignedData per RFC 3161 §2.4.2). Ignored for other modes.
+  endpoint?: string;
   interval_decisions?: number;
   interval_seconds?: number;
   on_failure?: SealOnFailure;

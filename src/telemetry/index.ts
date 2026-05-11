@@ -53,7 +53,7 @@ export type TelemetryEngineState =
 // instead of an import so telemetry stays independent of the
 // permission types module. Drift caught at the bootstrap's
 // wire-up where the assignment happens.
-export type TelemetrySealMode = 'none' | 'worm-file' | 'git-anchored';
+export type TelemetrySealMode = 'none' | 'worm-file' | 'git-anchored' | 'rfc3161-tsa';
 export type TelemetrySealOnFailure = 'degrade' | 'refuse';
 
 // Event: one decision, one row in the audit chain. Spec §18 line

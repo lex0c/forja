@@ -36,6 +36,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
+import { defaultRfc3161TsaFactory } from './sealing-rfc3161.ts';
 import type { SealMode, SealPolicy } from './types.ts';
 
 export interface SealEntry {
@@ -415,6 +416,7 @@ export const defaultGitAnchoredFactory = (config: SealPolicy): SealStore => {
 export const factoryForSealMode = (mode: SealMode): ((c: SealPolicy) => SealStore) | null => {
   if (mode === 'worm-file') return defaultWormFileFactory;
   if (mode === 'git-anchored') return defaultGitAnchoredFactory;
+  if (mode === 'rfc3161-tsa') return defaultRfc3161TsaFactory;
   return null;
 };
 

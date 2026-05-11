@@ -288,9 +288,9 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
   });
 
   test('reserved modes get a specific "not yet implemented" error', () => {
-    // git-anchored shipped in slice 63; only s3-object-lock and
-    // rfc3161-tsa remain reserved.
-    for (const mode of ['s3-object-lock', 'rfc3161-tsa']) {
+    // git-anchored shipped in slice 63; rfc3161-tsa shipped in
+    // slice 88; only s3-object-lock remains reserved.
+    for (const mode of ['s3-object-lock']) {
       expect(() => parsePolicy({ seal: { mode } })).toThrow(
         `seal.mode='${mode}' is reserved for a future slice`,
       );
@@ -299,7 +299,7 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
 
   test('unknown mode rejected with enum error', () => {
     expect(() => parsePolicy({ seal: { mode: 'cloud-storage' } })).toThrow(
-      "seal.mode must be one of none|worm-file, got 'cloud-storage'",
+      "seal.mode must be one of none|worm-file|git-anchored|rfc3161-tsa, got 'cloud-storage'",
     );
   });
 
@@ -349,9 +349,55 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
   });
 
   test('rejects unknown keys', () => {
-    expect(() => parsePolicy({ seal: { mode: 'none', endpoint: 'https://x' } })).toThrow(
-      "seal has unknown key 'endpoint'",
+    // `endpoint` is the new valid key (slice 88, for rfc3161-tsa);
+    // use a clearly-bogus name to exercise the rejection path.
+    expect(() => parsePolicy({ seal: { mode: 'none', frobnicate: 'yes' } })).toThrow(
+      "seal has unknown key 'frobnicate'",
     );
+  });
+
+  test('rfc3161-tsa requires path AND endpoint', () => {
+    expect(() => parsePolicy({ seal: { mode: 'rfc3161-tsa' } })).toThrow(
+      'seal.path is required when seal.mode is rfc3161-tsa',
+    );
+    expect(() => parsePolicy({ seal: { mode: 'rfc3161-tsa', path: '/tmp/seals' } })).toThrow(
+      "seal.endpoint is required when seal.mode is 'rfc3161-tsa'",
+    );
+  });
+
+  test('rfc3161-tsa endpoint must be http:// or https:// scheme', () => {
+    expect(() =>
+      parsePolicy({
+        seal: { mode: 'rfc3161-tsa', path: '/tmp/seals', endpoint: 'ftp://tsa.example.com' },
+      }),
+    ).toThrow('must start with http:// or https://');
+  });
+
+  test('rfc3161-tsa rejects empty endpoint', () => {
+    expect(() =>
+      parsePolicy({ seal: { mode: 'rfc3161-tsa', path: '/tmp/seals', endpoint: '' } }),
+    ).toThrow('seal.endpoint must be a non-empty string');
+  });
+
+  test('rfc3161-tsa with valid path + endpoint parses cleanly', () => {
+    const p = parsePolicy({
+      seal: {
+        mode: 'rfc3161-tsa',
+        path: '/var/forja/seals',
+        endpoint: 'https://tsa.example.com',
+        interval_decisions: 100,
+        interval_seconds: 3600,
+        on_failure: 'degrade',
+      },
+    });
+    expect(p.seal).toEqual({
+      mode: 'rfc3161-tsa',
+      path: '/var/forja/seals',
+      endpoint: 'https://tsa.example.com',
+      interval_decisions: 100,
+      interval_seconds: 3600,
+      on_failure: 'degrade',
+    });
   });
 
   test('absent seal section leaves the field undefined', () => {

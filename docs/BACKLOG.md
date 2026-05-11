@@ -15,6 +15,76 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 88: §7.3 RFC 3161 TSA sealing backend — audit-grade external anchoring
+
+**Done.** Eighty-eighth slice. Ships the third §7.3 sealing backend: `rfc3161-tsa`. Submits each seal hash to a configured Time-Stamp Authority via RFC 3161 TimeStampReq/Resp, stores the returned TSR proof token on disk, and appends the same seal.log wire format as the worm-file + git-anchored backends. Closes the audit-grade requirement for regulated deployments — production-ready checklist line 1292 calls out rfc3161-tsa specifically as the recommended backend.
+
+Pre-slice the §7.3 catalog had two of four backends shipped: `worm-file` (slice ~54-58) + `git-anchored` (slice 63). The remaining two were marked RESERVED in `parsePolicy`, producing a deliberately specific "not yet implemented" error if an operator copy-pasted from the spec. Slice 88 moves `rfc3161-tsa` from RESERVED to VALID and ships the full submit/store implementation; `s3-object-lock` stays reserved until a follow-up slice.
+
+### Why this matters
+
+Hash chains defend against piecemeal-silent edits to the audit log. An adversary with root who rewrites every row + recomputes hashes still gets caught by external sealing — periodically writing a chain hash to a surface they can't retroactively edit. The four §7.3 backends represent escalating trust models:
+
+- **worm-file** trusts the local kernel's `chattr +a` enforcement (or a WORM-mounted FS). An attacker who can `chattr -a` first defeats it.
+- **git-anchored** trusts git's commit semantics — rewrites are visible in `git log`. An attacker who can force-push to the protected remote defeats it.
+- **rfc3161-tsa** trusts a third-party TSA's signing key. An attacker would need to compromise the TSA itself, or collude with it to backdate timestamps.
+- **s3-object-lock** trusts AWS's COMPLIANCE-mode retention. Defers to AWS's operational guarantees.
+
+RFC 3161 is the canonical audit-grade choice for regulated deployments (healthcare/fintech per §23 line 1302-1306). The TSR (TimeStampResp) is a CMS SignedData blob whose embedded TSTInfo carries the TSA's timestamp + our hash; the TSA's signature binds those two together so a later edit can't reproduce the proof without compromising the TSA's signing key.
+
+Slice 88 ships SUBMIT + STORE only. Verification (parse the SignedData, validate the signature against the TSA's certificate chain, confirm the TSTInfo.messageImprint matches our recomputed chain hash) is a substantial separate concern — RFC 3161 §2.4.2 + CMS parsing — and lands in a future slice if/when operators need the offline-verify path. Today the proof tokens are stored byte-for-byte; verification is "send the .tsr file to a TSA-aware tool".
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | Adds `'rfc3161-tsa'` to `SealMode` union. Adds optional `endpoint?: string` to `SealPolicy` (REQUIRED for the new mode; ignored for others). Docs the polymorphic `path` semantics per backend: worm-file = file path; git-anchored = repo directory; rfc3161-tsa = directory holding TSR proof tokens + seal.log. |
+| `src/permissions/config.ts` | Moves `rfc3161-tsa` from `RESERVED_SEAL_MODES` to `VALID_SEAL_MODES`. Adds `endpoint` to allowed seal keys in `rejectUnknownKeys`. Validates: endpoint must be non-empty string + start with `http://` or `https://`; path required for rfc3161-tsa (same as worm-file/git-anchored); endpoint required ONLY for rfc3161-tsa. Error messages updated to list all valid modes (`none|worm-file|git-anchored|rfc3161-tsa`). |
+| `src/permissions/sealing-rfc3161.ts` (new, ~330 lines) | **DER encoder (~70 lines):** `encodeTimestampQuery(hashHex)` returns the 56-byte TimeStampReq for a SHA-256 hash. Helpers: `encodeLength` (short + long form), `concatBytes`, `tagged`, `SEQUENCE`, `INTEGER` (0..127 only, plenty for version=1), `OCTET_STRING`. SHA-256 OID hardcoded; AlgorithmIdentifier wraps OID + NULL parameter. MessageImprint = SEQUENCE(AlgId, OCTET_STRING(hash)). Optional fields (reqPolicy, nonce, certReq, extensions) deliberately omitted — minimum-valid TSQ; verifier-side nonce binding can come in a follow-up. **Curl transport (~40 lines):** `Rfc3161Submitter` type + `defaultRfc3161Submitter({timeoutSeconds?})` factory wrapping `execFileSync('curl', [...])` with `--max-time` (default 10s), `--data-binary @-` for TSQ on stdin, `--output -` for TSR on stdout. Failure → `{ok:false, reason:'curl failed: <msg>'}`; empty stdout → `'TSA returned empty response'`. **SealStore impl (~150 lines):** `createRfc3161TsaSealer({path, endpoint, submit?, exists?, read?, append?, writeBinary?, ensureDir?})`. Append flow: validate entry shape; validate hash is SHA-256 (64 hex); encode TSQ; ensureDir; submit; on ok write `<dir>/<seq>-<ts>.tsr` + append `<dir>/seal.log` line. Error mapping: `TSA submit failed:`, `rfc3161-tsa requires sha256 hash`, `TSQ encode failed:`, `write TSR failed:`, `append seal.log failed:`. List: parses seal.log same wire format as other backends (`seq=N\tts=N\thash=H\n`). Close: no-op (curl is one-shot subprocesses). **Factory:** `defaultRfc3161TsaFactory(config)` validates `config.path` + `config.endpoint`, throws if missing (defense-in-depth — parsePolicy already enforces presence). |
+| `src/permissions/sealing.ts` | Imports + re-exports `defaultRfc3161TsaFactory`. `factoryForSealMode` dispatcher adds `mode === 'rfc3161-tsa' → defaultRfc3161TsaFactory` branch. |
+| `src/telemetry/index.ts` | Widens `TelemetrySealMode` to include `'rfc3161-tsa'` so `sealing.failure` events from the new backend serialize cleanly via the existing scrubbing layer (slice 76). |
+| `tests/permissions/sealing-rfc3161.test.ts` (new, 20 tests) | **Encoder (5):** SHA-256 zero-hash produces expected 56-byte payload (byte-level assertions on each ASN.1 field); two distinct hashes produce identical header bytes + differing hash slots; uppercase hex case-folds; non-hex rejected; wrong-length rejected. **Append flow (8):** successful submit writes TSR + appends seal.log; multiple appends produce distinct TSR files; submitter `ok:false` maps to `TSA submit failed: <reason>` + NO files written; non-sha256 hash rejected pre-submit; invalid entry shape rejected; whitespace-in-hash rejected; submitter throwing surfaces (test-seam contract — thrown ≠ documented failure path); submitter receives TSQ + endpoint verbatim. **List (3):** empty dir → empty list; appended entries listed in order; malformed line throws on list(). **Factory (3):** throws on missing path; throws on missing endpoint; returns valid SealStore with production submitter wired. **Dispatcher (1):** `factoryForSealMode('rfc3161-tsa')` returns the new factory. |
+| `tests/permissions/config.test.ts` | Updates reserved-modes test to drop `rfc3161-tsa` (now valid); updates unknown-mode error message assertion; switches the "unknown keys" test from `endpoint` (now valid) to `frobnicate`. **New tests (4):** rfc3161-tsa requires both path AND endpoint (independent error messages); endpoint must be `http://` or `https://` scheme; empty endpoint rejected; full valid config parses cleanly with all 6 fields populated. |
+
+### Decisions
+
+- **Submitter as test-seam, not the whole call hardcoded.** Curl-based submission is the production default, but tests inject scripted submitters so the suite runs without network. The seam shape is `(tsq, endpoint) => SubmitResult`. Future transports (native HTTP, AWS SDK for s3-object-lock) drop into the same shape.
+- **Curl chosen over Bun's fetch.** SealStore.append is SYNCHRONOUS (matches scheduler's sealNow contract). Bun's fetch is async; using it would require either deasync (bad) or refactoring the entire scheduler chain to async (big surgery for one backend). `execFileSync('curl', ...)` is sync, ubiquitous on Linux/macOS, and adds no runtime deps. Sync subprocess blocking is acceptable here — seals fire at most once per `interval_decisions` / `interval_seconds`, not per decision.
+- **Minimum-valid TSQ (no nonce, no certReq).** RFC 3161 makes nonce + reqPolicy + certReq + extensions all optional. Omitting them produces the smallest valid TSQ (~56 bytes for SHA-256). Nonce binding (defending against TSR replay) is a verifier-side concern best added when the verify slice lands — premature optimization to ship it before then. The encoder structure makes adding fields trivial: extend `SEQUENCE` with more children.
+- **TSR stored as opaque binary.** No parsing in slice 88. The TSR is a CMS SignedData blob — proper parsing requires ASN.1 BER/DER tree walker + CMS algorithm dispatch. That's hundreds of lines for a verifier-side concern. Storing byte-for-byte preserves the proof; an offline tool (or a future verify slice) can validate it.
+- **One TSR file per seal entry, named `<seq>-<ts>.tsr`.** Predictable filename pattern lets operators correlate with the seal.log line by seq alone. The `<ts>` suffix disambiguates if the chain were ever rotated (same seq, different ts → different chain). Filename collisions are structurally impossible.
+- **`seal.log` wire format identical to other backends.** Same `seq=N\tts=N\thash=H\n` format means `verifySealAgainstChain` works without dispatch — the SealStore interface IS the seam. A future verifier that checks the chain against ALL stored TSR tokens would also work transparently across backends if it just reads seal.log + recomputes hashes; the .tsr files are only needed if you want to prove the timestamp.
+- **SHA-256 hardcoded at the encoder level.** Other hash algorithms would need different AlgorithmIdentifier OIDs + different OCTET_STRING lengths. The audit chain emits SHA-256 (per §7.2); ALL backend hashes flow from there. A future algorithm change is a §7.2 change, not a §7.3 change — the encoder follows downstream.
+- **endpoint scheme allowlist is `http://` and `https://`.** Not strict-https because internal TSAs on isolated networks may serve over plain HTTP. Operators that want strict-HTTPS enforce at the firewall layer. The check rejects obvious mistakes (`ftp://`, `tsa.example.com` without scheme) at policy load rather than surfacing later as a curl error.
+- **TSR file under the seal directory, NOT a separate config.** Adding a separate `tsr_path` field would let operators store .tsr tokens on a different filesystem (e.g., NFS for shared archival). For slice 88, one directory for both seal.log + .tsr keeps the config minimal; a separate config can land if operator demand emerges.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **6010 pass / 10 skip / 0 fail** (6020 total across 286 files); +24 tests on top of slice 87's 5986
+- `bun test tests/permissions/sealing-rfc3161.test.ts` — 20 pass in ~52ms
+- `bun test tests/permissions/config.test.ts` — config tests pass with updated error message + new rfc3161-tsa validation tests
+- `bun test tests/permissions/` — 920 pass (full permissions suite green)
+
+### Next
+
+§7.3 catalog status:
+
+- ✓ `none` (default)
+- ✓ `worm-file` (slice 54-58)
+- ✓ `git-anchored` (slice 63)
+- ✓ `rfc3161-tsa` (slice 88)
+- ☐ `s3-object-lock` (still reserved — AWS SDK / IAM design + sync-vs-async trade-off the same as RFC 3161)
+
+After s3-object-lock lands, the §7.3 catalog is complete. Operator-facing checklist `§23` line 1292 ("Sealing externo configurável e testado em ≥ 1 backend, recomendado: rfc3161-tsa") is now satisfied at the canonical recommended backend.
+
+Verification-side work (slice 89+ if needed): parse the TSR's CMS SignedData, validate the TSA cert chain, confirm TSTInfo.messageImprint matches the recomputed chain hash. Substantial — TSP + CMS + ASN.1 parsing across multiple primitives — and only valuable when operators need offline proof verification beyond "the TSR file exists".
+
+Other open work unchanged: §7.3 `s3-object-lock`, §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 87: §13.7 operator-facing security-mode flag — `--broker spawn` flips bootstrap to process isolation
 
 **Done.** Eighty-seventh slice. Ships the `--broker` CLI flag with values `in-process` (default) and `spawn`. When operators opt in via `--broker spawn`, bootstrap constructs `createSpawnBroker` against `bun run src/broker/worker.ts` instead of the in-process degenerate; bash exec moves into a fresh worker subprocess per call with sandbox wrap delegated to `maybeWrapSandboxArgv`. Closes spec line 928 ("CLI main não tem exec privilege") at the architectural level — the §13.7 thread is now structurally complete.

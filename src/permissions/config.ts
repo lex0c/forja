@@ -74,8 +74,13 @@ const VALID_MODES: ReadonlySet<string> = new Set(['strict', 'acceptEdits', 'bypa
 // remaining §7.3 backends ship in later slices; listing them as
 // RESERVED makes config errors specific ("not yet implemented")
 // rather than generic enum-mismatch.
-const VALID_SEAL_MODES: ReadonlySet<string> = new Set(['none', 'worm-file', 'git-anchored']);
-const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set(['s3-object-lock', 'rfc3161-tsa']);
+const VALID_SEAL_MODES: ReadonlySet<string> = new Set([
+  'none',
+  'worm-file',
+  'git-anchored',
+  'rfc3161-tsa',
+]);
+const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set(['s3-object-lock']);
 const VALID_SEAL_ON_FAILURE: ReadonlySet<string> = new Set(['degrade', 'refuse']);
 
 const isStringArray = (v: unknown): v is string[] =>
@@ -274,23 +279,26 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     const s = r.seal as Record<string, unknown>;
     rejectUnknownKeys(
       s,
-      ['mode', 'path', 'interval_decisions', 'interval_seconds', 'on_failure'],
+      ['mode', 'path', 'endpoint', 'interval_decisions', 'interval_seconds', 'on_failure'],
       'seal',
     );
     if (s.mode === undefined) {
       throw new Error('policy: seal.mode is required');
     }
     if (typeof s.mode !== 'string' || !VALID_SEAL_MODES.has(s.mode)) {
-      // Reserved modes (`s3-object-lock`, `rfc3161-tsa`,
-      // `git-anchored`) get a deliberately specific error so an
-      // operator copy-pasting from the spec gets a clear "not yet
-      // implemented" rather than a generic enum mismatch.
+      // Reserved modes (`s3-object-lock`) get a deliberately
+      // specific error so an operator copy-pasting from the spec
+      // gets a clear "not yet implemented" rather than a generic
+      // enum mismatch. As more modes ship (slice 88 added
+      // `rfc3161-tsa`), the reserved set shrinks.
       if (RESERVED_SEAL_MODES.has(String(s.mode))) {
         throw new Error(
-          `policy: seal.mode='${String(s.mode)}' is reserved for a future slice; current support: none|worm-file`,
+          `policy: seal.mode='${String(s.mode)}' is reserved for a future slice; current support: none|worm-file|git-anchored|rfc3161-tsa`,
         );
       }
-      throw new Error(`policy: seal.mode must be one of none|worm-file, got '${String(s.mode)}'`);
+      throw new Error(
+        `policy: seal.mode must be one of none|worm-file|git-anchored|rfc3161-tsa, got '${String(s.mode)}'`,
+      );
     }
     const mode = s.mode as SealMode;
     let path: string | undefined;
@@ -300,8 +308,26 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       }
       path = s.path;
     }
-    if ((mode === 'worm-file' || mode === 'git-anchored') && path === undefined) {
+    if (
+      (mode === 'worm-file' || mode === 'git-anchored' || mode === 'rfc3161-tsa') &&
+      path === undefined
+    ) {
       throw new Error(`policy: seal.path is required when seal.mode is ${mode}`);
+    }
+    let endpoint: string | undefined;
+    if (s.endpoint !== undefined) {
+      if (typeof s.endpoint !== 'string' || s.endpoint.length === 0) {
+        throw new Error('policy: seal.endpoint must be a non-empty string');
+      }
+      if (!s.endpoint.startsWith('http://') && !s.endpoint.startsWith('https://')) {
+        throw new Error(
+          `policy: seal.endpoint must start with http:// or https://, got '${s.endpoint}'`,
+        );
+      }
+      endpoint = s.endpoint;
+    }
+    if (mode === 'rfc3161-tsa' && endpoint === undefined) {
+      throw new Error("policy: seal.endpoint is required when seal.mode is 'rfc3161-tsa'");
     }
     let interval_decisions: number | undefined;
     if (s.interval_decisions !== undefined) {
@@ -337,6 +363,7 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     seal = {
       mode,
       ...(path !== undefined ? { path } : {}),
+      ...(endpoint !== undefined ? { endpoint } : {}),
       ...(interval_decisions !== undefined ? { interval_decisions } : {}),
       ...(interval_seconds !== undefined ? { interval_seconds } : {}),
       ...(on_failure !== undefined ? { on_failure } : {}),
