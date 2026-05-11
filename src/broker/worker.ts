@@ -21,6 +21,8 @@
 // `process.exit` needed; the absence preserves any flush-on-exit
 // behavior in the stdout pipe).
 
+import { scrubEnv } from '../sanitize/index.ts';
+import { createBashHandler } from './handlers/bash.ts';
 import type { BrokerRequest, BrokerResponse } from './types.ts';
 import { type WorkerToolHandler, runWorker } from './worker-runtime.ts';
 
@@ -39,6 +41,8 @@ const echoHandler: WorkerToolHandler = {
   }),
 };
 
+const bashHandler = createBashHandler({ scrubEnv });
+
 const readStdin = async (): Promise<string> => {
   let buffer = '';
   const decoder = new TextDecoder();
@@ -50,7 +54,7 @@ const readStdin = async (): Promise<string> => {
 };
 
 await runWorker({
-  handlers: [echoHandler],
+  handlers: [echoHandler, bashHandler],
   input: readStdin,
   output: (line) => {
     process.stdout.write(line);
