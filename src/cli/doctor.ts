@@ -15,6 +15,8 @@
 //     the sessions DB.
 //   - policy_load: §5 hierarchy resolution — per-layer
 //     enterprise/user/project status (slice 61).
+//   - hash_chain: §7.2 audit chain integrity — verifyChain over
+//     the current install's approvals_log (slice 62).
 //   - sealing: §7.3 worm-file seal status — entry count + last
 //     seal timestamp (slice 60).
 //   - git: presence on PATH — degrades git_* tools when absent.
@@ -32,12 +34,16 @@ import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { dirname } from 'node:path';
 import {
   type SealStore,
+  type VerifyResult,
+  createSqliteSink,
   createWormFileSealer,
   detectSandboxAvailability,
+  ensureInstallId,
   resolvePolicy,
 } from '../permissions/index.ts';
 import { installIdPath } from '../permissions/paths.ts';
 import type { SealPolicy } from '../permissions/types.ts';
+import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -74,6 +80,10 @@ export interface RunDoctorOptions {
   // ("last seal 4h ago"). Production: Date.now(); tests pin a fixed
   // number for stable assertions.
   now?: () => number;
+  // Override the default SQLite DB path for the hash_chain check.
+  // Production reads the operator's session DB at `defaultDbPath()`;
+  // tests pin an in-memory or temp-file path.
+  dbPath?: string;
   out?: (s: string) => void;
   err?: (s: string) => void;
 }
@@ -277,6 +287,120 @@ const policyLoadCheck = (options: PolicyLoadCheckOptions): DoctorCheck => {
   return { name: 'policy_load', status: 'ok', detail: summary };
 };
 
+// §7.2 + §13.3 hash chain health check (slice 62). Walks the
+// audit chain for the current install_id and reports integrity.
+// Mirrors what `agent permission verify` does, in a doctor-shaped
+// output: one line per outcome instead of the full forensic dump.
+//
+// Failure modes ranked:
+//   - `fail` — chain BROKEN at seq M with the verifier's reason.
+//     This is a P0 signal per spec line 1212
+//     (`chain_verification_failures_total > 0 = P0`). Operator
+//     remediation: full `agent permission verify` for details, or
+//     `agent permission rotate-chain` to archive the broken
+//     segment.
+//   - `warn` — chain intact BUT quarantined (post-rotation segment
+//     unreviewed). Engine still works; operator should inspect via
+//     `agent permission inspect <rotation_id>`.
+//   - `ok`   — chain intact, not quarantined. Reports the row
+//     count + rotation_id when non-zero.
+//
+// Empty cases:
+//   - No DB file → ok "no chain yet (DB created on first session)".
+//     Fresh installs don't have a sessions DB until the first
+//     emit.
+//   - DB exists but no rows → ok "no chain rows yet". Same shape;
+//     the DB was created (e.g., for sessions metadata) but no
+//     audit decisions landed.
+//
+// install_id discovery failure → fail. Without the install_id we
+// can't filter the chain to the current install; doctor can't
+// proceed without it.
+interface ChainCheckOptions {
+  env: NodeJS.ProcessEnv;
+  dbPath: string;
+}
+
+const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
+  let identity: { install_id: string; created_at_ms: number };
+  try {
+    identity = ensureInstallId({ env: options.env });
+  } catch (e) {
+    return {
+      name: 'hash_chain',
+      status: 'fail',
+      detail: `install_id discovery failed: ${(e as Error).message}`,
+      remediation: 'check $HOME / $XDG_CONFIG_HOME / %APPDATA% writability',
+    };
+  }
+
+  // No DB file yet — fresh install, nothing to verify. The first
+  // session's emit will create it via `migrate()`.
+  if (!existsSync(options.dbPath)) {
+    return {
+      name: 'hash_chain',
+      status: 'ok',
+      detail: 'no chain yet (DB will be created on first session)',
+    };
+  }
+
+  let result: VerifyResult;
+  try {
+    const db = openDb(options.dbPath);
+    migrate(db, MIGRATIONS);
+    const sink = createSqliteSink({ db, identity });
+    result = sink.verifyChain();
+  } catch (e) {
+    return {
+      name: 'hash_chain',
+      status: 'fail',
+      detail: `DB error: ${(e as Error).message}`,
+      remediation: `check ${options.dbPath} for corruption or permission issues`,
+    };
+  }
+
+  if (!result.ok) {
+    return {
+      name: 'hash_chain',
+      status: 'fail',
+      detail: `BROKEN at seq ${result.brokenAt}: ${result.reason}`,
+      remediation:
+        'run `agent permission verify` for full diagnostic, or `agent permission rotate-chain --reason <text>` to archive the broken segment',
+    };
+  }
+
+  if (result.rows === 0) {
+    return {
+      name: 'hash_chain',
+      status: 'ok',
+      detail: 'no chain rows yet (engine has not emitted any decisions)',
+    };
+  }
+
+  const rowWord = result.rows === 1 ? 'row' : 'rows';
+  const baseDetail = `intact (${result.rows} ${rowWord}`;
+  const rotationDetail =
+    result.current_rotation_id > 0 ? `, rotation_id=${result.current_rotation_id}` : '';
+
+  if (result.quarantined) {
+    // Quarantined = post-rotation segment hasn't been inspected.
+    // Engine still works; operator should review the archived
+    // rows. `warn` not `fail` because enforcement is unaffected.
+    return {
+      name: 'hash_chain',
+      status: 'warn',
+      detail: `${baseDetail}${rotationDetail}, quarantined)`,
+      remediation: `run \`agent permission inspect ${result.current_rotation_id}\` to audit the archived segment`,
+    };
+  }
+
+  return {
+    name: 'hash_chain',
+    status: 'ok',
+    detail: `${baseDetail}${rotationDetail})`,
+  };
+};
+
 // Human-readable relative-time formatter. Matches the spec example
 // at line 805 ("last success 4h ago"). Coarse buckets are fine — the
 // goal is "operator glances at doctor and sees sealing is recent vs
@@ -448,6 +572,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
 
   const cwd = options.cwd ?? process.cwd();
   const now = options.now ?? Date.now;
+  const dbPath = options.dbPath ?? defaultDbPath();
   const checks: DoctorCheck[] = [
     platformCheck(env),
     sandboxCheck(which),
@@ -459,6 +584,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
       ...(options.enterprisePath !== undefined ? { enterprisePath: options.enterprisePath } : {}),
       ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
     }),
+    chainCheck({ env, dbPath }),
     sealingCheck({
       env,
       cwd,

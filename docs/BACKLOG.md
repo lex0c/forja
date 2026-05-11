@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 62: `forja doctor` hash_chain integrity check (§7.2 + §13.3 line 804)
+
+**Done.** Sixty-second slice. Closes another spec-canonical doctor line: hash chain integrity. Spec line 1212 marks `chain_verification_failures_total > 0 = P0`, so chain breaks are the highest-severity signal doctor surfaces. The check mirrors `agent permission verify` but renders one-line doctor-shaped output (`intact (5 rows)` / `BROKEN at seq 2: this_hash_mismatch`) instead of the verify command's full forensic dump.
+
+### Why this matters
+
+The audit chain is §7.2's load-bearing security invariant — every decision links to the previous via `prev_hash`. Tampering with any past row breaks the chain at verify-time. Without doctor surfacing this, operators only learn about chain breaks when they explicitly run `agent permission verify` OR when the engine refuses to bootstrap (chain-broken refusing state). Doctor's job is the pre-flight: chain integrity at `forja doctor` time means an operator can catch tampering BEFORE the next session, BEFORE any new audit row anchors on a corrupted prev_hash.
+
+Empty / no-DB cases land as `ok` not `warn`. Fresh installs and operators between sessions legitimately have no chain rows yet — the engine hasn't emitted anything. Treating these as warnings would be noisy and unactionable; the first session's emit creates the DB and starts the chain naturally.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/doctor.ts` | New `chainCheck` function. Sequence: (1) `ensureInstallId(env)` — failures → fail with $HOME/$XDG remediation; (2) `existsSync(dbPath)` — false → ok "no chain yet (DB created on first session)"; (3) `openDb + migrate + createSqliteSink + verifyChain` — DB open / migrate / query errors → fail with path-specific remediation; (4) result.ok=false → fail "BROKEN at seq M: reason" + remediation pointing at `permission verify` and `permission rotate-chain`; (5) result.rows=0 → ok "no chain rows yet"; (6) result.quarantined=true → warn "intact ... quarantined" with `permission inspect <rotation_id>` remediation; (7) clean → ok "intact (N rows[, rotation_id=X])". New `dbPath?: string` option on `RunDoctorOptions` (defaults to `defaultDbPath()`). Positioned BETWEEN `policy_load` and `sealing` per spec line 804 order. |
+| `tests/cli/doctor.test.ts` | (+7 tests under new `runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)` describe.) Coverage: no DB file → ok "no chain yet"; DB exists empty → ok "no chain rows yet"; 5-row chain → ok "intact (5 rows)"; 1-row chain uses singular "row"; tampered seq=2 (decision flipped to deny via raw SQL) → fail "BROKEN at seq 2" with `verify` + `rotate-chain` remediation; install_id discovery failure (no HOME) → fail with install_id message; JSON mode includes `hash_chain` event with structured fields. Pre-existing NDJSON-count test updated 7→8 checks + 1 summary = 9 lines. |
+
+### Decisions
+
+- **`ensureInstallId` failure is `fail`, not `warn` or "skip the check".** Without install_id we can't filter the chain to the current install; the chain check has nothing to verify. Better to fail loudly with a remediation hint than silently degrade to a no-op. Pre-existing config_dir check already covers the $HOME setup directly; install_id failure here surfaces the same root cause in a different shape (consumed by the chain, not raw `installIdPath`).
+- **DB-file missing is `ok`, not `warn`.** Fresh installs (and operators who haven't run a session yet) have no DB. Treating this as a warning would noisy-up every greenfield doctor run. The first session's `emit` creates the DB via `migrate()` — there's nothing for the operator to fix.
+- **Empty chain (`rows=0`) is `ok`, not `warn`.** Same logic as the missing-DB case: the DB exists (maybe migrated for sessions metadata) but no audit decisions have landed. Engine hasn't emitted yet; not a problem.
+- **`fail` for chain broken, `warn` for quarantined.** Broken = tampered or corrupted; this is the §7.2 invariant violation that should block bootstrap (and DOES in production via the bootstrap's chain-verify gate). Quarantined = post-rotation segment unreviewed; chain is INTACT after the rotation point, enforcement still works, but the archived segment hasn't been audited. Operator action is different (rotate-chain vs inspect); statuses match.
+- **Singular "row" vs plural "rows".** Cosmetic but worth doing — small consistency win that makes doctor output read naturally for chains with exactly 1 row (first-emit state). Same convention as the sealing check's "1 entry" / "N entries" from slice 60.
+- **`rotation_id` rendered only when non-zero.** Chains that never rotated have `current_rotation_id = 0`; including it in the line would be noise. Rotated chains render `intact (5 rows, rotation_id=2)` so operators see the rotation provenance.
+- **Position BETWEEN policy_load (5) and sealing (7) — index 6.** Spec line 803-805 orders Policy load → Hash chain → External sealing. Following spec ordering keeps the canonical output recognizable. Also functional: sealing depends on chain rows (the seal entries point AT chain hashes), so chain integrity is logically the prerequisite.
+- **Remediation text quotes the exact CLI commands operators should run.** "run `agent permission verify` for full diagnostic" / "run `agent permission rotate-chain --reason <text>`" — operators can copy-paste. Same posture as the sealing check's `seal-verify` / `seal-now` references. Doctor is the entry point; the verbs are where the work happens.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5692 pass / 10 skip / 0 fail** (5702 total across 266 files); +7 tests on top of slice 61's 5685
+- `bun test tests/cli/doctor.test.ts` — 33 pass (was 26)
+
+### Next
+
+`forja doctor` now covers 8 of the spec's ~10 canonical lines (line 793-815). Remaining spec doctor lines not yet surfaced:
+
+1. **Classifier health** (line 806) — would need the engine's classifier subsystem to expose a `last_response_ms` / `last_seen_at` metric. Couple-line slice once the metric exists; classifier slice (§6.4) doesn't currently track this.
+2. **Engine state** (line 807) — doctor is pre-engine; surfacing "engine state: ready" would require a separate read of the last bootstrap event (e.g., from a `bootstrap_state` table or audit row). Slice scope likely needs spec clarification on where the source-of-truth lives.
+3. **Conformance suite last-run** (line 811) — operational metric, not derived from engine state. Likely tracked in a separate file (e.g., `.agent/conformance.json`) written by CI. Would need the CI emission slice first.
+
+These are nice-to-have rather than spec-blocking. Other open work unchanged: §7.3 backends (git-anchored simplest), §13.7 broker/worker (biggest remaining thread), §19 migration, §14 MCP (blocked), macOS SBPL conformance extension, fuzz harness, telemetria.
+
+§16 conformance still at per-category-bar in all 11 categories. §7.2 chain integrity now surfaced at both bootstrap-gate AND pre-flight doctor.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 61: `forja doctor` policy_load check (§13.3 line 803)
 
 **Done.** Sixty-first slice. Continues the doctor expansion from slice 60: a new `policy_load` check surfaces per-layer hierarchy resolution status, matching the spec's canonical line 803 (`Policy load: enterprise=none user=ok project=ok OK`). Operators can now see at a glance which policy layers loaded, which are absent, and which encountered lock conflicts — debugging "why isn't my project policy active" becomes a one-command answer.

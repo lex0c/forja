@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
 import { runDoctor } from '../../src/cli/doctor.ts';
-import type { SealEntry, SealStore } from '../../src/permissions/index.ts';
+import {
+  type SealEntry,
+  type SealStore,
+  createSqliteSink,
+  ensureInstallId,
+} from '../../src/permissions/index.ts';
+import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 
 const captured = () => {
   const lines: string[] = [];
@@ -129,16 +135,16 @@ describe('runDoctor', () => {
     });
     expect(code).toBe(0);
     const lines = out.lines.join('').trim().split('\n').filter(Boolean);
-    // 7 checks + 1 summary (policy_load added in slice 61, sealing
-    // in slice 60).
-    expect(lines.length).toBe(8);
+    // 8 checks + 1 summary (hash_chain added in slice 62,
+    // policy_load in slice 61, sealing in slice 60).
+    expect(lines.length).toBe(9);
     const events = lines.map((l) => JSON.parse(l));
     expect(events[0].kind).toBe('check');
     expect(events[0].name).toBe('platform');
     const summary = events[events.length - 1];
     expect(summary.kind).toBe('summary');
     expect(summary.ok).toBe(true);
-    expect(summary.counts).toEqual({ ok: 7, warn: 0, fail: 0 });
+    expect(summary.counts).toEqual({ ok: 8, warn: 0, fail: 0 });
   });
 
   test('--json: failures bump summary.ok to false + exit 1', async () => {
@@ -538,5 +544,182 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
     expect(policy).toBeDefined();
     expect(policy.status).toBe('ok');
     expect(policy.detail).toBe('enterprise=none user=ok project=none');
+  });
+});
+
+describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
+  let tmp: string;
+  let dbPath: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-doctor-chain-'));
+    dbPath = join(tmp, 'state.sqlite');
+    env = { HOME: tmp, PATH: process.env.PATH };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // Seed the audit chain with `rowCount` clean rows under the
+  // ensureInstallId identity. Returns the install identity so
+  // tests can also tamper rows by primary-key seq if needed.
+  const seedChain = (rowCount: number) => {
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env,
+      now: () => 1,
+      uuid: () => 'chain-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    for (let i = 0; i < rowCount; i++) {
+      sink.emit({
+        session_id: `s${i}`,
+        tool_name: 'bash',
+        args: { i },
+        decision: 'allow',
+        policy_hash: 'sha256:p',
+        reason_chain: [],
+        ts: 100 + i,
+      });
+    }
+    db.close?.();
+    return identity;
+  };
+
+  test('no DB file → ok "no chain yet"', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath, // path that doesn't exist yet
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('no chain yet');
+  });
+
+  test('DB exists but empty chain → ok "no chain rows yet"', async () => {
+    seedChain(0);
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('no chain rows yet');
+  });
+
+  test('healthy chain → ok "intact (N rows)"', async () => {
+    seedChain(5);
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('intact (5 rows)');
+  });
+
+  test('single-row chain uses singular "row"', async () => {
+    seedChain(1);
+    const out = captured();
+    await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(out.lines.join('')).toContain('intact (1 row)');
+  });
+
+  test('broken chain → fail with broken seq + remediation', async () => {
+    seedChain(3);
+    // Tamper with seq=2 — flip decision so the stored this_hash no
+    // longer matches the recomputed payload.
+    const db = openDb(dbPath);
+    db.run('UPDATE approvals_log SET decision = ? WHERE seq = 2', ['deny']);
+    db.close?.();
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1); // fail exits non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('hash_chain');
+    expect(text).toContain('BROKEN at seq 2');
+    expect(text).toContain('agent permission verify');
+    expect(text).toContain('agent permission rotate-chain');
+  });
+
+  test('install_id discovery failure → fail with remediation', async () => {
+    // No HOME / XDG / APPDATA → ensureInstallId throws.
+    const noHomeEnv = { PATH: process.env.PATH };
+    const out = captured();
+    const code = await runDoctor({
+      env: noHomeEnv,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1);
+    const text = out.lines.join('');
+    expect(text).toContain('hash_chain');
+    expect(text).toContain('install_id discovery failed');
+  });
+
+  test('--json: hash_chain check is included with structured fields', async () => {
+    seedChain(7);
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const events = lines.map((l) => JSON.parse(l));
+    const chain = events.find((e) => e.name === 'hash_chain');
+    expect(chain).toBeDefined();
+    expect(chain.status).toBe('ok');
+    expect(chain.detail).toBe('intact (7 rows)');
   });
 });
