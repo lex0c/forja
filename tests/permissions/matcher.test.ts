@@ -64,6 +64,43 @@ describe('matchPath', () => {
   test('dot-prefixed cwd-relative pattern', () => {
     expect(matchPath('./src/**', 'src/foo.ts', CWD)).toBe(true);
   });
+
+  describe('lexical normalization (slice 29 — closes resolveSymlinks gap)', () => {
+    // Pre-slice-29: an absolute target with embedded `..` survived
+    // both realpath fallbacks when intermediate dirs didn't exist on
+    // the live FS, then relativize textually stripped `/proj/`,
+    // matching the residual `../etc/x` against a cwd-relative `**`.
+    // After slice 29, `path.resolve(cwd, target)` is called
+    // unconditionally so `..` resolves LEXICALLY before realpath
+    // ever runs.
+
+    test('absolute target with .. that escapes cwd does NOT match `**`', () => {
+      // `/proj/../etc/passwd` lexically normalizes to `/etc/passwd`,
+      // outside `/proj`. cwd-relative `**` cannot reach it.
+      expect(matchPath('**', '/proj/../etc/passwd', CWD)).toBe(false);
+    });
+
+    test('absolute target with deep .. chain that escapes cwd does NOT match `src/**`', () => {
+      expect(matchPath('src/**', '/proj/src/../../etc/passwd', CWD)).toBe(false);
+    });
+
+    test('absolute target with .. that stays within cwd DOES match', () => {
+      // `/proj/sub/../src/foo.ts` lexically normalizes to
+      // `/proj/src/foo.ts`, inside `/proj`. `src/**` matches.
+      expect(matchPath('src/**', '/proj/sub/../src/foo.ts', CWD)).toBe(true);
+    });
+
+    test('absolute pattern with .. lexically normalizes (symmetric with target)', () => {
+      // Operator-authored pattern with `..` lexically resolves the
+      // same way the target does. `/proj/../etc/**` becomes
+      // `/etc/**`, which matches `/etc/passwd`.
+      expect(matchPath('/proj/../etc/**', '/etc/passwd', CWD)).toBe(true);
+    });
+
+    test('embedded ./ noise in target normalizes away', () => {
+      expect(matchPath('src/**', '/proj/./src/./foo.ts', CWD)).toBe(true);
+    });
+  });
 });
 
 describe('matchCommand', () => {

@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
 import { canonicalHash } from './canonical.ts';
@@ -446,12 +446,24 @@ const matchTargetForRules = (toolName: string, path: string): string =>
 // Resolve a path to its symlink-followed absolute form for protected
 // path classification. Mirrors the matcher's `resolveSymlinks` so a
 // symlink at `./safe → /etc/passwd` is caught by the protected check
-// just like the matcher catches it for rule matching. realpath fails
-// on paths that don't exist (write_file creating a new file); fall
-// back to realpathing the parent + joining the basename (catches
-// symlink parents) and finally to the textual absolute form.
+// just like the matcher catches it for rule matching.
+//
+// Always normalizes lexically via `path.resolve(cwd, rawPath)` first
+// — even when `rawPath` is already absolute. This closes the slice-28
+// finding where `/work/proj/data/../../etc/hosts` in a fictional cwd
+// stayed un-normalized (both realpath fallbacks ENOENT-failed,
+// textual abs was returned with the `/work/proj/` prefix intact, and
+// the protected classifier missed the underlying `/etc/` target).
+// `path.resolve` does the .. and `./` resolution lexically without
+// touching the filesystem; realpath then refines for symlinks if the
+// resolved target exists.
+//
+// realpath fails on paths that don't exist (write_file creating a
+// new file); fall back to realpathing the parent + joining the
+// basename (catches symlink parents) and finally to the lexically
+// normalized absolute form.
 const resolveForProtected = (rawPath: string, cwd: string): string => {
-  const abs = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+  const abs = resolve(cwd, rawPath);
   try {
     return realpathSync(abs);
   } catch {

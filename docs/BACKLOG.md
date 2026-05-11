@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 29: lexical path normalization (closes slice-28 traversal gap)
+
+**Done.** Twenty-ninth slice. Closes the engine finding documented in slice 28: 7 call sites across `engine.ts`, `matcher.ts`, `resolvers/fs.ts`, and `resolvers/bash.ts` had the same vulnerable pattern — `isAbsolute(p) ? p : resolve(cwd, p)` — which left absolute paths with embedded `..`/`./` components UN-normalized when `realpath` couldn't resolve them on the live FS (intermediate directories missing). With a fictional or never-existed cwd and a permissive `allow_paths: ["/**"]`, an LLM-crafted `write_file /work/proj/data/../../../etc/hosts` slipped past the protected-path classifier because the classifier saw the textual `/work/proj/data/../../../etc/hosts` (no `/etc/` startsWithSegment match) — escalate tier never fired, and the write was auto-allowed. Slice 29 normalizes lexically via `path.resolve(cwd, p)` unconditionally BEFORE any realpath fallback, so `..`/`./` are resolved textually first regardless of FS state.
+
+### Why this matters
+
+The bug was a real defense gap, not a theoretical one. The matcher's separate realpath chain DID work for the rule-match side (because `realpath(dirname)` succeeds when only the leaf file is missing — common for `write_file` creating a new file), but `resolveForProtected` hit the same failure mode in the engine's protected-path classification: when ANY intermediate dir is missing, both `realpath(abs)` and `realpath(dirname(abs))` ENOENT-fail and the fallback returns the textual abs verbatim. In a fictional cwd (which is the common case in tests and any operator-supplied path resolution where the cwd was deleted between commands), this meant `..`-walks never reached the classifier.
+
+The same pattern (`isAbsolute? p : resolve(cwd, p)`) appeared in 5 distinct sites in the path-handling pipeline; some carry capability scopes into the audit log (fs.ts/bash.ts), and the un-normalized form would carry into intersection checks (slice 25/26), defeating §10 scope-level enforcement. The slice fixes all sites at once for symmetry.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/engine.ts` | `resolveForProtected` now always calls `resolve(cwd, rawPath)` instead of the conditional `isAbsolute? rawPath : resolve(cwd, rawPath)`. Removed unused `isAbsolute` import. Comment block updated with the slice-28 finding and the fix rationale (lexical resolution BEFORE realpath). |
+| `src/permissions/matcher.ts` | `matchPath` now calls `resolve(cwd, target)` and `resolve(cwd, pattern)` unconditionally — `..`/`./` in either input normalizes lexically before realpath runs. Removed unused `isAbsolute` import. Comment block updated with the closes-slice-28 rationale and the relativize-strip bypass shape that the fix prevents. |
+| `src/permissions/resolvers/fs.ts` | `resolveAbs` simplified to `resolve(ctx.cwd, path)` always. Removed unused `isAbsolute` import. Comment updated noting that an un-normalized capability scope (e.g. `read-fs:/work/proj/../../etc/x`) would defeat slice-25/26 scope-level §10 enforcement — the fix preserves the security boundary. |
+| `src/permissions/resolvers/bash.ts` | `resolveArg` simplified to `resolvePath(ctx.cwd, path)` always. Two additional sites in `analyzeCommand` (per-arg protected-path check + redirect-target protected-path check) also flipped from conditional to unconditional resolve. Removed unused `isAbsolute` import. |
+| `tests/permissions/matcher.test.ts` | New `describe` block "lexical normalization (slice 29 — closes resolveSymlinks gap)" with 5 unit tests: absolute target with `..` escaping cwd → no match; absolute target with deep `..` chain → no match; `..` that stays inside cwd → match; absolute pattern with `..` normalizes symmetrically; embedded `./` noise normalizes away. |
+| `tests/conformance/cases/path_traversal.yaml` | New 16th case "..-walk into /etc still escalates write to confirm (slice 29 fix)". Reinstates the contract I'd documented as unreachable in slice 28's BACKLOG. With the slice-29 fix, `/work/proj/data/../../../etc/hosts` in a fictional cwd normalizes to `/etc/hosts` → escalate tier fires → write upgrades to confirm. (3× `..` to climb from `data` → `proj` → `work` → `/`.) Header updated with new Group F (slice 29) before the renamed Group G (tilde-escalate exact-match). |
+
+### Decisions
+
+- **`path.resolve(cwd, p)` is sufficient — no realpath needed for lexical normalization.** node:path's resolve does `..`/`./` resolution textually as a pure function: `resolve("/work/proj", "/work/proj/data/../../../etc/hosts")` returns `/etc/hosts` regardless of whether any of those dirs exist. realpath is still useful for symlink resolution AFTER normalization; the pre-realpath lexical pass closes the gap without changing realpath's role.
+- **Same fix at every call site, no helper extraction.** Five-plus sites all do `isAbsolute(p) ? p : resolve(cwd, p)`. Extracting a `normalizeToAbs(p, cwd)` helper would add an import to every site for a one-line wrapper around `resolve(cwd, p)`. The direct call is clearer; the comment in each site explains why the unconditional form matters.
+- **Unused `isAbsolute` imports removed from all 4 files.** No other code path in those files needs it; leaving dead imports would invite re-introducing the conditional form later. Clean cut.
+- **Bash resolver has two additional sites that needed the same treatment.** `analyzeCommand`'s per-arg protected check (line 759 pre-slice) and redirect-target protected check (line 784 pre-slice) used the same pattern for the same protected-path classification. Same flaw, same fix. Without these, a `bash` invocation passing `cat /work/proj/data/../../../etc/passwd` (literal arg, not a $-substitution since those red-flag-refuse anyway) would slip past the bash-side protected-path check that closes the slice-1 gap.
+- **3× `..` is the correct depth.** Slice 28 BACKLOG had used `/work/proj/data/../../etc/hosts` (2× `..`) which resolves to `/work/etc/hosts` (NOT `/etc/hosts`) — wrong count, would not have triggered escalate even with the fix. Caught when writing the conformance case for slice 29; updated to 3× `..` (`data` → `proj` → `work` → `/`). Documents the fix needs a real depth match, not a magic shape.
+- **Backwards-compatible: paths that were already normalized stay the same.** `resolve("/work/proj", "src/foo.ts")` returns `/work/proj/src/foo.ts` — same as before. `resolve("/work/proj", "/work/proj/src/foo.ts")` returns `/work/proj/src/foo.ts` — same as before. Only paths with `..`/`./` components change behavior, and the new behavior is the security-correct one. Full test suite passes with no other modifications.
+- **`isAbsolute` callers in other modules left alone.** This slice only touches the path-classification / capability-emission sites. Other `isAbsolute` usages (in path-display helpers, validation, etc.) are correctness-irrelevant for the protected check and stay as-is.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5344 pass / 10 skip / 0 fail** (5354 total across 249 files); 5 new matcher unit tests + 1 new conformance case + the conformance case from slice 28 (`bashrc-backup` exact-match) still passing as expected
+- `bun test tests/conformance/` — 94 pass (52 prior + 25 bash adversarial + 16 path traversal + 1 meta-test); suite coverage 93/136 = **68%**
+- Defense gap closed: `/work/proj/data/../../../etc/hosts` in fictional cwd now triggers `/etc` escalate → confirm (previously: allow)
+
+### Next
+
+Successor slices on the conformance trail:
+1. **score_determinism** (~10 cases) — identical inputs → identical score, ordering invariance, classifier-disabled ceiling. Existing shape covers via `score_gte/lte/components_include`.
+2. **subagent_intersection** (~6 cases) — requires extending `ConformanceCase` shape with `parent_capabilities` + `declared_capabilities` + effective/excess assertions.
+3. **hash_chain** (~8 cases) — requires real audit DB + tampering harness, not the fake sink.
+4. **ttl_expiry** (~6 cases) — needs grants table + time mocks.
+5. **sandbox_select** (~6 cases) — needs sandbox plan output in the case shape.
+6. **concurrency** (~5 cases) — separate driver.
+
+Non-conformance: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 28: conformance suite — path traversal cases (§16.2 minimum)
 
 **Done.** Twenty-eighth slice. Second top-up of the conformance suite, this time covering path traversal & matcher normalization — the §16.2 category that closes the most common bypass shape (`..`-walks, `./` noise, descendants of `/proc`/`/sys`/`/boot`, and lookalike directories that should NOT match protected roots). 15 new cases lock down both the normalizer (in `matcher.ts` + `engine.ts resolveForProtected`) and the protected-paths classifier's `startsWithSegment` boundary semantics. Suite grows **77 → 92** (68% of the §16.2 GA bar).

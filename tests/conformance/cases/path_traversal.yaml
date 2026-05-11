@@ -13,7 +13,8 @@
 #   C. /sys descendants                          (2)
 #   D. /boot descendants                         (1)
 #   E. Lookalike roots (NOT protected)           (3)
-#   F. Tilde-escalate file exact-match           (1)
+#   F. Traversal preserves protected detection   (1, slice 29)
+#   G. Tilde-escalate file exact-match           (1)
 #
 # Existing `protected_paths.yaml` covers the direct-path contracts (/proc /sys
 # /boot deny tiers, /etc + ~/.bashrc escalate tiers, read pass-through, deny
@@ -297,6 +298,36 @@
 # ─────────────────────────────────────────────────────────────────────
 # Group F — Tilde-escalate file requires EXACT match (no suffix bleed)
 # ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: ..-walk into /etc still escalates write to confirm (slice 29 fix)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      # Pre-slice-29: `/work/proj/data/../../../etc/hosts` in a
+      # fictional cwd (/work/proj doesn't exist on the test machine)
+      # survived both realpath fallbacks in `resolveForProtected`,
+      # the textual abs was returned with the `/work/proj/` prefix,
+      # and the protected classifier missed `/etc/`. Result: allow
+      # without escalate prompt.
+      #
+      # Slice 29 fix: `path.resolve(cwd, rawPath)` is called
+      # unconditionally, lexically resolving `..` BEFORE realpath
+      # runs. The classifier now sees `/etc/hosts` and `/etc` write
+      # escalate fires. (Three `..` components needed: data → proj →
+      # work → /, then /etc/hosts.)
+      file_path: "/work/proj/data/../../../etc/hosts"
+  expect:
+    kind: "confirm"
+    source_section: "write_file"
+    reason_substring: "escalated"
 
 - name: "path traversal: ~/.bashrc-backup does NOT match ~/.bashrc escalate (exact, not prefix)"
   setup:

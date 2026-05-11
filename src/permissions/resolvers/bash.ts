@@ -32,7 +32,7 @@
 //      escalate-tier drops confidence to low so the engine forces
 //      a confirm via slice-3 wiring.
 
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { resolve as resolvePath } from 'node:path';
 import type { Node } from 'web-tree-sitter';
 import { parseBash } from '../bash-parser.ts';
 import type { Capability } from '../capabilities.ts';
@@ -47,8 +47,11 @@ import {
 
 const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
 
-const resolveArg = (path: string, ctx: ResolverContext): string =>
-  isAbsolute(path) ? path : resolvePath(ctx.cwd, path);
+// Always lexically normalizes via `path.resolve(cwd, ...)` even when
+// `path` is already absolute, so `..`/`./` components don't survive
+// into the resulting capability scope. See slice 29 / fs.ts:resolveAbs
+// for the security rationale.
+const resolveArg = (path: string, ctx: ResolverContext): string => resolvePath(ctx.cwd, path);
 
 // POSIX-aware positional extraction: tokens before `--` get the
 // classic "starts-with-`-` is a flag" treatment; `--` itself is
@@ -753,7 +756,7 @@ const analyzeCommand = (
   if (!isPureOutputCommand(shape.name)) {
     for (const arg of shape.args) {
       if (arg.length === 0 || arg.startsWith('-')) continue;
-      const abs = isAbsolute(arg) ? arg : resolvePath(ctx.cwd, arg);
+      const abs = resolvePath(ctx.cwd, arg);
       const op: 'read' | 'write' = isReadOnlyCommand(shape.name) ? 'read' : 'write';
       const tier = classifyProtectedPath({ absPath: abs, op, home: ctx.home, cwd: ctx.cwd });
       if (tier === 'deny') {
@@ -778,7 +781,7 @@ const analyzeCommand = (
   const redirectCaps: Capability[] = [];
   for (const r of shape.redirects) {
     if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
-      const tgtAbs = isAbsolute(r.target) ? r.target : resolvePath(ctx.cwd, r.target);
+      const tgtAbs = resolvePath(ctx.cwd, r.target);
       const tier = classifyProtectedPath({
         absPath: tgtAbs,
         op: 'write',

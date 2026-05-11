@@ -5,7 +5,7 @@
 // a missing or malformed `path` arg is structural failure and earns
 // Refuse, not Conservative.
 
-import { isAbsolute, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import type { Capability } from '../capabilities.ts';
 import { readFs, writeFs } from '../capabilities.ts';
 import {
@@ -27,16 +27,19 @@ const filePathOf = (args: Record<string, unknown>): string | null => {
   return null;
 };
 
-// Resolve a path arg into a textual absolute form. Mirrors the
-// matcher's resolve order (isAbsolute → cwd-relative resolve) but
-// does NOT follow symlinks — the engine's path-matching pipeline
-// already resolves them via `realpath`; doing it here would
+// Resolve a path arg into a lexically-normalized textual absolute
+// form. Always calls `path.resolve(cwd, ...)` even on absolute
+// inputs so `..`/`./` components are normalized lexically; without
+// this, a capability scope like `read-fs:/work/proj/../../etc/x`
+// would carry the un-normalized form into the audit log and
+// intersection checks, defeating slice-25/26 scope-level §10
+// enforcement. Does NOT follow symlinks — the engine's path-matching
+// pipeline already resolves them via `realpath`; doing it here would
 // double the syscalls per check and produce a `read-fs(realpath)`
 // capability whose scope no longer matches the policy YAML the
-// operator authored. Capabilities carry the textual path; the
+// operator authored. Capabilities carry the lexical path; the
 // runtime classifier (slice 1) is the symlink defense.
-const resolveAbs = (path: string, ctx: ResolverContext): string =>
-  isAbsolute(path) ? path : resolve(ctx.cwd, path);
+const resolveAbs = (path: string, ctx: ResolverContext): string => resolve(ctx.cwd, path);
 
 const readFileResolver: Resolver = (args, ctx): ResolverResult => {
   const path = filePathOf(args);

@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { Glob } from 'bun';
 
 // Resolve symlinks before matching. Without this, a symlink at
@@ -29,10 +29,19 @@ const resolveSymlinks = (abs: string): string => {
 // `/etc/passwd`), which is the security property we want. Symlinks are
 // resolved on the target before matching, so a symlink inside cwd that
 // points outside cwd won't sneak past.
+//
+// `path.resolve(cwd, ...)` is called unconditionally on both target and
+// pattern — even when the input is already absolute — so `..`/`./`
+// components are lexically normalized BEFORE realpath. Without this
+// (pre-slice-29 behavior), an absolute input like `/work/proj/../../etc/x`
+// would survive both realpath fallbacks when intermediate dirs don't
+// exist on the live FS, and the matcher would then strip the textual
+// `/work/proj/` prefix via relativize and match the residual
+// `../../etc/x` against the cwd-relative pattern.
 export const matchPath = (pattern: string, target: string, cwd: string): boolean => {
-  const absTargetRaw = isAbsolute(target) ? target : resolve(cwd, target);
+  const absTargetRaw = resolve(cwd, target);
   const absTarget = resolveSymlinks(absTargetRaw);
-  const absPattern = isAbsolute(pattern) ? pattern : resolve(cwd, pattern);
+  const absPattern = resolve(cwd, pattern);
 
   const absCwd = resolve(cwd);
   const targetRel = relativize(absCwd, absTarget);
