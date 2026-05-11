@@ -15,6 +15,75 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 6: bash AST resolver (tree-sitter + whitelist + Refuse)
+
+**Done.** Sixth slice of the v2 evolution. Replaces the slice-3 token-based bash resolver with a proper tree-sitter parse + closed whitelist walk. Path A.2 from `TREE_SITTER.md` (web-tree-sitter WASM, vendored grammar) plus the §9 shape recognition pattern from `TREE_SITTER_SHELL.md`.
+
+### Why this design (and not the slice 6 attempt B)
+
+A first attempt (slice 6 B, never committed) implemented a hand-rolled bash mini-parser. Critical review surfaced the structural problem: a custom bash parser is a known anti-pattern for security gates. Cover 80% of benign shapes and you create a false sense of safety — the remaining 20% (arithmetic expansion, parameter modifiers, ANSI-C quoting, process substitution, here-string body interpretation, function definitions, variable assignment prefixes, command substitution inside args) IS the adversarial surface, and missing modeling becomes silent bypass.
+
+`TREE_SITTER.md §9` and `TREE_SITTER_SHELL.md §9` codify the correct shape: parse with tree-sitter (entry-point only), walk the AST against a small closed whitelist, **refuse** anything outside. Refuse is fail-safe and forensically loud; Conservative obscures gaps.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `package.json` | New dep `web-tree-sitter@0.26.8` (runtime). Tree-sitter-bash grammar is vendored, not a runtime dep. |
+| `src/permissions/grammars/tree-sitter-bash.wasm` | New (vendored). Upstream `tree-sitter-bash@0.25.1` from npm; `sha256:8292919c…`. Why vendored: `bun build --compile` cross-platform single-binary needs the wasm embedded, not fetched. `tree-sitter-wasms` redistribution ABI-mismatched with `web-tree-sitter@0.26.x` (dylink metadata failure) so we pull from the upstream package directly. |
+| `src/permissions/grammars/README.md` | New. Provenance + checksum + update process. |
+| `src/permissions/bash-parser.ts` | New. `initBashParser()` async one-time init (Parser.init + Language.load). `parseBash(src)` sync after init. Singleton parser cached across the process. |
+| `src/permissions/resolvers/bash.ts` | Rewritten. Walks the tree-sitter AST against a closed WHITELIST_NODE_TYPES + RED_FLAG_NODES (§3.5). `command_substitution`, `process_substitution`, parameter `expansion`, `simple_expansion`, `arithmetic_expansion`, `function_definition`, `variable_assignment` prefix, `subscript`, `regex`, `ansi_c_string`, `translated_string`, `heredoc_redirect`, `herestring_redirect`, `if_statement`, `while_statement`, `for_statement`, `case_statement`, `subshell`, `compound_statement`, `negated_command`, `test_command` all return Refuse with stable reasons. Per-arg + per-redirect `classifyProtectedPath` closes the bash-side gap from slice 1: deny-tier paths refuse the whole script; escalate-tier drops confidence to low (engine forces confirm via slice-3 wiring). HARD_REFUSE_COMMANDS hardened: `eval` / `exec` / `source` / `.` / `trap` / `alias` / `shopt` / `set` / `unset` / `declare` / `export` / `typeset` / `readonly` / `local` / `dd` / `fdisk` / `parted` / `mkswap` / `shred` / `mkfs.*`. Pipe-to-shell pattern (`curl ... \| sh`) detected explicitly and refused. COMMAND_TABLE expanded with common builtins / utilities: `mkdir` / `touch` / `ln` / `mktemp` (writes), `sleep` / `true` / `false` (no-op), `whoami` / `id` / `groups` / `hostname` / `uname` / `uptime` / `date` / `env` / `printenv` / `which` / `type` / `command` (read-only sys-info), `cd` (no persistent side effect across tool calls). |
+| `src/permissions/bootstrap-engine.ts` | Now `async`. Calls `await initBashParser()` during validating-chain so the engine's first `check()` finds a warm parser. Returns `Promise<BootstrapPermissionEngineResult>`. |
+| `src/cli/bootstrap.ts` | Now `async`. Cascade through the engine bootstrap. Returns `Promise<BootstrapResult>`. |
+| `src/cli/run.ts` + `src/cli/repl.ts` + `src/evals/executor.ts` | Each adds `await` on the bootstrap call site. `repl.ts` widens its `bootstrapFn?` test seam to `Promise<BootstrapResult> \| BootstrapResult` so sync test fixtures still satisfy. |
+| `tests/permissions/resolvers.test.ts` | Updated. Adversarial shape Refuse tests (cmd_sub / backtick / process_substitution / parameter_expansion / unknown command). `beforeAll(initBashParser)`. |
+| `tests/permissions/engine.test.ts` | Updated. Tests that pre-slice-6 expected `confirm` on adversarial shapes (`$(...)`, backtick, `<(...)`, `a; b`) now expect `deny` with `source.section='resolver-refuse'`. `beforeAll(initBashParser)`. |
+| `tests/cli/bootstrap.test.ts` + `tests/permissions/bootstrap-engine.test.ts` | All test bodies async; `expect(...).toThrow()` → `await expect(...).rejects.toThrow()` for the bootstrap-rejection cases. |
+| `tests/conformance/conformance.test.ts` | `beforeAll(initBashParser)` inside the describe. |
+| `tests/conformance/cases/capability_resolvers.yaml` + `risk_score.yaml` | Adversarial cases updated: pipe-to-shell → Refuse; pipeline of known commands → Ok at resolver, confirm at engine (slice-1 compound guard still fires). |
+
+### Decisions
+
+- **Path A.2 (web-tree-sitter WASM), not A.1 (native).** Native `tree-sitter` bindings via `node-addon-api` break `bun build --compile` cross-platform (each release target needs different bindings). WASM is universal — Bun runs WebAssembly natively. Empirical parse latency is 0.018–0.15 ms per call (1000-call benchmark, simple to compound shapes); init is ~32 ms once per process. Negligible vs the audit-row SQLite + hash chain cost in the same hot path.
+- **Grammar vendored under `src/permissions/grammars/`, not fetched.** `tree-sitter-wasms@0.1.13` (a re-package) was ABI-incompatible with `web-tree-sitter@0.26.x` — dylink metadata mismatch on `Language.load`. The upstream `tree-sitter-bash@0.25.1` npm tarball ships `tree-sitter-bash.wasm` directly; we pull from there.
+- **Closed whitelist; everything outside is Refuse.** Per `TREE_SITTER_SHELL.md §9`. Adding a new shape requires a PR + threat-model breve + conformance case (per `TREE_SITTER.md §6` governance).
+- **Refuse > Conservative.** The hand-rolled attempt (B) emitted Conservative + capability set for shapes it didn't model. The correct posture is to surface the gap as Refuse with a specific reason so the operator either reformulates with a tool that has a proper resolver, or knows the limit.
+- **Async bootstrap cascade accepted.** Init of WebAssembly + grammar load is async; the principled fix is the async cascade through `bootstrap` → `bootstrap-engine` → `cli/bootstrap.ts` → `run.ts` / `repl.ts` / `evals/executor.ts`. Same pattern other CLI tools use for tree-sitter integration.
+- **COMMAND_TABLE expanded with common builtins.** Pre-expansion, every `sleep 30` / `whoami` / `mkdir build` came back Refuse (closed whitelist working as designed). The expanded table is the UX trade-off: known commands resolve precisely, unknown ones refuse loud.
+- **Pipe-to-shell explicit detection.** Even though `pipeline` is whitelisted, the *shape* `... | sh` reads stdin as arbitrary script. Detected by scanning every pipeline's final stage against SHELL_INTERPRETERS.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5022 pass / 10 skip / 0 fail** (5032 total across 235 files)
+- Empirical: `web-tree-sitter` init 32ms, parse per-call 0.018–0.15ms (1000 iterations across simple + compound + dynamic shapes)
+
+### Closed (from earlier slices)
+
+- **Bash-side protected-path enforcement (slice 1's "wired but deferred").** AST per-arg + per-redirect-target classification refuses every deny-tier path (`/proc/`, `/sys/`, `/boot/`); escalate-tier (`/etc/`, `~/.bashrc`) drops confidence to low so the engine forces confirm. Closes the gap where `rm -rf /proc/sys/...` previously needed an explicit bash deny rule.
+- **Slice 6 B (hand-rolled mini-parser).** Documented as anti-pattern in `TREE_SITTER.md §2.B`. Never committed.
+
+### Wired but deferred
+
+- **Brace expansion `{a,b,c}`.** Tree-sitter captures it as `concatenation` (in whitelist); resolver doesn't enumerate the post-expansion args.
+- **Heredoc bodies as opaque.** `heredoc_redirect` is RED_FLAG — body interpretation isn't modeled. Operators reformulate via write_file + bash, or face Refuse.
+- **`<<<` here-string body interpretation.** Refused.
+- **Process substitution `<(cmd)` / `>(cmd)`.** Refused. Could be modeled by recursing into inner command if a real workflow demands.
+
+### Next
+
+Successor slices (in spec order):
+1. Approval-gate consumption of score (post-pilot calibration).
+2. `--rotate-chain` flow.
+3. Subagent intersection formal.
+4. Sandbox plan integration (bwrap profile selection).
+5. Context-summary builder for the classifier input.
+6. Replay tool (`agent permission replay`).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 5: classifier hint
 
 **Done.** Fifth slice of the v2 evolution. Implements the optional classifier hint per PERMISSION_ENGINE.md §6.4 — an external model that receives the resolved capabilities + deterministic score and emits a `score_adjust` clamped to ±0.2. Hint-only by design: the classifier can NEVER produce a deny that the deterministic floor wouldn't already have produced; its job is to nudge borderline scores. Schema validation, clamping, lenient vs strict modes, and full prompt-injection isolation (the classifier never sees args / outputs / file contents) all land here.

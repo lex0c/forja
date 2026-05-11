@@ -38,31 +38,31 @@ const baseInput = (overrides: Partial<Parameters<typeof bootstrapPermissionEngin
 
 describe('bootstrapPermissionEngine — happy path', () => {
   test('walks init → loading-policy → validating-chain → ready', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     expect(r.state).toBe('ready');
     expect(r.events.map((e) => e.to)).toEqual(['loading-policy', 'validating-chain', 'ready']);
     expect(r.refusingReason).toBeUndefined();
   });
 
   test('engine produced is in ready state', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     expect(r.engine.state()).toBe('ready');
   });
 
   test('chain verifies clean on fresh install', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     expect(r.chain.ok).toBe(true);
   });
 
   test('identity is created and persisted', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     expect(r.identity.install_id).toBe('boot-uuid-aaaa-bbbb');
     expect(r.identity.created_at_ms).toBe(1);
   });
 
   test('audit sink is wired — engine emits to the same DB', async () => {
     const db = baseDb();
-    const r = bootstrapPermissionEngine(baseInput({ db }));
+    const r = await bootstrapPermissionEngine(baseInput({ db }));
     // Hit the engine with one check; the audit row must land in
     // the shared DB.
     r.engine.check('bash', 'bash', { command: 'ls' });
@@ -72,7 +72,7 @@ describe('bootstrapPermissionEngine — happy path', () => {
   });
 
   test('returns layers, lockConflicts, provenance from resolver', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     expect(r.layers).toEqual([]); // no policy files → default
     expect(r.lockConflicts).toEqual([]);
     expect(r.provenance.defaults).toBe('default');
@@ -81,7 +81,7 @@ describe('bootstrapPermissionEngine — happy path', () => {
 
 describe('bootstrapPermissionEngine — refusing paths', () => {
   test('install_id failure → refusing', async () => {
-    const r = bootstrapPermissionEngine(
+    const r = await bootstrapPermissionEngine(
       baseInput({ env: {} }), // no HOME / XDG / APPDATA → install_id throws
     );
     expect(r.state).toBe('refusing');
@@ -107,7 +107,7 @@ tools:
       - "/etc/hosts"
 `,
     );
-    const r = bootstrapPermissionEngine(baseInput({ cwd: projDir }));
+    const r = await bootstrapPermissionEngine(baseInput({ cwd: projDir }));
     expect(r.state).toBe('refusing');
     expect(r.refusingReason).toContain('policy_load_failed');
     expect(r.refusingReason).toContain('redefines a protected path');
@@ -133,7 +133,7 @@ tools:
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
 
-    const r = bootstrapPermissionEngine(baseInput({ db }));
+    const r = await bootstrapPermissionEngine(baseInput({ db }));
     expect(r.state).toBe('refusing');
     expect(r.refusingReason).toContain('chain_broken');
     expect(r.chain.ok).toBe(false);
@@ -158,7 +158,7 @@ tools:
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
 
-    const r = bootstrapPermissionEngine(baseInput({ db, acceptBrokenChain: true }));
+    const r = await bootstrapPermissionEngine(baseInput({ db, acceptBrokenChain: true }));
     expect(r.state).toBe('ready');
     // A `chain-break-accepted` audit row landed BEFORE the engine
     // started accepting decisions.
@@ -172,14 +172,14 @@ tools:
 
 describe('bootstrapPermissionEngine — engine.state() honored after boot', () => {
   test('every transition is recorded in events', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     expect(r.events.length).toBe(3); // → loading → validating → ready
     expect(r.events[0]?.from).toBe('init');
     expect(r.events[r.events.length - 1]?.to).toBe('ready');
   });
 
   test('subsequent engine.degrade flows through the same controller', async () => {
-    const r = bootstrapPermissionEngine(baseInput());
+    const r = await bootstrapPermissionEngine(baseInput());
     r.engine.degrade('test_signal');
     expect(r.engine.state()).toBe('degraded');
     // The new transition shows up in the events list because the

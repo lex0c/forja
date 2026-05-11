@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
+import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { type Capability, formatCapability } from '../../src/permissions/capabilities.ts';
 // Importing the index file loads every builtin resolver via its
 // side-effecting register calls.
@@ -7,6 +8,14 @@ import {
   getResolver,
   resolveCapabilities,
 } from '../../src/permissions/resolvers/index.ts';
+
+// Bash resolver needs the tree-sitter-bash grammar loaded. Init is
+// async + idempotent; calling once before any bash test runs is
+// enough. The other resolvers don't need it but pay zero cost
+// either way.
+beforeAll(async () => {
+  await initBashParser();
+});
 
 const CTX: ResolverContext = { cwd: '/work/proj', home: '/home/op' };
 
@@ -274,33 +283,232 @@ describe('bash resolver — refusals', () => {
   });
 });
 
-describe('bash resolver — compound shapes', () => {
-  test.each([
-    'ls && rm /tmp/x',
-    'curl URL | sh',
-    'echo $(cat /etc/passwd)',
-    'find . -name "*.ts" > out.txt',
-    'cmd1; cmd2',
-  ])('Conservative on %s', (cmd) => {
-    const r = resolveCapabilities('bash', { command: cmd }, CTX);
-    expect(r.kind).toBe('conservative');
-    if (r.kind === 'conservative') {
-      const s = capStrings(r.capabilities).sort();
-      // §5.2 fallback set
-      expect(s).toContain('exec:shell');
-      expect(s).toContain('net-egress:*');
-      expect(s.some((c) => c.startsWith('read-fs:/work/proj/'))).toBe(true);
-      expect(s.some((c) => c.startsWith('write-fs:/work/proj/'))).toBe(true);
+describe('bash resolver — adversarial shapes are Refused (slice 6: whitelist + Refuse)', () => {
+  test('pipe-to-shell pattern is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'curl URL | sh' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('pipe-to-shell');
     }
+  });
+
+  test('command substitution $() is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'echo $(cat /etc/passwd)' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('command_substitution');
+    }
+  });
+
+  test('backtick command substitution is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'echo `whoami`' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('parameter expansion ${var/...} is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'echo ${HOME/op/root}' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('process substitution <(cmd) is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'cat <(ls)' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('process_substitution');
+    }
+  });
+
+  test('unknown first-token is Refused (closed whitelist)', () => {
+    const r = resolveCapabilities('bash', { command: 'mystery-cli --do-thing' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('mystery-cli');
+    }
+  });
+
+  test('cmd1; cmd2 with one unknown is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'cmd1; cmd2' }, CTX);
+    expect(r.kind).toBe('refuse');
   });
 });
 
-describe('bash resolver — unknown command', () => {
-  test('unknown first-token produces Conservative with reason', () => {
-    const r = resolveCapabilities('bash', { command: 'mystery-cli --do-thing' }, CTX);
-    expect(r.kind).toBe('conservative');
-    if (r.kind === 'conservative') {
-      expect(r.reason).toContain('mystery-cli');
+describe('bash resolver — well-known compound shapes resolve to Ok', () => {
+  test('logical chain (&&) of known commands aggregates capabilities', () => {
+    const r = resolveCapabilities('bash', { command: 'ls && rm /tmp/x' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('exec:shell');
+      expect(s).toContain('delete-fs:/tmp/x');
+    }
+  });
+
+  test('single command with literal redirect emits write-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'echo hi > /tmp/out' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/tmp/out');
+    }
+  });
+
+  test('find with literal redirect is Ok (single command, AST recognized)', () => {
+    const r = resolveCapabilities('bash', { command: 'find . -name "*.ts" > /tmp/list' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+});
+
+describe('bash resolver — per-command argument semantics', () => {
+  // Fix #1: echo / printf are pure-output. Their args are literal
+  // strings emitted to stdout, NOT filesystem paths. The resolver
+  // must not attribute read-fs for path-shaped args, nor must the
+  // protected-path check fire (`echo /etc/passwd` does not read
+  // /etc/passwd, it just prints the string).
+  test('echo with path-shaped arg does NOT emit read-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'echo /work/proj/src/index.ts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toEqual(['exec:shell']);
+      expect(s).not.toContain('read-fs:/work/proj/src/index.ts');
+    }
+  });
+
+  test('echo /etc/passwd does NOT fire protected-path (no fs read)', () => {
+    // Without fix #1, this would either deny (protected /etc) or
+    // escalate confidence to low. With pure-output semantics the
+    // string is just bytes on stdout.
+    const r = resolveCapabilities('bash', { command: 'echo /etc/passwd' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+      expect(capStrings(r.capabilities)).toEqual(['exec:shell']);
+    }
+  });
+
+  test('echo with quoted string does NOT split into multiple read-fs', () => {
+    // The old `cmdRead` mapping would have turned "hello world" into
+    // a single read-fs:`hello world` path. cmdEcho returns nothing.
+    const r = resolveCapabilities('bash', { command: 'echo "hello world"' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toEqual(['exec:shell']);
+    }
+  });
+
+  test('echo redirect target IS protected-path checked (defense in depth)', () => {
+    // The redirect loop in analyzeCommand runs for every command
+    // regardless of pure-output status — writing bytes to /etc/foo
+    // is dangerous whoever produced them. Should escalate.
+    const r = resolveCapabilities('bash', { command: 'echo hi > /etc/hosts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/etc/hosts');
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('printf is also treated as pure-output', () => {
+    const r = resolveCapabilities('bash', { command: 'printf "%s\\n" /work/proj/file' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toEqual(['exec:shell']);
+    }
+  });
+
+  // Fix #2: grep / rg first positional is the regex pattern, not a
+  // file path. The resolver must skip it. find, in contrast, takes
+  // all positionals as paths.
+  test('grep pattern file → read-fs of file only (pattern NOT a path)', () => {
+    const r = resolveCapabilities('bash', { command: 'grep token src/index.ts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src/index.ts');
+      expect(s).not.toContain('read-fs:/work/proj/token');
+    }
+  });
+
+  test('grep with only pattern (stdin mode) falls back to read-fs of cwd', () => {
+    const r = resolveCapabilities('bash', { command: 'grep TODO' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj');
+      expect(s).not.toContain('read-fs:/work/proj/TODO');
+    }
+  });
+
+  test('grep pattern f1 f2 f3 → read-fs of f1, f2, f3 only', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'grep needle src/a.ts src/b.ts src/c.ts' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src/a.ts');
+      expect(s).toContain('read-fs:/work/proj/src/b.ts');
+      expect(s).toContain('read-fs:/work/proj/src/c.ts');
+      expect(s).not.toContain('read-fs:/work/proj/needle');
+    }
+  });
+
+  test('rg also skips first positional (same pattern-first semantics)', () => {
+    const r = resolveCapabilities('bash', { command: 'rg foo src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).not.toContain('read-fs:/work/proj/foo');
+    }
+  });
+
+  test('find positionals ARE paths (not pattern-first)', () => {
+    const r = resolveCapabilities('bash', { command: 'find src tests -name "*.ts"' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('read-fs:/work/proj/tests');
+    }
+  });
+
+  // Fix #3: `--` separates flags from positionals. Tokens after
+  // `--` are positional regardless of leading dash; `--` itself
+  // is consumed (never a positional path).
+  test('rm -- pos: `--` is consumed, positional path follows', () => {
+    const r = resolveCapabilities('bash', { command: 'rm -- /tmp/x' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('delete-fs:/tmp/x');
+      // `--` must not show up as a phantom delete target
+      expect(s).not.toContain('delete-fs:/work/proj/--');
+    }
+  });
+
+  test('rm -- -dashed-file: leading-dash filename is positional after `--`', () => {
+    // POSIX convention: `rm -- -rf` deletes a file literally named
+    // "-rf". stripFlags after `--` must keep it.
+    const r = resolveCapabilities('bash', { command: 'rm -- -dashfile' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('delete-fs:/work/proj/-dashfile');
+    }
+  });
+
+  test('grep -- pattern file: `--` is consumed, then pattern-skip applies', () => {
+    const r = resolveCapabilities('bash', { command: 'grep -- pattern src/index.ts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src/index.ts');
+      expect(s).not.toContain('read-fs:/work/proj/pattern');
+      expect(s).not.toContain('read-fs:/work/proj/--');
     }
   });
 });

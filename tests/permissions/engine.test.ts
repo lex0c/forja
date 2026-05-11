@@ -1,6 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
+import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
 import type { Policy } from '../../src/permissions/types.ts';
+
+// Bash resolver (slice 6) walks the tree-sitter-bash AST. Init is
+// async + idempotent; needs to complete before any engine.check on
+// the bash category fires.
+beforeAll(async () => {
+  await initBashParser();
+});
 
 const CWD = '/proj';
 
@@ -357,22 +365,35 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('confirm');
   });
 
-  test('command substitution $(...) forces confirm', () => {
+  test('command substitution $(...) is denied via resolver-refuse (slice 6)', () => {
+    // Pre-slice-6: containsShellInjection caught `$(...)` and the
+    // engine forced confirm. Post-slice-6: the bash AST resolver
+    // recognizes `command_substitution` as a red-flag node type and
+    // refuses outright (TREE_SITTER_SHELL.md §3.5). Refuse beats
+    // Conservative because composition rules in bash mean any
+    // single unsafe element can poison the rest.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
     const d = eng.check('bash', 'bash', { command: 'echo $(cat /etc/passwd)' });
-    expect(d.kind).toBe('confirm');
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.source?.section).toBe('resolver-refuse');
+      expect(d.reason).toContain('command_substitution');
+    }
   });
 
-  test('backtick command substitution forces confirm', () => {
+  test('backtick command substitution is denied via resolver-refuse', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
     const d = eng.check('bash', 'bash', { command: 'echo `whoami`' });
-    expect(d.kind).toBe('confirm');
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.source?.section).toBe('resolver-refuse');
+    }
   });
 
   test('deny rules still win over the compound guard (catastrophic shapes blocked)', () => {
@@ -404,17 +425,22 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('allow');
   });
 
-  test('compound source.layer reflects bash section provenance', () => {
-    // The forced-confirm path still attributes to the layer that
-    // wrote the bash section, so /perms why and the modal can
-    // point at the YAML the operator should edit.
+  test('compound with unknown commands lands as resolver-refuse (slice 6)', () => {
+    // Pre-slice-6: containsShellInjection saw `;` and forced
+    // confirm with bash-section attribution. Post-slice-6: AST
+    // resolver checks each command in the sequence against the
+    // COMMAND_TABLE. Two unknown names → refuse; attribution
+    // shifts to `resolver-refuse` because the failure is
+    // structural (closed whitelist), not policy-driven.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'user' },
     });
     const d = eng.check('bash', 'bash', { command: 'a; b' });
-    expect(d.kind).toBe('confirm');
-    expect(d.source).toEqual({ layer: 'user', section: 'bash' });
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.source?.section).toBe('resolver-refuse');
+    }
   });
 
   test('newline-injected command is NOT silently allowed by glob with dotAll', () => {
@@ -495,20 +521,19 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('confirm');
   });
 
-  test('process substitution forces confirm even when allow matches the host command', () => {
-    // The `<(cmd)` and `>(cmd)` forms run cmd in a subshell. Same
-    // security shape as `$(...)`: an allow like `cat *` would
-    // otherwise admit `cat <(rm -rf /tmp/pwn)` because no standard
-    // separator appears in the input. Closes the third bypass
-    // class against the compound guard (after `;`/`\n`/`&`).
+  test('process substitution is denied via resolver-refuse (slice 6)', () => {
+    // Pre-slice-6: forced confirm via the compound guard.
+    // Post-slice-6: `process_substitution` is a red-flag node type
+    // in the AST whitelist — refused before the rule pipeline runs.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['cat *'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
     const d = eng.check('bash', 'bash', { command: 'cat <(rm -rf /tmp/pwn)' });
-    expect(d.kind).toBe('confirm');
-    if (d.kind === 'confirm') {
-      expect(d.reason).toContain('compound shell command');
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.source?.section).toBe('resolver-refuse');
+      expect(d.reason).toContain('process_substitution');
     }
   });
 
@@ -770,11 +795,13 @@ describe('Decision.source provenance', () => {
     // Operator editing config to undo the bypass needs to know
     // which YAML set mode — pointing the modal/audit there is
     // exactly the affordance the source field provides.
+    // Use a known command so the bash AST resolver doesn't refuse
+    // before bypass short-circuit can fire.
     const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
       cwd: CWD,
       provenance: { defaults: 'session' },
     });
-    const d = eng.check('bash', 'bash', { command: 'whatever' });
+    const d = eng.check('bash', 'bash', { command: 'ls' });
     expect(d.kind).toBe('allow');
     expect(d.source).toEqual({ layer: 'session' });
   });
@@ -920,10 +947,14 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
     //   - the escaped rule matches the original literal (operator
     //     doesn't get re-prompted)
     //   - the escaped rule does NOT match injection variants
-    //     (`echo $(rm -rf /)`, `echo extra`, etc.)
+    //     (`echo extra`, etc.) → default-deny falls through
     // Without escaping, the rule's `*` would be a wildcard and
-    // the engine's order (session-allow before compound guard)
     // would auto-allow the injection.
+    //
+    // Slice-6 change: `echo $(rm -rf /)` no longer hits the
+    // session-allow / rule pipeline at all — the bash AST resolver
+    // refuses `command_substitution` upstream. The bypass shape
+    // closes via Refuse before the rule layer is even consulted.
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
     eng.addSessionAllow('bash', 'echo \\*');
     // Original literal: allowed.
@@ -931,32 +962,28 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
     // Plain variant: NOT matched by the escaped rule, no other
     // rules to fall through to → default-deny.
     expect(eng.check('bash', 'bash', { command: 'echo file.txt' }).kind).toBe('deny');
-    // Injection variant: session-allow doesn't match (escape
-    // worked), so falls through to the compound-shell guard which
-    // forces confirm. The crucial property is "NOT allow" — the
-    // bypass would have returned allow without the bridge's
-    // escaping. Confirm here means the operator gets another
-    // modal, which is the safe behavior.
-    expect(eng.check('bash', 'bash', { command: 'echo $(rm -rf /)' }).kind).toBe('confirm');
+    // Injection variant: resolver-refuse on `$(...)` before any
+    // rule consults. Defense-in-depth — even if session-allow
+    // had matched, the resolver would still refuse.
+    expect(eng.check('bash', 'bash', { command: 'echo $(rm -rf /)' }).kind).toBe('deny');
   });
 
-  test('UNESCAPED bare wildcard rule still broadens (negative pin — proves the bridge fix is load-bearing)', () => {
-    // Documents what the bridge's escaping prevents. A bare `*`
-    // pattern stored as session-allow IS a wildcard at the
-    // matcher level — that's why the bridge has to escape
-    // args-derived literals. Without the bridge layer, an
-    // operator's "Yes, don't ask again for: echo *" would
-    // accidentally authorize every echo invocation.
+  test('UNESCAPED bare wildcard rule broadens for benign shapes but Refuse traps adversarial ones (slice 6)', () => {
+    // Documents what the bridge's escaping prevents AND the new
+    // belt-and-suspenders: session-allow with `echo *` (no
+    // escape) DOES broaden to `echo file.txt` (the bridge bug
+    // class the production code fixes by escaping). But the
+    // adversarial shape `echo $(...)` is now caught by the bash
+    // AST resolver — even if the bridge were buggy, the resolver
+    // refuses the substitution before session-allow runs.
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
     eng.addSessionAllow('bash', 'echo *');
-    // Unescaped: matches the original AND every other echo.
     expect(eng.check('bash', 'bash', { command: 'echo *' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: 'echo file.txt' }).kind).toBe('allow');
-    // BUT note: `echo $(...)` still trips the compound-shell
-    // guard? Actually no — session-allow runs BEFORE the guard.
-    // This is exactly the bypass shape the bridge's escape
-    // closes from the operator's side.
-    expect(eng.check('bash', 'bash', { command: 'echo $(rm -rf /)' }).kind).toBe('allow');
+    // Adversarial: resolver-refuse upstream of session-allow.
+    // Crucially NOT allow — the bridge's escape used to be the
+    // only defense; now the resolver is a second wall.
+    expect(eng.check('bash', 'bash', { command: 'echo $(rm -rf /)' }).kind).toBe('deny');
   });
 
   test('search-tool session-allow with bare-root pattern does NOT fire (regression pin)', () => {
@@ -1382,12 +1409,14 @@ describe('engine — state machine integration (§2)', () => {
   });
 
   test('degraded blocks bypass mode shortcut (defense in depth)', () => {
+    // Use a known command so the bash AST resolver doesn't refuse
+    // before the bypass / degraded short-circuit fires.
     const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
       cwd: PROJ,
       home: HOME,
       initialState: 'degraded',
     });
-    const d = eng.check('bash', 'bash', { command: 'anything' });
+    const d = eng.check('bash', 'bash', { command: 'ls' });
     expect(d.kind).toBe('confirm');
   });
 

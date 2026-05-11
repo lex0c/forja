@@ -107,7 +107,7 @@
     score_components_include:
       - "untrusted_egress"
 
-- name: "bash compound (|) → shell_complex + confidence_low"
+- name: "bash pipeline of known commands → shell_complex score component (slice 6)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -120,11 +120,14 @@
     args:
       command: "cat file | grep token"
   expect:
+    # Slice-6 AST resolver accepts pipelines of known commands as
+    # Ok with aggregated capabilities. The engine's slice-1
+    # compound-shell guard fires on `|` and forces confirm
+    # downstream (defense in depth); risk-score still flags
+    # `shell_complex` because the `|` token carries composition risk.
     kind: "confirm"
-    score_gte: 0.5
     score_components_include:
       - "shell_complex"
-      - "confidence_low"
 
 - name: "MCP tool prefix triggers mcp_tool feature"
   setup: {}

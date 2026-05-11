@@ -26,6 +26,7 @@ import {
   type VerifyResult,
   createSqliteSink,
 } from './audit.ts';
+import { initBashParser } from './bash-parser.ts';
 import { canonicalHash } from './canonical.ts';
 import { type PermissionEngine, createPermissionEngine } from './engine.ts';
 import {
@@ -159,9 +160,16 @@ const emitChainBreakAcceptedRow = (
   });
 };
 
-export const bootstrapPermissionEngine = (
+export const bootstrapPermissionEngine = async (
   input: BootstrapPermissionEngineInput,
-): BootstrapPermissionEngineResult => {
+): Promise<BootstrapPermissionEngineResult> => {
+  // Bash AST resolver requires the tree-sitter-bash grammar to be
+  // loaded. Init is idempotent and cached across invocations — first
+  // call is ~30ms (wasm + grammar load), subsequent calls return
+  // immediately. Runs during the validating-chain phase so the
+  // engine's first check() finds a warm parser.
+  await initBashParser();
+
   const events: StateTransition[] = [];
   const controller = createStateController({
     initial: 'init',

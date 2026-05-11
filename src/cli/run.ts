@@ -223,7 +223,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           signal: options.signal ?? new AbortController().signal,
           ...(options.bootstrapOverride ?? {}),
         };
-        const result = bootstrap(bootstrapInput);
+        const result = await bootstrap(bootstrapInput);
         provider = result.config.provider;
         dbOverride = result.db;
         bootstrappedDbCloser = () => result.db.close();
@@ -431,7 +431,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       permissionState,
       permissionRefusingReason,
       permissionChain,
-    } = bootstrap(bootstrapInput);
+    } = await bootstrap(bootstrapInput);
 
     // Permission engine refused to come up — typically a broken
     // audit chain (PERMISSION_ENGINE.md §7.2). Surface the cause

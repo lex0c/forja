@@ -150,7 +150,7 @@ export interface BootstrapResult {
 // if present, instantiate the provider from the registry. Any failure
 // (unknown model, missing API key) bubbles up — the caller decides whether
 // to print to stderr and exit 1.
-export const bootstrap = (input: BootstrapInput): BootstrapResult => {
+export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult> => {
   const cwd = input.cwd ?? process.cwd();
   const modelId = input.modelId ?? DEFAULT_MODEL;
 
@@ -249,7 +249,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // controller drives runtime degrade/restore, and the audit sink
   // built here is the one the engine emits through — single SQLite
   // handle for the entire lifetime.
-  const permResult = bootstrapPermissionEngine({
+  const permResult = await bootstrapPermissionEngine({
     cwd,
     db,
     sessionId: 'session-bootstrap',

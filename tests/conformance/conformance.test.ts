@@ -4,9 +4,10 @@
 // surface the case name + the reasons array so the operator
 // sees exactly which assertion broke.
 
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { loadCasesFromYaml, runCase } from './index.ts';
 
 const CASES_DIR = join(import.meta.dir, 'cases');
@@ -23,6 +24,12 @@ const allCases = () =>
   });
 
 describe('conformance suite', () => {
+  // Bash cases need the tree-sitter-bash grammar loaded. Init runs
+  // once for the whole suite (idempotent + cached).
+  beforeAll(async () => {
+    await initBashParser();
+  });
+
   const cases = allCases();
 
   test(`discovers at least one case file under ${CASES_DIR}`, () => {

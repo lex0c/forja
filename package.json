@@ -41,6 +41,7 @@
     "@google/genai": "^1.50.1",
     "openai": "^6.34.0",
     "string-width": "^8.2.1",
+    "web-tree-sitter": "^0.26.8",
     "wrap-ansi": "^10.0.0",
     "yaml": "^2.8.3"
   }

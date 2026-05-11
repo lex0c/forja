@@ -56,8 +56,8 @@ afterEach(() => {
 });
 
 describe('bootstrap', () => {
-  test('builds a config with provider override and a fresh DB', () => {
-    const { config, db, modelId, policyLayers } = bootstrap({
+  test('builds a config with provider override and a fresh DB', async () => {
+    const { config, db, modelId, policyLayers } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -104,8 +104,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('honors --model override', () => {
-    const { modelId, db } = bootstrap({
+  test('honors --model override', async () => {
+    const { modelId, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       modelId: 'mock/custom',
@@ -118,9 +118,9 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('throws on unknown model when no override is supplied', () => {
+  test('throws on unknown model when no override is supplied', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-test';
-    expect(() =>
+    await expect(
       bootstrap({
         prompt: 'hi',
         cwd: workdir,
@@ -129,16 +129,16 @@ describe('bootstrap', () => {
         enterprisePolicyPath: null,
         userPolicyPath: null,
       }),
-    ).toThrow(/unknown model: fake\/nope/);
+    ).rejects.toThrow(/unknown model: fake\/nope/);
   });
 
-  test('loads project policy when .agent/permissions.yaml exists', () => {
+  test('loads project policy when .agent/permissions.yaml exists', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(
       join(workdir, '.agent/permissions.yaml'),
       'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
-    const { config, db, policyLayers } = bootstrap({
+    const { config, db, policyLayers } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -151,8 +151,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('falls back to default policy when no file', () => {
-    const { config, db, policyLayers } = bootstrap({
+  test('falls back to default policy when no file', async () => {
+    const { config, db, policyLayers } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -165,8 +165,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan: true sets harness planMode and injects plan-aware system prompt', () => {
-    const { config, db } = bootstrap({
+  test('plan: true sets harness planMode and injects plan-aware system prompt', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'refactor auth',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -181,13 +181,13 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan omitted leaves planMode unset; system prompt carries the parallelism hint', () => {
+  test('plan omitted leaves planMode unset; system prompt carries the parallelism hint', async () => {
     // Post-D227: every bootstrap surfaces the parallelism hint
     // as a base preamble so the model knows multi-tool turns
     // dispatch concurrently. Pre-D227 this test asserted
     // `systemPrompt === undefined`; that's now the only surface
     // change visible to the model.
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -202,13 +202,13 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan + caller systemPrompt composes (parallelism hint, then plan, then user)', () => {
+  test('plan + caller systemPrompt composes (parallelism hint, then plan, then user)', async () => {
     // Post-D227: three-layer composition. Parallelism hint is
     // the universal background; plan-mode prompt is the
     // operating mode; caller's prompt is the most specific
     // context. Ordering must be hint → plan → user so the
     // model reads them most-generic → most-specific.
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'refactor',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -252,12 +252,12 @@ Body for ${name}.`,
     );
   };
 
-  test('playbook hint absent when no subagent declares when_to_use', () => {
+  test('playbook hint absent when no subagent declares when_to_use', async () => {
     // Default workdir has no agents/ dir → registry is empty and
     // the hint must not render. Without this guard the model
     // reads a "Playbook subagents" preamble that lists nothing —
     // pure noise.
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -270,7 +270,7 @@ Body for ${name}.`,
     db.close();
   });
 
-  test('playbook hint absent when subagent has no when_to_use field', () => {
+  test('playbook hint absent when subagent has no when_to_use field', async () => {
     // Project def WITHOUT when_to_use must not surface in the
     // table. Anchors the §1.4 filter at the bootstrap layer.
     const dir = join(workdir, '.agent', 'agents');
@@ -287,7 +287,7 @@ budget:
 ---
 Body.`,
     );
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -300,9 +300,9 @@ Body.`,
     db.close();
   });
 
-  test('playbook hint sits between parallel and user when a def declares when_to_use', () => {
+  test('playbook hint sits between parallel and user when a def declares when_to_use', async () => {
     writePlaybookDef('code-review', 'gate diff before merge');
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -324,14 +324,14 @@ Body.`,
     db.close();
   });
 
-  test('playbook hint composes with plan-mode (parallel → playbook → plan → user)', () => {
+  test('playbook hint composes with plan-mode (parallel → playbook → plan → user)', async () => {
     // Four-layer ordering: most-generic background first, then
     // catalogue, then operating mode, then operator-specific
     // framing. Anchors the bootstrap.ts comment and prevents a
     // future refactor from reordering the layers without
     // updating the model's mental hierarchy.
     writePlaybookDef('refactor', 'apply scope-bounded mutations');
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -353,12 +353,12 @@ Body.`,
     db.close();
   });
 
-  test('memory section appended to caller systemPrompt when memories exist', () => {
+  test('memory section appended to caller systemPrompt when memories exist', async () => {
     // Project local memory under workdir.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — full-stack TS dev\n');
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -376,7 +376,7 @@ Body.`,
     db.close();
   });
 
-  test('boot triggers probe the repo root, not the invocation cwd (regression)', () => {
+  test('boot triggers probe the repo root, not the invocation cwd (regression)', async () => {
     // Bug: bootstrap evaluated boot triggers from the invocation
     // cwd, not the repo root. Operator running `agent` from
     // `/repo/src/components/` saw `git` / `package` / `tsconfig`
@@ -418,7 +418,7 @@ Body.`,
         'body',
       ].join('\n'),
     );
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: subDir, // invocation cwd is the SUBDIR, not the repo root
       providerOverride: mockProvider,
@@ -433,7 +433,7 @@ Body.`,
     db.close();
   });
 
-  test('layered system prompt: env → discipline → response → parallel → memory', () => {
+  test('layered system prompt: env → discipline → response → parallel → memory', async () => {
     // Layered prompt ordering (bootstrap.ts comment). The
     // outermost layer (which lands FIRST in the rendered string)
     // gives the model situational anchor; each inner layer
@@ -448,7 +448,7 @@ Body.`,
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -471,7 +471,7 @@ Body.`,
     db.close();
   });
 
-  test('closes DB when memory registry construction throws (regression: C1)', () => {
+  test('closes DB when memory registry construction throws (regression: C1)', async () => {
     // Seed a project_local MEMORY.md with valid content so the
     // index parser succeeds, then chmod the file 0 so loadScopeIndex
     // hits EACCES on read. The construction error must propagate
@@ -485,7 +485,7 @@ Body.`,
     try {
       let threw = false;
       try {
-        bootstrap({
+        await bootstrap({
           prompt: 'hi',
           cwd: workdir,
           providerOverride: mockProvider,
@@ -539,7 +539,7 @@ Body.`,
     // Invoke from a subdir, NOT the repo root.
     const subdir = join(workdir, 'src', 'components');
     mkdirSync(subdir, { recursive: true });
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: subdir,
       providerOverride: mockProvider,
@@ -554,8 +554,8 @@ Body.`,
     db.close();
   });
 
-  test('memory registry is wired even when no memories exist (empty list)', () => {
-    const { config, db } = bootstrap({
+  test('memory registry is wired even when no memories exist (empty list)', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -576,13 +576,13 @@ Body.`,
     db.close();
   });
 
-  test('caller systemPrompt is layered after environment / discipline / response-format / parallelism hints without plan', () => {
+  test('caller systemPrompt is layered after environment / discipline / response-format / parallelism hints without plan', async () => {
     // Caller prompt sits INNERMOST in the layered system prompt.
     // The outer wrappers (environment, task discipline,
     // response-format, parallelism) all land before it; the
     // caller's framing comes last so the operator's specific
     // instructions read against the established context.
-    const { config, db } = bootstrap({
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -610,8 +610,8 @@ Body.`,
     db.close();
   });
 
-  test('forwards budget overrides into config', () => {
-    const { config, db } = bootstrap({
+  test('forwards budget overrides into config', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -624,8 +624,8 @@ Body.`,
     db.close();
   });
 
-  test('migrates the DB so the schema is ready to use', () => {
-    const { db } = bootstrap({
+  test('migrates the DB so the schema is ready to use', async () => {
+    const { db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -643,10 +643,10 @@ Body.`,
     db.close();
   });
 
-  test('malformed permissions.yaml throws BEFORE the DB is opened (no leak)', () => {
+  test('malformed permissions.yaml throws BEFORE the DB is opened (no leak)', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(join(workdir, '.agent/permissions.yaml'), 'defaults: { mode: [unterminated');
-    expect(() =>
+    await expect(
       bootstrap({
         prompt: 'hi',
         cwd: workdir,
@@ -655,16 +655,16 @@ Body.`,
         enterprisePolicyPath: null,
         userPolicyPath: null,
       }),
-    ).toThrow();
+    ).rejects.toThrow();
     // The DB file should not exist because openDb was never called for
     // this run. (Our reorder loads policy first; if the DB had been
     // opened pre-throw, SQLite would have created the file.)
     expect(existsSync(dbPath)).toBe(false);
   });
 
-  test('unknown model throws BEFORE the DB is opened (no leak)', () => {
+  test('unknown model throws BEFORE the DB is opened (no leak)', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-test';
-    expect(() =>
+    await expect(
       bootstrap({
         prompt: 'hi',
         cwd: workdir,
@@ -673,15 +673,15 @@ Body.`,
         enterprisePolicyPath: null,
         userPolicyPath: null,
       }),
-    ).toThrow(/unknown model/);
+    ).rejects.toThrow(/unknown model/);
     expect(existsSync(dbPath)).toBe(false);
   });
 
   describe('isCwdTrusted resolution (MEMORY.md §7.2.1)', () => {
-    test('returns true when cwd is in the trust list', () => {
+    test('returns true when cwd is in the trust list', async () => {
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
@@ -694,10 +694,10 @@ Body.`,
       db.close();
     });
 
-    test('returns false when cwd is absent from trust list', () => {
+    test('returns false when cwd is absent from trust list', async () => {
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] }));
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
@@ -710,9 +710,9 @@ Body.`,
       db.close();
     });
 
-    test('returns false when trust file is missing (storage absent)', () => {
+    test('returns false when trust file is missing (storage absent)', async () => {
       const trustPath = join(workdir, 'never-created.json');
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
@@ -725,8 +725,8 @@ Body.`,
       db.close();
     });
 
-    test('returns false when trustListPathOverride is null (storage disabled)', () => {
-      const { config, db } = bootstrap({
+    test('returns false when trustListPathOverride is null (storage disabled)', async () => {
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
@@ -748,11 +748,11 @@ Body.`,
     // result into config.systemPrompt at the right position
     // (between the system layers and the memory section).
 
-    test('emits the AGENTS.md pointer when cwd is trusted and AGENTS.md exists', () => {
+    test('emits the AGENTS.md pointer when cwd is trusted and AGENTS.md exists', async () => {
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
       writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
@@ -788,7 +788,7 @@ Body.`,
       db.close();
     });
 
-    test('emits the pointer for the cwd-specific AGENTS.md when present (subdir scope)', () => {
+    test('emits the pointer for the cwd-specific AGENTS.md when present (subdir scope)', async () => {
       // Operator running `agent` from a subdir that has its own
       // AGENTS.md should see THAT file pointed to, not the
       // repoRoot one. Bootstrap forwards both `cwd` and
@@ -800,7 +800,7 @@ Body.`,
       writeFileSync(join(subdir, 'AGENTS.md'), '# subdir-specific');
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: subdir,
         providerOverride: mockProvider,
@@ -817,7 +817,7 @@ Body.`,
       db.close();
     });
 
-    test('does not advertise repoRoot AGENTS.md when only the subdir is trusted (security boundary)', () => {
+    test('does not advertise repoRoot AGENTS.md when only the subdir is trusted (security boundary)', async () => {
       // Threat model: operator trusted only the subdir
       // (`directories: [subdir]`), not the repoRoot. Trust
       // storage is exact-path membership — a trusted subdir does
@@ -840,7 +840,7 @@ Body.`,
       // No AGENTS.md at the trusted subdir.
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: subdir,
         providerOverride: mockProvider,
@@ -854,7 +854,7 @@ Body.`,
       db.close();
     });
 
-    test('falls back to repoRoot when BOTH cwd and repoRoot are trusted (typical workflow)', () => {
+    test('falls back to repoRoot when BOTH cwd and repoRoot are trusted (typical workflow)', async () => {
       // The common operator workflow: trust the whole repo, run
       // `agent` from a subdir. Both directories are in the trust
       // list. Pointer should fall back to repoRoot/AGENTS.md
@@ -868,7 +868,7 @@ Body.`,
       writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide rules');
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir, subdir] }));
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: subdir,
         providerOverride: mockProvider,
@@ -881,14 +881,14 @@ Body.`,
       db.close();
     });
 
-    test('suppresses the pointer when cwd is untrusted (even with AGENTS.md present)', () => {
+    test('suppresses the pointer when cwd is untrusted (even with AGENTS.md present)', async () => {
       // Trust modal not yet granted (one-shot CLI / programmatic
       // boot) — the pointer must NOT advertise a file the
       // operator hasn't authorized the agent to read. The
       // permission engine would block read_file anyway; this
       // gate avoids the misleading nudge upstream.
       writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
@@ -902,11 +902,11 @@ Body.`,
       db.close();
     });
 
-    test('suppresses the pointer when AGENTS.md is absent (even on a trusted cwd)', () => {
+    test('suppresses the pointer when AGENTS.md is absent (even on a trusted cwd)', async () => {
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
       // No AGENTS.md written.
-      const { config, db } = bootstrap({
+      const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
         providerOverride: mockProvider,
