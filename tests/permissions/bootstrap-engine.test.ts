@@ -789,4 +789,123 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
     }
     expect(event.tool).toBe('bash');
   });
+
+  test('sealing.failure event fires when scheduler reports onSealFailed (slice 72)', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const failingFactory = (): SealStore => ({
+      append: () => ({ ok: false, reason: 'chattr +a failed: permission denied' }),
+      list: () => [],
+      close: () => {},
+    });
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/var/log/agent/seal.log',
+            interval_decisions: 1,
+            interval_seconds: 0,
+            on_failure: 'degrade',
+          },
+        },
+        sealStoreFactory: failingFactory,
+        sealSchedulerSetTimer: () => null,
+        sealSchedulerClearTimer: () => {},
+        telemetry,
+        now: () => 99999,
+      }),
+    );
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    const sealingEvents = telemetry.events().filter((e) => e.kind === 'sealing.failure');
+    expect(sealingEvents).toHaveLength(1);
+    const event = sealingEvents[0];
+    if (event === undefined || event.kind !== 'sealing.failure') {
+      throw new Error('expected sealing.failure event');
+    }
+    expect(event.mode).toBe('worm-file');
+    expect(event.path).toBe('/var/log/agent/seal.log');
+    expect(event.reason).toContain('chattr +a failed');
+    expect(event.on_failure).toBe('degrade');
+    expect(event.ts).toBe(99999);
+    // State machine also transitioned (slice 71 wire-up) — the
+    // two events pair for a complete forensic picture.
+    expect(r.engine.state()).toBe('degraded');
+    r.sealingScheduler?.close();
+  });
+
+  test('sealing.failure carries on_failure=refuse when policy configured for refuse', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const failingFactory = (): SealStore => ({
+      append: () => ({ ok: false, reason: 'disk full' }),
+      list: () => [],
+      close: () => {},
+    });
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/var/audit/seal.log',
+            interval_decisions: 1,
+            interval_seconds: 0,
+            on_failure: 'refuse',
+          },
+        },
+        sealStoreFactory: failingFactory,
+        sealSchedulerSetTimer: () => null,
+        sealSchedulerClearTimer: () => {},
+        telemetry,
+      }),
+    );
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    const sealingEvents = telemetry.events().filter((e) => e.kind === 'sealing.failure');
+    expect(sealingEvents).toHaveLength(1);
+    const event = sealingEvents[0];
+    if (event === undefined || event.kind !== 'sealing.failure') {
+      throw new Error('expected sealing.failure event');
+    }
+    expect(event.on_failure).toBe('refuse');
+    expect(r.engine.state()).toBe('refusing');
+    r.sealingScheduler?.close();
+  });
+
+  test('telemetry.emit throwing inside onSealFailed does NOT break the degrade path', async () => {
+    const failingFactory = (): SealStore => ({
+      append: () => ({ ok: false, reason: 'fake' }),
+      list: () => [],
+      close: () => {},
+    });
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/seal.log',
+            interval_decisions: 1,
+            interval_seconds: 0,
+          },
+        },
+        sealStoreFactory: failingFactory,
+        sealSchedulerSetTimer: () => null,
+        sealSchedulerClearTimer: () => {},
+        telemetry: {
+          emit: () => {
+            throw new Error('synthetic telemetry failure');
+          },
+        },
+      }),
+    );
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    // Engine still degraded despite telemetry emit throwing.
+    expect(r.engine.state()).toBe('degraded');
+    r.sealingScheduler?.close();
+  });
 });

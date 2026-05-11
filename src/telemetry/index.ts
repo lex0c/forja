@@ -48,6 +48,14 @@ export type TelemetryEngineState =
   | 'degraded'
   | 'refusing';
 
+// §7.3 sealing modes — mirrors `SealMode` from types.ts. Same
+// rationale as `TelemetryEngineState`: kept as a string union
+// instead of an import so telemetry stays independent of the
+// permission types module. Drift caught at the bootstrap's
+// wire-up where the assignment happens.
+export type TelemetrySealMode = 'none' | 'worm-file' | 'git-anchored';
+export type TelemetrySealOnFailure = 'degrade' | 'refuse';
+
 // Event: one decision, one row in the audit chain. Spec §18 line
 // 1179-1202 lists every field. `engine_state` is optional —
 // sources that don't have access to the state controller omit
@@ -90,10 +98,42 @@ export interface StateTransitionEvent {
   reason: string;
 }
 
+// §7.3 sealing failure event — emitted from the bootstrap's
+// `onSealFailed` callback (registered with the
+// `SealingScheduler`). Each event corresponds to one rejected
+// seal attempt: `store.append` returned ok:false, or the
+// scheduler's `sealLatestInternal` could not produce a valid
+// entry. The companion `state.transition` event (slice 71)
+// fires with `to: degraded` or `to: refusing` per the policy's
+// `on_failure` knob; the `sealing.failure` event carries the
+// per-event diagnostic (mode + path + reason) that the
+// transition's free-form `reason` field can't structurally
+// expose. Spec §18 line 1213 lists `sealing_failures_total > 0
+// em strict mode` as a P0 metric.
+export interface SealingFailureEvent {
+  kind: 'sealing.failure';
+  ts: number;
+  mode: TelemetrySealMode;
+  // Polymorphic path (worm-file: seal file path; git-anchored:
+  // repo directory). Absent for `mode: 'none'` (in practice
+  // unreachable here — sealing is disabled and no scheduler is
+  // wired — but the field is optional for completeness).
+  path?: string;
+  reason: string;
+  // Configured response to this failure. The actual state
+  // transition lands in a separate `state.transition` event;
+  // this field documents the operator's INTENT regardless of
+  // whether the engine was already in the target state (e.g.,
+  // a second failure with on_failure=degrade against an already-
+  // degraded engine is a no-op transition but still produces
+  // this telemetry event).
+  on_failure: TelemetrySealOnFailure;
+}
+
 // Discriminated union of every event kind the engine emits.
 // Future slices extend with chain.verify_failed,
-// sealing.failure, classifier.unavailable.
-export type TelemetryEvent = PermissionDecisionEvent | StateTransitionEvent;
+// classifier.unavailable.
+export type TelemetryEvent = PermissionDecisionEvent | StateTransitionEvent | SealingFailureEvent;
 
 export interface TelemetrySink {
   // Fire-and-forget. Sinks MUST NOT throw — telemetry is

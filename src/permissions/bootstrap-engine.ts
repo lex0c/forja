@@ -553,6 +553,26 @@ export const bootstrapPermissionEngine = async (
         ? { intervalSeconds: sealConfig.interval_seconds }
         : {}),
       onSealFailed: (reason: string): void => {
+        // §18 telemetry — emit a structured sealing.failure
+        // event BEFORE the state transition so an OTEL consumer
+        // sees the diagnostic context (mode + path + reason)
+        // paired with the subsequent state.transition event.
+        // Wrapped in try/catch — observability cannot break the
+        // degrade/refuse path.
+        if (input.telemetry !== undefined) {
+          try {
+            input.telemetry.emit({
+              kind: 'sealing.failure',
+              ts: input.now?.() ?? Date.now(),
+              mode: sealConfig.mode,
+              ...(sealConfig.path !== undefined ? { path: sealConfig.path } : {}),
+              reason,
+              on_failure: onFailure,
+            });
+          } catch {
+            // Best-effort.
+          }
+        }
         // Both degrade() and refuse() are idempotent for
         // already-in-state engines; refuse() supersedes degrade()
         // (state machine prevents the reverse). Repeated failures

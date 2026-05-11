@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 72: telemetry — `sealing.failure` event
+
+**Done.** Seventy-second slice. Adds the third telemetry event type — `sealing.failure` — fired from the bootstrap's existing `onSealFailed` callback (registered with the `SealingScheduler` since slice 57). Spec §18 line 1213 lists `sealing_failures_total > 0 em strict mode` as a P0 metric; this slice makes that metric directly emittable. Pairs with the `state.transition` event (slice 71) for a complete forensic picture: sealing.failure carries the per-event diagnostic (mode + path + reason); state.transition records the resulting engine state change.
+
+### Why this matters
+
+Without `sealing.failure` telemetry, operators see sealing problems only via the secondary `state.transition` event with a free-form `reason` string. That works for human investigation but can't be aggregated by OTEL — there's no structured field for "which backend failed" or "what kind of failure". The structured event lets dashboards count failures per backend (`mode=worm-file` failures separately from `git-anchored`), filter by configured response (`on_failure=refuse` failures are the P0 trigger), and correlate with deployment context (the `path` field surfaces which repo / file).
+
+The bootstrap already had the `onSealFailed` callback wired (slice 57); adding telemetry inside it is a 12-line insert. The data is already there — just structured emission now.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/index.ts` | New `TelemetrySealMode = 'none' \| 'worm-file' \| 'git-anchored'` and `TelemetrySealOnFailure = 'degrade' \| 'refuse'` string unions — mirror SealMode/SealOnFailure from types.ts without importing them (same posture as `TelemetryEngineState` from slice 71). New `SealingFailureEvent` interface: `kind: 'sealing.failure'`, `ts`, `mode`, optional `path`, `reason`, `on_failure`. `TelemetryEvent` union extended to `PermissionDecisionEvent \| StateTransitionEvent \| SealingFailureEvent`. |
+| `src/permissions/bootstrap-engine.ts` | The existing `onSealFailed: (reason) => { engine.degrade/refuse(...) }` callback (slice 57) now ALSO emits a `sealing.failure` telemetry event BEFORE the state transition. Same try/catch posture as the other emission sites — observability cannot break the degrade/refuse path. Uses `input.now?.() ?? Date.now()` for the event timestamp so test seams flow through. |
+| `tests/permissions/bootstrap-engine.test.ts` (+3 tests) | sealing.failure event fires when scheduler reports onSealFailed (full field validation: mode='worm-file', path, reason contains the underlying error, on_failure='degrade', ts matches the test seam, plus engine.state()='degraded' from the paired state.transition); sealing.failure carries on_failure='refuse' when policy configured for refuse + engine ends up in 'refusing'; telemetry.emit throwing inside onSealFailed does NOT break the degrade path (engine still degrades). |
+
+### Decisions
+
+- **Event emit BEFORE the engine state transition.** Two reasons. (a) An OTEL consumer that aggregates by `(sealing.failure → state.transition)` causal pairs sees them in the expected order. (b) If the telemetry sink throws, the state transition still happens — the engine reaches the configured target state regardless. The reverse order would mean a thrown telemetry emit before the transition leaves the engine in its prior state, which is worse than a missed event.
+- **`path` is optional on the event.** SealPolicy schema allows `path` to be omitted when `mode='none'`, even though `mode='none'` doesn't have a scheduler and thus can't fire `onSealFailed`. The field is optional in the event for type completeness; the omitted-path branch is unreachable in current code but documents the schema flexibility for future backends (e.g., a mode like `rfc3161-tsa` that uses `endpoint` instead of `path`).
+- **`on_failure` documents INTENT, not OUTCOME.** A second sealing failure against an already-degraded engine is a no-op transition (state machine prevents degraded→degraded as a no-op), but the event still fires with `on_failure='degrade'` because that's what the operator configured. Pairs with the `state.transition` event which is the OUTCOME side. Tests pin both: degraded path produces both events; refuse path produces a state.transition that lands in 'refusing'.
+- **TelemetrySealMode/OnFailure as string unions, mirroring types.ts.** Same rationale as `TelemetryEngineState` from slice 71. Telemetry stays independent of the permission types module; drift caught at the bootstrap's wire-up where the assignment happens.
+- **No wire-up in the scheduler itself.** The scheduler's `onSealFailed` callback is the right hook for telemetry. Adding telemetry inside `createSealingScheduler` would couple the scheduler to the telemetry types unnecessarily. Bootstrap is the integration point; scheduler stays narrow.
+- **Event fires once per onSealFailed invocation, even with repeated failures.** Each scheduler tick that hits a failing append produces ONE event. Operators get accurate failure-rate metrics; the event volume scales linearly with retry attempts.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5788 pass / 10 skip / 0 fail** (5798 total across 273 files); +3 tests on top of slice 71's 5785
+- `bun test tests/permissions/bootstrap-engine.test.ts` — 40 pass (was 37)
+
+### Next
+
+§18 telemetry follow-ups, two events remaining of the four spec-listed metric streams:
+
+1. **`chain.verify_failed`** — fires from chainCheck in doctor + bootstrap's chain-verify branch. Fields: `seq` (where chain broke), `reason` (prev_hash_mismatch / this_hash_mismatch), `install_id`. Bootstrap already detects the break and transitions to refusing (slice 53 area); adding the telemetry emit is a small insert next to the existing chain-break-accepted audit row.
+2. **`classifier.unavailable`** — fires from the classifier's strict-mode degrade path. Requires engine instrumentation (classifier is currently inside `engine.check`'s pipeline).
+3. **State controller bridge** — populate `engine_state` field on `permission.decision` events. Plumb a state getter through `CreateSqliteSinkOptions`.
+4. **OTEL adapter** — `src/telemetry/adapters/otel.ts`. Translates `TelemetryEvent[]` → OTLP metrics + spans.
+5. **Scrubbing layer** — wraps another sink, redacts likely-PII fields before forwarding.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 71: telemetry — `state.transition` event + bootstrap fan-out
 
 **Done.** Seventy-first slice. Adds the second event type to the telemetry union (`state.transition`) and wires the telemetry sink into the bootstrap so a single sink receives BOTH `permission.decision` events (slice 70 wire-up via the audit sink) AND `state.transition` events (slice 71 — emitted from the state controller's `onTransition` listener). Spec §18 line 1214 lists `state_transitions{from,to}` as a tracked metric; any transition INTO `refusing` is the P0 trigger.
