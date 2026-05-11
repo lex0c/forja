@@ -1,0 +1,323 @@
+# Conformance: path traversal & matcher normalization (PERMISSION_ENGINE.md §11,
+# matcher.ts resolveSymlinks + engine.ts resolveForProtected).
+#
+# The matcher resolves every input path to its symlink-followed absolute form
+# BEFORE checking against allow_paths/deny_paths and BEFORE the protected
+# classifier runs. This file pins the contracts that path tricks — `..`-walks,
+# `./` and `//` noise, descendants of system pseudofs roots — cannot bypass
+# the engine's path guards.
+#
+# Coverage groups (counts per §16.2 minimum of 15):
+#   A. Normalization before allow/deny matching  (5)
+#   B. /proc descendants                         (3)
+#   C. /sys descendants                          (2)
+#   D. /boot descendants                         (1)
+#   E. Lookalike roots (NOT protected)           (3)
+#   F. Tilde-escalate file exact-match           (1)
+#
+# Existing `protected_paths.yaml` covers the direct-path contracts (/proc /sys
+# /boot deny tiers, /etc + ~/.bashrc escalate tiers, read pass-through, deny
+# override). This file complements with the OBLIQUE inputs: relative paths,
+# `..`-walks, descendants, and lookalikes — the shapes an LLM is most likely
+# to emit when trying to slip past a permissive policy.
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Normalization before allow/deny matching
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: relative ../etc/x exits allow=src/** → deny via mismatch"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["src/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "../etc/x"
+  expect:
+    # node:path resolve normalizes ../etc/x relative to /work/proj → /work/etc/x,
+    # which is outside src/**. Strict mode → deny.
+    kind: "deny"
+    source_section: "read_file"
+
+- name: "path traversal: embedded src/../etc/x exits allow=src/** → deny via mismatch"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["src/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "src/../etc/x"
+  expect:
+    # Normalize → /work/proj/etc/x, outside src/** → deny.
+    kind: "deny"
+    source_section: "write_file"
+
+- name: "path traversal: positive src/./index.ts within allow=src/** → allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["src/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      # ./ noise inside the path normalizes away — should still match the
+      # allow rule. Pins that the normalizer is correct on the positive path,
+      # not just deny-sided.
+      file_path: "src/./index.ts"
+  expect:
+    kind: "allow"
+
+- name: "path traversal: absolute /work/proj/../../etc/passwd exits allow root → deny via mismatch"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/work/proj/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      # Absolute path with ..-walks. Normalize → /etc/passwd. /etc on READS
+      # passes through protected (escalate is write-only) so it reaches the
+      # rule gate, which denies via mismatch (allow root doesn't cover /etc).
+      file_path: "/work/proj/../../etc/passwd"
+  expect:
+    kind: "deny"
+    source_section: "read_file"
+
+- name: "path traversal: mixed ./../ exits allow=data/** → deny via mismatch"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/work/proj/data/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      # Stress-test for the normalizer: ./ noise + .. exit combined.
+      # Normalize → /work/proj/etc/x, outside data/**.
+      file_path: "/work/proj/./data/../etc/x"
+  expect:
+    kind: "deny"
+    source_section: "write_file"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — /proc descendants (deny tier covers all depths)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: /proc/<pid>/environ denies (credential-exfil shape)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "/proc/1/environ"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+    reason_substring: "protected zone"
+
+- name: "path traversal: /proc/self/maps denies (memory-layout leak shape)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      # /proc/self is a kernel symlink; realpath follows to /proc/<pid>/maps,
+      # still under /proc → deny tier wins.
+      file_path: "/proc/self/maps"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+- name: "path traversal: /proc deep descendant denies (depth-independent)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "/proc/sys/kernel/randomize_va_space"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — /sys descendants
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: /sys hardware-info descendant denies (HW serial leak shape)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "/sys/devices/virtual/dmi/id/sys_vendor"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+- name: "path traversal: /sys firmware descendant denies"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "/sys/firmware/dmi/tables/DMI"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group D — /boot descendants
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: /boot initrd descendant denies (boot-tamper shape)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      # /boot/initrd.img may be a symlink to /boot/initrd.img-X; realpath
+      # follows but stays under /boot → deny tier wins.
+      file_path: "/boot/initrd.img"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group E — Lookalike roots that must NOT false-positive
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: /procfoo lookalike does NOT match /proc deny"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/procfoo/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      # startsWithSegment requires `/proc` + `/` boundary OR equality.
+      # `/procfoo/x.cfg` is neither — it's a distinct directory tree.
+      # Without the boundary, naive prefix-match would deny this falsely.
+      file_path: "/procfoo/x.cfg"
+  expect:
+    kind: "allow"
+
+- name: "path traversal: /system_files lookalike does NOT match /sys deny"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/system_files/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "/system_files/config.json"
+  expect:
+    kind: "allow"
+
+- name: "path traversal: /boot_backup lookalike does NOT match /boot deny"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/boot_backup/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "/boot_backup/recovery.img"
+  expect:
+    kind: "allow"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group F — Tilde-escalate file requires EXACT match (no suffix bleed)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "path traversal: ~/.bashrc-backup does NOT match ~/.bashrc escalate (exact, not prefix)"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/home/op/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      # TILDE_ESCALATE_FILES checks `absPath === resolved-tilde-file` (exact
+      # equality), unlike SYSTEM_DENY_ROOTS which uses startsWithSegment.
+      # A suffixed name like `.bashrc-backup` is NOT the rc file the
+      # classifier guards — it's a user-created backup, allow.
+      #
+      # Pins that the asymmetry between exact-match TILDE_ESCALATE_FILES
+      # and prefix-match TILDE_ESCALATE_DIRS holds — and that `-backup`
+      # / `-old` / `.bak` siblings of rc files pass through normally.
+      file_path: "/home/op/.bashrc-backup"
+  expect:
+    kind: "allow"

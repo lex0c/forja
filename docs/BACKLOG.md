@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 28: conformance suite — path traversal cases (§16.2 minimum)
+
+**Done.** Twenty-eighth slice. Second top-up of the conformance suite, this time covering path traversal & matcher normalization — the §16.2 category that closes the most common bypass shape (`..`-walks, `./` noise, descendants of `/proc`/`/sys`/`/boot`, and lookalike directories that should NOT match protected roots). 15 new cases lock down both the normalizer (in `matcher.ts` + `engine.ts resolveForProtected`) and the protected-paths classifier's `startsWithSegment` boundary semantics. Suite grows **77 → 92** (68% of the §16.2 GA bar).
+
+### Why this matters
+
+`protected_paths.yaml` already covers the direct-path contracts (write to `/proc/cpuinfo`, read `/sys/class/net/lo`, etc.). What it didn't cover: the OBLIQUE inputs an LLM is most likely to emit when trying to slip past a permissive policy — relative `..`-walks, `./` and `//` noise, deep descendants of pseudofs roots, and lookalike directories (`/procfoo`, `/system_files`, `/boot_backup`) that share a prefix with protected roots but are NOT protected. Each of these has a specific contract in code, none of them was pinned in the suite. A regression in `startsWithSegment`, the `..`-resolution chain (`node:path.resolve` + `realpathSync` fallback), or the tilde-escalate exact-match check would have slipped through.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/cases/path_traversal.yaml` (new, ~280 lines) | 15 cases across 6 groups: A. normalization before allow/deny matching (5: relative `..`, embedded `src/../etc/x`, positive `./` within allow, absolute `../../etc/passwd`, mixed `./../`), B. /proc descendants (3: `/proc/<pid>/environ`, `/proc/self/maps`, `/proc/sys/kernel/randomize_va_space`), C. /sys descendants (2: `/sys/devices/virtual/dmi/.../sys_vendor`, `/sys/firmware/dmi/tables/DMI`), D. /boot descendants (1: `/boot/initrd.img`), E. lookalike roots that must NOT false-positive (3: `/procfoo`, `/system_files`, `/boot_backup`), F. tilde-escalate file exact-match (1: `~/.bashrc-backup` ≠ `~/.bashrc`). Distinct path exemplars from `protected_paths.yaml` so the two files complement rather than duplicate. |
+
+### Decisions
+
+- **One file per category — same convention as slice 27.** §16.2 lists `path_traversal` as a distinct category from `protected_paths`; the existing 8 cases in `protected_paths.yaml` test the tier-system per se (deny vs. escalate vs. read-pass-through), while this slice tests the path-shape defenses (normalization, descendants, lookalikes). Two files, different intent.
+- **Lookalike roots use distinct directory names, not `/procfoo` only.** `startsWithSegment` enforces a `/` boundary (`prefix === path || path.startsWith(prefix + '/')`), so each protected root has a corresponding lookalike that exercises the boundary: `/procfoo` for `/proc`, `/system_files` for `/sys`, `/boot_backup` for `/boot`. Three exemplars instead of one — without distinct cases, a regression that broke `/sys` boundary handling but kept `/proc` working would pass.
+- **Tilde-escalate exact-match (case #15) replaces the originally-planned ..-walk escalate case.** I'd planned a case for "write_file path=`/work/proj/data/../../etc/hosts` allow=`/**` → confirm (escalate via normalization)", but `resolveForProtected`'s realpath fallback chain doesn't normalize when intermediate dirs (`/work/proj/data`) don't exist on the test machine — both `realpath(abs)` and `realpath(dirname(abs))` fail with ENOENT, fallback returns the textual path verbatim, protected classifier sees `/work/proj/.../etc/hosts` (NOT under `/etc/`), and no escalate fires. **This is a real engine behavior** that I'd describe as a defense gap: in a fictional cwd, traversal-via-..-walk doesn't get normalized for the protected check. The matcher's separate realpath-on-dirname path still catches the case for rule matching (so `/work/proj/**` doesn't admit `/etc/hosts`), but if the operator has a permissive `/**` allow, the missing normalization means the protected escalate never fires. Filed as a follow-up below; for this slice the contract is replaced with a different exact-match invariant (`~/.bashrc-backup` ≠ `~/.bashrc`) that pins a known-correct asymmetry: TILDE_ESCALATE_FILES uses exact equality, TILDE_ESCALATE_DIRS uses startsWithSegment.
+- **Positive `./` case included (case #3) to pin normalization correctness on the allow side.** Negative-only cases prove the normalizer rejects bad shapes; the positive case proves it doesn't break legitimate ones (`src/./index.ts` → `src/index.ts`, matches allow). A normalizer that incorrectly STRIPPED `./` would pass deny tests but fail this one.
+- **Deep descendants for each pseudofs root (case #8 `/proc/sys/kernel/randomize_va_space`).** Shallow tests (`/proc/cpuinfo`) verify the prefix check fires; deep tests verify the prefix check is depth-INDEPENDENT. Without a deep case, a regression that limited depth (`startsWith` → `startsWith && depth < 3`) would slip past the shallow tests.
+
+### Engine finding (filed as follow-up slice)
+
+**`resolveForProtected` falls back to textual when intermediate path components don't exist, leaving `..`-walks un-normalized for the protected classifier.** Concrete: `write_file` with `path=/work/proj/data/../../etc/hosts` in a context where `/work/proj/data` doesn't exist:
+1. `isAbsolute` returns true → `abs = "/work/proj/data/../../etc/hosts"` verbatim (no normalization)
+2. `realpathSync(abs)` fails (path doesn't exist after .. resolution)
+3. `realpath(dirname(abs))` also fails (`/work/proj/data/../../etc` not realpath-able either, because intermediate `/work/proj/data` doesn't exist)
+4. Fallback returns `abs` verbatim — STILL has `/work/proj/` prefix textually
+5. `classifyProtectedPath` sees `/work/proj/data/../../etc/hosts` → doesn't match `/etc/` startsWithSegment → returns null
+6. With permissive allow=`/**`, rule check matches → allow (no escalate prompt)
+
+The matcher's realpath chain DOES normalize correctly for non-existent target paths (because `realpath(dirname)` succeeds when only the LEAF is missing — common for `write_file` creating a new file), but the engine's `resolveForProtected` uses the same flow and hits the same limitation when intermediate dirs are missing. **Real defense gap when the cwd is fictional or the operator has a permissive allow.** Follow-up slice: replace the dual realpath-fallback with a lexical `path.resolve`-based normalization first, then realpath only for symlink resolution.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5338 pass / 10 skip / 0 fail** (5348 total across 249 files); 15 new conformance tests on top of slice 27's 5323
+- `bun test tests/conformance/` — 93 pass (52 prior + 25 bash adversarial + 15 path traversal + 1 meta-test)
+- Suite coverage now: 92/136 = **68%** of the §16.2 GA bar (up from 56% after slice 27)
+
+### Next
+
+Successor slices on the conformance trail (largest gaps first):
+1. **Engine hardening (from finding above)** — `resolveForProtected` should normalize lexically before realpath fallback, so `..`-walks land at the right target regardless of intermediate-dir existence. Small fix, security-positive.
+2. **score_determinism** (~10 cases) — identical inputs → identical score, ordering invariance, classifier-disabled ceiling. Existing shape covers via `score_gte/lte/components_include`.
+3. **subagent_intersection** (~6 cases) — requires extending `ConformanceCase` shape with `parent_capabilities` + `declared_capabilities` + effective/excess assertions.
+4. **hash_chain** (~8 cases) — requires real audit DB + tampering harness, not the fake sink.
+5. **ttl_expiry** (~6 cases) — needs grants table + time mocks.
+6. **sandbox_select** (~6 cases) — needs sandbox plan output in the case shape.
+7. **concurrency** (~5 cases) — likely a separate driver, hardest to express as static YAML.
+
+Non-conformance successors: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 27: conformance suite — bash adversarial cases (§16.2 minimum)
 
 **Done.** Twenty-seventh slice. First major top-up of the conformance suite since slice 7: adds 25 bash-resolver adversarial cases covering every refusal contract the AST resolver exposes. §16.2 sets a minimum of 25 cases in the bash-adversarial category for GA, and the suite was at zero on that line — only ad-hoc bash cases lived in `capability_resolvers.yaml`. With this slice, the suite grows from **52 → 77 cases** (56% of the §16.2 GA bar of 136), and the bash refusal contract is locked behind explicit YAML pins so a regression in the AST walk / whitelist / hard-refuse list / pipe-to-shell detector fails loudly.
