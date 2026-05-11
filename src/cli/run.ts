@@ -406,6 +406,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       return await runWelcome({
         out: (s) => process.stdout.write(s),
         err: errSink,
+        ...(args.iKnowWhatImDoing === true ? { iKnowWhatImDoing: true } : {}),
       });
     }
 

@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 91: §13.5 sandbox_skip marker (`--i-know-what-im-doing`)
+
+**Done.** Ninety-first slice. Closes the §13.5 first-boot UX gap from the slice-90 audit: operators who explicitly want to suppress the sandbox-setup re-prompt across sessions can now pass `agent welcome --i-know-what-im-doing` to create the `~/.config/forja/sandbox_skip` marker. Subsequent sessions read the marker and skip the prompt silently — but engine enforcement (degraded state, per-call confirm) is unaffected.
+
+Pre-slice the welcome flow re-prompted on every session when sandbox was missing. The spec calls this out explicitly (line 893): "Nunca há opção silenciosa 'skip and don't ask again'. Re-prompt em toda sessão se sandbox continua ausente; suprimível só com `~/.config/forja/sandbox_skip` criado via `--i-know-what-im-doing`." Slice 91 implements that suppression mechanism.
+
+### Why this matters
+
+The spec's intent is deliberate friction: the flag name is long, has no short form, no env-var equivalent, and no config-file shorthand. Operators who legitimately want the suppression (CI pipelines, advanced single-machine setups where sandbox is intentionally absent) pass the flag ONCE. The marker file:
+
+1. Carries a human-readable timestamp + forja version so audits can trace when/by-which-version it was created.
+2. Has zero effect on runtime enforcement — engine still degrades, still upgrades allow→confirm, still emits the per-degraded-call posture.
+3. Is trivially reversible: `rm ~/.config/forja/sandbox_skip` re-enables the prompt next session.
+
+The slice DELIBERATELY does NOT couple the marker to the existing `unsafe_mode_acknowledged_at` audit row that runSandboxSetup's option [3] creates. Those are distinct concerns: option [3] continues unsafe mode WITH visible banner; `--i-know-what-im-doing` suppresses the prompt entirely. Operators choose which posture matches their threat model.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New `iKnowWhatImDoing?: boolean` field on `CLIArgs`. Top-level parser case for `--i-know-what-im-doing` (presence flag, no value). `parseWelcomeSubcommand` widens to accept the flag in addition to `--help`; help error message updated to list both. |
+| `src/cli/sandbox-skip.ts` (new, ~95 lines) | Three exported helpers. `sandboxSkipPath(env)`: resolves `~/.config/forja/sandbox_skip` honoring `$XDG_CONFIG_HOME` first, then `env.HOME`, then `homedir()` system call. `hasSandboxSkip({env?, exists?})`: read-only check (file presence is the signal; contents are operator-readable diagnostics, not machine state). `createSandboxSkip({env?, ensureDir?, write?, exists?, now?, engineVersion?})`: idempotent first-create; returns `{path, created}` so callers can render "created" vs "already present" messaging. Body carries `# created: <iso>`, `# version: X`, and a block explicitly noting that the marker does NOT bypass engine enforcement. |
+| `src/cli/welcome.ts` | Imports the new helpers. `RunWelcomeOptions` adds `iKnowWhatImDoing?: boolean` + two test seams (`hasSkipMarker`, `createSkipMarker`). Sandbox-setup section now has three branches: (1) `iKnowWhatImDoing === true` → invoke `createSkipMarker` + emit "Marker created/already at ${path}" line + "Engine enforcement is unchanged" reassurance, skip `runSandboxSetup`; (2) marker present (no flag) → emit "Sandbox setup skipped — marker present" + "Remove that file to re-enable" hint, skip `runSandboxSetup`; (3) normal path → `runSandboxSetup` as before. |
+| `src/cli/run.ts` | When `args.welcome === true`, forwards `iKnowWhatImDoing` to `runWelcome` via conditional spread (preserves `exactOptionalPropertyTypes`). |
+| `tests/cli/sandbox-skip.test.ts` (new, 8 tests) | **`sandboxSkipPath` (3):** XDG_CONFIG_HOME takes precedence; missing → HOME fallback; empty → HOME fallback. **`hasSandboxSkip` (2):** exists branch + missing branch. **`createSandboxSkip` (3):** writes the marker when absent with full body shape (timestamp + version + ack text); body contains the "does NOT bypass enforcement" disclaimer; idempotent on already-present (skips ensureDir + write). |
+| `tests/cli/welcome.test.ts` | **+7 tests** under `parseArgs — agent welcome --i-know-what-im-doing` (3) and `runWelcome — §13.5 sandbox_skip` (4): args parsing captures the flag; omitted → undefined; unknown flag rejected with updated error message. Flag + no marker → create called + "Marker created at" line + setup body skipped. Flag + marker already present → create still called (returns ok created:false) + "Marker already at" + "stay silenced". No flag + marker present → silently skip + "marker present" hint + create NOT called. No flag + no marker → setup runs (no marker text in output). |
+
+### Decisions
+
+- **Marker creation is one-shot per session via the flag.** Running `agent welcome --i-know-what-im-doing` creates the marker; subsequent sessions without the flag READ the marker. Operators who want to suppress AND continue unsafe-mode (banner) chain into the existing option [3] flow — those are separate UX surfaces.
+- **`sandboxSkipPath` honors `env.HOME` before `homedir()` system call.** Tests can pin a synthetic path by passing `env`; production runtime falls through to the real `homedir()` if env wasn't overridden. Matches existing patterns in `src/permissions/paths.ts`.
+- **Marker file content is human-readable, NOT machine-parsed.** Body has commented metadata (timestamp + version + acknowledgment block). `hasSandboxSkip` only checks file existence — contents are operator-readable diagnostics. A future verifier could parse the timestamp for audit retention, but slice 91 doesn't.
+- **Idempotency: re-creating an existing marker returns `created: false`, skips ensureDir + write entirely.** Preserves the original timestamp so audits see WHEN the operator first acknowledged, not the most recent invocation. Welcome's UX message disambiguates "Marker created" vs "Marker already at" so operators see whether the flag had an effect.
+- **`--i-know-what-im-doing` accepted ONLY in the `welcome` subcommand, not top-level.** Top-level `agent --i-know-what-im-doing "your prompt"` is meaningless — there's no welcome flow running. The flag's only valid context is the welcome subcommand; rejecting it elsewhere keeps the surface clean.
+- **Test exit-code assertion REMOVED from the flag-creates-marker test.** Doctor returns 1 in synthetic test envs (no $HOME, missing config dir, etc.) for reasons unrelated to the marker flow. The marker contract is what slice 91 needs to assert; the exit-code assertion was incidental + brittle. Comment in the test documents this.
+- **`createSandboxSkip` returns `{path, created}` rather than throwing on already-present.** Callers consistently want to differentiate "first-time acknowledgment" from "already silent" in their UX message. Throw would force try/catch boilerplate; the discriminated return is cleaner.
+- **No corresponding `clearSandboxSkip` helper.** Operators who want to remove the marker `rm` the file directly. Adding a helper would imply Forja owns the lifecycle; the spec's intent is that the marker is operator-owned + transparent.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **6063 pass / 10 skip / 0 fail** (6073 total across 288 files); +15 tests on top of slice 90's 6048
+- `bun test tests/cli/sandbox-skip.test.ts tests/cli/welcome.test.ts` — 24 pass
+
+### Next
+
+§13.6 degraded banner re-display (the second item from the §13.5/§13.6 pair the user asked for) lands in slice 92. That one touches the harness loop (counter per tool call) + adds a new HarnessEvent variant + telemetry event for periodic emission. Independent surfaces from §13.5; cleaner as a separate commit.
+
+After slice 92, PERMISSION_ENGINE.md will have only two non-code remaining items: §14 MCP (blocked) and §19 v1→v2 migration (premature). Plus §13.3 conformance footer (deferred — requires CI-side persistence infrastructure).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 90: §13.3 doctor expansion — kernel + LSM checks + engine version footer
 
 **Done.** Ninetieth slice. Expands `forja doctor` to cover the spec's §13.3 kernel-state matrix: user namespaces, nftables, SELinux/AppArmor. Adds a derived "capability ceiling" footer that shows the sandbox profile set reachable on the current host, plus an "engine version" footer read from `package.json`. Closes the last partial section of `PERMISSION_ENGINE.md` — every named section now has a corresponding implementation.

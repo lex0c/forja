@@ -151,3 +151,119 @@ describe('runWelcome', () => {
     expect(text).not.toContain('brew install');
   });
 });
+
+// ─── §13.5 sandbox_skip marker (slice 91) ─────────────────────────────────
+
+describe('parseArgs — agent welcome --i-know-what-im-doing', () => {
+  test('flag is captured into iKnowWhatImDoing', () => {
+    const r = parseArgs(['welcome', '--i-know-what-im-doing']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.welcome).toBe(true);
+      expect(r.args.iKnowWhatImDoing).toBe(true);
+    }
+  });
+
+  test('omitted leaves iKnowWhatImDoing undefined', () => {
+    const r = parseArgs(['welcome']);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.args.iKnowWhatImDoing).toBeUndefined();
+  });
+
+  test('unknown flag still rejected (help + i-know are the only two)', () => {
+    const r = parseArgs(['welcome', '--mystery']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('unknown flag');
+  });
+});
+
+describe('runWelcome — §13.5 sandbox_skip', () => {
+  test('--i-know-what-im-doing creates the marker AND skips setup', async () => {
+    const out = captured();
+    const createCalls: NodeJS.ProcessEnv[] = [];
+    await runWelcome({
+      env: { PATH: process.env.PATH },
+      which: ALWAYS_WHICH,
+      iKnowWhatImDoing: true,
+      hasSkipMarker: () => false,
+      createSkipMarker: (env) => {
+        createCalls.push(env);
+        return { path: '/cfg/forja/sandbox_skip', created: true };
+      },
+      out: out.write,
+      err: captured().write,
+    });
+    // The exit code is max(doctor, setup); doctor may return 1
+    // for env reasons in the test runner (no $HOME, etc.) — the
+    // marker contract is what matters here.
+    expect(createCalls.length).toBe(1);
+    const text = out.lines.join('');
+    expect(text).toContain('Marker created at /cfg/forja/sandbox_skip');
+    expect(text).toContain('Engine enforcement');
+    // Inner setup prompt body should NOT run (no distro install
+    // tables, no "Continue without sandbox" prompt).
+    expect(text).not.toContain('apt install bubblewrap');
+    expect(text).not.toContain('Continue without sandbox');
+  });
+
+  test('--i-know-what-im-doing when marker already present: skip creation but still silence setup', async () => {
+    const out = captured();
+    let createCalled = false;
+    await runWelcome({
+      env: { PATH: process.env.PATH },
+      which: ALWAYS_WHICH,
+      iKnowWhatImDoing: true,
+      hasSkipMarker: () => true,
+      createSkipMarker: () => {
+        createCalled = true;
+        return { path: '/cfg/forja/sandbox_skip', created: false };
+      },
+      out: out.write,
+      err: captured().write,
+    });
+    expect(createCalled).toBe(true);
+    const text = out.lines.join('');
+    expect(text).toContain('Marker already at');
+    expect(text).toContain('stay silenced');
+  });
+
+  test('marker already present (no flag): silently skip setup prompt', async () => {
+    const out = captured();
+    let createCalled = false;
+    await runWelcome({
+      env: { PATH: process.env.PATH },
+      which: ALWAYS_WHICH,
+      hasSkipMarker: () => true,
+      createSkipMarker: () => {
+        createCalled = true;
+        return { path: '/cfg/forja/sandbox_skip', created: false };
+      },
+      out: out.write,
+      err: captured().write,
+    });
+    expect(createCalled).toBe(false);
+    const text = out.lines.join('');
+    expect(text).toContain('Sandbox setup skipped');
+    expect(text).toContain('sandbox_skip` marker present');
+  });
+
+  test('no marker + no flag: sandbox setup runs (marker hints absent)', async () => {
+    const out = captured();
+    let createCalled = false;
+    await runWelcome({
+      env: { PATH: process.env.PATH },
+      which: ALWAYS_WHICH,
+      hasSkipMarker: () => false,
+      createSkipMarker: () => {
+        createCalled = true;
+        return { path: '/cfg/forja/sandbox_skip', created: false };
+      },
+      out: out.write,
+      err: captured().write,
+    });
+    expect(createCalled).toBe(false);
+    const text = out.lines.join('');
+    expect(text).not.toContain('marker present');
+    expect(text).not.toContain('Marker created');
+  });
+});

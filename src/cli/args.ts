@@ -65,6 +65,16 @@ export interface ParsedArgs {
   // bootstrap surfaces a clear error if the worker source isn't
   // on disk.
   brokerMode?: 'in-process' | 'spawn';
+  // §13.5 first-boot UX (slice 91). When set, the welcome /
+  // sandbox-setup flow creates `~/.config/forja/sandbox_skip`
+  // (if not already present) AND skips the re-prompt for this
+  // run. Subsequent sessions see the marker + skip the prompt
+  // entirely. The spec calls this the "silent skip" gate that's
+  // intentionally hard to engage: the long flag name signals
+  // intent unambiguously; no short form. Operator-facing UX
+  // ONLY — does NOT bypass any policy / permission / sandbox
+  // enforcement at runtime.
+  iKnowWhatImDoing?: boolean;
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
   // `agent --checkpoints restore <session> <latest-ckpt>` but
@@ -485,12 +495,15 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
-// `agent welcome` — §13.5 first-boot walkthrough. No flags
-// except --help. Composes doctor + sandbox setup + next-steps
-// menu. Plain text only (operators wanting structured data call
-// `agent doctor --json` / `agent sandbox setup --json` directly).
+// `agent welcome` — §13.5 first-boot walkthrough. Accepts --help
+// and --i-know-what-im-doing (slice 91, creates the
+// `~/.config/forja/sandbox_skip` marker + silences sandbox setup
+// in future sessions). Plain text only (operators wanting
+// structured data call `agent doctor --json` / `agent sandbox
+// setup --json` directly).
 const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'welcome') return null;
+  let iKnow = false;
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === undefined) continue;
@@ -510,9 +523,13 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
         },
       };
     }
+    if (token === '--i-know-what-im-doing') {
+      iKnow = true;
+      continue;
+    }
     return {
       ok: false,
-      message: `agent welcome: unknown flag '${token}' (only --help is accepted)`,
+      message: `agent welcome: unknown flag '${token}' (only --help and --i-know-what-im-doing are accepted)`,
     };
   }
   return {
@@ -528,6 +545,7 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
       explainPermissions: false,
       yes: false,
       welcome: true,
+      ...(iKnow ? { iKnowWhatImDoing: true } : {}),
     },
   };
 };
@@ -1145,6 +1163,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
+      case '--i-know-what-im-doing':
+        args.iKnowWhatImDoing = true;
+        i += 1;
+        break;
       case '--undo': {
         const value = argv[i + 1];
         if (value === undefined || value.startsWith('--')) {

@@ -18,6 +18,7 @@
 
 import { runDoctor } from './doctor.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';
+import { createSandboxSkip, hasSandboxSkip } from './sandbox-skip.ts';
 
 export interface RunWelcomeOptions {
   // Test seams — both inner verbs accept the same hooks. Forwarded
@@ -30,6 +31,14 @@ export interface RunWelcomeOptions {
   arch?: string;
   out?: (s: string) => void;
   err?: (s: string) => void;
+  // §13.5 first-boot UX (slice 91). When true, welcome creates
+  // the `~/.config/forja/sandbox_skip` marker (if absent) AND
+  // skips the sandbox-setup prompt for this run. Forwarded from
+  // `--i-know-what-im-doing` on the CLI.
+  iKnowWhatImDoing?: boolean;
+  // Test seams for the sandbox_skip marker mechanism.
+  hasSkipMarker?: (env: NodeJS.ProcessEnv) => boolean;
+  createSkipMarker?: (env: NodeJS.ProcessEnv) => { path: string; created: boolean };
 }
 
 const INTRO_LINES = [
@@ -81,14 +90,40 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
   out('Sandbox setup\n');
   out(`${SECTION_DIVIDER}\n\n`);
 
-  const setupCode = await runSandboxSetup({
-    ...(options.which !== undefined ? { which: options.which } : {}),
-    ...(options.readOsRelease !== undefined ? { readOsRelease: options.readOsRelease } : {}),
-    ...(options.platform !== undefined ? { platform: options.platform } : {}),
-    ...(options.arch !== undefined ? { arch: options.arch } : {}),
-    out,
-    err,
-  });
+  // §13.5 sandbox_skip marker (slice 91). Two interacting gates:
+  //   1. --i-know-what-im-doing on this run → create the marker
+  //      (if absent) and skip the setup prompt;
+  //   2. marker already present → silently skip the setup prompt.
+  // Either path produces a one-line acknowledgment so audits +
+  // operators tracing welcome output see WHY setup was skipped.
+  // Marker has zero effect on runtime enforcement; engine still
+  // degrades + confirms per the standard posture.
+  const env = options.env ?? process.env;
+  const hasSkip = (options.hasSkipMarker ?? ((e) => hasSandboxSkip({ env: e })))(env);
+  const createSkip = options.createSkipMarker ?? ((e) => createSandboxSkip({ env: e }));
+
+  let setupCode = 0;
+  if (options.iKnowWhatImDoing === true) {
+    const result = createSkip(env);
+    out(
+      result.created
+        ? `Marker created at ${result.path} — sandbox setup will be silenced in future sessions.\n`
+        : `Marker already at ${result.path} — sandbox setup will stay silenced.\n`,
+    );
+    out('Engine enforcement (degraded state, per-call confirm) is unchanged.\n');
+  } else if (hasSkip) {
+    out('Sandbox setup skipped — `~/.config/forja/sandbox_skip` marker present.\n');
+    out('Remove that file to re-enable the prompt.\n');
+  } else {
+    setupCode = await runSandboxSetup({
+      ...(options.which !== undefined ? { which: options.which } : {}),
+      ...(options.readOsRelease !== undefined ? { readOsRelease: options.readOsRelease } : {}),
+      ...(options.platform !== undefined ? { platform: options.platform } : {}),
+      ...(options.arch !== undefined ? { arch: options.arch } : {}),
+      out,
+      err,
+    });
+  }
 
   for (const line of NEXT_STEPS_LINES) out(`${line}\n`);
 
