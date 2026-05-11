@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 86: §13.7 graceful shutdown — SIGTERM handler + broker.close on exit
+
+**Done.** Eighty-sixth slice. Closes the broker-leak surface on operator shutdown. `installSignalHandler` now traps SIGTERM alongside SIGINT (both abort the controller for graceful drain); the CLI main finally blocks (`src/cli/run.ts`, `src/cli/repl.ts`) await `broker.close()` BEFORE `db.close()` so in-flight exec calls complete + audit rows land while the sqlite handle is still open.
+
+Pre-slice the broker was constructed in bootstrap, threaded through `HarnessConfig.broker`, and never closed. In-process broker has no OS resources to leak — but when bootstrap flips to `createSpawnBroker` (next slice), un-closed brokers would leave orphan worker processes per session. Slice 86 wires the shutdown ahead of that flip so the upgrade is bit-clean.
+
+### Why this matters
+
+The §13.7 thread had three distinct cleanup gaps the harness needed to close before spawn broker becomes default:
+
+1. **Signal trap incomplete** — pre-slice only SIGINT (Ctrl+C) was wired. systemd / init / k8s pod-stop send SIGTERM; the harness would receive it, default-terminate, and the spawn broker's worker subprocesses would orphan with no audit-row finalization.
+2. **No broker.close() call site** — bootstrap returned a broker but no path drained it. In-process broker's FIFO chain would be left holding in-flight Promises if the process exited mid-call; spawn broker's worker subprocesses would orphan.
+3. **Ordering between broker.close and db.close** — broker drain MAY emit audit rows (e.g., the bash handler's response triggers `tool_call_finish` upstream). Closing the DB first would corrupt the audit chain mid-final-write.
+
+Slice 86 fixes all three. Pattern is intentionally conservative: graceful drain on signal, deterministic close order in finally, idempotent broker.close() so a runtime hiccup doesn't matter.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/signal.ts` | `installSignalHandler` now registers BOTH SIGINT and SIGTERM. SIGINT keeps its escalation (first press = abort, second = `process.exit(130)`); SIGTERM has NO escalation (the sender can follow up with SIGKILL if they want force, which the JS layer can't intercept anyway). Both call `controller.abort()` on the supplied AbortController. `restore()` removes both listeners. Module top-comment expanded to describe the design + slice 86 reference. |
+| `src/cli/run.ts` | Finally block after `runAgent` now awaits `cfg.broker?.close()` BEFORE `db.close()`. Conditional check is for headless/SDK callers that may not wire a broker; production bootstrap always sets it. Comment documents the ordering rationale (in-flight handler emits audit rows; closing DB first would hit a closed sqlite handle). |
+| `src/cli/repl.ts` | Same change in the `shutdown` async function: awaits `baseConfig.broker?.close()` BEFORE `db.close()`. `shutdown` was already async (line 1361) so no signature change needed. |
+| `tests/cli/signal.test.ts` (new, 6 tests) | **SIGINT (2):** first SIGINT aborts; handler is wired exactly once per install. **SIGTERM (2):** SIGTERM aborts; second SIGTERM does NOT force-exit (no escalation, distinct from SIGINT). **Restore (2):** restore() removes both listeners (post-restore, signals don't abort the controller); 5 install/restore cycles don't leak listeners. Tests use `process.emit('SIG*' as NodeJS.Signals)` to fire signals synthetically — registered listeners run as if the OS delivered them, without actually interrupting the test process. `silenceStderr` helper suppresses the handler's stderr write so test output stays clean. |
+
+### Decisions
+
+- **SIGTERM gets NO escalation, distinct from SIGINT.** SIGINT is interactive (Ctrl+C from a terminal) and a "second press to force quit" is the expected UX — the user is at the keyboard, ready to bash keys. SIGTERM is programmatic (systemd, init, k8s pod-stop, parent process). The sender that wants force-quit follows up with SIGKILL, which we can't catch anyway. Asymmetric escalation is the right design.
+- **Both signals go through the SAME controller.** No separate "graceful" vs "forceful" abort channels. The harness sees one abort and tears down identically. The escalation difference (SIGINT process.exit, SIGTERM doesn't) is at the signal-handler layer, not the harness layer.
+- **`broker.close()` BEFORE `db.close()`, NOT vice versa or in parallel.** broker.close() awaits in-flight handler execution (slice 78's FIFO chain). A handler that completes mid-drain may emit an audit row via the harness's `finishToolCall` → DB write. If we closed the DB first that write would hit a closed sqlite handle (SQLITE_MISUSE). Sequential close order is the safe choice.
+- **Conditional check `cfg.broker !== undefined`.** Production bootstrap always sets a broker, but headless / SDK callers may construct a HarnessConfig without one (e.g., a test that only exercises read tools). The check keeps the code defensive against future call shapes without forcing a broker on every consumer.
+- **Test surface uses synthetic `process.emit`, NOT real signals.** Firing real SIGINT/SIGTERM would terminate the test process. `process.emit('SIGTERM' as NodeJS.Signals)` runs all registered handlers synchronously without affecting process state. The cast is needed because the typings make `emit` accept only events known to NodeJS, but Bun supports the same convention. Tests assert controller state, not emit's return value, because other test-runner-installed listeners (if any) would affect the boolean.
+- **`silenceStderr` helper rather than capturing.** The handler writes a status line to stderr ("forja: interrupting..." / "forja: received SIGTERM..."). Without silencing, the test runner output interleaves with these lines, making failures harder to read. We don't assert on the stderr content here — that's a UX detail, not a behavior contract.
+- **No test for the run.ts / repl.ts cleanup ORDER.** End-to-end testing of "broker drains before DB closes" would require running an actual CLI session with a synthetic abort. The 1-line code change in the finally is easy to read; integration tests of the full CLI lifecycle are out of scope. The contract is enforced by code review + the comment documenting intent.
+- **Idempotency relied on, not retested.** `broker.close()` is documented as idempotent (slice 78). If two cleanup paths both call it (e.g., signal aborts mid-`runAgent` + the natural finally), the second call is a no-op. Idempotency is the broker's job; slice 86 just trusts the contract.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; no changes triggered new formatting
+- `bun test` — **5977 pass / 10 skip / 0 fail** (5987 total across 285 files); +6 tests on top of slice 85's 5971
+- `bun test tests/cli/signal.test.ts` — 6 pass in ~40ms
+
+### Next
+
+§13.7 remaining work:
+
+1. **Operator-facing security-mode flag + bootstrap spawn-broker wiring.** Flip bootstrap from `createInProcessBroker` to `createSpawnBroker` based on a config knob (`[broker] mode = "spawn"` in agent.toml or `--broker=spawn` CLI flag). Threads existing `maybeWrapSandboxArgv` as `sandboxRunner` + the telemetry sink (slice 84) into broker construction. Closes spec line 928. Binary-mode (compiled binary) needs separate planning — `bun run src/broker/worker.ts` doesn't work when the source isn't on disk.
+
+After this slice the §13.7 architectural thread is structurally complete; remaining concerns are deployment / packaging (binary-mode worker invocation) and operational tuning (timeouts, retry policy on worker crash).
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 85: §13.7 per-call timeoutMs override — broker outer scales with handler timeout
 
 **Done.** Eighty-fifth slice. Extends `BrokerCallOptions` with `timeoutMs?` so callers can override the broker-construction outer guard per call. bashTool computes a broker-level timeout from `args.timeout_ms + grace + buffer` and passes it on every call, ensuring the broker outer is always at least as wide as the handler inner — no more silent kills when an operator legitimately sets `timeout_ms: 5min` while the broker default is 30s.

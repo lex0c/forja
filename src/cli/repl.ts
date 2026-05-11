@@ -1401,6 +1401,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // production it'd just delay process exit by up to ESC_DRAIN_MS).
     cancelDrain();
     if (typeof stdin.pause === 'function') stdin.pause();
+    // §13.7 broker drain BEFORE storage close — same rationale as
+    // src/cli/run.ts. Awaits in-flight exec; closes idempotently.
+    if (baseConfig.broker !== undefined) {
+      await baseConfig.broker.close();
+    }
     db.close();
     resolveExit();
   };

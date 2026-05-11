@@ -726,6 +726,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       renderer.flush();
       return exitCodeFor(result);
     } finally {
+      // §13.7 broker drain BEFORE storage close. broker.close()
+      // awaits any in-flight exec call (slice 78's FIFO chain); if
+      // we closed the DB first, an orphaned handler that emits an
+      // audit row mid-drain would hit a closed sqlite handle. The
+      // close is idempotent + always-defined in production (bootstrap
+      // wires it); the conditional is for headless / SDK callers
+      // that may construct a HarnessConfig without a broker.
+      if (cfg.broker !== undefined) {
+        await cfg.broker.close();
+      }
       db.close();
     }
   } catch (e) {
