@@ -23,10 +23,21 @@
 // `rotate-chain`: DB-only, no provider, no session start. Exit 0
 // on a row found, 1 on bootstrap/DB/missing-row errors.
 
-import { DEFAULT_SCORE_CONFIRM_THRESHOLD, ensureInstallId } from '../permissions/index.ts';
+import {
+  DEFAULT_SCORE_CONFIRM_THRESHOLD,
+  createNoopSink,
+  createPermissionEngine,
+  ensureInstallId,
+} from '../permissions/index.ts';
 import { type Policy, canonicalHash, resolvePolicy } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import type { ToolArgs } from '../permissions/index.ts';
+import type { Decision, PolicyCategory } from '../permissions/types.ts';
+import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { getToolCallByApprovalSeq } from '../storage/repos/approval-call-links.ts';
 import { type ApprovalLogRow, getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
+import { getSession } from '../storage/repos/sessions.ts';
+import { getToolCall } from '../storage/repos/tool-calls.ts';
+import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
@@ -85,6 +96,15 @@ export interface RunPermissionReplayOptions {
   // surfaces whether the classifier moved the decision across the
   // §6.6 threshold. Default mode is unchanged.
   withoutClassifier?: boolean;
+  // §17 `--against-current-policy` mode. When true, replay re-runs
+  // the engine pipeline against the ACTIVE policy using the row's
+  // raw args (recovered via approval_call_links → tool_calls.input).
+  // The replayed decision is rendered alongside the original; a diff
+  // flags policy drift impact. When the prerequisites are missing
+  // (link absent, tool_call garbage-collected by retention,
+  // resolver returns refuse), the analysis surfaces "skipped" with
+  // the operator-readable cause and the rest of the replay proceeds.
+  againstCurrentPolicy?: boolean;
   dbPath?: string;
   env?: NodeJS.ProcessEnv;
   out?: (s: string) => void;
@@ -130,12 +150,161 @@ interface ClassifierImpactAnalysis {
   would_gate_without_classifier: boolean;
 }
 
+// §17 `--against-current-policy` analysis. Re-executes the engine
+// pipeline against a target policy using the row's recovered raw
+// args. `verdict` distills the outcome into operationally meaningful
+// shape; the four sub-objects below carry the inputs and the
+// replayed decision so JSON consumers can build their own diff.
+//
+//   - `deterministic`     — replayed.kind matches row.decision; the
+//                           active policy produces the same outcome.
+//   - `changed_decision`  — replayed.kind differs from row.decision.
+//                           The active policy would gate differently.
+//   - `skipped`           — re-execution prereqs missing: link
+//                           absent, tool_calls row GC'd, resolver
+//                           refused on the recovered args, etc.
+//                           The cause string names the missing piece.
+type AgainstCurrentPolicyVerdict = 'deterministic' | 'changed_decision' | 'skipped';
+
+interface AgainstCurrentPolicyAnalysis {
+  verdict: AgainstCurrentPolicyVerdict;
+  // Row's recorded decision kind, for parity with the replayed side.
+  // Always populated; mirrors `row.decision`.
+  original_decision: 'allow' | 'deny' | 'confirm';
+  // Decision from re-executing against the active policy. Absent on
+  // `skipped`; the `skipped_reason` describes why.
+  replayed_decision?: 'allow' | 'deny' | 'confirm';
+  replayed_reason?: string;
+  // Free-form cause string for the `skipped` verdict. Operator-
+  // facing. Empty on the other two verdicts.
+  skipped_reason?: string;
+}
+
 interface ReplayResult {
   row: ApprovalLogRow;
   drift: boolean;
   activePolicyHash: string;
   classifierImpact?: ClassifierImpactAnalysis;
+  againstCurrentPolicy?: AgainstCurrentPolicyAnalysis;
 }
+
+// PERMISSION_ENGINE.md §17 re-execution helper. Pulls together the
+// inputs the engine needs from sibling tables — tool_calls.input
+// (raw args via approval_call_links), sessions.cwd (engine
+// `cwd`), tool registry (PolicyCategory by toolName), and the
+// caller-supplied target policy. Builds a DISPOSABLE engine with
+// the noop sink so re-execution doesn't write a new audit row,
+// runs check(), and returns the resulting Decision.
+//
+// Graceful skip when any prereq is missing — replay is a forensic
+// tool, not a critical path; printing "skipped: <cause>" is more
+// useful than aborting the whole replay surface.
+const tryReExecute = (params: {
+  row: ApprovalLogRow;
+  policy: Policy;
+  db: DB;
+  cwd: string;
+  home: string;
+}): { ok: true; decision: Decision } | { ok: false; reason: string } => {
+  const { row, policy, db, cwd, home } = params;
+
+  const toolCallId = getToolCallByApprovalSeq(db, row.seq);
+  if (toolCallId === null) {
+    return {
+      ok: false,
+      reason:
+        'no tool_call linked to this seq (audit row predates slice 15, or the harness emit/link race surfaced)',
+    };
+  }
+  const toolCall = getToolCall(db, toolCallId);
+  if (toolCall === null) {
+    return {
+      ok: false,
+      reason: `tool_call row ${toolCallId} missing (session retention may have GC'd it)`,
+    };
+  }
+
+  // Resolve category via the builtin tool registry. MCP tools and
+  // any extension tools registered at run-time aren't here — they
+  // fall through to 'misc', which produces an engine.check() shape
+  // that maps to the misc default-allow path. Documented as a
+  // known caveat for replay against non-builtin tool surfaces.
+  const registry = createToolRegistry();
+  registerBuiltinTools(registry);
+  const tool = registry.get(row.tool_name);
+  const category: PolicyCategory = tool?.metadata.category ?? 'misc';
+
+  const engine = createPermissionEngine(policy, {
+    cwd,
+    home,
+    audit: createNoopSink(),
+  });
+  try {
+    const decision = engine.check(row.tool_name, category, toolCall.input as ToolArgs);
+    return { ok: true, decision };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: `engine.check threw: ${(e as Error).message}`,
+    };
+  }
+};
+
+// Build the §17 against-current-policy analysis. Wrapper around
+// `tryReExecute` that resolves the engine inputs from row + DB and
+// converts the prereq-missing case into a `skipped` verdict.
+const analyzeAgainstCurrentPolicy = (params: {
+  row: ApprovalLogRow;
+  activePolicy: Policy | null;
+  db: DB;
+  home: string;
+}): AgainstCurrentPolicyAnalysis => {
+  const original_decision = params.row.decision as 'allow' | 'deny' | 'confirm';
+  if (params.activePolicy === null) {
+    return {
+      verdict: 'skipped',
+      original_decision,
+      skipped_reason: 'active policy unavailable (malformed YAML or missing dir)',
+    };
+  }
+  const session = getSession(params.db, params.row.session_id);
+  if (session === null) {
+    return {
+      verdict: 'skipped',
+      original_decision,
+      skipped_reason: `session ${params.row.session_id} not found (retention may have GC'd it)`,
+    };
+  }
+  const result = tryReExecute({
+    row: params.row,
+    policy: params.activePolicy,
+    db: params.db,
+    cwd: session.cwd,
+    home: params.home,
+  });
+  if (!result.ok) {
+    return { verdict: 'skipped', original_decision, skipped_reason: result.reason };
+  }
+  const replayedKind = result.decision.kind;
+  const replayedReason =
+    result.decision.kind === 'confirm'
+      ? `confirm: ${result.decision.prompt}`
+      : (result.decision.reason ?? '');
+  if (replayedKind === original_decision) {
+    return {
+      verdict: 'deterministic',
+      original_decision,
+      replayed_decision: replayedKind,
+      replayed_reason: replayedReason,
+    };
+  }
+  return {
+    verdict: 'changed_decision',
+    original_decision,
+    replayed_decision: replayedKind,
+    replayed_reason: replayedReason,
+  };
+};
 
 const loadActivePolicy = (cwd: string, env: NodeJS.ProcessEnv): Policy | null => {
   try {
@@ -278,6 +447,30 @@ const renderText = (result: ReplayResult, out: (s: string) => void): void => {
     }
     out(`    ${verdictLine}\n`);
   }
+
+  if (result.againstCurrentPolicy !== undefined) {
+    const a = result.againstCurrentPolicy;
+    out('\n');
+    out('  Re-execution against ACTIVE policy (--against-current-policy):\n');
+    out(`    original decision:         ${a.original_decision}\n`);
+    if (a.verdict === 'skipped') {
+      out(`    replayed decision:         skipped (${a.skipped_reason})\n`);
+    } else {
+      out(`    replayed decision:         ${a.replayed_decision ?? '<unknown>'}\n`);
+      if (a.replayed_reason !== undefined && a.replayed_reason.length > 0) {
+        out(`    replayed reason:           ${a.replayed_reason}\n`);
+      }
+    }
+    let verdictLine: string;
+    if (a.verdict === 'skipped') {
+      verdictLine = 'verdict: re-execution skipped (see reason above)';
+    } else if (a.verdict === 'deterministic') {
+      verdictLine = 'verdict: ✓ deterministic — active policy would produce the same decision';
+    } else {
+      verdictLine = `verdict: ⚠ policy drift changed the decision (${a.original_decision} → ${a.replayed_decision})`;
+    }
+    out(`    ${verdictLine}\n`);
+  }
 };
 
 const renderJson = (result: ReplayResult, out: (s: string) => void): void => {
@@ -336,6 +529,9 @@ const renderJson = (result: ReplayResult, out: (s: string) => void): void => {
       active_policy_hash: result.activePolicyHash,
       ...(result.classifierImpact !== undefined
         ? { classifier_impact: result.classifierImpact }
+        : {}),
+      ...(result.againstCurrentPolicy !== undefined
+        ? { against_current_policy: result.againstCurrentPolicy }
         : {}),
     })}\n`,
   );
@@ -425,11 +621,22 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
       ? analyzeClassifierImpact(row, DEFAULT_SCORE_CONFIRM_THRESHOLD)
       : undefined;
 
+  const againstCurrentPolicy =
+    options.againstCurrentPolicy === true
+      ? analyzeAgainstCurrentPolicy({
+          row,
+          activePolicy,
+          db,
+          home: env.HOME ?? cwd,
+        })
+      : undefined;
+
   const result: ReplayResult = {
     row,
     drift,
     activePolicyHash,
     ...(classifierImpact !== undefined ? { classifierImpact } : {}),
+    ...(againstCurrentPolicy !== undefined ? { againstCurrentPolicy } : {}),
   };
   if (json) renderJson(result, out);
   else renderText(result, out);

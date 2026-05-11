@@ -15,6 +15,67 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 16: replay `--against-current-policy` (§17)
+
+**Done.** Sixteenth slice of the v2 evolution. Third of the three §17 replay modes lands: `agent permission replay <seq> --against-current-policy` re-executes the full decision pipeline against the ACTIVE policy using the row's raw args (recovered via slice 15's `approval_call_links` + `tool_calls.input`), and reports whether the active policy would gate the same call differently.
+
+The two prereqs are now both load-bearing: slice 13's `policy_archive` (untouched in this slice — future `permission diff` will consume it for two-row comparisons) and slice 15's `approval_call_links` (the live edge that lets replay recover the args raw). With this slice, every line from spec §17's example output is achievable except the cross-row `agent permission diff`, which is a structural variant of this same machinery.
+
+### What re-execution actually does
+
+1. Resolves `tool_call_id` via `getToolCallByApprovalSeq(row.seq)`.
+2. Loads `tool_calls.input` (the raw args the model emitted).
+3. Looks up the policy `category` via the builtin tool registry (`createToolRegistry()` + `registerBuiltinTools()`). MCP / extension tools fall through to `misc` — documented caveat.
+4. Loads `sessions.cwd` for the engine's `cwd` setting.
+5. Builds a **disposable** engine with `createNoopSink()` so re-execution doesn't write a new audit row.
+6. Calls `engine.check(row.tool_name, category, toolCall.input)`.
+7. Compares the replayed `decision.kind` with `row.decision`.
+
+When any prereq is missing (link absent, `tool_calls` row GC'd by retention, `sessions` row absent), the analysis surfaces a `skipped` verdict with the operator-readable cause and the rest of the replay output proceeds — forensic readouts shouldn't die on missing data.
+
+### Verdicts
+
+| Verdict | Meaning |
+|---|---|
+| `deterministic` | Replayed decision matches the row's. Active policy produces the same outcome. |
+| `changed_decision` | Replayed decision differs from the row's. Policy drift moved the gate. Both decisions surfaced in the output (`original → replayed`). |
+| `skipped` | Re-execution prereq missing. Cause string names the gap (link absent, session GC'd, etc.). |
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | `--against-current-policy` presence-only flag on the `replay` verb. Rejects on non-replay verbs with the same parser shape as `--without-classifier`. Composes with `--without-classifier`. |
+| `src/cli/permission-replay.ts` | `RunPermissionReplayOptions.againstCurrentPolicy?: boolean`. New `tryReExecute()` helper that pulls together args/category/cwd/engine and runs `engine.check()` against the supplied policy with noop sink. New `analyzeAgainstCurrentPolicy()` wrapper that resolves engine inputs from `row + db + active policy + home` and produces the `AgainstCurrentPolicyAnalysis`. Text rendering adds a 5-line block; JSON output embeds the analysis as `against_current_policy` sub-object. |
+| `src/cli/run.ts` | Threads `againstCurrentPolicy` flag into `runPermissionReplay`. |
+| `tests/cli/permission-replay.test.ts` | 8 new tests — parse (flag flows, non-replay rejected, composes with `--without-classifier`) + 5 integration scenarios (deterministic happy path with a planted project policy, changed_decision when active policy lacks the rule, skipped when no link exists, JSON includes `against_current_policy`, default mode omits the block). The integration fixture seeds the full chain (sessions, message, tool_call, sink emit, link). |
+
+### Decisions
+
+- **Re-execution scoped to `--against-current-policy` only.** Default-mode replay (slice 12) keeps its hash-comparison-only semantics. Justification: when the policy_hash matches the live one, the engine is deterministic enough that re-execution would by definition produce the same answer — re-running adds cost (engine + bash parser init) without new information. The flag is opt-in for the drift case.
+- **Disposable engine with noop sink.** Re-execution must NOT write a new audit row — a replay row would falsify the audit trail (rows that look like decisions but aren't). The noop sink keeps the engine's emit path active for `Decision.approvalSeq` plumbing (slice 15) without producing persistence.
+- **Tool registry resolved here, not passed in.** `createToolRegistry()` + `registerBuiltinTools()` runs at replay time. MCP / extension tools that need run-time registration aren't here — they fall through to `category: 'misc'`, which produces a `default-allow` from the engine. Documented as a caveat. A future slice can wire a richer registry (via bootstrap reuse) when MCP replay matters.
+- **`tryReExecute` returns `{ ok, decision } | { ok: false, reason }` rather than throwing.** Skipped paths (missing link, missing tool_call, engine throw) all surface as `reason` strings. The handler converts to a `skipped` verdict; the rest of the replay output continues to render. Forensic tools that abort the whole flow on missing data are useless — replay should ALWAYS print what it can.
+- **Composes with `--without-classifier`.** Both flags can be set together; the renderer emits both blocks. No special handling needed — each analysis is independent (different rows of the result struct, different render sections).
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5212 pass / 10 skip / 0 fail** (5222 total across 246 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. `agent permission diff <id1> <id2>` — cross-row replay comparison. Consumes `policy_archive` (slice 13) for both rows' policy bytes + `approval_call_links` (slice 15) for both rows' args. Structurally similar to `--against-current-policy` but with two archived contexts instead of one archived + one live.
+2. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+5. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 15: approval_call_links (§17 re-execution prereq)
 
 **Done.** Fifteenth slice of the v2 evolution. Plumbing for replay's re-execution modes (`--against-current-policy`, `permission diff`): every engine.check() now carries the audit row's `seq` on the returned `Decision`, and the harness's invoke-tool transaction links it with the matching `tool_calls.id` in `approval_call_links`. Future slices join the table to recover raw args (`tool_calls.input`) for deterministic re-execution.

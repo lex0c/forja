@@ -227,6 +227,12 @@ export interface ParsedArgs {
     // from the classifier adjust and report whether the classifier
     // moved the decision across the §6.6 threshold.
     withoutClassifier?: boolean;
+    // `agent permission replay <seq> --against-current-policy` (§17 mode).
+    // Re-executes the decision pipeline using the row's args (recovered
+    // via approval_call_links + tool_calls.input) against the ACTIVE
+    // policy. Reports the original decision vs the replayed one;
+    // diverging outcomes flag policy drift impact.
+    againstCurrentPolicy?: boolean;
   };
 }
 
@@ -480,6 +486,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   let json = false;
   let reason: string | undefined;
   let withoutClassifier = false;
+  let againstCurrentPolicy = false;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -520,12 +527,22 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       withoutClassifier = true;
       continue;
     }
+    if (token === '--against-current-policy') {
+      againstCurrentPolicy = true;
+      continue;
+    }
     positionals.push(token);
   }
   if (withoutClassifier && verb !== 'replay') {
     return {
       ok: false,
       message: `agent permission ${verb}: --without-classifier only applies to 'replay'`,
+    };
+  }
+  if (againstCurrentPolicy && verb !== 'replay') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --against-current-policy only applies to 'replay'`,
     };
   }
   if (verb === 'rotate-chain') {
@@ -580,6 +597,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         positionals,
         ...(reason !== undefined ? { reason } : {}),
         ...(withoutClassifier ? { withoutClassifier: true } : {}),
+        ...(againstCurrentPolicy ? { againstCurrentPolicy: true } : {}),
       },
     },
   };

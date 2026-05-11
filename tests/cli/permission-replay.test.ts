@@ -104,6 +104,37 @@ describe('parseArgs — permission replay', () => {
       expect(r.args.permission?.withoutClassifier).toBeUndefined();
     }
   });
+
+  test('--against-current-policy flag flows through replay parse', () => {
+    const r = parseArgs(['permission', 'replay', '42', '--against-current-policy']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.againstCurrentPolicy).toBe(true);
+    }
+  });
+
+  test('--against-current-policy on verify fails parse', () => {
+    const r = parseArgs(['permission', 'verify', '--against-current-policy']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain('--against-current-policy only applies to');
+    }
+  });
+
+  test('--against-current-policy and --without-classifier compose', () => {
+    const r = parseArgs([
+      'permission',
+      'replay',
+      '42',
+      '--against-current-policy',
+      '--without-classifier',
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.againstCurrentPolicy).toBe(true);
+      expect(r.args.permission?.withoutClassifier).toBe(true);
+    }
+  });
 });
 
 describe('runPermissionReplay', () => {
@@ -538,5 +569,224 @@ describe('runPermissionReplay — --without-classifier analysis', () => {
     });
     expect(code).toBe(0);
     expect(out.lines.join('')).not.toContain('Classifier impact analysis');
+  });
+});
+
+describe('runPermissionReplay — --against-current-policy re-execution (slice 16)', () => {
+  let tmp: string;
+  let dbPath: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-replay-acp-'));
+    dbPath = join(tmp, 'sessions.db');
+    env = { HOME: tmp };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // Seeds the full chain a replay would consume: sessions, message,
+  // tool_calls (with raw args), approvals_log (emitted via SQLite
+  // sink), approval_call_links. Returns the emitted approval seq.
+  const seedFullReplayable = async (args: Record<string, unknown>): Promise<number> => {
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    // Make sure the bash AST resolver is ready — engine.check on
+    // `bash` category fires the resolver, which throws without init.
+    const { initBashParser } = await import('../../src/permissions/bash-parser.ts');
+    await initBashParser();
+
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const { appendMessage } = await import('../../src/storage/repos/messages.ts');
+    const { createToolCall } = await import('../../src/storage/repos/tool-calls.ts');
+    const { linkApprovalToToolCall } = await import(
+      '../../src/storage/repos/approval-call-links.ts'
+    );
+
+    const session = createSession(db, { model: 'm', cwd: tmp });
+    const message = appendMessage(db, {
+      sessionId: session.id,
+      role: 'assistant',
+      content: 'x',
+    });
+    const toolCall = createToolCall(db, {
+      messageId: message.id,
+      toolName: 'bash',
+      input: args,
+    });
+    const sink = createSqliteSink({ db, identity });
+    const emitted = sink.emit({
+      session_id: session.id,
+      tool_name: 'bash',
+      args,
+      decision: 'allow',
+      policy_hash: 'sha256:fixture',
+      reason_chain: [{ stage: 'engine-default' }],
+      capabilities: ['exec:shell', `read-fs:${tmp}`],
+      score: 0,
+      score_components: {},
+      confidence: 'high',
+      classifier_hash: null,
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ts: 1,
+    });
+    linkApprovalToToolCall(db, {
+      approvalSeq: emitted.seq,
+      toolCallId: toolCall.id,
+    });
+    db.close();
+    return emitted.seq;
+  };
+
+  test('deterministic: active policy produces the same decision', async () => {
+    // Project policy allows ls in cwd; row is decision='allow';
+    // active policy (loaded from tmp cwd — no .agent/permissions.yaml
+    // so defaults apply) would default-deny. Hmm, default behavior is
+    // strict + default-deny → drift. To make this case truly
+    // deterministic we plant a project policy mirroring what produced
+    // the row's allow.
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.agent', 'permissions.yaml'),
+      `defaults:
+  mode: strict
+tools:
+  bash:
+    allow:
+      - "ls*"
+`,
+    );
+    const seq = await seedFullReplayable({ command: 'ls -la' });
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('Re-execution against ACTIVE policy');
+    expect(text).toContain('original decision:         allow');
+    expect(text).toContain('replayed decision:         allow');
+    expect(text).toContain('✓ deterministic');
+  });
+
+  test('changed_decision: active policy differs (no rule matches → default deny)', async () => {
+    // No active policy file. Active resolves to defaults: strict /
+    // empty rules. row.decision='allow' (fixture-seeded); replay
+    // re-execution gets default-deny → verdict 'changed_decision'.
+    const seq = await seedFullReplayable({ command: 'ls -la' });
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('policy drift changed the decision');
+    expect(text).toContain('(allow → deny)');
+  });
+
+  test('skipped: no approval_call_link for the seq', async () => {
+    // Seed a real session + audit row but DON'T write a link —
+    // emulates a pre-slice-15 audit row, or a write that dropped
+    // through a transaction crash between emit and link.
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const session = createSession(db, { model: 'm', cwd: tmp });
+    const sink = createSqliteSink({ db, identity });
+    const emitted = sink.emit({
+      session_id: session.id,
+      tool_name: 'bash',
+      args: { command: 'ls' },
+      decision: 'allow',
+      policy_hash: 'sha256:fixture',
+      reason_chain: [],
+      ts: 1,
+    });
+    db.close();
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq: emitted.seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('skipped');
+    expect(text).toContain('no tool_call linked');
+  });
+
+  test('JSON output includes against_current_policy sub-object', async () => {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.agent', 'permissions.yaml'),
+      `defaults:
+  mode: strict
+tools:
+  bash:
+    allow:
+      - "ls*"
+`,
+    );
+    const seq = await seedFullReplayable({ command: 'ls -la' });
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      json: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const obj = JSON.parse(out.lines[0] as string) as Record<string, unknown>;
+    const acp = obj.against_current_policy as Record<string, unknown>;
+    expect(acp).toBeDefined();
+    expect(acp.verdict).toBe('deterministic');
+    expect(acp.original_decision).toBe('allow');
+    expect(acp.replayed_decision).toBe('allow');
+  });
+
+  test('default replay (no flag) omits against_current_policy', async () => {
+    const seq = await seedFullReplayable({ command: 'ls' });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).not.toContain('Re-execution against ACTIVE policy');
   });
 });
