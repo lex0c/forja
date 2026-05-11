@@ -6,6 +6,7 @@ import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.t
 import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 import {
   type PermissionDecisionEvent,
+  type TelemetryEvent,
   createRecordingTelemetrySink,
 } from '../../src/telemetry/index.ts';
 
@@ -84,8 +85,9 @@ describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {
     });
     const event = telemetry.events()[0];
     expect(event).toBeDefined();
-    if (event === undefined) return;
-    expect(event.kind).toBe('permission.decision');
+    if (event === undefined || event.kind !== 'permission.decision') {
+      throw new Error('expected permission.decision event');
+    }
     expect(event.ts).toBe(7777);
     expect(event.approval_id).toBe(row.seq);
     expect(event.parent_approval_id).toBeNull();
@@ -116,7 +118,7 @@ describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {
     const { db, identity } = setupBase();
     const observedHeadSeqs: number[] = [];
     const queryingSink = {
-      emit: (_event: PermissionDecisionEvent) => {
+      emit: (_event: TelemetryEvent) => {
         const row = db
           .query('SELECT seq FROM approvals_log WHERE install_id = ? ORDER BY seq DESC LIMIT 1')
           .get(identity.install_id) as { seq: number } | null;
@@ -158,7 +160,7 @@ describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {
     // Caller omitted tool_version / resolver_version — sink
     // defaults to 'v1' for both. The telemetry event reflects
     // what the AUDIT ROW recorded.
-    const event = telemetry.events()[0];
+    const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
     expect(event?.tool_version).toBe('v1');
     expect(event?.resolver_version).toBe('v1');
   });
@@ -168,7 +170,8 @@ describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {
     const telemetry = createRecordingTelemetrySink();
     const sink = createSqliteSink({ db, identity, telemetry });
     sink.emit({ ...baseEmitArgs, ts: 100 });
-    expect(telemetry.events()[0]?.capabilities).toEqual([]);
+    const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
+    expect(event?.capabilities).toEqual([]);
   });
 
   test('score_components default to empty object when omitted', () => {
@@ -176,6 +179,7 @@ describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {
     const telemetry = createRecordingTelemetrySink();
     const sink = createSqliteSink({ db, identity, telemetry });
     sink.emit({ ...baseEmitArgs, ts: 100 });
-    expect(telemetry.events()[0]?.score_components).toEqual({});
+    const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
+    expect(event?.score_components).toEqual({});
   });
 });

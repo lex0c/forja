@@ -35,6 +35,19 @@ export type TelemetryDecision = 'allow' | 'deny' | 'confirm' | 'confirm-allowed'
 
 export type TelemetryConfidence = 'high' | 'medium' | 'low';
 
+// State-machine label set — mirrors `EngineState` from
+// state-machine.ts. Duplicated here as a string union (rather
+// than imported) so telemetry stays independent of the engine
+// module. Drift between the two is caught by the wire-up types
+// in bootstrap (and the conformance suite's engine_state cases).
+export type TelemetryEngineState =
+  | 'init'
+  | 'loading-policy'
+  | 'validating-chain'
+  | 'ready'
+  | 'degraded'
+  | 'refusing';
+
 // Event: one decision, one row in the audit chain. Spec §18 line
 // 1179-1202 lists every field. `engine_state` is optional —
 // sources that don't have access to the state controller omit
@@ -61,10 +74,26 @@ export interface PermissionDecisionEvent {
   engine_state?: string;
 }
 
+// State-machine transition event — emitted on every successful
+// `controller.transition(to, reason)`. Spec §18 line 1214 lists
+// `state_transitions{from,to}` as a tracked metric; any
+// transition INTO `refusing` is the P0 trigger. Bootstrap wires
+// the controller's `onTransition` listener to forward into the
+// telemetry sink so engine-driven transitions (engine.degrade,
+// engine.refuse, engine.restore) also produce events via the
+// shared controller.
+export interface StateTransitionEvent {
+  kind: 'state.transition';
+  ts: number;
+  from: TelemetryEngineState;
+  to: TelemetryEngineState;
+  reason: string;
+}
+
 // Discriminated union of every event kind the engine emits.
 // Future slices extend with chain.verify_failed,
-// sealing.failure, state.transition, etc.
-export type TelemetryEvent = PermissionDecisionEvent;
+// sealing.failure, classifier.unavailable.
+export type TelemetryEvent = PermissionDecisionEvent | StateTransitionEvent;
 
 export interface TelemetrySink {
   // Fire-and-forget. Sinks MUST NOT throw — telemetry is

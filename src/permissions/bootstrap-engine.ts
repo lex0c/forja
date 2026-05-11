@@ -21,6 +21,7 @@
 
 import type { DB } from '../storage/db.ts';
 import { archivePolicy } from '../storage/repos/policy-archive.ts';
+import type { TelemetryEvent } from '../telemetry/index.ts';
 import {
   type AuditSink,
   type ReasonChainEntry,
@@ -117,6 +118,14 @@ export interface BootstrapPermissionEngineInput {
   sealSchedulerNow?: () => number;
   sealSchedulerSetTimer?: (cb: () => void, ms: number) => unknown;
   sealSchedulerClearTimer?: (handle: unknown) => void;
+  // §18 telemetry sink (slice 70 foundation + slice 71 state
+  // transitions). When set, the bootstrap wires the sink into
+  // (a) the state controller's `onTransition` listener so every
+  // engine state change emits a `state.transition` event, and
+  // (b) the audit sink so every emit produces a
+  // `permission.decision` event. Production: pass an OTEL
+  // adapter (future slice). Tests: pass a recording sink.
+  telemetry?: { emit: (event: TelemetryEvent) => void };
 }
 
 export interface PreflightResult {
@@ -294,7 +303,27 @@ export const bootstrapPermissionEngine = async (
   const controller = createStateController({
     initial: 'init',
     ...(input.now !== undefined ? { now: input.now } : {}),
-    onTransition: (e) => events.push(e),
+    onTransition: (e) => {
+      events.push(e);
+      // §18 state.transition telemetry (slice 71). Wrapped in
+      // try/catch — observability failures must not break the
+      // state machine itself (a thrown emit would corrupt the
+      // events trail). Same posture as the audit sink's
+      // telemetry handling (slice 70).
+      if (input.telemetry !== undefined) {
+        try {
+          input.telemetry.emit({
+            kind: 'state.transition',
+            ts: e.ts,
+            from: e.from,
+            to: e.to,
+            reason: e.reason,
+          });
+        } catch {
+          // Best-effort.
+        }
+      }
+    },
   });
 
   const home = input.home ?? input.env?.HOME ?? process.env.HOME ?? input.cwd;
@@ -358,7 +387,12 @@ export const bootstrapPermissionEngine = async (
       liveScheduler?.tick();
     },
   };
-  const sink = createSqliteSink({ db: input.db, identity, scheduler: schedulerProxy });
+  const sink = createSqliteSink({
+    db: input.db,
+    identity,
+    scheduler: schedulerProxy,
+    ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
+  });
   const chain = sink.verifyChain();
 
   if (!chain.ok && input.acceptBrokenChain !== true) {

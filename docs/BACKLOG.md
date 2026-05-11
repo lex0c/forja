@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 71: telemetry — `state.transition` event + bootstrap fan-out
+
+**Done.** Seventy-first slice. Adds the second event type to the telemetry union (`state.transition`) and wires the telemetry sink into the bootstrap so a single sink receives BOTH `permission.decision` events (slice 70 wire-up via the audit sink) AND `state.transition` events (slice 71 — emitted from the state controller's `onTransition` listener). Spec §18 line 1214 lists `state_transitions{from,to}` as a tracked metric; any transition INTO `refusing` is the P0 trigger.
+
+### Why this matters
+
+Without state-transition telemetry, operators only see the engine's lifecycle through the bootstrap's events trail (synchronous, returned from the bootstrap call). Mid-session transitions — `engine.degrade(reason)` triggered by a classifier outage, `engine.refuse(reason)` triggered by a sealing failure, `engine.restore(reason)` after the operator fixes the issue — would be invisible to any external observer. Telemetry events flow ALL transitions through the same sink that receives audit decisions, so an OTEL adapter (future slice) routes them to the same metrics backend.
+
+The bootstrap fan-out is the load-bearing wire-up. A single `telemetry` option on `BootstrapPermissionEngineInput` plumbs into TWO emission sources: state controller (this slice) + audit sink (slice 70). Operator configures one sink; engine observability is complete.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/index.ts` | New `TelemetryEngineState` string union (mirrors `EngineState` from state-machine.ts — duplicated to keep telemetry independent of the engine module; drift caught by bootstrap's wire-up types). New `StateTransitionEvent` interface: `kind: 'state.transition'`, `ts`, `from`, `to`, `reason`. `TelemetryEvent` union extended to `PermissionDecisionEvent \| StateTransitionEvent`. |
+| `src/permissions/bootstrap-engine.ts` | New `telemetry?: { emit: (event: TelemetryEvent) => void }` field on `BootstrapPermissionEngineInput`. The state controller's `onTransition` listener (existing — was just pushing to `events: StateTransition[]`) now also emits a `state.transition` telemetry event when telemetry is wired. Wrapped in try/catch — observability failures must not break the state machine. Audit sink construction also forwards the telemetry sink (slice 70's wire-up, now driven from the bootstrap rather than per-test). |
+| `tests/permissions/audit-telemetry.test.ts` | Existing test cases adjusted for `TelemetryEvent` union narrowing: `(events[0] as PermissionDecisionEvent \| undefined)` casts where prior code assumed `approval_id` was always accessible. The `queryingSink.emit` signature updated from `PermissionDecisionEvent` to `TelemetryEvent`. |
+| `tests/permissions/bootstrap-engine.test.ts` (+5 tests) | New describe block "§18 telemetry wire-up (slice 71)". Coverage: happy path emits state.transition events for every bootstrap step (init→loading-policy→validating-chain→ready = 3 transitions); refusing bootstrap (env={}) emits init→refusing transition; every event carries from + to + reason + ts; `telemetry.emit` throwing does NOT break the state machine + events trail stays intact; audit emit forwards to telemetry too (slice 70 wire-up via bootstrap fan-out, end-to-end). |
+| `tests/telemetry/index.test.ts` | Existing 6 cases adjusted for union narrowing on `events[N]?.approval_id` — cast as `PermissionDecisionEvent \| undefined` where the test specifically constructs only that event type. |
+
+### Decisions
+
+- **`TelemetryEngineState` mirrors `EngineState` as a string union, NOT an import.** Telemetry module shouldn't depend on state-machine.ts — the engine module is heavyweight (imports tree-sitter, capability resolvers, etc.), and the telemetry foundation must stay light enough for the future OTEL adapter to bundle independently. Duplicating the string union loses TS coupling but is caught by the bootstrap's wire-up: when the controller's `onTransition` receives a `StateTransition` and the bootstrap forwards `e.to: EngineState` into a `to: TelemetryEngineState` field, TS checks the assignability at the call site. Drift detected.
+- **Telemetry wire-up at the bootstrap level, not at `createStateController` level.** Considered adding `telemetry?` to `StateControllerOptions`, rejected. State machine is a generic primitive; telemetry is an integration. Bootstrap is the natural integration point — it constructs both the controller and the audit sink, and it's the only place that holds both in the same scope. State-machine.ts stays telemetry-agnostic; future slices that build controllers OUTSIDE bootstrap (e.g., the refusing-result fallback) inherit the same shape without re-doing the wiring.
+- **Telemetry sink wrapped in try/catch inside the controller's `onTransition` listener.** Same posture as the audit sink's telemetry handling (slice 70) and the scheduler's tick (slice 56). Observability is best-effort; a thrown emit must NOT corrupt the events trail OR halt the bootstrap. Test 4 pins this with a sink that throws on every emit — bootstrap still reaches `ready`, events trail is intact (3 entries).
+- **No `state.transition` event in the refusing-path-via-`buildRefusingResult` helper.** That helper builds a placeholder result with a fresh state controller pinned to `refusing` (NOT the same controller as the main bootstrap path). For slice 71 we don't wire telemetry through `buildRefusingResult` — the main bootstrap's controller emits the `→refusing` transition before returning the placeholder. Tests pin this: refusing-via-env-{} bootstrap produces one `state.transition` event with `to: 'refusing'`.
+- **Pre-existing tests narrowed via `as PermissionDecisionEvent | undefined`, not via type guards in the test bodies.** Cast is local to the assertion line and matches what an OTEL adapter would do when routing by `kind`. A full `if (event.kind === 'permission.decision')` guard is more verbose without improving safety — the tests already know what kind they're asserting.
+- **Slice 71 closes the slice 70 follow-up #1 partially.** Three event types remain on the roadmap: `chain.verify_failed`, `sealing.failure`, `classifier.unavailable`. Each is a small typed addition + a single wire-up site (the chain verify path, the scheduler's onSealFailed, the classifier's strict-mode degrade respectively). Slice 72+ ship them incrementally.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5785 pass / 10 skip / 0 fail** (5795 total across 273 files); +5 tests on top of slice 70's 5780
+- `bun test tests/permissions/bootstrap-engine.test.ts tests/telemetry/ tests/permissions/audit-telemetry.test.ts` — 51 pass
+
+### Next
+
+§18 telemetry follow-ups continue:
+
+1. **`chain.verify_failed`** (slice 72 candidate) — fires from `chainCheck` in doctor + `verifyChain` failure path in bootstrap. Fields: `seq` (where chain broke), `reason` (prev_hash_mismatch / this_hash_mismatch), `install_id`. Wire at the bootstrap's chain-verify branch + the doctor's `hash_chain` check.
+2. **`sealing.failure`** — fires from the scheduler's `onSealFailed`. Fields: `mode`, `path`, `reason`. The bootstrap already builds the scheduler's onSealFailed callback (slice 57); add `telemetry.emit` inside that callback.
+3. **`classifier.unavailable`** — fires from the classifier's strict-mode degrade path. Needs slight engine wire-up.
+4. **State controller bridge for `engine_state` in `permission.decision` events.** Currently optional / omitted; plumbing a state getter through `CreateSqliteSinkOptions` populates the field.
+5. **OTEL adapter** — `src/telemetry/adapters/otel.ts`. Translates `TelemetryEvent[]` → OTLP metrics + spans. Adds `@opentelemetry/api` + `@opentelemetry/sdk-metrics` deps. Behind a feature flag.
+6. **Scrubbing layer** — wraps another sink, redacts likely-PII fields before forwarding.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 70: telemetry foundation — `TelemetrySink` interface + `permission.decision` event
 
 **Done.** Seventieth slice. Opens the §18 observability thread per spec line 1175-1215. Ships the foundation: a `TelemetrySink` interface with one typed event (`permission.decision`), an in-memory recording sink for tests, and wire-up at the audit emit point so every successful row produces a structured event. Closes the first step of production-ready checklist line 1213 ("Telemetria com scrubbing"); follow-up slices add more event types (chain.verify_failed, sealing.failure, state.transition), then the OTEL adapter, then the scrubbing layer.

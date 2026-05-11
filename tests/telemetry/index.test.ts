@@ -48,9 +48,9 @@ describe('createRecordingTelemetrySink', () => {
     sink.emit(exampleEvent({ approval_id: 3 }));
     const events = sink.events();
     expect(events).toHaveLength(3);
-    expect(events[0]?.approval_id).toBe(1);
-    expect(events[1]?.approval_id).toBe(2);
-    expect(events[2]?.approval_id).toBe(3);
+    expect((events[0] as PermissionDecisionEvent | undefined)?.approval_id).toBe(1);
+    expect((events[1] as PermissionDecisionEvent | undefined)?.approval_id).toBe(2);
+    expect((events[2] as PermissionDecisionEvent | undefined)?.approval_id).toBe(3);
   });
 
   test('events() returns a snapshot — mutations of the returned array do NOT affect future reads', () => {
@@ -61,7 +61,7 @@ describe('createRecordingTelemetrySink', () => {
     // bypasses the type, the sink's internal state must stay intact.
     (snapshot as PermissionDecisionEvent[]).push(exampleEvent({ approval_id: 999 }));
     expect(sink.events()).toHaveLength(1);
-    expect(sink.events()[0]?.approval_id).toBe(1);
+    expect((sink.events()[0] as PermissionDecisionEvent | undefined)?.approval_id).toBe(1);
   });
 
   test('clear() empties the buffer', () => {
@@ -79,6 +79,6 @@ describe('createRecordingTelemetrySink', () => {
     sink.clear();
     sink.emit(exampleEvent({ approval_id: 2 }));
     expect(sink.events()).toHaveLength(1);
-    expect(sink.events()[0]?.approval_id).toBe(2);
+    expect((sink.events()[0] as PermissionDecisionEvent | undefined)?.approval_id).toBe(2);
   });
 });

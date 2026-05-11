@@ -703,3 +703,90 @@ describe('bootstrapPermissionEngine — §7.3 sealing wire-up', () => {
     r.sealingScheduler?.close();
   });
 });
+
+describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () => {
+  // The bootstrap fans out a single telemetry sink to two
+  // emission sources: (a) state controller transitions (slice 71
+  // — this describe) and (b) audit sink decisions (slice 70 —
+  // covered separately by audit-telemetry.test.ts).
+
+  test('happy path emits state.transition events for every bootstrap step', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const r = await bootstrapPermissionEngine(baseInput({ telemetry }));
+    expect(r.state).toBe('ready');
+    // §2 walk: init → loading-policy → validating-chain → ready.
+    // Three transitions = three events.
+    const stateEvents = telemetry.events().filter((e) => e.kind === 'state.transition');
+    expect(stateEvents).toHaveLength(3);
+    expect(stateEvents.map((e) => (e.kind === 'state.transition' ? e.to : null))).toEqual([
+      'loading-policy',
+      'validating-chain',
+      'ready',
+    ]);
+  });
+
+  test('refusing bootstrap emits its transition before returning', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    // env={} → install_id discovery fails → refusing transition.
+    const r = await bootstrapPermissionEngine(baseInput({ env: {}, telemetry }));
+    expect(r.state).toBe('refusing');
+    const stateEvents = telemetry.events().filter((e) => e.kind === 'state.transition');
+    // init → refusing (one transition; install_id failed before
+    // loading-policy was reached).
+    const lastEvent = stateEvents.at(-1);
+    if (lastEvent === undefined || lastEvent.kind !== 'state.transition') {
+      throw new Error('expected a state.transition event');
+    }
+    expect(lastEvent.to).toBe('refusing');
+    expect(lastEvent.reason).toContain('install_id_failed');
+  });
+
+  test('every state.transition event carries from + to + reason + ts', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    await bootstrapPermissionEngine(baseInput({ telemetry, now: () => 12345 }));
+    const stateEvents = telemetry.events().filter((e) => e.kind === 'state.transition');
+    for (const e of stateEvents) {
+      if (e.kind !== 'state.transition') continue;
+      expect(typeof e.from).toBe('string');
+      expect(typeof e.to).toBe('string');
+      expect(typeof e.reason).toBe('string');
+      expect(e.ts).toBe(12345);
+    }
+  });
+
+  test('telemetry.emit throwing does NOT break the state machine', async () => {
+    // The state controller's onTransition listener invokes
+    // telemetry.emit inside a try/catch — a thrown emit must
+    // not corrupt the events trail OR halt the bootstrap.
+    let throwCount = 0;
+    const throwingSink = {
+      emit: () => {
+        throwCount++;
+        throw new Error('synthetic telemetry failure');
+      },
+    };
+    const r = await bootstrapPermissionEngine(baseInput({ telemetry: throwingSink }));
+    expect(r.state).toBe('ready');
+    expect(throwCount).toBeGreaterThan(0);
+    // events trail is intact despite every emit throwing.
+    expect(r.events).toHaveLength(3);
+  });
+
+  test('audit emit also forwards to telemetry (slice 70 wire-up via bootstrap)', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const r = await bootstrapPermissionEngine(baseInput({ telemetry }));
+    // Engine.check produces an audit row → telemetry event.
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    const decisionEvents = telemetry.events().filter((e) => e.kind === 'permission.decision');
+    expect(decisionEvents).toHaveLength(1);
+    const event = decisionEvents[0];
+    if (event === undefined || event.kind !== 'permission.decision') {
+      throw new Error('expected a permission.decision event');
+    }
+    expect(event.tool).toBe('bash');
+  });
+});
