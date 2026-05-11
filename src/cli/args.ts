@@ -670,10 +670,16 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
 //   revoke        — revoke a grant by id (§8 line 621). Idempotent
 //                   per spec; `--reason <text>` optional but
 //                   recommended (audit forensics).
+//   policy-list   — enumerate the policy_archive (§12.4 read
+//                   surface). Each row is a UNIQUE policy hash the
+//                   engine ever booted with; pairs with future
+//                   `policy-rollback` for the write side.
 //
 // Future verbs (each lands in its own slice):
-//   list     — show approvals log entries
-//   test     — run conformance suite
+//   policy-rollback — revert to a previous archived policy (§12.4
+//                     write side; audit event per spec line 756).
+//   list           — show approvals log entries
+//   test           — run conformance suite
 const KNOWN_PERMISSION_VERBS = [
   'verify',
   'rotate-chain',
@@ -682,6 +688,7 @@ const KNOWN_PERMISSION_VERBS = [
   'inspect',
   'grants',
   'revoke',
+  'policy-list',
 ] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
@@ -885,6 +892,22 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message: 'agent permission grants: --reason only applies to revoke / rotate-chain',
+      };
+    }
+  }
+  if (verb === 'policy-list') {
+    // Read-only enumeration of policy_archive (§12.4 read side).
+    // No positionals, no verb-specific flags besides --json.
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission policy-list: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: 'agent permission policy-list: --reason only applies to revoke / rotate-chain',
       };
     }
   }

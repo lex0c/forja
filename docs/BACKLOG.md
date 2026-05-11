@@ -15,6 +15,51 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 49: `agent permission policy-list` (§12.4 read side)
+
+**Done.** Forty-ninth slice. Opens the §12.4 thread by shipping the read-only enumeration verb. `policy_archive` (slice 13 / migration 037) has stored every UNIQUE policy hash the engine ever booted with since the v2 audit chain landed; this slice gives operators the CLI to inspect it. Pairs with a future `policy-rollback` (slice 50+) that consumes the same data for the write side.
+
+Spec §12.4 names two operator actions: rollback to last-valid + view archive. This slice ships the view; rollback follows. Spec also says "5 mantidas em `~/.cache/agent/policy_history/`" — the current implementation stores them in the `policy_archive` SQLite table instead, with no retention cap. Future work could add retention if the table grows unbounded in production; for now, every UNIQUE hash stays forever (one row per distinct policy ever booted).
+
+### Why this matters
+
+Without a way to ENUMERATE the archive, the rollback verb has no discovery surface — operators would have to query SQLite directly to find the hash they want to roll back to. This slice closes that gap. The list output is also useful standalone for forensic audit ("which policies have run on this install?").
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New verb `'policy-list'` added to `KNOWN_PERMISSION_VERBS`. Header comment block updated to mention `policy-list` (slice 49) + `policy-rollback` (future). Verb-specific validation: no positionals, no `--reason`. |
+| `src/cli/run.ts` | Dispatch arm for `args.permission.verb === 'policy-list'`. Lazy-imports the handler. |
+| `src/cli/permission-policy-list.ts` (new, ~95 lines) | `runPermissionPolicyList({json?, dbPath?, env?, out, err})`. Reads `listPolicyArchive` (slice 13 repo), computes per-row metadata (hash, first_seen, last_seen, canonical_json byte size, current-flag). `current` is the row with `MAX(last_seen_ms)` — the operator's just-booted policy gets its last_seen bumped on every run, so the heuristic is reliable in practice. Plain text: compact one-line-per-row table with hash truncated to 24 chars + ISO timestamps + byte count + `*` marker for current. JSON: NDJSON one row per archive entry with the FULL hash (operators copy from JSON when they need the rollback target). Empty archive: plain prints "(empty)", JSON emits zero lines. |
+| `tests/cli/permission-policy-list.test.ts` (new, 9 tests) | Parser (4: verb recognized, --json captured, positionals rejected, --reason rejected) + handler (5: empty archive message, multi-row render with hash/timestamps/bytes/current flag, single-row marked current, JSON NDJSON shape with full hash, JSON empty emits zero lines). |
+
+### Decisions
+
+- **Flat verb name `policy-list`, not `policy list` (sub-verb hierarchy).** The spec's literal form is `agent permission policy rollback` (sub-verb). To keep the parser structure simple, I'm using the flat hyphenated form. When `policy-rollback` lands, the user-facing form will still be `policy-rollback` (matching this slice's pattern). If we later want to support the spec's literal sub-verb form, that's a parser refactor that affects both at once.
+- **`current` is `MAX(last_seen_ms)`, not bootstrap-passed.** Threading the active policy hash from bootstrap to the CLI would require an env var or a side-channel. `MAX(last_seen_ms)` is reliable in practice — every bootstrap upserts the active policy, bumping its last_seen. Operators reading the list see the just-booted row marked even when running `policy-list` against a different process's DB.
+- **Plain output truncates hash to 24 chars.** Full SHA256 hashes are 64 hex chars + `sha256:` prefix = 71 chars total — too wide for a one-line row. Truncation matches what `git log --oneline` does. Operators wanting the full hash use JSON mode.
+- **`bytes` field in output is `canonical_json.length`.** Helps operators sanity-check "this is a 12 KB policy" vs "this is a 200 KB policy" without dumping the canonical JSON. Surfaces the upper bound on rollback impact.
+- **No `--limit` / pagination.** `listPolicyArchive` orders by `first_seen_ms ASC`; bounded by UNIQUE hash count (one row per distinct policy ever). Production installs typically have <50 rows total (operators don't change policies often). When that count grows, a future slice can add `--limit` + `--since` for windowing.
+- **JSON shape mirrors `--list-sessions` / grants list conventions.** One JSON object per line, no envelope. Consumers stream-parse. Empty result = zero lines (not an envelope with `count: 0`).
+- **Test helper uses `archivePolicy` repo directly, not engine bootstrap.** Faster + deterministic + isolates the CLI surface from any engine-bootstrap behavior changes. Pinning two distinct hashes with controlled timestamps reads cleaner than bootstrapping a real engine twice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5532 pass / 10 skip / 0 fail** (5542 total across 258 files); 9 new tests on top of slice 48's 5523
+- `bun test tests/cli/permission-policy-list.test.ts` — 9 pass
+
+### Next
+
+§12.4 thread — remaining slices:
+1. **`agent permission policy-rollback <hash> [--target <file>] [--dry-run] [--json]`** — the write side. Reads the canonical JSON from archive, writes it to the target file (default `.agent/permissions.yaml`). Dry-run prints the diff without committing. Emits an audit event per spec line 756. The canonical JSON is valid YAML (JSON is a subset of YAML 1.2) so the write is trivial; the operator's comments + custom formatting are lost on rollback, which is acceptable for an emergency-revert use case.
+
+Other remaining spec work: §12.3 hot reload (medium, state machine ready), §7.3 sealing (audit-grade), §19 migration (medium), conformance sandbox_select platform-pinned cases (slice 48 follow-up).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 48: macOS sandbox-exec — `maybeWrapSandboxArgv` platform dispatch (§6.5)
 
 **Done.** Forty-eighth slice. Second on the macOS sandbox-exec thread. Closes the wire-up loop slice 47 left open: the spawn-site `maybeWrapSandboxArgv` primitive now dispatches by `process.platform`, calling `buildSandboxExecArgv` (slice 47) on darwin and `buildBwrapArgv` (slice 18) on Linux. Single function — every spawn site that already calls `maybeWrapSandboxArgv` (grep, glob, bash background, bash inline — slices 19-21) gets macOS support automatically. No spawn-site changes needed.

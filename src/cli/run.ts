@@ -281,6 +281,19 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'policy-list') {
+        // §12.4 policy archive enumeration (slice 49). Read-only;
+        // pairs with future `policy-rollback` for the write side.
+        const { runPermissionPolicyList } = await import('./permission-policy-list.ts');
+        return await runPermissionPolicyList({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       // The arg parser already rejects unknown verbs; this branch
       // catches the impossible-but-safe case of a verb the dispatch
       // doesn't know how to route.
