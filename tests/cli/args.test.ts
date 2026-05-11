@@ -949,3 +949,48 @@ describe('parseArgs — recap subcommand', () => {
     expect(r.args.sandboxHost).toBeUndefined();
   });
 });
+
+describe('--broker (§13.7 mode flag, slice 87)', () => {
+  test('--broker spawn sets brokerMode to "spawn"', () => {
+    const r = parseArgs(['--broker', 'spawn']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.brokerMode).toBe('spawn');
+  });
+
+  test('--broker in-process sets brokerMode to "in-process"', () => {
+    const r = parseArgs(['--broker', 'in-process']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.brokerMode).toBe('in-process');
+  });
+
+  test('--broker absent leaves brokerMode undefined (bootstrap defaults to in-process)', () => {
+    const r = parseArgs([]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.brokerMode).toBeUndefined();
+  });
+
+  test('--broker with no value is rejected', () => {
+    const r = parseArgs(['--broker']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--broker requires a mode');
+  });
+
+  test('--broker with a flag-shaped next token is rejected', () => {
+    const r = parseArgs(['--broker', '--yes']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--broker requires a mode');
+  });
+
+  test('--broker with an unknown mode is rejected with the offending value', () => {
+    const r = parseArgs(['--broker', 'magic']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain("'in-process' or 'spawn'");
+    expect(r.message).toContain('magic');
+  });
+});

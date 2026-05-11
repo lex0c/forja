@@ -1,5 +1,12 @@
-import { join } from 'node:path';
-import { createBashHandler, createInProcessBroker } from '../broker/index.ts';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import {
+  type Broker,
+  type SandboxRunner,
+  createBashHandler,
+  createInProcessBroker,
+  createSpawnBroker,
+} from '../broker/index.ts';
 import { loadCritiqueConfig } from '../critique/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
@@ -17,8 +24,10 @@ import {
 } from '../memory/index.ts';
 import {
   type LockConflict,
+  type SandboxProfile,
   bootstrapPermissionEngine,
   detectSandboxAvailability,
+  maybeWrapSandboxArgv,
   preflightPermissionEngine,
 } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
@@ -103,6 +112,14 @@ export interface BootstrapInput {
   // covers. Without this flag, `host` is pruned from the candidate
   // set unconditionally.
   sandboxHost?: boolean;
+  // §13.7 broker mode (slice 87). `'in-process'` (default) wires
+  // a degenerate in-process broker — bash exec stays in main, same
+  // behavior as pre-§13.7. `'spawn'` wires `createSpawnBroker`
+  // against `bun run src/broker/worker.ts`, moving exec into a
+  // worker subprocess per call (closes spec line 928). Compiled-
+  // binary mode is currently unsupported — bootstrap throws a
+  // clear error when the worker source isn't on disk.
+  brokerMode?: 'in-process' | 'spawn';
 }
 
 export interface BootstrapResult {
@@ -535,18 +552,15 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // honors the same flag (MEMORY.md §7.2.1) and the harness
   // surfaces it for downstream gates.)
 
-  // §13.7 broker for exec-tagged tools. In-process degenerate
-  // wiring against the bash handler — same shape as the
-  // production worker entry (src/broker/worker.ts), but without
-  // the OS-process separation. Slice 82 ships in-process by
-  // default so the harness behavior is bit-identical to the
-  // pre-§13.7 path; an operator-facing flag (future slice) will
-  // flip to `createSpawnBroker` for the security posture
-  // ("CLI main has no exec privilege", spec line 928).
-  const bashHandler = createBashHandler({ scrubEnv });
-  const broker = createInProcessBroker({
-    exec: (request, callOptions) => bashHandler.execute(request, callOptions),
-  });
+  // §13.7 broker for exec-tagged tools. Slice 87 added the
+  // operator-facing `--broker` flag — `'spawn'` flips bootstrap
+  // to construct `createSpawnBroker` against `bun run
+  // src/broker/worker.ts`, moving exec into a worker subprocess
+  // per call (closes spec line 928: "CLI main não tem exec
+  // privilege"). Default `'in-process'` keeps the bash exec in
+  // main via the degenerate in-process broker — bit-for-bit
+  // equivalent to the pre-§13.7 path.
+  const broker = constructBroker(input.brokerMode ?? 'in-process', cwd);
 
   const config: HarnessConfig = {
     provider,
@@ -612,4 +626,55 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     permissionChain: permResult.chain,
     installIdentity: permResult.identity,
   };
+};
+
+// §13.7 broker construction (slice 87). Extracted so each branch is
+// independently readable + tests can target without going through
+// the full bootstrap.
+//
+// `in-process`: degenerate broker delegating to `createBashHandler`
+// in the same process. Bash exec stays in main — same behavior as
+// the pre-§13.7 path. Used by default.
+//
+// `spawn`: real process isolation. Spawns `bun run
+// src/broker/worker.ts` per call; the worker reads the
+// BrokerRequest on stdin, dispatches to its bash handler, and
+// returns a BrokerResponse on stdout. The sandboxRunner closes
+// over `maybeWrapSandboxArgv` so the worker spawn is wrapped with
+// bwrap when the engine's planner picked a non-host profile.
+// Compiled-binary mode isn't supported here — `import.meta.dir`
+// in a compiled binary returns an embedded path that `bun run`
+// can't address. We surface this as a clear error rather than
+// silently failing later via a spawn-fail response.
+//
+// Per-call timeoutMs (slice 85) is set by the bashTool; the
+// broker-construction `timeoutMs` is the fallback ceiling for
+// callers that don't override (60s is generous for the bash
+// family + headroom for handler startup).
+const constructBroker = (mode: 'in-process' | 'spawn', cwd: string): Broker => {
+  if (mode === 'spawn') {
+    const workerPath = resolve(import.meta.dir, '../broker/worker.ts');
+    if (!existsSync(workerPath)) {
+      throw new Error(
+        `broker mode 'spawn' requires worker source at ${workerPath}; compiled-binary mode is not yet supported. Re-run with --broker in-process or from a source checkout.`,
+      );
+    }
+    const sandboxRunner: SandboxRunner = ({ profile, cwd: callCwd, innerArgv }) =>
+      maybeWrapSandboxArgv({
+        profile: profile as SandboxProfile,
+        cwd: callCwd,
+        innerArgv,
+      });
+    return createSpawnBroker({
+      command: process.execPath,
+      args: ['run', workerPath],
+      cwd,
+      timeoutMs: 60_000,
+      sandboxRunner,
+    });
+  }
+  const bashHandler = createBashHandler({ scrubEnv });
+  return createInProcessBroker({
+    exec: (request, callOptions) => bashHandler.execute(request, callOptions),
+  });
 };

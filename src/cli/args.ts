@@ -55,6 +55,16 @@ export interface ParsedArgs {
   // Pairs with the `host-passthrough` capability in the
   // resolved set — BOTH are required before host is selectable.
   sandboxHost?: boolean;
+  // §13.7 broker mode (slice 87). `in-process` (default) keeps
+  // the bash exec in main via the in-process broker — bit-for-bit
+  // equivalent to the pre-§13.7 path. `spawn` flips bootstrap to
+  // construct `createSpawnBroker` against `bun run
+  // src/broker/worker.ts`, moving exec into a separate worker
+  // subprocess per call. Closes spec line 928 ("CLI main não tem
+  // exec privilege"). Compiled-binary mode is not supported yet —
+  // bootstrap surfaces a clear error if the worker source isn't
+  // on disk.
+  brokerMode?: 'in-process' | 'spawn';
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
   // `agent --checkpoints restore <session> <latest-ckpt>` but
@@ -1117,6 +1127,24 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.sandboxHost = true;
         i += 1;
         break;
+      case '--broker': {
+        const value = argv[i + 1];
+        if (value === undefined || value.startsWith('-')) {
+          return {
+            ok: false,
+            message: '--broker requires a mode (in-process|spawn)',
+          };
+        }
+        if (value !== 'in-process' && value !== 'spawn') {
+          return {
+            ok: false,
+            message: `--broker mode must be 'in-process' or 'spawn', got '${value}'`,
+          };
+        }
+        args.brokerMode = value;
+        i += 2;
+        break;
+      }
       case '--undo': {
         const value = argv[i + 1];
         if (value === undefined || value.startsWith('--')) {

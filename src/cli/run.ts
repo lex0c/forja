@@ -623,6 +623,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
       ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
+      ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };

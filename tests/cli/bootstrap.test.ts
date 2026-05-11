@@ -919,4 +919,82 @@ Body.`,
       db.close();
     });
   });
+
+  describe('brokerMode (§13.7, slice 87)', () => {
+    test('omitted brokerMode → in-process broker is wired (default)', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+      });
+      const broker = config.broker;
+      if (broker === undefined) throw new Error('expected broker to be wired');
+      // Smoke-execute through the broker — in-process delegates
+      // straight to createBashHandler, so a simple echo should
+      // produce ok:true + stdout.
+      const r = await broker.execute({
+        toolName: 'bash',
+        args: { command: 'echo in-process-ok' },
+        capabilities: [],
+        sandboxProfile: null,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.stdout).toBe('in-process-ok\n');
+      await broker.close();
+      db.close();
+    });
+
+    test('brokerMode "in-process" explicit → same as default (in-process)', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        brokerMode: 'in-process',
+      });
+      const broker = config.broker;
+      if (broker === undefined) throw new Error('expected broker to be wired');
+      const r = await broker.execute({
+        toolName: 'bash',
+        args: { command: 'echo explicit-ok' },
+        capabilities: [],
+        sandboxProfile: null,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.stdout).toBe('explicit-ok\n');
+      await broker.close();
+      db.close();
+    });
+
+    test('brokerMode "spawn" → wired against bun run worker.ts; roundtrips a bash command', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        brokerMode: 'spawn',
+      });
+      const broker = config.broker;
+      if (broker === undefined) throw new Error('expected broker to be wired');
+      // End-to-end: bootstrap → createSpawnBroker → bun run
+      // src/broker/worker.ts → bash handler → echo response.
+      const r = await broker.execute({
+        toolName: 'bash',
+        args: { command: 'echo spawn-ok' },
+        capabilities: [],
+        sandboxProfile: null,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.stdout).toBe('spawn-ok\n');
+      await broker.close();
+      db.close();
+    });
+  });
 });

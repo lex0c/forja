@@ -15,6 +15,62 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 87: §13.7 operator-facing security-mode flag — `--broker spawn` flips bootstrap to process isolation
+
+**Done.** Eighty-seventh slice. Ships the `--broker` CLI flag with values `in-process` (default) and `spawn`. When operators opt in via `--broker spawn`, bootstrap constructs `createSpawnBroker` against `bun run src/broker/worker.ts` instead of the in-process degenerate; bash exec moves into a fresh worker subprocess per call with sandbox wrap delegated to `maybeWrapSandboxArgv`. Closes spec line 928 ("CLI main não tem exec privilege") at the architectural level — the §13.7 thread is now structurally complete.
+
+Pre-slice the entire broker stack (slices 78–86) existed but was dormant in production: bootstrap always wired in-process. Slice 87 ships the surface that operators flip to actualize the security upgrade. Default stays in-process so existing flows are bit-for-bit unchanged; opt-in keeps the upgrade explicit until binary-mode + production tuning land in follow-up slices.
+
+### Why this matters
+
+The §13.7 thread's premise (slice 78's intro): "the security upgrade from the spec (line 928, `CLI main não tem exec privilege`) requires running the broker in a SEPARATE process." Slices 78–86 built the broker stack — contract, in-process degenerate, spawn primitive, worker runtime + entry script, bash handler, harness migration, per-call cancellation, crash telemetry, per-call timeout override, graceful shutdown. Each piece independently reviewable + tested, but the production path stayed on in-process. Slice 87 closes the loop.
+
+The operator-facing knob is intentionally minimal: one CLI flag. Config-file support, env-var support, and policy-driven defaults are out of scope — operators who want the security upgrade today can pass `--broker spawn` per invocation, and bootstrap fail-loudly when the worker source isn't on disk (compiled-binary mode, which packages worker.ts differently). The plumbing for slice 87 is the same surface a future "config file picks broker mode" slice would consume — no rework needed.
+
+The spawn broker's sandbox runner closes over `maybeWrapSandboxArgv` (the §6.5 wrap synthesizer). When the engine planner picks `cwd-rw` (or any non-host profile), the spawn broker wraps the WORKER process spawn with bwrap before launching. Bash inside the worker inherits the sandbox — the bash handler's own `Bun.spawn` of bash lands inside the bwrap-wrapped worker, which means it's automatically sandboxed without the bash handler needing to know about bwrap. Clean separation.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New `brokerMode?: 'in-process' \| 'spawn'` field on `CLIArgs`. Parser case for `--broker <mode>`: rejects missing value, rejects flag-shaped next token, rejects unknown mode (with the offending value in the message). Same `space-separated` shape as `--undo`, `--worktrees`, `--memory`. |
+| `src/cli/run.ts` | Passes `args.brokerMode` into `bootstrapInput` conditionally (only when defined — preserves the existing `exactOptionalPropertyTypes` pattern). |
+| `src/cli/bootstrap.ts` | New `brokerMode?: 'in-process' \| 'spawn'` field on `BootstrapInput`. Imports `Broker`, `SandboxRunner`, `createSpawnBroker` from broker; `SandboxProfile`, `maybeWrapSandboxArgv` from permissions; `existsSync` + `resolve` from node:fs/node:path. New file-local `constructBroker(mode, cwd)` helper. **`'spawn'` branch:** resolves `workerPath = import.meta.dir + '../broker/worker.ts'`; throws on missing file with operator-readable message; constructs `createSpawnBroker({command: process.execPath, args: ['run', workerPath], cwd, timeoutMs: 60_000, sandboxRunner})` where `sandboxRunner` closes over `maybeWrapSandboxArgv` (casts the broker's `profile: string` to `SandboxProfile` — slice 79's runner type is structural). **`'in-process'` branch:** identical to slice 82's bootstrap construction. The previous inline construction is replaced with `const broker = constructBroker(input.brokerMode ?? 'in-process', cwd)`. |
+| `tests/cli/args.test.ts` | New `describe` block: 6 tests covering `--broker spawn`, `--broker in-process`, omitted (undefined), no value (error), flag-shaped next token (error), unknown mode (error message contains the offending value). |
+| `tests/cli/bootstrap.test.ts` | New `describe` block: 3 tests. Omitted → in-process; explicit `in-process` → same; explicit `spawn` → real `bun run worker.ts` end-to-end. Each test smoke-executes a bash echo through the broker and asserts `ok:true` + expected stdout. Test helper pattern uses `const broker = config.broker; if (broker === undefined) throw` to narrow without `!` non-null assertion (Biome rule). |
+
+### Decisions
+
+- **CLI flag only, no config file / env var.** Operators who want the upgrade today pass `--broker spawn` per invocation. A `[broker] mode = "spawn"` in `agent.toml` is a natural follow-up, but the CLI flag is the minimum-viable surface. The flag IS the override; the config file would be the default. Both can coexist.
+- **Default stays `in-process` for slice 87.** Flipping the default to `spawn` is a separate decision — it requires (a) confidence that the spawn broker's sandbox + timeout + cancellation paths are production-tuned, (b) binary-mode support so compiled binaries don't break, (c) consideration of the per-call spawn cost (fork overhead ~ms, acceptable for interactive use). Slice 87 ships the SURFACE; the flip can happen post-slice without the user noticing if everything else is right.
+- **Compiled-binary mode surfaces a clear error, not a silent fallback.** When `import.meta.dir` resolves to an embedded path that `bun run` can't address, the constructed `createSpawnBroker` would fail at first execute with "spawn failed: ENOENT". That diagnosis is poor: operators see `bash.spawn_failed` and don't know it's the worker entry, not bash itself. Pre-flighting `existsSync(workerPath)` + throwing at bootstrap surfaces the right cause + suggests the fallback ("Re-run with --broker in-process or from a source checkout").
+- **`workerPath` resolved via `import.meta.dir`, not relative to cwd.** Operators invoke `agent` from any directory; cwd-relative `src/broker/worker.ts` would only work from the repo root. `import.meta.dir` gives the directory of the bootstrap.ts module, which sits next to `src/broker/`. `resolve(import.meta.dir, '../broker/worker.ts')` is the canonical sibling-import pattern.
+- **`sandboxRunner` closure over `maybeWrapSandboxArgv`, NOT direct binding.** The broker passes `{profile: string, cwd, innerArgv}`; `maybeWrapSandboxArgv` wants `{profile: SandboxProfile, cwd, innerArgv}`. The closure handles the cast at the boundary. Direct binding would require widening the runner type signature on the broker side, which would dilute the typed boundary. The cast is narrowly scoped + documented inline.
+- **Per-call timeoutMs default `60_000` on the spawn broker.** Pre-slice 85 the spawn broker had no default; slice 87 sets `60_000` to give bash + handler startup + bwrap setup a reasonable ceiling. Bash tool's per-call override (slice 85) widens this for long-running commands — 60s is the floor, not the cap.
+- **No telemetry sink wired in slice 87.** Slice 84 ships `worker.crashed` emit logic on the spawn broker; slice 87 doesn't construct a sink. Operators who want telemetry construct it externally and pass via a future config knob. Wiring a default sink (JSONL to stderr? a file? OTEL?) is its own operator-facing decision; ducking it keeps slice 87 focused. The infrastructure is ready when the design is.
+- **Tests run `spawn` mode via real `bun run worker.ts`.** Integration is the load-bearing assertion — the bootstrap construction works AND the worker subprocess executes bash AND the response roundtrips. Mocking the spawn would test code paths but not the actual file resolution / spawn / NDJSON pipe. The bootstrap test cycles add subprocess fork cost (~hundreds of ms per test); acceptable for 3 tests, less so if we expanded to dozens.
+- **`config.broker` narrowing via `if (broker === undefined) throw`, not `!` non-null assertion.** Biome flags `!` on `config.broker`; the explicit narrow is type-safe + readable + matches the slice 82 pattern in `tests/tools/bash-broker.test.ts`. Repeated `broker.execute` / `broker.close` after narrowing makes the test bodies cleaner than `config.broker?.execute(...)` chains.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings
+- `bun test` — **5986 pass / 10 skip / 0 fail** (5996 total across 285 files); +9 tests on top of slice 86's 5977
+- `bun test tests/cli/args.test.ts` — 113 pass (incl. 6 new for `--broker`); `bun test tests/cli/bootstrap.test.ts` — 36 pass (incl. 3 new for `brokerMode`)
+- `--broker spawn` end-to-end exercised by the integration test which actually spawns `bun run src/broker/worker.ts` per call
+
+### Next
+
+§13.7 architectural thread COMPLETE. The broker stack works end-to-end with operator-selectable isolation mode. Remaining concerns are operational / deployment, not architectural:
+
+1. **Binary-mode worker invocation.** `bun build --compile` packages source into a single executable; `bun run src/broker/worker.ts` doesn't work post-compile. Options: (a) make the binary itself a worker via a subcommand (`agent --broker-worker`); (b) Bun's sea-config to embed worker.ts as a fetchable asset; (c) skip — operators run dev binaries for the security mode until packaging matures. Slice 87 throws a clear error in compiled mode; the fix is a packaging slice, not §13.7.
+2. **Telemetry sink wiring in bootstrap.** Slice 84 ships emit logic; slice 87 leaves the sink unset. A future slice constructs a default sink (JSONL to a configurable destination) and threads via the same `[broker]` config the mode flag will eventually live in.
+3. **Default flip from `in-process` to `spawn`.** Hold until binary-mode + telemetry + operator-tuned timeouts are settled. Currently `--broker spawn` is opt-in; default flip would make it the path everyone takes.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 86: §13.7 graceful shutdown — SIGTERM handler + broker.close on exit
 
 **Done.** Eighty-sixth slice. Closes the broker-leak surface on operator shutdown. `installSignalHandler` now traps SIGTERM alongside SIGINT (both abort the controller for graceful drain); the CLI main finally blocks (`src/cli/run.ts`, `src/cli/repl.ts`) await `broker.close()` BEFORE `db.close()` so in-flight exec calls complete + audit rows land while the sqlite handle is still open.
