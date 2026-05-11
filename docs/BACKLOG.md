@@ -15,6 +15,47 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 26: narrow `deriveParentCapabilities` from `allow_paths` / `allow_hosts` (§10 scope projection)
+
+**Done.** Twenty-sixth slice. Tightens the §10 parent-capability derivation introduced by slice 25. Slice 25 emitted every footprint kind at universal scope (kind-level delegation); slice 26 projects operator-authored `allow_paths` / `allow_hosts` into the parent set so the upper bound for a subagent is **scope-level**, not just kind-level. A subagent declaring `read-fs:/etc/passwd` no longer slips through `intersectCapabilities` just because some `read_file` allow rule exists — the declared scope must lie inside an explicit `allow_paths` entry (or under a universal bash footprint, which the operator opted into by allowing bash at all).
+
+### Why this matters
+
+Slice 25 documented the universal-scope shape as conservative-by-width with the explicit note that narrowing was "left for a successor slice — no caller is broken by the wider parent today." That note was honest about the gap: §10.1's `declared ⊆ parent` is a real subset check, and when parent is `read-fs:**` the subset is trivially satisfied by every conceivable filesystem path. Slice 26 closes the gap so the §10 invariant carries actual security weight: parent capabilities reflect what the operator authorized, not just the kinds the operator touched.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/capabilities.ts` | New `getSectionScopes(section, kind)` helper returning scope-shaped allow entries (`allow_paths` for fs kinds, `allow_hosts` for `net-egress`) or `null` when the section's allow rules are command-shaped (bash). New `subsumeCovered(caps)` pass that drops any cap covered by another via `capabilityCovers` — keeps the rendered parent set minimal (bash's `read-fs:**` subsumes a sibling `read-fs:src/**` from `read_file`, prefix-glob subsumes literals under the same prefix, etc.). `deriveParentCapabilities` now iterates `TOOL_CAPABILITY_FOOTPRINTS` keys in declaration order (deterministic), emits scope-shaped caps where applicable + universal otherwise, dedupes by formatted form, and runs `subsumeCovered`. Header comment rewritten to cover the new semantics. |
+| `tests/permissions/capabilities-intersection.test.ts` | Existing slice 25 tests updated: `read_file with allow_paths: ['src/**']` now emits `read-fs:src/**` (not `read-fs:**`); `write_file/edit_file` with distinct `allow_paths` now emit four caps (read-fs/write-fs × ./out/./src); `fetch_url` with `allow_hosts: ['github.com']` now emits `net-egress:github.com`. New describe block "deriveParentCapabilities — §10 scope narrowing (slice 26)" adds 9 tests: multi-path emission, multi-host emission, bash + path-section subsumption, universal `**` subsuming siblings, cross-section dedupe, prefix-glob subsuming literals, end-to-end excess for declared `read-fs:/etc/passwd` outside `src/**`, end-to-end excess for declared host outside `allow_hosts`, and bash-only kinds (`delete-fs`/`exec`/`git-write`/`net-egress`) staying out when no bash section exists. |
+
+### Decisions
+
+- **Bash stays universal.** `BashPolicy.allow` is command-shaped (`'ls *'`, `'git status'`), not path-shaped. Projecting commands into path scopes would require re-parsing shell tokens and reasoning about argv-position semantics per command — way out of scope for this slice (and arguably the bash AST resolver in slice 6 is the right place for that intelligence, not the cap derivation). So sections with `bash.allow` emit each footprint kind (`exec/read-fs/write-fs/delete-fs/net-egress/git-write`) at universal scope. Operators who open bash explicitly accept that breadth — slices 6/7 are the layer that controls what specific bash invocations get to do.
+- **Subsumption uses `capabilityCovers`.** Instead of a simple "drop narrower if universal exists" rule, the subsumption pass uses the same coverage primitive that intersection uses. This generalizes — `read-fs:src/**` subsumes `read-fs:src/index.ts`, not just `read-fs:**` subsuming everything. The intersection step doesn't need the narrower cap (it would never be reached anyway), and `/perms inspect` renders a cleaner set. Cost: O(n²) where n is the cap count, but n is bounded by ~7 sections × few-paths in practice.
+- **Delete-fs follows `allow_paths` when narrowed.** The bash footprint includes `delete-fs`. Path sections (`read_file`/`write_file`/`edit_file`) don't include `delete-fs` in their footprint, so this kind only appears when bash is present — and bash's universal `delete-fs:**` is what gets emitted. The `getSectionScopes` helper accepts `delete-fs` against `allow_paths` for future-proofing (if a tool section ever exposes a delete-shaped operation under `allow_paths`), but no current section triggers that branch.
+- **Iteration order is deterministic.** Walks `Object.keys(TOOL_CAPABILITY_FOOTPRINTS)` (insertion order: bash → read_file → write_file → edit_file → glob → grep → fetch_url) rather than `Object.keys(policy.tools)` (depends on JSON insertion). This means the order of emission — and hence first-write-wins dedupe — is independent of how the operator wrote the YAML. The final output still gets sorted by the caller when rendering.
+- **`getSectionScopes` returns `null` to signal "use universal".** This keeps the universal vs scope-shaped decision local to one helper, and the caller doesn't have to branch on section type — it just walks the kinds in the footprint, asks the helper, and either emits per-scope or universal. Symmetric and additive: a future footprint extension (e.g. tools that touch `secret-access` via an `allow_stores` field) plugs in by extending the helper, not the main loop.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5298 pass / 10 skip / 0 fail** (5308 total across 249 files); 9 new tests on top of slice 25's 5289
+
+### Next
+
+Successor slices:
+1. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18–21 on macOS).
+2. MCP-tool spawn wire-up (when MCP tools execute child processes).
+3. Section-level `locked` for `sandbox` (matching `defaults.locked`).
+4. Per-field provenance for `sandbox` (when `/perms why sandbox` ergonomics need it).
+5. ULID-shaped public approval ids.
+6. `subsumeCovered` extension: prefix-glob subsumption across distinct kinds (e.g. `write-fs:src/**` shadowing `read-fs:src/**` for write-implies-read semantics) — left out today because `capabilityCovers` cross-kind never returns true; would need new policy intent before adding asymmetric rules.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 25: auto-derive `parentCapabilities` from policy (§10 automation)
 
 **Done.** Twenty-fifth slice. Closes the §10 automation gap: when a subagent is spawned with `declaredCapabilities` but the caller doesn't pass `parentCapabilities`, the harness now derives the parent set from the live policy snapshot. Until this slice, callers had to construct the parent set by hand (or skip intersection entirely), which made `declared ⊆ parent` impossible to enforce in any code path that didn't already know the policy structure. Now the parent set is a deterministic function of the current `permissionEngine.policy()` — operator-authored allow rules become the upper bound on what any subagent can declare.

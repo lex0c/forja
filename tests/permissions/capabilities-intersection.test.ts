@@ -191,24 +191,29 @@ describe('deriveParentCapabilities — §10 policy-based parent set (slice 25)',
     expect(caps).toEqual([]);
   });
 
-  test('read_file alone emits read-fs only', () => {
+  test('read_file with allow_paths narrows read-fs to the path', () => {
     const caps = deriveParentCapabilities(policyOf({ read_file: { allow_paths: ['src/**'] } }));
-    expect(caps.map(formatCapability)).toEqual(['read-fs:**']);
+    expect(caps.map(formatCapability)).toEqual(['read-fs:src/**']);
   });
 
-  test('write_file/edit_file emit read-fs + write-fs (deduped across sections)', () => {
+  test('write_file/edit_file emit read-fs + write-fs per allow_path', () => {
     const caps = deriveParentCapabilities(
       policyOf({
         write_file: { allow_paths: ['./out'] },
         edit_file: { allow_paths: ['./src'] },
       }),
     );
-    expect(caps.map(formatCapability).sort()).toEqual(['read-fs:**', 'write-fs:**']);
+    expect(caps.map(formatCapability).sort()).toEqual([
+      'read-fs:./out',
+      'read-fs:./src',
+      'write-fs:./out',
+      'write-fs:./src',
+    ]);
   });
 
-  test('fetch_url with allow_hosts emits net-egress', () => {
+  test('fetch_url with allow_hosts narrows net-egress to the host', () => {
     const caps = deriveParentCapabilities(policyOf({ fetch_url: { allow_hosts: ['github.com'] } }));
-    expect(caps.map(formatCapability)).toEqual(['net-egress:**']);
+    expect(caps.map(formatCapability)).toEqual(['net-egress:github.com']);
   });
 
   test('section with empty allow array → no delegation (operator declared NO rules)', () => {
@@ -248,5 +253,106 @@ describe('deriveParentCapabilities — §10 policy-based parent set (slice 25)',
     const { effective, excess } = intersectCapabilities(parent, declared);
     expect(effective.map(formatCapability)).toEqual(['read-fs:src/index.ts', 'exec:python']);
     expect(excess).toEqual([]);
+  });
+});
+
+describe('deriveParentCapabilities — §10 scope narrowing (slice 26)', () => {
+  const policyOf = (
+    tools: Record<string, unknown>,
+  ): Parameters<typeof deriveParentCapabilities>[0] =>
+    ({ defaults: {}, tools }) as unknown as Parameters<typeof deriveParentCapabilities>[0];
+
+  test('multiple allow_paths emit one cap per path (no spurious universal)', () => {
+    const caps = deriveParentCapabilities(
+      policyOf({ read_file: { allow_paths: ['src/**', 'tests/**'] } }),
+    );
+    expect(caps.map(formatCapability).sort()).toEqual(['read-fs:src/**', 'read-fs:tests/**']);
+  });
+
+  test('multiple allow_hosts emit one cap per host', () => {
+    const caps = deriveParentCapabilities(
+      policyOf({ fetch_url: { allow_hosts: ['github.com', 'api.example.com'] } }),
+    );
+    expect(caps.map(formatCapability).sort()).toEqual([
+      'net-egress:api.example.com',
+      'net-egress:github.com',
+    ]);
+  });
+
+  test('bash + read_file: bash universal subsumes narrower read_file cap', () => {
+    // bash brings read-fs:** (and the rest of its footprint); the
+    // narrower read-fs:src/** from read_file is covered by bash and
+    // gets dropped by subsumption — keeps the rendered set readable.
+    const caps = deriveParentCapabilities(
+      policyOf({
+        bash: { allow: ['ls *'] },
+        read_file: { allow_paths: ['src/**'] },
+      }),
+    );
+    const formatted = caps.map(formatCapability).sort();
+    expect(formatted).toContain('read-fs:**');
+    expect(formatted).not.toContain('read-fs:src/**');
+  });
+
+  test('universal `**` in allow_paths subsumes narrower siblings in same section', () => {
+    const caps = deriveParentCapabilities(
+      policyOf({ read_file: { allow_paths: ['**', 'src/foo'] } }),
+    );
+    expect(caps.map(formatCapability)).toEqual(['read-fs:**']);
+  });
+
+  test('cross-section dedupe: read_file + glob with same path emit one cap', () => {
+    const caps = deriveParentCapabilities(
+      policyOf({
+        read_file: { allow_paths: ['src/**'] },
+        glob: { allow_paths: ['src/**'] },
+      }),
+    );
+    expect(caps.map(formatCapability)).toEqual(['read-fs:src/**']);
+  });
+
+  test('prefix-glob in allow_paths subsumes literal sibling under same prefix', () => {
+    // `src/**` covers `src/index.ts` per capabilityCovers rule 4.c —
+    // subsumption drops the literal so /perms inspect shows the
+    // broader rule.
+    const caps = deriveParentCapabilities(
+      policyOf({ read_file: { allow_paths: ['src/**', 'src/index.ts'] } }),
+    );
+    expect(caps.map(formatCapability)).toEqual(['read-fs:src/**']);
+  });
+
+  test('narrow parent rejects declared outside path scope (excess)', () => {
+    // Operator authorized `src/**` only. A subagent that declares
+    // `/etc/passwd` should NOT slip through just because the kind
+    // (read-fs) is allowed somewhere.
+    const parent = deriveParentCapabilities(policyOf({ read_file: { allow_paths: ['src/**'] } }));
+    const declared = ['read-fs:src/index.ts', 'read-fs:/etc/passwd'].map(parseCapability);
+    const { effective, excess } = intersectCapabilities(parent, declared);
+    expect(effective.map(formatCapability)).toEqual(['read-fs:src/index.ts']);
+    expect(excess.map(formatCapability)).toEqual(['read-fs:/etc/passwd']);
+  });
+
+  test('narrow net-egress parent rejects declared host outside allow_hosts', () => {
+    const parent = deriveParentCapabilities(
+      policyOf({ fetch_url: { allow_hosts: ['github.com'] } }),
+    );
+    const declared = ['net-egress:github.com', 'net-egress:evil.example.com'].map(parseCapability);
+    const { effective, excess } = intersectCapabilities(parent, declared);
+    expect(effective.map(formatCapability)).toEqual(['net-egress:github.com']);
+    expect(excess.map(formatCapability)).toEqual(['net-egress:evil.example.com']);
+  });
+
+  test('bash footprint kinds without policy projection stay universal (delete-fs/exec/git-write)', () => {
+    // Only path sections — no bash. Footprint emits read-fs/write-fs
+    // narrowed; delete-fs/exec/git-write/net-egress NOT in any path
+    // section's footprint, so they don't appear at all.
+    const caps = deriveParentCapabilities(policyOf({ write_file: { allow_paths: ['./out'] } }));
+    const kinds = new Set(caps.map((c) => c.kind));
+    expect(kinds.has('read-fs')).toBe(true);
+    expect(kinds.has('write-fs')).toBe(true);
+    expect(kinds.has('delete-fs')).toBe(false);
+    expect(kinds.has('exec')).toBe(false);
+    expect(kinds.has('git-write')).toBe(false);
+    expect(kinds.has('net-egress')).toBe(false);
   });
 });

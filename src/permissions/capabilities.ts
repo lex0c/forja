@@ -239,34 +239,37 @@ export const intersectCapabilities = (
 // PERMISSION_ENGINE.md §10 parent-capability derivation.
 //
 // Slice 9 introduced the `intersectCapabilities` primitive with
-// caller-supplied parent + declared sets. This module adds the
-// automatic derivation step: given the active policy, what kinds
-// of capabilities can the parent delegate?
+// caller-supplied parent + declared sets. Slice 25 added automatic
+// derivation from the live policy at kind-level (every footprint
+// kind at universal scope). Slice 26 narrows: scope-shaped allow
+// rules become scope-shaped parent capabilities.
 //
-// Design: per-section capability footprint table. When a policy
-// section has ANY allow rule (allow / allow_paths / allow_hosts),
-// the engine treats the section as "this tool family is reachable
-// for some workload", and emits one Capability per footprint kind
-// with scope `**` (universal). The subagent's `declaredCapabilities`
-// still narrows via intersection — universal scope on the parent
-// just means "no kind-level objection", and the subagent's
-// declared `read-fs:src/index.ts` survives intersection as the
-// effective scope.
+// Per-section mapping:
+//   - BashPolicy.allow         → command patterns (NOT path globs),
+//                                 every footprint kind stays universal.
+//   - PathPolicy.allow_paths   → one cap per path, per fs kind in
+//                                 the footprint (read-fs, write-fs).
+//   - FetchPolicy.allow_hosts  → one cap per host (net-egress).
 //
-// This is intentionally CONSERVATIVE-BY-WIDTH: parent delegates
-// every kind the policy could exercise. A future slice can narrow
-// by parsing allow_paths / allow_hosts into per-scope capabilities
-// (`read-fs:src/**` instead of `read-fs:**`), at the cost of much
-// more wire complexity. For slice 25 the wide-by-default behavior
-// matches what operators expect from §10 ("subagent inherits the
-// parent's effective set") without the parse churn.
+// After emission, two passes run:
+//   1. Dedupe by formatted form. Two sections that emit the same
+//      (kind, scope) tuple contribute a single cap.
+//   2. Subsumption via `capabilityCovers`. A cap is dropped if
+//      ANY other cap in the set covers it — `read-fs:**` from
+//      bash subsumes `read-fs:src/**` from read_file. The
+//      intersection step doesn't need the narrower entry; dropping
+//      it keeps the parent set readable in `/perms inspect`.
 //
-// `bash` is the broadest section — it can read, write, delete,
-// exec, hit the network, and touch git internals. Anything else
-// the resolver eventually exposes (env-mutate, agent-mutate,
-// host-passthrough) is NOT in the bash footprint by default —
-// those kinds carry their own risk surface and need explicit
-// section-level intent that bash's regex-style rules don't express.
+// Result: parent capabilities reflect what the operator authorized
+// AT THE SCOPE LEVEL. A subagent declaring `read-fs:/etc/passwd`
+// no longer slips through just because read_file has any allow
+// rule — the declared scope must lie inside an `allow_paths`
+// entry (or under a universal bash footprint, if bash is allowed).
+//
+// `bash` remains the broadest section — its command-shaped `allow`
+// can't be projected into path scopes without re-parsing shell, so
+// each kind in the bash footprint emits at universal scope. A
+// policy that opens bash explicitly accepts that breadth.
 import type { Policy } from './types.ts';
 
 export const TOOL_CAPABILITY_FOOTPRINTS: Record<
@@ -318,27 +321,79 @@ const universalScopeFor = (kind: CapabilityKind): string | null => {
   return '**';
 };
 
-// Build the parent capability snapshot at spawn time. Scope is
-// universal per kind (kind-level delegation). Subagent intersection
-// narrows.
+// Scope-shaped allow entries for a (section, kind) pair, or `null`
+// when the section's allow rules don't project into this kind's
+// scope grammar (so the caller should emit universal).
 //
-// Dedupes by kind — a policy with both `bash` and `write_file`
-// declaring `write-fs` produces a single `write-fs:**` capability
-// rather than two duplicates that would inflate `excess` rendering
-// when nothing matches.
+// - PathPolicy.allow_paths feeds fs kinds (read-fs/write-fs). Other
+//   kinds in the footprint (none today for path sections) would
+//   stay universal.
+// - FetchPolicy.allow_hosts feeds net-egress. Other kinds aren't
+//   in the fetch footprint.
+// - BashPolicy.allow is command-shaped, never scope-shaped. Returns
+//   `null` for every kind so bash's footprint stays universal.
+const getSectionScopes = (
+  section: NonNullable<Policy['tools']>[keyof NonNullable<Policy['tools']>] | undefined,
+  kind: CapabilityKind,
+): readonly string[] | null => {
+  if (section === undefined) return null;
+  const allowPaths = (section as { allow_paths?: readonly string[] }).allow_paths;
+  if (Array.isArray(allowPaths) && allowPaths.length > 0) {
+    if (kind === 'read-fs' || kind === 'write-fs' || kind === 'delete-fs') {
+      return allowPaths;
+    }
+    return null;
+  }
+  const allowHosts = (section as { allow_hosts?: readonly string[] }).allow_hosts;
+  if (Array.isArray(allowHosts) && allowHosts.length > 0) {
+    if (kind === 'net-egress') return allowHosts;
+    return null;
+  }
+  return null;
+};
+
+// Drop any cap in `caps` that is covered by SOME OTHER cap in the
+// same list. Mutually-covering pairs can't survive earlier dedupe
+// (formatted form is unique), so this filter only ever removes
+// strictly narrower caps. Keeps the parent set readable: a policy
+// with `bash` allow + `read_file.allow_paths: ['src/**']` renders
+// `read-fs:**` only, not `read-fs:**` + `read-fs:src/**`.
+const subsumeCovered = (caps: readonly Capability[]): Capability[] =>
+  caps.filter((c) => !caps.some((p) => p !== c && capabilityCovers(p, c)));
+
+// Build the parent capability snapshot at spawn time. Emits scope
+// from `allow_paths` / `allow_hosts` when the section is scope-
+// shaped; otherwise emits universal per kind. Dedupes by formatted
+// form, then subsumes covered caps so the rendered set has no
+// redundant narrowings.
 export const deriveParentCapabilities = (policy: Policy): Capability[] => {
-  const emitted = new Set<CapabilityKind>();
-  const caps: Capability[] = [];
-  const sections = Object.keys(policy.tools) as (keyof typeof TOOL_CAPABILITY_FOOTPRINTS)[];
+  const raw: Capability[] = [];
+  const sections = Object.keys(
+    TOOL_CAPABILITY_FOOTPRINTS,
+  ) as (keyof typeof TOOL_CAPABILITY_FOOTPRINTS)[];
   for (const key of sections) {
-    if (!hasAllowRule(policy.tools[key])) continue;
+    const section = policy.tools[key];
+    if (!hasAllowRule(section)) continue;
     for (const kind of TOOL_CAPABILITY_FOOTPRINTS[key]) {
-      if (emitted.has(kind)) continue;
-      emitted.add(kind);
-      caps.push({ kind, scope: universalScopeFor(kind) });
+      const scopes = getSectionScopes(section, kind);
+      if (scopes === null) {
+        raw.push({ kind, scope: universalScopeFor(kind) });
+      } else {
+        for (const scope of scopes) {
+          raw.push({ kind, scope });
+        }
+      }
     }
   }
-  return caps;
+  const seen = new Set<string>();
+  const deduped: Capability[] = [];
+  for (const c of raw) {
+    const k = formatCapability(c);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    deduped.push(c);
+  }
+  return subsumeCovered(deduped);
 };
 
 export const readFs = (scope: string): Capability => ({ kind: 'read-fs', scope });
