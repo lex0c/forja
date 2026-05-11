@@ -16,6 +16,7 @@
 import {
   type Layer,
   type Policy,
+  type SandboxProvenance,
   type SectionProvenance,
   formatBash,
   formatFetch,
@@ -58,6 +59,36 @@ const renderSection = (
   const lockHint = locked ? ' (locked)' : '';
   const lines: string[] = [`  ${name}:${layerHint}${lockHint}`];
   lines.push(...body);
+  return lines;
+};
+
+// §6.5 sandbox section renderer (slice 36). Unlike tools.* sections,
+// sandbox has per-field provenance (slice 35) — each field gets its
+// own `[from <layer> policy]` hint so operators can answer "WHY is
+// host_allowed true on this machine?" by looking at one line, not
+// inferring from a section-wide single writer. Lock state renders
+// as a footer line (the lock is about the section, not a field
+// value) with the locking layer's attribution when known.
+const renderSandbox = (
+  sandbox: NonNullable<Policy['sandbox']>,
+  provenance: SandboxProvenance | undefined,
+): string[] => {
+  const lines: string[] = ['  sandbox:'];
+  if (sandbox.required !== undefined) {
+    const layer = provenance?.required;
+    const hint = layer !== undefined ? ` [from ${layer} policy]` : '';
+    lines.push(`    required: ${sandbox.required}${hint}`);
+  }
+  if (sandbox.hostAllowed !== undefined) {
+    const layer = provenance?.hostAllowed;
+    const hint = layer !== undefined ? ` [from ${layer} policy]` : '';
+    lines.push(`    host_allowed: ${sandbox.hostAllowed}${hint}`);
+  }
+  if (sandbox.locked === true) {
+    const layer = provenance?.locked;
+    const lockHint = layer !== undefined ? ` by ${layer} policy` : '';
+    lines.push(`    (locked${lockHint})`);
+  }
   return lines;
 };
 
@@ -149,6 +180,15 @@ export const renderExplainPermissions = (
         t.fetch_url.locked === true,
       ),
     );
+  }
+
+  // §6.5 sandbox section. Per-field attribution per slice 35: each
+  // line carries its own writer. The lock is rendered as a footer
+  // line (conceptually about the section, not a field value). When
+  // no layer wrote sandbox the block is omitted entirely — `/perms
+  // why sandbox` outputs nothing for chains that never opted in.
+  if (policy.sandbox !== undefined) {
+    lines.push(...renderSandbox(policy.sandbox, provenance.sandbox));
   }
 
   // Footer hint: in strict mode without sections, EVERY gated

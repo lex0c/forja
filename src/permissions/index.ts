@@ -128,6 +128,7 @@ export type {
   LockConflict,
   ResolveOptions,
   ResolveResult,
+  SandboxProvenance,
   SectionProvenance,
 } from './hierarchy.ts';
 export { resolvePolicy } from './hierarchy.ts';

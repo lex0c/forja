@@ -15,6 +15,75 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 36: `agent perms` CLI renders sandbox section with per-field attribution
+
+**Done.** Thirty-sixth slice. Natural follow-on to slice 35: the per-field `SandboxProvenance` shape needed a consumer to be operator-visible. This slice extends `renderExplainPermissions` (the headless equivalent of `/perms` / `/perms why <tool>`) to render the §6.5 sandbox section with per-field layer attribution. Operators can now answer "why is `host_allowed` true on this machine?" by reading one line — `host_allowed: true [from user policy]` — rather than cross-referencing the merged policy and the layer trail manually.
+
+### Why this matters
+
+Slice 23 shipped the policy sandbox section. Slice 34 added section-level lock. Slice 35 surfaced per-field provenance internally. None of these were operator-visible — `agent perms` (the CLI surface for "show me my effective policy with attribution") rendered every `tools.*` section but quietly skipped `sandbox` even when it was set. An admin pinning `sandbox: { required: true, locked: true }` had no way to confirm at the CLI that the pin was active or to trace which layer set it; the policy quietly worked, with zero introspection.
+
+This slice closes the loop. The CLI surface now matches the policy surface — every section that can be written gets attribution rendering. The output reads like an operator's mental model: "here's what's set, here's who set it, here's whether it's locked."
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/index.ts` | `SandboxProvenance` added to the re-exported types — the CLI module needs the type and it wasn't surfacing through the barrel before this slice. |
+| `src/cli/explain-permissions.ts` | New `renderSandbox(sandbox, provenance)` helper. Renders header `sandbox:` plus one indented line per set field (`required: <value> [from <layer> policy]`, same for `host_allowed`) and a footer line `(locked by <layer> policy)` when the lock is active. Fields with no writer don't render. The lock footer renders even when no fields are set (lock-only-layer case from slice 34) — operators see `sandbox: \n   (locked by user policy)` and can reason about the freeze. `renderExplainPermissions` invokes it after the tools.* sections, gated on `policy.sandbox !== undefined`. New `SandboxProvenance` import. |
+| `tests/cli/explain-permissions.test.ts` | 4 new tests: sandbox absent → no sandbox block; all fields from single layer → uniform attribution; per-field different writers → independent attribution per line; lock-only layer → only the lock footer renders (no phantom `required:` / `host_allowed:` lines for unset fields). |
+
+### Sample output
+
+```
+layers:
+  - enterprise
+  - user
+  - project
+
+policy: mode=strict [from enterprise policy]
+  bash: [from project policy]
+      allow: 'ls *'
+  sandbox:
+    required: true [from enterprise policy]
+    host_allowed: false [from user policy]
+    (locked by enterprise policy)
+
+(unlisted tools default-deny in strict mode)
+```
+
+The shape mirrors the existing tools.* block convention: indented body lines under a section header. The differences against tools.* (no `[from X]` on the `sandbox:` header itself, per-line attribution instead of section-wide attribution) reflect that the sandbox section has truly per-field provenance — unlike tools.* sections where the whole section comes from one layer (slice-wise, no field-level merging within a tools section).
+
+### Decisions
+
+- **No `[from X]` on the `sandbox:` header.** Tools.* sections render as `bash: [from project policy]` because the whole section comes from one layer; sandbox has per-field writers, so a section-level hint would be misleading (which layer would we name? the locker? the last field writer?). The header stays bare and each field carries its own attribution.
+- **Lock renders as a footer line, not a header qualifier.** Tools.* sections render `(locked)` inline with the header (`bash: [from enterprise policy] (locked)`) because the lock and the section authorship coincide. For sandbox, lock and field-writers can diverge (slice 35's `locked: 'project'` + `required: 'user'` example). Footer-line rendering makes the lock visually distinct from the field lines — no risk of misreading.
+- **Lock-only-layer output is `sandbox:` + the lock footer.** No phantom `required: unset` or `host_allowed: unset` lines. The lock froze fields that were never set — surfacing "unset" would be noise. The empty section header followed by the lock is honest: "this section is frozen, no fields written."
+- **No JSON output yet.** The slice mirrors the existing plain-text-only convention from `renderExplainPermissions`. JSON output is a separate slice (the header comment on the file already notes this as a follow-up); when it ships, the JSON shape will mirror this structural breakdown (one object per field with `value` + `layer`, plus a top-level `locked: { value, layer }`).
+- **`/perms why sandbox` (in-REPL) not yet wired.** The headless `agent perms` surface ships first because it's the integration test surface — once the renderer is solid, the in-REPL `/perms why <section>` can reuse `renderSandbox` directly. That slice is small (just plumbing) but the renderer needed to land first to define the contract.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5388 pass / 10 skip / 0 fail** (5398 total across 249 files); 4 new CLI tests on top of slice 35's 5384
+- `bun test tests/cli/explain-permissions.test.ts` — 15 pass (11 prior + 4 new)
+- Manual visual check: ran the renderer against a 3-layer fixture (enterprise + user + project, mixed sandbox writers); output reads clean and operator-legible
+
+### Next
+
+Successor slices:
+1. **`/perms why sandbox` in-REPL surface** — wires the same renderer into the interactive REPL command. Small slice, mostly plumbing.
+2. **ULID-shaped public approval ids** — independent storage tweak.
+3. **Grants table + TTL persistence** — implements §8 properly. Unblocks ttl_expiry conformance (~6 cases).
+4. **macOS sandbox-exec** — SBPL profile generation + runtime wrap.
+5. **MCP-tool spawn wire-up** — when MCP tools execute child processes.
+6. **JSON output mode for `agent perms`** — header comment in the file already calls this out as follow-up. Same shape as `--list-sessions`: NDJSON one line per section.
+
+Remaining conformance: ttl_expiry (blocked on §8 grants table) + concurrency (separate driver). Suite still at 123/136 = 90%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 35: per-field provenance for `sandbox` (replaces single-Layer shape)
 
 **Done.** Thirty-fifth slice. Natural follow-on to slice 34: now that the sandbox section has `required` / `hostAllowed` / `locked` fields, single-Layer provenance is too coarse. `/perms why sandbox.required` and `/perms why sandbox.locked` should answer with field-level attribution — pre-slice-35 they collapsed to the same Layer, which loses authorship when different layers wrote different fields. This slice replaces `provenance.sandbox: Layer` with `provenance.sandbox: { required?, hostAllowed?, locked? }` and updates the resolver to track each writer independently.

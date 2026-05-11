@@ -137,6 +137,80 @@ describe('renderExplainPermissions', () => {
     expect(text).toContain('no tool sections defined');
     expect(text).not.toContain('every gated tool will be denied');
   });
+
+  test('sandbox absent: no sandbox block in output (slice 36)', () => {
+    const lines = renderExplainPermissions(
+      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } },
+      { defaults: 'project', bash: 'project' },
+      [{ layer: 'project' }],
+    );
+    const text = lines.join('\n');
+    expect(text).not.toContain('sandbox:');
+  });
+
+  test('sandbox with all fields from single layer: every field carries that layer (slice 36)', () => {
+    const lines = renderExplainPermissions(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { required: true, hostAllowed: false, locked: true },
+      },
+      {
+        defaults: 'enterprise',
+        sandbox: { required: 'enterprise', hostAllowed: 'enterprise', locked: 'enterprise' },
+      },
+      [{ layer: 'enterprise' }],
+    );
+    const text = lines.join('\n');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true [from enterprise policy]');
+    expect(text).toContain('host_allowed: false [from enterprise policy]');
+    expect(text).toContain('(locked by enterprise policy)');
+  });
+
+  test('sandbox with per-field different writers: each line attributes independently (slice 36)', () => {
+    const lines = renderExplainPermissions(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { required: true, hostAllowed: true, locked: true },
+      },
+      {
+        defaults: 'enterprise',
+        sandbox: { required: 'enterprise', hostAllowed: 'user', locked: 'project' },
+      },
+      [{ layer: 'enterprise' }, { layer: 'user' }, { layer: 'project' }],
+    );
+    const text = lines.join('\n');
+    // Three different writers, three different attribution hints —
+    // the operator can answer "WHY is host_allowed true?" by looking
+    // at a single line, not by cross-referencing layers manually.
+    expect(text).toContain('required: true [from enterprise policy]');
+    expect(text).toContain('host_allowed: true [from user policy]');
+    expect(text).toContain('(locked by project policy)');
+  });
+
+  test('sandbox lock-only layer: only the lock footer renders (no phantom field lines)', () => {
+    // The lock-only-layer case (no field values, just locked: true)
+    // should NOT emit `required:` / `host_allowed:` lines — those
+    // fields have no writers, and surfacing them with "(unset)" would
+    // be noise. The merged sandbox is {locked: true}; only the lock
+    // footer surfaces.
+    const lines = renderExplainPermissions(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { locked: true },
+      },
+      { defaults: 'project', sandbox: { locked: 'user' } },
+      [{ layer: 'user' }],
+    );
+    const text = lines.join('\n');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('(locked by user policy)');
+    expect(text).not.toContain('required:');
+    expect(text).not.toContain('host_allowed:');
+  });
 });
 
 describe('runExplainPermissionsCli', () => {
