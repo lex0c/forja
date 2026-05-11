@@ -908,4 +908,89 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
     expect(r.engine.state()).toBe('degraded');
     r.sealingScheduler?.close();
   });
+
+  test('chain.verify_failed event fires on chain-broken bootstrap (refusing path, slice 73)', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const db = baseDb();
+    // Seed a chain row + tamper to break verifyChain.
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'boot-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:x',
+      reason_chain: [],
+      ts: 1,
+    });
+    db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
+
+    const r = await bootstrapPermissionEngine(baseInput({ db, telemetry, now: () => 55555 }));
+    expect(r.state).toBe('refusing');
+
+    const chainEvents = telemetry.events().filter((e) => e.kind === 'chain.verify_failed');
+    expect(chainEvents).toHaveLength(1);
+    const event = chainEvents[0];
+    if (event === undefined || event.kind !== 'chain.verify_failed') {
+      throw new Error('expected chain.verify_failed event');
+    }
+    expect(event.install_id).toBe(identity.install_id);
+    expect(event.broken_at).toBe(1);
+    expect(event.reason).toBe('this_hash_mismatch');
+    expect(event.accepted).toBe(false);
+    expect(event.ts).toBe(55555);
+    expect(typeof event.expected).toBe('string');
+    expect(typeof event.actual).toBe('string');
+  });
+
+  test('chain.verify_failed event also fires on chain-broken + acceptBrokenChain (accepted=true)', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const db = baseDb();
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'boot-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:x',
+      reason_chain: [],
+      ts: 1,
+    });
+    db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
+
+    const r = await bootstrapPermissionEngine(
+      baseInput({ db, telemetry, acceptBrokenChain: true }),
+    );
+    expect(r.state).toBe('ready');
+
+    const chainEvents = telemetry.events().filter((e) => e.kind === 'chain.verify_failed');
+    expect(chainEvents).toHaveLength(1);
+    const event = chainEvents[0];
+    if (event === undefined || event.kind !== 'chain.verify_failed') {
+      throw new Error('expected chain.verify_failed event');
+    }
+    expect(event.accepted).toBe(true);
+    expect(event.broken_at).toBe(1);
+  });
+
+  test('chain.verify_failed event NOT fired when chain is intact', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const r = await bootstrapPermissionEngine(baseInput({ telemetry }));
+    expect(r.state).toBe('ready');
+    const chainEvents = telemetry.events().filter((e) => e.kind === 'chain.verify_failed');
+    expect(chainEvents).toHaveLength(0);
+  });
 });

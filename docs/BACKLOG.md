@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 73: telemetry — `chain.verify_failed` event
+
+**Done.** Seventy-third slice. Adds the fourth telemetry event type — `chain.verify_failed` — fired from the bootstrap's chain-verify branch when `sink.verifyChain()` returns ok:false. Closes the spec line 1212 P0 metric: `chain_verification_failures_total > 0`. Fires on BOTH chain-broken paths: (a) no override → engine refusing, (b) `acceptBrokenChain: true` → audit-loud accepted path. The `accepted` field distinguishes the two for OTEL filtering.
+
+### Why this matters
+
+Chain integrity is §7.2's load-bearing security property. Without `chain.verify_failed` telemetry, an OTEL consumer aggregating across many engines couldn't count chain breaks at all — the existing state.transition event (slice 71) only fires on the refusing path, NOT on the accepted path, and even then carries the diagnostic as a free-form `reason` string that can't be structurally aggregated.
+
+The `accepted` boolean is the load-bearing field for operational dashboards. Chain breaks that the operator chose to continue under (via `--accept-broken-chain`) are a known-but-tolerated forensic event; chain breaks that refused the bootstrap are a P0 incident that warrants page-out. Same underlying mismatch detection, different operational response.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/index.ts` | New `ChainVerifyFailedEvent` interface: `kind: 'chain.verify_failed'`, `ts`, `install_id`, `broken_at`, `reason` (enum `'prev_hash_mismatch' \| 'this_hash_mismatch'` mirroring `VerifyResult.reason` from audit.ts), `expected`, `actual`, `accepted` (boolean — distinguishes the refusing vs accepted paths). `TelemetryEvent` union extended to 4 event types. |
+| `src/permissions/bootstrap-engine.ts` | New telemetry emit BEFORE the chain-verify branches. Fires when `chain.ok === false` regardless of `acceptBrokenChain` setting; `accepted: input.acceptBrokenChain === true` carries the operator's choice. Wrapped in try/catch — observability cannot break the chain-verify gate. Placed BEFORE the refusing-transition / chain-break-accepted audit row so OTEL consumers see the diagnostic context before the downstream events. |
+| `tests/permissions/bootstrap-engine.test.ts` (+3 tests) | chain.verify_failed event fires on chain-broken bootstrap (refusing path) with all fields validated (install_id, broken_at, reason='this_hash_mismatch', accepted=false, ts via test seam, expected/actual hashes as strings); event also fires on `acceptBrokenChain: true` path with `accepted: true`; event NOT fired when chain is intact (regression guard). |
+
+### Decisions
+
+- **Event fires on BOTH paths (refusing AND accepted).** Initial design considered only the refusing path, but the spec's P0 metric is `chain_verification_failures_total > 0` — total, not "refusing total". Accepted breaks ARE still breaks; operators monitoring chain integrity want to see them. The `accepted` field lets dashboards split the two responses without losing visibility on either.
+- **`accepted` field instead of two separate event types.** Considered `chain.verify_failed_refusing` and `chain.verify_failed_accepted` as distinct types, rejected. The mismatch detection + payload (install_id, broken_at, reason, expected, actual) is identical between the two paths — only the operator's CHOICE differs. A single event type with a discriminator field is the standard observability shape.
+- **Emit BEFORE the refusing-transition / chain-break audit row.** Same ordering rationale as slice 72's sealing.failure: OTEL consumers see the diagnostic context before the downstream events. A thrown telemetry emit doesn't block the chain-verify gate (try/catch absorbs).
+- **No emit from doctor's `chainCheck` (slice 62).** Doctor is a one-shot CLI tool, not part of the engine's runtime lifecycle. Spec line 1212 P0 alarm is about runtime metrics; doctor breaks are operator-driven inspections. Operators running doctor see the break in the doctor output directly; runtime telemetry would double-count if doctor also emitted.
+- **`reason` is the typed enum, not free-form string.** `VerifyResult.reason` from audit.ts is already typed as `'prev_hash_mismatch' | 'this_hash_mismatch'`; telemetry inherits the discriminator. Lets OTEL adapters route by reason without parsing free-form strings.
+- **`install_id` included in the event.** Multi-install deployments (e.g., one CI system orchestrating multiple agent runs) need per-install attribution. install_id is the unambiguous identifier and is already in the audit row that the verify is checking.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings
+- `bun test` — **5791 pass / 10 skip / 0 fail** (5801 total across 273 files); +3 tests on top of slice 72's 5788
+- `bun test tests/permissions/bootstrap-engine.test.ts` — 43 pass (was 40)
+
+### Next
+
+§18 telemetry: 4 of 4 spec-listed events shipped (`permission.decision`, `state.transition`, `sealing.failure`, `chain.verify_failed`). One additional event type remains as a follow-up (not on the spec's mandatory list but useful for operators):
+
+1. **`classifier.unavailable`** — fires from the classifier's strict-mode degrade path (spec line 1211). Requires engine instrumentation (classifier is inside `engine.check`'s pipeline; current code transitions to degraded via `engine.degrade('classifier_unavailable')` but doesn't emit a structured event).
+
+After classifier.unavailable, the remaining telemetry follow-ups are:
+
+2. **State controller bridge** — populate `engine_state` field on `permission.decision` events. Plumb a state getter through `CreateSqliteSinkOptions`.
+3. **OTEL adapter** — `src/telemetry/adapters/otel.ts`. Translates `TelemetryEvent[]` → OTLP metrics + spans.
+4. **Scrubbing layer** — wraps another sink, redacts likely-PII fields before forwarding.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 72: telemetry — `sealing.failure` event
 
 **Done.** Seventy-second slice. Adds the third telemetry event type — `sealing.failure` — fired from the bootstrap's existing `onSealFailed` callback (registered with the `SealingScheduler` since slice 57). Spec §18 line 1213 lists `sealing_failures_total > 0 em strict mode` as a P0 metric; this slice makes that metric directly emittable. Pairs with the `state.transition` event (slice 71) for a complete forensic picture: sealing.failure carries the per-event diagnostic (mode + path + reason); state.transition records the resulting engine state change.

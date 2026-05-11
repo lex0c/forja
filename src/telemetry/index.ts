@@ -98,6 +98,37 @@ export interface StateTransitionEvent {
   reason: string;
 }
 
+// §7.2 chain integrity failure event — emitted from the
+// bootstrap's chain-verify branch when `sink.verifyChain()`
+// returns ok:false. Fires on BOTH paths: (a) no override →
+// engine transitions to refusing, (b) `acceptBrokenChain: true`
+// → audit-loud `chain-break-accepted` row + engine proceeds.
+// `accepted` field distinguishes the two for OTEL filtering.
+//
+// Spec §18 line 1212 lists `chain_verification_failures_total >
+// 0` as a P0 metric — any chain break (accepted or not) is a
+// retrospective tamper signal that operators must investigate.
+//
+// Reason values mirror `VerifyResult.reason` from audit.ts:
+// `prev_hash_mismatch` (row's prev_hash doesn't link to the
+// previous row's this_hash) and `this_hash_mismatch` (recomputed
+// this_hash doesn't match the stored value — typically a field
+// in the hash payload was mutated).
+export interface ChainVerifyFailedEvent {
+  kind: 'chain.verify_failed';
+  ts: number;
+  install_id: string;
+  broken_at: number;
+  reason: 'prev_hash_mismatch' | 'this_hash_mismatch';
+  expected: string;
+  actual: string;
+  // Whether the operator opted to continue under the broken
+  // chain via `--accept-broken-chain`. false → engine transitions
+  // to refusing; true → chain-break-accepted audit row + engine
+  // proceeds (audit-loud path).
+  accepted: boolean;
+}
+
 // §7.3 sealing failure event — emitted from the bootstrap's
 // `onSealFailed` callback (registered with the
 // `SealingScheduler`). Each event corresponds to one rejected
@@ -131,9 +162,12 @@ export interface SealingFailureEvent {
 }
 
 // Discriminated union of every event kind the engine emits.
-// Future slices extend with chain.verify_failed,
-// classifier.unavailable.
-export type TelemetryEvent = PermissionDecisionEvent | StateTransitionEvent | SealingFailureEvent;
+// Future slices extend with classifier.unavailable.
+export type TelemetryEvent =
+  | PermissionDecisionEvent
+  | StateTransitionEvent
+  | SealingFailureEvent
+  | ChainVerifyFailedEvent;
 
 export interface TelemetrySink {
   // Fire-and-forget. Sinks MUST NOT throw — telemetry is

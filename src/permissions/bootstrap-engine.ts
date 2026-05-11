@@ -395,6 +395,29 @@ export const bootstrapPermissionEngine = async (
   });
   const chain = sink.verifyChain();
 
+  // §18 chain.verify_failed telemetry (slice 73). Fires on EITHER
+  // chain-broken path BEFORE the state transition / audit row so
+  // OTEL consumers see the diagnostic context before the resulting
+  // refusing-transition (state.transition event) OR chain-break-
+  // accepted audit row. Wrapped in try/catch — observability cannot
+  // break the chain-verify gate.
+  if (!chain.ok && input.telemetry !== undefined) {
+    try {
+      input.telemetry.emit({
+        kind: 'chain.verify_failed',
+        ts: input.now?.() ?? Date.now(),
+        install_id: identity.install_id,
+        broken_at: chain.brokenAt,
+        reason: chain.reason,
+        expected: chain.expected,
+        actual: chain.actual,
+        accepted: input.acceptBrokenChain === true,
+      });
+    } catch {
+      // Best-effort.
+    }
+  }
+
   if (!chain.ok && input.acceptBrokenChain !== true) {
     const reason = `chain_broken: seq=${chain.brokenAt} reason=${chain.reason}`;
     controller.transition('refusing', reason);
