@@ -147,6 +147,13 @@ export type {
 } from './sealing.ts';
 export { createWormFileSealer, verifySealAgainstChain } from './sealing.ts';
 
+export type {
+  CreateSealingSchedulerOptions,
+  SealingScheduler,
+  SealNowResult,
+} from './sealing-scheduler.ts';
+export { createSealingScheduler } from './sealing-scheduler.ts';
+
 export {
   RULE_LIST_CAP,
   formatBash,

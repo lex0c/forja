@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 55: `createSealingScheduler` — §7.3 interval-driven sealing
+
+**Done.** Fifty-fifth slice. Bridges slice 54's `SealStore` primitive to the audit-decision flow + wall clock per the §7.3 spec: `interval_decisions = 100` (seal every N decisions) AND/OR `interval_seconds = 3600` (seal at most every M seconds), whichever fires first. Three trigger paths converge on a single sealing internal: `tick()` (called by the audit sink after every emit), wall-clock timer (auto-rescheduling), and `sealNow()` (manual — SessionEnd / CLI verb).
+
+### Why this matters
+
+Slice 54 shipped the worm-file backend in isolation — operators had a primitive but no driver. The scheduler is what makes "sealing every 100 decisions" a real engine behavior rather than a config knob nobody reads. Without it, slice 56 (audit-sink integration) couldn't be written: there'd be no `tick()` to call from emit.
+
+The `lastSealedSeq` guard is the subtle correctness property: if neither `tick()` nor the wall-clock pushes the chain past the last sealed point, sealing the same hash again would be pure noise in the seal file. Time-driven seals on idle sessions correctly no-op; only NEW chain activity creates new seal lines.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sealing-scheduler.ts` (new, ~160 lines) | `SealingScheduler` interface: `tick()`, `sealNow() → SealNowResult`, `close()`. `createSealingScheduler({store, db, installId, intervalDecisions?, intervalSeconds?, onSealFailed?, now?, setTimer?, clearTimer?})`. Internal `sealLatestInternal()` is the convergence point: queries `getLastApprovalsLogByInstall(db, installId)`, skips when chain empty OR `row.seq === lastSealedSeq`, else builds `SealEntry = {seq, ts: now(), hash: row.this_hash}` and hands off to `store.append`. Three outcomes (`{kind: 'sealed' \| 'noop' \| 'failed'}`) routed: `tick` and timer ignore noop/sealed + route failed to `onSealFailed`; `sealNow` maps to the public `SealNowResult` shape (`{ok: true, sealed: SealEntry \| null}` or `{ok: false, reason}`). Counter reset on every successful seal AND on every time-driven trigger (even on noop — prevents back-to-back fire when a tick threshold lines up with the next interval). Timer reschedules itself after firing — operators don't need to set up a recurring cron. `close()` clears any pending timer + flips `closed: true`; subsequent `tick`/`sealNow` are no-ops / ok:false. |
+| `src/permissions/index.ts` | Re-export `createSealingScheduler`, `SealingScheduler`, `SealNowResult`, `CreateSealingSchedulerOptions`. |
+| `tests/permissions/sealing-scheduler.test.ts` (new, 19 tests) | **tick (5):** counter→threshold fires seal + resets; `intervalDecisions=0` disables decision-driven sealing entirely; tick on empty chain noops; tick on already-sealed seq noops (no duplicate line); store failure routes to `onSealFailed` + counter still resets so subsequent ticks retry. **wall-clock timer (4):** timer fires → seals latest + reschedules; `intervalSeconds=0` schedules zero timers; time-driven seal resets `decisionCounter` (verified by injecting new row + ticking through the new window); timer-failure routes through `onSealFailed` AND reschedules anyway (operator may fix the underlying issue). **sealNow (6):** healthy chain → `{ok: true, sealed: entry}` with right seq/ts; empty chain → `{ok: true, sealed: null}`; already-sealed seq → `{ok: true, sealed: null}`; store failure → `{ok: false, reason}` + onSealFailed invoked; sealNow after close → `{ok: false, reason: 'scheduler closed'}`; sealNow resets `decisionCounter`. **close (3):** cancels the pending timer (captured via `clearTimer` seam); tick after close is a no-op (the gate); idempotent (three sequential closes don't throw). **integration (1):** real worm-file `SealStore` + real `createSqliteSink` chain — 12 emits with `tick` per emit fires exactly 2 seals (at decisions 5 and 10) + `verifySealAgainstChain` returns ok with `entriesChecked: 2`. |
+
+### Decisions
+
+- **`tick()` is fire-and-forget; only `sealNow()` returns a structured result.** The audit sink's emit path (slice 56) shouldn't pay an allocation per decision for a result it never reads — `tick()` returns `void`. The CLI verb (slice 58) and the SessionEnd handler are the only consumers that act on a sealing outcome, so they get `SealNowResult` instead.
+- **`onSealFailed` is observability, not state-machine control.** The scheduler does NOT degrade or refuse the engine on a sealing failure. That decision belongs to the bootstrap (slice 57), which reads `[seal] on_failure: degrade|refuse` from the Policy and wires the callback to `engine.degrade()` / `engine.refuse()`. Same posture as the watcher's `onReloadFailed` from slice 52.
+- **`lastSealedSeq` is in-memory, not persisted.** Restarting the scheduler (e.g., REPL restart) re-seals the latest chain row on the first trigger even if a previous session already sealed it. Duplicate-but-correct seals are acceptable — they don't break verification (same hash both times), and tracking state across processes would require another SQLite table for one byte of avoided noise. Worst case: an extra line in the seal file per session start.
+- **Decision counter resets on both seal AND time-driven trigger, even on noop.** Two reasons. (a) After a time-driven seal, we want the next "every N decisions" window to start fresh — otherwise a slow stream of decisions sprinkled across both triggers could fire back-to-back seals (timer at second 3600, then 1 tick later the counter is already at N from the pre-timer window). (b) After a noop time-driven trigger, we still want the counter zeroed so the decision-driven path doesn't suddenly fire because the chain JUST got busy. Tests pin both behaviors.
+- **No initial seal on creation.** A scheduler created mid-session shouldn't double-seal what's already been sealed (or seal a chain that's still empty). The first trigger (tick / timer / sealNow) is when work actually starts. Tests verify zero entries after construction.
+- **`intervalDecisions=0` and `intervalSeconds=0` are valid, independently.** Both disabled → only `sealNow` works (manual-only mode, useful for non-regulated deployments that want sealing-on-demand). Both enabled → both triggers fire, whichever comes first. Spec wording "whichever first" maps naturally to the OR semantics; this also matches the §7.3 example block where both fields appear together.
+- **Timer reschedules itself even after a failure.** Operators may notice the failure (via `onSealFailed`), fix the issue (e.g., remount filesystem), and want the next interval to try again automatically. Stopping the timer on first failure would force them to restart the session to re-enable sealing. Tests pin this: a failing timer trigger still produces a second `setTimer` call.
+- **Manual `sealNow` and automatic `tick` are independent paths through the SAME `sealLatestInternal`.** No code duplication; correctness invariants (noop on empty / already-sealed, counter reset on success) live in ONE place. The two public entry points just translate the internal outcome to the right return shape for their caller.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5606 pass / 10 skip / 0 fail** (5616 total across 262 files); +19 tests on top of slice 54's 5587
+- `bun test tests/permissions/sealing-scheduler.test.ts` — 19 pass
+
+### Next
+
+§7.3 thread state: primitive (54) ✓, scheduler (55) ✓, audit-sink integration (56) pending, bootstrap wire-up (57) pending, CLI verb (58) pending.
+
+Slice 56 is the smallest remaining step: extend `createSqliteSink` to accept an optional `scheduler` parameter and call `scheduler.tick()` after every successful `emit`. Three or four tests pin the integration — including the contract that emit FIRST persists the row, THEN ticks (so the seal sees the up-to-date chain head).
+
+Other open spec gaps unchanged. §16.2 conformance still at 95%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 54: `createWormFileSealer` — §7.3 sealing primitive (worm-file backend)
 
 **Done.** Fifty-fourth slice. Opens the §7.3 external-sealing thread by shipping the foundational primitive: a `SealStore` interface plus a worm-file backend that appends `seq\tts\thash\n` lines to a file destined to become `chattr +a`'d. Companion `verifySealAgainstChain(store, db)` cross-references each seal entry against the live `approvals_log` chain. With this slice, the building block for "the local hash chain is auditor-grade, not just root-trust" is in place — future slices wire the scheduler, audit sink integration, and `[seal]` Policy section.
