@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 37: `/perms` + `/perms why sandbox` in-REPL surfaces (closes slice-36 follow-on)
+
+**Done.** Thirty-seventh slice. Slice 36 wired sandbox rendering into the headless `agent perms` CLI but left two gaps: (1) the in-REPL `/perms` slash command quietly skipped sandbox even when set (same bug slice 36 fixed for the headless surface), and (2) operators had no way to ask "why is sandbox.required=true?" interactively — `/perms why <tool>` was tool-only. This slice closes both gaps: `/perms` now renders sandbox after the tools.* sections, and `/perms why sandbox` is a new sub-command that returns the sandbox state with per-field provenance from the engine.
+
+Shared renderer: `renderSandbox` moves from `cli/explain-permissions.ts` to `permissions/render.ts` so both surfaces (`/perms` and `agent perms`) share the same formatter — no risk of layout drift across the two outputs. Engine gets a new `provenance(): SectionProvenance` method so the slash layer can read what `agent perms` already had from the resolver.
+
+### Why this matters
+
+`/perms` is the operator's first stop when something looks wrong in the REPL — "did my rule load? is my policy in strict mode? what's my bash allow list?". Slice 23 made the sandbox section a real policy citizen; slices 34-36 deepened it with lock + per-field provenance + headless rendering. But the in-REPL surface stayed blind to sandbox — an admin pinning `sandbox: { required: true, locked: true }` would type `/perms` and see no sandbox section at all, leaving them wondering whether the policy even loaded. The gap was a smaller version of what slice 36 fixed for `agent perms`. This slice closes it symmetrically.
+
+`/perms why sandbox` mirrors `/perms why <tool>` but with different semantics — sandbox isn't a tool, has no dry-check shape, and produces no Decision. The new sub-command branch returns the merged sandbox state + per-field writers, the same content `agent perms` produces but scoped to one section. Operators auditing a single section don't have to scroll past the full policy.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/render.ts` | New `renderSandbox(sandbox, provenance?)` (moved from `cli/explain-permissions.ts`). Body indent is 6 spaces — matches `formatRules` and the rest of the section bodies. Provenance is optional: when undefined every field renders bare (`required: true`); when set, the per-field writer becomes `[from <layer> policy]`. Lock renders as a footer line, with or without attribution. `renderPolicy` now invokes `renderSandbox(policy.sandbox, undefined)` after tools.* sections. Empty-policy guard updated to consider both `sectionLines` and `sandboxLines` (sandbox-only policies render without the "no tool sections defined" notice). |
+| `src/permissions/index.ts` | `renderSandbox` re-exported from the barrel. |
+| `src/cli/explain-permissions.ts` | Local `renderSandbox` definition removed — imports from the barrel. Tests in `tests/cli/explain-permissions.test.ts` use `.toContain` checks that are indent-agnostic, so the 4-space → 6-space change required no test updates. |
+| `src/permissions/engine.ts` | `PermissionEngine` interface gets a new `provenance(): SectionProvenance` method. Implementation deep-clones `options.provenance` via `structuredClone` (matching `policy()`'s defensive-clone strategy); when no provenance was supplied at construction (test-built engines, headless dry-runs), the fallback shape is `{ defaults: 'default' }` — every section attributed to the built-in default. |
+| `src/cli/slash/commands/perms.ts` | New `runWhySandbox(ctx)` helper. `runWhy` dispatches to it when `args[1] === 'sandbox'`, before the per-tool lookup. Two outputs: declared sandbox → header + `renderSandbox(policy.sandbox, provenance.sandbox)`; undeclared sandbox → header + "(sandbox section not declared)" notice + bootstrap defaults (`required=false, host_allowed=false`) so the operator gets a definite answer instead of empty output. |
+| `tests/cli/slash/commands.test.ts` | 5 new tests: `renderPolicy` renders sandbox after tools.*, sandbox-only policy renders without the "no tool sections" notice, `/perms why sandbox` with declared section + provenance, `/perms why sandbox` with undeclared section + bootstrap-defaults notice, `/perms why sandbox` with lock-only section (no phantom field lines). |
+
+### Decisions
+
+- **Move renderSandbox to permissions/render.ts.** Slice 36 put the helper next to its first caller; slice 37 has a second caller in `/perms`. Without consolidation, the two surfaces would inevitably drift — a layout tweak in one wouldn't propagate to the other. The helper now lives next to the other section formatters; both surfaces import the same function.
+- **6-space body indent (matches `formatRules`).** Slice 36's 4-space indent was inconsistent with the rest of the section bodies (which use 6 spaces via `formatRules`). The move to `render.ts` was the right time to fix it — every section's body now indents at the same column. The existing slice-36 tests pass unchanged because they use `.toContain` matchers (not literal-line matchers), so indent-level changes don't fail them.
+- **`provenance()` on the engine, not derived from policy.** The slash command needs the per-field writers, and the engine already has them (passed in at construction via `EngineOptions.provenance`). Adding a getter is cleaner than threading the resolver result through every consumer of `permissionEngine`. Returns a deep clone — same defensive strategy as `policy()` so caller mutation can't corrupt the engine's attribution state.
+- **`/perms why sandbox` dispatched separately from `runWhy` (not through it).** Sandbox isn't a tool — it has no category, no resolver, no `engine.check` path. Trying to shoehorn it into `runWhy` would have polluted the per-tool args-building logic with a special case. The dispatch in `runWhy` checks `toolName === 'sandbox'` and hands off; the rest of `runWhy` stays focused on the per-tool shape. Future non-tool introspection (`/perms why defaults`?) can plug in the same way.
+- **Undeclared-sandbox notice surfaces bootstrap defaults explicitly.** An operator typing `/perms why sandbox` and getting "(section not declared)" needs to know what the engine IS using — otherwise they'd assume the section is somehow disabled and the call goes through unsandboxed. Adding `bootstrap defaults: required=false, host_allowed=false` to the notice closes the ambiguity. Same shape as the "no tool sections defined → every gated tool will be denied" footer in `/perms`.
+- **Sandbox-only policy doesn't trigger the "no tool sections defined" notice.** Slice-37 update to renderPolicy: the empty-policy guard now considers both tools.* sections AND sandbox. A policy that ONLY configures sandbox (typical enterprise lockdown) renders sandbox and skips the notice. Pre-slice-37 would have fired the strict-mode default-deny notice + omitted the sandbox entirely — actively misleading.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5393 pass / 10 skip / 0 fail** (5403 total across 249 files); 5 new slash-command tests on top of slice 36's 5388
+- `bun test tests/cli/slash/commands.test.ts` — 94 pass (89 prior + 5 new)
+- `bun test tests/cli/explain-permissions.test.ts` — 15 pass (slice 36 tests still green after renderSandbox moved out of the file)
+
+### Next
+
+Successor slices:
+1. **JSON output mode for `agent perms`** — header comment in `explain-permissions.ts` already calls this out as follow-up. Same NDJSON shape as `--list-sessions`.
+2. **ULID-shaped public approval ids** — independent storage tweak.
+3. **Grants table + TTL persistence** — implements §8. Unblocks ttl_expiry conformance (~6 cases).
+4. **macOS sandbox-exec** — SBPL profile generation + runtime wrap.
+5. **MCP-tool spawn wire-up** — when MCP tools execute child processes.
+
+Remaining conformance: ttl_expiry (blocked on §8 grants) + concurrency (separate driver). Suite still at 123/136 = 90%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 36: `agent perms` CLI renders sandbox section with per-field attribution
 
 **Done.** Thirty-sixth slice. Natural follow-on to slice 35: the per-field `SandboxProvenance` shape needed a consumer to be operator-visible. This slice extends `renderExplainPermissions` (the headless equivalent of `/perms` / `/perms why <tool>`) to render the §6.5 sandbox section with per-field layer attribution. Operators can now answer "why is `host_allowed` true on this machine?" by reading one line — `host_allowed: true [from user policy]` — rather than cross-referencing the merged policy and the layer trail manually.

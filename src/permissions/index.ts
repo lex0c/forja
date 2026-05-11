@@ -138,6 +138,7 @@ export {
   formatBash,
   formatFetch,
   formatPath,
+  renderSandbox,
   formatRules,
   formatSections,
   renderPolicy,

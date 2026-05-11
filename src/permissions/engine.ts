@@ -219,6 +219,14 @@ export interface PermissionEngine {
   // (typical policies are sub-10KB) compared to the latent-bug
   // surface a shared reference would expose.
   policy(): Policy;
+  // Returns a deep copy of the section-by-section layer attribution
+  // captured at policy resolution time. Operator-facing surfaces
+  // (`/perms why <section>`, `agent perms`) render this to answer
+  // "which layer set required=true?". When the engine was built
+  // without an explicit `EngineOptions.provenance`, the returned
+  // shape carries only `defaults: 'default'` — every section is
+  // attributed to the built-in default.
+  provenance(): SectionProvenance;
   // Append a pattern to the session-scoped allowlist for the
   // given section. Used by the REPL's "Yes, don't ask again
   // for: <rule>" modal answer — the bridge calls this BEFORE
@@ -1438,6 +1446,14 @@ export const createPermissionEngine = (
     // also work but loses Date/Map shapes if a future Policy
     // grows them; structuredClone preserves them.
     policy: () => structuredClone(policy),
+    // Same defensive-clone strategy as `policy()`. The returned
+    // provenance is consumed by /perms-style introspection; callers
+    // mutating it shouldn't corrupt the engine's enforcement
+    // attribution. When no provenance was supplied at construction
+    // (test-built engines, headless dry-runs), default to the
+    // sentinel "everything is the built-in default" shape.
+    provenance: () =>
+      structuredClone(options.provenance ?? ({ defaults: 'default' } as SectionProvenance)),
     addSessionAllow,
   };
 };

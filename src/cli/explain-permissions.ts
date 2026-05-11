@@ -16,11 +16,11 @@
 import {
   type Layer,
   type Policy,
-  type SandboxProvenance,
   type SectionProvenance,
   formatBash,
   formatFetch,
   formatPath,
+  renderSandbox,
   resolvePolicy,
 } from '../permissions/index.ts';
 
@@ -62,35 +62,9 @@ const renderSection = (
   return lines;
 };
 
-// §6.5 sandbox section renderer (slice 36). Unlike tools.* sections,
-// sandbox has per-field provenance (slice 35) — each field gets its
-// own `[from <layer> policy]` hint so operators can answer "WHY is
-// host_allowed true on this machine?" by looking at one line, not
-// inferring from a section-wide single writer. Lock state renders
-// as a footer line (the lock is about the section, not a field
-// value) with the locking layer's attribution when known.
-const renderSandbox = (
-  sandbox: NonNullable<Policy['sandbox']>,
-  provenance: SandboxProvenance | undefined,
-): string[] => {
-  const lines: string[] = ['  sandbox:'];
-  if (sandbox.required !== undefined) {
-    const layer = provenance?.required;
-    const hint = layer !== undefined ? ` [from ${layer} policy]` : '';
-    lines.push(`    required: ${sandbox.required}${hint}`);
-  }
-  if (sandbox.hostAllowed !== undefined) {
-    const layer = provenance?.hostAllowed;
-    const hint = layer !== undefined ? ` [from ${layer} policy]` : '';
-    lines.push(`    host_allowed: ${sandbox.hostAllowed}${hint}`);
-  }
-  if (sandbox.locked === true) {
-    const layer = provenance?.locked;
-    const lockHint = layer !== undefined ? ` by ${layer} policy` : '';
-    lines.push(`    (locked${lockHint})`);
-  }
-  return lines;
-};
+// §6.5 sandbox renderer lives in permissions/render.ts so both
+// `/perms` (in-REPL) and this headless surface share the exact same
+// formatting. Imported via the barrel.
 
 export const renderExplainPermissions = (
   policy: Policy,

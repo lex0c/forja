@@ -1276,6 +1276,42 @@ describe('/perms', () => {
     expect(lines[0]).toBe('policy: mode=acceptEdits');
     expect(lines.some((l) => l.includes('default-deny in strict mode'))).toBe(false);
   });
+
+  test('renders sandbox section after tools.* (slice 37)', () => {
+    const lines = renderPolicy({
+      defaults: { mode: 'strict' },
+      tools: { bash: { allow: ['ls *'] } },
+      sandbox: { required: true, hostAllowed: false, locked: true },
+    });
+    const text = lines.join('\n');
+    // Sandbox header + each set field + locked footer. No layer hints
+    // because /perms (no args) doesn't carry provenance — bare values.
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true');
+    expect(text).toContain('host_allowed: false');
+    expect(text).toContain('(locked)');
+    // Pre-slice-37 /perms quietly omitted sandbox even when set.
+    // Regression guard for that gap.
+    expect(text.indexOf('bash:')).toBeLessThan(text.indexOf('sandbox:'));
+  });
+
+  test('sandbox-only policy (no tools sections) still renders sandbox', () => {
+    // Edge case: a policy that ONLY configures sandbox (typical for an
+    // enterprise lockdown that defers tool sections to lower layers).
+    // Pre-slice-37 the "no tool sections defined" notice fired and
+    // sandbox stayed invisible; now the section renders and the
+    // strict-mode footer drops (no tool sections to caveat).
+    const lines = renderPolicy({
+      defaults: { mode: 'strict' },
+      tools: {},
+      sandbox: { required: true, locked: true },
+    });
+    const text = lines.join('\n');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true');
+    expect(text).toContain('(locked)');
+    expect(text).not.toContain('no tool sections defined');
+  });
 });
 
 describe('/perms why', () => {
@@ -1487,5 +1523,68 @@ describe('/perms why', () => {
     expect(result.kind).toBe('error');
     if (result.kind !== 'error') return;
     expect(result.message).toContain('unknown sub-command');
+  });
+
+  test('/perms why sandbox: section declared → renders state + per-field provenance (slice 37)', async () => {
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { required: true, hostAllowed: false, locked: true },
+      },
+      [],
+      {
+        defaults: 'enterprise',
+        sandbox: { required: 'enterprise', hostAllowed: 'user', locked: 'enterprise' },
+      },
+    );
+    const result = await permsCommand.exec(['why', 'sandbox'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    // Header echoes the input; renderSandbox produces the body.
+    expect(text).toContain('/perms why sandbox');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true [from enterprise policy]');
+    expect(text).toContain('host_allowed: false [from user policy]');
+    expect(text).toContain('(locked by enterprise policy)');
+  });
+
+  test('/perms why sandbox: no section declared → renders "not declared" notice with defaults', async () => {
+    // Bootstrap defaults are required=false, host_allowed=false. The
+    // notice surfaces this so the operator knows the engine ISN'T
+    // running sandboxed without having to dig into the source. Same
+    // shape as the "no tool sections defined" footer in `/perms`.
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, []);
+    const result = await permsCommand.exec(['why', 'sandbox'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('/perms why sandbox');
+    expect(text).toContain('sandbox section not declared');
+    expect(text).toContain('bootstrap defaults');
+    expect(text).toContain('required=false');
+    expect(text).toContain('host_allowed=false');
+  });
+
+  test('/perms why sandbox: lock-only section renders just the lock footer (no field lines)', async () => {
+    // Lock-only-layer case from slice 34: no required / host_allowed
+    // set, just locked=true. /perms why sandbox should render the
+    // header + lock footer with attribution, NOT phantom "required:
+    // unset" lines.
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { locked: true },
+      },
+      [],
+      { defaults: 'enterprise', sandbox: { locked: 'enterprise' } },
+    );
+    const result = await permsCommand.exec(['why', 'sandbox'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('(locked by enterprise policy)');
+    expect(text).not.toContain('required:');
+    expect(text).not.toContain('host_allowed:');
   });
 });
