@@ -153,6 +153,12 @@ export interface PolicySource {
 interface DecisionBase {
   approvalSeq?: number;
   sandboxProfile?: SandboxProfile;
+  // §8 TTL — when this Decision was produced by matching a persisted
+  // grant, the grant's `expires_at` flows through here so the audit
+  // row's `ttl_expires_at` column records when the granted authority
+  // lapses. Undefined for non-grant decisions (the default deny /
+  // session-allow / policy-rule paths).
+  ttlExpiresAt?: number;
 }
 
 // What the engine returns from a check. The harness converts `confirm`

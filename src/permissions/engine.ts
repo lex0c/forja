@@ -27,6 +27,9 @@ import {
   firstMatchingCommand,
   firstMatchingHost,
   firstMatchingPath,
+  matchCommand,
+  matchHost,
+  matchPath,
 } from './matcher.ts';
 import { type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
 // Importing the resolver index registers every builtin resolver at
@@ -177,6 +180,31 @@ export interface EngineOptions {
     hostExplicitlyAllowed: boolean;
     required: boolean;
   };
+  // §8 grants. Optional grants snapshot provider. Engine calls
+  // `listActive(Date.now())` on each `check()` so long-running
+  // sessions see grants revoked or expired mid-flight. Implementations:
+  //   - Production: `(ts) => listActiveGrants(db, installId, ts)`
+  //   - Tests: a closure over a fixed array; mutable for revocation tests.
+  // When omitted, the grant-match phase is a no-op — engine behaves
+  // as before slice 40. Persisted grants (pattern scope) authorize
+  // matching tool calls, short-circuiting AFTER deny rules and
+  // BEFORE the in-memory session-allow / base allow / confirm chain.
+  grants?: {
+    listActive: (snapshotTs: number) => readonly GrantSnapshot[];
+  };
+}
+
+// Minimal subset of `GrantRow` the engine consumes. Storage layer
+// (src/storage/repos/grants.ts) returns the full row; engine reads
+// only the fields needed for matching + attribution. Keeping the
+// type slim here avoids dragging the SQL repo's shape into the
+// engine module.
+export interface GrantSnapshot {
+  id: string;
+  scope_kind: 'pattern' | 'capability';
+  scope_value: string;
+  capability: string;
+  expires_at: number;
 }
 
 // §6.6 baseline. Sourced here (not inlined at the call site) so
@@ -337,6 +365,76 @@ const denyDefault = (toolName: string, mode: PolicyMode, source: PolicySource): 
   source,
 });
 
+// §8 grants — per-section relevance filter. A pattern grant
+// authorizes a tool call only when its `capability` kind aligns
+// with what the tool is doing. A `read-fs:src/**` grant does NOT
+// authorize a `write_file` call (write_file emits write-fs, not just
+// read-fs), even though the path glob matches.
+//
+// Slice 40 ships scope_kind='pattern' only; scope_kind='capability'
+// is a follow-up. Pattern grants check ONE direction (kind prefix);
+// capability grants will use `capabilityCovers` against the resolved
+// caps.
+const grantRelevantForSection = (
+  grant: GrantSnapshot,
+  section: keyof PolicyToolsSection,
+): boolean => {
+  if (grant.scope_kind !== 'pattern') return false;
+  const kindPrefix = grant.capability.split(':')[0];
+  switch (section) {
+    case 'bash':
+      // Bash multi-emits (exec/read-fs/write-fs/delete-fs/net-egress/
+      // git-write per slice 26 footprint). Slice 40 narrows: only
+      // `exec:`-prefixed grants authorize bash commands. Future
+      // capability-scope grants can cover the other kinds.
+      return kindPrefix === 'exec';
+    case 'read_file':
+    case 'glob':
+    case 'grep':
+      return kindPrefix === 'read-fs';
+    case 'write_file':
+    case 'edit_file':
+      // write_file/edit_file need write authorization — a read-only
+      // grant doesn't suffice.
+      return kindPrefix === 'write-fs';
+    case 'fetch_url':
+      return kindPrefix === 'net-egress';
+    default:
+      return false;
+  }
+};
+
+// §8 grants — first matching grant for the given target. Returns
+// the full snapshot (not just the pattern) so the caller can record
+// the grant id and expires_at on the Decision / audit row.
+const firstMatchingGrant = (
+  grants: readonly GrantSnapshot[] | undefined,
+  section: keyof PolicyToolsSection,
+  target: string,
+  cwd: string,
+): GrantSnapshot | null => {
+  if (grants === undefined || grants.length === 0) return null;
+  for (const g of grants) {
+    if (!grantRelevantForSection(g, section)) continue;
+    let matches: boolean;
+    if (section === 'bash') {
+      matches = matchCommand(g.scope_value, target);
+    } else if (section === 'fetch_url') {
+      matches = matchHost(g.scope_value, target);
+    } else {
+      matches = matchPath(g.scope_value, target, cwd);
+    }
+    if (matches) return g;
+  }
+  return null;
+};
+
+// Reason-chain entries for grant matches flow through the generic
+// `reasonChainFor` path (Decision.source.section='grants' triggers
+// the 'grant-match' stage). No dedicated builder needed — the
+// rule (grant id) + section ('grants') + layer ('session') fields
+// already carry the attribution.
+
 const checkBash = (
   toolName: string,
   args: ToolArgs,
@@ -344,6 +442,7 @@ const checkBash = (
   mode: PolicyMode,
   provenance: SectionProvenance | undefined,
   sessionAllow: readonly string[] | undefined,
+  activeGrants: readonly GrantSnapshot[] | undefined,
 ): Decision => {
   const command = args.command;
   if (typeof command !== 'string' || command.length === 0) {
@@ -371,6 +470,23 @@ const checkBash = (
       kind: 'deny',
       reason: `bash command matched deny rule: ${denied}`,
       source: { layer, rule: denied, section: 'bash' },
+    };
+  }
+
+  // §8 persisted grant check. Runs AFTER deny (deny always wins,
+  // even over an operator-granted exemption) and BEFORE the in-memory
+  // session-allow + compound guard. A matching grant carries the
+  // operator's prior approval forward across session boundaries.
+  // Compound guard is intentionally bypassed — same rationale as
+  // session-allow: the operator authorized this pattern explicitly
+  // for the grant's TTL window.
+  const grantMatch = firstMatchingGrant(activeGrants, 'bash', command, '');
+  if (grantMatch !== null) {
+    return {
+      kind: 'allow',
+      reason: `bash command matched grant ${grantMatch.id} (${grantMatch.scope_value})`,
+      source: { layer: 'session', rule: grantMatch.id, section: 'grants' },
+      ttlExpiresAt: grantMatch.expires_at,
     };
   }
 
@@ -494,6 +610,7 @@ const checkPath = (
   provenance: SectionProvenance | undefined,
   sectionKey: keyof PolicyToolsSection,
   sessionAllow: readonly string[] | undefined,
+  activeGrants: readonly GrantSnapshot[] | undefined,
 ): Decision => {
   const path = resolveFsTarget(toolName, args, cwd);
   if (path === null) {
@@ -544,6 +661,30 @@ const checkPath = (
       kind: 'deny',
       reason: `path matched deny rule: ${denied}`,
       source: { layer, rule: denied, section: sectionName },
+    };
+  }
+  // §8 persisted grant check. Same position as for bash: after deny,
+  // before session-allow. A grant carrying a path pattern that
+  // matches the resolved fs target authorizes the call. Protected-
+  // path `escalate` tier still upgrades the decision to confirm —
+  // the grant authorizes the WRITE attempt, but §11 demands a
+  // confirm-on-protected even with prior approval.
+  const grantMatch = firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd);
+  if (grantMatch !== null) {
+    if (protectedTier === 'escalate') {
+      return {
+        kind: 'confirm',
+        prompt: `Write to ${path}? (protected path)`,
+        reason: `path matched grant ${grantMatch.id} (${grantMatch.scope_value}) but is in protected zone; escalated to confirm per §11`,
+        source: { layer: 'session', rule: grantMatch.id, section: 'grants' },
+        ttlExpiresAt: grantMatch.expires_at,
+      };
+    }
+    return {
+      kind: 'allow',
+      reason: `path matched grant ${grantMatch.id} (${grantMatch.scope_value})`,
+      source: { layer: 'session', rule: grantMatch.id, section: 'grants' },
+      ttlExpiresAt: grantMatch.expires_at,
     };
   }
   // Session-allow check: same semantics as base `allow_paths` but
@@ -618,6 +759,7 @@ const checkFetch = (
   mode: PolicyMode,
   provenance: SectionProvenance | undefined,
   sessionAllow: readonly string[] | undefined,
+  activeGrants: readonly GrantSnapshot[] | undefined,
 ): Decision => {
   const url = args.url;
   if (typeof url !== 'string' || url.length === 0) {
@@ -645,6 +787,17 @@ const checkFetch = (
       kind: 'deny',
       reason: `host matched deny rule: ${denied}`,
       source: { layer, rule: denied, section: 'fetch_url' },
+    };
+  }
+  // §8 persisted grant check. Pattern grants targeting hosts use the
+  // same matcher as `allow_hosts` (case-insensitive host glob).
+  const grantMatch = firstMatchingGrant(activeGrants, 'fetch_url', host, '');
+  if (grantMatch !== null) {
+    return {
+      kind: 'allow',
+      reason: `host matched grant ${grantMatch.id} (${grantMatch.scope_value})`,
+      source: { layer: 'session', rule: grantMatch.id, section: 'grants' },
+      ttlExpiresAt: grantMatch.expires_at,
     };
   }
   // Session-allow check: same precedence as the bash/path branches.
@@ -838,6 +991,13 @@ const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
     stage = 'protected-path';
+  } else if (decision.source?.section === 'grants') {
+    // §8 grant match — checked before the generic session-allow
+    // branch (grant decisions carry both `section='grants'` and
+    // `layer='session'`). Distinct stage so audit replays and
+    // `/perms why` rendering can distinguish a PERSISTED grant
+    // from a transient session-allow.
+    stage = 'grant-match';
   } else if (decision.source?.layer === 'session') {
     stage = 'session-allow';
   } else if (decision.source?.rule !== undefined) {
@@ -955,6 +1115,12 @@ export const createPermissionEngine = (
       // chain entry pairs with this column on every row where the
       // planner ran (success or refusal).
       sandbox_profile: sandboxProfileForRow,
+      // §8 grant expiry. Populated when the Decision was produced
+      // by a persisted grant match (`decision.ttlExpiresAt`); null
+      // otherwise. Future replay can correlate `ttl_expires_at` +
+      // the `grant-match` reason chain stage to reconstruct the
+      // grant trail.
+      ttl_expires_at: decision.ttlExpiresAt ?? null,
     };
     const emitted = audit.emit(input);
 
@@ -1259,6 +1425,14 @@ export const createPermissionEngine = (
         ? undefined
         : (policy.tools as unknown as Record<string, unknown>)[sectionKey];
 
+    // §8 grants snapshot. Sampled once per `check()` call against
+    // the current wall-clock so a long-running session sees a grant
+    // revoked or expired mid-flight on its NEXT tool call (not this
+    // one — atomicity is per-check, not per-tool-execution). When
+    // `options.grants` is undefined, the snapshot is undefined and
+    // the grant-match phase in each checkX is a no-op.
+    const activeGrants = options.grants?.listActive(Date.now());
+
     let decision: Decision;
     switch (category) {
       case 'bash':
@@ -1272,6 +1446,7 @@ export const createPermissionEngine = (
           mode,
           provenance,
           sessionAllow.get('bash'),
+          activeGrants,
         );
         break;
       case 'fs.read':
@@ -1289,6 +1464,7 @@ export const createPermissionEngine = (
           provenance,
           sectionKey as keyof PolicyToolsSection,
           sessionAllow.get(sectionKey as keyof PolicyToolsSection),
+          activeGrants,
         );
         break;
       case 'fs.write':
@@ -1303,6 +1479,7 @@ export const createPermissionEngine = (
           provenance,
           sectionKey as keyof PolicyToolsSection,
           sessionAllow.get(sectionKey as keyof PolicyToolsSection),
+          activeGrants,
         );
         break;
       case 'web.fetch':
@@ -1313,6 +1490,7 @@ export const createPermissionEngine = (
           mode,
           provenance,
           sessionAllow.get('fetch_url'),
+          activeGrants,
         );
         break;
       case 'misc':

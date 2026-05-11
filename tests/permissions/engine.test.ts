@@ -2379,3 +2379,205 @@ describe('engine — Decision.sandboxProfile (§6.5 runtime wire-up, slice 19)',
     expect(d.sandboxProfile).toBe('ro');
   });
 });
+
+describe('engine.check — §8 grants (slice 40)', () => {
+  // Helper builds a minimal grants provider returning a fixed snapshot.
+  // The engine calls `listActive(Date.now())` on each check; the test
+  // ignores the timestamp arg (caller responsibility to pass already-
+  // filtered grants for time-sensitive scenarios) and returns the
+  // closed-over array directly.
+  const fixedGrants = (snapshots: ReadonlyArray<Parameters<typeof grantsBuilder>[0]>) =>
+    grantsBuilder(...snapshots) ?? undefined;
+
+  function grantsBuilder(
+    ...snapshots: {
+      id: string;
+      scope_kind?: 'pattern' | 'capability';
+      scope_value: string;
+      capability: string;
+      expires_at?: number;
+    }[]
+  ): { listActive: () => ReadonlyArray<NonNullable<ReturnType<typeof readGrant>>> } | null {
+    if (snapshots.length === 0) return { listActive: () => [] };
+    const list = snapshots.map(readGrant);
+    return { listActive: () => list };
+  }
+
+  function readGrant(s: {
+    id: string;
+    scope_kind?: 'pattern' | 'capability';
+    scope_value: string;
+    capability: string;
+    expires_at?: number;
+  }) {
+    return {
+      id: s.id,
+      scope_kind: s.scope_kind ?? 'pattern',
+      scope_value: s.scope_value,
+      capability: s.capability,
+      expires_at: s.expires_at ?? 9_999_999_999_999,
+    };
+  }
+
+  test('bash: grant pattern matches → allow with grant attribution + ttlExpiresAt', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: {} } }), {
+      cwd: CWD,
+      grants: fixedGrants([
+        {
+          id: '01JN0000000000000000000001',
+          scope_value: 'git status*',
+          capability: 'exec:shell',
+          expires_at: 1_700_000_000_000,
+        },
+      ]),
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status -s' });
+    expect(d.kind).toBe('allow');
+    expect(d.source?.layer).toBe('session');
+    expect(d.source?.section).toBe('grants');
+    expect(d.source?.rule).toBe('01JN0000000000000000000001');
+    expect(d.ttlExpiresAt).toBe(1_700_000_000_000);
+  });
+
+  test('read_file: grant pattern matches path → allow with grant attribution', () => {
+    const eng = createPermissionEngine(policy({ tools: { read_file: {} } }), {
+      cwd: CWD,
+      grants: fixedGrants([
+        {
+          id: '01JN0000000000000000000002',
+          scope_value: 'src/**',
+          capability: 'read-fs:src/**',
+        },
+      ]),
+    });
+    const d = eng.check('read_file', 'fs.read', { file_path: 'src/index.ts' });
+    expect(d.kind).toBe('allow');
+    expect(d.source?.rule).toBe('01JN0000000000000000000002');
+    expect(d.source?.section).toBe('grants');
+  });
+
+  test('fetch_url: grant pattern matches host → allow with grant attribution', () => {
+    const eng = createPermissionEngine(policy({ tools: { fetch_url: {} } }), {
+      cwd: CWD,
+      grants: fixedGrants([
+        {
+          id: '01JN0000000000000000000003',
+          scope_value: 'api.example.com',
+          capability: 'net-egress:api.example.com',
+        },
+      ]),
+    });
+    const d = eng.check('fetch_url', 'web.fetch', {
+      url: 'https://api.example.com/data',
+    });
+    expect(d.kind).toBe('allow');
+    expect(d.source?.rule).toBe('01JN0000000000000000000003');
+    expect(d.source?.section).toBe('grants');
+  });
+
+  test('deny rule wins over grant — deny is non-overridable', () => {
+    // Operator can never use a grant to bypass a deny. Slice 40
+    // explicitly orders deny BEFORE the grant check for this reason.
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
+      cwd: CWD,
+      grants: fixedGrants([
+        {
+          id: '01JN0000000000000000000004',
+          scope_value: '*',
+          capability: 'exec:shell',
+        },
+      ]),
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(d.kind).toBe('deny');
+    expect(d.source?.rule).toBe('rm -rf *');
+    // ttlExpiresAt MUST NOT be set on a deny decision — only grant
+    // decisions carry it.
+    expect(d.ttlExpiresAt).toBeUndefined();
+  });
+
+  test('wrong-capability grant does NOT authorize the call', () => {
+    // A read-fs grant must not authorize a write_file call.
+    // grantRelevantForSection filters by capability kind prefix.
+    const eng = createPermissionEngine(policy({ tools: { write_file: {} } }), {
+      cwd: CWD,
+      grants: fixedGrants([
+        {
+          id: '01JN0000000000000000000005',
+          scope_value: 'src/**',
+          capability: 'read-fs:src/**', // read-only → not write_file
+        },
+      ]),
+    });
+    const d = eng.check('write_file', 'fs.write', { file_path: 'src/foo.ts' });
+    expect(d.kind).toBe('deny');
+  });
+
+  test('empty grants list → default policy chain unchanged', () => {
+    // Engines with `grants: { listActive: () => [] }` behave
+    // identically to engines without `grants` at all. Regression
+    // guard for the slice-40 integration's no-op-when-empty path.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+      grants: fixedGrants([]),
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('allow');
+    expect(d.source?.rule).toBe('ls *');
+    expect(d.source?.section).toBe('bash');
+  });
+
+  test('grant snapshot is sampled per-check (revocation visible on next call)', () => {
+    // listActive is called on EVERY check, so revoking a grant
+    // mid-session takes effect on the next tool call. Tests this
+    // by mutating the underlying array between two checks.
+    const grants: Parameters<typeof readGrant>[0][] = [
+      {
+        id: '01JN0000000000000000000006',
+        scope_value: 'ls*',
+        capability: 'exec:shell',
+      },
+    ];
+    const eng = createPermissionEngine(policy({ tools: { bash: {} } }), {
+      cwd: CWD,
+      grants: { listActive: () => grants.map(readGrant) },
+    });
+    const first = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(first.kind).toBe('allow');
+    // Revoke by clearing the array — next check sees an empty
+    // snapshot.
+    grants.length = 0;
+    const second = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(second.kind).toBe('deny');
+  });
+
+  test('reason_chain.stage is "grant-match" when a grant authorized the call', () => {
+    // Audit forensics: the chain MUST distinguish a persisted-grant
+    // match from a transient session-allow (both carry layer='session',
+    // but only grants carry section='grants').
+    const captured: Array<{ reason_chain: ReadonlyArray<{ stage: string }> }> = [];
+    const sink = {
+      emit: (input: { reason_chain: ReadonlyArray<{ stage: string }> }) => {
+        captured.push({ reason_chain: input.reason_chain });
+        return { seq: captured.length, this_hash: `fake-${captured.length}` };
+      },
+      verifyChain: () => ({
+        ok: true as const,
+        rows: captured.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      }),
+    };
+    const eng = createPermissionEngine(policy({ tools: { bash: {} } }), {
+      cwd: CWD,
+      // biome-ignore lint/suspicious/noExplicitAny: stub captures input subset
+      audit: sink as any,
+      grants: fixedGrants([
+        { id: '01JN0000000000000000000007', scope_value: 'pwd', capability: 'exec:shell' },
+      ]),
+    });
+    eng.check('bash', 'bash', { command: 'pwd' });
+    expect(captured.length).toBe(1);
+    expect(captured[0]?.reason_chain[0]?.stage).toBe('grant-match');
+  });
+});

@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 40: §8 grants — engine integration (pattern scope)
+
+**Done.** Fortieth slice. Second slice on the §8 grants thread (slice 39 landed the storage foundation). Wires the engine to consult persisted grants during `check()`: a pattern grant covering the (capability-kind, target) tuple authorizes the call, short-circuiting AFTER policy deny but BEFORE the in-memory session-allow path. Grant attribution lands in `Decision.source` + `Decision.ttlExpiresAt`; audit row's `ttl_expires_at` column gets populated; reason chain stage becomes `'grant-match'` (distinct from `'session-allow'` for forensic clarity).
+
+Scope kind covered: **pattern only**. Capability-scope grants (where `scope_kind='capability'` and `scope_value` is itself a capability-string) are a follow-up. The pattern flavor is what the modal layer will produce most often (the operator answers "yes for: <pattern>"), so this slice unblocks the common path.
+
+### Why this matters
+
+Slice 39 shipped the grants table and repo but nothing consumed them. Operators inserting grants directly via SQL would have a persisted record with no effect on engine decisions. Slice 40 makes grants load-bearing: a row in the table actually authorizes tool calls until it expires or is revoked. Together slices 39+40 implement the bulk of §8 — the modal bridge (slice 41+) and CLI surface (slice 42+) build on this foundation.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | `DecisionBase` gets `ttlExpiresAt?: number`. Set when the Decision was produced by a grant match; undefined for non-grant decisions. Flows through to the audit row's `ttl_expires_at` column. |
+| `src/permissions/engine.ts` | New `GrantSnapshot` interface (minimal subset of `GrantRow` — id, scope_kind, scope_value, capability, expires_at). New `EngineOptions.grants?: { listActive: (snapshotTs: number) => readonly GrantSnapshot[] }`. New helpers `grantRelevantForSection` (per-tool capability-kind filter) and `firstMatchingGrant` (per-section scope_value matcher using `matchCommand` / `matchHost` / `matchPath` from `matcher.ts`). Each `checkX` (bash, path, fetch) gets a new `activeGrants` parameter and consults grants between the deny check and the session-allow check. On match: returns `kind='allow'` with `source={ layer: 'session', section: 'grants', rule: grant.id }` and `ttlExpiresAt: grant.expires_at`. Path branch preserves the §11 protected-tier escalate (grant on `/etc/...` still upgrades to confirm). `engine.check()` samples `options.grants?.listActive(Date.now())` once per call and threads the snapshot to the relevant `checkX`. `reasonChainFor` infers a `'grant-match'` stage from `section='grants'` (placed before the generic session-allow inference). `emitAudit`'s `AuditEmitInput` now includes `ttl_expires_at: decision.ttlExpiresAt ?? null`. Imports `matchCommand` / `matchHost` / `matchPath` (additions to the existing matcher import). |
+| `tests/permissions/engine.test.ts` | New describe `engine.check — §8 grants (slice 40)` with 8 tests: bash/read_file/fetch_url match with grant attribution + ttlExpiresAt; deny rule wins over grant; wrong-capability-kind grant doesn't authorize (read-fs grant rejected on write_file); empty grants list ≡ no grants option (no-op no behavior change); revoked-mid-session visible on next check (mutates the array between two check calls); audit reason_chain stage is `'grant-match'` (verified via a capturing sink). |
+
+### Decisions
+
+- **Pattern scope only this slice; capability scope deferred.** Spec §8 lists both `pattern:<glob>` and `capability:<cap>+<scope>` as persisted scope kinds. The pattern flavor matches the modal's natural output (operator types "yes for: <pattern>"). Capability scope requires the slice 9 `capabilityCovers` machinery against the resolved caps at check time — a bigger refactor (checkX doesn't currently see the resolved capabilities). Splitting keeps slice 40 reviewable.
+- **Grant lookup runs AFTER deny, BEFORE session-allow.** Deny is non-overridable (a grant must never bypass a security-policy deny — test 4 pins this). Session-allow is in-memory transient; persisted grants are the canonical record, so they take precedence in attribution (a session-allow re-grant of an already-persisted grant produces no second source of authority). Same order as session-allow vs base allow: short-circuit on match.
+- **Per-section capability-kind filter (`grantRelevantForSection`).** A `read-fs:src/**` grant authorizes read_file/glob/grep but NOT write_file (write_file emits write-fs, not just read-fs). Test 5 pins this — without the filter, a read-only grant would silently authorize destructive writes that happen to match the same path glob. Conservative-by-default: bash grants must carry `exec:` prefix; path-read grants must carry `read-fs:`; path-write grants must carry `write-fs:`; fetch grants must carry `net-egress:`. Capability-scope grants (slice 41+) will use the full `capabilityCovers` primitive instead of prefix matching.
+- **`Decision.ttlExpiresAt` instead of threading through a side-channel.** Adding the field to DecisionBase keeps the data flow public: any consumer that has the Decision (audit emit, modal layer, replay tool, /perms why output) can read the expiry without a separate query. Mirrors the existing `sandboxProfile` pattern.
+- **Grant snapshot sampled per-check.** `engine.check()` calls `options.grants?.listActive(Date.now())` on EVERY tool call. Cost is dominated by the SQL query in production (~10µs typical with the `idx_grants_active` covering index). Benefit: a revocation lands on the next tool call without engine rebuild. Test 7 pins this — mutating the underlying array between two checks flips the decision from allow to deny.
+- **`section='grants'` attribution, not `layer='grant'`.** PolicyLayer is `'enterprise' | 'user' | 'project' | 'session' | 'default'`. Adding a new `'grant'` layer would ripple through every type and every test that asserts specific layers. Cheaper: keep `layer='session'` (grants are session-tier authority — operator-issued) and use `section='grants'` to distinguish from in-memory session-allow. `reasonChainFor` switches on `section==='grants'` to produce the dedicated `'grant-match'` stage.
+- **`reasonChainFor` infers the grant stage, no extra plumbing.** Initially I prototyped a separate `grantStageEntry` builder that engine.check would push via `extraStages`. Removed in favor of the inferred path — the Decision's `source.section='grants'` is already a sufficient signal, and adding a parallel mechanism just duplicates the source-of-truth.
+- **`AuditEmitInput.ttl_expires_at` populated unconditionally.** Pre-slice-40 the field was always defaulted to `null` at the sink. Now it carries the grant's `expires_at` on match, `null` otherwise. Forensically: a future replay can correlate `ttl_expires_at IS NOT NULL` with the `'grant-match'` reason-chain stage to reconstruct exactly which calls flowed through grants.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5433 pass / 10 skip / 0 fail** (5443 total across 251 files); 8 new engine tests on top of slice 39's 5425
+- `bun test tests/permissions/engine.test.ts` — 172 pass (164 prior + 8 new)
+- All existing engine tests pass unchanged — grants integration is fully optional (engines without `options.grants` behave exactly as before)
+
+### Next
+
+§8 grants thread — remaining slices:
+1. **Modal bridge → `insertGrant`.** When the operator answers "Yes, don't ask again for: <pattern>" with a TTL choice (24h / 7d / 30d), the bridge calls `insertGrant` instead of (or alongside) the current in-memory `addSessionAllow`. Requires UX for TTL selection in the modal.
+2. **CLI surface**: `agent permission grants list` (active by default, `--all` for revoked/expired), `agent permission grants revoke <id> [--reason <text>]`. Read + revoke only; insertion goes through the modal.
+3. **Capability-scope grants**: `scope_kind='capability'` grants where `scope_value` is itself a capability-string. Engine consults `capabilityCovers(grant.scope_value, emitted_cap)` instead of glob matching. Requires plumbing the resolved capabilities into checkX.
+4. **TTL UX promotion**: spec §8 line 604 — "`once` é default sugerido pra primeira aprovação. UX promove pra `session` na N-ésima repetição da mesma capability+scope". Counter + threshold + promotion prompt.
+5. **ttl_expiry conformance (~6 cases)**: now buildable. Tests cover grant insertion + match + expiry + revocation. Builds on slice 40's engine integration.
+
+Non-grants successors: macOS sandbox-exec, MCP-tool spawn wire-up, §13 platform provisioning, §7.3 external sealing.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 39: §8 grants table — schema + repo + ULID generator (foundation)
 
 **Done.** Thirty-ninth slice. First slice on the §8 TTL/grants thread — the spec gap that's been deferred since slice 1. Pivots from sandbox-introspection (slices 23/34-38) to the §8 line item that blocks `ttl_expiry` conformance (~6 cases) and unblocks operator-facing `/perms list-grants` / `/perms revoke <id>` UX. This is a FOUNDATION slice: storage layer only (table + repo + ULID generator). Engine integration, CLI surface, and conformance cases follow in subsequent slices on this thread.
