@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 76: telemetry — scrubbing layer (§18 line 1205)
+
+**Done.** Seventy-sixth slice. Ships the telemetry scrubbing layer required by spec §18 line 1205 ("OTEL export com scrubbing"). `createScrubbingTelemetrySink(inner, options?)` wraps another sink and redacts likely-PII fields before forwarding — capability scopes (paths + hosts), the seal config path, and path-shaped substrings inside `state.transition.reason`. Closes the operator-side half of production-ready checklist line 1213; the OTEL adapter (next slice) completes the export side.
+
+### Why this matters
+
+Without scrubbing, raw events carry capability scopes that leak the operator's filesystem layout: `read-fs:/home/john/secrets.env`, `write-fs:/Users/jane/Projects/myapp/db.sqlite`. Net-egress capabilities leak internal infrastructure: `net-egress:internal.corp.example.com`. Seal paths leak the operator's audit-file location. State-transition reasons may interpolate error messages with paths. ANY of these reaching a shared OTEL backend would be a PII / infrastructure leak that the spec wants prevented at the engine boundary.
+
+The default policy (BOTH axes ON when wrapping with this sink) makes the safe choice the easy one. Operators who explicitly want raw events for a local-only dev loop simply don't wrap; production deployments wrap once and forget.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/scrubbing.ts` (new, ~175 lines) | `ScrubOptions` interface with `redactPaths?: boolean` and `redactHosts?: boolean` (both default true). `scrubEvent(event, options?)` — top-level dispatcher with exhaustive switch on `kind` (TS catches missing branches when new event types ship). Per-kind scrubbers: permission.decision maps `capabilities` through `scrubCapability` (recognizes `read-fs/write-fs/delete-fs/exec-fs/git-write` as path-scoped + `net-egress` as host-scoped); sealing.failure replaces `path` with `<path>`; state.transition runs `reason` through a conservative path regex (`\/[^\s'":\\]{2,}` — leading slash + ≥2 chars of non-whitespace/quote/colon); chain.verify_failed + classifier.unavailable pass through unchanged (only hashes / counts / enums). `createScrubbingTelemetrySink(inner, options?)` constructs the wrapper. |
+| `src/telemetry/index.ts` | Re-exports `createScrubbingTelemetrySink`, `scrubEvent`, `ScrubOptions`. |
+| `tests/telemetry/scrubbing.test.ts` (new, 19 tests) | **permission.decision (7):** FS scopes replaced; net scopes replaced; exec:shell + unknown kinds pass through; non-capability fields preserved; redactPaths=false leaves FS intact (hosts still scrubbed); redactHosts=false leaves nets intact; both off → identity. **sealing.failure (3):** path replaced; absent path preserved as undefined; redactPaths=false keeps path. **state.transition (3):** path-shaped substrings in reason → `<path>`; non-path reasons pass; redactPaths=false keeps paths. **chain.verify_failed + classifier.unavailable (2):** both pass through unchanged. **createScrubbingTelemetrySink (4):** wrap forwards every event through scrubEvent; inner.emit throwing propagates (no extra try/catch); options forward; default options scrub both. |
+
+### Decisions
+
+- **Default policy: BOTH axes ON.** Spec wording "OTEL export com scrubbing" implies opt-out, not opt-in. Operators who want raw events skip wrapping entirely; production wraps once with defaults and gets safe-by-default behavior.
+- **Placeholder strings (`<path>`, `<host>`), not hashes.** Operators querying metric streams don't need to recover the original value — the audit log has it for forensic analysis. A hash would let metric values be joined retrospectively across runs (`sha256:abc` always means the same path), which is mild metadata leakage. Plain placeholders surrender that join-by-hash capability deliberately.
+- **Per-kind exhaustive switch in `scrubEvent`.** TypeScript surfaces missing cases when the `TelemetryEvent` union grows. New event types added in future slices will fail typecheck until they get an explicit branch — caught by the same mechanism as the audit row's `decision` enum.
+- **Capability kind detection by string prefix, not regex.** `cap.indexOf(':')` + `cap.slice(0, colonIdx)` is faster + more predictable than a regex. The FS_KINDS / NET_KINDS sets enumerate the kinds the engine resolvers actually emit (read-fs, write-fs, delete-fs, exec-fs, git-write, net-egress); anything else (exec:shell, future kinds) passes through.
+- **Conservative path regex (`\/[^\s'":\\]{2,}`).** Matches paths starting with `/` followed by ≥2 chars of non-whitespace/non-quote/non-colon. Avoids over-redacting short tokens like `/` alone or `/x` in operator-readable text. Worst case: a missed redaction surfaces in a metric label; the audit log has unredacted text for forensics. Better than aggressive regex over-redacting structural text.
+- **`createScrubbingTelemetrySink` does NOT add its own try/catch.** Every emission site (slices 70-74) already wraps in try/catch. Adding another layer inside the wrapper would silently mask sink failures that operators would want surfaced via the existing try/catch's discard. The scrubbing layer is a transformer, not a fault barrier — the surrounding engine code is the fault barrier.
+- **No `redactReasons` separate axis.** Initial design considered it, rejected. Reason-string path-redaction is a derivative of `redactPaths` (the same regex matches paths regardless of context). Splitting into a separate axis would let operators redact capability paths while leaving reason paths exposed, which is incoherent. One axis per data category (path vs host) keeps semantics tight.
+- **`sealing.failure.path` redacted under `redactPaths` (not a separate axis).** The seal path IS a filesystem path; the same operator FS concern applies. Treating it differently would invite confusion.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5823 pass / 10 skip / 0 fail** (5833 total across 275 files); +19 tests on top of slice 75's 5804
+- `bun test tests/telemetry/scrubbing.test.ts` — 19 pass in ~26ms
+
+### Next
+
+§18 telemetry: 5 events + engine_state + scrubbing. One remaining piece:
+
+1. **OTEL adapter** — `src/telemetry/adapters/otel.ts`. Translates `TelemetryEvent[]` → OTLP metrics + spans. Adds `@opentelemetry/api` + `@opentelemetry/sdk-metrics` deps. Behind a feature flag (regulated deployments opt in). Production chain: bootstrap → scrubbing → OTEL.
+
+After the OTEL adapter, production-ready checklist line 1213 is fully satisfied. Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 75: telemetry — `engine_state` getter bridge (§18)
 
 **Done.** Seventy-fifth slice. Closes the `engine_state` field on `permission.decision` events that slice 70 left as optional / forward-compat. The audit sink now accepts an `engineState?: () => string` getter; the bootstrap plumbs `controller.get` through it. Every emitted `permission.decision` event carries the current engine state at emit time, letting OTEL consumers correlate decision outcomes with engine health (e.g., "every confirm-allowed happened while degraded — operator should fix the underlying subsystem").

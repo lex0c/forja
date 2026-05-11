@@ -245,3 +245,6 @@ export const createRecordingTelemetrySink = (): RecordingTelemetrySink => {
     },
   };
 };
+
+export type { ScrubOptions } from './scrubbing.ts';
+export { createScrubbingTelemetrySink, scrubEvent } from './scrubbing.ts';
