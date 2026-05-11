@@ -200,6 +200,24 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'diff') {
+        // Both seqs validated at parse time. Defensive re-parse
+        // keeps the runtime handler's contract tight when a
+        // programmatic caller bypasses the CLI.
+        const seq1 = Number.parseInt(args.permission.positionals[0] ?? '0', 10);
+        const seq2 = Number.parseInt(args.permission.positionals[1] ?? '0', 10);
+        const { runPermissionDiff } = await import('./permission-diff.ts');
+        return await runPermissionDiff({
+          seq1,
+          seq2,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       if (args.permission.verb === 'replay') {
         // <seq> positional + numeric range are enforced at parse time.
         // The handler re-parses defensively in case a programmatic

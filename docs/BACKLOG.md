@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 17: `agent permission diff <s1> <s2>` (§17 cross-row)
+
+**Done.** Seventeenth slice of the v2 evolution. Closes §17 with the cross-row comparison verb: `agent permission diff <seq1> <seq2>` renders two audit rows side-by-side with field-by-field diff markers, capabilities set diff, and score-components deltas. Read-only — every input the analysis needs is already columns on the rows. No re-execution: §17's three replay modes (slice 12 default, slice 14 `--without-classifier`, slice 16 `--against-current-policy`) own the re-execution surface.
+
+### Use cases
+
+- **Calibration**: "score deu 0.4 mas humano clicou deny — qual feature mudou entre essa row e a anterior?". The score-components delta surfaces exactly which features differ.
+- **Policy review**: "duas chamadas similares, decisões diferentes — qual rule fired?". Field diff + capabilities set diff + reason-chain fingerprint (visible via policy_hash + decision side by side).
+- **Forensic triage**: two suspicious decisions in a short window — show what changed without piping through `jq`.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | `diff` joins `KNOWN_PERMISSION_VERBS`. Parser accepts exactly two positionals, validates each via `^\d+$` + `Number.isSafeInteger` + `> 0`. Distinct seqs NOT enforced (diffing a row against itself is harmless — all fields show ✓ same, useful as a sanity check). |
+| `src/cli/permission-diff.ts` (new) | `runPermissionDiff({ seq1, seq2, json, env, dbPath, out, err })`. Reads both rows; refuses cross-install (forensic-data leak defense, same shape as replay). Builds three diff structs: `fieldDiffs` (scalar columns side-by-side with same/different markers), `CapabilitiesDiff` (only-in-1 / only-in-2 / common as set ops), `ScoreComponentsDiff` (only-in-1 / only-in-2 / shared-with-deltas). Text render aligns columns with truncation at 40 chars per side; JSON render embeds all three diff structs as sub-objects of `diff`. |
+| `src/cli/run.ts` | Dispatch branch for `verb='diff'` — parses both validated seqs from positionals (defensive re-parse), delegates to `runPermissionDiff`. |
+| `tests/cli/permission-diff.test.ts` (new) | 14 tests — parse (two seqs flow, missing/single/triple positionals rejected, non-numeric, zero, --json toggle) + integration (identical rows show only ✓ same; different decisions surface ⚠ on decision; capabilities set diff renders only/common; score_components diff renders deltas; missing row → exit 1 not_found; cross-install refuse; JSON shape with structured rows + diff sub-object). |
+
+### Decisions
+
+- **No re-execution.** Diff is rendering of stored data. Re-execution belongs to the three replay modes; conflating it here would either duplicate logic or force replay to subsume diff (and `permission diff` becomes a wrapper around two `permission replay` calls). Keeping them distinct verbs matches spec §17 phrasing and keeps each surface small.
+- **Set semantics for capabilities, not array.** Resolvers emit capabilities in canonical order; identical lists already render byte-equal. But when two rows have different ORDER of the same set (resolver internals changed across versions), set semantics give the right answer ("same capabilities, different order ≠ different capabilities"). The implementation uses `Set` over the parsed arrays.
+- **`only_in_seq1` / `only_in_seq2` for capability sides, not `added`/`removed`.** The diff is symmetric — there's no "before/after" semantics implied. Operator labels are explicit about WHICH seq carries what; the directional metaphor ("removed") would invite confusion when seq1 isn't necessarily the "older" row.
+- **Score-components shared with same value → omitted from `deltas`.** Only changed values land in the deltas map. Operator scanning a 20-feature score (slice 4) sees just what moved, not a wall of `feature: +0.40 → +0.40 (Δ +0.00)` noise.
+- **Field render truncates each side to 40 chars.** Long policy hashes (`sha256:abc...64chars`) would push the comparison marker off a standard 80-col terminal. Truncation keeps the line scannable; full values are available via `--json`.
+- **Cross-install refusal at parse time of the rows, NOT at install_id resolution.** Both rows are checked individually: a diff against rows from two different installs (rare but possible during a DB restore) refuses with the SPECIFIC seq that mismatched, not a vague "wrong install". Operator can immediately tell which row to investigate.
+
+### §17 closure
+
+The replay surface now matches the spec example output verbatim (`agent permission replay <id>`, `replay <id> --against-current-policy`, `replay <id> --without-classifier`, `diff <id1> <id2>`). The only piece of §17 still on the roadmap is ULID-shaped public ids (`ap_01H3K5...`) — current implementation uses `seq` (locally unique). That's a parallel-design task (column add + emit-path change + parser sync) and lands when external ULID referencing matters.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5226 pass / 10 skip / 0 fail** (5236 total across 247 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+2. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+3. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+4. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
+5. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+6. ULID-shaped public approval ids (parallel-design task; surface change spanning every replay/diff endpoint).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 16: replay `--against-current-policy` (§17)
 
 **Done.** Sixteenth slice of the v2 evolution. Third of the three §17 replay modes lands: `agent permission replay <seq> --against-current-policy` re-executes the full decision pipeline against the ACTIVE policy using the row's raw args (recovered via slice 15's `approval_call_links` + `tool_calls.input`), and reports whether the active policy would gate the same call differently.

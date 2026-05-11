@@ -455,15 +455,19 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 //   rotate-chain  — archive + start a fresh chain (§7.2).
 //   replay        — render every input the engine saw for a past
 //                   decision identified by its seq, flag policy
-//                   drift (§17). Slice 12 ships default mode only;
-//                   --against-current-policy / --without-classifier
-//                   / `permission diff` land in successor slices.
+//                   drift (§17). Default mode (slice 12),
+//                   --without-classifier (slice 14),
+//                   --against-current-policy (slice 16) all routed
+//                   here.
+//   diff          — cross-row comparison of two audit rows by seq.
+//                   Renders field-by-field diff + capabilities set
+//                   diff + score-components deltas (§17 cross-row).
 //
 // Future verbs (each lands in its own slice):
 //   revoke   — drop a session/pattern grant
 //   list     — show approvals log entries
 //   test     — run conformance suite
-const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain', 'replay'] as const;
+const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain', 'replay', 'diff'] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
@@ -578,6 +582,34 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ok: false,
         message: `agent permission replay: <seq> out of range (got ${raw})`,
       };
+    }
+  }
+  if (verb === 'diff') {
+    // Two seqs required, same validation as the replay positional —
+    // tight contract on the runtime handler. Distinct seqs are NOT
+    // enforced at parse: comparing a row to itself is harmless (all
+    // fields show ✓ same) and operationally useful as a sanity check.
+    if (positionals.length !== 2) {
+      return {
+        ok: false,
+        message:
+          'agent permission diff: exactly two <seq> positionals are required (e.g. `agent permission diff 42 43`)',
+      };
+    }
+    for (const raw of positionals) {
+      if (!/^\d+$/.test(raw)) {
+        return {
+          ok: false,
+          message: `agent permission diff: <seq> must be a positive integer (got '${raw}')`,
+        };
+      }
+      const seq = Number.parseInt(raw, 10);
+      if (seq <= 0 || !Number.isSafeInteger(seq)) {
+        return {
+          ok: false,
+          message: `agent permission diff: <seq> out of range (got ${raw})`,
+        };
+      }
     }
   }
   return {
