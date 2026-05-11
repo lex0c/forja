@@ -142,6 +142,7 @@ export type { PolicyWatcher, WatchAndReloadOptions } from './policy-watcher.ts';
 export { watchAndReload } from './policy-watcher.ts';
 
 export type {
+  CreateGitAnchoredSealerOptions,
   CreateWormFileSealerOptions,
   SealAppendResult,
   SealEntry,
@@ -149,8 +150,11 @@ export type {
   VerifySealResult,
 } from './sealing.ts';
 export {
+  createGitAnchoredSealer,
   createWormFileSealer,
+  defaultGitAnchoredFactory,
   defaultWormFileFactory,
+  factoryForSealMode,
   verifySealAgainstChain,
 } from './sealing.ts';
 

@@ -272,12 +272,25 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
     );
   });
 
+  test('mode=git-anchored requires path (slice 63)', () => {
+    expect(() => parsePolicy({ seal: { mode: 'git-anchored' } })).toThrow(
+      'seal.path is required when seal.mode is git-anchored',
+    );
+  });
+
+  test('mode=git-anchored with path parses cleanly', () => {
+    const p = parsePolicy({ seal: { mode: 'git-anchored', path: '/var/audit/seal-repo' } });
+    expect(p.seal).toEqual({ mode: 'git-anchored', path: '/var/audit/seal-repo' });
+  });
+
   test('mode=none does NOT require path', () => {
     expect(() => parsePolicy({ seal: { mode: 'none' } })).not.toThrow();
   });
 
   test('reserved modes get a specific "not yet implemented" error', () => {
-    for (const mode of ['s3-object-lock', 'rfc3161-tsa', 'git-anchored']) {
+    // git-anchored shipped in slice 63; only s3-object-lock and
+    // rfc3161-tsa remain reserved.
+    for (const mode of ['s3-object-lock', 'rfc3161-tsa']) {
       expect(() => parsePolicy({ seal: { mode } })).toThrow(
         `seal.mode='${mode}' is reserved for a future slice`,
       );

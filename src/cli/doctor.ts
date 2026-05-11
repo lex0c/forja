@@ -36,9 +36,9 @@ import {
   type SealStore,
   type VerifyResult,
   createSqliteSink,
-  createWormFileSealer,
   detectSandboxAvailability,
   ensureInstallId,
+  factoryForSealMode,
   resolvePolicy,
 } from '../permissions/index.ts';
 import { installIdPath } from '../permissions/paths.ts';
@@ -469,70 +469,74 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
     };
   }
 
-  if (sealConfig.mode === 'worm-file') {
-    if (sealConfig.path === undefined) {
-      // parsePolicy enforces this; unreachable in well-formed input.
-      return {
-        name: 'sealing',
-        status: 'fail',
-        detail: "worm-file mode missing 'path' field",
-        remediation: "add 'path: /var/log/agent/seal.log' to the seal section",
-      };
-    }
-    const factory =
-      options.sealStoreFactory ?? ((c: SealPolicy) => createWormFileSealer({ path: c.path ?? '' }));
-    let store: SealStore;
-    try {
-      store = factory(sealConfig);
-    } catch (e) {
-      return {
-        name: 'sealing',
-        status: 'fail',
-        detail: `factory failed: ${(e as Error).message}`,
-      };
-    }
-    let entries: readonly { seq: number; ts: number; hash: string }[];
-    try {
-      entries = store.list();
-    } catch (e) {
-      // Malformed seal file — strong tampering signal.
-      return {
-        name: 'sealing',
-        status: 'fail',
-        detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
-        remediation: 'inspect the file; run `agent permission seal-verify` for chain cross-check',
-      };
-    }
-    if (entries.length === 0) {
-      return {
-        name: 'sealing',
-        status: 'warn',
-        detail: `worm-file at ${sealConfig.path}: configured but no entries yet`,
-        remediation:
-          'the engine seals automatically per interval; run `agent permission seal-now` to force one',
-      };
-    }
-    const last = entries[entries.length - 1];
-    if (last === undefined) {
-      // Defensive; unreachable since entries.length > 0.
-      return { name: 'sealing', status: 'fail', detail: 'list returned a missing tail entry' };
-    }
-    const relTime = formatRelativeTime(last.ts, options.now());
-    const entryWord = entries.length === 1 ? 'entry' : 'entries';
+  // Backend dispatch via the shared `factoryForSealMode` helper —
+  // worm-file (slice 60) + git-anchored (slice 63) supported. The
+  // list()-only read path doesn't trigger backend side effects
+  // (chattr / git commit) — doctor reads the seal entries without
+  // touching the underlying store.
+  if (sealConfig.path === undefined) {
+    // parsePolicy enforces this for file-backed modes; unreachable
+    // in well-formed input.
     return {
       name: 'sealing',
-      status: 'ok',
-      detail: `worm-file at ${sealConfig.path}: ${entries.length} ${entryWord}, last ${relTime}`,
+      status: 'fail',
+      detail: `${sealConfig.mode} mode missing 'path' field`,
+      remediation: "add 'path: <seal-file-or-repo>' to the seal section",
     };
   }
-
-  // Defensive — parsePolicy rejects reserved modes; this only fires
-  // if a future schema accepts a new mode before the dispatch is
-  // updated.
+  const factory = options.sealStoreFactory ?? factoryForSealMode(sealConfig.mode);
+  if (factory === null) {
+    // Defensive — parsePolicy rejects unknown modes; this only
+    // fires if a future schema accepts a new mode before the
+    // dispatcher is updated.
+    return {
+      name: 'sealing',
+      status: 'warn',
+      detail: `mode '${sealConfig.mode}' has no doctor check wired yet`,
+    };
+  }
+  let store: SealStore;
+  try {
+    store = factory(sealConfig);
+  } catch (e) {
+    return {
+      name: 'sealing',
+      status: 'fail',
+      detail: `factory failed: ${(e as Error).message}`,
+    };
+  }
+  let entries: readonly { seq: number; ts: number; hash: string }[];
+  try {
+    entries = store.list();
+  } catch (e) {
+    // Malformed seal file — strong tampering signal.
+    return {
+      name: 'sealing',
+      status: 'fail',
+      detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
+      remediation: 'inspect the file; run `agent permission seal-verify` for chain cross-check',
+    };
+  }
+  if (entries.length === 0) {
+    return {
+      name: 'sealing',
+      status: 'warn',
+      detail: `${sealConfig.mode} at ${sealConfig.path}: configured but no entries yet`,
+      remediation:
+        'the engine seals automatically per interval; run `agent permission seal-now` to force one',
+    };
+  }
+  const last = entries[entries.length - 1];
+  if (last === undefined) {
+    // Defensive; unreachable since entries.length > 0.
+    return { name: 'sealing', status: 'fail', detail: 'list returned a missing tail entry' };
+  }
+  const relTime = formatRelativeTime(last.ts, options.now());
+  const entryWord = entries.length === 1 ? 'entry' : 'entries';
   return {
     name: 'sealing',
-    status: 'warn',
-    detail: `mode '${sealConfig.mode}' has no doctor check wired yet`,
+    status: 'ok',
+    detail: `${sealConfig.mode} at ${sealConfig.path}: ${entries.length} ${entryWord}, last ${relTime}`,
   };
 };
 

@@ -20,8 +20,8 @@ import {
   type SealEntry,
   type SealPolicy,
   type SealStore,
-  defaultWormFileFactory,
   ensureInstallId,
+  factoryForSealMode,
 } from '../permissions/index.ts';
 import { resolvePolicy } from '../permissions/index.ts';
 import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
@@ -105,14 +105,14 @@ export const runPermissionSealNow = async (
     return 1;
   }
 
-  // Branch per backend. Only worm-file in slice 58; future modes
-  // (s3-object-lock, rfc3161-tsa, git-anchored) add cases here.
+  // Backend dispatch via the shared `factoryForSealMode` helper —
+  // worm-file (slice 58) and git-anchored (slice 63) supported.
+  // Future modes (s3-object-lock, rfc3161-tsa) light up by adding
+  // a branch in `factoryForSealMode` + a `defaultXFactory` export.
   let store: SealStore;
   try {
-    if (sealConfig.mode === 'worm-file') {
-      const factory = options.sealStoreFactory ?? defaultWormFileFactory;
-      store = factory(sealConfig);
-    } else {
+    const factory = options.sealStoreFactory ?? factoryForSealMode(sealConfig.mode);
+    if (factory === null) {
       // Defensive — parsePolicy rejects reserved modes; this only
       // fires if a future schema accepts a new mode before the
       // dispatch is updated.
@@ -123,6 +123,7 @@ export const runPermissionSealNow = async (
       }
       return 1;
     }
+    store = factory(sealConfig);
   } catch (e) {
     const reason = (e as Error).message;
     if (json) {

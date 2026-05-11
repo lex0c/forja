@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 63: `git-anchored` sealing backend (§7.3 second mode)
+
+**Done.** Sixty-third slice. Ships the second §7.3 sealing backend: `git-anchored`. Each `append` writes the entry to `<repoPath>/seal.log` (same wire format as worm-file) then runs `git add + git commit` so the seal is recorded as an immutable commit. Operators get append-only audit semantics via git's natural model — push to a protected remote (out-of-band) for external anchoring without the chattr / WORM-FS Linux dependencies.
+
+Also introduces `factoryForSealMode(mode)` as the single dispatcher consumed by `bootstrap-engine.ts`, `permission-seal-now.ts`, `permission-seal-verify.ts`, and `doctor.ts` — replaces the per-call-site `if (mode === 'worm-file') { factory = defaultWormFileFactory }` branches that would have multiplied as more backends ship.
+
+### Why this matters
+
+Worm-file (slice 54-58) satisfies the production-ready "≥ 1 backend" bar but bakes in two Linux dependencies — `chattr +a` (ext4-specific, root-required for CAP_LINUX_IMMUTABLE) and the WORM mount alternative. Cross-platform deployments (macOS, BSD, Windows-via-WSL) couldn't use sealing. `git-anchored` works wherever `git` is installed; the append-only semantics come from "commits are immutable + remote disallows force-push" instead of filesystem flags.
+
+The `factoryForSealMode` dispatcher is a small refactor that pays for itself THIS slice (four consumers consolidate their per-mode branches). Without it, every future backend (`s3-object-lock`, `rfc3161-tsa`) would multiply the duplication 4×.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | `SealMode` union grows: `'none' \| 'worm-file' \| 'git-anchored'`. SealPolicy docstring updated: `path` is polymorphic — worm-file uses it for the seal file path; git-anchored uses it for the repo directory. |
+| `src/permissions/config.ts` | `VALID_SEAL_MODES` adds `'git-anchored'`; `RESERVED_SEAL_MODES` drops it. `path` validation expanded to require it for `mode='worm-file'` OR `mode='git-anchored'`. |
+| `src/permissions/sealing.ts` | New `createGitAnchoredSealer({repoPath, sealFile?, exec?, exists?, read?, append?})`. Wire format byte-identical to worm-file (same `seq=<n>\tts=<n>\thash=<H>\n` lines), so `verifySealAgainstChain` works on either backend without dispatch. `append`: validate → write line → `git add <sealFile>` → `git commit -m "seal: seq=N hash=H"` (each failure surfaces with a backend-specific reason). `list`: same parser as worm-file. New `defaultGitAnchoredFactory(config)`: maps `config.path` → `repoPath`. New `factoryForSealMode(mode)`: dispatcher returning the matching default factory or `null`. |
+| `src/permissions/index.ts` | Re-exports `createGitAnchoredSealer`, `CreateGitAnchoredSealerOptions`, `defaultGitAnchoredFactory`, `factoryForSealMode`. |
+| `src/permissions/bootstrap-engine.ts` | Refactored to use `factoryForSealMode` — replaces the explicit `sealConfig.mode === 'worm-file'` branch with a mode-agnostic `sealConfig.mode !== 'none'` check + factory lookup. Defensive throw on unwired modes (parsePolicy rejects them upstream, so unreachable in well-formed input). |
+| `src/cli/permission-seal-now.ts` | Same refactor — `factoryForSealMode` replaces inline branch. The `unsupported_mode` JSON / stderr path stays for the unwired-mode case. |
+| `src/cli/permission-seal-verify.ts` | Same refactor + the `file: <path>` rendering generalized: worm-file shows `file: <path>`, git-anchored shows `repo: <path>` (polymorphic label per mode). |
+| `src/cli/doctor.ts` | `sealingCheck` refactored to mode-agnostic: dispatcher lookup, generic detail strings (`worm-file at <path>` / `git-anchored at <path>`). The "no doctor check wired yet" warn path stays for defensive coverage of future modes. |
+| `tests/permissions/sealing.test.ts` | (+13 tests across three describes.) `createGitAnchoredSealer — append` (6): entry line + git add/commit calls; custom sealFile flows to git add; invalid entry rejected with no git work; fs failure short-circuits before git; git add failure aborts before commit; git commit failure surfaces with reason. `createGitAnchoredSealer — list` (3): entries parse back in order; empty repo → []; malformed line throws. `defaultGitAnchoredFactory + factoryForSealMode` (3): default factory throws on missing path; default factory returns a SealStore shape; dispatcher returns the right function per mode + null for 'none'. `verifySealAgainstChain` (1) integration: 3-row chain + git-anchored sealer (with no-op `exec`) cross-verifies clean — wire-format-identical guarantee. |
+| `tests/permissions/config.test.ts` | (+2 tests.) `mode=git-anchored` requires path; `mode=git-anchored with path` parses cleanly. Updated `reserved modes get a specific error` to drop `git-anchored` (now valid). |
+
+### Decisions
+
+- **Wire format byte-identical between worm-file and git-anchored.** Same `seq=<n>\tts=<n>\thash=<H>\n` lines, same parser, same `verifySealAgainstChain`. The backend dimension is "how the file is made append-only" (chattr vs git commit), not "how entries are encoded". A future operator switching backends keeps their existing seal files readable.
+- **Per-entry commits, not batched.** Spec line 573 says "hash periódico commitado em repo separado" — "periodic" maps naturally to the scheduler's `interval_decisions` / `interval_seconds`. Per-entry commits give the operator one git commit per seal event, which is also one row per audit interval. `git log` becomes the seal trail directly readable by humans. Batched commits would amortize cost but obscure the timeline.
+- **No `push` step in slice 63.** Pushing to a remote on every append is the spec-recommended audit-grade configuration but adds network failure modes + credential management to the sealer. Operator pushes via cron or post-session hook (`git -C <repo> push`). Future slice can add a `push: true` opt-in field; for now, local commits are the contract.
+- **`config.path` polymorphic per mode, not a per-mode field.** Schema dimension stays flat (worm-file: `path: /var/log/agent/seal.log`; git-anchored: `path: /var/audit/seal-repo`). Different field names (`file_path` vs `repo_path`) would force operators to relearn the schema per backend; semantic overloading via `path` keeps YAML samples consistent. Backend-specific labels in CLI output disambiguate (`file: <path>` vs `repo: <path>` in seal-verify).
+- **`factoryForSealMode` returns `null` for `'none'`, not a sentinel factory.** Sealing being off is a distinct state from "configured but unknown mode" — null is the natural signal. Consumers check `if (factory === null)` and treat as "no factory" (which equals "sealing disabled" for none, and "unsupported_mode error" for an unwired future mode).
+- **`exec` test seam takes `(cmd, args, opts)` matching `execFileSync` shape.** Production: shells out to `/usr/bin/git`. Tests: capture into array, optionally `failGitAt('add' | 'commit', reason)` to simulate git failures at specific subcommands. Mirrors the chattr seam shape from worm-file's `onCreate`.
+- **No `git init` autorun.** Operator pre-initializes the repo. Auto-init would be surprising side effect (created `.git/` in a path the operator hadn't yet vetted) and would invite "engine accidentally clobbered my work tree" bug reports. The sealer fails loudly on first append when the repo isn't initialized (git add returns "not a git repository") and the failure routes through `onSealFailed` → state machine per `seal.on_failure`.
+- **doctor's sealingCheck reads via `list()` only — never triggers git work.** The store's `list()` reads the seal file directly from disk; no `exec` call. So doctor instantiates a git-anchored sealer safely without running `git add` / `commit` (which would fail anyway in a read-only health check). Mode-agnostic by construction.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5707 pass / 10 skip / 0 fail** (5717 total across 266 files); +15 tests on top of slice 62's 5692 (13 sealing primitive + 2 config parse)
+- `bun test tests/permissions/sealing.test.ts` — 29 pass (was 16)
+- `bun test tests/permissions/config.test.ts` — 48 pass (was 46)
+
+### Next
+
+§7.3 backends: worm-file ✓, git-anchored ✓. Remaining: `s3-object-lock` (AWS SDK dep), `rfc3161-tsa` (ASN.1 TimeStampResp parsing — spec-recommended audit-grade). Each lights up by adding a `createXSealer` primitive + `defaultXFactory` + a branch in `factoryForSealMode`. The CLI verbs / bootstrap / doctor consumers need NO changes for additional backends now that the dispatcher is the single entry point.
+
+Other open work unchanged: §13.7 broker/worker (biggest remaining thread), §19 migration (premature for greenfield), §14 MCP (blocked), fuzz harness, telemetria. §16 conformance still at per-category-bar in all 11 categories.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 62: `forja doctor` hash_chain integrity check (§7.2 + §13.3 line 804)
 
 **Done.** Sixty-second slice. Closes another spec-canonical doctor line: hash chain integrity. Spec line 1212 marks `chain_verification_failures_total > 0 = P0`, so chain breaks are the highest-severity signal doctor surfaces. The check mirrors `agent permission verify` but renders one-line doctor-shaped output (`intact (5 rows)` / `BROKEN at seq 2: this_hash_mismatch`) instead of the verify command's full forensic dump.

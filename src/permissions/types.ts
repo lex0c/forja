@@ -98,16 +98,25 @@ export interface PolicySandbox {
 // hashes still leaves a trail.
 //
 // `mode`:
-//   - 'none'      — default; no sealing. Local hash chain only.
-//   - 'worm-file' — append-only file (chattr +a on Linux / WORM mount).
-// Other §7.3 modes (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`)
-// are reserved for future slices; parsing rejects them now so a
-// typo or premature upgrade fails loudly instead of silently
-// falling back to `none`.
+//   - 'none'         — default; no sealing. Local hash chain only.
+//   - 'worm-file'    — append-only file (chattr +a on Linux / WORM mount).
+//   - 'git-anchored' — append to a file inside a git repo, commit
+//                      per entry (shipped in slice 63). Commits
+//                      give append-only semantics + a forensic log
+//                      via `git log`. Operator pushes to a remote
+//                      out-of-band for additional anchoring.
+// Other §7.3 modes (`s3-object-lock`, `rfc3161-tsa`) are reserved
+// for future slices; parsing rejects them now so a typo or
+// premature upgrade fails loudly instead of silently falling back
+// to `none`.
 //
-// `path` (required when mode='worm-file') — absolute path to the
-// seal file. The bootstrap creates the file on first append and
-// invokes `chattr +a` via the SealStore's `onCreate` hook.
+// `path` (required when mode='worm-file' or 'git-anchored'):
+//   - worm-file:    absolute path to the seal file. The bootstrap
+//                   creates the file on first append and invokes
+//                   `chattr +a` via the SealStore's `onCreate` hook.
+//   - git-anchored: absolute path to a pre-initialized git repo
+//                   directory. The sealer writes `seal.log` inside
+//                   it and commits per append.
 //
 // `interval_decisions` (default 100) — fire a seal every N audit
 // decisions. Set to 0 to disable decision-driven sealing (only the
@@ -129,7 +138,7 @@ export interface PolicySandbox {
 // `seal` defines the entire config. No partial merge across layers
 // (a mixed config — enterprise sets mode, user sets interval — is
 // usually a mistake; "all-or-nothing" makes intent obvious).
-export type SealMode = 'none' | 'worm-file';
+export type SealMode = 'none' | 'worm-file' | 'git-anchored';
 export type SealOnFailure = 'degrade' | 'refuse';
 
 export interface SealPolicy {

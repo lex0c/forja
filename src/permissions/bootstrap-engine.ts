@@ -40,7 +40,7 @@ import {
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
 import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
-import { type SealStore, defaultWormFileFactory } from './sealing.ts';
+import { type SealStore, factoryForSealMode } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
 import type { Policy, SealPolicy } from './types.ts';
 
@@ -496,8 +496,16 @@ export const bootstrapPermissionEngine = async (
   let sealStore: SealStore | undefined;
   let sealingScheduler: SealingScheduler | undefined;
   const sealConfig = resolveResult.policy.seal;
-  if (sealConfig !== undefined && sealConfig.mode === 'worm-file' && archiveState !== 'refusing') {
-    const factory = input.sealStoreFactory ?? defaultWormFileFactory;
+  if (sealConfig !== undefined && sealConfig.mode !== 'none' && archiveState !== 'refusing') {
+    const factory = input.sealStoreFactory ?? factoryForSealMode(sealConfig.mode);
+    if (factory === null) {
+      // Unreachable in well-formed input — parsePolicy rejects
+      // unknown modes. Defensive guard for a future schema that
+      // accepts a mode before this branch knows about it.
+      throw new Error(
+        `bootstrapPermissionEngine: no factory wired for seal.mode='${sealConfig.mode}'`,
+      );
+    }
     sealStore = factory(sealConfig);
     const onFailure: SealOnFailureLocal = sealConfig.on_failure ?? 'degrade';
     sealingScheduler = createSealingScheduler({

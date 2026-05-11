@@ -17,8 +17,8 @@ import {
   type SealPolicy,
   type SealStore,
   type VerifySealResult,
-  defaultWormFileFactory,
   ensureInstallId,
+  factoryForSealMode,
   verifySealAgainstChain,
 } from '../permissions/index.ts';
 import { resolvePolicy } from '../permissions/index.ts';
@@ -92,10 +92,8 @@ export const runPermissionSealVerify = async (
 
   let store: SealStore;
   try {
-    if (sealConfig.mode === 'worm-file') {
-      const factory = options.sealStoreFactory ?? defaultWormFileFactory;
-      store = factory(sealConfig);
-    } else {
+    const factory = options.sealStoreFactory ?? factoryForSealMode(sealConfig.mode);
+    if (factory === null) {
       if (json) {
         out(`${JSON.stringify({ ok: false, error: 'unsupported_mode', mode: sealConfig.mode })}\n`);
       } else {
@@ -103,6 +101,7 @@ export const runPermissionSealVerify = async (
       }
       return 1;
     }
+    store = factory(sealConfig);
   } catch (e) {
     const reason = (e as Error).message;
     if (json) {
@@ -141,8 +140,9 @@ export const runPermissionSealVerify = async (
         result.entriesChecked === 1 ? 'y' : 'ies'
       } cross-checked, install_id=${identity.install_id})\n`,
     );
-    if (sealConfig.mode === 'worm-file' && sealConfig.path !== undefined) {
-      out(`  file: ${sealConfig.path}\n`);
+    if (sealConfig.path !== undefined) {
+      const label = sealConfig.mode === 'git-anchored' ? 'repo' : 'file';
+      out(`  ${label}: ${sealConfig.path}\n`);
     }
     if (result.entriesChecked === 0) {
       out('  note: no seal entries yet — the file is empty\n');
@@ -157,8 +157,9 @@ export const runPermissionSealVerify = async (
   if (result.firstMismatchAt !== undefined) {
     out(`  first mismatch at seq: ${result.firstMismatchAt}\n`);
   }
-  if (sealConfig.mode === 'worm-file' && sealConfig.path !== undefined) {
-    out(`  file: ${sealConfig.path}\n`);
+  if (sealConfig.path !== undefined) {
+    const label = sealConfig.mode === 'git-anchored' ? 'repo' : 'file';
+    out(`  ${label}: ${sealConfig.path}\n`);
   }
   out('\n');
   out('Investigate before continuing. Forensic options:\n');

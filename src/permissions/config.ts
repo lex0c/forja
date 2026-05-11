@@ -68,16 +68,14 @@ const enforceProtectedPathInvariants = (
 
 const VALID_MODES: ReadonlySet<string> = new Set(['strict', 'acceptEdits', 'bypass']);
 
-// §7.3 sealing modes. Currently 'none' (default) and 'worm-file'
-// (Linux ext4 + chattr +a). The other §7.3 backends ship in later
-// slices; listing them as RESERVED makes config errors specific
-// ("not yet implemented") rather than generic enum-mismatch.
-const VALID_SEAL_MODES: ReadonlySet<string> = new Set(['none', 'worm-file']);
-const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set([
-  's3-object-lock',
-  'rfc3161-tsa',
-  'git-anchored',
-]);
+// §7.3 sealing modes. Currently 'none' (default), 'worm-file'
+// (Linux ext4 + chattr +a, slice 54), 'git-anchored' (append to
+// file inside a git repo + commit per entry, slice 63). The
+// remaining §7.3 backends ship in later slices; listing them as
+// RESERVED makes config errors specific ("not yet implemented")
+// rather than generic enum-mismatch.
+const VALID_SEAL_MODES: ReadonlySet<string> = new Set(['none', 'worm-file', 'git-anchored']);
+const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set(['s3-object-lock', 'rfc3161-tsa']);
 const VALID_SEAL_ON_FAILURE: ReadonlySet<string> = new Set(['degrade', 'refuse']);
 
 const isStringArray = (v: unknown): v is string[] =>
@@ -302,8 +300,8 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       }
       path = s.path;
     }
-    if (mode === 'worm-file' && path === undefined) {
-      throw new Error('policy: seal.path is required when seal.mode is worm-file');
+    if ((mode === 'worm-file' || mode === 'git-anchored') && path === undefined) {
+      throw new Error(`policy: seal.path is required when seal.mode is ${mode}`);
     }
     let interval_decisions: number | undefined;
     if (s.interval_decisions !== undefined) {

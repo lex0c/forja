@@ -36,7 +36,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
-import type { SealPolicy } from './types.ts';
+import type { SealMode, SealPolicy } from './types.ts';
 
 export interface SealEntry {
   seq: number;
@@ -264,6 +264,158 @@ export const defaultWormFileFactory = (config: SealPolicy): SealStore => {
       execFileSync('/usr/bin/chattr', ['+a', p], { stdio: 'ignore' });
     },
   });
+};
+
+// §7.3 git-anchored backend (slice 63). Append-only by virtue of
+// git's commit semantics: each `append` writes the entry to a
+// designated file inside a pre-initialized git repository, then
+// runs `git add + git commit` so the seal entry is also recorded
+// as an immutable commit in the repo's history. An operator who
+// later pushes the repo to a remote (out-of-band — slice 63 keeps
+// it local) gets external anchoring without the chattr / WORM-FS
+// dependencies the worm-file backend requires.
+//
+// Threat model:
+//   - In-scope: silent edits to past seal entries. `git status`
+//     surfaces uncommitted modifications; `git log -p` shows the
+//     full history; `git reset --hard <earlier>` is detectable.
+//   - Out-of-scope: rewriting the repo's history (force-push,
+//     `git filter-branch`). Operator's responsibility to push to
+//     a protected remote that disallows force-push.
+//   - Out-of-scope: the repo dir being world-writable. Operator
+//     sets repo permissions; sealer doesn't enforce.
+//
+// Wire format is byte-identical to worm-file (same `seq=<n>\tts=<n>\thash=<H>\n`
+// lines), so verifySealAgainstChain works on either backend
+// without dispatch — the SealStore interface is the only seam.
+//
+// Test seams: `exec` (git invocations), `exists` / `read` /
+// `append` (fs). Production callers leave them undefined.
+
+export interface CreateGitAnchoredSealerOptions {
+  // Path to a pre-existing git repository directory. Initialization
+  // (`git init`, configuring user.name/email if needed) is the
+  // operator's responsibility — the sealer doesn't init repos
+  // because that would create surprising side effects if the path
+  // was wrong.
+  repoPath: string;
+  // Filename within the repo for seal entries. Default 'seal.log'.
+  // Operators with multi-engine deployments can use distinct names
+  // per install_id to avoid commit collisions.
+  sealFile?: string;
+  // Production: shells out to /usr/bin/git via execFileSync.
+  // Tests: capture-into-array stub so unit tests don't need a real
+  // repo. Throws on git failure; the sealer's catch translates to
+  // SealAppendResult.
+  exec?: (cmd: string, args: readonly string[], opts: { cwd: string }) => void;
+  exists?: (path: string) => boolean;
+  read?: (path: string) => string;
+  append?: (path: string, content: string) => void;
+}
+
+const defaultGitExec = (cmd: string, args: readonly string[], opts: { cwd: string }): void => {
+  execFileSync(cmd, args, { cwd: opts.cwd, stdio: 'ignore' });
+};
+
+export const createGitAnchoredSealer = (opts: CreateGitAnchoredSealerOptions): SealStore => {
+  const sealFile = opts.sealFile ?? 'seal.log';
+  const fullPath = `${opts.repoPath.replace(/\/+$/, '')}/${sealFile}`;
+  const exists = opts.exists ?? defaultExists;
+  const read = opts.read ?? defaultRead;
+  const append = opts.append ?? defaultAppend;
+  const exec = opts.exec ?? defaultGitExec;
+
+  return {
+    append: (entry: SealEntry): SealAppendResult => {
+      if (
+        !Number.isInteger(entry.seq) ||
+        entry.seq < 1 ||
+        !Number.isInteger(entry.ts) ||
+        entry.ts < 0 ||
+        typeof entry.hash !== 'string' ||
+        entry.hash.length === 0 ||
+        /\s/.test(entry.hash)
+      ) {
+        return { ok: false, reason: `invalid seal entry: ${JSON.stringify(entry)}` };
+      }
+      try {
+        append(fullPath, ENTRY_LINE(entry));
+      } catch (e) {
+        return {
+          ok: false,
+          reason: `append failed: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+      // git add + commit. We commit per seal entry — the operator's
+      // `interval_decisions` / `interval_seconds` controls cadence,
+      // so per-entry commits naturally match the spec's "periodic"
+      // wording. Commit message embeds seq + hash so `git log`
+      // alone is a human-readable seal trail.
+      try {
+        exec('git', ['add', sealFile], { cwd: opts.repoPath });
+      } catch (e) {
+        return {
+          ok: false,
+          reason: `git add failed: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+      try {
+        exec('git', ['commit', '-m', `seal: seq=${entry.seq} hash=${entry.hash}`], {
+          cwd: opts.repoPath,
+        });
+      } catch (e) {
+        return {
+          ok: false,
+          reason: `git commit failed: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+      return { ok: true };
+    },
+    list: (): readonly SealEntry[] => {
+      if (!exists(fullPath)) return [];
+      const content = read(fullPath);
+      if (content.length === 0) return [];
+      const lines = content.split('\n');
+      const out: SealEntry[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i] ?? '';
+        if (line.length === 0) continue;
+        const parsed = parseLine(line);
+        if (parsed === null) {
+          throw new Error(`malformed seal entry at line ${i + 1}: ${JSON.stringify(line)}`);
+        }
+        out.push(parsed);
+      }
+      return out;
+    },
+    close: (): void => {
+      // No-op for git-anchored. Reserved for future backends.
+    },
+  };
+};
+
+// Production default factory for git-anchored mode. Maps
+// `config.path` (semantically a repo directory) to the
+// `createGitAnchoredSealer` constructor's `repoPath` field. The
+// SealPolicy schema uses `path` polymorphically per backend
+// (worm-file: seal file; git-anchored: repo directory).
+export const defaultGitAnchoredFactory = (config: SealPolicy): SealStore => {
+  if (config.path === undefined) {
+    throw new Error('defaultGitAnchoredFactory: config.path is required for git-anchored mode');
+  }
+  return createGitAnchoredSealer({ repoPath: config.path });
+};
+
+// Dispatcher: returns the production-default factory for the given
+// mode, or null when no factory is wired yet. Consumers
+// (bootstrap, seal-now, seal-verify, doctor) call this to avoid
+// replicating per-mode branches at every call site. Tests can
+// still inject a `sealStoreFactory` seam that bypasses this
+// dispatcher entirely.
+export const factoryForSealMode = (mode: SealMode): ((c: SealPolicy) => SealStore) | null => {
+  if (mode === 'worm-file') return defaultWormFileFactory;
+  if (mode === 'git-anchored') return defaultGitAnchoredFactory;
+  return null;
 };
 
 export const verifySealAgainstChain = (store: SealStore, db: DB): VerifySealResult => {

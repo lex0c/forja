@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
 import {
   type SealEntry,
+  createGitAnchoredSealer,
   createWormFileSealer,
+  defaultGitAnchoredFactory,
+  defaultWormFileFactory,
+  factoryForSealMode,
   verifySealAgainstChain,
 } from '../../src/permissions/sealing.ts';
 import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
@@ -378,5 +382,248 @@ describe('createWormFileSealer — close', () => {
       ensureDir: fs.ensureDir,
     });
     expect(() => sealer.close()).not.toThrow();
+  });
+});
+
+describe('createGitAnchoredSealer — append (§7.3 slice 63)', () => {
+  // Capture git invocations via the exec seam so unit tests don't
+  // need a real repo. Same content map for fs so list() reflects
+  // what append() wrote.
+  const makeFakeGitFs = () => {
+    const fs = makeFakeFs();
+    const gitCalls: Array<{ cmd: string; args: readonly string[]; cwd: string }> = [];
+    let gitFail: { atArg0: string; reason: string } | null = null;
+    const exec = (cmd: string, args: readonly string[], opts: { cwd: string }) => {
+      gitCalls.push({ cmd, args, cwd: opts.cwd });
+      if (gitFail !== null && args[0] === gitFail.atArg0) {
+        throw new Error(gitFail.reason);
+      }
+    };
+    return {
+      ...fs,
+      exec,
+      gitCalls,
+      failGitAt: (subcommand: string, reason: string) => {
+        gitFail = { atArg0: subcommand, reason };
+      },
+    };
+  };
+
+  test('append writes entry line + runs git add + commit', () => {
+    const fs = makeFakeGitFs();
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: fs.exec,
+    });
+    const r = sealer.append({ seq: 1, ts: 1000, hash: 'sha256:abc' });
+    expect(r).toEqual({ ok: true });
+    // Line landed in seal.log.
+    expect(fs.contents.get(join(tmpRoot, 'seal.log'))).toBe('seq=1\tts=1000\thash=sha256:abc\n');
+    // git add seal.log + git commit -m "seal: seq=1 hash=sha256:abc"
+    expect(fs.gitCalls).toHaveLength(2);
+    expect(fs.gitCalls[0]?.cmd).toBe('git');
+    expect(fs.gitCalls[0]?.args).toEqual(['add', 'seal.log']);
+    expect(fs.gitCalls[0]?.cwd).toBe(tmpRoot);
+    expect(fs.gitCalls[1]?.cmd).toBe('git');
+    expect(fs.gitCalls[1]?.args).toEqual(['commit', '-m', 'seal: seq=1 hash=sha256:abc']);
+  });
+
+  test('custom sealFile name flows through to git add', () => {
+    const fs = makeFakeGitFs();
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      sealFile: 'audit.log',
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: fs.exec,
+    });
+    sealer.append({ seq: 2, ts: 2000, hash: 'sha256:def' });
+    expect(fs.gitCalls[0]?.args).toEqual(['add', 'audit.log']);
+    expect(fs.contents.get(join(tmpRoot, 'audit.log'))).toBeDefined();
+  });
+
+  test('invalid entry → ok:false, no disk write, no git invocation', () => {
+    const fs = makeFakeGitFs();
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: fs.exec,
+    });
+    const r = sealer.append({ seq: 0, ts: 1, hash: 'sha256:abc' });
+    expect(r.ok).toBe(false);
+    expect(fs.appendCalls).toHaveLength(0);
+    expect(fs.gitCalls).toHaveLength(0);
+  });
+
+  test('append fs failure → ok:false, no git invocation', () => {
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: () => false,
+      read: () => '',
+      append: () => {
+        throw new Error('ENOSPC: no space left');
+      },
+      exec: () => {
+        throw new Error('should not be called');
+      },
+    });
+    const r = sealer.append({ seq: 1, ts: 1000, hash: 'sha256:abc' });
+    expect(r.ok).toBe(false);
+    expect((r as { ok: false; reason: string }).reason).toContain('ENOSPC');
+  });
+
+  test('git add failure → ok:false with reason; commit not attempted', () => {
+    const fs = makeFakeGitFs();
+    fs.failGitAt('add', 'fatal: not a git repository');
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: fs.exec,
+    });
+    const r = sealer.append({ seq: 1, ts: 1000, hash: 'sha256:abc' });
+    expect(r.ok).toBe(false);
+    expect((r as { ok: false; reason: string }).reason).toContain('git add failed');
+    expect((r as { ok: false; reason: string }).reason).toContain('not a git repository');
+    // Only one git call happened (add); commit was skipped.
+    expect(fs.gitCalls).toHaveLength(1);
+    expect(fs.gitCalls[0]?.args[0]).toBe('add');
+  });
+
+  test('git commit failure → ok:false with reason', () => {
+    const fs = makeFakeGitFs();
+    fs.failGitAt('commit', 'nothing to commit, working tree clean');
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: fs.exec,
+    });
+    const r = sealer.append({ seq: 1, ts: 1000, hash: 'sha256:abc' });
+    expect(r.ok).toBe(false);
+    expect((r as { ok: false; reason: string }).reason).toContain('git commit failed');
+  });
+});
+
+describe('createGitAnchoredSealer — list', () => {
+  test('parses appended entries back in order', () => {
+    const fs = makeFakeFs();
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: () => {}, // no-op git
+    });
+    sealer.append({ seq: 1, ts: 100, hash: 'sha256:aaa' });
+    sealer.append({ seq: 2, ts: 200, hash: 'sha256:bbb' });
+    expect(sealer.list()).toEqual([
+      { seq: 1, ts: 100, hash: 'sha256:aaa' },
+      { seq: 2, ts: 200, hash: 'sha256:bbb' },
+    ]);
+  });
+
+  test('empty / non-existent repo seal file → []', () => {
+    const fs = makeFakeFs();
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: () => {},
+    });
+    expect(sealer.list()).toEqual([]);
+  });
+
+  test('malformed line → throws with line number (tampering signal)', () => {
+    const fs = makeFakeFs();
+    const path = join(tmpRoot, 'seal.log');
+    fs.contents.set(path, 'seq=1\tts=100\thash=sha256:aaa\nGARBAGE\n');
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: () => {},
+    });
+    expect(() => sealer.list()).toThrow(/malformed seal entry at line 2/);
+  });
+});
+
+describe('defaultGitAnchoredFactory + factoryForSealMode', () => {
+  test('defaultGitAnchoredFactory throws when config.path is missing', () => {
+    expect(() => defaultGitAnchoredFactory({ mode: 'git-anchored' })).toThrow(
+      'config.path is required',
+    );
+  });
+
+  test('defaultGitAnchoredFactory builds a SealStore using config.path as repoPath', () => {
+    // We can't easily assert "uses config.path as repoPath" without
+    // exposing internals; instead, verify the factory returns the
+    // expected SealStore shape (append + list + close present).
+    const store = defaultGitAnchoredFactory({ mode: 'git-anchored', path: '/tmp/no-such-repo' });
+    expect(typeof store.append).toBe('function');
+    expect(typeof store.list).toBe('function');
+    expect(typeof store.close).toBe('function');
+  });
+
+  test('factoryForSealMode dispatches by mode', () => {
+    expect(factoryForSealMode('worm-file')).toBe(defaultWormFileFactory);
+    expect(factoryForSealMode('git-anchored')).toBe(defaultGitAnchoredFactory);
+    expect(factoryForSealMode('none')).toBeNull();
+  });
+});
+
+describe('verifySealAgainstChain — works with git-anchored backend too', () => {
+  // verifySealAgainstChain reads via store.list() — the backend
+  // doesn't matter as long as the wire format is preserved. Pin
+  // that contract here: a git-anchored sealer + a chain produced
+  // by createSqliteSink cross-verify cleanly.
+  test('git-anchored seal entries verify against the chain', async () => {
+    const { createSqliteSink, ensureInstallId } = await import('../../src/permissions/index.ts');
+    const { MIGRATIONS, migrate, openMemoryDb } = await import('../../src/storage/index.ts');
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'git-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    const rows: Array<{ seq: number; this_hash: string }> = [];
+    for (let i = 0; i < 3; i++) {
+      const row = sink.emit({
+        session_id: `s${i}`,
+        tool_name: 'bash',
+        args: { i },
+        decision: 'allow',
+        policy_hash: 'sha256:p',
+        reason_chain: [],
+        ts: 100 + i,
+      });
+      rows.push({ seq: row.seq, this_hash: row.this_hash });
+    }
+    const fs = makeFakeFs();
+    const sealer = createGitAnchoredSealer({
+      repoPath: tmpRoot,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      exec: () => {}, // skip git work; we're testing the wire format
+    });
+    for (const r of rows) {
+      sealer.append({ seq: r.seq, ts: 100 + r.seq, hash: r.this_hash });
+    }
+    const v = verifySealAgainstChain(sealer, db);
+    expect(v.ok).toBe(true);
+    if (v.ok) expect(v.entriesChecked).toBe(3);
   });
 });
