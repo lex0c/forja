@@ -3,13 +3,24 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
 import { canonicalHash } from './canonical.ts';
-import { type Capability, formatCapability, sortCapabilities } from './capabilities.ts';
+import {
+  type Capability,
+  type CapabilityKind,
+  formatCapability,
+  sortCapabilities,
+} from './capabilities.ts';
 import {
   type Classifier,
   buildClassifierInput,
   clampAdjust,
   validateClassifierOutput,
 } from './classifier.ts';
+import {
+  DEFAULT_CONTEXT_SUMMARY_DEPTH,
+  DEFAULT_CONTEXT_SUMMARY_MAX_BYTES,
+  buildContextSummary,
+  createContextSummaryBuffer,
+} from './context-summary.ts';
 import type { SectionProvenance } from './hierarchy.ts';
 import {
   containsShellInjection,
@@ -131,6 +142,14 @@ export interface EngineOptions {
   // re-derives the value; the knob exists so a redeployment can ship
   // the new constant without rebuilding the engine module.
   scoreConfirmThreshold?: number;
+  // Classifier context-summary tuning (PERMISSION_ENGINE.md §6.4).
+  // The engine retains the last `contextSummaryDepth` decisions in
+  // an in-memory ring buffer and renders them into a sanitized
+  // string (capability KINDS only, never scopes/args/outputs) that
+  // the classifier receives. Both knobs ship at the v2 baseline
+  // (10 entries, 1 KiB cap); calibration sweeps can tune.
+  contextSummaryDepth?: number;
+  contextSummaryMaxBytes?: number;
   // Sandbox planning inputs (PERMISSION_ENGINE.md §6.5). Optional —
   // when omitted, the sandbox-plan stage is skipped entirely (legacy
   // path; engine.check() never refuses for `no_viable_sandbox` and
@@ -843,6 +862,10 @@ export const createPermissionEngine = (
   // §6.6 score threshold. Caller can override for calibration sweeps
   // or per-deployment tuning; default is the v2 baseline (0.4).
   const scoreConfirmThreshold = options.scoreConfirmThreshold ?? DEFAULT_SCORE_CONFIRM_THRESHOLD;
+  const contextSummaryDepth = options.contextSummaryDepth ?? DEFAULT_CONTEXT_SUMMARY_DEPTH;
+  const contextSummaryMaxBytes =
+    options.contextSummaryMaxBytes ?? DEFAULT_CONTEXT_SUMMARY_MAX_BYTES;
+  const contextSummaryBuffer = createContextSummaryBuffer(contextSummaryDepth);
   const sandboxOptions = options.sandbox;
   // policy_hash is stamped on every audit row. Computed ONCE at
   // construction — the policy doesn't change for an engine
@@ -910,6 +933,20 @@ export const createPermissionEngine = (
       sandbox_profile: sandboxProfileForRow,
     };
     audit.emit(input);
+
+    // §6.4: record THIS decision in the ring buffer so the NEXT
+    // check's classifier sees it. Capability KINDS only — scopes
+    // never enter the buffer (defense against leaking adversary-
+    // visible paths/hosts to a sometimes-remote classifier). Dedup
+    // kinds so a call with five `read-fs:...` capabilities lands
+    // as a single `read-fs` kind in the summary.
+    const kindSet = new Set<CapabilityKind>();
+    for (const cap of capabilities) kindSet.add(cap.kind);
+    contextSummaryBuffer.push({
+      toolName,
+      decision: decisionToAuditEnum(decision.kind),
+      capabilityKinds: Array.from(kindSet),
+    });
   };
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
@@ -1004,11 +1041,21 @@ export const createPermissionEngine = (
     let classifierAdjust: number | null = null;
     let classifierStage: ReasonChainEntry | null = null;
     if (classifier !== undefined && category !== 'misc') {
+      // PERMISSION_ENGINE.md §6.4: classifier sees a sanitized
+      // summary of recent activity. Built from the engine's ring
+      // buffer (capability KINDS only, never scopes/args/outputs)
+      // capped by `contextSummaryMaxBytes`. Empty string when the
+      // session has no prior decisions yet — the classifier degrades
+      // gracefully on absent context.
+      const contextSummary = buildContextSummary(contextSummaryBuffer.snapshot(), {
+        maxBytes: contextSummaryMaxBytes,
+      });
       const classifierInput = buildClassifierInput({
         toolName,
         capabilities: resolvedCapabilities,
         score: deterministicScore,
         classifierHash,
+        ...(contextSummary.length > 0 ? { contextSummary } : {}),
       });
       let rawOutput: ReturnType<Classifier> | null = null;
       let failed = false;

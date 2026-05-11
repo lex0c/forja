@@ -57,6 +57,18 @@ export type {
 export { SANDBOX_PROFILE_ORDER, selectSandboxProfile } from './sandbox-plan.ts';
 
 export type {
+  BuildContextSummaryOptions,
+  ContextSummaryBuffer,
+  ContextSummaryEntry,
+} from './context-summary.ts';
+export {
+  DEFAULT_CONTEXT_SUMMARY_DEPTH,
+  DEFAULT_CONTEXT_SUMMARY_MAX_BYTES,
+  buildContextSummary,
+  createContextSummaryBuffer,
+} from './context-summary.ts';
+
+export type {
   BootstrapPermissionEngineInput,
   BootstrapPermissionEngineResult,
   PreflightInput,

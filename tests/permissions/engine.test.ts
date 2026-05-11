@@ -2131,3 +2131,139 @@ describe('engine — sandbox plan (§6.5, slice 10)', () => {
     expect(stages).toContain('sandbox-plan');
   });
 });
+
+describe('engine — classifier context summary (§6.4, slice 11)', () => {
+  const PROJ = '/work/proj';
+
+  interface SeenInput {
+    toolName: string;
+    capabilities: readonly string[];
+    score: number;
+    classifierHash: string;
+    contextSummary?: string;
+  }
+
+  // Build a recording classifier so tests can assert on the exact
+  // input shape the engine constructed. Returns null (no adjust)
+  // since these tests focus on the input plumbing.
+  const recordingClassifier = (seen: SeenInput[]): ((input: SeenInput) => null) => {
+    return (input) => {
+      seen.push({ ...input });
+      return null;
+    };
+  };
+
+  test('first check sees no contextSummary (buffer empty)', () => {
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      classifier: recordingClassifier(seen),
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(seen.length).toBe(1);
+    expect(seen[0]?.contextSummary).toBeUndefined();
+  });
+
+  test('subsequent check sees the prior decision in contextSummary', () => {
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      classifier: recordingClassifier(seen),
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(seen.length).toBe(2);
+    expect(seen[1]?.contextSummary).toContain('step 1: tool=bash decision=allow');
+    // Capability kinds visible (read-fs + exec from cmdRead);
+    // scopes NOT visible.
+    expect(seen[1]?.contextSummary).toContain('caps=');
+    expect(seen[1]?.contextSummary).not.toContain('/work/proj');
+    expect(seen[1]?.contextSummary).not.toContain('read-fs:');
+  });
+
+  test('contextSummary lists steps in chronological order', () => {
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(
+      policy({
+        tools: {
+          bash: { allow: ['ls*'] },
+          read_file: { allow_paths: ['**'] },
+        },
+      }),
+      {
+        cwd: PROJ,
+        classifier: recordingClassifier(seen),
+      },
+    );
+    eng.check('bash', 'bash', { command: 'ls' });
+    eng.check('read_file', 'fs.read', { file_path: 'src/x.ts' });
+    eng.check('bash', 'bash', { command: 'ls' });
+    expect(seen.length).toBe(3);
+    const summary = seen[2]?.contextSummary ?? '';
+    const lines = summary.split('\n');
+    expect(lines[0]).toContain('tool=bash');
+    expect(lines[1]).toContain('tool=read_file');
+  });
+
+  test('contextSummaryDepth bounds the ring buffer', () => {
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      classifier: recordingClassifier(seen),
+      contextSummaryDepth: 2,
+    });
+    for (let i = 0; i < 5; i += 1) eng.check('bash', 'bash', { command: 'ls' });
+    // Sixth check (the one we measure) sees a summary with the
+    // last 2 entries pre-this-call (entries from checks 4 and 5).
+    eng.check('bash', 'bash', { command: 'ls' });
+    const summary = seen[seen.length - 1]?.contextSummary ?? '';
+    const lines = summary.split('\n');
+    expect(lines.length).toBe(2);
+  });
+
+  test('contextSummaryMaxBytes truncates the rendered string', () => {
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      classifier: recordingClassifier(seen),
+      contextSummaryMaxBytes: 50, // first line is ~45 bytes, so only 1 fits
+    });
+    eng.check('bash', 'bash', { command: 'ls' });
+    eng.check('bash', 'bash', { command: 'ls' });
+    eng.check('bash', 'bash', { command: 'ls' });
+    const summary = seen[seen.length - 1]?.contextSummary ?? '';
+    expect(summary.length).toBeLessThanOrEqual(50);
+  });
+
+  test('misc category contributes to the buffer (full activity view)', () => {
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      classifier: recordingClassifier(seen),
+    });
+    // todo_write is misc — would not call the classifier, but
+    // should still land in the buffer so a subsequent bash check
+    // SEES the misc activity.
+    eng.check('todo_write', 'misc', {});
+    eng.check('bash', 'bash', { command: 'ls' });
+    // Misc doesn't invoke the classifier, so seen[0] is the bash call.
+    expect(seen.length).toBe(1);
+    expect(seen[0]?.contextSummary).toContain('tool=todo_write');
+  });
+
+  test('sanitization: scopes never appear in the summary even when capabilities have them', () => {
+    // bash `cat /etc/hosts` resolves to `read-fs:/etc/hosts`.
+    // The summary must show `read-fs` (kind) but never the path.
+    const seen: SeenInput[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['cat*'] } } }), {
+      cwd: PROJ,
+      classifier: recordingClassifier(seen),
+    });
+    eng.check('bash', 'bash', { command: 'cat /etc/hosts' });
+    eng.check('bash', 'bash', { command: 'cat /etc/hosts' });
+    const summary = seen[1]?.contextSummary ?? '';
+    expect(summary).toContain('read-fs');
+    expect(summary).not.toContain('/etc/hosts');
+    expect(summary).not.toContain('/etc');
+  });
+});

@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 11: context summary for classifier (§6.4)
+
+**Done.** Eleventh slice of the v2 evolution. Lands the §6.4 "contexto resumido (últimos N steps, sumarizados pela engine)" input the classifier expects. Slice 5 wired the classifier surface and stub'd `contextSummary` as optional/empty; this slice gives it real content — a sanitized, byte-capped rendering of recent decisions so the classifier can branch on activity patterns without ever seeing adversary-controlled bytes.
+
+### Hard sanitization invariants (§6.4)
+
+The summary is built from a closed-shape entry that physically cannot carry:
+
+- raw tool args
+- tool outputs
+- file contents / web-fetched bytes
+- capability **scopes** (paths, hosts, store names)
+
+Only three fields enter:
+
+| Field | Source | Why safe |
+|---|---|---|
+| `toolName` | registry-controlled | Model can't inject a fake tool name through args. |
+| `decision` | engine's own output | `allow` / `deny` / `confirm`, closed enum. |
+| `capabilityKinds` | derived from resolver output | `CapabilityKind` is a closed enum; scopes (the only place adversary-shaped bytes could live) are stripped at this layer. |
+
+Even though slice 3 already canonicalizes capability scopes, this slice drops them entirely from the classifier-visible path. A scope like `read-fs:/home/op/secret.txt` reads fine for the audit row but isn't worth surfacing to a sometimes-remote classifier — `read-fs` alone tells it what pattern matters without leaking the operator's filesystem layout.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/context-summary.ts` (new) | `ContextSummaryEntry` type (toolName + decision + capabilityKinds — that's it). `buildContextSummary(buffer, { maxBytes })` renders one line per entry (`step N: tool=X decision=Y caps=A,B`) with alphabetically-sorted kinds for replay determinism. Byte cap enforced by walking entries and stopping before the next line would overflow — no `...` marker, deterministic across runs. `createContextSummaryBuffer(depth)` returns a ring buffer with `push` / `snapshot` (defensive copy) / `size`. `DEFAULT_CONTEXT_SUMMARY_DEPTH = 10` and `DEFAULT_CONTEXT_SUMMARY_MAX_BYTES = 1024` exported for tests + audit replays. |
+| `src/permissions/engine.ts` | `EngineOptions.contextSummaryDepth?` + `contextSummaryMaxBytes?` knobs default to the constants above. Engine constructs a private ring buffer at instantiation. Before invoking the classifier, `buildContextSummary(buffer.snapshot(), { maxBytes })` produces the string; non-empty values flow through `buildClassifierInput`. After every `emitAudit` (every code path in `check()`), the engine pushes a new entry with deduplicated capability kinds. Misc-category calls contribute to the buffer even though the classifier doesn't run on misc — a subsequent non-misc call sees the misc activity. |
+| `src/permissions/index.ts` | Re-exports `ContextSummaryEntry`, `ContextSummaryBuffer`, `BuildContextSummaryOptions`, `buildContextSummary`, `createContextSummaryBuffer`, `DEFAULT_CONTEXT_SUMMARY_DEPTH`, `DEFAULT_CONTEXT_SUMMARY_MAX_BYTES`. |
+| `tests/permissions/context-summary.test.ts` (new) | 15 tests covering: format (one line per entry, sorted kinds, `caps=-` for empty), byte cap (0, smaller-than-first-line, mid-stream cutoff, default constant respected), ring eviction (default depth, eviction order, chronological snapshot, defensive copy), sanitization invariants (entry shape, output never carries `:` from scopes). |
+| `tests/permissions/engine.test.ts` | New describe block (7 tests): first check has no contextSummary; subsequent checks see prior decisions WITHOUT scopes; chronological order; `contextSummaryDepth` honored; `contextSummaryMaxBytes` truncates; misc-category contributes; sanitization regression (bash `cat /etc/hosts` → kind visible, path not). |
+
+### Decisions
+
+- **Capability KINDS only, never scopes.** Slice 3 already canonicalizes scopes (resolved abs paths, lowercased hosts). They're safe-by-construction in the audit row but not worth surfacing to a sometimes-remote classifier. The kind alone (`read-fs`, `net-egress`, `env-mutate`) gives enough signal for a "many writes in a row" pattern without leaking the operator's filesystem. This is the §6.4 "NÃO recebe args brutos com conteúdo controlável" rule applied paranoiacally one layer above where it strictly needs to.
+- **Byte cap stops at the boundary with no marker.** A truncation marker (`...`) varies in byte count and would make `byte_count(rendered) == config.maxBytes` non-deterministic at boundaries. Stopping exactly before overflow keeps the renderer pure and the chain hash stable across versions.
+- **Misc category contributes to the buffer.** Slice 5 routed misc tools around the classifier entirely (no resolver, score 0). But the buffer is a CONTEXT signal — the classifier wants to know "the model ran 4 misc tools then asked for bash exec," which it can't see if misc skips the buffer. The classifier still doesn't fire on misc calls; it just gets misc activity in the summary when it fires on a non-misc call.
+- **Empty-buffer first call sends no contextSummary field.** When the buffer is empty (or the cap forces an empty render), `buildClassifierInput` is called WITHOUT `contextSummary`. The field is optional in `ClassifierInput`; explicit absence vs explicit empty string is a downstream distinction the classifier can branch on if it wants.
+- **In-memory, session-scoped.** The buffer never persists to SQLite. A new engine instance (fresh session, post-resume, post-rotate-chain) starts with an empty buffer. Persisting would let the classifier reach across sessions — a different threat model than "this conversation" — and would require schema work. Out of scope for this slice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5160 pass / 10 skip / 0 fail** (5170 total across 243 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Replay tool (`agent permission replay`).
+2. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+5. `--accept-broken-chain` operator override (§7.2 second flag).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 10: sandbox plan (§6.5)
 
 **Done.** Tenth slice of the v2 evolution. Lands the §6.5 sandbox PLANNING step: given a resolved capability set, pick the most restrictive viable profile from `{ro, cwd-rw, cwd-rw-net, home-rw, host}` (or refuse with `no_viable_sandbox`). The chosen profile flows into the audit row's `sandbox_profile` column and a `sandbox-plan` reason-chain entry; refusals deny with `source.section='sandbox-plan'`. Operator opts into the `host` fallback via `--sandbox-host`. Bootstrap probes `bwrap` / `sandbox-exec` availability; an unavailable + `required` sandbox transitions the engine straight to `refusing` at bootstrap, while unavailable + lenient transitions to `degraded`.
