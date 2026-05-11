@@ -893,7 +893,7 @@ export const createPermissionEngine = (
     classifierAdjust: number | null,
     extraStages: readonly ReasonChainEntry[] = [],
     sandboxProfileForRow: string | null = null,
-  ): void => {
+  ): { seq: number; this_hash: string } => {
     const chain = reasonChainFor(decision);
     if (score > 0) {
       // Surface the score in the reason chain so the modal preview
@@ -932,7 +932,7 @@ export const createPermissionEngine = (
       // planner ran (success or refusal).
       sandbox_profile: sandboxProfileForRow,
     };
-    audit.emit(input);
+    const emitted = audit.emit(input);
 
     // §6.4: record THIS decision in the ring buffer so the NEXT
     // check's classifier sees it. Capability KINDS only — scopes
@@ -947,6 +947,17 @@ export const createPermissionEngine = (
       decision: decisionToAuditEnum(decision.kind),
       capabilityKinds: Array.from(kindSet),
     });
+    return emitted;
+  };
+
+  // Attach `approvalSeq` to a Decision so the harness can link the
+  // audit row with the matching `tool_calls` row (§17 prerequisite).
+  // The noop sink returns seq=0 (no row persisted); we omit the field
+  // in that case so a downstream `linkApprovalToToolCall(seq=0)` call
+  // never fires under tests/headless paths.
+  const withApprovalSeq = (decision: Decision, seq: number): Decision => {
+    if (seq === 0) return decision;
+    return { ...decision, approvalSeq: seq };
   };
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
@@ -965,8 +976,8 @@ export const createPermissionEngine = (
         reason: `engine not ready (state=${currentState})`,
         source: { layer: 'default', section: 'engine-state' },
       };
-      emitAudit(toolName, args, decision, [], 0, {}, null);
-      return decision;
+      const e = emitAudit(toolName, args, decision, [], 0, {}, null);
+      return withApprovalSeq(decision, e.seq);
     }
 
     // Resolve capabilities (PERMISSION_ENGINE.md §5). Runs BEFORE
@@ -996,8 +1007,8 @@ export const createPermissionEngine = (
           reason: `resolver refused: ${resolverResult.reason}`,
           source: { layer: 'default', section: 'resolver-refuse' },
         };
-        emitAudit(toolName, args, decision, [], 0, {}, null);
-        return decision;
+        const e = emitAudit(toolName, args, decision, [], 0, {}, null);
+        return withApprovalSeq(decision, e.seq);
       }
       resolvedCapabilities = resolverResult.capabilities;
     }
@@ -1131,7 +1142,7 @@ export const createPermissionEngine = (
         const stages: ReasonChainEntry[] = [];
         if (classifierStage !== null) stages.push(classifierStage);
         stages.push(sandboxStage);
-        emitAudit(
+        const e = emitAudit(
           toolName,
           args,
           decision,
@@ -1142,7 +1153,7 @@ export const createPermissionEngine = (
           stages,
           /* sandbox_profile= */ null,
         );
-        return decision;
+        return withApprovalSeq(decision, e.seq);
       }
       sandboxProfile = planResult.profile;
     }
@@ -1189,7 +1200,7 @@ export const createPermissionEngine = (
       if (sandboxStage !== null) stages.push(sandboxStage);
       const degradedStage = degradedStageEntry(currentState);
       if (degradedStage !== undefined) stages.push(degradedStage);
-      emitAudit(
+      const e = emitAudit(
         toolName,
         args,
         upgraded,
@@ -1200,7 +1211,7 @@ export const createPermissionEngine = (
         stages,
         sandboxProfile,
       );
-      return upgraded;
+      return withApprovalSeq(upgraded, e.seq);
     }
 
     // Single source of truth for section key + rule lookup. Both
@@ -1338,7 +1349,7 @@ export const createPermissionEngine = (
       tailStage = approvalGateStageEntry(score, gateConfidence, scoreConfirmThreshold);
     }
     if (tailStage !== undefined) stages.push(tailStage);
-    emitAudit(
+    const e = emitAudit(
       toolName,
       args,
       decision,
@@ -1349,7 +1360,7 @@ export const createPermissionEngine = (
       stages,
       sandboxProfile,
     );
-    return decision;
+    return withApprovalSeq(decision, e.seq);
   };
 
   const view = (): PermissionsView => ({ mode });

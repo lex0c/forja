@@ -10,6 +10,7 @@ import {
   startToolCall,
   withTransaction,
 } from '../storage/index.ts';
+import { linkApprovalToToolCall } from '../storage/repos/approval-call-links.ts';
 import {
   type Tool,
   type ToolContext,
@@ -347,6 +348,19 @@ export const invokeTool = async (
       toolName: input.toolName,
       input: input.args,
     });
+
+    // PERMISSION_ENGINE.md §17 prerequisite: link the audit row's
+    // approval_seq with this tool_call so future replay modes
+    // (--against-current-policy, permission diff) can recover raw
+    // args from tool_calls.input. The engine populates approvalSeq
+    // only when the SQLite sink wrote a row; the noop sink (tests,
+    // headless) omits it and the link is skipped cleanly.
+    if (decision.approvalSeq !== undefined) {
+      linkApprovalToToolCall(deps.db, {
+        approvalSeq: decision.approvalSeq,
+        toolCallId: toolCall.id,
+      });
+    }
 
     if (decision.kind === 'deny') {
       recordApproval(deps.db, {

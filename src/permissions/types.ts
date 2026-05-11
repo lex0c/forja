@@ -101,14 +101,26 @@ export interface PolicySource {
   section?: string;
 }
 
+// Fields common to every Decision variant. PERMISSION_ENGINE.md §17
+// linkage: `approvalSeq` is populated when the engine's audit sink
+// wrote a row to `approvals_log` (production path with the SQLite
+// sink). Omitted under the noop sink (tests, headless paths that
+// skip persistence). The harness uses it to link `approvals_log.seq`
+// with the matching `tool_calls.id` via the `approval_call_links`
+// table, so future replay modes (`--against-current-policy`,
+// `permission diff`) can recover raw args from `tool_calls.input`.
+interface DecisionBase {
+  approvalSeq?: number;
+}
+
 // What the engine returns from a check. The harness converts `confirm`
 // into a UI prompt at invocation time; without a confirmFn, the harness
 // must default to deny — silently auto-allowing a `confirm` decision is
 // the bug class this type prevents.
 export type Decision =
-  | { kind: 'allow'; reason?: string; source?: PolicySource }
-  | { kind: 'deny'; reason: string; source?: PolicySource }
-  | { kind: 'confirm'; prompt: string; reason?: string; source?: PolicySource };
+  | (DecisionBase & { kind: 'allow'; reason?: string; source?: PolicySource })
+  | (DecisionBase & { kind: 'deny'; reason: string; source?: PolicySource })
+  | (DecisionBase & { kind: 'confirm'; prompt: string; reason?: string; source?: PolicySource });
 
 // Snapshot view of permissions handed to a tool's ToolContext (per
 // CONTRACTS §2 line 63). Read-only — tools must not mutate. Currently

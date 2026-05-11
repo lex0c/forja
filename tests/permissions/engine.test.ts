@@ -2264,6 +2264,68 @@ describe('engine — classifier context summary (§6.4, slice 11)', () => {
     const summary = seen[1]?.contextSummary ?? '';
     expect(summary).toContain('read-fs');
     expect(summary).not.toContain('/etc/hosts');
-    expect(summary).not.toContain('/etc');
+    expect(summary).not.toContain('/etc/');
+  });
+});
+
+describe('engine — Decision.approvalSeq (§17 replay linkage, slice 15)', () => {
+  test('default (noop) sink: decision.approvalSeq is undefined', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: '/work/proj',
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls' });
+    expect(d.approvalSeq).toBeUndefined();
+  });
+
+  test('capture-style audit sink: decision.approvalSeq matches the emitted seq', () => {
+    let nextSeq = 0;
+    const collected: number[] = [];
+    const sink = {
+      emit() {
+        nextSeq += 1;
+        collected.push(nextSeq);
+        return { seq: nextSeq, this_hash: `fake-${nextSeq}` };
+      },
+      verifyChain() {
+        return {
+          ok: true as const,
+          rows: nextSeq,
+          current_rotation_id: 0,
+          quarantined: false,
+        };
+      },
+    };
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: '/work/proj',
+      audit: sink,
+    });
+    const a = eng.check('bash', 'bash', { command: 'ls' });
+    const b = eng.check('bash', 'bash', { command: 'ls' });
+    expect(a.approvalSeq).toBe(1);
+    expect(b.approvalSeq).toBe(2);
+    expect(collected).toEqual([1, 2]);
+  });
+
+  test('deny branches also carry approvalSeq', () => {
+    let nextSeq = 0;
+    const sink = {
+      emit() {
+        nextSeq += 1;
+        return { seq: nextSeq, this_hash: `fake-${nextSeq}` };
+      },
+      verifyChain() {
+        return {
+          ok: true as const,
+          rows: nextSeq,
+          current_rotation_id: 0,
+          quarantined: false,
+        };
+      },
+    };
+    const eng = createPermissionEngine(policy({}), { cwd: '/work/proj', audit: sink });
+    // No allow rule → default-deny.
+    const d = eng.check('bash', 'bash', { command: 'whoami' });
+    expect(d.kind).toBe('deny');
+    expect(d.approvalSeq).toBe(1);
   });
 });

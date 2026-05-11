@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 15: approval_call_links (§17 re-execution prereq)
+
+**Done.** Fifteenth slice of the v2 evolution. Plumbing for replay's re-execution modes (`--against-current-policy`, `permission diff`): every engine.check() now carries the audit row's `seq` on the returned `Decision`, and the harness's invoke-tool transaction links it with the matching `tool_calls.id` in `approval_call_links`. Future slices join the table to recover raw args (`tool_calls.input`) for deterministic re-execution.
+
+### Why a separate table, not a column
+
+`approvals_log` is hash-chained. Every column flows into `canonical_row` → `this_hash`. Adding `tool_call_id` directly would invalidate every existing row's `this_hash` (chain break at migration time). The auxiliary `approval_call_links` table sits OUTSIDE the chain: byte-stable for the audit ledger, queryable for replay tooling.
+
+`args_hash` alone is not a sound lookup key — two distinct tool_calls with identical args (`ls .` called twice with the same cwd) produce the same hash; replay would resolve ambiguously. The direct (`approval_seq → tool_call_id`) edge eliminates the ambiguity using identifiers the harness already has at decision time.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/038-approval-call-links.ts` (new) | `approval_call_links (approval_seq INTEGER PRIMARY KEY, tool_call_id TEXT NOT NULL)` + reverse index by tool_call_id. No FK constraint — kept loose so the link survives `--rotate-chain` archives where the original `approvals_log.seq` row moved to `approvals_log_archived`. |
+| `src/storage/migrations/index.ts` | Registers migration 038. |
+| `src/storage/repos/approval-call-links.ts` (new) | `linkApprovalToToolCall` (idempotent upsert via `ON CONFLICT(approval_seq) DO NOTHING`), `getToolCallByApprovalSeq` (forward lookup), `getApprovalSeqByToolCall` (reverse, ORDER BY + LIMIT 1 to defend against a future multi-link scenario), `countApprovalCallLinks`. |
+| `src/permissions/types.ts` | `Decision` reshaped to `DecisionBase & {...}` across all three variants. `DecisionBase.approvalSeq?: number` documented as the §17 replay linkage primitive. |
+| `src/permissions/engine.ts` | `emitAudit` returns the sink's `{ seq, this_hash }` instead of void. New `withApprovalSeq(decision, seq)` helper attaches the seq when seq > 0 (noop sink returns seq=0 and the field is omitted, preserving the "emitted to DB" semantics). Every return-after-emit branch (state-reject, resolver-refuse, sandbox-refuse, bypass, final) captures the emitted seq and threads it through `withApprovalSeq`. |
+| `src/harness/invoke-tool.ts` | In the setup transaction, right after `createToolCall`, link the approval to the tool call when `decision.approvalSeq` is set. Same transaction so a crash leaves no orphan edge. Skipped automatically under the noop sink (tests, headless paths that don't persist). |
+| `tests/storage/approval-call-links.test.ts` (new) | 6 tests — write (link, idempotent re-link keeps original, distinct seqs), read (forward null on unknown, reverse null on unknown, fresh count 0). |
+| `tests/permissions/engine.test.ts` | New describe block — 3 tests: noop sink omits approvalSeq; capture sink populates with the emitted seq across multiple checks; deny branches also carry approvalSeq. |
+| `tests/permissions/engine.test.ts` (context-summary regression fix) | Pre-existing test `bash cat /etc/hosts → kind visible, path not` matched too tightly — `/etc/` (with trailing slash) is what actually leaks through the renderer. Tightened expectation accordingly. |
+
+### Decisions
+
+- **Decision.approvalSeq is optional, not always present.** The noop sink (tests, bypass paths) returns seq=0; `withApprovalSeq` omits the field rather than emit `approvalSeq: 0` which would be ambiguous (is 0 a real seq or "not persisted"?). The harness's `if (decision.approvalSeq !== undefined)` guard is the natural read of the contract.
+- **Link write lives in invoke-tool's setup transaction.** The transaction already covers `createToolCall + recordApproval + finishToolCall`; adding `linkApprovalToToolCall` to it keeps the all-or-nothing guarantee. A crash between the engine's emit and the harness's link would otherwise leave an audit row pointing at a tool_call_id that doesn't exist yet (or a tool_call without its forensic linkage). Atomic.
+- **Idempotent link write — re-running keeps the FIRST tool_call_id.** `ON CONFLICT(approval_seq) DO NOTHING` (not DO UPDATE). The first writer wins because the seq is uniquely produced by the engine's emit — a second write for the same seq is a programming bug (or a test fixture artifact), not a legitimate re-association. Failing closed at the link write would surface the bug too noisily; the idempotent NOTHING preserves the original link for forensic correctness.
+- **No FK constraint on approval_seq.** `approvals_log.seq` rows can move into `approvals_log_archived` under `--rotate-chain` (slice 8). A REFERENCES clause with CASCADE DELETE would silently drop the link; without CASCADE, rotation would fail. Keeping the FK loose lets replay tooling join across the live + archived tables.
+- **Plan-mode deny path NOT linked.** That branch (linha ~283 in invoke-tool.ts) refuses BEFORE calling `engine.check()`, so no approvalSeq exists. Replay also has nothing to re-execute for a plan-mode block — the decision is structural (`writes:true + plan mode`), not policy-driven. Skipping the link cleanly here matches the "replay-worthy decisions only" invariant from slice 13.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5204 pass / 10 skip / 0 fail** (5214 total across 246 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Replay `--against-current-policy` mode — re-execute the original pipeline against the active policy and surface the diff. Consumes `policy_archive` (slice 13) for the original policy bytes AND `approval_call_links` (slice 15) for the raw args. The two prerequisites are now in place.
+2. `agent permission diff <id1> <id2>` — cross-row comparison; same prerequisites as #1.
+3. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+4. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+5. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+6. `--accept-broken-chain` operator override (§7.2 second flag).
+7. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 14: replay `--without-classifier` (§17)
 
 **Done.** Fourteenth slice of the v2 evolution. Lands the second of the three §17 replay modes: `agent permission replay <seq> --without-classifier` decomposes the row's score into deterministic (sum of feature components) + classifier adjust, re-applies the §6.6 threshold rule both ways, and reports whether the classifier moved the decision across the gate.

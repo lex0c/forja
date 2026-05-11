@@ -35,6 +35,7 @@ import { migration034ApprovalsLog } from './034-approvals-log.ts';
 import { migration035ChainRotation } from './035-chain-rotation.ts';
 import { migration036SubagentGateEscalation } from './036-subagent-gate-escalation.ts';
 import { migration037PolicyArchive } from './037-policy-archive.ts';
+import { migration038ApprovalCallLinks } from './038-approval-call-links.ts';
 
 export interface Migration {
   id: number;
@@ -80,4 +81,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration035ChainRotation,
   migration036SubagentGateEscalation,
   migration037PolicyArchive,
+  migration038ApprovalCallLinks,
 ];
