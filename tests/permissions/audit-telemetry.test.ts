@@ -182,4 +182,66 @@ describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {
     const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
     expect(event?.score_components).toEqual({});
   });
+
+  test('engineState getter populates the event field (slice 75)', () => {
+    const { db, identity } = setupBase();
+    const telemetry = createRecordingTelemetrySink();
+    const sink = createSqliteSink({
+      db,
+      identity,
+      telemetry,
+      engineState: () => 'degraded',
+    });
+    sink.emit({ ...baseEmitArgs, ts: 100 });
+    const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
+    expect(event?.engine_state).toBe('degraded');
+  });
+
+  test('engineState getter called PER EMIT (captures current state, not snapshot)', () => {
+    const { db, identity } = setupBase();
+    const telemetry = createRecordingTelemetrySink();
+    let currentState = 'ready';
+    const sink = createSqliteSink({
+      db,
+      identity,
+      telemetry,
+      engineState: () => currentState,
+    });
+    sink.emit({ ...baseEmitArgs, ts: 100 });
+    currentState = 'degraded';
+    sink.emit({ ...baseEmitArgs, ts: 101 });
+    currentState = 'refusing';
+    sink.emit({ ...baseEmitArgs, ts: 102 });
+    const events = telemetry.events() as PermissionDecisionEvent[];
+    expect(events[0]?.engine_state).toBe('ready');
+    expect(events[1]?.engine_state).toBe('degraded');
+    expect(events[2]?.engine_state).toBe('refusing');
+  });
+
+  test('no engineState option → event omits engine_state field', () => {
+    const { db, identity } = setupBase();
+    const telemetry = createRecordingTelemetrySink();
+    const sink = createSqliteSink({ db, identity, telemetry });
+    sink.emit({ ...baseEmitArgs, ts: 100 });
+    const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
+    expect(event?.engine_state).toBeUndefined();
+  });
+
+  test('engineState getter throwing → event ships without the field, audit succeeds', () => {
+    const { db, identity } = setupBase();
+    const telemetry = createRecordingTelemetrySink();
+    const sink = createSqliteSink({
+      db,
+      identity,
+      telemetry,
+      engineState: () => {
+        throw new Error('synthetic getter failure');
+      },
+    });
+    const r = sink.emit({ ...baseEmitArgs, ts: 100 });
+    expect(r.seq).toBe(1);
+    const event = telemetry.events()[0] as PermissionDecisionEvent | undefined;
+    expect(event).toBeDefined();
+    expect(event?.engine_state).toBeUndefined();
+  });
 });

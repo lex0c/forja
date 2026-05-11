@@ -993,4 +993,34 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
     const chainEvents = telemetry.events().filter((e) => e.kind === 'chain.verify_failed');
     expect(chainEvents).toHaveLength(0);
   });
+
+  test('permission.decision events carry engine_state populated from the controller (slice 75)', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const r = await bootstrapPermissionEngine(baseInput({ telemetry }));
+    // Healthy bootstrap → engine state 'ready' captured per emit.
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    const events = telemetry.events().filter((e) => e.kind === 'permission.decision');
+    expect(events).toHaveLength(1);
+    const event = events[0];
+    if (event === undefined || event.kind !== 'permission.decision') {
+      throw new Error('expected permission.decision event');
+    }
+    expect(event.engine_state).toBe('ready');
+  });
+
+  test('engine_state reflects state changes between emits', async () => {
+    const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+    const telemetry = createRecordingTelemetrySink();
+    const r = await bootstrapPermissionEngine(baseInput({ telemetry }));
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    r.engine.degrade('test_signal');
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    const events = telemetry
+      .events()
+      .filter((e) => e.kind === 'permission.decision')
+      .map((e) => (e.kind === 'permission.decision' ? e.engine_state : undefined));
+    expect(events[0]).toBe('ready');
+    expect(events[1]).toBe('degraded');
+  });
 });

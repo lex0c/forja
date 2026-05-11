@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 75: telemetry — `engine_state` getter bridge (§18)
+
+**Done.** Seventy-fifth slice. Closes the `engine_state` field on `permission.decision` events that slice 70 left as optional / forward-compat. The audit sink now accepts an `engineState?: () => string` getter; the bootstrap plumbs `controller.get` through it. Every emitted `permission.decision` event carries the current engine state at emit time, letting OTEL consumers correlate decision outcomes with engine health (e.g., "every confirm-allowed happened while degraded — operator should fix the underlying subsystem").
+
+### Why this matters
+
+The state machine is the engine's spine — but pre-slice the `permission.decision` event carried only the decision outcome, not the engine's posture. Operators investigating a drift in approval rates couldn't tell whether decisions happened in `ready` state (operator-trusted) or `degraded` state (subsystem-health-driven upgrade to confirm). Spec §18 line 1202 lists `engine_state` in the canonical event shape; slice 70 deferred it because the audit sink didn't have a state-controller reference. Slice 75 plumbs the getter — the bridge is minimal (one option + one optional spread in the event constructor) but the operator value is large.
+
+The getter pattern (vs passing the value once at sink construction) is the load-bearing design choice: state CAN change between bootstrap and any individual `check`. `engine.degrade(reason)` fires from anywhere holding a controller reference; the getter captures THE state at emit time, not a stale snapshot.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/audit.ts` | New `engineState?: () => string` field on `CreateSqliteSinkOptions`. Inside `emit()`, after the row persists + scheduler ticks, resolve the state via the getter (wrapped in its own try/catch — a thrown getter omits the field rather than corrupting the event). Spread the resolved value into the telemetry event's optional `engine_state` field. |
+| `src/permissions/bootstrap-engine.ts` | Audit sink construction passes `engineState: () => controller.get()` — the controller is in scope at sink-construction time, the getter captures the current state at every emit. Documented with the rationale (state CAN change mid-session via engine.degrade / refuse). |
+| `tests/permissions/audit-telemetry.test.ts` (+4 tests) | `engineState` getter populates the event field; getter called PER EMIT (multi-emit captures shifting state values: ready → degraded → refusing across three emits); no `engineState` option → event omits the field (regression guard for slice 70 behavior); getter throwing → event ships without field + audit succeeds. |
+| `tests/permissions/bootstrap-engine.test.ts` (+2 tests) | permission.decision events carry `engine_state='ready'` from the bootstrap's controller; `engine_state` reflects state changes between emits (engine.degrade between two checks → event 1 ready, event 2 degraded). |
+
+### Decisions
+
+- **Getter, not value.** State CAN change between bootstrap-time and any individual `check`. A stale value pinned at sink construction would mislead operators: a decision emitted while degraded but tagged 'ready' is wrong. The getter `() => controller.get()` re-reads on every emit, capturing the live state.
+- **Getter wrapped in its own try/catch INSIDE the outer telemetry try/catch.** The outer try/catch protects the audit emit signal from telemetry failures. The inner try/catch around the getter call lets the event ship WITHOUT the field if the getter throws — operators see the rest of the event payload, just missing one optional field. Without the inner catch, a thrown getter would crash the entire telemetry emission (still caught by the outer catch, but losing the full event).
+- **Field stays optional on `PermissionDecisionEvent`.** Slice 70 made it optional for forward compatibility; slice 75 doesn't promote to required. Callers without a controller (e.g., a future replay path that synthesizes events from past audit rows) shouldn't have to fake a state value. The OTEL adapter handles the missing-field case as "unknown state".
+- **No new field on `BootstrapPermissionEngineInput`.** The bootstrap already has the controller in scope — it's the natural source for the getter. Adding a custom getter as a bootstrap option would invite drift (the controller's state vs the operator-passed getter's state). Bootstrap is opinionated; the controller IS the source of truth.
+- **Test that getter is called PER EMIT, not once.** The "captures current state, not snapshot" test is the load-bearing regression guard — if a future refactor accidentally caches the first getter call, decisions in degraded state would falsely show 'ready'. The test exercises three different state values across three emits.
+- **Bootstrap test pins the controller's state via `engine.degrade('test_signal')`.** Validates the bootstrap fan-out end-to-end: bootstrap wires the getter, engine.degrade transitions the controller, the next emit reflects 'degraded'. No mocking needed.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5804 pass / 10 skip / 0 fail** (5814 total across 274 files); +6 tests on top of slice 74's 5798
+- `bun test tests/permissions/audit-telemetry.test.ts tests/permissions/bootstrap-engine.test.ts` — 57 pass
+
+### Next
+
+§18 telemetry: 5 of 5 spec event types shipped, engine_state populated. Remaining follow-ups:
+
+1. **OTEL adapter** — `src/telemetry/adapters/otel.ts`. Translates `TelemetryEvent[]` → OTLP metrics + spans. Adds `@opentelemetry/api` + `@opentelemetry/sdk-metrics` deps. Behind a feature flag.
+2. **Scrubbing layer** — wraps another sink, redacts likely-PII fields before forwarding. Per spec line 1205 "OTEL export com scrubbing".
+
+After scrubbing the production-ready checklist line 1213 ("Telemetria com scrubbing") will be fully satisfied. The OTEL adapter unblocks real-world exporting; scrubbing is the security gate that makes the export safe for shared infrastructure.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 74: telemetry — `classifier.unavailable` event (§18 metric roster closes)
 
 **Done.** Seventy-fourth slice. Adds the fifth telemetry event type — `classifier.unavailable` — fired from inside `engine.check` when the classifier returns null, throws, or yields an invalid schema. Closes the §18 spec metric roster: all five listed metric streams (`approval_rate`, `score_distribution`, `classifier_unavailable_total`, `chain_verification_failures_total`, `sealing_failures_total`, `state_transitions`, `approval_fatigue_proxy`) now have a corresponding event type.

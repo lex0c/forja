@@ -392,6 +392,17 @@ export const bootstrapPermissionEngine = async (
     identity,
     scheduler: schedulerProxy,
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
+    // §18 engine_state bridge (slice 75). Telemetry events for
+    // permission.decision now carry the current state alongside
+    // the decision so an OTEL consumer can correlate decision
+    // outcomes with engine health (e.g., "every confirm-allowed
+    // happened while degraded — operator should fix the
+    // underlying subsystem"). Plumbing the getter (not the value)
+    // here means the event captures state AT EMIT TIME — accurate
+    // even if the state changed between bootstrap and the
+    // individual check (which happens via engine.degrade /
+    // engine.refuse fired from anywhere with a controller ref).
+    engineState: () => controller.get(),
   });
   const chain = sink.verifyChain();
 

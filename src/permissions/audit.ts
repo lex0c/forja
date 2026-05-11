@@ -223,6 +223,19 @@ export interface CreateSqliteSinkOptions {
   // telemetry sink NEVER break audit emit — wrapped in try/catch
   // identical to the scheduler.tick handling.
   telemetry?: { emit: (event: TelemetryEvent) => void };
+  // §18 engine_state bridge (slice 75). Optional getter that
+  // populates the `permission.decision` event's `engine_state`
+  // field. The audit sink doesn't own a state controller — the
+  // bootstrap (which constructs both the sink and the controller)
+  // plumbs `controller.get` through here. Production wiring:
+  // `engineState: () => controller.get()`. Without this getter,
+  // the event's `engine_state` field is omitted (slice 70 left
+  // it as optional for forward compatibility).
+  //
+  // Wrapped in try/catch at emit time — a thrown getter does not
+  // break the audit path nor the telemetry emission; the event
+  // simply ships without the field.
+  engineState?: () => string;
 }
 
 export const createSqliteSink = ({
@@ -230,6 +243,7 @@ export const createSqliteSink = ({
   db,
   scheduler,
   telemetry,
+  engineState,
 }: CreateSqliteSinkOptions): AuditSink => {
   // Resolve the active genesis once at construction. Rotations are
   // operator-driven via the CLI `--rotate-chain` flow that exits
@@ -302,6 +316,17 @@ export const createSqliteSink = ({
     // diagnostics, safe to export.
     if (telemetry !== undefined) {
       try {
+        // §18 engine_state bridge (slice 75). Resolve the state
+        // via the optional getter; failures inside the getter
+        // surface as an omitted field, not a corrupted event.
+        let resolvedEngineState: string | undefined;
+        if (engineState !== undefined) {
+          try {
+            resolvedEngineState = engineState();
+          } catch {
+            // Getter threw — ship the event without the field.
+          }
+        }
         telemetry.emit({
           kind: 'permission.decision',
           ts,
@@ -320,6 +345,7 @@ export const createSqliteSink = ({
           classifier_adjust: persistedExceptHash.classifier_adjust,
           sandbox_profile: persistedExceptHash.sandbox_profile,
           ttl_expires_at: persistedExceptHash.ttl_expires_at,
+          ...(resolvedEngineState !== undefined ? { engine_state: resolvedEngineState } : {}),
         });
       } catch {
         // Same rationale as the scheduler tick — observability
