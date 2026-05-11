@@ -15,6 +15,69 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 80: §13.7 worker runtime + production entry script
+
+**Done.** Eightieth slice. Continues the §13.7 thread by shipping `runWorker` — the pure-function dispatch primitive that lives inside every spawned worker subprocess — plus `src/broker/worker.ts`, the production entry script the spawn broker invokes via `bun run src/broker/worker.ts`. The runtime owns the wire-format protocol end-to-end: drain stdin → parse NDJSON → validate shape → dispatch by `toolName` → catch handler throws → emit one NDJSON response line. Slice 80 ships the runtime with one diagnostic handler (`__echo__`); concrete tool handlers (bash, read_file, glob, etc.) land in subsequent slices.
+
+Pair with slices 78 (broker contract) and 79 (spawn primitive). The triangle is now complete on the BROKER side: `Broker` interface defines the contract → `createSpawnBroker` runs the subprocess → `runWorker` is what the subprocess executes. With slice 80, the spawn broker is end-to-end functional against a real worker entry, validated by integration tests that spawn `bun run src/broker/worker.ts` and roundtrip the `__echo__` handler.
+
+### Why this matters
+
+Pre-slice, the spawn broker (slice 79) accepted any `command` + `args` — it had no opinion about what the subprocess does. That's fine for unit tests (which used `/bin/sh -c` scripts) but production wiring needed a real worker entry. Slice 80 ships THE entry point: a single canonical script the broker invokes, with an extensibility point (the handler registry) that future slices fill in. The `__echo__` handler is shipped immediately so operators can validate the broker → worker pipeline end-to-end before any real tool handler exists:
+
+```sh
+echo '{"toolName":"__echo__","args":{"k":"v"},"capabilities":[],"sandboxProfile":null}' \
+  | bun run src/broker/worker.ts
+```
+
+That command, today, exercises the FULL §13.7 plumbing: Bun reads stdin → `runWorker` parses → registry lookup → `__echo__.execute` → response serialized → Bun writes stdout. Slice 81 just adds a `bash` handler to the registry; the plumbing is unchanged.
+
+The runtime/entry separation is the load-bearing design property. The runtime is pure: `runWorker({handlers, input, output})` takes no Bun-specific dependencies, holds no module-level state, has test seams for stdin/stdout. Tests pin every wire-format edge case (empty input, invalid JSON, missing fields, handler throws, unknown tool, duplicate handler names) without spawning a single subprocess — fast + deterministic. The entry script is a 10-line wrapper that binds the seams to `Bun.stdin.stream()` + `process.stdout.write` and registers `__echo__`. Future slices append handlers; the runtime stays untouched.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/worker-runtime.ts` (new, ~175 lines) | `WorkerToolHandler` interface: `name` (unique within registry; `__echo__` reserved for diagnostic) + `execute(request) → Promise<BrokerResponse>` (well-behaved handlers return BrokerResponse from every path; runtime catches throws as defense-in-depth). `RunWorkerOptions`: `handlers` (readonly array), `input` (drains source as single string), `output` (writes single line). `runWorker(options)` flow: build handler map (duplicate names → registration error, fails fast before reading stdin); drain input; trim + check empty; `JSON.parse` (parse errors → response); shape-validate via `isBrokerRequest` (toolName:string, args:object, capabilities:string[], sandboxProfile:string\|null, approvalId:number\|undefined); lookup handler by toolName (unknown → response); execute (throws → `worker handler threw:` response); emit single NDJSON line. Failure mode catalog: `worker handler duplicate:`, `worker input read failed:`, `worker received empty input`, `worker request parse failed:`, `worker request missing required fields`, `worker handler not found:`, `worker handler threw:`. |
+| `src/broker/worker.ts` (new, ~50 lines) | Production entry script. Imports `runWorker` + types. Defines `echoHandler` (`name: '__echo__'`, returns `{ok:true, stdout: JSON.stringify({toolName, args, capabilities, sandboxProfile}), stderr:'', exitCode:0}`). `readStdin` async fn drains `Bun.stdin.stream()` with a streaming `TextDecoder`. Top-level `await runWorker({handlers: [echoHandler], input: readStdin, output: (line) => process.stdout.write(line)})`. No explicit `process.exit` — when stdin closes (broker writes request + closes pipe), drain returns, runWorker emits response, Bun exits naturally + flushes stdout. |
+| `src/broker/index.ts` | Re-exports `runWorker`, `RunWorkerOptions`, `WorkerToolHandler`. |
+| `tests/broker/worker-runtime.test.ts` (new, 24 tests) | **Dispatch (4):** drains input + dispatches by name + emits response; forwards request verbatim (capabilities, args, approvalId preserved); multiple handlers dispatched by toolName; emits handler response verbatim — runtime does NOT re-validate response shape (broker side does, see slice 79). **Handler errors (2):** handler throwing Error → `worker handler threw: <message>`; non-Error throws get `String()`-ified. **Handler registry (3):** unknown toolName → `worker handler not found: <name>`; empty registry → unknown-handler error; duplicate handler names → registration error AND `input()` is never called (fail-fast). **Input parse failures (7):** empty input → empty-input error; whitespace-only → empty-input error; invalid JSON → parse-failed error; valid JSON missing fields → missing-fields error; non-string capability element → missing-fields error; numeric sandboxProfile → missing-fields error; sandboxProfile:null IS accepted (legacy/host); trailing whitespace + newlines get trimmed before parse. **Input read failures (2):** input throwing Error → `worker input read failed: <message>`; non-Error throws stringified. **Statelessness (3):** two sequential invocations work independently; emits exactly one output line per invocation; one-line invariant holds across every error path. **Integration via spawn broker (2):** echo handler roundtrips via real `bun run src/broker/worker.ts` subprocess (timeoutMs: 10s, full pipe: createSpawnBroker → Bun.spawn → worker.ts → runWorker → echo handler → response → broker parse); unknown tool reports handler-not-found through real subprocess. |
+
+### Decisions
+
+- **Runtime is a pure function with seams; entry script is a thin wrapper.** Same posture as the spawn broker (slice 79's `spawn?` seam). The runtime takes `input` (returns Promise<string>) + `output` (writes line) callbacks; production binds `Bun.stdin.stream()` + `process.stdout.write`; tests pass in-memory functions. Without the seams, unit tests would need real subprocesses for every edge case — slow + flaky. The integration tests at the bottom of `worker-runtime.test.ts` exercise the real-subprocess path for the cases that depend on Bun's stdio behavior; everything else is in-memory.
+- **`__echo__` handler ships in slice 80, not deferred.** An empty entry script is a synthetic milestone; one diagnostic handler makes the entry production-runnable from day one. Operators can validate the broker → worker pipeline end-to-end before any real tool is wired. The double-underscore naming (`__echo__`) signals reserved: future slice 81+ tools use unprefixed names matching `src/tools/builtin/`.
+- **Handler registry is per-invocation, not module-level.** `runWorker({handlers: [...]})` takes the registry as an argument. Worker entry scripts can have different registries (production vs. integration tests vs. minimal smoke). Module-level state would block multi-tenant or test scenarios. Statelessness is a paranoia property — production workers are per-call disposable anyway, but the cost is zero so we keep it.
+- **Duplicate handler names fail fast — BEFORE input is read.** A duplicate is a caller bug (the worker entry script registered the same name twice). Detecting it after consuming stdin would waste the input read AND obscure the error (operator sees "request failed" when the real problem is registry construction). The integration test verifies `input()` is not invoked on registration error.
+- **Runtime emits exactly ONE output line per invocation.** The wire-format contract: one request in, one response out. Every error path emits one line + returns; no path emits multiple lines or zero lines. A dedicated test scans every error scenario to enforce this invariant.
+- **Runtime does NOT re-validate the handler's response shape.** Broker-side validation (slice 79's `isBrokerResponse`) already enforces the contract. Adding validation here would duplicate the check + tempt callers to skip the broker-side one. The runtime forwards whatever the handler returns; if a handler is buggy and returns malformed JSON, the broker's `response missing required fields` error fires + the operator sees a clear bug location. Tests pin this: a handler returning `{ok: true}` (no stdout/stderr) gets emitted as-is.
+- **`isBrokerRequest` validates `capabilities: readonly string[]` element-by-element.** A non-string element would silently slip past `Array.isArray` alone. The broker's `request.capabilities` is `readonly string[]` typewise, but the WIRE format is untyped JSON — the runtime is the trust boundary. Same for `sandboxProfile: string | null`: a numeric value passes typeof-object check on the array but fails the explicit `typeof string` test. Spelled-out element loop, not a clever functional one — the explicit loop is faster + easier to read.
+- **`__echo__` handler returns `{toolName, args, capabilities, sandboxProfile}` in its stdout JSON.** All the diagnostic-relevant fields, not just `args`. Operators validating the pipe can verify that capabilities + sandboxProfile round-tripped intact — important for debugging engine ↔ broker plumbing (slice 81+).
+- **Streaming `TextDecoder` in `readStdin`.** `decoder.decode(chunk, { stream: true })` correctly handles multi-byte characters that span chunk boundaries. The final `decoder.decode()` without `stream` flag flushes any remaining state. Simple `new TextDecoder().decode(chunk)` per chunk would corrupt non-ASCII input split mid-character. Production payload is JSON which is generally ASCII, but defensive correctness is cheap.
+- **No `process.exit(0)` at end of `worker.ts`.** Top-level `await runWorker(...)` returns; the Bun process exits naturally when the event loop empties. Adding `process.exit` would race against stdout flush + lose response bytes on some platforms. Bun's process exit waits for stdout drain by default. Tested via integration tests.
+- **Integration tests live in the same file as unit tests, not separate.** The integration test (2 cases) is small + tightly coupled to the worker entry. Splitting into `worker.integration.test.ts` would require duplicating helpers (`baseRequest`, `parseResponse`) or extracting them — overhead without payoff. The describe block names mark them as integration so a reader scanning the file sees the boundary.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5885 pass / 10 skip / 0 fail** (5895 total across 279 files); +24 tests on top of slice 79's 5861
+- `bun test tests/broker/worker-runtime.test.ts` — 24 pass in ~83ms; `bun test tests/broker/` — 56 pass (in-process + spawn + worker-runtime)
+
+### Next
+
+§13.7 thread next steps:
+
+1. **Slice 81: Bash worker handler.** Port the `Bun.spawn` logic from `src/tools/builtin/bash.ts` into a `WorkerToolHandler` registered in `src/broker/worker.ts`. The handler reads `args.command` (+ `args.timeout_ms`, `args.cwd`), spawns shell with the engine-chosen sandbox already wrapping the worker process, captures stdout/stderr/exitCode, returns BrokerResponse. The bash tool's harness-facing surface stays unchanged; only its inner spawn migrates.
+2. **Slice 82: Engine harness integration.** The harness inspects tool metadata: tools with `exec: true` route through `broker.execute` instead of direct `tool.execute`. Bootstrap injects the broker (in-process for fast tests; spawn-based for the security posture). Existing call sites in `invoke-tool.ts` (or equivalent) gain a broker-dispatch branch.
+3. **Slice 83: Lifecycle + crash recovery.** SIGTERM handler on the broker drains in-flight + closes gracefully. Worker crash detection (exit code ≠ 0 without parseable response) gets dedicated telemetry. Per-call timeout override (some tools have higher expected latency).
+
+After slice 83, §13.7 closes: CLI main has no exec privilege; every exec-tagged tool call flows through `broker.execute` → spawn → sandbox wrap → worker → response.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 79: §13.7 spawn broker primitive — per-request subprocess via Bun.spawn
 
 **Done.** Seventy-ninth slice. Continues the §13.7 thread by shipping `createSpawnBroker` — a `Broker` implementation that spawns a fresh worker subprocess per `execute` call via `Bun.spawn`. The broker pipes the request as one NDJSON line on stdin, reads the response as the LAST NDJSON line on stdout, captures stderr verbatim, and surfaces every failure mode via `BrokerResponse` (never throws). Sandbox wrap is delegated to a caller-supplied `sandboxRunner` callback so production wiring (slice 81) injects `maybeWrapSandboxArgv` while tests pass spies.

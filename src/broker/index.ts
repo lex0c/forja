@@ -9,3 +9,5 @@ export type {
   SpawnFnOptions,
 } from './spawn.ts';
 export { createSpawnBroker } from './spawn.ts';
+export type { RunWorkerOptions, WorkerToolHandler } from './worker-runtime.ts';
+export { runWorker } from './worker-runtime.ts';
