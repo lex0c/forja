@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 79: §13.7 spawn broker primitive — per-request subprocess via Bun.spawn
+
+**Done.** Seventy-ninth slice. Continues the §13.7 thread by shipping `createSpawnBroker` — a `Broker` implementation that spawns a fresh worker subprocess per `execute` call via `Bun.spawn`. The broker pipes the request as one NDJSON line on stdin, reads the response as the LAST NDJSON line on stdout, captures stderr verbatim, and surfaces every failure mode via `BrokerResponse` (never throws). Sandbox wrap is delegated to a caller-supplied `sandboxRunner` callback so production wiring (slice 81) injects `maybeWrapSandboxArgv` while tests pass spies.
+
+Pair with slice 78: the `Broker` contract is unchanged; only the concrete factory differs. Engine harness (slice 81) will accept whichever factory bootstrap chooses — in-process for fast tests / single-process operator runs, spawn-based for the actual `CLI-main-has-no-exec-privilege` posture once the worker script (slice 80) lands.
+
+### Why this matters
+
+Slice 78 shipped the abstraction; slice 79 ships the first real isolation. Each `execute` call gets a fresh OS process — no tool state leaks across invocations, and a stuck/runaway worker can be killed without touching the main process. Combined with the sandbox wrap (per-request `sandboxProfile` chosen by the engine), this is the §6.5 + §13.7 enforcement surface materialized: the broker is the ONE place where "spawn happens" + "sandbox is mounted" + "timeout is enforced" all live.
+
+Spec line 928 ("CLI main não tem exec privilege") is still incomplete after this slice — the broker still runs in-process. The full security posture requires slice 80's worker script + slice 81's harness migration. Slice 79 is the spawn primitive; slice 81 wires it into the actual call sites so main no longer calls `Bun.spawn` directly.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` (new, ~260 lines) | `SpawnedProcess` interface: narrowed shape of `Bun.Subprocess` the broker depends on (`stdin.write/end`, `stdout/stderr` streams, `exited` promise, `kill`). `SpawnFn` + `SpawnFnOptions` test seam. `SandboxRunner` callback shape: `({profile, cwd, innerArgv}) → readonly string[]`. `CreateSpawnBrokerOptions`: `command` + `args` + `cwd` + `env` + `timeoutMs` + `sandboxRunner` + `spawn` (seam). `createSpawnBroker(options)`: per-request, builds `innerArgv = [command, ...args]`, optionally wraps via `sandboxRunner` when profile non-null, spawns, writes request as `JSON.stringify(req) + '\n'` to stdin then closes, drains stdout/stderr in parallel with `proc.exited`, extracts last non-empty stdout line, parses as JSON, type-guards against `BrokerResponse` shape (`ok:boolean`, `stdout:string`, `stderr:string`, optional `exitCode:number`, optional `error:string`), returns. FIFO via single in-flight Promise chain (same pattern as in-process). Failure modes mapped to `BrokerResponse`: `sandbox wrap failed:`, `spawn failed:`, `stdin write failed:` (child killed), `timeout after Nms` (child killed), `worker produced no response`, `invalid response:`, `response missing required fields`, `wait failed:`, `broker bug:` (defensive), `broker closed` (after `close()`). `defaultSpawn` wraps `Bun.spawn` with `stdin/stdout/stderr: 'pipe'`; cwd/env spread conditionally to satisfy `exactOptionalPropertyTypes`. |
+| `src/broker/index.ts` | Re-exports `createSpawnBroker` + types (`CreateSpawnBrokerOptions`, `SandboxRunner`, `SpawnedProcess`, `SpawnFn`, `SpawnFnOptions`). |
+| `tests/broker/spawn.test.ts` (new, 21 tests) | **Real subprocess happy path (5):** roundtrips request → response through NDJSON via `/bin/sh -c`; worker stderr captured into response when stdout has no parseable line; noisy stdout (debug prints) before response — last line wins; invalid JSON on last line → `invalid response:` error + exitCode set; valid JSON missing required fields → shape error. **Timeout (2):** worker exceeding `timeoutMs: 50` is killed + returns `timeout after 50ms` error in <5s (vs 10s sleep); worker completing within timeout returns normally. **Sandbox wrap (4):** `sandboxRunner` invoked with `{profile, cwd, innerArgv}` when profile is `'cwd-rw'`; spawned argv is the runner's output verbatim; sandbox runner NOT invoked when profile is null; sandbox runner NOT invoked when no runner is configured (passthrough); runner throwing maps to `sandbox wrap failed:` error WITHOUT spawning. **Spawn / stdin errors (3):** spawn throwing → `spawn failed: ENOENT`; stdin write throwing kills child + returns `stdin write failed: EPIPE`; request forwarded as single NDJSON line (parses back identical). **FIFO serialization (2):** concurrent execute calls run one-at-a-time (max in-flight = 1 across 5 awaits); a thrown spawn does NOT block subsequent queued calls. **close lifecycle (3):** awaits in-flight before resolving; subsequent execute returns `broker closed`; idempotent. **Option plumbing (2):** cwd/env forwarded to spawn options; default cwd is `process.cwd()`. Mock spawn uses a `streamFromString` helper to construct `ReadableStream<Uint8Array>` for stdout/stderr; mock process tracks `killed` + reports `exitCode 137` when killed via `releaseExited` async hook. |
+
+### Decisions
+
+- **Per-call spawn, not a worker pool.** Cleanest semantics: every invocation starts with a fresh OS process, no inter-call state. The cost is fork overhead per call (~ms on Linux); profiling can decide whether a pool is worth the complexity later. The `Broker` contract doesn't promise either, so a future worker-pool slice can replace `createSpawnBroker` transparently.
+- **Wire format: one NDJSON line per direction, response is the LAST line.** Lets workers print debug output to stdout without breaking parsing. Most other shapes (length-prefixed, framed JSON-RPC) require a wire-format library; NDJSON parses with `String.split('\n')` + `JSON.parse`. Stderr is captured separately and surfaced in the response — not parsed, just forwarded.
+- **Sandbox wrap via callback, not built-in.** The broker takes a `sandboxRunner?` option that production passes `maybeWrapSandboxArgv` to (or a partial application that pins `home`/`platform`). Keeps `src/broker/` free of platform-conditional sandbox logic — the broker just asks "given a profile, what argv?" and spawns the answer. Tests pass spies.
+- **Defensive try/catch around `executeOnce`, not just spawn.** Even though every internal path returns a `BrokerResponse` rather than throwing, the outer `myTurn` chain wraps `executeOnce` in try/catch. Bug-class issues (OOM, unhandled async edge case in mock spawn) MUST still produce a response — the contract is "broker never throws" and that's load-bearing for the engine harness's error handling.
+- **`stdin.end()` result is awaited via `Promise.resolve(proc.stdin.end())`.** Bun's `FileSink.end()` returns `Promise<number>`, the test mock returns `undefined`. Wrapping in `Promise.resolve` normalizes both; the actual number isn't useful here.
+- **Timeout uses `setTimeout` + `proc.kill()`, no `AbortSignal`.** Bun's `proc.exited` doesn't support cancellation, but `kill()` causes `exited` to resolve with the signal exit code (137 for SIGKILL). The `timedOut` flag is checked AFTER the await so the response carries `timeout after Nms` rather than the raw exit code.
+- **Read LAST non-empty line of stdout, not first.** Workers may emit debug prints + the response; the contract is the response is FINAL. First-line parsing would force workers to silence stderr or buffer everything — last-line is the looser, more forgiving wire.
+- **Stream drain via `new Response(stream).text()`, not manual `getReader` loop.** Bun's `Response` handles backpressure + closes the stream after read. Manual loops are 10+ lines for the same effect; the Response constructor is the right primitive.
+- **`Parameters<typeof Bun.spawn>[1]` for spawn options in `defaultSpawn`.** Lets Bun's actual types drive the conditional spread for cwd/env without redeclaring the union. Future Bun versions can add fields and we don't have to chase the change.
+- **`SpawnedProcess` interface is narrower than `Bun.Subprocess`.** Tests construct mocks without needing the full Bun Subprocess shape (which has a dozen fields the broker doesn't touch). Production's `defaultSpawn` casts via `as unknown as SpawnedProcess` — type-safe at the consumption site, decoupled from Bun's evolving types.
+- **REQUIRED_FIELDS_ERROR as a const, not inlined.** One string, one place to grep for tests asserting on it. Future spec PR could surface this through telemetry — having it named makes that wiring cleaner.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied (organizeImports + format)
+- `bun test` — **5861 pass / 10 skip / 0 fail** (5871 total across 278 files); +21 tests on top of slice 78's 5840
+- `bun test tests/broker/spawn.test.ts` — 21 pass in ~137ms; `bun test tests/broker/` — 32 pass (in-process + spawn)
+
+### Next
+
+§13.7 thread next steps from here (slice 78's roadmap, unchanged):
+
+1. **Slice 80: Worker script.** `src/broker/worker.ts` — standalone entry point that the spawn broker invokes. Reads request from stdin, dispatches to the tool registry (existing `src/tools/`), writes response as last stdout line. The worker is the "what runs in the subprocess" piece; until slice 80, production wiring would have to provide its own worker.
+2. **Slice 81: Engine harness integration.** Replace direct `Bun.spawn` call sites in the harness with `broker.execute`. Bootstrap creates a broker (in-process or spawn-based per operator flag); engine emits Decisions; harness dispatches to broker.
+3. **Slice 82: Lifecycle + crash recovery.** SIGTERM handler closes broker gracefully; broker-side restart-on-crash policy; per-tool timeout override.
+
+After slice 82, §13.7 closes: CLI main has no exec privilege; every tool call flows through `broker.execute` → spawn → sandbox wrap → worker → response.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 78: §13.7 broker primitive — types + in-process implementation
 
 **Done.** Seventy-eighth slice. Opens the §13.7 broker/worker architecture thread per spec line 910-934. Ships the `Broker` contract (`BrokerRequest` / `BrokerResponse` types + `Broker` interface) plus an in-process degenerate implementation that establishes the FIFO serialization + close-lifecycle semantics. Subsequent slices migrate to a separate-process broker for the security upgrade (spec line 928: "CLI main não tem exec privilege").
