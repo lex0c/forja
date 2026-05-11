@@ -294,6 +294,27 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'policy-rollback') {
+        // §12.4 policy rollback (slice 50). Dry-run by default;
+        // --write commits AND emits an audit event per spec line
+        // 756. Positional <hash> validated upstream (parser checks
+        // length); handler validates against archive contents.
+        const hash = args.permission.positionals[0] ?? '';
+        const { runPermissionPolicyRollback } = await import('./permission-policy-rollback.ts');
+        return await runPermissionPolicyRollback({
+          hash,
+          json: args.json,
+          ...(args.permission.rollbackWrite === true ? { write: true } : {}),
+          ...(args.permission.rollbackTarget !== undefined
+            ? { target: args.permission.rollbackTarget }
+            : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       // The arg parser already rejects unknown verbs; this branch
       // catches the impossible-but-safe case of a verb the dispatch
       // doesn't know how to route.

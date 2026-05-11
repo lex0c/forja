@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 50: `agent permission policy-rollback` (closes §12.4)
+
+**Done.** Fiftieth slice. Write side of §12.4 — pairs with slice 49's `policy-list` to close the policy archive surface. The verb is dry-run by default for safety; `--write` commits the canonical JSON bytes to the target file AND emits an audit event per spec line 756 ("Cada rollback é audit event").
+
+Together with slice 49, this closes §12.4 entirely.
+
+### Why this matters
+
+Until this slice, the operator could SEE policy history (via slice 49's `policy-list`) but had no way to ROLL BACK without manual SQLite gymnastics. That made the archive informational only — useful for forensics, useless for recovery. Slice 50 turns the archive into an actual recovery tool: a broken policy edit can be reverted to any prior archived state in a single command, with the rollback itself recorded in the audit chain.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New verb `'policy-rollback'` added to `KNOWN_PERMISSION_VERBS`. New flags `--write` (commit) and `--target <file>` (override default `.agent/permissions.yaml`). `rollbackWrite?: boolean` + `rollbackTarget?: string` on the parsed permission args. Verb-specific validation: requires exactly one `<hash>` positional; rejects `--reason`. Header comment updated to describe both `policy-list` (49) and `policy-rollback` (50). |
+| `src/cli/run.ts` | Dispatch arm for `args.permission.verb === 'policy-rollback'`. Lazy-imports the handler. |
+| `src/cli/permission-policy-rollback.ts` (new, ~180 lines) | `runPermissionPolicyRollback({hash, target?, write?, json?, dbPath?, env?, now?, cwd?, writeFile?, readFile?, out, err})`. Default target is `.agent/permissions.yaml` resolved against the runner's cwd. Test seams: `writeFile`/`readFile` (filesystem injection so tests don't touch disk), `now` (deterministic audit timestamps), `cwd` (relative target resolution). Two paths: dry-run (default) prints summary (source hash, target file, current vs archive byte counts, "use --write to commit" hint); --write actually writes the canonical JSON bytes to the target AND emits an audit row via the real `createSqliteSink` (tool_name='permission-engine', session_id='cli-policy-rollback', decision='allow', reason_chain with stage='policy-rollback' + to_hash + target). Hash-not-found returns exit 1 with `error: 'not_found'` (plain or JSON). |
+| `tests/cli/permission-policy-rollback.test.ts` (new, 15 tests) | Parser (6: hash captured, --write captured, --target captured, --write on non-rollback rejected, missing hash rejected, --target without value rejected) + handler (9: hash-not-found exit 1, dry-run leaves target unchanged + writeFile not called, dry-run with non-existent target → "will be created" hint, --write overwrites target + emits audit row (verified via the real approvals_log table), --write on non-existent target still works (fresh install), --json dry-run shape, --json --write shape, --json not-found envelope, default target is `.agent/permissions.yaml` relative to cwd). |
+
+### Decisions
+
+- **Dry-run by default, `--write` to commit.** Same pattern as `--rm` / `git reset --hard` — destructive operations require explicit opt-in. Operators running `policy-rollback <hash>` for the first time get a "this is what would happen" summary, never a silent file overwrite.
+- **Canonical JSON written byte-for-byte (no YAML formatting).** Canonical JSON IS valid YAML (JSON ⊂ YAML 1.2), so the write is a single `writeFileSync`. Operators with formatted YAML (comments + custom layout) lose those on rollback — acceptable for an emergency-revert path. A future `--preserve-format` flag could merge formatting from the current file, but that's a separate slice.
+- **Hash positional is required, no `--latest` shortcut yet.** Spec §12.4 line 753 mentions "reverte pra última policy válida" — an implicit auto-latest path. Skipped for v1: requiring the hash forces the operator to inspect via `policy-list` first, which is the right discovery flow. `--latest` is a possible follow-up.
+- **Audit row uses the real `createSqliteSink`, not a synthetic JSON write.** The rollback event needs to land in the hash-chained approvals_log so future `agent permission verify` reads it as part of the chain. Reusing the existing sink keeps the chain unbroken and makes the rollback visible to every audit-grade introspection surface (replay, diff, inspect).
+- **Audit row's `policy_hash` is the hash we rolled back TO**, not the current/from hash. The operator's intent is captured: "this rollback authorized the policy at hash X to be active". The reason chain note records both endpoints for forensic completeness.
+- **File-system writes through `writeFile` seam.** Production passes node:fs.writeFileSync; tests pass a capture function. Lets the test suite assert the file-write contract (path + content) without depending on disk state.
+- **Default target resolved against cwd, not against the install root.** `agent permission policy-rollback <hash>` run from `/home/user/projects/foo/` writes to `/home/user/projects/foo/.agent/permissions.yaml` (the project's policy file). Mirrors how `agent init` scaffolds project-local config. Operators wanting user-level rollback pass `--target ~/.config/agent/permissions.yaml` explicitly.
+- **No backup of the old target file before write.** Considered + rejected: a backup (e.g. `permissions.yaml.bak`) would clutter the project dir without solving anything — the OLD policy is still in the archive table, retrievable via another `policy-rollback` call. The audit row IS the record. Adding a backup file would just be a different surface for the same data.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5547 pass / 10 skip / 0 fail** (5557 total across 259 files); 15 new tests on top of slice 49's 5532
+- `bun test tests/cli/permission-policy-rollback.test.ts` — 15 pass
+- §12.4 closure: both `policy-list` (read) and `policy-rollback` (write) now ship. §12.4 thread complete.
+
+### Next
+
+§12 thread substantively complete (policy lifecycle: load order 12.1, validation 12.2, rollback 12.4). The remaining piece is §12.3 hot reload (file-watch + `reload_policy` transition); state machine is ready, but the watcher isn't wired.
+
+Other remaining spec work (from the inventory):
+1. **§12.3 hot reload** — file-watch + transition (state machine ready). Medium.
+2. **§7.3 external sealing (worm-file backend)** — audit-grade for regulated deployments.
+3. **§19 v1→v2 migration** — translator + compat layer. Medium.
+4. **macOS sandbox-exec conformance** (extending slice 32's sandbox_select cases with platform-pinned scenarios).
+5. **§13.7 broker/worker architecture** — multi-slice; needed for sandboxed-cap subagents.
+6. **§14 MCP trust model** — blocked on MCP itself (M3+).
+
+§16.2 conformance suite is at 95% (only `concurrency` ~5 cases remain, spec calls for separate driver outside YAML).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 49: `agent permission policy-list` (§12.4 read side)
 
 **Done.** Forty-ninth slice. Opens the §12.4 thread by shipping the read-only enumeration verb. `policy_archive` (slice 13 / migration 037) has stored every UNIQUE policy hash the engine ever booted with since the v2 audit chain landed; this slice gives operators the CLI to inspect it. Pairs with a future `policy-rollback` (slice 50+) that consumes the same data for the write side.

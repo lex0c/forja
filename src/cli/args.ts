@@ -263,6 +263,16 @@ export interface ParsedArgs {
     // active (non-expired, non-revoked) grants. `--all` includes
     // every row for forensic audit (expired + revoked).
     allGrants?: boolean;
+    // `agent permission policy-rollback --write` (§12.4 slice 50).
+    // Without this flag, the verb is dry-run: prints the planned
+    // rollback summary without touching the target file. With it,
+    // canonical_json bytes are written to the target and an audit
+    // row is emitted per spec line 756.
+    rollbackWrite?: boolean;
+    // `agent permission policy-rollback --target <file>` override.
+    // Default `.agent/permissions.yaml` (project-local). Operators
+    // pointing at a user-level or enterprise YAML pass --target.
+    rollbackTarget?: string;
   };
 }
 
@@ -674,10 +684,15 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
 //                   surface). Each row is a UNIQUE policy hash the
 //                   engine ever booted with; pairs with future
 //                   `policy-rollback` for the write side.
+//   policy-rollback — revert to a previous archived policy (§12.4
+//                     write side). Dry-run by default; `--write`
+//                     commits the canonical JSON to the target file
+//                     and emits an audit event per spec line 756.
+//                     `--target <file>` overrides the default
+//                     `.agent/permissions.yaml`. Positional <hash>
+//                     identifies the archive entry.
 //
 // Future verbs (each lands in its own slice):
-//   policy-rollback — revert to a previous archived policy (§12.4
-//                     write side; audit event per spec line 756).
 //   list           — show approvals log entries
 //   test           — run conformance suite
 const KNOWN_PERMISSION_VERBS = [
@@ -689,6 +704,7 @@ const KNOWN_PERMISSION_VERBS = [
   'grants',
   'revoke',
   'policy-list',
+  'policy-rollback',
 ] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
@@ -715,6 +731,8 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   let againstCurrentPolicy = false;
   let clearQuarantine = false;
   let allGrants = false;
+  let rollbackWrite = false;
+  let rollbackTarget: string | undefined;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -767,12 +785,34 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       allGrants = true;
       continue;
     }
+    if (token === '--write') {
+      rollbackWrite = true;
+      continue;
+    }
+    if (token === '--target') {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return {
+          ok: false,
+          message: 'agent permission policy-rollback: --target requires a file path',
+        };
+      }
+      rollbackTarget = value;
+      i += 1;
+      continue;
+    }
     positionals.push(token);
   }
   if (allGrants && verb !== 'grants') {
     return {
       ok: false,
       message: `agent permission ${verb}: --all only applies to 'grants'`,
+    };
+  }
+  if ((rollbackWrite || rollbackTarget !== undefined) && verb !== 'policy-rollback') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --write / --target only apply to 'policy-rollback'`,
     };
   }
   if (withoutClassifier && verb !== 'replay') {
@@ -911,6 +951,25 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       };
     }
   }
+  if (verb === 'policy-rollback') {
+    // <hash> positional required; ULID-shape NOT validated here
+    // (policy_archive hashes are sha256, not ULID — the handler
+    // validates against the archive contents instead). --write
+    // commits, --target overrides default `.agent/permissions.yaml`.
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission policy-rollback: exactly one <hash> positional is required (e.g. `agent permission policy-rollback sha256:abc...`)',
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: 'agent permission policy-rollback: --reason only applies to revoke / rotate-chain',
+      };
+    }
+  }
   if (verb === 'revoke') {
     // Single <id> positional — ULID-shape validation in the handler
     // (CLI knows the ULID alphabet only via isUlid; keeping the
@@ -944,6 +1003,8 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ...(againstCurrentPolicy ? { againstCurrentPolicy: true } : {}),
         ...(clearQuarantine ? { clearQuarantine: true } : {}),
         ...(allGrants ? { allGrants: true } : {}),
+        ...(rollbackWrite ? { rollbackWrite: true } : {}),
+        ...(rollbackTarget !== undefined ? { rollbackTarget } : {}),
       },
     },
   };
