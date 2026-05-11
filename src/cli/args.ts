@@ -220,6 +220,11 @@ export interface ParsedArgs {
   // First slice on §13 — foundation for future `agent sandbox
   // setup` + broker/worker architecture.
   doctor?: { json: boolean };
+  // `agent sandbox <verb> [args]` — §13 platform provisioning
+  // operator surface. Verb is the second token. Currently:
+  //   setup — print the recommended sandbox install command for
+  //           the detected platform / distribution.
+  sandbox?: { verb: 'setup'; json: boolean };
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
@@ -452,6 +457,75 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       yes: false,
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
+    },
+  };
+};
+
+// `agent sandbox <verb> [--json]` — §13 platform provisioning
+// guided bootstrap. First verb: `setup` (slice 44). Future verbs
+// will cover sandbox profile testing + introspection.
+const KNOWN_SANDBOX_VERBS = ['setup'] as const;
+
+const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'sandbox') return null;
+  if (argv.length === 1) {
+    return {
+      ok: false,
+      message: `usage: agent sandbox <${KNOWN_SANDBOX_VERBS.join('|')}> [--json]`,
+    };
+  }
+  const verb = argv[1];
+  if (verb === undefined) {
+    return { ok: false, message: 'agent sandbox: missing verb' };
+  }
+  if (!KNOWN_SANDBOX_VERBS.includes(verb as (typeof KNOWN_SANDBOX_VERBS)[number])) {
+    return {
+      ok: false,
+      message: `agent sandbox: unknown verb '${verb}' (expected: ${KNOWN_SANDBOX_VERBS.join('|')})`,
+    };
+  }
+  let json = false;
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent sandbox ${verb}: unknown flag '${token}' (only --json and --help are accepted)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      sandbox: { verb: 'setup', json },
     },
   };
 };
@@ -808,6 +882,8 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
   if (recapParsed !== null) return recapParsed;
   const doctorParsed = parseDoctorSubcommand(argv);
   if (doctorParsed !== null) return doctorParsed;
+  const sandboxParsed = parseSandboxSubcommand(argv);
+  if (sandboxParsed !== null) return sandboxParsed;
   const permissionParsed = parsePermissionSubcommand(argv);
   if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
@@ -1295,4 +1371,5 @@ export const usage = (): string =>
     '  agent --list-sessions --json',
     '  agent --resume last "now refactor the parts you flagged"',
     '  agent doctor             Health check: platform, sandbox tools, config + data dirs, git',
+    '  agent sandbox setup      Print the recommended sandbox install command for this platform',
   ].join('\n');

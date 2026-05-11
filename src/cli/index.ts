@@ -115,7 +115,10 @@ const main = async (): Promise<number> => {
     // `agent doctor` (§13 slice 43) is the headless platform-health
     // surface. No prompt, no provider, no REPL — same exemption as
     // the other lifecycle modes above.
-    args.doctor !== undefined;
+    args.doctor !== undefined ||
+    // `agent sandbox setup` (§13 slice 44) — same lifecycle-mode
+    // exemption as doctor. Pure informational verb.
+    args.sandbox !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

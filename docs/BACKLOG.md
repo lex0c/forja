@@ -15,6 +15,94 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 44: `agent sandbox setup` (§13 guided sandbox bootstrap)
+
+**Done.** Forty-fourth slice. Second on the §13 thread. Direct follow-on to slice 43's `agent doctor`: when doctor reports `sandbox: warn` (no bwrap on Linux, or sandbox-exec missing on macOS), this surface tells the operator HOW to fix it — distro detection + the exact install command + a verification step pointing back at doctor.
+
+Per spec §13.1 ("detect, don't distribute"), this verb NEVER auto-installs. It prints the recommended command and the operator runs it themselves. Same philosophy as `npm doctor` or `git status`: surface the right action, don't take it.
+
+### Why this matters
+
+`agent doctor` (slice 43) tells the operator WHAT's missing; this slice tells them WHAT TO DO about it. Without setup, a fresh Linux user who runs doctor and sees "sandbox: warn — install bubblewrap" has to figure out the right command for their distro themselves. That's a real bar for first-boot — every distribution has a different incantation (`apt`, `dnf`, `pacman`, `apk`, etc), and operators new to Forja shouldn't have to do that lookup.
+
+This slice closes the gap. `agent sandbox setup` detects the distro from `/etc/os-release` and renders the exact command:
+- Ubuntu → `sudo apt install bubblewrap`
+- Fedora → `sudo dnf install bubblewrap`
+- Arch → `sudo pacman -S bubblewrap`
+- Alpine → `sudo apk add bubblewrap`
+- ... (16 distros mapped, with ID_LIKE fallback for derivatives)
+- Unknown distro → generic "via your package manager" fallback
+- macOS → sandbox-exec built-in, path-broken diagnostic
+- Other platforms → clear "not supported" message
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New `parseSandboxSubcommand` matching the `agent permission <verb>` shape — `sandbox` is the outer subcommand, `setup` is the verb. `KNOWN_SANDBOX_VERBS = ['setup']` so future sandbox verbs (e.g. `test`, `list-profiles`) plug in cleanly. New `sandbox?: { verb: 'setup'; json: boolean }` on parsed args. Help text updated with `agent sandbox setup` example. Wired into `parseArgs` before `parsePermissionSubcommand`. |
+| `src/cli/run.ts` | New dispatch arm for `args.sandbox !== undefined` — verb switch on `args.sandbox.verb`. Lazy-imports `./sandbox-setup.ts` for the `setup` verb. Same lifecycle-mode shape as `doctor`. |
+| `src/cli/index.ts` | `promptOptional` list extended with `args.sandbox !== undefined` — same TTY-gate exemption as the other lifecycle modes. |
+| `src/cli/sandbox-setup.ts` (new, ~225 lines) | `runSandboxSetup({json?, which?, readOsRelease?, platform?, arch?, out, err})`. Three test seams: `which()` for binary probes, `readOsRelease()` for the /etc/os-release file, and `platform`/`arch` overrides so a Linux runner can pin a macOS scenario. `DISTRO_INSTALL` table maps 16 known distro IDs to install commands (Ubuntu/Debian/Pop/Mint/Fedora/RHEL/CentOS/Rocky/AlmaLinux/openSUSE/SLES/Arch/Manjaro/EndeavourOS/Alpine/Gentoo/Void/NixOS). `parseOsRelease` tolerates quoted and unquoted values per the freedesktop spec. ID_LIKE fallback handles boutique derivatives (e.g. an unrecognized ID with `ID_LIKE="ubuntu debian"` falls back to apt). 4 recommendation statuses: `install` (distro known, command renders), `already-installed` (sandbox already on PATH), `path-broken` (macOS without sandbox-exec → almost always PATH issue), `unsupported` (other platforms). JSON mode emits a single envelope; plain mode renders multi-line text with platform/distro header + command block + verification pointer. |
+| `tests/cli/sandbox-setup.test.ts` (new, 16 tests) | Parser (5: verb recognized, --json captured, missing verb, unknown verb, unknown flag) + handler (11: already-installed exit 0, Ubuntu→apt, Fedora→dnf, Arch→pacman, ID_LIKE chain fallback, unknown-distro generic fallback, missing /etc/os-release, macOS path-broken, freebsd unsupported, JSON envelope shape, JSON already-installed status). |
+
+### Smoke
+
+```
+$ agent sandbox setup        # on a Ubuntu box with bwrap installed
+Platform: linux x64
+Distro:   Ubuntu 22.04 LTS (ubuntu)
+
+bwrap is already installed. Run 'agent doctor' to verify the full health check.
+```
+
+```
+$ agent sandbox setup        # on a Ubuntu box WITHOUT bwrap
+Platform: linux x64
+Distro:   Ubuntu 22.04 LTS (ubuntu)
+
+bubblewrap (provides bwrap) is the sandbox runtime on Linux. Install it via your distribution's package manager.
+
+Recommended install:
+  sudo apt install bubblewrap
+
+After install, verify with:
+  agent doctor
+```
+
+```
+$ agent sandbox setup --json # on a Ubuntu box WITHOUT bwrap
+{"ok":true,"platform":"linux","arch":"x64","status":"install","distro":{"id":"ubuntu","pretty":"Ubuntu 22.04 LTS","installCommand":"sudo apt install bubblewrap"},"installCommand":"sudo apt install bubblewrap","message":"..."}
+```
+
+### Decisions
+
+- **Verb shape: `agent sandbox setup` (noun + sub-verb), not `agent sandbox-setup` (flat).** Matches `agent permission <verb>`. The hierarchical shape leaves room for future sandbox verbs (`test`, `list-profiles`, `verify`) without polluting the top-level verb namespace.
+- **No auto-install.** Spec §13.1 explicit: "detect, don't distribute". An auto-install would: (a) require root, (b) introduce a security boundary Forja shouldn't own, (c) make Forja responsible for every distro's package idiosyncrasies. The operator-runs-the-command model keeps Forja stateless w.r.t. system packages.
+- **16-distro table, with ID_LIKE fallback for derivatives.** Initial mapping covers ~90% of operator distros. ID_LIKE handles the long tail of derivatives (Pop!_OS, Linux Mint, MX Linux all have `ID_LIKE=ubuntu` or `ID_LIKE=debian`) — they automatically inherit the parent's install command without explicit mapping. Unknown ID + unknown ID_LIKE → generic fallback message naming the package, not the command (operator does the lookup but knows what to look for).
+- **JSON envelope is a single line, not NDJSON.** Doctor's NDJSON makes sense (one event per check); sandbox setup produces ONE recommendation, so a single JSON object is simpler. Consumers do a single `JSON.parse` instead of stream parsing.
+- **macOS path-broken message instead of install command.** sandbox-exec ships with every supported macOS version at `/usr/bin/sandbox-exec`. If `which sandbox-exec` returns null, the binary IS there — the operator's $PATH is broken. Telling them to "install sandbox-exec" would be misleading. Surfacing the real diagnostic (re-source shell rc, check that /usr/bin is on PATH) catches the actual failure mode.
+- **`already-installed` returns exit 0 with an informational message, not an error.** The verb is informational, not a gate. An operator running `agent sandbox setup` to double-check should get a "you're good" answer, not an error code. Exit 1 reserved for internal failures (file read errors, etc).
+- **Distro table values are strings, not structured records.** Considered a richer shape (`{ command, requiresRoot: true, postInstallCheck: '...' }`) but rejected — every entry is `sudo $pm install bubblewrap` modulo the package manager. Strings keep the table readable and grep-friendly.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5487 pass / 10 skip / 0 fail** (5497 total across 255 files); 16 new tests on top of slice 43's 5471
+- `bun test tests/cli/sandbox-setup.test.ts` — 16 pass
+- Manual smoke: `bun src/cli/index.ts sandbox setup` on this Ubuntu dev machine prints the already-installed message correctly
+
+### Next
+
+§13 platform provisioning — remaining slices:
+1. **First-boot UX**: spec §13.5. When `agent` runs for the first time (no install_id), show a tailored doctor + setup walkthrough before opening the REPL. Builds on slices 43+44.
+2. **Broker/worker architecture**: spec §13.7. Multi-slice.
+3. **Doctor extensions**: kernel-feature probe (Linux unshare / user namespaces / cgroups), `/tmp` size + permissions, container detection.
+
+Non-§13 successors: macOS sandbox-exec (the second-biggest platform gap), MCP-tool spawn wire-up, §7.3 external sealing, capability-scope grants, modal bridge → insertGrant.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 43: `agent doctor` (§13 platform provisioning — foundation)
 
 **Done.** Forty-third slice. First slice on §13 — biggest user-facing block remaining from the §23 production-ready criteria. Pivots from the §8 grants thread (39-42) to platform provisioning. Spec §13.3-13.9 calls for `forja doctor` (renamed `agent doctor` per repo conventions), `agent sandbox setup`, broker/worker architecture, first-boot UX, degradation banners. This slice ships the foundation — the doctor verb — with 5 checks; subsequent slices add `sandbox setup`, the broker arch, and the rest of §13.

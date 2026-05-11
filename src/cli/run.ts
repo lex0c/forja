@@ -314,6 +314,23 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
+    // `agent sandbox <verb> [--json]` — §13 guided sandbox bootstrap.
+    // Slice 44: setup verb. Same lifecycle-mode shape as doctor.
+    if (args.sandbox !== undefined) {
+      if (args.sandbox.verb === 'setup') {
+        const { runSandboxSetup } = await import('./sandbox-setup.ts');
+        return await runSandboxSetup({
+          json: args.sandbox.json,
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      // Defensive: parser rejects unknown verbs, but route the
+      // impossible case to a clean error.
+      errSink(`forja sandbox: verb '${args.sandbox.verb}' has no handler\n`);
+      return 1;
+    }
+
     if (args.recap !== undefined) {
       const { runRecapHeadless } = await import('./recap-headless.ts');
       let provider: import('../providers/types.ts').Provider;
