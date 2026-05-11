@@ -167,6 +167,39 @@ export const computeRotatedGenesisHash = (
   rotated_at_ms: number,
 ): string => `GENESIS-ROTATED:${sha256Hex(`${identity.install_id}${rotated_at_ms}${rotation_id}`)}`;
 
+// PERMISSION_ENGINE.md §7.2 `--accept-broken-chain` lookup. Returns
+// (seq, ts) for every audit row emitted by the bootstrap when the
+// operator opted to continue under a known-broken chain. The
+// `bootstrapPermissionEngine` flow writes one such row PER acceptance
+// (so multiple resumes under different breaks all stack visibly in
+// the chain).
+//
+// Filter strategy: `tool_name = 'permission-engine'` narrows the scan
+// to engine-emitted rows (the only path that produces these), then a
+// LIKE on `reason_chain_json` matches the `chain-break-accepted`
+// stage marker. The LIKE is acceptable here because (a) the prefix
+// filter on tool_name keeps the scanned set tiny in production
+// (typically zero or single-digit rows), and (b) the chain stage
+// marker is a stable string literal the engine writes verbatim — no
+// JSON-shape sensitivity.
+export interface ChainBreakAcceptedRow {
+  seq: number;
+  ts: number;
+}
+
+export const listChainBreakAcceptedRows = (db: DB, installId: string): ChainBreakAcceptedRow[] => {
+  return db
+    .query(
+      `SELECT seq, ts
+         FROM approvals_log
+        WHERE install_id = ?
+          AND tool_name = 'permission-engine'
+          AND reason_chain_json LIKE '%chain-break-accepted%'
+        ORDER BY seq ASC`,
+    )
+    .all(installId) as ChainBreakAcceptedRow[];
+};
+
 export interface CreateSqliteSinkOptions {
   identity: InstallIdentity;
   db: DB;

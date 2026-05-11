@@ -41,7 +41,13 @@ export type {
   ReasonChainEntry,
   VerifyResult,
 } from './audit.ts';
-export { computeGenesisHash, createNoopSink, createSqliteSink } from './audit.ts';
+export type { ChainBreakAcceptedRow } from './audit.ts';
+export {
+  computeGenesisHash,
+  createNoopSink,
+  createSqliteSink,
+  listChainBreakAcceptedRows,
+} from './audit.ts';
 
 export type {
   SandboxAvailability,

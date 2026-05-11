@@ -7,7 +7,13 @@
 // This is the minimal verification entry — the richer `replay`
 // surface from PERMISSION_ENGINE.md §17 is a separate slice.
 
-import { type VerifyResult, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
+import {
+  type ChainBreakAcceptedRow,
+  type VerifyResult,
+  createSqliteSink,
+  ensureInstallId,
+  listChainBreakAcceptedRows,
+} from '../permissions/index.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
 export interface RunPermissionVerifyOptions {
@@ -43,11 +49,18 @@ export const runPermissionVerify = async (
 
   const dbPath = options.dbPath ?? defaultDbPath();
   let result: VerifyResult;
+  let acceptedBreaks: ChainBreakAcceptedRow[] = [];
   try {
     const db = openDb(dbPath);
     migrate(db, MIGRATIONS);
     const sink = createSqliteSink({ db, identity });
     result = sink.verifyChain();
+    // §7.2: surface accepted breaks even on intact chains. An
+    // operator who ran with `--accept-broken-chain` once should see
+    // that history every time they verify — accepted breaks are
+    // forensically meaningful (the chain CONTAINS a known break;
+    // the operator signed off on it).
+    acceptedBreaks = listChainBreakAcceptedRows(db, identity.install_id);
   } catch (e) {
     const reason = (e as Error).message;
     if (json) {
@@ -66,7 +79,13 @@ export const runPermissionVerify = async (
   }
 
   if (json) {
-    out(`${JSON.stringify({ install_id: identity.install_id, ...result })}\n`);
+    out(
+      `${JSON.stringify({
+        install_id: identity.install_id,
+        ...result,
+        accepted_breaks: acceptedBreaks,
+      })}\n`,
+    );
     return result.ok ? 0 : 1;
   }
 
@@ -84,6 +103,23 @@ export const runPermissionVerify = async (
         `          'SELECT * FROM approvals_log_archived WHERE archive_rotation_id = ${result.current_rotation_id};'\n`,
       );
       out('          to audit the pre-rotation rows.\n');
+    }
+    if (acceptedBreaks.length > 0) {
+      // §7.2: an intact chain that CONTAINS an accepted break is
+      // forensically meaningful — operator opted to continue under
+      // a known break. Surface the seqs so the operator can audit
+      // them by row.
+      const seqList = acceptedBreaks.map((r) => r.seq).join(', ');
+      out(
+        `  ⚠ ${acceptedBreaks.length} chain-break-accepted row(s) on this chain (seq${
+          acceptedBreaks.length === 1 ? '' : 's'
+        }: ${seqList})\n`,
+      );
+      out('     The chain is intact AFTER each acceptance point, but operators\n');
+      out('     explicitly continued under a known break at these seqs. Inspect with:\n');
+      out(
+        `       'SELECT * FROM approvals_log WHERE install_id = ''${identity.install_id}'' AND seq IN (${seqList});'\n`,
+      );
     }
     return 0;
   }
@@ -105,7 +141,8 @@ export const runPermissionVerify = async (
   out('  - Re-run with `agent permission rotate-chain --reason "<text>"` to archive\n');
   out('    the broken segment and start a fresh chain (chain remains QUARANTINED\n');
   out('    until you inspect the archived rows).\n');
-  out('  - `--accept-broken-chain` is reserved for an explicit operator override that\n');
-  out('    keeps the broken chain live — not implemented in this slice.\n');
+  out('  - Re-run `agent --accept-broken-chain ...` to continue under the known break.\n');
+  out('    A `chain-break-accepted` audit row lands BEFORE new decisions; the\n');
+  out('    acceptance is permanently visible in the chain and `verify` flags it.\n');
   return 1;
 };

@@ -5,6 +5,7 @@ import {
   computeGenesisHash,
   createNoopSink,
   createSqliteSink,
+  listChainBreakAcceptedRows,
 } from '../../src/permissions/audit.ts';
 import { sha256Hex } from '../../src/permissions/canonical.ts';
 import type { InstallIdentity } from '../../src/permissions/install_id.ts';
@@ -270,5 +271,80 @@ describe('createSqliteSink — verifyChain', () => {
     expect(aRows.length).toBe(2);
     expect(bRows.length).toBe(1);
     expect(bRows[0]?.prev_hash).toBe(computeGenesisHash(idB));
+  });
+});
+
+describe('listChainBreakAcceptedRows — §7.2 --accept-broken-chain visibility', () => {
+  test('returns empty array when no acceptance rows exist', () => {
+    const db = openMemoryDb();
+    migrate(db);
+    const rows = listChainBreakAcceptedRows(db, 'never-accepted');
+    expect(rows).toEqual([]);
+  });
+
+  test('finds chain-break-accepted rows by install_id, ordered by seq', () => {
+    // Simulate two accept events on the same install + one
+    // unrelated row that should NOT match.
+    const db = openMemoryDb();
+    migrate(db);
+    const id = { install_id: 'inst-acc', created_at_ms: 1000 };
+    const sink = createSqliteSink({ db, identity: id });
+    // Unrelated tool row first.
+    sink.emit({
+      session_id: 's',
+      tool_name: 'bash',
+      args: { command: 'ls' },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [{ stage: 'static-rule' }],
+      ts: 1,
+    });
+    // Engine-emitted chain-break-accepted (mimics what
+    // bootstrap-engine writes on the override path).
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'permission-engine',
+      args: { acceptBrokenChain: true },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [{ stage: 'chain-break-accepted', note: 'broken_at=1' }],
+      ts: 2,
+    });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'permission-engine',
+      args: { acceptBrokenChain: true },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [{ stage: 'chain-break-accepted', note: 'broken_at=5' }],
+      ts: 3,
+    });
+
+    const rows = listChainBreakAcceptedRows(db, id.install_id);
+    expect(rows.length).toBe(2);
+    expect(rows[0]?.ts).toBe(2);
+    expect(rows[1]?.ts).toBe(3);
+    expect(rows[0]?.seq).toBeLessThan(rows[1]?.seq ?? 0);
+  });
+
+  test('scoped to the requested install_id (no cross-install leak)', () => {
+    const db = openMemoryDb();
+    migrate(db);
+    const sink = createSqliteSink({
+      db,
+      identity: { install_id: 'OTHER', created_at_ms: 1 },
+    });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'permission-engine',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:x',
+      reason_chain: [{ stage: 'chain-break-accepted' }],
+      ts: 1,
+    });
+
+    expect(listChainBreakAcceptedRows(db, 'NOT-OTHER')).toEqual([]);
+    expect(listChainBreakAcceptedRows(db, 'OTHER').length).toBe(1);
   });
 });

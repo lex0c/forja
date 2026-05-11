@@ -15,6 +15,49 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 24: `--accept-broken-chain` visibility + verify banner (§7.2)
+
+**Done.** Twenty-fourth slice. The `--accept-broken-chain` operator override was effectively complete back in slice 8 (parse + bootstrap propagation + bootstrap-engine emit path all in place), but with two gaps left: (1) verify's deny-path help text still labeled the flag as "not implemented in this slice", and (2) once an operator USED it, the resulting `chain-break-accepted` audit row was invisible on subsequent `verify` runs of the intact chain. This slice closes both gaps so the override's forensic trail is operator-readable.
+
+### Why the visibility matters
+
+§7.2 makes the override audit-loud BY DESIGN: a `chain-break-accepted` row lands BEFORE new decisions, permanently fingerprinting the moment the operator signed off on a known break. But until this slice the only way to SEE that row on a healthy chain was a direct SQL scan. Verify rendered "audit chain: intact" without mentioning that the chain HAD an accepted break inside it. Forensically poor — the operator could forget that their install carried an acceptance.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/audit.ts` | New `ChainBreakAcceptedRow` type + `listChainBreakAcceptedRows(db, installId)`. Filters `approvals_log` by `tool_name = 'permission-engine'` first (narrows the scan to a tiny set in production) then matches `reason_chain_json LIKE '%chain-break-accepted%'`. Returns `(seq, ts)` ordered by seq. The LIKE on JSON is acceptable here — the prefix tool_name filter bounds the scan, and the stage marker is a stable literal the engine writes verbatim. |
+| `src/permissions/index.ts` | Re-exports the new type + function. |
+| `src/cli/permission-verify.ts` | After verifyChain returns, looks up accepted breaks via the new repo function. Text output: when the chain is intact AND breaks exist, renders `⚠ N chain-break-accepted row(s) on this chain (seqs: ...)` + an SQL hint. JSON output: adds `accepted_breaks: [{ seq, ts }, ...]` to the result envelope. Deny path: replaced obsolete "not implemented in this slice" text with a real operator hint (run `agent --accept-broken-chain` to continue under the known break). |
+| `tests/permissions/audit.test.ts` | 3 new tests — empty case, multi-row case ordered by seq, install_id scoping. |
+| `tests/cli/permission-verify.test.ts` | 4 new tests — banner renders on intact chain with accepted breaks, JSON includes `accepted_breaks` array, clean chain shows no banner, broken-chain help text updated (recommends the flag as a real option, no "not implemented in this slice"). |
+
+### Decisions
+
+- **Banner fires on intact AND broken chains.** An accepted break on a still-intact chain is the operator's prior signature — it stays informational on every `verify` call. On the broken-chain path the help text already directs operators at the flag; rendering the banner there too would be noise. So intact-only banner; broken path has its own help block.
+- **`tool_name='permission-engine'` prefix filter narrows the LIKE scan.** SQLite's `reason_chain_json LIKE '%chain-break-accepted%'` is O(n) over candidates; the tool_name filter keeps the candidate set tiny (engine-emitted rows are rare — one per acceptance event AND one per `chain-break-accepted` stage). In production the entire approvals_log scans tens-of-thousands of rows; the prefix filter trims to single digits.
+- **JSON adds the `accepted_breaks` field unconditionally.** Empty array when none — same shape every time. Consumers piping into `jq` don't have to branch on field presence. Cost: 17 bytes (`,"accepted_breaks":[]`) per call when empty.
+- **Deny-path help text drops the "not implemented in this slice" qualifier.** The flag IS implemented (since slice 8). The wording now points operators at the real flow: `agent --accept-broken-chain` re-runs with the override, an audit row lands BEFORE new decisions, and verify visibility (this slice) keeps the override permanent in the chain's forensic surface.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5280 pass / 10 skip / 0 fail** (5290 total across 249 files)
+
+### Next
+
+Successor slices:
+1. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18–21 on macOS).
+2. MCP-tool spawn wire-up (when MCP tools execute child processes).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Section-level `locked` for `sandbox` (matching `defaults.locked`).
+5. Per-field provenance for `sandbox` (when `/perms why sandbox` ergonomics need it).
+6. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 23: policy `sandbox` section (§6.5 policy-layer controls)
 
 **Done.** Twenty-third slice. Moves the sandbox knobs from CLI-flag-only (slice 10) and bootstrap-hardcoded false to a proper YAML policy section. Enterprise authors can now declare `sandbox.required: true` to refuse boot under a missing toolchain; `sandbox.host_allowed: true` activates the `host` profile path without the operator passing `--sandbox-host` on every invocation.

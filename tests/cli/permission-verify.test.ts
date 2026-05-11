@@ -257,4 +257,143 @@ describe('runPermissionVerify', () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toBe('install_id');
   });
+
+  test('intact chain with accepted breaks renders banner naming seqs', async () => {
+    // Seed an intact row + a chain-break-accepted row. The chain
+    // stays intact (the engine emit path appends it cleanly), but
+    // verify should call out the acceptance.
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'permission-engine',
+      args: { acceptBrokenChain: true },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [{ stage: 'chain-break-accepted' }],
+      ts: 1,
+    });
+    sink.emit({
+      session_id: 's',
+      tool_name: 'bash',
+      args: { command: 'ls' },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [],
+      ts: 2,
+    });
+    db.close();
+
+    const out = captured();
+    const code = await runPermissionVerify({
+      dbPath,
+      env,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('audit chain: intact');
+    expect(text).toContain('chain-break-accepted row(s)');
+    expect(text).toContain('seq');
+  });
+
+  test('JSON output includes accepted_breaks array', async () => {
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'permission-engine',
+      args: { acceptBrokenChain: true },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [{ stage: 'chain-break-accepted' }],
+      ts: 1,
+    });
+    db.close();
+
+    const out = captured();
+    const code = await runPermissionVerify({
+      json: true,
+      dbPath,
+      env,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.lines.join(''));
+    expect(parsed.ok).toBe(true);
+    expect(Array.isArray(parsed.accepted_breaks)).toBe(true);
+    expect(parsed.accepted_breaks.length).toBe(1);
+    expect(typeof parsed.accepted_breaks[0].seq).toBe('number');
+    expect(typeof parsed.accepted_breaks[0].ts).toBe('number');
+  });
+
+  test('clean chain with no accepted breaks does NOT render banner', async () => {
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 's',
+      tool_name: 'bash',
+      args: { command: 'ls' },
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [],
+      ts: 1,
+    });
+    db.close();
+
+    const out = captured();
+    await runPermissionVerify({
+      dbPath,
+      env,
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('audit chain: intact');
+    expect(text).not.toContain('chain-break-accepted');
+  });
+
+  test('broken-chain help text recommends --accept-broken-chain as a real option', async () => {
+    // Seed a broken chain. The verify failure path renders the
+    // forensic options including the accept-broken-chain hint —
+    // this slice updates the wording away from "not implemented
+    // in this slice" since the flag IS implemented.
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 's',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:fix',
+      reason_chain: [],
+      ts: 1,
+    });
+    // Tamper.
+    db.run('UPDATE approvals_log SET this_hash = ? WHERE seq = 1', ['forged']);
+    db.close();
+
+    const out = captured();
+    await runPermissionVerify({
+      dbPath,
+      env,
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('BROKEN');
+    expect(text).toContain('--accept-broken-chain');
+    // Pin away from the obsolete "not implemented in this slice" wording.
+    expect(text).not.toContain('not implemented in this slice');
+  });
 });
