@@ -15,6 +15,51 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 48: macOS sandbox-exec — `maybeWrapSandboxArgv` platform dispatch (§6.5)
+
+**Done.** Forty-eighth slice. Second on the macOS sandbox-exec thread. Closes the wire-up loop slice 47 left open: the spawn-site `maybeWrapSandboxArgv` primitive now dispatches by `process.platform`, calling `buildSandboxExecArgv` (slice 47) on darwin and `buildBwrapArgv` (slice 18) on Linux. Single function — every spawn site that already calls `maybeWrapSandboxArgv` (grep, glob, bash background, bash inline — slices 19-21) gets macOS support automatically. No spawn-site changes needed.
+
+Slice 47 shipped the SBPL profile generator as a pure function; this slice connects it to the runtime path. After this slice, an operator on macOS with sandbox-exec on PATH (the default on every supported version) gets the same per-call wrap behavior Linux operators have had since slice 19.
+
+### Why this matters
+
+The introspection path already advertised macOS support — `detectSandboxAvailability` returns `available: true, tool: 'sandbox-exec'` on darwin (was already there before slice 47), and the doctor/setup/welcome verbs (slices 43-45) surface that. But until this slice the engine NEVER ACTUALLY WRAPPED on macOS. Every tool call on a Mac ran with `host` privileges silently. Slice 48 makes the advertisement true.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-runner.ts` | New imports for `buildSandboxExecArgv` from slice 47. `MaybeWrapSandboxArgvOptions` gets two new test seams: `platform?: NodeJS.Platform` and `which?: (name) => string \| null`. Production callers leave both undefined and the function reads `process.platform` + `Bun.which`. `maybeWrapSandboxArgv` rewritten to dispatch: profile-undefined or host → passthrough; linux + bwrap available → `buildBwrapArgv`; darwin + sandbox-exec available → `buildSandboxExecArgv`; anything else (degraded) → passthrough. Header comment reflects the multi-platform shape. |
+| `tests/permissions/sandbox-runner.test.ts` | New describe block "platform dispatch (slice 48 seams)" with 7 tests pinning: darwin + sandbox-exec → wraps via sandbox-exec with correct argv shape (no `--` separator, profile carries cwd), darwin without sandbox-exec → passthrough, linux without bwrap → passthrough, host profile bypasses dispatch on darwin, unsupported platform (freebsd) → passthrough, darwin home-rw carries home not cwd in the profile, darwin cwd-rw-net carries `(allow network*)`. |
+
+### Decisions
+
+- **Test seams instead of mocking `process.platform`.** Mocking globals in Bun is fragile; the seams (`platform` and `which`) let tests pin specific scenarios deterministically. Production callers stay clean — leaving both undefined keeps behavior identical to pre-slice-48 on Linux.
+- **`host` profile checked before platform dispatch.** Operator-opted-in passthrough must work regardless of which platform we're on or what binary is installed. The host check short-circuits FIRST so the dispatch logic stays orthogonal: "if we should wrap, what platform are we on?" rather than "what platform are we on, should we even wrap?".
+- **Degraded passthrough is silent (no log/throw).** The engine's §6.5 plan stage (`selectSandboxProfile`) is responsible for routing to host (or refusing) when sandboxing is required-but-unavailable. The wrap helper enforces the wrap when it CAN, falls back when it CAN'T, but doesn't second-guess the planner. Mirrors slice 19's design.
+- **Single function, not two (`maybeWrapLinuxArgv` + `maybeWrapDarwinArgv`).** The dispatch logic is straightforward (3 platform branches × the host check) and lives in one place. Splitting into two functions would force every spawn site to call a dispatcher anyway. Single function with internal branching keeps the call site clean.
+- **No `home` fallback per platform.** Same `home ?? process.env.HOME ?? cwd` default as Linux. macOS home directories conventionally live at `/Users/<name>` but the runner doesn't enforce that — if the operator's `$HOME` is unset (CI containers running on macOS workers), the falling-back-to-cwd posture matches Linux and keeps the home-rw profile valid. Tests pin this with `home: '/home/op'` for portability across runner platforms.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5523 pass / 10 skip / 0 fail** (5533 total across 257 files); 7 new tests on top of slice 47's 5516
+- `bun test tests/permissions/sandbox-runner.test.ts` — 23 pass (16 prior + 7 new)
+- No spawn-site changes — grep/glob/bash sites (slices 19-21) automatically inherit macOS support via the dispatch update.
+
+### Next
+
+macOS sandbox-exec thread — remaining work:
+1. **Spawn-site smoke tests on macOS** — verify nothing platform-specific leaks (path conventions, /tmp shape, command quoting). Would need a real macOS runner; conformance is the safer surrogate.
+2. **Conformance**: extend `sandbox_select` cases (slice 32) with platform-pinned scenarios so the SBPL profile shape is locked behind the suite. Need to extend the case shape with a `platform` field.
+3. **Sandbox-availability extension**: `detectSandboxAvailability` already probes sandbox-exec on darwin (was already there). Doctor / sandbox setup verbs already render the right output. No further work this thread on detection.
+4. **Macos-specific: hide_paths / scrub_env**: §9 credential scoping. Linux uses bwrap `--bind /dev/null <path>` to hide. macOS SBPL has `(deny file-read* (subpath "/path"))` for the same effect. Worth a slice once §9 verification (engine-side post-spawn checks) ships.
+
+Other remaining spec work: §12.4 rollback CLI (small), §12.3 hot reload (medium), §7.3 sealing (audit-grade), §19 migration (medium).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 47: macOS sandbox-exec — SBPL profile generator (§6.5, foundation)
 
 **Done.** Forty-seventh slice. Opens the macOS sandbox-exec thread — the second-biggest platform gap remaining. Parallel to slice 18's bwrap argv synthesis on Linux. This slice ships the SBPL profile generator + sandbox-exec argv builder; runtime wire-up (the `maybeWrapSandboxArgv` dispatch by platform) is a follow-up.

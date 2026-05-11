@@ -63,6 +63,7 @@
 // caller's expected working directory.
 
 import type { SandboxProfile } from './sandbox-plan.ts';
+import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
 
 export interface BuildBwrapArgvOptions {
   profile: SandboxProfile;
@@ -126,20 +127,20 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
 };
 
 // Per-spawn-site consume primitive (§6.5 runtime wire-up).
-// Encapsulates the four-condition gate every spawn site has to
-// apply identically:
+// Encapsulates the gate every spawn site has to apply identically.
+// The wrap fires only when:
 //
 //   1. `profile` was set by the planner (engine wired with sandbox).
 //   2. `profile` isn't `host` (operator-opted-in passthrough).
-//   3. `process.platform === 'linux'` (bwrap is Linux-only).
-//   4. `Bun.which('bwrap') !== null` (defensive recheck — bootstrap
-//      detected once at startup; a package update can remove the
-//      binary mid-session).
+//   3. The host platform supports a sandbox tool:
+//        Linux  → bwrap available on $PATH
+//        darwin → sandbox-exec available on $PATH (slice 48)
+//        other  → never (Windows + BSD + etc fall through to passthrough)
 //
-// All four must hold for the wrap to fire. Otherwise the helper
-// returns `innerArgv.slice()` (defensive copy — caller can mutate
-// without poisoning source data) and the spawn proceeds with the
-// inner argv directly.
+// Otherwise the helper returns `innerArgv.slice()` (defensive copy
+// — caller can mutate without poisoning source data) and the spawn
+// proceeds with the inner argv directly. Same degraded-passthrough
+// posture across both platforms.
 //
 // The defensive Bun.which() call is a single PATH lookup — cheap
 // enough to live in the hot path. We'd rather pay the lookup per
@@ -150,25 +151,47 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
 // $HOME may be unset, and the `home-rw` profile needs SOMETHING
 // to bind. Falling back to cwd keeps the wrap valid without
 // throwing or accidentally binding `/root`.
+//
+// Test seams (`platform`, `which`) override the live probes so the
+// suite can pin macOS scenarios from a Linux runner and vice versa.
+// Production callers leave both undefined.
 export interface MaybeWrapSandboxArgvOptions {
   profile?: SandboxProfile;
   cwd: string;
   home?: string;
   innerArgv: readonly string[];
+  platform?: NodeJS.Platform;
+  which?: (name: string) => string | null;
 }
 
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
   const { profile, cwd, home, innerArgv } = options;
-  const shouldWrap =
-    profile !== undefined &&
-    profile !== 'host' &&
-    process.platform === 'linux' &&
-    Bun.which('bwrap') !== null;
-  if (!shouldWrap) return innerArgv.slice();
-  return buildBwrapArgv({
-    profile: profile as Exclude<SandboxProfile, 'host'>,
-    cwd,
-    home: home ?? process.env.HOME ?? cwd,
-    innerArgv,
-  });
+  const platform = options.platform ?? process.platform;
+  const which = options.which ?? ((name) => Bun.which(name));
+
+  if (profile === undefined || profile === 'host') return innerArgv.slice();
+
+  if (platform === 'linux' && which('bwrap') !== null) {
+    return buildBwrapArgv({
+      profile: profile as Exclude<SandboxProfile, 'host'>,
+      cwd,
+      home: home ?? process.env.HOME ?? cwd,
+      innerArgv,
+    });
+  }
+
+  if (platform === 'darwin' && which('sandbox-exec') !== null) {
+    return buildSandboxExecArgv({
+      profile: profile as Exclude<SandboxProfile, 'host'>,
+      cwd,
+      home: home ?? process.env.HOME ?? cwd,
+      innerArgv,
+    });
+  }
+
+  // No sandbox tool available — degraded passthrough. The engine's
+  // §6.5 plan stage is responsible for routing to host (or refusing)
+  // when sandboxing is required; this helper only enforces the wrap
+  // when both the profile AND the platform/tooling agree.
+  return innerArgv.slice();
 };

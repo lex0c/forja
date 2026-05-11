@@ -186,4 +186,108 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     }
   });
+
+  // Test seams added in slice 48: pin a darwin scenario from a
+  // Linux runner. Production callers leave platform/which undefined.
+  describe('platform dispatch (slice 48 seams)', () => {
+    test('darwin + sandbox-exec available → wraps via sandbox-exec', () => {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        platform: 'darwin',
+        which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+      });
+      expect(argv[0]).toBe('sandbox-exec');
+      expect(argv[1]).toBe('-p');
+      // Profile string is the third element; contains the SBPL
+      // version + the cwd writable subpath.
+      expect(argv[2]).toContain('(version 1)');
+      expect(argv[2]).toContain('(allow file-write* (subpath "/work/proj"))');
+      // Inner argv follows the profile, no `--` separator (unlike
+      // bwrap).
+      expect(argv.slice(3)).toEqual(['bash', '-c', 'echo hi']);
+    });
+
+    test('darwin without sandbox-exec → passthrough (degraded)', () => {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'ro',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        platform: 'darwin',
+        which: () => null,
+      });
+      expect(argv).toEqual(['bash', '-c', 'echo hi']);
+    });
+
+    test('linux without bwrap → passthrough (degraded)', () => {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'ro',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        platform: 'linux',
+        which: () => null,
+      });
+      expect(argv).toEqual(['bash', '-c', 'echo hi']);
+    });
+
+    test('host profile bypasses platform dispatch entirely', () => {
+      // Host is operator-opted-in passthrough — no wrap regardless
+      // of which platform we're on or whether the tool exists.
+      const argv = maybeWrapSandboxArgv({
+        profile: 'host',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        platform: 'darwin',
+        which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+      });
+      expect(argv).toEqual(['bash', '-c', 'echo hi']);
+    });
+
+    test('unsupported platform → passthrough', () => {
+      // FreeBSD / Windows / etc — `detectSandboxAvailability` would
+      // have flagged this at bootstrap. The wrap helper stays
+      // forgiving (degraded) instead of throwing, mirroring the
+      // missing-binary path.
+      const argv = maybeWrapSandboxArgv({
+        profile: 'ro',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        platform: 'freebsd' as NodeJS.Platform,
+        which: () => '/usr/bin/whatever',
+      });
+      expect(argv).toEqual(['bash', '-c', 'echo hi']);
+    });
+
+    test('darwin home-rw profile carries the home in the profile string', () => {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'home-rw',
+        cwd: CWD,
+        home: '/home/op',
+        innerArgv: INNER,
+        platform: 'darwin',
+        which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+      });
+      expect(argv[2]).toContain('(allow file-write* (subpath "/home/op"))');
+      // cwd should NOT be writable under home-rw.
+      expect(argv[2]).not.toContain('(allow file-write* (subpath "/work/proj"))');
+    });
+
+    test('darwin cwd-rw-net profile carries network grant', () => {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'cwd-rw-net',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        platform: 'darwin',
+        which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+      });
+      expect(argv[2]).toContain('(allow network*)');
+    });
+  });
 });
