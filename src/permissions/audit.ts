@@ -203,9 +203,22 @@ export const listChainBreakAcceptedRows = (db: DB, installId: string): ChainBrea
 export interface CreateSqliteSinkOptions {
   identity: InstallIdentity;
   db: DB;
+  // §7.3 sealing integration (slice 56). When set, every successful
+  // `emit` notifies the scheduler via `tick()` so the scheduler can
+  // count decisions toward `interval_decisions` and seal at the
+  // appropriate threshold. Optional — sinks created without a
+  // scheduler simply skip the notification and behave exactly as
+  // before slice 56. Production wiring lives in the bootstrap
+  // (slice 57): construct the scheduler from `[seal]` Policy config,
+  // pass it here.
+  scheduler?: { tick(): void };
 }
 
-export const createSqliteSink = ({ identity, db }: CreateSqliteSinkOptions): AuditSink => {
+export const createSqliteSink = ({
+  identity,
+  db,
+  scheduler,
+}: CreateSqliteSinkOptions): AuditSink => {
   // Resolve the active genesis once at construction. Rotations are
   // operator-driven via the CLI `--rotate-chain` flow that exits
   // before any engine starts, so the sink never sees a mid-flight
@@ -251,6 +264,22 @@ export const createSqliteSink = ({ identity, db }: CreateSqliteSinkOptions): Aud
 
     const this_hash = sha256Hex(prev_hash + canonicalize(buildHashPayload(persistedExceptHash)));
     const inserted = appendApprovalsLog(db, { ...persistedExceptHash, this_hash });
+    // §7.3 sealing tick (slice 56). ORDER MATTERS: the row is
+    // already persisted, so the scheduler's `sealLatestInternal`
+    // sees the up-to-date chain head when it queries
+    // `getLastApprovalsLogByInstall`. Wrapped in try/catch because
+    // the audit path is critical and sealing is best-effort —
+    // scheduler internals OR a user-supplied `onSealFailed`
+    // callback throwing must NOT break audit emission.
+    if (scheduler !== undefined) {
+      try {
+        scheduler.tick();
+      } catch {
+        // Best-effort. Surfacing the error here would mean a
+        // half-emitted row from the caller's perspective — the row
+        // is in the DB, but emit() threw. Silently swallow.
+      }
+    }
     return { seq: inserted.seq, this_hash };
   };
 

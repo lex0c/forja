@@ -15,6 +15,51 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 56: audit-sink × scheduler integration — §7.3 emit→tick wiring
+
+**Done.** Fifty-sixth slice. Wires slice 55's `SealingScheduler` into `createSqliteSink`: every successful `emit` notifies the scheduler via `tick()`, driving the `interval_decisions` counter from real audit traffic. Three components (sealer + scheduler + sink) now operate end-to-end — `interval_decisions = N` becomes a real engine behavior, not just a config knob.
+
+### Why this matters
+
+Slices 54 and 55 shipped isolated primitives: the sealer wrote entries, the scheduler counted decisions, but nothing called `tick()`. This slice is the smallest possible bridge — five non-test lines in `audit.ts` — that turns the chain into the trigger for sealing. After this, every audit decision the engine emits implicitly drives the seal cadence.
+
+The ordering contract (emit FIRST persists, THEN ticks) is the critical correctness property: `sealLatestInternal` queries `getLastApprovalsLogByInstall` to find the latest chain head. If `tick` fired before the row landed, the scheduler would seal the PREVIOUS chain tip — off-by-one in the seal file forever. Test 3 pins this by querying the DB from inside the `tick` stub and asserting the just-emitted seq is visible.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/audit.ts` | `CreateSqliteSinkOptions` gains `scheduler?: { tick(): void }` — structurally typed, no import of `SealingScheduler` to avoid a circular dep between `audit.ts` and `sealing-scheduler.ts` (which imports nothing from audit but DOES import from the storage layer). After `appendApprovalsLog` succeeds in `emit`, the sink calls `scheduler?.tick()` inside a `try/catch` block. The catch swallows: sealing is best-effort, scheduler internals or a user-supplied `onSealFailed` callback throwing must NOT break audit emission (the row is already persisted; throwing from emit would leave callers thinking the row failed, leading to double-emit on retry). |
+| `tests/permissions/audit-scheduler.test.ts` (new, 6 tests) | (1) no scheduler → emit behaves exactly as before (regression guard). (2) `scheduler.tick` invoked once per emit across 3 emits. (3) ORDERING — tick stub queries the DB and observes the just-emitted seq as the head, proving emit persists BEFORE ticking. (4) tick throwing does NOT break emit — the row still lands + emit returns a valid `EmittedRow`. (5) full integration — real `createWormFileSealer` + real `createSealingScheduler` + real `createSqliteSink`, 10 emits with `intervalDecisions=4` produce exactly 2 seal entries (at seq=4 and seq=8), `verifySealAgainstChain` returns ok with `entriesChecked: 2`. (6) structural-type sanity — a hand-rolled `{ tick(): void }` stub works as a scheduler. |
+
+### Decisions
+
+- **Structural typing on the sink's `scheduler` param, not nominal `SealingScheduler` import.** The audit-sink module is a peer of the sealing-scheduler module, not its parent. Importing `SealingScheduler` here would create a dependency that's purely cosmetic (the sink only uses `tick()`). The `{ tick(): void }` shape captures exactly what the sink needs and lets tests pass hand-rolled stubs without constructing a real scheduler. Real production wiring (slice 57's bootstrap) will pass the full `SealingScheduler`, which structurally fits.
+- **Tick AFTER persist, never before.** The scheduler's `sealLatestInternal` queries the chain tip via `getLastApprovalsLogByInstall`. If tick fired before persist, the seal would always lag by one decision. Worse, a freshly-emitted row at a threshold boundary (decision N) would seal the row from decision N-1 — off-by-one in the seal file accumulating session-over-session. Test 3 pins this.
+- **`try/catch` around `tick()`, swallow errors.** The audit emit MUST succeed even when sealing fails. The scheduler is defensive (its `sealLatestInternal` already catches `store.append` failures and routes them through `onSealFailed`), so a thrown error from `tick()` would indicate either (a) a SQLite query failure inside `getLastApprovalsLogByInstall` — which would have already failed the just-completed `appendApprovalsLog`, so unreachable here, or (b) a user-supplied `onSealFailed` callback throwing. In case (b), the user's own callback misbehaved; we already tried to surface the failure to them. Swallowing prevents a corrupted audit emit signal.
+- **No observability hook for swallowed errors yet.** Could later add `onSchedulerError?: (e: unknown) => void` to `CreateSqliteSinkOptions` for operators who want to know when their sealing scheduler exploded. Deferred — not on the §7.3 critical path, and the scheduler's own `onSealFailed` already covers the common failure mode (store.append rejected). Adding it now would be feature-creep ahead of any real need.
+- **Test ordering: persist-first proof goes BEFORE tick-throwing proof.** Tests run in file order; the ordering invariant is the more interesting correctness property, so it gets the more elaborate assertion (querying the DB from inside the stub). The "tick throws → emit survives" test is a simpler shape check that follows.
+- **No update to existing audit tests.** `tests/permissions/audit.test.ts` and `audit-rotation.test.ts` continue to pass — adding an optional parameter doesn't break callers that don't pass it. Test 1 in the new file explicitly verifies the no-scheduler regression.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5612 pass / 10 skip / 0 fail** (5622 total across 263 files); +6 tests on top of slice 55's 5606
+- `bun test tests/permissions/audit-scheduler.test.ts` — 6 pass
+
+### Next
+
+§7.3 thread state: primitive (54) ✓, scheduler (55) ✓, audit-sink integration (56) ✓, bootstrap wire-up (57) pending, CLI verb (58) pending.
+
+Slice 57 is where the operator-facing surface lands: a `[seal]` section in the Policy schema (`mode`, `interval_decisions`, `interval_seconds`, `path`, `on_failure`), with the bootstrap constructing the right `SealStore` based on `mode` (only `none` and `worm-file` initially; others land as separate later slices), then wiring it to `createSealingScheduler` and forwarding the scheduler to `createSqliteSink`. The `on_failure: degrade|refuse` mapping turns sealing failures into state-machine transitions — that's the piece that closes the §7.3 production-readiness checkbox.
+
+After 57+58, additional sealing backends (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) become independent slices of the same shape as 54.
+
+Other open spec gaps unchanged. §16.2 conformance still at 95%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 55: `createSealingScheduler` — §7.3 interval-driven sealing
 
 **Done.** Fifty-fifth slice. Bridges slice 54's `SealStore` primitive to the audit-decision flow + wall clock per the §7.3 spec: `interval_decisions = 100` (seal every N decisions) AND/OR `interval_seconds = 3600` (seal at most every M seconds), whichever fires first. Three trigger paths converge on a single sealing internal: `tick()` (called by the audit sink after every emit), wall-clock timer (auto-rescheduling), and `sealNow()` (manual — SessionEnd / CLI verb).
