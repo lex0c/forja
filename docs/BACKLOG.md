@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 30: conformance suite — score determinism cases (§16.2 minimum)
+
+**Done.** Thirtieth slice. Third conformance top-up: 10 cases pinning EXACT score weights per §6.3.1 baseline-v2.0, complementing the existing 9 threshold-shaped cases in `risk_score.yaml`. Every new case asserts `score_gte === score_lte` so the score is locked to the spec's decimal weight values; a regression that drifted any single weight by even 0.05 fails immediately. Suite grows **93 → 103** (76% of the §16.2 GA bar).
+
+Side-effect: the runner now uses an IEEE 754-tolerant comparison (`SCORE_EPSILON = 1e-9`) for `score_gte`/`score_lte`, fixing a precision wart where the spec's decimal weights (e.g. 0.4 + 0.2 = 0.6000000000000001 in binary float) made exact-pin assertions impossible. The epsilon is far below any meaningful score delta and far above float precision noise; existing threshold cases (score_gte 0.5, score_lte 0.0) are unaffected.
+
+### Why this matters
+
+§6.3 makes a strong claim: the score is a pure function of (capabilities, command, confidence, engineState, recentErrors, isMcp, trustedHosts, cwd, home). That's load-bearing for replay (slice 16) — same engine version + same audit inputs must reproduce the same score, otherwise comparing past decisions against current policy meaningfully fails. The existing `risk_score.yaml` cases test that the RIGHT FEATURES fire for typical inputs (score_gte 0.5 when these features are expected), but they don't pin the WEIGHTS themselves. A regression that changed `capability_risk` from 0.4 to 0.45 would pass every existing case (still above 0.5 in combination) but silently rewrite the historical replay baseline. Slice 30 closes that gap.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/cases/score_determinism.yaml` (new, ~225 lines) | 10 cases across 5 groups: A. trusted-host egress baseline → exact 0 (2: github.com, registry.npmjs.org), B. single-feature isolation → exact weight (4: untrusted_egress 0.25, mcp_tool 0.1, workspace_escape 0.15, shell_complex 0.2), C. multi-feature sums (2: capability_risk + wildcard_scope = 0.6, capability_risk + blocklist + workspace_escape = 0.85), D. clamp saturation at 1.0 (1: compound bash with 1.3 raw sum), E. path-agnostic determinism (1: rm -rf /opt/y same features as /tmp/x → 0.85). Header documents all 11 §6.3.1 weights inline so a weight-drift PR has to also touch this file. |
+| `tests/conformance/index.ts` | `runCase` now uses `SCORE_EPSILON = 1e-9` tolerance for both `score_gte` and `score_lte` comparisons. Comment explains why: spec weights are decimal multiples of 0.05 that don't all round-trip through IEEE 754 binary float (`0.4 + 0.2 = 0.6000000000000001`), and exact-pin tests would fail without tolerance even when the engine is correct. |
+
+### Decisions
+
+- **`score_gte === score_lte` is the exact-pin pattern.** The existing `score_gte` / `score_lte` shape is sufficient — no schema extension. Setting both to the same value pins exact equality (within `SCORE_EPSILON`). Cleaner than introducing a new `score_eq` field and back-compat-broken across existing cases.
+- **Epsilon = 1e-9 is the right magnitude.** Spec weights are decimal at one or two significant digits (0.4, 0.15, 0.25). The smallest "meaningful" weight delta is 0.05 (changing one tier). 1e-9 is 7 orders of magnitude below that — no real regression hides under the epsilon, and no float precision noise rises above it.
+- **Trust-list pinning targets `registry.npmjs.org` specifically, not just github.com.** github.com is the obvious one — easy to keep. The less-obvious risk is silently dropping less-touched entries (`registry.npmjs.org`, `pypi.org`, `crates.io`) during a "cleanup" refactor. Pinning npm specifically catches the "tightened the trust list too far" regression at conformance time, not when a user notices `npm install` started prompting.
+- **`mcp_tool isolated → 0.1 exact`** validates that an MCP tool with no resolver + no command + ready engine state + high confidence (default for unknown-tool path) lands at exactly the weight value. Catches a regression that introduced a "default conservative confidence" fallback for unresolved tools, which would have added 0.1 (medium) or 0.3 (low) silently.
+- **Saturation clamp pinned at exactly 1.0, not "near 1.0".** With raw sum 1.3 (capability_risk 0.4 + workspace_escape 0.15 + blocklist 0.3 + shell_complex 0.2 + untrusted_egress 0.25), the engine clamps to 1.0. The exact bound matters because downstream consumers (the §6.6 approval gate threshold, the audit row's typed score field) expect a closed unit interval. A regression that changed the clamp to `Math.min(raw, 0.99)` would slip past threshold-shaped assertions.
+- **Path-agnostic determinism (case 10) demonstrates the score is a function of FEATURES, not input bytes.** `rm -rf /opt/y` and `rm -rf /tmp/x` trigger the same three features (capability_risk + blocklist + workspace_escape) and must produce the same score (0.85). A regression that introduced path-specific weighting (e.g. "extra penalty for /opt because it usually holds production binaries") would diverge these two cases. The contract is "score depends on feature set, not raw input" — case 10 is the smallest test that captures that.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5354 pass / 10 skip / 0 fail** (5364 total across 249 files); 10 new conformance tests + the runner epsilon change benefits future exact-pin work without disturbing any existing case
+- `bun test tests/conformance/` — 104 pass (52 prior + 25 bash adversarial + 16 path traversal + 10 score determinism + 1 meta-test); suite coverage **103/136 = 76%** of the §16.2 GA bar (up from 68%)
+
+### Next
+
+Successor slices on the conformance trail:
+1. **subagent_intersection** (~6 cases) — requires extending `ConformanceCase` shape with `parent_capabilities` + `declared_capabilities` + effective/excess assertions. Heavier slice (schema work + 6 cases).
+2. **hash_chain** (~8 cases) — requires real audit DB + tampering harness, not the fake sink. Schema work + DB plumbing.
+3. **ttl_expiry** (~6 cases) — needs grants table + time mocks in the runner.
+4. **sandbox_select** (~6 cases) — needs sandbox plan output in the case shape.
+5. **concurrency** (~5 cases) — separate driver, hardest to express as static YAML.
+
+Non-conformance: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 29: lexical path normalization (closes slice-28 traversal gap)
 
 **Done.** Twenty-ninth slice. Closes the engine finding documented in slice 28: 7 call sites across `engine.ts`, `matcher.ts`, `resolvers/fs.ts`, and `resolvers/bash.ts` had the same vulnerable pattern — `isAbsolute(p) ? p : resolve(cwd, p)` — which left absolute paths with embedded `..`/`./` components UN-normalized when `realpath` couldn't resolve them on the live FS (intermediate directories missing). With a fictional or never-existed cwd and a permissive `allow_paths: ["/**"]`, an LLM-crafted `write_file /work/proj/data/../../../etc/hosts` slipped past the protected-path classifier because the classifier saw the textual `/work/proj/data/../../../etc/hosts` (no `/etc/` startsWithSegment match) — escalate tier never fired, and the write was auto-allowed. Slice 29 normalizes lexically via `path.resolve(cwd, p)` unconditionally BEFORE any realpath fallback, so `..`/`./` are resolved textually first regardless of FS state.

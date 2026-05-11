@@ -253,15 +253,22 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
       );
     }
   }
+  // IEEE 754 epsilon for score bound comparisons. The spec weights
+  // (§6.3.1) are decimal multiples of 0.05 that don't all round-trip
+  // through binary float (e.g. 0.4 + 0.2 = 0.6000000000000001). Without
+  // tolerance, exact-pin cases like score_gte=score_lte=0.6 fail
+  // spuriously even when the engine is correct. 1e-9 is far below any
+  // meaningful score delta and far above the float precision noise.
+  const SCORE_EPSILON = 1e-9;
   if (c.expect.score_gte !== undefined) {
     const score = auditRow?.score ?? 0;
-    if (score < c.expect.score_gte) {
+    if (score < c.expect.score_gte - SCORE_EPSILON) {
       reasons.push(`score_gte mismatch: expected >= ${c.expect.score_gte}, got ${score}`);
     }
   }
   if (c.expect.score_lte !== undefined) {
     const score = auditRow?.score ?? 0;
-    if (score > c.expect.score_lte) {
+    if (score > c.expect.score_lte + SCORE_EPSILON) {
       reasons.push(`score_lte mismatch: expected <= ${c.expect.score_lte}, got ${score}`);
     }
   }
