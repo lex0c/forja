@@ -11,6 +11,9 @@ export type {
   PolicyMode,
   PolicySource,
   PolicyToolsSection,
+  SealMode,
+  SealOnFailure,
+  SealPolicy,
 } from './types.ts';
 
 export {

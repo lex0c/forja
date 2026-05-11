@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { allProtectedRoots } from './protected_paths.ts';
-import type { Policy, PolicyMode } from './types.ts';
+import type { Policy, PolicyMode, SealMode, SealOnFailure } from './types.ts';
 
 // Optional validation context for parsePolicy. When supplied, the
 // validator additionally rejects allow/confirm patterns that
@@ -67,6 +67,18 @@ const enforceProtectedPathInvariants = (
 };
 
 const VALID_MODES: ReadonlySet<string> = new Set(['strict', 'acceptEdits', 'bypass']);
+
+// §7.3 sealing modes. Currently 'none' (default) and 'worm-file'
+// (Linux ext4 + chattr +a). The other §7.3 backends ship in later
+// slices; listing them as RESERVED makes config errors specific
+// ("not yet implemented") rather than generic enum-mismatch.
+const VALID_SEAL_MODES: ReadonlySet<string> = new Set(['none', 'worm-file']);
+const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set([
+  's3-object-lock',
+  'rfc3161-tsa',
+  'git-anchored',
+]);
+const VALID_SEAL_ON_FAILURE: ReadonlySet<string> = new Set(['degrade', 'refuse']);
 
 const isStringArray = (v: unknown): v is string[] =>
   Array.isArray(v) && v.every((e) => typeof e === 'string');
@@ -250,6 +262,89 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     }
   }
 
+  // PERMISSION_ENGINE.md §7.3 sealing section (slice 57).
+  // Required field: `mode`. Required IF `mode='worm-file'`: `path`.
+  // All other fields optional with documented defaults applied at
+  // bootstrap-time (not here — keeping the parsed shape minimal so
+  // the hierarchy resolver can tell "operator silenced this field"
+  // from "operator chose the default value").
+  let seal: Policy['seal'];
+  if (r.seal !== undefined) {
+    if (typeof r.seal !== 'object' || r.seal === null || Array.isArray(r.seal)) {
+      throw new Error('policy: `seal` must be a mapping');
+    }
+    const s = r.seal as Record<string, unknown>;
+    rejectUnknownKeys(
+      s,
+      ['mode', 'path', 'interval_decisions', 'interval_seconds', 'on_failure'],
+      'seal',
+    );
+    if (s.mode === undefined) {
+      throw new Error('policy: seal.mode is required');
+    }
+    if (typeof s.mode !== 'string' || !VALID_SEAL_MODES.has(s.mode)) {
+      // Reserved modes (`s3-object-lock`, `rfc3161-tsa`,
+      // `git-anchored`) get a deliberately specific error so an
+      // operator copy-pasting from the spec gets a clear "not yet
+      // implemented" rather than a generic enum mismatch.
+      if (RESERVED_SEAL_MODES.has(String(s.mode))) {
+        throw new Error(
+          `policy: seal.mode='${String(s.mode)}' is reserved for a future slice; current support: none|worm-file`,
+        );
+      }
+      throw new Error(`policy: seal.mode must be one of none|worm-file, got '${String(s.mode)}'`);
+    }
+    const mode = s.mode as SealMode;
+    let path: string | undefined;
+    if (s.path !== undefined) {
+      if (typeof s.path !== 'string' || s.path.length === 0) {
+        throw new Error('policy: seal.path must be a non-empty string');
+      }
+      path = s.path;
+    }
+    if (mode === 'worm-file' && path === undefined) {
+      throw new Error('policy: seal.path is required when seal.mode is worm-file');
+    }
+    let interval_decisions: number | undefined;
+    if (s.interval_decisions !== undefined) {
+      if (
+        typeof s.interval_decisions !== 'number' ||
+        !Number.isInteger(s.interval_decisions) ||
+        s.interval_decisions < 0
+      ) {
+        throw new Error('policy: seal.interval_decisions must be a non-negative integer');
+      }
+      interval_decisions = s.interval_decisions;
+    }
+    let interval_seconds: number | undefined;
+    if (s.interval_seconds !== undefined) {
+      if (
+        typeof s.interval_seconds !== 'number' ||
+        !Number.isInteger(s.interval_seconds) ||
+        s.interval_seconds < 0
+      ) {
+        throw new Error('policy: seal.interval_seconds must be a non-negative integer');
+      }
+      interval_seconds = s.interval_seconds;
+    }
+    let on_failure: SealOnFailure | undefined;
+    if (s.on_failure !== undefined) {
+      if (typeof s.on_failure !== 'string' || !VALID_SEAL_ON_FAILURE.has(s.on_failure)) {
+        throw new Error(
+          `policy: seal.on_failure must be one of degrade|refuse, got '${String(s.on_failure)}'`,
+        );
+      }
+      on_failure = s.on_failure as SealOnFailure;
+    }
+    seal = {
+      mode,
+      ...(path !== undefined ? { path } : {}),
+      ...(interval_decisions !== undefined ? { interval_decisions } : {}),
+      ...(interval_seconds !== undefined ? { interval_seconds } : {}),
+      ...(on_failure !== undefined ? { on_failure } : {}),
+    };
+  }
+
   return {
     defaults: {
       ...(mode !== undefined ? { mode } : {}),
@@ -257,6 +352,7 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     },
     tools: tools as Policy['tools'],
     ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(seal !== undefined ? { seal } : {}),
   };
 };
 

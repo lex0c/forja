@@ -92,10 +92,59 @@ export interface PolicySandbox {
   locked?: boolean;
 }
 
+// PERMISSION_ENGINE.md §7.3 external sealing. Configures how the
+// engine snapshots the local hash chain to a write-once surface
+// so a root adversary who rewrites every audit row + recomputes
+// hashes still leaves a trail.
+//
+// `mode`:
+//   - 'none'      — default; no sealing. Local hash chain only.
+//   - 'worm-file' — append-only file (chattr +a on Linux / WORM mount).
+// Other §7.3 modes (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`)
+// are reserved for future slices; parsing rejects them now so a
+// typo or premature upgrade fails loudly instead of silently
+// falling back to `none`.
+//
+// `path` (required when mode='worm-file') — absolute path to the
+// seal file. The bootstrap creates the file on first append and
+// invokes `chattr +a` via the SealStore's `onCreate` hook.
+//
+// `interval_decisions` (default 100) — fire a seal every N audit
+// decisions. Set to 0 to disable decision-driven sealing (only the
+// wall-clock interval applies). The audit sink's `emit` ticks the
+// scheduler on every successful row persist.
+//
+// `interval_seconds` (default 3600) — fire a seal every M seconds.
+// Set to 0 to disable time-driven sealing. The scheduler self-
+// reschedules so operators don't need an external cron.
+//
+// `on_failure`:
+//   - 'degrade' (default) — store.append failure transitions the
+//     engine to `degraded`. New decisions continue but every
+//     would-be allow becomes confirm.
+//   - 'refuse'           — store.append failure transitions the
+//     engine to `refusing`. Every check returns deny until restart.
+//
+// Single layer wins — the highest-precedence layer that sets
+// `seal` defines the entire config. No partial merge across layers
+// (a mixed config — enterprise sets mode, user sets interval — is
+// usually a mistake; "all-or-nothing" makes intent obvious).
+export type SealMode = 'none' | 'worm-file';
+export type SealOnFailure = 'degrade' | 'refuse';
+
+export interface SealPolicy {
+  mode: SealMode;
+  path?: string;
+  interval_decisions?: number;
+  interval_seconds?: number;
+  on_failure?: SealOnFailure;
+}
+
 export interface Policy {
   defaults: PolicyDefaults;
   tools: PolicyToolsSection;
   sandbox?: PolicySandbox;
+  seal?: SealPolicy;
 }
 
 // Provenance of the matching rule that produced a Decision.

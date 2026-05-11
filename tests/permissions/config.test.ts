@@ -231,3 +231,118 @@ describe('parsePolicy — sandbox section (§6.5, slice 23)', () => {
     expect(p.sandbox).toBeUndefined();
   });
 });
+
+describe('parsePolicy — seal section (§7.3, slice 57)', () => {
+  test('mode=none parses with no other fields required', () => {
+    const p = parsePolicy({ seal: { mode: 'none' } });
+    expect(p.seal).toEqual({ mode: 'none' });
+  });
+
+  test('mode=worm-file with path parses cleanly', () => {
+    const p = parsePolicy({ seal: { mode: 'worm-file', path: '/var/log/agent/seal.log' } });
+    expect(p.seal).toEqual({ mode: 'worm-file', path: '/var/log/agent/seal.log' });
+  });
+
+  test('all optional fields propagate', () => {
+    const p = parsePolicy({
+      seal: {
+        mode: 'worm-file',
+        path: '/var/log/agent/seal.log',
+        interval_decisions: 50,
+        interval_seconds: 1800,
+        on_failure: 'refuse',
+      },
+    });
+    expect(p.seal).toEqual({
+      mode: 'worm-file',
+      path: '/var/log/agent/seal.log',
+      interval_decisions: 50,
+      interval_seconds: 1800,
+      on_failure: 'refuse',
+    });
+  });
+
+  test('mode is required', () => {
+    expect(() => parsePolicy({ seal: {} })).toThrow('seal.mode is required');
+  });
+
+  test('mode=worm-file requires path', () => {
+    expect(() => parsePolicy({ seal: { mode: 'worm-file' } })).toThrow(
+      'seal.path is required when seal.mode is worm-file',
+    );
+  });
+
+  test('mode=none does NOT require path', () => {
+    expect(() => parsePolicy({ seal: { mode: 'none' } })).not.toThrow();
+  });
+
+  test('reserved modes get a specific "not yet implemented" error', () => {
+    for (const mode of ['s3-object-lock', 'rfc3161-tsa', 'git-anchored']) {
+      expect(() => parsePolicy({ seal: { mode } })).toThrow(
+        `seal.mode='${mode}' is reserved for a future slice`,
+      );
+    }
+  });
+
+  test('unknown mode rejected with enum error', () => {
+    expect(() => parsePolicy({ seal: { mode: 'cloud-storage' } })).toThrow(
+      "seal.mode must be one of none|worm-file, got 'cloud-storage'",
+    );
+  });
+
+  test('invalid on_failure rejected with enum error', () => {
+    expect(() => parsePolicy({ seal: { mode: 'none', on_failure: 'crash' } })).toThrow(
+      "seal.on_failure must be one of degrade|refuse, got 'crash'",
+    );
+  });
+
+  test('rejects non-mapping seal', () => {
+    expect(() => parsePolicy({ seal: true })).toThrow('`seal` must be a mapping');
+    expect(() => parsePolicy({ seal: [] })).toThrow('`seal` must be a mapping');
+  });
+
+  test('rejects empty path', () => {
+    expect(() => parsePolicy({ seal: { mode: 'worm-file', path: '' } })).toThrow(
+      'seal.path must be a non-empty string',
+    );
+  });
+
+  test('rejects non-integer interval_decisions', () => {
+    expect(() => parsePolicy({ seal: { mode: 'none', interval_decisions: 1.5 } })).toThrow(
+      'seal.interval_decisions must be a non-negative integer',
+    );
+    expect(() => parsePolicy({ seal: { mode: 'none', interval_decisions: -1 } })).toThrow(
+      'seal.interval_decisions must be a non-negative integer',
+    );
+    expect(() => parsePolicy({ seal: { mode: 'none', interval_decisions: 'lots' } })).toThrow(
+      'seal.interval_decisions must be a non-negative integer',
+    );
+  });
+
+  test('rejects non-integer interval_seconds', () => {
+    expect(() => parsePolicy({ seal: { mode: 'none', interval_seconds: 60.5 } })).toThrow(
+      'seal.interval_seconds must be a non-negative integer',
+    );
+  });
+
+  test('accepts interval_decisions=0 (disables decision-driven sealing)', () => {
+    const p = parsePolicy({ seal: { mode: 'none', interval_decisions: 0 } });
+    expect(p.seal?.interval_decisions).toBe(0);
+  });
+
+  test('accepts interval_seconds=0 (disables time-driven sealing)', () => {
+    const p = parsePolicy({ seal: { mode: 'none', interval_seconds: 0 } });
+    expect(p.seal?.interval_seconds).toBe(0);
+  });
+
+  test('rejects unknown keys', () => {
+    expect(() => parsePolicy({ seal: { mode: 'none', endpoint: 'https://x' } })).toThrow(
+      "seal has unknown key 'endpoint'",
+    );
+  });
+
+  test('absent seal section leaves the field undefined', () => {
+    const p = parsePolicy({ defaults: { mode: 'strict' } });
+    expect(p.seal).toBeUndefined();
+  });
+});

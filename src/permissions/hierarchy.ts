@@ -79,6 +79,10 @@ export interface SectionProvenance {
   // Per-field writer attribution per slice 35 — replaces the slice-23
   // single-Layer shape. Absent when no layer wrote any sandbox field.
   sandbox?: SandboxProvenance;
+  // PERMISSION_ENGINE.md §7.3 sealing section (slice 57). Single-
+  // layer-wins — the layer that LAST set `seal: {...}` is the writer.
+  // Absent when no layer wrote a seal section.
+  seal?: Layer;
 }
 
 export interface ResolveResult {
@@ -204,6 +208,15 @@ const merge = (
   let sandboxRequiredWriter: Layer | null = null;
   let sandboxHostAllowedWriter: Layer | null = null;
   let sandboxLockedWriter: Layer | null = null;
+  // §7.3 seal section (slice 57). Single-layer-wins semantics —
+  // whatever layer is LAST to set `seal: { ... }` defines the entire
+  // section. Cross-layer field merge would create surprising
+  // configs (enterprise sets mode, user accidentally overrides
+  // path); all-or-nothing keeps operator intent obvious. No lock
+  // semantics in slice 57 — sealing isn't field-mergeable so lock
+  // adds no value over the natural last-writer-wins flow.
+  let mergedSeal: Policy['seal'];
+  let sealWriter: Layer | null = null;
   const lockConflicts: LockConflict[] = [];
 
   for (const { layer, policy } of layers) {
@@ -288,6 +301,12 @@ const merge = (
           sandboxLockedWriter = layer;
         }
       }
+    }
+
+    // §7.3 seal section — last-writer-wins for the whole section.
+    if (policy.seal !== undefined) {
+      mergedSeal = policy.seal;
+      sealWriter = layer;
     }
 
     // tools.* sections
@@ -375,9 +394,13 @@ const merge = (
       defaults: mergedDefaults,
       tools: mergedTools,
       ...(mergedSandbox !== undefined ? { sandbox: mergedSandbox } : {}),
+      ...(mergedSeal !== undefined ? { seal: mergedSeal } : {}),
     },
     lockConflicts,
-    provenance,
+    provenance: {
+      ...provenance,
+      ...(sealWriter !== null ? { seal: sealWriter } : {}),
+    },
   };
 };
 

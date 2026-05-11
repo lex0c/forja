@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bootstrapPermissionEngine } from '../../src/permissions/bootstrap-engine.ts';
-import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
+import {
+  type SealEntry,
+  type SealStore,
+  createSqliteSink,
+  ensureInstallId,
+} from '../../src/permissions/index.ts';
 import { type DB, MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 import { listApprovalsLogByInstall } from '../../src/storage/repos/approvals-log.ts';
 
@@ -423,5 +428,278 @@ describe('bootstrapPermissionEngine — §12.3 watchPolicy wire-up', () => {
     expect(r.state).toBe('refusing');
     expect(r.policyWatcher).toBeUndefined();
     expect(watcherCalls).toBe(0);
+  });
+});
+
+describe('bootstrapPermissionEngine — §7.3 sealing wire-up', () => {
+  // Factory helpers for tests. The factory captures the entries
+  // written so tests can inspect what got sealed without touching
+  // a real worm-file.
+  const makeMemFactory = () => {
+    const entries: SealEntry[] = [];
+    let shouldFail: string | null = null;
+    const factory = (): SealStore => ({
+      append: (entry) => {
+        if (shouldFail !== null) return { ok: false, reason: shouldFail };
+        entries.push(entry);
+        return { ok: true };
+      },
+      list: () => entries.slice(),
+      close: () => {},
+    });
+    return {
+      factory,
+      entries,
+      failNext: (reason: string) => {
+        shouldFail = reason;
+      },
+    };
+  };
+
+  const noopTimerSeams = () => ({
+    sealSchedulerSetTimer: () => null,
+    sealSchedulerClearTimer: () => {},
+  });
+
+  test('no seal section in policy → no sealStore / sealingScheduler in result', async () => {
+    const r = await bootstrapPermissionEngine(baseInput());
+    expect(r.sealStore).toBeUndefined();
+    expect(r.sealingScheduler).toBeUndefined();
+  });
+
+  test('mode=none → no sealStore / sealingScheduler in result', async () => {
+    const r = await bootstrapPermissionEngine(
+      baseInput({ sessionPolicy: { defaults: {}, tools: {}, seal: { mode: 'none' } } }),
+    );
+    expect(r.sealStore).toBeUndefined();
+    expect(r.sealingScheduler).toBeUndefined();
+  });
+
+  test('mode=worm-file → sealStore + sealingScheduler attached', async () => {
+    const mem = makeMemFactory();
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: { mode: 'worm-file', path: '/seal.log' },
+        },
+        sealStoreFactory: mem.factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    expect(r.state).toBe('ready');
+    expect(r.sealStore).toBeDefined();
+    expect(r.sealingScheduler).toBeDefined();
+    r.sealingScheduler?.close();
+  });
+
+  test('emit ticks the scheduler — decision threshold triggers a seal', async () => {
+    const mem = makeMemFactory();
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/seal.log',
+            interval_decisions: 3,
+            interval_seconds: 0,
+          },
+        },
+        sealStoreFactory: mem.factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    // 3 audit emits via the engine → scheduler counts to 3 → seals.
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    expect(mem.entries).toHaveLength(0);
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    expect(mem.entries).toHaveLength(1);
+    r.sealingScheduler?.close();
+  });
+
+  test('seal failure with on_failure=degrade transitions engine to degraded', async () => {
+    const mem = makeMemFactory();
+    mem.failNext('chattr +a failed: permission denied');
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/seal.log',
+            interval_decisions: 1,
+            interval_seconds: 0,
+            on_failure: 'degrade',
+          },
+        },
+        sealStoreFactory: mem.factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    expect(r.engine.state()).toBe('ready');
+    // Single emit at intervalDecisions=1 immediately triggers a seal
+    // attempt → store returns ok:false → onSealFailed fires →
+    // engine.degrade().
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    expect(r.engine.state()).toBe('degraded');
+    r.sealingScheduler?.close();
+  });
+
+  test('seal failure with on_failure=refuse transitions engine to refusing', async () => {
+    const mem = makeMemFactory();
+    mem.failNext('disk full');
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/seal.log',
+            interval_decisions: 1,
+            interval_seconds: 0,
+            on_failure: 'refuse',
+          },
+        },
+        sealStoreFactory: mem.factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    expect(r.engine.state()).toBe('ready');
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    expect(r.engine.state()).toBe('refusing');
+    r.sealingScheduler?.close();
+  });
+
+  test('default on_failure is degrade (omitted on_failure behaves as degrade)', async () => {
+    const mem = makeMemFactory();
+    mem.failNext('fake fail');
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/seal.log',
+            interval_decisions: 1,
+            interval_seconds: 0,
+          },
+        },
+        sealStoreFactory: mem.factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    r.engine.check('bash', 'bash', { command: 'ls' });
+    expect(r.engine.state()).toBe('degraded');
+    r.sealingScheduler?.close();
+  });
+
+  test('refusing-state bootstrap does NOT initialize sealing', async () => {
+    let factoryCalls = 0;
+    const factory = (): SealStore => {
+      factoryCalls++;
+      return {
+        append: () => ({ ok: true }),
+        list: () => [],
+        close: () => {},
+      };
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        env: {}, // forces install_id failure → refusing
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: { mode: 'worm-file', path: '/seal.log' },
+        },
+        sealStoreFactory: factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    expect(r.state).toBe('refusing');
+    expect(r.sealStore).toBeUndefined();
+    expect(r.sealingScheduler).toBeUndefined();
+    expect(factoryCalls).toBe(0);
+  });
+
+  test('sandbox required+unavailable refusing path also skips sealing', async () => {
+    let factoryCalls = 0;
+    const factory = (): SealStore => {
+      factoryCalls++;
+      return {
+        append: () => ({ ok: true }),
+        list: () => [],
+        close: () => {},
+      };
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: { mode: 'worm-file', path: '/seal.log' },
+        },
+        sandbox: { available: false, hostExplicitlyAllowed: false, required: true },
+        sealStoreFactory: factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    expect(r.state).toBe('refusing');
+    expect(r.sealStore).toBeUndefined();
+    expect(r.sealingScheduler).toBeUndefined();
+    expect(factoryCalls).toBe(0);
+  });
+
+  test('chain-break-accepted emit during bootstrap does NOT prematurely seal', async () => {
+    // Phase 3 emits a chain-break row BEFORE sealing is wired up.
+    // The proxy must absorb the early tick as a no-op so no seal
+    // happens until the operator's first actual decision.
+    const db = baseDb();
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'boot-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:x',
+      reason_chain: [],
+      ts: 1,
+    });
+    db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
+    const mem = makeMemFactory();
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        db,
+        acceptBrokenChain: true,
+        sessionPolicy: {
+          defaults: {},
+          tools: {},
+          seal: {
+            mode: 'worm-file',
+            path: '/seal.log',
+            interval_decisions: 1, // very aggressive — would seal on chain-break if proxy were broken
+            interval_seconds: 0,
+          },
+        },
+        sealStoreFactory: mem.factory,
+        ...noopTimerSeams(),
+      }),
+    );
+    expect(r.state).toBe('ready');
+    // chain-break-accepted row landed but no seal: scheduler wasn't
+    // attached at chain-break emit time.
+    expect(mem.entries).toHaveLength(0);
+    r.sealingScheduler?.close();
   });
 });

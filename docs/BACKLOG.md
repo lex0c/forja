@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 57: `[seal]` Policy section + bootstrap wire-up (§7.3 closes)
+
+**Done.** Fifty-seventh slice. Closes the operator-facing surface of §7.3: a `seal:` mapping in `permissions.yaml` now configures real sealing behavior end-to-end. The schema (slice 57 in `types.ts`) is parsed (config.ts), merged across layers (hierarchy.ts), and consumed by the bootstrap (bootstrap-engine.ts) which constructs the `SealStore` + `SealingScheduler` and wires the scheduler's `onSealFailed` into the engine's state machine. `on_failure: degrade|refuse` becomes a real transition path: a chattr failure in production trips the engine, and operators see the state change in the events log.
+
+With this slice, the §7.3 thread is **closed for the worm-file backend**: operator writes `seal: { mode: worm-file, path: /var/log/agent/seal.log, on_failure: refuse }` → the bootstrap runs `/usr/bin/chattr +a` on the path → every audit emit ticks the scheduler → seals land at the configured interval → seal failure transitions to refusing.
+
+### Why this matters
+
+Slices 54–56 shipped the machinery in isolation. None of it was reachable from an actual policy — operators had no syntax to enable sealing, and the spec's §7.3 example block (`[seal] mode="rfc3161-tsa" interval_decisions=100 …`) was aspirational. This slice is the bridge that makes "configurable sealing" a real engine capability rather than a programmer-only API.
+
+The state-machine integration is the security-critical correctness property: spec line 587 demands "Falha de sealing → state = degraded (default) ou refusing (strict)". Without this wire-up, a failing chattr (filesystem readonly, no CAP_LINUX_IMMUTABLE, full disk) would be observable ONLY in the bootstrap caller's `onSealFailed` callback — which production code would forget to attach. Wiring `engine.degrade()` / `engine.refuse()` from the bootstrap closes the gap by default.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | New `SealMode = 'none' \| 'worm-file'`, `SealOnFailure = 'degrade' \| 'refuse'`, and `SealPolicy` interface (`mode`, optional `path`, `interval_decisions`, `interval_seconds`, `on_failure`). Added `seal?: SealPolicy` to the `Policy` interface. Reserved modes (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) ship in future slices — the schema enforces "current support: none\|worm-file" at parse time. |
+| `src/permissions/config.ts` | New constants `VALID_SEAL_MODES`, `RESERVED_SEAL_MODES`, `VALID_SEAL_ON_FAILURE`. `parsePolicy` now handles a `seal:` mapping: validates `mode` (required), `path` (required when mode='worm-file'), `interval_decisions` / `interval_seconds` (non-negative integers, 0 allowed to disable), `on_failure` (enum). Reserved modes get a specific "not yet implemented" error pointing at the slice scope, not a generic enum mismatch. Unknown keys rejected. |
+| `src/permissions/hierarchy.ts` | New `mergedSeal` tracker + `sealWriter` provenance. Single-layer-wins semantics — whichever layer is LAST to set `seal: {...}` defines the entire section. Cross-layer field merge (enterprise sets mode, user overrides path) would create surprising configs; all-or-nothing keeps operator intent obvious. No lock semantics in slice 57 — sealing isn't field-mergeable, so lock adds no value over the natural last-writer-wins flow. `SectionProvenance.seal?: Layer` records the writer for future `/perms why seal` introspection. |
+| `src/permissions/bootstrap-engine.ts` | New input fields: `sealStoreFactory?` (test seam — defaults to a factory that runs `/usr/bin/chattr +a` via `execFileSync`), `sealSchedulerNow`/`sealSchedulerSetTimer`/`sealSchedulerClearTimer` (forwarded to scheduler). New result fields: `sealStore?`, `sealingScheduler?` (caller MUST close both on session end). **Wire-up flow**: (a) Phase 3 declares a `schedulerProxy = { tick: () => liveScheduler?.tick() }` and passes it to `createSqliteSink` — emits during validating-chain (chain-break-accepted) hit a no-op proxy tick. (b) After engine construction, archive, and watcher wire-up, the sealing block checks `policy.seal !== undefined && mode === 'worm-file' && archiveState !== 'refusing'`. (c) Factory builds the `SealStore`; `onSealFailed` captures `engine` by closure and routes to `engine.refuse()` or `engine.degrade()` per `seal.on_failure ?? 'degrade'`. (d) The scheduler is assigned to `liveScheduler`, activating the proxy. Both refusing paths (early install_id failure + late sandbox-required) skip the wire-up via the `archiveState` guard. |
+| `src/permissions/index.ts` | Re-export `SealMode`, `SealOnFailure`, `SealPolicy`. |
+| `tests/permissions/config.test.ts` (+15 tests) | New describe block "parsePolicy — seal section (§7.3, slice 57)". Covers: valid configs (mode=none, mode=worm-file with path, all optional fields propagating); required-field errors (mode required, path required when mode=worm-file); enum validations (mode, on_failure); reserved modes get specific "not yet implemented" errors; type validations (non-mapping, empty path, non-integer intervals, negative intervals); accepting 0 for intervals (disables); unknown-keys rejection; absent section → undefined. |
+| `tests/permissions/bootstrap-engine.test.ts` (+9 tests) | New describe block "§7.3 sealing wire-up". Covers: (1) no seal section → no scheduler/store in result; (2) mode=none → no scheduler/store; (3) mode=worm-file → both attached; (4) emit ticks the scheduler — 3 engine.check calls with intervalDecisions=3 fire exactly one seal; (5) on_failure=degrade → state transitions to degraded after a failing emit; (6) on_failure=refuse → state transitions to refusing; (7) default on_failure is degrade; (8) install_id-failure refusing path skips sealing (factory not called); (9) sandbox-required-unavailable late-refusing path also skips. (10) Bonus: chain-break-accepted emit during bootstrap does NOT prematurely seal — the schedulerProxy absorbs the early tick before `liveScheduler` is set. |
+
+### Decisions
+
+- **Single-layer-wins for seal, not field-by-field merge.** Sandbox uses field-by-field with locks because sandbox fields (required, hostAllowed) are independent knobs. Seal fields are interrelated — mode determines whether path is required, on_failure couples to the engine's state machine. A mixed config (enterprise sets mode, user accidentally overrides path) would be surprising. All-or-nothing makes intent obvious; if a user wants to tweak sealing, they re-state the entire section. No lock semantics needed for the same reason.
+- **`schedulerProxy` pattern, not deferred sink construction.** The sink takes a scheduler at construction (slice 56). To wire `onSealFailed → engine.degrade/refuse`, the scheduler needs the engine — which doesn't exist until after the sink. A proxy `{ tick: () => liveScheduler?.tick() }` passed to the sink during Phase 3 absorbs all pre-engine ticks as no-ops; once the engine is constructed, the scheduler is created and assigned to `liveScheduler`, activating the proxy. The alternative (re-create the sink after engine construction) would break the chain-hash continuity invariant (sink is the single SQLite handle for the chain's lifetime).
+- **`onSealFailed` captures `engine` by closure, not via mutable holder.** When the sealing wire-up runs, `engine` is already in scope from the earlier construction. The callback closes over the const reference. No need for a `liveEngine` mutable slot — engine creation completes BEFORE sealing wire-up.
+- **`archiveState !== 'refusing'` is the guard, NOT `controller.get()` at wire-up time.** Same pattern as the slice 53 watcher. Both refusing paths (early via `buildRefusingResult` + late via `sandbox_required_but_unavailable`) leave `archiveState` as 'refusing'. Reading the snapshot once after the sandbox-transition block keeps the guard consistent across both wire-ups (watcher + sealer).
+- **Default `sealStoreFactory` runs `chattr +a` via `execFileSync`.** Production wiring SHOULD just work on Linux ext4. On other platforms (macOS HFS, BSD UFS, Windows), execFileSync throws → sealer returns ok:false → scheduler routes to onSealFailed → engine transitions per on_failure. Operators get a clear signal in audit + state events. The test seam (`sealStoreFactory`) lets unit tests skip the binary call entirely and inject mem-stores.
+- **Default `on_failure` is 'degrade', not 'refuse'.** Spec line 587 defines degrade as default ("local-CLI" usage), refuse as the regulated-deployment option. Lower-friction default matches the spec's tiering: hobbyist / non-regulated operators get visible-but-non-fatal sealing failures; regulated operators opt-in to refuse.
+- **`SealPolicy.path` is required-when-`mode='worm-file'`, not always-required.** When mode='none', the path key is irrelevant (sealing disabled) — requiring it would force a useless placeholder. Operators sketching `seal: { mode: none }` for a dry-run shouldn't trip a "path is required" error. Validation enforces the conditional in `parsePolicy` rather than at type-level (TS would require a discriminated union; overkill for two fields).
+- **Reserved modes throw at parse time with specific "future slice" wording.** Operators copy-pasting the spec's `[seal] mode = "rfc3161-tsa"` example would otherwise get a generic enum-mismatch error. The specific message ("reserved for a future slice; current support: none\|worm-file") points them at the actual scope.
+- **Test seams for the scheduler (now/setTimer/clearTimer) are bootstrap-level inputs, not factory-level.** The factory builds the SealStore only — schedulers are constructed by the bootstrap with the seams passed through. Tests can inject sync timers without rebuilding a custom factory. Matches slice 53's watcher seam plumbing.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5639 pass / 10 skip / 0 fail** (5649 total across 263 files); +27 tests on top of slice 56's 5612 (15 config + 9 bootstrap + 3 incidental from hierarchy merge unblocking)
+- `bun test tests/permissions/config.test.ts` — 46 pass (was 31)
+- `bun test tests/permissions/bootstrap-engine.test.ts` — 32 pass (was 22)
+
+### Next
+
+§7.3 thread is **closed for the worm-file backend**: primitive (54) + scheduler (55) + audit-sink integration (56) + Policy section + bootstrap wire-up (57). What's left:
+
+1. **Slice 58**: CLI verbs — `agent permission seal-now` (manual flush, e.g. before SIGTERM in scripts), `agent permission seal-verify` (runs `verifySealAgainstChain` and renders the result). Small slice — both verbs already have the underlying functions; this is just the argv-parsing + output rendering.
+2. Additional sealing backends (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) — each becomes an independent slice with its own `SealStore` factory + parse-side support (unblocking the reserved-mode error). Production-readiness checklist demands "≥ 1 backend"; worm-file already satisfies that, so other backends are nice-to-have rather than blockers.
+
+Other open spec gaps unchanged (§19 v1→v2 migration, macOS sandbox-exec conformance, §13.7 broker/worker, §14 MCP). §16.2 conformance still at 95%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 56: audit-sink × scheduler integration — §7.3 emit→tick wiring
 
 **Done.** Fifty-sixth slice. Wires slice 55's `SealingScheduler` into `createSqliteSink`: every successful `emit` notifies the scheduler via `tick()`, driving the `interval_decisions` counter from real audit traffic. Three components (sealer + scheduler + sink) now operate end-to-end — `interval_decisions = N` becomes a real engine behavior, not just a config knob.

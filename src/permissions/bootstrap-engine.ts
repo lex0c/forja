@@ -19,6 +19,7 @@
 //                                                audit row (audit-loud)
 //   - all of the above clean                   → state=ready
 
+import { execFileSync } from 'node:child_process';
 import type { DB } from '../storage/db.ts';
 import { archivePolicy } from '../storage/repos/policy-archive.ts';
 import {
@@ -39,8 +40,10 @@ import {
 } from './hierarchy.ts';
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
+import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
+import { type SealStore, createWormFileSealer } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
-import type { Policy } from './types.ts';
+import type { Policy, SealPolicy } from './types.ts';
 
 export interface BootstrapPermissionEngineInput {
   cwd: string;
@@ -100,6 +103,21 @@ export interface BootstrapPermissionEngineInput {
   policyWatcherSetTimer?: (cb: () => void, ms: number) => unknown;
   policyWatcherClearTimer?: (handle: unknown) => void;
   policyWatcherExists?: (path: string) => boolean;
+  // §7.3 sealing wire-up (slice 57). When the resolved policy has
+  // a `seal` section with `mode='worm-file'`, the bootstrap builds
+  // a `SealStore` via this factory, constructs a
+  // `SealingScheduler`, and wires the scheduler into the audit
+  // sink so every emit ticks toward `interval_decisions`. The
+  // scheduler's `onSealFailed` callback transitions the engine to
+  // `degraded` or `refusing` per `seal.on_failure`. Production
+  // callers leave `sealStoreFactory` undefined → default factory
+  // constructs a worm-file sealer that runs `/usr/bin/chattr +a`
+  // on first creation. Tests override to inject a mem-store and
+  // skip the chattr call.
+  sealStoreFactory?: (config: SealPolicy) => SealStore;
+  sealSchedulerNow?: () => number;
+  sealSchedulerSetTimer?: (cb: () => void, ms: number) => unknown;
+  sealSchedulerClearTimer?: (handle: unknown) => void;
 }
 
 export interface PreflightResult {
@@ -171,6 +189,16 @@ export interface BootstrapPermissionEngineResult {
   // keeps writing audit rows on every editor save. Undefined when
   // `watchPolicy` was false / omitted.
   policyWatcher?: PolicyWatcher;
+  // §7.3 sealing (slice 57). Set when the resolved policy has a
+  // `seal` section with `mode='worm-file'` AND the bootstrap
+  // reached a non-refusing state. Caller MUST call
+  // `sealingScheduler.close()` AND `sealStore.close()` on session
+  // end — the scheduler's wall-clock timer keeps the process alive
+  // (per Node's libuv semantics) and the store may hold backend
+  // handles in future modes. Both undefined when sealing was off,
+  // mode=none, or bootstrap ended refusing.
+  sealStore?: SealStore;
+  sealingScheduler?: SealingScheduler;
 }
 
 const emitChainBreakAcceptedRow = (
@@ -316,8 +344,22 @@ export const bootstrapPermissionEngine = async (
   // Phase 3: validate the audit chain. The sink we build here is the
   // same one the engine will emit through, so a single SQLite handle
   // backs the entire lifetime.
+  //
+  // §7.3 sealing proxy (slice 57). The sink takes a structurally-
+  // typed `{ tick(): void }` from slice 56. We can't construct the
+  // real `SealingScheduler` yet — it needs the engine for its
+  // `onSealFailed` callback, and the engine doesn't exist until
+  // Phase 4. The proxy defers to a mutable `liveScheduler` slot;
+  // any emit during Phase 3 (`chain-break-accepted`) hits a no-op
+  // tick, and the slot fills in later when sealing is wired.
   controller.transition('validating-chain', 'policy_loaded');
-  const sink = createSqliteSink({ db: input.db, identity });
+  let liveScheduler: SealingScheduler | undefined;
+  const schedulerProxy = {
+    tick: (): void => {
+      liveScheduler?.tick();
+    },
+  };
+  const sink = createSqliteSink({ db: input.db, identity, scheduler: schedulerProxy });
   const chain = sink.verifyChain();
 
   if (!chain.ok && input.acceptBrokenChain !== true) {
@@ -442,6 +484,56 @@ export const bootstrapPermissionEngine = async (
     });
   }
 
+  // §7.3 sealing wire-up (slice 57). Construct the real
+  // `SealStore` + `SealingScheduler` when (a) policy has a
+  // `seal` section with mode='worm-file', AND (b) the engine
+  // didn't end up refusing. Mode='none' (or omitted) bypasses
+  // sealing entirely. The scheduler's `onSealFailed` captures
+  // `engine` by closure and transitions the state machine per
+  // `seal.on_failure` (degrade default, refuse strict). The
+  // schedulerProxy declared in Phase 3 wires through to the
+  // newly-assigned `liveScheduler` from this point onward, so the
+  // sink's emit→tick path becomes live.
+  let sealStore: SealStore | undefined;
+  let sealingScheduler: SealingScheduler | undefined;
+  const sealConfig = resolveResult.policy.seal;
+  if (sealConfig !== undefined && sealConfig.mode === 'worm-file' && archiveState !== 'refusing') {
+    const factory = input.sealStoreFactory ?? defaultSealStoreFactory;
+    sealStore = factory(sealConfig);
+    const onFailure: SealOnFailureLocal = sealConfig.on_failure ?? 'degrade';
+    sealingScheduler = createSealingScheduler({
+      store: sealStore,
+      db: input.db,
+      installId: identity.install_id,
+      ...(sealConfig.interval_decisions !== undefined
+        ? { intervalDecisions: sealConfig.interval_decisions }
+        : {}),
+      ...(sealConfig.interval_seconds !== undefined
+        ? { intervalSeconds: sealConfig.interval_seconds }
+        : {}),
+      onSealFailed: (reason: string): void => {
+        // Both degrade() and refuse() are idempotent for
+        // already-in-state engines; refuse() supersedes degrade()
+        // (state machine prevents the reverse). Repeated failures
+        // re-issue the same transition — harmless but visible in
+        // the events log for forensics.
+        if (onFailure === 'refuse') {
+          engine.refuse(`seal_failed: ${reason}`);
+        } else {
+          engine.degrade(`seal_failed: ${reason}`);
+        }
+      },
+      ...(input.sealSchedulerNow !== undefined ? { now: input.sealSchedulerNow } : {}),
+      ...(input.sealSchedulerSetTimer !== undefined
+        ? { setTimer: input.sealSchedulerSetTimer }
+        : {}),
+      ...(input.sealSchedulerClearTimer !== undefined
+        ? { clearTimer: input.sealSchedulerClearTimer }
+        : {}),
+    });
+    liveScheduler = sealingScheduler;
+  }
+
   return {
     engine,
     identity,
@@ -458,7 +550,37 @@ export const bootstrapPermissionEngine = async (
       ? { refusingReason: 'sandbox_required_but_unavailable' }
       : {}),
     ...(policyWatcher !== undefined ? { policyWatcher } : {}),
+    ...(sealStore !== undefined ? { sealStore } : {}),
+    ...(sealingScheduler !== undefined ? { sealingScheduler } : {}),
   };
+};
+
+// Local type alias — avoids importing SealOnFailure when the
+// schema's union is already pinned by the policy parser. The
+// import would be purely cosmetic given the parsed `seal.on_failure`
+// is already typed.
+type SealOnFailureLocal = 'degrade' | 'refuse';
+
+// Production-default `SealStore` factory. Invokes `/usr/bin/chattr +a`
+// on first append via the sealer's `onCreate` hook so the file
+// becomes append-only from the next write onward. Non-Linux
+// platforms (no chattr binary) → execFileSync throws → sealer
+// returns ok:false → scheduler routes to onSealFailed → engine
+// transitions per `seal.on_failure`. Tests inject `sealStoreFactory`
+// to skip the binary call and use a mem-store.
+const defaultSealStoreFactory = (config: SealPolicy): SealStore => {
+  if (config.path === undefined) {
+    // parsePolicy enforces this when mode='worm-file', so this
+    // branch is unreachable in well-formed input — but throwing
+    // explicitly here keeps the contract visible at the call site.
+    throw new Error('defaultSealStoreFactory: config.path is required for worm-file mode');
+  }
+  return createWormFileSealer({
+    path: config.path,
+    onCreate: (p) => {
+      execFileSync('/usr/bin/chattr', ['+a', p], { stdio: 'ignore' });
+    },
+  });
 };
 
 // Build a placeholder result for any refusing transition. The engine
