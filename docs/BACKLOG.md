@@ -15,6 +15,76 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 19: sandbox runtime wire-up (§6.5, part 2)
+
+**Done.** Nineteenth slice. Consumes slice 18's `buildBwrapArgv` builder and wires it through the runtime stack so a tool's `Bun.spawn` actually runs under the planner's chosen profile. End-to-end §6.5 enforcement now fires for the `bash` builtin on Linux hosts with bwrap installed; other tools that spawn child processes (`grep`, future MCP tools) inherit the same plumbing pattern in successor slices.
+
+### End-to-end flow
+
+```
+engine.check() → Decision { sandboxProfile: 'cwd-rw' }
+              ↓
+invoke-tool builds ToolContext { ...deps.ctx, sandboxProfile: 'cwd-rw' }
+              ↓
+bash.execute reads ctx.sandboxProfile
+              ↓
+(linux + bwrap on PATH + profile !== 'host')
+              ↓
+buildBwrapArgv({ profile: 'cwd-rw', cwd, home, innerArgv: ['bash', '-c', cmd] })
+              ↓
+Bun.spawn(['bwrap', --bind cwd cwd, --unshare-pid, ..., --, 'bash', '-c', cmd])
+```
+
+When any prereq is missing, the spawn falls through to the legacy direct path — same argv that worked before this slice. No regression for non-Linux hosts, no-sandbox installs, or `host` profile (operator-opted-in passthrough).
+
+### Skip cases (documented in code)
+
+| Condition | Why skip |
+|---|---|
+| `ctx.sandboxProfile === undefined` | Engine wasn't constructed with `EngineOptions.sandbox`, or the call is `misc` category (planner not consulted on misc resolves), or the decision short-circuited before the planner stage (state-reject, resolver-refuse). |
+| `ctx.sandboxProfile === 'host'` | Operator opted into passthrough via `--sandbox-host` AND the resolved cap set carries `host-passthrough`. Both gates were checked at planning time; runner trusts and runs direct. |
+| `process.platform !== 'linux'` | bwrap is Linux-only. macOS `sandbox-exec` is a parallel slice (SBPL profile template generation). |
+| `Bun.which('bwrap') === null` | Bootstrap should have already transitioned the engine to `degraded` via `detectSandboxAvailability`, but the runner re-checks defensively against a binary getting removed/uninstalled mid-session. |
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | `DecisionBase.sandboxProfile?: SandboxProfile`. Documented as the harness-readable hint for runtime enforcement, mirroring slice 15's `approvalSeq` plumbing pattern. Imports `SandboxProfile` from `sandbox-plan.ts`. |
+| `src/permissions/engine.ts` | `withSandboxProfile(decision, profile)` helper (parallels `withApprovalSeq`). The bypass + final return branches wrap their decisions with both helpers — the planner already populated the `sandboxProfile` local earlier in `check()`. Pre-planner refusals (state-reject, resolver-refuse, sandbox-refuse itself) skip the field entirely: tools shouldn't try to spawn under a refused decision. |
+| `src/tools/types.ts` | `ToolContext.sandboxProfile?: SandboxProfile`. Documentation explains when it's set/unset and which tools consume it. Imports `SandboxProfile` via the existing permissions index re-export. |
+| `src/harness/invoke-tool.ts` | New `ctxForExecute` local that spreads `deps.ctx` + adds `sandboxProfile` when `decision.sandboxProfile !== undefined`. Passed into `tool.execute(input.args, ctxForExecute)` in place of `deps.ctx`. Cheap clone — invocations aren't a hot path. |
+| `src/tools/builtin/bash.ts` | Imports `buildBwrapArgv` from the permissions index. Builds `innerArgv = ['bash', '-c', command]` upfront. Determines `shouldWrap` from the four conditions above; passes either the wrapped argv or `innerArgv` to `Bun.spawn`. Status-quo behavior preserved on all skip paths. |
+| `tests/permissions/engine.test.ts` | New describe block — 5 tests: no-sandbox-option → undefined; sandbox + read-only → `ro`; sandbox + write → `cwd-rw`; misc category still gets `ro` (planner runs because sandbox was configured; misc's empty cap set fits ro); bypass mode still carries the profile. |
+
+### Decisions
+
+- **Skip wrap on `host` profile by design.** Operator opted into passthrough at the planning layer; the runner trusts and doesn't second-guess. The `buildBwrapArgv` builder also returns `innerArgv.slice()` for `host`, but the early skip in `bash.ts` avoids the unnecessary call entirely.
+- **Defensive `Bun.which('bwrap')` re-check at spawn time.** Slice 10's `detectSandboxAvailability` runs once at bootstrap and stores the result in `EngineOptions.sandbox`. Between bootstrap and the call, a host package update or container layer change could have removed bwrap. The re-check at spawn is cheap (single PATH lookup) and lets the call fall through to direct spawn rather than crash on `bwrap: command not found`.
+- **`process.env.HOME ?? wd` for the home arg.** When `$HOME` is unset (uncommon, but possible in CI containers / sandboxed test runs), falling back to `wd` is conservative: `home-rw` profile binds something writable but doesn't escape the cwd. Better than throwing or binding `/root`.
+- **Wrap inside the existing try/catch.** `Bun.spawn` may fail with the wrapped argv too (bwrap permission denied, kernel unshare not allowed, etc.). The existing `bashSpawnFailed` error code surfaces those as a tool error with the wrapped command's failure message — operator sees exactly which `bwrap` flag the kernel rejected.
+- **Decision: only `bash` builtin wired this slice.** `grep` (via ripgrep subprocess), `bash-background`, MCP tools — all spawn child processes that could benefit from sandboxing. Pattern is identical: read `ctx.sandboxProfile`, wrap with `buildBwrapArgv`. Folding them into one slice would balloon the test surface; they get their own follow-ups so each spawn site can be inspected individually.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5243 pass / 10 skip / 0 fail** (5253 total across 248 files)
+
+### Next
+
+Successor slices:
+1. Sandbox runtime wire-up for `grep` (ripgrep subprocess).
+2. Sandbox runtime wire-up for `bash-background` (long-running subprocesses; bg manager touches additional state).
+3. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slice 18+19 on macOS).
+4. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+5. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+6. `--accept-broken-chain` operator override (§7.2 second flag).
+7. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+8. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 18: sandbox runner — bwrap argv synthesis (§6.5, part 1)
 
 **Done.** Eighteenth slice of the v2 evolution. Slice 10 picked the sandbox profile (`selectSandboxProfile`); this slice synthesizes the actual bwrap command line that wraps a tool's inner argv. Pure-function deliverable today; runtime wire-up (Decision shape + ToolContext threading + bash spawn-site change) lands in slice 19 so the enforcement actually fires.

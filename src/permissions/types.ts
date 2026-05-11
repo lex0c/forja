@@ -3,6 +3,8 @@
 // Categories group tools by what they do, so policy rules can target the
 // behavior rather than every individual tool name. New tools join an
 // existing category instead of inventing a new section.
+import type { SandboxProfile } from './sandbox-plan.ts';
+
 export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc';
 
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
@@ -109,8 +111,17 @@ export interface PolicySource {
 // with the matching `tool_calls.id` via the `approval_call_links`
 // table, so future replay modes (`--against-current-policy`,
 // `permission diff`) can recover raw args from `tool_calls.input`.
+//
+// §6.5 sandbox profile populated when EngineOptions.sandbox is set
+// (production bootstrap wires it from `detectSandboxAvailability`).
+// The harness propagates it into ToolContext so tools that spawn
+// child processes (currently bash) can wrap with the bwrap argv
+// from `buildBwrapArgv`. Omitted on misc category (resolver skipped,
+// no profile to plan) or when the engine was constructed without
+// sandbox inputs (legacy / test path).
 interface DecisionBase {
   approvalSeq?: number;
+  sandboxProfile?: SandboxProfile;
 }
 
 // What the engine returns from a check. The harness converts `confirm`

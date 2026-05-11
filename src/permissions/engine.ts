@@ -39,7 +39,11 @@ import {
   computeRiskScore,
   defaultIsMcpTool,
 } from './risk-score.ts';
-import { type SelectSandboxProfileResult, selectSandboxProfile } from './sandbox-plan.ts';
+import {
+  type SandboxProfile,
+  type SelectSandboxProfileResult,
+  selectSandboxProfile,
+} from './sandbox-plan.ts';
 import {
   type EngineState,
   type StateController,
@@ -960,6 +964,16 @@ export const createPermissionEngine = (
     return { ...decision, approvalSeq: seq };
   };
 
+  // Attach `sandboxProfile` to a Decision so the harness can thread
+  // it into ToolContext for runtime enforcement (§6.5 part 2). Omits
+  // the field when the planner didn't run (no `EngineOptions.sandbox`
+  // or refused branch); the runner-side wrap is a no-op without the
+  // hint.
+  const withSandboxProfile = (decision: Decision, profile: string | null): Decision => {
+    if (profile === null) return decision;
+    return { ...decision, sandboxProfile: profile as SandboxProfile };
+  };
+
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
     // State machine gate (PERMISSION_ENGINE.md §2 + §6 approval-gate).
     // Runs BEFORE bypass and before any rule lookup: an engine in
@@ -1211,7 +1225,7 @@ export const createPermissionEngine = (
         stages,
         sandboxProfile,
       );
-      return withApprovalSeq(upgraded, e.seq);
+      return withSandboxProfile(withApprovalSeq(upgraded, e.seq), sandboxProfile);
     }
 
     // Single source of truth for section key + rule lookup. Both
@@ -1360,7 +1374,7 @@ export const createPermissionEngine = (
       stages,
       sandboxProfile,
     );
-    return withApprovalSeq(decision, e.seq);
+    return withSandboxProfile(withApprovalSeq(decision, e.seq), sandboxProfile);
   };
 
   const view = (): PermissionsView => ({ mode });

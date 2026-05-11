@@ -631,10 +631,21 @@ export const invokeTool = async (
   // below.
   startToolCall(deps.db, toolCall.id);
 
+  // §6.5 wire-up: propagate the planner's chosen sandbox profile
+  // (populated by the engine on the Decision) into the tool's
+  // ToolContext. Tools that spawn child processes (currently `bash`)
+  // consume `ctx.sandboxProfile` to wrap argv via `buildBwrapArgv`.
+  // Skipped (undefined) when the planner didn't run for this call —
+  // legacy callers / misc category / pre-planner refusals.
+  const ctxForExecute: ToolContext =
+    decision.sandboxProfile === undefined
+      ? deps.ctx
+      : { ...deps.ctx, sandboxProfile: decision.sandboxProfile };
+
   let rawResult: unknown;
   let crashed = false;
   try {
-    rawResult = await tool.execute(input.args, deps.ctx);
+    rawResult = await tool.execute(input.args, ctxForExecute);
   } catch (e) {
     rawResult = wrapException(e);
     crashed = true;

@@ -2329,3 +2329,53 @@ describe('engine — Decision.approvalSeq (§17 replay linkage, slice 15)', () =
     expect(d.approvalSeq).toBe(1);
   });
 });
+
+describe('engine — Decision.sandboxProfile (§6.5 runtime wire-up, slice 19)', () => {
+  test('no sandbox option → sandboxProfile undefined', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: '/work/proj',
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.sandboxProfile).toBeUndefined();
+  });
+
+  test('sandbox configured + read-only call → sandboxProfile=ro on the decision', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: '/work/proj',
+      sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.sandboxProfile).toBe('ro');
+  });
+
+  test('write call → sandboxProfile=cwd-rw', () => {
+    const eng = createPermissionEngine(policy({ tools: { write_file: { allow_paths: ['**'] } } }), {
+      cwd: '/work/proj',
+      sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
+    });
+    const d = eng.check('write_file', 'fs.write', { file_path: './out.txt' });
+    expect(d.sandboxProfile).toBe('cwd-rw');
+  });
+
+  test('misc category → no profile (planner gated by category)', () => {
+    const eng = createPermissionEngine(policy({}), {
+      cwd: '/work/proj',
+      sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
+    });
+    const d = eng.check('todo_write', 'misc', {});
+    // Misc capabilities are empty; planner picks 'ro' (most
+    // restrictive that covers ∅). Field IS populated — the engine
+    // ran the planner because sandbox was configured.
+    expect(d.sandboxProfile).toBe('ro');
+  });
+
+  test('bypass mode still carries sandboxProfile', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' }, tools: {} }), {
+      cwd: '/work/proj',
+      sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('allow');
+    expect(d.sandboxProfile).toBe('ro');
+  });
+});

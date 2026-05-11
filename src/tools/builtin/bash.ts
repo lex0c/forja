@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { buildBwrapArgv } from '../../permissions/index.ts';
 import { scrubEnv } from '../../sanitize/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
@@ -172,9 +173,36 @@ export const bashTool: Tool<BashInput, BashOutput> = {
           : resolve(ctx.cwd, args.cwd);
     const start = Date.now();
 
+    // §6.5 sandbox runtime wire-up. When the engine's planner chose
+    // a profile AND the host can actually wrap (Linux + bwrap on
+    // $PATH), prefix the argv with bwrap flags. Skip wrap on:
+    //   - missing ctx.sandboxProfile (legacy / misc / no sandbox in
+    //     EngineOptions) → spawn direct, status quo.
+    //   - profile === 'host' → operator opted in to passthrough,
+    //     `buildBwrapArgv` returns the inner argv unchanged.
+    //   - process.platform !== 'linux' → bwrap is Linux-only;
+    //     macOS sandbox-exec wiring is a parallel slice.
+    //   - bwrap not on $PATH → bootstrap should have already
+    //     degraded the engine, but the runner double-checks so a
+    //     race between detect and exec is recoverable.
+    const innerArgv = ['bash', '-c', args.command];
+    const shouldWrap =
+      ctx.sandboxProfile !== undefined &&
+      ctx.sandboxProfile !== 'host' &&
+      process.platform === 'linux' &&
+      Bun.which('bwrap') !== null;
+    const spawnArgv = shouldWrap
+      ? buildBwrapArgv({
+          profile: ctx.sandboxProfile as Exclude<typeof ctx.sandboxProfile, undefined | 'host'>,
+          cwd: wd,
+          home: process.env.HOME ?? wd,
+          innerArgv,
+        })
+      : innerArgv;
+
     let proc: ReturnType<typeof Bun.spawn>;
     try {
-      proc = Bun.spawn(['bash', '-c', args.command], {
+      proc = Bun.spawn(spawnArgv, {
         stdout: 'pipe',
         stderr: 'pipe',
         cwd: wd,

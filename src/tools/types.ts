@@ -1,7 +1,13 @@
 import type { BgManager } from '../bg/index.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
-import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
+import type {
+  Decision,
+  PermissionsView,
+  PolicyCategory,
+  SandboxProfile,
+  ToolArgs,
+} from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
@@ -133,6 +139,15 @@ export interface ToolContext {
   sessionId: string;
   stepId: string;
   permissions: PermissionsView;
+  // §6.5 sandbox profile the engine planner chose for THIS call.
+  // Populated by `invoke-tool.ts` from `decision.sandboxProfile`
+  // when the engine was constructed with sandbox inputs. Tools
+  // that spawn child processes (currently `bash`) consume this to
+  // wrap argv via `buildBwrapArgv(...)`. Undefined when the planner
+  // didn't run (legacy / test path), when category is `misc`, or
+  // when the decision didn't reach the planner stage (state-reject,
+  // resolver-refuse).
+  sandboxProfile?: SandboxProfile;
   // Recursion depth of the CURRENT run inside a subagent chain.
   // 0 (or unset) = top-level user session. The harness threads
   // this from `HarnessConfig.subagentDepth` so tools that spawn
