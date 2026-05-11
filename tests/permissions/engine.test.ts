@@ -2727,3 +2727,50 @@ describe('engine.reloadPolicy — §12.3 hot reload (slice 51)', () => {
     expect(after.source?.layer).toBe('session');
   });
 });
+
+// ─── §13.6 reason plumbing (slice 93) ─────────────────────────────────────
+
+describe('engine — getDegradedReason() (§13.6, slice 93)', () => {
+  const PROJ = '/work/proj';
+  const HOME = '/home/op';
+
+  test('ready engine returns undefined', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    expect(eng.state()).toBe('ready');
+    expect(eng.getDegradedReason()).toBeUndefined();
+  });
+
+  test('after degrade(reason), returns that reason', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    eng.degrade('bwrap binary missing');
+    expect(eng.state()).toBe('degraded');
+    expect(eng.getDegradedReason()).toBe('bwrap binary missing');
+  });
+
+  test('after restore, returns undefined again (back to ready)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    eng.degrade('classifier unavailable');
+    expect(eng.getDegradedReason()).toBe('classifier unavailable');
+    eng.restore('classifier back online');
+    expect(eng.state()).toBe('ready');
+    expect(eng.getDegradedReason()).toBeUndefined();
+  });
+
+  test('degrade → restore → degrade returns the LATEST reason', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    eng.degrade('reason one');
+    eng.restore('back to ready');
+    eng.degrade('reason two');
+    expect(eng.getDegradedReason()).toBe('reason two');
+  });
+
+  test('refusing state does NOT return a degraded reason (state-gated)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    eng.degrade('first');
+    eng.refuse('hash chain break');
+    // engine is in `refusing` (not `degraded`) — getDegradedReason
+    // returns undefined despite a prior degrade row in history.
+    expect(eng.state()).toBe('refusing');
+    expect(eng.getDegradedReason()).toBeUndefined();
+  });
+});

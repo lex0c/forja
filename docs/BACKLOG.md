@@ -15,6 +15,51 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 93: §13.6 reason plumbing (engine.getDegradedReason → banner)
+
+**Done.** Ninety-third slice. Closes the reason-plumbing follow-up from slice 92: while the engine is degraded, `engine.getDegradedReason()` returns the root cause (e.g., `'bwrap binary missing'`), and the harness's `DegradedBannerEmitter` reads it on every fire so banner output carries the reason. Pre-slice the emitter accepted a `getReason` callback (slice 92 wired the seam), but the harness passed nothing → operators saw banners with empty parens. Slice 93 fills the seam.
+
+### Why this matters
+
+Slice 92 shipped the banner mechanics correctly but with one cosmetic gap: the banner read `⚠ Sandbox no longer available` with no reason suffix. Operators had to run `agent doctor` to find out WHY the engine degraded — even though `engine.degrade(reason)` already had the reason in scope. The plumbing was just missing.
+
+The fix is mechanical: the engine's `StateController` already records every transition with its reason in `history()`. `getDegradedReason()` walks history backwards to the most recent transition INTO `degraded` and returns its reason — but ONLY when the engine is currently degraded. Once `restore()` flips state back to ready, the function returns `undefined` (no degraded reason currently applies, even though history retains the row).
+
+State-gated read keeps the semantics clean. Operators never see a banner quoting an OLD reason; the engine is either currently degraded (and the banner has reason text) or not (and there's no banner). Tests pin every transition combination: ready → undefined; degrade → reason; restore → undefined; degrade-restore-degrade returns the LATEST reason; refusing returns undefined (state-gated, not history-gated).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/engine.ts` | Adds `getDegradedReason(): string \| undefined` to `PermissionEngine` interface. Implementation: returns `undefined` if `stateController.get() !== 'degraded'`; otherwise walks `stateController.history()` backwards to the most recent transition where `to === 'degraded'` and returns its `reason`. Defense-in-depth final `return undefined` for the (unreachable in practice) case where state is 'degraded' but history has no transition INTO degraded. |
+| `src/harness/loop.ts` | `createDegradedBannerEmitter` invocation now passes `getReason: () => config.permissionEngine.getDegradedReason() ?? ''`. Undefined → empty string (banner falls back to suffix-less form, matching slice 92's renderer). |
+| `tests/permissions/engine.test.ts` | New describe block `engine — getDegradedReason() (§13.6, slice 93)` with 5 tests: ready returns undefined; after `degrade(reason)` returns the reason; after `restore` returns undefined (state-gated); degrade-restore-degrade returns LATEST reason; refusing state returns undefined despite prior degrade row in history. |
+
+### Decisions
+
+- **State-gated, not history-only.** Returning the most recent degrade reason from history regardless of current state would surface stale reasons (operator restored, then engine refused for a different reason — `getDegradedReason()` would lie about the current state). State-gating means the function tracks reality: degraded engine has a reason, anything else returns undefined.
+- **Walk history backwards instead of caching the latest reason.** Caching would require mutating the engine on every transition; reading from history is `O(history.length)` but history is small (typically 1-5 transitions per engine lifetime). Avoiding the cache keeps the engine's `transition`-emission path unchanged from slice 92.
+- **Empty-string fallback in the harness, NOT undefined-as-empty in the renderer.** The emitter's `getReason` returns `string` (not `string | undefined`); the harness applies the `?? ''` at the boundary. Cleaner contract: the emitter doesn't have to know about undefined; the renderer doesn't have to handle a "missing reason" case.
+- **No `getReasonForState(state)` general accessor.** The slice 92 emitter only needs degraded reasons; adding a generic per-state lookup would be overgeneralized for one consumer. If a future caller wants e.g., "why are we refusing?", they'd add `getRefusingReason()` with the same pattern.
+
+### Verification
+
+- `bun run typecheck` — clean (TS would have caught the new interface field unimplemented in `createPermissionEngine`)
+- `bun run lint` — 0 errors, 2 pre-existing warnings
+- `bun test` — **6082 pass / 10 skip / 0 fail** (6092 total across 289 files); +5 tests on top of slice 92's 6077
+- `bun test tests/permissions/engine.test.ts` — 185 pass
+
+### Next
+
+PERMISSION_ENGINE.md remaining items:
+- §14 MCP — blocked (BACKLOG-level decision; ecosystem premature for v1)
+- §19 v1→v2 — premature (no v1 in production to migrate)
+- §13.3 conformance footer — fechável; `~/.local/share/forja/conformance-status.json` written by CI, read by doctor. Slice ~50 lines + CI hook. Not procrastination; just hadn't been picked up. Single remaining "actual implementation gap" by honest reading.
+
+**Spec status (HONEST):** PERMISSION_ENGINE.md is one slice away from 100% code-side closure. §14 + §19 stay deferred for principled reasons (ecosystem / no-v1).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 92: §13.6 degraded banner re-display (harness loop + telemetry heartbeat)
 
 **Done.** Ninety-second slice. Closes the §13.6 gap from the slice-90 audit: while the engine is in `degraded` state, the harness now emits a `sandbox_degraded_active` event on the FIRST tool call after the transition AND every N tool calls thereafter (default 10). Spec line 905-908: "Banner é não-suprimível durante a sessão atual, re-exibido a cada N tool calls (default 10), logado em audit como `sandbox_degraded_active`."

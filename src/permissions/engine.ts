@@ -259,6 +259,16 @@ export interface PermissionEngine {
   // `refusing` on a fatal event (chain break, policy reload failure
   // in strict mode).
   state(): EngineState;
+  // Returns the reason associated with the most recent ready→degraded
+  // (or any-state→degraded) transition while the engine IS currently
+  // degraded. Returns `undefined` when the engine is not degraded,
+  // OR when it's degraded but never had an explicit reason (legacy
+  // path; shouldn't happen in practice — `degrade(reason)` always
+  // supplies one). The §13.6 degraded-banner emitter (slice 92)
+  // consumes this so the operator-facing banner can quote the
+  // root cause ("⚠ Sandbox no longer available (bwrap binary missing)").
+  // Reads from the state controller's history; no extra storage.
+  getDegradedReason(): string | undefined;
   // Transition the engine to a degraded state — happens when an
   // auxiliary subsystem (classifier, sandbox, sealing target) goes
   // offline mid-session. `check()` keeps running but every `allow`
@@ -1679,6 +1689,22 @@ export const createPermissionEngine = (
     view,
     mode: () => mode,
     state: () => stateController.get(),
+    // §13.6 reason plumbing (slice 93). Walks history backwards
+    // for the most recent transition INTO degraded — that's the
+    // root cause until a `restore()` flips state back to ready
+    // (which itself produces a transition pair, so the next
+    // degrade after restore overwrites this lookup).
+    getDegradedReason: (): string | undefined => {
+      if (stateController.get() !== 'degraded') return undefined;
+      const history = stateController.history();
+      for (let i = history.length - 1; i >= 0; i--) {
+        const entry = history[i];
+        if (entry !== undefined && entry.to === 'degraded') {
+          return entry.reason;
+        }
+      }
+      return undefined;
+    },
     degrade: (reason) => {
       stateController.transition('degraded', reason);
     },

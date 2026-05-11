@@ -875,6 +875,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // the call site.
       const degradedBannerEmitter = createDegradedBannerEmitter({
         getState: () => config.permissionEngine.state(),
+        // §13.6 reason plumbing (slice 93). Reads the root cause
+        // from the engine's state controller history; renderers
+        // surface it in the banner ("⚠ Sandbox no longer available
+        // (bwrap binary missing)"). Undefined → empty reason, banner
+        // falls back to the suffix-less form.
+        getReason: () => config.permissionEngine.getDegradedReason() ?? '',
         onFire: (event) => {
           safeEmit(config.onEvent, {
             type: 'sandbox_degraded_active',
