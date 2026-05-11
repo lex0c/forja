@@ -331,6 +331,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       return 1;
     }
 
+    // `agent welcome` — §13.5 first-boot walkthrough (slice 45).
+    // Composes doctor + sandbox setup. Same lifecycle-mode shape.
+    if (args.welcome === true) {
+      const { runWelcome } = await import('./welcome.ts');
+      return await runWelcome({
+        out: (s) => process.stdout.write(s),
+        err: errSink,
+      });
+    }
+
     if (args.recap !== undefined) {
       const { runRecapHeadless } = await import('./recap-headless.ts');
       let provider: import('../providers/types.ts').Provider;

@@ -15,6 +15,113 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 45: `agent welcome` — first-boot walkthrough (§13.5)
+
+**Done.** Forty-fifth slice. Third on the §13 thread. Composes slice 43 (`agent doctor`) + slice 44 (`agent sandbox setup`) into a single guided walkthrough for first-time operators. Spec §13.5 calls for first-boot UX; this slice ships it as an operator-invokable verb.
+
+Designed for first-time use but explicitly idempotent — running `agent welcome` later as a "checkup" is harmless and useful. The verb reads host state and renders recommendations; it never writes anything.
+
+### Why this matters
+
+After slices 43 and 44, the operator has the tools (doctor + setup) but no integrated entry point. A new user landing on Forja would have to know to type `agent doctor`, parse the output, decide if `agent sandbox setup` is needed, run that, then figure out what to do with their environment. That's three discovery hops. `agent welcome` collapses them into one: a single command that walks through the entire first-boot story and ends with a "what to do next" menu.
+
+Spec §13.5 ("first-boot UX") doesn't dictate auto-invocation — operators run `agent welcome` themselves, the same way they run `agent doctor`. Bootstrap auto-detection of first-boot (no install_id → suggest `agent welcome`) is a future slice that touches the bootstrap path; this slice ships the surface that detection points at.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New `parseWelcomeSubcommand`. Top-level verb matching `agent doctor` shape — no flags except `--help`. New `welcome?: true` on parsed args (a bare presence marker; no per-verb config needed). Help text updated with `agent welcome` example. Wired into `parseArgs` after `parseSandboxSubcommand`. |
+| `src/cli/run.ts` | New dispatch arm for `args.welcome === true` — lazy-imports `./welcome.ts`. Same lifecycle-mode shape as the other §13 verbs. |
+| `src/cli/index.ts` | `promptOptional` list extended with `args.welcome === true` — same TTY-gate exemption as doctor / sandbox setup. |
+| `src/cli/welcome.ts` (new, ~80 lines) | `runWelcome({env?, which?, readOsRelease?, platform?, arch?, out, err}): Promise<number>`. All five test seams forwarded from the inner verbs. Output structure: (1) intro banner, (2) doctor section with divider header + `runDoctor` output, (3) sandbox setup section with divider + `runSandboxSetup` output, (4) next-steps menu. Exit code is `Math.max(doctorCode, setupCode)` — any inner failure surfaces via exit, so CI pre-deploy hooks can run `agent welcome` and fail-fast on environment issues. |
+| `tests/cli/welcome.test.ts` (new, 9 tests) | Parser (4: verb recognized, --help short-circuits, unknown flag rejected, positional rejected) + handler (5: all-green renders all four sections + exit 0, missing sandbox/git surfaces warnings + exit 0, non-writable HOME → exit 1 via inner doctor fail, sections clearly delimited by box-drawing dividers, macOS scenario shows path-broken message not install command). |
+
+### Sample output
+
+```
+$ agent welcome
+Welcome to Forja!
+
+Let's check your environment first, then walk you through how to get started.
+
+────────────────────────────────────────────────────────────
+Environment health check
+────────────────────────────────────────────────────────────
+
+platform
+  status: ok
+  linux x64 (node 24.3.0, bun 1.3.13)
+
+sandbox
+  status: ok
+  bwrap available
+
+config_dir
+  status: ok
+  /home/lex/.config/agent
+
+data_dir
+  status: ok
+  /home/lex/.local/share/forja
+
+git
+  status: ok
+  found at /usr/bin/git
+
+summary: all checks passed
+
+────────────────────────────────────────────────────────────
+Sandbox setup
+────────────────────────────────────────────────────────────
+
+Platform: linux x64
+
+bwrap is already installed. Run 'agent doctor' to verify the full health check.
+
+
+────────────────────────────────────────────────────────────
+Next steps
+────────────────────────────────────────────────────────────
+
+  agent init                Generate a permission policy in .agent/
+  agent "your prompt"        Ask the agent something
+  agent --explain-permissions
+                            Show the resolved policy + per-section attribution
+  agent permission grants    List active grants
+  agent --help               See all options
+
+Run `agent doctor` any time to re-check the environment.
+```
+
+### Decisions
+
+- **Plain text only — no `--json` flag.** Welcome is an interactive walkthrough surface. Operators wanting structured data call `agent doctor --json` and `agent sandbox setup --json` directly; those are the headless/CI surfaces. Adding `--json` to welcome would produce a doubly-wrapped envelope that doesn't simplify anything.
+- **Welcome calls the existing verbs verbatim, no compute extraction.** I considered exporting `buildDoctorChecks` and `computeRecommendation` so welcome could compose structured results into a custom render. Rejected: it'd require refactoring both inner modules plus a third render path, all to produce output that looks like the verbs already do. The current shape — section dividers around verbatim verb output — reads cleanly and keeps the modules independent. Future re-rendering (if welcome wants its own formatting) can extract then.
+- **Exit code is `Math.max(doctorCode, setupCode)`.** Doctor returns 1 on any fail check; sandbox setup returns 1 only on internal failure. Either non-zero → welcome non-zero. Surfaces real environment failures to CI / pre-deploy scripts that run `agent welcome` as a sanity check.
+- **`welcome?: true` instead of `welcome?: { ...config }`.** No per-verb config exists (no flags). A bare presence marker is enough; growing to `{}` adds noise for no semantic benefit. The dispatch reads `args.welcome === true` explicitly.
+- **Box-drawing dividers (─×60) frame the three sections.** Matches the in-REPL welcome banner conventions and reads cleanly in 80+ col terminals. Plain dashes (`-` × 60) would work too but the box-drawing chars give clearer visual separation when the output is also colorized later.
+- **Idempotent + always-on test seams.** Welcome forwards every test seam from doctor + sandbox setup. Tests pin specific scenarios (all-green / missing-bwrap / non-writable HOME / macOS path-broken) without touching the runner's actual environment. Production callers leave the seams undefined and the system probes run.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5496 pass / 10 skip / 0 fail** (5506 total across 256 files); 9 new tests on top of slice 44's 5487
+- `bun test tests/cli/welcome.test.ts` — 9 pass
+- Manual smoke: `bun src/cli/index.ts welcome` on this Ubuntu dev machine renders the full walkthrough with all-green checks
+
+### Next
+
+§13 platform provisioning — remaining work:
+1. **First-boot auto-detection**: on bootstrap, when install_id is missing, print a one-line nudge `(First time? Try: agent welcome)` before opening the REPL. Smaller scope than this slice; just plumbing in the bootstrap path.
+2. **Broker/worker architecture**: spec §13.7. Multi-slice.
+3. **Doctor extensions**: kernel-feature probe (Linux unshare / user namespaces / cgroups), `/tmp` size + permissions, container detection (docker / podman / k8s), Forja own-binary integrity.
+
+Non-§13 successors: macOS sandbox-exec (the second-biggest platform gap), MCP-tool spawn wire-up, §7.3 external sealing, capability-scope grants, modal bridge → insertGrant.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 44: `agent sandbox setup` (§13 guided sandbox bootstrap)
 
 **Done.** Forty-fourth slice. Second on the §13 thread. Direct follow-on to slice 43's `agent doctor`: when doctor reports `sandbox: warn` (no bwrap on Linux, or sandbox-exec missing on macOS), this surface tells the operator HOW to fix it — distro detection + the exact install command + a verification step pointing back at doctor.

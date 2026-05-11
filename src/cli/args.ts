@@ -225,6 +225,10 @@ export interface ParsedArgs {
   //   setup — print the recommended sandbox install command for
   //           the detected platform / distribution.
   sandbox?: { verb: 'setup'; json: boolean };
+  // `agent welcome` — §13.5 first-boot walkthrough. Composes doctor
+  // + sandbox setup + next-steps menu into a guided intro. Idempotent
+  // — running it later as a "checkup" is fine.
+  welcome?: true;
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
@@ -457,6 +461,53 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       yes: false,
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
+    },
+  };
+};
+
+// `agent welcome` — §13.5 first-boot walkthrough. No flags
+// except --help. Composes doctor + sandbox setup + next-steps
+// menu. Plain text only (operators wanting structured data call
+// `agent doctor --json` / `agent sandbox setup --json` directly).
+const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'welcome') return null;
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    return {
+      ok: false,
+      message: `agent welcome: unknown flag '${token}' (only --help is accepted)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json: false,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      welcome: true,
     },
   };
 };
@@ -884,6 +935,8 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
   if (doctorParsed !== null) return doctorParsed;
   const sandboxParsed = parseSandboxSubcommand(argv);
   if (sandboxParsed !== null) return sandboxParsed;
+  const welcomeParsed = parseWelcomeSubcommand(argv);
+  if (welcomeParsed !== null) return welcomeParsed;
   const permissionParsed = parsePermissionSubcommand(argv);
   if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
@@ -1372,4 +1425,5 @@ export const usage = (): string =>
     '  agent --resume last "now refactor the parts you flagged"',
     '  agent doctor             Health check: platform, sandbox tools, config + data dirs, git',
     '  agent sandbox setup      Print the recommended sandbox install command for this platform',
+    '  agent welcome            First-boot walkthrough: composes doctor + sandbox setup + next steps',
   ].join('\n');

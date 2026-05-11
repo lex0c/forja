@@ -118,7 +118,10 @@ const main = async (): Promise<number> => {
     args.doctor !== undefined ||
     // `agent sandbox setup` (§13 slice 44) — same lifecycle-mode
     // exemption as doctor. Pure informational verb.
-    args.sandbox !== undefined;
+    args.sandbox !== undefined ||
+    // `agent welcome` (§13.5 slice 45) — first-boot walkthrough.
+    // Composes doctor + sandbox setup; same lifecycle-mode shape.
+    args.welcome === true;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop
