@@ -15,6 +15,48 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 61: `forja doctor` policy_load check (§13.3 line 803)
+
+**Done.** Sixty-first slice. Continues the doctor expansion from slice 60: a new `policy_load` check surfaces per-layer hierarchy resolution status, matching the spec's canonical line 803 (`Policy load: enterprise=none user=ok project=ok OK`). Operators can now see at a glance which policy layers loaded, which are absent, and which encountered lock conflicts — debugging "why isn't my project policy active" becomes a one-command answer.
+
+### Why this matters
+
+Doctor's role is the pre-flight surface — operators run it before sessions, after config changes, when something feels off. Per-layer policy status is one of the most-needed diagnostics: "I edited `~/.config/agent/permissions.yaml`, is it actually being read?" Without this check, operators had to bootstrap a session and inspect `agent perms` to confirm. With it, `forja doctor` answers in one line.
+
+Lock conflicts are the secondary value: a higher layer's `locked: true` rejecting a lower layer's attempted override is a real config-hygiene signal. The policy still loads (lower-layer change is dropped), so it's a `warn` not a `fail`, but the operator should know — the lower-layer YAML is doing nothing.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/doctor.ts` | New `policyLoadCheck` function. Resolves the active policy via `resolvePolicy(cwd/HOME)`. Initial state: every layer is `none`. Iterates `resolved.layers` to flip per-layer status to `ok` when the layer loaded. Branches: (a) parse error → `fail` with parser message + "check YAML syntax" remediation; (b) lock conflicts present → `warn` with first conflict's `section + lockedBy + attemptedBy` plus "(+N more)" if multiple; (c) clean load → `ok "enterprise=X user=Y project=Z"`. Session layer is NOT reported — runtime-injected via CLI flag, not file-backed, so irrelevant for a pre-flight disk-state check. Inserted in the check order BETWEEN `data_dir` and `sealing` (functional dependency: sealing reads policy, so policy_load lands first). |
+| `tests/cli/doctor.test.ts` | (+7 tests under new `runDoctor — policy_load check (§13.3 / slice 61)` describe.) Coverage: no layers present → ok "all none"; user layer present → ok "user=ok"; project layer present → ok "project=ok"; all three present → ok with all `ok`; malformed YAML → fail exits 1 with parser message; lock conflict (enterprise locks defaults.mode, user attempts to override) → warn with conflict summary + "locked by enterprise, attempted by user"; JSON mode includes `policy_load` event with structured fields. Pre-existing NDJSON-count test updated 6→7 checks + 1 summary = 8 lines. |
+
+### Decisions
+
+- **Sandbox layer NOT reported as a layer in policy_load output.** The policy has a `sandbox` SECTION (§6.5), but it's a field WITHIN any layer's policy, not a layer itself. Doctor's policy_load reports which LAYERS loaded; `agent perms sandbox` reports the merged sandbox section state. Keeping concerns separate avoids confusing operators.
+- **`warn` for lock conflicts, not `fail`.** A lock conflict means a higher layer locked something AND a lower layer tried to change it — the change was DROPPED, but the policy as a whole still loaded with the lock-winner values. Enforcement still works correctly. `warn` surfaces the issue without blocking the operator; `fail` would force them to delete the lower-layer YAML or restructure the lock, neither of which is always the right answer.
+- **Show only the FIRST lock conflict's details, with "(+N more)" tail.** Multiple lock conflicts could cascade if a higher layer locks several sections; rendering all in one doctor line would be unreadable. First-conflict-with-count gives the operator a starting point for investigation via `agent perms`. Same posture as slice 56's `verifySealAgainstChain` reporting `firstMismatchAt` only.
+- **`ok` for the all-absent case.** No policy files present is a valid configuration — the engine boots with `defaultPolicy()` (strict mode, no rules). Treating this as `warn` would be noisy for fresh-install operators who haven't created any policy yet. Spec doesn't mandate any layer's presence.
+- **Test seams already plumbed in slice 60 reused.** `cwd`, `enterprisePath`, `userPath` were added to `RunDoctorOptions` for the sealing check; policy_load uses the same. Zero new option fields.
+- **Position BEFORE `sealing` in the check order.** Functional dependency: sealing reads the resolved policy's `seal` section, so a failed policy load means the sealing check would also fail (with the same error). Running policy_load FIRST surfaces the root cause; sealing's policy resolution wouldn't double-report (sealing's catch returns `warn`, which is benign). Operators see one clear `policy_load: fail` and one secondary `sealing: warn`, not two failures.
+- **`resolved.layers` is the authoritative source for "did this layer load".** `loadLayers` in hierarchy.ts only pushes a layer when the file exists AND parses cleanly. So absence from the array means "not loaded" (either file missing or skipped via test seam). No need to probe paths separately in doctor.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5685 pass / 10 skip / 0 fail** (5695 total across 266 files); +7 tests on top of slice 60's 5678
+- `bun test tests/cli/doctor.test.ts` — 26 pass (was 19)
+
+### Next
+
+Doctor surface still has spec-canonical lines 804 (hash chain integrity), 806 (classifier health), 807 (engine state), 811 (conformance last-run) that aren't surfaced yet. Each is a small follow-up slice. Closest in shape to slices 60-61: hash chain integrity — opens the DB read-only, runs `verifyChain`, reports `intact (seq N)` / `BROKEN at seq M`.
+
+Other open work unchanged. §16 conformance still at per-category-bar in all 11 categories.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 60: `forja doctor` sealing health check (§13.3 line 805)
 
 **Done.** Sixtieth slice. Closes the loop between §7.3 sealing and §13.3 doctor visibility: operators now see seal-file state in `forja doctor` output, matching the spec's canonical line 805 (`External sealing: rfc3161-tsa (last success 4h ago) OK`). Slice 60 ships the worm-file variant; future backends extend the dispatch.

@@ -13,6 +13,8 @@
 //     install_id + policy files.
 //   - data_dir: `~/.local/share/forja` writability — needed for
 //     the sessions DB.
+//   - policy_load: §5 hierarchy resolution — per-layer
+//     enterprise/user/project status (slice 61).
 //   - sealing: §7.3 worm-file seal status — entry count + last
 //     seal timestamp (slice 60).
 //   - git: presence on PATH — degrades git_* tools when absent.
@@ -186,6 +188,93 @@ const dataDirCheck = (env: NodeJS.ProcessEnv): DoctorCheck => {
     detail: `${dir} not writable: ${probe.error ?? 'unknown error'}`,
     remediation: `ensure ${dir} is writable by the current user`,
   };
+};
+
+// §13.3 policy-load health check (slice 61). Resolves the active
+// policy via `resolvePolicy(cwd/HOME)` and reports per-layer
+// loaded/absent status. Lock conflicts surface as `warn` — the
+// policy DID load, but a higher layer's lock rejected a lower
+// layer's attempted override. Schema errors during parse fail
+// loudly with the underlying parser message as the remediation
+// guide.
+//
+// Spec line 803 shows the canonical line:
+//   `Policy load: enterprise=none user=ok project=ok OK`
+// Status semantics:
+//   - `ok`         — every requested layer either loaded cleanly
+//                    or was absent (no errors, no lock conflicts).
+//   - `warn`       — loaded with lock conflicts. Operator should
+//                    review the layer hierarchy; enforcement still
+//                    works but lower-layer intent was overridden.
+//   - `fail`       — parse error / schema violation. The bootstrap
+//                    would refuse to start; doctor catches it
+//                    early.
+//
+// Session layer is not reported — it's runtime-injected via CLI
+// flag overrides, not file-backed, so it's irrelevant for a
+// pre-flight check that's about disk state.
+interface PolicyLoadCheckOptions {
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+  enterprisePath?: string | null;
+  userPath?: string | null;
+}
+
+const policyLoadCheck = (options: PolicyLoadCheckOptions): DoctorCheck => {
+  let resolved: ReturnType<typeof resolvePolicy>;
+  try {
+    resolved = resolvePolicy({
+      cwd: options.cwd,
+      home: options.env.HOME ?? options.cwd,
+      env: options.env,
+      ...(options.enterprisePath !== undefined ? { enterprisePath: options.enterprisePath } : {}),
+      ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
+    });
+  } catch (e) {
+    return {
+      name: 'policy_load',
+      status: 'fail',
+      detail: (e as Error).message,
+      remediation: 'check the YAML files for syntax errors or schema violations',
+    };
+  }
+  // Initial state: every requested layer is `none` (absent on disk).
+  // `resolved.layers` includes ONLY the layers that loaded cleanly,
+  // so any layer NOT in the list is genuinely missing. Disabled
+  // layers (test seam `enterprisePath: null`) also show as `none` —
+  // semantically correct: doctor reports observed state, not
+  // intent.
+  const status: { enterprise: string; user: string; project: string } = {
+    enterprise: 'none',
+    user: 'none',
+    project: 'none',
+  };
+  for (const l of resolved.layers) {
+    if (l.layer === 'enterprise' || l.layer === 'user' || l.layer === 'project') {
+      status[l.layer] = 'ok';
+    }
+  }
+  const summary = `enterprise=${status.enterprise} user=${status.user} project=${status.project}`;
+  if (resolved.lockConflicts.length > 0) {
+    // Render the first conflict's `section + lockedBy + attemptedBy`
+    // shape; if there are more, append "(+N more)". One line stays
+    // readable; the operator drills deeper via `agent perms`.
+    const first = resolved.lockConflicts[0];
+    if (first === undefined) {
+      // Defensive — unreachable since length > 0.
+      return { name: 'policy_load', status: 'ok', detail: summary };
+    }
+    const more =
+      resolved.lockConflicts.length > 1 ? ` (+${resolved.lockConflicts.length - 1} more)` : '';
+    return {
+      name: 'policy_load',
+      status: 'warn',
+      detail: `${summary}; lock conflict: ${first.section} locked by ${first.lockedBy}, attempted by ${first.attemptedBy}${more}`,
+      remediation:
+        'review layer precedence: a lower-priority layer attempted to override a locked field',
+    };
+  }
+  return { name: 'policy_load', status: 'ok', detail: summary };
 };
 
 // Human-readable relative-time formatter. Matches the spec example
@@ -364,6 +453,12 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
     sandboxCheck(which),
     configDirCheck(env),
     dataDirCheck(env),
+    policyLoadCheck({
+      env,
+      cwd,
+      ...(options.enterprisePath !== undefined ? { enterprisePath: options.enterprisePath } : {}),
+      ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
+    }),
     sealingCheck({
       env,
       cwd,

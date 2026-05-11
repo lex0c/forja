@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
@@ -129,15 +129,16 @@ describe('runDoctor', () => {
     });
     expect(code).toBe(0);
     const lines = out.lines.join('').trim().split('\n').filter(Boolean);
-    // 6 checks + 1 summary (sealing check added in slice 60).
-    expect(lines.length).toBe(7);
+    // 7 checks + 1 summary (policy_load added in slice 61, sealing
+    // in slice 60).
+    expect(lines.length).toBe(8);
     const events = lines.map((l) => JSON.parse(l));
     expect(events[0].kind).toBe('check');
     expect(events[0].name).toBe('platform');
     const summary = events[events.length - 1];
     expect(summary.kind).toBe('summary');
     expect(summary.ok).toBe(true);
-    expect(summary.counts).toEqual({ ok: 6, warn: 0, fail: 0 });
+    expect(summary.counts).toEqual({ ok: 7, warn: 0, fail: 0 });
   });
 
   test('--json: failures bump summary.ok to false + exit 1', async () => {
@@ -379,5 +380,163 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
     expect(sealing.status).toBe('ok');
     expect(sealing.detail).toContain('1 entry');
     expect(sealing.detail).toContain('last 5s ago');
+  });
+});
+
+describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
+  let tmp: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-doctor-policy-'));
+    env = { HOME: tmp, PATH: process.env.PATH };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('no layers present → ok "enterprise=none user=none project=none"', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null, // explicitly disabled (no file to look for)
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('enterprise=none user=none project=none');
+  });
+
+  test('user layer present → ok "user=ok"', async () => {
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: strict\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('user=ok');
+  });
+
+  test('project layer present → ok "project=ok"', async () => {
+    // Project layer is discovered relative to cwd. Build a project
+    // policy under .agent/permissions.yaml.
+    const projDir = join(tmp, 'proj');
+    const agentDir = join(projDir, '.agent');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'permissions.yaml'), 'defaults:\n  mode: strict\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: projDir,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('project=ok');
+  });
+
+  test('all three layers present → ok with every layer marked ok', async () => {
+    const enterprisePath = join(tmp, 'enterprise-permissions.yaml');
+    writeFileSync(enterprisePath, 'defaults:\n  mode: strict\n');
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: strict\n');
+    const projDir = join(tmp, 'proj');
+    mkdirSync(join(projDir, '.agent'), { recursive: true });
+    writeFileSync(join(projDir, '.agent', 'permissions.yaml'), 'defaults:\n  mode: strict\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: projDir,
+      enterprisePath,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('enterprise=ok user=ok project=ok');
+  });
+
+  test('malformed yaml → fail with parser error + remediation', async () => {
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: not_a_real_mode\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1); // fail exits non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('policy_load');
+    expect(text).toMatch(/defaults\.mode|not_a_real_mode/);
+    expect(text).toContain('check the YAML files');
+  });
+
+  test('lock conflict → warn with conflict summary + remediation', async () => {
+    // Enterprise locks defaults.mode=strict; user tries to set
+    // mode=acceptEdits. Hierarchy reports a lock conflict; the
+    // policy still loads (lower-layer change is dropped).
+    const enterprisePath = join(tmp, 'enterprise-permissions.yaml');
+    writeFileSync(enterprisePath, 'defaults:\n  mode: strict\n  locked: true\n');
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: acceptEdits\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0); // warn doesn't exit non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('enterprise=ok user=ok');
+    expect(text).toContain('lock conflict');
+    expect(text).toContain('locked by enterprise');
+    expect(text).toContain('attempted by user');
+    expect(text).toContain('review layer precedence');
+  });
+
+  test('--json: policy_load check is included with structured fields', async () => {
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: strict\n');
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const events = lines.map((l) => JSON.parse(l));
+    const policy = events.find((e) => e.name === 'policy_load');
+    expect(policy).toBeDefined();
+    expect(policy.status).toBe('ok');
+    expect(policy.detail).toBe('enterprise=none user=ok project=none');
   });
 });
