@@ -248,3 +248,6 @@ export const createRecordingTelemetrySink = (): RecordingTelemetrySink => {
 
 export type { ScrubOptions } from './scrubbing.ts';
 export { createScrubbingTelemetrySink, scrubEvent } from './scrubbing.ts';
+
+export type { CreateJsonLinesTelemetrySinkOptions } from './jsonlines.ts';
+export { createJsonLinesTelemetrySink } from './jsonlines.ts';

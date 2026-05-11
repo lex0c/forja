@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 77: telemetry — JSON-lines export adapter (§18 closes)
+
+**Done.** Seventy-seventh slice. Ships the final piece of the §18 telemetry thread: `createJsonLinesTelemetrySink({write})` writes each event as one JSON object per line (NDJSON / JSONL format). Operators pipe the stream to anything that ingests JSON lines — `otelcol-contrib`'s `filelogreceiver`, Loki, Vector, fluentbit, or a hand-rolled tail script. Production chain: bootstrap → scrubbing → jsonlines → operator's pipe.
+
+**Closes production-ready checklist line 1213** ("Telemetria com scrubbing"). All §18 spec requirements satisfied: 5 event types covering the 5 spec-listed metric streams (slices 70-74), `engine_state` populated from the controller (slice 75), scrubbing layer (slice 76), and export adapter (this slice).
+
+### Why this matters
+
+The spec calls for "OTEL export". Slices 70-76 produced typed, scrubbed events — but without an export path, they only live in test-shaped recording sinks. JSON lines is the operator-side completion: a deterministic, line-oriented format that every observability tool consumes.
+
+The "no SDK dep" choice is the load-bearing constraint. Forja's locked stack (CLAUDE.md) bars new runtime deps without a spec PR. The `@opentelemetry/api` + `@opentelemetry/sdk-metrics` family is ~300KB of TS code + transitive deps. JSON lines is dep-free; operators who specifically want in-process OTEL pipe through `otelcol`'s `filelog` receiver — three lines of YAML, zero engine surface.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/jsonlines.ts` (new, ~50 lines) | `CreateJsonLinesTelemetrySinkOptions`: single `write: (line: string) => void` field. `createJsonLinesTelemetrySink(options)`: returns a `TelemetrySink` whose `emit` calls `options.write(JSON.stringify(event) + '\n')`. No internal try/catch — the engine's outer try/catch at each emission site absorbs (same posture as the scrubbing sink in slice 76). Production wiring: `write: process.stdout.write.bind(process.stdout)` for stdout streaming, or a bound `fs.createWriteStream().write` for file. Tests pass capturing functions. |
+| `src/telemetry/index.ts` | Re-exports `createJsonLinesTelemetrySink` + `CreateJsonLinesTelemetrySinkOptions`. |
+| `tests/telemetry/jsonlines.test.ts` (new, 6 tests) | Single emit produces one JSON line with `\n` terminator + parses to the event; multiple emits produce one line each; all five event kinds round-trip without field loss; write throwing propagates (no internal try/catch); 100-iteration line-boundary contract test (each line independently parseable); end-to-end composition with scrubbing (`scrubbing → jsonlines`) produces redacted JSON. |
+
+### Decisions
+
+- **JSON lines, not OTEL SDK in-process.** CLAUDE.md's locked stack rule bars new runtime deps. The OTEL SDK is significant binary footprint + transitive deps; JSON lines is dep-free. Operators who specifically want OTEL pipe through `otelcol`'s `filelog` receiver — the engine emits, OTEL consumes. Same protocol shape; different ownership boundary. A future slice CAN add a true `@opentelemetry/api` adapter if operator demand emerges + spec PR lands; both adapters share the `TelemetrySink` contract.
+- **`write: (line: string) => void` — minimal interface.** Production callers bind a write method from a file/stream/whatever; tests pass capturing functions. No Node `Writable` dep, no async semantics. Each `write` is a single, complete line (already includes the `\n` terminator).
+- **No internal try/catch.** Identical posture to the scrubbing sink. Every emission site (slices 70-74) wraps in try/catch. The adapter is a transformer, not a fault barrier. A `write` throw propagates → outer try/catch absorbs → audit emit / state machine / etc. continue uninterrupted.
+- **Trailing newline always.** Operators tailing files expect line-terminated input. Without the `\n`, a `cat` of the file would concatenate the last event with the first event of the next file (after rotation). JSONL spec defines lines as `\n`-terminated.
+- **`JSON.stringify` default behavior.** No custom serializer — operators get standard JSON, no field reordering, no special encoding. Future slice can add canonical-JSON serialization if cross-run determinism becomes a need (e.g., for replay-verification); slice 77 ships the operator-side default.
+- **Adapter lives at `src/telemetry/jsonlines.ts` (flat layout).** Slice 76's BACKLOG suggested `src/telemetry/adapters/otel.ts` (a subdirectory). With only one adapter shipped, the subdir would be over-engineering; if 3+ adapters land, restructuring is a one-line move. Flat layout matches the existing `src/telemetry/scrubbing.ts` peer.
+- **End-to-end test pins scrubbing + jsonlines composition.** The two sinks chain via the `TelemetrySink` contract: scrubbing wraps jsonlines. The test verifies that capability scopes are scrubbed BEFORE the JSON is written, so the on-disk JSON never contains the raw path / host. This is the load-bearing security invariant: scrubbed-then-exported, not exported-then-scrubbed.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings
+- `bun test` — **5829 pass / 10 skip / 0 fail** (5839 total across 276 files); +6 tests on top of slice 76's 5823
+- `bun test tests/telemetry/jsonlines.test.ts` — 6 pass in ~33ms
+
+### Next
+
+**§18 telemetry thread fully closed.** Production-ready checklist (line 1287-1299) status after this slice:
+
+- [x] Conformance suite ≥ 136 casos passando
+- [x] Fuzz harness 10⁹ iterations sem crash novo
+- [x] Bash resolver registry cobre top 30 commands
+- [x] Path resolver com symlink escape testado
+- [x] Hash chain genesis + verify + rotação testados
+- [x] Sealing externo configurável e testado em ≥ 1 backend
+- [x] State machine completa com transitions audit-loggadas
+- [x] Replay tool funcional pra todas categorias de decisão
+- [x] **Telemetria com scrubbing — slices 70-77**
+- [ ] Threat model § 14 review por terceiro — out-of-band
+- [ ] Calibração baseline-v2.0 piloto ≥ 30d — operational
+- [ ] Migration path v1 testado — premature for greenfield
+
+**9 of 12 checklist items satisfied**; remaining 3 are operational / out-of-band, not engineering work.
+
+Other open spec threads (none are GA blockers): §7.3 backends (s3-object-lock + rfc3161-tsa — additional sealing backends, worm-file + git-anchored already satisfy ≥1), §13.7 broker/worker architecture (biggest remaining engineering scope but not on the checklist), §14 MCP trust model (blocked on MCP itself in M3+), §19 v1→v2 migration (premature for greenfield).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 76: telemetry — scrubbing layer (§18 line 1205)
 
 **Done.** Seventy-sixth slice. Ships the telemetry scrubbing layer required by spec §18 line 1205 ("OTEL export com scrubbing"). `createScrubbingTelemetrySink(inner, options?)` wraps another sink and redacts likely-PII fields before forwarding — capability scopes (paths + hosts), the seal config path, and path-shaped substrings inside `state.transition.reason`. Closes the operator-side half of production-ready checklist line 1213; the OTEL adapter (next slice) completes the export side.
