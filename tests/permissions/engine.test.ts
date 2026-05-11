@@ -2386,38 +2386,24 @@ describe('engine.check — §8 grants (slice 40)', () => {
   // ignores the timestamp arg (caller responsibility to pass already-
   // filtered grants for time-sensitive scenarios) and returns the
   // closed-over array directly.
-  const fixedGrants = (snapshots: ReadonlyArray<Parameters<typeof grantsBuilder>[0]>) =>
-    grantsBuilder(...snapshots) ?? undefined;
-
-  function grantsBuilder(
-    ...snapshots: {
-      id: string;
-      scope_kind?: 'pattern' | 'capability';
-      scope_value: string;
-      capability: string;
-      expires_at?: number;
-    }[]
-  ): { listActive: () => ReadonlyArray<NonNullable<ReturnType<typeof readGrant>>> } | null {
-    if (snapshots.length === 0) return { listActive: () => [] };
-    const list = snapshots.map(readGrant);
-    return { listActive: () => list };
-  }
-
-  function readGrant(s: {
+  interface RawGrant {
     id: string;
     scope_kind?: 'pattern' | 'capability';
     scope_value: string;
     capability: string;
     expires_at?: number;
-  }) {
-    return {
-      id: s.id,
-      scope_kind: s.scope_kind ?? 'pattern',
-      scope_value: s.scope_value,
-      capability: s.capability,
-      expires_at: s.expires_at ?? 9_999_999_999_999,
-    };
   }
+  const readGrant = (s: RawGrant) => ({
+    id: s.id,
+    scope_kind: s.scope_kind ?? ('pattern' as const),
+    scope_value: s.scope_value,
+    capability: s.capability,
+    expires_at: s.expires_at ?? 9_999_999_999_999,
+  });
+  const fixedGrants = (snapshots: readonly RawGrant[]) => {
+    const list = snapshots.map(readGrant);
+    return { listActive: () => list };
+  };
 
   test('bash: grant pattern matches → allow with grant attribution + ttlExpiresAt', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: {} } }), {

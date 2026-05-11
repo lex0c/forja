@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 41: §8 grants — CLI surface (`agent permission grants` + `revoke`)
+
+**Done.** Forty-first slice. Third on the §8 thread (39 = storage foundation, 40 = engine integration). Adds the two operator-facing CLI verbs spec §8 calls for: `agent permission grants [--all] [--json]` to list and `agent permission revoke <id> [--reason <text>] [--json]` to revoke (idempotent per spec line 621). Operators can now inspect what they've granted + revoke when needed BEFORE the modal-bridge slice (42+) wires up insert. Insertion remains operator-driven; the CLI exposes read + revoke only — no insert verb (that's the modal's job).
+
+### Why this matters
+
+Slice 40 made grants load-bearing in the engine, but operators couldn't see them. A grant inserted by some future modal flow would just... be there, with no operator visibility into what's authorized. Slice 41 closes the gap with the spec's two named CLI surfaces:
+- Spec line 621 explicitly names `agent permission revoke <id>`. This slice ships exactly that.
+- Listing is the natural complement — without it, `revoke <id>` requires the operator to know an id they can't discover.
+
+The two verbs together are the minimum viable §8 operator surface. After this slice, an admin can audit the entire grant state of a machine and clear anything they want gone, without touching SQL.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | `KNOWN_PERMISSION_VERBS` extended with `'grants'` and `'revoke'`. New `--all` flag (verb-restricted to `grants`). `permission.allGrants?: boolean` on the parsed args. Verb-specific validation: `grants` rejects positionals + `--reason`; `revoke` requires exactly one positional (ULID shape validated in the handler). Help-comment block updated to enumerate the new verbs. |
+| `src/cli/run.ts` | Dispatch arms for `'grants'` and `'revoke'` that lazy-load their handlers and pass through `--json` + `--all` + `--reason` + `dbPath` override. |
+| `src/cli/permission-grants.ts` (new) | `runPermissionGrants({ all?, json?, dbPath?, env?, now?, out, err })`. Wires `listActiveGrants` (default) / `listAllGrants` (`--all`). Plain-text mode: header `active grants (N):` followed by indented row per grant with id, status (active/expired/revoked), scope, capability, ISO expires_at. Empty case shows `(none)` + `--all` hint. JSON mode: one NDJSON line per grant, zero lines for empty. Errors go to stderr (text) or `{ok: false, error: ...}` on stdout (json). |
+| `src/cli/permission-revoke.ts` (new) | `runPermissionRevoke({ id, reason?, json?, dbPath?, env?, now?, out, err })`. Validates ULID shape via `isUlid` BEFORE touching the DB. Fetches the grant first (distinguishes not-found from already-revoked). On revoke: renders the revocation envelope (scope, capability, reason, ISO revoked_at). Idempotent path: renders the ORIGINAL revocation's metadata so the operator can see WHO revoked first and WHY — distinct from the fresh-revoke text so the first-call audit trail survives. JSON envelope: `{ok, revoked, grant: <row state>}` where `revoked: false` means already-revoked (no-op). Not-found is `{ok: false, error: 'not_found'}` with exit 1. |
+| `tests/cli/permission-verify.test.ts` | One test updated: the previous "unknown verb" probe used `revoke` (which was unknown pre-slice-41); now uses `list` (the remaining unimplemented verb from the future-verbs table). |
+| `tests/cli/permission-grants.test.ts` (new) | 11 tests across 2 describes: parser (verb recognition, --all capture, --all on non-grants rejected, positionals rejected, --reason on grants rejected) + runner (empty install with --all hint, active grants shape, expired/revoked excluded by default + included with --all, JSON NDJSON per grant, JSON empty case emits zero lines). |
+| `tests/cli/permission-revoke.test.ts` (new) | 10 tests across 2 describes: parser (missing positional, id captured, --reason captured, multiple positionals rejected) + runner (non-ULID rejected at shape gate, first revoke renders envelope + DB row updated, second revoke idempotent + original metadata preserved + DB unchanged, not-found exit 1, JSON revoked=true→false flip, JSON not-found envelope). |
+
+### Decisions
+
+- **`grants` listing verb + `revoke` action verb (flat names).** Spec line 621 says `agent permission revoke <id>` verbatim. Listing isn't named in the spec; `grants` is the natural choice (matches the table name; future verbs like `policies` or `sessions` follow the same noun-as-verb pattern). Considered `list-grants` + `revoke-grant` (verb-prefixed) but rejected — flat names compose better and match the existing `verify` / `inspect` / `replay` shape.
+- **`--all` is verb-specific, not generic.** Restricted to `grants` at parse time (the validation block matches `--reason → revoke/rotate-chain`, `--clear → inspect`, etc). Reusing `--all` later for a different verb would need an explicit parser update — flag drift is caught at parse, not by silent ignore.
+- **No `--id <id>` flag, positional argument only.** Spec line 621 says `agent permission revoke <id>` — id is the principal subject of the command, not a flag. Positional matches the existing `inspect <rotation_id>` / `diff <seq1> <seq2>` shape.
+- **ULID-shape validation at the handler, not the parser.** Could have rejected non-ULID ids during arg parse (already do this for numeric seqs in `replay`/`inspect`/`diff`). Decided to validate in the handler instead: keeps the ULID import out of args.ts (which doesn't otherwise need permissions/ulid.ts), and the error message can mention the canonical form (26 chars, Crockford base32, uppercase) at the same surface as the runtime. Net effect for operators is identical.
+- **CLI doesn't scope by install_id.** Grants are matched globally by ULID on revoke. Multi-install machines (rare, but technically possible) could in principle have grants from a different install on the same DB file — but the operator running the CLI is authorized to revoke anything in their DB regardless of install attribution. Isolation is at the DB-file level, not the install_id level. Keeps the revoke surface simple.
+- **Listing scopes by install_id (different rationale).** Operators expect "what did I grant?" to mean THEIR install's grants. Cross-install bleed in the listing would be confusing — they'd see grants they didn't issue. The repo's existing `installId` filter handles this.
+- **JSON empty case emits zero lines (not `{ok: true, count: 0}` envelope).** Consumers stream-parse — they iterate lines and detect EOF / empty stdout. An envelope object would force every consumer to branch (`if (line.kind === 'count') ... else if (line.kind === 'grant') ...`). Zero lines for zero results is the simpler contract.
+- **Revoked-twice path preserves original audit trail.** Tests pin: second revoke renders the FIRST call's `revoked_at` + `revoked_reason`. Critical for compliance — if a reviewer asks "WHO revoked this first?" the operator can answer from the CLI output, not by re-querying the DB. Backed by the repo's `WHERE revoked_at IS NULL` filter (slice 39 contract).
+- **`now()` injectable in both handlers.** Default `Date.now()`, overridable for tests so revoked_at and expiry-comparison scenarios pin to fixed clocks. Mirrors the repo's `snapshotTs` parameter — wallclock isn't baked into the handler.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format to 4 files
+- `bun test` — **5454 pass / 10 skip / 0 fail** (5464 total across 253 files); 21 new tests on top of slice 40's 5433 (11 grants + 10 revoke)
+- `bun test tests/cli/permission-grants.test.ts tests/cli/permission-revoke.test.ts` — 21 pass
+
+### Next
+
+§8 grants thread — remaining slices:
+1. **Modal bridge → `insertGrant`.** When the operator answers "Yes, don't ask again for: <pattern>" with a TTL choice (24h / 7d / 30d), the bridge calls `insertGrant` instead of (or alongside) the current in-memory `addSessionAllow`. Requires UX for TTL selection in the modal.
+2. **Capability-scope grants**: `scope_kind='capability'` grants where `scope_value` is itself a capability-string. Engine consults `capabilityCovers(grant.scope_value, emitted_cap)` instead of glob matching. Requires plumbing the resolved capabilities into checkX.
+3. **TTL UX promotion**: spec §8 line 604 — "`once` é default sugerido pra primeira aprovação. UX promove pra `session` na N-ésima repetição da mesma capability+scope". Counter + threshold + promotion prompt.
+4. **ttl_expiry conformance (~6 cases)**: now buildable on top of slices 39-41. Conformance YAML lifts the grants tests to the §16 surface; suite progresses 90% → 94%.
+
+Non-grants successors: macOS sandbox-exec, MCP-tool spawn wire-up, §13 platform provisioning, §7.3 external sealing.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 40: §8 grants — engine integration (pattern scope)
 
 **Done.** Fortieth slice. Second slice on the §8 grants thread (slice 39 landed the storage foundation). Wires the engine to consult persisted grants during `check()`: a pattern grant covering the (capability-kind, target) tuple authorizes the call, short-circuiting AFTER policy deny but BEFORE the in-memory session-allow path. Grant attribution lands in `Decision.source` + `Decision.ttlExpiresAt`; audit row's `ttl_expires_at` column gets populated; reason chain stage becomes `'grant-match'` (distinct from `'session-allow'` for forensic clarity).

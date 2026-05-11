@@ -239,6 +239,10 @@ export interface ParsedArgs {
     // this flag, `inspect` is read-only — render chain_meta + the
     // archived-row count for the rotation_id.
     clearQuarantine?: boolean;
+    // `agent permission grants --all` (§8). Default lists only
+    // active (non-expired, non-revoked) grants. `--all` includes
+    // every row for forensic audit (expired + revoked).
+    allGrants?: boolean;
   };
 }
 
@@ -473,12 +477,25 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 //                   archived row count; `--clear` flips the
 //                   quarantine flag after the operator confirms the
 //                   archived segment is benign.
+//   grants        — list §8 persisted grants. Active by default;
+//                   `--all` includes revoked + expired rows for
+//                   forensic audit.
+//   revoke        — revoke a grant by id (§8 line 621). Idempotent
+//                   per spec; `--reason <text>` optional but
+//                   recommended (audit forensics).
 //
 // Future verbs (each lands in its own slice):
-//   revoke   — drop a session/pattern grant
 //   list     — show approvals log entries
 //   test     — run conformance suite
-const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain', 'replay', 'diff', 'inspect'] as const;
+const KNOWN_PERMISSION_VERBS = [
+  'verify',
+  'rotate-chain',
+  'replay',
+  'diff',
+  'inspect',
+  'grants',
+  'revoke',
+] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
@@ -503,6 +520,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   let withoutClassifier = false;
   let againstCurrentPolicy = false;
   let clearQuarantine = false;
+  let allGrants = false;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -551,7 +569,17 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       clearQuarantine = true;
       continue;
     }
+    if (token === '--all') {
+      allGrants = true;
+      continue;
+    }
     positionals.push(token);
+  }
+  if (allGrants && verb !== 'grants') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --all only applies to 'grants'`,
+    };
   }
   if (withoutClassifier && verb !== 'replay') {
     return {
@@ -658,6 +686,34 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       }
     }
   }
+  if (verb === 'grants') {
+    // No positionals; --all is the only verb-specific flag.
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission grants: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: 'agent permission grants: --reason only applies to revoke / rotate-chain',
+      };
+    }
+  }
+  if (verb === 'revoke') {
+    // Single <id> positional — ULID-shape validation in the handler
+    // (CLI knows the ULID alphabet only via isUlid; keeping the
+    // import out of args.ts avoids dragging permissions/ulid.ts
+    // through every parse). Empty / multi-positional rejected here.
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission revoke: exactly one <id> positional is required (e.g. `agent permission revoke 01JN...`)',
+      };
+    }
+  }
   return {
     ok: true,
     args: {
@@ -677,6 +733,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ...(withoutClassifier ? { withoutClassifier: true } : {}),
         ...(againstCurrentPolicy ? { againstCurrentPolicy: true } : {}),
         ...(clearQuarantine ? { clearQuarantine: true } : {}),
+        ...(allGrants ? { allGrants: true } : {}),
       },
     },
   };

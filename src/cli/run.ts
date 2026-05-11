@@ -251,6 +251,36 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'grants') {
+        // §8 grants list (slice 41). Active by default; --all
+        // includes revoked + expired rows for forensic audit.
+        const { runPermissionGrants } = await import('./permission-grants.ts');
+        return await runPermissionGrants({
+          all: args.permission.allGrants === true,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'revoke') {
+        // §8 grant revoke (slice 41). Idempotent per spec line 621;
+        // <id> positional shape (ULID) re-validated in the handler.
+        const id = args.permission.positionals[0] ?? '';
+        const { runPermissionRevoke } = await import('./permission-revoke.ts');
+        return await runPermissionRevoke({
+          id,
+          json: args.json,
+          ...(args.permission.reason !== undefined ? { reason: args.permission.reason } : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       // The arg parser already rejects unknown verbs; this branch
       // catches the impossible-but-safe case of a verb the dispatch
       // doesn't know how to route.
