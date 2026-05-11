@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 65: §16 capability_resolvers conformance closes — 15 new cases bring it to 30/30
+
+**Done.** Sixty-fifth slice. Closes the last remaining §16 conformance gap from slice 64: `capability_resolvers.yaml` was at 15/30. Ships +15 cases covering per-tool resolver behavior for read_file, write_file, edit_file, grep, glob, fetch_url, plus one more bash case to round to 30. Every §16 category now meets its per-category minimum (11/11 ✓). Production-ready checklist item line 1287 ("Conformance suite ≥ 136 casos passando") is now genuinely satisfied at the per-category level.
+
+### Why this matters
+
+The §16 capability_resolvers category was the only remaining gap after slice 64. The spec line 1092 specifies "3 cases × 10 builtins = 30 cases" — each tool's resolver needs at minimum a happy-path case (capability shape correct) + an absolute-path case (no cwd resolution) + a refuse case (missing required arg / non-string). Pre-slice the suite had heavy bash coverage (8 cases) but light coverage for fs/fetch tools — edit_file had ZERO cases, and write_file / grep / glob each had only 1.
+
+Closing this gap means: (a) per-tool resolver regression tests are guaranteed for every builtin; (b) the capability shape contract (`write-fs` ALWAYS pairs with `read-fs` on write tools, `fetch_url` strips path/query from the host scope, `grep`/`glob` default to cwd when no path arg) is pinned at the §16 conformance layer instead of relying on the resolver unit tests alone; (c) the production-ready conformance bar is now actually met, not aspirationally claimed.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/cases/capability_resolvers.yaml` | (+15 cases across six tools.) **read_file (1):** missing file_path refuses. **write_file (3):** relative path resolves against cwd; absolute path preserved; missing file_path refuses. **edit_file (4):** relative; absolute; produces BOTH write-fs AND read-fs (edit needs the read leg for diff); missing file_path refuses. **grep (2):** no path arg falls back to session cwd (search-tool root semantics); non-string path refuses. **glob (3):** explicit cwd arg resolves; absolute cwd preserved; non-string cwd refuses. **fetch_url (1):** path + query stripped from host capability scope (host-level gating only). **bash (1):** `bash echo` produces exec:shell only (no fs access). |
+
+### Decisions
+
+- **Each tool's 3 cases follow a consistent shape: path-resolution + capability-shape + refuse.** Mirrors the spec's "3 cases × 10 builtins" structure — operators reading the suite can locate the tool's coverage block and immediately understand what's pinned. Future builtins added to the registry slot in the same pattern.
+- **edit_file got 4 cases (one extra beyond the per-tool minimum).** The "produces BOTH write-fs and read-fs" case is documented separately from the path cases — the dual-capability shape is the key edit-vs-write distinction worth a standalone test. write_file ships the same shape but its case is the absolute-path one (paired into one); edit_file's case is dedicated to the pairing fact, since spec §5.2 calls out the read-leg explicitly for edit-shaped tools.
+- **Refuse cases use empty `args: {}` for missing-arg tools, not garbage values.** The resolver's refuse path is `path === null`, triggered by ANY shape that doesn't match the `file_path: string` invariant. Empty args is the canonical operator-facing failure mode (the LLM forgot the arg); cases that test "non-string path" (grep, glob with `path: 42`) cover the typed-but-wrong-shape branch.
+- **fetch_url path/query strip is a SEPARATE case from the basic match.** Operators reading the spec or composing policies need to know the resolver doesn't emit per-path capabilities — `net-egress:<host>` is the gating granularity. Without an explicit test, this contract is invisible to anyone reading just the resolver source. Same reason §16 demands cases beyond happy-path: the spec is operator-facing documentation rendered as runnable code.
+- **bash echo case rounds the total to exactly 30 (spec minimum), not 29 or 31.** Adding more would not improve coverage in proportion to the bash resolver's already-heavy 8-case treatment. The case itself has independent value: pinning that "simple builtin" → "only exec:shell capability" is the contract that prevents resolver drift (e.g., accidentally emitting read-fs for echo because someone refactored a capability set).
+- **No new runner extensions.** All 15 cases work with the existing runner shape — `expect.capabilities_include` + `expect.resolver_kind` + `expect.source_section`. Slice 64 added multi-layer support; this slice doesn't need it because per-tool resolver behavior is single-layer by nature.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; no auto-format changes
+- `bun test` — **5738 pass / 10 skip / 0 fail** (5748 total across 266 files); +15 tests on top of slice 64's 5723
+- `bun test tests/conformance/conformance.test.ts` — 161 pass (was 146)
+- §16 conformance category breakdown post-slice: Static rules (20) ✓, **Capability resolvers (30) ✓ NEW**, Bash adversarial (25) ✓, Path traversal (16) ✓, Hash chain (8) ✓, TTL expiry (6) ✓, Subagent intersection (6) ✓, Protected paths (8) ✓, Concurrency (5) ✓, Score determinism (10) ✓, Sandbox profile (6) ✓. **All 11 categories meet per-category minimums (11/11).**
+
+### Next
+
+§16 conformance closes. Production-ready checklist (spec line 1287-1299) status update:
+
+- [x] Conformance suite ≥ 136 casos passando — slice 65 (160 cases across YAML + 5 programmatic concurrency)
+- [ ] Fuzz harness 10⁹ iterations sem crash novo — pending
+- [x] Bash resolver registry cobre top 30 commands
+- [x] Path resolver com symlink escape testado
+- [x] Hash chain genesis + verify + rotação testados
+- [x] Sealing externo configurável e testado em ≥ 1 backend (worm-file + git-anchored shipped)
+- [x] State machine completa com transitions audit-loggadas
+- [x] Replay tool funcional pra todas categorias de decisão
+- [ ] Telemetria com scrubbing — pending
+- [ ] Threat model § 14 review por terceiro — out-of-band
+- [ ] Calibração baseline-v2.0 piloto ≥ 30d — operational
+- [ ] Migration path v1 testado — premature for greenfield
+
+Remaining engineering work for v2 GA: fuzz harness (~200 LOC infra + targets) and telemetria/OTEL (multi-slice, external SDK dep). Other open spec threads: §7.3 backends `s3-object-lock` / `rfc3161-tsa`, §13.7 broker/worker (biggest remaining), §14 MCP (blocked on M3+), §19 migration (premature for greenfield).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 64: §16 static_rules conformance — multi-layer runner + 16 new cases
 
 **Done.** Sixty-fourth slice. Closes the static_rules conformance gap that slice 59 incorrectly counted as met: the YAML category had only 4 cases against the spec's minimum of 20 (line 1091). Ships +16 cases bringing it to 20 ✓, plus the conformance runner extension that makes hierarchy + locked-section cases expressible.
