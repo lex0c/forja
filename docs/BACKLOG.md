@@ -15,6 +15,49 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 22: `agent permission inspect <rotation_id>` (§7.2 quarantine clearance)
+
+**Done.** Twenty-second slice. Closes the rotate-chain loop opened by slice 8: an operator who has inspected an archived chain segment can now flip its `quarantined` flag via the CLI, instead of issuing direct SQL. Read-only by default — renders chain_meta + archived-row count; `--clear` performs the flip after the operator confirms.
+
+### Why this matters
+
+Slice 8 added `rotate-chain` with mandatory `--reason` and a default-1 `quarantined` column. Slice 12's verify surface renders the quarantine flag prominently. Until now there was no operator path to drop the flag once the segment had been audited — the SQL hint in `verify`'s output (`UPDATE chain_meta SET quarantined = 0 WHERE ...`) worked but bypassed every audit + safety check. This verb makes the clearance auditable on the live chain: the call ran through the CLI, the row's `quarantined` transitioned through the documented path, and the operator's intent is observable in shell history.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | `inspect` joins `KNOWN_PERMISSION_VERBS`. Parser accepts one positional `<rotation_id>` validated via `^\d+$` + `Number.isSafeInteger` + `> 0` (same shape as replay's `<seq>`). New `--clear` presence-only flag; rejected on non-`inspect` verbs. `permission.clearQuarantine?: boolean` threaded through `ParsedArgs`. |
+| `src/cli/permission-inspect.ts` (new) | `runPermissionInspect({ rotationId, clear, json, dbPath, env, out, err })`. Resolves `install_id`, opens DB, looks up `chain_meta` via `listChainMetaByInstall` + `.find()` (lookup is bounded by rotation count — typically single digits). Counts archived rows under the rotation via a direct COUNT query. With `--clear`: calls `clearQuarantine`, re-reads the row to surface `quarantined_after`. Text output describes the segment + clearance status; JSON output is a flat object with `quarantined_before`/`quarantined_after`/`cleared` booleans. Refuses cross-install lookups (mirrors replay/diff). |
+| `src/cli/run.ts` | Dispatch branch for `verb='inspect'` — parses validated rotation_id, threads `clear` from `args.permission.clearQuarantine`. |
+| `tests/cli/permission-inspect.test.ts` (new) | 13 tests — parse (rotation_id required, `--clear` flows, `--clear` on non-inspect rejected, missing positional, non-numeric, zero, `--json`) + integration (text output renders meta + archived count, `--clear` flips quarantined, already-clear no-op message, missing rotation → not_found, JSON shapes for read-only and `--clear`). |
+
+### Decisions
+
+- **Read-only by default.** Operator inspects FIRST (the verb's name says so); explicit `--clear` performs the flip. Mirrors the surgical-vs-blunt distinction in other CLI tools (e.g. `git restore` requires explicit flags to write).
+- **`listChainMetaByInstall` + `.find()` instead of a dedicated repo getter.** Rotation count is bounded by operator action — typically single digits in production. Adding `getChainMetaByRotationId` to the repo for a one-off use would grow the read surface for negligible savings. The `find()` is O(n) in n=rotation count; acceptable.
+- **Direct SQL COUNT for archived row count.** `listArchivedByRotation` would load every row; we just need the count. Single COUNT query avoids the load and round-trip.
+- **`--clear` is idempotent.** Re-clearing an already-clear rotation isn't an error — the text output surfaces "already clear — no change" and JSON shows `cleared=true`/`quarantined_after=false`. Matches the underlying `clearQuarantine`'s UPDATE semantics (zero rows changed is fine).
+- **Cross-install refusal.** Same shape as replay/diff: a rotation_id from one install can't be inspected/cleared under another install's identity. Defense against forensic-data leaks when a DB file is copied between installs.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5260 pass / 10 skip / 0 fail** (5270 total across 249 files)
+
+### Next
+
+Successor slices:
+1. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18–21 on macOS).
+2. MCP-tool spawn wire-up (when MCP tools execute child processes).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+5. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
+6. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 21: sandbox wire-up for bash-background + extract maybeWrapSandboxArgv (§6.5)
 
 **Done.** Twenty-first slice. Third sandbox runtime consume site (`bash_background` via `bgManager.spawn`) crossed the rule-of-three threshold; the four-condition gate that bash + grep duplicated is now lifted into `maybeWrapSandboxArgv` and the three call sites consume it.

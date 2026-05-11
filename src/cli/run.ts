@@ -200,6 +200,20 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'inspect') {
+        const rotationId = Number.parseInt(args.permission.positionals[0] ?? '0', 10);
+        const { runPermissionInspect } = await import('./permission-inspect.ts');
+        return await runPermissionInspect({
+          rotationId,
+          ...(args.permission.clearQuarantine === true ? { clear: true } : {}),
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       if (args.permission.verb === 'diff') {
         // Both seqs validated at parse time. Defensive re-parse
         // keeps the runtime handler's contract tight when a

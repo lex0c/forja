@@ -233,6 +233,12 @@ export interface ParsedArgs {
     // policy. Reports the original decision vs the replayed one;
     // diverging outcomes flag policy drift impact.
     againstCurrentPolicy?: boolean;
+    // `agent permission inspect <rotation_id> --clear` (§7.2).
+    // Flips chain_meta.quarantined to 0 for the named rotation after
+    // the operator confirms the archived segment is benign. Without
+    // this flag, `inspect` is read-only — render chain_meta + the
+    // archived-row count for the rotation_id.
+    clearQuarantine?: boolean;
   };
 }
 
@@ -462,12 +468,17 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 //   diff          — cross-row comparison of two audit rows by seq.
 //                   Renders field-by-field diff + capabilities set
 //                   diff + score-components deltas (§17 cross-row).
+//   inspect       — operator surface for a rotation event (§7.2
+//                   quarantine clearance). Renders chain_meta +
+//                   archived row count; `--clear` flips the
+//                   quarantine flag after the operator confirms the
+//                   archived segment is benign.
 //
 // Future verbs (each lands in its own slice):
 //   revoke   — drop a session/pattern grant
 //   list     — show approvals log entries
 //   test     — run conformance suite
-const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain', 'replay', 'diff'] as const;
+const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain', 'replay', 'diff', 'inspect'] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
@@ -491,6 +502,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   let reason: string | undefined;
   let withoutClassifier = false;
   let againstCurrentPolicy = false;
+  let clearQuarantine = false;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -535,6 +547,10 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       againstCurrentPolicy = true;
       continue;
     }
+    if (token === '--clear') {
+      clearQuarantine = true;
+      continue;
+    }
     positionals.push(token);
   }
   if (withoutClassifier && verb !== 'replay') {
@@ -547,6 +563,12 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     return {
       ok: false,
       message: `agent permission ${verb}: --against-current-policy only applies to 'replay'`,
+    };
+  }
+  if (clearQuarantine && verb !== 'inspect') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --clear only applies to 'inspect'`,
     };
   }
   if (verb === 'rotate-chain') {
@@ -581,6 +603,30 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message: `agent permission replay: <seq> out of range (got ${raw})`,
+      };
+    }
+  }
+  if (verb === 'inspect') {
+    // Single <rotation_id> positional; same int validation as replay.
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission inspect: exactly one <rotation_id> positional is required (e.g. `agent permission inspect 1`)',
+      };
+    }
+    const raw = positionals[0] as string;
+    if (!/^\d+$/.test(raw)) {
+      return {
+        ok: false,
+        message: `agent permission inspect: <rotation_id> must be a positive integer (got '${raw}')`,
+      };
+    }
+    const rotationId = Number.parseInt(raw, 10);
+    if (rotationId <= 0 || !Number.isSafeInteger(rotationId)) {
+      return {
+        ok: false,
+        message: `agent permission inspect: <rotation_id> out of range (got ${raw})`,
       };
     }
   }
@@ -630,6 +676,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ...(reason !== undefined ? { reason } : {}),
         ...(withoutClassifier ? { withoutClassifier: true } : {}),
         ...(againstCurrentPolicy ? { againstCurrentPolicy: true } : {}),
+        ...(clearQuarantine ? { clearQuarantine: true } : {}),
       },
     },
   };
