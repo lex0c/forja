@@ -80,6 +80,26 @@ export interface BrokerResponse {
   error?: string;
 }
 
+// Per-call options. Threaded through every broker implementation
+// down to the tool handler. Added in slice 83 (`signal`) so
+// callers can cancel an in-flight call instead of leaking the
+// subprocess until natural completion. Future fields (per-call
+// timeout override, per-call telemetry tags) slot in here.
+export interface BrokerCallOptions {
+  // Abort signal. When the signal fires:
+  //   - in-process broker passes it to the supplied `exec`
+  //     callback (the bash handler kills its bash subprocess);
+  //   - spawn broker sends SIGTERM to the spawned worker
+  //     (worker.ts catches SIGTERM, propagates to runWorker,
+  //     which passes it to the handler, which kills the
+  //     subprocess; if worker.ts doesn't handle SIGTERM the OS
+  //     terminates the process).
+  // The broker resolves with `{ok: false, error: 'aborted', ...}`
+  // when the signal fired. Pre-aborted signals are handled at
+  // entry — no spawn happens.
+  signal?: AbortSignal;
+}
+
 // The broker contract. All implementations satisfy this — the
 // in-process degenerate (slice 78), a separate-process
 // implementation (future slice), a mock for tests, etc.
@@ -91,7 +111,13 @@ export interface Broker {
   // to keep state machine reasoning simple) or parallelize them
   // (separate-process broker spawns workers concurrently);
   // callers shouldn't rely on either.
-  execute(request: BrokerRequest): Promise<BrokerResponse>;
+  //
+  // Per-call options (slice 83): `signal` cancels the in-flight
+  // call by propagating to the tool handler (in-process) or
+  // killing the worker (spawn). On abort the response carries
+  // `ok: false, error: 'aborted'` plus whatever stdout/stderr
+  // had been captured up to that point.
+  execute(request: BrokerRequest, options?: BrokerCallOptions): Promise<BrokerResponse>;
   // Release any held resources (long-lived broker process
   // handle, worker pool, etc.). The in-process broker has no
   // resources to release but exposes the method for interface

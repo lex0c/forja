@@ -53,10 +53,20 @@ const readStdin = async (): Promise<string> => {
   return buffer;
 };
 
+// SIGTERM propagation (slice 83). The spawn broker sends SIGTERM
+// on caller-abort; we catch it here, abort the JS-level signal,
+// and runWorker passes that into the handler. Without this catch
+// the OS would terminate the worker mid-handler, the bash
+// subprocess would orphan, and the broker would see "worker
+// produced no response" instead of the canonical aborted shape.
+const ac = new AbortController();
+process.on('SIGTERM', () => ac.abort());
+
 await runWorker({
   handlers: [echoHandler, bashHandler],
   input: readStdin,
   output: (line) => {
     process.stdout.write(line);
   },
+  signal: ac.signal,
 });

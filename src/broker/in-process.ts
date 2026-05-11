@@ -30,15 +30,17 @@
 // `exec` implementations (wraps around the sandbox runner) are
 // expected to handle their own error paths.
 
-import type { Broker, BrokerRequest, BrokerResponse } from './types.ts';
+import type { Broker, BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 export interface CreateInProcessBrokerOptions {
   // The actual tool exec function. Receives a fully-validated
-  // BrokerRequest; returns the response. Slice 78 doesn't
-  // define WHAT this function looks like — that's the harness
-  // wire-up's concern. Tests pass capturing / scripted
-  // implementations.
-  exec: (request: BrokerRequest) => Promise<BrokerResponse>;
+  // BrokerRequest plus per-call options (slice 83: signal for
+  // cancellation). Returns the response. Slice 78 doesn't define
+  // WHAT this function looks like — that's the harness wire-up's
+  // concern. Tests pass capturing / scripted implementations.
+  // Implementations that ignore the options parameter remain valid
+  // (TypeScript allows fewer-arg functions).
+  exec: (request: BrokerRequest, options?: BrokerCallOptions) => Promise<BrokerResponse>;
 }
 
 export const createInProcessBroker = (options: CreateInProcessBrokerOptions): Broker => {
@@ -49,7 +51,10 @@ export const createInProcessBroker = (options: CreateInProcessBrokerOptions): Br
   let closed = false;
 
   return {
-    execute: async (request: BrokerRequest): Promise<BrokerResponse> => {
+    execute: async (
+      request: BrokerRequest,
+      callOptions?: BrokerCallOptions,
+    ): Promise<BrokerResponse> => {
       if (closed) {
         return {
           ok: false,
@@ -66,7 +71,7 @@ export const createInProcessBroker = (options: CreateInProcessBrokerOptions): Br
       let result: BrokerResponse;
       const myTurn = inFlight.then(async () => {
         try {
-          result = await options.exec(request);
+          result = await options.exec(request, callOptions);
         } catch (e) {
           result = {
             ok: false,

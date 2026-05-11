@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 83: §13.7 per-call cancellation — AbortSignal threaded through the broker stack
+
+**Done.** Eighty-third slice. Closes the orphan-subprocess debt from slice 82's `Promise.race` workaround: `Broker.execute` now accepts `options.signal`, propagating an AbortSignal from the caller (bashTool's ctx.signal) all the way down to the bash subprocess. On abort the broker kills the worker, the worker propagates to the handler, the handler kills its bash subprocess, and the response carries `error: 'aborted'`. The mid-exec abort path no longer leaks subprocesses — they die when the caller asks.
+
+Scope is intentionally tight: per-call cancellation only. The original slice 83 sketch bundled SIGTERM-on-main lifecycle, worker crash telemetry, and per-call timeout override. Each of those is its own substantial design — they get separate slices once §13.7's mainline (broker stack + harness migration + cancellation) lands clean.
+
+### Why this matters
+
+Slice 82 shipped the migration but used `Promise.race(brokerPromise, abortPromise)` to surface tool.aborted within budget. The in-flight broker call kept running until natural completion or worker-side timeout — bounded leak, not a hang, but a `sleep 60` after abort cost 60 seconds of subprocess time. With slice 83 the same path uses ~30ms (abort → SIGTERM → bash exits → handler returns aborted → broker returns aborted → bashTool returns tool.aborted).
+
+The plumbing also makes the broker contract more honest. Slice 82 documented the leak; slice 83 closes it. Spec line 928 ("CLI main não tem exec privilege") expects the broker to fully own subprocess lifecycle — including abort. Without slice 83, the abort path bypassed the broker abstraction (the bash subprocess died on its own timer, not because the broker said so). Now the kill flows through the broker, the broker owns the answer.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/types.ts` | New `BrokerCallOptions { signal?: AbortSignal }` interface. `Broker.execute(request, options?: BrokerCallOptions)`. Signal documented as the cancellation primitive: in-process broker passes it to the exec callback; spawn broker uses it to SIGTERM the worker. Pre-aborted signal is handled at entry — no spawn happens. Aborted response shape is `{ok: false, error: 'aborted', stdout: <partial>, stderr: <partial>}`. |
+| `src/broker/in-process.ts` | `execute` accepts callOptions, passes verbatim to the supplied `exec(request, callOptions)`. exec callback's signature widens to `(request, options?: BrokerCallOptions) => Promise<BrokerResponse>` — backward-compatible (callers that supplied `(request) =>` arrow functions still typecheck; they just ignore the new arg). |
+| `src/broker/spawn.ts` | Pre-aborted signal returns `{error: 'aborted'}` without spawning. After spawning, registers an abort listener that fires `proc.kill('SIGTERM')` to the worker process. After exited resolves: if `signalAborted` flag is set, override whatever the worker emitted with the canonical aborted response. Listener cleanup on every exit branch (wait-failed, success, timeout). |
+| `src/broker/worker-runtime.ts` | `RunWorkerOptions.signal?: AbortSignal` — production worker entry (`worker.ts`) wires this from `process.on('SIGTERM')`. `WorkerToolHandler.execute(request, options?: BrokerCallOptions)` — backward-compatible widening. `runWorker` constructs a BrokerCallOptions object from `options.signal` (if defined) and passes to `handler.execute`. |
+| `src/broker/handlers/bash.ts` | Pre-aborted signal returns `{error: 'aborted'}` without spawning. After spawning, registers an abort listener that fires `proc.kill('SIGTERM')` + escalates to SIGKILL after `timeoutGraceMs` (same grace window as the timeout path). New `aborted` flag tracks whether abort fired before timeout — when set, response uses `error: 'aborted'` instead of `bash handler: timed out after Nms` (abort takes precedence). Listener removed in `finally` so a long-lived handler (impossible today — slice 81 ships single-shot — but defensive) doesn't leak listeners. |
+| `src/broker/worker.ts` | Installs `process.on('SIGTERM', () => ac.abort())` and passes `ac.signal` to `runWorker`. The spawn broker sends SIGTERM to the worker on caller abort; this catch propagates JS-level so the bash handler can kill its subprocess + emit a proper aborted response before the worker exits. Without this catch the OS would terminate the worker mid-handler, the bash subprocess would orphan, and the broker would see "worker produced no response". |
+| `src/tools/builtin/bash.ts` | Removes the `Promise.race(brokerPromise, abortPromise)` workaround. Now passes `{signal: ctx.signal}` to `ctx.broker.execute`. Adds `ABORTED_ERROR = 'aborted'` constant + a translation branch that maps the broker's aborted response to `toolError(ERROR_CODES.aborted, 'bash command aborted by caller', {retryable: true, details: {duration_ms, command}})`. Net result: the same tool.aborted observable behavior, but no leaked subprocess. |
+| `src/cli/bootstrap.ts` | Updated `exec` thunk in the in-process broker construction: `(request, callOptions) => bashHandler.execute(request, callOptions)`. Without the second arg the bash handler would never receive the signal. |
+| `tests/tools/_helpers.ts` | Same `exec` thunk update for `makeCtx`'s default broker. Without it the existing bash test "caller abort mid-exec returns tool.aborted" would fail (handler never sees the signal). |
+| `tests/broker/cancellation.test.ts` (new, 10 tests) | **In-process propagation (2):** exec callback receives the signal in callOptions; omitted callOptions ⇒ exec sees undefined. **Bash handler cancellation (5):** pre-aborted signal never spawns (asserts spawn-call count = 0); mid-exec abort kills bash subprocess + returns aborted in <2s (real `sleep 5; echo nope` killed); SIGTERM-trapping bash gets SIGKILL-escalated (real `trap "" TERM; while true; sleep 0.1` killed in <3s via grace); abort takes precedence over timeout when both fire; no signal ⇒ handler runs to completion. **Spawn broker propagation (2):** pre-aborted signal never spawns the worker; mid-exec abort sends SIGTERM + returns aborted in <2s. **End-to-end (1):** spawn broker → real `bun run worker.ts` → bash handler → real bash subprocess; abort at 100ms kills `sleep 10; echo nope` in <3s. |
+
+### Decisions
+
+- **AbortSignal in an options object, not a positional second arg.** `execute(request, options?)` leaves room for future per-call config (timeout override, telemetry tags) without another signature break. Symmetric across the stack: broker, exec callback, handler all take `options?: BrokerCallOptions`. The cost is slight verbosity (`{signal: ctx.signal}` vs. `ctx.signal`) — paid once at the bashTool site, never elsewhere.
+- **Optional parameter, NOT a new method.** Adding `cancel(request)?` to the Broker interface would have forced every implementation to handle two distinct cancellation models (signal-based + handle-based). Signal-based wins because (a) it's idiomatic in TS — same shape as fetch + Bun.spawn + Node streams; (b) AbortSignal composes (operators can combine signals via `AbortSignal.any` if/when the spec adds it); (c) bashTool already has `ctx.signal`, no new plumbing on the caller side.
+- **Canonical response shape on abort: `{ok: false, error: 'aborted', stdout: <partial>, stderr: <partial>}`.** Three layers can independently produce this shape (in-process broker via exec, spawn broker via worker-kill, bash handler via subprocess-kill). All three emit the same string so bashTool's translation has one branch to write + the test surface has one prefix to assert. The `'aborted'` sentinel is short + obviously not a real error message; collision with handler-emitted errors is implausible.
+- **Abort takes precedence over timeout.** When both fire (rare; e.g., abort during the timeout's grace window), the handler's response uses `error: 'aborted'` not `bash handler: timed out after Nms`. Rationale: the caller's intent (abort) is the load-bearing signal — telling them "your call timed out" when they asked to cancel would be misleading. Dedicated test pins this branch.
+- **Signal handler in `worker.ts` catches SIGTERM, doesn't override.** Default Node/Bun behavior is to terminate. The catch installs a listener that aborts the JS-level signal; SIGTERM no longer kills the worker directly, the handler gets to clean up. If the handler hangs (bug), the broker's outer timeout still kills the worker via the existing timer path. Defense in depth.
+- **SIGTERM-trapping bash is SIGKILL-escalated by the handler, not the broker.** The bash handler owns the bash subprocess's lifecycle. When abort fires, the handler issues SIGTERM, then queues a SIGKILL after `timeoutGraceMs` (default 2s). The spawn broker DOESN'T escalate to the worker — it only sends SIGTERM. Why: the worker's SIGTERM handler is JS code; if it hangs, the broker's timeout already covers that. Adding broker-side escalation would race with the handler's own escalation.
+- **Pre-aborted-signal early return at three layers (broker, spawn, bash handler).** Each layer independently bails on a pre-aborted signal. The earliest layer to see the abort returns the canonical response; the others are belt-and-braces. Cost: ~3 lines per layer. Benefit: a caller that builds a broker, immediately aborts a signal, and calls execute gets the aborted response in microseconds — no spawn cost, no FIFO chain advance.
+- **`exec` thunk updated in bootstrap AND tests/_helpers.** Without forwarding callOptions, the bash handler never receives the signal — the broker abstraction would silently drop cancellation. Both wiring points have the same shape so production + test behavior match. The cancellation test surface explicitly verifies the in-process broker passes callOptions through.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5952 pass / 10 skip / 0 fail** (5962 total across 283 files); +10 tests on top of slice 82's 5942
+- `bun test tests/broker/cancellation.test.ts` — 10 pass; existing bash + broker tests all green
+- Mid-exec abort path verified end-to-end via real `sleep N` commands at three layers (in-process via bash handler; spawn broker via /bin/sh worker; full pipeline via `bun run src/broker/worker.ts` → bash subprocess). All abort in <3s; pre-slice timed leak budget was up to 30s (bash handler default timeout).
+
+### Next
+
+§13.7 remaining work (post-cancellation):
+
+1. **SIGTERM on CLI main → graceful broker.close.** When the operator Ctrl-C's the REPL, main should call `broker.close()` to drain in-flight calls before exit. Slice 83 didn't wire this — `bootstrap` constructs the broker but no shutdown path exists. Future slice adds it; until then, the OS kill cascade (main dies → broker GC'd → in-process broker has no resources to clean) is the safety net.
+2. **Worker crash telemetry.** When a spawned worker exits ≠ 0 without a parseable response (likely a crash, OOM, or panic), the broker today returns `error: 'worker produced no response'` but emits no telemetry event. Slice 83 left this as the next pain point — crashes are rare but operators need to see them.
+3. **Per-call timeout override.** Some tools (long-running tests, big builds) need a longer timeout than the default 30s. Today timeout_ms goes into `args` and the bash handler reads it; broker-level timeout (slice 79's `timeoutMs`) is fixed at broker-construction. A future `BrokerCallOptions.timeoutMs` would let bashTool override per-call.
+4. **Operator-facing security-mode flag.** Flip bootstrap from `createInProcessBroker` to `createSpawnBroker` against `bun run src/broker/worker.ts`. The harness side stays unchanged. Adds the actual process-isolation that spec line 928 calls for.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 82: §13.7 harness migration — bash routes through broker.execute
 
 **Done.** Eighty-second slice. Closes the §13.7 thread for the bash family: `bashTool.execute` no longer calls `Bun.spawn` directly — it builds a `BrokerRequest` and routes through `ctx.broker.execute(request)`. The harness loop threads a broker from `HarnessConfig.broker`; bootstrap constructs an in-process broker wired to the bash worker handler from slice 81. After this slice, the harness has no direct spawn privilege for the bash family — every bash invocation flows through the broker pipeline (slices 78–81).

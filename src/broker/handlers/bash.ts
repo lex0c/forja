@@ -37,7 +37,7 @@
 // within test wall-clock budgets.
 
 import { isAbsolute, resolve as resolvePath } from 'node:path';
-import type { BrokerRequest, BrokerResponse } from '../types.ts';
+import type { BrokerCallOptions, BrokerRequest, BrokerResponse } from '../types.ts';
 import type { WorkerToolHandler } from '../worker-runtime.ts';
 import { readCapped } from './read-capped.ts';
 
@@ -124,8 +124,23 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
 
   return {
     name: 'bash',
-    execute: async (request: BrokerRequest): Promise<BrokerResponse> => {
+    execute: async (
+      request: BrokerRequest,
+      callOptions?: BrokerCallOptions,
+    ): Promise<BrokerResponse> => {
       const args = request.args;
+
+      // Pre-aborted signal: never spawn. Same shape as the spawn
+      // broker's pre-abort check (slice 83) so callers see one
+      // canonical aborted response regardless of where it fired.
+      if (callOptions?.signal?.aborted === true) {
+        return {
+          ok: false,
+          stdout: '',
+          stderr: '',
+          error: 'aborted',
+        };
+      }
 
       const rawCommand = args.command;
       if (typeof rawCommand !== 'string' || rawCommand.length === 0) {
@@ -166,6 +181,7 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
       }
 
       let timedOut = false;
+      let aborted = false;
       let killEscalationTimer: ReturnType<typeof setTimeout> | undefined;
       const escalateToSigkill = (graceMs: number): void => {
         killEscalationTimer = setTimeout(() => {
@@ -185,6 +201,25 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
         }
         escalateToSigkill(timeoutGraceMs);
       }, timeoutMs);
+
+      // Mid-exec abort propagation. Same SIGTERM → SIGKILL grace
+      // as the timeout path so a bash process that traps TERM
+      // still dies. The orphan-read-stop signal (below) fires when
+      // proc.exited resolves regardless of why it died.
+      const signal = callOptions?.signal;
+      let signalListener: (() => void) | null = null;
+      if (signal !== undefined) {
+        signalListener = (): void => {
+          aborted = true;
+          try {
+            proc.kill('SIGTERM');
+          } catch {
+            // already exited
+          }
+          escalateToSigkill(timeoutGraceMs);
+        };
+        signal.addEventListener('abort', signalListener, { once: true });
+      }
 
       const readStopAc = new AbortController();
       void proc.exited.then(() => readStopAc.abort());
@@ -208,6 +243,22 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
       } finally {
         clearTimeout(timer);
         if (killEscalationTimer !== undefined) clearTimeout(killEscalationTimer);
+        if (signal !== undefined && signalListener !== null) {
+          signal.removeEventListener('abort', signalListener);
+        }
+      }
+
+      // Abort takes precedence over timeout — if the caller cancelled
+      // AND the timeout fired (rare; e.g., abort during the grace
+      // window), the canonical shape is aborted, not timeout.
+      if (aborted) {
+        return {
+          ok: false,
+          stdout: outRes.text,
+          stderr: errRes.text,
+          exitCode,
+          error: 'aborted',
+        };
       }
 
       if (timedOut) {

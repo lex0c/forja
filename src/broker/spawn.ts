@@ -46,7 +46,7 @@
 //   - parsed JSON missing fields   → ok:false, error:'response missing required fields', exitCode set
 //   - worker emits valid response  → response returned verbatim (worker is the source of truth)
 
-import type { Broker, BrokerRequest, BrokerResponse } from './types.ts';
+import type { Broker, BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 // The subprocess shape the broker depends on. Narrower than
 // `Bun.Subprocess` so tests can pass mocks without depending
@@ -141,7 +141,21 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
   let inFlight: Promise<void> = Promise.resolve();
   let closed = false;
 
-  const executeOnce = async (request: BrokerRequest): Promise<BrokerResponse> => {
+  const executeOnce = async (
+    request: BrokerRequest,
+    callOptions?: BrokerCallOptions,
+  ): Promise<BrokerResponse> => {
+    // Pre-aborted signal: return immediately, never spawn. Same
+    // posture as fetch() with a pre-aborted signal — no work.
+    if (callOptions?.signal?.aborted === true) {
+      return {
+        ok: false,
+        stdout: '',
+        stderr: '',
+        error: 'aborted',
+      };
+    }
+
     const innerArgv: readonly string[] = [command, ...baseArgs];
 
     let wrappedArgv: readonly string[] = innerArgv;
@@ -212,6 +226,29 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       }, timeoutMs);
     }
 
+    // Signal handler — when the caller aborts, send SIGTERM to the
+    // worker. The worker's own SIGTERM handler (worker.ts) catches
+    // it and propagates JS-level abort to the running tool handler,
+    // which kills its subprocesses + emits an aborted response. If
+    // the worker doesn't handle SIGTERM the OS terminates the
+    // process; the broker then sees the missing/non-parseable
+    // response and the "aborted" branch below maps it to the
+    // canonical aborted shape regardless.
+    let signalAborted = false;
+    let signalListener: (() => void) | null = null;
+    const signal = callOptions?.signal;
+    if (signal !== undefined) {
+      signalListener = (): void => {
+        signalAborted = true;
+        try {
+          proc.kill('SIGTERM');
+        } catch {
+          // already exited
+        }
+      };
+      signal.addEventListener('abort', signalListener, { once: true });
+    }
+
     const stdoutP =
       proc.stdout !== null && proc.stdout !== undefined
         ? new Response(proc.stdout).text()
@@ -231,6 +268,9 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       exitCode = code;
     } catch (e) {
       if (timer !== null) clearTimeout(timer);
+      if (signal !== undefined && signalListener !== null) {
+        signal.removeEventListener('abort', signalListener);
+      }
       return {
         ok: false,
         stdout: stdoutText,
@@ -239,6 +279,22 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       };
     }
     if (timer !== null) clearTimeout(timer);
+    if (signal !== undefined && signalListener !== null) {
+      signal.removeEventListener('abort', signalListener);
+    }
+
+    if (signalAborted) {
+      // Caller cancellation — override whatever the worker emitted
+      // (a worker that caught SIGTERM may have produced a partial
+      // response; one that didn't dies mid-write). Either way the
+      // canonical shape is `error: 'aborted'`.
+      return {
+        ok: false,
+        stdout: stdoutText,
+        stderr: stderrText,
+        error: 'aborted',
+      };
+    }
 
     if (timedOut) {
       return {
@@ -291,7 +347,10 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
   };
 
   return {
-    execute: async (request: BrokerRequest): Promise<BrokerResponse> => {
+    execute: async (
+      request: BrokerRequest,
+      callOptions?: BrokerCallOptions,
+    ): Promise<BrokerResponse> => {
       if (closed) {
         return {
           ok: false,
@@ -303,7 +362,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       let result: BrokerResponse;
       const myTurn = inFlight.then(async () => {
         try {
-          result = await executeOnce(request);
+          result = await executeOnce(request, callOptions);
         } catch (e) {
           // executeOnce shouldn't throw, but if it does (bug,
           // OOM, etc.) keep the queue draining + the contract

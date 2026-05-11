@@ -38,16 +38,18 @@ export interface BashOutput {
 // truncation via a dedicated BrokerResponse field if/when other
 // handlers need it.
 //
-// Mid-exec abort: races broker.execute against ctx.signal. On
-// abort, returns `tool.aborted` immediately and lets the in-flight
-// broker call finish in the background (worker-side timeout is the
-// upper bound). Slice 83 will add broker-level cancellation so
-// the worker dies the moment the harness aborts.
+// Mid-exec abort (slice 83): passes ctx.signal to broker.execute.
+// The broker propagates to the bash worker handler, which kills
+// its bash subprocess via SIGTERM → SIGKILL escalation. The
+// broker response then carries `error: 'aborted'`, which this
+// tool maps to `tool.aborted`. No orphan subprocesses, no
+// Promise.race workaround.
 
 // Match BashSpawnFn message prefixes from src/broker/handlers/bash.ts.
 const TIMED_OUT_PREFIX = 'bash handler: timed out after ';
 const SPAWN_FAILED_PREFIX = 'bash handler: failed to spawn bash: ';
 const HANDLER_PREFIX = 'bash handler: ';
+const ABORTED_ERROR = 'aborted';
 const TRUNCATION_FOOTER_RE = /\n\[\.\.\. truncated; \d+ bytes omitted]$/;
 
 const isInvalidArgError = (msg: string): boolean =>
@@ -144,44 +146,19 @@ export const bashTool: Tool<BashInput, BashOutput> = {
     };
 
     const start = Date.now();
-    const brokerPromise = ctx.broker.execute(request);
-
-    // Mid-exec abort: race the broker call against ctx.signal. The
-    // in-flight broker call MAY continue in the background after
-    // the race resolves with 'aborted' — slice 83 will add
-    // broker-side cancellation. The worker-side timeout caps how
-    // long the orphan keeps running.
-    let response: BrokerResponse;
-    {
-      let abortListener: (() => void) | null = null;
-      const abortPromise = new Promise<'aborted'>((resolve) => {
-        if (ctx.signal.aborted) {
-          resolve('aborted');
-          return;
-        }
-        abortListener = (): void => resolve('aborted');
-        ctx.signal.addEventListener('abort', abortListener, { once: true });
-      });
-      const raced = await Promise.race([brokerPromise, abortPromise]);
-      if (abortListener !== null) {
-        ctx.signal.removeEventListener('abort', abortListener);
-      }
-      if (raced === 'aborted') {
-        return toolError(ERROR_CODES.aborted, 'bash command aborted by caller', {
-          retryable: true,
-          details: {
-            duration_ms: Date.now() - start,
-            command: args.command,
-          },
-        });
-      }
-      response = raced;
-    }
-
+    const response: BrokerResponse = await ctx.broker.execute(request, {
+      signal: ctx.signal,
+    });
     const duration_ms = Date.now() - start;
 
     // Map broker-side error messages to the tool's error vocabulary.
     if (response.error !== undefined) {
+      if (response.error === ABORTED_ERROR) {
+        return toolError(ERROR_CODES.aborted, 'bash command aborted by caller', {
+          retryable: true,
+          details: { duration_ms, command: args.command },
+        });
+      }
       if (response.error.startsWith(TIMED_OUT_PREFIX)) {
         const ms = response.error.slice(TIMED_OUT_PREFIX.length);
         return toolError(ERROR_CODES.bashTimeout, `bash command timed out after ${ms}`, {

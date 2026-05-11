@@ -26,7 +26,7 @@ const allowAll = (): Decision => ({ kind: 'allow', reason: 'test default allow-a
 const defaultBroker = (): Broker => {
   const bashHandler = createBashHandler({ scrubEnv });
   return createInProcessBroker({
-    exec: (request) => bashHandler.execute(request),
+    exec: (request, callOptions) => bashHandler.execute(request, callOptions),
   });
 };
 

@@ -545,7 +545,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // ("CLI main has no exec privilege", spec line 928).
   const bashHandler = createBashHandler({ scrubEnv });
   const broker = createInProcessBroker({
-    exec: (request) => bashHandler.execute(request),
+    exec: (request, callOptions) => bashHandler.execute(request, callOptions),
   });
 
   const config: HarnessConfig = {

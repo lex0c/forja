@@ -51,7 +51,7 @@
 // independently. Production workers are per-call disposable so
 // this is paranoia, not requirement.
 
-import type { BrokerRequest, BrokerResponse } from './types.ts';
+import type { BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 export interface WorkerToolHandler {
   // Identifier the broker passes as `request.toolName`. Must be
@@ -66,7 +66,13 @@ export interface WorkerToolHandler {
   // and mapped to an error response, but well-behaved handlers
   // SHOULD return a BrokerResponse from every path (including
   // failure modes — set `ok: false` + populate `error` + `stderr`).
-  execute(request: BrokerRequest): Promise<BrokerResponse>;
+  //
+  // Per-call options (slice 83): `signal` aborts in-flight work.
+  // Handlers that own a subprocess should kill it on signal abort
+  // and return a response with `error: 'aborted'`. Handlers that
+  // don't honor signals remain valid — the broker reports abort
+  // at its own layer (spawn broker kills the worker process).
+  execute(request: BrokerRequest, options?: BrokerCallOptions): Promise<BrokerResponse>;
 }
 
 export interface RunWorkerOptions {
@@ -83,6 +89,12 @@ export interface RunWorkerOptions {
   // trailing '\n'. Production binds `process.stdout.write`; tests
   // capture into an array.
   output: (line: string) => void;
+  // Abort signal propagated to the handler (slice 83). Production
+  // worker entry (`worker.ts`) wires `process.on('SIGTERM', ...)`
+  // to abort this signal — the broker sends SIGTERM on caller
+  // abort. Tests pass a controller-backed signal to validate the
+  // pipe without spawning real subprocesses.
+  signal?: AbortSignal;
 }
 
 const isBrokerRequest = (v: unknown): v is BrokerRequest => {
@@ -165,7 +177,9 @@ export const runWorker = async (options: RunWorkerOptions): Promise<void> => {
 
   let response: BrokerResponse;
   try {
-    response = await handler.execute(parsed);
+    const handlerOptions: BrokerCallOptions = {};
+    if (options.signal !== undefined) handlerOptions.signal = options.signal;
+    response = await handler.execute(parsed, handlerOptions);
   } catch (e) {
     response = errorResponse(`worker handler threw: ${e instanceof Error ? e.message : String(e)}`);
   }
