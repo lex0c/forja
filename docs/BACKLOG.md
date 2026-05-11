@@ -15,6 +15,50 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 68: fuzz harness — policy parser target (§15.4 line 1119)
+
+**Done.** Sixty-eighth slice. Adds the third fuzz target: `policyFuzzTarget` exercises the YAML policy parser pipeline (`loadPolicyFromString` → YAML parse → `parsePolicy` schema validation) against YAML-meta-biased random strings. 2000-iteration suite gate produces zero crashes on the current parser. Closes another quarter of production-ready checklist line 1289 — 3 of 4 spec-required targets now wired; only hash chain verify (line 1120) remains.
+
+### Why this matters
+
+The policy parser is the engine's first untrusted-input surface: operators' YAML files hit `loadPolicyFromString` BEFORE any state machine wire-up. Spec line 1119 says "random TOML → no crash" (project uses YAML, not TOML — spec text is loose). The invariant is binary: `loadPolicyFromString` either returns a valid `Policy` object OR throws a standard `Error` with a string message. Non-Error throws, undefined returns, infinite recursion, or stack overflow are all crashes that would break the engine's bootstrap (which converts parse failures into operator-readable refusing reasons).
+
+Pre-slice the YAML parser + parsePolicy had no fuzz coverage — every code path was exercised only by the conformance suite's hand-crafted policies + parser's targeted unit tests. Random inputs probe corners those don't reach: deeply-nested malformed structures, ambiguous indentation, mixed flow/block syntax, partial tokens that look like keys but aren't.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/fuzz/targets/policy.ts` (new, ~150 lines) | `policyFuzzTarget`: §15.4 line 1119. `POLICY_TOKENS` array of ~35 real policy keys/values (defaults, mode, tools, bash, allow, deny, allow_paths, locked, sandbox, seal, worm-file, etc.) — sampled with ~12% weight per generated chunk so inputs LOOK like policy with random structural breakage. `randYamlChar(rng)`: ~57% YAML metas (newline 15%, space/colon/dash/quotes/braces/brackets/comment-marker/pipe) + 43% identifier chars. `randPolicyYaml(rng, n)`: composes tokens + chars to target length. Generate: length 8-256 (covers tiny-valid → medium-pathological). Run: calls `loadPolicyFromString(yaml)` and asserts two valid outcomes — Policy object with `defaults` + `tools` mappings, OR thrown `Error` with string `.message`. Non-Error throws + non-object returns surface as fuzz failures. |
+| `tests/fuzz/policy-target.test.ts` (new, 5 tests) | 2000-iteration suite gate (zero crashes); format renders single-line JSON-escaped key=value with newline escape; format handles embedded quotes; replay determinism (same seed → same input); invariant smoke test wraps with a stub throwing a plain-string (catches the "non-Error throw" branch). |
+
+### Decisions
+
+- **2000 iterations as the suite gate, matching glob.** Policy parser is pure code (no async deps, no SQLite, no fs), so iterations are cheap — 2000 runs in ~250ms. Same threshold as glob (>0.05% crash rate detection) since both targets exercise pure-code parsers.
+- **YAML-meta bias, not TOML.** Spec line 1119 says "random TOML → no crash" but the implementation parses YAML. Following implementation over spec text — the actual surface to fuzz is what production reads. Bias toward `:` `\n` `-` `"` `[]` `{}` `#` produces inputs that exercise the YAML tokenizer's full state machine.
+- **Token injection at ~12% per chunk.** Pure-meta random rarely produces structures that look like policy schema (e.g. `defaults: { mode: strict }`). Injecting full tokens like `defaults`, `mode`, `tools`, `bash`, etc. pushes inputs past tokenization into parsePolicy's validation layer — where unhandled-branch bugs typically live. Empirically chosen: 12% gives ~30 token-injections per 256-char input, enough to mix recognizable keys with random structural noise.
+- **Two-outcome invariant: Policy OR Error.** Anything else is a crash. `loadPolicyFromString` returning `undefined` would silently break the engine's bootstrap (which checks `policy.defaults.mode`). Throwing a plain string instead of an Error would break operator error rendering. Both are checked explicitly. The test "non-Error throws surface as fuzz failures" validates this assertion path.
+- **Structural sanity beyond "is object".** The invariant also checks `Policy.defaults` and `Policy.tools` are objects — these are the two fields the engine bootstrap reads to construct the runtime policy. A parser that returns an object but with missing `defaults` would crash the bootstrap downstream; the fuzz catches it here.
+- **Comment marker `#` (~2%) in the bias.** YAML comments are easy to mis-tokenize (especially near quotes / multi-line strings). The bias ensures comment edge cases get coverage without dominating the input.
+- **Pipe `|` (~2%) in the bias.** YAML block scalars (`|`, `>`) are uncommon in policies but the parser must handle them gracefully. Including in the bias catches any unhandled branches in block-scalar tokenization.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings
+- `bun test` — **5760 pass / 10 skip / 0 fail** (5770 total across 270 files); +5 tests on top of slice 67's 5755
+- `bun test tests/fuzz/policy-target.test.ts` — 5 pass; 2000-iteration policy fuzz completes in ~250ms with ZERO crashes — `loadPolicyFromString` is fuzz-robust on the YAML-meta-biased + token-seeded generator distribution.
+
+### Next
+
+Fuzz harness: only one spec-mandated target remains — **hash chain verify** (§15.4 line 1120): "corrupted rows → state=refusing, no panic". Requires SQLite seeding per iteration (slower than other targets), so ~250-LOC slice with more setup machinery than slice 66-68.
+
+After slice 69 closes that gap, production-ready checklist line 1289 ("Fuzz harness 10⁹ iterations sem crash novo") will be satisfied for all four spec targets. The 10⁹-iteration nightly CI run uses the same harness with larger `iterations`; the suite gate of 1000-2000 stays in `bun test`.
+
+Other open work unchanged: telemetria/OTEL (§18 / line 1213), §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining thread).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 67: fuzz harness — bash resolver target (§15.4 line 1118)
 
 **Done.** Sixty-seventh slice. Adds the second fuzz target from slice 66's roadmap: `bashFuzzTarget` exercises the bash resolver's full pipeline (tree-sitter-bash parse → AST walk → whitelist match → capability resolution) against bash-meta-biased random command strings. 1000-iteration suite gate produces zero crashes on the current resolver.
