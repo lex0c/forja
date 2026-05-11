@@ -189,3 +189,56 @@ describe('bootstrapPermissionEngine — engine.state() honored after boot', () =
     // checking engine.state() is what proves it.
   });
 });
+
+describe('bootstrapPermissionEngine — policy_archive (§17 prerequisite)', () => {
+  // Roundtrip invariant: the archived bytes regenerate the row's
+  // policy_hash. Without this, replay can't reconstruct the policy
+  // from the hash and the §17 modes would be non-deterministic.
+  test('archives the active policy with bytes that roundtrip the hash', async () => {
+    const db = baseDb();
+    const r = await bootstrapPermissionEngine(baseInput({ db }));
+    const { canonicalHash } = await import('../../src/permissions/canonical.ts');
+    const { listPolicyArchive } = await import('../../src/storage/repos/policy-archive.ts');
+    const archive = listPolicyArchive(db);
+    expect(archive.length).toBe(1);
+    const row = archive[0];
+    expect(row).toBeDefined();
+    if (row === undefined) return;
+    const parsed = JSON.parse(row.canonical_json);
+    expect(`sha256:${canonicalHash(parsed)}`).toBe(row.policy_hash);
+    // The engine's emit path tags audit rows with the SAME hash —
+    // pin that linkage so a future divergence (e.g. engine stops
+    // including a field in the canonical form) trips immediately.
+    expect(r.engine.policy()).toEqual(parsed);
+  });
+
+  test('rebooting under the same policy upserts (no duplicates)', async () => {
+    const db = baseDb();
+    await bootstrapPermissionEngine(baseInput({ db, now: () => 1000 }));
+    await bootstrapPermissionEngine(baseInput({ db, now: () => 2000 }));
+    const { countPolicyArchive, listPolicyArchive } = await import(
+      '../../src/storage/repos/policy-archive.ts'
+    );
+    expect(countPolicyArchive(db)).toBe(1);
+    const row = listPolicyArchive(db)[0];
+    expect(row).toBeDefined();
+    if (row === undefined) return;
+    // first_seen stays anchored at the first boot; last_seen advances.
+    expect(row.first_seen_ms).toBe(1000);
+    expect(row.last_seen_ms).toBe(2000);
+  });
+
+  test('refusing-state bootstrap does NOT archive (no replay-worthy decisions follow)', async () => {
+    // Force a refusing bootstrap via malformed user policy.
+    const userYaml = join(tmpRoot, '.config', 'agent', 'permissions.yaml');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(join(tmpRoot, '.config', 'agent'), { recursive: true });
+    writeFileSync(userYaml, 'this is: not :: valid: :: yaml: :');
+
+    const db = baseDb();
+    const r = await bootstrapPermissionEngine(baseInput({ db, userPath: userYaml }));
+    expect(r.state).toBe('refusing');
+    const { countPolicyArchive } = await import('../../src/storage/repos/policy-archive.ts');
+    expect(countPolicyArchive(db)).toBe(0);
+  });
+});

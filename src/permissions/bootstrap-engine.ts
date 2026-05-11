@@ -20,6 +20,7 @@
 //   - all of the above clean                   → state=ready
 
 import type { DB } from '../storage/db.ts';
+import { archivePolicy } from '../storage/repos/policy-archive.ts';
 import {
   type AuditSink,
   type ReasonChainEntry,
@@ -27,7 +28,7 @@ import {
   createSqliteSink,
 } from './audit.ts';
 import { initBashParser } from './bash-parser.ts';
-import { canonicalHash } from './canonical.ts';
+import { canonicalHash, canonicalize } from './canonical.ts';
 import { type PermissionEngine, createPermissionEngine } from './engine.ts';
 import {
   type Layer,
@@ -292,6 +293,27 @@ export const bootstrapPermissionEngine = async (
     }
   } else {
     controller.transition('ready', chain.ok ? 'chain_intact' : 'chain_break_accepted');
+  }
+
+  // PERMISSION_ENGINE.md §17 prerequisite: snapshot the canonical
+  // policy bytes into `policy_archive` so future replay modes
+  // (`--against-current-policy`, `--without-classifier`,
+  // `permission diff`) can reconstruct the original policy from its
+  // hash. Skip when the engine ended up `refusing` — that state never
+  // produces replay-worthy decisions.
+  //
+  // Uses the SAME bytes the engine hashed (`canonicalize(policy)`)
+  // so the roundtrip invariant
+  // `canonicalHash(JSON.parse(canonical_json)) === policy_hash`
+  // holds for every archived row.
+  const archiveState = controller.get();
+  if (archiveState !== 'refusing') {
+    const now = input.now?.() ?? Date.now();
+    archivePolicy(input.db, {
+      policy_hash: `sha256:${canonicalHash(resolveResult.policy)}`,
+      canonical_json: canonicalize(resolveResult.policy),
+      now,
+    });
   }
 
   return {

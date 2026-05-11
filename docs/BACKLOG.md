@@ -15,6 +15,73 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 13: policy_archive table (§17 prerequisite)
+
+**Done.** Thirteenth slice of the v2 evolution. Pure plumbing: adds the `policy_archive` table the spec §17 references ("`policy_hash` (lookup em `policy_archive`)") but never schema'd. Bootstrap now writes one row per engine boot snapshotting the canonical policy bytes. No user-visible behavior change; replay still only compares hashes today. The slice unlocks the next three deferred §17 modes — `--against-current-policy`, `--without-classifier`, `permission diff <id1> <id2>` — which all need the original policy bytes to re-execute deterministically.
+
+### Schema
+
+```sql
+CREATE TABLE policy_archive (
+  policy_hash    TEXT PRIMARY KEY,     -- sha256:<hex> (same format as approvals_log.policy_hash)
+  canonical_json TEXT NOT NULL,        -- canonicalize(policy) — exact bytes that produced the hash
+  first_seen_ms  INTEGER NOT NULL,     -- immutable; set on initial INSERT
+  last_seen_ms   INTEGER NOT NULL      -- advances on every re-boot under the same hash
+);
+CREATE INDEX idx_policy_archive_last_seen ON policy_archive(last_seen_ms);
+```
+
+Upsert by hash: same policy across multiple boots only updates `last_seen_ms`. The archive grows with UNIQUE policy bytes, not with boots — a stable install with one policy stays at 1 row indefinitely.
+
+### Roundtrip invariant
+
+The §17 prerequisite the table exists to satisfy:
+
+```
+canonicalHash(JSON.parse(row.canonical_json)) === row.policy_hash
+```
+
+Bootstrap stores `canonicalize(policy)` (the same bytes the engine hashes) and `canonicalHash(policy)` (the engine's actual hash). Tests pin the invariant both at the unit layer (`policy-archive.test.ts`) and at the integration layer (`bootstrap-engine.test.ts`) so a future divergence (e.g. engine stops including a field in the canonical form, or canonicalize gains a normalization step) trips immediately.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/037-policy-archive.ts` (new) | `policy_archive` table + `last_seen_ms` index. Schema mirrors the spec's implied shape exactly; no extra columns. |
+| `src/storage/migrations/index.ts` | Registers migration 037. |
+| `src/storage/repos/policy-archive.ts` (new) | `archivePolicy(db, { policy_hash, canonical_json, now })` upsert via `INSERT … ON CONFLICT(policy_hash) DO UPDATE SET last_seen_ms = excluded.last_seen_ms`. Returns the post-upsert row. Read-side: `getPolicyArchive(db, hash)`, `listPolicyArchive(db)` (chronological by `first_seen_ms`), `countPolicyArchive(db)`. Raw SQL throughout; no ORM. |
+| `src/permissions/bootstrap-engine.ts` | After `createPermissionEngine`, archives the resolved policy with the same `now` seam the rest of the bootstrap uses. Skip when `controller.get() === 'refusing'` — an engine that never accepts decisions has no replay-worthy history. Imports `canonicalize` from `./canonical.ts` so the SAME bytes the engine's emit path hashes are what land in the archive. |
+| `tests/storage/policy-archive.test.ts` (new) | 8 tests — fresh insert (`first_seen == last_seen == now`), upsert keeps `first_seen` and advances `last_seen`, distinct hashes coexist, repeated upserts don't duplicate, roundtrip invariant, `getPolicyArchive` null for unknown hash, `listPolicyArchive` chronological order, `countPolicyArchive` starts at 0. |
+| `tests/permissions/bootstrap-engine.test.ts` | New describe block — 3 tests: archive populated post-boot with roundtrip invariant + engine policy matching the archived parsed bytes; rebooting under the same policy upserts without duplicates and advances `last_seen_ms`; refusing-state bootstrap leaves archive empty (refusing has no replay-worthy decisions). |
+
+### Decisions
+
+- **Plumbing only — no read-side consumer in this slice.** The replay surface (slice 12) keeps using `policy_hash` comparison; nothing yet calls `getPolicyArchive`. Splitting the write path from the consumer paths keeps slice scope small and lets the next slices land the §17 modes without revisiting the storage layer.
+- **`first_seen_ms` is immutable per hash.** Lets future retention queries express "this policy has been live for N days" against `now - first_seen_ms`. Once a row's `first_seen_ms` is set, no code path mutates it; `ON CONFLICT DO UPDATE SET last_seen_ms = …` explicitly excludes it.
+- **No retention in this slice.** Archive grows with UNIQUE policies, which is bounded by the operator's edit history (rare). Production deployments will see a handful of rows. If retention becomes a concern, a future slice adds a `forja policy gc` that drops rows whose `last_seen_ms` predates a cutoff AND whose hash has no surviving `approvals_log` rows.
+- **Refusing branch skips archive.** A refusing engine never produces replay-able audit rows; archiving its policy bytes would consume storage without ever being read. Same reasoning as the `chain-break-accepted` audit row only firing in the `acceptBrokenChain` path: the archive captures only states the engine could decide from.
+- **Upsert returns the row.** A few callers want to know the post-upsert `first_seen_ms` (whether they just inserted or hit an existing). Returning the row is one round-trip; counting on `RunResult.changes === 1` to infer insert-vs-update is fragile because SQLite reports changes==1 for an UPDATE that actually no-ops (same `last_seen_ms`). Re-reading is clearer.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5186 pass / 10 skip / 0 fail** (5196 total across 245 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Replay `--against-current-policy` mode — re-execute the original decision pipeline against the active policy and surface the diff. Consumes `policy_archive`.
+2. Replay `--without-classifier` mode — same as default but force the classifier branch off. Consumes `policy_archive`.
+3. `agent permission diff <id1> <id2>` — cross-row comparison. Consumes `policy_archive` for both ids.
+4. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+5. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+6. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+7. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
+8. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 12: replay tool default mode (§17)
 
 **Done.** Twelfth slice of the v2 evolution. Lands `agent permission replay <seq>` — the spec §17 forensic surface for "qual decisão liberou X?". Slice 12 ships the **default mode only**: read the approvals_log row, render every preserved input, flag policy drift. The two extension modes (`--against-current-policy`, `--without-classifier`) and the cross-row `agent permission diff <id1> <id2>` are deferred — they all require a `policy_archive` table the slice deliberately doesn't add yet.
