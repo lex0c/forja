@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 70: telemetry foundation — `TelemetrySink` interface + `permission.decision` event
+
+**Done.** Seventieth slice. Opens the §18 observability thread per spec line 1175-1215. Ships the foundation: a `TelemetrySink` interface with one typed event (`permission.decision`), an in-memory recording sink for tests, and wire-up at the audit emit point so every successful row produces a structured event. Closes the first step of production-ready checklist line 1213 ("Telemetria com scrubbing"); follow-up slices add more event types (chain.verify_failed, sealing.failure, state.transition), then the OTEL adapter, then the scrubbing layer.
+
+### Why this matters
+
+Per §18 line 1213, the metric `chain_verification_failures_total > 0` is a P0 alarm — without telemetry, operators only see chain breaks when `agent permission verify` is run manually or when bootstrap refuses. The same applies to sealing failures, classifier unavailability, state transitions, and approval-rate drift. Spec line 1207-1213 lists seven metric streams that need OTEL export; this slice doesn't wire any external adapter, but it establishes the event surface that adapters consume.
+
+The `permission.decision` event is the highest-volume + most-load-bearing — every audit emit produces one. Wiring it FIRST lets follow-up slices (OTEL adapter, scrubbing layer) be tested against real telemetry traffic rather than synthetic events. The recording sink in slice 70 also unlocks future operator-facing surfaces like `agent telemetry tail` (a `tail -f` for in-process events).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/index.ts` (new, ~110 lines) | `TelemetryDecision = 'allow' \| 'deny' \| 'confirm' \| 'confirm-allowed' \| 'confirm-denied'` (matches the audit row's union). `TelemetryConfidence = 'high' \| 'medium' \| 'low'`. `PermissionDecisionEvent` interface: every field from spec §18 line 1179-1202 (ts, approval_id, tool, capabilities, decision, score, score_components, confidence, policy_hash, classifier_hash, classifier_adjust, sandbox_profile, ttl_expires_at, parent_approval_id) + optional `engine_state` (deferred — sources without controller access omit it). `TelemetryEvent = PermissionDecisionEvent` discriminated union — future slices extend. `TelemetrySink` interface (one method: `emit(event)`). `createNoopTelemetrySink` (default for unwired callers). `RecordingTelemetrySink` with `events()` snapshot getter + `clear()` for buffer reset; `events()` returns a slice so external mutation of the returned array doesn't pollute internal state. |
+| `src/permissions/audit.ts` | New `telemetry?: { emit: (event: TelemetryEvent) => void }` field on `CreateSqliteSinkOptions`. Same posture as the scheduler tick option (slice 56): structurally-typed to avoid hard import of the full sink type, wrapped in try/catch in the emit path so observability failures never break audit. Event derives from `persistedExceptHash` + `input` AFTER `appendApprovalsLog` so `approval_id = inserted.seq` is stable. |
+| `tests/telemetry/index.test.ts` (new, 6 tests) | createNoopTelemetrySink (1): emit no-op + no throw. createRecordingTelemetrySink (5): empty events on construction; emit appends in order with stable approval_id; events() returns a snapshot — caller mutating the array does NOT affect future reads; clear() empties the buffer; emit after clear continues capturing. |
+| `tests/permissions/audit-telemetry.test.ts` (new, 8 tests) | (1) No telemetry option → emit behaves exactly as before slice 70 (regression guard). (2) Telemetry sink receives one `permission.decision` event per emit across 3 emits. (3) Event mirrors the audit row content (all 14 spec fields verified field-by-field against a hand-crafted full input). (4) ORDERING — event fires AFTER persist; a querying-sink that reads the DB inside `emit` sees the just-emitted row's seq as the chain head. (5) Telemetry.emit throwing does NOT break audit emit + the row still lands in DB. (6) Default tool_version / resolver_version pass through as 'v1'. (7) Capabilities default to empty array when input omits them. (8) Score_components default to empty object. |
+
+### Decisions
+
+- **Structurally-typed `telemetry?: { emit: (event: TelemetryEvent) => void }` on `CreateSqliteSinkOptions`.** Same pattern as the scheduler tick option (slice 56). Audit module imports the `TelemetryEvent` type but doesn't pull in any concrete sink implementations — keeps the audit module focused, avoids a circular-dep risk with the future OTEL adapter.
+- **Event emit AFTER persist + scheduler tick.** Three things happen in `emit()`: persist row → tick scheduler → emit telemetry. Ordering matters: the row must land BEFORE the scheduler ticks (so the sealer sees the right chain head) AND BEFORE telemetry fires (so the event's `approval_id` is stable). Test 4 pins the latter explicitly via a querying-sink that observes the chain head from inside its own emit.
+- **Telemetry emit wrapped in try/catch — observability failures never break audit.** Identical posture to the scheduler tick from slice 56. The audit path is critical (rows must persist + chain hash linked); telemetry is best-effort (OTEL down, network blip, scrubbing rejection). A `try/catch` around `telemetry.emit` absorbs any throw. Test 5 pins this with a sink that always throws — emit() still succeeds, row still lands.
+- **One event type in slice 70: `permission.decision`.** Spec lists seven metric streams + several event types worth of OTEL exports. Shipping ALL of them in one slice would be a 1000+ LOC change with too many fan-out points to wire safely. Slice 70 establishes the surface; follow-ups extend the union with chain.verify_failed (slice 71 candidate), sealing.failure (72), state.transition (73), etc. Each is a contained addition: new type, new wire-up, new tests.
+- **`engine_state` is optional in the event.** Spec example shows it, but the audit sink doesn't have access to the state controller. Plumbing a state getter through `CreateSqliteSinkOptions` is a separate concern — slice 70 ships the field as optional. Bootstrap wire-up slice (future) adds `engineState?: () => string` to options and threads through `stateController.get`.
+- **`RecordingTelemetrySink.events()` returns a slice, not the buffer reference.** A caller who calls `events()` and mutates the returned array MUST NOT affect the sink's internal state. Test 3 pins this by mutating the snapshot and verifying the sink's next `events()` call returns the original content. Same posture as deep-clone defenses in `engine.policy()`.
+- **No `src/telemetry/sinks.ts` split.** Sinks + types + factories all in `index.ts` for slice 70. Splits naturally when sink count grows (OTEL adapter → `src/telemetry/adapters/otel.ts`); for two sinks (noop + recording) the single file is right-sized.
+- **Score / capabilities defaults at emission time, not in the event type.** Spec event shape requires `capabilities` + `score_components` always present (operators reading dashboards don't want missing-field nulls). The sink defaults them at emit time (`input.capabilities ?? []`, `input.score_components ?? {}`). Tests 7 + 8 pin the default values.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5780 pass / 10 skip / 0 fail** (5790 total across 273 files); +14 tests on top of slice 69's 5766 (6 telemetry sink + 8 audit-telemetry integration)
+- `bun test tests/telemetry/ tests/permissions/audit-telemetry.test.ts` — 14 pass in ~175ms
+
+### Next
+
+§18 telemetry follow-ups, in roughly increasing surface area per slice:
+
+1. **More event types.** chain.verify_failed (fires from `chainCheck` in bootstrap + the verify CLI verb), sealing.failure (fires from the scheduler's `onSealFailed`), state.transition (fires from `stateController.transition`), classifier.unavailable (fires from the classifier's strict-mode degrade path). Each is a small typed addition + wire-up + tests.
+2. **State controller bridge.** Plumb a state getter through `CreateSqliteSinkOptions` so `engine_state` is populated on every event.
+3. **OTEL adapter.** `src/telemetry/adapters/otel.ts` — translates `TelemetryEvent[]` into OTLP-compatible metrics + spans. Adds `@opentelemetry/api` + `@opentelemetry/sdk-metrics` deps. Behind a feature flag (line 1213 implies opt-in for "regulated deployments").
+4. **Scrubbing layer.** Per spec line 1205 "OTEL export com scrubbing". A `ScrubbingTelemetrySink` wraps another sink and redacts likely-PII fields (paths, hosts) before forwarding. Configurable via the Policy schema (e.g., `[telemetry] scrub_paths: true`).
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature). §13.3 doctor expansion (classifier health, engine state, conformance last-run) depends on the subsystems being instrumented for these metrics — which telemetry shipping unblocks.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 69: fuzz harness — hash chain verify target (§15.4 closes)
 
 **Done.** Sixty-ninth slice. Closes the §15.4 four-target fuzz roster: ships `chainFuzzTarget` exercising the audit chain's `verifyChain` after random tamper ops on a seeded in-memory chain. Every spec-mandated fuzz target now has coverage — production-ready checklist line 1289 is fully satisfied for the four parser-heavy subsystems (glob, bash, policy, chain).

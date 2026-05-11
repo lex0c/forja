@@ -41,6 +41,7 @@ import {
   listApprovalsLogByInstall,
 } from '../storage/repos/approvals-log.ts';
 import { getLatestChainMeta } from '../storage/repos/chain-rotation.ts';
+import type { TelemetryEvent } from '../telemetry/index.ts';
 import { canonicalize, sha256Hex } from './canonical.ts';
 import type { InstallIdentity } from './install_id.ts';
 
@@ -212,12 +213,23 @@ export interface CreateSqliteSinkOptions {
   // (slice 57): construct the scheduler from `[seal]` Policy config,
   // pass it here.
   scheduler?: { tick(): void };
+  // §18 telemetry integration (slice 70). When set, every
+  // successful `emit` produces a typed `permission.decision`
+  // telemetry event mirroring the audit row's content. Structurally-
+  // typed `{emit: (event: TelemetryEvent) => void}` so the sink
+  // doesn't import from src/telemetry (peer modules — same
+  // posture as the scheduler tick option). Production wires the
+  // OTEL adapter; tests inject a recording sink. Failures in the
+  // telemetry sink NEVER break audit emit — wrapped in try/catch
+  // identical to the scheduler.tick handling.
+  telemetry?: { emit: (event: TelemetryEvent) => void };
 }
 
 export const createSqliteSink = ({
   identity,
   db,
   scheduler,
+  telemetry,
 }: CreateSqliteSinkOptions): AuditSink => {
   // Resolve the active genesis once at construction. Rotations are
   // operator-driven via the CLI `--rotate-chain` flow that exits
@@ -278,6 +290,40 @@ export const createSqliteSink = ({
         // Best-effort. Surfacing the error here would mean a
         // half-emitted row from the caller's perspective — the row
         // is in the DB, but emit() threw. Silently swallow.
+      }
+    }
+    // §18 telemetry emission (slice 70). Same posture as the
+    // scheduler tick: AFTER persist so the event's approval_id
+    // (= row.seq) is stable, wrapped in try/catch because
+    // observability MUST NOT break audit emit. The event carries
+    // the row's content minus secrets-bearing fields (args + raw
+    // chain hashes); resolved capabilities + decision + score +
+    // policy_hash + classifier_hash are operator-facing
+    // diagnostics, safe to export.
+    if (telemetry !== undefined) {
+      try {
+        telemetry.emit({
+          kind: 'permission.decision',
+          ts,
+          approval_id: inserted.seq,
+          parent_approval_id: persistedExceptHash.parent_approval_id,
+          tool: persistedExceptHash.tool_name,
+          tool_version: persistedExceptHash.tool_version,
+          resolver_version: persistedExceptHash.resolver_version,
+          capabilities: input.capabilities ?? [],
+          decision: persistedExceptHash.decision,
+          score: persistedExceptHash.score,
+          score_components: input.score_components ?? {},
+          confidence: persistedExceptHash.confidence,
+          policy_hash: persistedExceptHash.policy_hash,
+          classifier_hash: persistedExceptHash.classifier_hash,
+          classifier_adjust: persistedExceptHash.classifier_adjust,
+          sandbox_profile: persistedExceptHash.sandbox_profile,
+          ttl_expires_at: persistedExceptHash.ttl_expires_at,
+        });
+      } catch {
+        // Same rationale as the scheduler tick — observability
+        // failures cannot corrupt the audit emit signal.
       }
     }
     return { seq: inserted.seq, this_hash };
