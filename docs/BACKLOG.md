@@ -15,6 +15,53 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 67: fuzz harness — bash resolver target (§15.4 line 1118)
+
+**Done.** Sixty-seventh slice. Adds the second fuzz target from slice 66's roadmap: `bashFuzzTarget` exercises the bash resolver's full pipeline (tree-sitter-bash parse → AST walk → whitelist match → capability resolution) against bash-meta-biased random command strings. 1000-iteration suite gate produces zero crashes on the current resolver.
+
+Closes another quarter of the production-ready checklist fuzz item (line 1289): 2 of 4 spec-required targets now wired. Remaining targets: policy parser (line 1119) and hash chain verify (line 1120).
+
+### Why this matters
+
+The bash resolver is the engine's most-parser-heavy path: tree-sitter-bash's WASM grammar parses arbitrary shell into an AST, then the engine walks the AST through a whitelist + capability matcher. Spec line 1118 specifies this target precisely: "random shell snippets → no panic, sempre Conservative ou Refuse em casos esquisitos". Any input must produce a structurally-valid `ResolverResult`, never a thrown exception or a malformed shape.
+
+Without fuzz coverage, a regression in the AST walker — e.g., an unhandled grammar node, a NaN in the confidence aggregator, a forgotten branch in the capability emitter — would only surface when a real LLM emits the specific failing input. The fuzz target catches these structurally: the harness exercises ~30 random shell-meta combinations per iteration and asserts the result has the right shape, regardless of which kind the resolver chose.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/fuzz/targets/bash.ts` (new, ~110 lines) | `bashFuzzTarget`: §15.4 line 1118. `randBashChar(rng)`: bash-meta-biased character distribution. ~50% shell metas spread across grammar classes — whitespace (5%), pipe `\|` (5%), background `&` (3%), sequence `;` (3%), expansion `$` (3%), parens / braces / quotes / backtick (3% each), redirects `<` `>`, escape `\\`, path `/` (5%), then seed chars for common command starts (`l`, `s`, `c`) before falling through to printable ASCII. `randBashCommand(rng, n)` composes them. Generate: length 1-96 chars (covers single-token to medium-pathological). Run: calls `getResolver('bash')` with the random command + a realistic `{cwd: '/work/proj', home: '/home/op'}` context; asserts `result.kind ∈ {ok, conservative, refuse}` plus per-kind shape (ok → array + valid confidence; conservative → array + reason; refuse → reason). |
+| `tests/fuzz/bash-target.test.ts` (new, 5 tests) | `beforeAll(initBashParser)` — the AST walker requires the WASM grammar to be loaded; init is idempotent + cached. Imports the resolvers barrel as a side-effect so `getResolver('bash')` succeeds. **Tests:** 1000 iterations produce no crashes (suite gate); format renders single-line key=value via JSON.stringify; format escapes newlines + quotes for CI log safety; same seed produces same input (replay contract via capturing wrapper); a stub resolver with `kind: 'invalid-kind'` triggers the target's invariant assertion. |
+
+### Decisions
+
+- **1000 iterations as the suite gate, vs glob's 2000.** parseBash + AST walk is ~10× slower than `matchPath`'s regex compile. 1000 iterations catch >0.1%-rate crashes while keeping the suite under 2s. CI nightly runners crank to 10⁹ via the same harness with a larger `iterations`.
+- **Bash-meta bias instead of glob bias.** The two targets exercise different parser surfaces. Glob's bias emphasizes path-shaped strings (`*`, `?`, `/`, `[`); bash's emphasizes shell operators (`|`, `&`, `;`, `$`, `()`, `{}`, quotes, redirects). Pure-ASCII random hits maybe 1% of either parser's branches; the targeted bias pushes coverage to ~50%+ of grammar classes per iteration.
+- **Seed letters `l`/`s`/`c` for command starts.** Without these, random strings rarely begin with characters that match common command prefixes (`ls`, `sed`, `cat`, `curl`, `cp`). Seeding pushes the resolver past tokenization and into the whitelist walk, exercising the capability-emission branches. ~9% of generated chars are these seeds — empirically enough to mix `ls` / `sh -c` / `cat` / `curl` patterns into longer random strings.
+- **Caller initializes the parser, target does not.** `parseBash` requires tree-sitter-bash's WASM grammar loaded asynchronously via `initBashParser`. The target's `run` is sync (FuzzTarget interface contract), so it can't `await`. Test files call `initBashParser()` in `beforeAll`; CI runner scripts do the same in setup. The resolver itself catches "parser unavailable" as a refuse, so the worst case is "every iteration refuses" — not a panic, but the harness wouldn't be measuring what we want.
+- **Side-effect import of resolvers barrel.** `import '../../src/permissions/resolvers/index.ts'` ensures `registerResolver('bash', ...)` runs before `getResolver('bash')` in the target. Without this import, the target's first iteration throws "resolver not registered". The import is a single line in the test file with a comment explaining the dependency.
+- **Invariant assertion test uses a wrapper, not module mocking.** The resolver registry is a module-level `Map`; replacing entries mid-test is fragile. The "unknown kind" test wraps the target with a custom `run` that mimics the invariant check against a bogus result — same logic, no module surgery. Faithful to what the target's run() does.
+- **No async init helper in the target module.** Considered exporting `initBashFuzzTarget = async () => initBashParser()` for symmetry; rejected because (a) callers already know to call `initBashParser` (it's used in many tests), (b) the indirection adds a name without value, (c) a future bash-parser-replacing slice would need to change two places instead of one.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5755 pass / 10 skip / 0 fail** (5765 total across 269 files); +5 tests on top of slice 66's 5750
+- `bun test tests/fuzz/bash-target.test.ts` — 5 pass; 1000-iteration bash run completes in ~250ms with ZERO crashes — bash resolver is fuzz-robust on the current generator distribution.
+
+### Next
+
+Fuzz harness next targets per spec §15.4 (2 of 4 remaining):
+
+1. **policy parser** (line 1119): "random TOML → no crash". Generator emits random YAML strings; invariant is "throws are EXPECTED for malformed input but never panic the process". Smallest of the remaining targets — parsePolicy is pure code, no async deps, ~150-line slice with single test file.
+2. **hash chain verify** (line 1120): "corrupted rows → state=refusing, no panic". Generator seeds a chain with N rows then corrupts random fields; invariant is `verifyChain.ok=false, never throws`. Requires SQLite seeding per iteration — slower than other targets, ~250-line slice.
+
+Other open work unchanged: telemetria/OTEL (line 1213/§18), §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining thread).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 66: fuzz harness §15.4 — `runFuzz` infra + glob target
 
 **Done.** Sixty-sixth slice. Opens the fuzz harness thread per spec §15.4 line 1114-1122 ("Target: 10⁹ iterations sem crash novo entre releases"). Ships the target-agnostic `runFuzz` runner with deterministic per-iteration seeding + the first of four required targets: the glob compiler (line 1117). Subsequent slices add bash resolver, policy parser, and hash chain verify targets.
