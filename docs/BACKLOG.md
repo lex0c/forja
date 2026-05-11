@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 52: `watchAndReload()` — §12.3 file watcher (closes §12)
+
+**Done.** Fifty-second slice. Consumes slice 51's `engine.reloadPolicy()` primitive: when any of the policy YAML files on disk changes, the watcher re-resolves the hierarchy + atomically swaps the engine's policy. With this, §12.3 ships end-to-end: spec line 731 "File-watch nos arquivos de policy. Mudança → re-validate em background; se válido, swap atômico" now executes.
+
+§12 is now substantively complete: 12.1 load order (existing) + 12.2 validation (existing) + 12.3 hot reload PRIMITIVE + WIRING (51 + 52) + 12.4 rollback (49 + 50).
+
+### Why this matters
+
+A long-running Forja session needed a policy tweak before slice 52: terminate, edit YAML, restart, lose context. Now the editor save triggers a debounced reload — operators see the new policy take effect on their next tool call without leaving the REPL. Same shape as `nodemon` / `vite --watch` but for the permission policy.
+
+The failure path is the security-critical one: a malformed YAML, a lock conflict introduced by a lower-layer edit, or a policy that fails canonical-hash MUST keep the OLD policy authoritative. The watcher surfaces these via `onReloadFailed` and leaves the engine state untouched. Operators see the warning; enforcement stays consistent.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/policy-watcher.ts` (new, ~175 lines) | `watchAndReload({engine, resolveOptions, onReload?, onReloadFailed?, debounceMs?, watcher?, setTimer?, clearTimer?, exists?})` returns a `PolicyWatcher` with `close()`. Discovers paths via the existing `enterprisePolicyPath` / `userPolicyPath` / `projectPolicyPath` helpers; honors the same null-disable conventions as `loadLayers`. Sets up `fs.watch` on every existing path; missing paths skipped silently. Events debounced (default 100ms — editors fire 2-5 events per save). On debounced fire: `resolvePolicy` → lockConflicts check → `engine.reloadPolicy`. Three failure surfaces collapse into one `onReloadFailed` callback (resolvePolicy throw, lockConflicts present, reloadPolicy ok:false) so consumers get a uniform diagnostic. Subscribe-time errors (fs.watch throws on inotify-exhausted systems) also surface as onReloadFailed, leaving other watched paths working. `close()` cancels any pending debounce timer + closes all watchers + idempotent (swallows already-closed errors). Four test seams: `watcher` (replaces fs.watch), `setTimer` / `clearTimer` (replaces setTimeout pair), `exists` (replaces existsSync). |
+| `src/permissions/index.ts` | Re-export `watchAndReload`, `PolicyWatcher`, `WatchAndReloadOptions`. |
+| `tests/permissions/policy-watcher.test.ts` (new, 9 tests) | Successful reload fires onReload with the hash transition + the engine's policy() reflects the new YAML. Debounce coalesces 5 rapid events into 1 reload. Non-existent paths skipped (zero watchers). Existing project file → only that watched. Malformed YAML → onReloadFailed with "policy resolve failed" + engine unchanged. Lock conflicts → onReloadFailed with "lock conflicts: <description>" + engine unchanged. close() cleans up watchers + cancels pending timer (verified via the fake-watcher's `closed` set). Subscribe-time watcher throw surfaces via onReloadFailed (inotify-exhausted simulation). Successive reloads each fire their own callback with chained hashes (reloads[1].oldHash === reloads[0].newHash). |
+
+### Decisions
+
+- **Single integrated function, not a generic `watchPolicyFiles` primitive.** Considered splitting into a generic file-watch helper + a separate reload integration. Decided against: the only realistic caller is the bootstrap, and they want resolvePolicy + reloadPolicy already wired. A generic helper would have one consumer (this one) and tests would need to exercise both layers anyway. Single function keeps the surface small.
+- **Watch each FILE directly, not parent directory.** `fs.watch(file)` is simpler but doesn't catch files CREATED mid-session (a policy file that doesn't exist at watch start won't fire when it shows up). Closing that gap would mean watching the parent dir + filtering by basename — more complexity for a rare case. Operators create policy files via `agent init` (project) or manual setup (user / enterprise), not mid-session. Acceptable trade-off documented in the file header.
+- **Debounce default 100ms, configurable.** Editor saves fire 2-5 events (truncate + write, atomic rename, inode change). 100ms covers every reasonable editor's burst window without making the operator wait perceptibly. Tests pass tiny values (`setTimer` seam) to fire synchronously.
+- **Failed reload keeps OLD policy authoritative.** Spec line 736-740 demands this — "if validate(new_policy) fails: emit policy_reload_failed event with details / keep old_policy / unlock / return". The watcher's failure path NEVER calls `engine.reloadPolicy` (the engine's own reloadPolicy is itself non-destructive on failure per slice 51, but the watcher's pre-checks like resolvePolicy throws + lockConflicts catch failures BEFORE the engine sees them). Tests pin: engine.policy() unchanged after a failed reload.
+- **`onReload` / `onReloadFailed` are observability hooks, not control flow.** They don't block the reload, don't enable retry. The watcher's contract is "best-effort hot reload"; consumers route to audit / log via these callbacks but the watcher proceeds regardless. If a consumer wants to throttle reloads, they wrap watchAndReload.
+- **Subscribe-time watcher throws surface via onReloadFailed, not propagate.** On Linux with too many inotify watchers (the kernel default is ~8K per user, easily exhausted in dev environments with multiple editors), `fs.watch` throws ENOSPC. Throwing from `watchAndReload` would crash the bootstrap. Surface as a warning, set up watchers for paths that DID succeed, let the engine still bootstrap correctly. Test 8 pins this.
+- **`close()` is idempotent + best-effort.** Multiple `close()` calls don't throw. Watchers that are already closed (the underlying inotify watch ended) swallow errors silently — there's no useful diagnostic to emit. Same posture as the audit sink's verifyChain — operationally robust.
+- **No file content reading in the watcher's hot path.** All file reads happen INSIDE `resolvePolicy` (which the watcher delegates to). The watcher's own job is just "trigger a reload"; the read+parse+merge happens in the function that already does that at bootstrap. Zero duplication of the policy-resolution logic.
+- **`resolveOptions` passed through unchanged.** Whatever paths the bootstrap watched at startup, the same paths get re-resolved on each reload. No drift; no separate "watcher's policy resolution" vs "bootstrap's policy resolution". Identical behavior — just triggered by inotify instead of process start.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5564 pass / 10 skip / 0 fail** (5574 total across 260 files); 9 new tests on top of slice 51's 5555
+- `bun test tests/permissions/policy-watcher.test.ts` — 9 pass
+
+### Next
+
+§12 thread is now COMPLETE end-to-end:
+- §12.1 load order — slices 23 (resolvePolicy hierarchy)
+- §12.2 validation — slice 28+ (loadPolicyFromString validation, hierarchy lock conflicts)
+- §12.3 hot reload — slice 51 (engine primitive) + slice 52 (file watcher)
+- §12.4 rollback — slices 49 (list) + 50 (rollback CLI)
+
+The remaining wire-up is the bootstrap call site — `bootstrap-engine.ts` (or wherever the engine is constructed for the operator's REPL session) should call `watchAndReload` with the live engine + the same `resolveOptions` it used at startup. That's a small integration slice (3-5 lines) that lands when we tackle the production bootstrap audit.
+
+Other remaining spec work (from the inventory):
+1. **§7.3 external sealing (worm-file backend)** — audit-grade for regulated deployments.
+2. **§19 v1→v2 migration** — translator + compat layer.
+3. **macOS sandbox-exec conformance** (extending slice 32's sandbox_select cases).
+4. **§13.7 broker/worker architecture** — multi-slice; needed for sandboxed-cap subagents.
+5. **§14 MCP trust model** — blocked on MCP itself (M3+).
+
+§16.2 conformance suite is at 95% (only `concurrency` ~5 cases remain, spec calls for separate driver outside YAML).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 51: `engine.reloadPolicy()` — §12.3 hot reload primitive
 
 **Done.** Fifty-first slice. Ships the engine-side primitive for §12.3 hot reload. `engine.reloadPolicy(newPolicy)` swaps the active Policy atomically — recomputes `policy_hash`, updates `mode`, and the next `check()` consults the new rules. File-watch wiring (the resolver-side that detects YAML edits + triggers the reload) is a follow-up slice; this one ships the primitive everything else builds on.
