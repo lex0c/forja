@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 39: §8 grants table — schema + repo + ULID generator (foundation)
+
+**Done.** Thirty-ninth slice. First slice on the §8 TTL/grants thread — the spec gap that's been deferred since slice 1. Pivots from sandbox-introspection (slices 23/34-38) to the §8 line item that blocks `ttl_expiry` conformance (~6 cases) and unblocks operator-facing `/perms list-grants` / `/perms revoke <id>` UX. This is a FOUNDATION slice: storage layer only (table + repo + ULID generator). Engine integration, CLI surface, and conformance cases follow in subsequent slices on this thread.
+
+### Why this matters
+
+The user explicitly asked "ainda estamos seguindo a spec?" after noticing the sandbox trajectory drifted into UX polish. The honest answer: conformance suite went 38% → 90%, sandbox introspection went 0 → complete, but several spec lines from §8/§12/§13/§14/§7.3 stayed at zero progress. §8 grants is the highest-leverage single line because:
+1. It implements an actual spec contract (operators "yes for session, expires in 24h" needs to persist and expire).
+2. It unblocks the last ~6 conformance cases that fit the existing YAML harness (ttl_expiry).
+3. The slice work is well-defined — the spec gives the exact table schema verbatim.
+
+Slice 39 lands the storage foundation: nothing in the engine consults grants yet, but the table, repo, and ULID id-generator are in place. Future slices build on this without re-litigating the schema.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/ulid.ts` (new) | ULID generator per https://github.com/ulid/spec. 26 chars Crockford base32 (no I/L/O/U glyphs to dodge re-typing errors), 10-char 48-bit ms timestamp + 16-char 80-bit random suffix. Test seam via `GenerateUlidOptions { now?, randomBytes? }` so unit tests pin exact byte-for-byte output. `isUlid(s)` strict validator (length + alphabet, rejects lowercase and the ambiguous glyphs). BigInt internals handle the 48-bit timestamp precision JS bit-ops can't reach. |
+| `src/storage/migrations/039-grants.ts` (new) | `grants` table per spec §8 verbatim: id (TEXT PRIMARY KEY ULID), install_id, scope_kind ∈ {pattern, capability}, scope_value, capability, granted_at, expires_at, granted_by ∈ {user, enterprise, project}, granted_reason, revoked_at, revoked_reason. CHECK constraints pin the spec enums. Two indexes: `idx_grants_install` (install scoping) + `idx_grants_active` (covers the active-grants query). `install_id` added (spec doesn't list it but grants are per-install — without it, a future multi-install machine would bleed grants between agents). |
+| `src/storage/migrations/index.ts` | Wire `migration039Grants` into the migration list. |
+| `src/storage/repos/grants.ts` (new) | Repo: `insertGrant(db, input)`, `getGrantById(db, id)`, `listActiveGrants(db, installId, snapshotTs)`, `listAllGrants(db, installId)`, `revokeGrant(db, id, revokedAt, reason)`. Active-grants query mirrors spec §8: `WHERE expires_at > snapshot_ts AND revoked_at IS NULL`. `snapshotTs` is a parameter (not `Date.now()` baked in) so callers replay against historical timestamps and tests pin against fixed clocks. `revokeGrant` is idempotent — returns `{ revoked: boolean }` so callers can render "already revoked" without a second query. |
+| `tests/permissions/ulid.test.ts` (new) | 11 tests: 26-char length + Crockford alphabet check, lexicographic-tracks-chronological ordering, deterministic with injected now/randomBytes, different random bytes at same ts produce different ULIDs, rejects negative / NaN / Infinity / >48-bit timestamps, default RNG produces 100 distinct values, isUlid validator (length, lowercase, ambiguous glyphs, empty/whitespace). |
+| `tests/storage/grants.test.ts` (new) | 18 tests across 4 describes: insert + read (round-trip, missing-id null, PK uniqueness, scope_kind CHECK rejecting 'session'/'once', granted_by CHECK rejecting 'subagent'), listActiveGrants (filters expired, filters revoked, scopes per install_id, orders newest first, boundary `expires_at == snapshot_ts` is EXPIRED per spec's strict-`>`), listAllGrants (includes expired+revoked, scopes per install_id), revokeGrant (first call marks fields, idempotent no-op preserves original audit trail, non-existent id returns false, null reason accepted). |
+
+### Decisions
+
+- **`install_id` added to the table beyond what the spec shows.** Spec §8's verbatim schema omits `install_id`, but the rest of the engine scopes everything per install. Without it, a future machine running multiple installs would let grants bleed across agents. Adding the column now (with an `idx_grants_install` index) is cheap; retrofitting it later would require migration + backfill + the install attribution lost for any pre-migration row. Documented in the migration comment so reviewers see the spec-extension is deliberate.
+- **CHECK constraints pin spec enums.** `scope_kind ∈ {pattern, capability}` rejects `once` / `session` explicitly — those scopes are NOT persisted (session-allow lives in engine memory; once doesn't need storage). Insert-time rejection catches the bug where a caller accidentally tries to persist a session grant. Same for `granted_by ∈ {user, enterprise, project}` — the modal layer fills this in based on who approved.
+- **`snapshotTs` parameterized in listActiveGrants.** Spec §8 names the variable explicitly: "WHERE expires_at > snapshot_ts AND revoked_at IS NULL". Mirroring it as a function parameter (not `Date.now()` baked in) gives three benefits: deterministic tests (fixed clocks pin behavior), historical replay (asking "what grants were live at T0?" feeds the audit reconstruction surface), and zero clock-reading in the repo (the test surface stays free of `vi.useFakeTimers()`-style mocks).
+- **`revokeGrant` returns `{ revoked: boolean }` not just void.** Idempotent operations are often surfaced as "no-op silently succeeded" — fine for write-once contracts, but here the operator might want a "already revoked at <ts>" message instead of a generic "ok". Returning a discriminator lets the CLI render the difference. The implementation uses the `WHERE revoked_at IS NULL` clause to filter out the second-revoke case at the SQL layer, so the result is naturally `changes=0` for repeats.
+- **Idempotent revoke preserves the FIRST revocation's audit trail.** A second `revokeGrant(id, t2, "reason2")` call must NOT overwrite the first call's `revoked_at` / `revoked_reason`. Test 18 pins this: the SQL `WHERE revoked_at IS NULL` filter means the UPDATE matches zero rows on the second call, leaving the original fields intact. Forensically critical — if compliance reviews the revocation log later, they see WHO revoked first and WHY.
+- **ULID over `crypto.randomUUID()`.** Spec §8 names ULID explicitly ("id TEXT PRIMARY KEY, -- ULID"). The properties that matter: time-sortable (lex order tracks chronological order, so `ORDER BY granted_at DESC` ties break naturally on id; without time-sort, queries would need secondary sort), URL/CLI-safe (Crockford base32 — no special chars in `agent permission revoke <id>`), and human-typeable (the alphabet drops I/L/O/U so a paste from terminal scrollback re-types without ambiguity). UUIDv4 misses every one of those — random 128 bits is more entropy than needed and doesn't sort.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format to 3 files
+- `bun test` — **5425 pass / 10 skip / 0 fail** (5435 total across 251 files); 29 new tests on top of slice 38's 5396 (11 ULID + 18 grants repo)
+- `bun test tests/permissions/ulid.test.ts tests/storage/grants.test.ts` — 29 pass
+
+### Next
+
+§8 grants thread — subsequent slices:
+1. **Engine integration**: `permissionEngine.check()` consults `listActiveGrants` before the regular allow/deny lookup. A live grant covering the (capability, scope) tuple short-circuits to allow. Audit row records the grant id in a new column. Multi-piece (engine wiring + migration for `approval_log.matched_grant_id` + tests).
+2. **CLI surface**: `agent permission grants list` (active by default, `--all` for revoked/expired), `agent permission grants revoke <id> [--reason <text>]`. Read-only audit + revocation, no insert from CLI (grants are created by the modal flow).
+3. **Modal bridge**: when the operator answers "yes, don't ask again for: <pattern>" with a TTL choice (24h / 7d / 30d), the bridge calls `insertGrant`. Replaces the current in-memory session-allow promotion for the persisted scope kinds.
+4. **TTL UX promotion**: spec §8 line 604 — "`once` é default sugerido pra primeira aprovação. UX promove pra `session` na N-ésima repetição da mesma capability+scope". Counter + threshold + promotion prompt. Out-of-scope for the foundation slice.
+5. **ttl_expiry conformance (6 cases)**: now unblocked. Tests cover insert + expire + revoke + cross-install scoping + scope-kind validation, mostly already in `grants.test.ts` shape; the conformance YAML lifts them to the §16 surface.
+
+Non-grants successors: macOS sandbox-exec, MCP-tool spawn wire-up, §13 platform provisioning, §7.3 external sealing.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 38: `agent --explain-permissions --json` NDJSON output
 
 **Done.** Thirty-eighth slice. Closes the explicit follow-up in `explain-permissions.ts`'s file header ("JSON output is a follow-up — same shape pattern as --list-sessions: switch on `json` flag, emit one NDJSON line per layer + a summary line"). Adds `--json` support to `agent --explain-permissions`: stdout becomes NDJSON, one `{"kind":"layer",...}` event per loaded YAML file followed by one `{"kind":"merged",...}` event with the full resolved policy, per-section provenance, and lock conflicts. Stderr stays silent on the happy path — stdout is the pure stream. Closes the introspection trajectory (slices 23 → 34 → 35 → 36 → 37 → 38) with a CI/scriptable surface.
