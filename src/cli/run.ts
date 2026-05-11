@@ -315,6 +315,40 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'seal-now') {
+        // §7.3 manual seal flush (slice 58). Reads active policy
+        // for `seal.mode`, builds the matching SealStore, appends
+        // one entry pointing at the latest chain row. Idempotent
+        // when chain hasn't moved since last seal — returns 0 with
+        // noop status. Operators use this before SIGTERM in
+        // scripts, in cron, or when one-shot batch jobs don't hit
+        // the scheduler's automatic intervals.
+        const { runPermissionSealNow } = await import('./permission-seal-now.ts');
+        return await runPermissionSealNow({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'seal-verify') {
+        // §7.3 seal-file integrity check (slice 58). Reads active
+        // policy for `seal.mode`, builds the matching SealStore in
+        // read-only mode, cross-references every seal entry against
+        // the live `approvals_log` chain. Exit 0 (intact) or 1
+        // (broken / not configured / fs error).
+        const { runPermissionSealVerify } = await import('./permission-seal-verify.ts');
+        return await runPermissionSealVerify({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       // The arg parser already rejects unknown verbs; this branch
       // catches the impossible-but-safe case of a verb the dispatch
       // doesn't know how to route.

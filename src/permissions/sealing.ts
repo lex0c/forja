@@ -31,10 +31,12 @@
 // `append`. Production callers wire `onCreate` to `execFileSync
 // ('/usr/bin/chattr', ['+a', path])`; tests mock as no-op or capture.
 
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
+import type { SealPolicy } from './types.ts';
 
 export interface SealEntry {
   seq: number;
@@ -228,6 +230,41 @@ export const createWormFileSealer = (opts: CreateWormFileSealerOptions): SealSto
 export type VerifySealResult =
   | { ok: true; entriesChecked: number }
   | { ok: false; reason: string; firstMismatchAt?: number };
+
+// Production-default `SealStore` factory for the worm-file backend.
+// Invokes `/usr/bin/chattr +a` on first append via the sealer's
+// `onCreate` hook so the file becomes append-only from the next
+// write onward. Non-Linux platforms (no chattr binary) →
+// execFileSync throws → sealer returns ok:false → caller routes
+// the failure (scheduler's `onSealFailed`, or the CLI verb's
+// error rendering).
+//
+// `stdio: 'ignore'` suppresses chattr's normal silence on success
+// while keeping a noisy stderr off the operator's terminal in the
+// happy path. Failures throw with the exit code in the Error,
+// which `createWormFileSealer` wraps into the standard ok:false
+// reason string.
+//
+// Slice 58 hoisted this from bootstrap-engine.ts so both the
+// bootstrap wire-up AND the `agent permission seal-*` CLI verbs
+// can construct the same store without duplication. Future
+// backends (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) ship
+// alongside this factory with their own `defaultXFactory`
+// functions; the CLI dispatch reads `config.mode` to pick.
+export const defaultWormFileFactory = (config: SealPolicy): SealStore => {
+  if (config.path === undefined) {
+    // parsePolicy enforces this for mode='worm-file' — branch is
+    // unreachable in well-formed input. Explicit error keeps the
+    // contract visible at the call site.
+    throw new Error('defaultWormFileFactory: config.path is required for worm-file mode');
+  }
+  return createWormFileSealer({
+    path: config.path,
+    onCreate: (p) => {
+      execFileSync('/usr/bin/chattr', ['+a', p], { stdio: 'ignore' });
+    },
+  });
+};
 
 export const verifySealAgainstChain = (store: SealStore, db: DB): VerifySealResult => {
   let entries: readonly SealEntry[];

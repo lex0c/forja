@@ -148,7 +148,11 @@ export type {
   SealStore,
   VerifySealResult,
 } from './sealing.ts';
-export { createWormFileSealer, verifySealAgainstChain } from './sealing.ts';
+export {
+  createWormFileSealer,
+  defaultWormFileFactory,
+  verifySealAgainstChain,
+} from './sealing.ts';
 
 export type {
   CreateSealingSchedulerOptions,

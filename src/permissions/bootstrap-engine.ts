@@ -19,7 +19,6 @@
 //                                                audit row (audit-loud)
 //   - all of the above clean                   → state=ready
 
-import { execFileSync } from 'node:child_process';
 import type { DB } from '../storage/db.ts';
 import { archivePolicy } from '../storage/repos/policy-archive.ts';
 import {
@@ -41,7 +40,7 @@ import {
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
 import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
-import { type SealStore, createWormFileSealer } from './sealing.ts';
+import { type SealStore, defaultWormFileFactory } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
 import type { Policy, SealPolicy } from './types.ts';
 
@@ -498,7 +497,7 @@ export const bootstrapPermissionEngine = async (
   let sealingScheduler: SealingScheduler | undefined;
   const sealConfig = resolveResult.policy.seal;
   if (sealConfig !== undefined && sealConfig.mode === 'worm-file' && archiveState !== 'refusing') {
-    const factory = input.sealStoreFactory ?? defaultSealStoreFactory;
+    const factory = input.sealStoreFactory ?? defaultWormFileFactory;
     sealStore = factory(sealConfig);
     const onFailure: SealOnFailureLocal = sealConfig.on_failure ?? 'degrade';
     sealingScheduler = createSealingScheduler({
@@ -560,28 +559,6 @@ export const bootstrapPermissionEngine = async (
 // import would be purely cosmetic given the parsed `seal.on_failure`
 // is already typed.
 type SealOnFailureLocal = 'degrade' | 'refuse';
-
-// Production-default `SealStore` factory. Invokes `/usr/bin/chattr +a`
-// on first append via the sealer's `onCreate` hook so the file
-// becomes append-only from the next write onward. Non-Linux
-// platforms (no chattr binary) → execFileSync throws → sealer
-// returns ok:false → scheduler routes to onSealFailed → engine
-// transitions per `seal.on_failure`. Tests inject `sealStoreFactory`
-// to skip the binary call and use a mem-store.
-const defaultSealStoreFactory = (config: SealPolicy): SealStore => {
-  if (config.path === undefined) {
-    // parsePolicy enforces this when mode='worm-file', so this
-    // branch is unreachable in well-formed input — but throwing
-    // explicitly here keeps the contract visible at the call site.
-    throw new Error('defaultSealStoreFactory: config.path is required for worm-file mode');
-  }
-  return createWormFileSealer({
-    path: config.path,
-    onCreate: (p) => {
-      execFileSync('/usr/bin/chattr', ['+a', p], { stdio: 'ignore' });
-    },
-  });
-};
 
 // Build a placeholder result for any refusing transition. The engine
 // here is a stub that denies every check — caller MUST inspect

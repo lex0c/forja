@@ -705,6 +705,9 @@ const KNOWN_PERMISSION_VERBS = [
   'revoke',
   'policy-list',
   'policy-rollback',
+  // §7.3 sealing CLI verbs (slice 58).
+  'seal-now',
+  'seal-verify',
 ] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
@@ -980,6 +983,24 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ok: false,
         message:
           'agent permission revoke: exactly one <id> positional is required (e.g. `agent permission revoke 01JN...`)',
+      };
+    }
+  }
+  if (verb === 'seal-now' || verb === 'seal-verify') {
+    // Both §7.3 sealing verbs take no positionals and no verb-
+    // specific flags besides --json. Reason/target/etc are not
+    // applicable; reject up front so a stray flag doesn't pass
+    // silently and lead to confused operator follow-up.
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: --reason only applies to revoke / rotate-chain`,
       };
     }
   }

@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 58: `agent permission seal-now` + `seal-verify` CLI verbs
+
+**Done.** Fifty-eighth slice. Ships the operator-facing CLI surface for §7.3: `agent permission seal-now` flushes a manual seal entry (for scripts before SIGTERM, cron, or batch jobs that don't hold the engine resident long enough to hit `interval_seconds`); `agent permission seal-verify` cross-references the external seal file against the live audit chain. Both verbs are DB-only — they don't bootstrap the engine, just read the active policy for `seal.mode`, build the matching `SealStore`, and run the underlying primitives from slices 54-55.
+
+With this slice, the §7.3 thread is **closed end-to-end**: automatic sealing via the scheduler (slices 54-57) + manual sealing via the CLI (slice 58) + integrity verification via both `permission verify` (chain, pre-existing) and `permission seal-verify` (seal file vs chain, this slice).
+
+### Why this matters
+
+Slice 57 made sealing AUTOMATIC. Manual sealing is the safety valve for two real scenarios. (a) **Script termination**: a CI job calling `agent` for batch work might exit before the scheduler's `interval_seconds` fires; without a final `seal-now`, the last decisions go unsealed. (b) **Forensic flush**: an operator suspecting tampering wants a fresh seal entry pinning the current chain head NOW, not at the next scheduled interval — that snapshots the chain state at a defensible moment.
+
+`seal-verify` is the complement to `agent permission verify`. Chain-verify checks the SQLite chain itself; seal-verify checks that the EXTERNAL seal file matches the chain at every recorded point. A divergence flags either chain tampering (DB rows rewritten with recomputed hashes) OR seal-file tampering (`chattr -a` first, then edit). The two together close the audit-grade loop: chain intact + seal file matches = the chain hasn't been tampered with even by a root adversary who rewrote everything.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sealing.ts` | New exported `defaultWormFileFactory(config: SealPolicy): SealStore` — hoisted from `bootstrap-engine.ts` so both the bootstrap wire-up AND the CLI verbs construct the same store without duplication. Imports `execFileSync` (was previously only in bootstrap); the chattr `+a` call moves with the factory. Future backends (s3-object-lock, rfc3161-tsa, git-anchored) ship alongside this factory with their own `defaultXFactory` functions; the CLI dispatch reads `config.mode` to pick. |
+| `src/permissions/bootstrap-engine.ts` | Drops the local `defaultSealStoreFactory` (moved to sealing.ts as `defaultWormFileFactory`) + the `execFileSync` import. The factory dispatch in the wire-up block now uses the re-exported name: `factory = input.sealStoreFactory ?? defaultWormFileFactory`. |
+| `src/permissions/index.ts` | Re-exports `defaultWormFileFactory`. |
+| `src/cli/permission-seal-now.ts` (new, ~210 lines) | `runPermissionSealNow({json, dbPath, cwd, env, sealStoreFactory, enterprisePath, userPath, now, out, err})`. Flow: `ensureInstallId` → `resolvePolicy` (read-only; just needs `seal.mode`) → check mode != 'none' → branch per mode (worm-file only in slice 58) → build SealStore → openDb + `getLastApprovalsLogByInstall` → if no row, exit 0 with chain_empty noop → otherwise check `store.list()` for already-sealed seq (skip with already_sealed noop) → `store.append(entry)` → render result. JSON mode emits one NDJSON line for composable hooks/CI pipelines. Exit codes: 0 (sealed OR noop), 1 (any error). |
+| `src/cli/permission-seal-verify.ts` (new, ~170 lines) | `runPermissionSealVerify({json, dbPath, cwd, env, sealStoreFactory, enterprisePath, userPath, out, err})`. Same skeleton as seal-now through SealStore construction, then runs `verifySealAgainstChain(store, db)` and renders the `VerifySealResult`. Intact case shows `entriesChecked` count + an empty-file note when N=0; broken case shows `firstMismatchAt` + forensic guidance (lsattr the file, run `permission verify` separately, etc.). |
+| `src/cli/args.ts` | Adds `'seal-now'` and `'seal-verify'` to `KNOWN_PERMISSION_VERBS`. New verb-shape guard rejects positionals and `--reason` for both (only `--json` applies). |
+| `src/cli/run.ts` | Dispatch branches for both verbs — dynamic-import the handler module, pass dbPath override + IO sinks, return the exit code. |
+| `tests/cli/permission-seal-now.test.ts` (new, 13 tests) | parseArgs (4): verb recognized, --json captured, positionals rejected, --reason rejected. Behavior (9): no seal section → 1 with stderr message; mode=none → 1; empty chain → 0 with chain_empty noop; healthy chain → seals latest with correct seq + ts; already-sealed seq → 0 with already_sealed noop; store.append failure → 1 with reason in stderr; JSON mode on success emits valid NDJSON; JSON mode on store failure emits structured error; corrupted seal file (list throws) → 1 with corruption message. |
+| `tests/cli/permission-seal-verify.test.ts` (new, 13 tests) | parseArgs (4): same shape as seal-now. Behavior (9): no seal section → 1; mode=none → 1; matching seal entries → 0 with intact message + count; hash mismatch → 1 with firstMismatchAt visible; missing seq → 1; empty seal file → 0 with empty-file note; corrupted seal file → 1 with corruption message; JSON mode on intact emits structured NDJSON with `entriesChecked` + `install_id`; JSON mode on broken emits structured error with `firstMismatchAt`. |
+
+### Decisions
+
+- **Hoist `defaultWormFileFactory` to `sealing.ts`, not duplicate per consumer.** Bootstrap and both CLI verbs need the same factory. Duplication means a future change (alternate chattr path, lsattr check on existing files) would land in 3+ places. Single canonical export in `sealing.ts` co-located with `createWormFileSealer` keeps the cohesion obvious. The factory takes `SealPolicy` (not just `path`) so future fields (`endpoint` for TSA, `bucket` for S3) work uniformly across backends.
+- **Both verbs are DB-only (no engine bootstrap).** Same posture as `agent permission verify`: read the policy from cwd/HOME, open the DB read-only-style (we do write for seal-now, but never via the engine's sink), do the work, exit. Avoids the cost + complexity of starting a session for a one-shot CLI invocation. Matches `verify` / `replay` / `policy-list` / `policy-rollback`.
+- **seal-now's already-sealed check uses `store.list()`, not a separate state file.** The seal store IS the source of truth for "what's sealed". Reading `store.list()` and comparing the last entry's seq is O(N) but cheap (the seal file is tiny — one line per interval, so even at `interval_decisions=1` and 100k decisions, parsing 100k lines is microseconds). Adding a separate "last-sealed-seq" cache would invite drift bugs.
+- **Both verbs reject `--reason`, both reject positionals.** Verbs that take no arguments should fail loudly on stray flags rather than silently accept them — a `--reason "before-prod-cutover"` typo'd into seal-verify would otherwise pass parse and be silently ignored, leaving the operator wondering whether the reason landed somewhere. Same posture as `policy-list`.
+- **`seal-now` exits 0 on noops (chain_empty, already_sealed), not 1.** Exit codes 0 = "the requested operation completed successfully OR there's nothing to do"; 1 = "something went wrong and the operator should investigate". Scripts running `agent permission seal-now && rm -rf /tmp/scratch` shouldn't fail just because the chain happens to be empty.
+- **JSON output uses a single NDJSON line, not pretty-printed.** Pipeline-composable: `agent permission seal-verify --json | jq` works. Matches the `permission verify` precedent. Operators wanting human-readable output drop `--json`.
+- **`seal-verify` reports `firstMismatchAt` rather than walking all mismatches.** Once the chain diverges, every entry after the first tamper looks mismatched against a re-hashed sub-chain. Reporting all would cascade noise; first mismatch is the actionable signal.
+- **No top-level chattr presence check in the default factory.** On non-Linux platforms, the factory's `onCreate` call to `execFileSync('/usr/bin/chattr', ...)` throws → sealer returns ok:false → CLI verb renders the error. Pre-checking `which chattr` would be a second call, slightly slower, and the error would arrive at a different code path; the natural failure path through execFileSync is fine. Operators on macOS / BSD see "chattr +a failed" clearly and either install the binary or pick a different sealing mode (when more backends ship).
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5665 pass / 10 skip / 0 fail** (5675 total across 265 files); +26 tests on top of slice 57's 5639 (13 seal-now + 13 seal-verify)
+- `bun test tests/cli/permission-seal-now.test.ts tests/cli/permission-seal-verify.test.ts` — 26 pass
+
+### Next
+
+§7.3 thread is **closed end-to-end** for the worm-file backend: primitive (54) + scheduler (55) + audit-sink integration (56) + Policy section + bootstrap wire-up (57) + CLI verbs (58). Production-ready checklist's "Sealing externo configurável e testado em ≥ 1 backend" (line 1292) is now satisfied.
+
+Remaining for §7.3:
+1. Additional backends (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) — each is an independent slice (~150 lines + ~10 tests of the same shape as slice 54's worm-file). Unblocked by removing the mode from `RESERVED_SEAL_MODES` once the factory + tests land. Order driven by deployment demand (TSA is the most spec-favored "audit-grade" choice; S3 covers AWS deployments; git for ops-team git-natives).
+
+Other open spec gaps unchanged (§19 v1→v2 migration, macOS sandbox-exec conformance, §13.7 broker/worker, §14 MCP). §16.2 conformance still at 95%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 57: `[seal]` Policy section + bootstrap wire-up (§7.3 closes)
 
 **Done.** Fifty-seventh slice. Closes the operator-facing surface of §7.3: a `seal:` mapping in `permissions.yaml` now configures real sealing behavior end-to-end. The schema (slice 57 in `types.ts`) is parsed (config.ts), merged across layers (hierarchy.ts), and consumed by the bootstrap (bootstrap-engine.ts) which constructs the `SealStore` + `SealingScheduler` and wires the scheduler's `onSealFailed` into the engine's state machine. `on_failure: degrade|refuse` becomes a real transition path: a chattr failure in production trips the engine, and operators see the state change in the events log.
