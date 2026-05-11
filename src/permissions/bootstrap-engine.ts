@@ -38,6 +38,7 @@ import {
   resolvePolicy,
 } from './hierarchy.ts';
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
+import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
 import type { Policy } from './types.ts';
 
@@ -83,6 +84,22 @@ export interface BootstrapPermissionEngineInput {
   // preflight, bootstrap performs the two phases inline; either
   // path produces the same final state.
   preflight?: PreflightResult;
+  // §12.3 hot reload opt-in (slice 53). When true, the bootstrap
+  // sets up `watchAndReload` on the discovered policy paths AND
+  // emits `policy-reloaded` / `policy-reload-failed` audit rows on
+  // every reload event. Default false — one-shot CLI verbs
+  // (`agent permission verify` etc.) don't pay the inotify cost.
+  // The REPL bootstrap is the primary caller; it owns the
+  // returned `policyWatcher` and closes it on session end.
+  watchPolicy?: boolean;
+  // Test seams for the watcher's debounce + fs.watch + setTimeout
+  // hooks. Forwarded verbatim to watchAndReload; production
+  // callers leave undefined.
+  policyWatcherDebounceMs?: number;
+  policyWatcherWatcher?: (path: string, cb: () => void) => { close: () => void };
+  policyWatcherSetTimer?: (cb: () => void, ms: number) => unknown;
+  policyWatcherClearTimer?: (handle: unknown) => void;
+  policyWatcherExists?: (path: string) => boolean;
 }
 
 export interface PreflightResult {
@@ -148,6 +165,12 @@ export interface BootstrapPermissionEngineResult {
   // Set when refusing — operator-facing description of what failed.
   // Empty when state is ready.
   refusingReason?: string;
+  // §12.3 file watcher (slice 53). Set when `watchPolicy: true`
+  // was passed to bootstrap. Caller MUST call `.close()` on session
+  // end — leaking the inotify handle keeps the engine resident +
+  // keeps writing audit rows on every editor save. Undefined when
+  // `watchPolicy` was false / omitted.
+  policyWatcher?: PolicyWatcher;
 }
 
 const emitChainBreakAcceptedRow = (
@@ -168,6 +191,64 @@ const emitChainBreakAcceptedRow = (
     args: { acceptBrokenChain: true },
     decision: 'allow',
     policy_hash: policyHash,
+    reason_chain: reasonChain,
+  });
+};
+
+// §12.3 audit emission — spec line 743 demands "emit policy_reloaded
+// event with old_hash, new_hash". Mirrors `emitChainBreakAcceptedRow`:
+// tool_name='permission-engine', decision='allow' (operator
+// authorized the reload by editing the file), reasonChain captures
+// the hash transition. policy_hash on the row is the NEW hash —
+// the reload IS the act of authorizing the new policy.
+const emitPolicyReloadedRow = (
+  sink: AuditSink,
+  sessionId: string,
+  oldHash: string,
+  newHash: string,
+): void => {
+  const reasonChain: ReasonChainEntry[] = [
+    {
+      stage: 'policy-reloaded',
+      note: `old_hash=${oldHash} new_hash=${newHash}`,
+    },
+  ];
+  sink.emit({
+    session_id: sessionId,
+    tool_name: 'permission-engine',
+    args: { reload: true },
+    decision: 'allow',
+    policy_hash: newHash,
+    reason_chain: reasonChain,
+  });
+};
+
+// §12.3 audit emission — spec line 737 demands "emit
+// policy_reload_failed event with details / keep old_policy".
+// decision='deny' because the new policy WAS rejected (the old
+// stays authoritative). The reason chain carries the specific
+// failure surface (parse error / lock conflict / engine
+// reloadPolicy ok:false) so operators see WHY in the audit log.
+// policy_hash on the row is the CURRENT (old, still-authoritative)
+// hash — the failed candidate has no archive entry.
+const emitPolicyReloadFailedRow = (
+  sink: AuditSink,
+  sessionId: string,
+  currentHash: string,
+  reason: string,
+): void => {
+  const reasonChain: ReasonChainEntry[] = [
+    {
+      stage: 'policy-reload-failed',
+      note: reason,
+    },
+  ];
+  sink.emit({
+    session_id: sessionId,
+    tool_name: 'permission-engine',
+    args: { reload: true },
+    decision: 'deny',
+    policy_hash: currentHash,
     reason_chain: reasonChain,
   });
 };
@@ -316,6 +397,51 @@ export const bootstrapPermissionEngine = async (
     });
   }
 
+  // §12.3 file-watch wire-up (slice 53). Only fires when the
+  // caller opted in (`watchPolicy: true`) AND the engine reached a
+  // non-refusing state — refusing engines have no policy worth
+  // hot-reloading. The watcher's callbacks emit audit rows per spec
+  // line 743 (policy_reloaded with old/new hashes) and line 737
+  // (policy_reload_failed with reason). Caller owns the returned
+  // handle and MUST close() it on session end.
+  let policyWatcher: PolicyWatcher | undefined;
+  if (input.watchPolicy === true && archiveState !== 'refusing') {
+    const resolveOptionsForWatcher: Parameters<typeof watchAndReload>[0]['resolveOptions'] = {
+      cwd: input.cwd,
+      home,
+      env: input.env ?? process.env,
+      ...(input.enterprisePath !== undefined ? { enterprisePath: input.enterprisePath } : {}),
+      ...(input.userPath !== undefined ? { userPath: input.userPath } : {}),
+      ...(input.sessionPolicy !== undefined ? { session: input.sessionPolicy } : {}),
+    };
+    policyWatcher = watchAndReload({
+      engine,
+      resolveOptions: resolveOptionsForWatcher,
+      onReload: (result) => {
+        emitPolicyReloadedRow(sink, input.sessionId, result.oldHash, result.newHash);
+      },
+      onReloadFailed: (reason) => {
+        // Use the engine's CURRENT policy hash (post-reload-attempt,
+        // which equals pre-attempt on failure since the engine
+        // didn't swap). policy() returns a deep clone — recompute
+        // hash is cheap and matches what the engine itself stamps.
+        const currentHash = `sha256:${canonicalHash(engine.policy())}`;
+        emitPolicyReloadFailedRow(sink, input.sessionId, currentHash, reason);
+      },
+      ...(input.policyWatcherDebounceMs !== undefined
+        ? { debounceMs: input.policyWatcherDebounceMs }
+        : {}),
+      ...(input.policyWatcherWatcher !== undefined ? { watcher: input.policyWatcherWatcher } : {}),
+      ...(input.policyWatcherSetTimer !== undefined
+        ? { setTimer: input.policyWatcherSetTimer }
+        : {}),
+      ...(input.policyWatcherClearTimer !== undefined
+        ? { clearTimer: input.policyWatcherClearTimer }
+        : {}),
+      ...(input.policyWatcherExists !== undefined ? { exists: input.policyWatcherExists } : {}),
+    });
+  }
+
   return {
     engine,
     identity,
@@ -331,6 +457,7 @@ export const bootstrapPermissionEngine = async (
     ...(sandbox !== undefined && !sandbox.available && sandbox.required
       ? { refusingReason: 'sandbox_required_but_unavailable' }
       : {}),
+    ...(policyWatcher !== undefined ? { policyWatcher } : {}),
   };
 };
 

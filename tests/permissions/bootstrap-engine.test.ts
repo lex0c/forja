@@ -242,3 +242,186 @@ describe('bootstrapPermissionEngine — policy_archive (§17 prerequisite)', () 
     expect(countPolicyArchive(db)).toBe(0);
   });
 });
+
+describe('bootstrapPermissionEngine — §12.3 watchPolicy wire-up', () => {
+  // The watcher itself is exhaustively tested in policy-watcher.test.ts;
+  // these tests pin the bootstrap-side INTEGRATION: opt-in plumbing,
+  // audit emission on reload events, and the refusing-state guard.
+
+  test('watchPolicy omitted → result.policyWatcher is undefined', async () => {
+    const r = await bootstrapPermissionEngine(baseInput());
+    expect(r.policyWatcher).toBeUndefined();
+  });
+
+  test('watchPolicy=false → result.policyWatcher is undefined', async () => {
+    const r = await bootstrapPermissionEngine(baseInput({ watchPolicy: false }));
+    expect(r.policyWatcher).toBeUndefined();
+  });
+
+  test('watchPolicy=true → policyWatcher attached, close() is a no-throw', async () => {
+    let closeCalls = 0;
+    const fakeWatcher = () => ({
+      close: () => {
+        closeCalls++;
+      },
+    });
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        watchPolicy: true,
+        policyWatcherExists: () => true,
+        policyWatcherWatcher: fakeWatcher,
+        policyWatcherSetTimer: () => null,
+        policyWatcherClearTimer: () => {},
+      }),
+    );
+    expect(r.policyWatcher).toBeDefined();
+    expect(() => r.policyWatcher?.close()).not.toThrow();
+    expect(closeCalls).toBeGreaterThan(0);
+  });
+
+  test('successful reload emits a policy-reloaded audit row with old/new hashes', async () => {
+    // Write a USER policy that the bootstrap will load + the
+    // watchAndReload will re-read after we mutate it.
+    const userYaml = join(tmpRoot, 'user-permissions.yaml');
+    writeFileSync(userYaml, 'defaults:\n  mode: strict\n');
+
+    const db = baseDb();
+    const captured: { cb: (() => void) | null } = { cb: null };
+    const fakeWatcher = (_path: string, cb: () => void) => {
+      captured.cb = cb;
+      return { close: () => {} };
+    };
+    // Synchronous timer — the watcher's debounce becomes a no-op so
+    // the reload happens during the captured-callback invocation.
+    const syncTimer = (cb: () => void, _ms: number) => {
+      cb();
+      return null;
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        db,
+        userPath: userYaml,
+        watchPolicy: true,
+        policyWatcherExists: () => true,
+        policyWatcherWatcher: fakeWatcher,
+        policyWatcherSetTimer: syncTimer,
+        policyWatcherClearTimer: () => {},
+      }),
+    );
+    expect(r.state).toBe('ready');
+    expect(captured.cb).not.toBeNull();
+
+    // Mutate the policy on disk and fire the captured fs event. The
+    // engine will swap to the new policy and emit policy-reloaded.
+    writeFileSync(userYaml, 'defaults:\n  mode: acceptEdits\n');
+    captured.cb?.();
+
+    const rows = listApprovalsLogByInstall(db, r.identity.install_id);
+    const reloadRow = rows.find((row) => row.reason_chain_json.includes('policy-reloaded'));
+    expect(reloadRow).toBeDefined();
+    expect(reloadRow?.tool_name).toBe('permission-engine');
+    expect(reloadRow?.decision).toBe('allow');
+    expect(reloadRow?.reason_chain_json).toContain('old_hash=sha256:');
+    expect(reloadRow?.reason_chain_json).toContain('new_hash=sha256:');
+    // old_hash !== new_hash (the bytes really changed).
+    if (reloadRow === undefined) return;
+    const reasonChain = JSON.parse(reloadRow.reason_chain_json) as Array<{ note: string }>;
+    const note = reasonChain[0]?.note ?? '';
+    const old = /old_hash=(sha256:[a-f0-9]+)/.exec(note)?.[1];
+    const next = /new_hash=(sha256:[a-f0-9]+)/.exec(note)?.[1];
+    expect(old).toBeDefined();
+    expect(next).toBeDefined();
+    expect(old).not.toBe(next);
+  });
+
+  test('failed reload (malformed file) emits a policy-reload-failed audit row', async () => {
+    const userYaml = join(tmpRoot, 'user-permissions.yaml');
+    writeFileSync(userYaml, 'defaults:\n  mode: strict\n');
+
+    const db = baseDb();
+    const captured: { cb: (() => void) | null } = { cb: null };
+    const fakeWatcher = (_path: string, cb: () => void) => {
+      captured.cb = cb;
+      return { close: () => {} };
+    };
+    const syncTimer = (cb: () => void, _ms: number) => {
+      cb();
+      return null;
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        db,
+        userPath: userYaml,
+        watchPolicy: true,
+        policyWatcherExists: () => true,
+        policyWatcherWatcher: fakeWatcher,
+        policyWatcherSetTimer: syncTimer,
+        policyWatcherClearTimer: () => {},
+      }),
+    );
+    expect(r.state).toBe('ready');
+
+    // Corrupt the policy: schema-invalid mode trips parsePolicy.
+    writeFileSync(userYaml, 'defaults:\n  mode: not_a_real_mode\n');
+    captured.cb?.();
+
+    const rows = listApprovalsLogByInstall(db, r.identity.install_id);
+    const failRow = rows.find((row) => row.reason_chain_json.includes('policy-reload-failed'));
+    expect(failRow).toBeDefined();
+    expect(failRow?.tool_name).toBe('permission-engine');
+    expect(failRow?.decision).toBe('deny');
+    // policy_hash on the failed row IS the still-authoritative
+    // (pre-reload-attempt) hash — the engine never swapped.
+    expect(failRow?.policy_hash).toBe(
+      `sha256:${(await import('../../src/permissions/canonical.ts')).canonicalHash(r.engine.policy())}`,
+    );
+  });
+
+  test('watchPolicy=true is skipped when bootstrap ends refusing', async () => {
+    let watcherCalls = 0;
+    const fakeWatcher = () => {
+      watcherCalls++;
+      return { close: () => {} };
+    };
+    // Force the install_id failure path → buildRefusingResult →
+    // bootstrap returns BEFORE reaching the watcher wire-up.
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        env: {},
+        watchPolicy: true,
+        policyWatcherExists: () => true,
+        policyWatcherWatcher: fakeWatcher,
+        policyWatcherSetTimer: () => null,
+        policyWatcherClearTimer: () => {},
+      }),
+    );
+    expect(r.state).toBe('refusing');
+    expect(r.policyWatcher).toBeUndefined();
+    expect(watcherCalls).toBe(0);
+  });
+
+  test('watchPolicy=true skipped when sandbox required+unavailable forces late refusing', async () => {
+    // This is the SECOND refusing path — the late transition AFTER
+    // archive but inside the same bootstrap body. The wire-up's
+    // `archiveState !== 'refusing'` guard catches it before any
+    // watcher attaches.
+    let watcherCalls = 0;
+    const fakeWatcher = () => {
+      watcherCalls++;
+      return { close: () => {} };
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        watchPolicy: true,
+        sandbox: { available: false, hostExplicitlyAllowed: false, required: true },
+        policyWatcherExists: () => true,
+        policyWatcherWatcher: fakeWatcher,
+        policyWatcherSetTimer: () => null,
+        policyWatcherClearTimer: () => {},
+      }),
+    );
+    expect(r.state).toBe('refusing');
+    expect(r.policyWatcher).toBeUndefined();
+    expect(watcherCalls).toBe(0);
+  });
+});

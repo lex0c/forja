@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 53: bootstrap wire-up for `watchAndReload` (§12.3 production caller)
+
+**Done.** Fifty-third slice. Closes the loose end left by slice 52: the file watcher primitive existed but had no production caller. The bootstrap now opts into hot reload via `watchPolicy?: boolean`, attaches the watcher with the SAME `resolveOptions` it used at startup, and emits two new audit-row stages on every reload event — `policy-reloaded` (spec line 743) and `policy-reload-failed` (spec line 737). With this slice, an operator can edit `~/.config/agent/permissions.yaml`, save, and see (a) the engine pick up the new policy on the next `check()`, AND (b) two audit rows in `approvals_log` capturing the hash transition (or the failure reason).
+
+### Why this matters
+
+Slice 52 was a primitive — a unit-tested function with test seams. Until production wires it up, `--watchPolicy` doesn't exist as a knob, so the spec line "operadores podem editar policy.yaml e ver mudança aplicar sem reiniciar a sessão" wasn't realized end-to-end. This slice is the integration that makes §12.3 a real operator-visible feature.
+
+The audit emission is the security-critical part: spec §12.3 lines 737/743 demand that every reload outcome (success OR failure) lands in the chain. Without those rows, an operator could swap to a more-permissive policy mid-session and a retrospective audit would only see "policy_hash changed across rows" with no signal that the swap was a hot reload (vs. a fresh bootstrap with chain reset). The two new stages make the swap point explicit in the chain.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/bootstrap-engine.ts` | New input fields: `watchPolicy?: boolean` (opt-in flag) + 5 test seams (`policyWatcherDebounceMs`, `policyWatcherWatcher`, `policyWatcherSetTimer`, `policyWatcherClearTimer`, `policyWatcherExists`) forwarded to `watchAndReload`. New result field: `policyWatcher?: PolicyWatcher` — caller owns it and MUST `close()` on session end. Two new helper emitters next to `emitChainBreakAcceptedRow`: `emitPolicyReloadedRow` (decision='allow', stage='policy-reloaded', note='old_hash=… new_hash=…', policy_hash=NEW) and `emitPolicyReloadFailedRow` (decision='deny', stage='policy-reload-failed', note=reason, policy_hash=CURRENT-still-authoritative). Wire-up block after the policy_archive section: when `watchPolicy: true` AND archiveState !== 'refusing', construct `resolveOptionsForWatcher` mirroring the bootstrap's resolve options, then `watchAndReload({engine, resolveOptions, onReload→emitPolicyReloadedRow, onReloadFailed→emitPolicyReloadFailedRow, …seams})`. Refusing states (both early via `buildRefusingResult` and late via `sandbox_required_but_unavailable`) skip the wire-up; `archiveState !== 'refusing'` guard catches both. |
+| `tests/permissions/bootstrap-engine.test.ts` (+7 tests) | New describe block "§12.3 watchPolicy wire-up". Pins: (1) omitted flag → no watcher in result; (2) `watchPolicy: false` → no watcher; (3) `watchPolicy: true` → policyWatcher present + close() doesn't throw + fake watcher's close was invoked; (4) successful reload (strict → acceptEdits) → `policy-reloaded` audit row with both hashes present + old_hash !== new_hash; (5) failed reload (`mode: not_a_real_mode`) → `policy-reload-failed` audit row + tool_name='permission-engine' + decision='deny' + policy_hash matches the still-authoritative engine.policy() hash; (6) install_id-failure refusing path → no watcher, fakeWatcher never called; (7) sandbox-required+unavailable refusing path → no watcher (verifies the LATE refusing transition is also caught). |
+
+### Decisions
+
+- **Opt-in, not default.** `watchPolicy` defaults to false. One-shot CLI verbs (`agent permission verify`, `agent doctor`) don't pay the inotify cost; only the REPL bootstrap flips it on. Same posture as `acceptBrokenChain` — a knob the caller (CLI driver) chooses, not the engine.
+- **Wire-up sits AFTER `archivePolicy`, BEFORE the return.** Two reasons. (a) `archiveState` is already computed at that line — reuse the same `controller.get()` snapshot so the refusing guard is consistent. (b) The watcher needs the live `engine` reference; constructing it before the engine exists is impossible. Placing it post-archive also means the wire-up only fires for engines that actually reached a non-refusing state.
+- **`archiveState !== 'refusing'` guard, not `sandbox` flag check.** The bootstrap has TWO refusing paths: (a) early via `buildRefusingResult` (install_id / policy_load failure) which returns BEFORE my wire-up — never reached; (b) late via `sandbox_required_but_unavailable` which transitions at line 371 BEFORE archiveState is captured. The guard catches both because archiveState is read AFTER both transition points. Tests 6 + 7 verify each path explicitly.
+- **`emitPolicyReloadFailedRow` uses the CURRENT (still-authoritative) hash.** Spec line 737-740 says "keep old_policy / unlock / return". The engine's `policy()` returns the unchanged policy because `reloadPolicy()` is non-destructive on failure (slice 51). So `canonicalHash(engine.policy())` IS the old hash. Test 5 pins this: `failRow.policy_hash === sha256:${canonicalHash(r.engine.policy())}`.
+- **`emitPolicyReloadedRow` records hashes in the reason chain's note field, not in policy_hash.** policy_hash on the row is the NEW hash (the reload IS the authorization act for the new policy). The chain transition `old → new` is documented in `note=old_hash=… new_hash=…`. This matches the pattern used by `chain-break-accepted` (where the row's policy_hash is current + the diagnostic info goes in the note).
+- **decision='allow' for reload-success, 'deny' for reload-failed.** The reload is an act authorized by the operator (they edited the YAML); the success row says "this authorization succeeded". The failure row says "the candidate policy was REJECTED — old stays authoritative", which is functionally a deny of the candidate. Consistent with how the chain-break path uses 'allow' for accepted breaks.
+- **All test seams forwarded as optional pass-throughs.** `policyWatcherDebounceMs`, `policyWatcherWatcher`, `policyWatcherSetTimer`, `policyWatcherClearTimer`, `policyWatcherExists` mirror watchAndReload's seams 1:1. Production callers leave them undefined; tests pin specific scenarios. No seam-renaming or seam-merging — straight forwarding keeps the bootstrap-side tests independent of any future watcher-side API change (which would surface as a typecheck error rather than a silent test divergence).
+- **Caller owns `policyWatcher.close()`.** The bootstrap doesn't auto-close it on any state transition; if the engine degrades or refuses LATER (during the session), the watcher stays attached. This is intentional — a degraded engine still has a policy worth hot-reloading (operator fixes the YAML, engine re-checks). The REPL session driver closes on Ctrl-D / SIGTERM. Tests document this contract by calling `r.policyWatcher?.close()` explicitly.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5571 pass / 10 skip / 0 fail** (5581 total across 260 files); +7 tests on top of slice 52's 5564
+- `bun test tests/permissions/bootstrap-engine.test.ts` — 22 pass
+
+### Next
+
+§12 thread fully closed: load-order + validation + hot reload (primitive + watcher + bootstrap wire-up) + rollback. The next obvious targets from the spec-gap inventory:
+
+1. **§7.3 external sealing (worm-file backend)** — audit-grade chain export for regulated deployments.
+2. **§19 v1→v2 migration** — translator + compat layer.
+3. **macOS sandbox-exec conformance** (extending slice 32's sandbox_select cases).
+4. **§13.7 broker/worker architecture** — multi-slice; needed for sandboxed-cap subagents.
+5. **§14 MCP trust model** — blocked on MCP itself (M3+).
+
+§16.2 conformance suite stays at 95% (only `concurrency` ~5 cases remain, spec calls for separate driver outside YAML).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 52: `watchAndReload()` — §12.3 file watcher (closes §12)
 
 **Done.** Fifty-second slice. Consumes slice 51's `engine.reloadPolicy()` primitive: when any of the policy YAML files on disk changes, the watcher re-resolves the hierarchy + atomically swaps the engine's policy. With this, §12.3 ships end-to-end: spec line 731 "File-watch nos arquivos de policy. Mudança → re-validate em background; se válido, swap atômico" now executes.
