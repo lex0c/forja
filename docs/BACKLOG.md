@@ -15,6 +15,78 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 18: sandbox runner — bwrap argv synthesis (§6.5, part 1)
+
+**Done.** Eighteenth slice of the v2 evolution. Slice 10 picked the sandbox profile (`selectSandboxProfile`); this slice synthesizes the actual bwrap command line that wraps a tool's inner argv. Pure-function deliverable today; runtime wire-up (Decision shape + ToolContext threading + bash spawn-site change) lands in slice 19 so the enforcement actually fires.
+
+### Why split argv synthesis from runtime wire-up
+
+The builder is matrix-shaped: profile × Linux argv flags. Pure function, no side effects, fully testable against the spec §6.5 mount/network table. The runtime wire-up touches `Decision`, `ToolContext`, `invoke-tool.ts`, `bash.ts`, and the engine's emit path — a larger blast radius with cascading test updates. Separating them keeps slice 18 small and observable: the next slice consumes a known-correct builder.
+
+### bwrap profile flags
+
+Common across the 4 sandboxed profiles (`ro`, `cwd-rw`, `cwd-rw-net`, `home-rw`):
+
+| Flag | Why |
+|---|---|
+| `--ro-bind / /` | Read-only base layer; specific paths overridden as RW below per profile. |
+| `--tmpfs /tmp` | Fresh /tmp inside the sandbox — isolates ephemeral artifacts. |
+| `--proc /proc` | Mount a fresh proc fs inside the namespace (without it, `ps`/`top` from inside would see the host's processes). |
+| `--dev /dev` | Fresh /dev with minimal device nodes (random, null, urandom, zero, tty). |
+| `--unshare-pid` | pid namespace: the wrapped process can't see or signal host pids. |
+| `--die-with-parent` | Kernel reaps child if parent exits — prevents orphaned sandboxed processes. |
+| `--chdir <cwd>` | Start the inner process in the caller's expected working directory. |
+
+Per-profile differentiators:
+
+| Profile | Net | Writable mount | Notes |
+|---|---|---|---|
+| `ro` | `--unshare-net` | none | Maximally restrictive. |
+| `cwd-rw` | `--unshare-net` | `--bind <cwd> <cwd>` | Writes scoped to cwd; egress blocked. |
+| `cwd-rw-net` | inherited | `--bind <cwd> <cwd>` | Egress filtering by nftables is a separate enforcement plane — out of scope here. |
+| `home-rw` | `--unshare-net` | `--bind <home> <home>` | Required for `secret-access` cap; the planner only routes those calls to this profile (slice 10 coverage table). |
+| `host` | passthrough | passthrough | No wrap; operator already opted in via `--sandbox-host` AND the resolved cap set carries `host-passthrough`. Builder returns `innerArgv` unchanged. |
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-runner.ts` (new) | `BuildBwrapArgvOptions` + `buildBwrapArgv(opts) → string[]` pure function. `COMMON_PROFILE_FLAGS` constant captures the shared flag block; per-profile differences appended via branching on `profile`. `host` short-circuits to `innerArgv.slice()` (defensive copy — caller mutation of the returned array can't poison the function's source data). Empty `innerArgv` throws (programmer bug, fail loud rather than silently producing a `bwrap --` no-op). |
+| `src/permissions/index.ts` | Re-exports `BuildBwrapArgvOptions` + `buildBwrapArgv`. |
+| `tests/permissions/sandbox-runner.test.ts` (new) | 12 tests — host passthrough + defensive-copy of innerArgv, ro/cwd-rw/cwd-rw-net/home-rw flag assertions (which flags are present, which absent), common-flag matrix across all 4 sandboxed profiles, innerArgv preservation (different shape lands after `--` verbatim), empty innerArgv throws. |
+
+### Decisions
+
+- **Linux-only this slice.** macOS `sandbox-exec` uses SBPL profile files with completely different syntax (SBPL is its own language with a Lisp-shaped surface). Forcing a single abstraction across both today would invite premature genericism. The caller (slice 19) is expected to skip wrapping when `process.platform !== 'linux'`; macOS sandboxing comes in a future slice with its own SBPL profile templates.
+- **`cwd-rw-net` does NOT filter egress.** Spec §6.5 implies nftables/proxy egress filtering for this profile, but that's a parallel enforcement plane that needs its own design (kernel privilege, rule installation, allow-host list compilation). The argv builder doesn't try to inline it. Documented in the file header.
+- **Defensive copy for `host` profile.** The function returns `innerArgv.slice()` rather than the input array directly. A future caller that mutates the returned array — e.g. appending an argument — can't accidentally rewrite the static fixture in a test. Cheap (host argvs are short).
+- **`--die-with-parent` on every sandboxed profile.** Without it, a hung sandboxed process would survive the parent's exit and leak. Standard sandboxing hygiene.
+- **Explicit error on empty innerArgv.** `bwrap … --` with no inner command is a no-op that silently succeeds. A caller passing an empty argv has a bug; throwing surfaces it immediately rather than producing a "success" that did nothing.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5238 pass / 10 skip / 0 fail** (5248 total across 248 files)
+
+### Next
+
+Slice 19 — sandbox runtime wire-up — consumes this builder:
+
+1. `Decision.sandboxProfile?: SandboxProfile` populated by the engine (mirrors slice 15's `approvalSeq` pattern).
+2. `ToolContext.sandboxProfile?` threaded by `invoke-tool.ts` from `decision.sandboxProfile`.
+3. `bash` tool reads `ctx.sandboxProfile` and wraps `Bun.spawn` with `buildBwrapArgv(...)` when (a) Linux, (b) sandbox availability is true, (c) profile ≠ `host`.
+
+Other pending slices:
+- macOS sandbox-exec (SBPL profile generation) — parallel to slice 19 on macOS.
+- Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+- Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+- `--accept-broken-chain` operator override (§7.2 second flag).
+- `agent permission inspect <rotation_id>` (clears the quarantine flag).
+- ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 17: `agent permission diff <s1> <s2>` (§17 cross-row)
 
 **Done.** Seventeenth slice of the v2 evolution. Closes §17 with the cross-row comparison verb: `agent permission diff <seq1> <seq2>` renders two audit rows side-by-side with field-by-field diff markers, capabilities set diff, and score-components deltas. Read-only — every input the analysis needs is already columns on the rows. No re-execution: §17's three replay modes (slice 12 default, slice 14 `--without-classifier`, slice 16 `--against-current-policy`) own the re-execution surface.
