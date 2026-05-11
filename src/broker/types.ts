@@ -83,8 +83,10 @@ export interface BrokerResponse {
 // Per-call options. Threaded through every broker implementation
 // down to the tool handler. Added in slice 83 (`signal`) so
 // callers can cancel an in-flight call instead of leaking the
-// subprocess until natural completion. Future fields (per-call
-// timeout override, per-call telemetry tags) slot in here.
+// subprocess until natural completion. Slice 85 adds `timeoutMs`
+// for per-call override of the broker-construction default —
+// long-running tools (big tests, builds) need a wider outer
+// guard than the broker's session-wide setting.
 export interface BrokerCallOptions {
   // Abort signal. When the signal fires:
   //   - in-process broker passes it to the supplied `exec`
@@ -98,6 +100,26 @@ export interface BrokerCallOptions {
   // when the signal fired. Pre-aborted signals are handled at
   // entry — no spawn happens.
   signal?: AbortSignal;
+  // Per-call outer-guard timeout (slice 85). Overrides the
+  // broker-construction `timeoutMs` for this single call. The
+  // outer guard kills the WORKER (spawn broker) or relies on the
+  // exec function (in-process broker) when exceeded.
+  //
+  // Distinct from handler-specific timeouts: the bash handler
+  // enforces `args.timeout_ms` on the bash subprocess itself
+  // (SIGTERM → SIGKILL), while THIS field is the broker-level
+  // ceiling for the worker process. The caller (e.g., bashTool)
+  // typically sets this wider than the handler timeout so the
+  // outer fires only when the handler itself hangs.
+  //
+  // Semantics:
+  //   - `undefined` → use broker-construction default
+  //   - `0` → disable timeout for this call (no outer guard)
+  //   - positive → use as outer-guard ms
+  // The in-process broker passes this to the exec callback;
+  // bash-handler-equivalent exec functions may ignore (they have
+  // their own per-command timer via args.timeout_ms).
+  timeoutMs?: number;
 }
 
 // The broker contract. All implementations satisfy this — the

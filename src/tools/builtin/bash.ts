@@ -1,6 +1,19 @@
 import { isAbsolute, resolve as resolvePath } from 'node:path';
-import type { BrokerRequest, BrokerResponse } from '../../broker/index.ts';
+import {
+  BASH_DEFAULT_TIMEOUT_MS,
+  BASH_TIMEOUT_GRACE_MS,
+  type BrokerRequest,
+  type BrokerResponse,
+} from '../../broker/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+
+// Buffer above the handler's effective timeout for the broker
+// outer guard. Covers worker startup (~100ms), JSON parse, bash
+// handler setup, SIGTERM → SIGKILL grace window, and response
+// emission. Generous so the outer fires ONLY when the handler
+// itself hung; the handler's own SIGKILL is the precise per-
+// command kill.
+const BROKER_OUTER_BUFFER_MS = 10_000;
 
 export interface BashInput {
   command: string;
@@ -145,9 +158,19 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       sandboxProfile: ctx.sandboxProfile ?? null,
     };
 
+    // Broker-level outer guard. The bash handler's args.timeout_ms
+    // is the precise per-command kill (SIGTERM → SIGKILL); this
+    // is the outer ceiling for the worker process itself in case
+    // the handler logic hangs. Width = handler timeout + grace +
+    // buffer; never narrower than handler timeout.
+    const handlerTimeoutMs =
+      typeof args.timeout_ms === 'number' ? args.timeout_ms : BASH_DEFAULT_TIMEOUT_MS;
+    const brokerTimeoutMs = handlerTimeoutMs + BASH_TIMEOUT_GRACE_MS + BROKER_OUTER_BUFFER_MS;
+
     const start = Date.now();
     const response: BrokerResponse = await ctx.broker.execute(request, {
       signal: ctx.signal,
+      timeoutMs: brokerTimeoutMs,
     });
     const duration_ms = Date.now() - start;
 

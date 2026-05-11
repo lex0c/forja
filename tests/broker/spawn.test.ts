@@ -165,6 +165,69 @@ describe('createSpawnBroker — timeout', () => {
   });
 });
 
+// ─── per-call timeoutMs override (slice 85) ───────────────────────────────
+
+describe('createSpawnBroker — per-call timeoutMs override', () => {
+  test('per-call timeoutMs takes precedence over broker default', async () => {
+    // Broker default is 10s; per-call is 50ms — the override
+    // fires first, response error message reflects the override.
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'IFS= read -r _; sleep 10'],
+      timeoutMs: 10_000,
+    });
+    const start = Date.now();
+    const r = await broker.execute(baseRequest(), { timeoutMs: 50 });
+    const elapsed = Date.now() - start;
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('timeout after 50ms');
+    expect(elapsed).toBeLessThan(5000);
+    await broker.close();
+  });
+
+  test('per-call timeoutMs omitted falls back to broker default', async () => {
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'IFS= read -r _; sleep 10'],
+      timeoutMs: 50,
+    });
+    const r = await broker.execute(baseRequest());
+    expect(r.error).toBe('timeout after 50ms');
+    await broker.close();
+  });
+
+  test('per-call timeoutMs = 0 disables timer (no kill, worker runs to completion)', async () => {
+    // Broker default 50ms WOULD kill at 50ms; per-call 0 disables.
+    // Worker runs to natural completion (the printf).
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'IFS= read -r _; printf \'{"ok":true,"stdout":"ran","stderr":""}\\n\''],
+      timeoutMs: 50,
+    });
+    const r = await broker.execute(baseRequest(), { timeoutMs: 0 });
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toBe('ran');
+    await broker.close();
+  });
+
+  test('per-call timeoutMs widens beyond broker default', async () => {
+    // Broker default would fire at 50ms; per-call 5s lets the
+    // worker complete its 100ms work.
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: [
+        '-c',
+        'IFS= read -r _; sleep 0.1; printf \'{"ok":true,"stdout":"wide","stderr":""}\\n\'',
+      ],
+      timeoutMs: 50,
+    });
+    const r = await broker.execute(baseRequest(), { timeoutMs: 5000 });
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toBe('wide');
+    await broker.close();
+  });
+});
+
 // ─── sandbox wrap ──────────────────────────────────────────────────────────
 
 describe('createSpawnBroker — sandbox wrap', () => {

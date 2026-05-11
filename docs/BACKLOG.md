@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 85: §13.7 per-call timeoutMs override — broker outer scales with handler timeout
+
+**Done.** Eighty-fifth slice. Extends `BrokerCallOptions` with `timeoutMs?` so callers can override the broker-construction outer guard per call. bashTool computes a broker-level timeout from `args.timeout_ms + grace + buffer` and passes it on every call, ensuring the broker outer is always at least as wide as the handler inner — no more silent kills when an operator legitimately sets `timeout_ms: 5min` while the broker default is 30s.
+
+Pre-slice the broker timeout was fixed at broker construction. Long-running bash invocations (big test runs, builds with `timeout_ms: 300_000`) would hit the broker's outer kill before the handler's own SIGTERM had a chance, producing `timeout after Nms` from the broker layer where the operator expected `bash.timeout` from the handler — confusing diagnosis. Slice 85 lets the bash tool size the broker outer relative to the operator's request.
+
+### Why this matters
+
+Two timeout layers coexist:
+- **Handler-level** (`args.timeout_ms`, default 30s): the bash subprocess's per-command kill, fires SIGTERM → SIGKILL with `BASH_TIMEOUT_GRACE_MS` (2s) grace. This is the precise per-command guard.
+- **Broker-level** (`timeoutMs` at construction): kills the WORKER process if the handler itself hangs (logic bug, OOM, runtime wedge). This is the safety net.
+
+If broker-level < handler-level + grace, the broker fires first and the handler never finishes — wrong diagnosis path, wrong error code, wrong audit row. Pre-slice the relationship was operator-tuned at broker construction; slice 85 makes it per-call.
+
+The buffer formula (`handler_timeout + grace + 10s`) is conservative: 10s covers worker startup, JSON parse, sandbox setup, and response emission. Generous enough that the broker outer fires ONLY when the handler logic itself is wedged — which is the actual signal operators want from a broker timeout.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/types.ts` | New optional `timeoutMs?: number` on `BrokerCallOptions`. Documented semantics: `undefined` → broker default; `0` → disable timeout for this call; positive → use as outer-guard ms. Notes that the in-process broker passes it to the exec callback (which may ignore — bash handler has its own per-command timer). |
+| `src/broker/spawn.ts` | `effectiveTimeoutMs = callOptions?.timeoutMs ?? timeoutMs`. Same arming check (`> 0`) so `0` means disabled, `undefined` falls through to default. Error message uses `effectiveTimeoutMs` so the operator sees the actual fire-time, not the construction default. |
+| `src/tools/builtin/bash.ts` | New imports: `BASH_DEFAULT_TIMEOUT_MS`, `BASH_TIMEOUT_GRACE_MS`. New `BROKER_OUTER_BUFFER_MS = 10_000` constant. Computes `brokerTimeoutMs = handlerTimeoutMs + BASH_TIMEOUT_GRACE_MS + BROKER_OUTER_BUFFER_MS` where `handlerTimeoutMs = args.timeout_ms ?? BASH_DEFAULT_TIMEOUT_MS`. Passes `{signal: ctx.signal, timeoutMs: brokerTimeoutMs}` to `broker.execute`. |
+| `tests/broker/spawn.test.ts` | New `describe` block: per-call timeoutMs override (4 tests). Per-call overrides default; per-call omitted falls back; per-call `0` disables; per-call widens beyond default. Each uses real `/bin/sh` subprocess + asserts both the error message string AND elapsed time bound. |
+| `tests/tools/bash-broker.test.ts` | `capturing()` helper extended with `getCallOptions()` accessor. 3 new tests: passes `ctx.signal` via callOptions; computes brokerTimeoutMs from `args.timeout_ms` (5000 → 17000); uses `BASH_DEFAULT_TIMEOUT_MS` when `args.timeout_ms` absent (default → 42000). Constants (5000 + 2000 + 10000 = 17000; 30000 + 2000 + 10000 = 42000) pinned exact so future buffer-constant tweaks fail the test loud. |
+
+### Decisions
+
+- **Override at the OPTIONS layer, not a per-broker reconfigure.** Adding `broker.setTimeout(...)` or reconstructing the broker per call would force callers to manage broker state. Options-based override is stateless and idiomatic (mirrors how AbortSignal landed in slice 83). The broker construction default stays as the session-wide ceiling.
+- **`0` means disabled, not "fire immediately".** Mirrors the pre-existing arming check (`timeoutMs > 0`). The alternative semantics (fire immediately) would make the value-of-0 case unusable for the "I trust this command" override. Documented explicitly.
+- **bashTool sizes the broker timeout, not the operator.** The operator sets `args.timeout_ms`; the bash tool sees the operator's intent and translates to the equivalent broker outer width. Pushing the buffer math to the operator would expose internal broker mechanics. The tool absorbs the responsibility.
+- **`BROKER_OUTER_BUFFER_MS = 10_000` is a tool-side constant, not shared.** This value is bashTool's judgment about "how much slack does my handler need". Other future tools (`task_async` worker handlers, etc.) may pick different buffers — keeping the constant local to bash.ts avoids over-coupling.
+- **Error message uses `effectiveTimeoutMs`, not the construction default.** Operators reading "timeout after 50ms" expect the actual elapsed; "timeout after 30000ms" would be a lie when the per-call override fired at 50ms. The tests pin this string so a future refactor can't silently regress it.
+- **In-process broker is unchanged.** It passes callOptions through to `exec`; the bash handler ignores callOptions.timeoutMs (uses its own `args.timeout_ms` via the BashInput). The override is meaningful for spawn broker only; in-process is the same-process degenerate case where "outer guard" is structurally undefined.
+- **Test surface uses real subprocesses for spawn broker, mock for bashTool plumbing.** spawn broker tests assert real-time behavior (process killed within elapsed bound); bashTool tests assert capture of the computed value via a scripted broker. Two surfaces, two test postures, both deterministic.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5971 pass / 10 skip / 0 fail** (5981 total across 284 files); +7 tests on top of slice 84's 5964
+- `bun test tests/broker/spawn.test.ts tests/tools/bash-broker.test.ts` — 45 pass
+
+### Next
+
+§13.7 remaining work:
+
+1. **SIGTERM on CLI main → graceful broker.close.** Operator Ctrl-C should drain in-flight calls before exit.
+2. **Operator-facing security-mode flag + bootstrap telemetry wiring.** Flip bootstrap from `createInProcessBroker` to `createSpawnBroker` against `bun run src/broker/worker.ts`, threading the existing telemetry sink + cwd-relative sandbox runner. Closes spec line 928. Binary-mode (compiled binary) needs separate planning (worker.ts isn't on disk in compiled mode).
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 84: §13.7 worker crash telemetry — operator visibility into post-spawn failures
 
 **Done.** Eighty-fourth slice. Adds the `worker.crashed` telemetry event to the §18 catalog and wires the spawn broker to emit it on the three post-spawn failure paths (no response, invalid response, missing fields). Production wiring threads through the existing scrubbing layer — handler stack traces with absolute paths get `<path>` placeholder before export, same posture as `state.transition.reason` and capability scopes.

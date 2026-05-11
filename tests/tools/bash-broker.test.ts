@@ -19,11 +19,19 @@ const scripted = (response: BrokerResponse | ((req: BrokerRequest) => BrokerResp
   };
 };
 
-const capturing = (): { broker: Broker; getRequest: () => BrokerRequest } => {
-  const state: { request: BrokerRequest | null } = { request: null };
+const capturing = (): {
+  broker: Broker;
+  getRequest: () => BrokerRequest;
+  getCallOptions: () => { signal?: AbortSignal; timeoutMs?: number };
+} => {
+  const state: {
+    request: BrokerRequest | null;
+    callOptions: { signal?: AbortSignal; timeoutMs?: number };
+  } = { request: null, callOptions: {} };
   const broker: Broker = {
-    execute: async (req) => {
+    execute: async (req, opts) => {
       state.request = req;
+      state.callOptions = opts ?? {};
       return { ok: true, stdout: '', stderr: '', exitCode: 0 };
     },
     close: async () => undefined,
@@ -32,7 +40,8 @@ const capturing = (): { broker: Broker; getRequest: () => BrokerRequest } => {
     if (state.request === null) throw new Error('broker.execute was not called');
     return state.request;
   };
-  return { broker, getRequest };
+  const getCallOptions = (): { signal?: AbortSignal; timeoutMs?: number } => state.callOptions;
+  return { broker, getRequest, getCallOptions };
 };
 
 describe('bashTool — broker routing contract', () => {
@@ -78,6 +87,27 @@ describe('bashTool — broker routing contract', () => {
     const { broker, getRequest } = capturing();
     await bashTool.execute({ command: 'echo' }, makeCtx({ broker }));
     expect(getRequest().sandboxProfile).toBeNull();
+  });
+
+  test('passes ctx.signal to broker.execute via callOptions', async () => {
+    const { broker, getCallOptions } = capturing();
+    const ctrl = new AbortController();
+    await bashTool.execute({ command: 'echo' }, makeCtx({ broker, signal: ctrl.signal }));
+    expect(getCallOptions().signal).toBe(ctrl.signal);
+  });
+
+  test('computes brokerTimeoutMs from args.timeout_ms + grace + buffer', async () => {
+    const { broker, getCallOptions } = capturing();
+    // args.timeout_ms = 5000; brokerTimeoutMs = 5000 + 2000 (grace) + 10000 (buffer)
+    await bashTool.execute({ command: 'echo', timeout_ms: 5000 }, makeCtx({ broker }));
+    expect(getCallOptions().timeoutMs).toBe(17_000);
+  });
+
+  test('uses BASH_DEFAULT_TIMEOUT_MS when args.timeout_ms is absent', async () => {
+    const { broker, getCallOptions } = capturing();
+    // default 30000 + 2000 + 10000 = 42000
+    await bashTool.execute({ command: 'echo' }, makeCtx({ broker }));
+    expect(getCallOptions().timeoutMs).toBe(42_000);
   });
 });
 

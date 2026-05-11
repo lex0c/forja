@@ -242,9 +242,15 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       };
     }
 
+    // Per-call timeoutMs (slice 85) overrides the broker-
+    // construction default when present. `0` is the explicit
+    // "disable for this call" value (the > 0 guard below skips
+    // arming the timer). `undefined` falls back to the broker
+    // default (also possibly undefined → no timer).
+    const effectiveTimeoutMs = callOptions?.timeoutMs ?? timeoutMs;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    if (timeoutMs !== undefined && timeoutMs > 0) {
+    if (effectiveTimeoutMs !== undefined && effectiveTimeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
         try {
@@ -252,7 +258,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
         } catch {
           // ignore
         }
-      }, timeoutMs);
+      }, effectiveTimeoutMs);
     }
 
     // Signal handler — when the caller aborts, send SIGTERM to the
@@ -330,7 +336,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
         ok: false,
         stdout: stdoutText,
         stderr: stderrText,
-        error: `timeout after ${timeoutMs}ms`,
+        error: `timeout after ${effectiveTimeoutMs}ms`,
       };
     }
 
