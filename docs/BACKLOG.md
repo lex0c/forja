@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 78: §13.7 broker primitive — types + in-process implementation
+
+**Done.** Seventy-eighth slice. Opens the §13.7 broker/worker architecture thread per spec line 910-934. Ships the `Broker` contract (`BrokerRequest` / `BrokerResponse` types + `Broker` interface) plus an in-process degenerate implementation that establishes the FIFO serialization + close-lifecycle semantics. Subsequent slices migrate to a separate-process broker for the security upgrade (spec line 928: "CLI main não tem exec privilege").
+
+§13.7 is the engine's biggest remaining architectural thread. Pre-slice, tool execution happened wherever the harness called `Bun.spawn` directly. The broker abstraction centralizes that into one contract — slice 78 ships the abstraction; later slices migrate the call sites + add process separation + sandbox wrap.
+
+### Why this matters
+
+The spec's main concern (line 928-934) is defense-in-depth against prompt injection in the harness: if main is compromised, an attacker shouldn't gain `exec()` directly — they can only ASK the broker. Slice 78 ships the abstraction WITHOUT process separation yet (in-process degenerate), which gets the engine harness integrating against the contract immediately. The multi-process plumbing (slice 79+) adds the actual security upgrade; until then, the abstraction is groundwork.
+
+The FIFO serialization is the load-bearing design property for the in-process impl. JS is single-threaded but `async/await` allows multiple `execute` calls to be in-flight simultaneously (one awaiting tool exec, others queued). Serializing them keeps state-machine + telemetry reasoning simple: an audit row + telemetry event from call N lands before call N+1 observes that state. A future separate-process broker MAY parallelize across workers; callers shouldn't rely on either ordering.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/types.ts` (new, ~90 lines) | `BrokerRequest`: `toolName`, `args`, `capabilities` (formatted strings from the engine), `sandboxProfile` (`'ro'` / `'cwd-rw'` / etc., null = host), optional `approvalId` (audit row seq for forensic correlation). `BrokerResponse`: `ok: boolean`, `stdout: string` (always defined), `stderr: string`, optional `exitCode` (defined when worker ran), optional `error` (broker-side diagnostic when ok=false AND exitCode undefined). `Broker` interface: `execute(request) → Promise<response>` (never throws — failures encoded in response), `close() → Promise<void>` (idempotent). |
+| `src/broker/in-process.ts` (new, ~70 lines) | `CreateInProcessBrokerOptions.exec`: the caller-supplied tool exec function. `createInProcessBroker(options)`: returns a `Broker` that delegates to `options.exec` with FIFO serialization. Single in-flight chain via `inFlight: Promise<void>` — each new call chains onto the tail. Try/catch around `exec` maps unexpected throws to `{ok: false, error: 'exec threw: ...'}` (the supplied exec is expected to return responses, but defensive). `close()` flips a `closed` flag (subsequent execute returns broker-closed error) + awaits the in-flight chain. |
+| `src/broker/index.ts` (new) | Re-exports types + factory. |
+| `tests/broker/in-process.test.ts` (new, 11 tests) | **execute (3):** delegates to exec + returns response; forwards request verbatim; non-ok responses pass through. **error handling (3):** exec throwing → `ok:false` with `error: 'exec threw: ...'`; non-Error throws get `String()`-ified; next call after thrown exec still works (recovery). **FIFO serialization (2):** concurrent calls run one-at-a-time (max in-flight = 1 across 5 parallel awaits); throwing exec does NOT block subsequent queued calls. **close (3):** awaits in-flight before resolving; subsequent execute returns broker-closed error; idempotent (three closes don't throw). |
+
+### Decisions
+
+- **Ship the CONTRACT first, defer the security upgrade to later slices.** Process separation is substantial IPC + worker-script plumbing — would balloon a single slice past reviewable size. Shipping types + in-process degenerate impl lets the engine harness integrate against the abstraction NOW; future slices replace `createInProcessBroker` with `createSpawnBroker` etc. without touching call sites.
+- **FIFO serialization in the in-process impl, not parallelism.** Single-threaded JS doesn't NEED serialization for memory safety, but tool calls produce ordered side effects (audit row, telemetry event, state transition). Serializing keeps reasoning straightforward — a tool that emits a side effect lands before the next call observes that state. Future separate-process broker MAY parallelize; the contract doesn't promise ordering, so consumers don't depend on it.
+- **`exec` is a caller-supplied function, not built into the broker.** Slice 78 doesn't define WHAT the exec does (sandbox wrap, Bun.spawn, mock, anything). Production wiring (later slice) injects an exec that calls into the existing sandbox-runner. Tests inject scripted impls. The broker is a control layer, not a transport.
+- **Defensive try/catch around exec, even though contract says exec must not throw.** The caller-supplied function might be buggy. Defensive mapping to `{ok: false, error: 'exec threw: ...'}` keeps the response contract intact AND keeps the queue moving (next call proceeds normally).
+- **`stdout` + `stderr` always defined (empty string default), `exitCode` optional.** `exitCode` is undefined when the failure happened BEFORE the worker ran (sandbox refusal, spawn error). The `error` field carries that diagnostic. Operators reading response telemetry can discriminate via `exitCode !== undefined` ("the tool ran but failed") vs `error !== undefined` ("the broker rejected before exec").
+- **`close()` flips a flag + awaits in-flight, doesn't cancel.** Cancelling an in-flight exec would leave the side-effect chain (audit, telemetry) half-applied — worse than waiting a few ms for the call to finish. Production callers SIGTERM the broker explicitly if they need cancellation; `close()` is a graceful drain.
+- **Subsequent `execute` after close returns `{ok: false, error: 'broker closed'}`, not throws.** Same pattern as `BrokerResponse` for all error paths — never throws, always returns. Callers don't need separate exception handlers; one switch on `response.ok` covers every failure mode.
+- **`src/broker/` as a new top-level module.** Parallel to `src/telemetry/` (slice 70), `src/permissions/`, etc. Future broker primitives (spawn-based, IPC-based, worker pool) slot in here.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5840 pass / 10 skip / 0 fail** (5850 total across 277 files); +11 tests on top of slice 77's 5829
+- `bun test tests/broker/in-process.test.ts` — 11 pass
+
+### Next
+
+§13.7 thread roadmap from here. Each slice is independently reviewable and lands a discrete piece of the architecture:
+
+1. **Slice 79: Spawn broker primitive.** `createSpawnBroker({command, args, sandboxRunner?})` — broker that spawns a real subprocess per request via `Bun.spawn`. The subprocess receives the request via stdin (NDJSON line) and writes the response via stdout. Wraps with sandbox-runner (existing slice 47-48) when `sandboxProfile !== null`.
+2. **Slice 80: Worker script.** A small standalone script `src/broker/worker.ts` that's the entry point for the spawned subprocess. Reads request, dispatches to the tool registry, writes response. Slice 80 is the "what runs in the worker process" piece.
+3. **Slice 81: Engine harness integration.** Replace direct `Bun.spawn` call sites in the harness with `broker.execute`. Bootstrap creates the broker; engine returns Decisions; harness asks broker for exec.
+4. **Slice 82: Lifecycle + timeout.** Broker tracks worker timeouts, kills stuck workers, restarts on crash. SIGTERM handler closes broker gracefully.
+
+After slice 82, §13.7 is closed: CLI main has no exec privilege; all tool calls flow through the broker → worker pipeline with sandbox wrap.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 77: telemetry — JSON-lines export adapter (§18 closes)
 
 **Done.** Seventy-seventh slice. Ships the final piece of the §18 telemetry thread: `createJsonLinesTelemetrySink({write})` writes each event as one JSON object per line (NDJSON / JSONL format). Operators pipe the stream to anything that ingests JSON lines — `otelcol-contrib`'s `filelogreceiver`, Loki, Vector, fluentbit, or a hand-rolled tail script. Production chain: bootstrap → scrubbing → jsonlines → operator's pipe.
