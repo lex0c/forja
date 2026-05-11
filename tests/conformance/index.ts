@@ -23,6 +23,7 @@
 // readable diffs.
 
 import { parse as parseYaml } from 'yaml';
+import { type AuditEmitInput, createSqliteSink } from '../../src/permissions/audit.ts';
 import {
   formatCapability,
   intersectCapabilities,
@@ -36,13 +37,47 @@ import {
   createPermissionEngine,
 } from '../../src/permissions/index.ts';
 import { loadPolicyFromString } from '../../src/permissions/index.ts';
+import type { InstallIdentity } from '../../src/permissions/install_id.ts';
 import { resolveCapabilities } from '../../src/permissions/resolvers/index.ts';
 import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
+import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 
 // Pre-baked classifier fixtures keyed by name. YAML cases can pin
 // a behavior without needing to express a function inline. Add new
 // names here when a case needs a shape not already covered.
 export type ClassifierFixtureName = 'noop' | 'neutral' | 'safe' | 'risky' | 'broken' | 'thrower';
+
+// §7.2 hash chain seed event — minimum required fields to populate
+// an `approvals_log` row via the sink's `emit`. The runner fills in
+// defaults for session_id / args / policy_hash / reason_chain so
+// YAML cases stay focused on what they're pinning.
+export interface AuditEventSeed {
+  tool: string;
+  decision: 'allow' | 'deny' | 'confirm';
+  ts?: number;
+}
+
+// §7.2 tamper operations against the seeded chain. Two shapes:
+//   - `update_field` — raw SQL update of one column on one row.
+//     Used to forge prev_hash / this_hash, or to mutate input
+//     fields (decision / tool_name) so the stored this_hash no
+//     longer matches the recomputed payload.
+//   - `insert_forged` — raw SQL insert of an entirely fake row
+//     between existing seqs. Tests that verify catches synthesized
+//     rows that bypass the sink.
+export type AuditTamperOp =
+  | {
+      kind: 'update_field';
+      row: number;
+      field: 'prev_hash' | 'this_hash' | 'decision' | 'tool_name';
+      value: string;
+    }
+  | {
+      kind: 'insert_forged';
+      ts: number;
+      prev_hash: string;
+      this_hash: string;
+    };
 
 export interface ConformanceCase {
   name: string;
@@ -83,6 +118,13 @@ export interface ConformanceCase {
     // Same engine-bypass pattern as intersection cases.
     sandbox_capabilities?: readonly string[];
     host_explicitly_allowed?: boolean;
+    // §7.2 hash chain cases (slice 33). When `audit_events` is
+    // present, the case seeds an in-memory bun:sqlite-backed audit
+    // sink with the listed emits, optionally applies `audit_tamper`
+    // to corrupt a row, then calls `verifyChain`. Engine pipeline
+    // skipped (no policy, no decision).
+    audit_events?: readonly AuditEventSeed[];
+    audit_tamper?: AuditTamperOp;
   };
   // Optional for §10.1 subagent intersection cases (no engine call).
   // Required for every other case shape.
@@ -103,6 +145,14 @@ export interface ConformanceCase {
     sandbox_profile?: 'ro' | 'cwd-rw' | 'cwd-rw-net' | 'home-rw' | 'host';
     sandbox_refuse?: 'no_viable_sandbox';
     sandbox_uncovered?: readonly string[];
+    // §7.2 hash chain cases: `verify_ok` pins whether the chain
+    // verifies; `verify_rows` pins the row count on the ok path;
+    // `verify_broken_at` + `verify_reason` pin the seq and failure
+    // mode on the broken path.
+    verify_ok?: boolean;
+    verify_rows?: number;
+    verify_broken_at?: number;
+    verify_reason?: 'prev_hash_mismatch' | 'this_hash_mismatch';
     kind?: 'allow' | 'deny' | 'confirm';
     source_section?: string;
     source_layer?: string;
@@ -147,11 +197,13 @@ export const loadCasesFromYaml = (content: string): ConformanceCase[] => {
     if (typeof obj.setup !== 'object' || obj.setup === null) {
       throw new Error(`conformance: case '${obj.name}' missing setup`);
     }
-    // Engine-bypass cases (slices 31/32) don't need an `input` block —
-    // their setup carries the primitive's inputs directly.
+    // Engine-bypass cases (slices 31/32/33) don't need an `input`
+    // block — their setup carries the primitive's inputs directly.
     const setupObj = obj.setup as Record<string, unknown>;
     const isEngineBypass =
-      Array.isArray(setupObj.declared_capabilities) || Array.isArray(setupObj.sandbox_capabilities);
+      Array.isArray(setupObj.declared_capabilities) ||
+      Array.isArray(setupObj.sandbox_capabilities) ||
+      Array.isArray(setupObj.audit_events);
     if (!isEngineBypass && (typeof obj.input !== 'object' || obj.input === null)) {
       throw new Error(`conformance: case '${obj.name}' missing input`);
     }
@@ -270,6 +322,111 @@ const runSandboxSelectCase = (c: ConformanceCase): CaseRunResult => {
   return { case: c, decision: null, ok: reasons.length === 0, reasons };
 };
 
+// §7.2 hash chain runner. Spins up an in-memory bun:sqlite DB,
+// migrates the schema, builds a real `createSqliteSink` against a
+// fixed identity, replays `audit_events`, optionally applies one
+// `audit_tamper` op via raw SQL, then calls `verifyChain` and
+// matches the result against the case's `verify_*` expectations.
+//
+// Uses a stable identity (deterministic install_id + ts) so the
+// computed genesis hash is reproducible across runs.
+const HASH_CHAIN_IDENTITY: InstallIdentity = {
+  install_id: '00000000-0000-0000-0000-0000000000aa',
+  created_at_ms: 1731000000000,
+};
+
+const runHashChainCase = (c: ConformanceCase): CaseRunResult => {
+  const reasons: string[] = [];
+  const db = openMemoryDb();
+  migrate(db, MIGRATIONS);
+  const sink = createSqliteSink({ db, identity: HASH_CHAIN_IDENTITY });
+
+  // Seed the chain. Defaults mirror `audit.test.ts` baseInput so
+  // YAML cases stay focused on what they're pinning (tool, decision,
+  // optional ts). The runner fills session_id / args / policy_hash /
+  // reason_chain with deterministic placeholders — the values matter
+  // only because the chain hashes them, not because the test reads
+  // them back.
+  const events = c.setup.audit_events ?? [];
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i] as AuditEventSeed;
+    const input: AuditEmitInput = {
+      session_id: 'sess-1',
+      tool_name: e.tool,
+      args: { command: `seed-${i}` },
+      decision: e.decision,
+      policy_hash: 'sha256:policy-fixture',
+      reason_chain: [{ stage: 'static-rule', layer: 'project', section: 'bash' }],
+      ts: e.ts ?? 1731000001000 + i,
+    };
+    sink.emit(input);
+  }
+
+  // Apply tamper if present. `update_field` overwrites a single
+  // column on an existing row; `insert_forged` synthesizes a row
+  // with the given hashes but no genuine chain link. Both are raw
+  // SQL because the sink's `emit` rebuilds the hash each call —
+  // there's no in-API way to corrupt a row.
+  if (c.setup.audit_tamper !== undefined) {
+    const t = c.setup.audit_tamper;
+    if (t.kind === 'update_field') {
+      db.run(`UPDATE approvals_log SET ${t.field} = ? WHERE seq = ?`, [t.value, t.row]);
+    } else if (t.kind === 'insert_forged') {
+      db.run(
+        `INSERT INTO approvals_log (
+          ts, install_id, session_id, tool_name, args_hash, decision,
+          policy_hash, reason_chain_json, prev_hash, this_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          t.ts,
+          HASH_CHAIN_IDENTITY.install_id,
+          'sess-1',
+          'forged',
+          'forged_args_hash',
+          'allow',
+          'sha256:policy-fixture',
+          '[]',
+          t.prev_hash,
+          t.this_hash,
+        ],
+      );
+    }
+  }
+
+  const result = sink.verifyChain();
+  if (c.expect.verify_ok !== undefined) {
+    if (result.ok !== c.expect.verify_ok) {
+      reasons.push(`verify_ok mismatch: expected ${c.expect.verify_ok}, got ${result.ok}`);
+    }
+  }
+  if (c.expect.verify_rows !== undefined) {
+    if (!result.ok) {
+      reasons.push(`verify_rows expected ${c.expect.verify_rows}, got broken chain`);
+    } else if (result.rows !== c.expect.verify_rows) {
+      reasons.push(`verify_rows mismatch: expected ${c.expect.verify_rows}, got ${result.rows}`);
+    }
+  }
+  if (c.expect.verify_broken_at !== undefined) {
+    if (result.ok) {
+      reasons.push(`verify_broken_at expected ${c.expect.verify_broken_at}, got ok chain`);
+    } else if (result.brokenAt !== c.expect.verify_broken_at) {
+      reasons.push(
+        `verify_broken_at mismatch: expected ${c.expect.verify_broken_at}, got ${result.brokenAt}`,
+      );
+    }
+  }
+  if (c.expect.verify_reason !== undefined) {
+    if (result.ok) {
+      reasons.push(`verify_reason expected ${c.expect.verify_reason}, got ok chain`);
+    } else if (result.reason !== c.expect.verify_reason) {
+      reasons.push(
+        `verify_reason mismatch: expected ${c.expect.verify_reason}, got ${result.reason}`,
+      );
+    }
+  }
+  return { case: c, decision: null, ok: reasons.length === 0, reasons };
+};
+
 // Pre-baked classifier fixtures keyed by name. Each is a sync
 // function with the documented shape per §6.4. New shapes plug in
 // here without touching the YAML loader.
@@ -294,6 +451,11 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
   // a `sandbox_capabilities` set. Same engine-bypass pattern.
   if (c.setup.sandbox_capabilities !== undefined) {
     return runSandboxSelectCase(c);
+  }
+  // Dispatch to the §7.2 hash chain runner when the case carries an
+  // `audit_events` set. Same engine-bypass pattern.
+  if (c.setup.audit_events !== undefined) {
+    return runHashChainCase(c);
   }
   // Engine path: input is required (the YAML loader enforces this
   // when declared_capabilities is absent). Narrow the type so the

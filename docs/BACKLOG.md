@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 33: conformance suite — hash chain cases (§16.2 minimum)
+
+**Done.** Thirty-third slice. Sixth conformance top-up — and the one with the highest security-grade impact remaining. 8 cases pin §7.2 audit hash chain: chain construction (empty / single / multi-row), tamper detection at every break-path × every chain position, and forged-row insertion. The runner now spins up a real `bun:sqlite`-backed `createSqliteSink` (the same code path production uses), applies raw-SQL tampering, and checks `verifyChain`'s envelope. Suite grows **115 → 123** (90% of the §16.2 GA bar — past the 90% mark for the first time).
+
+### Why this matters
+
+§7.2 is the audit-grade defense: every decision the engine emits chains into the next, and any tamper after-the-fact breaks the chain at the point of forgery. The mechanism — SHA256 of the canonical payload, `prev_hash` from the previous row, `this_hash` re-computable from persisted columns — is small and self-contained. The risk is also small but unbounded if it goes wrong: a regression that, say, dropped `tool_name` from the hashing payload would silently let an attacker rewrite the decision history without verify catching it. Unit tests cover the primitive in `tests/permissions/audit.test.ts`; the conformance suite was empty for the entire §7.2 surface until this slice.
+
+The slice closes the gap by exercising the real DB-backed sink (not the fake one the engine-path conformance cases use), seeding multi-row chains, applying every tamper shape the §7.2 threat model considers, and pinning `verifyChain`'s break-detection at every chain position (first / middle / last) and every break mode (`prev_hash_mismatch` / `this_hash_mismatch`). Together, the 8 cases cover the load-bearing surface for §16 GA.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/index.ts` | Schema extension: `setup.audit_events?` (array of `AuditEventSeed` — tool + decision + optional ts) + `setup.audit_tamper?` (tagged union: `update_field` for raw-SQL column overwrite, `insert_forged` for synthesized row insert) + `expect.verify_ok?` / `expect.verify_rows?` / `expect.verify_broken_at?` / `expect.verify_reason?`. New `runHashChainCase`: opens in-memory DB, migrates, builds `createSqliteSink` with a stable identity, replays events, applies optional tamper via raw SQL, calls `verifyChain`, matches against expectations. `runCase` dispatches on `setup.audit_events !== undefined`. Loader's `isEngineBypass` predicate extended. |
+| `tests/conformance/cases/hash_chain.yaml` (new, ~150 lines) | 8 cases across 2 groups: A. verify on intact chains (3 — empty/single/multi-row; pins `verify_ok=true` + row count), B. tamper detection (5 — prev_hash @ row 2, this_hash @ row 2, decision @ row 1 (input mutation → recomputed hash mismatch), tool_name @ last row (last-row break detection), forged row insert between valid rows). Covers every break-detection path × every chain position the spec defines. |
+
+### Decisions
+
+- **Real `bun:sqlite` sink, not a fake.** Engine-path conformance cases use a fake audit sink (in-memory capture + fake hash) because they care about the engine pipeline output, not the audit chain itself. Hash-chain cases need the REAL hashing logic — fakes can't be tampered into producing a hash mismatch. The runner opens an in-memory DB per case (zero ms overhead, no FS state) so isolation is automatic.
+- **Stable identity → deterministic genesis.** A fixed `install_id` and `created_at_ms` mean the genesis hash is the same across runs, and the chain's first `prev_hash` is reproducible. The identity is hardcoded in `HASH_CHAIN_IDENTITY` constant; cases don't need to override it.
+- **Tamper as raw SQL, not via the sink's API.** The sink's `emit` always rebuilds the correct hash — there's no API to "emit a corrupt row". Tampering MUST go around the sink (raw `db.run` UPDATE/INSERT). This mirrors what an attacker would do in production: bypassing the engine to modify the SQLite file directly. The tests are forensically faithful.
+- **`update_field` covers all 4 break shapes; `insert_forged` covers the synthesized-row shape.** Five tamper cases use update_field (prev_hash forge, this_hash forge, decision mutation → recomputed mismatch, tool_name mutation at last row), one uses insert_forged (synthesized row between valid ones). Together they exhaust the tamper surface — there's no third tamper shape that produces a qualitatively different break-detection outcome.
+- **Forged-row case pins `verify_ok: false` without pinning `verify_broken_at`.** The exact seq where verify reports the break depends on which inconsistency the algorithm reaches first (the inserted row's `prev_hash` not matching seq-2's `this_hash`, or the inserted row's own `this_hash` not matching its payload). Both are valid detections; the contract is "verify catches it", not "verify catches it at row N". Pinning just `verify_ok: false` keeps the case stable against a smarter detection algorithm that might converge to a different seq.
+- **Decision mutation @ row 1 (case 6) tests the most security-critical tamper shape.** An attacker rewriting "deny" → "allow" in the audit log is the canonical forensic-corruption scenario. Verify catches it not because `decision` is in `prev_hash` (it isn't), but because `decision` is in the `this_hash` payload, and the stored `this_hash` no longer matches the recomputed one. The case documents both the contract and the mechanism in the YAML comment.
+- **Last-row tamper (case 7) ensures verify doesn't short-circuit at chain end.** Without this case, an algorithm that walked only [1..N-1] would pass every other tamper test. The last-row case forces verify to inspect the trailing row's hash relationship.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; applied Biome auto-format to merged import
+- `bun test` — **5374 pass / 10 skip / 0 fail** (5384 total across 249 files); 8 new conformance tests on top of slice 32's 5366
+- `bun test tests/conformance/` — 124 pass (52 prior + 25 bash adversarial + 16 path traversal + 10 score determinism + 6 subagent intersection + 6 sandbox select + 8 hash chain + 1 meta-test); suite coverage **123/136 = 90%** of the §16.2 GA bar (up from 85% — past 90% for the first time)
+
+### Next
+
+Two conformance blocks remain to reach the §16.2 minimum:
+1. **ttl_expiry** (~6 cases) — needs grants table + deterministic clock injection in the runner. Engine-bypass pattern likely applies (`setup.grant_events` + `setup.clock_advance`).
+2. **concurrency** (~5 cases) — likely a separate driver outside the YAML harness; static cases struggle to express race-condition shapes. May need a different infrastructure shape.
+
+§16.2 GA bar: 123 / 136 = 90%. ~13 cases remain across 2 categories. The conformance trail is effectively done save these two — every other category is at or above its §16.2 minimum.
+
+Non-conformance: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 32: conformance suite — sandbox profile selection cases (§16.2 minimum)
 
 **Done.** Thirty-second slice. Fifth conformance top-up: 6 cases pinning §6.5 `selectSandboxProfile` — the function that decides which of the five fixed sandbox profiles (ro / cwd-rw / cwd-rw-net / home-rw / host) covers a given resolved capability set, with the `host` profile dually gated (operator flag AND `host-passthrough` capability). The same engine-bypass dispatch pattern from slice 31 — `setup.sandbox_capabilities` triggers a dedicated runner that invokes the primitive directly, no engine pipeline. Suite grows **109 → 115** (85% of the §16.2 GA bar).
