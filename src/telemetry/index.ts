@@ -195,17 +195,75 @@ export interface SealingFailureEvent {
   on_failure: TelemetrySealOnFailure;
 }
 
+// §13.7 broker worker crash event — emitted from the spawn
+// broker (slice 84) when a worker subprocess exits without a
+// usable response. Three distinct causes the broker can detect
+// post-spawn:
+//   - `no_response`: worker exited but emitted no parseable line
+//     on stdout. Likely a hard crash (panic, OOM, signal) before
+//     the handler could write its response.
+//   - `invalid_response`: worker emitted a final stdout line but
+//     it failed JSON.parse. Likely a corrupted write or a partial
+//     emission (e.g., kill mid-flush).
+//   - `missing_fields`: worker emitted a parseable JSON object
+//     but the shape didn't match BrokerResponse. Indicates a
+//     buggy handler or a protocol mismatch.
+//
+// Not emitted for: timeout (operator-known), abort (caller-
+// known), spawn failure (pre-exec), sandbox wrap refusal
+// (pre-exec), broker-closed errors (configuration issue),
+// stdin write failed (pre-exec ish), broker-self-bug errors
+// (control-plane invariant violation). Those have their own
+// telemetry paths or are not crash signals.
+//
+// Spec §18 doesn't enumerate this metric — slice 84 adds it
+// because §13.7 ("CLI main não tem exec privilege") shifts the
+// failure surface to the worker, and silent crashes there
+// were invisible. Operator value: `worker_crashed_total{cause}`
+// is a leading indicator for broker-stack regressions
+// (handler bugs, OOM under load, hostile inputs).
+export interface WorkerCrashEvent {
+  kind: 'worker.crashed';
+  ts: number;
+  cause: 'no_response' | 'invalid_response' | 'missing_fields';
+  // Worker exit code. Undefined when the spawn broker never
+  // observed an exit (extremely rare — would mean wait failed
+  // before exited resolved, which produces a different broker
+  // error). When defined, 0 = worker exited cleanly without
+  // writing (a logic bug), non-zero = worker crashed.
+  exitCode?: number;
+  // Captured stderr — scrubbed by the scrubbing layer (path
+  // regex applied). Useful for postmortem: handler crashes
+  // typically dump a stack trace here. Bounded by the spawn
+  // broker's stream cap (currently unlimited inside `new
+  // Response().text()` — a future slice may add capping).
+  stderr: string;
+  // Time from spawn to detection. Discriminates fast-crash
+  // (likely binary issue) from slow-crash (likely handler
+  // logic). Includes the wait for `proc.exited` to resolve;
+  // does NOT include broker-side translation.
+  elapsedMs: number;
+  // Tool name + sandbox profile for correlation with the audit
+  // row that fired this call. Capabilities are deliberately
+  // omitted — they'd be scrubbed anyway, and tool+profile is
+  // the actionable signal for operators.
+  toolName: string;
+  sandboxProfile: string | null;
+}
+
 // Discriminated union of every event kind the engine emits.
 // All five spec-listed metric streams have a corresponding event
-// type as of slice 74. Future event types (audit-derived
-// aggregates like approval_fatigue_proxy) ship as the OTEL
-// adapter slices wire them.
+// type as of slice 74. Slice 84 adds `worker.crashed` for the
+// §13.7 broker-stack failure surface. Future event types
+// (audit-derived aggregates like approval_fatigue_proxy) ship as
+// the OTEL adapter slices wire them.
 export type TelemetryEvent =
   | PermissionDecisionEvent
   | StateTransitionEvent
   | SealingFailureEvent
   | ChainVerifyFailedEvent
-  | ClassifierUnavailableEvent;
+  | ClassifierUnavailableEvent
+  | WorkerCrashEvent;
 
 export interface TelemetrySink {
   // Fire-and-forget. Sinks MUST NOT throw — telemetry is

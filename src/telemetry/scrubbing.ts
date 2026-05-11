@@ -36,6 +36,7 @@ import type {
   StateTransitionEvent,
   TelemetryEvent,
   TelemetrySink,
+  WorkerCrashEvent,
 } from './index.ts';
 
 // Capability-scope kinds whose value-after-colon is a filesystem
@@ -134,6 +135,17 @@ const scrubClassifierUnavailable = (
   return e;
 };
 
+const scrubWorkerCrashed = (
+  e: WorkerCrashEvent,
+  opts: Required<ScrubOptions>,
+): WorkerCrashEvent => {
+  // stderr is free-form text — handler crashes typically include
+  // a stack trace with absolute paths. Same path regex used for
+  // state.transition reasons. Tool name + sandboxProfile + cause
+  // + exitCode + elapsedMs carry no PII.
+  return { ...e, stderr: scrubReason(e.stderr, opts) };
+};
+
 // Top-level dispatcher. New event types added to the union must
 // add a branch here — the exhaustive switch via `kind` makes
 // TS surface the missing case.
@@ -153,6 +165,8 @@ export const scrubEvent = (event: TelemetryEvent, options?: ScrubOptions): Telem
       return scrubChainVerifyFailed(event, opts);
     case 'classifier.unavailable':
       return scrubClassifierUnavailable(event, opts);
+    case 'worker.crashed':
+      return scrubWorkerCrashed(event, opts);
   }
 };
 

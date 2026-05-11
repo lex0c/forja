@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 84: §13.7 worker crash telemetry — operator visibility into post-spawn failures
+
+**Done.** Eighty-fourth slice. Adds the `worker.crashed` telemetry event to the §18 catalog and wires the spawn broker to emit it on the three post-spawn failure paths (no response, invalid response, missing fields). Production wiring threads through the existing scrubbing layer — handler stack traces with absolute paths get `<path>` placeholder before export, same posture as `state.transition.reason` and capability scopes.
+
+Pre-slice the spawn broker surfaced these failures via the BrokerResponse `error` field — operators saw individual calls fail but had no metric stream to track crash rate. With §13.7 shifting the exec privilege into a worker subprocess, silent crashes there were invisible to dashboards. Slice 84 closes that.
+
+### Why this matters
+
+§13.7's threat-model upgrade ("CLI main não tem exec privilege", spec line 928) moves real failure modes into the worker process. The harness sees a graceful `BrokerResponse` regardless of whether the worker exited cleanly, panicked, or returned garbage. Without explicit telemetry, three distinct operational signals collapse into one error string:
+
+- **`no_response`**: worker exited but emitted nothing on stdout → hard crash (panic, OOM, signal) before the handler could write its response.
+- **`invalid_response`**: worker emitted a final line but it failed `JSON.parse` → corrupted write or partial emission (worker killed mid-flush).
+- **`missing_fields`**: parseable JSON but shape didn't match BrokerResponse → buggy handler or protocol mismatch.
+
+Each cause maps to a different operator action: `no_response` spikes mean infrastructure issues (OOM, signal, sandbox refusal); `invalid_response` means bit-corruption or shutdown-during-write; `missing_fields` means a code regression in a handler. Surfacing them as discriminated metric labels (`worker_crashed_total{cause="no_response"}`) gives dashboards + alerts the granularity to route.
+
+The slice ALSO formalizes the non-emission contract. Timeout, abort, spawn failure, sandbox refusal, and broker-self bugs are NOT crashes — they have their own diagnosis paths or are user-known. Dedicated tests pin every non-emission branch so future refactors can't accidentally start counting expected failures as crashes (which would inflate the crash rate + poison alerts).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/index.ts` | New `WorkerCrashEvent` interface: `kind: 'worker.crashed'`, `ts`, `cause: 'no_response' \| 'invalid_response' \| 'missing_fields'`, optional `exitCode`, `stderr` (free-form, scrubbed), `elapsedMs` (spawn → detection), `toolName`, `sandboxProfile`. Capabilities deliberately omitted — they'd be scrubbed and tool+profile is the actionable signal. Added to `TelemetryEvent` union (sixth variant). Documented exhaustively: every emission cause + every NON-emission path. |
+| `src/telemetry/scrubbing.ts` | New `scrubWorkerCrashed` branch in the dispatcher. `stderr` runs through the same `PATH_REGEX` as `state.transition.reason` (replaces absolute path-shaped substrings with `<path>`). Other fields (cause enum, exitCode number, elapsedMs number, toolName, sandboxProfile string|null) carry no PII — pass through. |
+| `src/broker/spawn.ts` | New `CreateSpawnBrokerOptions.telemetry?: TelemetrySink` + `now?: () => number` (test seam for elapsedMs). Module imports `TelemetrySink` + `WorkerCrashEvent` types. `emitCrash` helper: defensive try/catch around `telemetry.emit` (sinks MUST NOT throw per slice 70 contract, but a buggy sink shouldn't crash the broker). The three post-spawn detection branches each emit a `WorkerCrashEvent` BEFORE returning the BrokerResponse error. `spawnStart = now()` captured at spawn entry; `elapsedMs = now() - spawnStart` at detection. NO emit on: timeout (operator-known), abort (caller-known), spawn failure (pre-exec), sandbox wrap refusal (pre-exec), stdin write failed (pre-exec ish), broker self-bug (control-plane). |
+| `tests/broker/worker-crash-telemetry.test.ts` (new, 12 tests) | **Emits on crash (3):** no_response with stderr captured + non-zero exit + all required fields populated; invalid_response with parseable garbage on stdout; missing_fields with valid JSON wrong shape. **Does NOT emit (7):** successful response (broker returns parsed BrokerResponse); timeout via real `/bin/sh -c 'sleep 10'` with 50ms timeout; abort via real subprocess + 30ms abort timer; spawn throwing pre-exec; sandbox runner throwing pre-exec; no telemetry configured (broker doesn't crash); sink itself throwing (defensive try/catch absorbs). **Scrubbing (2):** stderr with absolute path `/home/john/.secret/key.pem` → `<path>` placeholder via end-to-end scrubbing→recording chain; non-path stderr passes through unchanged. |
+
+### Decisions
+
+- **Three causes, not one umbrella.** A flat `worker.crashed` event with no discriminator would collapse the three signals into one metric — operators couldn't distinguish infrastructure crashes from handler bugs. The `cause` discriminator is cheap (one string field) and lets downstream queries select on it. Future causes (e.g., `protocol_mismatch` if a handler emits a structurally-invalid response) extend the union without breaking existing consumers.
+- **Emit BEFORE returning the BrokerResponse error.** If telemetry threw or hung the broker would still return its error — wrong order would make the response wait on the sink. Emission is fire-and-forget per the slice 70 contract; the wrapping try/catch ensures even a misbehaving sink doesn't bleed back into the caller's call site.
+- **Skip emission on timeout + abort + spawn failure + sandbox refusal + stdin write failed + broker bug.** Each has its own diagnosis path: timeout has the explicit `timeout after Nms` error string + the worker-side `bash handler: timed out after Nms`; abort is caller-initiated; spawn failure is pre-exec (no worker existed to crash); sandbox refusal is pre-exec; broker bug is a control-plane invariant violation, not a worker behavior. Counting these as crashes would dilute the metric.
+- **`stderr` captured verbatim then scrubbed by the layer.** Handler crashes typically dump stack traces with absolute paths to `node_modules`, repo source files, or `/tmp` temp paths. Without scrubbing the metric stream would leak filesystem layout to whatever OTEL backend exports to. The scrubbing layer's existing `PATH_REGEX` (used for `state.transition.reason`) handles this — no new redaction primitive needed.
+- **`exitCode` optional even though we always know it post-spawn.** The `proc.exited` await always resolves with a code, but the type signature stays optional for symmetry with the BrokerResponse contract (where `exitCode?` is also optional). A future broker that detects "wait failed" before `exited` resolves would set `exitCode: undefined`; events from that path still validate against the schema.
+- **`elapsedMs` measures spawn → detection, NOT request → detection.** The broker's FIFO queueing time (waiting for prior calls to finish) is not part of the worker's own behavior. Operators correlating `elapsedMs` with system load want spawn-relative time. The `now?` test seam pins this deterministically.
+- **No telemetry on the in-process broker.** The in-process broker IS main; "worker crash" is a category error. Failures there would be JS exceptions or assertion failures — surfaced via the existing engine error paths, not via worker-specific telemetry.
+- **`now?` seam added to `CreateSpawnBrokerOptions`.** Tests assert `elapsedMs > 0` via a synthetic `now` that advances by 50ms per call. Without the seam, the assertion would race with real wall-clock — the mocked spawn returns instantly and `now() - spawnStart` could be 0ms on a fast machine. The seam also gates the `ts` field for any future test that asserts on absolute timestamps.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5964 pass / 10 skip / 0 fail** (5974 total across 284 files); +12 tests on top of slice 83's 5952
+- `bun test tests/broker/worker-crash-telemetry.test.ts` — 12 pass in ~130ms; `bun test tests/telemetry/ tests/broker/` — 149 pass (all telemetry + broker)
+- Scrubbing dispatcher exhaustiveness verified by TS — adding `WorkerCrashEvent` to the `TelemetryEvent` union without a corresponding `scrubWorkerCrashed` branch would have failed `bun run typecheck` at the switch statement.
+
+### Next
+
+§13.7 remaining work:
+
+1. **SIGTERM on CLI main → graceful broker.close.** Operator Ctrl-C should drain in-flight calls before exit. Bootstrap returns broker; main needs to call `broker.close()` on shutdown signal. Slice 84 doesn't wire this — OS kill cascade is still the safety net.
+2. **Per-call timeout override via `BrokerCallOptions.timeoutMs`.** Long-running tools (big builds, integration tests) need per-call latency budget. Today timeout_ms is in `args` and the bash handler reads it; broker-level timeout is broker-construction-time. Future slice plumbs per-call override.
+3. **Operator-facing security-mode flag.** Flip bootstrap from `createInProcessBroker` to `createSpawnBroker` against `bun run src/broker/worker.ts`. Closes the spec-928 loop. Bonus: now that crash telemetry exists, the spawn broker has visibility into the new failure surface from day one.
+4. **Wire telemetry into bootstrap.** Slice 84 ships the emit logic; bootstrap currently constructs the in-process broker (no telemetry). When the security-mode flip lands, bootstrap will pass the telemetry sink to `createSpawnBroker`. Until then the emit logic is dormant in production but fully tested.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 83: §13.7 per-call cancellation — AbortSignal threaded through the broker stack
 
 **Done.** Eighty-third slice. Closes the orphan-subprocess debt from slice 82's `Promise.race` workaround: `Broker.execute` now accepts `options.signal`, propagating an AbortSignal from the caller (bashTool's ctx.signal) all the way down to the bash subprocess. On abort the broker kills the worker, the worker propagates to the handler, the handler kills its bash subprocess, and the response carries `error: 'aborted'`. The mid-exec abort path no longer leaks subprocesses — they die when the caller asks.

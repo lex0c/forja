@@ -46,6 +46,7 @@
 //   - parsed JSON missing fields   → ok:false, error:'response missing required fields', exitCode set
 //   - worker emits valid response  → response returned verbatim (worker is the source of truth)
 
+import type { TelemetrySink, WorkerCrashEvent } from '../telemetry/index.ts';
 import type { Broker, BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 // The subprocess shape the broker depends on. Narrower than
@@ -96,6 +97,18 @@ export interface CreateSpawnBrokerOptions {
   sandboxRunner?: SandboxRunner;
   // Test seam. Defaults to Bun.spawn wrapper.
   spawn?: SpawnFn;
+  // Telemetry sink (slice 84). When set, the broker emits
+  // `worker.crashed` events on the three post-spawn detection
+  // paths (no response, invalid JSON, missing fields). Absent ⇒
+  // crashes are still surfaced via the BrokerResponse `error`
+  // field (operators see the call fail) but no metric stream
+  // captures the rate. Production wiring binds an OTEL-bound
+  // sink via bootstrap; tests pass a recording sink to assert
+  // emission shape.
+  telemetry?: TelemetrySink;
+  // Test seam — current-time fn. Same shape as the engine's
+  // `now`; lets tests pin `elapsedMs` deterministically.
+  now?: () => number;
 }
 
 const REQUIRED_FIELDS_ERROR = 'response missing required fields';
@@ -137,6 +150,21 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
   const timeoutMs = options.timeoutMs;
   const sandboxRunner = options.sandboxRunner;
   const spawn = options.spawn ?? defaultSpawn;
+  const telemetry = options.telemetry;
+  const now = options.now ?? (() => Date.now());
+
+  // Fire-and-forget telemetry emit. Defensive try/catch around the
+  // sink — slice 70's contract says sinks MUST NOT throw, but bugs
+  // happen and a broken sink shouldn't crash the broker (which
+  // would also break harness-level error reporting).
+  const emitCrash = (event: WorkerCrashEvent): void => {
+    if (telemetry === undefined) return;
+    try {
+      telemetry.emit(event);
+    } catch {
+      // Telemetry is observability, not critical path.
+    }
+  };
 
   let inFlight: Promise<void> = Promise.resolve();
   let closed = false;
@@ -156,6 +184,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       };
     }
 
+    const spawnStart = now();
     const innerArgv: readonly string[] = [command, ...baseArgs];
 
     let wrappedArgv: readonly string[] = innerArgv;
@@ -308,8 +337,25 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     // Extract the last non-empty line of stdout as the response.
     // Noisy stdout (debug prints) is allowed before the response
     // line, but the LAST line is the contract.
+    //
+    // Slice 84: the three branches below are the "post-spawn
+    // crash" detection surface. Each emits a `worker.crashed`
+    // telemetry event with its specific cause so operators can
+    // discriminate handler bugs (missing_fields) from corrupt
+    // writes (invalid_response) from hard crashes (no_response).
     const lines = stdoutText.split('\n').filter((l) => l.length > 0);
+    const elapsedMs = now() - spawnStart;
     if (lines.length === 0) {
+      emitCrash({
+        kind: 'worker.crashed',
+        ts: now(),
+        cause: 'no_response',
+        exitCode,
+        stderr: stderrText,
+        elapsedMs,
+        toolName: request.toolName,
+        sandboxProfile: request.sandboxProfile,
+      });
       return {
         ok: false,
         stdout: stdoutText,
@@ -324,6 +370,16 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     try {
       parsed = JSON.parse(lastLine);
     } catch (e) {
+      emitCrash({
+        kind: 'worker.crashed',
+        ts: now(),
+        cause: 'invalid_response',
+        exitCode,
+        stderr: stderrText,
+        elapsedMs,
+        toolName: request.toolName,
+        sandboxProfile: request.sandboxProfile,
+      });
       return {
         ok: false,
         stdout: stdoutText,
@@ -334,6 +390,16 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     }
 
     if (!isBrokerResponse(parsed)) {
+      emitCrash({
+        kind: 'worker.crashed',
+        ts: now(),
+        cause: 'missing_fields',
+        exitCode,
+        stderr: stderrText,
+        elapsedMs,
+        toolName: request.toolName,
+        sandboxProfile: request.sandboxProfile,
+      });
       return {
         ok: false,
         stdout: stdoutText,
