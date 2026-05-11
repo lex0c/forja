@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 35: per-field provenance for `sandbox` (replaces single-Layer shape)
+
+**Done.** Thirty-fifth slice. Natural follow-on to slice 34: now that the sandbox section has `required` / `hostAllowed` / `locked` fields, single-Layer provenance is too coarse. `/perms why sandbox.required` and `/perms why sandbox.locked` should answer with field-level attribution — pre-slice-35 they collapsed to the same Layer, which loses authorship when different layers wrote different fields. This slice replaces `provenance.sandbox: Layer` with `provenance.sandbox: { required?, hostAllowed?, locked? }` and updates the resolver to track each writer independently.
+
+### Why this matters
+
+The slice-23 single-Layer shape made sense when the sandbox section had only two fields and `/perms why sandbox` didn't exist. Slice 34 added `locked` (so three fields) and made it plausible for one layer to write `required` while a different layer added the lock — at which point "who wrote this section?" needs to be answered per-field, not as a single aggregate. The aggregate collapses to "the LAST layer that wrote ANY field", which is misleading: an enterprise admin who pinned `required: true, locked: true` would see provenance flip to 'project' the moment the project layer set `hostAllowed`, even though enterprise still owns the lock + the required field. Forensic introspection has to reflect what actually happened, not just last-writer.
+
+This slice carries the per-field attribution all the way through. Same per-field writers the resolver tracked internally for the merge are now surfaced in `provenance.sandbox`. Aggregate "did anyone write this section?" becomes `provenance.sandbox !== undefined`; field-level "who wrote X" becomes `provenance.sandbox?.X`.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/hierarchy.ts` | New `SandboxProvenance` interface (`{ required?: Layer, hostAllowed?: Layer, locked?: Layer }`). `SectionProvenance.sandbox` changes from `Layer` to `SandboxProvenance`. Resolver replaces single `sandboxWriter: Layer \| null` with three trackers (`sandboxRequiredWriter` / `sandboxHostAllowedWriter` / `sandboxLockedWriter`). Each is updated independently when the matching field is written; lock conflicts do NOT update writers (the lower layer's change was discarded — its provenance MUST NOT shift). The merged-provenance emit builds `SandboxProvenance` from the three trackers; the whole sub-object is omitted when all three are null. |
+| `tests/permissions/hierarchy.test.ts` | 4 existing slice-23/34 tests updated to the new shape (assertions like `.toBe('project')` → `.toEqual({ required: 'project', hostAllowed: 'project' })`). 2 slice-34 tests (lock + override conflict; lock-only freeze) updated to the per-field shape. New describe block "resolvePolicy — sandbox per-field provenance (§6.5, slice 35)" adds 4 tests: three-layers/three-fields/three-writers, single-layer-all-fields, overridden field updates only its own writer (sibling stays), locking layer separates locked-writer from field-value-writers. |
+
+### Decisions
+
+- **Lock conflicts do NOT update the writer.** When a lower layer attempts to override a locked field and the change is discarded, the writer MUST stay at the locking layer. Updating the writer to the conflicting layer would falsely attribute the value to a layer that didn't actually set it. The conflict is captured separately in `lockConflicts[]`; provenance and conflicts are independent surfaces. Test 6 (slice 34's lock-override test, now slice 35-shaped) pins this: `{ required: 'user', locked: 'user' }` — project tried to override required but failed; user remains the writer of both.
+- **Activating the lock attributes ONLY `locked`, not `required` / `hostAllowed`.** A layer that sets `locked: true` with no field values doesn't suddenly own the field values too — those stay at whoever last wrote them (or null if nobody did). Lock-only layer attribution becomes `{ locked: 'user' }`, not `{ required: 'user', hostAllowed: 'user', locked: 'user' }`. Matches the principle "writer reflects who SET the value", not "who's responsible for the section".
+- **Aggregate sub-object is omitted entirely when no field has a writer.** `provenance.sandbox: undefined` (not `{}`) when no layer touched any sandbox field. Mirrors how `provenance.bash: undefined` works for tools.* sections. Test 1 (empty case) verifies via `toBeUndefined()`.
+- **Type-level breaking change but contained.** `provenance.sandbox` is consumed only by `tests/permissions/hierarchy.test.ts` today — `src/cli/explain-permissions.ts` doesn't render sandbox yet. Changing the shape now (before any UI wires up) is much cheaper than after. Future `/perms why sandbox` CLI work consumes the new shape directly.
+- **No `SectionProvenance` field reordering.** The new `SandboxProvenance` interface declaration goes above the existing `SectionProvenance` so types resolve in order. `SectionProvenance.sandbox`'s position stays at the bottom of the interface for visual parity with `policy.sandbox` (also bottom of `Policy`). Minimal diff on the type's overall structure.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5384 pass / 10 skip / 0 fail** (5394 total across 249 files); 4 new hierarchy tests on top of slice 34's 5380
+- `bun test tests/permissions/hierarchy.test.ts` — 36 pass (32 prior + 4 new)
+- All slice-23/34 sandbox tests passed after assertion updates — semantic behavior unchanged, only the shape of `provenance.sandbox` changed.
+
+### Next
+
+Successor slices:
+1. **`/perms why sandbox` CLI wiring** — now that per-field provenance is surfaced, the explain-permissions renderer can consume it and produce the operator-facing "your enterprise locked required" output. Small slice (mostly renderer code).
+2. **ULID-shaped public approval ids** — independent storage tweak. Currently approval ids are seq-based; ULID makes them URL-safe and globally unique.
+3. **Grants table + TTL persistence** — implements §8 properly. Unblocks ttl_expiry conformance (~6 cases). Multi-slice undertaking.
+4. **macOS sandbox-exec** — SBPL profile generation + runtime wrap. Parallel to slices 18-21 on macOS.
+5. **MCP-tool spawn wire-up** — when MCP tools execute child processes.
+
+Remaining conformance: ttl_expiry (blocked on §8 grants table) + concurrency (separate driver). Conformance suite still at 123/136 = 90%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 34: section-level `locked` for `sandbox` (closes slice-23 gap)
 
 **Done.** Thirty-fourth slice. Closes the explicit deferral in slice 23: the `PolicySandbox` interface comment said "section-level lock is intentionally deferred — none of the current operator workflows need it yet". The remaining conformance work blocked on `grants` table infra reminded me this gap is still open and asymmetric with every other section (`PolicyDefaults.locked`, `BashPolicy.locked`, `PathPolicy.locked`, `FetchPolicy.locked` all exist; `PolicySandbox.locked` was the holdout). Operators authoring enterprise-tier policies need the same freeze semantics on `sandbox.required` / `sandbox.host_allowed` they have on every other section — without it, an enterprise-pinned `required: true` could be silently flipped by a lower-layer `required: false` and the sandbox wrap would be bypassed.

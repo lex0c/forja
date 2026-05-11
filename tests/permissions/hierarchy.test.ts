@@ -357,44 +357,46 @@ describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
     expect(result.provenance.sandbox).toBeUndefined();
   });
 
-  test('project-only sandbox surfaces in merged policy + provenance', () => {
+  test('project-only sandbox surfaces in merged policy + provenance (slice 35: per-field)', () => {
     writeYaml(
       projectFile('.agent/permissions.yaml'),
       'sandbox:\n  required: true\n  host_allowed: true\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: null });
     expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true });
-    expect(result.provenance.sandbox).toBe('project');
+    expect(result.provenance.sandbox).toEqual({ required: 'project', hostAllowed: 'project' });
   });
 
-  test('field-by-field last-writer wins across layers', () => {
+  test('field-by-field last-writer wins across layers (slice 35: per-field provenance)', () => {
     // user file sets required only; project file sets host_allowed only.
-    // Merged result has both — project is the LAST writer (provenance).
+    // Per-field provenance attributes each to its actual writer — pre-slice-35
+    // both fields collapsed to a single 'project' writer (the last layer to
+    // touch ANY field), losing the user's authorship of `required`.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
     writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true });
-    expect(result.provenance.sandbox).toBe('project');
+    expect(result.provenance.sandbox).toEqual({ required: 'user', hostAllowed: 'project' });
   });
 
-  test('project explicitly overrides user', () => {
+  test('project explicitly overrides user (slice 35: required writer updates)', () => {
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
     writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox?.required).toBe(false);
-    expect(result.provenance.sandbox).toBe('project');
+    expect(result.provenance.sandbox).toEqual({ required: 'project' });
   });
 
-  test('a layer that omits sandbox does not move the writer trail', () => {
-    // user sets sandbox; project is silent → provenance stays at user.
+  test('a layer that omits sandbox does not move the writer trail (slice 35)', () => {
+    // user sets sandbox; project is silent → required writer stays at user.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
     writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: bypass\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox?.required).toBe(true);
-    expect(result.provenance.sandbox).toBe('user');
+    expect(result.provenance.sandbox).toEqual({ required: 'user' });
   });
 });
 
@@ -408,9 +410,10 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     expect(result.lockConflicts).toEqual([
       { section: 'sandbox', lockedBy: 'user', attemptedBy: 'project' },
     ]);
-    // Provenance stays at the locking layer — the project layer's
-    // change was discarded, so it did NOT write the section.
-    expect(result.provenance.sandbox).toBe('user');
+    // Per-field provenance: `required` written by user (the lock
+    // attempt by project was discarded, so it did NOT update the
+    // writer); `locked` also at user.
+    expect(result.provenance.sandbox).toEqual({ required: 'user', locked: 'user' });
   });
 
   test('user lock + project re-asserts SAME required → silent (no conflict)', () => {
@@ -451,8 +454,11 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     expect(result.lockConflicts).toEqual([
       { section: 'sandbox', lockedBy: 'user', attemptedBy: 'project' },
     ]);
-    // The locking layer counts as the writer for provenance.
-    expect(result.provenance.sandbox).toBe('user');
+    // Per-field provenance: ONLY `locked` writer is set — no layer
+    // ever wrote `required` or `hostAllowed`. Pre-slice-35 the
+    // single-Layer shape collapsed this to 'user', losing the fact
+    // that `required` and `hostAllowed` had no authorship at all.
+    expect(result.provenance.sandbox).toEqual({ locked: 'user' });
   });
 
   test('enterprise lock + user change + project change → both lower layers conflict', () => {
@@ -479,6 +485,71 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: false });
     expect(result.lockConflicts).toEqual([]);
-    expect(result.provenance.sandbox).toBe('project');
+    expect(result.provenance.sandbox).toEqual({ required: 'project' });
+  });
+});
+
+describe('resolvePolicy — sandbox per-field provenance (§6.5, slice 35)', () => {
+  test('three layers, three fields, three writers — each field attributes independently', () => {
+    // Enterprise writes required; user writes host_allowed; project
+    // writes locked. Per-field provenance attributes EACH field to
+    // its own writer.
+    const ent = join(workdir, 'enterprise.yaml');
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(ent, 'sandbox:\n  required: true\n');
+    writeYaml(usr, 'sandbox:\n  host_allowed: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  locked: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true, locked: true });
+    expect(result.provenance.sandbox).toEqual({
+      required: 'enterprise',
+      hostAllowed: 'user',
+      locked: 'project',
+    });
+  });
+
+  test('locking layer that also writes fields attributes ALL three to itself', () => {
+    // Single-layer sandbox: required + host_allowed + locked all
+    // from the same source. Per-field map carries the same Layer
+    // three times — operators see "your enterprise pinned + locked
+    // this section" with full attribution.
+    const ent = join(workdir, 'enterprise.yaml');
+    writeYaml(ent, 'sandbox:\n  required: true\n  host_allowed: false\n  locked: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    expect(result.provenance.sandbox).toEqual({
+      required: 'enterprise',
+      hostAllowed: 'enterprise',
+      locked: 'enterprise',
+    });
+  });
+
+  test('overridden field updates only its own writer, not siblings', () => {
+    // User writes BOTH required AND host_allowed. Project overrides
+    // ONLY required. The `hostAllowed` writer stays at user; only
+    // `required` updates to project.
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n  host_allowed: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.provenance.sandbox).toEqual({
+      required: 'project',
+      hostAllowed: 'user',
+    });
+  });
+
+  test('locking layer activates locked-writer separately from field-value writers', () => {
+    // User writes required=true (no lock). Project sets locked=true
+    // (no field values). `required` writer is user; `locked` writer
+    // is project. The two attributions are independent — pre-slice-35
+    // the single-Layer shape would have collapsed to project.
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  locked: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: true, locked: true });
+    expect(result.provenance.sandbox).toEqual({
+      required: 'user',
+      locked: 'project',
+    });
   });
 });

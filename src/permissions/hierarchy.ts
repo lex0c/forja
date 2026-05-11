@@ -49,6 +49,23 @@ export interface LockConflict {
 // The engine reads provenance for whatever section it consults;
 // an absent entry means "no policy section exists" → engine
 // fell into default-deny, source.layer='default'.
+// Per-field provenance for the §6.5 sandbox section (slice 35).
+// Each field tracks the layer that LAST wrote it; a lock conflict
+// does NOT update the writer (the lower layer's change was discarded).
+// `/perms why sandbox.required` reads `required`; `/perms why
+// sandbox.locked` reads `locked` — operators get field-level
+// attribution instead of a single "last writer of anything" Layer.
+//
+// Aggregate "did anything write this section?" check: any of the
+// three fields being present (use `Object.keys().length > 0` or
+// `provenance.sandbox !== undefined` since the resolver omits the
+// whole sub-object when no field was written).
+export interface SandboxProvenance {
+  required?: Layer;
+  hostAllowed?: Layer;
+  locked?: Layer;
+}
+
 export interface SectionProvenance {
   defaults: Layer | 'default';
   bash?: Layer;
@@ -59,10 +76,9 @@ export interface SectionProvenance {
   grep?: Layer;
   fetch_url?: Layer;
   // PERMISSION_ENGINE.md §6.5 policy-layer sandbox section.
-  // Tracks the last writer of `policy.sandbox` (any field). Absent
-  // when no layer wrote a sandbox block — bootstrap falls back to
-  // hardcoded defaults (`required: false`, `hostAllowed: false`).
-  sandbox?: Layer;
+  // Per-field writer attribution per slice 35 — replaces the slice-23
+  // single-Layer shape. Absent when no layer wrote any sandbox field.
+  sandbox?: SandboxProvenance;
 }
 
 export interface ResolveResult {
@@ -180,12 +196,14 @@ const merge = (
   // layer sets `locked: true`; from that point lower layers can't
   // change `required` or `hostAllowed` (re-affirming the same
   // values is silent; an actual change records a `lockConflict`).
-  // The writer tracker captures the LAST layer that wrote ANY
-  // sandbox field — for provenance + `/perms why sandbox`.
+  // Per-field writers tracked separately per slice 35 — `/perms why
+  // sandbox.required` reads the `required` writer, etc.
   let sandboxRequired: boolean | undefined;
   let sandboxHostAllowed: boolean | undefined;
   let sandboxLockedBy: Layer | null = null;
-  let sandboxWriter: Layer | null = null;
+  let sandboxRequiredWriter: Layer | null = null;
+  let sandboxHostAllowedWriter: Layer | null = null;
+  let sandboxLockedWriter: Layer | null = null;
   const lockConflicts: LockConflict[] = [];
 
   for (const { layer, policy } of layers) {
@@ -252,25 +270,22 @@ const merge = (
         }
         // Locked layers never mutate sandboxRequired / sandboxHostAllowed.
       } else {
-        let wroteSomething = false;
         if (incoming.required !== undefined) {
           sandboxRequired = incoming.required;
-          wroteSomething = true;
+          sandboxRequiredWriter = layer;
         }
         if (incoming.hostAllowed !== undefined) {
           sandboxHostAllowed = incoming.hostAllowed;
-          wroteSomething = true;
+          sandboxHostAllowedWriter = layer;
         }
         if (incoming.locked === true) {
           sandboxLockedBy = layer;
-          // Activating the lock counts as "writing the section" for
-          // provenance — `/perms why sandbox` should attribute the
-          // lock to the layer that set it, even if no field value
-          // changed in the same layer.
-          wroteSomething = true;
-        }
-        if (wroteSomething) {
-          sandboxWriter = layer;
+          // Activating the lock attributes the `locked` field's
+          // provenance to this layer. `required` / `hostAllowed`
+          // writers stay at whoever last set them (or null if no
+          // layer set them, which captures the "lock-only layer
+          // freezes inherited undefined state" case).
+          sandboxLockedWriter = layer;
         }
       }
     }
@@ -313,6 +328,21 @@ const merge = (
   // back to 'default' when no layer wrote mode (so the engine
   // can render "default-deny — strict mode (built-in default)"
   // honestly, distinct from "user policy chose strict mode").
+  //
+  // Sandbox provenance is per-field (slice 35) — `/perms why
+  // sandbox.required` and `.hostAllowed` and `.locked` each read
+  // their own writer. The aggregate sub-object is omitted entirely
+  // when no field was written.
+  const sandboxProvenance: SandboxProvenance | undefined =
+    sandboxRequiredWriter !== null ||
+    sandboxHostAllowedWriter !== null ||
+    sandboxLockedWriter !== null
+      ? {
+          ...(sandboxRequiredWriter !== null ? { required: sandboxRequiredWriter } : {}),
+          ...(sandboxHostAllowedWriter !== null ? { hostAllowed: sandboxHostAllowedWriter } : {}),
+          ...(sandboxLockedWriter !== null ? { locked: sandboxLockedWriter } : {}),
+        }
+      : undefined;
   const provenance: SectionProvenance = {
     defaults: defaultsModeWriter ?? 'default',
     ...(sectionWriter.bash !== undefined ? { bash: sectionWriter.bash } : {}),
@@ -322,7 +352,7 @@ const merge = (
     ...(sectionWriter.glob !== undefined ? { glob: sectionWriter.glob } : {}),
     ...(sectionWriter.grep !== undefined ? { grep: sectionWriter.grep } : {}),
     ...(sectionWriter.fetch_url !== undefined ? { fetch_url: sectionWriter.fetch_url } : {}),
-    ...(sandboxWriter !== null ? { sandbox: sandboxWriter } : {}),
+    ...(sandboxProvenance !== undefined ? { sandbox: sandboxProvenance } : {}),
   };
 
   // §6.5 sandbox section: emit only when at least one field was
