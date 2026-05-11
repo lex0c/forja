@@ -1159,7 +1159,7 @@ export const usage = (): string =>
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
     '  --memory <verb>        Inspect cross-session memory (verb: list [scope] | show <name> [scope])',
-    '  --explain-permissions  Print the resolved permission policy + per-section layer attribution and exit',
+    '  --explain-permissions  Print the resolved permission policy + per-section layer attribution and exit (pair with --json for NDJSON output)',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',

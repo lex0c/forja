@@ -15,6 +15,67 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 38: `agent --explain-permissions --json` NDJSON output
+
+**Done.** Thirty-eighth slice. Closes the explicit follow-up in `explain-permissions.ts`'s file header ("JSON output is a follow-up — same shape pattern as --list-sessions: switch on `json` flag, emit one NDJSON line per layer + a summary line"). Adds `--json` support to `agent --explain-permissions`: stdout becomes NDJSON, one `{"kind":"layer",...}` event per loaded YAML file followed by one `{"kind":"merged",...}` event with the full resolved policy, per-section provenance, and lock conflicts. Stderr stays silent on the happy path — stdout is the pure stream. Closes the introspection trajectory (slices 23 → 34 → 35 → 36 → 37 → 38) with a CI/scriptable surface.
+
+### Why this matters
+
+The explain CLI's plain-text output is great for humans but awkward to consume programmatically. CI pipelines checking "did enterprise lock bash?" would have to grep textual output, and changes to the renderer's wording (cosmetic) would break the grep. JSON output decouples the contract from the rendering — consumers parse the data shape (which is the Policy + SectionProvenance + LockConflict[] types directly), and human renderer can evolve independently.
+
+The slice also resolves a stream-pollution awkwardness in the human mode: lock conflicts go to stderr there (so stdout stays grep-friendly for the policy itself), but JSON consumers want everything on stdout in a single stream. In JSON mode lock conflicts move INTO the merged event — one parse, all data.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/explain-permissions.ts` | New `json?: boolean` field on `ExplainPermissionsOptions`. New private `writeJson(layers, policy, provenance, lockConflicts, out)` emits NDJSON: one `{"kind":"layer","layer":<name>,"path":<file>}` per loaded layer (path omitted when absent — test-only edge case), then one `{"kind":"merged","policy":<Policy>,"provenance":<SectionProvenance>,"lockConflicts":<array>}` summary. `runExplainPermissionsCli` branches on `options.json` BEFORE the human renderer; resolve-failure errors still go to stderr (diagnostic, not data). File header rewritten — used to call this out as follow-up, now documents the shape. `LayerPolicy` + `LockConflict` types imported from the permissions barrel. |
+| `src/cli/run.ts` | Pass `args.json` through to `runExplainPermissionsCli`. One-line addition. |
+| `src/cli/args.ts` | Help text for `--explain-permissions` mentions JSON pairing. |
+| `tests/cli/explain-permissions.test.ts` | 3 new tests: NDJSON output with layer + merged events (happy path with sandbox + bash sections, sandbox provenance check); lock conflicts move into merged event (stderr stays silent); no-policy case emits a merged event only (zero layers + bootstrap shape). |
+
+### Sample output
+
+```
+$ agent --explain-permissions --json
+{"kind":"layer","layer":"enterprise","path":"/etc/agent/permissions.yaml"}
+{"kind":"layer","layer":"project","path":"/r/.agent/permissions.yaml"}
+{"kind":"merged","policy":{"defaults":{"mode":"strict","locked":true},"tools":{"bash":{...}},"sandbox":{"required":true,"locked":true}},"provenance":{"defaults":"enterprise","bash":"project","sandbox":{"required":"enterprise","locked":"enterprise"}},"lockConflicts":[]}
+```
+
+Consumers pipe via `jq`: `agent --explain-permissions --json | jq 'select(.kind == "merged").policy.sandbox'` returns the merged sandbox section directly.
+
+### Decisions
+
+- **`kind` discriminator on every event.** Mirrors the run-mode NDJSON events (`{"kind":"text",...}`, `{"kind":"tool_use",...}`). Consumers `select(.kind == "merged")` to grab the summary without parsing every layer line. Adding new event kinds later (e.g. classifier-status, sandbox-availability) doesn't break existing filters.
+- **One merged event, not per-section streaming.** Could have emitted one event per tools.* section + one per sandbox field + one for defaults. Decided against: the policy is a single coherent object, and consumers usually want the whole shape in one pass (the YAML it came from was a single file). Streaming per-section would make `jq '.policy.tools.bash'` impossible — consumers would have to reassemble. The merged-event approach mirrors how the resolved Policy travels through the engine internally.
+- **Lock conflicts go INTO the merged event, not separate events.** Pre-slice-38 the human renderer routed conflicts to stderr to keep stdout grep-friendly. JSON consumers don't need that split — they parse structured data. Folding conflicts into `merged.lockConflicts` means one parse, all data, stdout-only.
+- **`lockConflicts` is always an array.** Empty `[]` when none, populated when present. Consumers can pipe through `jq '.lockConflicts[]'` without checking field presence. Same `consumers-don't-have-to-branch` principle as `--list-sessions`'s shape.
+- **Layer events emit even when zero layers loaded.** Wait, no — they DON'T. The no-policy case (default-deny chain) emits just the merged event. Verified in test 3. Pre-emitting an empty array would have been an option but the for-loop on zero items produces zero events naturally; explicit `{"kind":"layers_done"}` markers would just be ceremony. Consumers check `.kind === 'merged'` to know the stream ended.
+- **`structuredClone` not needed in writeJson.** The `JSON.stringify` already produces a fresh string per call; nothing to clone defensively. The Policy + SectionProvenance objects passed in are read-only (the resolver doesn't mutate them after returning). Skipped the clone for ~10µs savings on large policies.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5396 pass / 10 skip / 0 fail** (5406 total across 249 files); 3 new tests on top of slice 37's 5393
+- `bun test tests/cli/explain-permissions.test.ts` — 18 pass (15 prior + 3 new)
+- Verified the help text update via `agent --help` rendering (manual inspection in the args.ts test setup).
+
+### Next
+
+The sandbox-introspection / explain-CLI thread is now complete (slices 23/34/35/36/37/38). Successor slices pivot to different areas:
+1. **ULID-shaped public approval ids** — independent storage tweak.
+2. **Grants table + TTL persistence** — implements §8. Unblocks ttl_expiry conformance (~6 cases).
+3. **macOS sandbox-exec** — SBPL profile generation + runtime wrap.
+4. **MCP-tool spawn wire-up** — when MCP tools execute child processes.
+5. **§13 platform provisioning** — `forja doctor`, `forja sandbox setup`, broker/worker. Largest remaining user-facing block from the §23 production-ready criteria.
+6. **§7.3 external sealing** — worm-file, S3 object-lock, RFC3161 TSA. Bloqueador for regulated deployments.
+
+Remaining conformance: ttl_expiry (blocked on §8 grants) + concurrency (separate driver). Suite still at 123/136 = 90%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 37: `/perms` + `/perms why sandbox` in-REPL surfaces (closes slice-36 follow-on)
 
 **Done.** Thirty-seventh slice. Slice 36 wired sandbox rendering into the headless `agent perms` CLI but left two gaps: (1) the in-REPL `/perms` slash command quietly skipped sandbox even when set (same bug slice 36 fixed for the headless surface), and (2) operators had no way to ask "why is sandbox.required=true?" interactively — `/perms why <tool>` was tool-only. This slice closes both gaps: `/perms` now renders sandbox after the tools.* sections, and `/perms why sandbox` is a new sub-command that returns the sandbox state with per-field provenance from the engine.

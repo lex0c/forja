@@ -163,6 +163,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       const { runExplainPermissionsCli } = await import('./explain-permissions.ts');
       return await runExplainPermissionsCli({
         cwd,
+        json: args.json,
         out: (s) => process.stdout.write(s),
         err: errSink,
       });
