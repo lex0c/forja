@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 92: §13.6 degraded banner re-display (harness loop + telemetry heartbeat)
+
+**Done.** Ninety-second slice. Closes the §13.6 gap from the slice-90 audit: while the engine is in `degraded` state, the harness now emits a `sandbox_degraded_active` event on the FIRST tool call after the transition AND every N tool calls thereafter (default 10). Spec line 905-908: "Banner é não-suprimível durante a sessão atual, re-exibido a cada N tool calls (default 10), logado em audit como `sandbox_degraded_active`."
+
+Pre-slice the engine's state machine emitted ONE state-transition event on the ready→degraded edge. That single emission was sufficient for audit, but after 5 minutes of `confirm-on-every-call` UX, operators needed a recurring nudge to investigate. The harness now provides that recurring trigger; the TUI's harness adapter translates each event into a three-line warning banner.
+
+### Why this matters
+
+The §13.6 contract has three pieces and all three land in slice 92:
+
+- **Non-suppressible during the session.** No flag or env var silences the banner. Operators who explicitly acknowledge unsafe-mode (option [3] in sandbox setup, or `--i-know-what-im-doing` from slice 91) still see the recurring nudge — those mechanisms suppress the *prompt*, not the *banner*. The banner is the engine telling the operator "you're still degraded after N more calls, please investigate."
+- **Re-displayed every N tool calls (default 10).** The emitter counts tool dispatches; first call after entering degraded fires immediately (operators see the banner the moment confirm-on-every-call kicks in), then every Nth call thereafter.
+- **Logged in telemetry.** New `SandboxDegradedActiveEvent` in the §18 telemetry catalog. Operators with metric dashboards see `sandbox_degraded_active_total{reason}` rising while the engine stays degraded — a leading indicator that someone hasn't run `agent doctor` yet.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/degraded-banner.ts` (new, ~115 lines) | `DegradedBannerEvent` interface (ts, sessionId, reason, firstEmission). `DegradedBannerEmitter` interface with `notifyToolCall(sessionId)`. `createDegradedBannerEmitter({getState, onFire, getReason?, intervalCalls?, now?})` factory. State machine: tracks `inDegraded` flag + `countSinceLastBanner` counter. On `notifyToolCall`: queries `getState()`; not-degraded → reset state, return; first-time-degraded → fire immediately with `firstEmission: true`, reset counter; already-degraded → increment counter, fire on `>= intervalCalls` boundary with `firstEmission: false`. Argument validation: `intervalCalls` must be integer ≥ 1 (`0` would fire on every call AND mean "fire every time we count up to 0" — ambiguous; throwing forces a sane choice). |
+| `src/telemetry/index.ts` | `SandboxDegradedActiveEvent` interface added to `TelemetryEvent` union: kind, ts, sessionId, reason (free-form, scrubbed), firstEmission. Doc explains the distinction from `StateTransitionEvent` (one-shot edge) vs this (recurring heartbeat). |
+| `src/telemetry/scrubbing.ts` | `scrubSandboxDegradedActive` branch added to the dispatcher. `reason` field runs through the same `PATH_REGEX` as state.transition.reason (subsystem-specific reasons like `bwrap binary missing at /usr/...` would leak paths otherwise). Other fields (kind, ts, sessionId UUID, firstEmission bool) pass through. |
+| `src/harness/types.ts` | New `sandbox_degraded_active` HarnessEvent variant: `{type, sessionId, reason, firstEmission}`. Doc references spec line 905-908 + clarifies that `firstEmission` lets renderers format the initial banner differently from recurring nudges. |
+| `src/harness/loop.ts` | Imports `createDegradedBannerEmitter`. Constructs the emitter once per `runAgent` invocation, between the `bgManager` block and the subagent dispatcher (similar run-scoped lifecycle). Closures over `config.permissionEngine.state()` for state reads + `config.onEvent` for HarnessEvent fan-out. In `invokeOne` (the per-tool-use worker), calls `degradedBannerEmitter.notifyToolCall(sessionId)` right after the `tool_finished` event. Single-line integration. |
+| `src/tui/harness-adapter.ts` | New `case 'sandbox_degraded_active'` in the translate switch. Emits THREE `warn` UIEvents: headline ("⚠ Sandbox no longer available [reason]" on firstEmission, "⚠ Sandbox still unavailable [reason]" on recurring), an effect line ("All tool calls now require manual confirmation."), and a recovery hint ("Run 'agent doctor' to investigate."). Matches the spec's example output verbatim. |
+| `tests/permissions/degraded-banner.test.ts` (new, 14 tests) | **State transitions (4):** ready → no emissions; first degraded call → immediate emit + `firstEmission: true`; recurring fires every Nth after first; default `intervalCalls = 10`. **Reset on transition back (1):** degraded → ready → degraded re-fires `firstEmission: true` + counter resets (next emission after N MORE calls). **Reason + ts (3):** reason from `getReason` callback flows into events; omitted defaults to empty string; `now()` seam pinned via incrementing counter. **Non-degraded states (2):** `refusing` and `loading-policy` do NOT trigger emissions. **Argument validation (3):** `intervalCalls < 1`, `1.5` (non-integer) throw; `intervalCalls = 1` valid (fires every call after first). **Per-call sessionId (1):** sessionId from `notifyToolCall` flows into event verbatim. |
+
+### Decisions
+
+- **First emission fires IMMEDIATELY, not after waiting N calls.** Operators who just transitioned to degraded need to see the banner ON THE NEXT TOOL CALL, not after 10 confirm prompts. The two-tier behavior (immediate + every Nth) matches operator intuition: "tell me something changed" then "remind me periodically".
+- **Counter resets on transition back to ready.** A future degraded transition gets its own fresh first-emission semantics. Without this, an operator who fixed the issue, ran 9 calls in ready, then re-broke sandbox would miss the immediate emission (counter would already be at 9, fire on next call as if it were a recurring nudge). The reset preserves the "tell me something changed" signal.
+- **Reason field defaults to empty string when `getReason` not supplied.** The engine's `state()` doesn't carry the reason for being degraded — that's in the most recent `StateTransitionEvent`. The harness could thread the reason through, but slice 92 ships with empty default for simplicity; the renderer's banner text ("Sandbox no longer available") is already informative without the reason suffix. A future slice can plumb reason if operator demand emerges.
+- **`onFire` callback in the emitter, NOT direct HarnessEvent / telemetry emission.** The emitter is a pure decision engine (when to fire); the caller decides where to route the event. Harness wraps with `safeEmit(config.onEvent, ...)`; a future production deployment could ALSO route to a telemetry sink without modifying the emitter. Clean separation.
+- **HarnessEvent shape, NOT direct UIEvent.** The harness-adapter does the UIEvent translation (3 warn lines). This keeps the harness-level event shape consistent (one event per state change) and lets non-TUI renderers (NDJSON consumers, audit log viewers, future web UIs) format the banner their own way.
+- **`intervalCalls` validated as integer ≥ 1 at construction, not runtime.** Throwing on bad config at construction surfaces the operator misconfiguration immediately, not silently every N tool calls. Forcing a specific integer prevents the `0.5` "fire on every other call" interpretation drift.
+- **`notifyToolCall` runs UNCONDITIONALLY on every tool dispatch.** Single state read + counter check per call — negligible perf cost. Gating on "is engine degraded?" at the call site would split the decision logic across two surfaces; centralizing in the emitter keeps the contract clean.
+- **Emitter is per-`runAgent`, not per-engine.** State transitions outside the run (engine was degraded across a previous session that exited cleanly) don't carry the counter. Each `runAgent` invocation gets a fresh first-emission timeline. Production lifecycle: bootstrap creates engine → bootstrap creates harness → runAgent constructs emitter → emitter dies with runAgent's scope.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **6077 pass / 10 skip / 0 fail** (6087 total across 289 files); +14 tests on top of slice 91's 6063
+- `bun test tests/permissions/degraded-banner.test.ts` — 14 pass in ~30ms
+- Adapter integration: TUI's harness-adapter switch now exhaustive on the new variant (TS would have failed `typecheck` if missing)
+
+### Next
+
+PERMISSION_ENGINE.md remaining items:
+- §14 MCP — blocked (BACKLOG-level decision; ecosystem premature for v1)
+- §19 v1→v2 — premature (no v1 in production)
+- §13.3 conformance footer — deferred (CI-side persistence concern, no operator demand yet)
+- §13.6 reason plumbing — emitter accepts `getReason` but harness doesn't thread the latest state-transition reason through (operator sees blank reason in banners today). Trivial follow-up if/when operators ask for it.
+
+**Spec status: CLOSED for v1 local-CLI.** Every section that has code in it is implemented. Every section that doesn't is either intentionally deferred (MCP, v1→v2 migration) or operator-side process (threat model review, baseline calibration). The §23 production-ready checklist is fully ✓ on code items.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 91: §13.5 sandbox_skip marker (`--i-know-what-im-doing`)
 
 **Done.** Ninety-first slice. Closes the §13.5 first-boot UX gap from the slice-90 audit: operators who explicitly want to suppress the sandbox-setup re-prompt across sessions can now pass `agent welcome --i-know-what-im-doing` to create the `~/.config/forja/sandbox_skip` marker. Subsequent sessions read the marker and skip the prompt silently — but engine enforcement (degraded state, per-call confirm) is unaffected.

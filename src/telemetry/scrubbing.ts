@@ -32,6 +32,7 @@ import type {
   ChainVerifyFailedEvent,
   ClassifierUnavailableEvent,
   PermissionDecisionEvent,
+  SandboxDegradedActiveEvent,
   SealingFailureEvent,
   StateTransitionEvent,
   TelemetryEvent,
@@ -146,6 +147,17 @@ const scrubWorkerCrashed = (
   return { ...e, stderr: scrubReason(e.stderr, opts) };
 };
 
+const scrubSandboxDegradedActive = (
+  e: SandboxDegradedActiveEvent,
+  opts: Required<ScrubOptions>,
+): SandboxDegradedActiveEvent => {
+  // `reason` is free-form text — operator subsystems may quote
+  // paths ("bwrap binary missing at /usr/local/bin/bwrap"). Same
+  // path scrub as state.transition.reason. sessionId is
+  // engine-generated UUID; firstEmission + ts are PII-free.
+  return { ...e, reason: scrubReason(e.reason, opts) };
+};
+
 // Top-level dispatcher. New event types added to the union must
 // add a branch here — the exhaustive switch via `kind` makes
 // TS surface the missing case.
@@ -167,6 +179,8 @@ export const scrubEvent = (event: TelemetryEvent, options?: ScrubOptions): Telem
       return scrubClassifierUnavailable(event, opts);
     case 'worker.crashed':
       return scrubWorkerCrashed(event, opts);
+    case 'sandbox.degraded_active':
+      return scrubSandboxDegradedActive(event, opts);
   }
 };
 

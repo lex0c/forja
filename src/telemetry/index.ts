@@ -256,19 +256,50 @@ export interface WorkerCrashEvent {
   sandboxProfile: string | null;
 }
 
+// §13.6 recurring banner heartbeat (slice 92). Emitted by the
+// `DegradedBannerEmitter` in `src/permissions/degraded-banner.ts`
+// while the engine is in `degraded` state — once on entry, then
+// every N tool calls. Distinct from `StateTransitionEvent` which
+// fires ONCE on the ready→degraded edge; this is the recurring
+// heartbeat that lets operators see "still degraded after X tool
+// calls" via metric dashboards.
+//
+// Operator value: `sandbox_degraded_active_total{reason}` is a
+// proxy for "how long was the engine running unsafe?" — a rising
+// counter while the operator hasn't run `forja doctor` signals
+// they're missing the in-terminal banner.
+export interface SandboxDegradedActiveEvent {
+  kind: 'sandbox.degraded_active';
+  ts: number;
+  // Session this banner is tagged to. Used for correlation in
+  // metric backends with per-session filters.
+  sessionId: string;
+  // Operator-readable reason the engine is degraded. Free-form;
+  // scrubbed by the scrubbing layer (paths may leak from
+  // subsystem-specific reasons like "bwrap binary missing at /usr/...").
+  reason: string;
+  // True only on the FIRST emission after entering degraded.
+  // Lets metrics distinguish "transition happened now" from
+  // "still degraded N tool calls later".
+  firstEmission: boolean;
+}
+
 // Discriminated union of every event kind the engine emits.
 // All five spec-listed metric streams have a corresponding event
 // type as of slice 74. Slice 84 adds `worker.crashed` for the
-// §13.7 broker-stack failure surface. Future event types
-// (audit-derived aggregates like approval_fatigue_proxy) ship as
-// the OTEL adapter slices wire them.
+// §13.7 broker-stack failure surface. Slice 92 adds
+// `sandbox.degraded_active` for the §13.6 recurring banner
+// heartbeat. Future event types (audit-derived aggregates like
+// approval_fatigue_proxy) ship as the OTEL adapter slices wire
+// them.
 export type TelemetryEvent =
   | PermissionDecisionEvent
   | StateTransitionEvent
   | SealingFailureEvent
   | ChainVerifyFailedEvent
   | ClassifierUnavailableEvent
-  | WorkerCrashEvent;
+  | WorkerCrashEvent
+  | SandboxDegradedActiveEvent;
 
 export interface TelemetrySink {
   // Fire-and-forget. Sinks MUST NOT throw — telemetry is

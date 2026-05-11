@@ -25,6 +25,7 @@ import {
   intersectCapabilities,
   parseCapability,
 } from '../permissions/capabilities.ts';
+import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -863,6 +864,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           },
         });
       }
+
+      // §13.6 degraded banner emitter (slice 92). One emitter per
+      // runAgent invocation. State changes outside the run (engine
+      // degraded/restored between sessions) don't carry the counter
+      // across — each run gets a fresh first-emission semantics for
+      // its own degraded-transition timeline. The emitter is cheap
+      // (single state read per tool call); invoking it
+      // unconditionally is simpler than gating on engine state at
+      // the call site.
+      const degradedBannerEmitter = createDegradedBannerEmitter({
+        getState: () => config.permissionEngine.state(),
+        onFire: (event) => {
+          safeEmit(config.onEvent, {
+            type: 'sandbox_degraded_active',
+            sessionId: event.sessionId,
+            reason: event.reason,
+            firstEmission: event.firstEmission,
+          });
+        },
+      });
 
       // Subagent dispatcher + handle store. Wired only when a
       // subagent registry is configured; both `task` (sync) and the
@@ -2444,6 +2465,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
           });
+          // §13.6 degraded banner heartbeat (slice 92). Fires after
+          // every tool call; emitter is cheap + queries engine state
+          // internally. Emits a `sandbox_degraded_active` harness
+          // event on first-entry to degraded + every N calls
+          // thereafter (default 10).
+          degradedBannerEmitter.notifyToolCall(sessionId);
           return { toolResult: inv.toolResult, failed: inv.failed };
         };
 

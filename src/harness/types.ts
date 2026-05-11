@@ -157,6 +157,23 @@ export type HarnessEvent =
       reason: string;
     }
   | {
+      // §13.6 degraded banner (slice 92). Emitted by the harness
+      // loop's `DegradedBannerEmitter` while the engine is in
+      // `degraded` state: once immediately on the FIRST tool call
+      // after the transition, then every N tool calls (default
+      // 10). Renderers display a non-suppressible banner with the
+      // reason + a hint to run `agent doctor`. Spec line 905-908.
+      //
+      // `firstEmission` lets renderers format the initial entry
+      // differently from recurring nudges ("⚠ Sandbox no longer
+      // available" first, then "⚠ Sandbox still unavailable"
+      // subsequently).
+      type: 'sandbox_degraded_active';
+      sessionId: string;
+      reason: string;
+      firstEmission: boolean;
+    }
+  | {
       // Background process started. Fires once per process right
       // after `bash_background` (or any future bg-spawning tool)
       // succeeds in `BgManager.spawn`. The TUI uses this to
