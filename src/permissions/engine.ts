@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import type { TelemetryEvent } from '../telemetry/index.ts';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
 import { canonicalHash } from './canonical.ts';
@@ -88,6 +89,20 @@ export interface EngineOptions {
   // DB; production bootstrap injects `createSqliteSink({ db,
   // identity })`.
   audit?: AuditSink;
+  // §18 telemetry sink (slice 74). When set, the engine emits
+  // typed events for in-line signals that don't fit the audit row
+  // shape — currently `classifier.unavailable` (slice 74). The
+  // audit sink emits `permission.decision` events separately via
+  // its own telemetry hook (slice 70). Production wiring passes
+  // the SAME sink through both paths so a single observer sees
+  // every event type. Structurally-typed `{emit(event)}` to keep
+  // the engine module from importing concrete sink classes.
+  telemetry?: { emit: (event: TelemetryEvent) => void };
+  // Timestamp seam for telemetry events emitted in-line from
+  // `check` (currently `classifier.unavailable`). Production:
+  // `Date.now()`. Tests pin a fixed number for stable event
+  // assertions.
+  now?: () => number;
   // Session ID stamped on every audit row. Default 'session-anon'
   // for tests; production bootstrap passes the active session id
   // from the harness loop.
@@ -1070,6 +1085,8 @@ export const createPermissionEngine = (
   const classifier = options.classifier;
   const classifierHash = options.classifierHash ?? 'none';
   const classifierRequired = options.classifierRequired ?? false;
+  const telemetry = options.telemetry;
+  const telemetryNow = options.now ?? Date.now;
   // §6.6 score threshold. Caller can override for calibration sweeps
   // or per-deployment tuning; default is the v2 baseline (0.4).
   const scoreConfirmThreshold = options.scoreConfirmThreshold ?? DEFAULT_SCORE_CONFIRM_THRESHOLD;
@@ -1312,6 +1329,36 @@ export const createPermissionEngine = (
         // continues with the deterministic score.
         const reason = failed ? failureReason : 'unavailable';
         classifierStage = { stage: 'classifier-unavailable', note: reason };
+        // §18 classifier.unavailable telemetry (slice 74). Fires
+        // regardless of strict mode — the metric counts EVERY
+        // unavailable response across the install; the `strict`
+        // field distinguishes the operational impact. Wrapped in
+        // try/catch — observability cannot break engine.check.
+        // Categorize the failure mode: threw, unavailable
+        // (returned null), or invalid (returned non-conformant
+        // schema). The two non-throwing failures collapse here
+        // under `validated === null`, so we differentiate by
+        // whether rawOutput was non-null (invalid schema) or
+        // null (genuinely unavailable).
+        if (telemetry !== undefined) {
+          try {
+            const eventReason: 'unavailable' | 'threw' | 'invalid' = failed
+              ? 'threw'
+              : rawOutput === null
+                ? 'unavailable'
+                : 'invalid';
+            telemetry.emit({
+              kind: 'classifier.unavailable',
+              ts: telemetryNow(),
+              tool: toolName,
+              classifier_hash: classifierHash,
+              reason: eventReason,
+              strict: classifierRequired,
+            });
+          } catch {
+            // Best-effort.
+          }
+        }
         if (classifierRequired && currentState === 'ready') {
           stateController.transition('degraded', `classifier_${failed ? 'threw' : 'unavailable'}`);
         }

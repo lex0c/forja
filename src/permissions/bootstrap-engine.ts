@@ -462,6 +462,8 @@ export const bootstrapPermissionEngine = async (
     sessionId: input.sessionId,
     stateController: controller,
     ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
+    ...(input.now !== undefined ? { now: input.now } : {}),
   });
 
   if (sandbox !== undefined && !sandbox.available) {

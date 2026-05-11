@@ -98,6 +98,40 @@ export interface StateTransitionEvent {
   reason: string;
 }
 
+// §6.4 classifier-unavailable event — emitted from inside
+// `engine.check` when the classifier returns null, throws, or
+// produces a schema-invalid response. Spec §18 line 1211 lists
+// `classifier_unavailable_total > 5% das decisões` as the
+// calibration-alarm threshold.
+//
+// Fires regardless of `classifierRequired`: lenient mode emits
+// the event AND continues with the deterministic score; strict
+// mode emits the event AND transitions the engine to degraded
+// via the state controller (which produces a paired
+// `state.transition` event). The `strict` field distinguishes
+// the two operationally.
+//
+// `tool` carries the tool that was being checked — operators
+// can isolate per-tool unavailability rates (e.g., the classifier
+// might fail more often on bash than on read_file due to longer
+// context summaries).
+export interface ClassifierUnavailableEvent {
+  kind: 'classifier.unavailable';
+  ts: number;
+  tool: string;
+  classifier_hash: string;
+  // Categorical failure mode. 'unavailable' = classifier returned
+  // null (offline / no response); 'threw' = classifier function
+  // raised an exception (schema or runtime error); 'invalid' =
+  // classifier returned a value that didn't validate against the
+  // expected schema.
+  reason: 'unavailable' | 'threw' | 'invalid';
+  // Whether `classifierRequired` was set. true → engine transitions
+  // to degraded; false → engine continues with the deterministic
+  // score.
+  strict: boolean;
+}
+
 // §7.2 chain integrity failure event — emitted from the
 // bootstrap's chain-verify branch when `sink.verifyChain()`
 // returns ok:false. Fires on BOTH paths: (a) no override →
@@ -162,12 +196,16 @@ export interface SealingFailureEvent {
 }
 
 // Discriminated union of every event kind the engine emits.
-// Future slices extend with classifier.unavailable.
+// All five spec-listed metric streams have a corresponding event
+// type as of slice 74. Future event types (audit-derived
+// aggregates like approval_fatigue_proxy) ship as the OTEL
+// adapter slices wire them.
 export type TelemetryEvent =
   | PermissionDecisionEvent
   | StateTransitionEvent
   | SealingFailureEvent
-  | ChainVerifyFailedEvent;
+  | ChainVerifyFailedEvent
+  | ClassifierUnavailableEvent;
 
 export interface TelemetrySink {
   // Fire-and-forget. Sinks MUST NOT throw — telemetry is

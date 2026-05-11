@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 74: telemetry — `classifier.unavailable` event (§18 metric roster closes)
+
+**Done.** Seventy-fourth slice. Adds the fifth telemetry event type — `classifier.unavailable` — fired from inside `engine.check` when the classifier returns null, throws, or yields an invalid schema. Closes the §18 spec metric roster: all five listed metric streams (`approval_rate`, `score_distribution`, `classifier_unavailable_total`, `chain_verification_failures_total`, `sealing_failures_total`, `state_transitions`, `approval_fatigue_proxy`) now have a corresponding event type.
+
+The event fires regardless of `classifierRequired`; the `strict` field captures the operational impact. Lenient mode emits the event and continues with the deterministic score; strict mode emits the event AND transitions the engine to degraded (which produces a paired `state.transition` event). Spec §18 line 1211 lists `classifier_unavailable_total > 5%` as the calibration-alarm threshold.
+
+### Why this matters
+
+The classifier is the §6.4 hint layer — it sees a sanitized capability summary and adjusts the deterministic score by ±0.2 clamped. When it's offline or misbehaving, the engine degrades (strict mode) or continues with the deterministic score alone (lenient). Without telemetry, operators only learn about classifier instability through the audit row's `reason_chain_json` carrying a `classifier-unavailable` stage — that requires post-hoc parsing and can't drive alarms in real time.
+
+The `reason` discriminator (`unavailable` / `threw` / `invalid`) lets dashboards split failure modes: offline classifiers fail differently than crashing classifiers, which fail differently than version-mismatch classifiers. The `tool` field surfaces per-tool unavailability rates — operators can spot e.g. bash failing more often than read_file because context summaries are longer.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/index.ts` | New `ClassifierUnavailableEvent` interface: `kind: 'classifier.unavailable'`, `ts`, `tool`, `classifier_hash`, `reason: 'unavailable' \| 'threw' \| 'invalid'`, `strict: boolean`. `TelemetryEvent` union extended to 5 event types — closes the spec mandatory roster. |
+| `src/permissions/engine.ts` | New optional `telemetry?: { emit: (event: TelemetryEvent) => void }` and `now?: () => number` fields on `EngineOptions`. Inside the classifier-unavailable branch (which already existed since §6.4), emit the structured event BEFORE the strict-mode degrade transition. Categorize the failure mode by inspecting `failed` (threw) vs `rawOutput === null` (genuinely unavailable) vs otherwise (invalid schema). Wrapped in try/catch — observability cannot break engine.check. |
+| `src/permissions/bootstrap-engine.ts` | Engine construction now forwards `telemetry` and `now` from `BootstrapPermissionEngineInput` into `createPermissionEngine`'s options. The same telemetry sink fans out across 5 emission paths (audit emit, state controller, scheduler onSealFailed, chain-verify branch, engine classifier branch). |
+| `tests/permissions/engine-classifier-telemetry.test.ts` (new, 7 tests) | classifier returning null → reason=unavailable; classifier throwing → reason=threw; classifier returning malformed shape → reason=invalid; strict mode → strict=true + engine degrades; NO telemetry option → engine still degrades (regression guard); classifier responds normally → no event; telemetry.emit throwing does NOT break engine.check (engine still degrades). |
+
+### Decisions
+
+- **Event fires regardless of `classifierRequired`, not only in strict mode.** Spec line 1211 measures `classifier_unavailable_total > 5%` — a count, not a strict-only count. Lenient deployments with persistent classifier failures still warrant operator awareness even though the engine continues. The `strict` field is the operational discriminator.
+- **`reason` enum with three values: `unavailable` / `threw` / `invalid`.** The engine code already collapses all three into the same `classifier-unavailable` reason-chain stage; telemetry preserves the categorical distinction for dashboards. `failed === true` → threw; `rawOutput === null` → unavailable (genuinely no response); otherwise → invalid (response had wrong schema). Pre-slice the three were operationally indistinguishable.
+- **`now?` seam on `EngineOptions`, not just for telemetry.** Same pattern as the state controller's `now` — tests pin a deterministic timestamp. Production: `Date.now()`. Currently only used for telemetry timestamps inside check(); future audit-emit timestamps could plumb through this too. Slice 74 doesn't change the audit ts source (still `Date.now()` inside the sink).
+- **`telemetry` is on EngineOptions, separately from AuditSink's telemetry hook.** The engine emits in-line events (classifier.unavailable) that don't correspond to a single audit row — they fire from inside the pipeline before the row is finalized. AuditSink's telemetry hook (slice 70) emits per-row events. Two distinct emission paths sharing the same sink is the natural shape.
+- **Bootstrap fan-out grows to 5 paths.** A single `telemetry` option on `BootstrapPermissionEngineInput` plumbs into: (a) state controller `onTransition`, (b) audit sink emit, (c) scheduler `onSealFailed`, (d) chain-verify branch, (e) engine classifier branch. All 5 paths share the same try/catch posture — observability never breaks the critical path. Operator configures one sink; all engine telemetry flows through it.
+- **Test fixtures use `read_file` not `bash`.** The bash resolver requires `initBashParser()` to be called in `beforeAll`; using `read_file` keeps the test setup minimal. Same shape as the §10 conformance suite's lighter cases.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5798 pass / 10 skip / 0 fail** (5808 total across 274 files); +7 tests on top of slice 73's 5791
+- `bun test tests/permissions/engine-classifier-telemetry.test.ts` — 7 pass
+
+### Next
+
+§18 telemetry roster complete — 5 of 5 spec-listed events shipped. Remaining follow-ups:
+
+1. **State controller bridge** — populate `engine_state` field on `permission.decision` events. Currently optional / omitted. Plumb a state getter through `CreateSqliteSinkOptions`.
+2. **OTEL adapter** — `src/telemetry/adapters/otel.ts`. Translates `TelemetryEvent[]` → OTLP metrics + spans. Adds `@opentelemetry/api` + `@opentelemetry/sdk-metrics` deps. Behind a feature flag.
+3. **Scrubbing layer** — wraps another sink, redacts likely-PII fields before forwarding. Per spec line 1205 "OTEL export com scrubbing".
+
+After scrubbing the production-ready checklist line 1213 ("Telemetria com scrubbing") will be fully satisfied — currently only the foundation (events + recording sink) ships; the scrubbing component is what makes it "with scrubbing" per spec wording.
+
+Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7 broker/worker (biggest remaining), §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 73: telemetry — `chain.verify_failed` event
 
 **Done.** Seventy-third slice. Adds the fourth telemetry event type — `chain.verify_failed` — fired from the bootstrap's chain-verify branch when `sink.verifyChain()` returns ok:false. Closes the spec line 1212 P0 metric: `chain_verification_failures_total > 0`. Fires on BOTH chain-broken paths: (a) no override → engine refusing, (b) `acceptBrokenChain: true` → audit-loud accepted path. The `accepted` field distinguishes the two for OTEL filtering.
