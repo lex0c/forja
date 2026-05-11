@@ -15,6 +15,48 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 25: auto-derive `parentCapabilities` from policy (§10 automation)
+
+**Done.** Twenty-fifth slice. Closes the §10 automation gap: when a subagent is spawned with `declaredCapabilities` but the caller doesn't pass `parentCapabilities`, the harness now derives the parent set from the live policy snapshot. Until this slice, callers had to construct the parent set by hand (or skip intersection entirely), which made `declared ⊆ parent` impossible to enforce in any code path that didn't already know the policy structure. Now the parent set is a deterministic function of the current `permissionEngine.policy()` — operator-authored allow rules become the upper bound on what any subagent can declare.
+
+### Why this is the natural shape
+
+The §10 invariant says **declared ⊆ parent**. Parent comes from policy. The previous slice (24) leaned on `parentCapabilities` being passed explicitly, but no production caller has that array lying around — the policy IS the source of truth, and any independent caller-built array would either drift from the policy or get repeated in every spawn site. Conservative-by-width: parent delegates per-kind with universal scope, subagent's declared still narrows via intersection. A future slice can narrow further by parsing `allow_paths` into per-scope caps, but for v2 this gives correct subset semantics without requiring path-set introspection at spawn time.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/capabilities.ts` | New `TOOL_CAPABILITY_FOOTPRINTS` — per-policy-section map to `CapabilityKind[]`. `bash` is the full footprint (`exec`, `read-fs`, `write-fs`, `delete-fs`, `net-egress`, `git-write`); `read_file`/`glob`/`grep` are `read-fs` only; `write_file`/`edit_file` are `read-fs` + `write-fs`; `fetch_url` is `net-egress`. New `hasAllowRule(section)` helper covers all three policy shapes: `BashPolicy.allow`, `PathPolicy.allow_paths`, `FetchPolicy.allow_hosts`. New `universalScopeFor(kind)` returns `'arbitrary'` for `exec`, `'**'` for other scoped kinds, `null` for scope-less kinds (`env-mutate`, `agent-mutate`, `host-passthrough`). New `deriveParentCapabilities(policy): Capability[]` walks `policy.tools` sections that have a non-empty allow rule, expands each section to its footprint, and dedupes by kind (first wins). |
+| `src/harness/loop.ts` | `spawnSubagentImpl` now auto-derives parent from `config.permissionEngine.policy()` when `declaredCapabilities` is set but `parentCapabilities` is not. Explicit `parentCapabilities` still wins (override path). Intersection runs as before — `effective` flows down to the child, `excess` is audited as the slice 22 contract requires. |
+| `tests/permissions/capabilities-intersection.test.ts` | 9 new tests under "deriveParentCapabilities — §10 policy-based parent set (slice 25)". Covers: empty tools section; bash w/ allow emits full footprint with `exec:arbitrary` (NOT `exec:**`); bash w/ only confirm/deny emits empty; per-section emission (`read_file` → read-fs only; `write_file`/`edit_file` → read-fs + write-fs; `fetch_url` → net-egress); empty allow array → no delegation; multi-section dedupe (each kind once); end-to-end with intersection (typical declared subagent caps survive). |
+
+### Decisions
+
+- **Conservative by width, narrowing left for a successor slice.** Parent emits per-kind with universal scope (`**` or `arbitrary`). This is the loosest correct upper bound — any subagent declared with narrower scope (e.g. `read-fs:src/x`) is `⊆ parent` by construction. A future slice can narrow parent further by parsing `allow_paths` into per-scope caps (e.g. `read-fs:src/**` from `read_file.allow_paths: ['src/**']`), but it requires path-set introspection that isn't load-bearing yet — no caller is broken by the wider parent today.
+- **`exec` uses `arbitrary`, not `**`.** This was the subtle bug. `capabilityCovers`'s exec branch treats scope as a class name in the `arbitrary > shell|python|node` hierarchy. `**` is not a recognized class — `capabilityCovers(cap('exec:**'), cap('exec:shell'))` returns `false`. So `universalScopeFor('exec')` returns `'arbitrary'` (the umbrella that covers every class), while every other scoped kind uses `'**'`. The footprint test pins this with the exact expected literal `'exec:arbitrary'`.
+- **Empty allow array means no delegation.** Operator-declared "no rules" is meaningful — if `bash.allow: []` they explicitly chose not to allow anything. `hasAllowRule` returns false in that case, the section contributes zero caps to the parent set, and any subagent declaring `exec` will see it as `excess`.
+- **First-write-wins dedupe.** Multi-section policies (`bash` + `write_file` both touching read-fs) emit each kind once. Iteration order is bash → read_file → write_file → edit_file → glob → grep → fetch_url, so bash's footprint claims the slots first. Scope is universal across sections anyway, so first-wins doesn't lose information.
+- **Explicit `parentCapabilities` still wins.** The auto-derivation only fires when the caller passes `declaredCapabilities` but omits `parentCapabilities`. Existing tests that pass both keep their semantics; the override path is preserved for tools that need to spawn under a tighter parent than the policy alone implies (e.g. `/perms try` simulating a narrower delegation).
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5289 pass / 10 skip / 0 fail** (5299 total across 249 files); 9 new tests on top of slice 24's 5280
+
+### Next
+
+Successor slices:
+1. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18–21 on macOS).
+2. MCP-tool spawn wire-up (when MCP tools execute child processes).
+3. Narrow `deriveParentCapabilities` parent scopes by parsing `allow_paths` into per-scope caps (e.g. `read-fs:src/**` from `read_file.allow_paths: ['src/**']`).
+4. Section-level `locked` for `sandbox` (matching `defaults.locked`).
+5. Per-field provenance for `sandbox` (when `/perms why sandbox` ergonomics need it).
+6. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 24: `--accept-broken-chain` visibility + verify banner (§7.2)
 
 **Done.** Twenty-fourth slice. The `--accept-broken-chain` operator override was effectively complete back in slice 8 (parse + bootstrap propagation + bootstrap-engine emit path all in place), but with two gaps left: (1) verify's deny-path help text still labeled the flag as "not implemented in this slice", and (2) once an operator USED it, the resulting `chain-break-accepted` audit row was invisible on subsequent `verify` runs of the intact chain. This slice closes both gaps so the override's forensic trail is operator-readable.

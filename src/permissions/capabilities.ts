@@ -236,6 +236,111 @@ export const intersectCapabilities = (
   return { effective, excess };
 };
 
+// PERMISSION_ENGINE.md §10 parent-capability derivation.
+//
+// Slice 9 introduced the `intersectCapabilities` primitive with
+// caller-supplied parent + declared sets. This module adds the
+// automatic derivation step: given the active policy, what kinds
+// of capabilities can the parent delegate?
+//
+// Design: per-section capability footprint table. When a policy
+// section has ANY allow rule (allow / allow_paths / allow_hosts),
+// the engine treats the section as "this tool family is reachable
+// for some workload", and emits one Capability per footprint kind
+// with scope `**` (universal). The subagent's `declaredCapabilities`
+// still narrows via intersection — universal scope on the parent
+// just means "no kind-level objection", and the subagent's
+// declared `read-fs:src/index.ts` survives intersection as the
+// effective scope.
+//
+// This is intentionally CONSERVATIVE-BY-WIDTH: parent delegates
+// every kind the policy could exercise. A future slice can narrow
+// by parsing allow_paths / allow_hosts into per-scope capabilities
+// (`read-fs:src/**` instead of `read-fs:**`), at the cost of much
+// more wire complexity. For slice 25 the wide-by-default behavior
+// matches what operators expect from §10 ("subagent inherits the
+// parent's effective set") without the parse churn.
+//
+// `bash` is the broadest section — it can read, write, delete,
+// exec, hit the network, and touch git internals. Anything else
+// the resolver eventually exposes (env-mutate, agent-mutate,
+// host-passthrough) is NOT in the bash footprint by default —
+// those kinds carry their own risk surface and need explicit
+// section-level intent that bash's regex-style rules don't express.
+import type { Policy } from './types.ts';
+
+export const TOOL_CAPABILITY_FOOTPRINTS: Record<
+  keyof NonNullable<Policy['tools']>,
+  readonly CapabilityKind[]
+> = {
+  bash: ['exec', 'read-fs', 'write-fs', 'delete-fs', 'net-egress', 'git-write'],
+  read_file: ['read-fs'],
+  write_file: ['read-fs', 'write-fs'],
+  edit_file: ['read-fs', 'write-fs'],
+  glob: ['read-fs'],
+  grep: ['read-fs'],
+  fetch_url: ['net-egress'],
+};
+
+// True when a policy section has any allow-shaped rule. The
+// presence of allow / allow_paths / allow_hosts signals operator
+// intent to enable some workload of that kind; absence (or
+// confirm/deny only) means "no path through this section that the
+// parent uses without prompting" → don't delegate. Conservative.
+const hasAllowRule = (
+  section: NonNullable<Policy['tools']>[keyof NonNullable<Policy['tools']>] | undefined,
+): boolean => {
+  if (section === undefined) return false;
+  // BashPolicy.allow
+  if (Array.isArray((section as { allow?: readonly string[] }).allow)) {
+    return ((section as { allow?: readonly string[] }).allow?.length ?? 0) > 0;
+  }
+  // PathPolicy.allow_paths
+  if (Array.isArray((section as { allow_paths?: readonly string[] }).allow_paths)) {
+    return ((section as { allow_paths?: readonly string[] }).allow_paths?.length ?? 0) > 0;
+  }
+  // FetchPolicy.allow_hosts
+  if (Array.isArray((section as { allow_hosts?: readonly string[] }).allow_hosts)) {
+    return ((section as { allow_hosts?: readonly string[] }).allow_hosts?.length ?? 0) > 0;
+  }
+  return false;
+};
+
+// Universal scope per kind. `exec` is a hierarchy enum (`shell` /
+// `python` / `node` / `arbitrary`); `**` isn't a valid exec class
+// and wouldn't cover `python` under `capabilityCovers`. The umbrella
+// is `arbitrary`. Every other scoped kind uses path/host-shaped
+// scopes that DO honor `**` (per `capabilityCovers` literal-and-
+// glob coverage).
+const universalScopeFor = (kind: CapabilityKind): string | null => {
+  if (KINDS_WITHOUT_SCOPE.has(kind)) return null;
+  if (kind === 'exec') return 'arbitrary';
+  return '**';
+};
+
+// Build the parent capability snapshot at spawn time. Scope is
+// universal per kind (kind-level delegation). Subagent intersection
+// narrows.
+//
+// Dedupes by kind — a policy with both `bash` and `write_file`
+// declaring `write-fs` produces a single `write-fs:**` capability
+// rather than two duplicates that would inflate `excess` rendering
+// when nothing matches.
+export const deriveParentCapabilities = (policy: Policy): Capability[] => {
+  const emitted = new Set<CapabilityKind>();
+  const caps: Capability[] = [];
+  const sections = Object.keys(policy.tools) as (keyof typeof TOOL_CAPABILITY_FOOTPRINTS)[];
+  for (const key of sections) {
+    if (!hasAllowRule(policy.tools[key])) continue;
+    for (const kind of TOOL_CAPABILITY_FOOTPRINTS[key]) {
+      if (emitted.has(kind)) continue;
+      emitted.add(kind);
+      caps.push({ kind, scope: universalScopeFor(kind) });
+    }
+  }
+  return caps;
+};
+
 export const readFs = (scope: string): Capability => ({ kind: 'read-fs', scope });
 export const writeFs = (scope: string): Capability => ({ kind: 'write-fs', scope });
 export const deleteFs = (scope: string): Capability => ({ kind: 'delete-fs', scope });

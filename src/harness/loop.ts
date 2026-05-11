@@ -20,6 +20,7 @@ import {
 } from '../critique/index.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import {
+  deriveParentCapabilities,
   formatCapability,
   intersectCapabilities,
   parseCapability,
@@ -949,25 +950,30 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           }
           // Capability intersection gate (PERMISSION_ENGINE.md §10.1).
-          // When the calling tool supplied BOTH `declaredCapabilities`
-          // (the model's requested set via the `capabilities` task
-          // arg) AND `parentCapabilities` (a snapshot of the parent's
-          // effective set), the spawn factory enforces declared ⊆
-          // parent. Any declared capability not covered by some
-          // parent capability refuses the spawn with the spec's
-          // `subagent_escalation` envelope; the tool surface maps
+          // When the model requested capabilities via `task`'s
+          // `capabilities` arg (→ `args.declaredCapabilities`), the
+          // spawn factory enforces declared ⊆ parent. Any declared
+          // capability not covered by the parent set refuses the
+          // spawn with `subagent_escalation`; the tool layer maps
           // it onto `subagent.escalation`.
           //
-          // Both fields are optional. Legacy callers (omitted
-          // `capabilities` in task args, OR a parent path that
-          // doesn't yet wire `parentCapabilities`) skip this guard —
-          // §10 enforcement is opt-in at the call site for slice 9.
-          // A later slice wires parentCapabilities derivation from
-          // policy automatically, making §10 the default.
-          if (args.declaredCapabilities !== undefined && args.parentCapabilities !== undefined) {
+          // Slice 25 closes the §10 wiring: when the caller didn't
+          // pass an explicit `parentCapabilities`, derive it from
+          // the parent's active policy via
+          // `deriveParentCapabilities`. The intersection now fires
+          // automatically whenever the model declares capabilities,
+          // matching the §10 spec wording ("subagent inherits the
+          // parent's effective set"). Tests still pass an explicit
+          // `parentCapabilities` when they want to pin the parent
+          // set verbatim — caller-supplied takes precedence over
+          // derivation.
+          if (args.declaredCapabilities !== undefined) {
             try {
               const declared = args.declaredCapabilities.map(parseCapability);
-              const parentCaps = args.parentCapabilities.map(parseCapability);
+              const parentCaps =
+                args.parentCapabilities !== undefined
+                  ? args.parentCapabilities.map(parseCapability)
+                  : deriveParentCapabilities(config.permissionEngine.policy());
               const { excess } = intersectCapabilities(parentCaps, declared);
               if (excess.length > 0) {
                 return {
