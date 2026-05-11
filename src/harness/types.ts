@@ -1,3 +1,4 @@
+import type { Broker } from '../broker/index.ts';
 import type {
   ConfirmCritiqueRequest,
   CritiqueAnswer,
@@ -907,6 +908,16 @@ export interface HarnessConfig {
   // this to `modalManager.askCritique`; one-shot mode leaves
   // it unset.
   confirmCritique?: (req: ConfirmCritiqueRequest) => Promise<CritiqueAnswer>;
+  // Broker for exec-tagged tools (PERMISSION_ENGINE.md §13.7). The
+  // bash family routes through `broker.execute(request)` instead of
+  // spawning directly from main. Bootstrap (`src/cli/bootstrap.ts`)
+  // constructs an in-process broker wired to the bash worker
+  // handler; future security-mode flips can swap in a spawn-based
+  // broker without touching the harness or tool code. Optional on
+  // the type so headless / SDK callers without exec needs don't
+  // have to construct one; bash surfaces `bash.spawn_failed` when
+  // absent.
+  broker?: Broker;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

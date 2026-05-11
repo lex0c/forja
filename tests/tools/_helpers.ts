@@ -1,4 +1,6 @@
+import { type Broker, createBashHandler, createInProcessBroker } from '../../src/broker/index.ts';
 import type { Decision, PermissionsView } from '../../src/permissions/index.ts';
+import { scrubEnv } from '../../src/sanitize/index.ts';
 import type { ToolContext } from '../../src/tools/types.ts';
 
 const defaultView = (): PermissionsView => ({ mode: 'strict' });
@@ -12,6 +14,21 @@ const defaultView = (): PermissionsView => ({ mode: 'strict' });
 // while making any future `permissionCheck`-using code path break
 // loudly when the helper isn't updated.
 const allowAll = (): Decision => ({ kind: 'allow', reason: 'test default allow-all' });
+
+// Default broker for tests — in-process degenerate (slice 78) wired
+// to the bash handler from slice 81. Mirrors the production worker
+// registry (src/broker/worker.ts) so the bash tool's broker-routed
+// path is exercised by every existing test that goes through
+// makeCtx, without those tests needing to know about the broker
+// architecture. Tests that need a different broker (or none) pass
+// `broker: undefined` in overrides — but bash explicitly requires
+// one and surfaces `bash.spawn_failed` if missing.
+const defaultBroker = (): Broker => {
+  const bashHandler = createBashHandler({ scrubEnv });
+  return createInProcessBroker({
+    exec: (request) => bashHandler.execute(request),
+  });
+};
 
 export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   signal: overrides.signal ?? new AbortController().signal,
@@ -51,4 +68,6 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
     : {}),
   ...(overrides.emitWarn !== undefined ? { emitWarn: overrides.emitWarn } : {}),
   ...(overrides.fireHook !== undefined ? { fireHook: overrides.fireHook } : {}),
+  ...(overrides.sandboxProfile !== undefined ? { sandboxProfile: overrides.sandboxProfile } : {}),
+  broker: overrides.broker ?? defaultBroker(),
 });

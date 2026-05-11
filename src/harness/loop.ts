@@ -2386,6 +2386,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // memory_write fires MemoryWrite); chain failure is
           // null-returned so tools fail-open per spec line 1057.
           fireHook: dispatchHooks,
+          // Broker for exec-tagged tools (PERMISSION_ENGINE.md
+          // §13.7). When bootstrap wired one through HarnessConfig,
+          // the bash tool routes through `broker.execute`. Absent
+          // ⇒ bash returns `bash.spawn_failed` (fail-loud).
+          ...(config.broker !== undefined ? { broker: config.broker } : {}),
         });
 
         // Per-tu worker. Emits tool_invoking, dispatches through

@@ -1,6 +1,5 @@
-import { isAbsolute, resolve } from 'node:path';
-import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
-import { scrubEnv } from '../../sanitize/index.ts';
+import { isAbsolute, resolve as resolvePath } from 'node:path';
+import type { BrokerRequest, BrokerResponse } from '../../broker/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface BashInput {
@@ -19,83 +18,42 @@ export interface BashOutput {
   truncated: boolean;
 }
 
-const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_OUTPUT_BYTES = 4 * 1024 * 1024; // 4 MB per CONTRACTS §2.6.3
-const MAX_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-
-// Stream the pipe and stop accumulating once we've kept `cap` bytes.
-// We KEEP draining the reader after the cap is hit — if we abandoned
-// the stream the kernel pipe buffer would fill and the child would
-// block on its next write (effectively a deadlock when paired with
-// `proc.exited`). Memory stays bounded at ~cap because past-cap chunks
-// are read and discarded, never appended to the chunk list.
+// Pre-slice-82, this tool spawned bash directly via Bun.spawn. The
+// PERMISSION_ENGINE.md §13.7 broker work moved the spawn into a
+// worker subprocess (slice 81's createBashHandler). This tool now
+// owns just the harness-facing surface: argument validation,
+// cwd resolution, BrokerRequest construction, abort handling, and
+// translation of BrokerResponse back into BashOutput / ToolError.
 //
-// UTF-8 is decoded with `{ stream: true }` so a multi-byte sequence
-// straddling a chunk boundary doesn't produce a replacement char. The
-// final `decoder.decode()` flushes any trailing incomplete bytes.
-const readCapped = async (
-  stream: ReadableStream<Uint8Array>,
-  cap: number,
-  stopSignal?: AbortSignal,
-): Promise<{ text: string; truncated: boolean }> => {
-  const reader = stream.getReader();
-  // Optional stop hook — when the caller signals "no more reads needed",
-  // cancel the reader so any pending `read()` resolves with done=true.
-  // Used by the bash tool to break out when the spawned process exits
-  // but its orphaned children keep the pipe fd open. Without this,
-  // `bash -c 'sleep 60 &'` (which exits immediately but leaves a
-  // background sleep holding stdout) would block this function for
-  // the full 60 seconds.
-  const onStop = (): void => {
-    reader.cancel().catch(() => {
-      /* already cancelled */
-    });
-  };
-  if (stopSignal !== undefined) {
-    if (stopSignal.aborted) onStop();
-    else stopSignal.addEventListener('abort', onStop, { once: true });
-  }
-  const decoder = new TextDecoder('utf-8');
-  const chunks: string[] = [];
-  let acceptedBytes = 0;
-  let omittedBytes = 0;
-  let truncated = false;
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (truncated) {
-        omittedBytes += value.byteLength;
-        continue;
-      }
-      const remaining = cap - acceptedBytes;
-      if (value.byteLength <= remaining) {
-        chunks.push(decoder.decode(value, { stream: true }));
-        acceptedBytes += value.byteLength;
-      } else {
-        // Last chunk that fits — take the prefix that fits the cap,
-        // flush the decoder, mark truncated. Subsequent reads just
-        // count omitted bytes.
-        if (remaining > 0) {
-          chunks.push(decoder.decode(value.subarray(0, remaining), { stream: true }));
-          acceptedBytes += remaining;
-        }
-        chunks.push(decoder.decode());
-        omittedBytes += value.byteLength - remaining;
-        truncated = true;
-      }
-    }
-    if (!truncated) chunks.push(decoder.decode());
-  } finally {
-    if (stopSignal !== undefined) stopSignal.removeEventListener('abort', onStop);
-    reader.releaseLock();
-  }
-  let text = chunks.join('');
-  if (truncated) {
-    text = `${text}\n[... truncated; ${omittedBytes} bytes omitted]`;
-  }
-  return { text, truncated };
-};
+// The broker is REQUIRED — no inline-spawn fallback. Bootstrap
+// (slice 82) wires a broker for every harness; tests inject a
+// degenerate in-process broker via tests/tools/_helpers.ts. A
+// missing broker surfaces `bash.spawn_failed` so misconfigured
+// harnesses fail loudly rather than silently bypassing isolation.
+//
+// Truncation detection: the broker handler appends
+// `\n[... truncated; N bytes omitted]` to capped streams. This
+// tool inspects the trailing pattern to recover the `truncated`
+// flag on BashOutput. Brittle by design — slice 83 may surface
+// truncation via a dedicated BrokerResponse field if/when other
+// handlers need it.
+//
+// Mid-exec abort: races broker.execute against ctx.signal. On
+// abort, returns `tool.aborted` immediately and lets the in-flight
+// broker call finish in the background (worker-side timeout is the
+// upper bound). Slice 83 will add broker-level cancellation so
+// the worker dies the moment the harness aborts.
+
+// Match BashSpawnFn message prefixes from src/broker/handlers/bash.ts.
+const TIMED_OUT_PREFIX = 'bash handler: timed out after ';
+const SPAWN_FAILED_PREFIX = 'bash handler: failed to spawn bash: ';
+const HANDLER_PREFIX = 'bash handler: ';
+const TRUNCATION_FOOTER_RE = /\n\[\.\.\. truncated; \d+ bytes omitted]$/;
+
+const isInvalidArgError = (msg: string): boolean =>
+  msg.startsWith('bash handler: args.command must be') ||
+  msg.startsWith('bash handler: args.cwd must be') ||
+  msg.startsWith('bash handler: timeout_ms must be');
 
 export const bashTool: Tool<BashInput, BashOutput> = {
   name: 'bash',
@@ -121,26 +79,16 @@ export const bashTool: Tool<BashInput, BashOutput> = {
   },
   metadata: {
     category: 'bash',
-    writes: true, // pessimistic per CONTRACTS §2.6.3
-    // Bash side effects (DB writes, network, process spawns, files
-    // outside cwd) are not reversed by checkpoint restore. See
-    // CHECKPOINTS.md §2.6 for the warning UX this drives.
+    writes: true,
     escapesCwd: true,
-    // Plan mode allows bash ONLY when the model declares the
-    // call read-only via `args.read_only === true`. Without this
-    // gate, plan mode would either block all bash (losing
-    // legitimate inspections like git status / ls / cat / head)
-    // or allow all bash including `echo x > file` (silently
-    // breaking the "plan mode = no writes" promise). Strict
-    // equality to `true` — string "true", truthy values like 1,
-    // and missing field all fail closed. The model commits to
-    // intent; if it lies, policy + sandbox are the next layer
-    // of defense (AGENTIC_CLI §5.1 "bash com efeito").
+    // Plan mode allows bash ONLY when the model declares the call
+    // read-only via `args.read_only === true`. Strict equality —
+    // string "true", truthy values, missing field all fail closed.
     planSafe: (args) => (args as { read_only?: unknown }).read_only === true,
     exec: true,
     idempotent: false,
     display: 'raw',
-    cost: { latency_ms_typical: 100, max_output_bytes: MAX_OUTPUT_BYTES },
+    cost: { latency_ms_typical: 100, max_output_bytes: 4 * 1024 * 1024 },
   },
   async execute(args, ctx): Promise<ToolResult<BashOutput>> {
     if (ctx.signal.aborted) {
@@ -149,10 +97,10 @@ export const bashTool: Tool<BashInput, BashOutput> = {
 
     // Schema declares timeout_ms with minimum: 100 but providers
     // don't enforce schema constraints — model JSON arrives
-    // unvalidated. Without these checks: 'abc' coerces inside
-    // Math.min to NaN and setTimeout fires ~1ms; negative or zero
-    // values kill the command immediately; non-integers land in
-    // setTimeout's fractional-ms behavior. Reject runtime-side.
+    // unvalidated. The broker handler ALSO validates, but we keep
+    // the harness-side check so the error code stays
+    // `tool.invalid_arg` (the broker would surface its own message
+    // which we map below; pre-validating just keeps the path tight).
     if (args.timeout_ms !== undefined) {
       if (
         typeof args.timeout_ms !== 'number' ||
@@ -164,155 +112,112 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       }
     }
 
-    const timeout = Math.min(args.timeout_ms ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
-    const wd =
+    if (ctx.broker === undefined) {
+      return toolError(
+        ERROR_CODES.bashSpawnFailed,
+        'bash tool requires a broker but none was configured',
+      );
+    }
+
+    // Resolve cwd to absolute BEFORE handing off to the broker —
+    // the broker handler resolves relative paths against its own
+    // baseCwd (process.cwd() of the worker), which is NOT the same
+    // as ctx.cwd. Passing an absolute path bypasses that.
+    const resolvedCwd =
       args.cwd === undefined
         ? ctx.cwd
         : isAbsolute(args.cwd)
           ? args.cwd
-          : resolve(ctx.cwd, args.cwd);
+          : resolvePath(ctx.cwd, args.cwd);
+
+    const request: BrokerRequest = {
+      toolName: 'bash',
+      args: { ...args, cwd: resolvedCwd },
+      // Capability strings come from the engine's resolved set. Not
+      // surfaced through ToolContext today; broker handler doesn't
+      // consume them, and the sandbox wrap (slice 79) reads from
+      // sandboxProfile. A future slice will plumb resolved caps
+      // through so audit + telemetry on the worker side can
+      // discriminate scope.
+      capabilities: [],
+      sandboxProfile: ctx.sandboxProfile ?? null,
+    };
+
     const start = Date.now();
+    const brokerPromise = ctx.broker.execute(request);
 
-    // §6.5 sandbox runtime wire-up via the shared helper. Skip cases
-    // (missing profile, host profile, non-linux, missing bwrap) all
-    // fall through to a direct spawn — see `maybeWrapSandboxArgv`
-    // for the four-condition gate.
-    const spawnArgv = maybeWrapSandboxArgv({
-      ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
-      cwd: wd,
-      innerArgv: ['bash', '-c', args.command],
-    });
-
-    let proc: ReturnType<typeof Bun.spawn>;
-    try {
-      proc = Bun.spawn(spawnArgv, {
-        stdout: 'pipe',
-        stderr: 'pipe',
-        cwd: wd,
-        env: scrubEnv(process.env),
-        // Bun's spawn signal typing is narrow; cast at the boundary.
-        // biome-ignore lint/suspicious/noExplicitAny: Bun spawn signal typing
-        ...({ signal: ctx.signal } as any),
-      });
-    } catch (e) {
-      return toolError(
-        ERROR_CODES.bashSpawnFailed,
-        `failed to spawn bash: ${(e as Error).message}`,
-      );
-    }
-
-    // SIGTERM → SIGKILL escalation grace. Same window the bg manager
-    // uses for per-call kill (DEFAULT_KILL_GRACE_MS=5000ms) — keeping
-    // sibling parity per CODER_PLAYBOOK §4. A tighter 2s on the
-    // timeout path because timeouts are already a symptom of "this
-    // ran longer than expected" — no reason to give it 5 more.
-    const ABORT_GRACE_MS = 5000;
-    const TIMEOUT_GRACE_MS = 2000;
-    let timedOut = false;
-    let killEscalationTimer: ReturnType<typeof setTimeout> | undefined;
-    const escalateToSigkill = (graceMs: number): void => {
-      killEscalationTimer = setTimeout(() => {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          /* already exited */
+    // Mid-exec abort: race the broker call against ctx.signal. The
+    // in-flight broker call MAY continue in the background after
+    // the race resolves with 'aborted' — slice 83 will add
+    // broker-side cancellation. The worker-side timeout caps how
+    // long the orphan keeps running.
+    let response: BrokerResponse;
+    {
+      let abortListener: (() => void) | null = null;
+      const abortPromise = new Promise<'aborted'>((resolve) => {
+        if (ctx.signal.aborted) {
+          resolve('aborted');
+          return;
         }
-      }, graceMs);
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      // Both kills can race against the proc exiting on its own; either
-      // throws ESRCH on a dead pid. Wrap both so the timeout path never
-      // leaks an exception out of the timer callback.
-      try {
-        proc.kill('SIGTERM');
-      } catch {
-        /* already exited */
+        abortListener = (): void => resolve('aborted');
+        ctx.signal.addEventListener('abort', abortListener, { once: true });
+      });
+      const raced = await Promise.race([brokerPromise, abortPromise]);
+      if (abortListener !== null) {
+        ctx.signal.removeEventListener('abort', abortListener);
       }
-      escalateToSigkill(TIMEOUT_GRACE_MS);
-    }, timeout);
-
-    // Caller-abort handler. Bun.spawn honors `signal` natively (sends
-    // SIGTERM on abort), but it does NOT escalate to SIGKILL if the
-    // child ignores SIGTERM. A misbehaving process (e.g., one with a
-    // SIGTERM trap that loops) would survive the abort and leave the
-    // OS holding a process slot until natural exit. This listener
-    // mirrors the bg manager's grace cycle so caller-abort gets the
-    // same "polite then forceful" treatment that operator-initiated
-    // kill gets via bash_kill.
-    let abortObserved = false;
-    const onAbort = (): void => {
-      abortObserved = true;
-      escalateToSigkill(ABORT_GRACE_MS);
-    };
-    if (ctx.signal.aborted) {
-      // Pre-flight check fired above already returned, so this
-      // branch is theoretically unreachable — but if a future
-      // refactor moves the pre-flight check, this path keeps the
-      // contract honest.
-      onAbort();
-    } else {
-      ctx.signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    // When the bash subshell dies but spawned a child (e.g.
-    // `bash -c 'sleep 60 &'`), the orphaned child keeps the stdout/
-    // stderr pipe fds open. Reading from those pipes blocks until
-    // the orphan exits naturally — defeating the whole point of
-    // the kill (the tool returns ~60s late on a 100ms abort). Once
-    // the bash process itself is gone, signal the readers to stop
-    // so any pending `read()` resolves with done=true. The child
-    // process is now an OS-level orphan; cleanup of orphans is a
-    // separate concern (M3+ resource caps), but the tool must not
-    // block waiting for them.
-    const readStopAc = new AbortController();
-    void proc.exited.then(() => readStopAc.abort());
-
-    let out: { text: string; truncated: boolean } = { text: '', truncated: false };
-    let err: { text: string; truncated: boolean } = { text: '', truncated: false };
-    let exitCode = -1;
-    try {
-      const [outRes, errRes, code] = await Promise.all([
-        readCapped(proc.stdout as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES, readStopAc.signal),
-        readCapped(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES, readStopAc.signal),
-        proc.exited,
-      ]);
-      out = outRes;
-      err = errRes;
-      exitCode = code;
-    } finally {
-      clearTimeout(timer);
-      if (killEscalationTimer !== undefined) clearTimeout(killEscalationTimer);
-      ctx.signal.removeEventListener('abort', onAbort);
+      if (raced === 'aborted') {
+        return toolError(ERROR_CODES.aborted, 'bash command aborted by caller', {
+          retryable: true,
+          details: {
+            duration_ms: Date.now() - start,
+            command: args.command,
+          },
+        });
+      }
+      response = raced;
     }
 
     const duration_ms = Date.now() - start;
 
-    // Abort takes precedence over timeout: if the caller (harness
-    // wall-clock, user Ctrl+C, parent abort) cancelled the call, the
-    // model should see `tool.aborted`, not a misleading 'timed out'
-    // or a bare exit_code 143 from the SIGTERM kill. Surface the
-    // dedicated terminal so audit / event handling routes correctly.
-    if (abortObserved) {
-      return toolError(ERROR_CODES.aborted, 'bash command aborted by caller', {
-        retryable: true,
-        details: { duration_ms, command: args.command, exit_code: exitCode },
-      });
+    // Map broker-side error messages to the tool's error vocabulary.
+    if (response.error !== undefined) {
+      if (response.error.startsWith(TIMED_OUT_PREFIX)) {
+        const ms = response.error.slice(TIMED_OUT_PREFIX.length);
+        return toolError(ERROR_CODES.bashTimeout, `bash command timed out after ${ms}`, {
+          details: { duration_ms, command: args.command },
+        });
+      }
+      if (response.error.startsWith(SPAWN_FAILED_PREFIX)) {
+        const reason = response.error.slice(SPAWN_FAILED_PREFIX.length);
+        return toolError(ERROR_CODES.bashSpawnFailed, `failed to spawn bash: ${reason}`);
+      }
+      if (isInvalidArgError(response.error)) {
+        const msg = response.error.startsWith(HANDLER_PREFIX)
+          ? response.error.slice(HANDLER_PREFIX.length)
+          : response.error;
+        return toolError(ERROR_CODES.invalidArg, msg);
+      }
+      // Unknown broker-side failure (broker closed, worker crashed,
+      // sandbox-wrap refused, etc.). Surface as spawn_failed so the
+      // model + audit see a clear "this didn't run" path.
+      return toolError(ERROR_CODES.bashSpawnFailed, `bash broker call failed: ${response.error}`);
     }
 
-    if (timedOut) {
-      return toolError(ERROR_CODES.bashTimeout, `bash command timed out after ${timeout}ms`, {
-        details: { duration_ms, command: args.command },
-      });
+    if (response.exitCode === undefined) {
+      return toolError(ERROR_CODES.bashSpawnFailed, 'bash broker returned no exit code');
     }
+
+    const stdoutTruncated = TRUNCATION_FOOTER_RE.test(response.stdout);
+    const stderrTruncated = TRUNCATION_FOOTER_RE.test(response.stderr);
 
     return {
-      stdout: out.text,
-      stderr: err.text,
-      exit_code: exitCode,
+      stdout: response.stdout,
+      stderr: response.stderr,
+      exit_code: response.exitCode,
       duration_ms,
       timed_out: false,
-      truncated: out.truncated || err.truncated,
+      truncated: stdoutTruncated || stderrTruncated,
     };
   },
 };

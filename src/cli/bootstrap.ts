@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { createBashHandler, createInProcessBroker } from '../broker/index.ts';
 import { loadCritiqueConfig } from '../critique/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
@@ -22,6 +23,7 @@ import {
 } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
+import { scrubEnv } from '../sanitize/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
@@ -533,6 +535,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // honors the same flag (MEMORY.md §7.2.1) and the harness
   // surfaces it for downstream gates.)
 
+  // §13.7 broker for exec-tagged tools. In-process degenerate
+  // wiring against the bash handler — same shape as the
+  // production worker entry (src/broker/worker.ts), but without
+  // the OS-process separation. Slice 82 ships in-process by
+  // default so the harness behavior is bit-identical to the
+  // pre-§13.7 path; an operator-facing flag (future slice) will
+  // flip to `createSpawnBroker` for the security posture
+  // ("CLI main has no exec privilege", spec line 928).
+  const bashHandler = createBashHandler({ scrubEnv });
+  const broker = createInProcessBroker({
+    exec: (request) => bashHandler.execute(request),
+  });
+
   const config: HarnessConfig = {
     provider,
     toolRegistry,
@@ -540,6 +555,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     db,
     cwd,
     bgLogDir,
+    broker,
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free. Plan mode opts out — there's

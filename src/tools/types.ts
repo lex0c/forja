@@ -1,4 +1,5 @@
 import type { BgManager } from '../bg/index.ts';
+import type { Broker } from '../broker/index.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type {
@@ -317,6 +318,17 @@ export interface ToolContext {
   // headless / one-shot ToolContexts without a wired-through
   // harness leave it unset; tools degrade to "no hook gate".
   fireHook?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
+  // Broker for exec-tagged tools (PERMISSION_ENGINE.md §13.7). Tools
+  // whose execution requires OS-level isolation (currently `bash`)
+  // dispatch through `broker.execute(request)` instead of calling
+  // `Bun.spawn` directly. The broker owns sandbox mounting + worker
+  // lifecycle (slices 78–81). REQUIRED for exec tools — bashTool
+  // returns `bash.spawn_failed` when this is absent. Optional on
+  // the type because read/glob/grep/edit/write don't need it.
+  // Tests inject a degenerate in-process broker via
+  // `tests/tools/_helpers.ts#makeCtx`; bootstrap (slice 82) wires a
+  // production broker for the live REPL.
+  broker?: Broker;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent
