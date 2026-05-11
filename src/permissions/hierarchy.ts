@@ -58,6 +58,11 @@ export interface SectionProvenance {
   glob?: Layer;
   grep?: Layer;
   fetch_url?: Layer;
+  // PERMISSION_ENGINE.md §6.5 policy-layer sandbox section.
+  // Tracks the last writer of `policy.sandbox` (any field). Absent
+  // when no layer wrote a sandbox block — bootstrap falls back to
+  // hardcoded defaults (`required: false`, `hostAllowed: false`).
+  sandbox?: Layer;
 }
 
 export interface ResolveResult {
@@ -171,6 +176,13 @@ const merge = (
   const mergedTools: PolicyToolsSection = {};
   const sectionLockedBy: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
   const sectionWriter: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
+  // §6.5 sandbox section. Field-by-field last-writer wins; no
+  // section-level lock yet (documented in PolicySandbox). The
+  // writer tracker captures the LAST layer that wrote ANY sandbox
+  // field — for provenance + `/perms why sandbox` introspection.
+  let sandboxRequired: boolean | undefined;
+  let sandboxHostAllowed: boolean | undefined;
+  let sandboxWriter: Layer | null = null;
   const lockConflicts: LockConflict[] = [];
 
   for (const { layer, policy } of layers) {
@@ -210,6 +222,26 @@ const merge = (
         // emit). Either way the freeze is enforced from here on.
         defaultsLocked = true;
         defaultsLockedBy = layer;
+      }
+    }
+
+    // §6.5 sandbox section — field-by-field last-writer wins.
+    // A layer that omits a field doesn't override the inherited
+    // value; a layer that sets a field overrides it. No
+    // section-level lock for sandbox in this slice.
+    if (policy.sandbox !== undefined) {
+      const incoming = policy.sandbox;
+      let wroteSomething = false;
+      if (incoming.required !== undefined) {
+        sandboxRequired = incoming.required;
+        wroteSomething = true;
+      }
+      if (incoming.hostAllowed !== undefined) {
+        sandboxHostAllowed = incoming.hostAllowed;
+        wroteSomething = true;
+      }
+      if (wroteSomething) {
+        sandboxWriter = layer;
       }
     }
 
@@ -260,10 +292,26 @@ const merge = (
     ...(sectionWriter.glob !== undefined ? { glob: sectionWriter.glob } : {}),
     ...(sectionWriter.grep !== undefined ? { grep: sectionWriter.grep } : {}),
     ...(sectionWriter.fetch_url !== undefined ? { fetch_url: sectionWriter.fetch_url } : {}),
+    ...(sandboxWriter !== null ? { sandbox: sandboxWriter } : {}),
   };
 
+  // §6.5 sandbox section: emit only when at least one field was
+  // written by some layer. Bootstrap's defaults (`required: false`,
+  // `hostAllowed: false`) handle the absent case.
+  const mergedSandbox: Policy['sandbox'] =
+    sandboxRequired !== undefined || sandboxHostAllowed !== undefined
+      ? {
+          ...(sandboxRequired !== undefined ? { required: sandboxRequired } : {}),
+          ...(sandboxHostAllowed !== undefined ? { hostAllowed: sandboxHostAllowed } : {}),
+        }
+      : undefined;
+
   return {
-    policy: { defaults: mergedDefaults, tools: mergedTools },
+    policy: {
+      defaults: mergedDefaults,
+      tools: mergedTools,
+      ...(mergedSandbox !== undefined ? { sandbox: mergedSandbox } : {}),
+    },
     lockConflicts,
     provenance,
   };

@@ -181,3 +181,53 @@ describe('parsePolicy — protected paths (§11)', () => {
     ).toThrow(/redefines a protected path/);
   });
 });
+
+describe('parsePolicy — sandbox section (§6.5, slice 23)', () => {
+  test('absent sandbox block leaves the field undefined', () => {
+    const p = parsePolicy({});
+    expect(p.sandbox).toBeUndefined();
+  });
+
+  test('parses required + host_allowed and maps to camelCase', () => {
+    const p = parsePolicy({ sandbox: { required: true, host_allowed: true } });
+    expect(p.sandbox).toEqual({ required: true, hostAllowed: true });
+  });
+
+  test('preserves "not present" vs "explicit false" for each field', () => {
+    const p1 = parsePolicy({ sandbox: { required: true } });
+    expect(p1.sandbox).toEqual({ required: true });
+    expect(p1.sandbox?.hostAllowed).toBeUndefined();
+
+    const p2 = parsePolicy({ sandbox: { host_allowed: false } });
+    expect(p2.sandbox).toEqual({ hostAllowed: false });
+    expect(p2.sandbox?.required).toBeUndefined();
+  });
+
+  test('rejects non-boolean required', () => {
+    expect(() => parsePolicy({ sandbox: { required: 'yes' } })).toThrow(
+      'sandbox.required must be boolean',
+    );
+  });
+
+  test('rejects non-boolean host_allowed', () => {
+    expect(() => parsePolicy({ sandbox: { host_allowed: 1 } })).toThrow(
+      'sandbox.host_allowed must be boolean',
+    );
+  });
+
+  test('rejects unknown keys', () => {
+    expect(() => parsePolicy({ sandbox: { typo: true } })).toThrow(
+      "sandbox has unknown key 'typo'",
+    );
+  });
+
+  test('rejects non-mapping sandbox', () => {
+    expect(() => parsePolicy({ sandbox: true })).toThrow('`sandbox` must be a mapping');
+    expect(() => parsePolicy({ sandbox: [] })).toThrow('`sandbox` must be a mapping');
+  });
+
+  test('empty sandbox object leaves the field undefined (no fields written)', () => {
+    const p = parsePolicy({ sandbox: {} });
+    expect(p.sandbox).toBeUndefined();
+  });
+});

@@ -349,3 +349,51 @@ describe('resolvePolicy — section provenance', () => {
     expect(result.provenance.defaults).toBe('user');
   });
 });
+
+describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
+  test('absent sandbox across all layers leaves policy.sandbox undefined', () => {
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: null });
+    expect(result.policy.sandbox).toBeUndefined();
+    expect(result.provenance.sandbox).toBeUndefined();
+  });
+
+  test('project-only sandbox surfaces in merged policy + provenance', () => {
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'sandbox:\n  required: true\n  host_allowed: true\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: null });
+    expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true });
+    expect(result.provenance.sandbox).toBe('project');
+  });
+
+  test('field-by-field last-writer wins across layers', () => {
+    // user file sets required only; project file sets host_allowed only.
+    // Merged result has both — project is the LAST writer (provenance).
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true });
+    expect(result.provenance.sandbox).toBe('project');
+  });
+
+  test('project explicitly overrides user', () => {
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox?.required).toBe(false);
+    expect(result.provenance.sandbox).toBe('project');
+  });
+
+  test('a layer that omits sandbox does not move the writer trail', () => {
+    // user sets sandbox; project is silent → provenance stays at user.
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: bypass\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox?.required).toBe(true);
+    expect(result.provenance.sandbox).toBe('user');
+  });
+});

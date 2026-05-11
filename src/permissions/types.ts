@@ -62,9 +62,36 @@ export interface PolicyDefaults {
   locked?: boolean;
 }
 
+// PERMISSION_ENGINE.md §6.5 policy-layer counterpart to the CLI
+// `--sandbox-host` flag and the bootstrap-hardcoded `required=false`.
+// All fields optional so the hierarchy resolver can distinguish
+// "silent" from "explicit false" (same convention as PolicyDefaults).
+//
+//   - `required`: when true AND `detectSandboxAvailability` returns
+//     unavailable, the bootstrap transitions the engine straight to
+//     `refusing` (vs the lenient `degraded` it picks today by
+//     default). Operators in regulated deployments set this in
+//     enterprise policy to refuse boot under a missing sandbox
+//     toolchain.
+//   - `hostAllowed`: when true, the `host` sandbox profile becomes
+//     selectable without the CLI flag. Pairs with `host-passthrough`
+//     capability in the resolved set — both still required for `host`
+//     to be picked. The CLI flag remains as a session-scoped opt-in;
+//     policy + CLI compose via OR.
+//
+// Section-level lock (mirroring `defaults.locked`) is intentionally
+// deferred to a successor slice — none of the current operator
+// workflows need it yet, and adding it without a real use case would
+// be premature.
+export interface PolicySandbox {
+  required?: boolean;
+  hostAllowed?: boolean;
+}
+
 export interface Policy {
   defaults: PolicyDefaults;
   tools: PolicyToolsSection;
+  sandbox?: PolicySandbox;
 }
 
 // Provenance of the matching rule that produced a Decision.

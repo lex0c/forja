@@ -262,7 +262,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // options so `check()` runs the §6.5 planner. Probing here
   // rather than per-check keeps the bootstrap path the single
   // source of truth for "is this host capable of sandboxing?".
+  //
+  // §6.5 policy section composes with the CLI flag:
+  //   - `policy.sandbox.required` (default false) → engine becomes
+  //     `refusing` on unavailable bwrap. Enterprise-policy authors
+  //     use this to refuse boot under a missing toolchain.
+  //   - `policy.sandbox.hostAllowed` OR `--sandbox-host` flag → the
+  //     `host` profile becomes selectable. Either path is enough;
+  //     the planner still requires `host-passthrough` in resolved
+  //     capabilities.
   const sandboxAvail = detectSandboxAvailability();
+  const policySandbox = preflight.resolved.policy.sandbox;
   const permResult = await bootstrapPermissionEngine({
     cwd,
     db,
@@ -271,10 +281,8 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(input.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
     sandbox: {
       available: sandboxAvail.available,
-      hostExplicitlyAllowed: input.sandboxHost === true,
-      // Policy-level `sandbox.required` lands in a later slice when
-      // the section is parsed; default lenient for now.
-      required: false,
+      hostExplicitlyAllowed: input.sandboxHost === true || policySandbox?.hostAllowed === true,
+      required: policySandbox?.required === true,
     },
   });
   const permissionEngine = permResult.engine;

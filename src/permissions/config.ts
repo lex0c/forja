@@ -203,12 +203,52 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
   validatePathPolicy(tools.grep, 'grep', context);
   validateFetchPolicy(tools.fetch_url, 'fetch_url');
 
+  // PERMISSION_ENGINE.md §6.5 policy-layer sandbox section. Optional;
+  // when absent, the bootstrap falls back to hardcoded defaults
+  // (`required: false`, hostAllowed: false). Booleans only; YAML
+  // uses snake_case (`host_allowed`) and we map to camelCase
+  // (`hostAllowed`) at parse time for consistency with the rest of
+  // the TS-facing policy shape.
+  let sandbox: Policy['sandbox'];
+  if (r.sandbox !== undefined) {
+    if (typeof r.sandbox !== 'object' || r.sandbox === null || Array.isArray(r.sandbox)) {
+      throw new Error('policy: `sandbox` must be a mapping');
+    }
+    const s = r.sandbox as Record<string, unknown>;
+    rejectUnknownKeys(s, ['required', 'host_allowed'], 'sandbox');
+    let required: boolean | undefined;
+    let hostAllowed: boolean | undefined;
+    if (s.required !== undefined) {
+      if (typeof s.required !== 'boolean') {
+        throw new Error('policy: sandbox.required must be boolean');
+      }
+      required = s.required;
+    }
+    if (s.host_allowed !== undefined) {
+      if (typeof s.host_allowed !== 'boolean') {
+        throw new Error('policy: sandbox.host_allowed must be boolean');
+      }
+      hostAllowed = s.host_allowed;
+    }
+    // `locked` is accepted by rejectUnknownKeys for shape consistency
+    // with the other sections but NOT yet honored by the hierarchy
+    // merge for sandbox specifically. Documented as a successor slice
+    // — no current operator workflow needs it.
+    if (required !== undefined || hostAllowed !== undefined) {
+      sandbox = {
+        ...(required !== undefined ? { required } : {}),
+        ...(hostAllowed !== undefined ? { hostAllowed } : {}),
+      };
+    }
+  }
+
   return {
     defaults: {
       ...(mode !== undefined ? { mode } : {}),
       ...(defaultsLocked !== undefined ? { locked: defaultsLocked } : {}),
     },
     tools: tools as Policy['tools'],
+    ...(sandbox !== undefined ? { sandbox } : {}),
   };
 };
 

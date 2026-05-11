@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 23: policy `sandbox` section (§6.5 policy-layer controls)
+
+**Done.** Twenty-third slice. Moves the sandbox knobs from CLI-flag-only (slice 10) and bootstrap-hardcoded false to a proper YAML policy section. Enterprise authors can now declare `sandbox.required: true` to refuse boot under a missing toolchain; `sandbox.host_allowed: true` activates the `host` profile path without the operator passing `--sandbox-host` on every invocation.
+
+### YAML shape
+
+```yaml
+sandbox:
+  required: true       # engine → refusing when bwrap unavailable
+  host_allowed: false  # operator must still pass --sandbox-host for `host` profile
+```
+
+Both fields optional. Snake-case in YAML, camel-case in TS (`hostAllowed`) — same convention as the rest of the policy parser. Section-level `locked` is intentionally deferred (no current workflow needs it; documented).
+
+### Composition rules
+
+- `policy.sandbox.required`: when true AND `detectSandboxAvailability` returns unavailable → engine transitions straight to `refusing` (vs the lenient `degraded` default). Lower layers can lift this back to false unless an upper layer locks it (future slice).
+- `policy.sandbox.hostAllowed` **OR** `--sandbox-host` CLI flag → activates the `host` profile branch. Either path is enough; the planner still requires `host-passthrough` in resolved capabilities. The OR keeps the CLI flag as a session-scoped opt-in even when policy doesn't grant it.
+- A layer that omits a field doesn't override the inherited value (last-writer-wins per field). Mirrors the existing `defaults.mode` merging.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | New `PolicySandbox { required?: boolean; hostAllowed?: boolean }`. `Policy.sandbox?: PolicySandbox`. Documented as the policy-layer counterpart to slice 10's CLI flag + bootstrap default. |
+| `src/permissions/config.ts` | Top-level `sandbox:` block parsed via `rejectUnknownKeys(['required', 'host_allowed'])` (with `locked` accepted by the helper's default whitelist for shape consistency, but not yet honored by the hierarchy merge — documented). Boolean validation; preserves "not present" vs "explicit false" for both fields. Empty `sandbox: {}` yields `policy.sandbox = undefined`. |
+| `src/permissions/hierarchy.ts` | `SectionProvenance.sandbox?: Layer` tracks the last writer of any sandbox field. `merge()` walks layers in order; field-by-field last-writer-wins; emits `policy.sandbox` only when at least one field was written by some layer. |
+| `src/cli/bootstrap.ts` | Reads `preflight.resolved.policy.sandbox` and threads through to `bootstrapPermissionEngine`. `required = policy.sandbox?.required === true`. `hostExplicitlyAllowed = input.sandboxHost === true OR policy.sandbox?.hostAllowed === true`. Documentation comment explains the composition. |
+| `tests/permissions/config.test.ts` | 8 new tests — absent block, parse + camelCase mapping, "not present" vs "explicit false" preserved, non-boolean rejected, unknown keys rejected, non-mapping rejected, empty object leaves undefined. |
+| `tests/permissions/hierarchy.test.ts` | 5 new tests — absent across layers leaves undefined, project-only surfaces in merged + provenance, field-by-field cross-layer wins, project overrides user, omission doesn't move writer trail. |
+
+### Decisions
+
+- **CLI flag remains as an OR with policy.** Slice 10's `--sandbox-host` was session-scoped operator-opt-in; making it a policy-only knob would break that workflow. The OR composition lets enterprise policy grant the path AND lets operators opt in per-session without policy changes.
+- **`locked` accepted at parse but not honored at merge.** `rejectUnknownKeys` includes `locked` in its default whitelist so the helper stays shape-consistent across sections. The merge doesn't yet enforce a sandbox-section lock — there's no current operator workflow that needs to freeze the sandbox config. A future slice adds the lock + lockConflict surface for sandbox.
+- **Empty `sandbox: {}` leaves the merged field undefined.** A layer that declares the block but writes no fields hasn't actually expressed intent. Treating it as "I want defaults" would race with the inherited value from a lower layer; treating it as "I want no sandbox config" would conflict with the lower layer's intent. Skipping it entirely lets the inherited value (or bootstrap default) win, which is the spec's "silence doesn't override" semantics.
+- **Provenance tracks the LAST writer of any field, not per-field.** A user layer that sets `required` and a project layer that sets `hostAllowed` produce `provenance.sandbox = 'project'`. Per-field provenance would be ergonomic for `/perms why sandbox` introspection but isn't needed today; current callers ask "where did this section come from?" not "where did this field come from?".
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5273 pass / 10 skip / 0 fail** (5283 total across 249 files)
+
+### Next
+
+Successor slices:
+1. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18–21 on macOS).
+2. MCP-tool spawn wire-up (when MCP tools execute child processes).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
+5. Section-level `locked` for `sandbox` (matching `defaults.locked`).
+6. Per-field provenance for `sandbox` (when `/perms why sandbox` ergonomics need it).
+7. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 22: `agent permission inspect <rotation_id>` (§7.2 quarantine clearance)
 
 **Done.** Twenty-second slice. Closes the rotate-chain loop opened by slice 8: an operator who has inspected an archived chain segment can now flip its `quarantined` flag via the CLI, instead of issuing direct SQL. Read-only by default — renders chain_meta + archived-row count; `--clear` performs the flip after the operator confirms.
