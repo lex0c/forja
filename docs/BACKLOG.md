@@ -15,6 +15,43 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 20: sandbox wire-up for grep (§6.5 pattern replication)
+
+**Done.** Twentieth slice. Replicates slice 19's bwrap wrap pattern on the `grep` builtin's `Bun.spawn(cmd, ...)` site. The plumbing (`Decision.sandboxProfile` → `ToolContext.sandboxProfile`) is already in place since slice 19 — this slice only adds the per-tool consume.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/grep.ts` | Import `buildBwrapArgv` from the permissions index. Builds `innerArgv = cmd` (the ripgrep argv already constructed earlier). Computes `shouldWrap` from the four standard conditions (profile set, profile ≠ `host`, Linux platform, bwrap on `$PATH`). Passes either the wrapped argv or `innerArgv` to `Bun.spawn`. Status-quo behavior preserved on every skip path. The existing `ENOENT → ripgrepMissing` detection stays scoped to ripgrep — bwrap availability is filtered out BEFORE the spawn so the error code never confuses "rg missing" with "bwrap missing". |
+
+No engine changes, no context plumbing changes. Slice 19 already wired everything through; this is the per-spawn-site consume.
+
+### Decisions
+
+- **Identical four-condition gate as bash.** Profile undefined / `host` / non-Linux / missing bwrap → spawn direct. Same skip semantics keeps the operator's mental model uniform across tools that spawn child processes.
+- **No new test cases.** The wrap logic is byte-identical to slice 19's; the engine + invoke-tool path that produces `ctx.sandboxProfile` is unchanged. Slice 18 covered the builder; slice 19 covered the plumbing + bash consume. Duplicating the bash test matrix for grep would be ceremony without new signal — the four-condition gate is shared code by pattern, not by extraction (extracting now would invite a too-early helper; the THIRD wire-up will be the right time to lift a shared helper).
+- **Future helper extraction trigger documented.** When the next spawn site (e.g. `bash-background`) lands, the four-condition gate becomes a clear duplication candidate. Slice 20 deliberately doesn't extract; rule of three.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5243 pass / 10 skip / 0 fail** (5253 total across 248 files)
+
+### Next
+
+Successor slices:
+1. Sandbox wire-up for `bash-background` (long-running subprocesses; bg manager touches additional lifecycle state). Will hit the rule-of-three threshold — extract a shared helper at this point.
+2. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18-19 on macOS).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+5. `--accept-broken-chain` operator override (§7.2 second flag).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+7. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 19: sandbox runtime wire-up (§6.5, part 2)
 
 **Done.** Nineteenth slice. Consumes slice 18's `buildBwrapArgv` builder and wires it through the runtime stack so a tool's `Bun.spawn` actually runs under the planner's chosen profile. End-to-end §6.5 enforcement now fires for the `bash` builtin on Linux hosts with bwrap installed; other tools that spawn child processes (`grep`, future MCP tools) inherit the same plumbing pattern in successor slices.

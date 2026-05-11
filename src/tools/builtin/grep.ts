@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { buildBwrapArgv } from '../../permissions/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface GrepInput {
@@ -123,9 +124,31 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       cmd.push(target);
     }
 
+    // §6.5 sandbox runtime wire-up (mirrors bash.ts). When the
+    // engine's planner chose a profile AND the host can actually
+    // wrap (Linux + bwrap on $PATH), prefix the argv with bwrap
+    // flags. Skip wrap on the four standard cases (no profile,
+    // host profile, non-linux, missing bwrap). ENOENT detection
+    // below stays scoped to ripgrep — bwrap missing is filtered
+    // out HERE before the spawn so the error path is unambiguous.
+    const innerArgv = cmd;
+    const shouldWrap =
+      ctx.sandboxProfile !== undefined &&
+      ctx.sandboxProfile !== 'host' &&
+      process.platform === 'linux' &&
+      Bun.which('bwrap') !== null;
+    const spawnArgv = shouldWrap
+      ? buildBwrapArgv({
+          profile: ctx.sandboxProfile as Exclude<typeof ctx.sandboxProfile, undefined | 'host'>,
+          cwd: ctx.cwd,
+          home: process.env.HOME ?? ctx.cwd,
+          innerArgv,
+        })
+      : innerArgv;
+
     let proc: ReturnType<typeof Bun.spawn>;
     try {
-      proc = Bun.spawn(cmd, {
+      proc = Bun.spawn(spawnArgv, {
         stdout: 'pipe',
         stderr: 'pipe',
         cwd: ctx.cwd,
