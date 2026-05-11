@@ -79,6 +79,19 @@ export type AuditTamperOp =
       this_hash: string;
     };
 
+// §8 grant seed for ttl_expiry conformance cases (slice 42). Mirrors
+// the engine's `GrantSnapshot` shape plus an optional `revoked_at`
+// the runner uses to filter the seed list — a row with `revoked_at`
+// set never appears in the snapshot the engine sees.
+export interface GrantSeed {
+  id: string;
+  scope_kind: 'pattern' | 'capability';
+  scope_value: string;
+  capability: string;
+  expires_at: number;
+  revoked_at?: number;
+}
+
 export interface ConformanceCase {
   name: string;
   setup: {
@@ -125,6 +138,14 @@ export interface ConformanceCase {
     // skipped (no policy, no decision).
     audit_events?: readonly AuditEventSeed[];
     audit_tamper?: AuditTamperOp;
+    // §8 grants cases (slice 42). Seeds an engine with a fixed
+    // grants snapshot — the runner filters by `setup.now` (defaults
+    // to a fixed wall-clock if absent) so the engine sees only
+    // un-expired, un-revoked grants. Engine path runs normally; the
+    // grants provider mocks `listActive`. `now` doubles as the
+    // engine's effective `Date.now()` for snapshot filtering.
+    grants?: readonly GrantSeed[];
+    now?: number;
   };
   // Optional for §10.1 subagent intersection cases (no engine call).
   // Required for every other case shape.
@@ -237,6 +258,26 @@ const arraysEqual = (a: readonly string[], b: readonly string[]): boolean => {
 // path the harness uses at spawn time), invokes `intersectCapabilities`,
 // and asserts the resulting `effective` + `excess` arrays match the
 // YAML expectations — order-preserving on both arrays.
+// §8 grants snapshot builder. Filters the seed array by the case's
+// `now` timestamp + revocation state so the engine's `listActive`
+// receives exactly the rows that should be live. The engine's call
+// passes its own snapshot ts (production: `Date.now()`); the
+// returned closure ignores that argument and returns the pre-filtered
+// list — conformance pins the snapshot at case-build time, not at
+// check-time, so the result is deterministic across runs.
+const buildGrantsProvider = (seeds: readonly GrantSeed[], now: number | undefined) => {
+  const ts = now ?? Date.now();
+  const filtered = seeds.filter((g) => g.revoked_at === undefined && g.expires_at > ts);
+  const snapshot = filtered.map((g) => ({
+    id: g.id,
+    scope_kind: g.scope_kind,
+    scope_value: g.scope_value,
+    capability: g.capability,
+    expires_at: g.expires_at,
+  }));
+  return { listActive: () => snapshot };
+};
+
 const runIntersectionCase = (c: ConformanceCase): CaseRunResult => {
   const reasons: string[] = [];
   let parent: ReturnType<typeof parseCapability>[];
@@ -504,6 +545,15 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     c.setup.classifier_fixture !== undefined
       ? classifierFixtures[c.setup.classifier_fixture]
       : undefined;
+  // §8 grants snapshot for ttl_expiry conformance (slice 42). The
+  // case provides a seed array + `now` timestamp; the runner filters
+  // out revoked + expired rows BEFORE handing the snapshot to the
+  // engine, so the engine's `listActive` call returns exactly what
+  // the spec's `WHERE expires_at > snapshot_ts AND revoked_at IS NULL`
+  // clause would return at that point in time. Engine path unchanged
+  // when `setup.grants` is absent.
+  const grantsProvider =
+    c.setup.grants !== undefined ? buildGrantsProvider(c.setup.grants, c.setup.now) : undefined;
   const engine = createPermissionEngine(policy, {
     cwd,
     home,
@@ -512,6 +562,7 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     ...(classifier !== undefined ? { classifier } : {}),
     ...(c.setup.classifier_hash !== undefined ? { classifierHash: c.setup.classifier_hash } : {}),
     ...(c.setup.classifier_required === true ? { classifierRequired: true } : {}),
+    ...(grantsProvider !== undefined ? { grants: grantsProvider } : {}),
   });
   const decision = engine.check(
     input.tool,

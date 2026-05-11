@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 42: §8 grants — ttl_expiry conformance cases (§16.2 minimum)
+
+**Done.** Forty-second slice. Closes the last conformance block that fits the existing YAML harness — the suite goes from **123/136 = 90% → 129/136 = 95%** against §16.2's GA bar. Only `concurrency` (~7 cases) remains, and the spec docs it as needing a separate driver outside the YAML format (race conditions don't render as static fixtures).
+
+Slices 39-41 shipped the storage + engine + CLI for §8 grants; this slice lifts the engine-side contracts to the conformance layer so a regression in grant lookup / TTL expiry / revocation / capability-kind filtering / deny precedence fails the suite, not just unit tests.
+
+### Why this matters
+
+§8 grants are now load-bearing in production (slice 40), but the conformance suite is what the spec §16 makes the GA gate. Without ttl_expiry cases, a future refactor could break grant TTL semantics and the suite would stay green — only unit tests would catch it, and unit tests aren't the GA contract.
+
+The six cases together cover the lifecycle: a grant is born, authorizes, expires or gets revoked, and stops authorizing. Plus the precedence rules (deny wins, grant overrides confirm) and the capability-kind filter (slice 40's safety property — a read-only grant cannot authorize destructive writes).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/index.ts` | Schema extension: `setup.grants?: readonly GrantSeed[]` + `setup.now?: number`. New `GrantSeed` interface mirroring `GrantSnapshot` plus an optional `revoked_at` the runner uses to filter the seed list. New `buildGrantsProvider(seeds, now)` helper that pre-filters by `revoked_at === undefined && expires_at > now` and returns a `{ listActive: () => snapshot }` provider — the engine's snapshot ts argument is ignored (the conformance pin happens at case-build time, not check-time, so the result is deterministic). The engine factory in `runCase` now spreads `grants: grantsProvider` when seeds are present. |
+| `tests/conformance/cases/ttl_expiry.yaml` (new, ~165 lines) | 6 cases across 6 groups: A. active grant matches + authorizes; B. expired grant filtered → default-deny; C. revoked grant filtered → default-deny; D. deny rule wins over grant; E. grant overrides confirm rule (operator pre-approved); F. read-fs grant does NOT authorize write_file (capability-kind filter). Each case uses a deterministic `now` value and seeds the grants list with realistic ULIDs; the runner filters and threads to the engine. |
+
+### Decisions
+
+- **Snapshot filtering happens at case-build time, not check-time.** The engine calls `options.grants.listActive(Date.now())` in production. In conformance, the runner pre-filters using `setup.now` and returns a closure that ignores the snapshot-ts arg. Conformance pins SHOULD be deterministic across runs — building the snapshot from `Date.now()` would make case 2 (expired grant) flaky if the case ran exactly at the millisecond boundary. The pre-filter at construction time eliminates the dependency on wall-clock entirely.
+- **Mirror the spec's strict-`>` semantics.** `expires_at > now` (not `>=`). A grant whose expires_at equals the snapshot is past validity per spec line 621. Case 2 pins this: `expires_at: 1000, now: 1000` → grant filtered out.
+- **Cases use the ENGINE path, not engine-bypass.** Subagent / sandbox / hash-chain cases bypass the engine because their primitive is pure and orthogonal to policy. Grants are an integral part of the engine pipeline (slice 40 added them inline in checkBash/checkPath/checkFetch), so the conformance flows through engine.check with the full policy. The grants seed is the only input the case provides; everything else (policy, capabilities, score) runs as in production.
+- **Each case asserts the OBSERVABLE contract, not internal mechanism.** Case 1 (active grant) asserts `kind=allow + source_layer=session + source_section=grants`. Doesn't peek at the audit row's `ttl_expires_at` column or the reason chain stage — those are tested in unit tests. The conformance layer pins what an OPERATOR / `/perms why` consumer would see.
+- **Realistic ULIDs in fixtures (`01JN0000000000000000000001`).** Sequential numeric tail makes test failures readable (`expected 01JN...000004, got 01JN...000005`) without dragging a real ULID generator into the conformance loader. Lexicographically sortable, so future ordering tests still work.
+- **Case 6 (capability-kind filter) is the highest-value safety contract.** Slice 40's `grantRelevantForSection` is what stops a read-only grant from authorizing a destructive write. Without case 6 in the suite, a regression that flipped to a permissive prefix-only match would pass every other case (the path globs would match) and only blow up in production when a write came through.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5460 pass / 10 skip / 0 fail** (5470 total across 253 files); 6 new conformance tests on top of slice 41's 5454
+- `bun test tests/conformance/` — 130 pass (52 prior + 25 bash adversarial + 16 path traversal + 10 score determinism + 6 subagent intersection + 6 sandbox select + 8 hash chain + 6 ttl_expiry + 1 meta-test); suite coverage **129/136 = 95%** of the §16.2 GA bar (up from 90%)
+
+### Next
+
+§8 grants thread — remaining slices:
+1. **Modal bridge → `insertGrant`.** When the operator answers "Yes, don't ask again for: <pattern>" with a TTL choice (24h / 7d / 30d), the bridge calls `insertGrant` instead of (or alongside) the current in-memory `addSessionAllow`. Requires UX for TTL selection in the modal.
+2. **Capability-scope grants**: `scope_kind='capability'` grants where `scope_value` is itself a capability-string. Engine consults `capabilityCovers(grant.scope_value, emitted_cap)` instead of glob matching. Requires plumbing the resolved capabilities into checkX.
+3. **TTL UX promotion**: spec §8 line 604 — "`once` é default sugerido pra primeira aprovação. UX promove pra `session` na N-ésima repetição da mesma capability+scope".
+
+§16.2 remaining: `concurrency` (~7 cases) — spec docs it as needing a separate driver outside the YAML harness. Conformance YAML suite is effectively complete.
+
+Non-grants successors: macOS sandbox-exec, MCP-tool spawn wire-up, §13 platform provisioning, §7.3 external sealing.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 41: §8 grants — CLI surface (`agent permission grants` + `revoke`)
 
 **Done.** Forty-first slice. Third on the §8 thread (39 = storage foundation, 40 = engine integration). Adds the two operator-facing CLI verbs spec §8 calls for: `agent permission grants [--all] [--json]` to list and `agent permission revoke <id> [--reason <text>] [--json]` to revoke (idempotent per spec line 621). Operators can now inspect what they've granted + revoke when needed BEFORE the modal-bridge slice (42+) wires up insert. Insertion remains operator-driven; the CLI exposes read + revoke only — no insert verb (that's the modal's job).
