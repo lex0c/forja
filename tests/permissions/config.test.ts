@@ -287,19 +287,18 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
     expect(() => parsePolicy({ seal: { mode: 'none' } })).not.toThrow();
   });
 
-  test('reserved modes get a specific "not yet implemented" error', () => {
-    // git-anchored shipped in slice 63; rfc3161-tsa shipped in
-    // slice 88; only s3-object-lock remains reserved.
-    for (const mode of ['s3-object-lock']) {
-      expect(() => parsePolicy({ seal: { mode } })).toThrow(
-        `seal.mode='${mode}' is reserved for a future slice`,
-      );
+  test('all §7.3 modes shipped — no reserved modes today', () => {
+    // After slice 89 the reserved set is empty; every §7.3 mode is
+    // implemented. Adding a new mode to the spec resurrects this
+    // assertion against the new value.
+    for (const mode of ['none', 'worm-file', 'git-anchored', 'rfc3161-tsa', 's3-object-lock']) {
+      expect(() => parsePolicy({ seal: { mode } })).not.toThrow(/reserved for a future slice/);
     }
   });
 
   test('unknown mode rejected with enum error', () => {
     expect(() => parsePolicy({ seal: { mode: 'cloud-storage' } })).toThrow(
-      "seal.mode must be one of none|worm-file|git-anchored|rfc3161-tsa, got 'cloud-storage'",
+      "seal.mode must be one of none|worm-file|git-anchored|rfc3161-tsa|s3-object-lock, got 'cloud-storage'",
     );
   });
 
@@ -394,6 +393,89 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
       mode: 'rfc3161-tsa',
       path: '/var/forja/seals',
       endpoint: 'https://tsa.example.com',
+      interval_decisions: 100,
+      interval_seconds: 3600,
+      on_failure: 'degrade',
+    });
+  });
+
+  test('s3-object-lock requires path + bucket + retention_days', () => {
+    expect(() => parsePolicy({ seal: { mode: 's3-object-lock' } })).toThrow(
+      'seal.path is required when seal.mode is s3-object-lock',
+    );
+    expect(() => parsePolicy({ seal: { mode: 's3-object-lock', path: '/tmp/s' } })).toThrow(
+      "seal.bucket is required when seal.mode is 's3-object-lock'",
+    );
+    expect(() =>
+      parsePolicy({ seal: { mode: 's3-object-lock', path: '/tmp/s', bucket: 'b' } }),
+    ).toThrow('seal.retention_days is required');
+  });
+
+  test('s3-object-lock retention_days must be integer >= 1', () => {
+    const base = { mode: 's3-object-lock', path: '/tmp/s', bucket: 'b' };
+    expect(() => parsePolicy({ seal: { ...base, retention_days: 0 } })).toThrow(
+      'seal.retention_days must be an integer >= 1',
+    );
+    expect(() => parsePolicy({ seal: { ...base, retention_days: 1.5 } })).toThrow(
+      'seal.retention_days must be an integer >= 1',
+    );
+    expect(() => parsePolicy({ seal: { ...base, retention_days: -5 } })).toThrow(
+      'seal.retention_days must be an integer >= 1',
+    );
+  });
+
+  test('s3-object-lock key_prefix must not start or end with /', () => {
+    const base = { mode: 's3-object-lock', path: '/tmp/s', bucket: 'b', retention_days: 30 };
+    expect(() => parsePolicy({ seal: { ...base, key_prefix: '/leading' } })).toThrow(
+      "must not start or end with '/'",
+    );
+    expect(() => parsePolicy({ seal: { ...base, key_prefix: 'trailing/' } })).toThrow(
+      "must not start or end with '/'",
+    );
+  });
+
+  test('s3-object-lock rejects empty bucket / region', () => {
+    expect(() =>
+      parsePolicy({
+        seal: { mode: 's3-object-lock', path: '/tmp/s', bucket: '', retention_days: 30 },
+      }),
+    ).toThrow('seal.bucket must be a non-empty string');
+    expect(() =>
+      parsePolicy({
+        seal: {
+          mode: 's3-object-lock',
+          path: '/tmp/s',
+          bucket: 'b',
+          retention_days: 30,
+          region: '',
+        },
+      }),
+    ).toThrow('seal.region must be a non-empty string');
+  });
+
+  test('s3-object-lock with full config parses cleanly', () => {
+    const p = parsePolicy({
+      seal: {
+        mode: 's3-object-lock',
+        path: '/var/forja/seals',
+        bucket: 'forja-audit',
+        region: 'us-east-1',
+        key_prefix: 'install-id/seals',
+        retention_days: 2555,
+        endpoint: 'https://s3.amazonaws.com',
+        interval_decisions: 100,
+        interval_seconds: 3600,
+        on_failure: 'degrade',
+      },
+    });
+    expect(p.seal).toEqual({
+      mode: 's3-object-lock',
+      path: '/var/forja/seals',
+      bucket: 'forja-audit',
+      region: 'us-east-1',
+      key_prefix: 'install-id/seals',
+      retention_days: 2555,
+      endpoint: 'https://s3.amazonaws.com',
       interval_decisions: 100,
       interval_seconds: 3600,
       on_failure: 'degrade',

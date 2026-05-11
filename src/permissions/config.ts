@@ -79,8 +79,13 @@ const VALID_SEAL_MODES: ReadonlySet<string> = new Set([
   'worm-file',
   'git-anchored',
   'rfc3161-tsa',
+  's3-object-lock',
 ]);
-const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set(['s3-object-lock']);
+// All §7.3 backends shipped as of slice 89. The set stays for the
+// branch in parsePolicy that emits the "reserved for a future
+// slice" diagnostic when ops type a mode that's documented but
+// unimplemented; today it's empty.
+const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set();
 const VALID_SEAL_ON_FAILURE: ReadonlySet<string> = new Set(['degrade', 'refuse']);
 
 const isStringArray = (v: unknown): v is string[] =>
@@ -279,25 +284,37 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     const s = r.seal as Record<string, unknown>;
     rejectUnknownKeys(
       s,
-      ['mode', 'path', 'endpoint', 'interval_decisions', 'interval_seconds', 'on_failure'],
+      [
+        'mode',
+        'path',
+        'endpoint',
+        'bucket',
+        'region',
+        'key_prefix',
+        'retention_days',
+        'interval_decisions',
+        'interval_seconds',
+        'on_failure',
+      ],
       'seal',
     );
     if (s.mode === undefined) {
       throw new Error('policy: seal.mode is required');
     }
     if (typeof s.mode !== 'string' || !VALID_SEAL_MODES.has(s.mode)) {
-      // Reserved modes (`s3-object-lock`) get a deliberately
-      // specific error so an operator copy-pasting from the spec
-      // gets a clear "not yet implemented" rather than a generic
-      // enum mismatch. As more modes ship (slice 88 added
-      // `rfc3161-tsa`), the reserved set shrinks.
+      // Reserved modes (currently empty after slice 89) get a
+      // deliberately specific error so an operator copy-pasting
+      // from a future spec revision gets a clear "not yet
+      // implemented" rather than a generic enum mismatch. The
+      // branch stays even when the set is empty so future
+      // additions are one-line.
       if (RESERVED_SEAL_MODES.has(String(s.mode))) {
         throw new Error(
-          `policy: seal.mode='${String(s.mode)}' is reserved for a future slice; current support: none|worm-file|git-anchored|rfc3161-tsa`,
+          `policy: seal.mode='${String(s.mode)}' is reserved for a future slice; current support: none|worm-file|git-anchored|rfc3161-tsa|s3-object-lock`,
         );
       }
       throw new Error(
-        `policy: seal.mode must be one of none|worm-file|git-anchored|rfc3161-tsa, got '${String(s.mode)}'`,
+        `policy: seal.mode must be one of none|worm-file|git-anchored|rfc3161-tsa|s3-object-lock, got '${String(s.mode)}'`,
       );
     }
     const mode = s.mode as SealMode;
@@ -309,7 +326,10 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       path = s.path;
     }
     if (
-      (mode === 'worm-file' || mode === 'git-anchored' || mode === 'rfc3161-tsa') &&
+      (mode === 'worm-file' ||
+        mode === 'git-anchored' ||
+        mode === 'rfc3161-tsa' ||
+        mode === 's3-object-lock') &&
       path === undefined
     ) {
       throw new Error(`policy: seal.path is required when seal.mode is ${mode}`);
@@ -328,6 +348,52 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     }
     if (mode === 'rfc3161-tsa' && endpoint === undefined) {
       throw new Error("policy: seal.endpoint is required when seal.mode is 'rfc3161-tsa'");
+    }
+    // §7.3 s3-object-lock fields (slice 89).
+    let bucket: string | undefined;
+    if (s.bucket !== undefined) {
+      if (typeof s.bucket !== 'string' || s.bucket.length === 0) {
+        throw new Error('policy: seal.bucket must be a non-empty string');
+      }
+      bucket = s.bucket;
+    }
+    if (mode === 's3-object-lock' && bucket === undefined) {
+      throw new Error("policy: seal.bucket is required when seal.mode is 's3-object-lock'");
+    }
+    let region: string | undefined;
+    if (s.region !== undefined) {
+      if (typeof s.region !== 'string' || s.region.length === 0) {
+        throw new Error('policy: seal.region must be a non-empty string');
+      }
+      region = s.region;
+    }
+    let key_prefix: string | undefined;
+    if (s.key_prefix !== undefined) {
+      if (typeof s.key_prefix !== 'string') {
+        throw new Error('policy: seal.key_prefix must be a string');
+      }
+      if (s.key_prefix.startsWith('/') || s.key_prefix.endsWith('/')) {
+        throw new Error(
+          `policy: seal.key_prefix must not start or end with '/', got '${s.key_prefix}'`,
+        );
+      }
+      key_prefix = s.key_prefix;
+    }
+    let retention_days: number | undefined;
+    if (s.retention_days !== undefined) {
+      if (
+        typeof s.retention_days !== 'number' ||
+        !Number.isInteger(s.retention_days) ||
+        s.retention_days < 1
+      ) {
+        throw new Error('policy: seal.retention_days must be an integer >= 1');
+      }
+      retention_days = s.retention_days;
+    }
+    if (mode === 's3-object-lock' && retention_days === undefined) {
+      throw new Error(
+        "policy: seal.retention_days is required when seal.mode is 's3-object-lock' (no default — Object Lock COMPLIANCE makes objects undeletable until expiry)",
+      );
     }
     let interval_decisions: number | undefined;
     if (s.interval_decisions !== undefined) {
@@ -364,6 +430,10 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       mode,
       ...(path !== undefined ? { path } : {}),
       ...(endpoint !== undefined ? { endpoint } : {}),
+      ...(bucket !== undefined ? { bucket } : {}),
+      ...(region !== undefined ? { region } : {}),
+      ...(key_prefix !== undefined ? { key_prefix } : {}),
+      ...(retention_days !== undefined ? { retention_days } : {}),
       ...(interval_decisions !== undefined ? { interval_decisions } : {}),
       ...(interval_seconds !== undefined ? { interval_seconds } : {}),
       ...(on_failure !== undefined ? { on_failure } : {}),

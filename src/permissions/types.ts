@@ -138,7 +138,7 @@ export interface PolicySandbox {
 // `seal` defines the entire config. No partial merge across layers
 // (a mixed config — enterprise sets mode, user sets interval — is
 // usually a mistake; "all-or-nothing" makes intent obvious).
-export type SealMode = 'none' | 'worm-file' | 'git-anchored' | 'rfc3161-tsa';
+export type SealMode = 'none' | 'worm-file' | 'git-anchored' | 'rfc3161-tsa' | 's3-object-lock';
 export type SealOnFailure = 'degrade' | 'refuse';
 
 export interface SealPolicy {
@@ -148,13 +148,39 @@ export interface SealPolicy {
   //   - `git-anchored`: path to the pre-existing git repo directory
   //   - `rfc3161-tsa`: path to a directory holding TSR proof tokens
   //     (one file per seal) AND the seal.log line index
+  //   - `s3-object-lock`: path to a local directory holding the
+  //     seal.log line index (the immutable proofs themselves live
+  //     in S3 under `bucket/key_prefix/`)
   path?: string;
-  // RFC 3161 Time-Stamp Authority endpoint URL. REQUIRED when
-  // `mode === 'rfc3161-tsa'`. Standard HTTPS endpoint that
-  // accepts `application/timestamp-query` POST bodies and
-  // returns `application/timestamp-reply` (TSR token bytes,
-  // CMS SignedData per RFC 3161 §2.4.2). Ignored for other modes.
+  // Polymorphic endpoint URL.
+  //   - `rfc3161-tsa`: REQUIRED. TSA HTTP endpoint accepting
+  //     application/timestamp-query.
+  //   - `s3-object-lock`: OPTIONAL custom S3 endpoint (e.g., MinIO
+  //     `http://minio:9000`). Absent → AWS default for the region.
   endpoint?: string;
+  // §7.3 `s3-object-lock` mode (slice 89). S3 bucket holding the
+  // sealed objects. REQUIRED for that mode. Bucket MUST have
+  // Object Lock enabled at creation (`aws s3api
+  // create-bucket --object-lock-enabled-for-bucket`); this engine
+  // doesn't bootstrap that.
+  bucket?: string;
+  // §7.3 `s3-object-lock`. AWS region. Optional — when absent,
+  // the `aws` CLI uses the operator's profile default
+  // (`AWS_REGION` env var, `~/.aws/config`, etc.).
+  region?: string;
+  // §7.3 `s3-object-lock`. S3 key prefix for sealed objects.
+  // Each entry lands at `${prefix}${seq}-${ts}.seal`. Operators
+  // typically scope by install_id (e.g., `forja/<install-id>/`).
+  // Optional — defaults to empty (bucket root). MUST NOT start or
+  // end with `/`; the sealer always inserts the separator.
+  key_prefix?: string;
+  // §7.3 `s3-object-lock`. Retention window for the Object Lock
+  // (COMPLIANCE mode). REQUIRED for s3-object-lock — no default,
+  // because the lock makes the objects undeletable by anyone
+  // (including root) until expiry. Operators MUST choose
+  // deliberately. Typical regulated values: 2555 (7 years for
+  // SOX), 3650 (10 years for HIPAA). Must be ≥ 1.
+  retention_days?: number;
   interval_decisions?: number;
   interval_seconds?: number;
   on_failure?: SealOnFailure;

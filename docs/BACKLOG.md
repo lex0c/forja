@@ -15,6 +15,84 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 89: §7.3 S3 Object Lock sealing backend — closes the §7.3 catalog
+
+**Done.** Eighty-ninth slice. Ships the fourth and final §7.3 sealing backend: `s3-object-lock`. Each seal record uploads to S3 as an object protected by Object Lock COMPLIANCE-mode retention; the local seal.log keeps the chain index. Closes the §7.3 catalog — every mode the spec catalogues is now implemented. `RESERVED_SEAL_MODES` is empty.
+
+Pre-slice the §7.3 catalog had `none` + `worm-file` + `git-anchored` + `rfc3161-tsa` shipped; `s3-object-lock` was the lone holdout. Operators on AWS infrastructure who preferred S3 as their audit anchor (regulated SOX/HIPAA deployments where AWS is already the trust root) got a "reserved for a future slice" error. Slice 89 closes the gap.
+
+### Why this matters
+
+The §7.3 catalog is the spec's audit-grade trust-model menu. Four backends, four trust roots:
+
+| Backend | Trust root | Defeats |
+|---|---|---|
+| `worm-file` | Local kernel `chattr +a` / WORM mount | Adversary who can chattr -a |
+| `git-anchored` | Git commit history + pushed remote | Force-push to a protected remote |
+| `rfc3161-tsa` | Third-party TSA signing key | TSA compromise / collusion |
+| `s3-object-lock` | AWS Object Lock COMPLIANCE retention | AWS root + bucket pre-empt |
+
+S3 Object Lock in COMPLIANCE mode is the audit-grade choice WITHIN AWS: once written, the object is undeletable by ANY principal (including the root user) until the retention timestamp expires. Operators paranoid about a single trust root pair this with `rfc3161-tsa` (run both backends — each catches what the other would miss). Operators on AWS without external TSAs use s3-object-lock alone.
+
+Same sync-subprocess shape as `rfc3161-tsa` (slice 88): `execFileSync('aws', ...)` for the S3 PUT, body via temp file (portable across aws CLI versions). No SDK runtime dep — the AWS CLI is the abstraction. Operators who want a different transport (native HTTP + SigV4, or the AWS SDK) drop in via the `submit` test-seam.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | Adds `'s3-object-lock'` to `SealMode`. Adds four optional fields to `SealPolicy`: `bucket?`, `region?`, `key_prefix?`, `retention_days?`. Reuses `endpoint?` for the optional custom S3 host (MinIO etc.). Docstrings call out which fields are REQUIRED per mode. |
+| `src/permissions/config.ts` | `VALID_SEAL_MODES` adds `s3-object-lock`. `RESERVED_SEAL_MODES` becomes empty (every catalogued mode is shipped). `rejectUnknownKeys` widens allowed seal keys to include the four new fields. Validation branches: bucket REQUIRED for s3-object-lock (non-empty string); retention_days REQUIRED + integer ≥ 1 (no default — COMPLIANCE locks are irreversible); region optional non-empty string; key_prefix optional string MUST NOT start/end with `/`. Same `path` requirement as other backends. Error messages updated to list all 5 valid modes. |
+| `src/permissions/sealing-s3-object-lock.ts` (new, ~265 lines) | **Submitter (~50 lines):** `S3Submitter` type + `defaultS3Submitter` wrapping `execFileSync('aws', ['s3api', 'put-object', ...])` with `--body <tempfile>`, `--object-lock-mode COMPLIANCE`, `--object-lock-retain-until-date <iso>`, optional `--region` + `--endpoint-url`. Temp file via `mkdtempSync` + cleanup in finally. Failure → `{ok:false, reason:'aws s3api put-object failed: <msg>'}`. **SealStore impl (~150 lines):** `createS3ObjectLockSealer({path, bucket, retentionDays, keyPrefix?, region?, endpoint?, submit?, now?, ...})`. Append flow: validate entry shape; ensureDir; build object key as `<prefix>/<seq>-<ts>.seal` (or `<seq>-<ts>.seal` when no prefix); body = the seal-log line bytes (`seq=N\tts=N\thash=H\n`); compute retainUntilIso from `now() + retention_days * 86400 * 1000`; submit; on ok append seal.log. Error mapping: `S3 put failed:`, `ensure seal dir failed:`, `append seal.log failed:`, `invalid seal entry:`. List parses seal.log with the same wire format as other backends. Close is no-op. **Factory (~30 lines):** `defaultS3ObjectLockFactory(config)` validates required fields + maps to constructor. |
+| `src/permissions/sealing.ts` | Imports + dispatches `s3-object-lock` to the new factory in `factoryForSealMode`. |
+| `src/telemetry/index.ts` | `TelemetrySealMode` widens to include `'s3-object-lock'`. |
+| `tests/permissions/sealing-s3-object-lock.test.ts` (new, 20 tests) | **Append flow (5):** captures submitter params + asserts bucket/key/region/retainUntilIso/body are correct (object key composition, ISO date math via `now: () => Date.UTC(2026,0,1) + 365 days = 2027-01-01`); empty keyPrefix → bucket-root key; endpoint passthrough; multiple appends produce distinct keys; retention math at epoch. **Error mapping (5):** submitter ok:false → `S3 put failed: <reason>` + NO seal.log line written; negative seq rejected pre-submit (submit not called); whitespace-in-hash rejected; ensureDir failure mapped; append-seal.log failure AFTER submit succeeded → ok:false (best-effort — S3 already has it). **List (3):** empty dir → empty; entries listed in order; malformed line throws. **Factory (4):** throws on missing path / bucket / retention_days; returns valid SealStore with all optional fields plumbed through. **Dispatcher (2):** `factoryForSealMode('s3-object-lock')` returns the new factory; every shipped mode has a factory (regression: none returns null). **fs hygiene (1):** only seal.log lands locally — no `.seal` files leak into the local dir (those live in S3). |
+| `tests/permissions/config.test.ts` | Reserved-modes test updated to assert ALL shipped modes don't throw the "reserved" diagnostic (set is empty after slice 89). Unknown-mode error message updated to list all 5 modes. **New tests (5):** s3-object-lock requires path AND bucket AND retention_days (three independent error messages); retention_days must be integer ≥ 1 (0, 1.5, -5 all rejected); key_prefix rejects leading/trailing `/`; bucket + region rejected when empty; full s3-object-lock config (mode + path + bucket + region + key_prefix + retention_days + endpoint + intervals + on_failure) parses cleanly with every field preserved. |
+
+### Decisions
+
+- **AWS CLI subprocess, not the AWS SDK.** Same posture as rfc3161-tsa's curl approach (slice 88). The `aws` CLI is the de-facto abstraction for one-shot S3 operations; adding `@aws-sdk/client-s3` would balloon the runtime + transitive deps. Operators who explicitly want SDK control inject via the `submit` test-seam. Sync subprocess matches `SealStore.append`'s sync contract — no scheduler refactor needed.
+- **Body via temp file, NOT stdin.** `aws s3api put-object` accepts `--body <path>` reliably across versions. `--body -` (stdin) works on v2 but historical v1 was inconsistent. Temp file is portable; cleanup happens in finally.
+- **`retention_days` REQUIRED with no default.** COMPLIANCE-mode Object Lock makes the object undeletable until expiry — even by AWS root. A wrong-on-default value (7 years that operator wanted as 30 days) means 7 years of stuck data. Forcing operators to choose deliberately is the safe path. The error message calls out the consequence so a confused operator sees the rationale.
+- **Body is the seal-log LINE bytes, not just the hash.** Operators inspecting the S3 object see the full record (`seq=1\tts=NNN\thash=H\n`); the line IS the proof. A hash-only body would lose seq + ts metadata that's useful for forensic correlation. Local seal.log carries identical bytes — the two artifacts are byte-for-byte reconcilable.
+- **Object key includes BOTH seq + ts (`<seq>-<ts>.seal`).** Distinct keys per entry let operators list / inspect via standard S3 tooling. The `ts` suffix disambiguates if the chain were rotated. Conflict-free naming is structurally enforced.
+- **`key_prefix` validated to NOT start/end with `/`.** S3 keys are bytes; a leading `/` becomes part of the key (`//1-100.seal`), which is technically valid but confusing in S3 listings. A trailing `/` is similarly confusing. The sealer always inserts the separator slash between prefix and filename. Validation at policy load time keeps the failure local instead of surfacing as weird-looking S3 listings.
+- **`endpoint` reused for custom S3 host.** Adds OPTIONAL semantics for the s3-object-lock mode (REQUIRED for rfc3161-tsa). Operators on MinIO / LocalStack point `endpoint` at their service. AWS-standard operators leave it blank → aws CLI uses regional defaults.
+- **`region` optional, defers to operator profile.** Most operators already have `AWS_REGION` env or `~/.aws/config` set. Forcing region in policy would be redundant for the common case. Operators who run forja across regions can pin per-install.
+- **`s3-object-lock` mode means the proof lives in S3, NOT locally.** seal.log is just the INDEX (so list() works without S3 round-trips). The actual immutable artifact is the S3 object. An operator who deletes the local seal directory loses the index but the proofs still exist in S3 — recoverable via `aws s3 ls`.
+- **`RESERVED_SEAL_MODES` kept as a (now-empty) Set.** Branch in parsePolicy survives. When the spec adds a new mode (e.g., a future Azure Blob Storage Immutable Storage backend), adding the name to the set is a one-line change. Empty-set today carries the contract for future-self.
+- **No retention-policy bootstrap check.** The bucket MUST have Object Lock enabled at creation — this engine doesn't enable it because that's a one-time setup with cascading IAM consequences. A future doctor expansion (§13.3) can verify `GetObjectLockConfiguration` on startup. For slice 89, operators get the AWS error if their bucket isn't configured ("InvalidRequest: Bucket is missing Object Lock Configuration"), which surfaces clearly via the SealStore error path.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **6035 pass / 10 skip / 0 fail** (6045 total across 287 files); +25 tests on top of slice 88's 6010
+- `bun test tests/permissions/sealing-s3-object-lock.test.ts` — 20 pass in ~48ms
+- `bun test tests/permissions/config.test.ts` — config tests pass with reserved-modes update + 5 new s3-object-lock validation tests
+- `bun test tests/permissions/` — 945 pass (full permissions suite green)
+
+### Next
+
+**§7.3 catalog COMPLETE.** All four shipped sealing backends + `none` (no-op). The production-ready §23 checklist line 1292 ("Sealing externo configurável e testado em ≥ 1 backend") is satisfied across multiple backends; operators can choose by trust model.
+
+Spec status post-slice (PERMISSION_ENGINE.md):
+- §1-13 (core engine + sandbox) ✓
+- §13.7 (broker thread, slices 78-87) ✓
+- §15.4 (fuzz, 4/4 targets) ✓
+- §16 (conformance, 11/11 categories) ✓
+- §17 (replay tool) ✓
+- §18 (telemetry + scrubbing) ✓
+- §7.3 (sealing, 5/5 modes) ✓ ← slice 89 closed
+- **§13.3 (doctor expansion) PARTIAL** — comando existe; faltam checks para a maioria dos sealing modes (`doctor.ts:495` mostra "no doctor check wired yet")
+- §14 (MCP) blocked
+- §19 (v1→v2) premature
+
+Remaining permission-engine work: §13.3 doctor expansion is the last partial. Sealing verification (slice 89 ships only submit + store; verifying a TSR or an S3 object lock retention is offline / out-of-band) is a separate operator concern that lands when needed.
+
+Other open work unchanged: §13.3 doctor expansion, §14 MCP (blocked), §19 v1→v2 (premature).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 88: §7.3 RFC 3161 TSA sealing backend — audit-grade external anchoring
 
 **Done.** Eighty-eighth slice. Ships the third §7.3 sealing backend: `rfc3161-tsa`. Submits each seal hash to a configured Time-Stamp Authority via RFC 3161 TimeStampReq/Resp, stores the returned TSR proof token on disk, and appends the same seal.log wire format as the worm-file + git-anchored backends. Closes the audit-grade requirement for regulated deployments — production-ready checklist line 1292 calls out rfc3161-tsa specifically as the recommended backend.
