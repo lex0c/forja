@@ -148,7 +148,7 @@
       - "exec:shell"
       - "read-fs:/work/proj"
 
-- name: "bash rm produces delete-fs"
+- name: "bash rm produces delete-fs (engine upgrades to confirm via §6.6 score-gate)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -161,7 +161,11 @@
     args:
       command: "rm -rf /tmp/x"
   expect:
-    kind: "allow"
+    # Resolver: Ok with `delete-fs:/tmp/x` (high confidence). Engine
+    # then applies the §6.6 approval gate: capability_risk (delete-fs)
+    # + blocklist_command (`rm -rf`) push the score above the 0.4
+    # threshold, forcing confirm on a would-be-allow.
+    kind: "confirm"
     capabilities_include:
       - "delete-fs:/tmp/x"
 
@@ -182,7 +186,7 @@
     capabilities_include:
       - "net-egress:api.github.com"
 
-- name: "bash git push produces git-write + net-egress"
+- name: "bash git push produces git-write + net-egress (engine upgrades to confirm via §6.6)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -195,7 +199,11 @@
     args:
       command: "git push origin main"
   expect:
-    kind: "allow"
+    # Resolver: Ok with `git-write:/work/proj` + `net-egress:*` (high
+    # confidence). capability_risk (git-write) alone hits the 0.4
+    # threshold; wildcard_scope on `net-egress:*` adds more. Engine
+    # upgrades the would-be-allow to confirm per §6.6.
+    kind: "confirm"
     capabilities_include:
       - "git-write:/work/proj"
       - "net-egress:*"

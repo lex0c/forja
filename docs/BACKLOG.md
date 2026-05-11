@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 7: approval gate consumes score (§6.6)
+
+**Done.** Seventh slice of the v2 evolution. Wires the deterministic risk score + classifier hint (already computed and recorded since slices 4–5) into the approval gate per `PERMISSION_ENGINE.md §6.6`. A would-be `allow` whose final score crosses the calibration threshold, OR whose resolver confidence is below `high`, is upgraded to `confirm` with stable audit attribution.
+
+### Why now
+
+Slices 4–5 produced the numbers; the gate didn't consume them. Calls like `git push origin main` (score 0.4+, capability_risk via `git-write`) and `rm -rf /tmp/x` (score 0.7+, capability_risk + blocklist_command) were sliding through as `allow` whenever a permissive policy matched — the operator never saw the modal for fundamentally state-changing operations because the static allow rule was the only signal the engine consulted. §6.6 closes that gap.
+
+This is the inflection between "score is an audit artifact" and "score is a runtime control." The classifier hint (slice 5) was wired hint-only on the same principle: cannot independently deny, can adjust ±0.2. Slice 7 makes both signals load-bearing by routing them through the upgrade path.
+
+### Spec invariants this slice respects (§6.6)
+
+| Static rule | Score | Confidence | Decision |
+|---|---|---|---|
+| `allow` matched | < threshold | `high` | `allow` |
+| `allow` matched | ≥ threshold | any | `confirm` |
+| `allow` matched | any | not `high` | `confirm` |
+| `ask` matched | — | — | `confirm` |
+| `deny` matched | — | — | `deny` |
+| state == `degraded` AND would-be-allow | — | — | `confirm` (overrides everything else) |
+
+Misc category skips the resolver, so its score is 0 and confidence is treated as `null` (gate no-ops). `bypass` mode short-circuits before the gate — explicit operator override. Session-allow is exempt from the upgrade (operator already saw the modal once; re-prompting on every invocation regresses the approval-fatigue mechanism slice 3 introduced).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/engine.ts` | New `DEFAULT_SCORE_CONFIRM_THRESHOLD = 0.4` exported. `EngineOptions.scoreConfirmThreshold?: number` knob (calibration sweeps / per-deployment tuning). `scoreForcesConfirm()` helper encapsulates the §6.6 row 4–5 disjunction. `approvalGateStageEntry()` returns a stable reason-chain stage `approval-gate` with a note naming which side fired (`score=0.62 >= threshold=0.40` or `confidence=medium`). Post-decision escalation now reads `(resolverForcesConfirm || scoreForcesConfirm) && !sessionAllowed`. Tail-stage attribution precedence: `engine-state` (degraded) > `resolve` (Conservative/low) > `approval-gate` (score/medium-confidence) — degraded wins because subsystem health overrides any operator/policy signal; resolver-driven beats score-driven because the resolver outcome is more precise than an aggregate. |
+| `tests/permissions/engine.test.ts` | New `describe('engine — approval gate consumes score (§6.6, slice 7)')` with 11 cases: high-confidence + score < threshold → allow; boundary (score == 0.4) → confirm; score > threshold → confirm; medium confidence → confirm regardless of score; custom threshold (high) disables score-side gating; custom threshold (low) escalates earlier; bypass mode skips the gate; session-allow exempts; reason-chain carries `approval-gate` stage with parseable note; degraded attribution wins over score-gate; misc category bypasses the gate cleanly. |
+| `tests/permissions/engine.test.ts` (existing) | Four tests that used `npm test` as a happy-path bash example switched to `ls -la` / `echo` — `npm` lands medium confidence via `cmdPkgInstall` and slice 7 correctly upgrades it to confirm, which would shadow the compound-guard / fd-dup / source-provenance signals those tests are actually validating. The commands chosen (`ls`, `echo`) are high-confidence + score 0 so the §6.6 gate stays quiet. |
+| `tests/conformance/cases/risk_score.yaml` | `bash rm -rf` and `bash git push` cases (already scoring above 0.4) now expect `kind: confirm` per §6.6. Component assertions unchanged. |
+| `tests/conformance/cases/capability_resolvers.yaml` | Same two cases (`bash rm produces delete-fs`, `bash git push produces git-write + net-egress`) now expect `kind: confirm`. The resolver is still `ok`; the engine is the one upgrading. |
+| `tests/conformance/cases/classifier.yaml` | `safe fixture lowers score by 0.1 (within bounds)` — the deterministic floor for `rm -rf` is ~0.7, even a -0.1 classifier nudge keeps it above 0.4. Updated to `kind: confirm`; `classifier_adjust: -0.1` still asserted. Demonstrates the hint-only property: a benign classifier signal cannot independently overturn a high-risk deterministic decision. |
+| `tests/cli/slash/commands.test.ts` | Added `beforeAll(initBashParser)` to fix a pre-existing latent flake from slice 6: when this file runs in isolation, the bash resolver's parser singleton is uninitialized and `/perms why bash <cmd>` checks hit `parser unavailable` Refuse. Full-suite runs masked the issue because other test files warmed the parser first. The `bash allow rule renders` test also switched from `npm test*` to `ls*` for the same medium-confidence reason as the engine tests above. |
+
+### Decisions
+
+- **Threshold knob exists, default at spec baseline (0.4).** §6.3.2 plans logistic-regression calibration against a 30-day pilot dataset. The knob is the API for shipping the re-derived constant without rebuilding the engine module; default ships the v2 baseline so any consumer that doesn't override gets the documented behavior.
+- **Tail-stage attribution precedence: degraded > resolver > score.** Three independent signals can force the same confirm; the audit row and modal preview need a single "why" line. Degraded wins because the failure is at the engine level (operator must know health is degraded before processing the call as normal). Resolver beats score because resolver Conservative/low is more specific than an aggregate score number — the modal can render "compound shell command, cannot pin capabilities" instead of "score 0.42 over 0.40 threshold." Score is the residual path for the high-confidence-but-risky calls.
+- **Session-allow exempts from score-gate.** The slice-3 logic exempted only the resolver-forced upgrade. Score-gate gets the same treatment for the same reason: the operator already approved the literal pattern once via the modal; re-prompting on every invocation regresses approval-fatigue and pushes operators toward bypass mode (the dangerous escape hatch). Degraded state still overrides session-allow (subsystem health beats operator trust granted under healthy assumptions).
+- **`medium` confidence forces confirm (slice 3 reversal).** The slice 3 BACKLOG entry explicitly deferred the spec §5.1 "confidence < high force human approval" rule to "the risk-score slice" — that's this slice. Spec is authoritative; the medium → confirm path closes a real gap (resolvers that admit some uncertainty about exact capability shape should surface the modal). Operator fatigue is mitigated by tightening resolver confidence upstream (resolvers should return `high` when they CAN pin the shape, not when they GUESS at it), not by ignoring the spec rule downstream.
+- **Misc category bypasses cleanly via `null` confidence.** Misc tools skip the resolver entirely (score 0, no resolved capabilities). Passing `null` to `scoreForcesConfirm` short-circuits the confidence check; only a degenerate `threshold ≤ 0` config could fire the score side. Documented as the safe escape hatch for tools that have no side effects worth gating (e.g. `todo_write`).
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5046 pass / 10 skip / 0 fail** (5056 total across 235 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. `--rotate-chain` flow.
+2. Subagent intersection formal (§10).
+3. Sandbox plan integration (bwrap profile selection, §6.5).
+4. Context-summary builder for the classifier input.
+5. Replay tool (`agent permission replay`).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 6: bash AST resolver (tree-sitter + whitelist + Refuse)
 
 **Done.** Sixth slice of the v2 evolution. Replaces the slice-3 token-based bash resolver with a proper tree-sitter parse + closed whitelist walk. Path A.2 from `TREE_SITTER.md` (web-tree-sitter WASM, vendored grammar) plus the §9 shape recognition pattern from `TREE_SITTER_SHELL.md`.

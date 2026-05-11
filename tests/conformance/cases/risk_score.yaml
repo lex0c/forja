@@ -35,7 +35,7 @@
     kind: "allow"
     score_lte: 0.0
 
-- name: "bash rm -rf → capability_risk + blocklist_command"
+- name: "bash rm -rf → capability_risk + blocklist_command (§6.6 score-gate confirms)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -48,13 +48,16 @@
     args:
       command: "rm -rf /tmp/x"
   expect:
-    kind: "allow"
+    # Score 0.7+ (capability_risk 0.4 + blocklist_command 0.3). The
+    # slice-7 approval gate upgrades the matching allow rule to
+    # confirm because the score is above the 0.4 threshold.
+    kind: "confirm"
     score_gte: 0.5
     score_components_include:
       - "capability_risk"
       - "blocklist_command"
 
-- name: "bash git push → capability_risk + wildcard_scope (net-egress:*)"
+- name: "bash git push → capability_risk + wildcard_scope (§6.6 score-gate confirms)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -67,7 +70,11 @@
     args:
       command: "git push origin main"
   expect:
-    kind: "allow"
+    # Score 0.4+ (capability_risk 0.4 from git-write; wildcard_scope
+    # adds on top). Approval gate forces confirm at the 0.4 boundary
+    # — git push is fundamentally a state-changing remote operation
+    # and the operator should see the modal once per session.
+    kind: "confirm"
     score_gte: 0.4
     score_components_include:
       - "capability_risk"

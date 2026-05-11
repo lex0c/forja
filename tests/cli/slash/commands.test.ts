@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
 import { budgetCommand } from '../../../src/cli/slash/commands/budget.ts';
 import { clearCommand } from '../../../src/cli/slash/commands/clear.ts';
 import { costCommand } from '../../../src/cli/slash/commands/cost.ts';
@@ -13,6 +13,7 @@ import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { initBashParser } from '../../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../../src/permissions/index.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { openMemoryDb } from '../../../src/storage/db.ts';
@@ -22,6 +23,15 @@ import { createToolRegistry } from '../../../src/tools/registry.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../src/tui/modal-manager.ts';
+
+// Bash resolver (slice 6) walks the tree-sitter-bash AST and requires
+// an async one-time init. Tests that exercise bash checks through
+// `/perms why` would otherwise hit `parser unavailable` Refuse when
+// this file runs in isolation. Idempotent across files via the module
+// singleton, so this is cheap even when other files have warmed it.
+beforeAll(async () => {
+  await initBashParser();
+});
 
 const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
   const bus = createBus();
@@ -1327,18 +1337,23 @@ describe('/perms why', () => {
   });
 
   test('bash allow rule renders decision + rule + layer + section', async () => {
+    // `ls -la` lands as high-confidence + score 0; the slice-7
+    // approval gate doesn't fire, so the matched allow rule
+    // surfaces as decision: allow in the render. Using a medium-
+    // confidence command (e.g. `npm test`) would force confirm via
+    // §6.6 and shadow the layer/rule attribution we're testing.
     const ctx = buildCtx(
-      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['npm test*'] } } },
+      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls*'] } } },
       [{ name: 'bash', category: 'bash' }],
       { defaults: 'project', bash: 'project' },
     );
-    const result = await permsCommand.exec(['why', 'bash', 'npm', 'test', '--watch'], ctx);
+    const result = await permsCommand.exec(['why', 'bash', 'ls', '-la'], ctx);
     if (result.kind !== 'ok') throw new Error('expected ok');
     const text = (result.notes ?? []).join('\n');
     // Header echoes the input verbatim so scrollback is greppable.
-    expect(text).toContain('/perms why bash npm test --watch');
+    expect(text).toContain('/perms why bash ls -la');
     expect(text).toContain('decision: allow');
-    expect(text).toContain('rule:     npm test*');
+    expect(text).toContain('rule:     ls*');
     expect(text).toContain('layer:    project policy');
     expect(text).toContain('section:  bash');
   });

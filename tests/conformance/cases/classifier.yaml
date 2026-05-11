@@ -20,7 +20,7 @@
     classifier_hash: "none"
     classifier_adjust: null
 
-- name: "safe fixture lowers score by 0.1 (within bounds)"
+- name: "safe fixture lowers score by 0.1 (within bounds; still confirms via §6.6)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -35,7 +35,14 @@
     args:
       command: "rm -rf /tmp/x"
   expect:
-    kind: "allow"
+    # Deterministic floor is well above the 0.4 threshold (rm -rf
+    # contributes capability_risk + blocklist_command ≈ 0.7). The
+    # safe fixture nudges -0.1 — observable in classifier_adjust —
+    # but the final score stays above 0.4, so the slice-7 approval
+    # gate still upgrades to confirm. The classifier is hint-only;
+    # it cannot independently overturn a high-risk deterministic
+    # decision.
+    kind: "confirm"
     classifier_hash: "fixture-safe-v1"
     classifier_adjust: -0.1
 

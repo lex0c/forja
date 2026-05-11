@@ -87,8 +87,10 @@ export interface EngineOptions {
   stateController?: StateController;
   // Risk-score inputs (PERMISSION_ENGINE.md §6.3). All optional;
   // defaults are documented at each field. The score is computed
-  // for every check and recorded in the audit row; the approval
-  // gate doesn't consume it yet (calibration slice — §6.3.2).
+  // for every check, recorded in the audit row, and consulted by
+  // the §6.6 approval gate via `scoreConfirmThreshold` below; a
+  // would-be allow whose score crosses the threshold upgrades to
+  // confirm.
   //
   // `trustedHosts`: hosts whose net-egress capabilities do NOT
   // trigger the `untrusted_egress` feature. Default:
@@ -120,7 +122,21 @@ export interface EngineOptions {
   // call proceeds. Regulated deployments set this to true; local
   // CLI rides lenient.
   classifierRequired?: boolean;
+  // Approval-gate score threshold (PERMISSION_ENGINE.md §6.6).
+  // A would-be `allow` whose final score (deterministic + clamped
+  // classifier adjust) reaches this value is upgraded to `confirm`.
+  // Default DEFAULT_SCORE_CONFIRM_THRESHOLD (0.4) — the v2 baseline
+  // calibration point per §6.3.2. Calibration phase (post-pilot)
+  // re-derives the value; the knob exists so a redeployment can ship
+  // the new constant without rebuilding the engine module.
+  scoreConfirmThreshold?: number;
 }
+
+// §6.6 baseline. Sourced here (not inlined at the call site) so
+// tests, audit replays, and future calibration sweeps can read the
+// exact threshold the engine is enforcing. Calibration plan is in
+// §6.3.2; the knob is `EngineOptions.scoreConfirmThreshold`.
+export const DEFAULT_SCORE_CONFIRM_THRESHOLD = 0.4;
 
 export interface PermissionEngine {
   check(toolName: string, category: PolicyCategory, args: ToolArgs): Decision;
@@ -689,6 +705,52 @@ const resolverStageEntry = (result: ResolverResult | null): ReasonChainEntry | u
   return undefined;
 };
 
+// §6.6 row 4-5: a would-be `allow` upgrades to `confirm` when EITHER
+// the final score (deterministic + clamped classifier adjust) crosses
+// the threshold OR the resolver confidence dropped below `high`. The
+// two conditions are independent — high-confidence/low-score allows
+// pass through; everything else escalates. Only `allow` is gated
+// (deny/confirm are already terminal for this purpose). Misc tools
+// skip the resolver and run at `high` confidence with score 0, so
+// they never trigger this gate. Caller passes `null` confidence for
+// misc to short-circuit.
+const scoreForcesConfirm = (
+  decision: Decision,
+  score: number,
+  confidence: RiskScoreConfidence | null,
+  threshold: number,
+): boolean => {
+  if (decision.kind !== 'allow') return false;
+  if (score >= threshold) return true;
+  if (confidence !== null && confidence !== 'high') return true;
+  return false;
+};
+
+// Reason-chain entry tagged `approval-gate` when the score / confidence
+// gate forced the confirm. Carries which side fired (`score=X >= T` or
+// `confidence=Y`) so the modal preview can render "Risk score: 0.62
+// (above 0.40 threshold)" verbatim. Distinct from `resolve` (which
+// fires on Conservative/low specifically — those are still attributed
+// to the resolver) because §6.6's score-threshold rule is an engine-
+// level gate over a successful resolver result, not a resolver
+// outcome itself.
+const approvalGateStageEntry = (
+  score: number,
+  confidence: RiskScoreConfidence | null,
+  threshold: number,
+): ReasonChainEntry | undefined => {
+  if (score >= threshold) {
+    return {
+      stage: 'approval-gate',
+      note: `score=${score.toFixed(2)} >= threshold=${threshold.toFixed(2)}`,
+    };
+  }
+  if (confidence !== null && confidence !== 'high') {
+    return { stage: 'approval-gate', note: `confidence=${confidence}` };
+  }
+  return undefined;
+};
+
 const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
@@ -738,6 +800,9 @@ export const createPermissionEngine = (
   const classifier = options.classifier;
   const classifierHash = options.classifierHash ?? 'none';
   const classifierRequired = options.classifierRequired ?? false;
+  // §6.6 score threshold. Caller can override for calibration sweeps
+  // or per-deployment tuning; default is the v2 baseline (0.4).
+  const scoreConfirmThreshold = options.scoreConfirmThreshold ?? DEFAULT_SCORE_CONFIRM_THRESHOLD;
   // policy_hash is stamped on every audit row. Computed ONCE at
   // construction — the policy doesn't change for an engine
   // instance (hot reload is a separate slice that builds a new
@@ -1068,29 +1133,56 @@ export const createPermissionEngine = (
     // rule that would have fired keeps its attribution in `source`
     // — the operator sees "rule X matched, but engine is degraded
     // so I'm asking anyway" in the modal. Same shape for
-    // resolver-driven upgrade (Conservative or low confidence).
+    // resolver-driven upgrade (Conservative or low confidence) and
+    // for the §6.6 approval-gate score/confidence rule.
     //
-    // Session-allow is intentionally exempt from the resolver
-    // upgrade: the operator already saw the modal once for this
-    // shape and explicitly authorized it ("Yes, don't ask again
-    // for: <rule>"). Resolver Conservative would re-prompt every
-    // time — same approval-fatigue regression the session-allow
-    // mechanism exists to prevent. degraded state, however, DOES
-    // override session-allow: a subsystem-health signal overrides
-    // operator trust because the trust was given under the
-    // expectation of a healthy engine.
+    // Session-allow is intentionally exempt from the resolver AND
+    // score upgrades: the operator already saw the modal once for
+    // this shape and explicitly authorized it ("Yes, don't ask
+    // again for: <rule>"). Re-prompting on every invocation would
+    // regress the same approval-fatigue the session-allow mechanism
+    // exists to prevent. degraded state, however, DOES override
+    // session-allow: a subsystem-health signal overrides operator
+    // trust because the trust was given under the expectation of a
+    // healthy engine.
+    //
+    // Misc category skipped the resolver, so its capability set is
+    // empty and the score is 0 — neither rule can fire. Pass `null`
+    // confidence to the gate so the medium/low check no-ops.
     const sessionAllowed = decision.source?.layer === 'session';
-    if (currentState === 'degraded' || (resolverForcesConfirm && !sessionAllowed)) {
+    const gateConfidence: RiskScoreConfidence | null =
+      resolverResult === null
+        ? null
+        : resolverResult.kind === 'conservative'
+          ? 'low'
+          : resolverResult.confidence;
+    const scoreEscalates = scoreForcesConfirm(
+      decision,
+      score,
+      gateConfidence,
+      scoreConfirmThreshold,
+    );
+    if (
+      currentState === 'degraded' ||
+      ((resolverForcesConfirm || scoreEscalates) && !sessionAllowed)
+    ) {
       decision = degradeAllowToConfirm(decision);
     }
     const stages: ReasonChainEntry[] = [];
     if (classifierStage !== null) stages.push(classifierStage);
-    const tailStage =
-      currentState === 'degraded'
-        ? degradedStageEntry(currentState)
-        : resolverForcesConfirm && !sessionAllowed
-          ? resolverStageEntry(resolverResult)
-          : undefined;
+    // Tail attribution: prefer the most specific cause. degraded
+    // beats everything (it's a system-health signal); resolver-
+    // forced beats score-gating (resolver outcome is more precise
+    // than an aggregate score); score-gating is the residual path.
+    // Both resolver-forced and score-gating respect session-allow.
+    let tailStage: ReasonChainEntry | undefined;
+    if (currentState === 'degraded') {
+      tailStage = degradedStageEntry(currentState);
+    } else if (resolverForcesConfirm && !sessionAllowed) {
+      tailStage = resolverStageEntry(resolverResult);
+    } else if (scoreEscalates && !sessionAllowed) {
+      tailStage = approvalGateStageEntry(score, gateConfidence, scoreConfirmThreshold);
+    }
     if (tailStage !== undefined) stages.push(tailStage);
     emitAudit(
       toolName,
