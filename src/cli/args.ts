@@ -512,10 +512,21 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 // structured data call `agent doctor --json` / `agent sandbox
 // setup --json` directly).
 const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => {
-  if (argv.length === 0 || argv[0] !== 'welcome') return null;
+  // Slice 125 (R2 P1): accept `welcome` in either position —
+  // bare `agent welcome [...]` OR `agent [flags...] welcome
+  // [more-flags...]`. Pre-slice the parser required `welcome`
+  // as argv[0], so `agent --i-know-what-im-doing welcome` hit
+  // the top-level parser instead and was rejected with a
+  // "use `agent welcome --i-know-what-im-doing` instead"
+  // error — confusing because the operator DID type `welcome`.
+  // POSIX muscle memory expects flags can precede positionals.
+  const welcomeIdx = argv.findIndex((t) => t === 'welcome');
+  if (welcomeIdx === -1) return null;
+  // Collect everything around `welcome` as the welcome flag set.
+  const welcomeArgs = [...argv.slice(0, welcomeIdx), ...argv.slice(welcomeIdx + 1)];
   let iKnow = false;
-  for (let i = 1; i < argv.length; i += 1) {
-    const token = argv[i];
+  for (let i = 0; i < welcomeArgs.length; i += 1) {
+    const token = welcomeArgs[i];
     if (token === undefined) continue;
     if (token === '--help' || token === '-h') {
       return {

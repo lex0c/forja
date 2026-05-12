@@ -85,14 +85,29 @@ export const createInMemoryDoctorCache = (): DoctorCheckCache => {
 // Process-wide singleton. Used by `runDoctor` when no cache is
 // explicitly provided. Tests pass a fresh cache via options so
 // shared state doesn't leak between tests.
+//
+// Slice 125 (R2 P1) responsibility note: §13.8 line 939 lists
+// SessionStart as a mandatory doctor trigger ("falha em check
+// crítico = state refusing"). Within a long-running process
+// spawning multiple sessions (or a future daemon mode), the
+// shared cache could feed stale `mac_lsm`/`user_namespaces`
+// values from session N into session N+1's SessionStart check.
+// The contract: callers that initiate a SessionStart-class
+// re-check MUST either:
+//   (a) call `resetSharedDoctorCache()` before invoking
+//       `runDoctor`, OR
+//   (b) pass `cache: createInMemoryDoctorCache()` for a fresh
+//       per-call cache.
+// The 50-tool-call mid-session re-check correctly uses the
+// shared cache (intra-session probes don't change kernel state).
 let sharedCache: DoctorCheckCache = createInMemoryDoctorCache();
 export const getSharedDoctorCache = (): DoctorCheckCache => sharedCache;
 
-// Test seam: reset the shared cache to a fresh instance. Used by
-// the long-lived `agent` process if it ever needs to invalidate
-// (e.g., explicit `forja doctor --no-cache` flag, future slice).
-// In tests, prefer injecting a per-test cache via runDoctor's
-// `cache` option instead of calling this.
+// Reset the shared cache to a fresh instance. Long-lived
+// processes call this at SessionStart boundaries (see contract
+// note above); tests call it in `beforeEach` to isolate from
+// neighbor tests. Pure side-effect on module-level state — no
+// callers required to coordinate.
 export const resetSharedDoctorCache = (): void => {
   sharedCache = createInMemoryDoctorCache();
 };

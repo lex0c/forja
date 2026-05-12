@@ -68,25 +68,52 @@ export interface CreateInProcessBrokerOptions {
   exec: (request: BrokerRequest, options?: BrokerCallOptions) => Promise<BrokerResponse>;
 }
 
-// Compose AbortSignals: returned signal aborts when ANY source
-// aborts. Returns the first aborted source unchanged (no listener
-// attached) when one is already aborted at link time. Otherwise
-// returns a fresh signal that mirrors first-to-abort.
+// Compose AbortSignals into a linked controller + disposer.
+// Returned signal aborts when ANY source aborts. Returns the
+// first aborted source unchanged when one is already aborted
+// at link time (no listener attached, dispose is a no-op).
+// Single-source case returns that source directly (no allocation).
 //
-// Listeners are attached `{once: true}` so a non-aborting signal
-// doesn't accumulate listeners across composition layers.
-const linkSignals = (...sources: readonly (AbortSignal | undefined)[]): AbortSignal => {
+// Slice 125 (R2 P1): pre-slice linkSignals only returned the
+// signal — listeners on caller-signal AND master-signal stayed
+// attached forever when neither fired (long-lived broker, never-
+// aborting caller signal, exec returns naturally). One extra
+// listener accumulated PER call indefinitely. Now the call site
+// invokes `dispose()` in its finally block; non-firing listeners
+// are explicitly removed.
+interface LinkedSignal {
+  signal: AbortSignal;
+  dispose: () => void;
+}
+
+const linkSignals = (...sources: readonly (AbortSignal | undefined)[]): LinkedSignal => {
   const real = sources.filter((s): s is AbortSignal => s !== undefined);
-  if (real.length === 0) return new AbortController().signal;
+  const noop = (): void => {
+    // empty
+  };
+  if (real.length === 0) {
+    return { signal: new AbortController().signal, dispose: noop };
+  }
   const alreadyAborted = real.find((s) => s.aborted);
-  if (alreadyAborted !== undefined) return alreadyAborted;
-  if (real.length === 1) return real[0] as AbortSignal;
+  if (alreadyAborted !== undefined) {
+    return { signal: alreadyAborted, dispose: noop };
+  }
+  if (real.length === 1) {
+    return { signal: real[0] as AbortSignal, dispose: noop };
+  }
   const ctrl = new AbortController();
+  const listeners: Array<{ source: AbortSignal; fn: () => void }> = [];
   for (const s of real) {
     const onAbort = (): void => ctrl.abort(s.reason);
     s.addEventListener('abort', onAbort, { once: true });
+    listeners.push({ source: s, fn: onAbort });
   }
-  return ctrl.signal;
+  const dispose = (): void => {
+    for (const { source, fn } of listeners) {
+      source.removeEventListener('abort', fn);
+    }
+  };
+  return { signal: ctrl.signal, dispose };
 };
 
 // Safe error-message extraction. `e.message` may be a getter
@@ -151,14 +178,19 @@ export const createInProcessBroker = (options: CreateInProcessBrokerOptions): Br
       // aborts on expiry. timeoutMs = 0 disables the outer guard
       // (per BrokerCallOptions docs); undefined → no timer here
       // (the in-process broker has no construction-level default).
-      const baseSignal = linkSignals(callOptions?.signal, masterCtrl.signal);
+      //
+      // Slice 125 (R2 P1): linkSignals returns a disposer that
+      // unhooks listeners on non-aborting sources. Called in the
+      // finally block below — pre-slice listeners accumulated on
+      // long-lived signals when neither source fired.
+      const baseLinked = linkSignals(callOptions?.signal, masterCtrl.signal);
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       let timeoutCtrl: AbortController | undefined;
-      let effectiveSignal: AbortSignal = baseSignal;
+      let effectiveLinked = baseLinked;
       const tms = callOptions?.timeoutMs;
       if (tms !== undefined && Number.isFinite(tms) && tms > 0) {
         timeoutCtrl = new AbortController();
-        effectiveSignal = linkSignals(baseSignal, timeoutCtrl.signal);
+        effectiveLinked = linkSignals(baseLinked.signal, timeoutCtrl.signal);
         timeoutHandle = setTimeout(() => {
           timeoutCtrl?.abort(new Error(`broker timeout after ${tms}ms`));
         }, tms);
@@ -166,7 +198,7 @@ export const createInProcessBroker = (options: CreateInProcessBrokerOptions): Br
 
       const effectiveCallOptions: BrokerCallOptions = {
         ...callOptions,
-        signal: effectiveSignal,
+        signal: effectiveLinked.signal,
       };
 
       // Defense in depth: scrub proto-pollution keys from args
@@ -207,6 +239,12 @@ export const createInProcessBroker = (options: CreateInProcessBrokerOptions): Br
         await myTurn;
       } finally {
         if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+        // Slice 125 (R2 P1): unhook linkSignals listeners. When
+        // sources didn't fire, the {once:true} attachment stays
+        // until the source itself aborts (potentially forever
+        // for a long-lived caller signal + never-closed broker).
+        effectiveLinked.dispose();
+        if (effectiveLinked !== baseLinked) baseLinked.dispose();
       }
       // result is always assigned by the time myTurn resolves: the
       // chain's only branches (early-close, exec success, exec

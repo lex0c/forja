@@ -45,7 +45,7 @@ import {
   readFs,
   writeFs,
 } from '../capabilities.ts';
-import { classifyProtectedPath } from '../protected_paths.ts';
+import { classifyProtectedPath, protectedTargets } from '../protected_paths.ts';
 import {
   type Resolver,
   type ResolverContext,
@@ -311,7 +311,41 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
   };
 };
 
-const cmdMvCp: CommandResolver = (positional, _tokens, ctx) => {
+const cmdMvCp: CommandResolver = (positional, tokens, ctx) => {
+  // Slice 125 (R2 P1): GNU `-t <dir>` / `--target-directory=<dir>`
+  // inverts the positional shape. `mv -t /etc src1 src2` makes
+  // `/etc` the destination and `src1`, `src2` the sources. Pre-
+  // slice cmdMvCp treated `src2` as dest (wrong shape; protected-
+  // path classifier still fired on `/etc` via the per-arg loop,
+  // but the emitted write-fs scope was wrong).
+  let targetDir: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--target-directory=')) {
+      targetDir = t.slice('--target-directory='.length);
+    } else if (t === '--target-directory' || t === '-t') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) targetDir = next;
+    }
+  }
+
+  if (targetDir !== null) {
+    // All positionals are sources; targetDir is the destination.
+    // Filter out the targetDir itself from positionals (it appears
+    // in stripFlags output but was already consumed as the flag value).
+    const srcs = positional.filter((p) => p !== targetDir);
+    if (srcs.length === 0) {
+      return { refuse: 'mv/cp: -t/--target-directory needs at least one source' };
+    }
+    return {
+      capabilities: [
+        ...srcs.map((s) => readFs(resolveArg(s, ctx))),
+        writeFs(resolveArg(targetDir, ctx)),
+      ],
+      confidence: 'high',
+    };
+  }
+
   if (positional.length < 2) {
     return { refuse: 'mv/cp: needs at least source and destination' };
   }
@@ -616,6 +650,60 @@ const cmdTee: CommandResolver = (positional, _tokens, ctx) => {
 // classifier together still mask the extraction destination.
 // Confidence stays `medium` to flag the inherent uncertainty.
 const cmdTar: CommandResolver = (positional, tokens, ctx) => {
+  // Slice 125 (R2 P0-1): GTFOBins arbitrary-exec flags. Documented
+  // tar flags whose value is a SHELL COMMAND, not a path:
+  //   --checkpoint-action=exec=<cmd>  — runs <cmd> at each checkpoint
+  //   --use-compress-program=<cmd>    — pipes the archive through <cmd>
+  //   --to-command=<cmd>              — runs <cmd> for each entry
+  // Pre-slice the resolver treated these as ordinary `--flag=value`
+  // pairs; the protected-path classifier saw `exec=rm-rf` as a path
+  // candidate under cwd, didn't match a deny zone, and cmdTar
+  // emitted a normal tar shape. A narrow `tar` allow rule would
+  // admit arbitrary local exec via any of these. Symmetric to ssh's
+  // ProxyCommand refuse — hard refuse the lot.
+  for (const t of tokens) {
+    if (t.startsWith('--checkpoint-action=')) {
+      const value = t.slice('--checkpoint-action='.length);
+      // `--checkpoint-action=exec=<cmd>` is the exploit; other
+      // values (sleep, ttyout, dot, totals, bell) are benign.
+      if (value.startsWith('exec=') || value === 'exec') {
+        return {
+          refuse:
+            'tar: --checkpoint-action=exec=<cmd> runs an arbitrary command — refusing static analysis',
+        };
+      }
+    }
+    if (t === '--checkpoint-action') {
+      // Space-separated form. We can't safely peek the next token
+      // because numeric values are stripped from args by tree-
+      // sitter — refuse unconditionally; the legitimate forms
+      // (sleep, dot) are equally unanalyzable via the static
+      // resolver.
+      return {
+        refuse:
+          'tar: --checkpoint-action <value> requires runtime inspection — refusing static analysis',
+      };
+    }
+    if (t === '--use-compress-program' || t.startsWith('--use-compress-program=')) {
+      return {
+        refuse:
+          'tar: --use-compress-program executes an arbitrary program as the compressor — refusing static analysis',
+      };
+    }
+    if (t === '--to-command' || t.startsWith('--to-command=')) {
+      return {
+        refuse: 'tar: --to-command runs an arbitrary command per entry — refusing static analysis',
+      };
+    }
+    if (t === '-I') {
+      // Short-form alias for --use-compress-program.
+      return {
+        refuse:
+          'tar: -I (alias of --use-compress-program) executes an arbitrary compressor — refusing static analysis',
+      };
+    }
+  }
+
   let mode: 'create' | 'extract' | 'list' | 'unknown' = 'unknown';
   let archivePath: string | null = null;
   let outputDir: string | null = null;
@@ -740,12 +828,23 @@ const cmdTar: CommandResolver = (positional, tokens, ctx) => {
 //     ergo arbitrary local exec via an option flag — refuse
 //     static analysis the same way cmdInterpreter refuses `-c`.
 const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
+  // Slice 125 (R2 P1): `-o LocalCommand=...` (and `-o
+  // PermitLocalCommand=yes` paired with `-o LocalCommand=...`)
+  // spawns a LOCAL shell as a connection-side hook, exactly like
+  // ProxyCommand. KnownHostsCommand also executes a local
+  // command on each connect. Refuse all three patterns. Match
+  // case-insensitively but report the canonical SSH option name
+  // so the operator's modal/log keeps the documented spelling.
+  const localExecOpts = ['ProxyCommand', 'LocalCommand', 'KnownHostsCommand'];
   for (const t of tokens) {
     const lower = t.toLowerCase();
-    if (lower.startsWith('proxycommand=') || lower.includes('proxycommand=')) {
-      return {
-        refuse: 'ssh: ProxyCommand option spawns local shell — refusing static analysis',
-      };
+    for (const opt of localExecOpts) {
+      const needle = `${opt.toLowerCase()}=`;
+      if (lower.startsWith(needle) || lower.includes(needle)) {
+        return {
+          refuse: `ssh: ${opt} option spawns a local command — refusing static analysis`,
+        };
+      }
     }
   }
 
@@ -762,11 +861,13 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
   //   - stringValueFlags: value is always a string (path / kv / host)
   //     → stays in args → peek next; consume if non-flag.
   //   - portForwardFlags: value is `[bind:]port:host:remote_port` for
-  //     -L/-R, `[bind:]port` for -D. When the value is plain numeric
-  //     (`-D 1080`) it's stripped from args; when it carries a colon
-  //     (`-L 8080:host:80`) it stays. Discriminator: peek-next contains
-  //     `:`. If yes, consume; if no, the value was numeric and gone.
-  const numericValueFlags: ReadonlySet<string> = new Set(['-p', '-w']);
+  //     -L/-R, `[bind:]port` for -D, `local_tun[:remote_tun]` for -w.
+  //     Slice 125: `-w` was previously in `numericValueFlags` (bare
+  //     `-w 5` form), but the colon-shape `-w 0:1` keeps the value
+  //     in shape.args and a host-extractor would otherwise pick
+  //     `0:1` as the target. Treat -w like the other port-forward
+  //     flags: peek next, consume only when the value contains `:`.
+  const numericValueFlags: ReadonlySet<string> = new Set(['-p']);
   const stringValueFlags: ReadonlySet<string> = new Set([
     '-i',
     '-F',
@@ -783,7 +884,7 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
     '-b',
     '-I',
   ]);
-  const portForwardFlags: ReadonlySet<string> = new Set(['-L', '-R', '-D']);
+  const portForwardFlags: ReadonlySet<string> = new Set(['-L', '-R', '-D', '-w']);
 
   let targetIdx = -1;
   let hasPortForward = false;
@@ -896,6 +997,37 @@ const cmdScp: CommandResolver = (positional, _tokens, ctx) => {
 //   - delete-fs(local dest) when --delete or any --delete-* flag
 //     is present (rsync can delete extraneous files on dest)
 const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
+  // Slice 125 (R2 P0-2): rsync transport-command flags. `-e <cmd>`
+  // and `--rsh=<cmd>` substitute the transport (rsync exec's the
+  // literal command string + args locally — GTFOBins reference:
+  //   rsync -e 'sh -c "sh -i 1>&0"' 127.0.0.1:
+  // is a documented shell escape). `--rsync-path=<cmd>` runs an
+  // arbitrary command on the REMOTE side. Pre-slice cmdRsync
+  // acknowledged the threat in a comment but did nothing about it
+  // — symmetric to ssh's ProxyCommand which slice 120 correctly
+  // hard-refused; bringing rsync to parity.
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t === '-e') {
+      return {
+        refuse:
+          'rsync: -e sets the transport command — local shell injection vector, refusing static analysis',
+      };
+    }
+    if (t === '--rsh' || t.startsWith('--rsh=')) {
+      return {
+        refuse:
+          'rsync: --rsh sets the transport command — local shell injection vector, refusing static analysis',
+      };
+    }
+    if (t === '--rsync-path' || t.startsWith('--rsync-path=')) {
+      return {
+        refuse:
+          'rsync: --rsync-path executes an arbitrary command on the remote side — refusing static analysis',
+      };
+    }
+  }
+
   if (positional.length < 2) {
     return { refuse: 'rsync: needs at least source and destination' };
   }
@@ -905,19 +1037,13 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
     return !p.slice(0, colon).includes('/');
   };
   const extractHost = (p: string): string => {
-    // Strip both `:` and `::` (rsync daemon form).
-    let cut = p.indexOf(':');
-    if (p[cut + 1] === ':') cut += 1;
     const left = p.slice(0, p.indexOf(':'));
     const at = left.lastIndexOf('@');
     const host = at === -1 ? left : left.slice(at + 1);
     return host || '*';
   };
   // `--delete`, `--delete-after`, `--delete-before`, etc. all enable
-  // destination deletion. `-e` / `--rsh` set the transport command;
-  // `--rsync-path=cmd` can run an arbitrary remote command — we
-  // don't refuse on those alone (a custom rsync-path is operator-
-  // legitimate in many fleets) but they signal medium confidence.
+  // destination deletion.
   const hasDelete = tokens.some((t) => t === '--delete' || t.startsWith('--delete-'));
 
   const dest = positional[positional.length - 1] as string;
@@ -968,8 +1094,24 @@ const cmdMake: CommandResolver = (_positional, _tokens, ctx) => {
 // Build / run / test / check / install / fetch — these can all
 // execute `build.rs` arbitrary code. Cargo also writes the
 // `target/` dir under cwd and reaches crates.io for deps.
-const cmdCargo: CommandResolver = (positional, _tokens, ctx) => {
+const cmdCargo: CommandResolver = (positional, tokens, ctx) => {
   const sub = positional[0];
+  // Slice 125 (R2 P1): `--target-dir=<path>` and `--target-dir <path>`
+  // redirect the build output dir. When present, the write-fs scope
+  // moves from `<cwd>/target` to that path.
+  let targetDir: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--target-dir=')) {
+      targetDir = t.slice('--target-dir='.length);
+    } else if (t === '--target-dir') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) targetDir = next;
+    }
+  }
+  const buildOutputDir =
+    targetDir !== null ? resolveArg(targetDir, ctx) : resolvePath(ctx.cwd, 'target');
+
   if (
     sub === 'tree' ||
     sub === 'metadata' ||
@@ -992,11 +1134,21 @@ const cmdCargo: CommandResolver = (positional, _tokens, ctx) => {
       confidence: 'medium',
     };
   }
+  // Slice 125 (R2 P1): `cargo clean` removes the build output dir.
+  // Pre-slice it fell into the default branch and emitted write-fs
+  // (alongside exec:arbitrary). The honest shape is delete-fs on
+  // the target dir; no exec:arbitrary because clean doesn't compile.
+  if (sub === 'clean') {
+    return {
+      capabilities: [deleteFs(buildOutputDir), readFs(ctx.cwd)],
+      confidence: 'high',
+    };
+  }
   return {
     capabilities: [
       exec('arbitrary'),
       readFs(ctx.cwd),
-      writeFs(resolvePath(ctx.cwd, 'target')),
+      writeFs(buildOutputDir),
       netEgress('crates.io'),
     ],
     confidence: 'medium',
@@ -1388,6 +1540,134 @@ const isReadOnlyCommand = (name: string): boolean => {
 // of which command produced the bytes.
 const isPureOutputCommand = (name: string): boolean => name === 'echo' || name === 'printf';
 
+// Slice 125 (R2 P0-3): shell brace + glob expansion helpers.
+// Bash's brace expansion (`{a,b}`) is FS-INDEPENDENT — the shell
+// expands deterministically before exec. Glob expansion (`*`, `?`,
+// `[`) is FS-dependent — runs at exec time against the live FS.
+// The resolver can pre-expand braces safely; for globs the best
+// we can do is detect the literal prefix and refuse if it could
+// lead into a protected zone.
+
+const GLOB_METACHAR_RE = /[*?[]/;
+
+const containsGlobMetachar = (s: string): boolean => GLOB_METACHAR_RE.test(s);
+
+// Extract the literal prefix of a glob pattern — everything before
+// the first `*`/`?`/`[`/`{`. Used to compare against protected
+// zone roots without resolving runtime glob expansion.
+const globLiteralPrefix = (arg: string): string => {
+  for (let i = 0; i < arg.length; i += 1) {
+    const c = arg[i];
+    if (c === '*' || c === '?' || c === '[' || c === '{') return arg.slice(0, i);
+  }
+  return arg;
+};
+
+// Expand brace patterns deterministically. Supports comma lists
+// `{a,b,c}` with arbitrary nesting. Numeric / character ranges
+// (`{1..5}`, `{a..z}`) are NOT expanded — those rely on bash-
+// specific semantics; we return [arg] unchanged for safety
+// (caller's classifier still handles literal prefix). A pattern
+// with mismatched braces returns [arg] as-is.
+//
+// Hard cap on expansion count: 1024 results. Beyond that we
+// abandon expansion to avoid pathological inputs like
+// `{a,b}{a,b}{a,b}...` exploding factorially. Caller treats this
+// as "could be anything"; combine with the glob-metachar refuse
+// path for safety.
+const MAX_BRACE_EXPANSIONS = 1024;
+const expandBraces = (arg: string): string[] => {
+  const out: string[] = [];
+  const visit = (s: string): void => {
+    if (out.length >= MAX_BRACE_EXPANSIONS) return;
+    const open = s.indexOf('{');
+    if (open === -1) {
+      out.push(s);
+      return;
+    }
+    // Find matching close, tracking nesting.
+    let depth = 1;
+    let close = -1;
+    for (let i = open + 1; i < s.length; i += 1) {
+      const c = s[i];
+      if (c === '{') depth += 1;
+      else if (c === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close === -1) {
+      out.push(s);
+      return;
+    }
+    const middle = s.slice(open + 1, close);
+    // Split top-level commas (ignore commas inside nested braces).
+    const parts: string[] = [];
+    let nested = 0;
+    let last = 0;
+    for (let i = 0; i < middle.length; i += 1) {
+      const c = middle[i];
+      if (c === '{') nested += 1;
+      else if (c === '}') nested -= 1;
+      else if (c === ',' && nested === 0) {
+        parts.push(middle.slice(last, i));
+        last = i + 1;
+      }
+    }
+    parts.push(middle.slice(last));
+    if (parts.length < 2) {
+      // Numeric range or single-element brace — refuse to expand;
+      // emit the literal so the glob-metachar branch picks it up.
+      out.push(s);
+      return;
+    }
+    const prefix = s.slice(0, open);
+    const suffix = s.slice(close + 1);
+    for (const p of parts) {
+      visit(prefix + p + suffix);
+      if (out.length >= MAX_BRACE_EXPANSIONS) return;
+    }
+  };
+  visit(arg);
+  return out;
+};
+
+// Test whether a literal-prefix path could reach any SYSTEM-level
+// protected target via glob expansion. True iff some protected
+// target's absolute path overlaps with the literal prefix (either
+// the target starts with the prefix, OR the prefix is inside the
+// target).
+//
+// Deliberately EXCLUDES `cwdEscalateDirs` (`.git`, `.agent`,
+// `.claude` under cwd): a legitimate glob like `*.ts` in cwd
+// resolves to `<cwd>/*.ts` whose literal prefix is `<cwd>/` — that
+// trivially matches every cwd-relative protected dir. Including
+// cwdEscalateDirs would refuse every glob under cwd as a bypass,
+// which is way too aggressive. The bypass threat that matters here
+// is SYSTEM-level (`/etc/*`, `/proc/*`, `~/.ssh/*`); cwd-relative
+// targets are caught by the per-expansion classifyProtectedPath
+// path when the glob is brace-expanded (or by the operator's
+// explicit allow/confirm rule shape).
+const couldGlobReachProtected = (
+  absLiteralPrefix: string,
+  targets: ReturnType<typeof protectedTargets>,
+): boolean => {
+  const all: string[] = [
+    ...targets.systemDeny,
+    ...targets.absoluteEscalate,
+    ...targets.tildeEscalateFiles,
+    ...targets.tildeEscalateDirs,
+  ];
+  for (const t of all) {
+    if (t === absLiteralPrefix || t.startsWith(absLiteralPrefix)) return true;
+    if (absLiteralPrefix.startsWith(`${t}/`)) return true;
+  }
+  return false;
+};
+
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
@@ -1427,19 +1707,54 @@ const analyzeCommand = (
   };
   let escalated = false;
   if (!isPureOutputCommand(shape.name)) {
+    const targets = protectedTargets(ctx.home, ctx.cwd);
     for (const arg of shape.args) {
       if (arg.length === 0) continue;
       const candidate = extractFlagValue(arg);
       if (candidate === null) continue;
-      const abs = resolvePath(ctx.cwd, candidate);
       const op: 'read' | 'write' = isReadOnlyCommand(shape.name) ? 'read' : 'write';
-      const tier = classifyProtectedPath({ absPath: abs, op, home: ctx.home, cwd: ctx.cwd });
-      if (tier === 'deny') {
-        return {
-          refuse: `bash: ${shape.name} target '${candidate}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
-        };
+
+      // Slice 125 (R2 P0-3): shell brace + glob expansion bypass.
+      // `rm /e{tc}/passwd` parses as a single `word` in the tree-
+      // sitter AST and resolves to literal `/e{tc}/passwd`; neither
+      // matches any protected zone via classifyProtectedPath. But
+      // the SHELL expands `{tc}` deterministically to `etc` before
+      // exec, so the actual call is `rm /etc/passwd`. Similarly
+      // `rm /e*/passwd` could match `/etc/passwd` via glob
+      // expansion at runtime.
+      //
+      // Defense:
+      //   1. Expand brace patterns deterministically and check
+      //      every expansion against the classifier. Brace
+      //      expansion is FS-INDEPENDENT in bash, so we can do
+      //      this safely.
+      //   2. For glob metachars (`*`, `?`, `[`) we can't pre-
+      //      expand without FS access. Refuse if the literal
+      //      prefix could lead into a protected zone (i.e., any
+      //      protected target starts with the literal prefix).
+      const expansions = expandBraces(candidate);
+      for (const exp of expansions) {
+        if (containsGlobMetachar(exp)) {
+          const absLiteralPrefix = resolvePath(ctx.cwd, globLiteralPrefix(exp));
+          if (couldGlobReachProtected(absLiteralPrefix, targets)) {
+            return {
+              refuse: `bash: ${shape.name} target '${exp}' uses a shell glob (*/?/[) whose literal prefix could expand into a protected zone — refusing static analysis`,
+            };
+          }
+          // Glob into safe paths: still escalate confidence so
+          // the operator's modal sees the metachar.
+          escalated = true;
+          continue;
+        }
+        const abs = resolvePath(ctx.cwd, exp);
+        const tier = classifyProtectedPath({ absPath: abs, op, home: ctx.home, cwd: ctx.cwd });
+        if (tier === 'deny') {
+          return {
+            refuse: `bash: ${shape.name} target '${exp}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
+          };
+        }
+        if (tier === 'escalate') escalated = true;
       }
-      if (tier === 'escalate') escalated = true;
     }
   }
 

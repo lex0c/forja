@@ -121,6 +121,23 @@ const PATH_REGEX_TILDE = /~[A-Za-z0-9_-]*\/[^\s'":\\]+/g;
 // redaction noise that would hide real signals.
 const URL_REGEX = /\b(?:https?|ftps?|sftp|ssh|file):\/\/[^\s'"<>\]\)]+/gi;
 const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g;
+// Slice 125 (R2 P1): IPv6 with optional bracketed port.
+// Matches `[::1]:8080`, `[2001:db8::1]:443`, also bare
+// `[::1]`. Conservative — only the bracketed form is matched
+// to avoid false positives on hex strings.
+const IPV6_BRACKETED_REGEX = /\[[0-9a-fA-F:]+\](?::\d{1,5})?/g;
+// Git SSH form: `git@github.com:org/repo.git`,
+// `user@host:path`. Distinguish from `user@host` URLs by the
+// trailing `:path` segment. The `:path` must not start with
+// `/` (that would be `host:/abs` which is rare and could
+// confuse with scp's local-path-with-colon shape; the user@
+// prefix here is the discriminator).
+const GIT_SSH_REGEX = /\b[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+/g;
+// Domain-only hostname with port: `internal.corp:443`,
+// `db.example.com:5432`. Matches `<dnsname>:<port>` where the
+// dnsname contains at least one dot. Conservative on dots to
+// avoid matching `version.bumped.to:something`.
+const DOMAIN_PORT_REGEX = /\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:\d{1,5}\b/g;
 
 export interface ScrubOptions {
   // Redact path scopes in capability strings + path-shaped
@@ -169,8 +186,18 @@ const scrubReason = (text: string, opts: Required<ScrubOptions>): string => {
     // scheme regex). IPv4 stays here because it's purely a host
     // axis: a reason like "192.168.1.10:5432" carries no path
     // shape but should still scrub.
+    //
+    // Slice 125 (R2 P1) additions: IPv6 brackets, git SSH
+    // (`user@host:path`), domain:port. Ordering matters — git
+    // SSH must come BEFORE domain:port because both can match
+    // `host:path` shapes, and git-ssh's user@ prefix needs the
+    // longer pattern. IPv6 first because brackets disambiguate
+    // immediately.
     scrubbed = scrubbed.replace(URL_REGEX, PLACEHOLDER_HOST);
+    scrubbed = scrubbed.replace(IPV6_BRACKETED_REGEX, PLACEHOLDER_HOST);
+    scrubbed = scrubbed.replace(GIT_SSH_REGEX, PLACEHOLDER_HOST);
     scrubbed = scrubbed.replace(IPV4_REGEX, PLACEHOLDER_HOST);
+    scrubbed = scrubbed.replace(DOMAIN_PORT_REGEX, PLACEHOLDER_HOST);
   }
   return scrubbed;
 };

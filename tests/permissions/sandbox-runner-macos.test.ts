@@ -31,15 +31,20 @@ describe('buildSbplProfile — common header + base rules', () => {
     }
   });
 
-  test('/tmp + /private/tmp + /private/var/folders writable in every profile', () => {
-    // Matches Linux's --tmpfs /tmp. macOS's TMPDIR routes through
-    // /private/var/folders; both forms allowed so mktemp /
-    // NSTemporaryDirectory work.
+  test('/tmp + /private/tmp writable in every profile (slice 125: /private/var/folders REMOVED)', () => {
+    // Matches Linux's --tmpfs /tmp.
+    //
+    // Slice 125 (R2 P0-6): /private/var/folders was the macOS TMPDIR
+    // root and pre-slice was writable for mktemp / NSTemporaryDirectory
+    // compatibility. But that root is shared across every app the user
+    // runs — exposing Keychain / security ephemeral state. Removed;
+    // tools needing TMPDIR can override via `TMPDIR=/tmp <cmd>` or
+    // use the host-passthrough profile.
     for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
       const profile = buildSbplProfile(p, '/work/proj', '/home/op');
       expect(profile).toContain('(allow file-write* (subpath "/tmp"))');
       expect(profile).toContain('(allow file-write* (subpath "/private/tmp"))');
-      expect(profile).toContain('(allow file-write* (subpath "/private/var/folders"))');
+      expect(profile).not.toContain('(allow file-write* (subpath "/private/var/folders"))');
     }
   });
 });

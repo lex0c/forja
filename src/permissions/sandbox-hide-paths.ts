@@ -13,25 +13,49 @@
 // but the path list is identical — these are platform-agnostic
 // credential locations defined by the spec, and divergence
 // between the two runners would create cross-platform leaks.
+//
+// Slice 125 (R2 P0-5) expansion: pre-slice this list covered the
+// §9 canonical set (.ssh / .aws / .config/gcloud / .gnupg / .kube
+// + .netrc / .docker/config.json / .npmrc / .pypirc). Reviewer
+// noted drift against `src/subagents/sensitive-paths.ts` (which
+// listed `.git-credentials`) AND missing coverage for cloud /
+// secret-manager creds that have proliferated since §9 was
+// written. The list now includes:
+//
+//   .terraform.d         Terraform credentials.tfrc.json + cache
+//   .config/azure        Azure CLI tokens
+//   .config/op           1Password CLI session
+//   .config/sops         SOPS encryption keys
+//   .ansible             vault password file location
+//   .local/share/forja   Forja's own audit DB — the sandboxed
+//                        process must not be able to mutate the
+//                        hash chain via direct sqlite writes
+//                        (home-rw profile exposes ~/.local/...
+//                        writable; the tmpfs overlay closes it).
+//   .git-credentials     Git HTTP credentials store
+//   .boto                Boto / legacy AWS SDK creds
 
-// Directories carrying SSH keys, AWS creds, GCP creds, GPG
-// secret keys, Kubernetes contexts. Masked as opaque empty
-// directories inside the sandbox.
+// Directories masked as opaque empty directories inside the sandbox.
 export const HIDE_PATHS_DIRS: readonly string[] = [
   '.ssh',
   '.aws',
   '.config/gcloud',
+  '.config/azure',
+  '.config/op',
+  '.config/sops',
   '.gnupg',
   '.kube',
+  '.terraform.d',
+  '.ansible',
+  '.local/share/forja',
 ];
 
-// Individual files: curl/wget HTTP/FTP creds (.netrc), Docker
-// registry token (.docker/config.json), npm registry token
-// (.npmrc), pip private-repo creds (.pypirc). Masked as
-// non-existent / empty files inside the sandbox.
+// Individual files masked as non-existent / empty inside the sandbox.
 export const HIDE_PATHS_FILES: readonly string[] = [
   '.netrc',
   '.docker/config.json',
   '.npmrc',
   '.pypirc',
+  '.git-credentials',
+  '.boto',
 ];

@@ -60,6 +60,16 @@ const INTRO_LINES = [
 
 const SECTION_DIVIDER = '─'.repeat(60);
 
+// Slice 125 (R2 P2): strip CC0 (U+0000-U+001F) + CC1 (U+0080-U+009F)
+// control characters. Used to sanitize operator-readable values
+// (e.g., marker timestamps parsed from a file body) before
+// emitting to stdout, where ANSI escape sequences (`\x1b...`)
+// or window-title escapes (`\x1b]0;evil\x07`) would otherwise
+// render. Preserves common whitespace (\t, \n, \r) for layout.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: the rule's purpose IS to match control chars (defense intent)
+const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
+const stripControlChars = (s: string): string => s.replace(CONTROL_CHAR_RE, '');
+
 const NEXT_STEPS_LINES = [
   '',
   SECTION_DIVIDER,
@@ -128,11 +138,24 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
     // unsafe mode. Falls back to the no-timestamp message when
     // the marker is unreadable / corrupted (rare; readSkipMarker
     // returns null defensively).
+    //
+    // Slice 125 (R2 P2): strip control characters before printing.
+    // The marker body is operator-controlled (per slice 122 docs
+    // it's expected to be hand-inspected, sometimes hand-edited).
+    // If an attacker can write the marker (mode 0600 makes that
+    // require operator-level access — already game-over for most
+    // threat models, but defense in depth) they could inject
+    // ANSI / window-title escape sequences (`\x1b]0;evil\x07`)
+    // that render arbitrarily in the operator's terminal.
+    // Strip CC0/CC1 control chars before emitting.
     const meta = readSkip(env);
     if (meta !== null && meta.createdAt !== undefined) {
-      const versionStr = meta.version !== undefined ? `, version ${meta.version}` : '';
+      const safeCreatedAt = stripControlChars(meta.createdAt);
+      const safeVersion = meta.version !== undefined ? stripControlChars(meta.version) : undefined;
+      const safePath = stripControlChars(meta.path);
+      const versionStr = safeVersion !== undefined ? `, version ${safeVersion}` : '';
       out(
-        `Sandbox setup skipped — marker present at ${meta.path} (created ${meta.createdAt}${versionStr}).\n`,
+        `Sandbox setup skipped — marker present at ${safePath} (created ${safeCreatedAt}${versionStr}).\n`,
       );
     } else {
       out('Sandbox setup skipped — `~/.config/forja/sandbox_skip` marker present.\n');

@@ -8,7 +8,7 @@ import {
   resolveScopeRoots,
 } from '../memory/index.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
-import { createPermissionEngine } from '../permissions/index.ts';
+import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
   type DB,
@@ -45,6 +45,7 @@ import {
   type ChildPermissionBridge,
   createChildPermissionBridge,
 } from '../subagents/permission-bridge.ts';
+import { createRecordingTelemetrySink } from '../telemetry/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithOutputSchemaBlock } from './output-schema-block.ts';
@@ -609,11 +610,49 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         effectiveCapabilitiesParsed = [];
       }
     }
+    // Slice 125 (R2 P0-9): wire the audit sink so child engine
+    // decisions enter the `approvals_log` chain. Pre-slice the
+    // child engine defaulted to createNoopSink(), so every child
+    // decision vanished — §17 replay couldn't find them, §7.2
+    // chain integrity coverage stopped at the parent's last seq.
+    //
+    // The child re-derives install_id via `ensureInstallId` (same
+    // path the parent uses; idempotent). The same `db` handle the
+    // child opened above feeds the sink — child + parent write
+    // to the same physical chain, ordered by their own append.
+    let childSink: ReturnType<typeof createSqliteSink> | undefined;
+    try {
+      const identity = ensureInstallId({ env: process.env });
+      childSink = createSqliteSink({ db, identity });
+    } catch {
+      // ensureInstallId can fail if HOME/$XDG_CONFIG_HOME aren't
+      // writable. We fall through to a noop audit (preserves pre-
+      // slice behavior); the child still runs but its decisions
+      // won't enter the chain. The parent's spawn path would have
+      // already caught the same fs issue, so this branch is
+      // exceptionally rare in practice.
+      childSink = undefined;
+    }
+
+    // Slice 125 (R2 P0-10): wire a telemetry sink so child harness
+    // events (sandbox.degraded_active, permission.decision,
+    // classifier.unavailable, state.transition) don't silently
+    // drop. The recording sink keeps events in memory; future
+    // slices can teach the IPC layer to drain them back to the
+    // parent's telemetry channel at session-finished time. Today
+    // the events at least surface in the child process for any
+    // local observer (e.g., process-level OTEL exporter wrapping
+    // bun) instead of vanishing entirely.
+    const childTelemetry = createRecordingTelemetrySink();
+
     const permissionEngine = createPermissionEngine(audit.policySnapshot, {
       cwd: session.cwd,
       ...(effectiveCapabilitiesParsed !== undefined
         ? { effectiveCapabilities: effectiveCapabilitiesParsed }
         : {}),
+      ...(childSink !== undefined ? { audit: childSink } : {}),
+      telemetry: childTelemetry,
+      sessionId: opts.sessionId,
     });
 
     // The audit row carries the canonical toolset (`tools_whitelist`)
@@ -1078,6 +1117,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       ...(permissionBridge !== undefined
         ? { confirmPermission: permissionBridge.confirmPermission }
         : {}),
+      // Slice 125 (R2 P0-10): forward telemetry into the child
+      // harness loop too. Without this, the slice-111
+      // SandboxDegradedActiveEvent emit at loop.ts:901 short-
+      // circuits on `config.telemetry === undefined` and the
+      // event never fires. Same recording sink shared with the
+      // engine above so all child events land in one stream.
+      telemetry: childTelemetry,
     };
 
     let result = await runAgent(config);

@@ -137,12 +137,50 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   }
   if (profile === 'host') return innerArgv.slice();
 
+  // Slice 125 (R2 P0-4 guard): cwd-inside-hidden-dir precondition.
+  // If the operator happens to run Forja from `~/.ssh/audit/` (or
+  // any cwd nested under a hide_paths root), the LATER `--tmpfs
+  // ~/.ssh` overlay would mask the bound cwd inside the sandbox.
+  // The inner process would receive a working dir that "vanishes"
+  // — opaque bwrap failure with no diagnostic. Refuse at build
+  // time with a clear error.
+  for (const dir of HIDE_PATHS_DIRS) {
+    const hiddenAbs = joinPath(home, dir);
+    if (cwd === hiddenAbs || cwd.startsWith(`${hiddenAbs}/`)) {
+      throw new Error(
+        `buildBwrapArgv: cwd '${cwd}' is inside hide_paths dir '${hiddenAbs}'; the sandbox would mask the cwd mount. Move to a different working directory.`,
+      );
+    }
+  }
+
   const flags: string[] = [...COMMON_PROFILE_FLAGS];
   // Network policy.
   if (profile !== 'cwd-rw-net') {
     flags.push('--unshare-net');
   }
   // Writable mounts per profile.
+  //
+  // Slice 125 (R2 P0-4 known limitation): bwrap's `--bind <src>
+  // <dst>` follows symlinks AT THE SOURCE before mounting. If
+  // `<cwd>` itself OR any path inside cwd is a symlink whose
+  // TARGET points outside cwd (e.g., `node_modules` → shared
+  // cache, `.cache` → ~/.aws/sso/cache), the inner process can
+  // write through the symlink to the symlink's target — which
+  // may be OUTSIDE the declared sandbox boundary. bwrap exposes
+  // no flag to refuse following symlinks at bind time.
+  //
+  // Documented as a known limitation. Mitigations available to
+  // the operator:
+  //   1. Don't run Forja from a cwd containing symlinks to
+  //      sensitive paths.
+  //   2. Use `--sandbox-host` (operator-opted-in passthrough)
+  //      when symlinks are legitimate workflow tooling.
+  //   3. Pre-realpath cwd before invoking Forja (`cd "$(realpath
+  //      .)"`) to canonicalize any leading symlinks.
+  //
+  // Engine-side §4.3 `symlink_escape` deny still fires on resolver-
+  // detected symlink targets, but the runtime sandbox layer does
+  // not duplicate that check.
   if (profile === 'cwd-rw' || profile === 'cwd-rw-net') {
     flags.push('--bind', cwd, cwd);
   } else if (profile === 'home-rw') {

@@ -3,6 +3,27 @@ import { type ParsePolicyContext, defaultPolicy, loadPolicyFromFile } from './co
 import { enterprisePolicyPath, projectPolicyPath, userPolicyPath } from './paths.ts';
 import type { Policy, PolicyDefaults, PolicyMode, PolicyToolsSection } from './types.ts';
 
+// Slice 125 (R2 P1): structural JSON stringify that sorts keys at
+// every nesting level. Used by the seal-lock deep-equal compare
+// so two semantically-equal seal objects with different property
+// ordering (e.g., disk-loaded YAML in `{ mode, path, locked }`
+// canonical order vs programmatic embedder building `{ path,
+// mode, locked }`) produce the same string.
+const stableJsonStringify = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJsonStringify).join(',')}]`;
+  }
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = (value as Record<string, unknown>)[k];
+    if (v === undefined) continue;
+    parts.push(`${JSON.stringify(k)}:${stableJsonStringify(v)}`);
+  }
+  return `{${parts.join(',')}}`;
+};
+
 // Hierarchy resolution per AGENTIC_CLI §8: enterprise → user → project
 // → session, with `locked` semantics. Higher-precedence layers can
 // mark sections as locked, preventing lower layers from overriding
@@ -322,13 +343,17 @@ const merge = (
       const incoming = policy.seal;
       if (sealLockedBy !== null) {
         // Already locked. Compare incoming to merged via
-        // canonical-JSON deep-equal. The seal section is small
-        // (<10 fields, all primitive) so the JSON.stringify
-        // cost is negligible; using canonicalHash here would be
-        // overkill since the keys are already in a canonical
-        // order after parsePolicy.
-        const incomingJson = JSON.stringify(incoming);
-        const mergedJson = mergedSeal === undefined ? undefined : JSON.stringify(mergedSeal);
+        // canonical-JSON deep-equal. parsePolicy normalizes keys
+        // to canonical order for YAML-loaded policies, so a
+        // direct `JSON.stringify(a) === JSON.stringify(b)` would
+        // work there. But `options.session` is forwarded WITHOUT
+        // re-parsing — a programmatic caller building `{ path,
+        // mode, locked }` (different key order vs the canonical
+        // `{ mode, path, locked }`) would spurious-flag
+        // lockConflict pre-slice. Slice 125 (R2 P1): sort keys
+        // before stringify so the equality is structural.
+        const incomingJson = stableJsonStringify(incoming);
+        const mergedJson = mergedSeal === undefined ? undefined : stableJsonStringify(mergedSeal);
         if (incomingJson !== mergedJson) {
           lockConflicts.push({
             section: 'seal',

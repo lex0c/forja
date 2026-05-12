@@ -6,7 +6,27 @@ export type DB = Database;
 
 export const MEMORY_DB = ':memory:';
 
-export const openDb = (path: string): DB => {
+export interface OpenDbOptions {
+  // Slice 125 (R2 P0-8): readonly handle for inspection / health
+  // checks that MUST NOT mutate schema or rows. Sets the bun:sqlite
+  // `readonly` flag (SQLite-level enforcement: any write fails
+  // with SQLITE_READONLY). Skips the WAL pragmas (which need write
+  // perms) and skips the parent-dir mkdir. `create` is forced off
+  // — readonly mode on a non-existent file would otherwise create
+  // an empty DB by accident. Doctor's chainCheck is the canonical
+  // consumer; future read-only inspection tools (export, replay
+  // against archived DB) can adopt the same shape.
+  readonly?: boolean;
+}
+
+export const openDb = (path: string, options: OpenDbOptions = {}): DB => {
+  if (options.readonly === true) {
+    // Don't mkdir parent; don't pass create:true. If the file is
+    // missing the open throws — caller decides how to surface.
+    const db = new Database(path, { readonly: true });
+    db.exec('PRAGMA foreign_keys = ON;');
+    return db;
+  }
   if (path !== MEMORY_DB) {
     mkdirSync(dirname(path), { recursive: true });
   }

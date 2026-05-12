@@ -45,8 +45,8 @@ import {
   defaultIsMcpTool,
 } from './risk-score.ts';
 import {
-  type SandboxProfile,
   type SelectSandboxProfileResult,
+  isSandboxProfile,
   selectSandboxProfile,
 } from './sandbox-plan.ts';
 import {
@@ -1256,7 +1256,19 @@ export const createPermissionEngine = (
   // hint.
   const withSandboxProfile = (decision: Decision, profile: string | null): Decision => {
     if (profile === null) return decision;
-    return { ...decision, sandboxProfile: profile as SandboxProfile };
+    // Slice 125 (R2 P1): defense-in-depth validation. The
+    // `profile` param's domain is `selectSandboxProfile`'s return
+    // type, but a future code path that wires an external string
+    // here would silently launder past the type system via the
+    // cast. `isSandboxProfile` matches the wire-validation gate
+    // slice 103 added at the runner boundary; keeping the engine
+    // boundary symmetric ensures both sides refuse the same way.
+    if (!isSandboxProfile(profile)) {
+      throw new Error(
+        `withSandboxProfile: invalid profile '${profile}' — expected ro|cwd-rw|cwd-rw-net|home-rw|host`,
+      );
+    }
+    return { ...decision, sandboxProfile: profile };
   };
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {

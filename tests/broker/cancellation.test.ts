@@ -32,22 +32,42 @@ describe('createInProcessBroker — signal propagation', () => {
   // OR broker close OR per-call timeoutMs). The contract pre-slice
   // 121 was "exec.signal IS callerSignal"; the post-slice contract
   // is "exec.signal MIRRORS callerSignal AND broker-shutdown".
-  test('caller-signal abort propagates to the linked signal exec sees', async () => {
-    const captured: { signal: AbortSignal | undefined } = { signal: undefined };
+  test('caller-signal abort during exec fires on the linked signal exec sees', async () => {
+    // Slice 125 (R2 P1): linkSignals disposers run in the finally
+    // block of `await myTurn`, BEFORE the broker.execute return.
+    // So a post-return ac.abort() no longer propagates to the
+    // linked signal exec stashed — that's the intentional leak
+    // fix. The propagation contract is "during exec only": this
+    // test pins the in-flight behavior by aborting WHILE exec is
+    // mid-call.
+    let observedAbortDuringExec = false;
     const broker = createInProcessBroker({
       exec: async (_req, callOptions) => {
-        captured.signal = callOptions?.signal;
+        const sig = callOptions?.signal;
+        sig?.addEventListener('abort', () => {
+          observedAbortDuringExec = true;
+        });
+        // Stall until the linked signal aborts (or a 1s safety
+        // timer fires, in which case the test fails the
+        // expectation below).
+        await new Promise<void>((resolve) => {
+          if (sig?.aborted) {
+            resolve();
+            return;
+          }
+          sig?.addEventListener('abort', () => resolve(), { once: true });
+          setTimeout(resolve, 1000);
+        });
         return { ok: true, stdout: '', stderr: '', exitCode: 0 };
       },
     });
     const ac = new AbortController();
-    await broker.execute(baseRequest(), { signal: ac.signal });
-    expect(captured.signal).toBeDefined();
-    expect(captured.signal?.aborted).toBe(false);
-    // Aborting the caller's controller fires on the linked signal
-    // exec saw (provided exec stashed the reference past return).
+    const execPromise = broker.execute(baseRequest(), { signal: ac.signal });
+    // Let exec start, then abort the caller.
+    await new Promise((r) => setTimeout(r, 10));
     ac.abort();
-    expect(captured.signal?.aborted).toBe(true);
+    await execPromise;
+    expect(observedAbortDuringExec).toBe(true);
     await broker.close();
   });
 

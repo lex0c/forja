@@ -45,7 +45,7 @@ import {
 import { installIdPath } from '../permissions/paths.ts';
 import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, openDb } from '../storage/index.ts';
 import { type DoctorCheckCache, getSharedDoctorCache, withDoctorCache } from './doctor-cache.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
@@ -397,19 +397,48 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
     };
   }
 
+  // Slice 125 (R2 P0-7 + P0-8):
+  //   - Open the DB READONLY. Pre-slice chainCheck called
+  //     `migrate(db, MIGRATIONS)` which writes to `_migrations`
+  //     and applies pending DDL. A doctor health check is the
+  //     wrong surface to mutate schema (§13.1 "detect, don't
+  //     distribute"); if the schema is stale, verifyChain's
+  //     query fails and that IS the right signal for the
+  //     operator.
+  //   - Close the DB handle on every return path. Pre-slice
+  //     the handle leaked: under §13.8 the harness re-runs
+  //     doctor every 50 tool calls, accumulating WAL connections
+  //     over a long session.
   let result: VerifyResult;
+  let db: ReturnType<typeof openDb> | null = null;
   try {
-    const db = openDb(options.dbPath);
-    migrate(db, MIGRATIONS);
+    db = openDb(options.dbPath, { readonly: true });
     const sink = createSqliteSink({ db, identity });
     result = sink.verifyChain();
   } catch (e) {
+    if (db !== null) {
+      try {
+        db.close();
+      } catch {
+        // ignore — primary error already in flight
+      }
+    }
     return {
       name: 'hash_chain',
       status: 'fail',
       detail: `DB error: ${(e as Error).message}`,
-      remediation: `check ${options.dbPath} for corruption or permission issues`,
+      remediation: `check ${options.dbPath} for corruption, permissions, or schema mismatch (run \`agent permission verify\` for details)`,
     };
+  } finally {
+    if (db !== null) {
+      try {
+        db.close();
+      } catch {
+        // ignore — close errors on a readonly handle indicate
+        // a low-level issue; the verifyChain result we just
+        // captured is still authoritative.
+      }
+    }
   }
 
   if (!result.ok) {
@@ -548,6 +577,12 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
       detail: `mode '${sealConfig.mode}' has no doctor check wired yet`,
     };
   }
+  // Slice 125 (R2 P1): close the store on every return path. The
+  // worm-file SealStore's close is a no-op today, but future
+  // backends (s3, rfc3161 TSA, git with persistent worktree) hold
+  // sockets / file descriptors that MUST be released. Doing it
+  // now is cheap defense in depth and matches the contract at
+  // sealing.ts:51-66.
   let store: SealStore;
   try {
     store = factory(sealConfig);
@@ -558,39 +593,46 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
       detail: `factory failed: ${(e as Error).message}`,
     };
   }
-  let entries: readonly { seq: number; ts: number; hash: string }[];
   try {
-    entries = store.list();
-  } catch (e) {
-    // Malformed seal file — strong tampering signal.
+    let entries: readonly { seq: number; ts: number; hash: string }[];
+    try {
+      entries = store.list();
+    } catch (e) {
+      return {
+        name: 'sealing',
+        status: 'fail',
+        detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
+        remediation: 'inspect the file; run `agent permission seal-verify` for chain cross-check',
+      };
+    }
+    if (entries.length === 0) {
+      return {
+        name: 'sealing',
+        status: 'warn',
+        detail: `${sealConfig.mode} at ${sealConfig.path}: configured but no entries yet`,
+        remediation:
+          'the engine seals automatically per interval; run `agent permission seal-now` to force one',
+      };
+    }
+    const last = entries[entries.length - 1];
+    if (last === undefined) {
+      return { name: 'sealing', status: 'fail', detail: 'list returned a missing tail entry' };
+    }
+    const relTime = formatRelativeTime(last.ts, options.now());
+    const entryWord = entries.length === 1 ? 'entry' : 'entries';
     return {
       name: 'sealing',
-      status: 'fail',
-      detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
-      remediation: 'inspect the file; run `agent permission seal-verify` for chain cross-check',
+      status: 'ok',
+      detail: `${sealConfig.mode} at ${sealConfig.path}: ${entries.length} ${entryWord}, last ${relTime}`,
     };
+  } finally {
+    try {
+      store.close();
+    } catch {
+      // Close errors on a read-only seal-check path don't change
+      // the verdict — the list() we already captured is authoritative.
+    }
   }
-  if (entries.length === 0) {
-    return {
-      name: 'sealing',
-      status: 'warn',
-      detail: `${sealConfig.mode} at ${sealConfig.path}: configured but no entries yet`,
-      remediation:
-        'the engine seals automatically per interval; run `agent permission seal-now` to force one',
-    };
-  }
-  const last = entries[entries.length - 1];
-  if (last === undefined) {
-    // Defensive; unreachable since entries.length > 0.
-    return { name: 'sealing', status: 'fail', detail: 'list returned a missing tail entry' };
-  }
-  const relTime = formatRelativeTime(last.ts, options.now());
-  const entryWord = entries.length === 1 ? 'entry' : 'entries';
-  return {
-    name: 'sealing',
-    status: 'ok',
-    detail: `${sealConfig.mode} at ${sealConfig.path}: ${entries.length} ${entryWord}, last ${relTime}`,
-  };
 };
 
 // §13.3 doctor checks (slice 90). Linux kernel + LSM detail that

@@ -59,11 +59,24 @@ export interface BuildSandboxExecArgvOptions {
 // literals; backslash escapes the next character. Filesystem paths
 // almost never contain `"` or `\`, but we escape defensively so a
 // crafted path can't break out of the literal and inject
-// (allow ...) clauses. Throws on null bytes — those aren't valid in
-// filesystem paths and indicate caller bugs upstream.
+// (allow ...) clauses.
+//
+// Rejects on:
+//   - NUL bytes — invalid in filesystem paths; indicates caller bug.
+//   - Newlines (`\n`/`\r`) — slice 125 (R2 P1): the SBPL profile is
+//     line-joined with `\n` (see buildSbplProfile's `.join('\n')`).
+//     A path containing a literal newline would break the line
+//     structure and could land attacker-controlled tokens at the
+//     start of a fresh line (e.g. `(allow file-read*)` injection).
+//     POSIX permits newlines in paths but they're extraordinarily
+//     rare in practice; rejecting defends against a real injection
+//     vector with negligible legitimate cost.
 const escapeSbplLiteral = (s: string): string => {
   if (s.includes('\0')) {
     throw new Error('sandbox-runner-macos: path contains NUL byte');
+  }
+  if (s.includes('\n') || s.includes('\r')) {
+    throw new Error('sandbox-runner-macos: path contains newline (CR/LF)');
   }
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 };
@@ -107,11 +120,24 @@ export const buildSbplProfile = (
   writeRules.push('(allow file-write* (subpath "/private/tmp"))');
   // macOS routes /tmp through /private/tmp via a firmlink; some
   // operations resolve one form, some the other. Allow both.
-  writeRules.push('(allow file-write* (subpath "/private/var/folders"))');
-  // /private/var/folders/... is macOS's per-user tempdir (TMPDIR).
-  // Wrapped commands that use mktemp / NSTemporaryDirectory land
-  // here. Allowing it matches the Linux profile's "ephemeral
-  // scratch is writable" property.
+  //
+  // Slice 125 (R2 P0-6): pre-slice we also allowed write to
+  // `/private/var/folders` (macOS per-user TMPDIR root) for
+  // mktemp / NSTemporaryDirectory compatibility. But that root
+  // is SHARED across every app the user runs — includes
+  // `com.apple.Keychain.*` ephemeral state, `com.apple.security.*`
+  // caches, credential-helper sockets. The Linux equivalent uses
+  // `--tmpfs /tmp` (fresh isolated tmpfs per-sandbox); macOS
+  // just unlocked the host path. Removed.
+  //
+  // Cost: wrapped tools that hard-code NSTemporaryDirectory
+  // (Swift/Obj-C apps; some Python/Ruby/Node tools via system
+  // libs) will fail at exec time. Workaround: operator can
+  // prefix `TMPDIR=/tmp <cmd>` to redirect, OR opt into
+  // `host-passthrough` for that specific call. Future slice
+  // could mint a per-sandbox tempdir + bind it as TMPDIR; that
+  // requires runtime side effects beyond the current pure-
+  // function runner contract.
   if (profile === 'cwd-rw' || profile === 'cwd-rw-net') {
     writeRules.push(`(allow file-write* (subpath "${escapeSbplLiteral(cwd)}"))`);
   } else if (profile === 'home-rw') {

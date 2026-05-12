@@ -15,6 +15,111 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 125: REVIEW_NOTES_R2 punch list (10 P0 + 12 P1)
+
+**Done.** One-hundred-twenty-fifth slice. Closes every actionable finding from `docs/REVIEW_NOTES_R2.md` — the second multi-agent review pass over slices 95-124. Ten P0 findings + twelve P1s in one consolidated slice; the surfaces touched are disjoint enough that a single review pass is more economical than five separate slices.
+
+### P0 fixes
+
+| # | File | Symptom → Fix |
+|---|---|---|
+| 1 | `src/permissions/resolvers/bash.ts:618` cmdTar | tar GTFOBins flags (`--checkpoint-action=exec=<cmd>`, `--use-compress-program=<cmd>`, `--to-command=<cmd>`, short alias `-I`) executed arbitrary local commands via the value half. Hard refuse symmetric to ssh's `ProxyCommand`. |
+| 2 | `src/permissions/resolvers/bash.ts:898` cmdRsync | rsync `-e <cmd>` / `--rsh=<cmd>` substituted the transport (literal local exec); `--rsync-path=<cmd>` ran arbitrary remote command. Pre-slice the comment acknowledged the threat but the runtime did nothing. Hard refuse all three. |
+| 3 | `src/permissions/resolvers/bash.ts:1473` analyzeCommand | Shell brace + glob expansion bypassed `classifyProtectedPath`. New `expandBraces` deterministically enumerates `{a,b,c}` and re-runs the classifier per branch. New `containsGlobMetachar` + `globLiteralPrefix` + `couldGlobReachProtected` refuse globs whose literal prefix could expand into system-level protected zones (`/proc`, `/sys`, `/etc`, `~/.ssh`, etc.). cwd-relative escalate dirs (`.git`, `.agent`, `.claude`) deliberately excluded from the bypass check to avoid false-positive on legitimate `*.ts` in cwd. |
+| 4 | `src/permissions/sandbox-runner.ts:147` buildBwrapArgv | `--bind <cwd> <cwd>` follows symlinks at the source — symlink in cwd pointing to `~/.aws/sso/cache` (or shared cache) escapes the sandbox boundary. Documented as known limitation (bwrap has no flag to refuse following symlinks at bind time) with operator mitigations (don't run from a cwd containing such symlinks; pre-`realpath` cwd; use `--sandbox-host`). Adjacent fix: pre-build `cwd-in-hide_paths-dir` precondition refuse — pre-slice this would silently produce a sandbox where the cwd mount vanishes mid-run. |
+| 5 | `src/permissions/sandbox-hide-paths.ts` | List drift vs `src/subagents/sensitive-paths.ts` (`.git-credentials` in the latter, not the former). Expanded canonical list: added `.config/azure`, `.config/op`, `.config/sops`, `.terraform.d`, `.ansible`, `.local/share/forja` (audit DB — sandboxed process now cannot mutate the hash chain via direct sqlite writes), `.boto` (legacy AWS), `.git-credentials`. New `tests/permissions/sandbox-hide-paths.test.ts` carries a fence test that requires every `SENSITIVE_PATH_DENY_LIST` entry to have an explicit mapping (dir/file/unmappable) — future drift in either list fails the fence loudly. |
+| 6 | `src/permissions/sandbox-runner-macos.ts:107` buildSbplProfile | macOS `(allow file-write* (subpath "/private/var/folders"))` exposed the entire per-user TMPDIR root including Keychain ephemeral state, `com.apple.security.*` caches, credential-helper sockets. Linux uses a fresh `--tmpfs /tmp`; macOS just unlocked the host path. Removed. Tools needing TMPDIR can prefix `TMPDIR=/tmp <cmd>` or use host-passthrough. |
+| 7 | `src/cli/doctor.ts:402` chainCheck | DB handle leaked on every invocation — under §13.8's every-50-tool-calls re-check, a 1000-call session leaked ~20 WAL connections. Added try/finally with `db.close()` on every return path including the catch arm. |
+| 8 | `src/cli/doctor.ts:403` chainCheck | `migrate(db, MIGRATIONS)` silently mutated schema during a "detect, don't distribute" doctor check (§13.1). New `openDb(path, { readonly: true })` option opens with bun:sqlite's readonly flag; chainCheck calls it. If schema is stale verifyChain's query fails — that IS the right signal. |
+| 9 | `src/cli/subagent-child.ts:612` child engine | Child engine constructed without `audit` sink → child decisions defaulted to `createNoopSink()`, never entered `approvals_log` chain. §17 replay + §7.2 chain integrity silent for child sessions. Wired `createSqliteSink({ db, identity })` with `identity` re-derived via `ensureInstallId` (idempotent against parent's existing file). Defensively falls back to noop sink on identity-discovery failure (preserves pre-slice behavior). |
+| 10 | `src/cli/subagent-child.ts:1120` child harness | `telemetry` sink also missing from child — slice-111's `SandboxDegradedActiveEvent` and every `permission.decision` / `classifier.unavailable` / `state.transition` from child harnesses silently dropped. Wired `createRecordingTelemetrySink()` into both the engine AND the harness config so events at least land in the child process's in-memory stream (future IPC drain to parent telemetry possible). |
+
+### P1 fixes
+
+- **Bash resolver** (`src/permissions/resolvers/bash.ts`):
+  - ssh `-w` colon-shape (`-w 0:1`) reclassified into `portForwardFlags` so the colon-discriminator consumes the value correctly instead of `0:1` being picked as the target host.
+  - ssh `-o` denylist extended: `LocalCommand` + `KnownHostsCommand` join `ProxyCommand` (all three spawn a local command on connect). Refuse message preserves the canonical option name (case-insensitive match, exact case in the error).
+  - cargo: `clean` subcommand now emits `delete-fs(target)` instead of `write-fs(target)`; `--target-dir=<path>` / `--target-dir <path>` redirects the build-output write-fs to that path.
+  - mv/cp: `-t <dir>` / `--target-directory=<dir>` flag inverts the positional shape — was treating the last positional as dest. Now correctly treats targetDir as the destination and all positionals as sources.
+
+- **Sandbox** (`src/permissions/sandbox-runner-macos.ts`, `src/permissions/engine.ts`):
+  - `escapeSbplLiteral` now rejects `\n` / `\r` (the SBPL profile is `\n`-joined; a newline in a path could land attacker-controlled tokens at a fresh line).
+  - `engine.ts:withSandboxProfile` now calls `isSandboxProfile(profile)` defense-in-depth — internal cast that the type system permits, the new gate refuses unknown strings the same way slice 103 wired at the wire boundary.
+
+- **Doctor / CLI**:
+  - `sealingCheck` wraps factory→list call in try/finally with `store.close()` — today's worm-file impl is a no-op, future s3/rfc3161 backends leak without it.
+  - `doctor-cache.ts` shared singleton contract now documented for SessionStart callers: long-lived processes MUST call `resetSharedDoctorCache()` at SessionStart boundaries OR pass a fresh per-call cache. Mid-session re-checks correctly reuse the cache.
+  - `args.ts:parseWelcomeSubcommand` now finds `welcome` in ANY position — POSIX-style `agent --i-know-what-im-doing welcome` works (was rejected pre-slice as a top-level flag misuse).
+
+- **Broker** (`src/broker/in-process.ts`):
+  - `linkSignals` returns `{ signal, dispose }` — disposer called in the per-call finally block unhooks `{once:true}` listeners on non-firing sources. Pre-slice listeners accumulated per call on long-lived caller signals + the never-aborting master signal in a long-lived broker. Behavioral change: post-return aborts of the caller signal no longer propagate to the linked signal exec stashed (intentional; documented; updated slice-83 test to assert in-flight propagation only).
+
+- **Hierarchy** (`src/permissions/hierarchy.ts`):
+  - New `stableJsonStringify` sorts keys at every nesting level before stringify. Pre-slice the seal-lock deep-equal compared `JSON.stringify(a) === JSON.stringify(b)`; YAML-loaded policies canonicalize so it worked there, but a programmatic embedder building `{ path, mode, locked }` (different order) would spurious-flag `lockConflict`.
+
+- **Telemetry** (`src/telemetry/scrubbing.ts`):
+  - `URL_REGEX` siblings added: `IPV6_BRACKETED_REGEX` (`[::1]:8080`, `[2001:db8::1]:443`), `GIT_SSH_REGEX` (`git@github.com:org/repo.git` and `user@host:path`), `DOMAIN_PORT_REGEX` (`internal.corp:443`). Applied in the redactHosts axis in the right order so longer patterns match before shorter ones.
+
+- **CLI welcome** (`src/cli/welcome.ts`):
+  - `stripControlChars` helper removes CC0/CC1 control characters from the marker metadata (path, createdAt, version) before emitting to stdout. The marker is operator-controlled; if hand-edited (per slice 122 docs), an attacker with write access could inject ANSI/window-title escapes. Strip defensively.
+
+### Surface
+
+| File | LoC delta |
+|---|---|
+| `src/permissions/resolvers/bash.ts` | +180 (tar/rsync refuses, glob/brace helpers, ssh -w reclass + LocalCommand, cargo clean/--target-dir, mv/cp -t) |
+| `src/permissions/sandbox-runner.ts` | +30 (cwd-in-hide_paths guard, cwd-symlink limitation comment) |
+| `src/permissions/sandbox-runner-macos.ts` | +20 (escapeSbplLiteral CRLF reject, /private/var/folders removal) |
+| `src/permissions/sandbox-hide-paths.ts` | +30 (new entries + commentary) |
+| `src/permissions/engine.ts` | +10 (isSandboxProfile defense-in-depth) |
+| `src/permissions/hierarchy.ts` | +20 (stableJsonStringify helper) |
+| `src/storage/db.ts` | +15 (readonly option on openDb) |
+| `src/cli/doctor.ts` | +30 (chainCheck readonly + close, sealingCheck close) |
+| `src/cli/doctor-cache.ts` | +15 (SessionStart contract docs) |
+| `src/cli/subagent-child.ts` | +40 (audit + telemetry sinks wired) |
+| `src/cli/welcome.ts` | +15 (stripControlChars) |
+| `src/cli/args.ts` | +15 (welcome flag-before-verb) |
+| `src/broker/in-process.ts` | +35 (linkSignals disposer pattern) |
+| `src/telemetry/scrubbing.ts` | +25 (IPv6/GitSSH/DomainPort regexes) |
+| `tests/permissions/sandbox-hide-paths.test.ts` | NEW (+150) — fence test |
+| `tests/broker/cancellation.test.ts` | +20 (test updated for new in-flight-only abort propagation contract) |
+| `tests/permissions/sandbox-runner-macos.test.ts` | +10 (/private/var/folders removal assertion) |
+
+### Decisions
+
+- **One slice, not five.** Each of the 22 findings was small; the file surfaces overlap enough (bash resolver = 6 findings, sandbox runners = 4, doctor = 3, broker = 1, etc.) that splitting into per-finding slices would have multiplied test-update overhead. The cluster review pass that surfaced the punch list is the natural commit unit.
+- **Glob/brace bypass: refuse globs into system-protected zones, NOT into cwd-protected zones.** Initial implementation refused any glob whose literal prefix overlapped with any protected target — broke legitimate `find . -name "*.ts"` because `*.ts` resolved to `/work/proj/<glob>` which "could reach" `/work/proj/.git`. The threat is system-level (attacker writes `/e*/passwd` to reach `/etc/passwd`); cwd-level protected dirs (`.git`, `.agent`, `.claude`) are caught by the deterministic brace expansion when the LLM types `/work/proj/{.git,foo}`. Single-pass dirty tracking on `couldGlobReachProtected` excludes `cwdEscalateDirs`.
+- **macOS TMPDIR breakage accepted.** Removing `/private/var/folders` write breaks NSTemporaryDirectory-hardcoded tools. The right alternative (mint a per-sandbox tempdir + bind it as TMPDIR) requires runtime side effects beyond the pure-function runner contract. Documented operator escape hatches (TMPDIR override, host-passthrough). Future slice can revisit with the runtime-tempdir approach.
+- **Subagent child audit sink defensively falls back to noop.** `ensureInstallId` can throw if `$HOME`/`$XDG_CONFIG_HOME` aren't writable — the parent's spawn path would catch the same issue first in 99% of cases, but if it slips through the child still runs (without chain coverage) rather than crashing. This is a conservative trade-off; future slice could refuse to start child entirely on identity-discovery failure.
+- **Broker linkSignals dispose changes post-return signal semantics.** Pre-slice 121 the signal was pass-through (identity preserved); slice 121 composed signals (broke identity, kept post-return aborts working). Slice 125 disposes listeners on natural completion — post-return aborts no longer propagate. This is the right trade-off for a long-lived broker (which is the production shape) but did break one slice-83 test that pinned post-return propagation. Test updated to assert in-flight propagation only.
+- **Sandbox cwd-symlink-escape stays documented, not enforced.** bwrap has no `--bind --no-follow-symlinks` flag. The runtime alternative would be to pre-realpath cwd before binding — but operators legitimately use symlinks in cwd (e.g., `node_modules` symlinked across projects). Trading legitimate workflow for a documented threat model boundary is a deliberate choice. Engine-side §4.3 still catches resolver-detected symlink targets; this is about the runtime sandbox layer's coverage.
+- **No spec changes.** All fixes are code-only; the spec section §9 (`hide_paths` canonical list) wasn't updated to add the new entries because that requires the architect's approval per CLAUDE.md. Future spec PR can canonicalize.
+
+### Trap navigated
+
+- **Glob bypass false-positives on cwd globs.** First pass refused every glob under cwd because `.git`/`.agent`/`.claude` are cwd-relative protected dirs. Three find tests failed (`find . -name "*.ts"`, etc.). Fix: exclude `cwdEscalateDirs` from the bypass-could-reach check; let brace expansion handle the deterministic case and let classifyProtectedPath handle the per-expansion check. System-level zones are what the bypass attack actually targets.
+- **`escapeSbplLiteral` reject on `\n` is defense-in-depth, not active defense.** POSIX permits newlines in paths. No legitimate Forja invocation hits this. But if an LLM somehow constructs a path with `\n` and Forja built an SBPL profile with that as a literal, the line-joined profile would have an injection. Reject loudly so the call fails early and visibly.
+- **Slice 83 test was over-specified for identity.** The test asserted `expect(captured.signal).toBe(ac.signal)` — strict reference equality. Composition (slice 121) and disposers (slice 125) both break that invariant. The contract pre-slice was "identity preservation"; the contract post-slice 121 was "behavioral propagation"; the contract post-slice 125 is "in-flight behavioral propagation". Each refinement narrows the visible contract. Test updated each time.
+- **`openDb` readonly path opens with `create: false` implicit.** Bun's `Database(path, { readonly: true })` doesn't accept a `create` flag — readonly DBs can't be created. If the file doesn't exist, open throws ENOENT. The `existsSync` guard in chainCheck already handles that path → returns "no chain yet" without ever calling openDb. Belt-and-suspenders: comment in `openDb` documents the implicit semantics.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from prior slices)
+- `bun test` — **6389 pass / 10 skip / 0 fail** (6399 total across 293 files); +9 tests on top of slice 124's 6380
+- Targeted suites all green: bash resolvers (134/134), sandbox runners (72/72 + fence), in-process broker (35/35), doctor (48/48), welcome (18/18), args (121/121), hierarchy (41/41), scrubbing (29/29)
+
+### Next
+
+REVIEW_NOTES_R2 punch list drained. R-bucket status:
+
+- R1 ✓, R2 ✓, R4 ✓, R5 ✓, R6 ✓, R7 ✓, R8 ✓, R10 ✓, R11 ✓, R12 partial. R9: 3 P0 closed (slice 122), 5 P1 closed (slices 123 + 124), 1 P0 remaining (§13.4/§13.5 interactive menu — spec-vs-code design decision).
+- REVIEW_NOTES_R2: 10 P0 + 12 P1 closed (slice 125). P2 items remain as backlog polish (cmdRsync extractHost dead code, redirectShape concatenation asymmetry, bash/sh/zsh-as-command unknown-command path, ssh netIngress port narrowing, scrubProtoPollution Map/Set, spawn.ts wait failed pending promises, hierarchy provenance Object-keys mutability hazard, more test gaps).
+
+Remaining bug-class roadmap: only R9 P0 #10 (design decision) and R12 fuzz CI workflow (aspirational, not functional). Slices 95-125 (31 consecutive) drained every actionable P0/P1 finding from both review rounds.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 124: doctor §13.8 60s cache for non-critical checks (R9 P1)
 
 **Done.** One-hundred-twenty-fourth slice. Closes the last R9 P1 finding: doctor §13.8 cache for non-critical checks (spec line 817 / 944). Pre-slice every `runDoctor` invocation re-probed ALL checks — including `mac_lsm` (shells out to `aa-status`), `user_namespaces` (reads /proc), `net_filtering` (shells out to `nft`), `git` (version probe), `platform` (sysinfo). Within a long-running harness session, doctor re-runs every 50 tool calls per §13.8, so a session with 1000 tool calls would re-probe these 20 times — wasted I/O on values that don't change within a session (kernel version is stable; nftables version is stable).
