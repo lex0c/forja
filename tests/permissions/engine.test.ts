@@ -121,6 +121,94 @@ describe('engine modes', () => {
     expect(eng.check('bash', 'bash', { command: 'rm -rf /' }).kind).toBe('allow');
   });
 
+  // Slice 97 — R1 #4: bypass mode previously skipped §11 protected
+  // paths entirely. Spec §11 says protected paths are HARDCODED in
+  // code, not flexible-via-policy — and bypass is a policy mode.
+  // The fix runs the classifier over the resolved capability set
+  // BEFORE returning the bypass-allow. Deny tier (/proc, /sys,
+  // /boot, /dev) refuses even under bypass; escalate tier on a
+  // write op upgrades to confirm.
+  test('bypass mode REFUSES write to /proc/sysrq-trigger (§11 deny tier)', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('write_file', 'fs.write', {
+      file_path: '/proc/sysrq-trigger',
+      content: 'c',
+    });
+    expect(d.kind).toBe('deny');
+    expect(d.source?.section).toBe('protected');
+    expect(d.reason).toContain('bypass mode does NOT override §11');
+  });
+
+  test('bypass mode REFUSES read of /proc/<pid>/environ (deny tier applies to reads too)', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('read_file', 'fs.read', { file_path: '/proc/1/environ' });
+    expect(d.kind).toBe('deny');
+    expect(d.source?.section).toBe('protected');
+  });
+
+  test('bypass mode REFUSES write to /dev/sda (slice 97 /dev addition)', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('write_file', 'fs.write', { file_path: '/dev/sda', content: 'c' });
+    expect(d.kind).toBe('deny');
+    expect(d.source?.section).toBe('protected');
+  });
+
+  test('bypass mode UPGRADES write to /etc/hosts to confirm (§11 escalate tier)', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('write_file', 'fs.write', { file_path: '/etc/hosts', content: 'c' });
+    expect(d.kind).toBe('confirm');
+    expect(d.source?.section).toBe('protected');
+    expect(d.reason).toContain('bypass mode still escalates §11');
+  });
+
+  test('bypass mode UPGRADES write to ~/.ssh/authorized_keys to confirm', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('write_file', 'fs.write', {
+      file_path: '~/.ssh/authorized_keys',
+      content: 'c',
+    });
+    expect(d.kind).toBe('confirm');
+    expect(d.source?.section).toBe('protected');
+  });
+
+  test('bypass mode allows READ of /etc/hosts (escalate tier only fires on write)', () => {
+    // Reads of escalate-tier paths pass through unchanged. Bypass
+    // is still bypass for the routine surface; only the §11
+    // hardcoded list trumps it.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('read_file', 'fs.read', { file_path: '/etc/hosts' });
+    expect(d.kind).toBe('allow');
+    expect(d.source?.section).not.toBe('protected');
+  });
+
+  test('bypass mode still allows non-protected paths', () => {
+    // Verify no regression on the routine bypass path.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('read_file', 'fs.read', { file_path: 'src/index.ts' });
+    expect(d.kind).toBe('allow');
+  });
+
   test('acceptEdits default-denies unmatched writes (mode is convenience, not bypass)', () => {
     const eng = createPermissionEngine(policy({ defaults: { mode: 'acceptEdits' } }), { cwd: CWD });
     expect(eng.check('write_file', 'fs.write', { path: 'src/foo.ts' }).kind).toBe('deny');

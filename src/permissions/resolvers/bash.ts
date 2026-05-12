@@ -51,7 +51,28 @@ const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v
 // `path` is already absolute, so `..`/`./` components don't survive
 // into the resulting capability scope. See slice 29 / fs.ts:resolveAbs
 // for the security rationale.
-const resolveArg = (path: string, ctx: ResolverContext): string => resolvePath(ctx.cwd, path);
+//
+// Tilde expansion (slice 97, R2 P0 finding): bash command-args
+// receive the same `~` → `home` mapping the fs resolver applies.
+// Without it, `cat ~/.ssh/id_rsa` resolves to a literal `~/.ssh/`
+// under cwd in the capability scope, but the SHELL then expands
+// `~` to the real HOME on execution — the gap between resolver
+// view and runtime view is a §11 bypass. Both shapes the shell
+// honors are expanded here:
+//   - bare `'~'` → `ctx.home`
+//   - `'~/<rest>'` → `<ctx.home>/<rest>`
+// `'~user/...'` (other-user expansion) stays literal — the engine
+// can't safely resolve another user's home without an OS call,
+// and an LLM emitting `~root/...` is far more often an attack
+// than a legitimate operator-aliased reference.
+const expandTilde = (path: string, home: string): string => {
+  if (path === '~') return home;
+  if (path.startsWith('~/')) return `${home}/${path.slice(2)}`;
+  return path;
+};
+
+const resolveArg = (path: string, ctx: ResolverContext): string =>
+  resolvePath(ctx.cwd, expandTilde(path, ctx.home));
 
 // POSIX-aware positional extraction: tokens before `--` get the
 // classic "starts-with-`-` is a flag" treatment; `--` itself is

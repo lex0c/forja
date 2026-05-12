@@ -156,7 +156,7 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
 describe('protectedTargets', () => {
   test('resolves tilde and cwd entries against supplied roots', () => {
     const t = protectedTargets(HOME, CWD);
-    expect(t.systemDeny).toEqual(['/proc', '/sys', '/boot']);
+    expect(t.systemDeny).toEqual(['/proc', '/sys', '/boot', '/dev']);
     expect(t.absoluteEscalate).toEqual(['/etc']);
     expect(t.tildeEscalateFiles).toContain('/home/op/.bashrc');
     expect(t.tildeEscalateFiles).toContain('/home/op/.zshrc');
@@ -174,5 +174,116 @@ describe('allProtectedRoots', () => {
     expect(roots).toContain('/etc');
     expect(roots).toContain('/home/op/.bashrc');
     expect(roots).toContain('/work/proj/.git');
+  });
+});
+
+// Slice 97 — R2 protected paths hardening. Three coordinated
+// changes land here: `/dev` joins the system deny tier, the cred
+// dirs `.ssh` / `.aws` / `.gnupg` / `.kube` join the tilde escalate
+// dir list, and `.netrc` / `.npmrc` join the tilde escalate file
+// list. These coverage tests pin each addition so a refactor that
+// drops one is loud rather than silent.
+describe('classifyProtectedPath — slice 97 additions (R2 P0/P1)', () => {
+  test('/dev write denies (slice 97, R2 #12)', () => {
+    // write_file('/dev/sda') would overwrite a raw disk — kernel-
+    // managed pseudofs, never a legitimate LLM target.
+    expect(classifyProtectedPath({ absPath: '/dev/sda', op: 'write', home: HOME, cwd: CWD })).toBe(
+      'deny',
+    );
+  });
+
+  test('/dev read also denies (system pseudofs, not just writes)', () => {
+    // Spec §11 deny tier applies to reads AND writes. `/dev/tcp/...`
+    // is the reverse-shell-via-redirect shape; refusing reads
+    // closes that bypass.
+    expect(
+      classifyProtectedPath({ absPath: '/dev/tcp/attacker/80', op: 'read', home: HOME, cwd: CWD }),
+    ).toBe('deny');
+  });
+
+  test('/dev exact-segment match (not /devfoo)', () => {
+    // `startsWithSegment` invariant — `/devfoo` is NOT under /dev,
+    // and a future kernel pseudofs `/devel` would survive renaming
+    // without colliding with this protected entry.
+    expect(
+      classifyProtectedPath({ absPath: '/devfoo', op: 'write', home: HOME, cwd: CWD }),
+    ).toBeNull();
+  });
+
+  test('~/.ssh/* escalates on write (slice 97, R2 P1)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.ssh/authorized_keys',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.ssh/* reads pass through (operator legitimately enumerates known_hosts)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.ssh/known_hosts',
+        op: 'read',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBeNull();
+  });
+
+  test('~/.aws/credentials escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.aws/credentials',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.gnupg/private-keys-v1.d escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.gnupg/private-keys-v1.d/abc.key',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.kube/config escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.kube/config',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.netrc file escalates on write (credential injection defense)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.netrc',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.npmrc file escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.npmrc',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
   });
 });

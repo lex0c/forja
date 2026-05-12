@@ -33,7 +33,7 @@ import {
   matchHost,
   matchPath,
 } from './matcher.ts';
-import { type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
+import { type ProtectedOp, type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
 // Importing the resolver index registers every builtin resolver at
 // module load. Engine consumers don't need a separate wire-up step.
 import { type ResolverResult, resolveCapabilities } from './resolvers/index.ts';
@@ -1543,12 +1543,82 @@ export const createPermissionEngine = (
       // The audit row still carries the resolved capabilities so
       // the row remains a faithful summary of what the tool will
       // touch, even when the decision was `allow`.
+      //
+      // §11 protected-path classification (slice 97, R1 #4): spec
+      // §11 declares the protected paths as HARDCODED, not
+      // flexible-via-policy. Bypass is a policy mode, not an
+      // override of §11. Walk the resolved capability set and
+      // classify each fs-shaped scope: a `deny` tier (system
+      // pseudofs like /proc, /sys, /boot, /dev) refuses even
+      // under bypass; an `escalate` tier on a write op upgrades
+      // the bypass-allow to confirm so the operator sees the
+      // literal target before the rewrite commits. Reads of
+      // escalate-tier paths pass through unchanged — bypass is
+      // still bypass for the routine surface; only the §11
+      // hardcoded list trumps it.
+      let bypassProtectedTier: ProtectedTier | null = null;
+      let bypassProtectedTarget = '';
+      for (const cap of resolvedCapabilities) {
+        if (cap.kind !== 'read-fs' && cap.kind !== 'write-fs' && cap.kind !== 'delete-fs') {
+          continue;
+        }
+        if (cap.scope === null) continue;
+        const op: ProtectedOp = cap.kind === 'read-fs' ? 'read' : 'write';
+        const protectedAbsPath = resolveForProtected(cap.scope, cwd);
+        const tier = classifyProtectedPath({ absPath: protectedAbsPath, op, home, cwd });
+        if (tier === 'deny') {
+          // First deny wins — short-circuit and refuse outright.
+          const decision: Decision = {
+            kind: 'deny',
+            reason: `path is in protected zone (deny tier): ${protectedAbsPath} (bypass mode does NOT override §11)`,
+            source: { layer: 'default', section: 'protected' },
+          };
+          const stages: ReasonChainEntry[] = [];
+          if (classifierStage !== null) stages.push(classifierStage);
+          if (sandboxStage !== null) stages.push(sandboxStage);
+          const e = emitAudit(
+            toolName,
+            args,
+            decision,
+            resolvedCapabilities,
+            score,
+            scoreComponents,
+            classifierAdjust,
+            stages,
+            sandboxProfile,
+          );
+          return withSandboxProfile(withApprovalSeq(decision, e.seq), sandboxProfile);
+        }
+        if (tier === 'escalate' && op === 'write') {
+          // Track the first escalating target for the confirm
+          // prompt; continue scanning so a later deny-tier hit
+          // still wins.
+          if (bypassProtectedTier === null) {
+            bypassProtectedTier = 'escalate';
+            bypassProtectedTarget = protectedAbsPath;
+          }
+        }
+      }
       const baseAllow: Decision = {
         kind: 'allow',
         reason: 'mode=bypass',
         source: { layer: provenance?.defaults ?? 'default' },
       };
-      const upgraded = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
+      let bypassDecision: Decision;
+      if (bypassProtectedTier === 'escalate') {
+        bypassDecision = {
+          kind: 'confirm',
+          prompt: `${toolName} on protected path: ${bypassProtectedTarget}`,
+          reason: `bypass mode still escalates §11 protected paths: ${bypassProtectedTarget}`,
+          source: { layer: 'default', section: 'protected' },
+        };
+      } else {
+        bypassDecision = baseAllow;
+      }
+      const upgraded =
+        currentState === 'degraded' && bypassDecision.kind === 'allow'
+          ? degradeAllowToConfirm(bypassDecision)
+          : bypassDecision;
       const stages: ReasonChainEntry[] = [];
       if (classifierStage !== null) stages.push(classifierStage);
       if (sandboxStage !== null) stages.push(sandboxStage);

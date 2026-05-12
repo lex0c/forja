@@ -512,3 +512,77 @@ describe('bash resolver — per-command argument semantics', () => {
     }
   });
 });
+
+// Slice 97 — R2 P0 finding: tilde was previously left literal by
+// both `fs.resolveAbs` and `bash.resolveArg`, so model-emitted
+// `~/.ssh/id_rsa` resolved to a literal `~` directory under cwd
+// (`/work/proj/~/.ssh/id_rsa`). Shells expand `~` on execution, so
+// the resolver view diverged from the runtime view — a `~`-rooted
+// protected_paths rule could never match because the lexical scope
+// no longer mentioned HOME. Slice 97 expands `~` and `~/<rest>`
+// before `path.resolve` in BOTH resolvers, closing the gap.
+describe('tilde expansion (slice 97, R2 P0)', () => {
+  test('read_file file_path="~/.ssh/id_rsa" resolves under HOME, not under cwd', () => {
+    const r = resolveCapabilities('read_file', { file_path: '~/.ssh/id_rsa' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh/id_rsa');
+      // Negative — pre-slice this was the bug shape.
+      expect(capStrings(r.capabilities)).not.toContain('read-fs:/work/proj/~/.ssh/id_rsa');
+    }
+  });
+
+  test('bare "~" expands to HOME', () => {
+    const r = resolveCapabilities('read_file', { file_path: '~' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op');
+    }
+  });
+
+  test('write_file path="~/.aws/credentials" lands under HOME', () => {
+    const r = resolveCapabilities('write_file', { file_path: '~/.aws/credentials' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/home/op/.aws/credentials');
+      expect(s).toContain('read-fs:/home/op/.aws/credentials');
+    }
+  });
+
+  test('bash "cat ~/.ssh/known_hosts" resolves the arg under HOME', () => {
+    const r = resolveCapabilities('bash', { command: 'cat ~/.ssh/known_hosts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/home/op/.ssh/known_hosts');
+      expect(s).not.toContain('read-fs:/work/proj/~/.ssh/known_hosts');
+    }
+  });
+
+  test('"~user/..." stays literal (other-user expansion is not safely resolvable)', () => {
+    // Shell would expand `~root/...` against /etc/passwd; the engine
+    // can't safely do that without an OS call and an LLM emitting
+    // `~root/` is much more often an attack than legitimate. The
+    // literal form will fail the policy in a downstream layer.
+    const r = resolveCapabilities('read_file', { file_path: '~root/.ssh/id_rsa' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      // Literal `~root` under cwd — not HOME-expanded. The engine
+      // is structurally unable to resolve it; the policy will
+      // either deny or surface a confirm depending on configuration.
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/~root/.ssh/id_rsa');
+    }
+  });
+
+  test('embedded "~" mid-path stays literal (not a shell-recognized form)', () => {
+    // Shell only expands `~` at the start of a word; `src/~/foo`
+    // is NOT a tilde reference. Resolver matches that contract —
+    // expansion only when the input is `~` or starts with `~/`.
+    const r = resolveCapabilities('read_file', { file_path: 'src/~/foo.ts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/src/~/foo.ts');
+    }
+  });
+});
