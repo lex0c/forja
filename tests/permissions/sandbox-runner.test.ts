@@ -386,6 +386,91 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
   });
 });
 
+// Slice 118 — R4: §9 hide_paths defense in the Linux bwrap
+// runner. Pre-slice every profile started with `--ro-bind / /`
+// which exposed the operator's full home read-only inside the
+// sandbox — the LLM could `cat ~/.ssh/id_rsa` from even a
+// `ro` profile. The engine-side §11 protected paths classifier
+// (slice 97) only catches calls that surface as resolved
+// capabilities; a sandboxed bash process reading the file
+// directly bypassed the classifier. Slice 118 emits bwrap
+// flags that mask credential dirs (`--tmpfs`) and files
+// (`--ro-bind /dev/null`) inside the sandbox.
+describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
+  const expectHidePaths = (argv: readonly string[]): void => {
+    const argvStr = argv.join(' ');
+    // Per PERMISSION_ENGINE.md §9 the canonical dir list.
+    expect(argvStr).toContain('--tmpfs /home/op/.ssh');
+    expect(argvStr).toContain('--tmpfs /home/op/.aws');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/gcloud');
+    expect(argvStr).toContain('--tmpfs /home/op/.gnupg');
+    expect(argvStr).toContain('--tmpfs /home/op/.kube');
+    // Canonical file list — masked via /dev/null overlay.
+    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.netrc');
+    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.docker/config.json');
+    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.npmrc');
+    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.pypirc');
+  };
+
+  test('ro profile emits hide_paths flags', () => {
+    const argv = buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: INNER });
+    expectHidePaths(argv);
+  });
+
+  test('cwd-rw profile emits hide_paths flags', () => {
+    const argv = buildBwrapArgv({ profile: 'cwd-rw', cwd: CWD, home: HOME, innerArgv: INNER });
+    expectHidePaths(argv);
+  });
+
+  test('cwd-rw-net profile emits hide_paths flags', () => {
+    const argv = buildBwrapArgv({ profile: 'cwd-rw-net', cwd: CWD, home: HOME, innerArgv: INNER });
+    expectHidePaths(argv);
+  });
+
+  test('home-rw profile emits hide_paths flags (load-bearing — home is writable)', () => {
+    // home-rw is the most exposed profile: full home is mounted
+    // read-write. Without the hide_paths overlay the LLM could
+    // not only READ but also WRITE to ~/.ssh/authorized_keys etc.
+    // Pin that the tmpfs overlays still mask these — applied
+    // AFTER `--bind home home` in the argv so the later mount wins.
+    const argv = buildBwrapArgv({ profile: 'home-rw', cwd: CWD, home: HOME, innerArgv: INNER });
+    expectHidePaths(argv);
+    // Verify the order: --bind home home appears BEFORE --tmpfs
+    // home/.ssh. bwrap applies in argv order; the tmpfs MUST be
+    // later or the rw bind would overwrite the mask.
+    const bindIdx = argv.indexOf('--bind');
+    const tmpfsSshIdx = argv.findIndex(
+      (v, i) => v === '--tmpfs' && argv[i + 1] === '/home/op/.ssh',
+    );
+    expect(bindIdx).toBeGreaterThanOrEqual(0);
+    expect(tmpfsSshIdx).toBeGreaterThan(bindIdx);
+  });
+
+  test('host profile does NOT emit hide_paths flags (passthrough)', () => {
+    // Host is the operator-opted-in passthrough; no bwrap wrap,
+    // no flags. The hide_paths defense doesn't apply because
+    // the inner process runs directly on the host.
+    const argv = buildBwrapArgv({ profile: 'host', cwd: CWD, home: HOME, innerArgv: INNER });
+    // Should be just innerArgv, no bwrap.
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('hide_paths use operator-supplied home, not host HOME env', () => {
+    // The defense follows the operator's chosen home value, not
+    // process.env.HOME. Tests pinning macOS home shape against
+    // a Linux runner stay reliable.
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: '/work/macproj',
+      home: '/Users/devloper',
+      innerArgv: INNER,
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).toContain('--tmpfs /Users/devloper/.ssh');
+    expect(argvStr).toContain('--ro-bind-try /dev/null /Users/devloper/.netrc');
+  });
+});
+
 describe('isSandboxProfile (slice 103)', () => {
   test('returns true for every enum member', () => {
     for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw', 'host']) {

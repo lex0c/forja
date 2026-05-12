@@ -15,6 +15,53 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 118: Linux sandbox hide_paths defense (R4, partial)
+
+**Done.** One-hundred-eighteenth slice. Closes the Linux half of R4: pre-slice every sandbox profile started with `--ro-bind / /` (read-only mount of the host root) which exposed the operator's **full home read-only** inside the sandbox. The LLM running inside the sandbox could `cat ~/.ssh/id_rsa` or `cat ~/.aws/credentials` even from a `ro` profile. Slice 97 hardened the engine-side §11 protected-paths classifier, but the classifier only catches calls that surface as resolved capabilities at the engine layer; a sandboxed bash process reading those files DIRECTLY (via the kernel mount) bypassed the engine entirely.
+
+### Why this matters
+
+This is the load-bearing R4 vector: an LLM that can spawn ANY bash command inside the sandbox can exfiltrate credentials regardless of policy. The engine-side checks are necessary but not sufficient — the runtime sandbox layer must mask the credentials at the kernel mount layer too. Spec §9 calls out exactly this defense:
+
+> hide_paths → bwrap `--bind /dev/null <path>` (path some pro processo).
+
+Slice 118 ships the bwrap argv plumbing. macOS (sandbox-exec / SBPL) follows the same pattern but uses a different policy grammar; that's a parallel slice (R4 macOS, deferred).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-runner.ts` | Imports `join as joinPath` from `node:path`. New `HIDE_PATHS_DIRS` constant `['.ssh', '.aws', '.config/gcloud', '.gnupg', '.kube']` and `HIDE_PATHS_FILES` constant `['.netrc', '.docker/config.json', '.npmrc', '.pypirc']`. `buildBwrapArgv` emits `--tmpfs <home>/<dir>` for each dir and `--ro-bind-try /dev/null <home>/<file>` for each file, AFTER the writable mounts so the masks override even `home-rw`'s full-home rw bind. Comments document the bwrap mount-order semantics ("later flag wins") and the per-profile rationale. |
+| `tests/permissions/sandbox-runner.test.ts` | New describe `hide_paths defense (slice 118, R4)` with 6 tests: (1-4) each sandboxed profile (ro, cwd-rw, cwd-rw-net, home-rw) emits the canonical dirs + files mask; (5) host profile does NOT emit (passthrough — no bwrap wrap); (6) the masks use operator-supplied `home`, not host `process.env.HOME`. The home-rw test additionally verifies the bind/tmpfs ORDER — bind appears BEFORE tmpfs in the argv so the later tmpfs masks the writable region. |
+
+### Decisions
+
+- **`--tmpfs` for dirs, `--ro-bind-try /dev/null` for files.** bwrap can't tmpfs a single file (tmpfs is a directory mount), so file targets use the `/dev/null` overlay. The `-try` suffix on the file variant defensive: if `/dev/null` is somehow unavailable in a weird container env without proper /dev, the bind is skipped rather than failing the whole sandbox setup. Dirs use straight `--tmpfs` (always succeeds, creates the target if missing).
+- **Mask applies to ALL sandboxed profiles, not just home-rw.** The `--ro-bind / /` in `COMMON_PROFILE_FLAGS` exposes home read-only in every profile (ro, cwd-rw, cwd-rw-net). Reading credentials is a leak regardless of writability. The mask applies uniformly; only `host` (no bwrap wrap) skips.
+- **Spec canonical list, not slice 97's tilde-escalate list.** Slice 97's TILDE_ESCALATE_DIRS includes `.config/agent` + `.config/claude` (engine config, written by the agent itself). Those SHOULD survive into the sandbox (agent reads its own state). The §9 hide_paths list is narrower — explicitly the credential surfaces (.ssh, .aws, .config/gcloud, .gnupg, .kube + the four files). Two different concerns, two different lists.
+- **Mounts AFTER the writable bind.** bwrap applies mount operations in argv order; the LAST mount wins for overlapping paths. The home-rw test pins this: `--bind home home` appears at index N, `--tmpfs home/.ssh` at index N+M (M > 0). If the order ever flipped, the test fails loudly.
+- **No "scrub_env on the runtime side" here.** That was already done at the broker layer in slice 105 (default env passed to worker is `scrubEnv(process.env)`). The runtime sandbox env is inherited from the worker, so it's already scrubbed. The §9 spec lists `scrub_env` alongside `hide_paths` but they're at different layers — env at the spawn boundary, paths at the mount boundary. Slice 105 closed the env half; slice 118 closes the path half.
+- **macOS deferred.** sandbox-exec uses SBPL (Sandbox Profile Language) — entirely different grammar. The same defense applies but the implementation is parallel: `(deny file-read* (subpath "<absolute-path>"))` rules for each hide_paths entry. The Linux fix lands today; macOS is its own slice when it's higher priority than the remaining R-bucket findings.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6285 pass / 10 skip / 0 fail** (6295 total across 291 files); +6 tests on top of slice 117's 6279
+- Targeted: `bun test tests/permissions/sandbox-runner.test.ts` — 38/38
+
+### Next
+
+R4 macOS half remaining (sandbox-exec SBPL `(deny file-read* (subpath ...))` rules for each hide_paths entry).
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R4 macOS hide_paths (parallel to slice 118).
+- R5 broker contract.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 117: truncation flag on BrokerResponse + Number.isFinite docs (R7 P1, R7 fully closed)
 
 **Done.** One-hundred-seventeenth slice. **Closes R7 fully** (last 2 P1 cleanups):

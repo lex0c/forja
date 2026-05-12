@@ -62,6 +62,7 @@
 // `--chdir <cwd>` is added so the wrapped process starts in the
 // caller's expected working directory.
 
+import { join as joinPath } from 'node:path';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
 
@@ -91,6 +92,41 @@ const COMMON_PROFILE_FLAGS: readonly string[] = [
   '--die-with-parent',
 ];
 
+// §9 hide_paths — credential directories that MUST NOT appear
+// inside the sandbox, regardless of profile (slice 118, R4).
+// Every profile starts with `--ro-bind / /` which exposes the
+// operator's full home read-only inside the sandbox; the LLM
+// could read `~/.ssh/id_rsa` even from a `ro` profile without
+// this defense. Slice 97 hardened the engine-side §11 protected
+// paths classifier, but that only catches calls that surface as
+// resolved capabilities — a sandboxed bash process reading the
+// file via `cat ~/.ssh/id_rsa` bypasses the engine entirely.
+//
+// The bwrap defense: emit `--tmpfs <resolved-home>/<dir>` for
+// each entry AFTER the common flags. bwrap applies mount
+// operations in order; the tmpfs overlay LATER than the
+// `--ro-bind / /` masks the credential path with an empty
+// directory inside the sandbox.
+//
+// Per PERMISSION_ENGINE.md §9 the canonical list is:
+//   ~/.ssh, ~/.aws, ~/.config/gcloud, ~/.gnupg, ~/.kube
+// (directories carrying SSH keys, AWS creds, GCP creds, GPG
+// secret keys, Kubernetes contexts).
+const HIDE_PATHS_DIRS: readonly string[] = ['.ssh', '.aws', '.config/gcloud', '.gnupg', '.kube'];
+
+// §9 hide_paths — credential FILES masked via `--ro-bind /dev/null`.
+// bwrap can't tmpfs a single file (tmpfs is a directory mount),
+// so we mount /dev/null over the file: reads return EOF
+// immediately, writes are discarded (and in ro profiles
+// outright fail). Same net effect as the dir tmpfs — file
+// appears non-existent / empty inside the sandbox.
+//
+// Per PERMISSION_ENGINE.md §9 the canonical file list is:
+//   ~/.netrc, ~/.docker/config.json, ~/.npmrc, ~/.pypirc
+// (curl/wget HTTP/FTP creds, Docker registry token, npm
+// registry token, pip private-repo creds).
+const HIDE_PATHS_FILES: readonly string[] = ['.netrc', '.docker/config.json', '.npmrc', '.pypirc'];
+
 // Build the bwrap argv for a given profile. Pure function.
 //
 // For host: returns `innerArgv` unchanged. The operator already
@@ -119,6 +155,29 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     flags.push('--bind', cwd, cwd);
   } else if (profile === 'home-rw') {
     flags.push('--bind', home, home);
+  }
+  // §9 hide_paths — mask credential dirs + files (slice 118, R4).
+  // Applied AFTER the writable mounts so that even on home-rw
+  // (which binds the full home read-write), the tmpfs / dev-null
+  // overlays mask the credential paths inside the sandbox.
+  // bwrap applies mount ops in order: the later flag wins.
+  //
+  // `--bind-try` (not `--bind`) for dirs would skip the path if
+  // the source doesn't exist, but we use `--tmpfs` which always
+  // creates the mount regardless of host state — every sandbox
+  // gets the same shape regardless of whether the operator
+  // happens to have `~/.gnupg` set up.
+  for (const dir of HIDE_PATHS_DIRS) {
+    flags.push('--tmpfs', joinPath(home, dir));
+  }
+  // For files we use `--ro-bind /dev/null <file>`. bwrap can
+  // bind char devices over regular files (the mount makes the
+  // file appear as /dev/null — reads return EOF, writes are
+  // discarded). `--ro-bind` keeps the overlay read-only even
+  // on home-rw, so the operator can't accidentally "create"
+  // a credential file by writing to the masked path.
+  for (const file of HIDE_PATHS_FILES) {
+    flags.push('--ro-bind-try', '/dev/null', joinPath(home, file));
   }
   // Start the inner process in cwd.
   flags.push('--chdir', cwd);
