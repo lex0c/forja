@@ -22,14 +22,21 @@ const expandTilde = (pattern: string, home: string): string => {
 };
 
 // True when `pattern` targets a protected path WITHOUT relying on
-// engine-wide catch-alls. Two shapes flagged:
+// engine-wide catch-alls. Three shapes flagged:
 //   - exact equality with a protected root (`/etc`, `~/.bashrc`)
-//   - pattern that descends INTO a protected dir without a leading
-//     wildcard (`/etc/hosts`, `/etc/**`, `/proc/1`)
+//   - pattern that descends INTO a protected dir (`/etc/hosts`,
+//     `/etc/**`, `/proc/1`) — `${root}/` prefix.
+//   - pattern that starts at the protected root and continues with
+//     a glob metacharacter (`/etc*`, `/proc?`, `/etc[abc]`) —
+//     these match the bare root via glob expansion even though
+//     they don't carry the `/` boundary (slice 101, R8 #321).
+//
 // Engine-wide catch-alls (`/**`, `**`) are not flagged here — the
 // runtime classifier in protected_paths.ts catches their matches
 // against protected targets at decision time. Flagging catch-alls
 // would break the common "allow all writes under cwd" pattern.
+const isGlobChar = (ch: string | undefined): boolean => ch === '*' || ch === '?' || ch === '[';
+
 const isProtectedRedefinition = (
   pattern: string,
   protectedRoots: readonly string[],
@@ -39,6 +46,15 @@ const isProtectedRedefinition = (
   for (const root of protectedRoots) {
     if (expanded === root) return true;
     if (expanded.startsWith(`${root}/`)) return true;
+    // Glob-suffix shapes: `/etc*` (matches /etc + /etcd + /etcetera
+    // — admitting the protected /etc via glob expansion), `/proc[1]`,
+    // `/etc?`. The check fires when the pattern starts with the root
+    // string AND the immediately-following character is a glob
+    // metachar. Non-glob continuations (`/etcd`, `/proche`) are NOT
+    // protected redefinitions — they reference different paths.
+    if (expanded.startsWith(root) && isGlobChar(expanded[root.length])) {
+      return true;
+    }
   }
   return false;
 };
@@ -96,12 +112,22 @@ const isStringArray = (v: unknown): v is string[] =>
 // (missing 'e'), etc. A typed-out-of-spec key means the user thought
 // they were setting a real rule but actually got nothing. We refuse
 // to load a policy with such typos rather than fall through.
+//
+// Slice 101 (R8 #318): pre-slice this added `'locked'` to every
+// section unconditionally. `seal: {..., locked: true}` parsed
+// silently even though seal has no lock semantics — the operator
+// who authored that line thought they locked the seal but got
+// nothing. The fix: callers list every supported key explicitly.
+// Sections that support locking pass `'locked'`; sections that
+// don't (seal today) leave it out and an authored `locked: true`
+// surfaces as an unknown-key error pointing the operator at the
+// actual supported set.
 const rejectUnknownKeys = (
   r: Record<string, unknown>,
   knownKeys: readonly string[],
   toolName: string,
 ): void => {
-  const known = new Set([...knownKeys, 'locked']);
+  const known = new Set(knownKeys);
   for (const key of Object.keys(r)) {
     if (!known.has(key)) {
       throw new Error(
@@ -123,7 +149,7 @@ const validateBashPolicy = (raw: unknown, toolName: string): void => {
     throw new Error(`policy: ${toolName} must be an object`);
   }
   const r = raw as Record<string, unknown>;
-  rejectUnknownKeys(r, ['allow', 'confirm', 'deny'], toolName);
+  rejectUnknownKeys(r, ['allow', 'confirm', 'deny', 'locked'], toolName);
   for (const key of ['allow', 'confirm', 'deny']) {
     if (r[key] !== undefined && !isStringArray(r[key])) {
       throw new Error(`policy: ${toolName}.${key} must be a string array`);
@@ -138,7 +164,7 @@ const validatePathPolicy = (raw: unknown, toolName: string, context: ParsePolicy
     throw new Error(`policy: ${toolName} must be an object`);
   }
   const r = raw as Record<string, unknown>;
-  rejectUnknownKeys(r, ['allow_paths', 'confirm_paths', 'deny_paths'], toolName);
+  rejectUnknownKeys(r, ['allow_paths', 'confirm_paths', 'deny_paths', 'locked'], toolName);
   for (const key of ['allow_paths', 'confirm_paths', 'deny_paths']) {
     if (r[key] !== undefined && !isStringArray(r[key])) {
       throw new Error(`policy: ${toolName}.${key} must be a string array`);
@@ -154,7 +180,7 @@ const validateFetchPolicy = (raw: unknown, toolName: string): void => {
     throw new Error(`policy: ${toolName} must be an object`);
   }
   const r = raw as Record<string, unknown>;
-  rejectUnknownKeys(r, ['allow_hosts', 'deny_hosts'], toolName);
+  rejectUnknownKeys(r, ['allow_hosts', 'deny_hosts', 'locked'], toolName);
   for (const key of ['allow_hosts', 'deny_hosts']) {
     if (r[key] !== undefined && !isStringArray(r[key])) {
       throw new Error(`policy: ${toolName}.${key} must be a string array`);
@@ -173,11 +199,38 @@ const validateFetchPolicy = (raw: unknown, toolName: string): void => {
 // patterns that redefine a protected path fail load. Tests building
 // hand-crafted policies in-memory typically skip the context;
 // production bootstrap supplies both.
+// Top-level keys the parser knows about. Slice 101 (R8 #319):
+// pre-slice an authored `defualts: { mode: 'bypass' }` (typo for
+// `defaults`) silently dropped because the top-level only matched
+// specific known keys via `if (r.X !== undefined)` blocks; everything
+// else was ignored. The operator who authored that line thought
+// they were setting bypass mode but actually got the empty-defaults
+// policy. The fix surfaces top-level typos at parse time with the
+// same shape used for nested sections.
+const TOP_LEVEL_KEYS: readonly string[] = ['defaults', 'tools', 'sandbox', 'seal'];
+
+// Tool keys the `tools.*` section accepts. Slice 101 (R8 #320):
+// pre-slice `tools.bsh: { deny: ['rm -rf *'] }` (typo for `bash`)
+// parsed silently — the validator dispatched on specific names
+// and ignored everything else. The operator thought they were
+// blocking rm but actually authored a no-op section. Same typo
+// surface as top-level keys.
+const KNOWN_TOOL_KEYS: readonly string[] = [
+  'bash',
+  'read_file',
+  'write_file',
+  'edit_file',
+  'glob',
+  'grep',
+  'fetch_url',
+];
+
 export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Policy => {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('policy: top-level must be a YAML mapping');
   }
   const r = raw as Record<string, unknown>;
+  rejectUnknownKeys(r, TOP_LEVEL_KEYS, 'policy');
 
   // Both fields preserve "not present" so the hierarchy resolver
   // can distinguish silence (don't override) from explicit assertion
@@ -192,7 +245,7 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       throw new Error('policy: `defaults` must be a mapping');
     }
     const d = r.defaults as Record<string, unknown>;
-    rejectUnknownKeys(d, ['mode'], 'defaults');
+    rejectUnknownKeys(d, ['mode', 'locked'], 'defaults');
     if (d.mode !== undefined) {
       if (typeof d.mode !== 'string' || !VALID_MODES.has(d.mode)) {
         throw new Error(
@@ -214,6 +267,7 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     throw new Error('policy: `tools` must be a mapping');
   }
   const tools = (toolsRaw ?? {}) as Record<string, unknown>;
+  rejectUnknownKeys(tools, KNOWN_TOOL_KEYS, 'tools');
 
   validateBashPolicy(tools.bash, 'bash');
   validatePathPolicy(tools.read_file, 'read_file', context);

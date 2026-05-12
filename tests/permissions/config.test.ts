@@ -487,3 +487,147 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
     expect(p.seal).toBeUndefined();
   });
 });
+
+// Slice 101 — R8 bootstrap/policy parsing hardening. Four
+// findings collapse to the same theme: silent acceptance of
+// authored garbage. Each test pins the new "loud refuse"
+// contract so a future relaxation is loud rather than silent.
+describe('parsePolicy — slice 101 hardening (R8 #318/#319/#320/#321)', () => {
+  test('top-level typo refuses with unknown-key error (R8 #319)', () => {
+    // `defualts` (typo for `defaults`) used to silently drop —
+    // policy parsed as `{}` and the operator's authored bypass
+    // mode never took effect. The fix surfaces the typo with
+    // the same shape used for nested keys.
+    expect(() => parsePolicy({ defualts: { mode: 'bypass' } })).toThrow(/unknown key 'defualts'/);
+  });
+
+  test('top-level error message lists every supported key', () => {
+    try {
+      parsePolicy({ defualts: { mode: 'bypass' } });
+      throw new Error('expected throw');
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toContain('defaults');
+      expect(msg).toContain('tools');
+      expect(msg).toContain('sandbox');
+      expect(msg).toContain('seal');
+    }
+  });
+
+  test('tool name typo refuses with unknown-key error (R8 #320)', () => {
+    // `tools.bsh` (typo for `tools.bash`) used to silently parse
+    // — the dispatcher matched specific names and ignored unknown
+    // ones. An operator authoring `tools.bsh.deny: ['rm -rf *']`
+    // got a no-op section that admitted everything.
+    expect(() => parsePolicy({ tools: { bsh: { deny: ['rm -rf *'] } } })).toThrow(
+      /unknown key 'bsh'/,
+    );
+  });
+
+  test('tool name error message lists every supported tool', () => {
+    try {
+      parsePolicy({ tools: { bsh: { deny: [] } } });
+      throw new Error('expected throw');
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toContain('bash');
+      expect(msg).toContain('read_file');
+      expect(msg).toContain('write_file');
+      expect(msg).toContain('edit_file');
+      expect(msg).toContain('glob');
+      expect(msg).toContain('grep');
+      expect(msg).toContain('fetch_url');
+    }
+  });
+
+  test('seal.locked refuses (seal has no lock semantics, R8 #318)', () => {
+    // Pre-slice `rejectUnknownKeys` added 'locked' to every
+    // section's known keys unconditionally — including seal,
+    // which never reads or honors it. The authored line was a
+    // lie: operator thought they locked the seal section but
+    // actually got an ignored field. Slice 101 removes the
+    // auto-add and seal doesn't list 'locked', so the typo
+    // surfaces at parse time.
+    expect(() => parsePolicy({ seal: { mode: 'none', locked: true } })).toThrow(
+      /seal has unknown key 'locked'/,
+    );
+  });
+
+  test('sections that DO support locked still accept it (no regression)', () => {
+    // The slice 101 fix removed auto-add, but each supporting
+    // section listed 'locked' explicitly. Verify each one still
+    // honors the field.
+    const p = parsePolicy({
+      defaults: { mode: 'strict', locked: true },
+      tools: {
+        bash: { allow: ['ls *'], locked: true },
+        write_file: { allow_paths: ['src/**'], locked: true },
+        fetch_url: { allow_hosts: ['*.com'], locked: true },
+      },
+      sandbox: { required: true, locked: true },
+    });
+    expect(p.defaults.locked).toBe(true);
+    // bash/path/fetch sections retain locked in their raw shape
+    // via the validator's pass-through (not modeled on Policy[..]
+    // today but visible via the hierarchy resolver). The smoke
+    // test here is that the parse SUCCEEDS without erroring.
+    expect(p.sandbox?.locked).toBe(true);
+  });
+
+  test('/etc* glob-suffix protected redefinition refuses (R8 #321)', () => {
+    // `/etc*` glob-matches `/etc` (bare root) via the trailing
+    // wildcard, but pre-slice the check only flagged `/etc/...`
+    // descendants. Slice 101 catches glob suffixes immediately
+    // following a protected root.
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['/etc*'] } } },
+        { home: '/home/op', cwd: '/work/proj' },
+      ),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('/etc[abc] character-class shape also refuses', () => {
+    // The same defense applies to `[` (character class) and
+    // `?` (single-char wildcard) immediately after the root.
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['/etc[abc]'] } } },
+        { home: '/home/op', cwd: '/work/proj' },
+      ),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('/etc? single-char wildcard also refuses', () => {
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['/etc?'] } } },
+        { home: '/home/op', cwd: '/work/proj' },
+      ),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('/etcd (non-glob continuation) does NOT refuse (different path)', () => {
+    // `/etcd` is the etcd config dir on some systems — a real,
+    // non-protected target. The fix must NOT regress to flagging
+    // it just because it starts with /etc.
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['/etcd/config'] } } },
+        { home: '/home/op', cwd: '/work/proj' },
+      ),
+    ).not.toThrow();
+  });
+
+  test('tilde-rooted glob-suffix shape refuses (~/.ssh*)', () => {
+    // ~/.ssh is in TILDE_ESCALATE_DIRS (slice 97). A ~/.ssh* glob
+    // would match the bare ~/.ssh directory via the trailing
+    // wildcard — same risk as /etc*.
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['~/.ssh*'] } } },
+        { home: '/home/op', cwd: '/work/proj' },
+      ),
+    ).toThrow(/redefines a protected path/);
+  });
+});

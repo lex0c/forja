@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 101: policy parsing hardening (R8 #318/#319/#320/#321)
+
+**Done.** One-hundred-first slice. Closes four R8 P0s in `config.ts` under one theme — **silent acceptance of authored garbage**:
+
+- **#318 `seal.locked` parses silently**: pre-slice `rejectUnknownKeys` added `'locked'` to every section's known keys unconditionally, but seal has no lock semantics. The operator authoring `seal: {locked: true}` thought they were locking seal but the field was silently discarded.
+- **#319 Top-level typos parse silently**: `defualts: {mode: 'bypass'}` (typo) dropped because the top-level only matched specific known keys via `if (r.X !== undefined)` blocks; everything else was ignored. The authored mode never took effect.
+- **#320 Unknown tool names parse silently**: `tools.bsh: {deny: ['rm -rf *']}` (typo) parsed but matched no tool — the dispatcher consumed specific tool names and ignored the rest. The deny rule was effectively a no-op admitting everything.
+- **#321 `isProtectedRedefinition` misses glob-suffix shapes**: `/etc*` glob-matches the bare `/etc` root via trailing wildcard, but pre-slice the check only flagged `/etc/...` descendants. The same gap applied to `/etc[abc]` (character class) and `/etc?` (single-char wildcard).
+
+### Why this matters
+
+All four bugs share one shape: an authored line that LOOKS like it does something but actually does nothing. Operators write policy YAML to constrain agent behavior; a silently-discarded line is worse than a syntax error because the operator believes they've authored a constraint that doesn't exist. Slice 101 makes each shape loud — the parser refuses with an error message naming the offending key and listing the actually-supported alternatives.
+
+#318 is the most subtle: the function that's SUPPOSED to catch typos (`rejectUnknownKeys`) was itself the bug source. Its auto-add of `'locked'` was originally a convenience for the bash/path/fetch sections that uniformly support locking — but the convenience extended to sections that didn't (seal). The fix makes every section explicit about its supported keys; the convenience is gone, but so is the silent acceptance.
+
+#321 is the most ergonomic-cost fix: `/etc*` and `/etcd` look syntactically similar, but only the first redefines a protected path. The new `isGlobChar` check distinguishes them — non-glob continuations like `/etcd` stay legitimate (etcd config is a real, non-protected target).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/config.ts` | `rejectUnknownKeys` no longer auto-adds `'locked'` — callers list every supported key explicitly. New `TOP_LEVEL_KEYS` array used to validate the policy root. New `KNOWN_TOOL_KEYS` array used to validate the `tools.*` mapping. `validateBashPolicy`, `validatePathPolicy`, `validateFetchPolicy`, and the `defaults` branch each pass `'locked'` in their known-keys list (preserving existing behavior). The `seal` branch deliberately omits `'locked'` so the typo surfaces. New `isGlobChar(ch)` helper used in `isProtectedRedefinition` — fires when the pattern matches a protected root followed immediately by `*`, `?`, or `[`. |
+| `tests/permissions/config.test.ts` | New describe `slice 101 hardening` with 11 tests covering each finding plus regression coverage: top-level typo refuses with full key list, tool name typo refuses with full tool list, `seal.locked` refuses, legitimate `locked: true` on bash/path/fetch/defaults/sandbox still works, glob-suffix shapes `/etc*` / `/etc[abc]` / `/etc?` / `~/.ssh*` all refuse, non-glob continuation `/etcd` passes through. |
+
+### Decisions
+
+- **Explicit known-keys lists per section, no auto-add.** The pre-slice convenience hid a real gap; the alternative (a per-section "supports locked?" boolean fed into a helper) would have been more code without functional benefit. The explicit approach makes the supported surface visible at each call site.
+- **`seal.locked` refuses, not silently honored.** The right path here was "make seal support locking" or "refuse the field". Adding lock semantics to seal is R8 #322 territory (hierarchy merge semantics for seal config) — a separate slice with cross-cutting impact on the policy resolver. Slice 101 takes the conservative route: refuse the authored line so the operator knows it's not yet supported, with the message naming the actual supported keys.
+- **Glob-suffix check uses three explicit metachars (`*`, `?`, `[`).** Avoiding a regex keeps the check fast and unambiguous. `[` is the character-class opener; closing `]` and the lookahead handling stays in the matcher's domain (the parser only needs to recognize that a class-opener IS a glob shape). Curly brace `{` (alternation) isn't in Bun.Glob's grammar and isn't flagged.
+- **`/etcd` stays legitimate.** A non-glob continuation references a different filesystem path. Flagging it would punish operators authoring policy for /etcd, /procps, etc. — none of which are protected.
+- **Tilde-rooted glob shapes (`~/.ssh*`) flow through the existing `expandTilde` step.** No new code path; the helper resolves `~/` to HOME before the prefix check, so the glob-suffix logic catches `<HOME>/.ssh*` against the resolved protected root `<HOME>/.ssh`.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6199 pass / 10 skip / 0 fail** (6209 total across 289 files); +11 tests on top of slice 100's 6188
+- Targeted: `bun test tests/permissions/config.test.ts` — 68/68
+
+### Next
+
+R8 remaining:
+- **#322 hierarchy seal section overridden silently**: enterprise-locked seal can be silently overridden by project-level config. Needs `seal` to support `locked` (with hierarchy merge semantics) — substantial cross-cutting change spanning `config.ts` + `hierarchy.ts`.
+- **#323 `bootstrap.ts` `preflightPermissionEngine` called without `home`**: on $HOME-unset hosts, tilde-rooted protected paths resolve incorrectly. Small wiring fix.
+- **R8 P1**: identical-re-affirm lock conflicts, missing field names in sandbox conflict messages, trust-file corruption defense, async policy reload.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R2 P1 #204 (bash-parser tree-sitter loop guard).
+- R4 sandbox `hide_paths` / `scrub_env`.
+- R5 broker contract.
+- R6 spawn broker hardening (drain caps + signal listener ordering + JSON proto pollution + env leak).
+- R7 bash worker handler (stacked SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring through HarnessConfig.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 100: bash resolver P1 cleanup (R2 #205 + #206 + #208)
 
 **Done.** One-hundredth slice. Closes three R2 P1 findings on the bash resolver:
