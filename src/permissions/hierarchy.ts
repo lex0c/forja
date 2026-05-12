@@ -208,15 +208,24 @@ const merge = (
   let sandboxRequiredWriter: Layer | null = null;
   let sandboxHostAllowedWriter: Layer | null = null;
   let sandboxLockedWriter: Layer | null = null;
-  // §7.3 seal section (slice 57). Single-layer-wins semantics —
-  // whatever layer is LAST to set `seal: { ... }` defines the entire
+  // §7.3 seal section. Single-layer-wins semantics — whatever
+  // layer is LAST to set `seal: { ... }` defines the entire
   // section. Cross-layer field merge would create surprising
   // configs (enterprise sets mode, user accidentally overrides
-  // path); all-or-nothing keeps operator intent obvious. No lock
-  // semantics in slice 57 — sealing isn't field-mergeable so lock
-  // adds no value over the natural last-writer-wins flow.
+  // path); all-or-nothing keeps operator intent obvious.
+  //
+  // §12.2 lock semantics added in slice 112 (R8 #322). Pre-slice
+  // seal was unconditionally last-writer-wins — an enterprise-
+  // mandated `worm-file` config could be silently swapped for
+  // `mode: none` by project policy, defeating the §7.3 forensic
+  // guarantee. With `locked: true` at a higher layer, lower
+  // layers can't override; re-asserting the EXACT same config
+  // is silent (compared via canonical-JSON deep equality);
+  // actual differences flag a `lockConflict` and the lower
+  // layer's version is discarded.
   let mergedSeal: Policy['seal'];
   let sealWriter: Layer | null = null;
+  let sealLockedBy: Layer | null = null;
   const lockConflicts: LockConflict[] = [];
 
   for (const { layer, policy } of layers) {
@@ -303,10 +312,38 @@ const merge = (
       }
     }
 
-    // §7.3 seal section — last-writer-wins for the whole section.
+    // §7.3 seal section — last-writer-wins for the whole
+    // section, with §12.2 lock semantics layered on (slice 112,
+    // R8 #322). When a higher layer set `locked: true`, lower
+    // layers can re-affirm the same seal config silently
+    // (deep-equal compare via canonical JSON) but actual
+    // differences flag a lockConflict.
     if (policy.seal !== undefined) {
-      mergedSeal = policy.seal;
-      sealWriter = layer;
+      const incoming = policy.seal;
+      if (sealLockedBy !== null) {
+        // Already locked. Compare incoming to merged via
+        // canonical-JSON deep-equal. The seal section is small
+        // (<10 fields, all primitive) so the JSON.stringify
+        // cost is negligible; using canonicalHash here would be
+        // overkill since the keys are already in a canonical
+        // order after parsePolicy.
+        const incomingJson = JSON.stringify(incoming);
+        const mergedJson = mergedSeal === undefined ? undefined : JSON.stringify(mergedSeal);
+        if (incomingJson !== mergedJson) {
+          lockConflicts.push({
+            section: 'seal',
+            lockedBy: sealLockedBy,
+            attemptedBy: layer,
+          });
+        }
+        // Locked layers never mutate mergedSeal.
+      } else {
+        mergedSeal = incoming;
+        sealWriter = layer;
+        if (incoming.locked === true) {
+          sealLockedBy = layer;
+        }
+      }
     }
 
     // tools.* sections

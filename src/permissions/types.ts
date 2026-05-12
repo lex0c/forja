@@ -184,6 +184,16 @@ export interface SealPolicy {
   interval_decisions?: number;
   interval_seconds?: number;
   on_failure?: SealOnFailure;
+  // §12.2 enterprise locking semantics (slice 112, R8 #322).
+  // When `true` at any layer, lower-precedence layers can't
+  // override the seal section. Re-asserting the exact same
+  // seal config is silent (no conflict); any field change
+  // records a `lockConflict` and the lower layer's version is
+  // discarded. Pre-slice the seal section was last-writer-wins
+  // with no lock semantics — enterprise-mandated `worm-file`
+  // sealing could be silently swapped for `mode: none` by
+  // project policy, defeating the §7.3 forensic guarantee.
+  locked?: boolean;
 }
 
 export interface Policy {

@@ -540,16 +540,20 @@ describe('parsePolicy — slice 101 hardening (R8 #318/#319/#320/#321)', () => {
     }
   });
 
-  test('seal.locked refuses (seal has no lock semantics, R8 #318)', () => {
-    // Pre-slice `rejectUnknownKeys` added 'locked' to every
-    // section's known keys unconditionally — including seal,
-    // which never reads or honors it. The authored line was a
-    // lie: operator thought they locked the seal section but
-    // actually got an ignored field. Slice 101 removes the
-    // auto-add and seal doesn't list 'locked', so the typo
-    // surfaces at parse time.
-    expect(() => parsePolicy({ seal: { mode: 'none', locked: true } })).toThrow(
-      /seal has unknown key 'locked'/,
+  test('seal.locked parses as a boolean field (slice 112 added lock semantics)', () => {
+    // Slice 101 refused `seal.locked` because the hierarchy
+    // resolver didn't honor it (no-op field would mislead).
+    // Slice 112 (R8 #322) wired the full lock semantics in
+    // hierarchy.ts; the config parser now accepts the field
+    // and the resolver enforces it. Inverted from the slice 101
+    // "refuses" assertion.
+    const p = parsePolicy({ seal: { mode: 'none', locked: true } });
+    expect(p.seal?.locked).toBe(true);
+  });
+
+  test('seal.locked must be boolean (typo defense)', () => {
+    expect(() => parsePolicy({ seal: { mode: 'none', locked: 'true' } })).toThrow(
+      /seal\.locked must be boolean/,
     );
   });
 

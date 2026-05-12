@@ -553,3 +553,94 @@ describe('resolvePolicy — sandbox per-field provenance (§6.5, slice 35)', () 
     });
   });
 });
+
+// Slice 112 — R8 #322: pre-slice the seal section was
+// unconditionally last-writer-wins, with no lock semantics. An
+// enterprise-mandated `worm-file` config could be silently
+// swapped for `mode: none` by project policy, defeating the
+// §7.3 forensic guarantee. Slice 112 adds enterprise-grade
+// lock semantics: when `locked: true` at any layer, lower
+// layers can re-assert the SAME config silently but field
+// changes flag a lockConflict and are discarded.
+describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
+  test('enterprise seal with locked:true blocks project override', () => {
+    const ent = join(workdir, 'ent.yaml');
+    writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'seal:\n  mode: none\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    expect(result.policy.seal?.mode).toBe('worm-file');
+    expect(result.policy.seal?.path).toBe('/var/log/seal.log');
+    expect(result.lockConflicts.length).toBe(1);
+    expect(result.lockConflicts[0]?.section).toBe('seal');
+    expect(result.lockConflicts[0]?.lockedBy).toBe('enterprise');
+    expect(result.lockConflicts[0]?.attemptedBy).toBe('project');
+  });
+
+  test('re-asserting the same seal config under a lock is silent', () => {
+    // Project re-affirms the exact enterprise seal config. The
+    // deep-equal check via JSON-stringify says these are
+    // identical; no conflict fires. Operators duplicating
+    // configs across layers (e.g., for hand-off documentation)
+    // don't get spurious conflict noise.
+    const ent = join(workdir, 'ent.yaml');
+    writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n');
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    expect(result.policy.seal?.mode).toBe('worm-file');
+    expect(result.lockConflicts.length).toBe(0);
+  });
+
+  test('any field difference under lock flags a conflict (path change)', () => {
+    const ent = join(workdir, 'ent.yaml');
+    writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n');
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'seal:\n  mode: worm-file\n  path: /tmp/other-seal.log\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    // Enterprise version preserved.
+    expect(result.policy.seal?.path).toBe('/var/log/seal.log');
+    expect(result.lockConflicts.length).toBe(1);
+    expect(result.lockConflicts[0]?.section).toBe('seal');
+  });
+
+  test('lock at project layer prevents session override', () => {
+    // Operators can also lock at the project layer (e.g., committed
+    // CI policy). Session is the innermost layer; a session-supplied
+    // seal can't override project's locked config.
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'seal:\n  mode: worm-file\n  path: /tmp/project-seal.log\n  locked: true\n',
+    );
+    const result = resolvePolicy({
+      cwd: workdir,
+      enterprisePath: null,
+      userPath: null,
+      session: {
+        defaults: { mode: 'strict' },
+        tools: {},
+        seal: { mode: 'none' },
+      },
+    });
+    expect(result.policy.seal?.mode).toBe('worm-file');
+    expect(result.lockConflicts.length).toBe(1);
+    expect(result.lockConflicts[0]?.lockedBy).toBe('project');
+    expect(result.lockConflicts[0]?.attemptedBy).toBe('session');
+  });
+
+  test('unlocked seal still follows last-writer-wins (no regression)', () => {
+    // Default seal behavior unchanged when no layer sets
+    // `locked: true`. Project overrides enterprise; the
+    // pre-slice "all-or-nothing" replacement semantic still
+    // applies.
+    const ent = join(workdir, 'ent.yaml');
+    writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'seal:\n  mode: none\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    expect(result.policy.seal?.mode).toBe('none');
+    expect(result.lockConflicts.length).toBe(0);
+  });
+});

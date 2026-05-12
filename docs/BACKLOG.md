@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 112: seal hierarchy locking (R8 #322)
+
+**Done.** One-hundred-twelfth slice. **Closes R8 fully.** Pre-slice the seal section was unconditionally last-writer-wins in the hierarchy resolver — an enterprise-mandated `worm-file` config could be silently swapped for `mode: none` by project policy, defeating the §7.3 forensic guarantee. Slice 101 deferred `seal.locked` support because the parser refused the field with no honoring code; slice 112 wires the full lock semantics end-to-end (parser + resolver) and re-enables the field.
+
+### Why this matters
+
+Spec §7.3 says sealing is the audit log's tamper-evidence layer — operators in regulated deployments rely on the seal config being preserved across the layer hierarchy. The pattern the rest of the engine uses (`defaults.locked`, `sandbox.locked`, `tools.*.locked`) lets enterprise lock down compliance-critical settings; without seal lock support, a single committed `permissions.yaml` in a misconfigured repo could silently disable sealing for the whole agent session.
+
+The lock semantics for seal differ from sandbox: seal is "all-or-nothing" (the section replaces wholesale; cross-layer field merge would create surprising configs like enterprise sets mode + user accidentally overrides path). The lock check uses canonical-JSON deep equality — re-asserting the EXACT same config under a lock is silent (operators duplicating configs across layers for documentation don't get spurious conflicts); any field difference flags a `lockConflict` and the lower layer's version is discarded.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | Adds `locked?: boolean` to `SealPolicy` with a long-form comment documenting §12.2 lock semantics and the pre-slice gap. |
+| `src/permissions/config.ts` | Adds `'locked'` to the seal section's known-keys list (slice 101 deliberately omitted it). New parse branch reads `s.locked` as a boolean (with type check) and includes it in the parsed `seal` object via the same `...(locked !== undefined ? { locked } : {})` pattern other fields use. |
+| `src/permissions/hierarchy.ts` | New `sealLockedBy: Layer \| null` state variable alongside the existing `mergedSeal` / `sealWriter`. Seal merge branch now checks if `sealLockedBy !== null` — re-asserting the exact same seal config (compared via `JSON.stringify` deep-equal) is silent; differences flag `{section: 'seal', lockedBy, attemptedBy}` and skip the merge. Lock activation happens on the first layer that sets `incoming.locked === true`. |
+| `tests/permissions/config.test.ts` | Slice 101's "seal.locked refuses" test inverted — now asserts the field parses as a boolean (slice 112 added support). New test pins the type check (`locked: 'true'` string → typo error). |
+| `tests/permissions/hierarchy.test.ts` | New describe `seal section locking (slice 112, R8 #322)` with 5 tests: enterprise lock blocks project override (mode change), re-asserting same config is silent (no spurious conflict), field difference under lock flags conflict (path change), project layer can lock against session, unlocked seal preserves last-writer-wins (no regression). |
+
+### Decisions
+
+- **All-or-nothing replacement with `locked: true` gate.** Slice 57's original "single-layer-wins" choice for seal was about avoiding surprising cross-layer merges (enterprise sets mode but user accidentally overrides path); slice 112 keeps that property AND adds the lock primitive on top. The lock makes the all-or-nothing semantic enforceable rather than just conventional.
+- **Deep-equal via JSON.stringify, not canonicalHash.** The seal section is small (<10 fields, all primitive). `JSON.stringify` of a parsed seal object produces a stable representation since the parser already builds the object with a fixed key order. Using `canonicalHash` would be overkill — it'd add a sha256 computation per merge step for no functional improvement.
+- **Lock provenance tracked at section level, not field level.** Unlike sandbox (where slice 35 added per-field provenance because operators wanted to ask "/perms why sandbox.required"), seal is wholesale-replaced; the operator question is "which layer's seal config is final?" The single `sealWriter` field already answers that. A future `/perms why seal` could read it.
+- **Slice 101 test inverted, not deleted.** The original test asserted the contract "seal.locked refuses with the actual supported set" — slice 101's hardening of typo defense. Slice 112 didn't undo that hardening; it added the missing semantic. Inverting the assertion documents the slice progression in-place: "pre-slice this refused; slice 112 added the wiring."
+- **Test coverage at the resolver level, not just the parser.** The fix has two halves (parser accepts the field + resolver honors it). Config-level tests cover the parser; hierarchy tests cover the resolver. Both need explicit coverage because either side breaking silently leaves the OTHER side passing tests but the operator getting a no-op field — exactly the slice 101 motivating shape.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6265 pass / 10 skip / 0 fail** (6275 total across 291 files); +6 tests on top of slice 111's 6259
+- Targeted: `bun test tests/permissions/config.test.ts tests/permissions/hierarchy.test.ts` — 110/110
+
+### Next
+
+**R8 fully closed.** R10 fully closed (slice 111).
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R4 sandbox hide_paths/scrub_env (substantial across Linux + macOS).
+- R5 broker contract.
+- R6 P1 leftovers (stdin race, SIGTERM→SIGKILL escalation, SIGTERM once).
+- R7 P1 leftovers.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 111: telemetry sink wiring for sandbox.degraded_active (R10 #48)
 
 **Done.** One-hundred-eleventh slice. Closes the last R10 finding (#48). Pre-slice the `SandboxDegradedActiveEvent` type was declared (slice 92), the scrubbing handler existed (slice 99), but the harness loop only emitted to `config.onEvent` — the §18 telemetry pipe was unwired. Operators with OTEL dashboards saw `sandbox.degraded_active_total{reason}` flat-line even when banners were firing in the TUI, making the metric stream documented in spec §18 effectively unobservable.

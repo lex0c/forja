@@ -349,6 +349,13 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
         'interval_decisions',
         'interval_seconds',
         'on_failure',
+        // §12.2 enterprise lock (slice 112, R8 #322). Slice 101
+        // deliberately omitted this key, refusing authored
+        // `locked: true` with the actual supported set. Slice 112
+        // adds support: hierarchy.ts now flags lockConflict when
+        // a lower-precedence layer attempts to override a sealed
+        // seal config.
+        'locked',
       ],
       'seal',
     );
@@ -480,6 +487,20 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       }
       on_failure = s.on_failure as SealOnFailure;
     }
+    // §12.2 lock field (slice 112, R8 #322). Mirrors the pattern
+    // every other section uses: `locked: true` at a higher layer
+    // (enterprise) prevents lower layers (user / project /
+    // session) from changing the seal config. Re-asserting the
+    // same config is silent; field changes flag a lockConflict
+    // in the hierarchy resolver and the lower layer's version
+    // is discarded.
+    let locked: boolean | undefined;
+    if (s.locked !== undefined) {
+      if (typeof s.locked !== 'boolean') {
+        throw new Error('policy: seal.locked must be boolean');
+      }
+      locked = s.locked;
+    }
     seal = {
       mode,
       ...(path !== undefined ? { path } : {}),
@@ -491,6 +512,7 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       ...(interval_decisions !== undefined ? { interval_decisions } : {}),
       ...(interval_seconds !== undefined ? { interval_seconds } : {}),
       ...(on_failure !== undefined ? { on_failure } : {}),
+      ...(locked !== undefined ? { locked } : {}),
     };
   }
 
