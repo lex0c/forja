@@ -48,7 +48,7 @@ describe('task tool — capabilities input validation', () => {
     expect(calls[0]?.declaredCapabilities).toEqual([]);
   });
 
-  test('omitting capabilities skips the field entirely', async () => {
+  test('omitting capabilities is REJECTED (slice 94 closed the §10 opt-in)', async () => {
     const calls: SpawnSubagentArgs[] = [];
     const ctx = makeCtx({
       spawnSubagent: async (args) => {
@@ -56,8 +56,25 @@ describe('task tool — capabilities input validation', () => {
         return ranEnvelope();
       },
     });
-    await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
-    expect(calls[0]?.declaredCapabilities).toBeUndefined();
+    // Pre-slice this passed silently with declaredCapabilities=undefined,
+    // bypassing §10 intersection entirely. Slice 94 makes capabilities
+    // REQUIRED — omitting it now errors with a clear pointer to spec
+    // §10.1. Operator MUST declare what the child can do (even [] for
+    // pure-LLM is acceptable).
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go' } as unknown as {
+        subagent: string;
+        prompt: string;
+        capabilities: string[];
+      },
+      ctx,
+    );
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    expect(result.error_code).toBe('tool.invalid_arg');
+    expect(result.error_message).toContain("'capabilities' is required");
+    expect(result.error_message).toContain('§10.1');
+    expect(calls.length).toBe(0);
   });
 
   test('rejects non-array capabilities', async () => {

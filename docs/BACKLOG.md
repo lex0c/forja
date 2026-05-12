@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 94: §10 subagent gate closure (capabilities REQUIRED + task_async wiring)
+
+**Done.** Ninety-fourth slice. Closes the first P0 from the 12-agent review (R11 finding, `docs/REVIEW_NOTES.md`): `capabilities` is now REQUIRED on both `task` and `task_async`, and `task_async` finally threads `declaredCapabilities` through the §10 intersection gate. Pre-slice, **`task_async` had ZERO §10 wiring** — any subagent spawned via the async path inherited the parent's full capability set verbatim, regardless of what it actually needed. The sync `task` tool also accepted absent `capabilities` and silently bypassed intersection. Both paths were §10 opt-in by accident; slice 94 makes §10 opt-out impossible.
+
+### Why this matters
+
+PERMISSION_ENGINE.md §10.1 is unambiguous:
+
+> `effective_caps = parent_caps ∩ declared_caps`
+
+That contract presupposes `declared_caps` exists. When `task` accepted `capabilities = undefined` and skipped the intersection, the child inherited the parent's full set — strictly broader than spec. When `task_async` ignored `capabilities` entirely (the field didn't even exist in its schema), the inheritance gap was complete: there was no surface to declare, no enforcement to bypass — the §10 mechanism just wasn't there.
+
+This is the canonical "privilege escalation by omission" anti-pattern: an operator who forgets the field gets MORE privilege than one who remembers it. Slice 94 inverts the default — omission is now a hard rejection (`tool.invalid_arg` pointing to spec §10.1), and the operator must explicitly declare `[]` to spawn a pure-LLM subagent with no side-effect capabilities. Forgetting the field can no longer escalate.
+
+The async path was the more dangerous gap because async subagents typically run longer (file searches, multi-step exploration) and accumulate more tool calls per spawn — each of which was previously enforced against the parent's full capability set rather than the child's declared subset.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task.ts` | `capabilities` moved to `required` in JSON schema. Description rewritten as "REQUIRED — engine intersects declared ∩ parent". Removed the legacy `args.capabilities === undefined → spawn without §10 guard` branch; that path now returns `tool.invalid_arg` with the §10.1 pointer and a hint suggesting `[]` for pure-LLM subagents. `declaredCapabilities` is now always-assigned (`const declaredCapabilities: string[] = args.capabilities`) and always passed to `spawnSubagent`. |
+| `src/tools/builtin/task-async.ts` | Adds `capabilities: string[]` to `TaskAsyncInput`, to the JSON schema `properties`, and to `required`. Adds the full validation block (array check, string-element check, `parseCapability` syntactic check) mirroring `task.ts` — intentional duplication, deferred lifting to a shared helper. Threads `declaredCapabilities` to `subagentHandleStore.spawn(...)`. This is the line that fills the prior ZERO-wiring gap. |
+| `tests/tools/task-capabilities.test.ts` | The "omitting capabilities skips field" test (pre-slice asserted silent fallback) is inverted to "omitting capabilities is REJECTED" — asserts `error_code === 'tool.invalid_arg'`, error message contains `'capabilities' is required`, message contains `§10.1`, and `spawnSubagent` is never invoked. |
+| `tests/tools/task.test.ts`, `tests/tools/task-async.test.ts` | 37 call sites updated to include `capabilities: []` (the new explicit pure-LLM form). Mostly mechanical via sed; a handful with variable-named subagents or wrapped long lines fixed manually. |
+| `tests/cli/subagent-child.test.ts`, `tests/harness/task-async-e2e.test.ts` | Mock-provider streams that emit synthetic `task` / `task_async` tool_uses (depth tests, grandchild tests, three-spawns e2e, cancel, cost progress) now include `capabilities: []` in `final_args` / `input` so the harness's new validation accepts them through to the §10 gate under test. |
+
+### Decisions
+
+- **Hard rejection, not migration-flag.** A "warn + fallback to undefined" mode would have given existing call sites a soft landing, but it preserves the escalation path. Subagents are a §10 boundary — there's no acceptable middle ground where the contract is sometimes enforced. Rejection now, with a hint that `[]` is acceptable, makes the migration mechanical (every call site gets `capabilities: []` until someone audits which ones actually need broader sets).
+- **Async path closure in same slice as sync.** Splitting `task` and `task_async` into two slices would have left the more dangerous gap (async ZERO-wiring) open during the intermediate state. Both tools share the same `SpawnSubagentArgs` interface and the same `intersectCapabilities` enforcement at the engine seam — coupling the change keeps the contract single-sourced.
+- **Validation block duplicated, not lifted.** The 30-line block (array check / element check / `parseCapability` syntactic check / error envelopes) is copy-pasted between `task.ts` and `task-async.ts`. Lifting to a shared `validateCapabilitiesArg(args)` helper is the obvious next step but defers cleanly to slice 95 — extracting now would couple this slice's contract change to a refactor, and the duplication is small enough that drift risk over one cycle is acceptable.
+- **`effective` is computed but NOT yet applied at the child engine.** R11 had THREE P0 findings: (1) declared required, (2) async wired through gate, (3) intersection result actually constrains the child engine's `allow` evaluation. Slice 94 closes (1) and (2); (3) requires a new `PermissionEngine` option (`effectiveCapabilities?: Set<string>`) plus scope-aware glob containment logic, deferred to slice 95. Today, the child engine still runs with the parent's full capability set — but the spawn gate now refuses any escalation request, so the child's effective surface is bounded by `declared` even though the engine isn't checking it explicitly. This is the safe ordering: refuse-at-spawn closes the escalation; refuse-at-evaluation is defense-in-depth, not the primary control.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from slice 93)
+- `bun test` — **6082 pass / 10 skip / 0 fail** (6092 total across 289 files); same numerical pass count as slice 93 because the contract change inverted a test rather than adding net coverage
+- Targeted: `bun test tests/cli/subagent-child.test.ts tests/harness/task-async-e2e.test.ts` — 39/39
+
+### Next
+
+R11 follow-up (slice 95): apply `effective` at the child engine via new `PermissionEngine` option, with scope-aware subset check (glob containment for `read-fs:src/**` ⊆ `read-fs:src/auth/**` etc.). Then the remaining P0 cluster from REVIEW_NOTES.md (replay tool, protected paths + tilde + /dev, bootstrap/policy parsing hardening, sandbox wire validation, broker drain caps, audit chain atomicity).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 93: §13.6 reason plumbing (engine.getDegradedReason → banner)
 
 **Done.** Ninety-third slice. Closes the reason-plumbing follow-up from slice 92: while the engine is degraded, `engine.getDegradedReason()` returns the root cause (e.g., `'bwrap binary missing'`), and the harness's `DegradedBannerEmitter` reads it on every fire so banner output carries the reason. Pre-slice the emitter accepted a `getReason` callback (slice 92 wired the seam), but the harness passed nothing → operators saw banners with empty parens. Slice 93 fills the seam.

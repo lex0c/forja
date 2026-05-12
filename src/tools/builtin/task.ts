@@ -92,10 +92,10 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         type: 'array',
         items: { type: 'string' },
         description:
-          'Optional capability list (PERMISSION_ENGINE.md §10). Each entry is a capability string like "read-fs:src/**", "exec:shell", "env-mutate". The spawned subagent receives only the intersection of these with the parent\'s capability snapshot; any capability outside the parent\'s set refuses the spawn. Omit to keep the legacy toolset-based gating; pass an empty array to run the subagent pure-LLM (no side-effect capabilities).',
+          'Capability list the child needs (PERMISSION_ENGINE.md §10.1). Each entry is a capability string like "read-fs:src/**", "exec:shell", "env-mutate". REQUIRED — the spec demands explicit declaration of what the child can do; the engine intersects declared ∩ parent and refuses the spawn if any declared capability is outside the parent\'s set. Pass [] to run the subagent pure-LLM (no side-effect capabilities). Slice 94 closed the prior "omit for legacy bypass" path — operator must declare.',
       },
     },
-    required: ['subagent', 'prompt'],
+    required: ['subagent', 'prompt', 'capabilities'],
   },
   metadata: {
     // Subagents are gated as their own permission category — the
@@ -160,45 +160,52 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       );
     }
 
-    // PERMISSION_ENGINE.md §10.1: validate every declared capability
-    // string parses to a well-formed Capability. Parse-fail is a
-    // model error (the model emitted a bogus kind / shape); surface
-    // it with the offending entry so the model can self-correct.
-    // Three cases survive validation:
-    //   - undefined  → no §10 guard (legacy path)
-    //   - []         → "pure-LLM" subagent (§10.1)
+    // PERMISSION_ENGINE.md §10.1: capabilities is REQUIRED (slice 94).
+    // Pre-slice the field was optional, with `undefined → no §10 guard`
+    // as a legacy escape — the review identified this as a privilege-
+    // escalation-by-omission: model spawning `task('foo', prompt)`
+    // without the field would skip intersection entirely and inherit
+    // the parent's full policy snapshot. Now: missing field is rejected;
+    // operator MUST declare. Two valid shapes:
+    //   - []         → "pure-LLM" subagent (no side-effect capabilities)
     //   - [valid…]   → intersection guard at the spawn factory
-    let declaredCapabilities: string[] | undefined;
-    if (args.capabilities !== undefined) {
-      if (!Array.isArray(args.capabilities)) {
+    if (args.capabilities === undefined) {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        "'capabilities' is required (PERMISSION_ENGINE.md §10.1)",
+        {
+          hint: "Declare the capabilities the child needs (e.g. ['read-fs:src/**', 'exec:shell']) or pass [] for a pure-LLM subagent with no side-effect capabilities.",
+        },
+      );
+    }
+    if (!Array.isArray(args.capabilities)) {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        "'capabilities' must be an array of capability strings",
+      );
+    }
+    for (const entry of args.capabilities) {
+      if (typeof entry !== 'string') {
         return toolError(
           ERROR_CODES.invalidArg,
-          "'capabilities' must be an array of capability strings",
+          "'capabilities' entries must be capability strings (e.g. 'read-fs:src/**')",
         );
       }
-      for (const entry of args.capabilities) {
-        if (typeof entry !== 'string') {
-          return toolError(
-            ERROR_CODES.invalidArg,
-            "'capabilities' entries must be capability strings (e.g. 'read-fs:src/**')",
-          );
-        }
-        try {
-          parseCapability(entry);
-        } catch (e) {
-          return toolError(
-            ERROR_CODES.invalidArg,
-            `'capabilities' entry '${entry}' is not a valid capability: ${(e as Error).message}`,
-          );
-        }
+      try {
+        parseCapability(entry);
+      } catch (e) {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          `'capabilities' entry '${entry}' is not a valid capability: ${(e as Error).message}`,
+        );
       }
-      declaredCapabilities = args.capabilities;
     }
+    const declaredCapabilities: string[] = args.capabilities;
 
     const result = await ctx.spawnSubagent({
       name: args.subagent,
       prompt: args.prompt,
-      ...(declaredCapabilities !== undefined ? { declaredCapabilities } : {}),
+      declaredCapabilities,
     });
     // Audit: the synchronous task family hits the dispatcher
     // first (no pre-flight check), so the three refusal kinds

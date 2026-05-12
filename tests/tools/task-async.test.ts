@@ -43,7 +43,7 @@ describe('task_async / task_await / task_cancel tools', () => {
     });
     const ctx = makeCtx({ subagentHandleStore: store });
     const spawnRes = await taskAsyncTool.execute(
-      { subagent: 'explore', prompt: 'find auth files' },
+      { subagent: 'explore', prompt: 'find auth files', capabilities: [] },
       ctx,
     );
     if (isToolError(spawnRes)) throw new Error(`unexpected error: ${spawnRes.error_message}`);
@@ -69,7 +69,7 @@ describe('task_async / task_await / task_cancel tools', () => {
     const ctx = makeCtx({ subagentHandleStore: store });
     const handles: string[] = [];
     for (const name of ['a', 'b', 'c']) {
-      const r = await taskAsyncTool.execute({ subagent: name, prompt: 'p' }, ctx);
+      const r = await taskAsyncTool.execute({ subagent: name, prompt: 'p', capabilities: [] }, ctx);
       if (isToolError(r)) throw new Error('spawn failed');
       handles.push(r.handle_id);
     }
@@ -109,7 +109,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       },
     });
     const ctx = makeCtx({ subagentHandleStore: store });
-    const spawn = await taskAsyncTool.execute({ subagent: 'slow', prompt: 'p' }, ctx);
+    const spawn = await taskAsyncTool.execute(
+      { subagent: 'slow', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     if (isToolError(spawn)) throw new Error('spawn failed');
     await inFlight;
     const cancel = await taskCancelTool.execute({ handle_id: spawn.handle_id }, ctx);
@@ -143,7 +146,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       }),
     });
     const ctx = makeCtx({ subagentHandleStore: store });
-    const spawn = await taskAsyncTool.execute({ subagent: 'review', prompt: 'p' }, ctx);
+    const spawn = await taskAsyncTool.execute(
+      { subagent: 'review', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     if (isToolError(spawn)) throw new Error('spawn failed');
     const awaitRes = await taskAwaitTool.execute({ handle_id: spawn.handle_id }, ctx);
     expect(isToolError(awaitRes)).toBe(true);
@@ -171,7 +177,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       spawnFn: async (args) => okResult(args),
     });
     const ctx = makeCtx({ subagentHandleStore: store });
-    const spawn = await taskAsyncTool.execute({ subagent: 'fast', prompt: 'p' }, ctx);
+    const spawn = await taskAsyncTool.execute(
+      { subagent: 'fast', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     if (isToolError(spawn)) throw new Error('spawn failed');
     await taskAwaitTool.execute({ handle_id: spawn.handle_id }, ctx);
     const cancel = await taskCancelTool.execute({ handle_id: spawn.handle_id }, ctx);
@@ -188,7 +197,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       },
     });
     const ctx = makeCtx({ subagentHandleStore: store });
-    const spawn = await taskAsyncTool.execute({ subagent: 'slow', prompt: 'p' }, ctx);
+    const spawn = await taskAsyncTool.execute(
+      { subagent: 'slow', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     if (isToolError(spawn)) throw new Error('spawn failed');
     const r1 = await taskAwaitTool.execute({ handle_id: spawn.handle_id, timeout_ms: 20 }, ctx);
     expect(isToolError(r1)).toBe(true);
@@ -214,7 +226,7 @@ describe('task_async / task_await / task_cancel tools', () => {
 
   test('all three tools surface subagent.unavailable when store is missing', async () => {
     const ctx = makeCtx({});
-    const a = await taskAsyncTool.execute({ subagent: 'x', prompt: 'p' }, ctx);
+    const a = await taskAsyncTool.execute({ subagent: 'x', prompt: 'p', capabilities: [] }, ctx);
     const b = await taskAwaitTool.execute({ handle_id: 'h' }, ctx);
     const c = await taskCancelTool.execute({ handle_id: 'h' }, ctx);
     for (const r of [a, b, c]) {
@@ -240,7 +252,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       },
     };
     const ctx = makeCtx({ subagentHandleStore: throwingStore });
-    const r = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    const r = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r)).toBe(true);
     if (!isToolError(r)) return;
     expect(r.error_code).toBe('subagent.spawn_failed');
@@ -271,9 +286,18 @@ describe('task_async / task_await / task_cancel tools', () => {
       }),
       getSubagentBudgetEstimate: () => 2,
     });
-    const r1 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
-    const r2 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'q' }, ctx);
-    const r3 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'r' }, ctx);
+    const r1 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx,
+    );
+    const r2 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'q', capabilities: [] },
+      ctx,
+    );
+    const r3 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'r', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r1)).toBe(false);
     expect(isToolError(r2)).toBe(false);
     expect(isToolError(r3)).toBe(true);
@@ -300,7 +324,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       getCostBudget: () => ({ spent: 1_000_000, cap: undefined }),
       getSubagentBudgetEstimate: () => 1_000_000,
     });
-    const r = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    const r = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r)).toBe(false);
   });
 
@@ -318,7 +345,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       },
     });
     const ctx = makeCtx({ subagentHandleStore: store });
-    const r1 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'a' }, ctx);
+    const r1 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'a', capabilities: [] },
+      ctx,
+    );
     if (isToolError(r1)) throw new Error('first spawn should succeed');
     // Spawn a second handle that's queued behind the first
     // (cap=1). Use the explicit estimate path on the store
@@ -363,7 +393,10 @@ describe('task_async / task_await / task_cancel tools', () => {
         name === 'explore' || name === 'review' ? 0.5 : null,
       getKnownSubagentNames: (): string[] => ['explore', 'review'],
     });
-    const r = await taskAsyncTool.execute({ subagent: 'explroe', prompt: 'p' }, ctx);
+    const r = await taskAsyncTool.execute(
+      { subagent: 'explroe', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r)).toBe(true);
     if (!isToolError(r)) return;
     expect(r.error_code).toBe('subagent.unknown');
@@ -384,7 +417,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       getSubagentBudgetEstimate: (): number | null => null,
       getKnownSubagentNames: (): string[] => [],
     });
-    const r = await taskAsyncTool.execute({ subagent: 'anything', prompt: 'p' }, ctx);
+    const r = await taskAsyncTool.execute(
+      { subagent: 'anything', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r)).toBe(true);
     if (!isToolError(r)) return;
     expect(r.error_code).toBe('subagent.unknown');
@@ -412,7 +448,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       subagentHandleStore: store,
       subagentDepth: MAX_SUBAGENT_DEPTH,
     });
-    const r = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    const r = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r)).toBe(true);
     if (!isToolError(r)) return;
     expect(r.error_code).toBe('subagent.depth_exceeded');
@@ -429,10 +468,13 @@ describe('task_async / task_await / task_cancel tools', () => {
       spawnFn: async (args) => okResult(args),
     });
     const ctx = makeCtx({ subagentHandleStore: store });
-    const r1 = await taskAsyncTool.execute({ subagent: '', prompt: 'p' }, ctx);
+    const r1 = await taskAsyncTool.execute({ subagent: '', prompt: 'p', capabilities: [] }, ctx);
     expect(isToolError(r1)).toBe(true);
     const huge = 'x'.repeat(33 * 1024);
-    const r2 = await taskAsyncTool.execute({ subagent: 'explore', prompt: huge }, ctx);
+    const r2 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: huge, capabilities: [] },
+      ctx,
+    );
     expect(isToolError(r2)).toBe(true);
     if (!isToolError(r2)) return;
     expect(r2.error_code).toBe('tool.invalid_arg');
@@ -466,7 +508,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       subagentDepth: 4, // MAX_SUBAGENT_DEPTH = 4 so child = 5 trips
       recordGateDecision: (d) => recorded.push(d),
     });
-    const rDepth = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctxDepth);
+    const rDepth = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctxDepth,
+    );
     expect(isToolError(rDepth)).toBe(true);
     if (isToolError(rDepth)) expect(rDepth.error_code).toBe('subagent.depth_exceeded');
 
@@ -477,7 +522,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       getKnownSubagentNames: () => ['explore', 'review'],
       recordGateDecision: (d) => recorded.push(d),
     });
-    const rUnknown = await taskAsyncTool.execute({ subagent: 'typo', prompt: 'p' }, ctxUnknown);
+    const rUnknown = await taskAsyncTool.execute(
+      { subagent: 'typo', prompt: 'p', capabilities: [] },
+      ctxUnknown,
+    );
     expect(isToolError(rUnknown)).toBe(true);
     if (isToolError(rUnknown)) expect(rUnknown.error_code).toBe('subagent.unknown');
 
@@ -488,7 +536,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       getSubagentBudgetEstimate: () => 1.0,
       recordGateDecision: (d) => recorded.push(d),
     });
-    const rBudget = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctxBudget);
+    const rBudget = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctxBudget,
+    );
     expect(isToolError(rBudget)).toBe(true);
     if (isToolError(rBudget)) expect(rBudget.error_code).toBe('subagent.budget_exhausted');
 
@@ -548,7 +599,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       subagentHandleStore: s1,
       recordGateDecision: (d) => recorded1.push(d),
     });
-    const spawn1 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx1);
+    const spawn1 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx1,
+    );
     if (isToolError(spawn1)) throw new Error('spawn should succeed');
     const await1 = await taskAwaitTool.execute({ handle_id: spawn1.handle_id }, ctx1);
     expect(isToolError(await1)).toBe(true);
@@ -571,7 +625,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       subagentHandleStore: s2,
       recordGateDecision: (d) => recorded2.push(d),
     });
-    const spawn2 = await taskAsyncTool.execute({ subagent: 'mistyped', prompt: 'p' }, ctx2);
+    const spawn2 = await taskAsyncTool.execute(
+      { subagent: 'mistyped', prompt: 'p', capabilities: [] },
+      ctx2,
+    );
     if (isToolError(spawn2)) throw new Error('spawn should succeed');
     const await2 = await taskAwaitTool.execute({ handle_id: spawn2.handle_id }, ctx2);
     expect(isToolError(await2)).toBe(true);
@@ -591,7 +648,10 @@ describe('task_async / task_await / task_cancel tools', () => {
       subagentHandleStore: s3,
       recordGateDecision: (d) => recorded3.push(d),
     });
-    const spawn3 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx3);
+    const spawn3 = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx3,
+    );
     if (isToolError(spawn3)) throw new Error('spawn should succeed');
     const await3 = await taskAwaitTool.execute({ handle_id: spawn3.handle_id }, ctx3);
     expect(isToolError(await3)).toBe(true);
