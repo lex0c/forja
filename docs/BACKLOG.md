@@ -15,6 +15,70 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 102: spawn broker drain caps (R6 #21 + #22)
+
+**Done.** One-hundred-second slice. Closes two R6 P0 DoS vectors that **inverted §13.7's isolation premise** — the spec explicitly promises that worker subprocess faults don't kill the broker, but pre-slice an unbounded drain could OOM the broker on hostile or pathological output.
+
+- **#21 broker stdout/stderr drain unbounded**: `new Response(proc.stdout).text()` accumulated every byte the worker produced with no cap. A worker emitting gigabytes (hostile handler, infinite-loop bug, broken pipe-back protocol) OOM'd the broker process — and since the broker hosts the harness loop, OOM cascaded to the entire agent session.
+- **#22 worker `readStdin` unbounded**: symmetric on the inbound side. The worker's stdin reader accumulated every byte until EOF; a manual `bigfile | bun worker.ts` invocation or buggy broker emitter could OOM the worker BEFORE the handler ever ran, making the canonical error envelope ("invalid request") unrecoverable.
+
+### Why this matters
+
+§13.7 is the central isolation contract: tools run in disposable worker subprocesses so that handler faults — segfaults, allocator panics, hung syscalls — can't take down the broker. The contract presupposes the broker reading worker output is itself bounded. Without that, a worker emitting too much output crashes the broker, which is exactly the failure mode workers exist to prevent. The drain cap closes the loop: a misbehaving worker now triggers a structured error envelope (`worker stdout exceeded N bytes (truncated)`) and the broker stays alive to serve the next call.
+
+The cap also disciplines the WORKER side. Pre-slice the worker entry's `readStdin` was the symmetric gap — anyone who could feed bytes to the worker process (manual `echo | bun worker.ts` invocations during dev/debug, or a buggy broker writing oversize requests) could OOM the worker before the handler could surface the bad-request error. The fix is a hard outer ceiling; the inner handler-side caps (bash `maxOutputBytes`, etc.) remain the routine enforcement layer.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` | Adds `maxStdoutBytes` / `maxStderrBytes` to `CreateSpawnBrokerOptions` (defaults: 16 MiB / 4 MiB). New `drainBounded(stream, cap)` helper: reads chunks until EOF or cap, cancels the reader on cap-hit (releasing the worker's pipe), returns `{text, truncated}` with a `<truncated at N bytes>` suffix on truncated text. The broker's `Promise.all([stdoutP, stderrP, proc.exited])` now consumes the `{text, truncated}` shape; truncation flags surface as new short-circuit branches BEFORE the response parser runs, returning a specific error envelope (`worker stdout exceeded N bytes (truncated; response line likely lost)` / `worker stderr exceeded N bytes`) with `exitCode` populated so operators can triage whether the worker exited cleanly or was wedged. |
+| `src/broker/worker.ts` | New `MAX_REQUEST_BYTES = 16 MiB` ceiling (matches the broker's stdout cap — symmetric upper bound on the request/response envelope). `readStdin` accumulates byte-counted chunks; on cap-cross it throws a structured "worker: stdin exceeded N bytes (request truncated)" error which the worker runtime surfaces in the canonical response envelope. |
+| `tests/broker/spawn.test.ts` | New describe `bounded stream drain (slice 102, R6 #21)` with 5 tests: stdout under cap drains cleanly (no regression), stdout over cap returns truncation error with marker, stderr over cap returns separate truncation error, default caps (16 MiB / 4 MiB) admit a 1 MB payload without truncation, truncation envelope includes `exitCode` for triage. |
+
+### Decisions
+
+- **16 MiB / 4 MiB defaults.** Picked well above any legitimate single-call response (grep over ~50k files lands well under 16 MiB), well below "memory pressure on the broker host" thresholds for the 8-16 GB typical machine. Operators with unusual workloads (large-LLM-output piping through bash) can raise via `maxStdoutBytes`. The asymmetry (stdout > stderr) reflects that stdout carries the canonical response while stderr is debug noise.
+- **Cancel the reader on cap-hit.** This is what actually closes the isolation gap. Without it, the worker's stdout would keep filling the pipe buffer + back-pressuring the worker, but the broker would still hold references to whatever bytes the worker had already flushed. Cancelling signals "we're done reading" to the stream — the worker's write returns EPIPE on the next chunk, the broker's memory usage stops growing.
+- **Truncation marker appended to text, not stripped.** Operators reading the BrokerResponse stdout (via `agent permission inspect` or audit log replay) need to see WHY the response is incomplete. A bare truncated string would look like a mid-message clip with no explanation; `<truncated at N bytes>` makes the cause self-explanatory.
+- **Short-circuit BEFORE the response parser runs.** Pre-slice the response parser would have failed on the truncated last line with "invalid response: <truncated...>" — technically correct but misattributing the cause to the worker producing bad JSON. The new branch returns the truncation envelope first, attributing the cause to the cap.
+- **Worker-side cap is symmetric (16 MiB).** Matches the broker's stdout cap. Asymmetric caps would create a routing trap where the broker accepted a request the worker would reject (or vice versa). One value, both directions.
+- **Worker-side cap throws, doesn't truncate-and-parse.** The handler is going to fail on truncated JSON anyway; the explicit throw with a clear message is more useful than letting the parse fail with a generic syntax error several layers deeper. The runtime catches and surfaces as the canonical response envelope.
+- **No telemetry event for drain-cap hits.** A future slice could add a `broker.drain_capped` event for monitoring dashboards (high cap-hit rate signals a misbehaving handler or hostile input), but the BrokerResponse error field already carries the per-call signal. Adding a metric is observability cleanup, not a closure of the P0.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6204 pass / 10 skip / 0 fail** (6214 total across 289 files); +5 tests on top of slice 101's 6199
+- Targeted: `bun test tests/broker/` — 127/127
+
+### Next
+
+R6 remaining (each is its own slice's worth of work):
+- **#9 `sandboxProfile` unvalidated on wire**: a hostile request emitter passes `'host'` and the broker passes it through to the sandbox runner without validating it's in the operator's allow set. This is the sandbox wire validation finding cross-referenced as R8.
+- **#41 `proc.exited` hang without timer**: if a child never exits AND no timer is set AND no signal aborts, the broker parks forever. The cap on stream reads helps (drain finishes when the worker closes its end of the pipe), but a worker that never closes stdout still hangs.
+- **#38 signal listener attach AFTER spawn**: abort during the spawn → stdin-write window is swallowed; only the outer timeout fires.
+- **#42 JSON proto-pollution defense**: `JSON.parse` runs on attacker input without `__proto__` filtering. Downstream `Object.assign({}, args)` would inherit poisoned prototypes.
+- **#44 env leak to worker**: worker inherits the full parent env (secrets) before scrubbing happens in the bash handler.
+
+R6 P1 remaining:
+- Stdin.end / proc.exited race window.
+- Broker timeout no SIGTERM→SIGKILL escalation.
+- Worker `process.on('SIGTERM')` without `{once: true}`.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section overridden, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 bash worker handler (SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 101: policy parsing hardening (R8 #318/#319/#320/#321)
 
 **Done.** One-hundred-first slice. Closes four R8 P0s in `config.ts` under one theme — **silent acceptance of authored garbage**:

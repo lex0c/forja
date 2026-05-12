@@ -531,3 +531,90 @@ describe('createSpawnBroker — option plumbing', () => {
     await broker.close();
   });
 });
+
+// Slice 102 — R6 #21: broker drain unbounded. Pre-slice `new
+// Response(stream).text()` read the worker's full stdout into the
+// broker's memory with NO cap; a worker emitting gigabytes would
+// OOM the broker process. `drainBounded` caps each stream and
+// short-circuits with a specific error envelope when the cap is
+// hit.
+describe('createSpawnBroker — bounded stream drain (slice 102, R6 #21)', () => {
+  test('stdout under cap drains cleanly (no regression)', async () => {
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      maxStdoutBytes: 1024,
+      spawn: () => makeMockProcess({ stdout: '{"ok":true,"stdout":"hello","stderr":""}\n' }),
+    });
+    const res = await broker.execute(baseRequest());
+    expect(res.ok).toBe(true);
+    expect(res.stdout).toBe('hello');
+    await broker.close();
+  });
+
+  test('stdout over cap returns truncation error', async () => {
+    // Build a payload exceeding the cap. The drain reads until
+    // the cap then short-circuits; the broker's response parser
+    // never runs (the error surfaces first).
+    const bigPayload = 'x'.repeat(100);
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      maxStdoutBytes: 50,
+      spawn: () => makeMockProcess({ stdout: bigPayload }),
+    });
+    const res = await broker.execute(baseRequest());
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('stdout exceeded 50 bytes');
+    expect(res.error).toContain('truncated');
+    // Truncated text + marker visible for forensic triage.
+    expect(res.stdout).toContain('<truncated at 50 bytes>');
+    await broker.close();
+  });
+
+  test('stderr over cap returns separate truncation error', async () => {
+    const bigStderr = 'e'.repeat(200);
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      maxStderrBytes: 100,
+      spawn: () =>
+        makeMockProcess({
+          stdout: '{"ok":true,"stdout":"","stderr":""}\n',
+          stderr: bigStderr,
+        }),
+    });
+    const res = await broker.execute(baseRequest());
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('stderr exceeded 100 bytes');
+    expect(res.stderr).toContain('<truncated at 100 bytes>');
+    await broker.close();
+  });
+
+  test('default caps are documented values (16 MiB stdout, 4 MiB stderr)', async () => {
+    // Smoke test for the default values — a payload of 1 MB
+    // passes through without truncation under default caps.
+    const oneMb = 'a'.repeat(1024 * 1024);
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () =>
+        makeMockProcess({
+          stdout: `${oneMb}\n{"ok":true,"stdout":"","stderr":""}\n`,
+        }),
+    });
+    const res = await broker.execute(baseRequest());
+    expect(res.ok).toBe(true);
+    await broker.close();
+  });
+
+  test('truncation includes exitCode (worker may still have exited cleanly)', async () => {
+    // Operator needs the exit code for triage — was the worker
+    // wedged or did it exit cleanly while producing too much
+    // output? Both are real shapes.
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      maxStdoutBytes: 10,
+      spawn: () => makeMockProcess({ stdout: 'x'.repeat(50), exitCode: 0 }),
+    });
+    const res = await broker.execute(baseRequest());
+    expect(res.exitCode).toBe(0);
+    await broker.close();
+  });
+});

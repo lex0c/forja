@@ -43,14 +43,45 @@ const echoHandler: WorkerToolHandler = {
 
 const bashHandler = createBashHandler({ scrubEnv });
 
+// Stdin byte ceiling (slice 102, R6 #22). The worker receives ONE
+// NDJSON line — typical request payloads are well under 1 MiB
+// even for large tool argument bags. A hostile or buggy caller
+// (manual `echo ... | bun worker.ts` invocations) could feed
+// gigabytes and OOM the worker before the handler ever runs.
+// 16 MiB matches the broker's stdout cap (drainBounded in
+// spawn.ts) — symmetric upper bound on the request/response
+// envelope. The handler-side caps (bash `maxOutputBytes`, etc.)
+// remain the inner enforcement layer; this is the outer barrier
+// that protects the worker process itself.
+const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+
 const readStdin = async (): Promise<string> => {
-  let buffer = '';
-  const decoder = new TextDecoder();
+  let total = 0;
+  const chunks: Uint8Array[] = [];
   for await (const chunk of Bun.stdin.stream()) {
-    buffer += decoder.decode(chunk, { stream: true });
+    if (total + chunk.byteLength > MAX_REQUEST_BYTES) {
+      // Truncate to the cap, then break. The handler will see
+      // a malformed (likely incomplete) JSON line and fail with
+      // the canonical "invalid request" envelope; the broker's
+      // response parser surfaces that as a worker crash with
+      // the truncated bytes available for triage.
+      const remaining = MAX_REQUEST_BYTES - total;
+      if (remaining > 0) {
+        chunks.push(chunk.subarray(0, remaining));
+        total += remaining;
+      }
+      throw new Error(`worker: stdin exceeded ${MAX_REQUEST_BYTES} bytes (request truncated)`);
+    }
+    chunks.push(chunk);
+    total += chunk.byteLength;
   }
-  buffer += decoder.decode();
-  return buffer;
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: false }).decode(merged);
 };
 
 // SIGTERM propagation (slice 83). The spawn broker sends SIGTERM

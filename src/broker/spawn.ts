@@ -94,6 +94,20 @@ export interface CreateSpawnBrokerOptions {
   // Undefined means no timeout (production should ALWAYS set
   // a timeout; tests omit it to validate happy path).
   timeoutMs?: number;
+  // Maximum bytes to accept from the worker's stdout / stderr
+  // before the drain truncates and the worker is killed (slice
+  // 102, R6 #21). Pre-slice the drain used `new Response(stream)
+  // .text()` with NO byte cap — a worker emitting a gigabyte of
+  // stdout would OOM the BROKER process, inverting §13.7's
+  // isolation premise ("worker isolation means worker faults
+  // don't kill the main process"). Defaults: 16 MiB stdout (the
+  // worker NDJSON response carries the tool's full output and
+  // can be large for grep/find), 4 MiB stderr (debug noise and
+  // crash trace, smaller than stdout). The drain replaces
+  // truncated content with a `<truncated at N bytes>` suffix so
+  // operators see the cause in the BrokerResponse.
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
   sandboxRunner?: SandboxRunner;
   // Test seam. Defaults to Bun.spawn wrapper.
   spawn?: SpawnFn;
@@ -142,12 +156,95 @@ const defaultSpawn: SpawnFn = (argv, options) => {
   return proc as unknown as SpawnedProcess;
 };
 
+// §13.7 isolation budget (slice 102, R6 #21). 16 MiB / 4 MiB are
+// well above any legitimate single-call response size (a grep
+// over ~50k files lands well under 16 MiB), well below "memory
+// pressure on the broker host" thresholds for the typical 8-16 GB
+// machine the agent runs on. Operators with unusual workloads
+// (large-LLM-output piping) can raise via `maxStdoutBytes`.
+const DEFAULT_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_STDERR_BYTES = 4 * 1024 * 1024;
+
+// Drain a worker stream with a byte cap. Reads chunks until the
+// stream ends OR the byte counter reaches `cap`; on cap, cancels
+// the reader (releasing the worker's pipe) and appends a
+// `<truncated at N bytes>` suffix to the returned text so the
+// truncation is visible in the BrokerResponse.
+//
+// Cancelling the reader is what closes the §13.7 isolation gap:
+// without it, the worker could keep writing indefinitely until the
+// OS pipe buffer filled, then back-pressure the worker but leave
+// the broker holding a reference to whatever bytes the worker
+// already emitted. The cancel signals "we're done reading"; the
+// worker's write returns EPIPE on the next chunk and (depending on
+// the handler) either exits or surfaces the error in the response
+// line that follows the cap. Either way the broker stops growing.
+const drainBounded = async (
+  stream: ReadableStream<Uint8Array>,
+  cap: number,
+): Promise<{ text: string; truncated: boolean }> => {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      const remaining = cap - total;
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+      if (value.byteLength <= remaining) {
+        chunks.push(value);
+        total += value.byteLength;
+      } else {
+        chunks.push(value.subarray(0, remaining));
+        total += remaining;
+        truncated = true;
+        break;
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Reader already closed by the stream's natural end is fine.
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // Already released by cancel on some platforms.
+    }
+  }
+  // Concatenate + decode. TextDecoder with `stream: true` would let
+  // us decode chunk-by-chunk above; we defer to a single decode
+  // here because the chunks are bounded by `cap` and the simpler
+  // shape avoids the partial-codepoint edge case where a truncated
+  // tail lands mid-character.
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(merged);
+  return {
+    text: truncated ? `${text}\n<truncated at ${cap} bytes>` : text,
+    truncated,
+  };
+};
+
 export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => {
   const command = options.command;
   const baseArgs: readonly string[] = options.args ?? [];
   const cwd = options.cwd ?? process.cwd();
   const env = options.env;
   const timeoutMs = options.timeoutMs;
+  const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
+  const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
   const sandboxRunner = options.sandboxRunner;
   const spawn = options.spawn ?? defaultSpawn;
   const telemetry = options.telemetry;
@@ -284,22 +381,33 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       signal.addEventListener('abort', signalListener, { once: true });
     }
 
+    // Bounded drain (slice 102, R6 #21). The previous `new
+    // Response(stream).text()` had no byte cap — a worker emitting
+    // unbounded stdout OOM'd the broker. `drainBounded` caps each
+    // stream and cancels the reader when the limit is hit, which
+    // releases the worker's pipe and lets the natural exit path
+    // proceed. The truncation marker lands in the returned text
+    // so operators see the cause in the BrokerResponse.
     const stdoutP =
       proc.stdout !== null && proc.stdout !== undefined
-        ? new Response(proc.stdout).text()
-        : Promise.resolve('');
+        ? drainBounded(proc.stdout, maxStdoutBytes)
+        : Promise.resolve({ text: '', truncated: false });
     const stderrP =
       proc.stderr !== null && proc.stderr !== undefined
-        ? new Response(proc.stderr).text()
-        : Promise.resolve('');
+        ? drainBounded(proc.stderr, maxStderrBytes)
+        : Promise.resolve({ text: '', truncated: false });
 
     let exitCode: number;
     let stdoutText = '';
     let stderrText = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     try {
       const [out, err, code] = await Promise.all([stdoutP, stderrP, proc.exited]);
-      stdoutText = out;
-      stderrText = err;
+      stdoutText = out.text;
+      stderrText = err.text;
+      stdoutTruncated = out.truncated;
+      stderrTruncated = err.truncated;
       exitCode = code;
     } catch (e) {
       if (timer !== null) clearTimeout(timer);
@@ -337,6 +445,32 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
         stdout: stdoutText,
         stderr: stderrText,
         error: `timeout after ${effectiveTimeoutMs}ms`,
+      };
+    }
+
+    // Stream truncation surfaces (slice 102, R6 #21). When the
+    // drain hit its cap, the canonical response line was likely
+    // chopped or the worker is producing pathological output.
+    // Short-circuit with a specific error so the caller doesn't
+    // misread an invalid-JSON parse as a worker bug. The
+    // truncated text + truncation marker are still in stdout/
+    // stderr for forensic inspection.
+    if (stdoutTruncated) {
+      return {
+        ok: false,
+        stdout: stdoutText,
+        stderr: stderrText,
+        exitCode,
+        error: `worker stdout exceeded ${maxStdoutBytes} bytes (truncated; response line likely lost)`,
+      };
+    }
+    if (stderrTruncated) {
+      return {
+        ok: false,
+        stdout: stdoutText,
+        stderr: stderrText,
+        exitCode,
+        error: `worker stderr exceeded ${maxStderrBytes} bytes (truncated)`,
       };
     }
 
