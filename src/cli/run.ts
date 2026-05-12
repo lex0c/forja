@@ -244,6 +244,9 @@ export const run = async (options: RunOptions): Promise<number> => {
           json: args.json,
           ...(args.permission.withoutClassifier === true ? { withoutClassifier: true } : {}),
           ...(args.permission.againstCurrentPolicy === true ? { againstCurrentPolicy: true } : {}),
+          ...(args.permission.againstArchivedPolicy === true
+            ? { againstArchivedPolicy: true }
+            : {}),
           ...(options.bootstrapOverride?.dbPath !== undefined
             ? { dbPath: options.bootstrapOverride.dbPath }
             : {}),

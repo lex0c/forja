@@ -273,6 +273,16 @@ export interface ParsedArgs {
     // policy. Reports the original decision vs the replayed one;
     // diverging outcomes flag policy drift impact.
     againstCurrentPolicy?: boolean;
+    // `agent permission replay <seq> --against-archived-policy` (§17
+    // mode, slice 96). The canonical reproducibility test: re-executes
+    // the pipeline using the row's args against the EXACT policy bytes
+    // that produced the row (looked up by `row.policy_hash` in the
+    // `policy_archive` table populated at engine bootstrap). When the
+    // archive hit is present, this is the "would replay reproduce
+    // bit-for-bit?" check the spec §17 calls for. Skipped when the
+    // archive doesn't contain the row's hash (pre-archive boot, or
+    // archive rotated out).
+    againstArchivedPolicy?: boolean;
     // `agent permission inspect <rotation_id> --clear` (§7.2).
     // Flips chain_meta.quarantined to 0 for the named rotation after
     // the operator confirms the archived segment is benign. Without
@@ -760,6 +770,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   let reason: string | undefined;
   let withoutClassifier = false;
   let againstCurrentPolicy = false;
+  let againstArchivedPolicy = false;
   let clearQuarantine = false;
   let allGrants = false;
   let rollbackWrite = false;
@@ -806,6 +817,10 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     }
     if (token === '--against-current-policy') {
       againstCurrentPolicy = true;
+      continue;
+    }
+    if (token === '--against-archived-policy') {
+      againstArchivedPolicy = true;
       continue;
     }
     if (token === '--clear') {
@@ -856,6 +871,12 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     return {
       ok: false,
       message: `agent permission ${verb}: --against-current-policy only applies to 'replay'`,
+    };
+  }
+  if (againstArchivedPolicy && verb !== 'replay') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --against-archived-policy only applies to 'replay'`,
     };
   }
   if (clearQuarantine && verb !== 'inspect') {
@@ -1050,6 +1071,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ...(reason !== undefined ? { reason } : {}),
         ...(withoutClassifier ? { withoutClassifier: true } : {}),
         ...(againstCurrentPolicy ? { againstCurrentPolicy: true } : {}),
+        ...(againstArchivedPolicy ? { againstArchivedPolicy: true } : {}),
         ...(clearQuarantine ? { clearQuarantine: true } : {}),
         ...(allGrants ? { allGrants: true } : {}),
         ...(rollbackWrite ? { rollbackWrite: true } : {}),

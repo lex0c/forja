@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 96: §17 replay reproducibility (R11 #34 + R12 #52 — `--against-archived-policy` + deny/confirm fixtures)
+
+**Done.** Ninety-sixth slice. Closes the two replay-side P0s from REVIEW_NOTES.md: (a) **R12 #52** — `§23 "Replay funcional pra todas categorias"` was marked `[x]` but every existing replay test seeded `decision: 'allow'` exclusively, with zero coverage for `deny` or `confirm` outcomes; (b) **R11 #34** — `policy_archive` was populated at every engine bootstrap but never consulted by replay, so even "deterministic" mode (`--against-current-policy`) compared the row against whatever policy is active NOW, not the bytes the row was actually decided under.
+
+Slice 96 ships `--against-archived-policy`: the canonical §17 reproducibility test. It reads `policy_archive` by `row.policy_hash`, parses the canonical bytes back into a Policy, runs `tryReExecute` against THOSE bytes, and reports whether the rule pipeline reproduces the row's decision. Both rule-pipeline modes (`--against-current-policy` and the new mode) now carry an explicit `caveats` array naming engine dimensions NOT modeled in replay — classifier output, grants snapshot, sandbox availability. The "✓ deterministic" verdict stays honest: matching means the rule pipeline alone produces the same outcome, not that the entire engine end-to-end was reproduced.
+
+### Why this matters
+
+Spec §17 calls for replay as a forensic tool: an operator investigating a past decision should be able to reconstruct what the engine saw and reproduce the verdict. Pre-slice:
+
+- The `policy_archive` table existed (migration 037, slice 50), the bootstrap wrote into it on every boot (bootstrap-engine.ts ~line 503), but **nothing read it**. The "active policy" branch (`--against-current-policy`) re-executed against `resolvePolicy(cwd)` — the CURRENT state of `.agent/permissions.yaml`. That's a drift-detection signal, not a reproducibility signal.
+- Every replay regression test exercised the `decision: 'allow'` path. The deny and confirm pipelines had ZERO end-to-end test coverage. Refactors that broke deny replay or confirm replay would have shipped without a test failure. The `§23 [x]` claim was structurally false.
+
+The "✓ deterministic" verdict was also misleading. The replay engine in `tryReExecute` builds a disposable `createPermissionEngine(policy, {cwd, home, audit: createNoopSink()})` — no classifier, no grants snapshot, no sandbox plan, no telemetry, no session id. A row decided under a different classifier hash + a now-revoked grant + a degraded sandbox could still pass "deterministic" because the rule pipeline alone matched. Operators reading "✓ deterministic" without context could have assumed full reproducibility.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/permission-replay.ts` | Imports `getPolicyArchive`. Adds `againstArchivedPolicy?: boolean` to `RunPermissionReplayOptions`. New `AgainstArchivedPolicyAnalysis` type + `analyzeAgainstArchivedPolicy` function: looks up `getPolicyArchive(db, row.policy_hash)`, parses canonical JSON, runs `tryReExecute`. Three distinct skip causes (archive miss / JSON parse fail / session GC'd) for triage. New `REPLAY_ENGINE_CAVEATS` constant lists dimensions NOT replayed; both `AgainstCurrentPolicyAnalysis` and `AgainstArchivedPolicyAnalysis` carry it as `caveats: readonly string[]`. New `renderCaveats` helper renders the list below every analysis verdict in text output. JSON output carries `against_archived_policy` sub-object with `verdict`, `archived_policy_hash`, `original_decision`, `replayed_decision`, `replayed_reason`, `skipped_reason`, `caveats`. Header comment updated to reflect the slice progression. |
+| `src/cli/args.ts` | Adds `againstArchivedPolicy?: boolean` to `permission` arg shape. Parses `--against-archived-policy` flag. Rejects flag for any verb other than `replay`. Propagates to the replay options bag. |
+| `src/cli/run.ts` | Forwards `args.permission.againstArchivedPolicy` to `runPermissionReplay`. |
+| `tests/cli/permission-replay.test.ts` | New describe `--against-current-policy decision coverage (R12 #52)` with 6 tests: deny→deny deterministic, deny→allow changed_decision, confirm→confirm deterministic, confirm→deny changed_decision, caveats rendered, JSON carries caveats. New describe `--against-archived-policy (R11 #34)` with 7 tests: allow/deny/confirm all reproduce deterministic via archive lookup, archive miss → skipped with cause, JSON sub-object with archived_policy_hash, both modes can run simultaneously, default replay omits the new section. Test helper `seedRowWithArchivedPolicy` plumbs `canonicalHash` + `canonicalize` + `archivePolicy` to mirror production bootstrap. |
+
+### Decisions
+
+- **New mode, not retrofit.** Replacing `--against-current-policy` with an archive-lookup variant would have broken the drift-detection use case operators already rely on. The two modes answer DIFFERENT questions: archived = "would the row reproduce?", current = "would the active policy still produce this verdict?". Both are useful; both kept, both wired with caveats. Operators can pass both flags simultaneously.
+- **Caveats as a contract, not free-text.** `REPLAY_ENGINE_CAVEATS` is a `readonly string[]` constant. Both analysis shapes carry `caveats: readonly string[]` in their JSON. Adding a caveat (e.g. when a future slice persists `grants_snapshot_at` on the audit row, the grants caveat goes away) is a contract change downstream tooling can observe. The list is intentionally monotonically shrinking — slices that close caveats remove entries; nothing else adds.
+- **Three skip causes for `--against-archived-policy`.** Archive miss / JSON parse fail / session GC'd. Conflating to a single "skipped" verdict would hide the difference between "this install booted before slice 50" (informational) and "the canonical JSON corrupted" (forensic). Each cause carries a verbatim reason string.
+- **Resolver-confidence trap surfaced in fixture choice.** The deny→allow fixture initially used `rm` as the test command — but `rm` has `low` confidence in the bash resolver, which forces a confirm upgrade after the allow rule matched. The verdict came back `deny → confirm`, not `deny → allow`. Switched the fixture to `ls -la` (high confidence) so the rule-pipeline outcome lands cleanly. The interaction is real and worth documenting: replay against a low-confidence command will always upgrade allow to confirm, hiding the policy-side allow rule. Operators should pair `--against-current-policy` with knowledge of the resolver's confidence model — or wait for a future slice that surfaces the resolver verdict in the analysis.
+- **No retrofit of existing `'fixture'` policy_hash tests.** The 4 pre-slice tests that seeded `policy_hash: 'sha256:fixture'` (with no corresponding archive entry) stay as-is — they test the `--against-current-policy` happy path, which doesn't need an archive entry. The new mode's tests use real `canonicalHash` so the archive lookup succeeds. Mixing the two would have either polluted every fixture with archive plumbing or papered over an actual hash-match in the legacy tests.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6126 pass / 10 skip / 0 fail** (6136 total across 289 files); +13 tests on top of slice 95's 6113
+- Targeted: `bun test tests/cli/permission-replay.test.ts` — 45/45
+
+### Next
+
+R11 P0s still open from REVIEW_NOTES.md:
+- **R11 #33** (partial): replay engine builds without classifier/grants/sandbox. Slice 96 surfaces this via caveats; full closure requires persisting classifier output + grants snapshot + sandbox availability on the audit row and rebuilding the replay engine with those inputs. Deferred.
+- **R11 #35**: `Date.now()` inside `engine.check()` for grants snapshot breaks replay determinism. Requires adding `grants_snapshot_at` column to approvals_log and threading a deterministic timestamp through the engine. Deferred.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- Protected paths hardening (R7) — tilde expansion + `/dev/**` + hide_paths integration.
+- Bootstrap/policy parsing hardening (R6) — malformed YAML / cycle detection.
+- Sandbox wire validation (R8) — bwrap stderr / sandbox-exec result checks.
+- Broker drain caps (R9) — unbounded backpressure on the permission broker.
+- Audit chain atomicity (R5) — rotation-rollover write ordering.
+- Telemetry scrubbing (R10) — secret-access + net-ingress kinds + PATH_REGEX gaps + scrubReason hostnames.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 95: §10.1 effective envelope at the child engine (R11 P0-3)
 
 **Done.** Ninety-fifth slice. Closes the third and last P0 from the 12-agent review's R11 finding: `effective_caps = parent_caps ∩ declared_caps` is now ENFORCED at the child engine's evaluation stage, not just refused at the spawn gate. Pre-slice, slice 94 made `capabilities` REQUIRED at spawn time and threaded `task_async` through the §10 intersection — but the *result* of the intersection (the `effective` set) was discarded, and the child engine still evaluated tool calls against the parent's FULL capability set. A child declaring `['read-fs:src/**']` for a parent with `read-fs:**` policy passed the spawn gate (declared ⊆ parent) but could still read `/etc/passwd` at evaluation time. Slice 95 plugs that gap.

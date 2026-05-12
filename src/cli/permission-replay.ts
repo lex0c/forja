@@ -1,23 +1,29 @@
 // `agent permission replay <seq>` — PERMISSION_ENGINE.md §17.
 //
-// Slice 12 ships the minimum viable replay surface: read an
-// approvals_log row by its sequence number, render every field
-// preserved on the row, and flag policy drift when the row's
-// `policy_hash` differs from the hash of the currently-loaded
-// policy. Operators investigating a past decision get every input
-// the engine saw at decision time, in one stable view.
+// Slice 12 shipped the minimum viable surface: read an approvals_log
+// row by its sequence number, render every field, and flag policy
+// drift when the row's `policy_hash` differs from the active hash.
+// Subsequent slices grew the replay modes:
+//   - slice 16: `--without-classifier` (hint-only impact analysis,
+//     pure function of the row's score columns).
+//   - slice 16: `--against-current-policy` (re-execute pipeline
+//     against the active policy via approval_call_links → tool_calls
+//     .input; drift diff).
+//   - slice 96: `--against-archived-policy` (re-execute against the
+//     ORIGINAL policy bytes via `policy_archive` keyed by
+//     row.policy_hash; the canonical §17 reproducibility check).
+//     Both rule-pipeline modes carry `caveats` listing engine
+//     dimensions NOT replayed (classifier output, grants snapshot,
+//     sandbox availability) so the "deterministic" verdict stays
+//     honest.
 //
-// Out of scope (next slices, all of them documented in BACKLOG):
-//   - `--against-current-policy`: real re-execution against the
-//     active policy. Requires a `policy_archive` table (the spec's
-//     §17 lookup) so the ORIGINAL policy can be reconstructed; the
-//     active policy alone isn't enough.
-//   - `--without-classifier`: re-run scoring with the classifier
-//     branch suppressed; same archive prerequisite.
+// Out of scope (deferred to later slices):
 //   - `agent permission diff <id1> <id2>`: cross-row comparison.
 //   - Raw args: live in session SQLite (not in approvals_log); a
 //     future slice persists them with a TTL. For now replay shows
 //     `args_hash` only.
+//   - Grants snapshot persistence on the audit row (R11 #35) — until
+//     this lands, the grants caveat above remains.
 //
 // The CLI surface mirrors `agent permission verify` /
 // `rotate-chain`: DB-only, no provider, no session start. Exit 0
@@ -35,6 +41,7 @@ import type { Decision, PolicyCategory } from '../permissions/types.ts';
 import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { getToolCallByApprovalSeq } from '../storage/repos/approval-call-links.ts';
 import { type ApprovalLogRow, getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
+import { getPolicyArchive } from '../storage/repos/policy-archive.ts';
 import { getSession } from '../storage/repos/sessions.ts';
 import { getToolCall } from '../storage/repos/tool-calls.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
@@ -105,6 +112,17 @@ export interface RunPermissionReplayOptions {
   // resolver returns refuse), the analysis surfaces "skipped" with
   // the operator-readable cause and the rest of the replay proceeds.
   againstCurrentPolicy?: boolean;
+  // §17 `--against-archived-policy` mode (slice 96). The canonical
+  // reproducibility test: re-runs the engine against the EXACT policy
+  // bytes that produced the row, recovered from `policy_archive` by
+  // `row.policy_hash`. When the archive contains the hash, the
+  // replayed decision SHOULD match the row (modulo the same caveats
+  // surfaced by `--against-current-policy`: classifier output, grants
+  // snapshot, sandbox availability are not preserved). When the
+  // archive doesn't contain the hash (pre-archive boot, archive
+  // rotated out, install_id mismatch), the analysis returns
+  // `skipped`.
+  againstArchivedPolicy?: boolean;
   dbPath?: string;
   env?: NodeJS.ProcessEnv;
   out?: (s: string) => void;
@@ -178,7 +196,62 @@ interface AgainstCurrentPolicyAnalysis {
   // Free-form cause string for the `skipped` verdict. Operator-
   // facing. Empty on the other two verdicts.
   skipped_reason?: string;
+  // Slice 96 — dimensions the replay engine does NOT model. The
+  // "deterministic" verdict above means "the rule pipeline produced
+  // the same decision" — NOT "the entire engine was byte-for-byte
+  // reproduced". These caveats reset operator expectations:
+  // matching here doesn't prove the engine would have done the
+  // same thing if classifier / grants / sandbox had been replayed
+  // verbatim. Surface in both text and JSON output so audit
+  // consumers see the reproducibility bound.
+  caveats: readonly string[];
 }
+
+// §17 `--against-archived-policy` analysis (slice 96). The canonical
+// reproducibility test: re-runs the pipeline against the ORIGINAL
+// policy bytes that produced the row. `policy_archive` is populated
+// by every engine bootstrap (one row per distinct hash); the row's
+// `policy_hash` keys the lookup. When present, the re-execution is
+// the strongest reproducibility signal the replay can produce —
+// modulo the same engine-dimension caveats `--against-current-policy`
+// has (classifier output, grants snapshot, sandbox availability).
+type AgainstArchivedPolicyVerdict = 'deterministic' | 'changed_decision' | 'skipped';
+
+interface AgainstArchivedPolicyAnalysis {
+  verdict: AgainstArchivedPolicyVerdict;
+  original_decision: 'allow' | 'deny' | 'confirm';
+  replayed_decision?: 'allow' | 'deny' | 'confirm';
+  replayed_reason?: string;
+  skipped_reason?: string;
+  // The hash the replay looked up. Surfaced so JSON consumers can
+  // correlate with `row.policy_hash` (they're equal by construction
+  // — the lookup key IS the row's hash — but explicit is better
+  // than asking the consumer to re-derive it).
+  archived_policy_hash: string;
+  // Same caveat list as the current-policy analysis. Even with a
+  // perfect policy match, the replay engine doesn't model classifier
+  // output / grants snapshot / sandbox availability.
+  caveats: readonly string[];
+}
+
+// Slice 96 — caveats the replay engine ALWAYS carries. Both replay
+// modes use `tryReExecute` which builds a disposable engine without
+// classifier/grants/sandbox/telemetry/session_id — the rule pipeline
+// is exercised but the side-channels that influence real decisions
+// are not. Surfacing these inline keeps the operator-facing "✓
+// deterministic" verdict honest: it means "the rule pipeline alone
+// produced the same outcome", NOT "the engine would have done the
+// same thing end-to-end".
+//
+// Adding a caveat (e.g. when a future slice persists grants_snapshot
+// on the audit row and removes it from this list) is a contract
+// change visible in JSON output; downstream tooling that filters
+// on caveats should treat the list as monotonically shrinking.
+const REPLAY_ENGINE_CAVEATS: readonly string[] = [
+  'classifier output not replayed (re-execution runs the deterministic core only)',
+  'grants snapshot not preserved on the audit row (row.ttl_expires_at indicates a grant match, but the full grant set at decision time is not recoverable)',
+  'sandbox availability not preserved (replay engine omits the sandbox planner; row.sandbox_profile reflects the original plan)',
+];
 
 interface ReplayResult {
   row: ApprovalLogRow;
@@ -186,6 +259,7 @@ interface ReplayResult {
   activePolicyHash: string;
   classifierImpact?: ClassifierImpactAnalysis;
   againstCurrentPolicy?: AgainstCurrentPolicyAnalysis;
+  againstArchivedPolicy?: AgainstArchivedPolicyAnalysis;
 }
 
 // PERMISSION_ENGINE.md §17 re-execution helper. Pulls together the
@@ -265,6 +339,7 @@ const analyzeAgainstCurrentPolicy = (params: {
       verdict: 'skipped',
       original_decision,
       skipped_reason: 'active policy unavailable (malformed YAML or missing dir)',
+      caveats: REPLAY_ENGINE_CAVEATS,
     };
   }
   const session = getSession(params.db, params.row.session_id);
@@ -273,6 +348,7 @@ const analyzeAgainstCurrentPolicy = (params: {
       verdict: 'skipped',
       original_decision,
       skipped_reason: `session ${params.row.session_id} not found (retention may have GC'd it)`,
+      caveats: REPLAY_ENGINE_CAVEATS,
     };
   }
   const result = tryReExecute({
@@ -283,7 +359,12 @@ const analyzeAgainstCurrentPolicy = (params: {
     home: params.home,
   });
   if (!result.ok) {
-    return { verdict: 'skipped', original_decision, skipped_reason: result.reason };
+    return {
+      verdict: 'skipped',
+      original_decision,
+      skipped_reason: result.reason,
+      caveats: REPLAY_ENGINE_CAVEATS,
+    };
   }
   const replayedKind = result.decision.kind;
   const replayedReason =
@@ -296,6 +377,7 @@ const analyzeAgainstCurrentPolicy = (params: {
       original_decision,
       replayed_decision: replayedKind,
       replayed_reason: replayedReason,
+      caveats: REPLAY_ENGINE_CAVEATS,
     };
   }
   return {
@@ -303,6 +385,110 @@ const analyzeAgainstCurrentPolicy = (params: {
     original_decision,
     replayed_decision: replayedKind,
     replayed_reason: replayedReason,
+    caveats: REPLAY_ENGINE_CAVEATS,
+  };
+};
+
+// Slice 96 — §17 `--against-archived-policy` analysis. Recovers the
+// EXACT policy bytes that produced the row via `policy_archive`
+// (keyed by `row.policy_hash`), re-executes the engine against
+// those bytes, and reports whether the original decision
+// reproduces.
+//
+// Two skip cases distinguish failure modes for triage:
+//   - Archive lookup MISSED — the install booted before slice 16
+//     (policy_archive migration) or the row's policy was archived
+//     and later GC'd. Operator can still replay against current
+//     policy.
+//   - Archive lookup HIT but `canonical_json` failed to parse —
+//     storage corruption. Surfaces the row's stored bytes for
+//     forensic inspection.
+//
+// The deterministic verdict here is the STRONGEST reproducibility
+// signal the replay can produce — the rule pipeline against the
+// original policy bytes. Modulo the caveats (classifier, grants,
+// sandbox), this is the §17 canonical mode.
+const analyzeAgainstArchivedPolicy = (params: {
+  row: ApprovalLogRow;
+  db: DB;
+  home: string;
+}): AgainstArchivedPolicyAnalysis => {
+  const original_decision = params.row.decision as 'allow' | 'deny' | 'confirm';
+  const archived_policy_hash = params.row.policy_hash;
+
+  const archive = getPolicyArchive(params.db, params.row.policy_hash);
+  if (archive === null) {
+    return {
+      verdict: 'skipped',
+      original_decision,
+      archived_policy_hash,
+      skipped_reason: `policy hash ${params.row.policy_hash} not in policy_archive (boot predates slice 16, or the archive entry was GC'd)`,
+      caveats: REPLAY_ENGINE_CAVEATS,
+    };
+  }
+
+  let archivedPolicy: Policy;
+  try {
+    archivedPolicy = JSON.parse(archive.canonical_json) as Policy;
+  } catch (e) {
+    return {
+      verdict: 'skipped',
+      original_decision,
+      archived_policy_hash,
+      skipped_reason: `archived canonical_json parse failed: ${(e as Error).message}`,
+      caveats: REPLAY_ENGINE_CAVEATS,
+    };
+  }
+
+  const session = getSession(params.db, params.row.session_id);
+  if (session === null) {
+    return {
+      verdict: 'skipped',
+      original_decision,
+      archived_policy_hash,
+      skipped_reason: `session ${params.row.session_id} not found (retention may have GC'd it)`,
+      caveats: REPLAY_ENGINE_CAVEATS,
+    };
+  }
+
+  const result = tryReExecute({
+    row: params.row,
+    policy: archivedPolicy,
+    db: params.db,
+    cwd: session.cwd,
+    home: params.home,
+  });
+  if (!result.ok) {
+    return {
+      verdict: 'skipped',
+      original_decision,
+      archived_policy_hash,
+      skipped_reason: result.reason,
+      caveats: REPLAY_ENGINE_CAVEATS,
+    };
+  }
+  const replayedKind = result.decision.kind;
+  const replayedReason =
+    result.decision.kind === 'confirm'
+      ? `confirm: ${result.decision.prompt}`
+      : (result.decision.reason ?? '');
+  if (replayedKind === original_decision) {
+    return {
+      verdict: 'deterministic',
+      original_decision,
+      archived_policy_hash,
+      replayed_decision: replayedKind,
+      replayed_reason: replayedReason,
+      caveats: REPLAY_ENGINE_CAVEATS,
+    };
+  }
+  return {
+    verdict: 'changed_decision',
+    original_decision,
+    archived_policy_hash,
+    replayed_decision: replayedKind,
+    replayed_reason: replayedReason,
+    caveats: REPLAY_ENGINE_CAVEATS,
   };
 };
 
@@ -470,6 +656,48 @@ const renderText = (result: ReplayResult, out: (s: string) => void): void => {
       verdictLine = `verdict: ⚠ policy drift changed the decision (${a.original_decision} → ${a.replayed_decision})`;
     }
     out(`    ${verdictLine}\n`);
+    renderCaveats(a.caveats, out);
+  }
+
+  if (result.againstArchivedPolicy !== undefined) {
+    const a = result.againstArchivedPolicy;
+    out('\n');
+    out('  Re-execution against ARCHIVED policy (--against-archived-policy):\n');
+    out(`    archived policy hash:      ${a.archived_policy_hash}\n`);
+    out(`    original decision:         ${a.original_decision}\n`);
+    if (a.verdict === 'skipped') {
+      out(`    replayed decision:         skipped (${a.skipped_reason})\n`);
+    } else {
+      out(`    replayed decision:         ${a.replayed_decision ?? '<unknown>'}\n`);
+      if (a.replayed_reason !== undefined && a.replayed_reason.length > 0) {
+        out(`    replayed reason:           ${a.replayed_reason}\n`);
+      }
+    }
+    let verdictLine: string;
+    if (a.verdict === 'skipped') {
+      verdictLine = 'verdict: re-execution skipped (see reason above)';
+    } else if (a.verdict === 'deterministic') {
+      verdictLine = 'verdict: ✓ deterministic — archived policy reproduces the original decision';
+    } else {
+      verdictLine = `verdict: ⚠ archived policy diverges from row (${a.original_decision} → ${a.replayed_decision}) — engine non-determinism, missing inputs, or storage corruption`;
+    }
+    out(`    ${verdictLine}\n`);
+    renderCaveats(a.caveats, out);
+  }
+};
+
+// Slice 96 — render the caveat list for replay analyses that actually
+// ran the engine. Caveats are an inherent property of the replay
+// engine's bounded scope (no classifier, no grants, no sandbox); they
+// don't depend on the verdict. Skipped analyses still carry them so
+// JSON consumers see a consistent shape; the text renderer keeps
+// them BELOW the verdict line so the operator's eye lands on the
+// outcome first.
+const renderCaveats = (caveats: readonly string[], out: (s: string) => void): void => {
+  if (caveats.length === 0) return;
+  out('    caveats (engine dimensions NOT replayed):\n');
+  for (const c of caveats) {
+    out(`      - ${c}\n`);
   }
 };
 
@@ -532,6 +760,9 @@ const renderJson = (result: ReplayResult, out: (s: string) => void): void => {
         : {}),
       ...(result.againstCurrentPolicy !== undefined
         ? { against_current_policy: result.againstCurrentPolicy }
+        : {}),
+      ...(result.againstArchivedPolicy !== undefined
+        ? { against_archived_policy: result.againstArchivedPolicy }
         : {}),
     })}\n`,
   );
@@ -631,12 +862,29 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
         })
       : undefined;
 
+  // Slice 96 — §17 against-archived-policy mode. The canonical
+  // reproducibility test: re-run the row against the EXACT bytes
+  // recorded at decision time (via `policy_archive`). When the row
+  // predates the archive (slice 16+) the lookup misses and the
+  // analysis collapses to `skipped` with the missing-hash cause;
+  // any downstream tooling can read the JSON `against_archived_policy
+  // .verdict` to triage.
+  const againstArchivedPolicy =
+    options.againstArchivedPolicy === true
+      ? analyzeAgainstArchivedPolicy({
+          row,
+          db,
+          home: env.HOME ?? cwd,
+        })
+      : undefined;
+
   const result: ReplayResult = {
     row,
     drift,
     activePolicyHash,
     ...(classifierImpact !== undefined ? { classifierImpact } : {}),
     ...(againstCurrentPolicy !== undefined ? { againstCurrentPolicy } : {}),
+    ...(againstArchivedPolicy !== undefined ? { againstArchivedPolicy } : {}),
   };
   if (json) renderJson(result, out);
   else renderText(result, out);
