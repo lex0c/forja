@@ -751,6 +751,41 @@ describe('--memory', () => {
   });
 });
 
+// Slice 123 (R9 P1): pre-slice `agent --i-know-what-im-doing`
+// (without the `welcome` verb) silently parsed `iKnowWhatImDoing:
+// true`, but the flag is only read inside the welcome branch in
+// run.ts — so the top-level form was a no-op that LOOKED like
+// it acknowledged unsafe-mode. Now the top-level parser rejects
+// with a pointer to the correct invocation.
+describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => {
+  test('agent --i-know-what-im-doing (no welcome) returns error pointing at `agent welcome`', () => {
+    const r = parseArgs(['--i-know-what-im-doing']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--i-know-what-im-doing');
+    expect(r.message).toContain('agent welcome');
+  });
+
+  test('agent welcome --i-know-what-im-doing still parses successfully', () => {
+    // The welcome subcommand parser is separate from the top-level
+    // parser and continues to accept the flag (slice 91 contract).
+    const r = parseArgs(['welcome', '--i-know-what-im-doing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBe(true);
+    expect(r.args.iKnowWhatImDoing).toBe(true);
+  });
+
+  test('agent --i-know-what-im-doing with other flags before still rejects', () => {
+    // Even when the flag appears alongside otherwise-valid flags,
+    // the top-level form is invalid.
+    const r = parseArgs(['--json', '--i-know-what-im-doing', 'hello']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('agent welcome');
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();

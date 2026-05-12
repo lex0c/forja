@@ -18,7 +18,12 @@
 
 import { describe, expect, test } from 'bun:test';
 import type { Stats } from 'node:fs';
-import { createSandboxSkip, hasSandboxSkip, sandboxSkipPath } from '../../src/cli/sandbox-skip.ts';
+import {
+  createSandboxSkip,
+  hasSandboxSkip,
+  readSandboxSkipMetadata,
+  sandboxSkipPath,
+} from '../../src/cli/sandbox-skip.ts';
 
 // Build a stat-like object with the booleans the production
 // code calls. Tests pass these into the `lstat` fs seam.
@@ -296,5 +301,102 @@ describe('createSandboxSkip — symlink attack defense (slice 122)', () => {
         },
       }),
     ).toThrow(/EACCES/);
+  });
+});
+
+// Slice 123 (R9 P1): the welcome flow surfaces the marker's
+// `# created: <iso>` timestamp in the "Sandbox setup skipped"
+// message so operators see WHEN they last opted into unsafe
+// mode. `readSandboxSkipMetadata` reads the marker (with
+// O_NOFOLLOW protection mirroring the write path) and parses
+// the body.
+describe('readSandboxSkipMetadata (slice 123, R9 P1)', () => {
+  const SAMPLE_BODY = [
+    '# forja sandbox_skip marker',
+    '# created: 2026-05-11T12:00:00.000Z',
+    '# version: 1.2.3',
+    '',
+    '# This file suppresses the first-boot sandbox prompt for the',
+    '# operator who acknowledged the unsafe-mode posture via',
+    '# --i-know-what-im-doing.',
+    '',
+  ].join('\n');
+
+  test('parses created + version from a regular-file marker', () => {
+    const meta = readSandboxSkipMetadata({
+      env: { XDG_CONFIG_HOME: '/cfg' },
+      fs: {
+        lstat: () => fakeStat('file'),
+        readContent: () => SAMPLE_BODY,
+      },
+    });
+    expect(meta).not.toBeNull();
+    expect(meta?.path).toBe('/cfg/forja/sandbox_skip');
+    expect(meta?.createdAt).toBe('2026-05-11T12:00:00.000Z');
+    expect(meta?.version).toBe('1.2.3');
+  });
+
+  test('returns null when the marker is absent (ENOENT)', () => {
+    const meta = readSandboxSkipMetadata({
+      env: { XDG_CONFIG_HOME: '/cfg' },
+      fs: { lstat: enoent, readContent: () => '' },
+    });
+    expect(meta).toBeNull();
+  });
+
+  // Defense in depth: if a symlink slips past hasSandboxSkip (e.g.,
+  // a future regression weakens the check), readSandboxSkipMetadata
+  // still refuses to read through it.
+  test('returns null when the marker path is a symlink (defense in depth)', () => {
+    const meta = readSandboxSkipMetadata({
+      env: { XDG_CONFIG_HOME: '/cfg' },
+      fs: {
+        lstat: () => fakeStat('symlink'),
+        readContent: () => 'should-not-be-read',
+      },
+    });
+    expect(meta).toBeNull();
+  });
+
+  test('returns null when readContent throws (corrupted / ELOOP / EACCES)', () => {
+    const meta = readSandboxSkipMetadata({
+      env: { XDG_CONFIG_HOME: '/cfg' },
+      fs: {
+        lstat: () => fakeStat('file'),
+        readContent: () => {
+          const e = new Error('ELOOP') as NodeJS.ErrnoException;
+          e.code = 'ELOOP';
+          throw e;
+        },
+      },
+    });
+    expect(meta).toBeNull();
+  });
+
+  test('marker body without `# created:` line returns path only (no createdAt)', () => {
+    const body = '# forja sandbox_skip marker\n# (no created line)\n';
+    const meta = readSandboxSkipMetadata({
+      env: { XDG_CONFIG_HOME: '/cfg' },
+      fs: {
+        lstat: () => fakeStat('file'),
+        readContent: () => body,
+      },
+    });
+    expect(meta).not.toBeNull();
+    expect(meta?.createdAt).toBeUndefined();
+    expect(meta?.version).toBeUndefined();
+    expect(meta?.path).toBe('/cfg/forja/sandbox_skip');
+  });
+
+  test('createdAt with leading whitespace is trimmed', () => {
+    const body = '# created:   2026-05-11T12:00:00.000Z\n';
+    const meta = readSandboxSkipMetadata({
+      env: { XDG_CONFIG_HOME: '/cfg' },
+      fs: {
+        lstat: () => fakeStat('file'),
+        readContent: () => body,
+      },
+    });
+    expect(meta?.createdAt).toBe('2026-05-11T12:00:00.000Z');
   });
 });

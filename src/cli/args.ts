@@ -1186,9 +1186,19 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       }
       case '--i-know-what-im-doing':
-        args.iKnowWhatImDoing = true;
-        i += 1;
-        break;
+        // Slice 123 (R9 P1): pre-slice this case silently accepted
+        // the flag at the top level, but `args.iKnowWhatImDoing` is
+        // only ever read inside the `args.welcome === true` branch
+        // in `run.ts` — so `agent --i-know-what-im-doing` (without
+        // the `welcome` verb) parsed successfully and did nothing.
+        // Now it's rejected with a pointer to the correct invocation
+        // so operators don't silently no-op their unsafe-mode
+        // acknowledgment.
+        return {
+          ok: false,
+          message:
+            '--i-know-what-im-doing is only valid as a flag of `agent welcome`; use `agent welcome --i-know-what-im-doing`',
+        };
       case '--undo': {
         const value = argv[i + 1];
         if (value === undefined || value.startsWith('--')) {

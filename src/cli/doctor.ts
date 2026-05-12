@@ -30,7 +30,7 @@
 // --list-sessions / --explain-permissions.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { accessSync, existsSync, constants as fsConstants, mkdirSync, readFileSync } from 'node:fs';
 import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { dirname, resolve as resolvePath } from 'node:path';
 import {
@@ -170,17 +170,25 @@ const sandboxCheck = (which: (cmd: string) => string | null): DoctorCheck => {
   };
 };
 
-// Check that a directory exists OR can be created with mode 0700.
-// Returns a tri-state: 'ok' (exists + writable), 'fail' (can't
-// create + parent unwritable). Errors caught broadly — the OS
-// returns enough information via the thrown error message; we
-// surface it verbatim.
+// Check that a directory exists AND is writable OR can be created
+// with mode 0700. Returns a tri-state: 'ok' (exists + writable),
+// 'fail' (can't create + parent unwritable). Errors caught broadly
+// — the OS returns enough information via the thrown error
+// message; we surface it verbatim.
+//
+// Slice 123 (R9 P1): pre-slice the existsSync branch returned
+// `writable: true` without probing — a dir at chmod 0500
+// (read+exec, no write) on the operator's `~/.config/forja`
+// passed the doctor check but EVERY runtime fs op on that path
+// failed. accessSync(W_OK) catches it.
 const dirWritable = (dir: string): { writable: boolean; error?: string } => {
   if (existsSync(dir)) {
-    // Best-effort writability probe: create + remove a sentinel
-    // file. Skipped here — `mkdirSync` with `recursive: true` is
-    // idempotent and would also fail if the dir is read-only.
-    return { writable: true };
+    try {
+      accessSync(dir, fsConstants.W_OK);
+      return { writable: true };
+    } catch (e) {
+      return { writable: false, error: (e as Error).message };
+    }
   }
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -717,20 +725,31 @@ const macLsmCheck = (
       return { name: 'mac_lsm', status: 'warn', detail: `SELinux returned: ${mode}` };
     }
   }
-  // AppArmor path.
+  // AppArmor path. `aa-status --enabled` exits 0 if the kernel
+  // has AppArmor enabled AND a Linux Security Module is loaded.
+  // Non-zero exit is the COMMON case on stock distros (Fedora,
+  // Arch) that ship the userspace `aa-status` binary without an
+  // AppArmor LSM enabled in the kernel — pre-slice we returned a
+  // "probe failed" warn, which was unhelpful (the probe didn't
+  // fail; the kernel module just isn't loaded). Slice 123 (R9 P1):
+  // surface that distinction. We still can't read aa-status's
+  // exact exit code via the runCmd seam (which returns
+  // string-or-null), but "non-zero exit on a host with the binary
+  // present" is overwhelmingly the disabled-kernel-module case in
+  // practice; the remediation hint walks operators through the
+  // right diagnosis.
   const aaStatusPath = which('aa-status');
   if (aaStatusPath !== null) {
     const out = runCmd('aa-status', ['--enabled']);
     if (out !== null) {
-      // `aa-status --enabled` exits 0 if the kernel has AppArmor
-      // enabled. We surface as ok with the profile-count hint when
-      // the verbose form succeeds.
       return { name: 'mac_lsm', status: 'ok', detail: 'AppArmor (enabled)' };
     }
     return {
       name: 'mac_lsm',
       status: 'warn',
-      detail: `aa-status at ${aaStatusPath} but enabled probe failed`,
+      detail: 'AppArmor userspace present but kernel enforcement disabled',
+      remediation:
+        'verify with `aa-status` (exit 4 = no kernel support, exit 2 = module not loaded); enable AppArmor in the kernel or via `systemctl enable apparmor`',
     };
   }
   return {

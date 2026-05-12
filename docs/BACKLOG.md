@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 123: R9 P1 cluster — doctor + args + welcome polish
+
+**Done.** One-hundred-twenty-third slice. Closes four of five R9 P1 findings — small fixes across `doctor.ts`, `args.ts`, `welcome.ts`, and `sandbox-skip.ts`. Each addresses a specific operator-UX paper cut surfaced by the multi-reviewer pass. The fifth P1 (60s cache for non-critical doctor checks) is a larger feature deferred to its own slice.
+
+### Findings closed
+
+| # | Severity | Symptom | Fix |
+|---|---|---|---|
+| — | P1 | `doctor.dirWritable` short-circuited on `existsSync(dir)` and returned `writable: true` without probing — a dir at chmod 0500 (read+exec, no write) passed `config_dir` → `ok` but every runtime fs op on the path failed | `accessSync(dir, W_OK)` probe when dir exists; surface EACCES verbatim |
+| — | P1 | `doctor.macLsmCheck` AppArmor branch emitted `warn: "aa-status at <path> but enabled probe failed"` when the binary was installed but the kernel module wasn't loaded — the COMMON case on Fedora/Arch | Surface as `warn: "AppArmor userspace present but kernel enforcement disabled"` with remediation walking through aa-status exit codes |
+| — | P1 | `args.ts` top-level parser silently accepted `--i-know-what-im-doing` and set `args.iKnowWhatImDoing = true`, but the flag is only read inside the `args.welcome === true` branch in `run.ts` — `agent --i-know-what-im-doing` (no welcome verb) parsed successfully and did nothing | Top-level case returns error pointing operator at `agent welcome --i-know-what-im-doing` |
+| — | P1 | `welcome.ts` "Sandbox setup skipped" output didn't show the marker's `# created: <iso>` timestamp; operators with no way to recall WHEN they opted into unsafe mode without manually cat'ing the marker | New `readSandboxSkipMetadata` in `sandbox-skip.ts` parses the marker body with O_NOFOLLOW + 1 KiB cap; welcome surfaces "marker present at <path> (created <ts>, version <v>)" when metadata available, falls back to the old single-line message otherwise |
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/doctor.ts` | `accessSync` + `fsConstants` imports added. `dirWritable` probes `accessSync(dir, W_OK)` when dir exists (was: trusted `existsSync` blindly). `macLsmCheck` AppArmor failed-probe branch reworded to "kernel enforcement disabled" with remediation walking through `aa-status` exit codes (4 = no kernel support, 2 = module not loaded). |
+| `src/cli/args.ts` | Top-level case `--i-know-what-im-doing` now returns an error pointing operator at `agent welcome --i-know-what-im-doing`. Welcome subcommand parser unchanged (continues to accept the flag in the welcome context, per slice 91 contract). |
+| `src/cli/sandbox-skip.ts` | New `readContent` primitive on `SandboxSkipFs` (production uses `openSync` with `O_NOFOLLOW`, hard-capped at 1 KiB read). New `MARKER_MAX_BYTES = 1024` constant. New `readSandboxSkipMetadata(options)` exported function: lstat → reject non-regular-file → read → parse `# created: <iso>` and `# version: <string>` lines. Returns null on absent / unreadable / non-regular-file. `SandboxSkipMetadata` interface exported. |
+| `src/cli/welcome.ts` | Import `readSandboxSkipMetadata` + `SandboxSkipMetadata` type. New `readSkipMarker` injectable in `RunWelcomeOptions`. When `hasSkip` fires (marker present, no `--i-know-what-im-doing` flag), welcome reads metadata; if `createdAt` is present, prints "marker present at <path> (created <ts>[, version <v>])"; otherwise prints the legacy single-line fallback. |
+| `tests/cli/doctor.test.ts` | +2 tests: `config_dir on chmod 0500 → fail` (real fs setup: mkdirSync + chmodSync + cleanup with chmod-back); `mac_lsm: AppArmor binary present but kernel disabled → warn with remediation`. |
+| `tests/cli/args.test.ts` | +3 tests in new describe `--i-know-what-im-doing top-level rejection (slice 123)`: bare top-level rejects with pointer; `agent welcome --i-know-what-im-doing` still parses; top-level with sibling flags also rejects. |
+| `tests/cli/sandbox-skip.test.ts` | +6 tests in new describe `readSandboxSkipMetadata (slice 123)`: parses created+version; ENOENT → null; symlink → null; readContent throws → null; missing `# created:` line → no `createdAt`; whitespace in createdAt is trimmed. |
+| `tests/cli/welcome.test.ts` | Existing "marker present" test updated to inject `readSkipMarker: () => null` so the fallback branch is exercised explicitly. +2 new tests: marker with metadata → output contains timestamp + version; marker with metadata but no version → output contains timestamp only (no "version " substring). |
+
+### Decisions
+
+- **Bundled 4 of 5 R9 P1 findings into one slice; deferred the 60s cache.** The cache for non-critical doctor checks (spec line 817) is a larger feature with its own state management, cache invalidation, and probe-vs-cache semantics. The other four findings are small fixes touching disjoint surfaces; bundling lets the slice review pass cover all of them at once and keeps the next slice's scope clean.
+- **`dirWritable` uses `accessSync(W_OK)`, not a touch-and-remove probe.** A sentinel-file probe would catch more subtle issues (e.g., quota-limited writes, FS in read-only mode) but it's two syscalls vs one and leaves a temp file on abort. `accessSync` honors the same EACCES semantics the production code path would hit, which is what `dirWritable`'s callers actually care about.
+- **macLsmCheck remediation walks aa-status exit codes verbatim.** The `runCmd` seam returns string-or-null based on exit code 0 vs non-zero — we can't distinguish the specific code (2 = no module, 4 = no kernel support). The remediation hint guides the operator to run `aa-status` manually and decode the exit code. Refining the seam to return exit codes is a follow-up if a real allowlist case appears.
+- **Top-level `--i-know-what-im-doing` returns ParseResult error, not just usage warning.** Going via a non-fatal warning would still allow the parse to succeed with `iKnowWhatImDoing: true` set on an inapplicable args shape — operator would never see the warning unless they checked stderr, and the no-op behavior would feel like the flag worked. Hard error with `ok: false` makes the failure visible.
+- **`readSandboxSkipMetadata` returns null on read errors (no propagation).** Symmetric with the welcome flow's graceful-fallback contract: the operator already knows the marker is present (hasSandboxSkip said true); the timestamp is informational, not load-bearing. A corrupted body or ELOOP shouldn't crash welcome; the single-line fallback message is the safe default. Different posture from `hasSandboxSkip`'s ENOENT-only swallow (which is decision-critical) and `createSandboxSkip`'s refuse-non-regular (which would silently overwrite an attacker target if it didn't).
+- **Marker body cap at 1 KiB.** Production markers are ~400 bytes (5-line header + reminder text). 1 KiB is 2.5x that, plenty of margin for future fields, but far below any "slurp a malicious 100 MB symlink target" attack surface. The cap is applied via `readSync` with a pre-allocated buffer.
+- **Symbol-level test seams (lstat / readContent / mkdir / createExclusive) over higher-level seams.** Earlier in the project we considered a single "marker fs" seam that exposed read/write/exists methods. Refused because each operation has DIFFERENT symlink semantics (read needs `O_NOFOLLOW`, exists needs lstat, write needs `O_EXCL | O_NOFOLLOW`), and a single coarser seam would either lose the per-op flags (insecure default) or duplicate the flag-passing logic.
+
+### Trap navigated
+
+- **doctor config_dir path is `~/.config/agent`, not `~/.config/forja`.** Initial chmod test used `${tmp}/.config/forja` and the test failed with `status: 'ok'` because doctor's `installIdPath` resolves to `~/.config/agent/install_id`, not `forja`. Fix: chmod the actual `${tmp}/.config/agent` dir. Spec naming and runtime naming diverged here historically (the sandbox_skip marker IS under `~/.config/forja/`; the engine state IS under `~/.config/agent/`); slice 123 doesn't reconcile that, just tests the right path.
+- **Existing welcome marker-present test depended on disk state.** Pre-slice the test injected `hasSkipMarker: () => true` but did NOT inject `readSkipMarker`; the production default would have gone to the actual filesystem and could have leaked a real marker on the test machine into the output. Updated the test to explicitly inject `readSkipMarker: () => null` so the fallback message is exercised deterministically. Pattern: any new injectable seam SHOULD be threaded through existing tests that touch the same code path, not just covered by new tests.
+- **Biome `organizeImports` flagged 3 files after the slice edits.** Same trap as slice 122: import statements added in declaration order, not alphabetical. `bun run lint:fix` auto-sorted; no behavioral change.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6365 pass / 10 skip / 0 fail** (6375 total across 291 files); +13 tests on top of slice 122's 6352
+- Targeted: `bun test tests/cli/sandbox-skip.test.ts tests/cli/welcome.test.ts tests/cli/doctor.test.ts tests/cli/args.test.ts` — 209/209
+
+### Next
+
+R9 P1 progress: 4/5 closed. Remaining R9:
+- **P0 #10** — §13.4/§13.5 interactive menu NOT implemented (spec-vs-code design decision).
+- **P1 — doctor 60s cache for non-critical checks** (spec line 817; deferred to its own slice, needs cache-state design).
+
+R-bucket status: R1 ✓, R2 ✓, R4 ✓, R5 ✓, R6 ✓, R7 ✓, R8 ✓, R10 ✓, R11 ✓, R12 partial. R9: 3 P0 closed (slice 122), 4 P1 closed (slice 123), 1 P0 + 1 P1 remaining.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 122: sandbox-skip symlink + permission hardening (R9 P0)
 
 **Done.** One-hundred-twenty-second slice. Closes three R9 findings clustered in `src/cli/sandbox-skip.ts` — the §13.5 marker file that suppresses the first-boot sandbox prompt for operators who acknowledged unsafe-mode posture via `--i-know-what-im-doing`. The marker is UX-only (engine enforcement is unaffected), but its read/write paths were the weakest link in the welcome flow: an attacker who could plant a symlink at the marker path silenced the prompt indefinitely, AND the file's 0644 default mode leaked the marker's presence to other users on multi-tenant hosts.

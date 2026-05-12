@@ -42,7 +42,7 @@
 //     `0700` (was 0777-minus-umask). On multi-tenant hosts,
 //     0755+ exposes the marker's existence to other users.
 
-import { constants, closeSync, lstatSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import { constants, closeSync, lstatSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -96,6 +96,13 @@ export interface SandboxSkipFs {
   // symlink (i.e., open with `O_EXCL | O_NOFOLLOW`). `mode`
   // is the creation mode for the new file.
   createExclusive?: (path: string, content: string, mode: number) => void;
+  // Read the marker's contents. Slice 123 (R9 P1): used by the
+  // welcome flow to surface the marker's `# created: <iso>`
+  // timestamp in the "Sandbox setup skipped" message. MUST NOT
+  // follow symlinks (open with `O_NOFOLLOW`). Tests can return
+  // a fixture body; production uses `node:fs` with the safe
+  // flag set.
+  readContent?: (path: string) => string;
 }
 
 const defaultLstat = lstatSync;
@@ -111,6 +118,26 @@ const defaultCreateExclusive = (path: string, content: string, mode: number): vo
     closeSync(fd);
   }
 };
+// Open the marker for read with `O_NOFOLLOW` so the read path
+// inherits the same symlink defense as the write path. Falls
+// through to a hard-bounded read (1 KiB) so a poisoned marker
+// can't blow the read buffer.
+const defaultReadContent = (path: string): string => {
+  const flags = constants.O_RDONLY | constants.O_NOFOLLOW;
+  const fd = openSync(path, flags);
+  try {
+    const buf = Buffer.alloc(MARKER_MAX_BYTES);
+    const n = readSync(fd, buf, 0, MARKER_MAX_BYTES, 0);
+    return buf.subarray(0, n).toString('utf-8');
+  } finally {
+    closeSync(fd);
+  }
+};
+
+// Marker body cap. Production markers are < 500 bytes; cap at
+// 1 KiB so a poisoned/large file at the marker path can't be
+// slurped fully into memory.
+const MARKER_MAX_BYTES = 1024;
 
 // Resolve a node:fs ErrnoException-like error's `code`. Errors
 // from `node:fs` carry a string `code` property (e.g., 'ENOENT',
@@ -231,4 +258,59 @@ export const createSandboxSkip = (
   // racing concurrent create fails EEXIST.
   createExclusive(path, body, MARKER_FILE_MODE);
   return { path, created: true };
+};
+
+// Read the marker's metadata for display in the welcome flow
+// (slice 123, R9 P1). Returns null when the marker is absent OR
+// when it exists but isn't a regular file (defense in depth: a
+// symlink-shaped marker should fall through to the "absent"
+// branch even if a future change weakens hasSandboxSkip).
+//
+// Parses the `# created: <iso>` and `# version: <string>` lines
+// from the body. Missing fields stay undefined — the caller
+// formats around them.
+//
+// Symlink defense matches the write path: read happens through
+// `O_NOFOLLOW` so a planted symlink fails the open with ELOOP.
+// Read errors return null to keep the welcome output graceful
+// (the operator sees a no-timestamp message rather than a stack
+// trace) — the failure modes worth surfacing already surfaced
+// from `hasSandboxSkip`.
+export interface SandboxSkipMetadata {
+  path: string;
+  createdAt?: string;
+  version?: string;
+}
+
+export const readSandboxSkipMetadata = (
+  options: { env?: NodeJS.ProcessEnv; fs?: SandboxSkipFs } = {},
+): SandboxSkipMetadata | null => {
+  const env = options.env ?? process.env;
+  const lstat = options.fs?.lstat ?? defaultLstat;
+  const readContent = options.fs?.readContent ?? defaultReadContent;
+  const path = sandboxSkipPath(env);
+  try {
+    const st = lstat(path);
+    if (!st.isFile() || st.isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  let body: string;
+  try {
+    body = readContent(path);
+  } catch {
+    return null;
+  }
+  const meta: SandboxSkipMetadata = { path };
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.trim();
+    if (line.startsWith('# created:')) {
+      const v = line.slice('# created:'.length).trim();
+      if (v.length > 0) meta.createdAt = v;
+    } else if (line.startsWith('# version:')) {
+      const v = line.slice('# version:'.length).trim();
+      if (v.length > 0) meta.version = v;
+    }
+  }
+  return meta;
 };

@@ -18,7 +18,12 @@
 
 import { runDoctor } from './doctor.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';
-import { createSandboxSkip, hasSandboxSkip } from './sandbox-skip.ts';
+import {
+  type SandboxSkipMetadata,
+  createSandboxSkip,
+  hasSandboxSkip,
+  readSandboxSkipMetadata,
+} from './sandbox-skip.ts';
 
 export interface RunWelcomeOptions {
   // Test seams — both inner verbs accept the same hooks. Forwarded
@@ -39,6 +44,11 @@ export interface RunWelcomeOptions {
   // Test seams for the sandbox_skip marker mechanism.
   hasSkipMarker?: (env: NodeJS.ProcessEnv) => boolean;
   createSkipMarker?: (env: NodeJS.ProcessEnv) => { path: string; created: boolean };
+  // Slice 123 (R9 P1): read the marker's metadata for the
+  // "Sandbox setup skipped — marker present (created <ts>)"
+  // message. Returns null when absent / unreadable / non-regular-
+  // file (welcome falls back to the no-timestamp message).
+  readSkipMarker?: (env: NodeJS.ProcessEnv) => SandboxSkipMetadata | null;
 }
 
 const INTRO_LINES = [
@@ -101,6 +111,7 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
   const env = options.env ?? process.env;
   const hasSkip = (options.hasSkipMarker ?? ((e) => hasSandboxSkip({ env: e })))(env);
   const createSkip = options.createSkipMarker ?? ((e) => createSandboxSkip({ env: e }));
+  const readSkip = options.readSkipMarker ?? ((e) => readSandboxSkipMetadata({ env: e }));
 
   let setupCode = 0;
   if (options.iKnowWhatImDoing === true) {
@@ -112,7 +123,20 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
     );
     out('Engine enforcement (degraded state, per-call confirm) is unchanged.\n');
   } else if (hasSkip) {
-    out('Sandbox setup skipped — `~/.config/forja/sandbox_skip` marker present.\n');
+    // Slice 123 (R9 P1): surface the marker's created/version
+    // metadata so operators can see WHEN they last opted into
+    // unsafe mode. Falls back to the no-timestamp message when
+    // the marker is unreadable / corrupted (rare; readSkipMarker
+    // returns null defensively).
+    const meta = readSkip(env);
+    if (meta !== null && meta.createdAt !== undefined) {
+      const versionStr = meta.version !== undefined ? `, version ${meta.version}` : '';
+      out(
+        `Sandbox setup skipped — marker present at ${meta.path} (created ${meta.createdAt}${versionStr}).\n`,
+      );
+    } else {
+      out('Sandbox setup skipped — `~/.config/forja/sandbox_skip` marker present.\n');
+    }
     out('Remove that file to re-enable the prompt.\n');
   } else {
     setupCode = await runSandboxSetup({

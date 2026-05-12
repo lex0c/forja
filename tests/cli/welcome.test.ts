@@ -227,13 +227,17 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     expect(text).toContain('stay silenced');
   });
 
-  test('marker already present (no flag): silently skip setup prompt', async () => {
+  test('marker already present (no flag, no metadata): silently skip setup prompt with fallback message', async () => {
     const out = captured();
     let createCalled = false;
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
       hasSkipMarker: () => true,
+      // Slice 123 (R9 P1): readSkipMarker is injected as null so the
+      // fallback "marker present" message fires (covers the
+      // corrupted/unreadable marker branch).
+      readSkipMarker: () => null,
       createSkipMarker: () => {
         createCalled = true;
         return { path: '/cfg/forja/sandbox_skip', created: false };
@@ -247,6 +251,51 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     expect(text).toContain('sandbox_skip` marker present');
   });
 
+  // Slice 123 (R9 P1): when the marker carries created/version
+  // metadata, welcome surfaces them in the skip message so
+  // operators see WHEN they last opted into unsafe mode.
+  test('marker already present with metadata: skip message includes created timestamp + version', async () => {
+    const out = captured();
+    await runWelcome({
+      env: { PATH: process.env.PATH },
+      which: ALWAYS_WHICH,
+      hasSkipMarker: () => true,
+      readSkipMarker: () => ({
+        path: '/cfg/forja/sandbox_skip',
+        createdAt: '2026-05-11T12:00:00.000Z',
+        version: '1.2.3',
+      }),
+      createSkipMarker: () => ({ path: '/cfg/forja/sandbox_skip', created: false }),
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('Sandbox setup skipped');
+    expect(text).toContain('/cfg/forja/sandbox_skip');
+    expect(text).toContain('2026-05-11T12:00:00.000Z');
+    expect(text).toContain('version 1.2.3');
+    expect(text).toContain('Remove that file');
+  });
+
+  test('marker with metadata but no version: skip message still includes timestamp', async () => {
+    const out = captured();
+    await runWelcome({
+      env: { PATH: process.env.PATH },
+      which: ALWAYS_WHICH,
+      hasSkipMarker: () => true,
+      readSkipMarker: () => ({
+        path: '/cfg/forja/sandbox_skip',
+        createdAt: '2026-05-11T12:00:00.000Z',
+      }),
+      createSkipMarker: () => ({ path: '/cfg/forja/sandbox_skip', created: false }),
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('2026-05-11T12:00:00.000Z');
+    expect(text).not.toContain('version ');
+  });
+
   test('no marker + no flag: sandbox setup runs (marker hints absent)', async () => {
     const out = captured();
     let createCalled = false;
@@ -254,6 +303,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
       hasSkipMarker: () => false,
+      readSkipMarker: () => null,
       createSkipMarker: () => {
         createCalled = true;
         return { path: '/cfg/forja/sandbox_skip', created: false };

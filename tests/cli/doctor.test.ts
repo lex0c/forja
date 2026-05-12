@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
@@ -93,6 +93,44 @@ describe('runDoctor', () => {
     expect(text).toContain('data_dir');
     expect(text).toContain('git');
     expect(text).toContain('summary: all checks passed');
+  });
+
+  // Slice 123 (R9 P1): pre-slice `dirWritable` short-circuited on
+  // `existsSync(dir)` and returned writable:true without probing.
+  // A dir at chmod 0500 (read+exec, no write) passed config_dir
+  // → 'ok' but every runtime fs op on the path failed. Now
+  // `accessSync(dir, W_OK)` is probed and the check fails loud.
+  test('config_dir on chmod 0500 → fail with EACCES-ish error', async () => {
+    const out = captured();
+    // The config_dir resolution: HOME/.config/agent (we control
+    // HOME via env). Pre-create the tree and chmod the LEAF to
+    // 0500 so accessSync(W_OK) fails.
+    const targetDir = join(tmp, '.config', 'agent');
+    mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+    chmodSync(targetDir, 0o500);
+    try {
+      await runDoctor({
+        json: true,
+        env,
+        which: (cmd) => `/usr/bin/${cmd}`,
+        readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+        runCmd: () => null,
+        engineVersion: '0.0.0',
+        out: out.write,
+      });
+      const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+      const configCheck = lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find((e) => e.kind === 'check' && e.name === 'config_dir');
+      expect(configCheck?.status).toBe('fail');
+      // The OS error text varies (EACCES vs permission denied) but
+      // both forms contain 'EACCES' or 'permission'.
+      const detail = configCheck?.detail as string | undefined;
+      expect(detail?.toLowerCase()).toMatch(/eacces|permission/);
+    } finally {
+      // chmod back so rmSync can clean up.
+      chmodSync(targetDir, 0o700);
+    }
   });
 
   test('missing sandbox tool → warn, exit 0 (sandbox absence is recoverable)', async () => {
@@ -953,6 +991,38 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
     const c = extractCheck(out, 'mac_lsm');
     expect(c?.status).toBe('ok');
     expect(c?.detail).toContain('no LSM detected');
+  });
+
+  // Slice 123 (R9 P1): pre-slice when aa-status was installed but
+  // the kernel module wasn't loaded, runCmd returned null and we
+  // emitted a "probe failed" warn — unhelpful because the probe
+  // didn't fail; the kernel just wasn't enforcing. Now the warn
+  // detail names the actual state + remediation walks the operator
+  // through the diagnostic.
+  test('mac_lsm: AppArmor binary present but kernel module disabled → warn with remediation', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => {
+        if (cmd === 'getenforce') return null; // no SELinux
+        return `/usr/bin/${cmd}`; // aa-status installed
+      },
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0\n';
+        if (cmd === 'aa-status') return null; // non-zero exit (kernel disabled)
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('AppArmor');
+    expect(c?.detail).toContain('kernel enforcement disabled');
+    expect(c?.remediation).toBeDefined();
+    expect(c?.remediation).toContain('aa-status');
   });
 
   test('capability_ceiling info line: Linux+bwrap+userNs → full set', async () => {
