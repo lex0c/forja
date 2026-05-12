@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 115: bash handler cwd normalization + dead export cleanup (R7 P1)
+
+**Done.** One-hundred-fifteenth slice. Closes 2 of the R7 P1 leftovers in the bash worker handler:
+
+- **`bash.ts:168` cwd absolute branch returned `args.cwd` verbatim**: pre-slice `cwd = isAbsolute(args.cwd) ? args.cwd : resolvePath(baseCwd, args.cwd)`. `isAbsolute` only checks the leading slash, not the path shape — so `/etc/../tmp` or `/work/../etc/passwd` was passed to spawn UNNORMALIZED. The protected-paths classifier at the engine layer would later miss these (it sees the literal absolute path with `..`, not the resolved form). Slice 115 always flows cwd through `resolvePath` which normalizes `..`/`./` lexically.
+- **`bash.ts:50` `BASH_ABORT_GRACE_MS` dead export**: declared in `bash.ts`, re-exported via `broker/index.ts`, never read by any caller. Cleanup — both the const declaration and the re-export are removed.
+
+Also: **`args.cwd === ''` validation**: a degenerate-empty-string cwd would otherwise pass through to spawn and surface as an opaque OS-level error. Catching at the handler boundary gives the operator a clear `bash handler: args.cwd must be non-empty` message.
+
+### Why this matters
+
+The cwd normalization is the security-relevant fix. Slice 97 (R2) tightened §11 protected-paths and slice 100 (R2 #206) closed flag-prefix bypass in the bash AST resolver. But the bash handler's cwd field bypassed BOTH defenses pre-slice: a model emitting `bash command="rm secret" cwd="/work/proj/../../etc"` would have the handler call spawn with cwd=`/work/proj/../../etc` literally. Spawn then resolves that relative to PWD which is operator-controlled; the resulting working directory is potentially outside the operator's intended sandbox. The protected-paths classifier at the engine layer DOES catch the `rm` against the resolved capability scope, but the cwd-level bypass changes the BASE of subsequent relative paths in the command — undermining other defenses that assumed cwd was reasonable.
+
+The fix is one line: drop `isAbsolute`, always `resolvePath`. `resolvePath('/work/proj', '/etc/../tmp')` returns `/tmp`; `resolvePath('/work/proj', '..')` returns `/work`. The result is the canonical absolute path regardless of input shape.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/handlers/bash.ts` | Removes `import { isAbsolute }` (no longer needed; resolvePath alone handles both branches). Removes the dead `BASH_ABORT_GRACE_MS` export with a comment noting the consolidation (BASH_TIMEOUT_GRACE_MS is the actual constant used by the SIGTERM → SIGKILL escalation; two consts for one window was a holdover). Updates the cwd branch: explicit `args.cwd === ''` check + unconditional `resolvePath(baseCwd, args.cwd)` for non-empty values. |
+| `src/broker/index.ts` | Drops `BASH_ABORT_GRACE_MS` from the re-export list. |
+| `tests/broker/handlers/bash.test.ts` | 2 new tests: (1) cwd absolute path with `..` is normalized (`/etc/../tmp` → `/tmp`); (2) empty-string cwd returns the explicit `must be non-empty` error. |
+| `tests/broker/spawn.test.ts` | Type tightening on slice 114's `endResolveFn` test fixture — `let endResolveFn: () => void = () => {}` (was `: () => void \| null = null`) so TypeScript's never-narrowing in the assignment-inside-Promise-executor flow doesn't trip the call site. Pure typecheck-only fix; behavior unchanged. |
+
+### Decisions
+
+- **Drop `isAbsolute` entirely.** Pre-slice the absolute branch was supposed to be a fast-path (skip resolve when not needed), but `resolvePath` already handles absolute inputs correctly and cheaply. The branching saved at most one path normalization per call and introduced the un-normalized-absolute hole. Removing the branch removes the hole and simplifies the code.
+- **Empty-string check at the boundary, not later.** Could let it fall through to spawn (which would error with `ENOENT` or similar), but the operator-readable message is cheaper. The check costs one comparison.
+- **`BASH_ABORT_GRACE_MS` removal, not deprecation.** No production caller imports it. No deprecation period needed; future external SDK users wanting the value can use `BASH_TIMEOUT_GRACE_MS` which is the actual operative constant.
+- **Slice 114 test fixture type fix bundled here.** The `endResolveFn: () => void | null = null` shape produced a TS narrowing error after slice 115's typecheck pass (an unrelated TS flow-analysis quirk surfaced when neighboring code changed). The fix is `let endResolveFn: () => void = () => {}` — default to no-op, assigned later. Same behavior; clean typecheck. Bundling here to avoid carrying a stale typecheck warning into the next slice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6275 pass / 10 skip / 0 fail** (6285 total across 291 files); +2 tests on top of slice 114's 6273
+- Targeted: `bun test tests/broker/handlers/bash.test.ts` — 35/35
+
+### Next
+
+R7 P1 remaining (less impactful):
+- Truncation footer regex false positive (any bash output ending in the footer pattern reports `truncated: true`).
+- read-capped stopSignal listener removal mismatch in pre-aborted path.
+- `Promise.all` reject bypasses error response shape.
+- Timeout error message + `Number.isFinite` triple-check load-bearing in non-obvious way.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 114: stdin.end race against proc.exited (R6 P1, R6 fully closed)
 
 **Done.** One-hundred-fourteenth slice. **Closes R6 fully.** Pre-slice `await proc.stdin.end()` could park if the OS pipe flush didn't surface a clean error when proc exited concurrently — Bun's FileSink#end has resolved-on-EPIPE semantics most of the time but a process that closes its read end mid-flush could leave the promise in a state that takes longer than expected to settle. The fix bounds the wait via `Promise.race` against `proc.exited` — whichever resolves first wins.

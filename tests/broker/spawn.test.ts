@@ -919,7 +919,7 @@ describe('createSpawnBroker — stdin.end race against proc.exited (slice 114, R
     // even resolves. The race resolves on proc.exited.then(()
     // => undefined) without erroring — the main Promise.all
     // below sees a finished proc and the response gets parsed.
-    let endResolveFn: (() => void) | null = null;
+    let endResolveFn: () => void = () => {};
     const endPromise = new Promise<void>((resolve) => {
       endResolveFn = resolve;
     });
@@ -943,7 +943,7 @@ describe('createSpawnBroker — stdin.end race against proc.exited (slice 114, R
     expect(r.stdout).toBe('done');
     // Resolve the dangling end() promise so the test cleanup
     // doesn't leave a pending microtask.
-    endResolveFn?.();
+    endResolveFn();
     await broker.close();
   });
 

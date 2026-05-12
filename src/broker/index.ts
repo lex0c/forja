@@ -18,7 +18,6 @@ export type {
   CreateBashHandlerOptions,
 } from './handlers/bash.ts';
 export {
-  BASH_ABORT_GRACE_MS,
   BASH_DEFAULT_TIMEOUT_MS,
   BASH_MAX_OUTPUT_BYTES,
   BASH_MAX_TIMEOUT_MS,

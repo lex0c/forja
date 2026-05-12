@@ -103,6 +103,28 @@ describe('createBashHandler — real bash subprocess', () => {
     const r = await handler.execute(baseRequest({ args: { command: 'pwd' } }));
     expect(r.stdout.trim()).toBe('/tmp');
   });
+
+  // Slice 115 — R7 P1: pre-slice the absolute branch returned
+  // args.cwd verbatim — `/etc/../bin/sh` was passed to spawn
+  // unnormalized because isAbsolute only checks the leading
+  // slash, not the path shape. Now ALL paths flow through
+  // resolvePath which collapses `..`/`./` lexically.
+  test('cwd: absolute path with .. is normalized (slice 115)', async () => {
+    const handler = createBashHandler({ baseCwd: '/work' });
+    // `/etc/../tmp` → `/tmp` after normalization.
+    const r = await handler.execute(baseRequest({ args: { command: 'pwd', cwd: '/etc/../tmp' } }));
+    expect(r.stdout.trim()).toBe('/tmp');
+  });
+
+  test('cwd: empty string refuses with explicit error (slice 115)', async () => {
+    // Empty string would otherwise pass through to spawn and
+    // surface as an opaque OS-level error. Catching at the
+    // handler boundary gives the operator a clear message.
+    const handler = createBashHandler({});
+    const r = await handler.execute(baseRequest({ args: { command: 'echo', cwd: '' } }));
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('bash handler: args.cwd must be non-empty');
+  });
 });
 
 // ─── argument validation ───────────────────────────────────────────────────

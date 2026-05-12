@@ -36,7 +36,7 @@
 // timeoutGraceMs so the SIGTERM→SIGKILL escalation is observable
 // within test wall-clock budgets.
 
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { resolve as resolvePath } from 'node:path';
 import type { BrokerCallOptions, BrokerRequest, BrokerResponse } from '../types.ts';
 import type { WorkerToolHandler } from '../worker-runtime.ts';
 import { readCapped } from './read-capped.ts';
@@ -47,7 +47,12 @@ import { readCapped } from './read-capped.ts';
 export const BASH_DEFAULT_TIMEOUT_MS = 30_000;
 export const BASH_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const BASH_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
-export const BASH_ABORT_GRACE_MS = 5_000;
+// `BASH_ABORT_GRACE_MS` (was 5_000) removed in slice 115 — it was
+// exported but never read. The actual grace window for SIGTERM →
+// SIGKILL escalation is `BASH_TIMEOUT_GRACE_MS` below; the abort
+// path uses the same value via `escalateToSigkill(timeoutGraceMs)`
+// (slice 108). Two constants for one window was a holdover from
+// a pre-consolidation draft.
 export const BASH_TIMEOUT_GRACE_MS = 2_000;
 
 // Narrowed spawned-process shape this handler depends on. Distinct
@@ -165,7 +170,20 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
         if (typeof args.cwd !== 'string') {
           return errorResponse('bash handler: args.cwd must be a string');
         }
-        cwd = isAbsolute(args.cwd) ? args.cwd : resolvePath(baseCwd, args.cwd);
+        if (args.cwd.length === 0) {
+          return errorResponse('bash handler: args.cwd must be non-empty');
+        }
+        // Always normalize via resolvePath (slice 115, R7 P1). Pre-slice
+        // the absolute branch returned `args.cwd` verbatim — so an
+        // absolute path with `..` components (`/etc/../bin/sh`) was
+        // passed to spawn unnormalized. `isAbsolute` only checks the
+        // leading slash, not the path shape. `resolvePath` normalizes
+        // `..`/`./` lexically regardless of whether the input is
+        // absolute or relative, producing a canonical form.
+        // `resolvePath('/work/proj', '/etc/../tmp')` returns `/tmp`
+        // — the leading absolute path replaces baseCwd, and the
+        // intermediate `..` is collapsed.
+        cwd = resolvePath(baseCwd, args.cwd);
       }
 
       let proc: BashSpawnedProcess;
