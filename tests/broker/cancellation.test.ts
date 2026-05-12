@@ -25,7 +25,14 @@ const baseRequest = (overrides: Partial<BrokerRequest> = {}): BrokerRequest => (
 // ─── in-process broker propagation ────────────────────────────────────────
 
 describe('createInProcessBroker — signal propagation', () => {
-  test('exec callback receives the signal in callOptions', async () => {
+  // Slice 121 (R5 P0): the in-process broker now COMPOSES the
+  // caller's signal with a master signal that close() aborts. So
+  // exec no longer receives the caller's signal by identity — it
+  // receives a linked signal that fires on first-to-abort (caller
+  // OR broker close OR per-call timeoutMs). The contract pre-slice
+  // 121 was "exec.signal IS callerSignal"; the post-slice contract
+  // is "exec.signal MIRRORS callerSignal AND broker-shutdown".
+  test('caller-signal abort propagates to the linked signal exec sees', async () => {
     const captured: { signal: AbortSignal | undefined } = { signal: undefined };
     const broker = createInProcessBroker({
       exec: async (_req, callOptions) => {
@@ -35,11 +42,20 @@ describe('createInProcessBroker — signal propagation', () => {
     });
     const ac = new AbortController();
     await broker.execute(baseRequest(), { signal: ac.signal });
-    expect(captured.signal).toBe(ac.signal);
+    expect(captured.signal).toBeDefined();
+    expect(captured.signal?.aborted).toBe(false);
+    // Aborting the caller's controller fires on the linked signal
+    // exec saw (provided exec stashed the reference past return).
+    ac.abort();
+    expect(captured.signal?.aborted).toBe(true);
     await broker.close();
   });
 
-  test('omitted callOptions: exec sees undefined signal', async () => {
+  test('omitted callOptions: exec still sees a defined signal (master only)', async () => {
+    // Post-slice 121, the broker ALWAYS provides a signal to exec
+    // — the master shutdown signal is composed in even when the
+    // caller doesn't pass one. exec.signal is always usable for
+    // "wait until abort" patterns.
     const captured: { signal: AbortSignal | undefined } = { signal: undefined };
     const broker = createInProcessBroker({
       exec: async (_req, callOptions) => {
@@ -48,8 +64,11 @@ describe('createInProcessBroker — signal propagation', () => {
       },
     });
     await broker.execute(baseRequest());
-    expect(captured.signal).toBeUndefined();
+    expect(captured.signal).toBeDefined();
+    expect(captured.signal?.aborted).toBe(false);
+    // Now closing the broker should abort the signal exec saw.
     await broker.close();
+    expect(captured.signal?.aborted).toBe(true);
   });
 });
 

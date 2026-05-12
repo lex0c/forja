@@ -15,6 +15,61 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 121: in-process broker contract hardenings (R5, closes)
+
+**Done.** One-hundred-twenty-first slice. Closes R5 — the in-process broker had six findings clustered in `src/broker/in-process.ts` (one file, ~100 lines pre-slice). Each was small in isolation; bundled because the fixes interact (composed AbortSignals serve both close() and timeoutMs). Three P0 + three P1, fully drained.
+
+### Findings closed
+
+| # | Severity | Symptom | Fix |
+|---|---|---|---|
+| 1 | P0 | `options.exec` mutable post-construction; caller could swap the function under the broker by mutating their options reference | Snapshot `const exec = options.exec` at construction |
+| 2 | P0 | close+execute "race" between sync `if (closed)` check and chain scheduling | Documented invariant (JS single-thread closes the apparent gap; no behavioral change) |
+| 3 | P0 | `close()` waits for natural completion, doesn't abort; long-running exec hangs the shutdown path | `masterCtrl.abort()` on close; composed into exec's `callOptions.signal` so signal-honoring execs wind down promptly |
+| 4 | P1 | `timeoutMs` silently ignored by in-process broker; asymmetric with spawn broker's setTimeout+kill | Compose timer-driven AbortController with the per-call signal; setTimeout fires `timeoutCtrl.abort()` at the deadline |
+| 5 | P1 | Error-message construction unsafe with throwing getters / `String(e)` failures; `result` never assigned then accessed via non-null assertion | `safeErrorMessage()` helper with layered fallbacks (e.message try/catch → String() try/catch → `'<unrepresentable>'`) |
+| 6 | P1 | `BrokerRequest.args: Record<string, unknown>` doesn't block `__proto__` injection; downstream `Object.assign({}, args)` patterns trigger prototype pollution | `scrubProtoPollution()` extracted into `safe-json.ts`, applied at broker entry; returns same reference when clean (zero-cost common case) |
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/safe-json.ts` | Exports `DANGEROUS_KEYS` (previously private). New `scrubProtoPollution(value)` — recursive scrubber for already-parsed object trees. Returns the same reference when no dangerous keys are present anywhere in the tree (zero-allocation common case); fresh tree when scrubbing was needed. Symmetric defense with `safeJsonParse`'s reviver — both refuse the same three keys at every nesting depth. |
+| `src/broker/in-process.ts` | Rewritten. Snapshot `exec` at construction. New `linkSignals(...sources)` helper composes multiple AbortSignals into one (fast-paths when any source is already aborted, returns the only real signal when only one is supplied). New `safeErrorMessage(e)` helper. Per-call composed signal mirrors caller + master + (optional) timeout. `timeoutMs > 0` sets a `setTimeout` that aborts a dedicated `timeoutCtrl`. Timer is cleared in `finally` regardless of outcome. `request.args` flows through `scrubProtoPollution` before reaching exec. `close()` aborts the master controller before awaiting in-flight. Extensive comment block at file top documenting all six hardenings and the close+execute sync invariant. |
+| `tests/broker/in-process.test.ts` | +14 new tests across 5 describes: (1) `exec` snapshot defends post-construction mutation; (2) close() aborts signal-honoring in-flight, caller signal composes correctly, pre-aborted caller signal still flows; (3) timeoutMs positive/zero/undefined/NaN/Infinity branches, timer cleared on natural completion; (4) error message safety for Error subclasses with throwing `.message` getter and bare objects with throwing `toString`; (5) proto-pollution scrub on top-level args, nested args, and reference equality for clean args. |
+| `tests/broker/cancellation.test.ts` | Slice-83 tests pinned `expect(execSignal).toBe(ac.signal)` (caller signal pass-through by identity). Slice 121 composes signals — exec receives a LINKED signal that mirrors caller + master, not the caller's signal by identity. Updated assertions: caller's abort propagates to the linked signal exec saw (still observable post-abort); when no caller signal is passed, exec STILL sees a defined signal (master-only) that aborts on broker close. |
+
+### Decisions
+
+- **Bundled all six findings into one slice.** Each fix was small but they share infrastructure: composed AbortSignals serve both close() abort and timeoutMs enforcement; the `linkSignals` helper is reused for all three signal sources. Splitting into six slices would have made each one's `linkSignals` either incomplete or duplicated.
+- **Did NOT add re-check on `closed` inside the FIFO chain.** Initial implementation added it (finding #2 close+execute race). It broke the existing test "close awaits in-flight calls before resolving" — pre-slice contract was "exec scheduled before close DOES run; close awaits it"; the re-check inverted that. The right reading of finding #2 (per the REVIEW_NOTES wording "Sync-contiguous safe today but undocumented invariant") is that the race is closed by JS single-threading and the fix is documentation, not behavior. Re-check removed; invariant documented in the file header.
+- **`linkSignals` fast-paths the single-source case.** When `callOptions.signal` is undefined and no timeout is set, the master signal becomes the only real source — `linkSignals` returns it directly instead of allocating a fresh controller + listener. Slice 83's "exec sees the same signal we passed" identity check is broken regardless of composition (we ALWAYS compose master), but the fast-path keeps allocations minimal on hot paths.
+- **`scrubProtoPollution` returns same reference when clean.** Naive deep-clone would allocate on every broker call (~1k+ per session for an active loop). The single-pass dirty-tracking variant returns the input reference unchanged when no scrubbing was needed — zero allocation common case. Reference equality is testable (test #15) so the optimization stays load-bearing.
+- **`safeErrorMessage` falls all the way through to `'<unrepresentable>'`.** Defensive third layer: even `String(e)` can throw if `Symbol.toPrimitive` is poisoned. The broker's error path must never propagate a SECONDARY throw — the in-process broker is the "exec MUST NOT throw" contract enforcer, and that contract becomes meaningless if the enforcement code itself throws.
+- **`timeoutMs` semantics match BrokerCallOptions docs.** `undefined` → no timer (in-process broker has no construction-level default; future slice could add one), `0` → explicitly disabled, positive finite → enforced. NaN and Infinity are rejected via `Number.isFinite(tms) && tms > 0`. Negative values fall through the same guard.
+- **Did NOT change `BrokerRequest.args` type to a stricter shape.** Could have used `Readonly<Record<string, unknown>>` with a runtime guard, or a branded type. The runtime defense (scrubProtoPollution at the broker boundary) is the load-bearing fix; tightening the type would be cosmetic without changing the threat surface.
+
+### Trap navigated
+
+- **Re-checking `closed` inside the chain broke the existing test.** Initial implementation rejected calls that were scheduled in sync before close() but ran in the microtask queue after. The test `close awaits in-flight calls before resolving` failed: it spawned exec via `broker.execute(...)` then immediately `await broker.close()` — the re-check fired before exec ran, set result to broker-closed, exec never executed, `execComplete` stayed false. Slice author's first reading of finding #2 was "block any post-close work"; the correct reading per the REVIEW_NOTES wording is "the race is closed by JS single-threading, just document the invariant". Removed re-check, kept the invariant comment.
+- **Slice 83 tests assumed signal identity, not behavior.** Two cancellation tests (`tests/broker/cancellation.test.ts`) pinned `expect(captured.signal).toBe(ac.signal)` — strict reference equality on the signal exec received. Composition breaks identity by design; the post-slice contract is behavioral ("aborting caller's controller fires on exec's linked signal"), not identity. Updated assertions to reflect the new contract.
+- **`AbortSignal.addEventListener('abort', ..., { once: true })` does NOT prevent listener leaks if the source never aborts.** A composed signal that's discarded mid-call (e.g., per-call composition for an exec that returns fast) leaves listeners attached to the caller's signal until the caller's signal is garbage collected. For broker calls this is fine (each exec is bounded-lifetime); for a hypothetical "compose signals into long-lived state" use case it'd be a leak. Documented in `linkSignals` comments — slice 121 doesn't use it that way, but a future broker rewrite should be aware.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6344 pass / 10 skip / 0 fail** (6354 total across 291 files); +14 tests on top of slice 120's 6330
+- Targeted: `bun test tests/broker/in-process.test.ts tests/broker/cancellation.test.ts` — 35/35
+
+### Next
+
+R5 fully closes. R-bucket roadmap drained except R9 (operator UX, 3 P0 + 5 P1 findings — needs scoping pass before pickup since one P0 is a spec-vs-code gap that requires either implementing §13.4/§13.5 interactive menu OR PRing the spec to declare info-only).
+
+R-bucket status: R1 ✓, R2 ✓, R4 ✓, R5 ✓ (just closed), R6 ✓, R7 ✓, R8 ✓, R10 ✓, R11 ✓, R12 partial (fuzz CI workflow aspirational), R9 pending.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 120: bash COMMAND_TABLE — tar/tee/ssh/scp/rsync/make/cargo (R2 #199, closes)
 
 **Done.** One-hundred-twentieth slice. Closes R2 #199 — pre-slice the bash resolver's `COMMAND_TABLE` had 73 entries (spec asks ≥ 30) but was missing several extremely common operator commands. Each missing command fell through to the `unknown_command` Refuse path, which was *safe* (no capability leak — the engine forced a manual confirm) but ergonomically hostile: every `tar -czf release.tar dist/`, `make build`, `cargo test`, `rsync -av src/ dst/` popped a confirm modal instead of running through an audited Allow path with the correct capability shape.

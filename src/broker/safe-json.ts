@@ -34,7 +34,11 @@
 // inheritance), `prototype` (defensive — rare but legitimate
 // proto-walk shape on function-shaped values).
 
-const DANGEROUS_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+export const DANGEROUS_KEYS: ReadonlySet<string> = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
 
 // Strip dangerous keys at every nesting level. Returning
 // `undefined` from the reviver removes the property from the
@@ -49,4 +53,46 @@ const safeReviver = (key: string, value: unknown): unknown => {
 // callers can keep their try/catch logic unchanged.
 export const safeJsonParse = (text: string): unknown => {
   return JSON.parse(text, safeReviver);
+};
+
+// Strip proto-pollution keys from an already-parsed object tree
+// (slice 121, R5 args proto-pollution defense). Useful when JSON
+// parsing happened upstream (e.g., the Anthropic SDK parses
+// tool-call args before they reach Forja) and the in-process
+// broker can't rely on `safeJsonParse` to defend downstream
+// `Object.assign({}, args)` patterns.
+//
+// Returns the SAME reference when no dangerous keys are present
+// anywhere in the tree — common case (no allocation overhead).
+// Returns a fresh object/array tree only when scrubbing is
+// needed. Primitives and `null` pass through unchanged.
+//
+// Symmetric with `safeJsonParse`'s reviver: both refuse the same
+// three keys (`__proto__`, `constructor`, `prototype`) at every
+// nesting depth so the IPC perimeter and the in-process boundary
+// share one threat model.
+export const scrubProtoPollution = (value: unknown): unknown => {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out: unknown[] = [];
+    for (const v of value) {
+      const r = scrubProtoPollution(v);
+      if (r !== v) changed = true;
+      out.push(r);
+    }
+    return changed ? out : value;
+  }
+  let changed = false;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (DANGEROUS_KEYS.has(k)) {
+      changed = true;
+      continue;
+    }
+    const r = scrubProtoPollution(v);
+    if (r !== v) changed = true;
+    out[k] = r;
+  }
+  return changed ? out : value;
 };
