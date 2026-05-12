@@ -85,9 +85,52 @@ export const __resetBashParserForTest = (): void => {
 // always produces a tree). Callers should treat null as Refuse.
 import type { Node, Tree } from 'web-tree-sitter';
 
+// Defensive timeout ceiling on tree-sitter parse (slice 110, R2
+// #204). Spec-side concern: tree-sitter's error recovery is
+// usually fast, but pathological adversarial input (deeply
+// recursive shapes with unbalanced delimiters, malformed
+// here-docs, or carefully crafted Unicode sequences that confuse
+// the LR(1) state machine) can drive parsing into a slow path
+// that approaches O(N²) or worse. A 5 s cap is well above any
+// legitimate bash command size (operator-typed commands typically
+// parse sub-millisecond; even a 100 KB script parses in <100 ms
+// on modern hardware) and well below "operator notices the hang"
+// thresholds.
+//
+// Implementation: `parser.parse(source, oldTree, { progressCallback })`
+// — web-tree-sitter calls the callback periodically during parse.
+// Returning `true` cancels parsing (the parse returns `null`).
+// We track the cancellation reason via a closure flag so the
+// caller can distinguish "timeout" (throw) from "parse failure"
+// (null) — the bash resolver maps the throw to `parser unavailable
+// (bash-parser: parse timeout ...)` and null to `parser produced
+// no tree`, so audit triage sees the right cause.
+const PARSE_TIMEOUT_MS = 5_000;
+
 export const parseBash = (source: string): { tree: Tree; root: Node } | null => {
   const parser = getBashParser();
-  const tree = parser.parse(source);
+  const startMs = Date.now();
+  let timedOut = false;
+  const tree = parser.parse(source, undefined, {
+    progressCallback: (() => {
+      if (Date.now() - startMs > PARSE_TIMEOUT_MS) {
+        timedOut = true;
+        return true;
+      }
+      return false;
+    }) as never, // ParseOptions types `=> void` but docs + parse return-null behavior treat `true` as cancel.
+  });
+  if (timedOut) {
+    // Reset the parser — without this, the cancelled parse
+    // leaves the parser in a paused state and the NEXT call
+    // resumes from where the last one left off (per the
+    // `Parser#reset` doc-comment in web-tree-sitter.d.ts:194-202).
+    // We want every parse call to be independent.
+    parser.reset();
+    throw new Error(
+      `bash-parser: parse timeout after ${PARSE_TIMEOUT_MS}ms (input length=${source.length})`,
+    );
+  }
   if (tree === null) return null;
   return { tree, root: tree.rootNode };
 };

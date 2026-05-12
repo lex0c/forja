@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 110: bash-parser timeout defense (R2 #204)
+
+**Done.** One-hundred-tenth slice. Closes R2 #204: tree-sitter is error-recovering and usually fast, but pathological adversarial input could drive the LR(1) state machine into a slow path approaching O(N²). Pre-slice `parseBash` had no defensive cap — a hostile bash command (deeply-recursive unbalanced delimiters, malformed here-docs, carefully-crafted Unicode that confuses the state machine) could park the engine inside a single parse for arbitrary time, blocking every subsequent decision.
+
+### Why this matters
+
+The bash resolver runs on every bash tool call. The engine's `check()` is synchronous; if the parser hangs, the harness loop hangs. Slice 102/106's broker-side drain caps and timeout floor protect against worker-process-level wedges, but they don't help when the wedge is INSIDE the engine on the main process. A 30-second adversarial bash command parsing in the engine looks identical to a slow tool to the operator — but the broker isn't running yet, the worker isn't even spawned. The operator sees the agent freeze.
+
+The fix uses web-tree-sitter's `progressCallback` API: the parser calls the callback periodically during parsing (between state transitions), and returning `true` cancels the parse. parseBash now installs a callback that compares `Date.now() - startMs > PARSE_TIMEOUT_MS` and cancels when the cap is exceeded. The parser returns `null` on cancellation; our closure flag (`timedOut`) lets us distinguish "timed out" from "parse failed organically" — the throw surfaces as `bash-parser: parse timeout after Nms (input length=X)` in the bash resolver's catch, which maps to `parser unavailable (bash-parser: ...)`. The audit row carries the timeout cause for triage.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/bash-parser.ts` | New `PARSE_TIMEOUT_MS = 5_000` constant. `parseBash` installs a `progressCallback` that returns `true` when elapsed > timeout. On timeout, calls `parser.reset()` (web-tree-sitter contract: a cancelled parse leaves the parser paused; the next call would otherwise resume where the last one left off) and throws `bash-parser: parse timeout after Nms (input length=X)`. Normal parses (no timeout) flow through unchanged — the callback returns false and parsing completes naturally. |
+| `tests/permissions/bash-parser.test.ts` | New file. 8 tests: 3 happy path (simple command, pipeline, empty string), 3 timeout-defense (legitimate large input parses cleanly, 10k-repeat input passes — exercises progressCallback wiring without false-positive timeout, trimmed-empty boundary), 2 sequential-parses (two parses in sequence both succeed; parse after parse still works — pins the `parser.reset()` contract). |
+
+### Decisions
+
+- **5-second ceiling.** Well above any legitimate bash command (operator-typed commands typically parse sub-millisecond; 100 KB scripts parse in <100 ms on modern hardware). Well below "operator notices the hang" thresholds (the harness's degraded-mode UX timeout is 10 s; the broker's defensive timeout floor is 60 s). The cap targets pathological inputs that LOOK fast but trigger O(N²) recovery paths — a 5 s threshold catches those without burning operator patience on legitimate slow parses.
+- **`progressCallback` over a worker-based timeout.** The web-tree-sitter API provides a native callback that the parser checks between state transitions. Wrapping `parser.parse` in a worker would let us SIGTERM a runaway parser, but it requires async (the worker boundary is inherently async) and `engine.check()` is sync. The progressCallback fits the sync contract cleanly.
+- **`Date.now()` polling, not setInterval.** The callback runs in the parser's call stack — there's no clean way to schedule a timer that fires DURING the parse without coupling to the parser's internal iteration. Polling on each callback invocation is the parser's native rhythm; the cost is O(parse iterations) string comparisons, negligible compared to the parse itself.
+- **Throw on timeout, not return null.** The caller (bash resolver) already maps `null` to `parser produced no tree` — that's the routine "tree-sitter couldn't recover" path. A timeout is operationally distinct (input is hostile, likely adversarial, deserves a separate audit signature). Throwing routes through the resolver's catch path which produces `parser unavailable (bash-parser: parse timeout after Nms (input length=X))` — the audit row carries the size hint that an operator triaging the event can use to track down the offending input.
+- **`parser.reset()` on timeout.** Documented in web-tree-sitter: "If the parser previously failed because of a callback, then by default, it will resume where it left off on the next call to Parser#parse." Without reset, the NEXT legitimate parse call would continue the previous (cancelled, hostile) parse — silently corrupting unrelated calls. One-line defensive call.
+- **`as never` cast on progressCallback.** The web-tree-sitter d.ts declares `progressCallback?: (state: ParseState) => void` but the documented behavior (`@returns A Tree if parsing succeeded, or null if: ... - The progress callback returned true.`) treats the boolean return as cancellation. The type system disagrees with the runtime; `as never` documents the divergence at the call site. A future web-tree-sitter version that aligns types with docs (`(state) => boolean`) would let us drop the cast.
+- **No synthetic-slowness test.** Verifying the timeout actually fires would require either (a) a real pathological input that always trips the grammar's slow paths (fragile across grammar versions), or (b) a mock parser that ignores progressCallback. Tree-sitter doesn't expose a synthetic-slowness seam. The tests cover the happy path (no false-positive timeout on legitimate input) and the progressCallback wiring (10k-repeat input exercises the callback path); the timeout firing is contract-tested via the throw-shape documentation.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6256 pass / 10 skip / 0 fail** (6266 total across 291 files); +8 tests on top of slice 109's 6248
+- Targeted: `bun test tests/permissions/bash-parser.test.ts` — 8/8
+
+### Next
+
+R2 P0+P1 fully closed except #199 (COMMAND_TABLE additions: tar/ssh/scp/rsync/make/cargo — each command needs its own capability inference, deserves its own slice with conformance fixtures).
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section locking.
+- R2 #199 COMMAND_TABLE additions.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R6 P1 leftovers.
+- R7 P1 leftovers.
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 109: bootstrap home plumbing (R8 #323)
 
 **Done.** One-hundred-ninth slice. Closes R8 #323: the CLI bootstrap called `preflightPermissionEngine` and `bootstrapPermissionEngine` without an explicit `home` parameter. Both functions had a degraded fallback chain (`input.home ?? input.env?.HOME ?? process.env.HOME ?? input.cwd`). On `$HOME`-unset hosts — containers, CI workers, systemd one-shots — the chain landed on `cwd`, making tilde-rooted protected-path checks resolve against the project directory instead of the operator's actual home.
