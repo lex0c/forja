@@ -481,9 +481,43 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     // complete. Errors here mean the child died before we
     // finished writing; kill defensively + drain exited so the
     // child doesn't linger.
+    //
+    // Slice 114 (R6 P1): `proc.stdin.end()` is raced against
+    // `proc.exited`. Pre-slice an await on stdin.end alone could
+    // park if the OS pipe flush didn't surface a clean error
+    // when proc exited concurrently — Bun's FileSink#end has
+    // resolved-on-EPIPE semantics most of the time but a
+    // process that closes its read end mid-flush could leave
+    // the promise in a state that takes longer than expected
+    // to settle. The race bounds the wait to proc.exited:
+    // whichever resolves first wins, and proc.exited resolving
+    // first signals the worker died before we could finish
+    // writing — the post-await drain still picks up the
+    // (now-truncated) response.
+    //
+    // `proc.exited.then(_, _)` swallows the rejection branch so
+    // the race doesn't surface as an unhandled rejection when
+    // proc.exited rejects (Bun edge case — usually it resolves
+    // with the exit code, but slice 108 documented that rejection
+    // IS possible). The race resolves with `undefined` either
+    // way; the actual exit value flows through proc.exited in
+    // the main Promise.all below.
     try {
       proc.stdin.write(`${JSON.stringify(request)}\n`);
-      await Promise.resolve(proc.stdin.end());
+      // The race: stdin.end's rejection (EPIPE etc.) propagates
+      // through the race and trips the catch — preserving the
+      // existing `stdin write failed` error path. proc.exited
+      // wins the race silently (.then(_, _) maps both fulfill
+      // and reject to undefined) so the race resolves and the
+      // main loop continues; proc.exited's actual rejection (if
+      // any) surfaces through the main Promise.all below.
+      await Promise.race([
+        Promise.resolve(proc.stdin.end()),
+        proc.exited.then(
+          () => undefined,
+          () => undefined,
+        ),
+      ]);
     } catch (e) {
       try {
         proc.kill();

@@ -15,6 +15,49 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 114: stdin.end race against proc.exited (R6 P1, R6 fully closed)
+
+**Done.** One-hundred-fourteenth slice. **Closes R6 fully.** Pre-slice `await proc.stdin.end()` could park if the OS pipe flush didn't surface a clean error when proc exited concurrently — Bun's FileSink#end has resolved-on-EPIPE semantics most of the time but a process that closes its read end mid-flush could leave the promise in a state that takes longer than expected to settle. The fix bounds the wait via `Promise.race` against `proc.exited` — whichever resolves first wins.
+
+### Why this matters
+
+Slice 113 fixed the broker's outbound kill path (SIGTERM→SIGKILL escalation); slice 114 closes the inbound write path. Together with slice 102 (drain caps), slice 106 (timeout floor), slice 107 (signal listener race), and slice 113 (kill escalation), every await in the broker's executeOnce is now bounded by either a configured timeout, an external abort, or a sibling promise (proc.exited). The broker can no longer park indefinitely on any single primitive operation.
+
+The race shape preserves the existing `stdin write failed` error path: stdin.end rejections (EPIPE etc.) propagate through the race and trip the catch unchanged. proc.exited winning the race resolves silently (.then(_, _) maps both fulfill and reject to undefined) — the main loop continues to drain stdout/stderr and proc.exited's actual rejection (if any) surfaces through the main `Promise.all` below where the existing try/catch handles it.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` | Replaces `await Promise.resolve(proc.stdin.end())` with `await Promise.race([Promise.resolve(proc.stdin.end()), proc.exited.then(() => undefined, () => undefined)])`. The race propagates stdin.end's rejection through to the existing catch (preserving the stdin-write-failed error path); proc.exited winning resolves silently. Long-form comment documents the race semantics and why the .then(_, _) pattern is intentional. |
+| `tests/broker/spawn.test.ts` | New describe `stdin.end race against proc.exited (slice 114, R6 P1)` with 4 tests: (1) normal stdin.end resolves cleanly (no regression); (2) stdin.end rejection still routes to stdin-write-failed (preserves the existing catch path — uses a synthetic spawn where end() throws synchronously); (3) proc.exited resolving early lets the main loop continue (synthetic where end() returns a never-resolving promise — the race resolves on proc.exited, main loop drains stdout); (4) proc.exited rejection during stdin.end is swallowed (no unhandled rejection — call completes without parking forever). |
+
+### Decisions
+
+- **`.then(_, _)` not `.catch(...)`.** The race needs to resolve regardless of which side wins. `.then(() => undefined, () => undefined)` maps both fulfill and reject to undefined, making the race resolve cleanly. `.catch(() => undefined)` alone would still let the fulfill path propagate the exit code value (which would then race ahead of stdin.end's rejection on the catch path). The two-arg .then is the most explicit "I don't care which way you went, just tell me you're done" primitive.
+- **Preserve the existing stdin-write-failed error path.** Slice 107's existing catch maps stdin.end rejections to `error: 'stdin write failed: ...'`. Slice 114 keeps that path intact by NOT swallowing the stdin.end rejection branch — only the proc.exited side is silenced. Operators inspecting the BrokerResponse still see the original EPIPE-shaped error when stdin.end was the cause.
+- **No new fields, no new public API.** The fix lives entirely inside the race expression. `CreateSpawnBrokerOptions` unchanged; existing callers see no behavior change unless they were hitting the race scenario (a wedged stdin.end), in which case they now see a cleaner exit instead of a hang.
+- **Test fixtures use synthetic spawns.** Verifying the race with a real /bin/sh would require an OS-level pipe wedge — fragile across platforms. The synthetic spawns (never-resolving end(), throwing end(), rejecting exited) exercise each race branch independently. Each test bounds itself with `timeoutMs: 1000` so a regression that re-introduces the hang surfaces quickly in CI rather than killing the test runner.
+- **R6 P1 leftovers: 3/3 closed.** Slice 113 covered SIGTERM→SIGKILL escalation + worker SIGTERM once; slice 114 covers stdin.end race. R6 is now fully closed across P0 + P1.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6273 pass / 10 skip / 0 fail** (6283 total across 291 files); +4 tests on top of slice 113's 6269
+- Targeted: `bun test tests/broker/spawn.test.ts` — 51/51
+
+### Next
+
+**R6 fully closed.** Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 P1 leftovers.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 113: broker SIGTERM→SIGKILL escalation + worker SIGTERM once (R6 P1)
 
 **Done.** One-hundred-thirteenth slice. Closes two R6 P1 findings that complete the broker concurrency-cleanup sweep started by slice 102:

@@ -861,6 +861,120 @@ describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)'
   });
 });
 
+// Slice 114 — R6 P1: pre-slice `await proc.stdin.end()` could
+// park if the OS pipe flush didn't surface a clean error when
+// proc exited concurrently. The fix wraps stdin.end in a race
+// against proc.exited — whichever resolves first wins. stdin.end
+// rejections still propagate (preserve the existing
+// stdin-write-failed error path); proc.exited resolving first
+// signals worker died early and the main loop continues to drain.
+describe('createSpawnBroker — stdin.end race against proc.exited (slice 114, R6 P1)', () => {
+  test('normal stdin.end resolves the race cleanly (no regression)', async () => {
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'IFS= read -r line; printf \'{"ok":true,"stdout":"got","stderr":""}\\n\''],
+    });
+    const r = await broker.execute(baseRequest());
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toBe('got');
+    await broker.close();
+  });
+
+  test('stdin.end rejection still routes to stdin-write-failed (preserves existing catch path)', async () => {
+    // A spawn fixture where stdin.end throws synchronously. The
+    // race propagates the rejection, the catch fires, the
+    // canonical error envelope surfaces.
+    let exitResolve: ((n: number) => void) | null = null;
+    const exited = new Promise<number>((resolve) => {
+      exitResolve = resolve;
+    });
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () => ({
+        stdin: {
+          write: () => 1,
+          end: () => {
+            throw new Error('synthetic EPIPE');
+          },
+        },
+        stdout: streamFromString(''),
+        stderr: streamFromString(''),
+        exited,
+        // kill() resolves the exited promise so the catch path's
+        // `await proc.exited` doesn't hang.
+        kill: () => {
+          exitResolve?.(137);
+        },
+      }),
+    });
+    const r = await broker.execute(baseRequest(), { timeoutMs: 1000 });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('stdin write failed');
+    expect(r.error).toContain('synthetic EPIPE');
+    await broker.close();
+  });
+
+  test('proc.exited resolving early lets the main loop continue to drain', async () => {
+    // Worker exits cleanly + emits response before stdin.end
+    // even resolves. The race resolves on proc.exited.then(()
+    // => undefined) without erroring — the main Promise.all
+    // below sees a finished proc and the response gets parsed.
+    let endResolveFn: (() => void) | null = null;
+    const endPromise = new Promise<void>((resolve) => {
+      endResolveFn = resolve;
+    });
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () => ({
+        stdin: {
+          write: () => 1,
+          // end() returns a never-resolving promise, simulating
+          // a wedge that pre-slice would have parked.
+          end: () => endPromise,
+        },
+        stdout: streamFromString('{"ok":true,"stdout":"done","stderr":""}\n'),
+        stderr: streamFromString(''),
+        exited: Promise.resolve(0),
+        kill: () => undefined,
+      }),
+    });
+    const r = await broker.execute(baseRequest(), { timeoutMs: 1000 });
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toBe('done');
+    // Resolve the dangling end() promise so the test cleanup
+    // doesn't leave a pending microtask.
+    endResolveFn?.();
+    await broker.close();
+  });
+
+  test('proc.exited rejection during stdin.end is swallowed (no unhandled rejection)', async () => {
+    // proc.exited rejecting (Bun edge — slice 108 documented)
+    // must NOT surface as an unhandled rejection on the race
+    // branch. The .then(_, _) maps both outcomes to undefined,
+    // so the race resolves and the main Promise.all picks up
+    // the rejection through its own try/catch.
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () => ({
+        stdin: {
+          write: () => 1,
+          end: () => undefined,
+        },
+        stdout: streamFromString(''),
+        stderr: streamFromString(''),
+        exited: Promise.reject(new Error('synthetic exit rejection')),
+        kill: () => undefined,
+      }),
+    });
+    // The call completes (not parks forever). Exact error shape
+    // depends on the main Promise.all surfacing — what matters
+    // is no crash + no hang.
+    const r = await broker.execute(baseRequest(), { timeoutMs: 1000 });
+    expect(r.ok).toBe(false);
+    await broker.close();
+  });
+});
+
 // Slice 113 — R6 P1: pre-slice the broker timeout / abort path
 // sent SIGTERM and waited on proc.exited indefinitely. A worker
 // trapping SIGTERM (`trap "" TERM; sleep 60`) held the broker
