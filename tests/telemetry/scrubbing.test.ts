@@ -35,13 +35,17 @@ const basePermissionEvent = (
 
 describe('scrubEvent — permission.decision (slice 76)', () => {
   test('FS capability scopes are replaced with <path>', () => {
+    // Slice 99 (R10 #51): `exec-fs` was dead code — no such
+    // CapabilityKind exists. The execution kind is `exec` with a
+    // fixed-enum scope (shell/python/node/arbitrary) that carries
+    // no path content. Dropped from the kind list AND from this
+    // fixture.
     const out = scrubEvent(
       basePermissionEvent({
         capabilities: [
           'read-fs:/home/john/secrets.env',
           'write-fs:/Users/jane/proj/db.sqlite',
           'delete-fs:/var/log/x',
-          'exec-fs:/usr/local/bin/script',
           'git-write:/work/private-repo',
         ],
       }),
@@ -50,7 +54,6 @@ describe('scrubEvent — permission.decision (slice 76)', () => {
       'read-fs:<path>',
       'write-fs:<path>',
       'delete-fs:<path>',
-      'exec-fs:<path>',
       'git-write:<path>',
     ]);
   });
@@ -282,5 +285,166 @@ describe('createScrubbingTelemetrySink', () => {
     );
     const event = inner.events()[0] as PermissionDecisionEvent;
     expect(event.capabilities).toEqual(['read-fs:<path>', 'net-egress:<host>']);
+  });
+});
+
+// Slice 99 — R10 scrubbing hardening. Four coordinated fixes
+// land here: secret-access joins the path-axis kinds (#46),
+// net-ingress joins the host-axis kinds (#47), PATH_REGEX
+// covers Windows + tilde shapes alongside posix (#49), and
+// scrubReason now also redacts hosts via URL + IPv4 patterns
+// (#50). The pre-slice `exec-fs` entry in FS_KINDS was dead
+// code — no such CapabilityKind exists — and is removed (#51).
+describe('scrubEvent — slice 99 R10 hardening', () => {
+  test('secret-access scope scrubs as path (R10 #46)', () => {
+    // The scope of a secret-access cap is a vault namespace or
+    // credential path. Pre-slice this leaked verbatim to the
+    // metric stream — an external observer could see WHICH
+    // credential store the operator authorized and target it.
+    const out = scrubEvent(
+      basePermissionEvent({
+        capabilities: [
+          'secret-access:/run/secrets/db_password',
+          'secret-access:vault://prod/api-keys',
+        ],
+      }),
+    ) as PermissionDecisionEvent;
+    expect(out.capabilities).toEqual(['secret-access:<path>', 'secret-access:<path>']);
+  });
+
+  test('net-ingress scope scrubs as host (R10 #47)', () => {
+    // The port number alone reveals service identity (5432 =
+    // postgres, 6443 = k8s API). Pre-slice this passed through.
+    const out = scrubEvent(
+      basePermissionEvent({
+        capabilities: ['net-ingress:5432', 'net-ingress:0.0.0.0:6443'],
+      }),
+    ) as PermissionDecisionEvent;
+    expect(out.capabilities).toEqual(['net-ingress:<host>', 'net-ingress:<host>']);
+  });
+
+  test('Windows-style paths in reason redact (R10 #49)', () => {
+    // C:\Users\foo and UNC \\server\share both leak filesystem
+    // layout. Pre-slice PATH_REGEX matched only posix `/...`.
+    const out = scrubEvent({
+      kind: 'state.transition',
+      ts: 1,
+      from: 'ready',
+      to: 'degraded',
+      reason: 'config at C:\\Users\\admin\\config.toml or \\\\fileserver\\share\\policy.toml',
+    } satisfies StateTransitionEvent) as StateTransitionEvent;
+    expect(out.reason).not.toContain('C:\\Users');
+    expect(out.reason).not.toContain('\\\\fileserver');
+    expect(out.reason).toContain('<path>');
+  });
+
+  test('tilde-rooted paths in reason redact (R10 #49)', () => {
+    // Reasons emitted by operator-quoted shells may carry
+    // unexpanded `~/...` forms. Pre-slice these slipped through.
+    const out = scrubEvent({
+      kind: 'state.transition',
+      ts: 1,
+      from: 'ready',
+      to: 'degraded',
+      reason: 'credential file ~/.ssh/id_rsa unreadable; also ~admin/.aws/credentials',
+    } satisfies StateTransitionEvent) as StateTransitionEvent;
+    expect(out.reason).not.toContain('~/.ssh');
+    expect(out.reason).not.toContain('~admin');
+    expect(out.reason).toContain('<path>');
+  });
+
+  test('URL with scheme in reason redacts as host (R10 #50)', () => {
+    // The original scrubReason ignored hosts entirely; a reason
+    // quoting an internal corp URL leaked infrastructure detail.
+    const out = scrubEvent({
+      kind: 'state.transition',
+      ts: 1,
+      from: 'ready',
+      to: 'degraded',
+      reason: 'fetch from https://internal.corp.example.com/api/secret failed',
+    } satisfies StateTransitionEvent) as StateTransitionEvent;
+    expect(out.reason).not.toContain('internal.corp.example.com');
+    expect(out.reason).toContain('<host>');
+  });
+
+  test('IPv4 address in reason redacts as host', () => {
+    // 192.168.x.y / 10.x.x.x / 172.16-31.x.x are RFC 1918 internal
+    // ranges; surfacing them in metrics leaks the operator's
+    // private network layout to the OTEL backend.
+    const out = scrubEvent({
+      kind: 'state.transition',
+      ts: 1,
+      from: 'ready',
+      to: 'degraded',
+      reason: 'bwrap couldn’t reach 10.0.0.5:5432 (postgres)',
+    } satisfies StateTransitionEvent) as StateTransitionEvent;
+    expect(out.reason).not.toContain('10.0.0.5');
+    expect(out.reason).toContain('<host>');
+  });
+
+  test('host scrubbing honors redactHosts=false (pure host shape)', () => {
+    // Opting out of host redaction preserves bare IPs and bare
+    // hostnames — used by local-only dev loops where the metric
+    // stream doesn't leave the host. URLs containing paths still
+    // get caught under the redactPaths axis (the URL has both a
+    // host AND a path component); to test the host-axis toggle
+    // cleanly, use a bare IPv4 with no path content.
+    const out = scrubEvent(
+      {
+        kind: 'state.transition',
+        ts: 1,
+        from: 'ready',
+        to: 'degraded',
+        reason: 'connect to 10.0.0.5 failed',
+      } satisfies StateTransitionEvent,
+      { redactHosts: false },
+    ) as StateTransitionEvent;
+    expect(out.reason).toContain('10.0.0.5');
+  });
+
+  test('version strings are NOT misclassified as IPv4', () => {
+    // "v1.2.3" has 3 dots but no leading word boundary that
+    // matches the 4-octet pattern. Pin the false-positive
+    // boundary so future tightening of the regex doesn't
+    // regress.
+    const out = scrubEvent({
+      kind: 'state.transition',
+      ts: 1,
+      from: 'ready',
+      to: 'degraded',
+      reason: 'engine version 1.2.3 ready; build 99.99',
+    } satisfies StateTransitionEvent) as StateTransitionEvent;
+    expect(out.reason).toContain('1.2.3');
+    expect(out.reason).toContain('99.99');
+  });
+
+  test('sandbox.degraded_active reason scrubs paths + hosts together', () => {
+    // The slice-92 SandboxDegradedActive event surfaces operator-
+    // facing reasons that often quote both. Verify both axes
+    // fire on a single reason string.
+    const out = scrubEvent({
+      kind: 'sandbox.degraded_active',
+      ts: 1,
+      sessionId: 'sess',
+      reason: 'bwrap at /usr/local/bin/bwrap rejected request from https://corp.example/api',
+      firstEmission: true,
+    }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
+    expect(out.reason).not.toContain('/usr/local/bin/bwrap');
+    expect(out.reason).not.toContain('corp.example');
+  });
+
+  test('exec-fs (removed dead code) no longer scrubs (R10 #51)', () => {
+    // Defensive: ensure a hypothetical `exec-fs:<path>` cap
+    // is NOT scrubbed — the kind isn't real and the entry was
+    // removed from FS_KINDS. A future addition that re-introduces
+    // it would have to land in CapabilityKind first; until then
+    // the scrubber leaves it alone (passes through any unknown
+    // kind unchanged).
+    const out = scrubEvent(
+      basePermissionEvent({
+        capabilities: ['exec-fs:/usr/local/bin/script'],
+      }),
+    ) as PermissionDecisionEvent;
+    expect(out.capabilities).toEqual(['exec-fs:/usr/local/bin/script']);
   });
 });

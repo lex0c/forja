@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 99: telemetry scrubbing hardening (R10 #46/#47/#49/#50/#51)
+
+**Done.** Ninety-ninth slice. Closes five R10 telemetry scrubbing findings — five PII-leak vectors in the metric stream — in one cohesive cut across `src/telemetry/scrubbing.ts`:
+
+- **#46 `secret-access` NOT scrubbed**: the scope of a secret-access capability is a vault namespace or credential file path (`/run/secrets/db_password`, `vault://prod/api-keys`). Pre-slice this leaked verbatim — an external observer scraping the metric stream could see WHICH credential store the operator authorized and target it.
+- **#47 `net-ingress` NOT scrubbed**: port number alone reveals service identity (5432=postgres, 6443=k8s API), and `0.0.0.0:6443` carries bind address detail. Pre-slice this passed through.
+- **#49 PATH_REGEX gaps**: Windows paths (`C:\Users\admin\config.toml`), UNC shares (`\\fileserver\share\policy.toml`), and tilde-rooted paths (`~/.ssh/id_rsa`, `~admin/.aws/credentials`) all slipped past the posix-only `\/[^\s'":\\]{2,}` pattern.
+- **#50 `scrubReason` never redacted hosts**: a reason like "bwrap connection failed to internal.corp.example.com" or "couldn't reach 10.0.0.5:5432 (postgres)" passed through with the internal hostname intact.
+- **#51 `exec-fs` dead code**: listed in FS_KINDS but no such CapabilityKind exists — `exec` capabilities use the kind `exec` with a fixed-enum scope (shell/python/node/arbitrary) that carries no path content. Removed.
+
+### Why this matters
+
+The threat model in `scrubbing.ts`'s header explicitly calls out "redact paths + hosts from capability scopes before they leave the process boundary" and "free-form reasons that may interpolate path strings". Pre-slice the implementation met the first half but had three gaps in the second:
+
+1. `secret-access` carries STRONGLY PII-bearing identity strings — vault paths like `/run/secrets/db_password` are exactly what an adversary scraping the metric stream wants to identify. The scrubber listed FS-shaped kinds but missed this one.
+2. `net-ingress` (port + bind address) wasn't in NET_KINDS. The scope is operationally meaningful infrastructure detail.
+3. `scrubReason` only applied the path regex. Reasons emitted by failing subsystems frequently quote both paths AND hosts ("bwrap binary missing at /usr/local/bin/bwrap" + "rejected from https://corp.example/api"); only the path half was being redacted.
+
+The fix is a coordinated extension of the scrubbing surface: capability-kind sets pick up the two missing kinds, the path regex grows to three independent shapes (posix + windows + tilde), a new pair of host regexes (URLs + IPv4) join the redaction pipeline, and `scrubReason` runs all of them sequenced so each consumes its canonical form without stepping on the others.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/telemetry/scrubbing.ts` | `FS_KINDS` removes `exec-fs` (dead) and adds `secret-access` (path-shaped identity). `NET_KINDS` adds `net-ingress` (port + bind address scrub under host axis). Four new path regexes split posix/windows/unc/tilde shapes; `PATH_REGEX_POSIX` retains the original conservative `>=2` body requirement. Two new host regexes: `URL_REGEX` matches scheme-prefixed URLs (https/ftp/sftp/ssh/file) holistically — the scheme is the discriminator that avoids false positives in version strings; `IPV4_REGEX` matches dotted-quad with optional port. Bare DNS hostnames (`api.github.com`) are intentionally NOT matched — surrounding context (version tuples, package names) is too often legitimate. `scrubReason` runs URL first (so the URL token is consumed whole), then the path shapes (which run only under `redactPaths`), then IPv4 (under `redactHosts`). The two URL passes are idempotent: the placeholder doesn't match the URL regex on a second pass. |
+| `tests/telemetry/scrubbing.test.ts` | Existing `exec-fs` fixture dropped (kind removed). New describe `slice 99 R10 hardening` with 10 tests covering: secret-access scrubs as path, net-ingress scrubs as host, Windows paths redact in reason, tilde-rooted paths redact in reason, URL with scheme redacts as host, IPv4 redacts as host, host-axis toggle preserves bare IP with `redactHosts=false`, version strings (`1.2.3`, `99.99`) NOT misclassified as IPv4, sandbox.degraded_active reason scrubs paths + hosts together, exec-fs no longer scrubs (defensive regression test). |
+
+### Decisions
+
+- **Bare DNS hostnames intentionally NOT redacted in free-form text.** A regex matching `[a-z0-9-]+\.[a-z0-9-]+(\.[a-z0-9-]+)*` would catch `internal.corp.example.com` but also catch `package-name-1.2.3`, version strings, decimal numbers in error messages, and a long tail of false positives. The cost of those false positives is high (operator can't read scrubbed metric labels). The cost of the missed redaction (bare hostnames without scheme) is acceptable: the audit log has the unredacted text for forensic analysis, and the most common operator-quoting context is a URL with a scheme — which the URL regex catches. A future slice can add an opt-in "aggressive host scrub" mode if specific deployments demand it.
+- **URL match runs under BOTH `redactPaths` AND `redactHosts`.** A URL like `https://corp.example/secret/api_key` carries a host AND a path. Either axis being ON should at least partially scrub it. The pre-slice tradeoff (URL host fully visible if `redactPaths` was off) admitted infrastructure leakage that didn't match the spec wording. Now: `redactPaths=false` alone leaves bare IPs/URLs unscrubbed; `redactHosts=false` alone leaves bare IPs unscrubbed but URLs with path components still scrub via the path-axis URL pass. Both off → no redaction (the explicit local-dev opt-out path).
+- **IPv4 with optional port.** `10.0.0.5` AND `10.0.0.5:5432` both scrub. Port-only ingress capability scrubs separately via NET_KINDS. The `:5432` suffix in the IPv4 regex closes the "address + port in free-form text" case that would otherwise miss the port.
+- **`exec-fs` removed, not aliased.** Pre-slice presence in FS_KINDS was harmless (the kind never appears in real capabilities) but misleading — readers of the scrubber thought `exec-fs` was a thing. Removing it AND adding a regression test prevents accidental re-introduction (a future PR adding `exec-fs` to CapabilityKind would have to also update FS_KINDS deliberately).
+- **#48 `SandboxDegradedActiveEvent` emission gap deferred.** The scrubbing handler exists and is wired (slice 92 contract); the gap is that `harness/loop.ts` only emits the event to the harness observer (`safeEmit(config.onEvent, ...)`), never to a telemetry sink. The harness has no `telemetry` field in HarnessConfig today. Closing #48 requires threading a TelemetrySink through HarnessConfig — a wiring change, not a scrubbing fix. Belongs in its own slice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6174 pass / 10 skip / 0 fail** (6184 total across 289 files); +10 tests on top of slice 98's 6164
+- Targeted: `bun test tests/telemetry/` — 41/41
+
+### Next
+
+R10 #48 (`SandboxDegradedActiveEvent` never emitted to telemetry) deferred — needs telemetry sink wiring through HarnessConfig, a substantial cross-cutting change that doesn't belong in a scrubbing-focused slice.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R2 P1 leftovers: bash-parser tree-sitter loop guard (#204), pip-as-npm cosmetic (#205), protected-path flag-prefix bypass (#206), `python -c` refuse (#208).
+- R4 sandbox `hide_paths` / `scrub_env` (substantial across Linux + macOS runners).
+- R5 audit chain atomicity (rotation-rollover write ordering).
+- R6 bootstrap/policy YAML hardening.
+- R8 sandbox wire validation (bwrap stderr / sandbox-exec result checks).
+- R9 broker drain caps.
+- R10 #48 (telemetry sink wiring through HarnessConfig).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 98: bash AST hardening (R2 #196 Unicode + #198 recursion depth + #200 curl -o)
 
 **Done.** Ninety-eighth slice. Closes three R2 P0 findings on the bash AST resolver:

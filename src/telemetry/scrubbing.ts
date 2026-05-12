@@ -41,26 +41,86 @@ import type {
 } from './index.ts';
 
 // Capability-scope kinds whose value-after-colon is a filesystem
-// path. The engine resolvers emit these (see src/permissions/
-// resolvers/fs.ts). `git-write` is included because its scope is
-// typically a repo path or `*`.
-const FS_KINDS = new Set(['read-fs', 'write-fs', 'delete-fs', 'exec-fs', 'git-write']);
+// path or path-shaped identity. The engine resolvers emit these
+// (see src/permissions/resolvers/fs.ts).
+//
+//   - `read-fs` / `write-fs` / `delete-fs` — operator filesystem
+//     paths. PII-bearing.
+//   - `git-write` — repo path or `*`. PII-bearing when it carries
+//     a project root like `/home/op/work/private-monorepo`.
+//   - `secret-access` (slice 99, R10 #46) — vault namespace or
+//     credential file path. STRONGLY PII-bearing — a leaked
+//     secret-access scope tells an external observer which
+//     credential store the operator authorized, and an
+//     adversary scraping the metric stream can target it. The
+//     spec §3.1 declares secret-access scope as "identity (store
+//     name)" — same shape as a path for redaction purposes.
+//
+// `exec-fs` was previously listed but is NOT a real capability
+// kind in `CapabilityKind`. The execution kind is `exec` with a
+// fixed enum scope (`shell` / `python` / `node` / `arbitrary`)
+// — no path content. Slice 99 removes the dead entry (R10 #51).
+const FS_KINDS = new Set(['read-fs', 'write-fs', 'delete-fs', 'git-write', 'secret-access']);
 
 // Capability-scope kinds whose value-after-colon is a network
-// host. Only `net-egress` today; future kinds (net-ingress,
-// dns-resolve) would land here.
-const NET_KINDS = new Set(['net-egress']);
+// host or port (slice 99, R10 #47). `net-egress` carries a host
+// pattern; `net-ingress` carries a port pattern. Both leak
+// infrastructure detail when surfaced to a metric backend (port
+// numbers reveal internal services — 5432=postgres, 6443=k8s
+// API — and bind addresses leak server identity). Both scrub
+// under the same `redactHosts` axis.
+const NET_KINDS = new Set(['net-egress', 'net-ingress']);
 
 const PLACEHOLDER_PATH = '<path>';
 const PLACEHOLDER_HOST = '<host>';
 
 // Path-shaped substrings inside free-form strings (reasons,
-// notes). Matches a leading `/` followed by non-whitespace,
-// non-quote, non-colon chars. Conservative: avoids over-redacting
-// short tokens like `/etc` keys in operator-readable text. Worst
-// case is a missed redaction surfacing in a metric label; the
-// audit log has the unredacted text for forensic analysis.
-const PATH_REGEX = /\/[^\s'":\\]{2,}/g;
+// notes, stderr). Worst case is a missed redaction surfacing in
+// a metric label; the audit log has the unredacted text for
+// forensic analysis. Slice 99 (R10 #49) extends the original
+// posix-only pattern to three independent shapes — applied in
+// sequence so each captures its own canonical form without
+// stepping on the others:
+//
+//   - Posix paths: `\/...` (leading slash + non-whitespace body).
+//   - Windows paths: `C:\Users\foo` (drive letter + colon + back-
+//     slash) AND UNC shares `\\server\share\...`.
+//   - Tilde-rooted paths: `~/...` and `~user/...`. Shells expand
+//     these on execution; the resolver also expands them (slice
+//     97), but operator-quoted free-form text in a reason might
+//     still embed the unexpanded form.
+//
+// Conservative on length: posix and tilde shapes require >= 2
+// non-empty chars after the prefix to avoid over-redacting short
+// tokens like `/etc` written as keys in operator-readable text.
+const PATH_REGEX_POSIX = /\/[^\s'":\\]{2,}/g;
+const PATH_REGEX_WINDOWS = /[A-Za-z]:[\\/][^\s'":<>|]+/g;
+const PATH_REGEX_UNC = /\\\\[^\s'":<>|]+/g;
+const PATH_REGEX_TILDE = /~[A-Za-z0-9_-]*\/[^\s'":\\]+/g;
+
+// Host-shaped substrings inside free-form strings (slice 99,
+// R10 #50). Pre-slice `scrubReason` only redacted paths — a
+// reason like "bwrap connection failed to internal.corp.example
+// .com:8080" passed through with the internal hostname intact.
+// Two independent shapes:
+//
+//   - Explicit URLs with scheme: `https://internal.corp/path`,
+//     `ssh://host`, `file://...`. Matched holistically — the
+//     scheme prefix is the discriminator that avoids false
+//     positives in version strings ("v1.2.3" has dots but no
+//     scheme).
+//   - IPv4 dotted-quad: `192.168.1.1`. Bounded to four octets
+//     so version strings ("99.99") and decimals ("3.14.15")
+//     don't trigger.
+//
+// Bare DNS hostnames (`api.github.com` with no scheme) are
+// intentionally NOT matched — the surrounding context is too
+// often legitimate (version tuples, package names with dots).
+// Falling back to the audit log for those is acceptable; the
+// metric label loses fidelity but doesn't gain false-positive
+// redaction noise that would hide real signals.
+const URL_REGEX = /\b(?:https?|ftps?|sftp|ssh|file):\/\/[^\s'"<>\]\)]+/gi;
+const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g;
 
 export interface ScrubOptions {
   // Redact path scopes in capability strings + path-shaped
@@ -88,8 +148,31 @@ const scrubCapability = (cap: string, opts: Required<ScrubOptions>): string => {
 };
 
 const scrubReason = (text: string, opts: Required<ScrubOptions>): string => {
-  if (!opts.redactPaths) return text;
-  return text.replace(PATH_REGEX, PLACEHOLDER_PATH);
+  let scrubbed = text;
+  if (opts.redactPaths) {
+    // Apply each path shape independently. Order matters when
+    // patterns can overlap: URLs (matched below under redactHosts)
+    // contain `/` characters that would otherwise be partially
+    // chewed by `PATH_REGEX_POSIX`. Running URLs FIRST consumes
+    // the whole scheme://path token before the posix matcher
+    // sees it. The runtime cost is small — each regex scans the
+    // already-reduced string left over by the previous pass.
+    scrubbed = scrubbed.replace(URL_REGEX, PLACEHOLDER_HOST);
+    scrubbed = scrubbed.replace(PATH_REGEX_WINDOWS, PLACEHOLDER_PATH);
+    scrubbed = scrubbed.replace(PATH_REGEX_UNC, PLACEHOLDER_PATH);
+    scrubbed = scrubbed.replace(PATH_REGEX_TILDE, PLACEHOLDER_PATH);
+    scrubbed = scrubbed.replace(PATH_REGEX_POSIX, PLACEHOLDER_PATH);
+  }
+  if (opts.redactHosts) {
+    // URLs already redacted above under the path axis — running
+    // again is idempotent (the placeholder doesn't match the
+    // scheme regex). IPv4 stays here because it's purely a host
+    // axis: a reason like "192.168.1.10:5432" carries no path
+    // shape but should still scrub.
+    scrubbed = scrubbed.replace(URL_REGEX, PLACEHOLDER_HOST);
+    scrubbed = scrubbed.replace(IPV4_REGEX, PLACEHOLDER_HOST);
+  }
+  return scrubbed;
 };
 
 const scrubPermissionDecision = (
