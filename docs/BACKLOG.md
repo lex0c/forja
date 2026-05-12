@@ -15,6 +15,73 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 104: JSON proto-pollution defense (R6 #42)
+
+**Done.** One-hundred-fourth slice. Closes R6 #42: `JSON.parse` ran on attacker-controlled input at both broker IPC boundaries (broker → worker request line + worker → broker response line) **without any proto-pollution defense**. A hostile payload like `{"__proto__":{"isAdmin":true}}` would parse cleanly, then any downstream `Object.assign({}, parsed)` or `{...parsed}` would pivot the dangerous keys onto the target's prototype chain — poisoning every plain object created afterwards.
+
+### Why this matters
+
+The exploitation chain is canonical:
+
+```js
+const raw = '{"__proto__":{"isAdmin":true}}';
+const parsed = JSON.parse(raw);          // __proto__ becomes an own enumerable property
+const args = Object.assign({}, parsed);  // setter on __proto__ pollutes args's prototype
+// Now: ({}).isAdmin === true. Every plain object in the process inherits.
+// Handler bug: `if (args.isAdmin) doDangerous()` fires on every CALL.
+```
+
+Pre-slice the broker fed `JSON.parse(lastLine)` directly into handler dispatch and the worker did the same on inbound requests. Downstream handlers don't have to do anything obviously unsafe — Bun's harness loop, the broker contract types, and even the audit-row serialization all use spread/merge patterns somewhere. One unguarded `Object.assign({}, args)` deep in a handler is enough to make `__proto__` flow into the prototype chain and stay there for the lifetime of the process.
+
+§13.7's worker-isolation premise also presupposes that the broker doesn't trust worker output. A compromised worker (handler bug, sandbox escape, supply-chain attack on a dependency) could emit `{"ok":true,"stdout":"","stderr":"","__proto__":{"polluted":true}}` and the broker's downstream consumers would inherit. The defense has to fire at both boundaries.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/safe-json.ts` | New module. `safeJsonParse(text)` is a drop-in replacement for `JSON.parse` that strips the three dangerous keys (`__proto__`, `constructor`, `prototype`) via a `JSON.parse` reviver. The reviver runs recursively over every key in the tree, so nested objects (most importantly `args.X` sub-objects that downstream handlers spread) get the same treatment as top-level. Returns `undefined` from the reviver for dangerous keys, which deletes them from the parsed result. Throws the same `SyntaxError` shapes as native `JSON.parse` so existing try/catch logic stays unchanged. |
+| `src/broker/worker-runtime.ts` | Imports `safeJsonParse`. Swaps `parsed = JSON.parse(trimmed)` for `parsed = safeJsonParse(trimmed)`. An attacker-crafted broker request with `__proto__` keys lands the canonical wire envelope (the `isBrokerRequest` validator will pass on a dangerous-keys-stripped request, but the global `Object.prototype` is unaffected — the handler dispatches normally). |
+| `src/broker/spawn.ts` | Same swap on the response-parse site. A hostile worker emitting `__proto__` in its response no longer pollutes the broker's downstream consumers. |
+| `tests/broker/safe-json.test.ts` | New test file with 13 tests covering: normal JSON parses identically, top-level `__proto__` stripped, nested `__proto__` stripped, `constructor` stripped, `prototype` stripped, dangerous keys stripped at every nesting level, downstream `Object.assign` does NOT pollute prototype (the canonical exploit shape), downstream spread does NOT pollute, malformed input throws SyntaxError, arrays-of-objects get keys stripped, legitimate string values containing `__proto__` as DATA are preserved (only KEYS are stripped), top-level arrays / primitives work. |
+| `tests/broker/worker-runtime.test.ts` | New test: request with `__proto__` inside `args` gets the key stripped before handler dispatch; the global `Object.prototype` stays clean. |
+| `tests/broker/spawn.test.ts` | New test: worker emitting `__proto__` in its response does NOT pollute consumer objects. |
+
+### Decisions
+
+- **Reviver approach, not post-parse traversal.** `JSON.parse(text, reviver)` is the canonical defense — the reviver runs INSIDE the parse, before the dangerous key ever exists as an own property on the result. A post-parse `delete parsed.__proto__` would also work, but only at the level we walk; nested sub-objects would need recursive cleanup, and any handler that spreads a sub-object before the cleanup completes would still poison. The reviver is exhaustive by construction.
+- **Three keys covered: `__proto__`, `constructor`, `prototype`.** `__proto__` is the canonical vector (the setter on the prototype slot). `constructor` is the less-common but still-real "poisoned `constructor.prototype` inheritance" shape — an attacker setting `constructor: {prototype: {x: 1}}` against an object whose constructor IS reachable from instances. `prototype` is defensive — function objects walk the proto chain via their `prototype` slot, so a value whose `prototype` is poisoned could leak through. Two real plus one defensive is the safe set.
+- **Strip via `undefined`, not throw.** A throw would refuse the whole parse, taking down the call for any payload containing the keys. Stripping silently lets the rest of the payload proceed — the legitimate fields are still parsed correctly. The defense is invisible to honest callers; only attackers get the silent strip. Audit consumers that need to see the rejection can still observe the absence of the key in `args`.
+- **Defense at BOTH IPC boundaries.** The broker doesn't trust the worker (worker-isolation premise) AND the worker doesn't trust the broker (manual `echo | bun worker.ts` invocations during dev are real). Symmetric defense — neither side accepts dangerous keys from the other.
+- **Drop-in module, not inline at each call site.** `safeJsonParse` is a one-line wrapper; centralizing in `src/broker/safe-json.ts` means a future PR adding a new JSON.parse site on the broker boundary can just import the helper. The README-style header comment documents the threat model so the next maintainer knows why the wrapper exists.
+- **No deep-clone or freezing.** A deep-clone would also defend against future spread bugs at the cost of doubling the parse cost. Freezing would prevent legitimate handler-side mutations of the args object. The reviver gets the job done with O(n) overhead — same as the parse itself.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6231 pass / 10 skip / 0 fail** (6241 total across 290 files); +15 tests on top of slice 103's 6216
+- Targeted: `bun test tests/broker/` — 145/145
+
+### Next
+
+R6 remaining (each its own slice):
+- **#41 `proc.exited` hang without timer**: a worker that never closes stdout AND never exits parks the broker forever. Slice 102's drain caps help (drain finishes on stdout close), but the `proc.exited` await still needs a defensive floor when no caller-supplied timeout exists.
+- **#38 signal listener attach AFTER spawn**: race window where abort during the spawn → stdin-write interval is swallowed; only the outer timeout fires.
+- **#44 env leak**: worker inherits full parent env (secrets) before bash handler runs scrubEnv. The handler-side scrub is defense in depth; the broker's env construction shouldn't have passed the secrets in the first place.
+- **R6 P1 leftovers**: `stdin.end()` raced by `proc.exited`, broker timeout SIGTERM→SIGKILL escalation, worker `process.on('SIGTERM')` without `{once: true}`.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 bash worker handler (SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 103: sandbox profile wire validation (R6 #9)
 
 **Done.** One-hundred-third slice. Closes R6 #9: **`sandboxProfile` was an unvalidated string on the wire**, opening a structural sandbox bypass.

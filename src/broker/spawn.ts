@@ -47,6 +47,7 @@
 //   - worker emits valid response  → response returned verbatim (worker is the source of truth)
 
 import type { TelemetrySink, WorkerCrashEvent } from '../telemetry/index.ts';
+import { safeJsonParse } from './safe-json.ts';
 import type { Broker, BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 // The subprocess shape the broker depends on. Narrower than
@@ -508,7 +509,12 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(lastLine);
+      // Slice 104 (R6 #42): worker → broker response line is
+      // attacker-controlled (a compromised worker emits whatever
+      // it wants). `safeJsonParse` strips proto-pollution keys
+      // via reviver so downstream code holding the BrokerResponse
+      // doesn't inherit poisoned prototypes via spread/merge.
+      parsed = safeJsonParse(lastLine);
     } catch (e) {
       emitCrash({
         kind: 'worker.crashed',

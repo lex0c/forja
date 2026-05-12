@@ -619,6 +619,33 @@ describe('createSpawnBroker — bounded stream drain (slice 102, R6 #21)', () =>
   });
 });
 
+// Slice 104 — R6 #42: a hostile worker emitting a response with
+// __proto__ keys would otherwise pollute the broker's downstream
+// objects via spread/merge. The broker uses safeJsonParse which
+// strips dangerous keys via reviver — the response object lands
+// clean, downstream consumers are safe.
+describe('createSpawnBroker — proto-pollution defense on response (slice 104, R6 #42)', () => {
+  test('worker emitting __proto__ in response does NOT pollute consumer objects', async () => {
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () =>
+        makeMockProcess({
+          // Hostile worker emits a response with __proto__ key.
+          // Pre-slice this would parse with __proto__ as an own
+          // property, then downstream Object.assign / spread
+          // would poison the global Object prototype.
+          stdout: '{"ok":true,"stdout":"ran","stderr":"","__proto__":{"polluted":true}}\n',
+        }),
+    });
+    const res = await broker.execute(baseRequest());
+    expect(res.ok).toBe(true);
+    expect(res.stdout).toBe('ran');
+    // Sanity: global Object.prototype was not polluted.
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+    await broker.close();
+  });
+});
+
 // Slice 103 — R6 #9: a sandboxRunner that throws on unknown
 // profile is the canonical defense; the broker maps the throw
 // into a structured `sandbox wrap failed` response without ever

@@ -52,6 +52,7 @@
 // this is paranoia, not requirement.
 
 import { isSandboxProfile } from '../permissions/sandbox-plan.ts';
+import { safeJsonParse } from './safe-json.ts';
 import type { BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 export interface WorkerToolHandler {
@@ -165,7 +166,11 @@ export const runWorker = async (options: RunWorkerOptions): Promise<void> => {
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(trimmed);
+    // Slice 104 (R6 #42): `safeJsonParse` strips `__proto__` /
+    // `constructor` / `prototype` keys via reviver so downstream
+    // patterns that spread or merge `parsed.args` don't pivot
+    // attacker-controlled prototype data into the global chain.
+    parsed = safeJsonParse(trimmed);
   } catch (e) {
     emit(
       options.output,

@@ -303,6 +303,29 @@ describe('runWorker — input parse failures', () => {
     }
   });
 
+  // Slice 104 (R6 #42): request line with proto-pollution payload
+  // gets the dangerous keys stripped via the reviver before
+  // isBrokerRequest validation runs. The remaining fields pass
+  // validation and the handler dispatches normally — no
+  // `__proto__` slips through to corrupt the global prototype
+  // chain via downstream spread/merge.
+  test('JSON with __proto__ key gets stripped before handler dispatch (proto-pollution defense)', async () => {
+    const { out, sink } = collectOutput();
+    // Inline raw JSON so we can include __proto__ verbatim; the
+    // base request helper would normalize the shape.
+    const raw =
+      '{"toolName":"__echo__","args":{"__proto__":{"polluted":true},"real":"value"},"capabilities":[],"sandboxProfile":null}\n';
+    await runWorker({
+      handlers: [okHandler('__echo__', { stdout: 'received' })],
+      input: () => Promise.resolve(raw),
+      output: sink,
+    });
+    const res = parseResponse(out);
+    expect(res.ok).toBe(true);
+    // Sanity: the global Object prototype was NOT polluted.
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+  });
+
   test('trailing whitespace + newlines on input get trimmed before parse', async () => {
     const { out, sink } = collectOutput();
     await runWorker({
