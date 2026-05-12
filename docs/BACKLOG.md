@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 122: sandbox-skip symlink + permission hardening (R9 P0)
+
+**Done.** One-hundred-twenty-second slice. Closes three R9 findings clustered in `src/cli/sandbox-skip.ts` — the §13.5 marker file that suppresses the first-boot sandbox prompt for operators who acknowledged unsafe-mode posture via `--i-know-what-im-doing`. The marker is UX-only (engine enforcement is unaffected), but its read/write paths were the weakest link in the welcome flow: an attacker who could plant a symlink at the marker path silenced the prompt indefinitely, AND the file's 0644 default mode leaked the marker's presence to other users on multi-tenant hosts.
+
+### Findings closed
+
+| # | Severity | Symptom | Fix |
+|---|---|---|---|
+| 23 | P0 | `hasSandboxSkip` uses `existsSync` (follows symlinks); `ln -s /dev/null ~/.config/forja/sandbox_skip` silences the welcome prompt without the operator ever running `--i-know-what-im-doing` | Switch to `lstatSync`; refuse non-regular-file inodes |
+| 24 | P0 | Marker file mode 0644 (default from `writeFileSync`); multi-tenant host can probe whether `--i-know-what-im-doing` was ever used | Explicit mode `0600` via `openSync` with mode argument; parent dir mode `0700` |
+| 45 | P0 | TOCTOU between `existsSync` check and `writeFileSync`: attacker plants symlink in the window → `writeFileSync` follows the link, writing marker body to attacker-chosen target | Atomic `openSync(path, O_WRONLY \| O_CREAT \| O_EXCL \| O_NOFOLLOW, 0o600)`: EEXIST on race, ELOOP on symlink — either way fails loud, never writes to follower target |
+
+All three are interdependent: a symlink-resistant *read* needs a symlink-resistant *write*, and both need the file/dir modes locked down so the marker's presence isn't probeable.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/sandbox-skip.ts` | Rewritten. `SandboxSkipFs` injectable seam now exposes three primitives: `lstat` (no symlink follow), `mkdir(path, mode)`, `createExclusive(path, content, mode)` (atomic with `O_EXCL` + `O_NOFOLLOW`). Production defaults wire `node:fs` with `constants.O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`. `MARKER_FILE_MODE = 0o600`, `MARKER_DIR_MODE = 0o700`. `hasSandboxSkip` calls `st.isFile() && !st.isSymbolicLink()`; ENOENT returns false, all other errors propagate (no silent fallthrough on EACCES). `createSandboxSkip` checks lstat first — regular file → idempotent no-op, symlink/dir → refuse with descriptive error, ENOENT → proceed to atomic create. |
+| `tests/cli/sandbox-skip.test.ts` | Reshaped to the new seam. +8 new tests across 3 describes: `hasSandboxSkip` symlink/dir/EACCES branches; `createSandboxSkip — happy path` now asserts both modes (0700 parent, 0600 file); `createSandboxSkip — symlink attack defense (slice 122)` covers symlink-at-create-time refuse, ELOOP propagation from atomic open, EEXIST propagation on race, non-ENOENT lstat error propagation. |
+
+### Decisions
+
+- **`lstat` rejects non-regular-file inodes, not just symlinks.** Defending only against symlinks misses other footguns: directory at the marker path, FIFO, socket. The check `st.isFile() && !st.isSymbolicLink()` covers all of them. The `!isSymbolicLink()` is technically redundant with `isFile()` (a symlink can't also be a regular file via lstat), but pinning both is cheap and self-documenting.
+- **Non-ENOENT lstat errors propagate; no silent fallthrough.** Pre-slice an EACCES on the marker path (operator chmod-ed `~/.config/forja` weirdly) was indistinguishable from "marker absent" — the welcome prompt fired with no diagnostic. Now it propagates so the operator sees the underlying issue. Same posture in `createSandboxSkip`.
+- **Refuse to overwrite a non-regular-file at the marker path.** When `createSandboxSkip` finds a symlink (or dir) where the marker should be, it throws an error rather than silently removing the symlink and creating fresh. Removing implicitly would be a confused-deputy escalation — we'd be deleting an attacker-planted symlink which might point ANYWHERE (`/etc/passwd`, `~/.ssh/authorized_keys`). The operator must inspect + remove manually. Defensive but conservative.
+- **No fallback retry on EEXIST.** When `createExclusive` fails with EEXIST (genuine race between two forja processes), we could re-stat and treat as idempotent-already-present. We don't — the race is rare enough that propagating the error and letting the operator re-run is simpler than chasing the resulting "is the marker valid now?" logic.
+- **`mkdir` does NOT update mode of an existing directory.** `mkdirSync(p, { recursive: true, mode })` only applies `mode` to newly-created leaf segments; if `~/.config/forja` already exists with mode 0755, slice 122 does NOT tighten it. Rationale: the dir may be shared with other forja-related tooling and changing its mode could break operator workflows. The marker FILE's 0600 already prevents content read; dir mode is defense in depth.
+- **Atomic open uses `openSync` + `writeSync` + `closeSync`, not `writeFileSync`.** `writeFileSync` doesn't accept `O_EXCL | O_NOFOLLOW` flags directly — its `flag` option accepts `'wx'` (= `O_EXCL`) but not `'wxn'` (there's no shorthand for O_NOFOLLOW). Dropping to the numeric flag form via `openSync` gives full control. The cost is a 3-call sequence with explicit error handling; `writeSync` could partially write on signal interruption, but for a sub-1-KB body that's not a real concern.
+- **Did NOT add ownership check via `fstat`+`geteuid`.** Linux-only; macOS path differs slightly; Windows isn't supported. A future slice could add `if (st.uid !== process.getuid()) throw` after the lstat, defending against root-planted symlinks. Slice 122 prioritized the cross-platform shape; ownership check is its own follow-up.
+
+### Trap navigated
+
+- **TypeScript narrowed `let content: string | null = null` and never widened on lambda assignment.** Initial test for "content body warns" used `let content: string | null = null; createExclusive: (_p, c) => { content = c }; expect(content).toContain(...)`. TypeScript reports the post-call `content` as type `null` because it can't prove the lambda ran. Fixed by boxing into `const captured = { content: null as string | null }` — the box is mutable, the lambda assigns into it, and `captured.content` keeps the wider type.
+- **Biome `organizeImports` rule was emitting as an error.** Pre-slice the imports were `lstatSync, mkdirSync, openSync, writeSync, closeSync, constants` in declaration order. Biome wanted alphabetical. The fix was mechanical (`bun run lint:fix` sorted them) but the lint output briefly looked like a regression — actually a slice-introduced ordering issue, not a pre-existing rule severity bump.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from prior slices)
+- `bun test` — **6352 pass / 10 skip / 0 fail** (6362 total across 291 files); +8 tests on top of slice 121's 6344
+- Targeted: `bun test tests/cli/sandbox-skip.test.ts tests/cli/welcome.test.ts` — 32/32 (welcome.ts caller unaffected — uses only the `env` parameter)
+
+### Next
+
+R9 P0 progress: 3 of 3 sandbox-skip findings closed. Remaining R9:
+- **P0 #10** — §13.4/§13.5 interactive menu NOT implemented (sandbox-setup + welcome). This is a **spec-vs-code design decision**: either implement the dual-confirm protocol (`[1] Show / [2] Run install (--yes + ci_mode_acknowledged) / [3] Continue unsafe (writes unsafe_mode_acknowledged_at) / [4] Cancel`) per spec §13.4/§13.5, OR PR the spec to declare info-only. Deferred until the design choice is settled.
+- **P1**: doctor `dirWritable` false-positive on chmod 0500; doctor 60s cache for non-critical checks not implemented; `--i-know-what-im-doing` accepted top-level silently; welcome output doesn't show marker timestamp; doctor `macLsmCheck` AppArmor disabled-kernel-module case.
+
+R-bucket status: R1 ✓, R2 ✓, R4 ✓, R5 ✓, R6 ✓, R7 ✓, R8 ✓, R10 ✓, R11 ✓, R12 partial, R9 partial (3/8 closed; remaining 1 P0 design decision + 5 P1).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 121: in-process broker contract hardenings (R5, closes)
 
 **Done.** One-hundred-twenty-first slice. Closes R5 — the in-process broker had six findings clustered in `src/broker/in-process.ts` (one file, ~100 lines pre-slice). Each was small in isolation; bundled because the fixes interact (composed AbortSignals serve both close() and timeoutMs). Three P0 + three P1, fully drained.

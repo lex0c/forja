@@ -18,10 +18,44 @@
 // Out of scope: bypassing policy / sandbox enforcement at
 // runtime. The marker is UX-only — the engine's degraded state +
 // confirm-on-every-call posture is unaffected.
+//
+// Slice 122 (R9 P0 #23/#24/#45) hardenings:
+//
+//   - `hasSandboxSkip` uses `lstat` instead of `existsSync`,
+//     refusing symlinks. Pre-slice an attacker who could plant
+//     a symlink at `~/.config/forja/sandbox_skip` pointing to
+//     any existing file (e.g., /dev/null) would silence the
+//     first-boot prompt without the operator ever running
+//     `--i-know-what-im-doing` — the read-only check followed
+//     the symlink and reported "marker present".
+//
+//   - `createSandboxSkip` opens the marker with `O_EXCL` +
+//     `O_NOFOLLOW` + mode `0600` (was implicit 0644 via
+//     writeFileSync). Pre-slice the TOCTOU between
+//     `existsSync` and `writeFileSync` allowed a symlink to be
+//     substituted in the window; writeFileSync then followed
+//     the symlink, writing the marker body to whatever path
+//     the attacker chose. The atomic open closes the window
+//     (O_EXCL fails on race; O_NOFOLLOW fails on symlink).
+//
+//   - Parent directory `~/.config/forja/` created with mode
+//     `0700` (was 0777-minus-umask). On multi-tenant hosts,
+//     0755+ exposes the marker's existence to other users.
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { constants, closeSync, lstatSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+// File mode for the marker — owner read/write only. Multi-tenant
+// hosts: other users can't probe whether `--i-know-what-im-doing`
+// has ever been used.
+const MARKER_FILE_MODE = 0o600;
+
+// Directory mode for `~/.config/forja/` — owner-only. Prevents
+// other users from listing the dir (which would reveal the
+// marker's presence even with file-mode 0600).
+const MARKER_DIR_MODE = 0o700;
 
 // Path to the marker file. Honors `$XDG_CONFIG_HOME` per
 // freedesktop spec; falls back to `$HOME/.config` (env-provided
@@ -39,30 +73,107 @@ export const sandboxSkipPath = (env: NodeJS.ProcessEnv = process.env): string =>
   return join(home, '.config', 'forja', 'sandbox_skip');
 };
 
-// True iff the marker exists. Read-only — no probing of contents.
-// The file's mere presence is the signal; contents are
-// operator-readable diagnostics (timestamp, version), not
-// machine-readable state.
+// Filesystem primitives that touch the marker. The injectable
+// shape lets tests substitute in-memory implementations while
+// production wires up `node:fs` with symlink-defended flags.
+//
+// All primitives operate on the ABSOLUTE marker path. They MUST
+// NOT follow symlinks — `lstat` returns symlink info as-is and
+// `createExclusive` uses `O_NOFOLLOW`. Tests overriding these
+// seams should preserve those semantics.
+export interface SandboxSkipFs {
+  // Stat the path WITHOUT following symlinks. Throw an
+  // `ErrnoException` with `code === 'ENOENT'` when the path
+  // doesn't exist. Any other error (EACCES, permissions, etc.)
+  // is propagated by callers.
+  lstat?: (path: string) => Stats;
+  // Create the parent directory (idempotent). `mode` is applied
+  // to the leaf segment; intermediate dirs use the OS default.
+  // `recursive` semantics: no-op when target exists.
+  mkdir?: (path: string, mode: number) => void;
+  // Atomic create-and-write. MUST fail with EEXIST if `path`
+  // already exists and MUST fail with ELOOP if `path` is a
+  // symlink (i.e., open with `O_EXCL | O_NOFOLLOW`). `mode`
+  // is the creation mode for the new file.
+  createExclusive?: (path: string, content: string, mode: number) => void;
+}
+
+const defaultLstat = lstatSync;
+const defaultMkdir = (path: string, mode: number): void => {
+  mkdirSync(path, { recursive: true, mode });
+};
+const defaultCreateExclusive = (path: string, content: string, mode: number): void => {
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+  const fd = openSync(path, flags, mode);
+  try {
+    writeSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
+};
+
+// Resolve a node:fs ErrnoException-like error's `code`. Errors
+// from `node:fs` carry a string `code` property (e.g., 'ENOENT',
+// 'EEXIST', 'ELOOP'). Tests may throw plain Errors without code;
+// helper coerces uniformly.
+const errnoCode = (e: unknown): string | undefined => {
+  if (e instanceof Error && 'code' in e) {
+    const c = (e as NodeJS.ErrnoException).code;
+    return typeof c === 'string' ? c : undefined;
+  }
+  return undefined;
+};
+
+// True iff the marker exists AS A REGULAR FILE. Symlinks at
+// the marker path return false — the operator never ran
+// `--i-know-what-im-doing`, so the welcome prompt must fire.
+//
+// ANY error other than ENOENT propagates. We deliberately do
+// NOT swallow EACCES / EIO / etc. — those indicate the operator
+// has a permissions or storage issue worth surfacing instead of
+// silently falling through to "marker absent → prompt".
 export const hasSandboxSkip = (
-  options: { env?: NodeJS.ProcessEnv; exists?: (path: string) => boolean } = {},
+  options: { env?: NodeJS.ProcessEnv; fs?: SandboxSkipFs } = {},
 ): boolean => {
   const env = options.env ?? process.env;
-  const exists = options.exists ?? existsSync;
-  return exists(sandboxSkipPath(env));
+  const lstat = options.fs?.lstat ?? defaultLstat;
+  const path = sandboxSkipPath(env);
+  let st: Stats;
+  try {
+    st = lstat(path);
+  } catch (e) {
+    if (errnoCode(e) === 'ENOENT') return false;
+    throw e;
+  }
+  // Refuse symlinks, directories, sockets, etc. — only a regular
+  // file counts as the marker. A symlink-shaped attack
+  // (`ln -s /dev/null ~/.config/forja/sandbox_skip`) would have
+  // silenced the prompt pre-slice; now it returns false and
+  // welcome re-prompts.
+  return st.isFile() && !st.isSymbolicLink();
 };
 
 // Create the marker file. Idempotent — re-creating an existing
-// marker is a no-op (timestamps stay). Body carries a human-
-// readable acknowledgment so operators inspecting the file can
-// see WHEN + by which forja version it was created.
+// regular-file marker is a no-op (timestamps stay). Body carries
+// a human-readable acknowledgment so operators inspecting the
+// file can see WHEN + by which forja version it was created.
 //
-// Test seams: `env`, `ensureDir`, `write`, `now`. Production
-// callers leave them undefined.
+// Symlink defense: if the marker path is occupied by a SYMLINK
+// (or any non-regular-file), throws an error rather than
+// silently overwriting. The operator must inspect + delete
+// manually before re-running `--i-know-what-im-doing` — a
+// symlink at this path is a strong signal of compromise (or
+// operator self-inflicted misconfiguration).
+//
+// Atomic create: even between the lstat-says-absent check and
+// the openSync, an attacker could plant a symlink. The
+// `O_EXCL | O_NOFOLLOW` open closes the TOCTOU window — EEXIST
+// on race (file appeared), ELOOP on symlink (planted between
+// our checks). Either way the call fails loud rather than
+// writing to an attacker-chosen path.
 export interface CreateSandboxSkipOptions {
   env?: NodeJS.ProcessEnv;
-  ensureDir?: (dir: string) => void;
-  write?: (path: string, content: string) => void;
-  exists?: (path: string) => boolean;
+  fs?: SandboxSkipFs;
   now?: () => number;
   engineVersion?: string;
 }
@@ -71,15 +182,35 @@ export const createSandboxSkip = (
   options: CreateSandboxSkipOptions = {},
 ): { path: string; created: boolean } => {
   const env = options.env ?? process.env;
-  const ensureDir = options.ensureDir ?? ((d) => mkdirSync(d, { recursive: true }));
-  const write = options.write ?? ((p, c) => writeFileSync(p, c, 'utf-8'));
-  const exists = options.exists ?? existsSync;
+  const lstat = options.fs?.lstat ?? defaultLstat;
+  const mkdir = options.fs?.mkdir ?? defaultMkdir;
+  const createExclusive = options.fs?.createExclusive ?? defaultCreateExclusive;
   const now = options.now ?? Date.now;
   const path = sandboxSkipPath(env);
-  if (exists(path)) {
-    return { path, created: false };
+
+  // Idempotency + symlink-attack check. lstat returns the
+  // symlink itself (no follow), so a planted symlink shows up
+  // as `isSymbolicLink() === true` and we refuse to overwrite.
+  try {
+    const st = lstat(path);
+    if (st.isFile() && !st.isSymbolicLink()) {
+      return { path, created: false };
+    }
+    throw new Error(
+      `sandbox_skip path '${path}' exists but is not a regular file (symlink / directory / other); refusing to overwrite — inspect and remove manually`,
+    );
+  } catch (e) {
+    // ENOENT is the expected "marker doesn't exist yet" branch.
+    // Any other error (including the refuse above) propagates.
+    if (errnoCode(e) !== 'ENOENT') throw e;
   }
-  ensureDir(dirname(path));
+
+  // Create parent dir with owner-only mode. mkdir with
+  // recursive:true is idempotent — no-op when present (mode of
+  // an existing dir is NOT updated, by design; we don't want to
+  // surprise operators whose `~/.config/` is shared via group).
+  mkdir(dirname(path), MARKER_DIR_MODE);
+
   const ts = new Date(now()).toISOString();
   const version = options.engineVersion ?? 'unknown';
   const body = [
@@ -93,6 +224,11 @@ export const createSandboxSkip = (
     '# prompt. Does NOT bypass engine enforcement at runtime.',
     '',
   ].join('\n');
-  write(path, body);
+
+  // Atomic open with O_EXCL | O_NOFOLLOW | mode 0600. Closes
+  // the TOCTOU window between the lstat above and the actual
+  // write: a symlink planted in this window fails ELOOP; a
+  // racing concurrent create fails EEXIST.
+  createExclusive(path, body, MARKER_FILE_MODE);
   return { path, created: true };
 };
