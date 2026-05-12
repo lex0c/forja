@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { isSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 import { buildBwrapArgv, maybeWrapSandboxArgv } from '../../src/permissions/sandbox-runner.ts';
 
 const INNER = ['bash', '-c', 'echo hi'] as const;
@@ -289,5 +290,119 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       });
       expect(argv[2]).toContain('(allow network*)');
     });
+  });
+});
+
+// Slice 103 — R6 #9: maybeWrapSandboxArgv accepted any string as
+// profile (TS cast erased at runtime). An attacker passing `'host'`
+// or any unknown string in a BrokerRequest pivoted through the
+// platform fallback into an unsandboxed exec. Slice 103 validates
+// enum membership at the gate and throws on unknown values.
+describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
+  test('valid profiles still wrap normally (no regression)', () => {
+    for (const profile of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
+      const argv = maybeWrapSandboxArgv({
+        profile,
+        cwd: CWD,
+        innerArgv: INNER,
+        platform: 'linux',
+        which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+      });
+      expect(argv[0]).toBe('bwrap');
+    }
+  });
+
+  test("'host' still passes through (intentional passthrough)", () => {
+    // host is a real enum member — operator-opted-in passthrough.
+    // Validation accepts it; the runner short-circuits to
+    // innerArgv (the existing branch). The defense is against
+    // UNKNOWN strings, not against host itself (the engine is
+    // responsible for only emitting host when authorized).
+    const argv = maybeWrapSandboxArgv({
+      profile: 'host',
+      cwd: CWD,
+      innerArgv: INNER,
+      platform: 'linux',
+    });
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('undefined profile passes through (no-sandbox-requested shape)', () => {
+    const argv = maybeWrapSandboxArgv({
+      cwd: CWD,
+      innerArgv: INNER,
+      platform: 'linux',
+    });
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('unknown string profile throws with enum list', () => {
+    // An attacker-crafted profile pre-slice would pivot through
+    // the platform fallback and emerge unsandboxed. Now it
+    // throws; the broker maps to `sandbox wrap failed: ...`.
+    expect(() =>
+      maybeWrapSandboxArgv({
+        profile: 'attacker',
+        cwd: CWD,
+        innerArgv: INNER,
+        platform: 'linux',
+        which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+      }),
+    ).toThrow(/unknown profile 'attacker'/);
+  });
+
+  test('error message lists every supported profile', () => {
+    try {
+      maybeWrapSandboxArgv({
+        profile: 'nope',
+        cwd: CWD,
+        innerArgv: INNER,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toContain('ro');
+      expect(msg).toContain('cwd-rw');
+      expect(msg).toContain('cwd-rw-net');
+      expect(msg).toContain('home-rw');
+      expect(msg).toContain('host');
+    }
+  });
+
+  test('unknown profile throws even on platforms without sandbox tooling', () => {
+    // Pre-slice the no-tool fallback at line 196 silently passed
+    // through ANY profile (including unknown). The validation
+    // happens BEFORE the platform branches, so an attacker can't
+    // pivot through the degraded path.
+    expect(() =>
+      maybeWrapSandboxArgv({
+        profile: 'attacker',
+        cwd: CWD,
+        innerArgv: INNER,
+        platform: 'win32' as NodeJS.Platform,
+        which: () => null,
+      }),
+    ).toThrow(/unknown profile/);
+  });
+});
+
+describe('isSandboxProfile (slice 103)', () => {
+  test('returns true for every enum member', () => {
+    for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw', 'host']) {
+      expect(isSandboxProfile(p)).toBe(true);
+    }
+  });
+
+  test('returns false for unknown strings', () => {
+    expect(isSandboxProfile('attacker')).toBe(false);
+    expect(isSandboxProfile('')).toBe(false);
+    expect(isSandboxProfile('RO')).toBe(false); // case-sensitive
+  });
+
+  test('returns false for non-strings', () => {
+    expect(isSandboxProfile(null)).toBe(false);
+    expect(isSandboxProfile(undefined)).toBe(false);
+    expect(isSandboxProfile(42)).toBe(false);
+    expect(isSandboxProfile({})).toBe(false);
   });
 });

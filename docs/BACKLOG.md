@@ -15,6 +15,74 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 103: sandbox profile wire validation (R6 #9)
+
+**Done.** One-hundred-third slice. Closes R6 #9: **`sandboxProfile` was an unvalidated string on the wire**, opening a structural sandbox bypass.
+
+The pre-slice TS type `BrokerRequest.sandboxProfile: string | null` admitted ANY string. Three layers of validation existed in name only:
+
+1. `worker-runtime.ts:109` — checked `typeof o.sandboxProfile === 'string'` (admits unknown strings).
+2. `bootstrap.ts:664` — `profile: profile as SandboxProfile` (TS cast erased at runtime — laundered the string through to the runner).
+3. `sandbox-runner.ts:172` — branched on `profile === 'host'` (passthrough) OR specific bwrap/sandbox-exec paths; an unknown string would either hit the platform fallback (degraded passthrough — `innerArgv.slice()` at line 196) or build malformed bwrap args that fail at spawn.
+
+The exploitation shape was specifically `sandboxProfile: 'attacker'` against a Linux host without bwrap installed (or any non-Linux/non-Darwin platform): the runner's degraded passthrough returned `innerArgv` unchanged, the broker spawned the inner argv directly, the tool ran without sandbox. The §6.5 sandbox plan stage is supposed to enforce profile selection but the wire-side check was the load-bearing defense and it had a hole.
+
+### Why this matters
+
+The threat model in `sandbox-runner.ts`'s header explicitly says the runner is the **final** authority on whether to wrap. Bootstrap and worker-runtime do TypeScript-level checks; only the runner sees the string at runtime and decides whether to spawn `bwrap` or pass through. If the runner trusts unvalidated input, every upstream caster becomes load-bearing — and they were already widened by `as SandboxProfile` casts.
+
+Slice 103 inverts the trust: the runner is now the canonical validator. Anyone passing a profile gets the enum check; unknown values throw with a list of every valid profile. The broker's per-call try/catch maps the throw to a `sandbox wrap failed: ...` response — the same shape that already handles legitimate sandbox runner failures (missing bwrap binary, sandbox-exec policy error). Defense-in-depth: the worker-runtime ALSO validates the enum so an attacker hitting the worker via `echo ... | bun worker.ts` lands the canonical `worker request missing required fields` envelope without dispatching the handler.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-plan.ts` | New `SANDBOX_PROFILE_SET` (Set form of `SANDBOX_PROFILE_ORDER` for O(1) membership lookup). New `isSandboxProfile(s): s is SandboxProfile` type predicate. |
+| `src/permissions/sandbox-runner.ts` | `MaybeWrapSandboxArgvOptions.profile` widened from `SandboxProfile?` to `string?` (callers no longer need `as` casts; the runner narrows). Gate at the top of `maybeWrapSandboxArgv`: when `profile` is defined and NOT in the enum, throw with the message `sandbox: unknown profile '<value>' (expected one of: ...)`. Existing branches unchanged — `'host'` and `undefined` still passthrough; known profiles still wrap via bwrap/sandbox-exec. |
+| `src/permissions/index.ts` | Re-exports `isSandboxProfile`. |
+| `src/broker/worker-runtime.ts` | `isBrokerRequest` swaps `typeof o.sandboxProfile === 'string'` for `isSandboxProfile(o.sandboxProfile)`. An attacker crafting `sandboxProfile: 'attacker'` lands `worker request missing required fields` instead of the prior silent pass. |
+| `src/cli/bootstrap.ts` | Drops `type SandboxProfile` import (no longer used after removing the cast). Drops the `as SandboxProfile` runtime-cast inside the `sandboxRunner` closure — the runner does the validation now. Documenting the gap in a comment so a future refactor doesn't restore the cast. |
+| `tests/permissions/sandbox-runner.test.ts` | New describe `wire validation (slice 103, R6 #9)` with 6 tests: valid profiles still wrap, `host` still passthrough, undefined still passthrough, unknown string throws with enum list, error message lists every supported profile, unknown profile throws even on platforms without sandbox tooling (closes the degraded-passthrough vector). New describe `isSandboxProfile (slice 103)` with 3 tests covering enum membership, unknown strings, non-string types. |
+| `tests/broker/spawn.test.ts` | New describe `sandboxProfile validation (slice 103, R6 #9)` with 1 test: a sandboxRunner that throws on unknown profile maps cleanly to `sandbox wrap failed: ...` response without spawning the worker. |
+| `tests/broker/worker-runtime.test.ts` | 2 new tests: unknown sandboxProfile string returns missing-fields error, every valid SandboxProfile enum member is accepted (regression coverage for all 5 enum values). |
+
+### Decisions
+
+- **Runner validates at the gate, not at every caller.** A scattered "validate before passing" pattern would let one forgetful refactor reopen the hole. The runner is the single chokepoint; every code path that wraps argv goes through it. Validation lives there, callers stay narrow.
+- **Throw on unknown, don't passthrough.** Pre-slice the degraded fallback at line 196 silently passed through any unknown profile (no bwrap installed → no wrap → unsandboxed exec). The new behavior throws BEFORE the platform branches; a hostile request can't pivot through a missing-tool fallback into an unsandboxed exec. Operators on platforms without sandbox tooling still get the `undefined → passthrough` path for legitimate "no sandbox needed" calls.
+- **Widen `profile` type to `string`, not keep `SandboxProfile`.** The point of the validation is that the TS type LIES at the wire — the runner accepts attacker strings and narrows internally. Keeping `SandboxProfile` in the signature would force every caller to either `as`-cast (re-introducing the bug) or pre-validate (duplicating the check).
+- **Defense in depth at three layers.** The runner is the single chokepoint, BUT: (1) worker-runtime rejects unknown profile strings at parse time so the canonical wire envelope surfaces before any handler runs; (2) bootstrap drops the misleading cast so future readers see the runner-as-authority intent. Each layer is independent; any one of them closes the bypass.
+- **`'host'` stays a legitimate enum member.** The defense is against UNKNOWN strings, not against `host` itself. The engine's §6.5 plan stage decides whether `host` is authorized for a given call; the runner trusts that decision once the value passes enum validation. A future slice can add per-request `hostAllowed` validation if the threat model expands to include "engine bug emits `host` when it shouldn't"; today that's the engine's responsibility.
+- **Test the platform-without-tooling case explicitly.** This was the actual exploitation shape — Linux without bwrap, macOS without sandbox-exec, Windows. The test pins that the validation throws BEFORE the platform branches so the degraded passthrough can't be reached with an unknown profile.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6216 pass / 10 skip / 0 fail** (6226 total across 289 files); +12 tests on top of slice 102's 6204
+- Targeted: `bun test tests/broker/ tests/permissions/sandbox-runner.test.ts` — 162/162
+
+### Next
+
+R6 remaining (each its own slice):
+- **#41 `proc.exited` hang without timer**: if a worker never exits AND no timer is set AND no signal aborts, the broker parks forever. Slice 102's drain caps help (the drain finishes when the worker closes its stdout), but a worker that never closes still hangs on `proc.exited`.
+- **#38 signal listener attach AFTER spawn**: race window where abort is swallowed.
+- **#42 JSON proto-pollution**: defense in `JSON.parse` at broker + worker entry points.
+- **#44 env leak to worker**: full parent env (including secrets) inherited before bash-handler-side scrubbing runs.
+- **R6 P1**: `stdin.end()` raced by `proc.exited`, broker timeout SIGTERM→SIGKILL escalation, worker `process.on('SIGTERM')` without `{once: true}`.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 bash worker handler (SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 102: spawn broker drain caps (R6 #21 + #22)
 
 **Done.** One-hundred-second slice. Closes two R6 P0 DoS vectors that **inverted §13.7's isolation premise** — the spec explicitly promises that worker subprocess faults don't kill the broker, but pre-slice an unbounded drain could OOM the broker on hostile or pathological output.

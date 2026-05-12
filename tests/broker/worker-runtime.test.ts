@@ -272,6 +272,37 @@ describe('runWorker — input parse failures', () => {
     });
   });
 
+  // Slice 103 (R6 #9): pre-slice the validator only checked
+  // typeof === 'string' — any string passed. An attacker
+  // crafting a request with `sandboxProfile: 'attacker'` could
+  // pivot through the runner's platform fallback. The runtime
+  // now validates against the SandboxProfile enum.
+  test('JSON with unknown sandboxProfile string → missing-fields error', async () => {
+    const { out, sink } = collectOutput();
+    const malformed = { ...baseRequest(), sandboxProfile: 'attacker' };
+    await runWorker({
+      handlers: [okHandler('__echo__')],
+      input: () => Promise.resolve(`${JSON.stringify(malformed)}\n`),
+      output: sink,
+    });
+    expect(parseResponse(out).error).toBe('worker request missing required fields');
+  });
+
+  test('every valid SandboxProfile enum member is accepted', async () => {
+    for (const profile of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw', 'host']) {
+      const { out, sink } = collectOutput();
+      await runWorker({
+        handlers: [okHandler('__echo__', { stdout: profile })],
+        input: () =>
+          Promise.resolve(`${JSON.stringify(baseRequest({ sandboxProfile: profile }))}\n`),
+        output: sink,
+      });
+      const res = parseResponse(out);
+      expect(res.ok).toBe(true);
+      expect(res.stdout).toBe(profile);
+    }
+  });
+
   test('trailing whitespace + newlines on input get trimmed before parse', async () => {
     const { out, sink } = collectOutput();
     await runWorker({

@@ -48,6 +48,20 @@ export const SANDBOX_PROFILE_ORDER: readonly SandboxProfile[] = [
   'host',
 ] as const;
 
+// Set form for runtime membership checks. Used by `isSandboxProfile`
+// (slice 103, R6 #9) at every wire boundary that receives an
+// untrusted `sandboxProfile` string — the broker validates inbound
+// requests, the worker runtime validates parsed BrokerRequest, the
+// sandbox runner validates before wrap. Without this set, an
+// attacker passing an unknown string would slip past the typed
+// `SandboxProfile` annotation (TS casts are erased at runtime) and
+// either bypass the wrap (`'host'` shape) or land malformed bwrap
+// args that fail mid-spawn.
+const SANDBOX_PROFILE_SET: ReadonlySet<string> = new Set(SANDBOX_PROFILE_ORDER);
+
+export const isSandboxProfile = (s: unknown): s is SandboxProfile =>
+  typeof s === 'string' && SANDBOX_PROFILE_SET.has(s);
+
 // Capability kinds each profile allows the tool to exercise.
 // Modeled at the KIND level (read-fs, write-fs, etc.) rather than
 // per-scope: scope-aware filtering is a separate concern handled

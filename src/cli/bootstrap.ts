@@ -24,7 +24,6 @@ import {
 } from '../memory/index.ts';
 import {
   type LockConflict,
-  type SandboxProfile,
   bootstrapPermissionEngine,
   detectSandboxAvailability,
   maybeWrapSandboxArgv,
@@ -659,9 +658,18 @@ const constructBroker = (mode: 'in-process' | 'spawn', cwd: string): Broker => {
         `broker mode 'spawn' requires worker source at ${workerPath}; compiled-binary mode is not yet supported. Re-run with --broker in-process or from a source checkout.`,
       );
     }
+    // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
+    // annotation upstream (`BrokerRequest.sandboxProfile: string |
+    // null`) admits attacker-controlled strings; the cast would
+    // silently launder an unknown profile through to
+    // `maybeWrapSandboxArgv` where it could land in the platform
+    // fallback (passthrough — unsandboxed exec). The runner now
+    // validates the enum membership at the gate and throws on
+    // unknown values; the broker's per-call try/catch maps the
+    // throw to a structured `sandbox wrap failed` response.
     const sandboxRunner: SandboxRunner = ({ profile, cwd: callCwd, innerArgv }) =>
       maybeWrapSandboxArgv({
-        profile: profile as SandboxProfile,
+        profile,
         cwd: callCwd,
         innerArgv,
       });

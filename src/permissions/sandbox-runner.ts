@@ -62,7 +62,7 @@
 // `--chdir <cwd>` is added so the wrapped process starts in the
 // caller's expected working directory.
 
-import type { SandboxProfile } from './sandbox-plan.ts';
+import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
 
 export interface BuildBwrapArgvOptions {
@@ -155,8 +155,13 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
 // Test seams (`platform`, `which`) override the live probes so the
 // suite can pin macOS scenarios from a Linux runner and vice versa.
 // Production callers leave both undefined.
+// `profile` widened to `string | undefined` (slice 103, R6 #9) so
+// callers don't need a `value as SandboxProfile` cast at the wire
+// boundary — the runner validates membership at the gate and
+// throws on unknown values. The narrowing happens inside, not
+// upstream.
 export interface MaybeWrapSandboxArgvOptions {
-  profile?: SandboxProfile;
+  profile?: string;
   cwd: string;
   home?: string;
   innerArgv: readonly string[];
@@ -168,6 +173,22 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
   const { profile, cwd, home, innerArgv } = options;
   const platform = options.platform ?? process.platform;
   const which = options.which ?? ((name) => Bun.which(name));
+
+  // Wire-validation gate (slice 103, R6 #9). The TypeScript
+  // `SandboxProfile` annotation is erased at runtime — any caller
+  // that runs a `value as SandboxProfile` cast on attacker-
+  // controlled input would slip an unknown string past the type
+  // checker. Bootstrap previously did exactly this. Validate that
+  // every defined profile is in the enum BEFORE any branch can
+  // act on it. Throws (the broker maps to `'sandbox wrap failed:
+  // unknown profile'`) rather than silently passing through, so a
+  // hostile `BrokerRequest.sandboxProfile = 'attacker'` doesn't
+  // pivot through the platform fallback into an unsandboxed exec.
+  if (profile !== undefined && !isSandboxProfile(profile)) {
+    throw new Error(
+      `sandbox: unknown profile '${String(profile)}' (expected one of: ${SANDBOX_PROFILE_ORDER.join(', ')})`,
+    );
+  }
 
   if (profile === undefined || profile === 'host') return innerArgv.slice();
 

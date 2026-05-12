@@ -618,3 +618,27 @@ describe('createSpawnBroker — bounded stream drain (slice 102, R6 #21)', () =>
     await broker.close();
   });
 });
+
+// Slice 103 — R6 #9: a sandboxRunner that throws on unknown
+// profile is the canonical defense; the broker maps the throw
+// into a structured `sandbox wrap failed` response without ever
+// spawning the worker.
+describe('createSpawnBroker — sandboxProfile validation (slice 103, R6 #9)', () => {
+  test('sandboxRunner throw maps to sandbox-wrap-failed response', async () => {
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      sandboxRunner: () => {
+        throw new Error("sandbox: unknown profile 'attacker'");
+      },
+      spawn: () => {
+        // Should NEVER be called — the runner throws first.
+        throw new Error('spawn should not run when runner throws');
+      },
+    });
+    const res = await broker.execute(baseRequest({ sandboxProfile: 'attacker' }));
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('sandbox wrap failed');
+    expect(res.error).toContain("unknown profile 'attacker'");
+    await broker.close();
+  });
+});

@@ -51,6 +51,7 @@
 // independently. Production workers are per-call disposable so
 // this is paranoia, not requirement.
 
+import { isSandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
 
 export interface WorkerToolHandler {
@@ -106,7 +107,16 @@ const isBrokerRequest = (v: unknown): v is BrokerRequest => {
   for (const c of o.capabilities) {
     if (typeof c !== 'string') return false;
   }
-  if (o.sandboxProfile !== null && typeof o.sandboxProfile !== 'string') return false;
+  // Slice 103 (R6 #9): validate sandboxProfile against the actual
+  // SandboxProfile enum, not just `typeof === 'string'`. An attacker
+  // crafting a BrokerRequest with `sandboxProfile: 'host'` (or any
+  // unknown string) could otherwise pivot through the runner's
+  // platform-fallback into an unsandboxed exec; the type-only
+  // check at line 109 pre-slice admitted that string verbatim.
+  // The runner ALSO validates at the wire-side gate (defense in
+  // depth), but rejecting here keeps the parse-fail signal closer
+  // to the cause.
+  if (o.sandboxProfile !== null && !isSandboxProfile(o.sandboxProfile)) return false;
   if (o.approvalId !== undefined && typeof o.approvalId !== 'number') return false;
   return true;
 };
