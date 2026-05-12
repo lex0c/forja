@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 116: bash handler Promise.all reject shape + read-capped listener symmetry (R7 P1)
+
+**Done.** One-hundred-sixteenth slice. Closes 2 more R7 P1 leftovers in the broker bash handler stack — both concurrency-cleanup concerns:
+
+- **`bash.ts:227-228` Promise.all reject bypasses error response shape**: pre-slice the `await Promise.all([stdoutP, stderrP, proc.exited])` was inside a try-finally with no catch. A rejection (readCapped throwing on a stream error; proc.exited rejecting per the Bun edge case slice 108 documented) propagated UP through `execute()` as a throw. The runWorker caller caught the throw and surfaced as a generic exec-threw error — audit row showed catch-all attribution instead of the canonical bash handler shape. Slice 116 adds a nested try/catch around the Promise.all; the catch captures the rejection into `waitError`, the finally cleans up timers/listeners, and a new branch BELOW the aborted/timedOut returns maps `waitError` to a structured BrokerResponse with `error: bash handler: wait failed: <message>`.
+- **`read-capped.ts:46-49 + 78-79` stopSignal listener attach/remove mismatch in pre-aborted path**: pre-slice the pre-aborted branch called `onStop()` synchronously but did NOT attach a listener — the finally below would then call `removeEventListener('abort', onStop)` against an unattached listener (a no-op in most EventTarget implementations but produces a warning in some stricter ones, and reads confusing to maintainers tracing the listener lifecycle). Slice 116 ALWAYS attaches the listener (even pre-aborted — the listener is then a no-op since cancel was already called by the synchronous `onStop()`); the finally's remove is always symmetric via a `listenerAttached` flag.
+
+### Why this matters
+
+Slice 108 closed the `proc.exited.then(() => readStopAc.abort())` no-catch path so a Bun edge rejection wouldn't park the readers. But the Promise.all wrapping the readers + proc.exited had its OWN rejection-handling gap: if anything in that race rejected, the throw propagated up. The handler's contract is to RETURN a BrokerResponse; throwing leaves the runWorker layer to synthesize a generic error envelope with less specificity than the handler could produce. Slice 116 captures the rejection at the handler boundary so the audit row carries the exact cause + any partial output captured before the throw.
+
+Both fixes share the same shape: "make the error path produce the structured response operators expect, not the implicit-throw fallback the caller layers have to recover from."
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/handlers/bash.ts` | Nested try/catch inside the existing try-finally around the Promise.all. The catch sets a new `waitError: Error \| null = null` flag, lets the finally run unchanged. New branch BELOW the aborted/timedOut returns checks `if (waitError !== null)` and returns a structured `error: bash handler: wait failed: <message>` response with whatever stdout/stderr was captured before the throw. Aborted + timedOut paths still win attribution (caller cancellation > timeout > wait error). |
+| `src/broker/handlers/read-capped.ts` | Always-attach symmetry. `let listenerAttached = false` flag; the `if (stopSignal !== undefined)` block now unconditionally `addEventListener(...)` + sets the flag + still fires `onStop()` synchronously when the signal is pre-aborted. The finally's `removeEventListener` is gated on `listenerAttached` (always true when stopSignal was supplied, but keeps the guard explicit for future readers). The `{ once: true }` listener option means the listener auto-removes on first fire too — explicit remove in the no-fire path keeps the AbortSignal's listener set clean. |
+| `tests/broker/handlers/bash.test.ts` | Updates the slice 108 "proc.exited REJECTION still stops the readers" test: was asserting `threw === true`, now asserts `r.ok === false && r.error.includes('wait failed')` to reflect the new structured-response shape. 2 new tests for slice 116: (1) Promise.all rejection maps to structured response (not a throw) — pins the new contract; (2) aborted flag wins attribution over Promise.all rejection — sets up a race where abort fires before exited's reject, verifies `error === 'aborted'` instead of `wait failed`. |
+
+### Decisions
+
+- **`waitError` as a captured flag, not a thrown rethrow at the end.** The flag lets the aborted/timedOut branches above check their own state first; only when neither fired does the wait-error branch run. Rethrowing at the bottom would lose this priority ordering (the rethrow would surface BEFORE the aborted check). Capturing keeps the explicit branch order intact.
+- **Branch ORDER: aborted > timedOut > waitError.** Operator cancellation is the strongest signal; timeout is the broker's defensive ceiling; wait error is the residual case. If both abort and wait error fire concurrently (test #2's race), `aborted` wins — the operator sees "you cancelled this" not "the worker had a transient issue".
+- **`bash handler: wait failed: <msg>` shape matches existing handler-prefix convention.** The `bash handler:` prefix is what other handler-side error paths use (slice 38 onwards). Operators querying audit rows by error prefix continue to match all bash-handler-originating failures uniformly.
+- **read-capped always-attach is defensive, not strictly needed.** With `{ once: true }` the listener auto-removes after firing, so the symmetry concern is mostly aesthetic — the finally's `removeEventListener` after a pre-aborted onStop is a no-op either way. But the code is easier to read with consistent attach/remove pairing, and stricter EventTarget implementations might emit a warning on the asymmetric path. Worth the three-line cleanup.
+- **No truncation regex fix or Number.isFinite cleanup here.** Both are lower-impact (truncation regex is a false-positive flag, not a real corruption; Number.isFinite is code-style). Bundling them would dilute the slice's focus. They stay as R7 P1 leftovers for a future cleanup pass.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6277 pass / 10 skip / 0 fail** (6287 total across 291 files); +2 tests on top of slice 115's 6275
+- Targeted: `bun test tests/broker/` — 169/169
+
+### Next
+
+R7 P1 remaining (low-impact cleanups):
+- Truncation footer regex false positive (any bash output ending in the footer pattern reports `truncated: true`).
+- `Number.isFinite` + `Number.isInteger` triple-check is load-bearing in non-obvious way (code-style).
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 115: bash handler cwd normalization + dead export cleanup (R7 P1)
 
 **Done.** One-hundred-fifteenth slice. Closes 2 of the R7 P1 leftovers in the bash worker handler:

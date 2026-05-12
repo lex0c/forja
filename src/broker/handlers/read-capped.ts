@@ -43,9 +43,23 @@ export const readCapped = async (
       // already cancelled
     });
   };
+  // Slice 116 (R7 P1): symmetric attach/remove. Pre-slice the
+  // pre-aborted branch called `onStop()` but did NOT attach a
+  // listener — the finally below would then call
+  // `removeEventListener('abort', onStop)` against an unattached
+  // listener (a no-op in normal cases, but produces a warning in
+  // some stricter EventTarget implementations + reads confusing
+  // to maintainers tracing the listener lifecycle). Now: ALWAYS
+  // attach the listener (even pre-aborted — the listener is then
+  // a no-op since cancel was already called by the synchronous
+  // onStop() below); the finally's remove is always symmetric.
+  let listenerAttached = false;
   if (stopSignal !== undefined) {
+    stopSignal.addEventListener('abort', onStop, { once: true });
+    listenerAttached = true;
+    // Pre-aborted: fire the cancel synchronously so we don't
+    // wait for the event loop to deliver the abort event.
     if (stopSignal.aborted) onStop();
-    else stopSignal.addEventListener('abort', onStop, { once: true });
   }
   const decoder = new TextDecoder('utf-8');
   const chunks: string[] = [];
@@ -76,7 +90,16 @@ export const readCapped = async (
     }
     if (!truncated) chunks.push(decoder.decode());
   } finally {
-    if (stopSignal !== undefined) stopSignal.removeEventListener('abort', onStop);
+    // Symmetric remove (slice 116, R7 P1): only remove when we
+    // actually attached. With { once: true } the listener auto-
+    // removes after firing, but explicit remove in the no-fire
+    // path keeps the AbortSignal's listener set clean — important
+    // for long-running operator sessions where the same stopSignal
+    // might be reused across many calls (though our actual
+    // construction pattern creates a fresh signal per call).
+    if (stopSignal !== undefined && listenerAttached) {
+      stopSignal.removeEventListener('abort', onStop);
+    }
     reader.releaseLock();
   }
   let text = chunks.join('');

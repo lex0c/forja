@@ -281,6 +281,7 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
       let outRes: { text: string; truncated: boolean } = { text: '', truncated: false };
       let errRes: { text: string; truncated: boolean } = { text: '', truncated: false };
       let exitCode = -1;
+      let waitError: Error | null = null;
       try {
         const stdoutP =
           proc.stdout !== null && proc.stdout !== undefined
@@ -290,10 +291,31 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
           proc.stderr !== null && proc.stderr !== undefined
             ? readCapped(proc.stderr, maxOutputBytes, readStopAc.signal)
             : Promise.resolve({ text: '', truncated: false });
-        const [o, e, code] = await Promise.all([stdoutP, stderrP, proc.exited]);
-        outRes = o;
-        errRes = e;
-        exitCode = code;
+        try {
+          const [o, e, code] = await Promise.all([stdoutP, stderrP, proc.exited]);
+          outRes = o;
+          errRes = e;
+          exitCode = code;
+        } catch (e) {
+          // Slice 116 (R7 P1): pre-slice a Promise.all rejection
+          // (readCapped throws on a stream error, or proc.exited
+          // rejects in the Bun edge case slice 108 documented)
+          // propagated up through execute() as a throw. The
+          // caller (worker-runtime) caught it and surfaced as a
+          // generic worker error — operators saw exec-threw
+          // catch-all attribution in audit, not the canonical
+          // bash error shape.
+          //
+          // Now: capture the rejection here, let the finally
+          // clean up timers/listeners, return a structured
+          // BrokerResponse with the partial output already
+          // captured before the throw + a clear error message.
+          // The existing aborted/timedOut branches below still
+          // run, so caller cancellation still maps to the
+          // canonical 'aborted' shape regardless of which side
+          // of the race threw.
+          waitError = e instanceof Error ? e : new Error(String(e));
+        }
       } finally {
         clearTimeout(timer);
         if (killEscalationTimer !== undefined) clearTimeout(killEscalationTimer);
@@ -322,6 +344,20 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
           stderr: errRes.text,
           exitCode,
           error: `bash handler: timed out after ${timeoutMs}ms`,
+        };
+      }
+
+      // Slice 116 (R7 P1): the wait error path is checked LAST
+      // (after aborted + timedOut) so caller-initiated cancellation
+      // wins attribution. If neither flag fired and Promise.all
+      // rejected, surface the throw as a structured error response
+      // instead of re-throwing up the stack.
+      if (waitError !== null) {
+        return {
+          ok: false,
+          stdout: outRes.text,
+          stderr: errRes.text,
+          error: `bash handler: wait failed: ${waitError.message}`,
         };
       }
 

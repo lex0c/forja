@@ -542,21 +542,65 @@ describe('createBashHandler — SIGKILL timer guard + proc.exited finally (slice
     // the stop signal, Promise.all resolves with the rejection
     // surfacing through the wrapper.
     const start = Date.now();
-    let threw = false;
-    try {
-      await handler.execute(baseRequest({ args: { command: 'echo hi' } }));
-    } catch {
-      threw = true;
-    }
+    const r = await handler.execute(baseRequest({ args: { command: 'echo hi' } }));
     const elapsed = Date.now() - start;
-    // The handler resolves OR throws — what matters is that it
-    // completes within a reasonable time, NOT parks forever.
-    // Either outcome means readStopAc.abort() fired.
+    // The handler must NOT park — readStopAc.abort() fires via
+    // .finally on the proc.exited rejection, the readers unblock,
+    // and slice 116's catch maps the Promise.all rejection to a
+    // structured BrokerResponse instead of re-throwing.
     expect(elapsed).toBeLessThan(2000);
-    // Promise.all rejects when proc.exited rejects; the
-    // handler's try/finally surfaces that as a thrown error.
-    // (Pre-slice the readers would also hang first, masking
-    // the rejection.)
-    expect(threw).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('wait failed');
+    expect(r.error).toContain('synthetic Bun edge');
+  });
+
+  // Slice 116 (R7 P1): Promise.all rejection used to propagate up
+  // through execute() as a throw — caller saw an exception instead
+  // of the canonical BrokerResponse shape. Now the catch maps the
+  // throw to a structured response. Aborted/timedOut paths still
+  // win attribution if either flag fired.
+  test('Promise.all rejection maps to structured response, not a throw (slice 116)', async () => {
+    // Use the same proc.exited rejection shape as the slice 108
+    // test; verify execute() RETURNS rather than throws, and the
+    // error message includes the rejection cause.
+    const spawn: BashSpawnFn = () => ({
+      stdout: streamFrom(''),
+      stderr: streamFrom(''),
+      exited: Promise.reject(new Error('synthetic wait error')),
+      kill: () => undefined,
+    });
+    const handler = createBashHandler({ spawn });
+    // No try/catch here — if execute throws, the test framework
+    // surfaces the throw and the assertion never runs.
+    const r = await handler.execute(baseRequest({ args: { command: 'echo' } }));
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('wait failed');
+    expect(r.error).toContain('synthetic wait error');
+    // ExitCode is the placeholder -1 since proc.exited rejected
+    // before we could read a real value — the response shape
+    // still includes the field (BrokerResponse expects ok, stdout,
+    // stderr, error; exitCode is optional).
+  });
+
+  test('aborted flag wins attribution over Promise.all rejection (slice 116)', async () => {
+    // If the caller aborts AND proc.exited rejects, the response
+    // should be `error: 'aborted'` (caller cancellation is the
+    // proximate cause). Slice 116's waitError check runs LAST
+    // after aborted/timedOut.
+    const ac = new AbortController();
+    const spawn: BashSpawnFn = () => ({
+      stdout: streamFrom(''),
+      stderr: streamFrom(''),
+      // Reject after a tiny delay so the abort fires first.
+      exited: new Promise((_, reject) => setTimeout(() => reject(new Error('synthetic exit')), 50)),
+      kill: () => undefined,
+    });
+    const handler = createBashHandler({ spawn });
+    setTimeout(() => ac.abort(), 10);
+    const r = await handler.execute(baseRequest({ args: { command: 'echo' } }), {
+      signal: ac.signal,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('aborted');
   });
 });
