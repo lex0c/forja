@@ -8,7 +8,7 @@ export type {
   SpawnFn,
   SpawnFnOptions,
 } from './spawn.ts';
-export { createSpawnBroker } from './spawn.ts';
+export { DEFAULT_TIMEOUT_MS, createSpawnBroker } from './spawn.ts';
 export type { RunWorkerOptions, WorkerToolHandler } from './worker-runtime.ts';
 export { runWorker } from './worker-runtime.ts';
 export type {

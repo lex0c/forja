@@ -106,8 +106,19 @@ export interface CreateSpawnBrokerOptions {
   // they keep full control and the scrub doesn't apply.
   env?: Record<string, string>;
   // Kill the worker if it takes longer than this many ms.
-  // Undefined means no timeout (production should ALWAYS set
-  // a timeout; tests omit it to validate happy path).
+  // Undefined means "use the broker default" (slice 106 raised
+  // this from "no timer" to `DEFAULT_TIMEOUT_MS=60_000`); 0
+  // disables timing entirely (test seam — production should
+  // never pass 0). Per-call `BrokerCallOptions.timeoutMs`
+  // overrides this for individual calls (slice 85).
+  //
+  // Slice 106 (R6 #41): pre-slice an undefined timeout meant
+  // the broker awaited `proc.exited` forever on a wedged
+  // worker (closed pipes but never exited, or never closed
+  // pipes either). The broker would park the in-flight chain
+  // indefinitely, blocking every subsequent call. Now there's
+  // always a defensive ceiling unless the operator explicitly
+  // opts out with 0.
   timeoutMs?: number;
   // Maximum bytes to accept from the worker's stdout / stderr
   // before the drain truncates and the worker is killed (slice
@@ -179,6 +190,24 @@ const defaultSpawn: SpawnFn = (argv, options) => {
 // (large-LLM-output piping) can raise via `maxStdoutBytes`.
 const DEFAULT_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STDERR_BYTES = 4 * 1024 * 1024;
+
+// Defensive timeout floor (slice 106, R6 #41). Matches the
+// production wiring's explicit value (bootstrap.ts sets 60_000
+// when constructing the spawn broker); making it the default
+// here means a broker constructed without an explicit timeout
+// — test fixture, programmatic caller that forgot — still has a
+// ceiling. A wedged worker (closed pipes but never exited, or
+// pipes never closed) used to park the broker's in-flight chain
+// indefinitely, blocking every subsequent call; now the floor
+// kicks in even on the "forgot to set timeout" path.
+//
+// Callers who genuinely want no timeout pass `timeoutMs: 0`
+// explicitly (test escape valve). 60 s is well above any
+// legitimate single tool call (typical bash invocation is
+// sub-second; longest realistic shape is a multi-file grep at
+// ~10 s) and well below "operator notices the hang" UX
+// thresholds.
+export const DEFAULT_TIMEOUT_MS = 60_000;
 
 // Drain a worker stream with a byte cap. Reads chunks until the
 // stream ends OR the byte counter reaches `cap`; on cap, cancels
@@ -371,11 +400,14 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     // construction default when present. `0` is the explicit
     // "disable for this call" value (the > 0 guard below skips
     // arming the timer). `undefined` falls back to the broker
-    // default (also possibly undefined → no timer).
-    const effectiveTimeoutMs = callOptions?.timeoutMs ?? timeoutMs;
+    // default, which in turn falls back to `DEFAULT_TIMEOUT_MS`
+    // (slice 106) — `??` short-circuits on undefined but NOT
+    // on 0, so an explicit `timeoutMs: 0` at either layer still
+    // disables the timer.
+    const effectiveTimeoutMs = callOptions?.timeoutMs ?? timeoutMs ?? DEFAULT_TIMEOUT_MS;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    if (effectiveTimeoutMs !== undefined && effectiveTimeoutMs > 0) {
+    if (effectiveTimeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
         try {

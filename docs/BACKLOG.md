@@ -15,6 +15,62 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 106: default broker timeout floor (R6 #41)
+
+**Done.** One-hundred-sixth slice. Closes R6 #41: when both `BrokerCallOptions.timeoutMs` and `CreateSpawnBrokerOptions.timeoutMs` were undefined, the broker's `await Promise.all([..., proc.exited])` could **park forever** on a wedged worker (closed pipes but never exited, or pipes never closed). The in-flight chain blocked every subsequent call indefinitely — operator either kills the agent process manually or waits forever.
+
+### Why this matters
+
+Slice 102's drain caps closed half the hang surface (a worker that emits unbounded output now hits the byte ceiling and the broker cancels the read). But `proc.exited` is a separate await — the OS waits for the actual process termination, which only happens when the worker exits OR receives a kill signal. A worker that:
+- Closes stdout/stderr cleanly (drains finish in microseconds)
+- Never exits (handler entered an infinite loop after writing the response)
+
+would have drains resolve immediately, then `proc.exited` parks forever. No drain cap helps; no caller-supplied timer fires (operator forgot); no abort signal arrives (no upstream cancellation).
+
+The bootstrap.ts production wiring explicitly sets `timeoutMs: 60_000`, so production was safe. But the broker's documented contract treated timeoutMs as fully optional, leaving programmatic callers and test fixtures vulnerable. Slice 106 makes the floor authoritative: any broker constructed without an explicit timeout still has a 60s ceiling; only an explicit `timeoutMs: 0` opts out (escape valve for benchmark tests and intentional long-running workloads).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` | New exported `DEFAULT_TIMEOUT_MS = 60_000`. The effective-timeout chain is now `callOptions?.timeoutMs ?? timeoutMs ?? DEFAULT_TIMEOUT_MS` — `??` short-circuits on undefined but NOT on 0, so an explicit 0 at either layer still disables the timer. The `if (effectiveTimeoutMs !== undefined && effectiveTimeoutMs > 0)` guard simplifies to `if (effectiveTimeoutMs > 0)` because the value is always defined now. The `CreateSpawnBrokerOptions.timeoutMs` doc-comment updated to reflect the new floor semantics. |
+| `src/broker/index.ts` | Re-exports `DEFAULT_TIMEOUT_MS` so tests can verify the constant value. |
+| `tests/broker/spawn.test.ts` | New describe `default timeout floor (slice 106, R6 #41)` with 4 tests: (1) worker hangs with explicit short timeoutMs is killed (regression coverage for the existing mechanism), (2) explicit `timeoutMs: 0` at the broker layer disables the timer (escape valve preserved), (3) per-call `timeoutMs: 0` overrides broker default to 0 (escape valve at call layer), (4) broker without explicit timeoutMs uses the floor + per-call timeoutMs path still works through the fall-through chain. |
+
+### Decisions
+
+- **Floor at 60s, matching bootstrap.** The production wiring already used 60s explicitly (bootstrap.ts:680 → `timeoutMs: 60_000`). Aligning the default keeps the broker's behavior consistent regardless of how it's constructed: programmatic callers, test fixtures, and the production bootstrap all get the same ceiling. Operators tuning higher (long-running workloads) override explicitly.
+- **`??` chain preserves `timeoutMs: 0` opt-out at both layers.** The nullish coalescing operator short-circuits only on `undefined` / `null`, not on `0`. The chain `callOptions?.timeoutMs ?? timeoutMs ?? DEFAULT_TIMEOUT_MS` means: explicit 0 at the call layer wins; explicit 0 at the broker layer wins (when call is undefined); otherwise the floor applies. This preserves the existing slice-85 "per-call timeoutMs=0 disables" contract.
+- **Floor is documented in the type, not in a separate config layer.** The pre-slice doc-comment said "Undefined means no timeout (production should ALWAYS set a timeout; tests omit it to validate happy path)." That contract leaked the production responsibility into the API surface. The new doc-comment makes the default authoritative — production needs to override only if it wants something other than 60s.
+- **Floor is exported.** Tests pin the constant value (`expect(DEFAULT_TIMEOUT_MS).toBe(60_000)`) and a future PR raising/lowering the floor is automatically loud (the test fails, forcing a documented decision). The bootstrap.ts hard-coded `60_000` could be migrated to import this constant in a follow-up, eliminating the magic-number drift surface.
+- **No test waits 60s.** The floor's actual value is verified by the exported-constant test. Behavior is verified via per-call `timeoutMs: 50` (the chain mechanism is the same whether the value comes from the per-call layer, the broker layer, or the floor). Waiting 60s in a unit test would slow the suite without adding signal.
+- **Existing tests unchanged.** The pre-slice tests that set explicit `timeoutMs` continue to pass — the floor doesn't affect callers that opt in to specific values. Tests that omit timeoutMs (the "default cwd" and "option plumbing" tests) use mock spawns that exit synchronously; the floor arms a 60s timer that clears on natural exit, no behavior change.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6238 pass / 10 skip / 0 fail** (6248 total across 290 files); +4 tests on top of slice 105's 6234
+- Targeted: `bun test tests/broker/spawn.test.ts` — 39/39
+
+### Next
+
+R6 remaining:
+- **#38 signal listener attach AFTER spawn**: race window where abort during the spawn → stdin-write interval is swallowed; only the outer timeout fires.
+- **R6 P1 leftovers**: `stdin.end()` raced by `proc.exited`, broker timeout SIGTERM→SIGKILL escalation, worker `process.on('SIGTERM')` without `{once: true}`.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 bash worker handler (SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 105: broker env scrub default (R6 #44)
 
 **Done.** One-hundred-fifth slice. Closes R6 #44: the broker called `Bun.spawn` without an explicit `env` option, which made the worker inherit the **full parent env** — every operator secret (API keys, vault tokens, AWS creds, OAuth tokens) reached the worker process before any scrubbing fired.
