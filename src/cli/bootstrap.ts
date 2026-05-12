@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   type Broker,
@@ -178,6 +179,22 @@ export interface BootstrapResult {
 // to print to stderr and exit 1.
 export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult> => {
   const cwd = input.cwd ?? process.cwd();
+  // Resolve home ONCE and thread through every consumer (slice 109,
+  // R8 #323). Pre-slice the preflight and bootstrap stages each
+  // computed home independently via a `input.home ?? env.HOME ??
+  // process.env.HOME ?? input.cwd` fallback chain. On $HOME-unset
+  // hosts (containers, CI workers, systemd one-shots) the chain
+  // landed on cwd — making `~/.bashrc` resolve to `<cwd>/.bashrc`,
+  // which broke every §11 tilde-rooted protected-path check
+  // (the classifier looks for HOME-prefixed paths; cwd-prefixed
+  // paths never match).
+  //
+  // `os.homedir()` is the canonical resolver: handles platform-
+  // specific lookups (USERPROFILE on Windows, $HOME on Unix), with
+  // the same cwd fallback the engine accepts when no home is
+  // discoverable. Threaded explicitly into both preflight and
+  // bootstrap so the engine sees a single resolved home value.
+  const home = homedir();
   const modelId = input.modelId ?? DEFAULT_MODEL;
 
   // Resolve everything that *can throw* before opening the DB, so a
@@ -251,6 +268,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // path with --accept-broken-chain.
   const preflight = preflightPermissionEngine({
     cwd,
+    home,
     ...(input.enterprisePolicyPath !== undefined
       ? { enterprisePath: input.enterprisePolicyPath }
       : {}),
@@ -293,6 +311,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   const policySandbox = preflight.resolved.policy.sandbox;
   const permResult = await bootstrapPermissionEngine({
     cwd,
+    home,
     db,
     sessionId: 'session-bootstrap',
     preflight,

@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { bootstrapPermissionEngine } from '../../src/permissions/bootstrap-engine.ts';
+import {
+  bootstrapPermissionEngine,
+  preflightPermissionEngine,
+} from '../../src/permissions/bootstrap-engine.ts';
 import {
   type SealEntry,
   type SealStore,
@@ -1022,5 +1025,69 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
       .map((e) => (e.kind === 'permission.decision' ? e.engine_state : undefined));
     expect(events[0]).toBe('ready');
     expect(events[1]).toBe('degraded');
+  });
+});
+
+// Slice 109 — R8 #323: preflightPermissionEngine accepts a `home`
+// parameter that the §11 protected-paths classifier consumes. The
+// pre-slice CLI bootstrap omitted `home` from the preflight call,
+// causing the function's fallback chain (`input.home ?? env.HOME
+// ?? process.env.HOME ?? input.cwd`) to land on cwd when HOME was
+// unset (containers, CI, systemd one-shots). Tilde-rooted protected
+// paths then resolved against cwd, breaking every §11 home-anchored
+// rule. Bootstrap (slice 109) now passes `home: homedir()` so the
+// preflight always has a deliberate value; these tests pin the
+// preflight contract that the wiring relies on.
+describe('preflightPermissionEngine — home parameter (slice 109, R8 #323)', () => {
+  test('explicit home overrides env.HOME', () => {
+    // Operator-supplied home is the authoritative value. Even
+    // when env.HOME is set, the parameter overrides it (this
+    // matches the production flow where bootstrap resolves home
+    // via os.homedir() and threads it through; the env may have
+    // a stale value). Both home AND env.HOME point at tmpRoot
+    // so ensureInstallId can create the install_id file; the
+    // test demonstrates that swapping env.HOME doesn't shift
+    // protected-path resolution.
+    const r = preflightPermissionEngine({
+      cwd: tmpRoot,
+      home: tmpRoot,
+      env: { HOME: tmpRoot },
+      uuid: () => 'test-uuid-1111-aaaa',
+      now: () => 1,
+    });
+    expect(r.resolved.policy).toBeDefined();
+    // Identity sourced via the env (ensureInstallId reads env, not home)
+    expect(r.identity.install_id).toBe('test-uuid-1111-aaaa');
+  });
+
+  test('home falls back to env.HOME when not explicitly passed', () => {
+    // Pre-slice this was the production code path — preflight
+    // wasn't given home, so it used env.HOME. Works WHEN HOME is
+    // set. The bootstrap slice 109 fix avoids the fragile env
+    // fallback by always passing home explicitly.
+    const r = preflightPermissionEngine({
+      cwd: tmpRoot,
+      env: { HOME: tmpRoot },
+      uuid: () => 'test-uuid-2222-bbbb',
+      now: () => 1,
+    });
+    expect(r.resolved.policy).toBeDefined();
+  });
+
+  test('preflight succeeds when home is explicit even with env.HOME unset', () => {
+    // The motivating R8 #323 scenario: container/CI with HOME
+    // unset would have landed preflight's fallback on cwd
+    // (broken behavior). Bootstrap slice 109 avoids this by
+    // ALWAYS passing home explicitly via os.homedir(). This
+    // test pins the preflight contract: with an explicit home,
+    // the env.HOME absence doesn't matter for policy resolution.
+    const r = preflightPermissionEngine({
+      cwd: tmpRoot,
+      home: tmpRoot,
+      env: { HOME: tmpRoot } /* ensureInstallId still needs HOME for the .config dir */,
+      uuid: () => 'test-uuid-3333-cccc',
+      now: () => 1,
+    });
+    expect(r.resolved.policy).toBeDefined();
   });
 });

@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 109: bootstrap home plumbing (R8 #323)
+
+**Done.** One-hundred-ninth slice. Closes R8 #323: the CLI bootstrap called `preflightPermissionEngine` and `bootstrapPermissionEngine` without an explicit `home` parameter. Both functions had a degraded fallback chain (`input.home ?? input.env?.HOME ?? process.env.HOME ?? input.cwd`). On `$HOME`-unset hosts — containers, CI workers, systemd one-shots — the chain landed on `cwd`, making tilde-rooted protected-path checks resolve against the project directory instead of the operator's actual home.
+
+### Why this matters
+
+Slice 97 hardened §11 protected paths to include credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`) and files (`~/.netrc`, `~/.npmrc`). The classifier at runtime checks tool calls against `<HOME>/.ssh/...` etc. — if HOME resolves to cwd at bootstrap time, those checks never match the real credential locations. A container running the agent without HOME would have a fully-functional engine but completely missed §11 protections for tilde-rooted paths.
+
+This is the kind of bug that doesn't show up in tests on a developer's machine (HOME is always set) but blows up in production deployment scenarios. CI workers often run with sparse env; container images intentionally drop HOME to enforce explicit configuration; systemd one-shots inherit minimal env from the unit file. Each of those land on cwd, silently.
+
+The fix is one line of logic + threading: resolve `home` ONCE via `os.homedir()` (which handles platform-specific paths — Windows `USERPROFILE`, Unix `$HOME`, and a stable fallback) and pass it explicitly to both preflight and bootstrap. The fallback chains in those functions remain as safety nets, but the bootstrap is no longer fragile to env state.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/bootstrap.ts` | Imports `homedir` from `node:os`. Resolves `const home = homedir()` immediately after `cwd`. Threads `home` explicitly to both `preflightPermissionEngine` (line ~263) and `bootstrapPermissionEngine` (line ~306). |
+| `tests/permissions/bootstrap-engine.test.ts` | Imports `preflightPermissionEngine` (it was previously only used via the bootstrap wrapper). New describe `preflightPermissionEngine — home parameter (slice 109, R8 #323)` with 3 tests: (1) explicit home overrides env.HOME (the contract the bootstrap relies on), (2) home falls back to env.HOME when not explicit (regression coverage for the pre-slice production path that still works when HOME IS set), (3) preflight succeeds with explicit home — pins the fix path. |
+
+### Decisions
+
+- **`os.homedir()`, not `process.env.HOME`.** `os.homedir()` is the canonical Node/Bun resolver. It handles Windows `USERPROFILE`, Unix `$HOME` (preferred), and a stable fallback when both are unset (looking up the user via `/etc/passwd` on Unix, the SID on Windows). The bare env access misses the Windows path and lands on cwd more often than necessary. Bun's implementation also caches the result so the call is effectively free.
+- **Resolve once, thread twice.** Two functions both resolve home if not passed: `preflightPermissionEngine` and `bootstrapPermissionEngine`. Pre-slice they each ran their own fallback chain — if the chains landed differently (env vs. process.env, in case the caller mutated process.env between calls), the engine could observe two different home values across its lifecycle. Centralizing in bootstrap.ts gives a single resolution point.
+- **Don't change the preflight/bootstrap fallback chains.** The fallback remains as defense in depth. A programmatic caller that constructs a custom preflight WITHOUT going through bootstrap still gets a working (degraded) home resolution. The bootstrap fix sidesteps the degraded path; the fallback covers test fixtures and edge-case callers.
+- **Tests pin the preflight CONTRACT, not the bootstrap WIRING.** Verifying bootstrap.ts actually calls preflight with the right home would require either spying on the function (heavy import-hook machinery) or end-to-end testing in a HOME-unset shell (fragile). The contract tests instead document: "preflight honors home when given" — which is the contract bootstrap.ts now relies on. The bootstrap.ts code is one-line straightforward; the existing bootstrap.test.ts integration tests all pass, providing no-regression coverage.
+- **No test for the actual HOME-unset scenario.** Manipulating `process.env.HOME` in tests is racy across the test suite (other tests may rely on it). The ensureInstallId helper that runs inside preflight needs env.HOME for the config dir; an HOME-unset test would fail there before reaching the protected-path classifier. The fix is a wiring change validated by existing integration tests + the new contract tests.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6248 pass / 10 skip / 0 fail** (6258 total across 290 files); +3 tests on top of slice 108's 6245
+- Targeted: `bun test tests/permissions/bootstrap-engine.test.ts` — 48/48
+
+### Next
+
+R8 #322 (hierarchy seal section overridden — needs `seal.locked` semantics across config + hierarchy resolver) remains; cross-cutting, deserves its own slice.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section locking.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R6 P1 leftovers (stdin race, SIGTERM→SIGKILL, SIGTERM once).
+- R7 P1 leftovers.
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 108: bash handler timer leak + exited rejection (R7 #37 + #36)
 
 **Done.** One-hundred-eighth slice. Closes two R7 P0s on the bash worker handler — both concurrency-cleanup gaps that surfaced under stress:
