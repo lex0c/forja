@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 113: broker SIGTERM→SIGKILL escalation + worker SIGTERM once (R6 P1)
+
+**Done.** One-hundred-thirteenth slice. Closes two R6 P1 findings that complete the broker concurrency-cleanup sweep started by slice 102:
+
+- **Broker timeout/abort SIGTERM-only**: pre-slice the spawn broker sent `proc.kill('SIGTERM')` (default signal) and waited on `proc.exited` indefinitely. A worker that traps SIGTERM (`trap "" TERM` in shell, or a Node handler that swallows it) held the broker hostage — `proc.exited` never resolves, the in-flight chain parks, every subsequent call queues behind. Slice 102's stdout drain caps + slice 106's timeout floor caught wedges via SIDE channels but the kill path itself didn't follow up.
+- **Worker `process.on('SIGTERM')` without `{once: true}`**: under test conditions that re-enter the worker module (importing handlers, re-running inline), the listener accumulated and Bun surfaced `MaxListenersExceededWarning` at 11. Single-fire intent + auto-remove via `process.once` keeps the worker process clean.
+
+### Why this matters
+
+R6 P0 closed worker-process-level wedges; R6 P1 closes the broker-kill-path-level wedges. Without escalation, a hostile or buggy handler that catches SIGTERM mid-execution holds the broker hostage for as long as it wants — the operator can hit Ctrl-C three times and the call still blocks. Slice 102's drain caps + slice 106's timeout floor cover the receive side; this slice covers the kill side. Together, the broker now has end-to-end "if something goes wrong, the call terminates within a bounded window."
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` | New `DEFAULT_TIMEOUT_GRACE_MS = 5_000` constant (matches the bash handler's grace from slice 38 onwards). Adds `timeoutGraceMs?: number` to `CreateSpawnBrokerOptions` with documentation. New `escalateToSigkill()` helper inside `executeOnce` — uses the same first-arm-wins guard pattern as slice 108's bash handler fix (the timer is single-`let`; first call to escalate wins, subsequent calls silently no-op). Both the timeout timer AND the abort signal listener now call `escalateToSigkill()` AFTER sending SIGTERM. The timer's `proc.kill()` (default) becomes `proc.kill('SIGTERM')` for explicit-intent readability. Cleanup in both error-path and success-path `finally`-equivalent regions: `if (killEscalationTimer !== undefined) clearTimeout(killEscalationTimer)` alongside the existing `clearTimeout(timer)`. |
+| `src/broker/worker.ts` | `process.on('SIGTERM', () => ac.abort())` becomes `process.once(...)`. The worker handles exactly one request and exits; the listener only ever needs to fire once. `once` auto-removes after the first fire, preventing the `MaxListenersExceededWarning` accumulation in test fixtures that re-import the module. |
+| `tests/broker/spawn.test.ts` | New describe `SIGTERM → SIGKILL escalation (slice 113, R6 P1)` with 4 tests: (1) timeout sends SIGTERM and follows with SIGKILL — uses `trap "" TERM` to make the worker ignore SIGTERM; call completes within `timeoutMs + timeoutGraceMs + slack` instead of parking on the 60s sleep; (2) abort path follows the same escalation; (3) honest worker that exits on SIGTERM doesn't wait for the grace (escalation timer is armed but cleared before SIGKILL would fire); (4) smoke test for the default 5s grace value. |
+
+### Decisions
+
+- **First-arm-wins guard.** Same shape as slice 108's bash-handler fix. If both timeout and abort want to escalate, the first call captures the grace window; the second silently no-ops. Multi-timer tracking would be overkill — the second-armed kill is functionally a no-op on a dead proc anyway, but having two pending timers is the leak slice 108 fixed at the bash layer; mirroring at the broker layer is consistent.
+- **`'SIGTERM'` explicit, not default `proc.kill()`.** The previous `proc.kill()` was implicit SIGTERM (Node default); making it explicit reads cleaner alongside the new `proc.kill('SIGKILL')` escalation call. Same wire behavior; readability win.
+- **5s grace default matches bash handler.** The bash handler's `timeoutGraceMs` (slice 38 onwards) is 5_000. Aligning the broker-level grace gives operators one window to reason about; if they raise one, raising the other in tandem is the natural intent. A future slice could expose both via a single config; today they're separately configurable but share the default.
+- **Cleanup in BOTH error-path and success-path.** The `clearTimeout(killEscalationTimer)` lives next to the existing `clearTimeout(timer)` calls. A natural exit (no kill fired) leaves the escalation timer undefined; the `if (... !== undefined)` guard makes the call a no-op. A killed-then-exited path leaves the escalation timer running until grace; the cleanup cancels it before it fires the redundant SIGKILL.
+- **Worker `process.once`, not `removeListener` after first fire.** Either works; `once` is the idiomatic Node API for "fire exactly once". Documents intent in the call site without requiring a wrapper closure.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6269 pass / 10 skip / 0 fail** (6279 total across 291 files); +4 tests on top of slice 112's 6265
+- Targeted: `bun test tests/broker/spawn.test.ts` — 47/47
+
+### Next
+
+R6 P1 remaining (1 left):
+- **`stdin.end()` raced by `proc.exited`**: pre-timer/signal window where the broker awaits `stdin.end()` but proc.exited could resolve first (worker died before reading stdin); the catch maps to `stdin write failed: <EPIPE>` but `proc.exited` was already resolved, so the post-await drain.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R6 P1 stdin race.
+- R7 P1 leftovers.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 112: seal hierarchy locking (R8 #322)
 
 **Done.** One-hundred-twelfth slice. **Closes R8 fully.** Pre-slice the seal section was unconditionally last-writer-wins in the hierarchy resolver — an enterprise-mandated `worm-file` config could be silently swapped for `mode: none` by project policy, defeating the §7.3 forensic guarantee. Slice 101 deferred `seal.locked` support because the parser refused the field with no honoring code; slice 112 wires the full lock semantics end-to-end (parser + resolver) and re-enables the field.

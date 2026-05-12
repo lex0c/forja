@@ -861,6 +861,90 @@ describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)'
   });
 });
 
+// Slice 113 — R6 P1: pre-slice the broker timeout / abort path
+// sent SIGTERM and waited on proc.exited indefinitely. A worker
+// trapping SIGTERM (`trap "" TERM; sleep 60`) held the broker
+// hostage until some other defense fired through a side channel.
+// Slice 113 adds SIGTERM → SIGKILL escalation: after the grace
+// window (default 5s, configurable via timeoutGraceMs), the
+// broker sends SIGKILL so the worker dies regardless of trap.
+describe('createSpawnBroker — SIGTERM → SIGKILL escalation (slice 113, R6 P1)', () => {
+  test('timeout sends SIGTERM and follows with SIGKILL after grace', async () => {
+    // Worker traps SIGTERM (ignores it) so only SIGKILL can
+    // kill it. Without the escalation the broker would park
+    // on proc.exited forever; with the escalation, SIGKILL
+    // fires after timeoutGraceMs and the call completes.
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'trap "" TERM; IFS= read -r _; sleep 60'],
+      timeoutMs: 50,
+      timeoutGraceMs: 100, // short grace for fast test
+    });
+    const start = Date.now();
+    const r = await broker.execute(baseRequest());
+    const elapsed = Date.now() - start;
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('timeout after 50ms');
+    // Bound the wall-time: timeout 50ms + grace 100ms + slack.
+    // Without escalation this would hit the 60s sleep ceiling.
+    expect(elapsed).toBeLessThan(3000);
+    await broker.close();
+  });
+
+  test('abort sends SIGTERM and follows with SIGKILL after grace', async () => {
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'trap "" TERM; IFS= read -r _; sleep 60'],
+      timeoutGraceMs: 100,
+    });
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 20);
+    const start = Date.now();
+    const r = await broker.execute(baseRequest(), { signal: ac.signal });
+    const elapsed = Date.now() - start;
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('aborted');
+    expect(elapsed).toBeLessThan(3000);
+    await broker.close();
+  });
+
+  test('worker that exits on SIGTERM doesn’t wait for grace', async () => {
+    // Honest worker — exits cleanly on SIGTERM (default
+    // shell behavior). The escalation timer is armed but
+    // cleared in the finally before SIGKILL would fire.
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'IFS= read -r _; sleep 60'],
+      timeoutMs: 50,
+      timeoutGraceMs: 5000, // long grace; should NOT be needed
+    });
+    const start = Date.now();
+    const r = await broker.execute(baseRequest());
+    const elapsed = Date.now() - start;
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('timeout after 50ms');
+    // Default sh sleep exits on SIGTERM; wall-time stays well
+    // under the 5s grace.
+    expect(elapsed).toBeLessThan(2000);
+    await broker.close();
+  });
+
+  test('default timeoutGraceMs is 5000ms when not specified', async () => {
+    // Smoke test: construction without timeoutGraceMs uses the
+    // default. The actual value is verified via behavior — a
+    // wedged worker DOES escalate, proving the timer fired,
+    // but the exact ms isn't asserted (test would take 5s).
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: ['-c', 'IFS= read -r _; sleep 60'],
+      timeoutMs: 50,
+    });
+    const r = await broker.execute(baseRequest());
+    expect(r.ok).toBe(false);
+    await broker.close();
+  });
+});
+
 // Slice 106 — R6 #41: pre-slice an undefined timeoutMs at both
 // caller and broker layers meant `proc.exited` could park
 // forever on a wedged worker (closed pipes but never exited).

@@ -90,8 +90,16 @@ const readStdin = async (): Promise<string> => {
 // the OS would terminate the worker mid-handler, the bash
 // subprocess would orphan, and the broker would see "worker
 // produced no response" instead of the canonical aborted shape.
+//
+// `process.once` (was `process.on`) — slice 113 (R6 P1). The
+// worker handles exactly ONE request and exits; the SIGTERM
+// listener only ever needs to fire once. Using `on` accumulated
+// a listener each time runWorker re-entered (in test fixtures
+// that import this module to extract handlers and re-run inline)
+// and Bun surfaced `MaxListenersExceededWarning` at 11. `once`
+// auto-removes after first fire and prevents the warning.
 const ac = new AbortController();
-process.on('SIGTERM', () => ac.abort());
+process.once('SIGTERM', () => ac.abort());
 
 await runWorker({
   handlers: [echoHandler, bashHandler],

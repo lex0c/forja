@@ -120,6 +120,15 @@ export interface CreateSpawnBrokerOptions {
   // always a defensive ceiling unless the operator explicitly
   // opts out with 0.
   timeoutMs?: number;
+  // Grace window between SIGTERM and SIGKILL for timeout +
+  // abort paths (slice 113, R6 P1). Pre-slice the broker sent
+  // SIGTERM and waited on proc.exited indefinitely — a worker
+  // that trapped SIGTERM (`trap "" TERM`) held the broker
+  // hostage until some other defense (drain cap, proc.exited
+  // resolution) fired. Now an unresponsive worker gets SIGKILL
+  // after this window. Default `DEFAULT_TIMEOUT_GRACE_MS` (5s)
+  // matches the bash handler's grace.
+  timeoutGraceMs?: number;
   // Maximum bytes to accept from the worker's stdout / stderr
   // before the drain truncates and the worker is killed (slice
   // 102, R6 #21). Pre-slice the drain used `new Response(stream)
@@ -209,6 +218,18 @@ const DEFAULT_MAX_STDERR_BYTES = 4 * 1024 * 1024;
 // thresholds.
 export const DEFAULT_TIMEOUT_MS = 60_000;
 
+// SIGTERM → SIGKILL grace (slice 113, R6 P1). When the timeout
+// or abort fires, the broker sends SIGTERM and waits this many
+// ms for the worker to clean up; if the worker hasn't exited by
+// then, SIGKILL escalates. Pre-slice the broker sent SIGTERM
+// and waited on proc.exited indefinitely — a worker that
+// trapped SIGTERM (e.g., `trap "" TERM`) held the broker
+// hostage until the underlying drain caps / proc.exited
+// timeout fired through some other path. 5 s matches the bash
+// handler's grace (slice 38 onwards) so both layers use the
+// same window.
+const DEFAULT_TIMEOUT_GRACE_MS = 5_000;
+
 // Drain a worker stream with a byte cap. Reads chunks until the
 // stream ends OR the byte counter reaches `cap`; on cap, cancels
 // the reader (releasing the worker's pipe) and appends a
@@ -297,6 +318,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
   // they're doing stay in control).
   const env = options.env ?? scrubEnv(process.env);
   const timeoutMs = options.timeoutMs;
+  const timeoutGraceMs = options.timeoutGraceMs ?? DEFAULT_TIMEOUT_GRACE_MS;
   const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
   const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
   const sandboxRunner = options.sandboxRunner;
@@ -358,6 +380,22 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     let signalAborted = false;
     let signalListener: (() => void) | null = null;
     let proc: SpawnedProcess | undefined = undefined;
+    // SIGTERM → SIGKILL escalation timer (slice 113, R6 P1).
+    // First-arm-wins guard — if both abort and timeout want to
+    // escalate, the first arming captures the grace window;
+    // subsequent calls silently no-op. Same pattern as the
+    // bash handler's slice 108 fix.
+    let killEscalationTimer: ReturnType<typeof setTimeout> | undefined;
+    const escalateToSigkill = (): void => {
+      if (killEscalationTimer !== undefined) return;
+      killEscalationTimer = setTimeout(() => {
+        try {
+          if (proc !== undefined) proc.kill('SIGKILL');
+        } catch {
+          // already exited
+        }
+      }, timeoutGraceMs);
+    };
     const signal = callOptions?.signal;
     if (signal !== undefined) {
       signalListener = (): void => {
@@ -371,6 +409,10 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
           } catch {
             // already exited
           }
+          // Arm SIGKILL grace — a worker trapping SIGTERM
+          // would otherwise hold the broker on proc.exited
+          // indefinitely.
+          escalateToSigkill();
         }
       };
       signal.addEventListener('abort', signalListener, { once: true });
@@ -487,12 +529,22 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
           // visible to TS inside the setTimeout closure
           // because of how flow analysis works across async
           // boundaries, so a runtime `if` keeps the call safe.
+          //
+          // Explicit `'SIGTERM'` (was `proc.kill()` default-
+          // signal) makes the intent loud — slice 113's
+          // escalation path follows up with SIGKILL.
           if (proc !== undefined) {
-            proc.kill();
+            proc.kill('SIGTERM');
           }
         } catch {
           // ignore
         }
+        // SIGTERM → SIGKILL grace (slice 113, R6 P1). A worker
+        // that traps SIGTERM stops responding to the soft kill
+        // but the hard SIGKILL after the grace window forces
+        // termination. Same first-arm-wins guard the bash
+        // handler uses (slice 108).
+        escalateToSigkill();
       }, effectiveTimeoutMs);
     }
 
@@ -526,6 +578,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       exitCode = code;
     } catch (e) {
       if (timer !== null) clearTimeout(timer);
+      if (killEscalationTimer !== undefined) clearTimeout(killEscalationTimer);
       if (signal !== undefined && signalListener !== null) {
         signal.removeEventListener('abort', signalListener);
       }
@@ -537,6 +590,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       };
     }
     if (timer !== null) clearTimeout(timer);
+    if (killEscalationTimer !== undefined) clearTimeout(killEscalationTimer);
     if (signal !== undefined && signalListener !== null) {
       signal.removeEventListener('abort', signalListener);
     }
