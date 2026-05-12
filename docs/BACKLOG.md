@@ -15,6 +15,86 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 120: bash COMMAND_TABLE — tar/tee/ssh/scp/rsync/make/cargo (R2 #199, closes)
+
+**Done.** One-hundred-twentieth slice. Closes R2 #199 — pre-slice the bash resolver's `COMMAND_TABLE` had 73 entries (spec asks ≥ 30) but was missing several extremely common operator commands. Each missing command fell through to the `unknown_command` Refuse path, which was *safe* (no capability leak — the engine forced a manual confirm) but ergonomically hostile: every `tar -czf release.tar dist/`, `make build`, `cargo test`, `rsync -av src/ dst/` popped a confirm modal instead of running through an audited Allow path with the correct capability shape.
+
+### Why this matters
+
+The bash resolver's capability inference IS the policy contract for shell commands. A command without a resolver entry produces NO capability attribution → no `read-fs`/`write-fs`/`net-egress` in the audit row → the engine can't compare against operator allow-rules → manual confirm. Operators end up either (a) running everything under `--sandbox-host` to bypass confirms (security regression) or (b) shipping their own catch-all allow rules (audit row regression). The fix is the audit-honest middle: each command gets a resolver that emits the narrowest TRUE capability set its shape admits, so allow-rules can target exactly the surfaces the command touches.
+
+The seven adds bring the registry to 80 entries.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/resolvers/bash.ts` | Imports `netIngress` from capabilities (new for ssh port-forward detection). Seven new resolvers (`cmdTar`, `cmdTee`, `cmdSsh`, `cmdScp`, `cmdRsync`, `cmdMake`, `cmdCargo`) inserted between `cmdCd` and the `COMMAND_TABLE`. Each is registered in the map with its canonical command name. |
+| `tests/permissions/resolvers.test.ts` | New describes — one per command — totaling 36 tests pinning the capability shape per flag form, refuse triggers, and edge cases (numeric-stripped flag values for ssh, colon-disambiguation for port-forward flags, local vs remote endpoint detection for scp/rsync). |
+
+### Per-command capability shape
+
+**tar** — mode-aware (`-c`/`-x`/`-t` from short-flag bundle OR long-form `--create`/`--extract`/`--list`):
+- `create` → `write-fs(archive)` + `read-fs(input1)`, `read-fs(input2)`...
+- `extract` → `read-fs(archive)` + `write-fs(-C dir or cwd)`
+- `list` → `read-fs(archive)`
+- `unknown` (no mode flag) → conservative `read-fs(cwd) + write-fs(cwd)` at medium
+- Honors `-f`/`-C` value consumption AND short-flag bundle (`-czf archive.tar src/`).
+- Confidence `medium` — archive content traversal is not statically checkable.
+
+**tee** — `write-fs` for each positional. `tee -a` is the same shape (append-vs-truncate is irrelevant to capability). `tee` with no args is no-op. Confidence `high`.
+
+**ssh** — net-egress to extracted hostname + `read-fs(~/.ssh)` baseline (ssh always reads known_hosts/config/keys). Adds `exec:arbitrary` if a remote command is present (post-target non-flag tokens). Adds `net-ingress(*)` if port-forwarding flags `-L`/`-R`/`-D` are present. Refuses on `-o ProxyCommand=…` (spawns local shell) or missing target. Confidence `medium`.
+
+**scp** — `read-fs(~/.ssh)` baseline. `net-egress(host)` for each remote endpoint (`[user@]host:path` shape). Local sources → `read-fs(path)`; local dest → `write-fs(path)`. Detects remote vs local via "colon appears before any slash". Refuses on <2 positionals. Confidence `medium`.
+
+**rsync** — same remote/local discrimination as scp. `--delete`/`--delete-*` adds `delete-fs(dest)` when dest is local. `read-fs(~/.ssh)` added when ANY endpoint is remote (ssh transport). Confidence `medium`.
+
+**make** — `exec:arbitrary` + `read-fs(cwd) + write-fs(cwd)`. Targets passed on the command line are NOT path-attributed (`make build test` doesn't read `./build` and `./test`). Confidence `medium`.
+
+**cargo** — subcommand-aware:
+- inspection (`tree`/`metadata`/`pkgid`/`help`/`--version`) → `read-fs(cwd)` only, confidence `high`
+- `search` → `read-fs(cwd) + net-egress(crates.io)`, confidence `high`
+- credential subcommands (`publish`/`login`/`yank`/`owner`) → `read-fs(cwd) + read-fs(~/.cargo) + net-egress(crates.io)`, no `exec:arbitrary` (these don't compile), confidence `medium`
+- build/run/test/check/install/fetch (default) → `exec:arbitrary + read-fs(cwd) + write-fs(cwd/target) + net-egress(crates.io)` (build.rs can run anything), confidence `medium`
+
+### Decisions
+
+- **Per-command resolvers, not a generic "remote command" abstraction.** Tried a shared `cmdRemoteCopy` helper for scp/rsync; the flag schemas diverge enough (--delete, -e ssh, --rsync-path on rsync; vs -P, -i on scp) that the abstraction added more conditional branches than it removed. Each resolver stays self-contained — easier to audit and easier to extend per-command in future slices.
+- **Refuse `-o ProxyCommand=…` for ssh.** ProxyCommand spawns a LOCAL shell as a side-channel for the SSH connection. From a capability perspective, an SSH call with ProxyCommand is equivalent to `exec:arbitrary` on the LOCAL side via a side door. Operators wanting custom ssh transport must wire it through ProxyJump (`-J`) or pre-configured `~/.ssh/config`, both of which are statically tractable. cmdInterpreter has the same hard-refuse for `-c <code>` (slice 100); the policy precedent is "refuse statically when the same flag could mean either benign or hostile".
+- **net-ingress(\*) for ssh port-forward, not net-ingress on specific port.** `-L 8080:host:80` opens a listener on local port 8080 — but extracting the port reliably requires colon-aware parsing on a value that may be partly stripped (numeric tokens drop). Net-ingress(\*) flags the existence of the listener; operator policy can choose to allow/deny on the wildcard. Refining to specific ports is a follow-up if a real allowlist case appears.
+- **Numeric-stripped flag values are the load-bearing trap.** Tree-sitter-bash tokenizes numeric literals as `number` nodes, and the analyzer DROPS them from `shape.args` (only `word`/`string`/`raw_string`/`concatenation` survive — see `bash.ts:1260-1270`). So `ssh -p 2222 server` arrives at the resolver as `['-p', 'server']`. A naive "consume next" for `-p` would eat `'server'` as the port value and refuse with "no target". Slice 120 splits SSH flags into three classes:
+  - `numericValueFlags = {-p, -w}` → DON'T consume next (value gone)
+  - `stringValueFlags = {-i, -F, -e, -o, -J, -l, -m, ...}` → peek and consume if non-flag
+  - `portForwardFlags = {-L, -R, -D}` → peek and consume ONLY if next contains `:` (colon-shaped spec like `8080:host:80`); plain numeric port shapes were stripped from args
+  This is the kind of trap that only surfaces under integration with the parser. Three failing tests caught it during development; pinning the discriminator in code + tests prevents regression.
+- **rsync `--delete-*` family captured via prefix.** rsync has `--delete`, `--delete-after`, `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-excluded`, `--delete-missing-args` — all enable destination deletion. Single prefix match `t.startsWith('--delete-')` catches the family without enumerating; bare `t === '--delete'` covers the no-suffix case.
+- **scp/rsync local-vs-remote discriminator: "colon BEFORE any slash".** scp's documented remote syntax is `[user@]host:path` — the colon-bearing segment can't contain `/` (host names can't have slashes). So `host:/abs/path` is remote, `host:rel` is remote, `local/path:foo` is local (a literal filename with `:` after a directory). Pinned with a test (`local/path:foo` MUST NOT trigger net-egress).
+- **cargo subcommand split is opinionated.** `cargo build` and `cargo test` both implicitly compile and run `build.rs` — they get `exec:arbitrary`. `cargo metadata` doesn't compile but might still hit the registry on first run; tested locally that fresh `cargo metadata` works offline once the lock file exists, so it gets read-fs only. If this turns out wrong in operator reports, it's a 2-line move.
+- **`-o /etc/passwd` style writes already covered.** cmdCurlWget (slice 98, R2 #200) already detects `-o`/`--output` value targets. Did NOT extend the new resolvers to do the same — none of tar/tee/ssh/scp/rsync/make/cargo route file writes via a `-o` flag pattern. The existing `--file=`/`-f` consumption in cmdTar is the analog.
+
+### Trap navigated
+
+- **Aggregator adds `exec:shell` baseline.** Every successful resolver result is merged with `exec:shell` at the analyzeCommand layer (`bash.ts:1517`). Initial test for `tee -a out.log` asserted `toEqual(['write-fs:/work/proj/out.log'])` and failed with one extra element. Fixed by asserting the sorted set `['exec:shell', 'write-fs:/work/proj/out.log']`. Same pattern needs to apply to any future resolver test that uses `toEqual` instead of `toContain`.
+- **make/cargo "target name" trap.** `make build test` and `cargo build --release` have positionals that LOOK like paths but are subcommand or target names. cmdMake / cmdCargo deliberately do NOT call `resolveArg(positional)` for these — emitting `read-fs:/work/proj/build` would be a capability LIE (make doesn't read a file called `build`). Pinned by a test asserting absence of `read-fs:/work/proj/build`.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6330 pass / 10 skip / 0 fail** (6340 total across 291 files); +36 tests on top of slice 119's 6294
+- Targeted: `bun test tests/permissions/resolvers.test.ts` — 134/134
+
+### Next
+
+R2 #199 closes. Remaining roadmap from REVIEW_NOTES.md:
+- **R5** broker contract (scope still broad — needs scoping pass before pickup).
+- **R9** operator UX (broad — needs scoping pass before pickup).
+
+R-bucket P0 findings are otherwise drained: R1 ✓, R2 ✓ (including #199 just closed), R3 N/A, R4 ✓ (Linux + macOS), R6 ✓, R7 ✓, R8 ✓, R10 ✓, R11 ✓, R12 partial (eval/fuzz CI workflow remains aspirational per spec note).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 119: macOS sandbox hide_paths defense (R4, closes)
 
 **Done.** One-hundred-nineteenth slice. Closes the macOS half of R4 — slice 118 covered Linux via bwrap `--tmpfs` / `--ro-bind-try /dev/null`; this slice ships the equivalent in SBPL (Apple's Sandbox Profile Language) consumed by `sandbox-exec`. Pre-slice the macOS profile granted `(allow file-read*)` for the whole filesystem, exposing the operator's full home read-only inside the sandbox — the LLM could `cat ~/.ssh/id_rsa` from even a `ro` profile. The engine-side §11 protected-paths classifier (slice 97) only catches calls that surface as resolved capabilities; a sandboxed bash process reading the file directly bypassed the classifier on macOS exactly as it did on Linux.

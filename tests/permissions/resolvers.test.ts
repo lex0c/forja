@@ -929,3 +929,403 @@ describe('bash resolver — pkg install honesty (slice 100, R2 #205)', () => {
     }
   });
 });
+
+// Slice 120 — R2 #199: COMMAND_TABLE was missing tar / tee / ssh
+// / scp / rsync / make / cargo. Each fell through to the
+// unknown_command Refuse path, which was safe (no capability leak)
+// but ergonomically hostile — every `tar -czf release.tar dist/`
+// popped a manual confirm. This slice attributes the narrowest
+// honest capability set per shape so audited Allow paths can fire.
+describe('bash resolver — tar (slice 120, R2 #199)', () => {
+  test('create mode (-czf archive src/) → write archive + read sources', () => {
+    const r = resolveCapabilities('bash', { command: 'tar -czf release.tar.gz src/ docs/' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/work/proj/release.tar.gz');
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('read-fs:/work/proj/docs');
+      expect(r.confidence).toBe('medium');
+    }
+  });
+
+  test('extract mode (-xf archive -C dest) → read archive + write dest', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'tar -xf release.tar.gz -C /tmp/extract' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/release.tar.gz');
+      expect(s).toContain('write-fs:/tmp/extract');
+      // Output dir is NOT cwd — extract attributed to -C target only.
+      expect(s).not.toContain('write-fs:/work/proj');
+    }
+  });
+
+  test('extract without -C → write cwd as fallback dest', () => {
+    const r = resolveCapabilities('bash', { command: 'tar -xf release.tar.gz' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/release.tar.gz');
+      expect(s).toContain('write-fs:/work/proj');
+    }
+  });
+
+  test('list mode (-tf archive) → read archive only, no write', () => {
+    const r = resolveCapabilities('bash', { command: 'tar -tf release.tar.gz' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/release.tar.gz');
+      expect(s.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
+
+  test('long-form flags (--create --file=) work like short-form', () => {
+    const r = resolveCapabilities('bash', { command: 'tar --create --file=out.tar src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/work/proj/out.tar');
+      expect(s).toContain('read-fs:/work/proj/src');
+    }
+  });
+
+  test('unknown mode (no -c/-x/-t) → conservative cwd read+write', () => {
+    // `tar archive.tar` is malformed but possible. Conservative
+    // shape so the operator's modal still gets a chance.
+    const r = resolveCapabilities('bash', { command: 'tar release.tar' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj');
+      expect(s).toContain('write-fs:/work/proj');
+    }
+  });
+});
+
+describe('bash resolver — tee (slice 120, R2 #199)', () => {
+  test('tee FILE → write-fs target only (no read attributed for stdin source)', () => {
+    const r = resolveCapabilities('bash', { command: 'tee out.log' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/out.log');
+      expect(s.some((c) => c.startsWith('read-fs:'))).toBe(false);
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('tee FILE1 FILE2 FILE3 → write-fs for each positional', () => {
+    const r = resolveCapabilities('bash', { command: 'tee a.log b.log c.log' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/work/proj/a.log');
+      expect(s).toContain('write-fs:/work/proj/b.log');
+      expect(s).toContain('write-fs:/work/proj/c.log');
+    }
+  });
+
+  test('tee -a (append) — same shape as plain tee, no special handling', () => {
+    const r = resolveCapabilities('bash', { command: 'tee -a out.log' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      // exec:shell is the aggregator baseline; the resolver itself
+      // contributes only write-fs.
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toEqual(['exec:shell', 'write-fs:/work/proj/out.log']);
+    }
+  });
+
+  test('tee with no args → no fs side effect (copies stdin to stdout)', () => {
+    const r = resolveCapabilities('bash', { command: 'tee' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      // Just the baseline exec:shell.
+      expect(capStrings(r.capabilities)).toEqual(['exec:shell']);
+    }
+  });
+});
+
+describe('bash resolver — ssh (slice 120, R2 #199)', () => {
+  test('ssh user@host → net-egress + read ~/.ssh', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh op@server.example.com' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:server.example.com');
+      expect(s).toContain('read-fs:/home/op/.ssh');
+      // No remote command → no exec:arbitrary.
+      expect(s.some((c) => c.startsWith('exec:arbitrary'))).toBe(false);
+    }
+  });
+
+  test('ssh host with bare hostname (no user@) extracts hostname', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh server.internal' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:server.internal');
+    }
+  });
+
+  test('ssh user@host remote-cmd → adds exec:arbitrary', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh op@host echo hello' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('exec:arbitrary');
+      expect(s).toContain('net-egress:host');
+    }
+  });
+
+  test('ssh -p 2222 host → port flag consumed before host detection', () => {
+    // Without flag-value consumption, `2222` would be picked as
+    // the target host. Pin the consumption.
+    const r = resolveCapabilities('bash', { command: 'ssh -p 2222 server' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:server');
+      expect(s.some((c) => c === 'net-egress:2222')).toBe(false);
+    }
+  });
+
+  test('ssh -L (local forwarding) → net-ingress added', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -L 8080:localhost:80 host' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-ingress:*');
+    }
+  });
+
+  test('ssh -D (SOCKS) → net-ingress added', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -D 1080 host' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('net-ingress:*');
+    }
+  });
+
+  test('ssh -o ProxyCommand=… → refuse (local shell spawn)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -o ProxyCommand=evilcmd host' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('ProxyCommand');
+    }
+  });
+
+  test('ssh with no target → refuse', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -v' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('no target');
+    }
+  });
+});
+
+describe('bash resolver — scp (slice 120, R2 #199)', () => {
+  test('upload (local-source remote-dest) → net-egress + read local', () => {
+    const r = resolveCapabilities('bash', { command: 'scp local.txt op@host:/remote/path' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('net-egress:host');
+      expect(s).toContain('read-fs:/work/proj/local.txt');
+      expect(s).toContain('read-fs:/home/op/.ssh');
+    }
+  });
+
+  test('download (remote-source local-dest) → net-egress + write local', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'scp op@host:/remote/file ./downloaded.txt' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('net-egress:host');
+      expect(s).toContain('write-fs:/work/proj/downloaded.txt');
+    }
+  });
+
+  test('local-path with `:` in filename is NOT treated as remote', () => {
+    // `local/path:foo` has a slash before the colon → local.
+    // (scp's documented remote syntax requires the colon BEFORE
+    // any slash in the leading hostname segment.)
+    const r = resolveCapabilities('bash', { command: 'scp local/path:foo ./dest' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('net-egress:'))).toBe(false);
+    }
+  });
+
+  test('scp with only one positional → refuse', () => {
+    const r = resolveCapabilities('bash', { command: 'scp single' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('source and destination');
+    }
+  });
+});
+
+describe('bash resolver — rsync (slice 120, R2 #199)', () => {
+  test('local-local rsync → read source + write dest, no net-egress', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -av src/ dst/' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('write-fs:/work/proj/dst');
+      expect(s.some((c) => c.startsWith('net-egress:'))).toBe(false);
+    }
+  });
+
+  test('push to remote (user@host:dest) → net-egress + read source + ~/.ssh', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -av src/ op@host:/var/www/' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('net-egress:host');
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('read-fs:/home/op/.ssh');
+    }
+  });
+
+  test('pull from remote (user@host:src) → net-egress + write dest + ~/.ssh', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -av op@host:/remote/ local/' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('net-egress:host');
+      expect(s).toContain('write-fs:/work/proj/local');
+      expect(s).toContain('read-fs:/home/op/.ssh');
+    }
+  });
+
+  test('--delete on local dest → adds delete-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -av --delete src/ dst/' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('delete-fs:/work/proj/dst');
+    }
+  });
+
+  test('--delete-after → also triggers delete-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -av --delete-after src/ dst/' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('delete-fs:/work/proj/dst');
+    }
+  });
+
+  test('rsync with only one positional → refuse', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync src/' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('source and destination');
+    }
+  });
+});
+
+describe('bash resolver — make (slice 120, R2 #199)', () => {
+  test('plain make → exec:arbitrary + read/write cwd (Makefile recipes are untrusted)', () => {
+    const r = resolveCapabilities('bash', { command: 'make' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('exec:arbitrary');
+      expect(s).toContain('read-fs:/work/proj');
+      expect(s).toContain('write-fs:/work/proj');
+      // exec:shell still present from the aggregator.
+      expect(s).toContain('exec:shell');
+    }
+  });
+
+  test('make with target → same shape (target name is not a path)', () => {
+    const r = resolveCapabilities('bash', { command: 'make build test' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('exec:arbitrary');
+      // Target names should NOT be attributed as fs reads.
+      expect(s.some((c) => c === 'read-fs:/work/proj/build')).toBe(false);
+      expect(s.some((c) => c === 'read-fs:/work/proj/test')).toBe(false);
+    }
+  });
+});
+
+describe('bash resolver — cargo (slice 120, R2 #199)', () => {
+  test('cargo build → exec:arbitrary + write target/ + crates.io', () => {
+    const r = resolveCapabilities('bash', { command: 'cargo build' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('exec:arbitrary');
+      expect(s).toContain('write-fs:/work/proj/target');
+      expect(s).toContain('net-egress:crates.io');
+    }
+  });
+
+  test('cargo test / run / install → same exec:arbitrary shape', () => {
+    for (const cmd of ['cargo test', 'cargo run', 'cargo install ripgrep']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).toContain('exec:arbitrary');
+      }
+    }
+  });
+
+  test('cargo metadata / tree / help → read-only (no exec:arbitrary)', () => {
+    for (const cmd of ['cargo metadata', 'cargo tree', 'cargo help']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        const s = capStrings(r.capabilities);
+        expect(s.some((c) => c.startsWith('exec:arbitrary'))).toBe(false);
+        expect(s.some((c) => c.startsWith('write-fs:'))).toBe(false);
+        expect(s.some((c) => c.startsWith('net-egress:'))).toBe(false);
+      }
+    }
+  });
+
+  test('cargo search → crates.io read but no exec:arbitrary', () => {
+    const r = resolveCapabilities('bash', { command: 'cargo search serde' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:crates.io');
+      expect(s.some((c) => c.startsWith('exec:arbitrary'))).toBe(false);
+    }
+  });
+
+  test('cargo publish → reads ~/.cargo credentials, no exec:arbitrary', () => {
+    const r = resolveCapabilities('bash', { command: 'cargo publish' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/home/op/.cargo');
+      expect(s).toContain('net-egress:crates.io');
+      expect(s.some((c) => c.startsWith('exec:arbitrary'))).toBe(false);
+    }
+  });
+
+  test('cargo login → same credential shape as publish', () => {
+    const r = resolveCapabilities('bash', { command: 'cargo login' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/home/op/.cargo');
+    }
+  });
+});

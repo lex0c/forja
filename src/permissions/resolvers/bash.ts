@@ -36,7 +36,15 @@ import { resolve as resolvePath } from 'node:path';
 import type { Node } from 'web-tree-sitter';
 import { parseBash } from '../bash-parser.ts';
 import type { Capability } from '../capabilities.ts';
-import { deleteFs, exec, gitWrite, netEgress, readFs, writeFs } from '../capabilities.ts';
+import {
+  deleteFs,
+  exec,
+  gitWrite,
+  netEgress,
+  netIngress,
+  readFs,
+  writeFs,
+} from '../capabilities.ts';
 import { classifyProtectedPath } from '../protected_paths.ts';
 import {
   type Resolver,
@@ -547,6 +555,454 @@ const cmdCd: CommandResolver = (positional, _tokens, ctx) => {
   };
 };
 
+// ─── Slice 120 (R2 #199) — archive / remote / build resolvers ───
+//
+// Pre-slice the registry lacked entries for `tar`, `tee`, `ssh`,
+// `scp`, `rsync`, `make`, `cargo` — all common operator commands
+// that fell through to the `unknown_command` Refuse path. The
+// fall-through is safe (no capability leak) but ergonomically
+// hostile: every `tar -cf release.tar dist/` popped a manual-
+// confirm modal instead of an audited Allow with the correct
+// capability shape.
+//
+// Each resolver here returns the narrowest honest capability set
+// the command's flag schema admits. Confidence is `medium` for
+// shapes that can't be fully resolved statically (archive
+// traversal targets, Makefile recipes, build.rs scripts) and
+// `high` for shapes that ARE statically determined (tee writes
+// to its positionals).
+
+// `tee [-a] FILE...` — copies stdin to stdout AND to each FILE.
+// No filesystem read implied (stdin is upstream-fed). Each
+// positional is a write target. `-a` only changes append vs
+// truncate; the capability shape is the same.
+const cmdTee: CommandResolver = (positional, _tokens, ctx) => {
+  if (positional.length === 0) {
+    // No targets — copies stdin to stdout only. No fs side effect.
+    return { capabilities: [], confidence: 'high' };
+  }
+  return {
+    capabilities: positional.map((p) => writeFs(resolveArg(p, ctx))),
+    confidence: 'high',
+  };
+};
+
+// `tar` — three modes (create/extract/list) with very different
+// capability shapes. The short-flag bundle `-czf`/`-xvf`/`-tvf`
+// is the canonical operator form on every Unix; we decode it
+// here instead of relying on stripFlags's positional-only view.
+//
+// Flag schema we honor:
+//   -c / --create        → create mode
+//   -x / --extract       → extract mode
+//   -t / --list          → list mode
+//   -f <path> / --file=  → archive path (consumed from positionals)
+//   -C <path> / --directory= → output dir for extract (consumed)
+//
+// Compression flags (`-z`/`-j`/`-J`/`--gzip` etc.) don't change
+// the capability shape and are ignored.
+//
+// Capability shape per mode:
+//   create  → write-fs(archive), read-fs(each input path)
+//   extract → read-fs(archive),  write-fs(output dir or cwd)
+//   list    → read-fs(archive)
+//   unknown → read-fs(cwd) + write-fs(cwd) at medium confidence
+//             (defensive: a malformed invocation could still do
+//             anything; let the operator's modal decide).
+//
+// Out of scope: path-traversal-in-archive (a crafted archive
+// can extract `../../etc/passwd`). The resolver can't see the
+// archive contents at planning time; the sandbox profile and §11
+// classifier together still mask the extraction destination.
+// Confidence stays `medium` to flag the inherent uncertainty.
+const cmdTar: CommandResolver = (positional, tokens, ctx) => {
+  let mode: 'create' | 'extract' | 'list' | 'unknown' = 'unknown';
+  let archivePath: string | null = null;
+  let outputDir: string | null = null;
+  // Token-consumed positionals (archive path, output dir) — when
+  // we later filter `positional` for input paths, these must be
+  // excluded. Strings, not indices, because stripFlags renumbers.
+  const consumed = new Set<string>();
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+
+    if (t === '--create') {
+      mode = 'create';
+      continue;
+    }
+    if (t === '--extract' || t === '--get') {
+      mode = 'extract';
+      continue;
+    }
+    if (t === '--list') {
+      mode = 'list';
+      continue;
+    }
+    if (t.startsWith('--file=')) {
+      archivePath = t.slice('--file='.length);
+      continue;
+    }
+    if (t === '--file') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        archivePath = next;
+        consumed.add(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--directory=')) {
+      outputDir = t.slice('--directory='.length);
+      continue;
+    }
+    if (t === '--directory' || t === '-C') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        outputDir = next;
+        consumed.add(next);
+        i += 1;
+      }
+      continue;
+    }
+    // Short-flag bundles like `-czf`, `-xvf`, `-t`. Iterate
+    // characters so combined forms work. `c`/`x`/`t` set mode
+    // (first-write wins so `-cf` doesn't get retagged by a later
+    // bundle elsewhere on the line); `f` consumes the next
+    // non-flag positional as the archive path.
+    if (t.startsWith('-') && !t.startsWith('--') && t.length > 1) {
+      const bundle = t.slice(1);
+      if (mode === 'unknown') {
+        if (bundle.includes('c')) mode = 'create';
+        else if (bundle.includes('x')) mode = 'extract';
+        else if (bundle.includes('t')) mode = 'list';
+      }
+      if (bundle.includes('f')) {
+        const next = tokens[i + 1];
+        if (next !== undefined && !next.startsWith('-')) {
+          archivePath = next;
+          consumed.add(next);
+        }
+      }
+    }
+  }
+
+  // Inputs: positionals NOT consumed by -f / -C lookahead.
+  const inputs = positional.filter((p) => !consumed.has(p));
+
+  const caps: Capability[] = [];
+  if (archivePath !== null && archivePath !== '-') {
+    if (mode === 'create') caps.push(writeFs(resolveArg(archivePath, ctx)));
+    else caps.push(readFs(resolveArg(archivePath, ctx)));
+  }
+
+  if (mode === 'create') {
+    for (const p of inputs) caps.push(readFs(resolveArg(p, ctx)));
+  } else if (mode === 'extract') {
+    const dest = outputDir !== null ? resolveArg(outputDir, ctx) : ctx.cwd;
+    caps.push(writeFs(dest));
+  } else if (mode === 'unknown') {
+    // No mode flag seen — could be anything. Conservative shape.
+    return {
+      capabilities: [readFs(ctx.cwd), writeFs(ctx.cwd)],
+      confidence: 'medium',
+    };
+  }
+  // List mode: archive read already attributed; nothing else.
+
+  if (caps.length === 0) caps.push(readFs(ctx.cwd));
+
+  return { capabilities: caps, confidence: 'medium' };
+};
+
+// `ssh [opts] [user@]host [command]` — remote shell.
+//
+// Static-analyzable surface:
+//   - destination host (positional after flag-value consumption)
+//   - remote command presence (everything after host that isn't a flag)
+//   - port forwarding (-L / -R / -D) → local listener side effect
+//   - ProxyCommand (-o ProxyCommand=…) → spawns a LOCAL shell
+//
+// Capability shape:
+//   - net-egress(host) — always
+//   - read-fs(~/.ssh) — ssh reads known_hosts + config + keys
+//     regardless of `-i` (the §11 classifier on the engine side
+//     will catch this and escalate as configured by the operator)
+//   - exec:arbitrary — IF a remote command is supplied (the
+//     remote side can do anything; from a defense perspective the
+//     spawn is dangerous even if it executes elsewhere)
+//   - net-ingress(*) — IF -L / -D / -R port forwarding flags
+//     present (opens local listener)
+//
+// Hard refuses:
+//   - ProxyCommand in `-o <kv>` or `-oProxyCommand=…`: spawns a
+//     LOCAL shell as a side-channel for the SSH connection,
+//     ergo arbitrary local exec via an option flag — refuse
+//     static analysis the same way cmdInterpreter refuses `-c`.
+const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
+  for (const t of tokens) {
+    const lower = t.toLowerCase();
+    if (lower.startsWith('proxycommand=') || lower.includes('proxycommand=')) {
+      return {
+        refuse: 'ssh: ProxyCommand option spawns local shell — refusing static analysis',
+      };
+    }
+  }
+
+  // ssh flag schema. The tree-sitter bash grammar tokenizes numeric
+  // literals as `number` nodes and the analyzer DROPS them from
+  // `shape.args` (only `word`/`string`/`raw_string`/`concatenation`
+  // survive). So a flag whose value is always numeric (`-p 2222`)
+  // arrives here as just `['-p', ...next-token...]` — the value is
+  // already gone, and a generic "consume next" would eat the WRONG
+  // token (the target host). Three flag classes:
+  //
+  //   - numericValueFlags: value is strictly numeric → stripped from
+  //     args → DON'T consume next (it's not the value).
+  //   - stringValueFlags: value is always a string (path / kv / host)
+  //     → stays in args → peek next; consume if non-flag.
+  //   - portForwardFlags: value is `[bind:]port:host:remote_port` for
+  //     -L/-R, `[bind:]port` for -D. When the value is plain numeric
+  //     (`-D 1080`) it's stripped from args; when it carries a colon
+  //     (`-L 8080:host:80`) it stays. Discriminator: peek-next contains
+  //     `:`. If yes, consume; if no, the value was numeric and gone.
+  const numericValueFlags: ReadonlySet<string> = new Set(['-p', '-w']);
+  const stringValueFlags: ReadonlySet<string> = new Set([
+    '-i',
+    '-F',
+    '-e',
+    '-o',
+    '-J',
+    '-l',
+    '-m',
+    '-O',
+    '-Q',
+    '-W',
+    '-S',
+    '-c',
+    '-b',
+    '-I',
+  ]);
+  const portForwardFlags: ReadonlySet<string> = new Set(['-L', '-R', '-D']);
+
+  let targetIdx = -1;
+  let hasPortForward = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (numericValueFlags.has(t)) continue; // value already stripped from args
+    if (stringValueFlags.has(t)) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) i += 1;
+      continue;
+    }
+    if (portForwardFlags.has(t)) {
+      hasPortForward = true;
+      const next = tokens[i + 1];
+      // `:` in next → colon-shaped port-forward spec (consume).
+      // No `:` → bare numeric port (stripped) OR the target host
+      // (don't consume; let the next iteration pick it as target).
+      if (next?.includes(':')) i += 1;
+      continue;
+    }
+    if (t.startsWith('-')) continue;
+    targetIdx = i;
+    break;
+  }
+
+  if (targetIdx === -1) {
+    return { refuse: 'ssh: no target host specified' };
+  }
+
+  const target = tokens[targetIdx] ?? '';
+  // user@host — split on the LAST `@` so user names containing
+  // `@` (rare but legal) still yield the right host.
+  const atIdx = target.lastIndexOf('@');
+  const host = atIdx === -1 ? target : target.slice(atIdx + 1);
+
+  const caps: Capability[] = [netEgress(host || '*'), readFs(resolveArg('~/.ssh', ctx))];
+
+  // Remote command: any non-flag token after the target index.
+  const hasRemoteCmd = tokens.slice(targetIdx + 1).some((t) => !t.startsWith('-'));
+  if (hasRemoteCmd) caps.push(exec('arbitrary'));
+
+  if (hasPortForward) caps.push(netIngress('*'));
+
+  return { capabilities: caps, confidence: 'medium' };
+};
+
+// `scp [opts] SOURCE... DEST` — copy via ssh.
+//
+// At least one of SOURCE/DEST must be remote (`[user@]host:path`);
+// scp doesn't replace cp for local-local copies. We detect remote
+// shape by the presence of a `:` before any `/` (Windows-style
+// `C:\` shape doesn't appear in scp argv since scp doesn't run
+// on Windows native CMD, and even then the colon is after the
+// drive letter; here we treat `<text>:<path>` as remote when the
+// text part contains no slashes).
+//
+// Capability shape:
+//   - read-fs(~/.ssh) — scp inherits ssh's credential surface
+//   - net-egress(host) — for each remote endpoint
+//   - read-fs(local source) / write-fs(local dest) — for the
+//     local side of the transfer
+const cmdScp: CommandResolver = (positional, _tokens, ctx) => {
+  if (positional.length < 2) {
+    return { refuse: 'scp: needs at least source and destination' };
+  }
+  // `host:path` shape detection. We only flag as remote when the
+  // colon appears BEFORE any `/` — so `local/path:foo` is local
+  // (a literal filename containing `:`) but `host:/abs/path` and
+  // `user@host:rel` are remote.
+  const isRemote = (p: string): boolean => {
+    const colon = p.indexOf(':');
+    if (colon <= 0) return false;
+    return !p.slice(0, colon).includes('/');
+  };
+  const extractHost = (p: string): string => {
+    const left = p.slice(0, p.indexOf(':'));
+    const at = left.lastIndexOf('@');
+    const host = at === -1 ? left : left.slice(at + 1);
+    return host || '*';
+  };
+
+  const dest = positional[positional.length - 1] as string;
+  const sources = positional.slice(0, -1);
+  const caps: Capability[] = [readFs(resolveArg('~/.ssh', ctx))];
+
+  if (isRemote(dest)) {
+    caps.push(netEgress(extractHost(dest)));
+  } else {
+    caps.push(writeFs(resolveArg(dest, ctx)));
+  }
+  for (const s of sources) {
+    if (isRemote(s)) caps.push(netEgress(extractHost(s)));
+    else caps.push(readFs(resolveArg(s, ctx)));
+  }
+
+  return { capabilities: caps, confidence: 'medium' };
+};
+
+// `rsync [opts] SOURCE... DEST` — sync files.
+//
+// Three transport modes:
+//   - local-local (no `:` in any positional)
+//   - ssh (one side has `host:path`, default transport)
+//   - rsync daemon (one side has `host::module/path`, double colon)
+//
+// Capability shape:
+//   - read-fs(local sources), write-fs(local dest)
+//   - net-egress(remote host) for remote endpoints
+//   - read-fs(~/.ssh) when ssh transport is in play
+//   - delete-fs(local dest) when --delete or any --delete-* flag
+//     is present (rsync can delete extraneous files on dest)
+const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
+  if (positional.length < 2) {
+    return { refuse: 'rsync: needs at least source and destination' };
+  }
+  const isRemote = (p: string): boolean => {
+    const colon = p.indexOf(':');
+    if (colon <= 0) return false;
+    return !p.slice(0, colon).includes('/');
+  };
+  const extractHost = (p: string): string => {
+    // Strip both `:` and `::` (rsync daemon form).
+    let cut = p.indexOf(':');
+    if (p[cut + 1] === ':') cut += 1;
+    const left = p.slice(0, p.indexOf(':'));
+    const at = left.lastIndexOf('@');
+    const host = at === -1 ? left : left.slice(at + 1);
+    return host || '*';
+  };
+  // `--delete`, `--delete-after`, `--delete-before`, etc. all enable
+  // destination deletion. `-e` / `--rsh` set the transport command;
+  // `--rsync-path=cmd` can run an arbitrary remote command — we
+  // don't refuse on those alone (a custom rsync-path is operator-
+  // legitimate in many fleets) but they signal medium confidence.
+  const hasDelete = tokens.some((t) => t === '--delete' || t.startsWith('--delete-'));
+
+  const dest = positional[positional.length - 1] as string;
+  const sources = positional.slice(0, -1);
+  const anyRemote = isRemote(dest) || sources.some(isRemote);
+
+  const caps: Capability[] = [];
+  if (anyRemote) caps.push(readFs(resolveArg('~/.ssh', ctx)));
+
+  if (isRemote(dest)) {
+    caps.push(netEgress(extractHost(dest)));
+  } else {
+    caps.push(writeFs(resolveArg(dest, ctx)));
+    if (hasDelete) caps.push(deleteFs(resolveArg(dest, ctx)));
+  }
+  for (const s of sources) {
+    if (isRemote(s)) caps.push(netEgress(extractHost(s)));
+    else caps.push(readFs(resolveArg(s, ctx)));
+  }
+
+  return { capabilities: caps, confidence: 'medium' };
+};
+
+// `make [target...]` — runs recipes from a Makefile. Recipes are
+// arbitrary shell; even `make help` may execute a recipe with
+// side effects. We don't try to parse the Makefile — exec:arbitrary
+// is the honest capability shape, matching the cmdInterpreter
+// pattern for "this runs untrusted code".
+const cmdMake: CommandResolver = (_positional, _tokens, ctx) => {
+  return {
+    capabilities: [exec('arbitrary'), readFs(ctx.cwd), writeFs(ctx.cwd)],
+    confidence: 'medium',
+  };
+};
+
+// `cargo <subcommand> ...` — Rust toolchain. Subcommand-aware
+// because the capability shape varies dramatically.
+//
+// Read-only / inspection subcommands (`tree`, `metadata`, `pkgid`,
+// `help`, `--version` / `-V`) — just read-fs(cwd).
+//
+// `search` reaches crates.io but doesn't build.
+//
+// Credential subcommands (`publish`, `login`, `yank`, `owner`) —
+// read ~/.cargo/credentials.toml + net-egress crates.io. No
+// build.rs exec since these don't compile.
+//
+// Build / run / test / check / install / fetch — these can all
+// execute `build.rs` arbitrary code. Cargo also writes the
+// `target/` dir under cwd and reaches crates.io for deps.
+const cmdCargo: CommandResolver = (positional, _tokens, ctx) => {
+  const sub = positional[0];
+  if (
+    sub === 'tree' ||
+    sub === 'metadata' ||
+    sub === 'pkgid' ||
+    sub === 'help' ||
+    sub === '--version' ||
+    sub === '-V'
+  ) {
+    return { capabilities: [readFs(ctx.cwd)], confidence: 'high' };
+  }
+  if (sub === 'search') {
+    return {
+      capabilities: [netEgress('crates.io'), readFs(ctx.cwd)],
+      confidence: 'high',
+    };
+  }
+  if (sub === 'publish' || sub === 'login' || sub === 'yank' || sub === 'owner') {
+    return {
+      capabilities: [readFs(ctx.cwd), readFs(resolveArg('~/.cargo', ctx)), netEgress('crates.io')],
+      confidence: 'medium',
+    };
+  }
+  return {
+    capabilities: [
+      exec('arbitrary'),
+      readFs(ctx.cwd),
+      writeFs(resolvePath(ctx.cwd, 'target')),
+      netEgress('crates.io'),
+    ],
+    confidence: 'medium',
+  };
+};
+
 const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, CommandResolver>([
   ['ls', cmdRead],
   ['cat', cmdRead],
@@ -606,6 +1062,14 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['command', cmdSysInfo],
   // Navigation (no persistent side-effect across tool calls)
   ['cd', cmdCd],
+  // Slice 120 — archive / remote / build (R2 #199)
+  ['tar', cmdTar],
+  ['tee', cmdTee],
+  ['ssh', cmdSsh],
+  ['scp', cmdScp],
+  ['rsync', cmdRsync],
+  ['make', cmdMake],
+  ['cargo', cmdCargo],
 ]);
 
 // ─── AST walk ──────────────────────────────────────────────
