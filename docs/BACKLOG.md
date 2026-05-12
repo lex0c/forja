@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 119: macOS sandbox hide_paths defense (R4, closes)
+
+**Done.** One-hundred-nineteenth slice. Closes the macOS half of R4 — slice 118 covered Linux via bwrap `--tmpfs` / `--ro-bind-try /dev/null`; this slice ships the equivalent in SBPL (Apple's Sandbox Profile Language) consumed by `sandbox-exec`. Pre-slice the macOS profile granted `(allow file-read*)` for the whole filesystem, exposing the operator's full home read-only inside the sandbox — the LLM could `cat ~/.ssh/id_rsa` from even a `ro` profile. The engine-side §11 protected-paths classifier (slice 97) only catches calls that surface as resolved capabilities; a sandboxed bash process reading the file directly bypassed the classifier on macOS exactly as it did on Linux.
+
+### Why this matters
+
+R4 (sandbox credential leak) was the load-bearing finding for both platforms. Slice 118 closed the Linux half but left macOS exposed. Forja is positioned to ship on macOS (Apple Silicon dev laptops are a primary surface); shipping with Linux-only credential masking would be a cross-platform double standard — the same threat model on macOS would leak `~/.ssh/id_rsa` while Linux operators see it masked. Slice 119 brings macOS to parity.
+
+The defense per platform reduces to:
+
+| Path kind | Linux (bwrap) | macOS (SBPL) |
+|---|---|---|
+| Directory | `--tmpfs <home>/<dir>` | `(deny file-read*\|file-write* (subpath "<home>/<dir>"))` |
+| File | `--ro-bind-try /dev/null <home>/<file>` | `(deny file-read*\|file-write* (literal "<home>/<file>"))` |
+
+Different primitives, identical net effect — the credential paths return EACCES (Linux: tmpfs sees nothing / bind read-only; macOS: deny rule wins last) regardless of profile.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-hide-paths.ts` | **NEW.** Single source of truth for the §9 canonical lists. Exports `HIDE_PATHS_DIRS = ['.ssh', '.aws', '.config/gcloud', '.gnupg', '.kube']` and `HIDE_PATHS_FILES = ['.netrc', '.docker/config.json', '.npmrc', '.pypirc']`. Comments cross-reference the per-platform mechanism. Extracted from slice 118 (which defined them locally in `sandbox-runner.ts`) so the two runners physically share one list and can't drift. |
+| `src/permissions/sandbox-runner.ts` | Removes the local `HIDE_PATHS_DIRS` / `HIDE_PATHS_FILES` declarations and imports them from `./sandbox-hide-paths.ts`. The surrounding bwrap-mechanism comments stay in the runner (mount-order semantics are bwrap-specific). Behavior unchanged — pure refactor on the Linux side. |
+| `src/permissions/sandbox-runner-macos.ts` | Imports `join as joinPath` from `node:path` + the shared constants. `buildSbplProfile` emits a `denyRules` block AFTER `readRules`, `writeRules`, and `netRules`. Each dir generates `(deny file-read* (subpath "<abs>"))` + `(deny file-write* (subpath "<abs>"))`; each file generates the same pair with `(literal "<abs>")`. Paths flow through the existing `escapeSbplLiteral` so `"` / `\` / NUL are handled defensively. |
+| `tests/permissions/sandbox-runner-macos.test.ts` | New describe `hide_paths defense (slice 119, R4)` with 9 tests: (1-4) each sandboxed profile (ro, cwd-rw, cwd-rw-net, home-rw) emits the canonical dirs + files deny pairs; (5) deny file-read* clauses appear AFTER `(allow file-read*)` in every profile (SBPL last-rule-wins); (6) home-rw deny file-write* appears AFTER `(allow file-write* (subpath home))` — the critical case where the allow would otherwise grant credential writes; (7) host profile passes innerArgv through unchanged (no SBPL built); (8) deny rules follow the operator-supplied `home`, not `process.env.HOME`; (9) crafted home with embedded `"` is escaped so the deny clause can't be broken out of the literal. |
+
+### Decisions
+
+- **Shared constant module instead of per-runner duplication.** Slice 118 defined the lists locally in `sandbox-runner.ts`. Duplicating them in `sandbox-runner-macos.ts` would be a 5-line addition but creates the risk that a future slice adds `.terraformrc` to one list and not the other (cross-platform credential leak from divergence). The extraction to `sandbox-hide-paths.ts` is two extra imports and zero runtime cost. Spec §9 says "canonical list" — one list, one file.
+- **`subpath` for dirs, `literal` for files.** SBPL's `(subpath ...)` matches the path and all descendants; `(literal ...)` matches only the exact path. For credential dirs we WANT the descendants masked (`~/.ssh/id_rsa`, `~/.ssh/known_hosts`, `~/.ssh/config` — all credentials). For credential files we want only the named file (`~/.docker/config.json`, NOT the rest of `.docker/` which may contain non-secret state like buildx contexts). This mirrors the Linux semantics: `--tmpfs <dir>` empties the dir AND all contents; `--ro-bind /dev/null <file>` masks only the file.
+- **Deny BOTH file-read* and file-write*.** `(deny default)` blocks file-write* by default on `ro` / `cwd-rw` / `cwd-rw-net` (no allow file-write* for home in those profiles), so deny file-write* is redundant there but harmless. On `home-rw` the `(allow file-write* (subpath home))` would otherwise let the LLM write `~/.ssh/authorized_keys`, `~/.aws/credentials`, etc. — those WRITE paths are dangerous as `read` (persistent credential implantation). Pinning both reads and writes makes the policy uniform across profiles regardless of which `(allow file-write* ...)` clauses precede.
+- **Deny rules appended at the END of the profile string.** SBPL evaluation: rules apply top-to-bottom and the LAST matching rule for a given (operation, path) tuple wins. So `(allow file-read*)` → `(allow file-write* ...)` → `(allow network*)` → DENY block. A test pins the ordering (`allowReadIdx < denySshReadIdx`); if a future slice rearranges the rule emission order and breaks the precedence, the test fails loudly.
+- **No SBPL `import` directives, no profile files on disk.** sandbox-exec accepts `-p <inline-string>` and the profile is small (<2 KB with hide_paths). Inline keeps the runner pure-function (no I/O, no tempfile cleanup, no fs writes during planning). Same as slice 47's original decision.
+- **Path joining via `node:path.join`, not template string.** `joinPath(home, '.config/gcloud')` normalizes `home` even if it has a trailing slash (`/Users/op/` → `/Users/op/.config/gcloud`, not `/Users/op//.config/gcloud`). Mirrors the Linux runner's `joinPath(home, dir)`.
+- **Path escaping via the existing `escapeSbplLiteral`.** Same function used for cwd / home in the allow rules. The slice 119 deny rules feed through the same escape, so a path with embedded `"` (caller bug) can't close the SBPL literal early and inject `(allow file-read*)`. NUL bytes still throw — invalid in paths and indicate caller bugs upstream.
+- **`host` profile remains untouched.** The host gate is operator-explicit (`--sandbox-host` + capability set must include `host-passthrough`); slice 119 doesn't alter the host pass-through. The hide_paths defense doesn't apply to host by design — operator opted in to full host access.
+
+### Trap navigated
+
+- **SBPL rule order is semantically load-bearing, not cosmetic.** Pre-slice the macOS profile was `header + readRules + writeRules + netRules`. Appending denyRules at the end is critical: if a refactor sorted rules alphabetically or grouped them by syntactic shape (all `subpath` together), the deny clauses could end up BEFORE the allow file-read* baseline, and SBPL's last-rule-wins would silently flip the credential masks into a no-op. Two tests pin the ordering — read-order across every profile and write-order for home-rw specifically.
+- **`literal` vs `subpath` for files is not interchangeable.** Both match `.netrc` correctly when the path is exact. But `subpath` on a file path would also match any extension — if the kernel resolved a symlink at `.netrc` to a directory (pathological), `subpath` would inadvertently mask the whole resolved tree. `literal` is the precise primitive for a single-file target.
+- **`(deny default)` does not retroactively cover home-rw's writes.** Slice 119 author's first instinct was "deny default already blocks everything; the deny file-write* is redundant". For ro / cwd-rw / cwd-rw-net profiles that's true (no allow file-write* for home), but home-rw EXPLICITLY allows file-write* under `subpath home` — which the deny file-write* clauses must then countermand.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from prior slices)
+- `bun test` — **6294 pass / 10 skip / 0 fail** (6304 total across 291 files); +9 tests on top of slice 118's 6285
+- Targeted: `bun test tests/permissions/sandbox-runner-macos.test.ts tests/permissions/sandbox-runner.test.ts` — 63/63 (no regression on Linux; macOS suite grew accordingly)
+
+### Next
+
+R4 closes (Linux + macOS both done). Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R5 broker contract (scope still broad — needs scoping pass before pickup).
+- R9 operator UX (broad — needs scoping pass before pickup).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 118: Linux sandbox hide_paths defense (R4, partial)
 
 **Done.** One-hundred-eighteenth slice. Closes the Linux half of R4: pre-slice every sandbox profile started with `--ro-bind / /` (read-only mount of the host root) which exposed the operator's **full home read-only** inside the sandbox. The LLM running inside the sandbox could `cat ~/.ssh/id_rsa` or `cat ~/.aws/credentials` even from a `ro` profile. Slice 97 hardened the engine-side §11 protected-paths classifier, but the classifier only catches calls that surface as resolved capabilities at the engine layer; a sandboxed bash process reading those files DIRECTLY (via the kernel mount) bypassed the engine entirely.

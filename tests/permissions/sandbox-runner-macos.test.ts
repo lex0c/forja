@@ -159,3 +159,128 @@ describe('buildSandboxExecArgv', () => {
     ).toThrow(/must not be empty/);
   });
 });
+
+// Slice 119 — R4: §9 hide_paths defense in the macOS sandbox-exec
+// runner, parallel to slice 118 in the Linux bwrap runner.
+// Pre-slice the SBPL profile granted `(allow file-read*)` for
+// the whole filesystem, which exposed the operator's full home
+// inside the sandbox — the LLM could `cat ~/.ssh/id_rsa` from
+// even a `ro` profile. The engine-side §11 protected paths
+// classifier (slice 97) only catches calls that surface as
+// resolved capabilities; a sandboxed bash process reading the
+// file directly bypassed the classifier. Slice 119 emits
+// `(deny file-read*|file-write* ...)` clauses for credential
+// dirs (subpath) and files (literal) AFTER the allow rules so
+// SBPL's last-rule-wins evaluation locks them down.
+describe('buildSbplProfile — hide_paths defense (slice 119, R4)', () => {
+  const HOME = '/Users/op';
+  const expectHidePaths = (profileStr: string): void => {
+    // Per PERMISSION_ENGINE.md §9 the canonical dir list (subpath
+    // form — covers the dir and every descendant inside).
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.ssh"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.ssh"))');
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.aws"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.aws"))');
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.config/gcloud"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.config/gcloud"))');
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.gnupg"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.gnupg"))');
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.kube"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.kube"))');
+    // Canonical file list (literal form — exact path match).
+    expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.netrc"))');
+    expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.netrc"))');
+    expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.docker/config.json"))');
+    expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.docker/config.json"))');
+    expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.npmrc"))');
+    expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.npmrc"))');
+    expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.pypirc"))');
+    expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.pypirc"))');
+  };
+
+  test('ro profile emits hide_paths deny rules', () => {
+    const profile = buildSbplProfile('ro', '/work/proj', HOME);
+    expectHidePaths(profile);
+  });
+
+  test('cwd-rw profile emits hide_paths deny rules', () => {
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', HOME);
+    expectHidePaths(profile);
+  });
+
+  test('cwd-rw-net profile emits hide_paths deny rules', () => {
+    const profile = buildSbplProfile('cwd-rw-net', '/work/proj', HOME);
+    expectHidePaths(profile);
+  });
+
+  test('home-rw profile emits hide_paths deny rules (load-bearing — home is writable)', () => {
+    // home-rw grants `(allow file-write* (subpath home))`, which
+    // would otherwise let the LLM write `~/.ssh/authorized_keys`
+    // and persist a key. The deny file-write* clauses must come
+    // AFTER the allow so SBPL's last-rule-wins picks the deny.
+    const profile = buildSbplProfile('home-rw', '/work/proj', HOME);
+    expectHidePaths(profile);
+  });
+
+  test('deny rules appear AFTER allow file-read* (SBPL last-rule-wins)', () => {
+    // SBPL evaluates rules top-to-bottom and the LAST matching
+    // rule for that (operation, path) tuple wins. If the deny
+    // appeared BEFORE the allow file-read* baseline, the allow
+    // would win and the credential read would succeed. Pin the
+    // ordering for every profile.
+    for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
+      const profile = buildSbplProfile(p, '/work/proj', HOME);
+      const allowReadIdx = profile.indexOf('(allow file-read*)');
+      const denySshReadIdx = profile.indexOf('(deny file-read* (subpath "/Users/op/.ssh"))');
+      expect(allowReadIdx).toBeGreaterThanOrEqual(0);
+      expect(denySshReadIdx).toBeGreaterThan(allowReadIdx);
+    }
+  });
+
+  test('home-rw: deny file-write* appears AFTER allow file-write* home subpath', () => {
+    // The critical ordering for home-rw: a `(allow file-write*
+    // (subpath "<home>"))` clause grants writes across the
+    // whole home, and the deny for `~/.ssh` must come after to
+    // override it. Without this order the LLM could write
+    // authorized_keys, .aws/credentials, etc.
+    const profile = buildSbplProfile('home-rw', '/work/proj', HOME);
+    const allowWriteHomeIdx = profile.indexOf(`(allow file-write* (subpath "${HOME}"))`);
+    const denySshWriteIdx = profile.indexOf('(deny file-write* (subpath "/Users/op/.ssh"))');
+    expect(allowWriteHomeIdx).toBeGreaterThanOrEqual(0);
+    expect(denySshWriteIdx).toBeGreaterThan(allowWriteHomeIdx);
+  });
+
+  test('host profile is unchanged — no profile string built, innerArgv passes through', () => {
+    // sandbox-exec is not invoked at all on host; buildSandboxExecArgv
+    // returns innerArgv unchanged. The hide_paths defense doesn't
+    // apply because the inner process runs directly on the host.
+    const argv = buildSandboxExecArgv({
+      profile: 'host',
+      cwd: '/work/proj',
+      home: HOME,
+      innerArgv: ['bash', '-c', 'cat ~/.ssh/id_rsa'],
+    });
+    expect(argv).toEqual(['bash', '-c', 'cat ~/.ssh/id_rsa']);
+  });
+
+  test('deny rules use operator-supplied home, not host HOME env', () => {
+    // The defense follows the operator's chosen home value, not
+    // process.env.HOME. Same property as the Linux runner (slice 118):
+    // tests can pin Linux-shaped home values against the macOS
+    // builder and stay platform-independent.
+    const profile = buildSbplProfile('home-rw', '/work/proj', '/home/linux-op');
+    expect(profile).toContain('(deny file-read* (subpath "/home/linux-op/.ssh"))');
+    expect(profile).toContain('(deny file-read* (literal "/home/linux-op/.netrc"))');
+  });
+
+  test('home with embedded `"` does not break out of the literal (SBPL injection defense)', () => {
+    // The escape applies to hide_paths just like cwd/home rules.
+    // A crafted home containing `"` could otherwise close the
+    // literal and inject SBPL clauses (e.g. `(allow file-read*)`).
+    // Escape protects against caller bugs even though real home
+    // paths almost never contain `"`.
+    const profile = buildSbplProfile('cwd-rw', '/work', '/Users/op"injected');
+    expect(profile).toContain('(deny file-read* (subpath "/Users/op\\"injected/.ssh"))');
+    expect(profile).toContain('(deny file-read* (literal "/Users/op\\"injected/.netrc"))');
+  });
+});

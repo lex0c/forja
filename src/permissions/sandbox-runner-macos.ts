@@ -40,6 +40,8 @@
 //                 includes `host-passthrough`. The runner returns
 //                 the innerArgv unchanged.
 
+import { join as joinPath } from 'node:path';
+import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import type { SandboxProfile } from './sandbox-plan.ts';
 
 export interface BuildSandboxExecArgvOptions {
@@ -125,7 +127,47 @@ export const buildSbplProfile = (
     netRules.push('(allow network*)');
   }
 
-  return [...header, ...readRules, ...writeRules, ...netRules].join('\n');
+  // §9 hide_paths — credential dirs + files masked inside every
+  // sandbox profile (slice 119, R4). The `(allow file-read*)`
+  // baseline above exposes the operator's entire home read-only
+  // inside the sandbox; the LLM could `cat ~/.ssh/id_rsa` from a
+  // `ro` profile without this defense. Engine-side §11 protected
+  // paths (slice 97) only catches calls that surface as resolved
+  // capabilities — a sandboxed bash reading the file directly
+  // bypasses the classifier.
+  //
+  // SBPL evaluation: rules apply top-to-bottom and the LAST
+  // matching rule wins for that operation. The deny clauses
+  // emitted here come AFTER the allow file-read* baseline and
+  // AFTER any profile-specific (allow file-write* ...) — so a
+  // read of `~/.ssh/id_rsa` matches both `(allow file-read*)`
+  // and `(deny file-read* (subpath "~/.ssh"))`, and deny wins.
+  //
+  // Path kind shapes:
+  //   dirs  → `(subpath "<abs>")` — matches the dir AND any
+  //           descendant, so `~/.ssh/known_hosts` is also denied.
+  //   files → `(literal "<abs>")` — matches only that exact path.
+  //
+  // We deny BOTH file-read* and file-write* so that home-rw
+  // (which grants `(allow file-write* (subpath home))`) still
+  // can't write `~/.ssh/authorized_keys` — the later deny wins
+  // there too. Canonical lists from `sandbox-hide-paths.ts`,
+  // shared with the Linux bwrap runner.
+  const denyRules: string[] = [];
+  for (const dir of HIDE_PATHS_DIRS) {
+    const absDir = joinPath(home, dir);
+    const escaped = escapeSbplLiteral(absDir);
+    denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
+    denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
+  }
+  for (const file of HIDE_PATHS_FILES) {
+    const absFile = joinPath(home, file);
+    const escaped = escapeSbplLiteral(absFile);
+    denyRules.push(`(deny file-read* (literal "${escaped}"))`);
+    denyRules.push(`(deny file-write* (literal "${escaped}"))`);
+  }
+
+  return [...header, ...readRules, ...writeRules, ...netRules, ...denyRules].join('\n');
 };
 
 // Build the `sandbox-exec` argv for a given profile. Pure function.
