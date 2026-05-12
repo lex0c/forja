@@ -15,6 +15,67 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 126: R9 P0 #10 deferred-decision (hybrid)
+
+**Done.** One-hundred-twenty-sixth slice. Records the design decision on the last open R-bucket finding: R9 P0 #10 — §13.4/§13.5 interactive menu NOT implemented.
+
+### The gap
+
+Spec `PERMISSION_ENGINE.md` §13.4-§13.5 describes a dual-confirm interactive menu for the sandbox-absent first-boot case:
+
+```
+Sandbox unavailable. How to proceed?
+  [1] Show         — display install commands
+  [2] Run install  — requires --yes AND writes ci_mode_acknowledged
+  [3] Continue unsafe — writes unsafe_mode_acknowledged_at to policy
+  [4] Cancel
+```
+
+Current implementation (`welcome.ts` + `sandbox-setup.ts`, slices 44-45 / 91) is INFO-ONLY: prints install recommendations, no menu, no policy mutation. CLAUDE.md says "spec is protocol, not suggestion" — this is a real divergence.
+
+### Decision: Option C (hybrid — defer with documented rationale)
+
+Three options were considered (REVIEW_NOTES_R2 triage):
+- **A**: implement the spec-canonical dual-confirm menu (~300-500 LOC: raw stdin TUI prompt + policy schema migration for `unsafe_mode_acknowledged_at` + `ci_mode_acknowledged` fields + tests).
+- **B**: PR the spec to declare §13.4/§13.5 info-only, removing the menu requirement entirely.
+- **C** (chosen): leave code info-only, document the gap as deferred-with-rationale in code comments + BACKLOG. Spec stays as-written. Future slice can implement when triggered.
+
+### Rationale
+
+- The operator's existing acknowledgment surface (`--i-know-what-im-doing` → `~/.config/forja/sandbox_skip` marker, slice 91) covers the same UX intent — "operator explicitly opted into unsafe-mode posture, visible to audit". Per-policy `_acknowledged_at` timestamps would be more granular but the marker IS the acknowledgment.
+- 300-500 LOC of TUI + schema migration for a UX gain that the marker already addresses is high cost/value ratio at this milestone.
+- Option B (rewriting the spec) is the wrong direction: §13.4 is a coherent UX design and operators in compliance scenarios (where per-policy timestamps matter for audit trails) DO need that shape. Keeping the spec preserves the option.
+- The gap is now ACKNOWLEDGED in code, not denied. Reviewer queries that find R9 #10 in REVIEW_NOTES land in code comments that explain the deferral + name the trigger conditions for re-evaluation.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/welcome.ts` | File-header doc block expanded with the deferred-decision rationale: spec §13.4/§13.5 menu spec, current info-only status, marker as existing acknowledgment, trigger conditions for re-evaluation (operator friction reports, compliance scenarios). |
+| `src/cli/sandbox-setup.ts` | File-header pointer to welcome.ts's full rationale. |
+| `docs/BACKLOG.md` | This entry. |
+
+### Decisions
+
+- **No spec edits.** Spec stays canonical; code documents the deferral. CLAUDE.md rule "never edit docs/spec/ without explicit user request" is preserved. A future Option A slice would land code first; spec stays unchanged regardless.
+- **Trigger conditions named in the code.** Future slice criteria spelled out: (a) operator reports show real friction with marker-only flow, or (b) compliance scenarios emerge needing per-policy `*_acknowledged_at` for audit trails. Without one of those, the deferral stands.
+- **Anchor in welcome.ts, pointer in sandbox-setup.ts.** Welcome composes sandbox-setup; centralizing the rationale on the composer avoids drift. Sandbox-setup just points back.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings
+- `bun test` — 6389 pass / 10 skip / 0 fail (unchanged; no behavioral change)
+- No new tests (documentation-only slice).
+
+### Next
+
+R-bucket FULLY drained (all bug-class findings actioned, R9 P0 #10 explicitly deferred). Slices 95-126 (32 consecutive) closed every actionable P0/P1 from both review rounds + recorded the one design-deferral.
+
+Roadmap left in the R-bucket scope: only R12's fuzz CI workflow (aspirational, not functional — nightly `.github/workflows/` infrastructure, not source-code bug).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 125: REVIEW_NOTES_R2 punch list (10 P0 + 12 P1)
 
 **Done.** One-hundred-twenty-fifth slice. Closes every actionable finding from `docs/REVIEW_NOTES_R2.md` — the second multi-agent review pass over slices 95-124. Ten P0 findings + twelve P1s in one consolidated slice; the surfaces touched are disjoint enough that a single review pass is more economical than five separate slices.

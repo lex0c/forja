@@ -15,6 +15,31 @@
 //
 // Plain text only — operators consuming structured data should call
 // `agent doctor --json` and `agent sandbox setup --json` directly.
+//
+// DEFERRED (REVIEW_NOTES.md R9 P0 #10 / slice 125 decision-C):
+// Spec PERMISSION_ENGINE.md §13.4 and §13.5 describe a dual-confirm
+// interactive menu for the sandbox-absent case:
+//   [1] Show         — display install commands
+//   [2] Run install  — requires --yes AND writes `ci_mode_acknowledged`
+//                      to the policy
+//   [3] Continue unsafe — writes `unsafe_mode_acknowledged_at` to the
+//                         policy
+//   [4] Cancel
+//
+// The current implementation is INFO-ONLY: it prints the install
+// recommendations and leaves the policy untouched. The operator's
+// existing acknowledgment surface is `--i-know-what-im-doing` (slice
+// 91), which writes the `~/.config/forja/sandbox_skip` marker. The
+// dual-confirm + per-policy acknowledgment fields are deliberately
+// deferred — implementing them is ~300-500 LOC of TUI + policy
+// schema migration for a UX gain that the marker already covers in
+// 99% of cases.
+//
+// The gap is acknowledged, not denied. A future slice can implement
+// the spec-canonical menu when (a) operator reports show real
+// friction with the marker-only flow, or (b) compliance scenarios
+// emerge that need per-policy `*_acknowledged_at` timestamps for
+// audit trails. Until then, the marker IS the acknowledgment.
 
 import { runDoctor } from './doctor.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';

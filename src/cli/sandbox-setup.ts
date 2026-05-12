@@ -20,6 +20,16 @@
 // recommendation rendered (even when sandbox is already installed —
 // the verb is informational, not a gate); exit 1 only on internal
 // failure (file read errors, etc).
+//
+// DEFERRED (REVIEW_NOTES.md R9 P0 #10 / slice 125 decision-C):
+// Spec PERMISSION_ENGINE.md §13.4 describes a dual-confirm
+// interactive menu ([1] Show / [2] Run install + --yes + writes
+// `ci_mode_acknowledged` / [3] Continue unsafe + writes
+// `unsafe_mode_acknowledged_at` / [4] Cancel). This implementation
+// is INFO-ONLY — it never offers to RUN the install nor mutates
+// the policy. Slice 91's `--i-know-what-im-doing` marker is the
+// existing acknowledgment surface (see welcome.ts for the full
+// deferred-decision rationale).
 
 import { readFileSync } from 'node:fs';
 import { arch as nodeArch, platform as nodePlatform } from 'node:os';
