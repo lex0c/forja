@@ -154,6 +154,19 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
 
       let timeoutMs = BASH_DEFAULT_TIMEOUT_MS;
       if (args.timeout_ms !== undefined) {
+        // Triple check is load-bearing (slice 117 documentation):
+        //   - `typeof === 'number'` rejects strings / null / etc.
+        //   - `Number.isInteger` rejects non-integer numbers AND
+        //     NaN / Infinity / -Infinity (these are not integers).
+        //   - `>= 100` rejects zero, negatives, and tiny values
+        //     that would timer-race the spawn.
+        // `Number.isFinite` would be REDUNDANT with `isInteger`
+        // (isInteger returns false for NaN/Infinity), but adding
+        // it doesn't cost anything and keeps the conditions
+        // structurally parallel to other numeric validators that
+        // accept floats — a future relaxation that removed
+        // isInteger would still have isFinite catching the
+        // NaN/Infinity edge case. Triple check stays.
         if (
           typeof args.timeout_ms !== 'number' ||
           !Number.isFinite(args.timeout_ms) ||
@@ -324,6 +337,16 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
         }
       }
 
+      // Slice 117 (R7 P1): emit truthful truncation flags on every
+      // return path. Pre-slice the bash tool inferred truncation
+      // by regex-testing the trailing pattern — fragile + false
+      // positive on legit content quoting the marker. The handler
+      // KNOWS truthfully via readCapped's returned `truncated`
+      // field; carrying that across the BrokerResponse wire is
+      // the canonical source.
+      const stdoutTruncated = outRes.truncated;
+      const stderrTruncated = errRes.truncated;
+
       // Abort takes precedence over timeout — if the caller cancelled
       // AND the timeout fired (rare; e.g., abort during the grace
       // window), the canonical shape is aborted, not timeout.
@@ -334,6 +357,8 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
           stderr: errRes.text,
           exitCode,
           error: 'aborted',
+          stdoutTruncated,
+          stderrTruncated,
         };
       }
 
@@ -344,6 +369,8 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
           stderr: errRes.text,
           exitCode,
           error: `bash handler: timed out after ${timeoutMs}ms`,
+          stdoutTruncated,
+          stderrTruncated,
         };
       }
 
@@ -358,6 +385,8 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
           stdout: outRes.text,
           stderr: errRes.text,
           error: `bash handler: wait failed: ${waitError.message}`,
+          stdoutTruncated,
+          stderrTruncated,
         };
       }
 
@@ -366,6 +395,8 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
         stdout: outRes.text,
         stderr: errRes.text,
         exitCode,
+        stdoutTruncated,
+        stderrTruncated,
       };
     },
   };

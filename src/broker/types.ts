@@ -78,6 +78,16 @@ export interface BrokerResponse {
   // exit non-zero produce ok=false + exitCode set + error
   // undefined.
   error?: string;
+  // Truthful truncation flags from the handler's read-capped
+  // primitive (slice 117, R7 P1). Pre-slice the bash tool inferred
+  // truncation by regex-testing the trailing pattern in stdout —
+  // any user output happening to end in `\n[... truncated; N
+  // bytes omitted]` would falsely report truncation. The flags
+  // carry the actual handler-side truth. Undefined when the
+  // handler doesn't track per-stream truncation (older handlers
+  // / non-bash); the bash tool treats undefined as false.
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
 }
 
 // Per-call options. Threaded through every broker implementation

@@ -170,6 +170,8 @@ const isBrokerResponse = (v: unknown): v is BrokerResponse => {
   if (typeof o.stderr !== 'string') return false;
   if (o.exitCode !== undefined && typeof o.exitCode !== 'number') return false;
   if (o.error !== undefined && typeof o.error !== 'string') return false;
+  if (o.stdoutTruncated !== undefined && typeof o.stdoutTruncated !== 'boolean') return false;
+  if (o.stderrTruncated !== undefined && typeof o.stderrTruncated !== 'boolean') return false;
   return true;
 };
 

@@ -44,12 +44,13 @@ export interface BashOutput {
 // missing broker surfaces `bash.spawn_failed` so misconfigured
 // harnesses fail loudly rather than silently bypassing isolation.
 //
-// Truncation detection: the broker handler appends
-// `\n[... truncated; N bytes omitted]` to capped streams. This
-// tool inspects the trailing pattern to recover the `truncated`
-// flag on BashOutput. Brittle by design — slice 83 may surface
-// truncation via a dedicated BrokerResponse field if/when other
-// handlers need it.
+// Truncation detection (slice 117): BrokerResponse now carries
+// `stdoutTruncated` / `stderrTruncated` boolean flags from the
+// handler's read-capped primitive. Pre-slice we regex-tested the
+// trailing `\n[... truncated; N bytes omitted]` pattern, which
+// false-positive'd on user output happening to end in that exact
+// string (e.g., `echo "[... truncated; 0 bytes omitted]"`). The
+// boolean flags carry the truthful handler-side state.
 //
 // Mid-exec abort (slice 83): passes ctx.signal to broker.execute.
 // The broker propagates to the bash worker handler, which kills
@@ -63,7 +64,6 @@ const TIMED_OUT_PREFIX = 'bash handler: timed out after ';
 const SPAWN_FAILED_PREFIX = 'bash handler: failed to spawn bash: ';
 const HANDLER_PREFIX = 'bash handler: ';
 const ABORTED_ERROR = 'aborted';
-const TRUNCATION_FOOTER_RE = /\n\[\.\.\. truncated; \d+ bytes omitted]$/;
 
 const isInvalidArgError = (msg: string): boolean =>
   msg.startsWith('bash handler: args.command must be') ||
@@ -208,8 +208,16 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       return toolError(ERROR_CODES.bashSpawnFailed, 'bash broker returned no exit code');
     }
 
-    const stdoutTruncated = TRUNCATION_FOOTER_RE.test(response.stdout);
-    const stderrTruncated = TRUNCATION_FOOTER_RE.test(response.stderr);
+    // Slice 117 (R7 P1): read truthful truncation flags from the
+    // BrokerResponse. Pre-slice we inferred via TRUNCATION_FOOTER_RE
+    // matching the trailing pattern — user output ending in
+    // `\n[... truncated; N bytes omitted]` (e.g., a bash command
+    // that echoed that literal text) was falsely reported as
+    // truncated. The handler's readCapped now carries its truthful
+    // truncated flag across the wire; we read it directly.
+    // Undefined (older handler / non-bash) treated as false.
+    const stdoutTruncated = response.stdoutTruncated === true;
+    const stderrTruncated = response.stderrTruncated === true;
 
     return {
       stdout: response.stdout,

@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 117: truncation flag on BrokerResponse + Number.isFinite docs (R7 P1, R7 fully closed)
+
+**Done.** One-hundred-seventeenth slice. **Closes R7 fully** (last 2 P1 cleanups):
+
+- **Truncation footer regex false positive**: pre-slice the bash tool inferred truncation via `TRUNCATION_FOOTER_RE.test(response.stdout)` — matching `\n[... truncated; N bytes omitted]$`. Any user output happening to end in that exact pattern (e.g., `echo "[... truncated; 42 bytes omitted]"`) was falsely reported as truncated. The handler always knew truthfully via `readCapped`'s returned `truncated` flag; the tool just couldn't see it. Slice 117 carries the flag across the BrokerResponse wire so the tool reads it directly.
+- **`Number.isFinite` triple-check load-bearing in non-obvious way**: pre-slice the timeout_ms validation chained `typeof === 'number' && Number.isFinite && Number.isInteger && >= 100`. The finding flagged that some checks are redundant (`Number.isInteger` already rejects NaN/Infinity, so `Number.isFinite` is technically superfluous). Slice 117 adds a long-form comment documenting why each check stays — preserving structural parallelism with future numeric validators that accept floats — rather than removing the redundancy. The defensive triple-check IS load-bearing; the docs make that explicit.
+
+### Why this matters
+
+Truncation flag accuracy is operator-facing: a model whose bash output happens to quote the truncation marker would get `truncated: true` in the BashOutput envelope, surfacing as a misleading audit signal. Audit consumers tracking truncation rates as a heuristic ("are we hitting output limits too often?") would see false positives skew the metric. The fix routes truthful state through a typed wire field — no inference, no regex matching, no false positives.
+
+The Number.isFinite check is the smaller of the two; the fix is documentation. Pre-slice a maintainer reading the check could legitimately think "wait, isInteger already rejects NaN — is this dead?". The added comment answers that explicitly: the redundancy is intentional defense in depth, parallel structure to other validators that DON'T have isInteger (and need isFinite as the NaN/Infinity guard).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/types.ts` | Adds `stdoutTruncated?: boolean` and `stderrTruncated?: boolean` to `BrokerResponse`. Optional so older handlers / non-bash handlers don't have to populate them; consumers treat undefined as false (same shape semantically as "did not truncate"). |
+| `src/broker/spawn.ts` | `isBrokerResponse` validator extended to accept the two new optional fields (and reject non-boolean values when present). |
+| `src/broker/handlers/bash.ts` | Captures `outRes.truncated` / `errRes.truncated` from the readCapped results, threads them through to every BrokerResponse return path (aborted / timedOut / waitError / success). Adds the long-form comment to the timeout_ms validation explaining why each check in the triple-check stays. |
+| `src/tools/builtin/bash.ts` | Removes `TRUNCATION_FOOTER_RE` constant (no longer used). The bash tool's return-shape construction now reads `response.stdoutTruncated === true` / `response.stderrTruncated === true` directly — undefined treated as false. Header comment updated to document the slice 117 change. |
+| `tests/tools/bash.test.ts` | New test: output literally ending in the truncation marker is NOT misreported. Uses real bash + printf to emit the exact false-positive shape; asserts `truncated === false`. |
+| `tests/tools/bash-broker.test.ts` | Updates 2 existing tests (`truncation footer in stdout → truncated:true` and same for stderr) to renamed `stdoutTruncated flag → truncated:true` shapes — they now set the flag explicitly in the scripted BrokerResponse rather than relying on regex inference. New test added pinning the false-positive fix: user output with the marker text but no flag → `truncated:false`. |
+
+### Decisions
+
+- **Flag is optional on BrokerResponse.** A bool that's strictly required would force every handler (echo, future custom handlers) to set it. Optional + `=== true` consumer check means non-bash handlers ship with no change, and the bash tool's behavior is unchanged for them (treats undefined as false).
+- **Remove `TRUNCATION_FOOTER_RE` entirely, no fallback.** The regex was the LAST source of truth pre-slice; with the flag in place, keeping the regex as a fallback would re-introduce the false positive on legacy paths. Clean removal forces every truncation path through the new flag.
+- **Document the triple-check rather than simplifying.** The "load-bearing in non-obvious way" finding hints that the redundancy is structural. Removing `Number.isFinite` would technically work (isInteger handles all current shapes) but breaks structural parallelism with other validators that might NOT have isInteger. A future PR that loosens isInteger to accept floats would silently lose the NaN/Infinity guard. The comment explains the contract.
+- **Test on real bash, not just unit.** The bash-broker.test scripts a BrokerResponse directly (unit-level coverage of the tool's interpretation logic). The bash.test additionally runs real bash with a printf that emits the false-positive marker — end-to-end verification that the flag path is consistent.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6279 pass / 10 skip / 0 fail** (6289 total across 291 files); +2 tests on top of slice 116's 6277
+- Targeted: `bun test tests/tools/bash.test.ts tests/tools/bash-broker.test.ts tests/broker/` — 186/186
+
+### Next
+
+**R7 fully closed** (P0 + all 5 P1). Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 116: bash handler Promise.all reject shape + read-capped listener symmetry (R7 P1)
 
 **Done.** One-hundred-sixteenth slice. Closes 2 more R7 P1 leftovers in the broker bash handler stack — both concurrency-cleanup concerns:

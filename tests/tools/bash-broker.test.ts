@@ -141,28 +141,51 @@ describe('bashTool — BrokerResponse translation', () => {
     expect(out.stderr).toBe('nope');
   });
 
-  test('truncation footer in stdout → truncated:true', async () => {
+  test('stdoutTruncated flag → truncated:true', async () => {
+    // Slice 117: the bash tool reads `stdoutTruncated` / `stderrTruncated`
+    // directly from BrokerResponse. The trailing footer text is
+    // informational for the operator but no longer the source of
+    // truth for the truncated flag.
     const broker = scripted({
       ok: true,
       stdout: 'data\n[... truncated; 100 bytes omitted]',
       stderr: '',
       exitCode: 0,
+      stdoutTruncated: true,
     });
     const out = await bashTool.execute({ command: 'dd' }, makeCtx({ broker }));
     if (isToolError(out)) throw new Error('unexpected error');
     expect(out.truncated).toBe(true);
   });
 
-  test('truncation footer in stderr → truncated:true', async () => {
+  test('stderrTruncated flag → truncated:true', async () => {
     const broker = scripted({
       ok: true,
       stdout: '',
       stderr: 'noise\n[... truncated; 50 bytes omitted]',
       exitCode: 0,
+      stderrTruncated: true,
     });
     const out = await bashTool.execute({ command: 'dd' }, makeCtx({ broker }));
     if (isToolError(out)) throw new Error('unexpected error');
     expect(out.truncated).toBe(true);
+  });
+
+  test('user output literally ending in truncation marker WITHOUT flags → truncated:false (slice 117 false-positive fix)', async () => {
+    // Pre-slice the regex matched this and set truncated:true even
+    // though the handler didn't truncate. Now the flag-only path
+    // refuses to false-positive on user-quoted content.
+    const broker = scripted({
+      ok: true,
+      stdout: 'echoed\n[... truncated; 42 bytes omitted]',
+      stderr: '',
+      exitCode: 0,
+      // No stdoutTruncated / stderrTruncated flags — handler did
+      // NOT truncate; user output happened to contain the marker.
+    });
+    const out = await bashTool.execute({ command: 'echo' }, makeCtx({ broker }));
+    if (isToolError(out)) throw new Error('unexpected error');
+    expect(out.truncated).toBe(false);
   });
 
   test('no truncation footer → truncated:false', async () => {
