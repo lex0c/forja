@@ -532,6 +532,87 @@ describe('createSpawnBroker — option plumbing', () => {
   });
 });
 
+// Slice 105 — R6 #44: pre-slice the broker called Bun.spawn
+// without an explicit `env` option, which made the worker inherit
+// the FULL parent env including every operator secret (API keys,
+// vault tokens, AWS creds). The worker would see them raw BEFORE
+// any per-call scrub fired. Slice 105 defaults `options.env` to
+// `scrubEnv(process.env)` so credentials don't reach the worker
+// process unless the operator explicitly passes them.
+describe('createSpawnBroker — env scrubbing default (slice 105, R6 #44)', () => {
+  test('default env strips credential-shaped vars from process.env', async () => {
+    // Plant fake secrets in process.env, build a broker without an
+    // explicit env, capture the env the broker hands to spawn.
+    // The credential-shaped names MUST NOT survive.
+    process.env.FAKE_API_KEY = 'leak-this-1';
+    process.env.FAKE_TOKEN = 'leak-this-2';
+    process.env.SOME_SECRET = 'leak-this-3';
+    try {
+      const captured: { opts: SpawnFnOptions | null } = { opts: null };
+      const broker = createSpawnBroker({
+        command: '/usr/bin/worker',
+        spawn: (_argv, opts) => {
+          captured.opts = opts;
+          return makeMockProcess({ stdout: '{"ok":true,"stdout":"","stderr":""}\n' });
+        },
+      });
+      await broker.execute(baseRequest());
+      const passedEnv = captured.opts?.env ?? {};
+      expect(passedEnv.FAKE_API_KEY).toBeUndefined();
+      expect(passedEnv.FAKE_TOKEN).toBeUndefined();
+      expect(passedEnv.SOME_SECRET).toBeUndefined();
+      // Sanity: a known-safe variable (PATH) is preserved — the
+      // scrub only drops credential-shaped names, not the whole
+      // env. Workers still need PATH to find binaries.
+      expect(typeof passedEnv.PATH).toBe('string');
+      await broker.close();
+    } finally {
+      process.env.FAKE_API_KEY = undefined;
+      process.env.FAKE_TOKEN = undefined;
+      process.env.SOME_SECRET = undefined;
+    }
+  });
+
+  test('explicit env bypasses the scrub (operator control)', async () => {
+    // An operator passing an explicit env stays in full control.
+    // The scrub doesn't second-guess deliberate config. If they
+    // pass a credential-shaped name, it goes through verbatim.
+    const captured: { opts: SpawnFnOptions | null } = { opts: null };
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      env: { CUSTOM_API_KEY: 'on-purpose', PATH: '/usr/bin' },
+      spawn: (_argv, opts) => {
+        captured.opts = opts;
+        return makeMockProcess({ stdout: '{"ok":true,"stdout":"","stderr":""}\n' });
+      },
+    });
+    await broker.execute(baseRequest());
+    expect(captured.opts?.env).toEqual({
+      CUSTOM_API_KEY: 'on-purpose',
+      PATH: '/usr/bin',
+    });
+    await broker.close();
+  });
+
+  test('default env is always defined (never undefined to spawn)', async () => {
+    // Pre-slice Bun.spawn with env=undefined inherits the parent
+    // env. The fix ensures env is ALWAYS explicit so the worker
+    // never sees the raw parent env, even on a brand-new broker
+    // construction.
+    const captured: { opts: SpawnFnOptions | null } = { opts: null };
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: (_argv, opts) => {
+        captured.opts = opts;
+        return makeMockProcess({ stdout: '{"ok":true,"stdout":"","stderr":""}\n' });
+      },
+    });
+    await broker.execute(baseRequest());
+    expect(captured.opts?.env).toBeDefined();
+    await broker.close();
+  });
+});
+
 // Slice 102 — R6 #21: broker drain unbounded. Pre-slice `new
 // Response(stream).text()` read the worker's full stdout into the
 // broker's memory with NO cap; a worker emitting gigabytes would

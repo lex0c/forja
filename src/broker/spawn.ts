@@ -46,6 +46,7 @@
 //   - parsed JSON missing fields   → ok:false, error:'response missing required fields', exitCode set
 //   - worker emits valid response  → response returned verbatim (worker is the source of truth)
 
+import { scrubEnv } from '../sanitize/index.ts';
 import type { TelemetrySink, WorkerCrashEvent } from '../telemetry/index.ts';
 import { safeJsonParse } from './safe-json.ts';
 import type { Broker, BrokerCallOptions, BrokerRequest, BrokerResponse } from './types.ts';
@@ -90,6 +91,19 @@ export interface CreateSpawnBrokerOptions {
   command: string;
   args?: readonly string[];
   cwd?: string;
+  // Env handed to the worker subprocess. When undefined (the
+  // common production case via bootstrap), the broker uses
+  // `scrubEnv(process.env)` — the same scrub the bash handler
+  // applies before its inner subprocess (slice 105, R6 #44).
+  // Pre-slice, undefined here meant Bun.spawn inherited the
+  // FULL parent env, which carried every operator secret (API
+  // keys, vault tokens, AWS creds) into the worker before any
+  // scrub fired. Defense in depth: even a compromised worker
+  // (handler bug, supply-chain attack) can't read raw
+  // credentials directly.
+  //
+  // Operators with deliberate env needs pass an explicit map;
+  // they keep full control and the scrub doesn't apply.
   env?: Record<string, string>;
   // Kill the worker if it takes longer than this many ms.
   // Undefined means no timeout (production should ALWAYS set
@@ -242,7 +256,17 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
   const command = options.command;
   const baseArgs: readonly string[] = options.args ?? [];
   const cwd = options.cwd ?? process.cwd();
-  const env = options.env;
+  // Default env scrubs credentials from the parent env before
+  // handing them to the worker (slice 105, R6 #44). Without
+  // this, `Bun.spawn` with no `env` option inherits the parent's
+  // full env — including every secret (API keys, vault tokens,
+  // AWS creds) that the operator's shell exported. The worker
+  // would see them raw before the bash handler's per-call
+  // scrubEnv ever fires; a compromised worker could exfil them
+  // via stderr / stdout / sandbox-escape. Explicit env from
+  // the caller bypasses this default (operators who know what
+  // they're doing stay in control).
+  const env = options.env ?? scrubEnv(process.env);
   const timeoutMs = options.timeoutMs;
   const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
   const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
@@ -305,8 +329,11 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
 
     let proc: SpawnedProcess;
     try {
-      const spawnOpts: SpawnFnOptions = { cwd };
-      if (env !== undefined) spawnOpts.env = env;
+      // env is always set after slice 105 — the factory defaulted
+      // to scrubEnv(process.env) at construction. Pass through
+      // unconditionally so a downstream Bun.spawn doesn't fall
+      // back to inheriting the parent env.
+      const spawnOpts: SpawnFnOptions = { cwd, env };
       proc = spawn(wrappedArgv, spawnOpts);
     } catch (e) {
       return {

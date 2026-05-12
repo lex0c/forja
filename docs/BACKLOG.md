@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 105: broker env scrub default (R6 #44)
+
+**Done.** One-hundred-fifth slice. Closes R6 #44: the broker called `Bun.spawn` without an explicit `env` option, which made the worker inherit the **full parent env** — every operator secret (API keys, vault tokens, AWS creds, OAuth tokens) reached the worker process before any scrubbing fired.
+
+### Why this matters
+
+The bash handler scrubs env via `scrubEnv(process.env)` BEFORE spawning the inner subprocess (slice 38). That defense covered the bash-subprocess threat surface but missed a layer: the WORKER itself sees raw env. A compromised worker — handler bug, supply-chain attack on a dependency, sandbox escape — could read `process.env.ANTHROPIC_API_KEY` directly, never going through bash.
+
+Concrete shapes the gap admitted:
+- Worker crash with stack trace including env values (`process.env` dumped in some error logger).
+- Handler with a debug-print of all env vars (`console.error(process.env)` deep in a tree-sitter resolver).
+- A vulnerability in any tool the worker spawns inside its own subprocess (Python interpreter, node, etc.) that exfiltrates env.
+- Manual `echo {...} | bun worker.ts` during dev workflows — bypass the broker entirely, see all secrets.
+
+Slice 105 plugs the leak at the BROKER layer: when no explicit env is provided (the common production case via bootstrap), the broker defaults to `scrubEnv(process.env)` — same pattern the bash handler uses. The worker never sees the raw env; only the scrubbed subset reaches it.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` | Imports `scrubEnv` from `../sanitize/index.ts`. The factory now reads `const env = options.env ?? scrubEnv(process.env)` — env is always defined after construction. Inside `executeOnce`, `spawnOpts.env` is unconditionally set (the previous `if (env !== undefined)` check was vestigial; env can no longer be undefined). The `CreateSpawnBrokerOptions.env` field gains a long-form comment documenting the threat model and the operator-control escape hatch. |
+| `tests/broker/spawn.test.ts` | New describe `env scrubbing default (slice 105, R6 #44)` with 3 tests: (1) default env strips credential-shaped names — plants fake `FAKE_API_KEY` / `FAKE_TOKEN` / `SOME_SECRET` in process.env, verifies they don't reach captured spawn opts; (2) explicit env bypasses the scrub (operator passing `CUSTOM_API_KEY` deliberately gets it through verbatim — operator stays in control); (3) default env is always defined (never `undefined` reaching `Bun.spawn`). |
+
+### Decisions
+
+- **Scrub by default, bypass via explicit env.** The threat model says "if the operator didn't think about env, the safe default applies." Operators with deliberate env needs (e.g., a custom registry token for the worker's own use, not for tool dispatch) pass it explicitly and bypass the scrub — they stay in full control. Inverting the default (raw env unless told otherwise) was the pre-slice posture, and that's the gap this slice closes.
+- **Reuse `scrubEnv`, not a broker-specific variant.** The bash handler has been using `scrubEnv` since slice 38; the patterns it covers (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASS`, `AWS_*`, `OPENAI_*`, `ANTHROPIC_*`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `DOCKER_PASSWORD`) are the canonical credential names. A broker-specific scrub would duplicate the patterns and drift over time; the shared helper keeps every spawning surface aligned with one source of truth.
+- **Defense in depth with the bash handler.** The handler's per-call `scrubEnv(process.env)` STILL runs — that's the inner subprocess env, distinct from the worker's own env. Slice 105 adds an OUTER scrub at the worker boundary; the handler's inner scrub remains the per-tool layer. Two scrubs, two boundaries, both load-bearing.
+- **`env` always defined post-construction.** Pre-slice the conditional `if (env !== undefined)` propagated undefined down to `Bun.spawn`, which interprets undefined as "inherit parent". Removing the conditional + defaulting at construction time makes the contract loud: the spawn call ALWAYS has an explicit env. A future PR that introduces a new spawn site automatically gets the same protection.
+- **Test plants fake secrets in process.env, not real ones.** The test sets `process.env.FAKE_API_KEY = 'leak-this-1'` (and two more), verifies captured spawn opts don't carry them, then unsets in the finally block. No real secrets touched; the planted names match the scrub patterns by shape (`*_API_KEY`, `*_TOKEN`, `*_SECRET`).
+- **PATH survives the scrub (verified explicitly).** Workers need PATH to find binaries; a regression that over-scrubbed PATH would break every tool. The test asserts `typeof passedEnv.PATH === 'string'` as the canary for "scrub didn't accidentally take the whole env".
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6234 pass / 10 skip / 0 fail** (6244 total across 290 files); +3 tests on top of slice 104's 6231
+- Targeted: `bun test tests/broker/` — 148/148
+
+### Next
+
+R6 remaining (each its own slice):
+- **#41 `proc.exited` hang without timer**: a worker that never closes stdout AND never exits parks the broker forever; slice 102's drain caps help but the `proc.exited` await still needs a defensive floor when no caller-supplied timeout exists.
+- **#38 signal listener attach AFTER spawn**: race window where abort during the spawn → stdin-write interval is swallowed; only the outer timeout fires.
+- **R6 P1 leftovers**: `stdin.end()` raced by `proc.exited`, broker timeout SIGTERM→SIGKILL escalation, worker `process.on('SIGTERM')` without `{once: true}`.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 bash worker handler (SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 104: JSON proto-pollution defense (R6 #42)
 
 **Done.** One-hundred-fourth slice. Closes R6 #42: `JSON.parse` ran on attacker-controlled input at both broker IPC boundaries (broker → worker request line + worker → broker response line) **without any proto-pollution defense**. A hostile payload like `{"__proto__":{"isAdmin":true}}` would parse cleanly, then any downstream `Object.assign({}, parsed)` or `{...parsed}` would pivot the dangerous keys onto the target's prototype chain — poisoning every plain object created afterwards.
