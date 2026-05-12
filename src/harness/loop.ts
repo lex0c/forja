@@ -882,12 +882,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // falls back to the suffix-less form.
         getReason: () => config.permissionEngine.getDegradedReason() ?? '',
         onFire: (event) => {
+          // §13.6 harness observer (renderers, NDJSON, future
+          // UI adapters). Unchanged from slice 92.
           safeEmit(config.onEvent, {
             type: 'sandbox_degraded_active',
             sessionId: event.sessionId,
             reason: event.reason,
             firstEmission: event.firstEmission,
           });
+          // §18 telemetry emit (slice 111, R10 #48). Pre-slice
+          // SandboxDegradedActiveEvent was a declared type with
+          // a scrubbing handler (slice 92) but no emit site —
+          // operators with OTEL dashboards saw `sandbox.degraded
+          // _active_total` flat-line even when banners were
+          // firing. The defensive try/catch matches slice 70's
+          // sink contract (sinks MUST NOT throw; observability
+          // bugs MUST NOT break the harness loop).
+          if (config.telemetry !== undefined) {
+            try {
+              config.telemetry.emit({
+                kind: 'sandbox.degraded_active',
+                ts: Date.now(),
+                sessionId: event.sessionId,
+                reason: event.reason,
+                firstEmission: event.firstEmission,
+              });
+            } catch {
+              // Telemetry sink threw — log site is the harness;
+              // we can't surface it without risking the same
+              // broken sink consuming our error. Swallow.
+            }
+          }
         },
       });
 

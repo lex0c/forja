@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 111: telemetry sink wiring for sandbox.degraded_active (R10 #48)
+
+**Done.** One-hundred-eleventh slice. Closes the last R10 finding (#48). Pre-slice the `SandboxDegradedActiveEvent` type was declared (slice 92), the scrubbing handler existed (slice 99), but the harness loop only emitted to `config.onEvent` — the §18 telemetry pipe was unwired. Operators with OTEL dashboards saw `sandbox.degraded_active_total{reason}` flat-line even when banners were firing in the TUI, making the metric stream documented in spec §18 effectively unobservable.
+
+### Why this matters
+
+The banner emitter (slice 92) is the engine's primary signal for "operator left agent running in degraded state for too long". The TUI surfaces it visually; the audit log captures the underlying state transition; the telemetry stream is supposed to capture the recurring heartbeat for fleet-level dashboards ("how many sessions per hour see the engine degrade?"). With the telemetry pipe unwired, every fleet operator running with the documented metric query would see zeros — silently misleading.
+
+The fix is the canonical "thread a TelemetrySink through HarnessConfig" pattern: add `telemetry?: TelemetrySink` to the config type, read it in the degraded-banner `onFire` closure, emit alongside the existing `onEvent` call. Defense in depth via try/catch around the emit (slice 70 contract: sinks MUST NOT throw, but bugs happen — a broken sink must not crash the harness loop).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | Imports `TelemetrySink` from `../telemetry/index.ts`. Adds `telemetry?: TelemetrySink` field to `HarnessConfig` with a long-form comment documenting the contract (production wires an OTEL-bound sink via bootstrap; tests use recording sinks; sinks MUST NOT throw; undefined drops all events silently). |
+| `src/harness/loop.ts` | The `onFire` callback inside `createDegradedBannerEmitter` now ALSO calls `config.telemetry.emit({kind: 'sandbox.degraded_active', ...})` when `config.telemetry !== undefined`. Wrapped in try/catch — sink throws are swallowed (logging the throw would risk the same broken sink consuming our error). The existing `safeEmit(config.onEvent, ...)` call stays unchanged; observability now has two independent paths. |
+| `tests/harness/loop.test.ts` | New describe `telemetry sink — sandbox.degraded_active emission (slice 111, R10 #48)` with 3 tests: (1) sink receives the event when engine is degraded and a tool call fires (verifies kind, firstEmission, sessionId); (2) undefined telemetry is no-op (defensive coverage — omitting the sink doesn't break the run, banner still fires through onEvent); (3) sink throw is caught defensively (synthetic throwing sink — run completes successfully, sinkCalls counter proves the emit was attempted). |
+
+### Decisions
+
+- **TelemetrySink as a top-level HarnessConfig field, not nested inside an observability config.** Future telemetry events (cost ticks, retry storms, etc.) can hang off the same field without restructuring. The pattern mirrors `permissionEngine.options.telemetry` from slice 71 — same sink can be threaded into both layers if the caller wants unified observability.
+- **Emit BOTH onEvent AND telemetry in the closure.** Two independent observers, two contracts. `onEvent` is for TUI/CLI rendering (sync, may throw — safeEmit handles); telemetry is for metric backends (async-friendly, MUST NOT throw — our wrapper still defends). A future slice could deduplicate via a shared event bus, but for one event the simple dual-emit reads cleaner.
+- **try/catch around the emit, not an if-else dance.** Sink throws are documented as bugs (slice 70); catching them defensively is cheaper than asking every sink author to guarantee non-throw. The cost of the catch is one stack frame; the value is "broken sink can't take down the agent session" — same posture as `safeEmit`'s catch.
+- **No change to bootstrap.ts.** This slice ships the wiring at the harness layer; bootstrap doesn't yet construct a TelemetrySink for the harness (only the engine has telemetry wiring today). A follow-up slice could add `--otel-endpoint` flag + bootstrap construction; until then operators construct their own sink and pass it programmatically (the headless/SDK use case). The harness layer is now READY for that wiring.
+- **No emit when telemetry is undefined.** Defaulting to a no-op sink would force the harness to always construct one; the type-level `?` makes "no telemetry" the zero-config case. Adding telemetry is opt-in (operators with dashboards) — the cost of zero-config is one event lost, which is the existing behavior pre-slice anyway.
+- **Tests don't snapshot the exact emit count.** The banner emitter fires on the first tool call + every Nth thereafter (default N=10, configured by slice 92). The test scripts one tool call so the count is 1, but the assertion uses `>= 1` to avoid coupling to the period. A future slice that changes the period doesn't break this test.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6259 pass / 10 skip / 0 fail** (6269 total across 291 files); +3 tests on top of slice 110's 6256
+- Targeted: `bun test tests/harness/loop.test.ts` — 72/72
+
+### Next
+
+**R10 fully closed** (slices 99 + 111 covered every R10 finding).
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R8 #322 hierarchy seal section locking.
+- R2 #199 COMMAND_TABLE additions.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R6 P1 leftovers.
+- R7 P1 leftovers.
+- R9 operator UX.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 110: bash-parser timeout defense (R2 #204)
 
 **Done.** One-hundred-tenth slice. Closes R2 #204: tree-sitter is error-recovering and usually fast, but pathological adversarial input could drive the LR(1) state machine into a slow path approaching O(N²). Pre-slice `parseBash` had no defensive cap — a hostile bash command (deeply-recursive unbalanced delimiters, malformed here-docs, carefully-crafted Unicode that confuses the state machine) could park the engine inside a single parse for arbitrary time, blocking every subsequent decision.

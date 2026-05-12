@@ -12,6 +12,7 @@ import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
+import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem } from '../todo/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
@@ -935,6 +936,22 @@ export interface HarnessConfig {
   // have to construct one; bash surfaces `bash.spawn_failed` when
   // absent.
   broker?: Broker;
+  // §18 telemetry sink (slice 111, R10 #48). When wired, the
+  // harness emits structured events for cross-cutting signals
+  // that don't fit the audit row shape — currently `sandbox
+  // .degraded_active` (the §13.6 recurring banner heartbeat).
+  // Pre-slice the SandboxDegradedActiveEvent type was declared
+  // and a scrubbing handler existed (slice 92), but the harness
+  // loop only emitted to `config.onEvent` — the telemetry pipe
+  // was unwired and the metric stream documented in spec §18
+  // was unfireable.
+  //
+  // Production wiring binds an OTEL-bound sink via bootstrap;
+  // tests pass a recording sink to assert emission shape.
+  // Sinks MUST NOT throw — the harness wraps every call in
+  // try/catch defensively (slice 70 contract). When undefined,
+  // every telemetry event is dropped silently.
+  telemetry?: TelemetrySink;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors
