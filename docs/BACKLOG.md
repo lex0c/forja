@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 107: signal listener race window (R6 #38)
+
+**Done.** One-hundred-seventh slice. Closes R6 #38 — the **last P0 from R6**. Pre-slice the broker attached the abort signal listener AFTER the `await proc.stdin.end()`. An abort firing during the sandbox-wrap / spawn / stdin-write window was silently lost — listener registered AFTER the event has fired is never invoked. The caller's cancellation no-op'd until the outer timeout (60s default after slice 106) finally fired.
+
+### Why this matters
+
+The broker's contract with the harness is that aborts cancel calls promptly. Pre-slice that contract held only AFTER stdin.end resolved — a 5-50ms window per call where cancellation was silently dropped. For short-lived calls (sub-second tools), the abort would land long after the call had already completed. For long-running calls, the abort effectively waited for the timeout to fire — turning a 50ms cancel into a 60s wait.
+
+This isn't a hypothetical race. The harness loop emits abort during tool-cancellation paths (operator Ctrl-C, subagent depth-exceeded, parent watchdog). A 60s delay between operator intent and broker cancellation makes the agent feel unresponsive AND leaves the worker doing work the operator no longer wants — potentially burning tokens, writing files, hitting external APIs.
+
+The fix is the canonical "attach listener BEFORE the await" pattern: hoist `proc` to `undefined`, set up the listener closure to guard against `proc === undefined` before calling `kill()`, attach the listener before any spawn or await. Once `proc` is assigned (after the sync `spawn()` call), the listener becomes effective for subsequent aborts. A post-spawn `signalAborted` check catches the (theoretical) race where abort fired during the sync spawn — JS is single-threaded so this can't actually happen, but the check keeps the contract explicit and guards against a future refactor that turns spawn async.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/spawn.ts` | Reorders the executeOnce body: signal listener setup hoisted BEFORE sandbox-wrap and spawn. `proc` is `let proc: SpawnedProcess \| undefined = undefined` initially; the listener checks `if (proc !== undefined)` before calling kill. After spawn assigns proc, a sync `if (signalAborted)` check catches abort-during-sync-spawn races. The stdin-write catch path checks signalAborted to surface the canonical `'aborted'` error instead of `'stdin write failed'` when the kill was caller-initiated (the EPIPE on the write is a symptom, not the cause). The setTimeout timer callback now guards `if (proc !== undefined)` for TS flow-analysis reasons (the narrowing doesn't survive across async boundaries). Listener removeEventListener calls added to every error-path return so the listener never leaks across calls. |
+| `tests/broker/spawn.test.ts` | New describe `signal listener race window (slice 107, R6 #38)` with 4 tests: (1) abort BEFORE execute starts → pre-aborted check fires (regression coverage), (2) abort DURING stdin.end (the canonical race window — fires via `onWrite` + `queueMicrotask`) IS caught and returns 'aborted' within 2s (well under the 5s timeout fallback), (3) listener detached on sandbox wrap failure (no event-listener leak across calls), (4) listener detached on spawn failure (no event-listener leak). Tests #3 and #4 use an EventTarget shim that counts addEventListener / removeEventListener calls and asserts they balance. |
+
+### Decisions
+
+- **Attach the listener UPFRONT, even though spawn is sync.** The listener attach + spawn ordering doesn't change behavior for synchronous abort propagation (JS event loop won't fire the listener between two sync statements). But it MATTERS for: (a) the `await proc.stdin.end()` that immediately follows spawn; (b) any future refactor that makes spawn async; (c) test fixtures that pre-arm the abort and want predictable semantics. The cost is one closure setup; the value is contract clarity.
+- **Post-spawn `signalAborted` check.** Strictly redundant in single-threaded JS — if abort fires during the sync spawn() it would have to be from another synchronously-running listener, which doesn't happen in normal code. But the check is structurally defensive: a future change that makes spawn async (e.g., a sandbox runner that awaits a check before returning) would silently re-open the race without this guard. One `if` is cheap insurance.
+- **stdin-write catch maps to 'aborted' on signalAborted.** Pre-slice the catch returned `'stdin write failed: <EPIPE>'` when the worker died mid-write. If the death was caller-initiated (the kill signal fired, the worker exited, the next stdin.write got EPIPE), the operator sees `stdin write failed` instead of `aborted` — misleading attribution. The post-catch `if (signalAborted)` check surfaces the actual cause.
+- **`if (proc !== undefined)` inside the timeout closure.** TypeScript flow analysis can narrow `let proc: T | undefined` to `T` after a control-flow check, but the narrowing is LOST across async boundaries (the closure captures the variable by reference; the narrowing applies at the read, not the capture). Adding the runtime check costs one comparison and keeps the code unambiguous for both TS and human readers.
+- **EventTarget shim in test #3 / #4.** Real `AbortSignal` doesn't expose listener count; verifying "no leak" requires a custom shim that wraps `AbortController.signal` and counts calls. The shim is intentionally minimal — proxies `addEventListener` / `removeEventListener` / `aborted` to the real signal but increments counters. Confirms attach/remove balance is 1:1.
+- **R6 P0 sweep complete.** Slices 102/103/104/105/106/107 closed every P0 finding in R6 (#9 sandbox wire, #21 stdout drain, #22 stdin drain, #41 hang floor, #42 proto-pollution, #44 env leak, #38 signal race). R6 P1 leftovers — `stdin.end()` raced by `proc.exited`, broker timeout SIGTERM→SIGKILL escalation, worker `process.on('SIGTERM')` without `{once: true}` — remain.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6242 pass / 10 skip / 0 fail** (6252 total across 290 files); +4 tests on top of slice 106's 6238
+- Targeted: `bun test tests/broker/` — 156/156
+
+### Next
+
+R6 P0 closed. R6 P1 remaining (defensive concurrency cleanup, lower priority):
+- `stdin.end()` raced by `proc.exited` (pre-timer/signal window).
+- Broker timeout has no SIGTERM→SIGKILL escalation; trapping worker holds broker hostage.
+- Worker `process.on('SIGTERM')` without `{once: true}` → MaxListenersExceededWarning at 11.
+
+Remaining roadmap from REVIEW_NOTES.md (now all R6 P0s done):
+- R8 #322 hierarchy seal section, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R7 bash worker handler (SIGKILL timers, proc.exited rejection).
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 106: default broker timeout floor (R6 #41)
 
 **Done.** One-hundred-sixth slice. Closes R6 #41: when both `BrokerCallOptions.timeoutMs` and `CreateSpawnBrokerOptions.timeoutMs` were undefined, the broker's `await Promise.all([..., proc.exited])` could **park forever** on a wedged worker (closed pipes but never exited, or pipes never closed). The in-flight chain blocked every subsequent call indefinitely — operator either kills the agent process manually or waits forever.

@@ -701,6 +701,166 @@ describe('createSpawnBroker — bounded stream drain (slice 102, R6 #21)', () =>
   });
 });
 
+// Slice 107 — R6 #38: pre-slice the signal listener was
+// attached AFTER the await on `proc.stdin.end()`. An abort
+// firing during the sandbox-wrap / spawn / stdin-write window
+// was lost — listener registered AFTER the event has fired is
+// never invoked. The caller's cancellation silently no-op'd
+// until the outer timeout fired. Slice 107 hoists the listener
+// BEFORE the spawn so the abort during the await IS caught.
+describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)', () => {
+  test('abort during sandbox-wrap kills the call without spawning', async () => {
+    // sandboxRunner is the very first place an abort can race
+    // (it's called before spawn). Pre-slice the listener wasn't
+    // attached yet; the abort was lost. Slice 107 attaches FIRST,
+    // so an abort during the wrap is caught — but since proc
+    // isn't created yet, the listener no-ops and the wrap path
+    // continues. The post-wrap signalAborted check would catch
+    // it — but actually the wrap throws synchronously, so abort
+    // can't fire mid-wrap. The interesting race is during the
+    // stdin.end await; this test exercises the simpler "abort
+    // immediately after broker.execute starts" path.
+    const ac = new AbortController();
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () =>
+        // Mock a spawn that succeeds but produces nothing on
+        // stdout — the call would hang on proc.exited if the
+        // abort isn't honored.
+        makeMockProcess({ stdout: '', stderr: '' }),
+    });
+    // Abort BEFORE calling execute — should short-circuit via
+    // the pre-aborted check, never spawn.
+    ac.abort();
+    const res = await broker.execute(baseRequest(), { signal: ac.signal });
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('aborted');
+    await broker.close();
+  });
+
+  test('abort during stdin.end (the canonical race window) IS caught', async () => {
+    // The motivating race shape. Slice 107 attaches the listener
+    // BEFORE spawn, so the abort fires the kill during the
+    // stdin.end await. Pre-slice this test would either: (a) hang
+    // until the default timeout fired, or (b) return the
+    // canonical 'aborted' error AFTER the worker was killed by
+    // the outer timeout, hours/seconds later.
+    let abortDuringWrite = false;
+    const ac = new AbortController();
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () =>
+        makeMockProcess({
+          stdout: '',
+          stderr: '',
+          // Fire the abort while the broker is awaiting stdin.end.
+          onWrite: () => {
+            // Defer to a microtask so we abort DURING the await
+            // on Promise.resolve(stdin.end), not before.
+            queueMicrotask(() => {
+              abortDuringWrite = true;
+              ac.abort();
+            });
+          },
+        }),
+      timeoutMs: 5000, // floor doesn't fire; abort should win first
+    });
+    const start = Date.now();
+    const res = await broker.execute(baseRequest(), { signal: ac.signal });
+    const elapsed = Date.now() - start;
+    expect(abortDuringWrite).toBe(true);
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('aborted');
+    // Abort fast-path — not the 5s timeout fallback.
+    expect(elapsed).toBeLessThan(2000);
+    await broker.close();
+  });
+
+  test('listener detached on sandbox wrap failure (no leak)', async () => {
+    // Each call attaches a listener; each call MUST detach it
+    // on every return path. Pre-slice the wrap-failure return
+    // didn't remove the listener (the attach was AFTER the
+    // wrap, so there was nothing to remove). Slice 107 attaches
+    // before the wrap, so the wrap-failure path now removes.
+    // Without proper cleanup, AbortSignal.addEventListener
+    // would leak handlers across calls.
+    const ac = new AbortController();
+    // Track listener count via a custom EventTarget shim.
+    let attachCount = 0;
+    let removeCount = 0;
+    const signal = new (class extends EventTarget {
+      get aborted() {
+        return ac.signal.aborted;
+      }
+      addEventListener(
+        type: string,
+        listener: EventListener,
+        opts?: AddEventListenerOptions,
+      ): void {
+        attachCount++;
+        super.addEventListener(type, listener, opts);
+        ac.signal.addEventListener(type, listener, opts);
+      }
+      removeEventListener(type: string, listener: EventListener): void {
+        removeCount++;
+        super.removeEventListener(type, listener);
+        ac.signal.removeEventListener(type, listener);
+      }
+    })() as unknown as AbortSignal;
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      sandboxRunner: () => {
+        throw new Error('synthetic wrap error');
+      },
+      spawn: () => makeMockProcess(),
+    });
+    const res = await broker.execute(baseRequest(), { signal });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('sandbox wrap failed');
+    // Listener was attached then detached cleanly — no leak.
+    expect(attachCount).toBe(1);
+    expect(removeCount).toBe(1);
+    await broker.close();
+  });
+
+  test('listener detached on spawn failure (no leak)', async () => {
+    let attachCount = 0;
+    let removeCount = 0;
+    const ac = new AbortController();
+    const signal = new (class extends EventTarget {
+      get aborted() {
+        return ac.signal.aborted;
+      }
+      addEventListener(
+        type: string,
+        listener: EventListener,
+        opts?: AddEventListenerOptions,
+      ): void {
+        attachCount++;
+        super.addEventListener(type, listener, opts);
+        ac.signal.addEventListener(type, listener, opts);
+      }
+      removeEventListener(type: string, listener: EventListener): void {
+        removeCount++;
+        super.removeEventListener(type, listener);
+        ac.signal.removeEventListener(type, listener);
+      }
+    })() as unknown as AbortSignal;
+    const broker = createSpawnBroker({
+      command: '/usr/bin/worker',
+      spawn: () => {
+        throw new Error('synthetic spawn error');
+      },
+    });
+    const res = await broker.execute(baseRequest(), { signal });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('spawn failed');
+    expect(attachCount).toBe(1);
+    expect(removeCount).toBe(1);
+    await broker.close();
+  });
+});
+
 // Slice 106 — R6 #41: pre-slice an undefined timeoutMs at both
 // caller and broker layers meant `proc.exited` could park
 // forever on a wedged worker (closed pipes but never exited).

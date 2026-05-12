@@ -338,6 +338,44 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     const spawnStart = now();
     const innerArgv: readonly string[] = [command, ...baseArgs];
 
+    // Signal handler set up BEFORE spawn (slice 107, R6 #38).
+    // Pre-slice the listener was attached AFTER the await on
+    // `proc.stdin.end()` — an abort firing during the
+    // sandbox-wrap / spawn / stdin-write window was lost
+    // because no listener was present, and a listener
+    // registered AFTER the event has already fired is never
+    // invoked. The caller's cancellation silently no-op'd
+    // until the outer timeout fired.
+    //
+    // Fix: hoist `proc` to undefined, set up the listener
+    // closure to call `proc.kill('SIGTERM')` ONLY when proc is
+    // defined, attach BEFORE any spawn/await. After the spawn
+    // resolves, an extra `signalAborted` check catches the
+    // (theoretical) race where abort fired during the sync
+    // spawn — JS is single-threaded so this can't actually
+    // happen, but the check keeps the contract explicit and
+    // guards against a future refactor that turns spawn async.
+    let signalAborted = false;
+    let signalListener: (() => void) | null = null;
+    let proc: SpawnedProcess | undefined = undefined;
+    const signal = callOptions?.signal;
+    if (signal !== undefined) {
+      signalListener = (): void => {
+        signalAborted = true;
+        // proc may be undefined if abort races with the spawn
+        // call (during the await on stdin.end). The post-spawn
+        // signalAborted check below handles that case.
+        if (proc !== undefined) {
+          try {
+            proc.kill('SIGTERM');
+          } catch {
+            // already exited
+          }
+        }
+      };
+      signal.addEventListener('abort', signalListener, { once: true });
+    }
+
     let wrappedArgv: readonly string[] = innerArgv;
     if (sandboxRunner !== undefined && request.sandboxProfile !== null) {
       try {
@@ -347,6 +385,9 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
           innerArgv,
         });
       } catch (e) {
+        if (signal !== undefined && signalListener !== null) {
+          signal.removeEventListener('abort', signalListener);
+        }
         return {
           ok: false,
           stdout: '',
@@ -356,7 +397,6 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       }
     }
 
-    let proc: SpawnedProcess;
     try {
       // env is always set after slice 105 — the factory defaulted
       // to scrubEnv(process.env) at construction. Pass through
@@ -365,12 +405,33 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       const spawnOpts: SpawnFnOptions = { cwd, env };
       proc = spawn(wrappedArgv, spawnOpts);
     } catch (e) {
+      if (signal !== undefined && signalListener !== null) {
+        signal.removeEventListener('abort', signalListener);
+      }
       return {
         ok: false,
         stdout: '',
         stderr: '',
         error: `spawn failed: ${e instanceof Error ? e.message : String(e)}`,
       };
+    }
+
+    // Post-spawn abort check (slice 107, R6 #38). If the abort
+    // fired during the sync spawn path, the listener already
+    // ran but proc was undefined at that moment — the kill
+    // call was a no-op. Catch the race here and kill the now-
+    // valid proc before any downstream await parks the call.
+    if (signalAborted) {
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        // already exited
+      }
+      await proc.exited.catch(() => 0);
+      if (signal !== undefined && signalListener !== null) {
+        signal.removeEventListener('abort', signalListener);
+      }
+      return { ok: false, stdout: '', stderr: '', error: 'aborted' };
     }
 
     // Write the request line + close stdin. The worker is
@@ -388,6 +449,16 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
         // ignore — child may already be dead
       }
       await proc.exited.catch(() => 0);
+      if (signal !== undefined && signalListener !== null) {
+        signal.removeEventListener('abort', signalListener);
+      }
+      // If abort fired during the write, the listener already
+      // killed proc; surface the canonical aborted shape
+      // instead of `stdin write failed` so the caller sees
+      // the cancellation cause, not a downstream symptom.
+      if (signalAborted) {
+        return { ok: false, stdout: '', stderr: '', error: 'aborted' };
+      }
       return {
         ok: false,
         stdout: '',
@@ -411,34 +482,18 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
       timer = setTimeout(() => {
         timedOut = true;
         try {
-          proc.kill();
+          // proc is non-undefined here (we already returned
+          // above on spawn failures). The narrowing isn't
+          // visible to TS inside the setTimeout closure
+          // because of how flow analysis works across async
+          // boundaries, so a runtime `if` keeps the call safe.
+          if (proc !== undefined) {
+            proc.kill();
+          }
         } catch {
           // ignore
         }
       }, effectiveTimeoutMs);
-    }
-
-    // Signal handler — when the caller aborts, send SIGTERM to the
-    // worker. The worker's own SIGTERM handler (worker.ts) catches
-    // it and propagates JS-level abort to the running tool handler,
-    // which kills its subprocesses + emits an aborted response. If
-    // the worker doesn't handle SIGTERM the OS terminates the
-    // process; the broker then sees the missing/non-parseable
-    // response and the "aborted" branch below maps it to the
-    // canonical aborted shape regardless.
-    let signalAborted = false;
-    let signalListener: (() => void) | null = null;
-    const signal = callOptions?.signal;
-    if (signal !== undefined) {
-      signalListener = (): void => {
-        signalAborted = true;
-        try {
-          proc.kill('SIGTERM');
-        } catch {
-          // already exited
-        }
-      };
-      signal.addEventListener('abort', signalListener, { once: true });
     }
 
     // Bounded drain (slice 102, R6 #21). The previous `new
