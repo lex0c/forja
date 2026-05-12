@@ -569,15 +569,19 @@ describe('compound command guard (shell injection defense)', () => {
     // Counter-test for the dotAll feature the matcher relies on:
     // legitimate multi-line commands with newlines INSIDE quoted
     // strings or escaped via line-continuation must not regress.
-    // `python -c "for i in range(3):\n  print(i)"` should match
-    // `python -c *` and pass through allow normally — newline is
-    // inside double quotes, the guard does not flag.
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['python -c *'] } } }), {
+    // `echo "line1\nline2"` should match `echo *` and pass through
+    // allow normally — newline is inside double quotes, the guard
+    // does not flag. (Pre-slice-100 this test used `python -c`,
+    // but slice 100 R2 #208 now refuses inline-code interpreter
+    // invocations regardless of policy; echo carries the same
+    // multi-line-in-quotes property without the interpreter
+    // concern.)
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
     const d = eng.check('bash', 'bash', {
-      command: 'python -c "for i in range(3):\n  print(i)"',
+      command: 'echo "line1\n  line2"',
     });
     expect(d.kind).toBe('allow');
   });

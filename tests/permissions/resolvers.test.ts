@@ -781,3 +781,151 @@ describe('bash resolver — redirect $() target stays refused (R2 #201)', () => 
     expect(r.kind).toBe('refuse');
   });
 });
+
+// Slice 100 — R2 P1 cleanup. Three coordinated fixes:
+//   #206 protected-path check skips flag-prefixed args, leaving
+//        `--config=/etc/agent/policy.toml` as a bypass.
+//   #208 cmdInterpreter accepts `python -c "code"` and emits
+//        exec:arbitrary, which a narrow exec:python allow rule
+//        could silently admit.
+//   #205 cmdPkgInstall conflates npm + pip ecosystems — pip
+//        invocations falsely emit npm registry hosts.
+describe('bash resolver — flag-prefix protected-path check (slice 100, R2 #206)', () => {
+  test('--config=/etc/agent/policy.toml is now classified, refuses', () => {
+    // Pre-slice the protected-path loop skipped this arg because
+    // arg.startsWith('-') was true. Now the `=` form extracts the
+    // value and classifies it; /etc is an escalate tier (not deny),
+    // so refusal is reserved for the underlying command. For an
+    // unknown command the resolver refuses with 'unknown command';
+    // we verify the kind only — the path under /etc/agent escalates
+    // but `cat --config=...` invokes cat (read-only), so the
+    // protected check returns escalate, NOT deny. The actual deny
+    // shape uses /proc.
+    const r = resolveCapabilities('bash', { command: 'cat --output=/proc/sysrq-trigger' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('/proc/sysrq-trigger');
+      expect(r.reason).toContain('protected zone');
+    }
+  });
+
+  test('--flag=value without protected path passes through', () => {
+    // No regression on legitimate flag-value shapes. `cat
+    // --flag=foo` resolves normally (cat reads cwd by default).
+    const r = resolveCapabilities('bash', { command: 'cat --foo=bar README' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+
+  test('pure flag (no = sign) still skipped', () => {
+    // `-r`/`--help` carry no path content; the loop should still
+    // skip them so a downstream command resolver gets a clean
+    // positional list.
+    const r = resolveCapabilities('bash', { command: 'rm -rf /tmp/scratch' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+
+  test('short-flag combined form -f=<path> also classified', () => {
+    const r = resolveCapabilities('bash', { command: 'cat -o=/proc/cpuinfo' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('/proc/cpuinfo');
+    }
+  });
+
+  test('empty flag value (--flag=) is skipped (no path content)', () => {
+    const r = resolveCapabilities('bash', { command: 'cat --foo=' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+});
+
+describe('bash resolver — interpreter -c refuse (slice 100, R2 #208)', () => {
+  test('python -c "code" refuses with inline-code reason', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'python -c "import os; os.system(\'rm -rf /\')"' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('inline code');
+      expect(r.reason).toContain('-c');
+    }
+  });
+
+  test('python3 -c refuses too', () => {
+    const r = resolveCapabilities('bash', { command: 'python3 -c "print(1)"' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('node -e refuses (perl/node inline-eval shape)', () => {
+    const r = resolveCapabilities('bash', { command: 'node -e "process.exit(0)"' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('perl -E refuses (perl extended one-liner)', () => {
+    const r = resolveCapabilities('bash', { command: 'perl -E "say 1"' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('python script.py (no -c) still emits exec:arbitrary cleanly', () => {
+    // The defense MUST NOT regress the routine case — script-file
+    // invocation is the legitimate interpreter shape and stays
+    // analyzable via the existing exec capability.
+    const r = resolveCapabilities('bash', { command: 'python script.py' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('exec:arbitrary');
+    }
+  });
+});
+
+describe('bash resolver — pkg install honesty (slice 100, R2 #205)', () => {
+  test('pip emits pypi.org but NOT npm/yarn registries', () => {
+    // Pre-slice pip invocations emitted `npmjs.org + yarnpkg.com
+    // + pypi.org` — the audit row lied about which network
+    // namespace pip actually reaches. Now pip's net-egress set
+    // is pypi-only.
+    const r = resolveCapabilities('bash', { command: 'pip install requests' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:pypi.org');
+      expect(s.some((c) => c.includes('npmjs'))).toBe(false);
+      expect(s.some((c) => c.includes('yarnpkg'))).toBe(false);
+    }
+  });
+
+  test('pip3 also emits pypi-only', () => {
+    const r = resolveCapabilities('bash', { command: 'pip3 install pytest' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:pypi.org');
+      expect(s.some((c) => c.includes('npmjs'))).toBe(false);
+    }
+  });
+
+  test('npm emits npmjs + yarnpkg but NOT pypi.org', () => {
+    // Symmetric fix: node-side managers don't reach pypi. The
+    // pre-slice cross-contamination went both ways.
+    const r = resolveCapabilities('bash', { command: 'npm install left-pad' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:registry.npmjs.org');
+      expect(s.some((c) => c.includes('pypi'))).toBe(false);
+    }
+  });
+
+  test('yarn / bun / pnpm follow the node-ecosystem set', () => {
+    for (const cmd of ['yarn add foo', 'bun install foo', 'pnpm add foo']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        const s = capStrings(r.capabilities);
+        expect(s).toContain('net-egress:registry.npmjs.org');
+        expect(s.some((c) => c.includes('pypi'))).toBe(false);
+      }
+    }
+  });
+});

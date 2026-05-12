@@ -430,7 +430,13 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
   }
 };
 
-const cmdPkgInstall: CommandResolver = (_positional, _tokens, ctx) => {
+// Node-ecosystem package managers (npm, yarn, pnpm, bun). Hosts and
+// target dirs reflect what those tools actually touch — `node_modules`
+// under cwd, plus the npm + yarn registries. Pre-slice 100 (R2 #205)
+// `cmdPkgInstall` collapsed every package manager to the SAME shape,
+// emitting npm hosts for pip and pypi hosts for npm; the audit row
+// lied about which network namespace each invocation actually reached.
+const cmdNpmLike: CommandResolver = (_positional, _tokens, ctx) => {
   return {
     capabilities: [
       exec('arbitrary'),
@@ -438,8 +444,20 @@ const cmdPkgInstall: CommandResolver = (_positional, _tokens, ctx) => {
       readFs(ctx.cwd),
       netEgress('registry.npmjs.org'),
       netEgress('registry.yarnpkg.com'),
-      netEgress('pypi.org'),
     ],
+    confidence: 'medium',
+  };
+};
+
+// Python ecosystem (pip, pip3). pip writes to site-packages (system or
+// venv path; we don't try to resolve it deterministically — `arbitrary
+// + read-fs:cwd` covers the worst case) and reaches PyPI. Other
+// registries (private mirrors, conda) require operator-side allow
+// rules that match the explicit `--index-url` flag — out of scope
+// for the static resolver.
+const cmdPip: CommandResolver = (_positional, _tokens, ctx) => {
+  return {
+    capabilities: [exec('arbitrary'), readFs(ctx.cwd), netEgress('pypi.org')],
     confidence: 'medium',
   };
 };
@@ -454,7 +472,33 @@ const cmdChmodChown: CommandResolver = (positional, _tokens, ctx) => {
   };
 };
 
-const cmdInterpreter: CommandResolver = (_positional, _tokens, ctx) => {
+// Language interpreters (python, python3, node, ruby, perl). Slice
+// 100 (R2 #208): pre-slice the resolver emitted `exec:arbitrary +
+// read-fs:cwd` for ANY invocation regardless of args — including
+// the `-c "..."` shape that hands the interpreter an arbitrary code
+// string to execute. While `exec:arbitrary` honestly admits "this
+// can run anything", it doesn't distinguish a script-file invocation
+// (statically analyzable) from inline-code execution. A policy that
+// allowed `exec:python` via a narrow bash allow rule for known
+// `python script.py` invocations would silently admit `python -c
+// "import os; os.system('rm -rf /')"` under the same umbrella.
+//
+// Defense: refuse when `-c <code>` is present. Operators wanting
+// inline interpreter exec must wire it through a separate tool with
+// explicit confirm semantics; the bash resolver isn't the right
+// place to model arbitrary inline-code execution shapes.
+const cmdInterpreter: CommandResolver = (_positional, tokens, ctx) => {
+  // `-c` indicates inline code. Both POSIX (`python -c "code"`) and
+  // perl-specific variants (`-e`/`-E` for one-liners) collapse here
+  // — perl's `-e` is the same threat model. Refuse the lot.
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (t === '-c' || t === '-e' || t === '-E') {
+      return {
+        refuse: `interpreter: '${t} <code>' executes inline code; refusing static analysis`,
+      };
+    }
+  }
   return {
     capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
     confidence: 'high',
@@ -525,12 +569,12 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['wget', cmdCurlWget],
   ['git', cmdGit],
   ['gh', cmdGit],
-  ['npm', cmdPkgInstall],
-  ['yarn', cmdPkgInstall],
-  ['bun', cmdPkgInstall],
-  ['pip', cmdPkgInstall],
-  ['pip3', cmdPkgInstall],
-  ['pnpm', cmdPkgInstall],
+  ['npm', cmdNpmLike],
+  ['yarn', cmdNpmLike],
+  ['bun', cmdNpmLike],
+  ['pip', cmdPip],
+  ['pip3', cmdPip],
+  ['pnpm', cmdNpmLike],
   ['chmod', cmdChmodChown],
   ['chown', cmdChmodChown],
   ['python', cmdInterpreter],
@@ -894,16 +938,41 @@ const analyzeCommand = (
   // Skipped for pure-output commands (echo/printf) whose args are
   // literal output text, not filesystem targets. Redirects on those
   // commands are still checked in the redirect loop below.
+  // §11 protected-path check over bash positional args. Slice 100
+  // (R2 #206): pre-slice this loop skipped EVERY token starting
+  // with `-`, including the `--flag=<value>` shape that carries
+  // a real path in the value half. `--config=/etc/agent/policy.toml`
+  // looked like a flag to the loop and slipped past the classifier
+  // — an LLM tricking a tool into accepting a protected path as
+  // a flag value would bypass §11 entirely.
+  //
+  // Fix: detect `--flag=<value>` and `-f=<value>` shapes, extract
+  // the value, classify it. Pure flags (`-r`, `--help`) without
+  // an `=` still skip — those carry no path content. Flag-value
+  // pairs separated by space (`-o /etc/foo`) are out of scope
+  // here because the loop sees them as two consecutive tokens;
+  // the per-command resolvers that care about them (cmdCurlWget,
+  // slice 98 R2 #200) already consume both and emit explicit
+  // capabilities that the engine's downstream §11 walk catches.
+  const extractFlagValue = (arg: string): string | null => {
+    if (!arg.startsWith('-')) return arg;
+    const eq = arg.indexOf('=');
+    if (eq === -1) return null;
+    const value = arg.slice(eq + 1);
+    return value.length > 0 ? value : null;
+  };
   let escalated = false;
   if (!isPureOutputCommand(shape.name)) {
     for (const arg of shape.args) {
-      if (arg.length === 0 || arg.startsWith('-')) continue;
-      const abs = resolvePath(ctx.cwd, arg);
+      if (arg.length === 0) continue;
+      const candidate = extractFlagValue(arg);
+      if (candidate === null) continue;
+      const abs = resolvePath(ctx.cwd, candidate);
       const op: 'read' | 'write' = isReadOnlyCommand(shape.name) ? 'read' : 'write';
       const tier = classifyProtectedPath({ absPath: abs, op, home: ctx.home, cwd: ctx.cwd });
       if (tier === 'deny') {
         return {
-          refuse: `bash: ${shape.name} target '${arg}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
+          refuse: `bash: ${shape.name} target '${candidate}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
         };
       }
       if (tier === 'escalate') escalated = true;

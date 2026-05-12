@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 100: bash resolver P1 cleanup (R2 #205 + #206 + #208)
+
+**Done.** One-hundredth slice. Closes three R2 P1 findings on the bash resolver:
+
+- **#206 flag-prefix bypass in protected-path check (real bypass)**: the per-bash-arg §11 loop skipped any token starting with `-`. The `--flag=<value>` shape — `--config=/etc/agent/policy.toml`, `--output=/proc/sysrq-trigger` — looked like a flag and slipped past the classifier entirely. An LLM tricking a tool into accepting a protected path as a flag value could bypass §11. Fix: detect the `=` form, extract the value, classify it. Pure flags without `=` still skip (they carry no path content).
+- **#208 `python -c "code"` admitted under exec:python rules**: the interpreter resolver emitted `exec:arbitrary + read-fs:cwd` for ANY invocation regardless of args. A narrow policy `bash.allow: ['python *']` with `exec:python` capability admitted `python -c "import os; os.system('rm -rf /')"` under the same umbrella. Slice 100 refuses `-c <code>` / `-e <code>` / `-E <code>` at the resolver — the bash AST can't statically analyze inline code, so admitting it is structurally unsound regardless of policy.
+- **#205 `cmdPkgInstall` cross-ecosystem lying (cosmetic but visible in audit)**: every package manager (npm/yarn/bun/pnpm/pip/pip3) collapsed to the SAME shape, emitting `npmjs.org + yarnpkg.com + pypi.org` together. The audit row for `pip install requests` carried npm hosts even though pip never reaches them. Split into `cmdNpmLike` (node ecosystem) + `cmdPip` (python ecosystem) — each emits only the hosts it actually touches.
+
+### Why this matters
+
+#206 is the load-bearing fix. The `arg.startsWith('-')` skip was a real bypass: combine it with slice 98's curl `-o` write detection and slice 97's `/dev` deny, and the loop still admitted `--output=/proc/sysrq-trigger` because the entire arg was a "flag". Pre-slice, the protected-path defense lived at the per-arg granularity but missed the canonical Unix shape where a flag carries its value via `=`. Closing this aligns the bash-resolver §11 walk with the engine's bypass-mode §11 walk (slice 97) — same defense at two layers.
+
+#208 is the second-most-impactful. Pre-slice, `python -c` honestly emitted `exec:arbitrary`, which an operator's broad allow rule could match. Now it refuses outright — the operator has to author a separate tool (with its own confirm/audit semantics) for inline interpreter exec, which keeps the LLM-driven dynamic-code path off the bash surface. Same defense applies to node `-e`, perl `-e`/`-E`.
+
+#205 is cosmetic but matters for forensic clarity. Audit rows that lie about which network namespace a tool reached make incident triage harder. The audit consumer reading "pip install touched registry.npmjs.org" is now told the truth: pip reached pypi.org.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/resolvers/bash.ts` | New `cmdNpmLike` (npm/yarn/bun/pnpm) + `cmdPip` (pip/pip3); the old `cmdPkgInstall` is deleted. COMMAND_TABLE re-points each name. `cmdInterpreter` now scans tokens for `-c`/`-e`/`-E` and returns a `refuse` envelope on hit; otherwise emits the unchanged `exec:arbitrary + read-fs:cwd` shape. New `extractFlagValue(arg)` helper inside the bash command resolver entry point: returns the arg verbatim when it doesn't start with `-`, or the substring after `=` when it does — null for pure flags without `=`. The protected-path loop iterates over `shape.args`, runs `extractFlagValue`, and skips when null; non-null values are classified as before. |
+| `tests/permissions/resolvers.test.ts` | New describe `flag-prefix protected-path check` with 5 tests covering: `--output=/proc/sysrq-trigger` refuses with deny-tier reason, `--foo=bar` passes through, pure flag `-rf` still skipped, combined short form `-o=/proc/...` also classified, empty flag value `--foo=` skipped. New describe `interpreter -c refuse` with 5 tests covering: python -c, python3 -c, node -e, perl -E, plus regression `python script.py` still passes. New describe `pkg install honesty` with 4 tests covering: pip emits pypi-only, pip3 same, npm emits npm/yarn but no pypi, yarn/bun/pnpm follow node-ecosystem set. |
+| `tests/permissions/engine.test.ts` | One pre-existing test (`compound command guard > multi-line allow pattern (heredoc) still matches when no separator outside quotes`) used `python -c "for i in range(3):\n  print(i)"` as its multi-line-in-quotes fixture. Slice 100 now refuses that shape regardless of policy; the test was verifying the compound-guard's dotAll matching, not python specifically. Swapped to `echo "line1\n  line2"` — same multi-line-in-quotes property, no interpreter concern. |
+
+### Decisions
+
+- **`extractFlagValue` extracts ONLY the value half of `--flag=value`, not free-standing flag/value pairs (`--output /etc/foo`).** Free-standing pairs are out of scope here because the per-command resolvers that care about them (`cmdCurlWget` for `-o <path>`, slice 98 R2 #200) already consume both tokens and emit explicit capabilities that the engine's downstream §11 walk catches. Centralizing space-separated detection here would duplicate the per-command argument parsing logic — and miss the cases where the value's semantic depends on the flag (`-o /tmp/x` is a write target for curl but `-o noatime` is a mount option for `mount`).
+- **Interpreter refuses `-c`, `-e`, `-E` together.** Three flags share the inline-code semantics: POSIX `-c` (python, sh-style), perl `-e` (one-liner), and perl `-E` (one-liner with feature::say enabled). Refusing the lot keeps the resolver from playing whack-a-mole with future interpreter syntax — operator wiring of explicit "inline interpreter exec" tools is the right escape valve, not loosening the resolver.
+- **`cmdPkgInstall` deleted, not aliased.** Keeping the old name as `cmdPkgInstall = cmdNpmLike` would have silently broken the npm-vs-pip distinction for any future caller that imports the symbol. The fix is a clean split; the old name is gone.
+- **`exec:arbitrary` stays for script-file interpreter invocations.** Slice 100 narrows ONLY the `-c`/`-e`/`-E` shape. `python script.py` still emits `exec:arbitrary` because the bash resolver can't statically know which script that file is (or whether it itself uses inline `eval` shapes). A future slice could tighten this further (emit `exec:python` for known-file invocations, gate the kind via a `policy.tools.bash.exec_kinds` allow list), but it's out of scope here.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6188 pass / 10 skip / 0 fail** (6198 total across 289 files); +14 tests on top of slice 99's 6174
+- Targeted: `bun test tests/permissions/resolvers.test.ts tests/permissions/engine.test.ts` — 298/298
+
+### Next
+
+R2 P1 remaining (deferred):
+- **#204 bash-parser.ts no timeout**: tree-sitter can loop on pathological input. Needs a synchronous timeout mechanism, slice of its own.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R2 #199 COMMAND_TABLE additions (tar/ssh/scp/rsync/make/cargo).
+- R4 sandbox `hide_paths` / `scrub_env` (substantial across Linux + macOS runners).
+- R5 audit chain atomicity (rotation-rollover write ordering).
+- R6 bootstrap/policy YAML hardening.
+- R8 sandbox wire validation (bwrap stderr / sandbox-exec result checks).
+- R9 broker drain caps.
+- R10 #48 (telemetry sink wiring through HarnessConfig).
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 99: telemetry scrubbing hardening (R10 #46/#47/#49/#50/#51)
 
 **Done.** Ninety-ninth slice. Closes five R10 telemetry scrubbing findings — five PII-leak vectors in the metric stream — in one cohesive cut across `src/telemetry/scrubbing.ts`:
