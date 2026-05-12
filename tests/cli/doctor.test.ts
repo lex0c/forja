@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
+import { resetSharedDoctorCache } from '../../src/cli/doctor-cache.ts';
 import { runDoctor } from '../../src/cli/doctor.ts';
 import {
   type SealEntry,
@@ -69,6 +70,12 @@ describe('runDoctor', () => {
     // Point HOME at a writable temp dir so config_dir + data_dir
     // checks pass deterministically on any runner.
     env = { HOME: tmp, PATH: process.env.PATH };
+    // Slice 124: reset the shared doctor cache so cached entries
+    // from previous tests don't leak into this test's check
+    // results (e.g., a test that stubbed `aa-status` to fail
+    // would otherwise feed a cached "warn" into a later test that
+    // expected "ok" with a different stub).
+    resetSharedDoctorCache();
   });
 
   afterEach(() => {
@@ -782,6 +789,15 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
 
 describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
   const env = { PATH: process.env.PATH };
+
+  // Slice 124: each kernel-check test stubs runCmd/readFile/which
+  // differently; the shared doctor cache would otherwise feed the
+  // first test's results into all subsequent ones, since these
+  // checks (user_namespaces, net_filtering, mac_lsm, git) are
+  // exactly the non-critical set covered by the 60s cache.
+  beforeEach(() => {
+    resetSharedDoctorCache();
+  });
 
   const seamsAllOk = {
     readFile: (path: string): string | null =>

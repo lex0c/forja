@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 124: doctor §13.8 60s cache for non-critical checks (R9 P1)
+
+**Done.** One-hundred-twenty-fourth slice. Closes the last R9 P1 finding: doctor §13.8 cache for non-critical checks (spec line 817 / 944). Pre-slice every `runDoctor` invocation re-probed ALL checks — including `mac_lsm` (shells out to `aa-status`), `user_namespaces` (reads /proc), `net_filtering` (shells out to `nft`), `git` (version probe), `platform` (sysinfo). Within a long-running harness session, doctor re-runs every 50 tool calls per §13.8, so a session with 1000 tool calls would re-probe these 20 times — wasted I/O on values that don't change within a session (kernel version is stable; nftables version is stable).
+
+### Why this matters
+
+§13.8 spells out the contract: "Cache de 60s pra checks não-críticos (kernel features, pkg versions). Checks críticos (bwrap binary presente, policy hash, hash chain integrity) sempre live." The cache is small-but-load-bearing — without it, the harness pays the doctor cost N times per session; with it, kernel/pkg version probes hit memory after the first call. The critical-checks-always-live contract is equally load-bearing: bwrap could be uninstalled mid-session, the policy file could be renamed, the audit chain could be tampered with. Caching those would silently mask the regressions doctor exists to catch.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/doctor-cache.ts` | **NEW.** Self-contained cache module. Exports `DOCTOR_CACHE_TTL_MS = 60_000` (per spec), `NON_CRITICAL_CHECK_NAMES` (Set: platform, user_namespaces, net_filtering, mac_lsm, git), `isCacheable(name)`, `DoctorCheckCache` interface (`get` / `set` / `clear` — `now` passed in for deterministic testing), `createInMemoryDoctorCache()` factory, `getSharedDoctorCache()` for the process-wide singleton, `resetSharedDoctorCache()` for test reset, `withDoctorCache(name, run, cache, now)` wrapper. |
+| `src/cli/doctor.ts` | Imports `DoctorCheckCache`, `getSharedDoctorCache`, `withDoctorCache`. New `cache?: DoctorCheckCache` option on `RunDoctorOptions`. `runDoctor` snapshots `cacheNow` once per invocation; wraps `platform`, `user_namespaces`, `net_filtering`, `mac_lsm`, `git` with `withDoctorCache`; `sandbox`, `config_dir`, `data_dir`, `policy_load`, `hash_chain`, `sealing` continue to run live regardless of cache state. |
+| `tests/cli/doctor.test.ts` | `beforeEach` reset calls added to two describe blocks (`runDoctor` and `runDoctor — §13.3 kernel checks`) so the shared cache doesn't leak between tests. Test setup unchanged otherwise; existing 48 tests still pass. |
+| `tests/cli/doctor-cache.test.ts` | **NEW.** 15 tests across 4 describes: `isCacheable` (canonical set membership, NON_CRITICAL_CHECK_NAMES fence), `createInMemoryDoctorCache` (set/get/clear/expiry/per-name independence), `withDoctorCache` (cache hit / TTL expiry / critical bypass), `runDoctor — §13.8 cache integration` (within-TTL no re-probe / past-TTL re-probe / critical always-live / cached-result-reflects-snapshot-time-not-read-time). |
+
+### Decisions
+
+- **Module-local + process-wide singleton.** The cache lives in the doctor module rather than being injected from the bootstrap layer. Production callers don't need to thread cache state through; the singleton just works. Tests inject per-test caches via `options.cache` (deterministic, no cross-test pollution) OR call `resetSharedDoctorCache()` in `beforeEach` (when they don't override the option).
+- **Hardcoded `NON_CRITICAL_CHECK_NAMES`, not a flag on `DoctorCheck`.** Each check name maps to a single cacheability decision per §13.8. A flag on the result would mean every check site has to think about caching; the central Set + wrapper keeps the policy in one place. If a future check needs different caching (e.g., 5min TTL for an expensive probe), it gets a new wrapper variant — not a per-result flag.
+- **`now` is passed in, not captured inside the cache.** Cache `get`/`set` take `now: number` so tests can pin time deterministically. The downstream effect: `runDoctor` calls `now()` once at the top and passes the same value to every `withDoctorCache` call — all cache decisions within one runDoctor invocation see the same snapshot moment. Time can't drift mid-invocation.
+- **Cache miss on EXACT TTL boundary, not strictly past.** The check is `now >= expiresAt`, so at `expiresAt` itself the entry is dropped. Spec says "60s cache"; the boundary is the moment caching stops, not the moment after. Matches the inclusive-end convention most language-stdlib caches follow.
+- **Expired entries are dropped on read, not on a timer.** No background sweep — fits the small entry count (~5 checks max). If a future slice adds many more cacheable check names, a sweep could be added; for now the read-time drop is fine.
+- **`withDoctorCache` is the call-site abstraction, not a decorator over the check functions themselves.** Could have rewritten each check function to take a cache argument; instead the wrapper lives at the orchestration layer (`runDoctor`). Lets check functions stay pure and unaware of caching — easier to read each check in isolation, easier to add a `--no-cache` flag in a future slice.
+- **`resetSharedDoctorCache()` is exported.** Pre-slice the doctor module had no test seam for cache state. Exporting reset lets tests use the singleton by default + clear between tests, instead of forcing every test to inject `cache: createInMemoryDoctorCache()`. Reduces friction for the 48 existing tests that didn't need to think about caching.
+
+### Trap navigated
+
+- **Existing tests leaked state across the shared cache.** Initial integration: 12 of 48 existing doctor tests failed because the shared cache persisted between tests. The first test stubbed `aa-status` to succeed, the cache stored the OK result, then a later test stubbed `aa-status` to fail — but `runDoctor` returned the cached OK instead of re-probing. Fix: `beforeEach(resetSharedDoctorCache)` in both describes that exercise the kernel checks. Pattern: any module-level state with TTL semantics MUST have a test-reset seam, and existing tests touching that module must reset in `beforeEach`.
+- **Cache TTL semantics interact with `now()` snapshot semantics.** The first iteration snapshotted `now` inside `withDoctorCache` itself (`const t = now()`), which created a subtle bug: if `runDoctor` happened to span > TTL across many checks (unlikely but possible on a slow CI), some checks within ONE invocation would see fresh cache, others would see expired. Fixed by snapshotting `cacheNow` ONCE at the top of `runDoctor` and passing the same value to every `withDoctorCache`. All cache decisions within one invocation are consistent.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6380 pass / 10 skip / 0 fail** (6390 total across 292 files); +15 tests on top of slice 123's 6365
+- Targeted: `bun test tests/cli/doctor-cache.test.ts tests/cli/doctor.test.ts` — 63/63 (48 pre-existing + 15 new)
+
+### Next
+
+R9 P1 fully drained (5/5 closed). R-bucket status:
+
+- R1 ✓, R2 ✓, R4 ✓, R5 ✓, R6 ✓, R7 ✓, R8 ✓, R10 ✓, R11 ✓, R12 partial
+- R9: 3 P0 closed (slice 122), 5 P1 closed (slices 123 + 124), **1 P0 remaining** — §13.4/§13.5 interactive menu (spec-vs-code design decision: implement dual-confirm OR PR the spec to declare info-only).
+
+Slices 95–124 (30 consecutive) closed all 56 P0/P1 findings except R9 P0 #10 (design decision) and R12 fuzz CI workflow (aspirational, not functional). The remaining work is genuinely scope-decision territory rather than bugfix territory.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 123: R9 P1 cluster — doctor + args + welcome polish
 
 **Done.** One-hundred-twenty-third slice. Closes four of five R9 P1 findings — small fixes across `doctor.ts`, `args.ts`, `welcome.ts`, and `sandbox-skip.ts`. Each addresses a specific operator-UX paper cut surfaced by the multi-reviewer pass. The fifth P1 (60s cache for non-critical doctor checks) is a larger feature deferred to its own slice.

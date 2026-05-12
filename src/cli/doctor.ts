@@ -46,6 +46,7 @@ import { installIdPath } from '../permissions/paths.ts';
 import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DoctorCheckCache, getSharedDoctorCache, withDoctorCache } from './doctor-cache.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -101,6 +102,14 @@ export interface RunDoctorOptions {
   // Production: PACKAGE_VERSION constant. Tests: pin a value
   // for stable assertions.
   engineVersion?: string;
+  // §13.8 60s cache for non-critical checks (slice 124). Production:
+  // a process-wide singleton from `getSharedDoctorCache()` so a
+  // long-running harness re-runs doctor every N tool calls without
+  // re-probing kernel/pkg versions. Tests: pass a fresh cache per
+  // test so shared state doesn't leak between tests. Critical
+  // checks (sandbox binary, policy_load, hash_chain, fs writable,
+  // sealing) bypass the cache regardless.
+  cache?: DoctorCheckCache;
   out?: (s: string) => void;
   err?: (s: string) => void;
 }
@@ -833,18 +842,37 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   const cwd = options.cwd ?? process.cwd();
   const now = options.now ?? Date.now;
   const dbPath = options.dbPath ?? defaultDbPath();
+  // §13.8 60s cache for non-critical checks (slice 124). Production
+  // uses a process-wide singleton so the harness's every-50-tool-
+  // calls re-run hits cached entries; tests inject a fresh cache.
+  const cache = options.cache ?? getSharedDoctorCache();
+  // Snapshot `now` once for ALL cache-aware checks within this
+  // runDoctor invocation. Each check sees the same "now" so a
+  // cache entry that expired mid-loop doesn't get retroactively
+  // refreshed only for some checks.
+  const cacheNow = now();
   // §13.3 platform / kernel block. Order matches the spec's
   // example output: OS, user namespaces, sandbox binary, net
   // filtering, MAC LSM — the kernel-side stack the engine
   // depends on, top to bottom.
-  const sandboxResult = sandboxCheck(which);
-  const userNsResult = userNamespacesCheck(readFile);
+  //
+  // Critical checks (sandbox, config_dir, data_dir, policy_load,
+  // hash_chain, sealing) bypass the cache and ALWAYS run live.
+  // Non-critical (platform, user_namespaces, net_filtering,
+  // mac_lsm, git) get the 60s cache treatment per §13.8.
+  const sandboxResult = sandboxCheck(which); // critical
+  const userNsResult = withDoctorCache(
+    'user_namespaces',
+    () => userNamespacesCheck(readFile),
+    cache,
+    cacheNow,
+  );
   const checks: DoctorCheck[] = [
-    platformCheck(env),
+    withDoctorCache('platform', () => platformCheck(env), cache, cacheNow),
     userNsResult,
     sandboxResult,
-    netFilteringCheck(which, runCmd),
-    macLsmCheck(which, runCmd),
+    withDoctorCache('net_filtering', () => netFilteringCheck(which, runCmd), cache, cacheNow),
+    withDoctorCache('mac_lsm', () => macLsmCheck(which, runCmd), cache, cacheNow),
     configDirCheck(env),
     dataDirCheck(env),
     policyLoadCheck({
@@ -864,7 +892,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
         : {}),
       now,
     }),
-    gitCheck(which),
+    withDoctorCache('git', () => gitCheck(which), cache, cacheNow),
   ];
 
   // §13.3 derived footer items.
