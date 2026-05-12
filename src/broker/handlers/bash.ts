@@ -183,7 +183,24 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
       let timedOut = false;
       let aborted = false;
       let killEscalationTimer: ReturnType<typeof setTimeout> | undefined;
+      // First-arm-wins guard (slice 108, R7 #37). Pre-slice both
+      // the timeout path AND the abort path called
+      // `escalateToSigkill`, each overwriting the `let`-bound
+      // timer reference. The previous timer was orphaned but
+      // still pending — it fired its callback after the grace
+      // window, hitting a try/catch on an already-dead proc
+      // (functionally a no-op) but leaking a setTimeout handle
+      // into the event loop. Under stress (concurrent timeout +
+      // abort across many calls), the leak compounded and Bun
+      // surfaced MaxListenersExceededWarning style symptoms.
+      //
+      // Fix: the FIRST escalation arms the timer; subsequent
+      // calls (abort during the grace window, or vice versa)
+      // silently no-op. The grace period applies once; the
+      // SIGKILL fires once. Worker process state is the same;
+      // the timer accounting is clean.
       const escalateToSigkill = (graceMs: number): void => {
+        if (killEscalationTimer !== undefined) return;
         killEscalationTimer = setTimeout(() => {
           try {
             proc.kill('SIGKILL');
@@ -222,7 +239,26 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
       }
 
       const readStopAc = new AbortController();
-      void proc.exited.then(() => readStopAc.abort());
+      // `.finally` (not `.then`) so rejection of `proc.exited`
+      // ALSO aborts the read controller (slice 108, R7 #36).
+      // Pre-slice the `.then(...)` callback was the only path
+      // to readStopAc.abort(); a Bun edge case where the
+      // process surface rejects (very rare — typically
+      // proc.exited resolves with the exit code) would leave
+      // the readers waiting on stream end forever, freezing
+      // the call until the outer timeout fired. .finally
+      // runs on both resolve and reject; the readers always
+      // get the stop signal regardless of which path
+      // proc.exited took.
+      //
+      // The trailing `.catch(() => {})` swallows the rejection
+      // on this branch ONLY — `proc.exited` is also part of
+      // the main `Promise.all` below, which surfaces the
+      // rejection through the try/catch wrapping the await.
+      // Without the swallow here, the .finally chain would
+      // produce an unhandled rejection (the rejection propagates
+      // through .finally; only an explicit handler consumes it).
+      void proc.exited.finally(() => readStopAc.abort()).catch(() => {});
 
       let outRes: { text: string; truncated: boolean } = { text: '', truncated: false };
       let errRes: { text: string; truncated: boolean } = { text: '', truncated: false };

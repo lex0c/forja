@@ -792,7 +792,7 @@ describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)'
       get aborted() {
         return ac.signal.aborted;
       }
-      addEventListener(
+      override addEventListener(
         type: string,
         listener: EventListener,
         opts?: AddEventListenerOptions,
@@ -801,7 +801,7 @@ describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)'
         super.addEventListener(type, listener, opts);
         ac.signal.addEventListener(type, listener, opts);
       }
-      removeEventListener(type: string, listener: EventListener): void {
+      override removeEventListener(type: string, listener: EventListener): void {
         removeCount++;
         super.removeEventListener(type, listener);
         ac.signal.removeEventListener(type, listener);
@@ -831,7 +831,7 @@ describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)'
       get aborted() {
         return ac.signal.aborted;
       }
-      addEventListener(
+      override addEventListener(
         type: string,
         listener: EventListener,
         opts?: AddEventListenerOptions,
@@ -840,7 +840,7 @@ describe('createSpawnBroker — signal listener race window (slice 107, R6 #38)'
         super.addEventListener(type, listener, opts);
         ac.signal.addEventListener(type, listener, opts);
       }
-      removeEventListener(type: string, listener: EventListener): void {
+      override removeEventListener(type: string, listener: EventListener): void {
         removeCount++;
         super.removeEventListener(type, listener);
         ac.signal.removeEventListener(type, listener);

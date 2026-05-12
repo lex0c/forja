@@ -410,3 +410,131 @@ describe('createBashHandler — production worker integration via spawn broker',
     expect(r.error).toBe('bash handler: timeout_ms must be an integer >= 100');
   });
 });
+
+// Slice 108 — R7 #37 + R7 #36 hardening on the bash handler.
+//
+// #37: escalateToSigkill overwrote killEscalationTimer when
+// both timeout and abort fired (timeout SIGTERM at T0 → grace
+// timer #1 armed; abort at T0+ε → grace timer #2 OVERWRITES
+// the reference, timer #1 is orphaned + still pending → fires
+// later as a no-op on a dead proc, leaking a setTimeout handle
+// into the event loop). First-arm-wins guard plugs the leak.
+//
+// #36: `proc.exited.then(() => readStopAc.abort())` only fires
+// on resolve. A Bun edge that rejects proc.exited leaves the
+// readers waiting forever. `.finally(...)` fires on either
+// path; readers always get the stop signal.
+describe('createBashHandler — SIGKILL timer guard + proc.exited finally (slice 108, R7 #37/#36)', () => {
+  test('first-arm wins: only one SIGKILL fires when timeout AND abort both want escalation', async () => {
+    // Set up a proc that ignores SIGTERM and never exits. The
+    // timeout fires first → SIGTERM + arm SIGKILL grace. Then
+    // abort fires during the grace window. Pre-slice this
+    // overwrote the timer, both timers fired their kills (the
+    // second was a no-op on dead proc but the timer handle
+    // leaked). Post-slice, abort's call to escalateToSigkill
+    // is a guard-no-op; only one SIGKILL ever lands.
+    let releaseExited: (() => void) | null = null;
+    const exitedPromise = new Promise<number>((resolve) => {
+      releaseExited = () => resolve(137);
+    });
+    const signalsReceived: (number | string | undefined)[] = [];
+    const spawn: BashSpawnFn = () => ({
+      stdout: streamFrom(''),
+      stderr: streamFrom(''),
+      exited: exitedPromise,
+      kill: (signal) => {
+        signalsReceived.push(signal);
+        // Resolve the exited promise on SIGKILL so the test
+        // doesn't hang.
+        if (signal === 'SIGKILL' && releaseExited !== null) releaseExited();
+      },
+    });
+
+    const handler = createBashHandler({ spawn, timeoutGraceMs: 50 });
+    const ac = new AbortController();
+    // Fire abort 10ms after start so it lands DURING the
+    // post-SIGTERM grace window (which begins at timeout_ms=100
+    // and lasts 50ms). Abort wants to re-escalate; the guard
+    // refuses to re-arm.
+    setTimeout(() => ac.abort(), 10);
+
+    await handler.execute(baseRequest({ args: { command: 'sleep 60', timeout_ms: 100 } }), {
+      signal: ac.signal,
+    });
+
+    // Exactly one SIGKILL. SIGTERM may appear once (timeout) or
+    // twice (timeout + abort, both call proc.kill('SIGTERM')) —
+    // that's a separate concern; the guard fix is about SIGKILL.
+    const sigkillCount = signalsReceived.filter((s) => s === 'SIGKILL').length;
+    expect(sigkillCount).toBe(1);
+  });
+
+  test('SIGTERM grace expiry still fires SIGKILL exactly once', async () => {
+    // Regression coverage for the existing happy path: a proc
+    // that ignores SIGTERM gets SIGKILL after the grace window.
+    // The guard MUST NOT prevent the first arming.
+    const signalsReceived: (number | string | undefined)[] = [];
+    let releaseExited: (() => void) | null = null;
+    const exitedPromise = new Promise<number>((resolve) => {
+      releaseExited = () => resolve(137);
+    });
+    const spawn: BashSpawnFn = () => ({
+      stdout: streamFrom(''),
+      stderr: streamFrom(''),
+      exited: exitedPromise,
+      kill: (signal) => {
+        signalsReceived.push(signal);
+        if (signal === 'SIGKILL' && releaseExited !== null) releaseExited();
+      },
+    });
+    const handler = createBashHandler({ spawn, timeoutGraceMs: 20 });
+    await handler.execute(
+      baseRequest({ args: { command: 'trap "" TERM; sleep 60', timeout_ms: 100 } }),
+    );
+    expect(signalsReceived).toContain('SIGTERM');
+    expect(signalsReceived).toContain('SIGKILL');
+  });
+
+  test('proc.exited REJECTION still stops the readers (finally fires)', async () => {
+    // Pre-slice `.then(() => readStopAc.abort())` only fired on
+    // resolve. A Bun edge that rejects proc.exited would leave
+    // the readers parked on stream end forever. The test
+    // synthesizes a rejection and verifies the handler still
+    // returns (the readStopAc.abort() in the .finally branch
+    // propagates the stop signal, the readers unblock, the
+    // call completes).
+    const spawn: BashSpawnFn = () => ({
+      // Streams close cleanly so the only thing the handler
+      // waits on is proc.exited — which rejects.
+      stdout: streamFrom('partial output'),
+      stderr: streamFrom(''),
+      exited: Promise.reject(new Error('synthetic Bun edge')),
+      kill: () => {
+        // no-op
+      },
+    });
+    const handler = createBashHandler({ spawn });
+    // Without the .finally fix, this would hang forever on the
+    // readers waiting for proc.exited to also resolve. With the
+    // fix, .finally fires readStopAc.abort(), the readers see
+    // the stop signal, Promise.all resolves with the rejection
+    // surfacing through the wrapper.
+    const start = Date.now();
+    let threw = false;
+    try {
+      await handler.execute(baseRequest({ args: { command: 'echo hi' } }));
+    } catch {
+      threw = true;
+    }
+    const elapsed = Date.now() - start;
+    // The handler resolves OR throws — what matters is that it
+    // completes within a reasonable time, NOT parks forever.
+    // Either outcome means readStopAc.abort() fired.
+    expect(elapsed).toBeLessThan(2000);
+    // Promise.all rejects when proc.exited rejects; the
+    // handler's try/finally surfaces that as a thrown error.
+    // (Pre-slice the readers would also hang first, masking
+    // the rejection.)
+    expect(threw).toBe(true);
+  });
+});

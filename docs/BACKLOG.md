@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 108: bash handler timer leak + exited rejection (R7 #37 + #36)
+
+**Done.** One-hundred-eighth slice. Closes two R7 P0s on the bash worker handler — both concurrency-cleanup gaps that surfaced under stress:
+
+- **#37 stacked SIGKILL timers**: `killEscalationTimer` was a single `let` reference. When the timeout fired SIGTERM and armed grace timer #1, then the abort signal fired during the grace window and called `escalateToSigkill` again, the new timer **overwrote** the reference. Timer #1 was orphaned but still pending — fired its callback after the grace, hit a try/catch on the already-dead proc (functionally a no-op), but leaked a `setTimeout` handle into the event loop. Under stress (concurrent timeout + abort across many calls), the leak compounded and Bun surfaced `MaxListenersExceededWarning`-style symptoms.
+- **#36 `proc.exited.then(...)` no `.catch`**: the `.then(() => readStopAc.abort())` only fired the read-stop signal on **resolve**. A Bun edge case where `proc.exited` rejects (rare — typically resolves with the exit code, but documented as possible on certain spawn failures that surface late) would leave the readers waiting on stream end forever, freezing the call until the outer timeout fired. The unhandled rejection ALSO surfaced as a Bun warning.
+
+### Why this matters
+
+Both findings are availability concerns, not security. The bash handler is the bulk of the broker's traffic; a leak per call quickly accumulates in long-running agent sessions. Two failure modes pre-slice:
+
+1. **Timer leak under abort+timeout race**: a busy session with frequent operator cancellations (subagent dispatch, Ctrl-C, depth-exceeded watchdog) accumulated orphan setTimeout handles. Bun's event loop kept references; after enough leaks the process slowed and eventually surfaced max-listener warnings.
+2. **Hang on `proc.exited` rejection**: a call where the bash subprocess died abnormally (segfault mid-spawn, kernel OOM kill) could leave the read loop waiting forever. The outer broker timeout (60s after slice 106) eventually killed the call, but the operator saw "timeout" instead of the actual cause.
+
+Slice 108 plugs both:
+
+- **#37**: `escalateToSigkill` now has a first-arm-wins guard. The first call (whichever fires first — timeout or abort) arms the grace timer. Subsequent calls during the grace window are silently absorbed. The grace period applies once; SIGKILL fires once. Same worker state as before, clean timer accounting.
+- **#36**: `proc.exited.then(...)` becomes `proc.exited.finally(() => readStopAc.abort()).catch(() => {})`. `.finally` runs on both resolve and reject paths, so the readers always get the stop signal. The trailing `.catch(() => {})` swallows the rejection on this branch only — `proc.exited` is ALSO part of the main `Promise.all` below, which surfaces the rejection through the try/catch wrapping the await. Without the swallow here, the .finally chain would produce an unhandled rejection (the rejection propagates through .finally; only an explicit handler consumes it).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/broker/handlers/bash.ts` | `escalateToSigkill` gains `if (killEscalationTimer !== undefined) return` guard. `proc.exited.then(() => readStopAc.abort())` becomes `proc.exited.finally(() => readStopAc.abort()).catch(() => {})`. |
+| `tests/broker/handlers/bash.test.ts` | New describe `SIGKILL timer guard + proc.exited finally (slice 108, R7 #37/#36)` with 3 tests: (1) first-arm wins when both timeout and abort want escalation — sigkillCount === 1; (2) regression coverage: SIGTERM grace expiry still fires SIGKILL on a TERM-trapping proc; (3) proc.exited REJECTION still stops the readers — synthesizes a rejected exited promise and verifies the handler completes within 2s instead of parking forever. |
+| `tests/broker/spawn.test.ts` | Pre-existing slice-107 test shim classes (EventTarget subclass) gain `override` modifier on `addEventListener` / `removeEventListener` — TS strict mode requires the modifier when overriding base class methods. Cosmetic typecheck fix; behavior unchanged. |
+
+### Decisions
+
+- **First-arm wins (not last-arm wins, not multi-timer tracking).** The semantic invariant is "after SIGTERM, give the proc N ms to clean up before SIGKILL". Whether the SIGTERM came from timeout or abort doesn't change the grace expectation. The first arming captures the operator's commitment; re-arming would extend the grace artificially. Multi-timer tracking would be overkill (the second-armed kill is functionally a no-op on a dead proc).
+- **`.finally` not `.then(_, _)`.** Two-argument `.then` would also fire on both paths, but `.finally` is the canonical Promise primitive for "do X regardless of outcome". Reads cleaner. The trailing `.catch` swallows the rejection that .finally passes through.
+- **Catch swallows ONLY on the finally branch.** The main `Promise.all([..., proc.exited])` still surfaces the rejection through its try/catch wrapper. Operators see the rejection as a structured error in BrokerResponse; the .finally branch just needs to fire readStopAc.abort without producing an unhandled rejection.
+- **No R7 #38 fix here.** REVIEW_NOTES.md tagged bash.ts:209-222 as "Signal listener attached AFTER spawn" but the bash handler doesn't have a stdin-write phase (bash gets the command via argv). The pre-spawn → listener-attach interval is fully synchronous; JS single-threaded execution means abort can't fire between two sync statements. The R6 #38 finding (which DOES have an `await proc.stdin.end()` between spawn and listener) was a real race; slice 107 fixed it there. The R7 #38 tag is a copy of the R6 finding that doesn't strictly apply.
+- **No new R7 P1 fixes.** R7 P1 leftovers (orphan-read-stop on grandchild processes, etc.) deferred — each requires deeper subprocess-tree-walking, fitting their own slice.
+- **TS `override` fix for slice 107 tests.** Pre-existing strict-mode typecheck warning surfaced when I ran `bun run typecheck` for slice 108. Fixing it here keeps the suite warning-free; one-line cosmetic change.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6245 pass / 10 skip / 0 fail** (6255 total across 290 files); +3 tests on top of slice 107's 6242
+- Targeted: `bun test tests/broker/handlers/bash.test.ts` — 33/33
+
+### Next
+
+R7 P1 remaining: bash worker handler still has some defensive-cleanup gaps (orphan-read-stop edge cases, etc.) — none rise to P0 after slice 108.
+
+Remaining roadmap from REVIEW_NOTES.md:
+- R6 P1 leftovers: stdin.end race, SIGTERM→SIGKILL escalation, worker SIGTERM {once}.
+- R8 #322 hierarchy seal section, #323 preflight home.
+- R2 #199 COMMAND_TABLE additions.
+- R2 #204 bash-parser tree-sitter loop guard.
+- R4 sandbox hide_paths/scrub_env.
+- R5 broker contract.
+- R9 operator UX.
+- R10 #48 telemetry sink wiring.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 107: signal listener race window (R6 #38)
 
 **Done.** One-hundred-seventh slice. Closes R6 #38 — the **last P0 from R6**. Pre-slice the broker attached the abort signal listener AFTER the `await proc.stdin.end()`. An abort firing during the sandbox-wrap / spawn / stdin-write window was silently lost — listener registered AFTER the event has fired is never invoked. The caller's cancellation no-op'd until the outer timeout (60s default after slice 106) finally fired.
