@@ -994,6 +994,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // `parentCapabilities` when they want to pin the parent
           // set verbatim — caller-supplied takes precedence over
           // derivation.
+          // Slice 95: capture the `effective` array from the
+          // intersection result so we can seal it onto the child's
+          // audit row (§10.1 evaluation-side gate). Pre-slice this
+          // value was discarded — only `excess` mattered for the
+          // refuse path. Defaults to `undefined` (no envelope,
+          // root behavior) so callers that don't declare
+          // capabilities preserve their legacy semantics.
+          let effectiveForChild: string[] | undefined;
           if (args.declaredCapabilities !== undefined) {
             try {
               const declared = args.declaredCapabilities.map(parseCapability);
@@ -1001,7 +1009,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 args.parentCapabilities !== undefined
                   ? args.parentCapabilities.map(parseCapability)
                   : deriveParentCapabilities(config.permissionEngine.policy());
-              const { excess } = intersectCapabilities(parentCaps, declared);
+              const { effective, excess } = intersectCapabilities(parentCaps, declared);
               if (excess.length > 0) {
                 return {
                   kind: 'subagent_escalation',
@@ -1009,6 +1017,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                   excess: excess.map(formatCapability),
                 };
               }
+              // Effective is what survived ⊆ declared, in declared
+              // order. Format back to the wire form for persistence.
+              // `[]` (pure-LLM) survives as `[]`, distinct from
+              // `undefined` — the child engine treats the two
+              // differently (see EngineOptions.effectiveCapabilities).
+              effectiveForChild = effective.map(formatCapability);
             } catch (e) {
               // Malformed capability string slipped through the
               // tool-layer validation (programmer error, not a
@@ -1187,6 +1201,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             cwd: config.cwd,
             ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // §10.1 effective envelope (slice 95). When the model
+            // declared capabilities, we forward the intersection
+            // result so the child engine can gate every resolved
+            // capability at evaluation time. `undefined` ⇒ child
+            // runs without a bound (root semantics) for callers
+            // that didn't declare.
+            ...(effectiveForChild !== undefined
+              ? { effectiveCapabilities: effectiveForChild }
+              : {}),
             signal: combinedSignal,
             ...(config.softStopSignal !== undefined
               ? { softStopSignal: config.softStopSignal }

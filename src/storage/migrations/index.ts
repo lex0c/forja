@@ -37,6 +37,7 @@ import { migration036SubagentGateEscalation } from './036-subagent-gate-escalati
 import { migration037PolicyArchive } from './037-policy-archive.ts';
 import { migration038ApprovalCallLinks } from './038-approval-call-links.ts';
 import { migration039Grants } from './039-grants.ts';
+import { migration040SubagentRunsEffectiveCapabilities } from './040-subagent-runs-effective-capabilities.ts';
 
 export interface Migration {
   id: number;
@@ -84,4 +85,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration037PolicyArchive,
   migration038ApprovalCallLinks,
   migration039Grants,
+  migration040SubagentRunsEffectiveCapabilities,
 ];

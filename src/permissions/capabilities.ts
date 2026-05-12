@@ -201,6 +201,100 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
   return false;
 };
 
+// Cwd-aware coverage variant for PERMISSION_ENGINE.md §10.1 child-side
+// enforcement (slice 95). The spawn-time intersection (`capabilityCovers`
+// above) is string-symmetric — both `parent_caps` and `declared_caps`
+// arrive in the SAME form (relative scopes, model + policy YAML
+// authored). The child engine's evaluation case is asymmetric: the
+// persisted effective set is the model's relative declared form
+// (`read-fs:src/**`), while the resolver-emitted capability is the
+// LEXICAL-ABSOLUTE form (`read-fs:/abs/cwd/src/auth/login.ts`) that
+// the FS resolvers produce via `path.resolve(cwd, ...)`.
+//
+// Pure string prefix matching fails this combination: `src/**` is not
+// a prefix of `/abs/cwd/src/auth/login.ts`. The cwd-aware variant
+// resolves both scopes against the engine's cwd via `matchPath`
+// (matcher.ts) so the relative pattern admits the absolute target
+// when the absolute target lives inside cwd's subtree. Non-fs kinds
+// (exec, net-egress, env-mutate, etc.) defer to the existing
+// `capabilityCovers` — those scopes are textual identities (class
+// names, host strings) that don't need cwd resolution.
+//
+// Symlink defense: `matchPath` already resolves symlinks on the
+// target. A symlink inside cwd pointing at `/etc/passwd` is treated
+// as `/etc/passwd` here, which doesn't lie under the cwd subtree, so
+// `relativize` returns null and the Glob falls back to absolute
+// matching — the relative pattern `src/**` resolves to `/abs/cwd/src/**`
+// and won't match `/etc/passwd`. Same property the engine's path
+// rules already enforce.
+//
+// Spec contract: this helper IS the §10.1 evaluation-side check. A
+// child with effective=['read-fs:src/**'] that emits `read-fs:/abs/cwd/
+// src/auth/login.ts` passes; a child that emits `read-fs:/etc/passwd`
+// fails. No flag / config / prompt can override.
+import { matchPath } from './matcher.ts';
+
+const FS_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
+  'read-fs',
+  'write-fs',
+  'delete-fs',
+]);
+
+export const capabilityCoversCwdAware = (
+  parent: Capability,
+  child: Capability,
+  cwd: string,
+): boolean => {
+  if (parent.kind !== child.kind) return false;
+  if (!FS_KINDS.has(parent.kind)) return capabilityCovers(parent, child);
+  const pScope = parent.scope;
+  const cScope = child.scope;
+  if (pScope === null || cScope === null) return false;
+  // Universal wildcards short-circuit — `matchPath` would resolve
+  // `**` against cwd and miss targets OUTSIDE cwd that the universal
+  // form should cover (e.g. a system-wide `read-fs:**` from a parent
+  // policy that allowed reads under `/usr/share/`). The slice-9
+  // semantics of `capabilityCovers` treat `**`/`*` as "covers
+  // everything of this kind" — preserve that contract here.
+  if (pScope === '**' || pScope === '*') return true;
+  // Literal equality wins before the matcher — covers the textual-
+  // identity case (declared `read-fs:src/index.ts` against resolved
+  // `read-fs:src/index.ts` without absolutization). Cheap pre-check.
+  if (pScope === cScope) return true;
+  return matchPath(pScope, cScope, cwd);
+};
+
+// §10.1 evaluation: split a resolved capability set into (covered,
+// uncovered) against an effective bound. The engine's `check()`
+// stage consumes the `uncovered` list to build the deny envelope's
+// reason and the audit row's `capabilities_json` (the uncovered
+// caps are the ones that pushed the child over its declared
+// envelope).
+//
+// Empty `effective` is the pure-LLM case: every non-empty resolved
+// cap is uncovered. An empty `resolved` (misc category) is trivially
+// covered regardless of effective — no side-effect capability was
+// requested, so the effective bound doesn't apply.
+export interface EffectiveCoverResult {
+  covered: Capability[];
+  uncovered: Capability[];
+}
+
+export const effectiveCovers = (
+  effective: readonly Capability[],
+  resolved: readonly Capability[],
+  cwd: string,
+): EffectiveCoverResult => {
+  const covered: Capability[] = [];
+  const uncovered: Capability[] = [];
+  for (const r of resolved) {
+    const isCovered = effective.some((e) => capabilityCoversCwdAware(e, r, cwd));
+    if (isCovered) covered.push(r);
+    else uncovered.push(r);
+  }
+  return { covered, uncovered };
+};
+
 // Apply the §10.1 intersection rule. Each `declared` capability that
 // IS covered by some `parent` capability survives into `effective`;
 // anything NOT covered lands in `excess`. The caller decides the

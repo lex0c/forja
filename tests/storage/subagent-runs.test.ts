@@ -792,4 +792,111 @@ describe('subagent_runs repo', () => {
       expect(getSubagentRun(db, child.id)?.contextRecipe).toBeNull();
     });
   });
+
+  // Slice 95 — PERMISSION_ENGINE.md §10.1 effective envelope
+  // persistence. The tri-state (undefined / [] / [...]) MUST
+  // survive round-trip without conflation: collapsing undefined
+  // and `[]` would silently flip a pure-LLM child to a
+  // parent-inherited envelope, re-opening the R11 P0-3 gap.
+  describe('effective_capabilities (migration 040)', () => {
+    test('omitting effectiveCapabilities lands as null', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '8'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+      });
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).toBeNull();
+    });
+
+    test('empty array round-trips as empty array (pure-LLM bound)', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '7'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        effectiveCapabilities: [],
+      });
+      // CRITICAL: `[]` must be distinguishable from `null`. The
+      // pure-LLM contract collapses if the column reads back as
+      // null (no constraint) when the parent meant "no side-
+      // effect caps".
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).toEqual([]);
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).not.toBeNull();
+    });
+
+    test('non-empty array round-trips verbatim', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '6'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        effectiveCapabilities: ['read-fs:src/**', 'exec:shell'],
+      });
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).toEqual([
+        'read-fs:src/**',
+        'exec:shell',
+      ]);
+    });
+
+    test('corrupt JSON falls back to null (not to []) — safer to surface as no-snapshot', () => {
+      // Falling back to `[]` would silently FLIP the child to
+      // pure-LLM (deny everything) on a corrupt row — surprising
+      // and hard to diagnose. Falling back to `null` keeps the
+      // child running under root semantics, matching the legacy
+      // / undefined behavior; the corrupt row is visible in
+      // audit listings.
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, effective_capabilities, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not json', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).toBeNull();
+    });
+
+    test('wrong-shape JSON (object instead of array) falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, effective_capabilities, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '{"x":1}', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).toBeNull();
+    });
+
+    test('mixed-type array (number entry) falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, effective_capabilities, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '["read-fs:**", 42]', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.effectiveCapabilities).toBeNull();
+    });
+  });
 });

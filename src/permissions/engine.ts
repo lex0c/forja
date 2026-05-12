@@ -7,6 +7,7 @@ import { canonicalHash } from './canonical.ts';
 import {
   type Capability,
   type CapabilityKind,
+  effectiveCovers,
   formatCapability,
   sortCapabilities,
 } from './capabilities.ts';
@@ -207,6 +208,36 @@ export interface EngineOptions {
   grants?: {
     listActive: (snapshotTs: number) => readonly GrantSnapshot[];
   };
+  // PERMISSION_ENGINE.md §10.1 — subagent effective capability bound
+  // (slice 95, R11 P0-3). When present, the engine treats itself as
+  // a CHILD engine constrained to this set. Every resolved capability
+  // (from the slice 5 resolver pipeline) must be covered by some
+  // entry per `effectiveCovers`; any uncovered capability lands a
+  // structural deny with `source.section='subagent-effective'`
+  // BEFORE the static rule / bypass / grant pipeline runs.
+  //
+  // Three states matter:
+  //   - `undefined` — root agent / legacy spawn. No bound, every
+  //     resolved cap passes the effective stage; the static rule
+  //     pipeline carries the call as before.
+  //   - `[]` — pure-LLM subagent. ANY non-empty resolved cap is
+  //     uncovered → deny. Misc-category tools (no resolver) carry
+  //     `resolvedCapabilities = []` and still pass; that's the
+  //     spec's intent ("no side-effect capabilities" doesn't mean
+  //     "no LLM activity").
+  //   - `[...]` — narrowed envelope. Each resolved cap must align
+  //     with some entry under the cwd-aware coverage rule. The
+  //     declared envelope is in operator-authored relative form
+  //     (`read-fs:src/**`); resolved capabilities arrive in the
+  //     lexical-absolute form the FS resolvers produce
+  //     (`read-fs:/abs/cwd/src/auth/login.ts`). `capabilityCoversCwdAware`
+  //     bridges the asymmetry via `matchPath`.
+  //
+  // The check is structural (fires AFTER resolver, BEFORE bypass /
+  // static rules / classifier / sandbox plan). A subagent cannot
+  // escape its declared envelope via any rule-pipeline path. Spec
+  // §10.3 ("Escape impossível").
+  effectiveCapabilities?: readonly Capability[];
 }
 
 // Minimal subset of `GrantRow` the engine consumes. Storage layer
@@ -1036,6 +1067,15 @@ const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
     stage = 'protected-path';
+  } else if (decision.source?.section === 'subagent-effective') {
+    // §10.1 child-envelope deny (slice 95). Distinct stage so audit
+    // replays and `/perms why` rendering can tell the operator the
+    // call was refused because it stepped OUTSIDE what the subagent
+    // declared — not because the parent's policy refused it. The
+    // distinction matters for triage: the operator's policy might
+    // already authorize the requested cap, but the SUBAGENT's
+    // declared envelope didn't.
+    stage = 'subagent-effective';
   } else if (decision.source?.section === 'grants') {
     // §8 grant match — checked before the generic session-allow
     // branch (grant decisions carry both `section='grants'` and
@@ -1105,6 +1145,12 @@ export const createPermissionEngine = (
     options.contextSummaryMaxBytes ?? DEFAULT_CONTEXT_SUMMARY_MAX_BYTES;
   const contextSummaryBuffer = createContextSummaryBuffer(contextSummaryDepth);
   const sandboxOptions = options.sandbox;
+  // §10.1 child-envelope bound (slice 95). `undefined` ⇒ root /
+  // legacy: skip the stage entirely. Empty array ⇒ pure-LLM child:
+  // any non-empty resolved cap is uncovered → deny. Non-empty
+  // ⇒ narrowed envelope: every resolved cap must be covered by
+  // `effectiveCovers`.
+  const effectiveCapabilities = options.effectiveCapabilities;
   // policy_hash is stamped on every audit row. Recomputed on hot
   // reload (§12.3 / slice 51) so post-swap rows carry the new
   // hash. Canonical hash so two engines with semantically
@@ -1264,6 +1310,31 @@ export const createPermissionEngine = (
         return withApprovalSeq(decision, e.seq);
       }
       resolvedCapabilities = resolverResult.capabilities;
+    }
+
+    // §10.1 child-envelope check (slice 95). Runs AFTER resolver and
+    // BEFORE every downstream stage (risk score, classifier, sandbox
+    // plan, bypass, static rules, grants, session-allow). A subagent
+    // that emits a resolved capability OUTSIDE its declared envelope
+    // is structurally rejected — no policy rule can override.
+    //
+    // Misc-category tools land here with `resolvedCapabilities = []`
+    // and trivially pass; pure-LLM children stay free to invoke
+    // them. The check fires ONLY when the engine was built with
+    // `effectiveCapabilities` (i.e. it's a child engine); root
+    // engines skip the stage entirely.
+    if (effectiveCapabilities !== undefined && resolvedCapabilities.length > 0) {
+      const { uncovered } = effectiveCovers(effectiveCapabilities, resolvedCapabilities, cwd);
+      if (uncovered.length > 0) {
+        const uncoveredStrings = sortCapabilities(uncovered).map(formatCapability);
+        const decision: Decision = {
+          kind: 'deny',
+          reason: `subagent capability outside declared envelope: ${uncoveredStrings.join(', ')}`,
+          source: { layer: 'default', section: 'subagent-effective' },
+        };
+        const e = emitAudit(toolName, args, decision, resolvedCapabilities, 0, {}, null);
+        return withApprovalSeq(decision, e.seq);
+      }
     }
 
     // Compute the deterministic risk score (PERMISSION_ENGINE.md §6.3)

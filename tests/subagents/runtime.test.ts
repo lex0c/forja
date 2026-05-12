@@ -2299,6 +2299,82 @@ describe('runSubagent — orchestration', () => {
   });
 });
 
+// Slice 95 — PERMISSION_ENGINE.md §10.1 effective envelope
+// persistence at the runtime layer. The harness loop computes
+// the intersection result and passes `effectiveCapabilities`
+// through `RunSubagentInput`; this slice's contract is that the
+// runtime persists it onto `subagent_runs` so the child engine
+// reads it at startup. These tests cover the runtime ↔ repo
+// seam; the capabilities helpers + engine gate are tested
+// elsewhere.
+describe('runSubagent — effective capabilities seal (§10.1, slice 95)', () => {
+  test('omitting effectiveCapabilities leaves the column NULL (root semantics)', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    const audit = getSubagentRun(db, result.sessionId);
+    expect(audit?.effectiveCapabilities).toBeNull();
+  });
+
+  test('explicit [] persists as [] (pure-LLM child contract)', async () => {
+    // CRITICAL: empty vs absent MUST stay distinguishable end-
+    // to-end. Conflating would let a corrupt or absent row
+    // grant the parent's full set, re-opening R11 P0-3.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      effectiveCapabilities: [],
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    const audit = getSubagentRun(db, result.sessionId);
+    expect(audit?.effectiveCapabilities).toEqual([]);
+    expect(audit?.effectiveCapabilities).not.toBeNull();
+  });
+
+  test('non-empty list persists verbatim (narrowed envelope)', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      effectiveCapabilities: ['read-fs:src/**', 'exec:shell'],
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    const audit = getSubagentRun(db, result.sessionId);
+    expect(audit?.effectiveCapabilities).toEqual(['read-fs:src/**', 'exec:shell']);
+  });
+});
+
 // End-to-end subprocess audit (migration 029). The fakes used by
 // the orchestration tests above intentionally omit `pid` / `cmd`
 // (they bypass the subprocess surface entirely), so the audit row

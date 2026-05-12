@@ -108,6 +108,24 @@ export interface SubagentRun {
   // field is optional and an empty recipe is functionally
   // identical to no recipe.
   contextRecipe: ContextRecipe | null;
+  // PERMISSION_ENGINE.md §10.1 — effective capability envelope
+  // (migration 040, slice 95). Result of `parent_caps ∩
+  // declared_caps` at spawn time, persisted as the formatted
+  // capability strings (`['read-fs:src/**', 'exec:shell']`). The
+  // child engine reads this and configures `EngineOptions
+  // .effectiveCapabilities` so every tool call is gated against
+  // the declared envelope BEFORE the policy pipeline runs.
+  //
+  // Tri-state mirrors `hooksSnapshot` / `toolRestrictions`:
+  //   - `null` — no snapshot. Legacy pre-migration-040 row, OR a
+  //     root agent (no parent ⇒ no envelope). Child engine
+  //     skips the §10.1 stage entirely.
+  //   - `[]` — pure-LLM subagent (declared = []). Child denies
+  //     ANY non-empty resolved capability at evaluation time.
+  //   - `['cap', ...]` — narrowed envelope. Each resolved cap
+  //     must align with some entry via cwd-aware coverage
+  //     (`capabilityCoversCwdAware`).
+  effectiveCapabilities: string[] | null;
   capturedAt: number;
 }
 
@@ -129,6 +147,7 @@ interface SubagentRunRow {
   reference_paths: string | null;
   output_schema: string | null;
   context_recipe: string | null;
+  effective_capabilities: string | null;
   captured_at: number;
 }
 
@@ -311,6 +330,30 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
       contextRecipe = null;
     }
   }
+  // Defensive parse on effective_capabilities (migration 040, slice
+  // 95). Shape: string[]. Corrupt or wrong-type rows collapse to
+  // null so the child engine treats them as legacy / root — the
+  // alternative ('[]' fallback) would silently flip a corrupt row
+  // from "no constraint" to "pure-LLM deny-all", which is a
+  // worse failure mode than re-opening the §10.1 gap on a row
+  // we couldn't read. The DB row was authored by the parent at
+  // spawn (synchronous trusted write); corruption is genuinely
+  // unexpected and operator should see it in audit.
+  let effectiveCapabilities: string[] | null;
+  if (row.effective_capabilities === null) {
+    effectiveCapabilities = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.effective_capabilities) as unknown;
+      if (Array.isArray(parsed) && parsed.every((e) => typeof e === 'string')) {
+        effectiveCapabilities = parsed;
+      } else {
+        effectiveCapabilities = null;
+      }
+    } catch {
+      effectiveCapabilities = null;
+    }
+  }
   return {
     sessionId: row.session_id,
     name: row.name,
@@ -329,6 +372,7 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     references,
     outputSchema,
     contextRecipe,
+    effectiveCapabilities,
     capturedAt: row.captured_at,
   };
 };
@@ -404,6 +448,23 @@ export interface InsertSubagentRunInput {
   // behavior on memory + prompt composition; non-empty
   // `ContextRecipe` ⇒ JSON-serialized into the column.
   contextRecipe?: ContextRecipe;
+  // PERMISSION_ENGINE.md §10.1 effective envelope (migration 040,
+  // slice 95). Tri-state:
+  //   - undefined / omitted → column NULL ⇒ child engine runs
+  //     WITHOUT a §10.1 bound (root behavior). Programmatic
+  //     callers that don't model the spawn-time intersection
+  //     land here.
+  //   - empty array `[]` → column `'[]'` ⇒ pure-LLM child. Child
+  //     engine denies any non-empty resolved capability at
+  //     evaluation time.
+  //   - non-empty `string[]` → column with the JSON-serialized
+  //     capability list. Child engine gates every resolved cap.
+  //
+  // The undefined-vs-`[]` distinction MUST survive to the child:
+  // conflating them would let a corrupt or absent snapshot
+  // silently grant the parent's full capability set, re-opening
+  // the R11 P0-3 gap slice 95 closes.
+  effectiveCapabilities?: readonly string[];
   capturedAt?: number;
 }
 
@@ -456,14 +517,23 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.contextRecipe !== undefined && input.contextRecipe !== null
       ? JSON.stringify(input.contextRecipe)
       : null;
+  // Same NULL-vs-array convention for effective_capabilities. Note
+  // that `[]` is an AUTHORITATIVE state here (pure-LLM child),
+  // distinct from `null` (no snapshot / root). The conditional
+  // preserves that distinction — `JSON.stringify([])` ⇒ `'[]'`
+  // (authoritative), `undefined` ⇒ null (absent).
+  const effectiveCapsJson =
+    input.effectiveCapabilities !== undefined && input.effectiveCapabilities !== null
+      ? JSON.stringify(input.effectiveCapabilities)
+      : null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
         tools_whitelist, budget_max_steps, budget_max_cost_usd,
         budget_max_wall_ms, policy_snapshot, hooks_snapshot,
         tool_restrictions, sampling, reference_paths, output_schema,
-        context_recipe, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        context_recipe, effective_capabilities, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -482,6 +552,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     referencesJson,
     outputSchemaJson,
     contextRecipeJson,
+    effectiveCapsJson,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -509,6 +580,8 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     references: input.references === undefined ? null : [...input.references],
     outputSchema: input.outputSchema ?? null,
     contextRecipe: input.contextRecipe ?? null,
+    effectiveCapabilities:
+      input.effectiveCapabilities === undefined ? null : [...input.effectiveCapabilities],
     capturedAt,
   };
 };
@@ -529,7 +602,7 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
               tools_whitelist, budget_max_steps, budget_max_cost_usd,
               budget_max_wall_ms, policy_snapshot, hooks_snapshot,
               tool_restrictions, sampling, reference_paths, output_schema,
-              context_recipe, captured_at
+              context_recipe, effective_capabilities, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

@@ -15,6 +15,80 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 95: §10.1 effective envelope at the child engine (R11 P0-3)
+
+**Done.** Ninety-fifth slice. Closes the third and last P0 from the 12-agent review's R11 finding: `effective_caps = parent_caps ∩ declared_caps` is now ENFORCED at the child engine's evaluation stage, not just refused at the spawn gate. Pre-slice, slice 94 made `capabilities` REQUIRED at spawn time and threaded `task_async` through the §10 intersection — but the *result* of the intersection (the `effective` set) was discarded, and the child engine still evaluated tool calls against the parent's FULL capability set. A child declaring `['read-fs:src/**']` for a parent with `read-fs:**` policy passed the spawn gate (declared ⊆ parent) but could still read `/etc/passwd` at evaluation time. Slice 95 plugs that gap.
+
+### Why this matters
+
+Spec §10.1 says `effective_caps = parent_caps ∩ declared_caps`. The contract has two enforcement points:
+
+- **Refuse-at-spawn** (slice 94): `declared ⊄ parent` → refuse with `subagent_escalation`. Effective is computed; excess is the rejection signal.
+- **Refuse-at-evaluation** (slice 95): every resolved capability the child emits at tool dispatch MUST be covered by `effective`. Uncovered → structural deny, regardless of policy.
+
+Without the second point, "declared" was advisory rather than enforced. A coordinator subagent declaring `read-fs:src/**` could STILL read anywhere the parent's policy permitted — declared was a politeness, not a contract. Slice 95 elevates the declared envelope to a binding constraint: declared is the **maximum** capability surface the child can ever touch, even if its parent's policy is broader.
+
+The fix is defense-in-depth: refuse-at-spawn was already the primary gate (spawn refusal is a hard stop), but refuse-at-evaluation catches:
+- A malformed envelope that slipped through (declared lexically matches parent but semantically doesn't).
+- A subagent that accumulates capabilities through subsequent tool calls (each call's resolved caps re-checked against the same `effective`).
+- The deeper invariant from §10.3: "Não há flag, prompt, ou config que permita subagent ter capability fora de `parent_caps`" — and by transitivity, of `declared`.
+
+### Cwd-aware coverage primitive
+
+The spawn-time intersection (`capabilityCovers`) is string-symmetric: parent_caps from operator policy YAML and declared from the model both arrive in relative form (`read-fs:src/**`). The evaluation case is asymmetric: persisted `effective` is the model's relative declared form, while the resolver-emitted target is lexical-absolute (`read-fs:/abs/cwd/src/auth/login.ts`) because FS resolvers normalize via `path.resolve(cwd, ...)`.
+
+Slice 95 introduces `capabilityCoversCwdAware(parent, child, cwd)`:
+- **fs kinds** (`read-fs`, `write-fs`, `delete-fs`): delegates to `matchPath` for cwd-aware glob containment. `src/**` admits `/abs/cwd/src/auth/login.ts`; refuses `/etc/passwd`.
+- **non-fs kinds** (exec, net-egress, env-mutate, etc.): defers to the existing `capabilityCovers` — those scopes are textual identities that don't need cwd resolution.
+- **universal `**`**: short-circuits to true even for absolute targets outside cwd, preserving slice-9 semantics.
+
+The companion `effectiveCovers(effective, resolved, cwd)` returns `{covered, uncovered}` so the engine can build a forensically-complete deny envelope listing exactly which caps stepped outside the envelope.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/capabilities.ts` | Adds `capabilityCoversCwdAware` + `effectiveCovers` + `EffectiveCoverResult`. Imports `matchPath` from `./matcher.ts`. The new helpers are additive; `capabilityCovers` stays as-is for the spawn-time intersection (both sides relative, no cwd needed). |
+| `src/permissions/engine.ts` | Adds `EngineOptions.effectiveCapabilities?: readonly Capability[]`. Adds `'subagent-effective'` to the reason-chain stage discriminator in `reasonChainFor`. In `check()`, after resolver runs, fires the §10.1 stage: `effectiveCovers(effective, resolvedCapabilities, cwd)` → any `uncovered` produces a structural deny with `source.section='subagent-effective'` BEFORE bypass / rule pipeline / classifier / sandbox plan. Reads `effectiveCapabilities` from options. |
+| `src/storage/migrations/040-subagent-runs-effective-capabilities.ts` | New migration adding `effective_capabilities TEXT` column to `subagent_runs`. NULL ⇒ root / legacy (no constraint); `'[]'` ⇒ pure-LLM (deny all side-effect tools); JSON array ⇒ narrowed envelope. |
+| `src/storage/migrations/index.ts` | Registers migration 040. |
+| `src/storage/repos/subagent-runs.ts` | Adds `effectiveCapabilities: string[] \| null` to `SubagentRun`; adds `effective_capabilities` to the row type; adds parsing in `fromRow` (corrupt JSON / wrong-shape rows fall back to `null`, NOT `[]` — surface-as-no-snapshot is safer than silent-flip to pure-LLM); adds `effectiveCapabilities?: readonly string[]` to `InsertSubagentRunInput`; INSERT + SELECT include the new column. |
+| `src/subagents/runtime.ts` | Adds `effectiveCapabilities?: readonly string[]` to `RunSubagentInput`; forwards to `insertSubagentRun` only when caller explicitly passed it (preserves `undefined` ⇒ NULL ⇒ root semantics). |
+| `src/harness/loop.ts` | Captures `effective` from the intersection result inside the spawn factory (pre-slice this value was discarded after `excess` was inspected). Formats back to wire form via `formatCapability` and threads through `runSubagent` as `effectiveCapabilities`. The async path (`task_async`) inherits automatically because the handle store's `spawn` forwards args to the same factory closure. |
+| `src/cli/subagent-child.ts` | Imports `parseCapability`. Reads `audit.effectiveCapabilities` from the subagent_runs row; parses each string into a Capability (malformed entries collapse the array to empty / pure-LLM rather than letting the child run with an unparseable envelope); passes to `createPermissionEngine` via `EngineOptions.effectiveCapabilities` only when the row column was non-NULL. |
+| `tests/permissions/capabilities.test.ts` | 12 new tests covering `capabilityCoversCwdAware` (relative-vs-absolute fs match, universal `**` short-circuit, literal eq, different kinds never cover, non-fs deferral, write-fs/delete-fs symmetry, null scope safety) and `effectiveCovers` (empty resolved trivially covered, empty effective denies all non-empty, partial cover, all covered, partition order). |
+| `tests/permissions/engine.test.ts` | 8 new tests covering the engine integration: undefined → root behavior, `[]` → pure-LLM deny, narrowed envelope covered vs uncovered, misc category passes regardless, bypass mode cannot escape, reason chain stage assertion, audit row carries resolved caps, multi-resolved-cap denies list every uncovered. |
+| `tests/storage/subagent-runs.test.ts` | 6 new tests covering tri-state persistence + 3 corruption scenarios (corrupt JSON / wrong shape / mixed-type array all fall back to `null`, never to `[]`). |
+| `tests/subagents/runtime.test.ts` | 3 new tests covering the runtime ↔ repo seal: omitting → NULL, explicit `[]` → `[]`, non-empty → verbatim. |
+
+### Decisions
+
+- **Cwd-aware coverage as a new primitive, not a `capabilityCovers` upgrade.** The spawn-time intersection has BOTH sides in relative form; making the existing primitive cwd-aware would force every caller (deriveParentCapabilities subsumption, intersection's `excess` path) to pass a cwd it doesn't need. Splitting into a second primitive keeps the slice-9 contract intact and isolates the cwd dependency to the evaluation-time use case.
+- **Effective check fires BEFORE bypass / static rules.** §10.3 ("Escape impossível") demands that no policy-layer mechanism can override §10.1. Placing the stage right after the resolver, before any decision branch, codifies this — bypass mode, deny rules, session-allow, grants all run AFTER the structural envelope check.
+- **Corrupt row → `null` fallback, NOT `[]`.** A `[]` fallback would silently flip a child to pure-LLM (deny everything) on any DB read error — confusing and hard to diagnose. `null` keeps the child running under root semantics matching the legacy state; the corrupt row stays visible in audit listings. Trade-off: a corrupted envelope re-opens the §10.1 gap on the affected row, but the row was AUTHORED by the parent's spawn write (synchronous trusted path), so corruption is genuinely unexpected.
+- **Empty array (`[]`) and undefined (`null`) MUST stay distinguishable end-to-end.** Conflating them at any layer would defeat the pure-LLM contract. The repo's tri-state, the runtime's optional-spread, the engine's `effectiveCapabilities !== undefined` check, and the child binary's `audit.effectiveCapabilities !== null` check all preserve the distinction. Tests pin every boundary.
+- **Audit emit on §10.1 deny carries `resolvedCapabilities`, not just empty.** Operator triaging a refusal needs to see WHAT the child requested. Emitting with the full resolved set makes the boundary crossing visible in concrete terms ("child tried `read-fs:/etc/passwd` against envelope `read-fs:src/**`") rather than abstract.
+- **Async path piggybacks on the existing seam.** `task_async` → handle store `spawn()` → registered factory closure (harness/loop.ts) → `runSubagent`. The factory already reads `args.declaredCapabilities`; slice 95 just captures `effective` from the intersection result it was already computing. No additional handle-store changes needed.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6113 pass / 10 skip / 0 fail** (6123 total across 289 files); +31 tests on top of slice 94's 6082
+- Targeted: `bun test tests/permissions/capabilities.test.ts tests/permissions/engine.test.ts tests/storage/subagent-runs.test.ts tests/subagents/runtime.test.ts` — 428 / 428
+
+### Next
+
+R11 fully closed. Remaining P0s from REVIEW_NOTES.md (in roadmap order):
+- Replay tool fix (R10) — `agent replay` accepts only `allow` fixtures; deny/confirm/refuse decisions corrupt the chain replay.
+- Protected paths hardening (R7): tilde expansion + `/dev/**` + hide_paths integration.
+- Bootstrap/policy parsing hardening (R6): malformed YAML / cycle detection.
+- Sandbox wire validation (R8): bwrap stderr / sandbox-exec result checks.
+- Broker drain caps (R9): unbounded backpressure on the permission broker.
+- Audit chain atomicity (R5): rotation-rollover write ordering.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 94: §10 subagent gate closure (capabilities REQUIRED + task_async wiring)
 
 **Done.** Ninety-fourth slice. Closes the first P0 from the 12-agent review (R11 finding, `docs/REVIEW_NOTES.md`): `capabilities` is now REQUIRED on both `task` and `task_async`, and `task_async` finally threads `declaredCapabilities` through the §10 intersection gate. Pre-slice, **`task_async` had ZERO §10 wiring** — any subagent spawned via the async path inherited the parent's full capability set verbatim, regardless of what it actually needed. The sync `task` tool also accepted absent `capabilities` and silently bypassed intersection. Both paths were §10 opt-in by accident; slice 94 makes §10 opt-out impossible.

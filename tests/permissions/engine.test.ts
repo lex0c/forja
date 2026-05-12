@@ -2774,3 +2774,161 @@ describe('engine — getDegradedReason() (§13.6, slice 93)', () => {
     expect(eng.getDegradedReason()).toBeUndefined();
   });
 });
+
+// Slice 95 — PERMISSION_ENGINE.md §10.1 child-engine evaluation
+// gate. The engine accepts an optional `effectiveCapabilities`
+// option; when set, every resolved capability must be covered by
+// some entry. Uncovered → structural deny with
+// `source.section='subagent-effective'`. Closes R11 P0-3 from the
+// post-slice-93 review (REVIEW_NOTES.md): pre-slice the child
+// engine still evaluated against the parent's FULL capability
+// set even when `effective` was a strict subset.
+describe('engine — effective capabilities envelope (§10.1, slice 95)', () => {
+  test('undefined effective: root behavior, no extra deny stage', async () => {
+    await initBashParser();
+    // No effectiveCapabilities option → engine runs as root.
+    // A read_file under the policy's allow_paths passes; no
+    // subagent-effective row appears in the audit chain.
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: CWD,
+    });
+    const decision = eng.check('read_file', 'fs.read', { file_path: 'src/index.ts' });
+    expect(decision.kind).toBe('allow');
+    expect(decision.source?.section).not.toBe('subagent-effective');
+  });
+
+  test('empty effective: pure-LLM child denies any side-effect tool', () => {
+    // Spec §10.1: declared=[] ⇒ subagent has NO capability. The
+    // engine refuses every non-misc tool call regardless of
+    // policy. Even a maximally-permissive parent policy can't
+    // override the empty envelope.
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+    });
+    const decision = eng.check('read_file', 'fs.read', { file_path: 'src/index.ts' });
+    expect(decision.kind).toBe('deny');
+    expect(decision.source?.section).toBe('subagent-effective');
+    expect(decision.reason).toContain('outside declared envelope');
+    expect(decision.reason).toContain('read-fs:');
+  });
+
+  test('narrowed effective: covered target passes, uncovered denied', () => {
+    // declared = ['read-fs:src/**']. read of src/x passes (the
+    // resolved absolute `/proj/src/x` is covered by the
+    // relative envelope `src/**` via cwd-aware matching);
+    // read of /etc/passwd fails (target outside cwd subtree).
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [{ kind: 'read-fs', scope: 'src/**' }],
+    });
+    const inside = eng.check('read_file', 'fs.read', { file_path: 'src/auth/login.ts' });
+    expect(inside.kind).toBe('allow');
+    expect(inside.source?.section).not.toBe('subagent-effective');
+
+    const outside = eng.check('read_file', 'fs.read', { file_path: '/etc/passwd' });
+    expect(outside.kind).toBe('deny');
+    expect(outside.source?.section).toBe('subagent-effective');
+    expect(outside.reason).toContain('/etc/passwd');
+  });
+
+  test('misc category (no resolver) passes regardless of effective', () => {
+    // Misc-category tools (e.g. think, todo_write) emit no
+    // resolved capabilities. Even a pure-LLM child with
+    // effective=[] uses them freely — `resolvedCapabilities`
+    // is empty so the §10.1 stage short-circuits.
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+    });
+    const decision = eng.check('think', 'misc', {});
+    // Misc tools without a configured policy section may
+    // default-deny under strict mode, but the deny MUST come
+    // from the rule pipeline (`section: undefined` / 'default-
+    // deny'), not from the §10.1 subagent-effective gate.
+    expect(decision.source?.section).not.toBe('subagent-effective');
+  });
+
+  test('bypass mode cannot escape the effective envelope', () => {
+    // §10.3: "Não há flag, prompt, ou config que permita
+    // subagent ter capability fora de parent_caps." The bypass
+    // shortcut at the policy layer must NOT override §10.1.
+    // Slice 95 fires the effective check BEFORE the bypass
+    // branch so a child engine in bypass mode still refuses
+    // out-of-envelope reads.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' }, tools: {} }), {
+      cwd: CWD,
+      effectiveCapabilities: [{ kind: 'read-fs', scope: 'src/**' }],
+    });
+    const escapeDecision = eng.check('read_file', 'fs.read', { file_path: '/etc/passwd' });
+    expect(escapeDecision.kind).toBe('deny');
+    expect(escapeDecision.source?.section).toBe('subagent-effective');
+  });
+
+  test('reason chain stage is "subagent-effective"', () => {
+    // The audit row's reason_chain must distinguish §10.1 child
+    // refusals from policy refusals so operators can triage
+    // "did the parent allow this?" vs "did the child stray
+    // from its declared scope?" cleanly.
+    const audited: { reason_chain: Array<{ stage: string }> }[] = [];
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      effectiveCapabilities: [{ kind: 'read-fs', scope: 'src/**' }],
+      audit: {
+        emit: (input) => {
+          audited.push({ reason_chain: input.reason_chain as Array<{ stage: string }> });
+          return { seq: 0, this_hash: '' };
+        },
+        verifyChain: () => ({ ok: true, rows: 0, current_rotation_id: 0, quarantined: false }),
+      },
+    });
+    eng.check('read_file', 'fs.read', { file_path: '/etc/passwd' });
+    expect(audited.length).toBe(1);
+    expect(audited[0]?.reason_chain.some((entry) => entry.stage === 'subagent-effective')).toBe(
+      true,
+    );
+  });
+
+  test('audit row carries the RESOLVED capabilities on a §10.1 deny', () => {
+    // Forensic value: the operator inspecting the audit row
+    // needs to see WHAT the child tried to do, not just THAT it
+    // was refused. Slice 95 emits with `resolvedCapabilities`
+    // (the cap the child requested) so post-hoc investigation
+    // shows the boundary crossing in concrete terms.
+    const audited: { capabilities: readonly string[] }[] = [];
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      effectiveCapabilities: [{ kind: 'read-fs', scope: 'src/**' }],
+      audit: {
+        emit: (input) => {
+          audited.push({ capabilities: input.capabilities ?? [] });
+          return { seq: 0, this_hash: '' };
+        },
+        verifyChain: () => ({ ok: true, rows: 0, current_rotation_id: 0, quarantined: false }),
+      },
+    });
+    eng.check('read_file', 'fs.read', { file_path: '/etc/passwd' });
+    const caps = audited[0]?.capabilities ?? [];
+    expect(caps).toContain('read-fs:/etc/passwd');
+  });
+
+  test('multiple resolved caps: all must be covered or deny lists every uncovered', () => {
+    // write_file emits BOTH read-fs and write-fs for the same
+    // target. A child with read-only envelope tries write_file
+    // → deny with both caps in the reason for forensic
+    // completeness.
+    const eng = createPermissionEngine(policy({ tools: { write_file: { allow_paths: ['**'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [{ kind: 'read-fs', scope: '**' }],
+    });
+    const decision = eng.check('write_file', 'fs.write', {
+      file_path: 'src/x.ts',
+      content: 'x',
+    });
+    expect(decision.kind).toBe('deny');
+    expect(decision.source?.section).toBe('subagent-effective');
+    // The child has read-fs:** but NOT write-fs; only write-fs
+    // is uncovered.
+    expect(decision.reason).toContain('write-fs:');
+  });
+});

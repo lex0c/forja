@@ -7,6 +7,7 @@ import {
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
+import { parseCapability } from '../permissions/capabilities.ts';
 import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
@@ -591,7 +592,29 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // collapses that window to zero — the rules are sealed at
     // spawn time. Locked sections, strict-mode defaults,
     // matched paths — all carry over byte-for-byte.
-    const permissionEngine = createPermissionEngine(audit.policySnapshot, { cwd: session.cwd });
+    //
+    // §10.1 effective envelope (migration 040, slice 95). The
+    // parent persisted the intersection result on the audit row;
+    // we parse each string back into a Capability and configure
+    // the engine. A malformed entry (shouldn't happen — parent
+    // formatted via `formatCapability`) collapses the array to
+    // empty (pure-LLM bound) rather than letting the child run
+    // with an unparseable envelope; safer to over-restrict than
+    // re-open the §10.1 gap on a corrupt row.
+    let effectiveCapabilitiesParsed: ReturnType<typeof parseCapability>[] | undefined;
+    if (audit.effectiveCapabilities !== null) {
+      try {
+        effectiveCapabilitiesParsed = audit.effectiveCapabilities.map(parseCapability);
+      } catch {
+        effectiveCapabilitiesParsed = [];
+      }
+    }
+    const permissionEngine = createPermissionEngine(audit.policySnapshot, {
+      cwd: session.cwd,
+      ...(effectiveCapabilitiesParsed !== undefined
+        ? { effectiveCapabilities: effectiveCapabilitiesParsed }
+        : {}),
+    });
 
     // The audit row carries the canonical toolset (`tools_whitelist`)
     // the parent pre-validated and committed. The child rebuilds
