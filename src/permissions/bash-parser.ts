@@ -26,6 +26,16 @@
 
 import { Language, Parser } from 'web-tree-sitter';
 import wasmFilePath from './grammars/tree-sitter-bash.wasm' with { type: 'file' };
+// The web-tree-sitter package ships an emscripten-built engine
+// wasm next to its JS entry; the runtime loader resolves it via
+// `import.meta.url + 'web-tree-sitter.wasm'`. Under `bun build
+// --compile`, the package's JS gets bundled into the binary but
+// the wasm sibling is NOT auto-embedded — the import here forces
+// Bun to register it as an asset and rewrite the path to point at
+// the embedded `/$bunfs/root/...` location. Without this, the
+// compiled binary aborts at `Parser.init()` with
+// `ENOENT: /$bunfs/root/web-tree-sitter.wasm`.
+import engineWasmPath from 'web-tree-sitter/web-tree-sitter.wasm' with { type: 'file' };
 
 let cachedParser: Parser | null = null;
 let initInFlight: Promise<Parser> | null = null;
@@ -43,7 +53,12 @@ export const initBashParser = async (options: InitBashParserOptions = {}): Promi
   if (cachedParser !== null) return cachedParser;
   if (initInFlight !== null) return initInFlight;
   initInFlight = (async () => {
-    await Parser.init();
+    // `locateFile` tells emscripten where to read the engine wasm
+    // from. In dev / test (running under `bun run`), `engineWasmPath`
+    // resolves to the node_modules copy; in a compiled binary it's
+    // rewritten by Bun to the embedded `/$bunfs/root/...` path. Both
+    // cases route through the same code — no #ifdef branch.
+    await Parser.init({ locateFile: () => engineWasmPath });
     const bytes = options.wasmBytes ?? (await Bun.file(wasmFilePath).bytes());
     const Bash = await Language.load(bytes);
     const parser = new Parser();
