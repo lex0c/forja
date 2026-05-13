@@ -108,18 +108,35 @@ export const buildSbplProfile = (
     '(allow process-exec)',
     '(allow process-fork)',
     '(allow signal (target same-sandbox))',
-    // Slice 140 sec-2: deny nested sandbox-exec. The `(allow
-    // process-exec)` above lets the wrapped process spawn
-    // arbitrary binaries; an LLM-driven bash could
+    // Slice 140 sec-2 + slice 145 S3: deny nested sandbox-exec.
+    // The `(allow process-exec)` above lets the wrapped process
+    // spawn arbitrary binaries; an LLM-driven bash could
     // `sandbox-exec -p '(version 1)(allow default)' /bin/sh` to
     // wrap itself in a permissive profile and escape the outer
     // one. macOS DOES intersect nested sandbox profiles for the
     // FS/network gates, but the inner profile can still toggle
     // mach-lookup / signal / process semantics within the outer
     // profile's allowed set. Cheaper to refuse the launch
-    // outright. SBPL last-match-wins means this deny comes AFTER
-    // (allow process-exec) and wins for the specific literal.
+    // outright.
+    //
+    // Slice 140 used only `(literal "/usr/bin/sandbox-exec")` —
+    // bypassable via `cp /usr/bin/sandbox-exec /tmp/se && /tmp/se
+    // ...` since both `/tmp` and cwd are writable in cwd-rw /
+    // cwd-rw-net profiles. Slice 145 adds a regex deny matching
+    // any path whose basename is exactly `sandbox-exec`:
+    //   `^/.*/sandbox-exec$` (any directory + trailing
+    //                          "/sandbox-exec")
+    //   `^/sandbox-exec$`     (root-level binary)
+    //
+    // SBPL last-match-wins, so both denys come AFTER
+    // (allow process-exec) and win. The regex is a SBPL primitive
+    // (not the Forja-side glob/prefix matcher) — the CLAUDE.md
+    // "no regex in policy/permissions" rule applies to operator-
+    // facing policy YAML, not to a kernel DSL where regex is the
+    // documented primitive. The literal deny stays for clarity.
     '(deny process-exec (literal "/usr/bin/sandbox-exec"))',
+    '(deny process-exec (regex #"^/.*/sandbox-exec$"))',
+    '(deny process-exec (regex #"^/sandbox-exec$"))',
     // sysctl-read is required for stdlib operations on macOS
     // (every shell invocation reads sysctl values during init).
     // Read-only — no sysctl-write granted.

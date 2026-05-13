@@ -44,6 +44,28 @@ describe('buildSbplProfile — common header + base rules', () => {
     }
   });
 
+  // Slice 145 (S3 — sandbox-exec copy bypass). Slice 140's literal
+  // deny matched only `/usr/bin/sandbox-exec`; an LLM-driven bash
+  // could `cp /usr/bin/sandbox-exec /tmp/se && /tmp/se -p ...` to
+  // escape via a copied binary (cwd-rw / cwd-rw-net make `/tmp`
+  // writable). The basename-regex denys close the bypass: any path
+  // whose basename is `sandbox-exec` is refused.
+  test('every sandboxed profile denies sandbox-exec by basename regex (slice 145 S3)', () => {
+    for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
+      const profile = buildSbplProfile(p, '/work/proj', '/home/op');
+      // The two regex denys: nested directory + root-level.
+      expect(profile).toContain('(deny process-exec (regex #"^/.*/sandbox-exec$"))');
+      expect(profile).toContain('(deny process-exec (regex #"^/sandbox-exec$"))');
+      // Both come AFTER the broad allow so last-match-wins fires
+      // them on any sandbox-exec basename match.
+      const allowIdx = profile.indexOf('(allow process-exec)');
+      const denyNestedIdx = profile.indexOf('(deny process-exec (regex #"^/.*/sandbox-exec$"))');
+      const denyRootIdx = profile.indexOf('(deny process-exec (regex #"^/sandbox-exec$"))');
+      expect(denyNestedIdx).toBeGreaterThan(allowIdx);
+      expect(denyRootIdx).toBeGreaterThan(allowIdx);
+    }
+  });
+
   test('file-read* always granted (read-only baseline)', () => {
     for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
       const profile = buildSbplProfile(p, '/work/proj', '/home/op');

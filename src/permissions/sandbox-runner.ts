@@ -78,8 +78,119 @@ export interface BuildBwrapArgvOptions {
   // The inner command + args the bwrap wraps. Typical bash tool
   // shape: `['bash', '-c', '<command>']`. Cannot be empty.
   innerArgv: readonly string[];
+  // Slice 145 (S2 — env-scrub defense in depth): the env from which
+  // the SAFE_ENV_VARS allowlist is extracted. Pre-slice the wrap
+  // had no env input — bwrap inherited the parent's env verbatim
+  // via `Bun.spawn({env})`, making userspace `scrubEnv` the SOLE
+  // defense against `LD_PRELOAD`/`NODE_OPTIONS`/etc. If a future
+  // spawn site forgets to call `scrubEnv`, the kernel boundary
+  // collapsed silently. Now `--clearenv` + `--setenv KEY VALUE`
+  // for each allowlisted var means bwrap enforces the env shape
+  // independent of what the caller passes via `Bun.spawn({env})`.
+  // Callers SHOULD still pass `scrubEnv(process.env)` here
+  // — defense in depth — but a missing scrub no longer leaks.
+  env: NodeJS.ProcessEnv;
 }
 
+// Slice 145 (S2): env vars the sandboxed inner process is allowed
+// to inherit. Everything else is blocked at the kernel boundary
+// via `--clearenv`. This is INTENTIONALLY a narrow list — the
+// goal is "enough for bash + common posix tooling to function",
+// not "convenient for arbitrary scripts".
+//
+// What's IN:
+//   PATH        — binary lookup
+//   HOME        — tilde expansion + tools that read $HOME
+//   USER/LOGNAME— identity for tools that look it up
+//   SHELL       — bash uses $SHELL for sub-shell invocation
+//   TERM        — terminal type; mostly cosmetic but cheap
+//   LANG/LC_*   — locale; affects sort order, date format, etc.
+//   TZ          — timezone for date/time output
+//   TMPDIR      — temp dir; bash + many tools honor this
+//
+// What's OUT (and why):
+//   LD_*, DYLD_*  — linker injection (sanitize/env.ts blocks too)
+//   NODE_OPTIONS  — Node code injection
+//   PYTHON*       — Python module / startup injection
+//   PERL5*, RUBY* — same threat for those interpreters
+//   BASH_ENV, ENV — bash auto-source on every non-interactive shell
+//   HTTPS_PROXY, HTTP_PROXY, ALL_PROXY — egress MITM redirect
+//   XDG_*         — user dirs; defaults are fine
+//   DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR — host service access
+//   GIT_*         — git config-via-env injection
+//   SSH_AUTH_SOCK, GPG_AGENT_INFO, etc. — agent socket access
+//   *_TOKEN, *_KEY, *_PASS, *_SECRET    — credentials
+//
+// Adding a new entry requires explicit justification in this
+// comment block + a corresponding test in sandbox-runner.test.ts.
+const SAFE_ENV_VARS: readonly string[] = [
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TERM',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LC_COLLATE',
+  'LC_MESSAGES',
+  'LC_NUMERIC',
+  'LC_TIME',
+  'LC_MONETARY',
+  'TZ',
+  'TMPDIR',
+];
+
+// Push `--clearenv` + `--setenv KEY VALUE` for each allowed var
+// present in `env`. Vars with NUL bytes are skipped (bwrap argv
+// can't carry them) — defensive, since `scrubEnv` returns
+// NodeJS.ProcessEnv whose values are JS strings (no embedded NUL
+// in practice). Vars with empty-string values ARE forwarded —
+// `LC_ALL=""` has semantic meaning in glibc.
+const appendEnvFlags = (flags: string[], env: NodeJS.ProcessEnv): void => {
+  flags.push('--clearenv');
+  for (const key of SAFE_ENV_VARS) {
+    const value = env[key];
+    if (value === undefined) continue;
+    if (value.includes('\0')) continue;
+    flags.push('--setenv', key, value);
+  }
+};
+
+// Slice 145 (S1 — sandbox hardening): namespace isolation + new
+// session. Pre-slice the wrapper unshared only pid (and net,
+// conditionally) — leaving four host surfaces reachable to a
+// sandboxed inner process:
+//
+//   - UTS (hostname / domainname): readable + writable. The host
+//     hostname leaks identity; the writable side is mostly
+//     cosmetic but unnecessary.
+//   - IPC (SysV IPC + POSIX shared memory): a probe via
+//     `ipcs`/`shmget` can read host shared memory segments
+//     created by the operator's other processes — leak vector
+//     for whatever happens to be live.
+//   - cgroup: visibility into the host's cgroup hierarchy reveals
+//     which containers/services are running.
+//   - controlling tty: the BIG one. Without a new session, the
+//     wrapped process inherits the operator's controlling tty
+//     and can `ioctl(TIOCSTI)` (Linux ≤ 6.2 default) or
+//     `ioctl(TIOCLINUX)` to inject keystrokes into the operator's
+//     shell that fire AFTER the sandbox exits. The bwrap manpage
+//     documents `--new-session` as the dedicated mitigation.
+//
+// `--unshare-user-try` is intentionally NOT added: on systems
+// where user namespaces are sysctl-disabled (Debian default,
+// some corporate kernels) it would either fail-open (the `-try`
+// variant proceeds anyway) or fail-closed and break the runner
+// entirely. Either way it's policy theater.
+//
+// `--unshare-cgroup-try` (with the `-try` suffix): cgroup
+// namespaces are Linux 4.6+. The `-try` variant skips silently
+// on older kernels — strictly better than fail-closed for a
+// defense-in-depth feature. UTS/IPC/PID date back to Linux 3.x
+// and are safe without `-try`. `--new-session` is a bwrap-level
+// flag (setsid call), not a kernel feature.
 const COMMON_PROFILE_FLAGS: readonly string[] = [
   '--ro-bind',
   '/',
@@ -91,6 +202,10 @@ const COMMON_PROFILE_FLAGS: readonly string[] = [
   '--dev',
   '/dev',
   '--unshare-pid',
+  '--unshare-uts',
+  '--unshare-ipc',
+  '--unshare-cgroup-try',
+  '--new-session',
   '--die-with-parent',
 ];
 
@@ -155,6 +270,11 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   }
 
   const flags: string[] = [...COMMON_PROFILE_FLAGS];
+  // Slice 145 (S2): kernel-level env hygiene. `--clearenv` plus a
+  // narrow `--setenv` allowlist replaces userspace-only scrubEnv
+  // as the authoritative env shaper. See `appendEnvFlags` comment
+  // for the allowlist rationale.
+  appendEnvFlags(flags, options.env);
   // Network policy.
   if (profile !== 'cwd-rw-net') {
     flags.push('--unshare-net');
@@ -269,12 +389,21 @@ export interface MaybeWrapSandboxArgvOptions {
   cwd: string;
   home?: string;
   innerArgv: readonly string[];
+  // Slice 145 (S2): env handed to the kernel-level allowlist (bwrap
+  // `--clearenv` + `--setenv` on Linux; macOS sandbox-exec doesn't
+  // need it — it doesn't strip env). When unset the helper falls back
+  // to `process.env`, which the caller is expected to have already
+  // scrubbed via `scrubEnv` before reaching here. Defense in depth:
+  // even if the caller forgets to scrub, only the SAFE_ENV_VARS
+  // allowlist is forwarded into the bwrap'd inner process.
+  env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   which?: (name: string) => string | null;
 }
 
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
   const { profile, cwd, home, innerArgv } = options;
+  const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const which = options.which ?? ((name) => Bun.which(name));
 
@@ -300,8 +429,9 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
     return buildBwrapArgv({
       profile: profile as Exclude<SandboxProfile, 'host'>,
       cwd,
-      home: home ?? process.env.HOME ?? cwd,
+      home: home ?? env.HOME ?? cwd,
       innerArgv,
+      env,
     });
   }
 

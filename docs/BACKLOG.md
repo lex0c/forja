@@ -2,6 +2,55 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 145: bwrap/SBPL kernel-boundary hardening (3 critical)
+
+**Done.** One-hundred-forty-fifth slice. Closes the 3 🔴 critical sandbox findings from the bash-tools code review (slice 143 follow-up). Each one was an exploit primitive — kernel-level isolation gaps that the userspace `scrubEnv` and the single-literal SBPL deny could not cover.
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **S1** | bwrap unshared only PID (+ net conditionally). UTS/IPC/cgroup leaked host state; missing `--new-session` left the wrapped process attached to the operator's controlling tty, enabling `TIOCSTI` keystroke injection back into the shell AFTER the sandbox exits. | `src/permissions/sandbox-runner.ts:83-95` (`COMMON_PROFILE_FLAGS`) | Added `--unshare-uts`, `--unshare-ipc`, `--unshare-cgroup-try` (try-variant for ≤4.5 kernels), and `--new-session`. Comment block documents why `--unshare-user-try` is deliberately NOT added (policy theater on user-ns-disabled kernels). |
+| **S2** | bwrap inherited the spawn parent's env verbatim. Userspace `scrubEnv` was the SOLE defense against `LD_PRELOAD` / `NODE_OPTIONS` / etc.; if any future spawn site forgot to call it, the kernel boundary collapsed silently. | `src/permissions/sandbox-runner.ts:71-89, 134-186` | New `SAFE_ENV_VARS` allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, `TMPDIR`) plus an `appendEnvFlags()` helper that pushes `--clearenv` + `--setenv KEY VALUE` for each present-and-allowed var. `BuildBwrapArgvOptions` now takes a required `env: NodeJS.ProcessEnv`; `MaybeWrapSandboxArgvOptions` adds an optional `env?` defaulting to `process.env`. Vars with embedded NUL bytes are skipped (bwrap argv can't carry them). |
+| **S3** | macOS deny was `(literal "/usr/bin/sandbox-exec")` only. `cp /usr/bin/sandbox-exec /tmp/se && /tmp/se -p '(allow default)' /bin/sh` escapes via a copy; cwd-rw / cwd-rw-net make `/tmp` writable and `(allow process-exec)` permits the launch. | `src/permissions/sandbox-runner-macos.ts:111-138` | Two additional SBPL regex denys matching any path whose basename is `sandbox-exec`: `(regex #"^/.*/sandbox-exec$")` (nested dir) + `(regex #"^/sandbox-exec$")` (root-level). Comment documents that SBPL regex is a kernel-DSL primitive — the project-level CLAUDE.md "no regex in policy/permissions" rule applies to operator-facing policy YAML, not to SBPL. |
+
+### Tests added (+14)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/permissions/sandbox-runner.test.ts` | +12 | S1: 4 tests pinning each new flag in each sandboxed profile (one parametric `test.each`); 1 test pinning host stays passthrough. S2: 1 test pinning `--clearenv` in each profile; 1 test asserting allowed vars (PATH/HOME/USER/LANG/TZ/SHELL) flow through; 1 test asserting dangerous vars (LD_PRELOAD/DYLD_*/NODE_OPTIONS/PYTHONPATH/BASH_ENV/HTTPS_PROXY/SSH_AUTH_SOCK/AWS_SECRET_ACCESS_KEY) are NOT forwarded; 1 test NUL-byte skip; 1 test empty env still applies `--clearenv`. |
+| `tests/permissions/sandbox-runner-macos.test.ts` | +2 | S3: 1 test pinning both regex denys in every sandboxed profile; 1 test pinning ordering (regex denys AFTER `(allow process-exec)` so last-match-wins fires). |
+
+### Call-site updates
+
+`BuildBwrapArgvOptions.env` is required, so existing direct callers (`buildBwrapArgv(...)` in 24 test sites) were updated to pass `env: {}` (no semantic change for shape-of-argv tests; allowlist body is empty). `maybeWrapSandboxArgv` keeps `env?` optional with `process.env` fallback — 3 production callers (`bg/manager.ts`, `tools/builtin/grep.ts`, `cli/bootstrap.ts`) continue working without change; the scrubbed env they pass via `Bun.spawn({env})` is the upstream layer's defense, while the bwrap allowlist is now the authoritative kernel-side shaper.
+
+### Files changed
+
+- Code: `src/permissions/sandbox-runner.ts`, `src/permissions/sandbox-runner-macos.ts`
+- Tests: `tests/permissions/sandbox-runner.test.ts`, `tests/permissions/sandbox-runner-macos.test.ts`
+- Spec: none (runtime hardening; protocol unchanged)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`)
+- `bun test` — **6875 pass / 10 skip / 0 fail / 17528 expect()** across 309 files (+14 over slice 143)
+
+### Remaining from bash-tools review
+
+Defered to follow-up slices:
+- **slice 146** — bg lifecycle (BG1 no process-group isolation, BG2 SIGHUP/SIGKILL leaks) — 🔴 critical correctness
+- **slice 147** — resolver tightening (R1 pipe-to-`python -c` not detected, `exec:arbitrary` not in score weights, `cmdGit` unknown subcommand falls to non-confirm medium, `rm -rf /` hardcoded refuse) — 🔴 critical policy
+- **slice 148** — bash tools surface (input validation for `label`/`cwd`, ACL for `bash_output`/`bash_kill`) — 🟠 important
+- **slice 149** — resolver calibration (cmdCd / cmdSysInfo false-positive read-fs entries) — 🟡 minor
+
+### Verified during review (no fix needed)
+
+- `rm -rf /` is NOT silently auto-deleted under default config: score gate fires `capability_risk + workspace_escape + blocklist_command` ≈ 0.85 → upgrade to `confirm`, and default-deny vetoes when no allow rule covers `delete-fs:/`. BUT the comment in `protected_paths.ts:30` claims a "bash deny list" hardcoded catches `rm -rf /` — the deny list doesn't exist. Slice 147 will (a) drop the misleading comment and (b) add the hardcoded refuse in `cmdRm` for `/`, `/home`, `/usr`, `~`, and `$HOME` as defense in depth against permissive policies.
+
+---
+
 ## [2026-05-13] refactor(permission-engine) — slice 143: API surface dedup + tighten
 
 **Done.** One-hundred-forty-third slice. Closes 2 of the 3 🟠 API surface refactors from the slice 139 review (GrantSnapshot duplicate, AuditEmitInput tighten) plus 2 minor type-dedup findings (SealMode comment drift, RiskScoreConfidence/ApprovalLogConfidence duplicate). Strategy: bug-shaped fixes first (the 7-field tighten reaches into every audit-emit call site across src + tests), then the cosmetic dedups, then defer the EngineOptions god-object split to slice 144 — the split decision (flat vs sub-object) needs a design alignment that doesn't belong squeezed alongside a 26-file refactor.

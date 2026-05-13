@@ -13,6 +13,7 @@ describe('buildBwrapArgv — host profile (passthrough)', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     expect(argv).toEqual(['bash', '-c', 'echo hi']);
   });
@@ -23,6 +24,7 @@ describe('buildBwrapArgv — host profile (passthrough)', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     argv.push('mutated');
     // Calling again returns a fresh array — the previous mutation
@@ -32,6 +34,7 @@ describe('buildBwrapArgv — host profile (passthrough)', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     expect(argv2).toEqual(['bash', '-c', 'echo hi']);
   });
@@ -44,6 +47,7 @@ describe('buildBwrapArgv — ro profile', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     expect(argv[0]).toBe('bwrap');
     expect(argv).toContain('--ro-bind');
@@ -66,6 +70,7 @@ describe('buildBwrapArgv — cwd-rw profile', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     expect(argv).toContain('--bind');
     // bind cwd→cwd appears as adjacent pair.
@@ -84,6 +89,7 @@ describe('buildBwrapArgv — cwd-rw-net profile', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     expect(argv).toContain('--bind');
     expect(argv).not.toContain('--unshare-net');
@@ -99,6 +105,7 @@ describe('buildBwrapArgv — home-rw profile', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      env: {},
     });
     const bindIdx = argv.indexOf('--bind');
     expect(argv[bindIdx + 1]).toBe(HOME);
@@ -114,7 +121,7 @@ describe('buildBwrapArgv — common flags', () => {
   test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
     'profile %s has die-with-parent + tmpfs/proc/dev + chdir',
     (profile) => {
-      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER });
+      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
       expect(argv).toContain('--die-with-parent');
       expect(argv).toContain('--tmpfs');
       expect(argv).toContain('--proc');
@@ -132,15 +139,16 @@ describe('buildBwrapArgv — innerArgv preservation', () => {
       cwd: CWD,
       home: HOME,
       innerArgv,
+      env: {},
     });
     const dashIdx = argv.indexOf('--');
     expect(argv.slice(dashIdx + 1)).toEqual(innerArgv);
   });
 
   test('empty innerArgv throws (programmer bug, fail loud)', () => {
-    expect(() => buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: [] })).toThrow(
-      'innerArgv must not be empty',
-    );
+    expect(() =>
+      buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: [], env: {} }),
+    ).toThrow('innerArgv must not be empty');
   });
 });
 
@@ -413,17 +421,29 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
   };
 
   test('ro profile emits hide_paths flags', () => {
-    const argv = buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: INNER });
+    const argv = buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
     expectHidePaths(argv);
   });
 
   test('cwd-rw profile emits hide_paths flags', () => {
-    const argv = buildBwrapArgv({ profile: 'cwd-rw', cwd: CWD, home: HOME, innerArgv: INNER });
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+    });
     expectHidePaths(argv);
   });
 
   test('cwd-rw-net profile emits hide_paths flags', () => {
-    const argv = buildBwrapArgv({ profile: 'cwd-rw-net', cwd: CWD, home: HOME, innerArgv: INNER });
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw-net',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+    });
     expectHidePaths(argv);
   });
 
@@ -433,7 +453,13 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
     // not only READ but also WRITE to ~/.ssh/authorized_keys etc.
     // Pin that the tmpfs overlays still mask these — applied
     // AFTER `--bind home home` in the argv so the later mount wins.
-    const argv = buildBwrapArgv({ profile: 'home-rw', cwd: CWD, home: HOME, innerArgv: INNER });
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+    });
     expectHidePaths(argv);
     // Verify the order: --bind home home appears BEFORE --tmpfs
     // home/.ssh. bwrap applies in argv order; the tmpfs MUST be
@@ -450,7 +476,13 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
     // Host is the operator-opted-in passthrough; no bwrap wrap,
     // no flags. The hide_paths defense doesn't apply because
     // the inner process runs directly on the host.
-    const argv = buildBwrapArgv({ profile: 'host', cwd: CWD, home: HOME, innerArgv: INNER });
+    const argv = buildBwrapArgv({
+      profile: 'host',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+    });
     // Should be just innerArgv, no bwrap.
     expect(argv).toEqual([...INNER]);
   });
@@ -464,6 +496,7 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       cwd: '/work/macproj',
       home: '/Users/devloper',
       innerArgv: INNER,
+      env: {},
     });
     const argvStr = argv.join(' ');
     expect(argvStr).toContain('--tmpfs /Users/devloper/.ssh');
@@ -502,6 +535,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         cwd: '/home/op/.ssh',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       }),
     ).toThrow(/inside hide_paths dir/);
   });
@@ -513,6 +547,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         cwd: '/home/op/.ssh/audit',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       }),
     ).toThrow(/inside hide_paths dir/);
   });
@@ -527,6 +562,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         cwd: '/home/op/.ssh-backup',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       }),
     ).not.toThrow();
   });
@@ -538,6 +574,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         cwd: '/home/op/work',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       }),
     ).not.toThrow();
   });
@@ -551,6 +588,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         cwd: '/home/op/.ssh',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       }),
     ).not.toThrow();
   });
@@ -579,6 +617,7 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         cwd: '/work/proj',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       });
       const argvStr = argv.join(' ');
       // The canonical home-relative overlay IS present.
@@ -602,6 +641,7 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         cwd: '/work/proj',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       });
       const argvStr = argv.join(' ');
       // Both overlays present: the canonical home-relative one
@@ -625,6 +665,7 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         cwd: '/work/proj',
         home: '/home/op',
         innerArgv: INNER,
+        env: {},
       });
       // Count tmpfs flags pointing at the data dir (`share/forja`).
       // Should be exactly 1: the canonical home-relative one. sec-1
@@ -638,5 +679,163 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
     } finally {
       restoreEnv();
     }
+  });
+});
+
+// Slice 145 (S1 — sandbox hardening): the four sandboxed profiles
+// MUST unshare UTS / IPC / cgroup namespaces and start a new
+// session. Pre-slice only pid was unshared, leaving four escape
+// surfaces (hostname leak via UTS, SysV IPC / POSIX shm probes,
+// cgroup hierarchy visibility, and the most-severe TIOCSTI
+// keystroke injection back into the operator's controlling tty).
+// Pin each flag's presence so a future refactor of
+// `COMMON_PROFILE_FLAGS` can't silently drop one.
+describe('buildBwrapArgv — slice 145 S1 namespace + session isolation', () => {
+  test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
+    '%s profile includes --unshare-uts / --unshare-ipc / --unshare-cgroup-try / --new-session',
+    (profile) => {
+      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
+      expect(argv).toContain('--unshare-uts');
+      expect(argv).toContain('--unshare-ipc');
+      expect(argv).toContain('--unshare-cgroup-try');
+      expect(argv).toContain('--new-session');
+    },
+  );
+
+  test('host profile remains a verbatim passthrough (no bwrap flags)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'host',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+    });
+    expect(argv).toEqual([...INNER]);
+    expect(argv).not.toContain('--new-session');
+    expect(argv).not.toContain('--unshare-uts');
+  });
+});
+
+// Slice 145 (S2 — env-scrub defense in depth): bwrap should apply
+// `--clearenv` and rebuild the env from a narrow allowlist via
+// `--setenv KEY VALUE`. Pre-slice the wrapped process inherited
+// the parent's env verbatim — userspace `scrubEnv` was the only
+// defense, and any future spawn site that forgot to call it
+// collapsed the boundary. Pin: clearenv present, allowed vars
+// forwarded, disallowed vars NOT forwarded.
+describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --setenv', () => {
+  test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
+    '%s profile starts with --clearenv',
+    (profile) => {
+      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
+      expect(argv).toContain('--clearenv');
+    },
+  );
+
+  test('allowed vars (PATH/HOME/USER/LANG/TZ etc.) flow through as --setenv', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {
+        PATH: '/usr/bin:/bin',
+        HOME: '/home/op',
+        USER: 'op',
+        LANG: 'en_US.UTF-8',
+        TZ: 'UTC',
+        SHELL: '/bin/bash',
+      },
+    });
+    // Each var should appear as `--setenv KEY VALUE` in argv order.
+    const setenvAt = (key: string, value: string): boolean => {
+      for (let i = 0; i < argv.length - 2; i++) {
+        if (argv[i] === '--setenv' && argv[i + 1] === key && argv[i + 2] === value) return true;
+      }
+      return false;
+    };
+    expect(setenvAt('PATH', '/usr/bin:/bin')).toBe(true);
+    expect(setenvAt('HOME', '/home/op')).toBe(true);
+    expect(setenvAt('USER', 'op')).toBe(true);
+    expect(setenvAt('LANG', 'en_US.UTF-8')).toBe(true);
+    expect(setenvAt('TZ', 'UTC')).toBe(true);
+    expect(setenvAt('SHELL', '/bin/bash')).toBe(true);
+  });
+
+  test('dangerous vars (LD_PRELOAD, NODE_OPTIONS, PYTHONPATH, HTTPS_PROXY) are NOT forwarded', () => {
+    // Even when the env carries them (e.g. caller forgot scrubEnv,
+    // or the operator's shell has them set legitimately), the
+    // sandbox allowlist drops them — kernel-level defense in depth.
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {
+        LD_PRELOAD: '/tmp/evil.so',
+        LD_LIBRARY_PATH: '/tmp/lib',
+        DYLD_INSERT_LIBRARIES: '/tmp/evil.dylib',
+        NODE_OPTIONS: '--require /tmp/x.js',
+        PYTHONPATH: '/tmp/py',
+        PYTHONSTARTUP: '/tmp/start.py',
+        BASH_ENV: '/tmp/bashenv',
+        HTTPS_PROXY: 'http://attacker.example.com',
+        HTTP_PROXY: 'http://attacker.example.com',
+        SSH_AUTH_SOCK: '/tmp/agent.sock',
+        AWS_SECRET_ACCESS_KEY: 'leaked',
+        PATH: '/usr/bin', // control: allowed, must still appear
+      },
+    });
+    const setenvKeys: string[] = [];
+    for (let i = 0; i < argv.length - 1; i++) {
+      if (argv[i] === '--setenv') setenvKeys.push(argv[i + 1] as string);
+    }
+    expect(setenvKeys).toContain('PATH');
+    // None of these dangerous vars should appear.
+    expect(setenvKeys).not.toContain('LD_PRELOAD');
+    expect(setenvKeys).not.toContain('LD_LIBRARY_PATH');
+    expect(setenvKeys).not.toContain('DYLD_INSERT_LIBRARIES');
+    expect(setenvKeys).not.toContain('NODE_OPTIONS');
+    expect(setenvKeys).not.toContain('PYTHONPATH');
+    expect(setenvKeys).not.toContain('PYTHONSTARTUP');
+    expect(setenvKeys).not.toContain('BASH_ENV');
+    expect(setenvKeys).not.toContain('HTTPS_PROXY');
+    expect(setenvKeys).not.toContain('HTTP_PROXY');
+    expect(setenvKeys).not.toContain('SSH_AUTH_SOCK');
+    expect(setenvKeys).not.toContain('AWS_SECRET_ACCESS_KEY');
+  });
+
+  test('env vars containing a NUL byte are skipped (bwrap argv cannot carry them)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {
+        PATH: '/usr/bin',
+        // Synthesized NUL — could happen if a tool exports a
+        // malformed value. Skip rather than crash bwrap.
+        HOME: '/home/op /extra',
+      },
+    });
+    const setenvKeys: string[] = [];
+    for (let i = 0; i < argv.length - 1; i++) {
+      if (argv[i] === '--setenv') setenvKeys.push(argv[i + 1] as string);
+    }
+    expect(setenvKeys).toContain('PATH');
+    expect(setenvKeys).not.toContain('HOME');
+  });
+
+  test('empty env still applies --clearenv (every spawn is shaped)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+    });
+    expect(argv).toContain('--clearenv');
+    const setenvCount = argv.filter((v) => v === '--setenv').length;
+    expect(setenvCount).toBe(0);
   });
 });
