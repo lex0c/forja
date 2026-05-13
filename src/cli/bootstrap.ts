@@ -24,6 +24,7 @@ import {
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
+import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type LockConflict,
   bootstrapPermissionEngine,
@@ -318,7 +319,15 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // Pre-fixup the sink type existed but no production caller
   // constructed one — slice 130's wire sites were inert at
   // runtime.
-  const failureSink = createSqliteFailureSink({ db });
+  //
+  // Slice 131: construct the outcome_signals sink alongside and
+  // pass to the failure sink as `outcomeSink` so downstream
+  // failures dual-write a calibration signal whenever the
+  // payload carries `approval_seq`. Also threaded onto the
+  // HarnessConfig so harness/loop emits `tool_error` signals
+  // and CLI checkpoint --undo emits `checkpoint_reverted`.
+  const outcomeSink = createSqliteOutcomeSink({ db });
+  const failureSink = createSqliteFailureSink({ db, outcomeSink });
   const permResult = await bootstrapPermissionEngine({
     cwd,
     home,
@@ -647,6 +656,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // bwrap/sandbox-exec.
     failureSink,
     ...(sandboxAvail.tool !== null ? { sandboxBootTool: sandboxAvail.tool } : {}),
+    // Slice 131: outcome_signals sink for tool_error +
+    // checkpoint_reverted wires (failure_event dual-write is
+    // handled internally by failureSink which received outcomeSink
+    // above; this slot is for the harness/loop tool-error wire).
+    outcomeSink,
   };
 
   return {

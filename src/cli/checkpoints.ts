@@ -17,6 +17,7 @@ import {
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
+import { type OutcomeSink, createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type Checkpoint,
   type DB,
@@ -26,6 +27,7 @@ import {
   migrate,
   openDb,
 } from '../storage/index.ts';
+import { listApprovalsLogBySessionSinceTs } from '../storage/repos/approvals-log.ts';
 
 export interface CheckpointsCliInput {
   verb: 'list' | 'diff' | 'restore' | 'purge' | 'undo';
@@ -41,6 +43,14 @@ export interface CheckpointsCliInput {
   // Mirrors the stdout/stderr split spec §2.6 mandates.
   out: (s: string) => void;
   err: (s: string) => void;
+  // Slice 131: outcome_signals sink for the `--undo` /
+  // `--checkpoints restore` paths. When wired, every approval
+  // that landed AFTER the restored checkpoint emits a
+  // `checkpoint_reverted` signal (weight 0.9) so spec §6.3.2
+  // calibration sweeps see operator-undo as a strong "harmful"
+  // proxy. Optional — pre-slice-131 callers (tests, headless
+  // restore invocations) skip the emit.
+  outcomeSink?: OutcomeSink;
 }
 
 const VALID_VERBS = ['list', 'diff', 'restore', 'purge', 'undo'] as const;
@@ -229,6 +239,57 @@ const runRestoreImpl = async (
   }
   try {
     const result = await mgr.restore(ckpt.id);
+    // Slice 131 (spec §6.3.2 calibration): every approval whose
+    // tool call landed AFTER the restored checkpoint's wall-clock
+    // is one the operator just rolled back. Emit a
+    // `checkpoint_reverted` outcome_signal per approval with
+    // weight 0.9 (strong: explicit human "this should not have
+    // happened"). Time-based filter is an approximation —
+    // operator may have undone a subset of intent — but
+    // calibration sweeps can downweight by grouping. Capped at
+    // 200 to bound the emit storm; if more approvals were
+    // reverted, the calibration script can re-derive the rest
+    // from the tool_calls + approval_call_links join.
+    //
+    // Best-effort: signal emit failure stderrs but never blocks
+    // the restore result reporting. The restore already
+    // committed; observability is downstream.
+    if (input.outcomeSink !== undefined) {
+      // Slice 131 fixup #3: push the `ts >= ckpt.createdAt`
+      // predicate into SQL + ORDER BY seq DESC LIMIT 200 so the
+      // cap truncates the OLDEST overflow, not the newest. Pre-
+      // fixup `listApprovalsLogBySession(.., 200)` returned the
+      // FIRST 200 by seq ASC — for any long session those are
+      // pre-checkpoint approvals and the wire silently signaled
+      // NONE of the actually-reverted rows. Result is sorted
+      // DESC; per-emit catch (slice 131 fixup #5) ensures a
+      // transient SQLITE_BUSY on one approval doesn't drop the
+      // whole cohort.
+      const revertedApprovals = listApprovalsLogBySessionSinceTs(
+        db,
+        sessionId,
+        ckpt.createdAt,
+        200,
+      );
+      for (const a of revertedApprovals) {
+        try {
+          input.outcomeSink.emit({
+            approval_seq: a.seq,
+            signal_kind: 'checkpoint_reverted',
+            payload: {
+              checkpoint_id: ckpt.id,
+              restored_to_step: ckpt.stepId,
+              tool_name: a.tool_name,
+            },
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          input.err(
+            `forja outcome_signals: checkpoint_reverted emit failed for approval_seq=${a.seq} (${msg}); continuing with remaining ${revertedApprovals.length} signals\n`,
+          );
+        }
+      }
+    }
     if (result.stashed && result.stashRef !== undefined) {
       // Recovery hint depends on where we stored the saved working
       // tree. The regular `git stash` path is recoverable via
@@ -346,17 +407,27 @@ export const runCheckpointsCli = async (input: CheckpointsCliInput): Promise<num
   const ownsDb = input.dbOverride === undefined;
   try {
     if (ownsDb) migrate(db);
-    switch (input.verb) {
+    // Slice 131: when caller didn't pass an outcomeSink AND the
+    // verb is restore/undo (the only verbs that emit signals),
+    // construct one from the opened DB. Keeps the CLI verbs
+    // self-contained — `agent --undo` doesn't need bootstrap.ts
+    // wiring to record calibration signals. Tests that want to
+    // assert NO emit can pass `outcomeSink: createNoopOutcomeSink()`.
+    const effectiveInput: CheckpointsCliInput =
+      input.outcomeSink === undefined && (input.verb === 'restore' || input.verb === 'undo')
+        ? { ...input, outcomeSink: createSqliteOutcomeSink({ db }) }
+        : input;
+    switch (effectiveInput.verb) {
       case 'list':
-        return await runList(input, db);
+        return await runList(effectiveInput, db);
       case 'diff':
-        return await runDiff(input, db);
+        return await runDiff(effectiveInput, db);
       case 'restore':
-        return await runRestore(input, db);
+        return await runRestore(effectiveInput, db);
       case 'purge':
-        return await runPurge(input, db);
+        return await runPurge(effectiveInput, db);
       case 'undo':
-        return await runUndo(input, db);
+        return await runUndo(effectiveInput, db);
     }
   } finally {
     if (ownsDb) db.close();

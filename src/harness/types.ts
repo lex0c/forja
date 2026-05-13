@@ -8,6 +8,7 @@ import type {
 import type { FailureEventSink } from '../failures/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
+import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
@@ -974,6 +975,16 @@ export interface HarnessConfig {
   // CLI bootstrap sources via `detectSandboxAvailability` and
   // forwards here; tests pin a constant.
   sandboxBootTool?: 'bwrap' | 'sandbox-exec';
+  // outcome_signals sink (slice 131). When wired, the harness
+  // emits a `tool_error` outcome_signal on every failed tool
+  // invocation that was authorized by the engine (failed=true,
+  // not denied). Spec §6.3.2 calibration: these signals link
+  // decisions to observed bad outcomes. Optional — without it,
+  // tool errors only land in `tool_calls.status='error'` and
+  // calibration scripts have to recover them via join. Production
+  // CLI bootstrap constructs `createSqliteOutcomeSink({ db })`
+  // and passes here.
+  outcomeSink?: OutcomeSink;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

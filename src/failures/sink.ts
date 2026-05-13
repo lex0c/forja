@@ -26,11 +26,13 @@
 // extends incrementally (rare in practice; most installs have
 // 0-2 bootstrap events ever).
 
+import type { OutcomeSink } from '../outcomes/sink.ts';
 import { sha256Hex } from '../permissions/canonical.ts';
 import { canonicalize } from '../permissions/canonical.ts';
 import { generateUlid } from '../permissions/ulid.ts';
 import type { DB } from '../storage/db.ts';
 import { withImmediateTransaction } from '../storage/db.ts';
+import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
 import {
   type AppendFailureEventInput,
   type FailureEventRow,
@@ -155,15 +157,54 @@ export const createSqliteFailureSink = (options: {
   // craft chain-drift scenarios deterministically without
   // racing the system clock.
   now?: () => number;
+  // Slice 131: when set, the failure_events sink dual-writes an
+  // outcome_signal row for any emit whose `payload.approval_seq`
+  // resolves to an existing approvals_log row (in the SAME
+  // session — fixup #2 cross-session attribution guard).
+  // Mirrors the spec §6.3.2 calibration convention — every
+  // downstream failure becomes a (weighted) signal toward the
+  // approval that authorized the tool call.
+  //
+  // ATOMICITY: the dual-write is ASYMMETRIC by design (slice 131
+  // fixup #7). The failure_events INSERT commits inside the
+  // outer IMMEDIATE transaction; the inner outcomeSink.emit is
+  // wrapped in try/catch and runs as a nested SAVEPOINT — its
+  // failure is logged to stderr and rolled back without
+  // unwinding the outer failure_events row. The failure event
+  // is the load-bearing audit artifact (forensics needs it
+  // regardless of calibration); the outcome signal is a
+  // derived calibration row (recoverable via backfill). Test
+  // `tests/outcomes/dual-write-failure-event.test.ts` pins
+  // this posture explicitly.
+  //
+  // Optional — callers without the calibration subsystem leave
+  // undefined and the sink behaves identically to slice 130.
+  outcomeSink?: OutcomeSink;
 }): FailureEventSink => {
-  const { db } = options;
+  const { db, outcomeSink } = options;
   const nowFn = options.now ?? (() => Date.now());
+
+  // Slice 131: extract approval_seq from payload BEFORE the
+  // payload goes through scrub. The scrubbed/serialized
+  // payload_json keeps the field (number, not string — scrub
+  // passes through), but reading it back via json_extract would
+  // require an additional SELECT. Reading it up front from the
+  // caller's object keeps the dual-write deterministic.
+  const extractApprovalSeq = (
+    payload: Record<string, unknown> | null | undefined,
+  ): number | null => {
+    if (payload === null || payload === undefined) return null;
+    const v = payload.approval_seq;
+    if (typeof v === 'number' && Number.isInteger(v) && v > 0) return v;
+    return null;
+  };
 
   const emit = (input: EmitFailureEventInput): EmittedFailureRow => {
     const now = nowFn();
     validateInput(input, now);
 
     const session_id = input.session_id ?? BOOTSTRAP_SESSION_ID;
+    const approval_seq = extractApprovalSeq(input.payload);
     const { json: payload_json } = scrubFailurePayload(input.payload);
 
     // Slice 130 fixup #2: read-last + insert wrapped in a single
@@ -229,6 +270,59 @@ export const createSqliteFailureSink = (options: {
 
       const full: AppendFailureEventInput = { ...rowWithoutThisHash, this_chain_hash };
       appendFailureEvent(db, full);
+
+      // Slice 131 dual-write: when an outcomeSink is wired AND
+      // the payload carries a numeric approval_seq, emit a
+      // matching outcome_signal row.
+      //
+      // SLICE 131 FIXUP #2 (cross-session attribution): validate
+      // the approval row's `session_id` matches THIS failure
+      // event's session_id before emitting. Pre-fixup a caller
+      // (or compromised tool) could plant `payload.approval_seq
+      // = <seq-from-other-session>` and pollute that session's
+      // calibration with this session's failure. The check
+      // closes the cross-session attribution vector while still
+      // permitting the legitimate case (failure observed
+      // within the same session that owns the approval).
+      //
+      // Wrapped in try/catch so an outcome-side error doesn't
+      // unwind the failure_events row. The failure_events row
+      // is the load-bearing audit event; the outcome signal is
+      // a derived calibration artifact and its absence is a
+      // recoverable backfill, not a forensic gap. The "asymmetric
+      // posture" — outer commits, inner may fail — is documented
+      // here and confirmed by the dual-write tests.
+      if (outcomeSink !== undefined && approval_seq !== null) {
+        try {
+          // Look up the approval row to verify session match.
+          // getApprovalsLogBySeq is cheap (PK lookup); same call
+          // the outcome sink would make internally, but we run
+          // it eagerly here so a mismatch becomes a typed reject
+          // before the outcome sink's own validation fires.
+          const approvalRow = getApprovalsLogBySeq(db, approval_seq);
+          if (approvalRow !== null && approvalRow.session_id !== session_id) {
+            process.stderr.write(
+              `forja failure_events: outcome_signal dual-write rejected — approval_seq=${approval_seq} belongs to session '${approvalRow.session_id}', not '${session_id}'; cross-session attribution suspected\n`,
+            );
+          } else {
+            outcomeSink.emit({
+              approval_seq,
+              signal_kind: 'failure_event',
+              observed_at: created_at,
+              payload: {
+                failure_code: input.code,
+                failure_classe: input.classe,
+                failure_id: id,
+              },
+            });
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          process.stderr.write(
+            `forja failure_events: outcome_signal dual-write failed for approval_seq=${approval_seq} (${msg}); failure row persisted\n`,
+          );
+        }
+      }
 
       return { id, this_chain_hash };
     });

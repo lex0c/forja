@@ -139,6 +139,45 @@ export const listApprovalsLogBySession = (
     .all(sessionId) as ApprovalLogRow[];
 };
 
+// Slice 131 fixup #3: row-bounded post-timestamp lookup. The
+// `checkpoint_reverted` wire (cli/checkpoints.ts) needs "approvals
+// in this session whose `ts >= ckpt.createdAt`", capped to a
+// sensible blast-radius. Pre-fixup the wire used
+// `listApprovalsLogBySession(db, id, 200)` which returns the
+// FIRST 200 by `seq ASC` — for any long session those are
+// pre-checkpoint approvals and the wire silently signaled NONE
+// of the actually-reverted rows. This dedicated query pushes
+// the `ts` predicate into SQL and orders `seq DESC` so the cap
+// truncates the OLDEST overflow, not the newest. Recent
+// approvals (the ones most likely to be reverted) always land
+// in the result.
+export const listApprovalsLogBySessionSinceTs = (
+  db: DB,
+  sessionId: string,
+  sinceTs: number,
+  limit: number,
+): ApprovalLogRow[] => {
+  return db
+    .query(`${SELECT_ALL} WHERE session_id = ? AND ts >= ? ORDER BY seq DESC LIMIT ?`)
+    .all(sessionId, sinceTs, limit) as ApprovalLogRow[];
+};
+
+// Slice 131 fixup #5: row-bounded recent-N lookup. The
+// `session_aborted` wire takes the last 5 approvals; pre-fixup
+// it materialized the whole session via `listApprovalsLogBySession`
+// and called `.slice(-5)` — a long session walks 10k+ rows on
+// every abort. SQL `ORDER BY seq DESC LIMIT N` gives the same
+// result for ~constant cost.
+export const listApprovalsLogBySessionRecent = (
+  db: DB,
+  sessionId: string,
+  limit: number,
+): ApprovalLogRow[] => {
+  return db
+    .query(`${SELECT_ALL} WHERE session_id = ? ORDER BY seq DESC LIMIT ?`)
+    .all(sessionId, limit) as ApprovalLogRow[];
+};
+
 export const countApprovalsLog = (db: DB): number => {
   const row = db.query('SELECT COUNT(*) as n FROM approvals_log').get() as { n: number };
   return row.n;

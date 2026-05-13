@@ -52,6 +52,7 @@ import {
   recordCritiqueRun,
   reopenSession,
 } from '../storage/index.ts';
+import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -600,6 +601,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     if (detail !== undefined) result.detail = detail;
     if (reason === 'aborted' && abortCause !== undefined) {
       result.abortCause = abortCause;
+    }
+
+    // Slice 131 wire: when the session terminates in an
+    // interrupted/error state, emit a `session_aborted`
+    // outcome_signal for the last N approvals. Weak signal
+    // (weight 0.20) — sessions abort for many reasons not all
+    // "decision-was-wrong" (Ctrl+C, timeout, cost cap, provider
+    // crash). N=5 is a heuristic floor: the problem is more
+    // likely in the recent few approvals than the session's
+    // very first. Best-effort: signal emit failure stderrs but
+    // never blocks the result.
+    if (
+      config.outcomeSink !== undefined &&
+      sessionId.length > 0 &&
+      (exitToStatus[reason] === 'interrupted' || exitToStatus[reason] === 'error')
+    ) {
+      // Slice 131 fixup #5: bounded query (ORDER BY seq DESC
+      // LIMIT 5) so a long session (10k tool calls) doesn't
+      // materialize the full list on every abort. Per-emit
+      // try/catch so a transient SQLITE_BUSY on one signal
+      // doesn't drop the rest of the cohort.
+      const SESSION_ABORTED_TAIL_N = 5;
+      const recent = listApprovalsLogBySessionRecent(config.db, sessionId, SESSION_ABORTED_TAIL_N);
+      for (const a of recent) {
+        try {
+          config.outcomeSink.emit({
+            approval_seq: a.seq,
+            signal_kind: 'session_aborted',
+            payload: {
+              exit_reason: reason,
+              ...(abortCause !== undefined ? { abort_cause: abortCause } : {}),
+            },
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          process.stderr.write(
+            `forja outcome_signals: session_aborted emit failed for approval_seq=${a.seq} (${msg})\n`,
+          );
+        }
+      }
     }
     // Stop hooks (spec AGENTIC_CLI.md §10.1). Fired AFTER the
     // session row is marked complete and the result struct is
@@ -2562,6 +2603,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
           });
+          // Slice 131 wire: when a tool execution fails AFTER
+          // permission allowed it (failed=true, denied!=true)
+          // AND we have an approval_seq from the decision, emit
+          // an outcome_signal kind=tool_error. Calibration sweeps
+          // use this as a weak proxy for "the allow decision led
+          // to a bad outcome". Best-effort: outcome-sink failure
+          // surfaces to stderr but never crashes the loop. Skip
+          // denied paths — denials are by construction the
+          // engine refusing the call; outcome of a deny is
+          // already encoded in the decision itself.
+          if (
+            config.outcomeSink !== undefined &&
+            inv.failed === true &&
+            inv.denied !== true &&
+            inv.decision?.approvalSeq !== undefined
+          ) {
+            try {
+              config.outcomeSink.emit({
+                approval_seq: inv.decision.approvalSeq,
+                signal_kind: 'tool_error',
+                payload: {
+                  tool_name: tu.name,
+                  duration_ms: inv.durationMs,
+                  ...(inv.errorMessage !== undefined ? { error_message: inv.errorMessage } : {}),
+                },
+              });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              process.stderr.write(
+                `forja outcome_signals: tool_error wire failed for approval_seq=${inv.decision.approvalSeq} (${msg})\n`,
+              );
+            }
+          }
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state
           // internally. Emits a `sandbox_degraded_active` harness

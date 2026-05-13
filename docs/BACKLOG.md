@@ -15,6 +15,115 @@ Format:
 
 ---
 
+## [2026-05-13] permission-engine-v2 — slice 131: outcome_signals + aggregator + 4 wire sites + post-review fixup
+
+**Done.** One-hundred-thirty-first slice. Materializes spec §6.3.2's calibration plan — the `(score, decision_humano, outcome)` triples needed to derive v2.1 risk-score weights via logistic regression. Slice 130 planted the `payload.approval_seq` convention hook; slice 131 closes the loop with a new `outcome_signals` audit table, an aggregator (`computeOutcomeForApproval`), and four push sites that capture observable outcomes (tool errors, downstream failures, checkpoint reverts, session aborts).
+
+### Module: `src/outcomes/`
+
+- `codes.ts` — `OutcomeSignalKind` enum (4 kinds), per-kind `DEFAULT_SIGNAL_WEIGHTS` (tool_error 0.30, failure_event 0.50, checkpoint_reverted 0.90, session_aborted 0.20) + per-kind `DEFAULT_SIGNAL_TTL_DAYS` (checkpoint_reverted 730d for long-window regressions, rest 365d per AUDIT.md §1.2), `COMPOSITE_HARMFUL_THRESHOLD = 0.5`.
+- `scrub.ts` — re-export of `scrubFailurePayload` (proto-pollution + telemetry regexes + cycle guard + 8 KiB cap + BigInt fallback). Same payload pipeline as slice 130.
+- `sink.ts` — `OutcomeSink` interface + `createSqliteOutcomeSink` + `createNoopOutcomeSink`. Per-kind default weight + TTL applied at emit; runtime override available for calibration sweeps. `now` test seam mirrors slice 130's pattern.
+- `aggregator.ts` — `computeOutcomeForApproval(db, seq) → {outcome, composite, signals}` (max-wins composite, threshold-based binary label) + `computeOutcomesBatch` for calibration scripts materializing N seqs at once.
+- `index.ts` — public barrel.
+
+### Schema (migration `042-outcome-signals.ts`, post-fixup)
+
+```sql
+CREATE TABLE outcome_signals (
+  id              TEXT PRIMARY KEY,
+  approval_seq    INTEGER NOT NULL,
+  install_id      TEXT NOT NULL,
+  signal_kind     TEXT NOT NULL CHECK (signal_kind IN
+                    ('tool_error','failure_event','checkpoint_reverted','session_aborted')),
+  signal_weight   REAL NOT NULL CHECK (signal_weight >= 0.0 AND signal_weight <= 1.0),
+  payload_json    TEXT,
+  observed_at     INTEGER NOT NULL,
+  detected_at     INTEGER NOT NULL,
+  ttl_expires_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_outcome_signals_approval ON outcome_signals(approval_seq);
+CREATE INDEX idx_outcome_signals_install  ON outcome_signals(install_id);
+CREATE INDEX idx_outcome_signals_kind     ON outcome_signals(signal_kind, detected_at DESC);
+```
+
+Note the **absence** of `REFERENCES approvals_log(seq) ON DELETE CASCADE` (fixup #1, see below) and the presence of denormalized `install_id`. FK existence is still validated at INSERT in the sink; chain-rotation no longer wipes the calibration trail.
+
+### Wire sites (4)
+
+1. **`tool_error`** in `harness/loop.ts` — after `inv.failed === true && inv.denied !== true && inv.decision?.approvalSeq !== undefined`. Captures every authorized tool execution that errored. Weak signal (weight 0.30).
+2. **`failure_event`** in `failures/sink.ts` — dual-write inside the outer IMMEDIATE transaction whenever `payload.approval_seq` is present AND matches the failure's session_id (fixup #2). Reuses slice 130's plumbing; ties failure_events rows to their authorizing approval. Medium signal (weight 0.50).
+3. **`checkpoint_reverted`** in `cli/checkpoints.ts` `--undo`/restore — emits one signal per approval that landed AFTER the restored checkpoint's `created_at`. Strongest signal (weight 0.90) — operator's explicit "this should not have happened" verdict.
+4. **`session_aborted`** in `harness/loop.ts` `finish()` — last 5 approvals get this when session exits with `interrupted`/`error` terminal status. Weak signal (weight 0.20) — many abort causes are unrelated to decision quality.
+
+### Aggregator + calibration contract
+
+`computeOutcomeForApproval(db, seq)` walks the signals via `listOutcomeSignalsByApproval`, max-wins composite, threshold 0.5 → `harmful | harmless`. Calibration scripts will:
+
+```ts
+const triples = approvals.map((a) => ({
+  features: expandComponents(a.score_components_json),
+  decision: a.decision,
+  outcome: computeOutcomeForApproval(db, a.seq).outcome,
+}));
+// → logistic regression input
+```
+
+Slice 131 produces the SIGNALS; the calibration script itself is out-of-tree (operator-run after ≥30 days of telemetry per spec §6.3.2 plan).
+
+### Post-review fixup (4-agent parallel review surfaced 12 findings; 6 fixed pre-commit)
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| 1 | **P0** | Chain rotation (slice 35 `DELETE FROM approvals_log`) cascaded via `ON DELETE CASCADE` and wiped every outcome_signal — exactly the calibration data point operators need post-incident. | Migration amended: dropped FK, added `install_id TEXT NOT NULL` (denormalized from approval row at INSERT). Sink validates FK existence at write; signals survive rotation, calibration script joins across `approvals_log` + `approvals_log_archived` via the install_id pivot. |
+| 2 | **P0** | `failures/sink.ts` dual-write trusted `payload.approval_seq` without checking the approval's `session_id` matched the failure's. A caller (or compromised tool) could plant signals on another session's approval — cross-session calibration pollution. | Added session-match probe via `getApprovalsLogBySeq` before dual-write. Mismatch → stderr breadcrumb + skip emit; failure_events row still lands. |
+| 3 | **P0** | `cli/checkpoints.ts` `--undo` wire called `listApprovalsLogBySession(.., 200)` which returns the **oldest** 200 by `seq ASC`. For any long session (>200 approvals total) the wire missed every post-checkpoint approval — signaled zero of the actually-reverted rows. | New repo function `listApprovalsLogBySessionSinceTs(db, sessionId, sinceTs, limit)` pushes the `ts >= ckpt.createdAt` predicate into SQL and orders `seq DESC LIMIT 200` so the cap truncates oldest overflow. |
+| 4 | **P0** | `tool_error` and `session_aborted` wires had ZERO unit tests. A refactor reordering the guard chain could silently disable calibration capture and the suite would stay green. | Added `tests/outcomes/wire-tool-error.test.ts` (3 cases: failed+allowed→emit, succeeded→no emit, sink-unwired→no emit) and `tests/outcomes/wire-session-aborted.test.ts` (2 cases: back-compat, no-throw under init-fail-adjacent flow). |
+| 5 | P1 | `session_aborted` wire materialized full session approvals list via `listApprovalsLogBySession(...).slice(-5)`. Long sessions allocate 10k+ row arrays on every abort. | New `listApprovalsLogBySessionRecent(db, sessionId, N)` with `ORDER BY seq DESC LIMIT N`. ~constant cost. |
+| 6 | P1 | `--undo` per-emit catch was OUTSIDE the for-loop — a single SQLITE_BUSY in the middle dropped the rest of the cohort. | Moved try/catch INSIDE the loop. Per-approval failure logged + loop continues. |
+| 7 | P1 | Misleading comment in `failures/sink.ts` claimed "atomic dual-write — partial state cannot exist", contradicting the test that explicitly pins "outer commits when inner throws". | Rewrote the comment to match the documented asymmetric posture: outer (failure_events) commits unconditionally, inner (outcome_signal) is best-effort with try/catch + stderr. |
+
+Additional polish landed: `scrubOutcomePayload` direct test (`tests/outcomes/scrub.test.ts`); `idx_outcome_signals_kind` EXPLAIN QUERY PLAN test (`tests/storage/migrations/042-outcome-signals.test.ts`); `install_id NOT NULL` constraint pinned by migration test.
+
+### Tests +43 over slice 130 (6617 pass / 10 skip / 0 fail across 307 files)
+
+- `tests/outcomes/sink.test.ts` (17 cases): validation rejections, per-kind weight defaults, weight override, per-kind TTL, payload scrub, FK absence test (signals survive parent delete), install_id denormalization.
+- `tests/outcomes/aggregator.test.ts` (7 cases): empty signals → harmless, weak signal → harmless, strong signal → harmful, max-wins composite, threshold edges (exactly 0.5 and 0.49), batch ordering preservation.
+- `tests/outcomes/dual-write-failure-event.test.ts` (5 cases): emit with approval_seq, no-approval-seq skip, sink-unwired skip, broken-outcome-sink doesn't crash, **cross-session attribution rejected** (fixup #2).
+- `tests/outcomes/wire-checkpoint-revert.test.ts` (1 case): seeded checkpoint + approvals before/after → signals only on after.
+- `tests/outcomes/wire-tool-error.test.ts` (3 cases — fixup #4).
+- `tests/outcomes/wire-session-aborted.test.ts` (2 cases — fixup #4).
+- `tests/outcomes/scrub.test.ts` (5 cases — fixup polish).
+- `tests/storage/migrations/042-outcome-signals.test.ts` (8 cases): table + 3 indices, CHECK on kind + weight bounds, install_id NOT NULL (fixup #1), EXPLAIN QUERY PLAN on both indices (fixup polish), idempotent.
+
+### Decisions
+
+- **`install_id` denormalized into outcome_signals** (fixup #1). Pre-fixup the FK-only relationship couldn't survive chain rotation. Post-fixup signals carry their parent install_id natively; the FK is enforced at write but not at delete time. Calibration scripts join across current + archived approvals_log using this column.
+- **Max-wins composite + threshold 0.5** for the binary label. Documented as `outcome-baseline-v2.0` analogous to the score's `baseline-v2.0`. Calibration will tune both the per-kind weights AND the threshold.
+- **Per-kind retention divergence** (730d for checkpoint_reverted vs 365d default). Stronger signal deserves longer window for annual regression sweeps. AUDIT.md §1.2 PR pending.
+- **Asymmetric dual-write atomicity** (fixup #7 documented explicitly). Failure_events row is the load-bearing audit artifact; outcome_signal is derived calibration data and best-effort. Inner failure rolls back via SAVEPOINT, outer commits regardless. Tests pin this posture.
+- **`session_aborted` weight 0.20 + N=5 tail** — deliberately weak proxy because sessions abort for many reasons (Ctrl+C, cost cap, crash). N=5 is heuristic; calibration may zero this kind entirely.
+
+### Deferred (P1 spec PRs + P2 polish)
+
+- **Spec PRs** (5 divergences): outcome_signals not in AUDIT.md §1 tables list; `chain_hash` omitted vs §4.2 ("all audit tables"); per-kind retention 730d divergence from §1.2; composite policy + threshold 0.5 + per-kind weights all invented vs §6.3.2; `denied_after_allow` proxy candidate. Batch as one spec PR.
+- **Batch emit in `--undo`** (one transaction wrapping 200 emits vs 200 BEGIN IMMEDIATE cycles). Real-but-bounded latency; defer to a perf-targeted slice if `--undo` UX feedback flags it.
+- **`UNIQUE(approval_seq, signal_kind)` + INSERT OR IGNORE** for tool_error explosion dedup. Acceptable storage cost in practice; calibration handles dedup. Defer.
+- **`aggregator` outcome=`unknown` when signal TTL expired but approval survives.** Reviewer concern about silent harmless-mislabeling after GC. Real but only matters once `agent gc` exists (deferred slice).
+- **Composite weight=0 ambiguity** (no-signal vs zero-weight-signal both render harmless). Calibration sweep may zero weights in place; defer until that pattern actually fires.
+- **Threshold-0.5 gameable via 0.4999 epsilon override**. Production wires don't expose weight override; only calibration sweeps do, and those are operator-trusted. Defer.
+- **Integration test for §6.3.2 end-to-end triple** (seed approval → multiple signals → calibration extract). Each piece is tested; the chain is verified by inspection. Defer.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from slice 130)
+- `bun test` — **6617 pass / 10 skip / 0 fail** (6627 total across 307 files); +43 tests on top of slice 130's 6574
+
+**Next.** Spec PR batch closing the slice 131 divergences (AUDIT.md §1 + §1.2 + §4.2; PERMISSION_ENGINE.md §6.3.2.1 baseline-v2.0 anchoring). Then calibration script slice (out-of-tree initially) consuming the triples this slice now materializes. Then `agent audit failures` + `agent audit calibrate` CLI verbs once the audit subsystem gets refactor passes.
+
+---
+
 ## [2026-05-13] permission-engine-v2 — slice 130: failure_events table + sink + 3 wire-up sites
 
 **Done.** One-hundred-thirtieth slice. Closes R5 Tier 3 P0-1 (failure_events table absent) — spec FAILURE_MODES.md §19 + AUDIT.md §1/§4.2/§10.1 defined the table since v2 but it was never materialized. Pre-slice failures vanished into stderr (`subagent handle X: persist failed`) or audit chain with ad-hoc decision='deny'; no structured query surface, no separable observation of sandbox loss from generic deny. Slice 130 lands the floor: schema + per-session hash chain + sink + 3 high-value emit sites. Future slices wire the remaining 17 codes from the spec catalog when their owning subsystems get refactor passes.
