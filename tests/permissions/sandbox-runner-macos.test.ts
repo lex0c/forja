@@ -323,3 +323,72 @@ describe('escapeSbplLiteral control-char rejection (slices 125 + 127)', () => {
     expect(() => buildSbplProfile('cwd-rw', '/work/proj', '/home/op')).not.toThrow();
   });
 });
+
+// Slice 134 P0-12: cross-platform parity with sandbox-runner.ts:147.
+// Pre-fixup macOS silently produced an SBPL profile where the
+// hide_paths deny rule (appended last, last-match-wins) masked the
+// cwd mount — the inner process received a working dir that
+// "vanishes". Linux refused at build time; macOS exec'd with an
+// opaque SBPL error. Fixup adds the equivalent guard.
+describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 parity)', () => {
+  const INNER = ['bash', '-c', 'echo hi'];
+
+  test('refuses when cwd === a hide_paths dir', () => {
+    expect(() =>
+      buildSandboxExecArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/.ssh',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).toThrow(/inside hide_paths dir/);
+  });
+
+  test('refuses when cwd is INSIDE a hide_paths dir', () => {
+    expect(() =>
+      buildSandboxExecArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/.ssh/audit',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).toThrow(/inside hide_paths dir/);
+  });
+
+  test('does NOT refuse for a sibling sharing a prefix with a hide_paths dir', () => {
+    // `.ssh-backup` is NOT inside `.ssh`; the `${hiddenAbs}/`
+    // suffix in the startsWith check protects against the
+    // prefix-collision false positive (parity with Linux).
+    expect(() =>
+      buildSandboxExecArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/.ssh-backup',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).not.toThrow();
+  });
+
+  test('does NOT refuse when cwd is outside all hide_paths dirs', () => {
+    expect(() =>
+      buildSandboxExecArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/work',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).not.toThrow();
+  });
+
+  test('host profile bypasses the guard (innerArgv passthrough)', () => {
+    // Host short-circuits BEFORE the hide_paths check. Operator
+    // who opted in via --sandbox-host accepts the cost.
+    const argv = buildSandboxExecArgv({
+      profile: 'host',
+      cwd: '/home/op/.ssh/audit',
+      home: '/home/op',
+      innerArgv: INNER,
+    });
+    expect(argv).toEqual(INNER);
+  });
+});

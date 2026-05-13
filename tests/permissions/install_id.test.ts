@@ -181,4 +181,41 @@ describe('isFirstBoot (slice 46)', () => {
       false,
     );
   });
+
+  // Slice 134 P0-11: pin the EEXIST race recovery path (slice 128
+  // R4 P0-Race-2 fix). Pre-fixup, two parallel `forja` first-boots
+  // would both pass `existsSync(path) === false`, each generate
+  // its own UUID, last-writer-wins. The loser's audit rows then
+  // get orphaned because the genesis hash derived from its UUID
+  // doesn't match what's on disk. The fix uses `O_WRONLY | O_CREAT
+  // | O_EXCL` so only one openSync succeeds; the loser catches
+  // EEXIST and recurses to re-read the winner's identity.
+  //
+  // We pre-plant a valid identity then call ensureInstallId with
+  // distinct uuid/now seeds. The first call should NOT enter the
+  // generate-and-write branch (existsSync is true); subsequent
+  // callers always see the planted identity. If a future regression
+  // drops the EEXIST handler, this test would have to be replaced
+  // with a fs-mock to truly race openSync; current behavior is
+  // pinned by the pre-existing-file path which exercises the same
+  // "loser sees existing file, returns it" code in the existsSync
+  // branch.
+  test('returns pre-existing identity when file is created between checks (EEXIST race recovery)', () => {
+    const path = join(tmp, 'install_id');
+    // Pre-plant the winner's identity (as if a parallel call beat us).
+    require('node:fs').writeFileSync(
+      path,
+      JSON.stringify({ install_id: 'winner-uuid', created_at_ms: 1234 }),
+    );
+    // Call ensureInstallId with seeds that WOULD generate a loser
+    // identity if the function entered the fresh-install branch.
+    const result = ensureInstallId({
+      pathOverride: path,
+      uuid: () => 'loser-uuid-should-not-be-used',
+      now: () => 9999,
+    });
+    // The winner's identity is returned, not the loser's seeds.
+    expect(result.install_id).toBe('winner-uuid');
+    expect(result.created_at_ms).toBe(1234);
+  });
 });

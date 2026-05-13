@@ -127,3 +127,35 @@ describe('sha256Hex / canonicalHash', () => {
     expect(canonicalHash({ a: 1, b: 2 })).toBe(canonicalHash({ b: 2, a: 1 }));
   });
 });
+
+// Slice 134 P0-3: pin determinism for special-shape inputs that
+// would silently diverge chain hashes if a future canonicalize
+// refactor "improved" their encoding. Each test here describes
+// a shape that REACHES canonicalize (not filtered upstream by
+// safeJsonParse / scrub).
+describe('canonicalize — surrogate pair determinism (slice 134 P0-3)', () => {
+  test('lone high surrogate is preserved verbatim in canonical output', () => {
+    // U+D800 is a lone high surrogate (not paired with U+DC00..U+DFFF).
+    // JSON.stringify emits it as the escape "\ud800". The chain
+    // hash depends on bit-stable output. A future canonicalize
+    // that normalizes lone surrogates to U+FFFD would silently
+    // invalidate every chain ever written.
+    expect(canonicalize('\uD800')).toBe('"\\ud800"');
+  });
+
+  test('lone low surrogate is preserved verbatim', () => {
+    expect(canonicalize('\uDFFF')).toBe('"\\udfff"');
+  });
+
+  test('paired surrogate (astral) round-trips as JSON.stringify default', () => {
+    // U+1F4A9 = surrogate pair U+D83D U+DCA9 — JSON.stringify
+    // emits the literal 4-byte UTF-8 (not escapes).
+    const astral = '💩';
+    expect(canonicalize(astral)).toBe(JSON.stringify(astral));
+  });
+
+  test('deterministic: same input → same output across calls', () => {
+    const input = '\uD800lone\uDFFFpair💩';
+    expect(canonicalize(input)).toBe(canonicalize(input));
+  });
+});

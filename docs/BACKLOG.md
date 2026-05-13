@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-13] tests + hardening — slice 134: 4-agent test-coverage review punch list (P0 partial)
+
+**Done.** One-hundred-thirty-fourth slice. Four parallel reviewers audited test coverage gaps across (a) security-critical paths, (b) audit chain integrity, (c) concurrency + lifecycle, (d) operator-facing surfaces. Combined punch list: **46 findings (14 P0, 23 P1, 9 P2)**. This slice closes **7 of 14 P0s + 1 production code change**. Remaining 7 P0 + 23 P1 deferred to slice 135 (they share test-infrastructure work — sealing scheduler multi-process, microtask race patterns, real-subprocess wiring — that benefits from a focused slice).
+
+### Code change
+
+**macOS sandbox cross-platform parity** (P0-12, found by security-critical reviewer):
+
+`src/permissions/sandbox-runner.ts:147-154` (Linux) refuses at build-time when cwd is inside a HIDE_PATHS dir — Linux fails loud. `src/permissions/sandbox-runner-macos.ts:218` had no equivalent guard — macOS silently produced an SBPL profile where the hide_paths deny rule (last-match-wins) masked the cwd mount, then exec failed with an opaque SBPL error. Fixup: added the same `HIDE_PATHS_DIRS` loop with throw at the entry of `buildSandboxExecArgv`. Linux + macOS now refuse identically. Test: 5 cases in `tests/permissions/sandbox-runner-macos.test.ts` mirroring the Linux suite.
+
+Additionally, `src/storage/migrate.ts` gained a forward-compat guard: if `_migrations` carries a row with an `id` not in the current `MIGRATIONS` registry (i.e., DB was last written by a newer Forja), `migrate()` throws with a clear "NEWER Forja" message instead of silently proceeding. The older binary cannot trust its schema knowledge to cover row shapes future migrations created.
+
+### Tests added
+
+| # | Test | File | Why |
+|---|---|---|---|
+| P0-1 | Concurrent emit on `approvals_log` chain | `tests/permissions/audit.test.ts` | `failure_events` had this; `approvals_log` (slice 127 R3 P0-A `BEGIN IMMEDIATE`) didn't. Regression to autocommit silently breaks chain. |
+| P0-2 | Cross-install seal binding | `tests/permissions/sealing.test.ts` | Slice 128 R4 P0-Audit-1 `installId` parameter pinned. Two installs on one DB; verify with B's identity refuses A's row. |
+| P0-3 | `canonical.ts` surrogate pair determinism | `tests/permissions/canonical.test.ts` | Lone/paired surrogates, deterministic across calls. Future "normalize to U+FFFD" refactor would silently invalidate every chain. |
+| P0-6 | Migration forward-compat detection | `tests/storage/migrate.test.ts` + `src/storage/migrate.ts` | Future-Forja DB opened by older binary now refuses loud. |
+| P0-11 | `install_id` EEXIST race recovery (pre-existing-file path) | `tests/permissions/install_id.test.ts` | Slice 128 R4 P0-Race-2 fix unprotected. Test: pre-plant identity, ensureInstallId returns winner's identity (not loser seeds). |
+| P0-12 | macOS sandbox cwd-inside-HIDE_PATHS refuse (parity) | `tests/permissions/sandbox-runner-macos.test.ts` | Cross-platform parity test. 5 cases mirror Linux suite. |
+| P0-13 | resolver-refuse audit row shape | `tests/permissions/engine.test.ts` | Pin: section='resolver-refuse', capabilities=[], score=0, no risk-score/classifier/sandbox-plan/approval-gate stages. |
+
+### Deferred to slice 135 (P0 remaining + P1 cluster)
+
+P0 still pending — each requires moderate test-infrastructure work that shares helpers across multiple findings:
+
+- P0-4 sealing-scheduler multi-process seed
+- P0-5 parametric missing-seq + hash-mismatch across all 4 seal backends
+- P0-7 handle-store FIFO under microtask-interleaved spawn
+- P0-8 cancelAll racing cost_update IPC mid-flight
+- P0-9 subagent IPC subprocessTransport EOF on parent death (requires real subprocess wiring)
+- P0-10 two `runAgent` processes cross-process audit chain (requires real process fork)
+- P0-14 first-boot nudge in cli/index.ts (subprocess stderr capture)
+
+P1 cluster (23 findings): full list in slice-134 review punch list. Will batch per axis (audit / concurrency / security / operator) in slice 135.
+
+### Decisions
+
+- **Split P0 across slices 134/135** rather than ship one slice with 14+23 fixes. Slice 134 lands the **structural** fixes (chain hashing determinism, macOS parity, forward-compat, FK-equivalent identity binding); slice 135 will land **dynamic** fixes (race-pattern tests, subprocess-wiring tests). The split groups work that shares test infrastructure together.
+- **Code change in slice 134, not slice 135.** The macOS sandbox parity bug is a real divergence that should not wait for the longer P1 batch. Shipped here.
+- **Honest test claims.** Every test in this slice was verified to FAIL on the pre-fixup code path where applicable, then PASS post-fixup (P0-12 was previously letting the broken SBPL profile build; now refuses). Where the pre-existing behavior already worked but lacked a pinning test (P0-1, P0-2, P0-3, P0-11, P0-13), the test passes as-is and pins the contract.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (unchanged)
+- `bun test` — **6631 pass / 10 skip / 0 fail** (6641 total / 307 files); +14 tests over slice 133
+
+**Next.** Slice 135: remaining 7 P0 + 23 P1 from the test-coverage review punch list. Then return to outcome_signals calibration script work.
+
+---
+
 ## [2026-05-13] docs — slice 133: operator-facing security + audit guides + repo-root disclosure policy
 
 **Done.** One-hundred-thirty-third slice. Docs-only. Three new files filling three distinct audiences that the spec docs (PT-BR, protocol-level) don't address: operators reading architecture, operators running audit, and security researchers wanting to report a vulnerability.

@@ -353,6 +353,42 @@ describe('listChainBreakAcceptedRows — §7.2 --accept-broken-chain visibility'
 // caller-supplied. Before this slice, an attacker-controlled tool
 // path could inject a ts arbitrarily far in the future, causing
 // time-based filters / rate-limits / quarantine windows to misfire.
+// Slice 134 P0-1: pin the concurrent emit invariant. Slice 127
+// R3 P0-A wrapped read-last + insert in BEGIN IMMEDIATE so
+// parallel emits to the SAME install_id serialize cleanly.
+// Pre-fixup the read + insert ran in autocommit; two callers
+// observing `last = X` would both compute `prev_hash =
+// X.this_hash` and one would lose the UNIQUE on `this_hash`.
+// `failure_events` ships an equivalent test (slice 130 fixup #2);
+// `approvals_log` had no regression net. This pins it.
+describe('createSqliteSink — slice 134 P0-1 concurrent emit', () => {
+  test('parallel emits to same install_id all persist with intact chain', async () => {
+    const { sink } = fresh();
+    const N = 10;
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        Promise.resolve().then(() => sink.emit(baseInput({ ts: 1000 + i }))),
+      ),
+    );
+    // Every emit returned a row.
+    expect(results.length).toBe(N);
+    // All seqs distinct (UNIQUE on seq via PK autoinc) — no race
+    // produced duplicate IDs.
+    const seqs = new Set(results.map((r) => r.seq));
+    expect(seqs.size).toBe(N);
+    // All this_hash distinct (UNIQUE constraint on the column).
+    const hashes = new Set(results.map((r) => r.this_hash));
+    expect(hashes.size).toBe(N);
+    // Chain verifies — every row's prev_hash links to the
+    // previous row's this_hash.
+    const verify = sink.verifyChain();
+    expect(verify.ok).toBe(true);
+    if (verify.ok) {
+      expect(verify.rows).toBe(N);
+    }
+  });
+});
+
 describe('createSqliteSink — slice 129 R5 ts validation', () => {
   test('refuses ts more than 1h ahead of wall clock', () => {
     const { sink } = fresh();

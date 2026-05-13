@@ -112,4 +112,22 @@ describe('migrate', () => {
     }
     db.close();
   });
+
+  // Slice 134 P0-6: forward-compat check. A DB written by a newer
+  // Forja (with a higher-id migration) must NOT be silently opened
+  // by an older binary — the older binary doesn't know the row
+  // shapes the newer migrations create.
+  test('refuses to open a DB with an unknown future migration id', async () => {
+    const db = openMemoryDb();
+    const { MIGRATIONS } = await import('../../src/storage/migrations/index.ts');
+    migrate(db, MIGRATIONS);
+    // Plant an extra row in _migrations pretending a newer
+    // migration (id=9999) ran on this DB. Re-run migrate — must
+    // refuse loud rather than silently proceed.
+    db.query(
+      'INSERT INTO _migrations (id, name, hash, applied_at) VALUES (?, ?, ?, ?)',
+    ).run(9999, '099-future-version', 'a'.repeat(64), Date.now());
+    expect(() => migrate(db, MIGRATIONS)).toThrow(/id=9999.*NEWER Forja/);
+    db.close();
+  });
 });

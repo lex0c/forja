@@ -222,6 +222,26 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   }
   if (profile === 'host') return innerArgv.slice();
 
+  // Slice 134 P0-12 (cross-platform parity with sandbox-runner.ts:147-154):
+  // SBPL evaluates rules top-to-bottom with last-match-wins. An operator
+  // running Forja from `~/.ssh/audit/` (or any cwd nested under a
+  // hide_paths root) would build a profile where
+  // `(allow file-write* (subpath cwd))` is followed by `(deny file-write*
+  // (subpath ~/.ssh))` — deny wins. The inner process receives a working
+  // dir that "vanishes" inside the sandbox, exec then fails with an
+  // opaque SBPL error rather than a clear build-time refuse. The Linux
+  // bwrap runner refuses here pre-slice 134; macOS silently produced
+  // the broken profile until this guard landed. Refuse at build time
+  // for parity.
+  for (const dir of HIDE_PATHS_DIRS) {
+    const hiddenAbs = joinPath(home, dir);
+    if (cwd === hiddenAbs || cwd.startsWith(`${hiddenAbs}/`)) {
+      throw new Error(
+        `buildSandboxExecArgv: cwd '${cwd}' is inside hide_paths dir '${hiddenAbs}'; the sandbox would mask the cwd mount. Move to a different working directory.`,
+      );
+    }
+  }
+
   const profileString = buildSbplProfile(profile, cwd, home);
   return ['sandbox-exec', '-p', profileString, ...innerArgv];
 };

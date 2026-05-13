@@ -1318,6 +1318,10 @@ describe('engine.check — audit emission', () => {
       section?: string;
       note?: string;
     }>;
+    // Slice 134 P0-13: surface capabilities + score for the
+    // resolver-refuse-shape assertion.
+    capabilities?: readonly string[];
+    score?: number;
   }
 
   const captureSink = (collected: CapturedEmit[]) => ({
@@ -1398,6 +1402,44 @@ describe('engine.check — audit emission', () => {
     eng.check('bash', 'bash', { command: 'pwd' });
     expect(collected[0]?.decision).toBe('allow');
     expect(collected[0]?.reason_chain[0]?.stage).toBe('session-allow');
+  });
+
+  // Slice 134 P0-13: pin the audit row shape on the resolver-
+  // refuse early-return path. The engine returns immediately
+  // after emitAudit with empty caps + score 0 + no risk-score /
+  // classifier / sandbox-plan stages. A regression that bleeds
+  // those stages into the refuse path would emit misleading
+  // scores into the audit chain, breaking replay determinism.
+  test('resolver-refuse audit row carries section + empty caps + score 0 + no downstream stages', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo*'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    // `command_substitution` is a RED_FLAG_NODE → resolver refuses.
+    eng.check('bash', 'bash', { command: 'echo $(cat /etc/passwd)' });
+    expect(collected.length).toBe(1);
+    const row = collected[0];
+    expect(row?.decision).toBe('deny');
+    // The section is the load-bearing attribution: refuse rows
+    // carry section='resolver-refuse' even though the stage maps
+    // to 'default-deny' in reasonChainFor (the source.rule is
+    // undefined, so the fallback branch picks default-deny).
+    expect(row?.reason_chain[0]?.section).toBe('resolver-refuse');
+    // No downstream stage names should appear — refuse short-
+    // circuits before risk-score / classifier / sandbox-plan /
+    // approval-gate run.
+    const stageNames = row?.reason_chain.map((s) => s.stage) ?? [];
+    expect(stageNames).not.toContain('risk-score');
+    expect(stageNames).not.toContain('classifier');
+    expect(stageNames).not.toContain('sandbox-plan');
+    expect(stageNames).not.toContain('approval-gate');
+    // Capabilities empty + score zero — refuse means no work
+    // analysis was performed.
+    expect(row?.capabilities).toEqual([]);
+    expect(row?.score).toBe(0);
   });
 
   test('policy_hash is stable across multiple checks (same engine)', () => {

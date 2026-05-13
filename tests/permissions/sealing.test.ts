@@ -370,6 +370,71 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
     if (v.ok) expect(v.entriesChecked).toBe(0);
   });
 
+  // Slice 134 P0-2: pin the cross-install forgery defense
+  // (slice 128 R4 P0-Audit-1). Pre-slice 128, `verifySealAgainstChain`
+  // called `getApprovalsLogBySeq(db, entry.seq)` without install_id
+  // filtering — an attacker with DB-write could insert a row for
+  // install B with a controlled hash, then edit the seal file for
+  // install A to reference that row → verify succeeds against
+  // install B's row, install A's actual chain unprotected.
+  // Slice 128 added the required install_id parameter; without a
+  // test pinning the refuse path, a refactor dropping the param
+  // ships green.
+  test('seal references row from different install_id → ok:false (cross-install forgery)', () => {
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    // Seed TWO installs on the same DB. Each sink chains
+    // independently under its own install_id.
+    const identityA = { install_id: 'install-a', created_at_ms: 1 };
+    const identityB = { install_id: 'install-b', created_at_ms: 2 };
+    const sinkA = createSqliteSink({ db, identity: identityA });
+    const sinkB = createSqliteSink({ db, identity: identityB });
+    const rowA = sinkA.emit({
+      session_id: 'sa',
+      tool_name: 'bash',
+      args: { x: 'a' },
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 100,
+    });
+    const rowB = sinkB.emit({
+      session_id: 'sb',
+      tool_name: 'bash',
+      args: { x: 'b' },
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 200,
+    });
+    // Seal references row from install B (a hostile seal store
+    // pointing at the wrong install's row).
+    const fs = makeFakeFs();
+    const sealer = createWormFileSealer({
+      path: join(tmpRoot, 'seal.log'),
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      ensureDir: fs.ensureDir,
+    });
+    sealer.append({ seq: rowB.seq, ts: 200, hash: rowB.this_hash });
+    // Verify with install A's identity — must refuse.
+    const v = verifySealAgainstChain(sealer, db, identityA.install_id);
+    expect(v.ok).toBe(false);
+    if (!v.ok) {
+      expect(v.firstMismatchAt).toBe(rowB.seq);
+      expect(v.reason).toMatch(/install_id|cross-install/);
+    }
+    // Sanity: verify with install B's identity passes for the
+    // same seal entry — the binding is identity-scoped, not
+    // global.
+    const vOk = verifySealAgainstChain(sealer, db, identityB.install_id);
+    expect(vOk.ok).toBe(true);
+    // Sanity: rowA exists but is not in the seal — irrelevant
+    // to this verify call.
+    void rowA;
+  });
+
   // Slice 129 (R5 P1): a hostile or corrupted seal backend can
   // surface two entries with the SAME seq. Pre-slice the
   // verifier reported OK when the duplicate's hash also matched
