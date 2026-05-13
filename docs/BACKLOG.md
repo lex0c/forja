@@ -2,6 +2,38 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] spec(permission-engine) — slice 141: 5 spec drift PRs batched
+
+**Done.** One-hundred-forty-first slice. Closes the **5 🟠 spec drift findings** from the slice 139 fresh review. All amendments in `docs/spec/PERMISSION_ENGINE.md`. Spec-only; no code touched.
+
+### Amendments
+
+| # | Section | Drift | Resolution |
+|---|---|---|---|
+| **M1** | §7.3.1 (new subsection) | SealStore contract (`append`/`list`/`close`), cross-install bind (slice 128), duplicate-seq replay defense (slice 129), scheduler seed (slice 128) were all in code but undocumented in spec. | Added §7.3.1 documenting the interface, wire format, and the 3 hardening properties. Cites slices 128/129/140 for traceability. |
+| **M2** | §2 (extended) | `state-machine.ts` throws on invalid transitions (e.g., `refusing → *`, `ready → init`); spec only described the canonical arrows. Operator reading spec could infer no-op semantics. | Appended slice 141 M2 note explaining throws-on-invalid as wiring-bug detector. Lists which transitions throw vs which are idempotent (degraded → degraded). |
+| **M3** | §5.2 (new subsection) | SSRF blocklist + bash HARD_REFUSE + RED_FLAG_NODES all curto-circuitam o pipeline ANTES das static rules; spec §5 only said resolvers "emit capabilities OR Refuse" without authorizing the pre-policy override. | Added "Resolver-level pre-policy refuses" subsection. Documents that resolver Refuse is engine-level trava that operator policy cannot unlock — separation operator vs platform. Lists the three classes (SSRF / HARD_REFUSE / RED_FLAG). |
+| **M4** | §15 (table row extended) | `audit.emit` refuses `ts > now + 1h` as forgery suspicion (slice 129 R5 P0). §15 only mentioned "abrupt jump > 1h = warning event"; the actual behavior is hard refuse. | Extended the Time-manipulation row to explicitly cite the audit-write-side refuse and the `now-1h..now+1h` valid window. |
+| **M5** | §6 (new §6.0) | `engine.ts` emits `reason_chain` entries with stage names not enumerated in spec: `resolver-refuse`, `engine-state`, `subagent-effective`, `grant-match`, `protected-path`, `session-allow`, `default-deny`, `engine-default`, `static-rule`. Spec §6 listed only the 6 pipeline stages. | New §6.0 "Reason chain taxonomy" table with 16 stage names, when each emits, `source.layer` populated, and notes. Documents the audit-consumer contract: stages are stable strings; new ones require engine version bump. |
+
+### Verification
+
+- `bun run typecheck` — clean (spec-only change; no TS surface affected)
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6851 pass / 10 skip / 0 fail** (unchanged from slice 140; spec-only slice)
+
+### Remaining from slice 139 review
+
+After slice 141 closes the 5 spec drift items:
+- 🟠 important: 6 left (2 correctness latent in `audit.ts`, 3 API surface refactor, + 1 unaccounted)
+- 🟡 minor: ~15 items
+
+Slice 142 will tackle the 2 correctness latent items (both in `audit.ts`):
+- `verifyChain` uses construction-time `genesisHash` but live rotation tip
+- `canonicalize(input.args)` throws on nested undefined
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 140: P1 security cluster (4 items)
 
 **Done.** One-hundred-fortieth slice. Closes the **4 🟠 important security findings** deferred from the slice 139 review: SBPL nested sandbox-exec, XDG_DATA_HOME unmask, git-anchored bare-repo advisory, IPv4-compatible IPv6 SSRF gap.

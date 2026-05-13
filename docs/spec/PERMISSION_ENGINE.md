@@ -84,6 +84,15 @@ A engine tem estados explícitos. Harness consulta `engine.state()` antes de qua
 
 Transição `ready ↔ degraded` é dinâmica (subsystem health). Transição pra `refusing` é **fatal e logada** — só sai com ação humana.
 
+**Slice 141 M2 — transição inválida lança (throws-on-invalid):** o controller de estado em `src/permissions/state-machine.ts` codifica um `VALID_TRANSITIONS` map. Tentar transitar fora dele lança `Error` síncrono. Pre-amend, leitor da spec podia inferir "transição inválida = no-op idempotente"; código sempre throw. Lança é load-bearing pra catch de wiring bug:
+
+- `loading-policy` → `loading-policy` lança (não há "re-load" implícito; reload de policy passa por `engine.reloadPolicy`, não por re-transição).
+- `refusing` → qualquer outra coisa lança (refusing é terminal por design).
+- `ready` → `init` / `validating-chain` lança (não há volta pelo state machine; restart do processo é o único caminho).
+- `degraded` → `degraded` é tolerado como no-op (idempotência intencional pra hot paths onde N classifier failures sucessivas não deveriam emitir N transition events; pin em test).
+
+Operadores que pegam o throw devem tratar como bug de boot/wiring, não como condição de runtime esperada. Sintoma típico: harness que tenta re-transitar pra `validating-chain` num resume — chamador wrong; resume não re-valida via state machine.
+
 ---
 
 ## 3. Modelo de recurso: capabilities
@@ -289,6 +298,18 @@ Conservative força `confirm` (score component +0.15 por unknown_command). User 
 | Process substitution `<(...)` com cmd dinâmico | low confidence |
 | Variable indirect (`${!var}`) | Refuse |
 
+#### Resolver-level pre-policy refuses (slice 141 M3)
+
+O contrato §5.1 do resolver é "emit capabilities OR Refuse". Por design, o resolver corre ANTES do estágio de static rules — Refuse no resolver curto-circuita o pipeline e ignora qualquer `allow` que o operador tenha colocado em `permissions.yaml`. Isso é proposital pra certos shapes onde nenhuma operator-policy razoável deveria autorizar:
+
+- **SSRF blocklist (slice 129 R5 P0)** em `fetch_url`: loopback, RFC1918, link-local (incluindo AWS/GCP metadata at 169.254.169.254), CGNAT, multicast, IPv6 loopback / link-local / unique-local, IPv4-mapped/-compatible IPv6 (slice 140 sec-4). Operator não pode `allow: 169.254.169.254` mesmo querendo — o resolver Refuse antes da policy entrar. Spec dependency: `SECURITY_GUIDELINE.md §9.1.6`.
+- **Bash hard-refuse commands**: `eval`, `exec`, `source`, `command`, `builtin`, `env <prog>` (slice 139 C1), `dd`, `fdisk`, etc. (lista canônica em `bash.ts:HARD_REFUSE_COMMANDS`). Operator não pode autorizar via `allow: "env *"` — o resolver Refuse antes.
+- **Bash RED_FLAG_NODES**: command substitution, process substitution, parameter expansion runtime, function definitions, etc. (lista em `bash.ts:RED_FLAG_NODES`). AST shapes que o resolver não consegue modelar staticamente.
+
+A semântica: resolver Refuse é uma **trava engine-level** que **operator policy não pode destravar**. A motivação é o threat model — esses shapes representam classes de comportamento que mesmo um operador "trusted" não deveria poder autorizar via policy YAML (separação operator vs platform). Diferente de `[[deny]]` em policy, que é override-able via layer mais alto: resolver Refuse é piso, policy é teto.
+
+Pre-amend, §5 falava genericamente de "Refuse" mas não documentava que Refuse vem ANTES das static rules. Slice 141 M3 amenda explicitamente.
+
 ### 5.3 Resolvers de MCP tools
 
 MCP tool declara seu resolver no manifest (JS function ou TOML pattern). Resolver MCP roda **em isolamento** (worker separado, sem acesso a engine state). Output validado contra schema antes de aceitar.
@@ -313,6 +334,35 @@ Cada resolver tem `version` no manifest. Mudança de versão = bump explícito +
 ```
 
 Falha em qualquer estágio → `deny`.
+
+### 6.0 Reason chain taxonomy (slice 141 M5)
+
+Cada decisão emite um `reason_chain: ReasonChainEntry[]` no audit row, onde cada entry tem `{ stage, layer?, rule?, section?, note? }`. O `stage` taxonomy canônica é:
+
+| Stage | Quando emite | Source de `source.layer` | Notas |
+|---|---|---|---|
+| `resolve` | Estágio 1 produziu capabilities Ok | resolver | Reason livre. Não emitido pra Refuse — esse usa `resolver-refuse`. |
+| `resolver-refuse` | Resolver retornou Refuse pré-policy | resolver | Curto-circuita pipeline (§5.2 M3). |
+| `static-rule` | Match em policy (`deny`/`allow`/`ask`) | enterprise / user / project / session | `rule` + `section` populados. |
+| `default-deny` | Nenhuma rule deu match, strict mode | engine | Fail-closed default. |
+| `engine-default` | Misc-category tool sem rule, bypass mode | engine | Auto-allow path. |
+| `risk-score` | Estágio 3 produziu score > 0 | engine | `note` carrega `score=0.NN`. |
+| `classifier` | Estágio 4 ajustou score | engine | `note` carrega `adjust=X.XX (<reason>)`. |
+| `classifier-unavailable` | Estágio 4 falhou (null / throw / invalid output) | engine | `note` carrega a causa. |
+| `sandbox-plan` | Estágio 5 escolheu profile | engine | `note` carrega `profile=<name>`. Emitido sempre que sandbox foi configurado. |
+| `sandbox-refused` | Estágio 5 retornou no_viable_sandbox | engine | `note` carrega `uncovered=[...]`. |
+| `approval-gate` | Estágio 6 forçou confirm (score ≥ threshold ou confidence=low) | engine | Diferenciador entre auto-allow e human-confirm. |
+| `engine-state` | State != ready interceptou a decisão | engine | `note` carrega `state=<degraded\|refusing\|...>`. |
+| `subagent-effective` | Capability fora do envelope do subagent (§10.1) | engine | `note` carrega capability `uncovered`. |
+| `grant-match` | Session-grant matched (§8) | session (sempre) | `rule` carrega o grant id (ULID). |
+| `protected-path` | Caller tocou protected path (§11) | engine | Override path: lista de paths escalada por classifier. |
+| `session-allow` | `addSessionAllow` runtime "yes, don't ask again" | session | `rule` é o pattern memorizado. |
+
+**Source attribution semantics:** `source.layer` indica qual policy layer escreveu a regra que firou (`enterprise`/`user`/`project`/`session`/`default`/`engine`); `source.rule` é o pattern string ou ULID do grant; `source.section` é a chave de §3.2 (ex: `bash`, `fs.read`, `fetch_url`, `grants`).
+
+**Audit consumer contract:** stages são strings estáveis. Adição de novos stages = bump de versão da engine (§16). Operadores escrevendo grep/jq queries contra `reason_chain` devem ler esta tabela como a lista canônica.
+
+Pre-amend, §6 listava apenas o pipeline em 6 fases sem documentar os stage names que o audit row carrega. Operadores liam fontes de `engine.ts` pra descobrir nomes. Slice 141 M5 canonicaliza.
 
 ### 6.1 Resolve
 
@@ -686,6 +736,32 @@ on_failure = "degrade"           # ou "refuse"
 ```
 
 Falha de sealing → state = `degraded` (default) ou `refusing` (strict). Sealing é **opcional**: deployment local-CLI pode rodar sem; deployment regulado **deve** habilitar.
+
+#### 7.3.1 SealStore contract (slice 141 M1)
+
+Cada um dos 4 backends acima implementa a interface `SealStore`:
+
+```ts
+interface SealStore {
+  append(entry: SealEntry): { ok: true } | { ok: false; reason: string };
+  list(): readonly SealEntry[];
+  close(): void;
+}
+
+interface SealEntry {
+  seq: number;     // FK pra approvals_log.seq
+  ts: number;     // wall-clock ms
+  hash: string;   // approvals_log.this_hash no momento do seal
+}
+```
+
+**Wire format compartilhado:** todos os backends que persistem em arquivo (worm-file, git-anchored, rfc3161-tsa, s3-object-lock — cada um materializa o seal entry em uma linha NDJSON-like) usam `seq=<n>\tts=<n>\thash=<H>\n`. `verifySealAgainstChain` reads via `store.list()` sem dispatch — a interface é o único seam entre cross-backend.
+
+**Cross-install seal binding (slice 128 R4 P0-Audit-1):** `verifySealAgainstChain(store, db, installId)` requer install_id no contrato — backend-agnostic. Reads `approvals_log` row by `seq`, refuses se `row.install_id !== installId`. Pre-fix, a função consultava sem filtro de install — atacante com DB-write podia inserir row pra install B com hash controlado + editar o seal file de install A pra apontar pra row de B → verify pra A succeedia contra row de B. Hoje a função pin a identity no boundary.
+
+**Duplicate-seq replay defense (slice 129 R5 P1):** o append path do SealStore é best-effort idempotent (writers de-dupe antes do flush) mas backend hostil ou corrompido (S3 versioned object replay, disk recovery merge, file editado manualmente) pode emitir duas entries com mesmo seq + hashes diferentes. Pre-fix, `verifySealAgainstChain` validava cada entry contra o row do DB independentemente — primeira entry batia, segunda batia também (DB rows são keyed por seq sozinho, mesma lookup retornava mesmo row). Hoje a função recusa entries duplicadas via `seenSeqs: Set<number>` durante o walk — replay-amplification attack closed.
+
+**Sealing scheduler seed (slice 128 R4 P0-Race-1):** `createSealingScheduler` lê `store.list()` no construtor e seeda `lastSealedSeq` com o max(entries[].seq). Pre-fix, dois processos forja concorrentes na mesma install ambos iniciavam com `lastSealedSeq = 0` e ambos appendavam `seq=N hash=H` ao mesmo seal file → duplicate entries. Seed do store.list() faz o segundo processo ver "já selei N" e noop. `store.list()` throwing (arquivo corrompido) cai pra fallback de 0 com aceitação do duplicate-on-first-tick risk; alternativa seria recusar construção e quebrar o pipeline inteiro por um seal file ruim — overcorrection.
 
 ### 7.4 Retenção
 
@@ -1132,7 +1208,7 @@ A engine é o gate. Comprometê-la é jogo perdido. Quem ataca a engine, e como 
 | **Engine bug (e.g., glob compiler com OOB)** | Conformance suite + fuzzing (§16.4); panic = state refusing |
 | **Race em concorrência** | Mutex de sessão; snapshot de policy por decisão; conformance test concurrency cases |
 | **Classifier model trocado** | classifier_hash gravado em audit; mismatch entre invocações = warning event |
-| **Time manipulation (clock fwd/back)** | TTL relative timestamps com monotonic clock onde possível; abrupt jump > 1h = warning event |
+| **Time manipulation (clock fwd/back)** | TTL relative timestamps com monotonic clock onde possível; abrupt jump > 1h = warning event. **Audit-write-side forgery defense (slice 129 R5 P0 / slice 141 M4):** `audit.emit` recusa `ts > now + 1h` como suspeita de forgery — atacante com tool path controlado poderia injetar ts arbitrariamente no futuro, fazendo TTL filters / rate-limits / quarantine windows misfirearem. Refuse no boundary é hard validation, não warning. `now-1h..now+1h` é a janela válida pra ts caller-supplied. |
 | **Resolver TOML / JS executado com privilégio** | Resolvers MCP em worker isolado; resolvers builtin são código compilado (não eval) |
 
 ### 14.2 Bootstrap
