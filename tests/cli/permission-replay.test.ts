@@ -135,6 +135,130 @@ describe('parseArgs — permission replay', () => {
       expect(r.args.permission?.withoutClassifier).toBe(true);
     }
   });
+
+  // Slice 135 P1 audit-2: full matrix of replay flag combinations.
+  // The three §17 replay modes are orthogonal — `--without-classifier`,
+  // `--against-current-policy`, `--against-archived-policy`. Any
+  // subset should parse + run together. The existing tests cover
+  // {classifier, current} parse and {current, archived} runner; this
+  // fills in the missing combinations (archived+classifier,
+  // all-three, and argument-order independence).
+  test('--against-archived-policy and --without-classifier compose', () => {
+    const r = parseArgs([
+      'permission',
+      'replay',
+      '42',
+      '--against-archived-policy',
+      '--without-classifier',
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.againstArchivedPolicy).toBe(true);
+      expect(r.args.permission?.withoutClassifier).toBe(true);
+      // Unused flag stays undefined — no cross-pollination.
+      expect(r.args.permission?.againstCurrentPolicy).toBeUndefined();
+    }
+  });
+
+  test('all three replay-mode flags compose', () => {
+    const r = parseArgs([
+      'permission',
+      'replay',
+      '42',
+      '--without-classifier',
+      '--against-current-policy',
+      '--against-archived-policy',
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.withoutClassifier).toBe(true);
+      expect(r.args.permission?.againstCurrentPolicy).toBe(true);
+      expect(r.args.permission?.againstArchivedPolicy).toBe(true);
+    }
+  });
+
+  test('flag ordering does not affect parse outcome', () => {
+    // Same flags, two different orders, identical result.
+    const order1 = parseArgs([
+      'permission',
+      'replay',
+      '42',
+      '--without-classifier',
+      '--against-current-policy',
+      '--against-archived-policy',
+    ]);
+    const order2 = parseArgs([
+      'permission',
+      'replay',
+      '42',
+      '--against-archived-policy',
+      '--against-current-policy',
+      '--without-classifier',
+    ]);
+    expect(order1.ok).toBe(true);
+    expect(order2.ok).toBe(true);
+    if (order1.ok && order2.ok) {
+      expect(order1.args.permission?.withoutClassifier).toBe(
+        order2.args.permission?.withoutClassifier,
+      );
+      expect(order1.args.permission?.againstCurrentPolicy).toBe(
+        order2.args.permission?.againstCurrentPolicy,
+      );
+      expect(order1.args.permission?.againstArchivedPolicy).toBe(
+        order2.args.permission?.againstArchivedPolicy,
+      );
+    }
+  });
+
+  test('--against-archived-policy rejected on verify verb', () => {
+    const r = parseArgs(['permission', 'verify', '--against-archived-policy']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain('--against-archived-policy only applies to');
+    }
+  });
+
+  test('flags can interleave with the seq positional after the verb', () => {
+    // Operator might write the seq anywhere after the verb;
+    // positional discovery scans through the post-verb argv. Each
+    // mode flag must still register regardless of where the seq
+    // lands. parseArgs returns `positionals: ['42']` — the seq
+    // proper is extracted by the runtime handler.
+    const r = parseArgs([
+      'permission',
+      'replay',
+      '--against-archived-policy',
+      '--without-classifier',
+      '42',
+      '--against-current-policy',
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.positionals).toEqual(['42']);
+      expect(r.args.permission?.withoutClassifier).toBe(true);
+      expect(r.args.permission?.againstCurrentPolicy).toBe(true);
+      expect(r.args.permission?.againstArchivedPolicy).toBe(true);
+    }
+  });
+
+  test('--json composes with all three replay-mode flags', () => {
+    const r = parseArgs([
+      'permission',
+      'replay',
+      '42',
+      '--json',
+      '--without-classifier',
+      '--against-current-policy',
+      '--against-archived-policy',
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.json).toBe(true);
+      expect(r.args.permission?.withoutClassifier).toBe(true);
+      expect(r.args.permission?.againstCurrentPolicy).toBe(true);
+      expect(r.args.permission?.againstArchivedPolicy).toBe(true);
+    }
+  });
 });
 
 describe('runPermissionReplay', () => {

@@ -389,6 +389,66 @@ describe('bg manager: kill', () => {
   test('throws on unknown id', async () => {
     expect(mgr.kill('nope')).rejects.toThrow(/not found/);
   });
+
+  // Slice 135 P1 conc-5: kill() concurrent with readOutput().
+  // The readOutput path: getBgProcess snapshot → fileSize →
+  // readWindow → cursor advance. If kill() lands BETWEEN the
+  // snapshot and the cursor advance, the row is finalized to
+  // status='killed' while the read still completes. The cursor
+  // advance writes through a `WHERE cursor_position < ?` guard
+  // (DB-level monotonicity), so racing writes can't roll the
+  // cursor backwards. This pins:
+  //   - readOutput completes without throwing (no race against
+  //     finalize);
+  //   - the row ends as status='killed';
+  //   - cursor advances monotonically;
+  //   - subsequent readOutput on the killed row still returns
+  //     the captured output.
+  test('kill() racing readOutput() leaves cursor monotonic + status killed (slice 135 P1 conc-5)', async () => {
+    // Process that streams enough output for the read to span
+    // the kill — `yes` is a flooding command, capped at 1s so
+    // the test doesn't hang if kill misfires.
+    const r = await mgr.spawn({ command: "yes 'streaming-payload-line' | head -n 5000" });
+    // Race: fire readOutput + kill in parallel.
+    const [readResult, killResult] = await Promise.all([
+      mgr.readOutput(r.id, { maxBytes: 10_000 }),
+      mgr.kill(r.id, { signal: 'SIGKILL' }),
+    ]);
+    // Both must resolve without throwing — no race against the
+    // finalize transaction.
+    expect(killResult.status).toBe('killed');
+    expect(typeof readResult.stdout).toBe('string');
+    expect(readResult.stdoutCursor).toBeGreaterThanOrEqual(0);
+    // Row finalized as killed (kill won the race or the SIGKILL
+    // landed before the kernel flushed the natural exit path).
+    const row = getBgProcess(db, r.id);
+    expect(row?.status).toBe('killed');
+    expect(row?.stdoutCursorPosition).toBeGreaterThanOrEqual(readResult.stdoutCursor);
+    // Follow-up read on the killed row still works — no crash on
+    // the missing live handle.
+    const after = await mgr.readOutput(r.id);
+    expect(after.status).toBe('killed');
+    expect(after.stdoutCursor).toBeGreaterThanOrEqual(row?.stdoutCursorPosition ?? 0);
+  });
+
+  test('kill() does not invalidate stdout reads issued before AND after the kill', async () => {
+    // Sequential rather than racing: read BEFORE kill, kill, then
+    // read AFTER. The "after" read must still find the file (logs
+    // aren't deleted on kill) and advance the cursor correctly.
+    // Use an unbounded `yes` to guarantee the process is alive
+    // when kill lands (head -n N would race the kill against
+    // natural exit).
+    const r = await mgr.spawn({ command: "yes 'persist-after-kill'" });
+    // Let some output land before killing.
+    await new Promise((res) => setTimeout(res, 50));
+    const before = await mgr.readOutput(r.id, { maxBytes: 2_000 });
+    expect(before.stdout.length).toBeGreaterThan(0);
+    await mgr.kill(r.id, { signal: 'SIGKILL' });
+    // Post-kill read: cursor advances, status reports killed.
+    const after = await mgr.readOutput(r.id);
+    expect(after.status).toBe('killed');
+    expect(after.stdoutCursor).toBeGreaterThanOrEqual(before.stdoutCursor);
+  });
 });
 
 describe('bg manager: maxRuntimeMs', () => {

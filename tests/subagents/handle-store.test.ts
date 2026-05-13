@@ -221,6 +221,131 @@ describe('SubagentHandleStore', () => {
     expect(out.kind).toBe('aborted');
   });
 
+  // Slice 135 P1 conc-3: task_await cancelled — exhaust the
+  // remaining await/cancel state matrix the basic case above
+  // doesn't cover. Pre-aborted signal, signal abort vs. settle
+  // race, repeat awaits after the cancelled one.
+  test('pre-aborted signal returns kind: aborted on the fast path', async () => {
+    const ctrl = new AbortController();
+    ctrl.abort(); // signal is aborted BEFORE awaitHandle is called
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        await sleep(200, signal);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'slow', prompt: 'p' }, { estimateCostUsd: 0 });
+    const out = await store.awaitHandle(h.id, { signal: ctrl.signal });
+    expect(out.kind).toBe('aborted');
+    // The spawn is still in flight — a subsequent await without
+    // the aborted signal recovers the actual result.
+    const out2 = await store.awaitHandle(h.id);
+    expect(out2.kind).toBe('done');
+  });
+
+  test('settled fast path beats both signal AND timeout', async () => {
+    // When status === 'settled' at the moment awaitHandle is
+    // called, the fast path returns kind:'done' BEFORE
+    // attaching the signal listener or arming the timer. Pin
+    // this: even with a pre-aborted signal AND a 1ms timeout
+    // (both would otherwise win), settled wins.
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+    const h = store.spawn({ name: 'fast', prompt: 'p' }, { estimateCostUsd: 0 });
+    // Wait for settle.
+    await store.awaitHandle(h.id);
+    // Now call again with pathological options — settled fast
+    // path runs first.
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const out = await store.awaitHandle(h.id, { timeoutMs: 1, signal: ctrl.signal });
+    expect(out.kind).toBe('done');
+  });
+
+  test('signal abort + settle racing: first-to-resolve wins', async () => {
+    // Window: awaitHandle attaches the abort listener AND the
+    // promise-settle .then in the same microtask. If both fire
+    // close together, the `settled` flag inside settle() resolves
+    // exactly one. We can't deterministically schedule the race,
+    // but we CAN assert that whichever resolves, the result is
+    // shape-correct (kind: 'aborted' OR kind: 'done', never both
+    // / never undefined).
+    const ctrl = new AbortController();
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+    const h = store.spawn({ name: 'race', prompt: 'p' }, { estimateCostUsd: 0 });
+    // Abort and settle race. Schedule both via setTimeout(0).
+    setTimeout(() => ctrl.abort(), 0);
+    const out = await store.awaitHandle(h.id, { signal: ctrl.signal });
+    expect(['aborted', 'done']).toContain(out.kind);
+  });
+
+  test('multiple concurrent awaits: one cancelled, others continue and see kind:done', async () => {
+    // Three awaits on the same handle. Only the second is wired
+    // to a signal that aborts. The first + third must STILL see
+    // kind:'done' once the spawn settles — per-await listeners
+    // are independent.
+    let releaseSpawn: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      releaseSpawn = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => {
+        await inFlight;
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'multi', prompt: 'p' }, { estimateCostUsd: 0 });
+    const ctrl = new AbortController();
+    const a1 = store.awaitHandle(h.id);
+    const a2 = store.awaitHandle(h.id, { signal: ctrl.signal });
+    const a3 = store.awaitHandle(h.id);
+    // Abort the middle waiter BEFORE the spawn resolves.
+    ctrl.abort();
+    const r2 = await a2;
+    expect(r2.kind).toBe('aborted');
+    // Now resolve the spawn. The other two awaits unblock with
+    // kind:'done' — they were never wired to the aborted signal.
+    releaseSpawn();
+    const r1 = await a1;
+    const r3 = await a3;
+    expect(r1.kind).toBe('done');
+    expect(r3.kind).toBe('done');
+  });
+
+  test('await on a handle cancelled via store.cancel: kind:done with cancelled envelope', async () => {
+    // task_cancel + task_await is the documented model flow:
+    //   1. spawn
+    //   2. cancel  (store.cancel)
+    //   3. await   (model wants to know what the cancellation produced)
+    // The await MUST settle with kind:'done' carrying an
+    // interrupted/cancelled envelope. Failure mode this catches:
+    // a regression where cancel + await + settle race and await
+    // returns kind:'aborted' (operator-signal semantics) instead
+    // of kind:'done' (the store-internal cancel completed).
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        await sleep(200, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'cancel-then-await', prompt: 'p' }, { estimateCostUsd: 0 });
+    store.cancel(h.id, 'model');
+    const out = await store.awaitHandle(h.id);
+    expect(out.kind).toBe('done');
+    if (out.kind === 'done' && out.result.kind === 'ran') {
+      // Cancel attribution stamped per slice 130 contract.
+      expect(out.result.cancelSource).toBe('model');
+    }
+  });
+
   test('drain cancels every running record and awaits settle', async () => {
     // Counter-based barrier: spawnFn increments on entry; the
     // test awaits the third entry before draining. Deterministic

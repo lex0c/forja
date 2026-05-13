@@ -1365,3 +1365,144 @@ describe('dispatchChain — shell unavailable short-circuits', () => {
     expect(result.blockedBy).toBeNull();
   });
 });
+
+// Slice 135 P1 conc-2: hook chain with non-zero exit at the
+// MIDDLE position. Existing tests cover (a) first-hook block,
+// (b) two-hook non-failClosed continues, (c) chain-timeout skips
+// remainder. The 3-hook chain with a block at position 2 is the
+// missing shape — it pins both "first hook ran ok" AND "third
+// hook never ran because middle blocked" + audit count.
+describe('dispatchChain — mid-chain non-zero exit (slice 135 P1 conc-2)', () => {
+  const PRE_TOOL_USE_PAYLOAD: HookEventPayload = {
+    schema: 'v1',
+    event: 'PreToolUse',
+    sessionId: 'sess-mid',
+    data: { tool: { name: 'bash', input: {} } },
+  } as HookEventPayload;
+
+  test('middle hook block_silent: first runs, middle blocks, third never runs', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      // h1=0 (pass), h2=1 (block_silent on blocking event), h3 must NOT spawn.
+      const exitCode = call === 1 ? 0 : call === 2 ? 1 : null;
+      return makeFakeSpawn({ exitCode: exitCode ?? 0 })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }),
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    // Exactly TWO runs landed: h1 (success), h2 (block_silent).
+    // h3 is never invoked — the dispatcher breaks the loop the
+    // moment a blocking decision lands.
+    expect(result.runs).toHaveLength(2);
+    expect(result.runs[0]?.spec.command).toBe('h1');
+    expect(result.runs[0]?.result.kind).toBe('allow');
+    expect(result.runs[1]?.spec.command).toBe('h2');
+    expect(result.runs[1]?.result.kind).toBe('block_silent');
+    expect(result.blockedBy?.spec.command).toBe('h2');
+    expect(result.blockedBy?.reason).toBe('silent');
+    // Spawn was invoked exactly 2 times (h1, h2). h3 never reached.
+    expect(call).toBe(2);
+  });
+
+  test('middle hook block_message: third hook still skipped, message threaded back', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      // h1=0 (pass), h2=2 with stdout (block_message), h3 must NOT spawn.
+      const spec: FakeSpec =
+        call === 1
+          ? { exitCode: 0 }
+          : call === 2
+            ? { exitCode: 2, stdout: 'denied by mid-chain policy' }
+            : { exitCode: 0 };
+      return makeFakeSpawn(spec)(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }),
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(2);
+    expect(result.blockedBy?.reason).toBe('message');
+    expect(result.blockedBy?.message).toBe('denied by mid-chain policy');
+    expect(call).toBe(2);
+  });
+
+  test('middle hook failClosed error: third hook skipped, message NOT leaked', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      // h1=0, h2=5 (error, failClosed). h3 never runs.
+      const exitCode = call === 1 ? 0 : 5;
+      return makeFakeSpawn({ exitCode })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2', failClosed: true }),
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(2);
+    expect(result.blockedBy?.spec.command).toBe('h2');
+    // failClosed → block_silent shape (NOT block_message); reason
+    // text never reaches the model per types.ts:198.
+    expect(result.blockedBy?.reason).toBe('silent');
+    expect(result.blockedBy?.message).toBeNull();
+    expect(call).toBe(2);
+  });
+
+  test('middle hook non-failClosed error: third hook STILL runs (no block from non-failClosed error)', async () => {
+    // Inverse: non-failClosed error in the middle should NOT halt
+    // the chain. h3 must still be invoked.
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      const exitCode = call === 2 ? 5 : 0;
+      return makeFakeSpawn({ exitCode })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }), // failClosed=false (default)
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(3);
+    expect(result.blockedBy).toBeNull();
+    expect(call).toBe(3);
+  });
+
+  test('non-blocking event: middle hook non-zero does NOT halt (drained chain)', async () => {
+    // PostToolUse is non-blocking — even an exit 1 doesn't stop
+    // the chain. All three hooks run to completion. This is the
+    // observability contract: every matching hook gets a chance
+    // to fire so audit captures the full picture.
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      const exitCode = call === 2 ? 1 : 0;
+      return makeFakeSpawn({ exitCode })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PostToolUse', command: 'h1' }),
+      makeSpec({ event: 'PostToolUse', command: 'h2' }),
+      makeSpec({ event: 'PostToolUse', command: 'h3' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PostToolUse',
+      sessionId: 'sess-non-blocking',
+      data: {
+        tool: { name: 'bash', input: {}, output: 'ok', failed: false },
+      },
+    } as HookEventPayload;
+    const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(3);
+    expect(result.blockedBy).toBeNull();
+    expect(call).toBe(3);
+  });
+});

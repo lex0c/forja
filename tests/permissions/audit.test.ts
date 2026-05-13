@@ -421,6 +421,157 @@ describe('createSqliteSink — slice 129 R5 ts validation', () => {
   });
 });
 
+// Slice 135 P1 audit-1: bootstrap cross-install collision. When
+// two distinct installs share the same DB (operator running two
+// independent Forja workspaces against the same SQLite file, or
+// a parent + child subprocess that synthesized a fresh identity
+// mid-flight), each install_id has its own chain. The chains MUST
+// stay independent:
+//   - install A's `verifyChain` only walks A's rows (install_id
+//     filter at `listApprovalsLogByInstall`);
+//   - install A's `verifyChain` is blind to B's tampering on B's
+//     rows;
+//   - cross-install grafting (an attacker plants a row claiming
+//     install_id=A but with a hash that fits B's chain) is caught
+//     by A's verify because the prev_hash chain wouldn't reconnect.
+describe('createSqliteSink — slice 135 P1 audit-1 cross-install isolation', () => {
+  const buildSharedDb = () => {
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    return db;
+  };
+
+  test('two installs on one DB produce independent chains', () => {
+    const db = buildSharedDb();
+    const idA: InstallIdentity = {
+      install_id: 'install-A-aaaa',
+      created_at_ms: 1731000000000,
+    };
+    const idB: InstallIdentity = {
+      install_id: 'install-B-bbbb',
+      created_at_ms: 1731000000000,
+    };
+    const sinkA = createSqliteSink({ db, identity: idA });
+    const sinkB = createSqliteSink({ db, identity: idB });
+    // Interleaved emits — each sink's `getLastApprovalsLogByInstall`
+    // is scoped to its own install_id so chains stay independent
+    // even though they share the DB file.
+    sinkA.emit(baseInput({ ts: 100, session_id: 'A-1' }));
+    sinkB.emit(baseInput({ ts: 200, session_id: 'B-1' }));
+    sinkA.emit(baseInput({ ts: 300, session_id: 'A-2' }));
+    sinkB.emit(baseInput({ ts: 400, session_id: 'B-2' }));
+
+    const verifyA = sinkA.verifyChain();
+    const verifyB = sinkB.verifyChain();
+    expect(verifyA.ok).toBe(true);
+    expect(verifyB.ok).toBe(true);
+    if (verifyA.ok) expect(verifyA.rows).toBe(2);
+    if (verifyB.ok) expect(verifyB.rows).toBe(2);
+
+    // listApprovalsLogByInstall returns each install's rows in
+    // isolation. A's rows know nothing about B's.
+    const rowsA = listApprovalsLogByInstall(db, idA.install_id);
+    const rowsB = listApprovalsLogByInstall(db, idB.install_id);
+    expect(rowsA.length).toBe(2);
+    expect(rowsB.length).toBe(2);
+    // Both chains start from their own genesis (different install
+    // ids → different genesis hashes).
+    expect(rowsA[0]?.prev_hash).toBe(computeGenesisHash(idA));
+    expect(rowsB[0]?.prev_hash).toBe(computeGenesisHash(idB));
+    expect(rowsA[0]?.prev_hash).not.toBe(rowsB[0]?.prev_hash);
+  });
+
+  test("tampering on install B does not invalidate install A's chain", () => {
+    const db = buildSharedDb();
+    const idA: InstallIdentity = {
+      install_id: 'install-A-aaaa',
+      created_at_ms: 1731000000000,
+    };
+    const idB: InstallIdentity = {
+      install_id: 'install-B-bbbb',
+      created_at_ms: 1731000000000,
+    };
+    const sinkA = createSqliteSink({ db, identity: idA });
+    const sinkB = createSqliteSink({ db, identity: idB });
+    sinkA.emit(baseInput({ ts: 1, session_id: 'a' }));
+    sinkA.emit(baseInput({ ts: 2, session_id: 'a' }));
+    sinkB.emit(baseInput({ ts: 3, session_id: 'b' }));
+    sinkB.emit(baseInput({ ts: 4, session_id: 'b' }));
+
+    // Tamper one of install B's rows. A's verify shouldn't notice.
+    db.run(
+      'UPDATE approvals_log SET prev_hash = ? WHERE install_id = ? AND seq = (SELECT MAX(seq) FROM approvals_log WHERE install_id = ?)',
+      ['forged-on-B', idB.install_id, idB.install_id],
+    );
+    expect(sinkA.verifyChain().ok).toBe(true);
+    expect(sinkB.verifyChain().ok).toBe(false);
+  });
+
+  test("cross-install graft (row with install_id=A but hash from B) caught by A's verify", () => {
+    const db = buildSharedDb();
+    const idA: InstallIdentity = {
+      install_id: 'install-A-aaaa',
+      created_at_ms: 1731000000000,
+    };
+    const idB: InstallIdentity = {
+      install_id: 'install-B-bbbb',
+      created_at_ms: 1731000000000,
+    };
+    const sinkA = createSqliteSink({ db, identity: idA });
+    const sinkB = createSqliteSink({ db, identity: idB });
+    sinkA.emit(baseInput({ ts: 1 }));
+    const bRow = sinkB.emit(baseInput({ ts: 2 }));
+
+    // Forge: take B's most-recent row and rewrite its install_id
+    // to A. A's chain head is at seq=1 (or similar). The grafted
+    // row's prev_hash was computed against B's genesis, so when
+    // A's verify walks past its own seq=1 (whose this_hash matches
+    // A's chain), the next row (now showing install_id=A) carries
+    // a prev_hash that doesn't link to A's seq=1.
+    db.run('UPDATE approvals_log SET install_id = ? WHERE this_hash = ?', [
+      idA.install_id,
+      bRow.this_hash,
+    ]);
+    const verifyA = sinkA.verifyChain();
+    expect(verifyA.ok).toBe(false);
+    if (!verifyA.ok) {
+      // The break is at the grafted row (whatever seq the graft
+      // ended up at when filtered by install_id=A). The reason is
+      // 'prev_hash_mismatch' — the grafted row's prev_hash points
+      // at B's genesis, not A's chain head.
+      expect(verifyA.reason).toBe('prev_hash_mismatch');
+    }
+  });
+
+  test('each install has its own genesis row (chain_meta isolation)', () => {
+    const db = buildSharedDb();
+    const idA: InstallIdentity = {
+      install_id: 'install-A-aaaa',
+      created_at_ms: 1731000000000,
+    };
+    const idB: InstallIdentity = {
+      install_id: 'install-B-bbbb',
+      created_at_ms: 1731000000099,
+    };
+    // Construction-time alone (no emits): verify both chains are
+    // clean and rotation_id starts at 0 for each.
+    const sinkA = createSqliteSink({ db, identity: idA });
+    const sinkB = createSqliteSink({ db, identity: idB });
+    const vA = sinkA.verifyChain();
+    const vB = sinkB.verifyChain();
+    expect(vA.ok).toBe(true);
+    expect(vB.ok).toBe(true);
+    if (vA.ok && vB.ok) {
+      expect(vA.rows).toBe(0);
+      expect(vB.rows).toBe(0);
+      expect(vA.current_rotation_id).toBe(0);
+      expect(vB.current_rotation_id).toBe(0);
+    }
+    // Genesis hashes differ because install_id + created_at_ms differ.
+    expect(computeGenesisHash(idA)).not.toBe(computeGenesisHash(idB));
+  });
+});
+
 // Slice 135 P0-10: cross-process audit chain coherence. The in-
 // process concurrent test (P0-1, above) covers `Promise.all` over
 // one DB connection inside one process — that pins the JS-side

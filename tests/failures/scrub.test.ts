@@ -104,6 +104,163 @@ describe('scrubFailurePayload', () => {
     expect(parsed.list[0]).toBe('__forja_cycle__');
   });
 
+  // Slice 135 P1 audit-5: multi-hop cycle scrub. The single-hop
+  // `a → a` test above proves the WeakSet recognizes a self-ref;
+  // a multi-hop cycle `a → b → c → a` is the more realistic shape
+  // — Error.cause chains, observable-pattern back-references, or
+  // a serializer-emitted ref-graph would all surface this way. The
+  // guard is per-descent (single WeakSet threaded through the
+  // entire walk), so the third-level visit MUST see `a` already
+  // present in the seen-set. A regression that re-instantiated the
+  // WeakSet per recurse-depth would only catch the trivial case.
+  test('multi-hop cycle a → b → c → a replaced with sentinel at the back-edge', () => {
+    const a: Record<string, unknown> = { id: 'a' };
+    const b: Record<string, unknown> = { id: 'b' };
+    const c: Record<string, unknown> = { id: 'c' };
+    a.next = b;
+    b.next = c;
+    c.next = a; // back-edge — third visit to `a`
+    const r = scrubFailurePayload(a);
+    expect(r.json).not.toBeNull();
+    const parsed = JSON.parse(r.json as string) as Record<string, unknown>;
+    // Walk: parsed.id='a'; parsed.next.id='b'; parsed.next.next.id='c';
+    // parsed.next.next.next === sentinel (back-edge to `a`).
+    expect(parsed.id).toBe('a');
+    const next1 = parsed.next as Record<string, unknown>;
+    expect(next1.id).toBe('b');
+    const next2 = next1.next as Record<string, unknown>;
+    expect(next2.id).toBe('c');
+    expect(next2.next).toBe('__forja_cycle__');
+  });
+
+  test('multi-hop cycle through arrays + objects mixed', () => {
+    // A cycle that bounces through an array node in the middle —
+    // exercises the array branch of the scrubber's seen-set check.
+    const root: Record<string, unknown> = { id: 'root' };
+    const inner: Record<string, unknown> = { id: 'inner' };
+    const list: unknown[] = [inner];
+    root.list = list;
+    inner.parent = root; // back-edge through inner
+    const r = scrubFailurePayload(root);
+    expect(r.json).not.toBeNull();
+    const parsed = JSON.parse(r.json as string) as {
+      id: string;
+      list: Array<{ id: string; parent: unknown }>;
+    };
+    expect(parsed.id).toBe('root');
+    expect(parsed.list[0]?.id).toBe('inner');
+    expect(parsed.list[0]?.parent).toBe('__forja_cycle__');
+  });
+
+  test('two disjoint cycles in the same payload both get scrubbed', () => {
+    // Two independent cycles in different subtrees. Both must
+    // terminate at the sentinel. A regression that exited the
+    // walk after the first sentinel would let the second cycle
+    // crash the stack.
+    const cyclesA: Record<string, unknown> = { tag: 'A' };
+    cyclesA.self = cyclesA;
+    const cyclesB: Record<string, unknown> = { tag: 'B' };
+    cyclesB.self = cyclesB;
+    const payload = { left: cyclesA, right: cyclesB };
+    const r = scrubFailurePayload(payload);
+    expect(r.json).not.toBeNull();
+    const parsed = JSON.parse(r.json as string) as {
+      left: { tag: string; self: unknown };
+      right: { tag: string; self: unknown };
+    };
+    expect(parsed.left.tag).toBe('A');
+    expect(parsed.left.self).toBe('__forja_cycle__');
+    expect(parsed.right.tag).toBe('B');
+    expect(parsed.right.self).toBe('__forja_cycle__');
+  });
+
+  test('non-cyclic shared reference (diamond) preserved across both branches', () => {
+    // The seen-set is per-descent — once we enter a node it gets
+    // added regardless of cycle vs. shared. With the current
+    // implementation, a SHARED but non-cyclic reference (`payload
+    // { a: shared, b: shared }`) collapses to sentinel on the
+    // second branch. This pins that behavior so a future
+    // "optimization" that allows shared-but-acyclic doesn't silently
+    // change the JSON shape consumers depend on.
+    //
+    // Operationally this is fine for audit: shared-references in
+    // payload objects are extremely rare (payload is usually
+    // built ad-hoc per emit site), and the sentinel preserves
+    // signal. Documenting the contract is the test's job.
+    const shared: Record<string, unknown> = { kind: 'shared' };
+    const payload = { a: shared, b: shared };
+    const r = scrubFailurePayload(payload);
+    expect(r.json).not.toBeNull();
+    const parsed = JSON.parse(r.json as string) as {
+      a: { kind: string };
+      b: unknown;
+    };
+    expect(parsed.a.kind).toBe('shared');
+    // Second branch sees `shared` already in seen → sentinel.
+    expect(parsed.b).toBe('__forja_cycle__');
+  });
+
+  test('proto-pollution at depth 5 is stripped (not just shallow nesting)', () => {
+    // Existing safe-json tests cover top-level + 1-3 nested levels.
+    // Make sure deep nesting doesn't accidentally bypass the
+    // recursion via an early-exit optimization.
+    const deep: Record<string, unknown> = {
+      l1: {
+        l2: {
+          l3: {
+            l4: {
+              l5: {
+                __proto__: { isAdmin: true },
+                real: 'value',
+              },
+              other: 'data',
+            },
+          },
+        },
+      },
+    };
+    const r = scrubFailurePayload(deep);
+    expect(r.json).not.toBeNull();
+    const parsed = JSON.parse(r.json as string);
+    // Walk down + assert __proto__ is gone, `real` preserved.
+    const l5 = (
+      (
+        (
+          ((parsed as Record<string, unknown>).l1 as Record<string, unknown>).l2 as Record<
+            string,
+            unknown
+          >
+        ).l3 as Record<string, unknown>
+      ).l4 as Record<string, unknown>
+    ).l5 as Record<string, unknown>;
+    expect(Object.hasOwn(l5, '__proto__')).toBe(false);
+    expect(l5.real).toBe('value');
+  });
+
+  test('proto-pollution inside an array element at any depth is stripped', () => {
+    // The proto-scrub walks arrays via the recursive branch; this
+    // pins that arrays of objects containing __proto__ at deep
+    // positions also get cleaned.
+    const payload = {
+      items: [
+        { ok: 1 },
+        {
+          nested: [{ ok: 2 }, { __proto__: { polluted: true }, ok: 3 }],
+        },
+      ],
+    };
+    const r = scrubFailurePayload(payload);
+    expect(r.json).not.toBeNull();
+    const parsed = JSON.parse(r.json as string) as {
+      items: Array<{ ok?: number; nested?: Array<Record<string, unknown>> }>;
+    };
+    const item1 = parsed.items[1];
+    const inner = item1?.nested?.[1];
+    if (inner === undefined) throw new Error('shape');
+    expect(Object.hasOwn(inner, '__proto__')).toBe(false);
+    expect(inner.ok).toBe(3);
+  });
+
   // Slice 130 fixup #5: BigInt is NOT JSON-serializable; the
   // catch around JSON.stringify must produce a `_scrub_failed`
   // marker row instead of letting the throw propagate to the

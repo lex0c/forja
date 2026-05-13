@@ -2,6 +2,63 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] tests — slice 136: P1 cluster (audit integrity + concurrency partial)
+
+**Done.** One-hundred-thirty-sixth slice. Tests only — closes the **P1 audit integrity cluster (5/5)** + **5 of 6 P1 concurrency findings** from the slice 134 4-agent test-coverage review. Each fixture exercises an existing production path; no source changes.
+
+### Tests added
+
+**P1 audit integrity (5/5):**
+
+| # | Test | File | Why |
+|---|---|---|---|
+| audit-1 | cross-install chain isolation | `tests/permissions/audit.test.ts` | Two installs on one DB → independent chains; tampering on B doesn't fail A's verify; graft attempt caught by A's prev_hash chain (4 tests). |
+| audit-2 | replay flag matrix | `tests/cli/permission-replay.test.ts` | All `--without-classifier` × `--against-current-policy` × `--against-archived-policy` combinations + `--json` interaction + flag/positional ordering (7 tests). |
+| audit-3 | computeOutcomeForApproval post-rotation | `tests/outcomes/aggregator.test.ts` | Rotation deletes from approvals_log but signals survive — confirms the denormalized install_id design holds; outcome sink refuses NEW signals against archived seqs; calibration batch preserves order across rotation boundary (5 tests). |
+| audit-4 | rotation + unsealed entries | `tests/permissions/sealing.test.ts` | Rotating without sealing first orphans seal entries — pin the observable "missing from approvals_log" diagnostic so operators see the contract; post-rotation fresh seal still works; mixed seal store fails at first orphan (3 tests). |
+| audit-5 | multi-hop cycle scrub | `tests/failures/scrub.test.ts` | Single-hop `a→a` cycle test covered shallow case; `a→b→c→a` cycle, cycle through arrays, two disjoint cycles, depth-5 proto-pollution, proto inside deep arrays (6 tests). |
+
+**P1 concurrency / lifecycle (5/6):**
+
+| # | Test | File | Why |
+|---|---|---|---|
+| conc-1 | `--undo` vs dirty tree | (no new test) | Already covered: `tests/checkpoints/git.test.ts` dirty-restore + `tests/cli/checkpoints.test.ts` undo-on-clean / undo-on-dirty / undo-on-unborn-HEAD. Documented in commit message. |
+| conc-2 | hook chain mid-chain non-zero | `tests/hooks/dispatcher.test.ts` | 3-hook chain with block at position 2 — pins "h1 ran, h2 blocked, h3 never spawned" for block_silent, block_message, failClosed-error. Plus inverse (non-failClosed continues) + non-blocking event (drained chain) (5 tests). |
+| conc-3 | task_await cancelled | `tests/subagents/handle-store.test.ts` | Pre-aborted signal fast path, settled fast path beats signal+timeout, signal-vs-settle race, concurrent awaits with one cancelled, task_cancel-then-await returns done with cancelSource (5 tests). |
+| conc-4 | soft-stop pre-step | `tests/harness/parallel.test.ts` | Mid-batch covered (D173); pre-step bail (provider never invoked, tools never executed) wasn't (1 test). |
+| conc-5 | bg kill vs readOutput | `tests/bg/manager.test.ts` | Concurrent `kill()` + `readOutput()` leaves cursor monotonic + status='killed'; sequential before/after-kill reads still find the log file (2 tests). |
+| conc-6 | resume after rotate-chain | (deferred) | Requires CLI subprocess test infra. Deferred to slice 137 alongside the security/operator clusters. |
+
+### Test scope summary
+
+- `tests/permissions/audit.test.ts`: +4 tests (30 total, was 26)
+- `tests/cli/permission-replay.test.ts`: +7 tests (51 total, was 44)
+- `tests/outcomes/aggregator.test.ts`: +5 tests (12 total, was 7)
+- `tests/permissions/sealing.test.ts`: +3 tests (46 total, was 43)
+- `tests/failures/scrub.test.ts`: +6 tests (20 total, was 14)
+- `tests/hooks/dispatcher.test.ts`: +5 tests (70 total, was 65)
+- `tests/subagents/handle-store.test.ts`: +5 tests (60 total, was 55)
+- `tests/harness/parallel.test.ts`: +1 test (16 total, was 15)
+- `tests/bg/manager.test.ts`: +2 tests (38 total, was 36)
+
+**Total: +38 tests across 9 files.**
+
+### Deferred to slice 137
+
+- conc-6 (resume after rotate-chain) — needs CLI subprocess wiring.
+- **P1 security-critical cluster (7 items)**: scrubEnv slice 128 vars, AST RED_FLAG_NODES, secret-access + net-egress refuse, trustedHosts engine-immune, classifier null degraded, symlink cwd integration, fetch_url protocol gate parametric.
+- **P1 operator-facing cluster (5 items)**: askHistoryClear, askMemoryAction, askTrust, --undo bogus session, confirmCritique severity.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (unchanged)
+- `bun test` — **6700 pass / 10 skip / 0 fail** (6710 total / 307 files); +37 tests over slice 135
+
+**Next.** Slice 137: conc-6 + P1 security-critical + P1 operator-facing (13 items total).
+
+---
+
 ## [2026-05-13] tests — slice 135: 4-agent test-coverage review punch list (P0 remaining)
 
 **Done.** One-hundred-thirty-fifth slice. Closes the **7 P0 findings deferred from slice 134**. Tests only — every fixture exercises an existing production code path; no source changes in this slice. The slice 134 commit shipped 7 P0s + 2 code changes (macOS sandbox parity + migrations forward-compat); this slice ships the remaining 7 P0s, which share test-infrastructure (real subprocesses, microtask race patterns, multi-process SQLite contention, sealing scheduler state).

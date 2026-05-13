@@ -935,3 +935,179 @@ describe('verifySealAgainstChain — parametric matrix across all 4 backends (sl
     });
   }
 });
+
+// Slice 135 P1 audit-4: rotation + unsealed entries. The rotate-chain
+// flow moves approvals_log rows into approvals_log_archived; the
+// seal store is NOT touched by rotation. If the scheduler hadn't
+// caught up to the chain tip before the operator rotated, the seal
+// entries now point at seqs that are no longer in approvals_log
+// — verifySealAgainstChain will fail with "missing from
+// approvals_log". This is the canonical "rotate without
+// sealing-first" gap; the test pins the observable failure mode
+// so an operator running `agent permission seal-verify` after a
+// rotation sees a clear diagnostic instead of a silent pass.
+describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 audit-4)', () => {
+  test('rotation orphans pre-rotation seal entries — verify reports missing seq', async () => {
+    const { rotateChain } = await import('../../src/storage/repos/chain-rotation.ts');
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'rot-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    // Emit 3 rows, seal the latest (seq=3) BEFORE rotation.
+    const rows: Array<{ seq: number; this_hash: string }> = [];
+    for (let i = 0; i < 3; i++) {
+      rows.push(
+        sink.emit({
+          session_id: `s${i}`,
+          tool_name: 'bash',
+          args: { i },
+          decision: 'allow',
+          policy_hash: 'sha256:p',
+          reason_chain: [],
+          ts: 100 + i,
+        }),
+      );
+    }
+    const fs = makeFakeFs();
+    const sealer = createWormFileSealer({
+      path: join(tmpRoot, 'seal.log'),
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      ensureDir: fs.ensureDir,
+    });
+    const seq3 = rows[2];
+    if (seq3 === undefined) throw new Error('setup');
+    sealer.append({ seq: seq3.seq, ts: 200, hash: seq3.this_hash });
+    // Pre-rotation: verify clean.
+    const before = verifySealAgainstChain(sealer, db, identity.install_id);
+    expect(before.ok).toBe(true);
+
+    // Operator rotates without first sealing the new tip. The
+    // existing seal entry still points at the pre-rotation seq=3,
+    // which is now in approvals_log_archived only.
+    rotateChain(db, {
+      install_id: identity.install_id,
+      reason: 'planned-rotation',
+      rotated_at_ms: 500,
+    });
+    const after = verifySealAgainstChain(sealer, db, identity.install_id);
+    expect(after.ok).toBe(false);
+    if (!after.ok) {
+      expect(after.firstMismatchAt).toBe(seq3.seq);
+      expect(after.reason).toContain('missing from approvals_log');
+    }
+  });
+
+  test('post-rotation: a freshly emitted + sealed row verifies cleanly (no cross-contamination)', async () => {
+    const { rotateChain } = await import('../../src/storage/repos/chain-rotation.ts');
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'rot-fresh-uuid',
+    });
+    const fs = makeFakeFs();
+    const sealer = createWormFileSealer({
+      path: join(tmpRoot, 'seal.log'),
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      ensureDir: fs.ensureDir,
+    });
+    // Pre-rotation chain (no seals yet).
+    const sinkPre = createSqliteSink({ db, identity });
+    sinkPre.emit({
+      session_id: 's-pre',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 100,
+    });
+    rotateChain(db, {
+      install_id: identity.install_id,
+      reason: 'r',
+      rotated_at_ms: 200,
+    });
+    // Post-rotation chain: emit + seal one row.
+    const sinkPost = createSqliteSink({ db, identity });
+    const post = sinkPost.emit({
+      session_id: 's-post',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 300,
+    });
+    sealer.append({ seq: post.seq, ts: 400, hash: post.this_hash });
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
+    expect(v.ok).toBe(true);
+    if (v.ok) expect(v.entriesChecked).toBe(1);
+  });
+
+  test('mixed seal store (some pre-rotation, some post-rotation) → verify fails at first orphan', async () => {
+    const { rotateChain } = await import('../../src/storage/repos/chain-rotation.ts');
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'rot-mixed-uuid',
+    });
+    const fs = makeFakeFs();
+    const sealer = createWormFileSealer({
+      path: join(tmpRoot, 'seal.log'),
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      ensureDir: fs.ensureDir,
+    });
+    // Pre-rotation: emit + seal.
+    const sinkPre = createSqliteSink({ db, identity });
+    const pre = sinkPre.emit({
+      session_id: 's-pre',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 100,
+    });
+    sealer.append({ seq: pre.seq, ts: 150, hash: pre.this_hash });
+    rotateChain(db, {
+      install_id: identity.install_id,
+      reason: 'r',
+      rotated_at_ms: 200,
+    });
+    // Post-rotation: emit + seal.
+    const sinkPost = createSqliteSink({ db, identity });
+    const post = sinkPost.emit({
+      session_id: 's-post',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 300,
+    });
+    sealer.append({ seq: post.seq, ts: 400, hash: post.this_hash });
+
+    // Seal store now has two entries: the pre-rotation seq (orphaned)
+    // and the post-rotation seq (valid). Verify walks in store order
+    // — fails at the FIRST orphan it hits.
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
+    expect(v.ok).toBe(false);
+    if (!v.ok) {
+      expect(v.firstMismatchAt).toBe(pre.seq);
+      expect(v.reason).toContain('missing from approvals_log');
+    }
+  });
+});
