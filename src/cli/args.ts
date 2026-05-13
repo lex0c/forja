@@ -303,6 +303,15 @@ export interface ParsedArgs {
     // Default `.agent/permissions.yaml` (project-local). Operators
     // pointing at a user-level or enterprise YAML pass --target.
     rollbackTarget?: string;
+    // `agent permission calibration-export --since-days <N>`
+    // (slice 138, §6.3.2 step 1). Time window in days; default
+    // 30. Must be > 0.
+    sinceDays?: number;
+    // `agent permission calibration-export --all-decisions`.
+    // Widens the decision filter to '*' (every approval_log row).
+    // Default keeps the spec's clean-label set
+    // (confirm-allowed + confirm-denied) per §6.3.2.1.
+    allDecisions?: boolean;
   };
 }
 
@@ -757,6 +766,8 @@ const KNOWN_PERMISSION_VERBS = [
   // §7.3 sealing CLI verbs (slice 58).
   'seal-now',
   'seal-verify',
+  // §6.3.2 step 1 calibration extractor (slice 138).
+  'calibration-export',
 ] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
@@ -786,6 +797,8 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   let allGrants = false;
   let rollbackWrite = false;
   let rollbackTarget: string | undefined;
+  let sinceDays: number | undefined;
+  let allDecisions = false;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -858,6 +871,22 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       i += 1;
       continue;
     }
+    if (token === '--since-days') {
+      const value = argv[i + 1];
+      if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
+        return {
+          ok: false,
+          message: 'agent permission calibration-export: --since-days requires a positive integer',
+        };
+      }
+      sinceDays = Number.parseInt(value, 10);
+      i += 1;
+      continue;
+    }
+    if (token === '--all-decisions') {
+      allDecisions = true;
+      continue;
+    }
     positionals.push(token);
   }
   if (allGrants && verb !== 'grants') {
@@ -888,6 +917,12 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     return {
       ok: false,
       message: `agent permission ${verb}: --against-archived-policy only applies to 'replay'`,
+    };
+  }
+  if ((sinceDays !== undefined || allDecisions) && verb !== 'calibration-export') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --since-days / --all-decisions only apply to 'calibration-export'`,
     };
   }
   if (clearQuarantine && verb !== 'inspect') {
@@ -1064,6 +1099,22 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       };
     }
   }
+  if (verb === 'calibration-export') {
+    // §6.3.2 step 1 — no positionals, only --since-days /
+    // --all-decisions / --json / --limit (limit defaults).
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: --reason only applies to revoke / rotate-chain`,
+      };
+    }
+  }
   return {
     ok: true,
     args: {
@@ -1087,6 +1138,8 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ...(allGrants ? { allGrants: true } : {}),
         ...(rollbackWrite ? { rollbackWrite: true } : {}),
         ...(rollbackTarget !== undefined ? { rollbackTarget } : {}),
+        ...(sinceDays !== undefined ? { sinceDays } : {}),
+        ...(allDecisions ? { allDecisions: true } : {}),
       },
     },
   };

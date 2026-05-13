@@ -209,6 +209,34 @@ describe('cli entrypoint: prompt requirement', () => {
     expect(stderr).toContain('/recap:');
   });
 
+  // Slice 138 regression net for `agent permission <verb>`. The
+  // entry's `promptOptional` list MUST include `args.permission`
+  // — every permission verb is DB-only with no prompt. Pre-slice
+  // 138 the gate fired BEFORE the dispatcher in run.ts could
+  // route the verb, so e.g. `agent permission verify --json`
+  // produced "--json requires a prompt" instead of the chain
+  // integrity report.
+  //
+  // All other permission-verb unit tests call their runners
+  // directly (runPermissionVerify / etc.), bypassing index.ts —
+  // a regression that drops `args.permission !== undefined` from
+  // the promptOptional list would slip through every existing
+  // assertion. This end-to-end test, spawned through the actual
+  // binary, is the canary for that gap.
+  test('`permission verify --json` does NOT require a prompt (slice 138 regression net)', async () => {
+    const { stderr } = await runCliWithRun(['permission', 'verify', '--json']);
+    expect(stderr).not.toContain('requires a prompt');
+    expect(stderr).not.toContain('TTY');
+  });
+
+  test('`permission calibration-export` does NOT require a prompt (slice 138)', async () => {
+    const { exitCode, stderr } = await runCliWithRun(['permission', 'calibration-export']);
+    expect(stderr).not.toContain('requires a prompt');
+    expect(stderr).not.toContain('TTY');
+    // The verb runs to completion on an empty DB (clean exit 0).
+    expect(exitCode).toBe(0);
+  });
+
   test('`recap` warns and falls back to stub when provider bootstrap fails', async () => {
     // Regression: pre-fix the dispatcher hardcoded a stub provider
     // (`constrained: false`), so `agent recap pr` could never

@@ -138,7 +138,14 @@ const main = async (): Promise<number> => {
     args.sandbox !== undefined ||
     // `agent welcome` (§13.5 slice 45) — first-boot walkthrough.
     // Composes doctor + sandbox setup; same lifecycle-mode shape.
-    args.welcome === true;
+    args.welcome === true ||
+    // `agent permission <verb>` (PERMISSION_ENGINE.md operator
+    // surface) — every verb is DB-only and one-shot; no prompt,
+    // no provider, no REPL. Pre-fixup the empty-prompt branch
+    // hit before the run.ts dispatcher could route the verb, so
+    // `agent permission verify --json` produced "--json requires
+    // a prompt" instead of the chain integrity report.
+    args.permission !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

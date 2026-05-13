@@ -353,6 +353,27 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'calibration-export') {
+        // §6.3.2 step 1 (slice 138). Reads approvals_log +
+        // outcome_signals for the current install over a configurable
+        // window (default 30d), produces coverage summary (text) or
+        // NDJSON triples (--json). Output consumed by offline
+        // calibration scripts; the in-process regression itself is a
+        // future slice.
+        const { runPermissionCalibrationExport } = await import('./permission-calibration.ts');
+        return await runPermissionCalibrationExport({
+          json: args.json,
+          ...(args.permission.sinceDays !== undefined
+            ? { sinceDays: args.permission.sinceDays }
+            : {}),
+          ...(args.permission.allDecisions === true ? { allDecisions: true } : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       // The arg parser already rejects unknown verbs; this branch
       // catches the impossible-but-safe case of a verb the dispatch
       // doesn't know how to route.

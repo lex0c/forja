@@ -422,6 +422,73 @@ A spec §6.3.2 plano define INPUT (triples) e MÉTODO (logistic regression) mas 
 - Sinais `tool_error` e `session_aborted` carregam ambiguidade não-causal alta (tool error por bug do código vs decision errada). Calibration sweep deve esperar `checkpoint_reverted` ser o sinal dominante; outros são complemento.
 - `confirm-allowed` seguido de `--undo` dentro do mesmo session é o caminho mais forte pra `outcome=harmful` com baixa false-positive rate.
 
+##### 6.3.2.2 Operator surface: `agent permission calibration-export` (slice 138)
+
+Materializa o §6.3.2 step 1 (coletar triples por 30d) como verb CLI DB-only — sem provider, sem sessão. Reads `approvals_log` + `outcome_signals` da install corrente.
+
+**CLI shape:**
+
+```
+agent permission calibration-export [--json] [--since-days N] [--all-decisions] [--limit N]
+```
+
+**Flags:**
+
+| Flag | Default | Semantics |
+|---|---|---|
+| `--json` | text mode | NDJSON-per-triple em stdout; coverage summary em stderr (pipes consomem stdout limpo) |
+| `--since-days N` | 30 | janela `[now - N*86400_000, now)` em `approvals_log.ts`. Inteiro positivo |
+| `--all-decisions` | off | widens decision filter para `'*'` (todas as decisões). Default mantém `['confirm-allowed','confirm-denied']` per §6.3.2.1 limitations |
+| `--limit N` | 100_000 | cap defensivo no result set; calibration sweeps típicos cabem |
+
+**Default text output (stdout):**
+
+```
+calibration export — install_id=<uuid>
+window: last 30 days
+triples: <N>
+  harmful : <H>
+  harmless: <M>
+  with at least one outcome_signal: <S>
+by decision:
+  confirm-allowed: <count>
+  confirm-denied: <count>
+
+note: <100 triples in window — calibration sweep recommended at ≥100+ rows.   ← opcional, fires quando total < 100
+```
+
+**`--json` NDJSON envelope (stdout):**
+
+Uma linha JSON por triple, achatada (sem o `OutcomeAggregate` aninhado):
+
+```json
+{
+  "approval_seq": <int>,
+  "ts": <ms>,
+  "tool_name": "<string>",
+  "decision": "<confirm-allowed|confirm-denied|...>",
+  "score": <float [0,1]>,
+  "score_components": { "<feature>": <float>, ... },
+  "outcome": "harmful" | "harmless",
+  "composite": <float [0,1]>,
+  "signal_kinds": ["checkpoint_reverted", ...]
+}
+```
+
+Coverage summary (mesmo texto do default mode) sai em stderr no `--json` mode — operator scripts que filtram stdout com `jq` veem só os triples; o sumário fica visível interativamente sem poluir o pipe.
+
+**Exit codes:** 0 (success — inclusive zero triples no window), 1 (install_id failure / DB error / --since-days invalid).
+
+**Install scope:** sempre filtrado pela install_id resolvida via `ensureInstallId`. Calibration cross-install num DB compartilhado é forbidden por construção — `extractCalibrationTriples` requer `installId` no contract, sem default.
+
+**Score components malformed:** se `approvals_log.score_components_json` está corrompido (storage rot, edição hostil), a linha não aborta o sweep — degrada a `{}` com stderr warn. O `score` row-level continua válido (coluna separada).
+
+**Out of scope (futuros slices):**
+- Step 2 (logistic regression) — offline tooling do operator (Python/R/etc.) consumindo o NDJSON. Não há regression in-process.
+- Step 3 (re-derive weights) → bump dos `DEFAULT_SIGNAL_WEIGHTS` em `src/outcomes/codes.ts` + nova baseline string (`outcome-baseline-v2.1`).
+- Step 4 (A/B test) precisa harness de side-by-side scoring.
+- Step 5 (engine version bump) amarra ao audit log marker.
+
 ### 6.4 Classifier (opcional, hint-only)
 
 Se habilitado e disponível, recebe:

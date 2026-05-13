@@ -28,6 +28,14 @@ export {
   type OutcomeLabel,
 } from './aggregator.ts';
 
+export {
+  extractCalibrationTriples,
+  summarizeCalibrationCoverage,
+  type CalibrationCoverage,
+  type CalibrationTriple,
+  type ExtractCalibrationTriplesOptions,
+} from './calibration.ts';
+
 // Re-export read primitives so callers depending on the public
 // barrel don't have to import from storage/repos directly.
 export {

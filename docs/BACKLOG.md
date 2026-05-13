@@ -2,6 +2,77 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] feat(outcomes) — slice 138: calibration extractor + CLI verb + spec §6.3.2.2
+
+**Done.** One-hundred-thirty-eighth slice. Materializes spec PERMISSION_ENGINE.md §6.3.2 step 1 — "Coletar telemetria por 30d em deployment piloto: `(score, decision_humano, outcome)` triples" — as a new module + CLI verb + canonical spec section. Closes the slice 134 "next" plan to return to calibration work.
+
+Spec PR + code in the same slice per CLAUDE.md root rule ("diverging from spec requires a PR against spec first"). The verb shape was draft-implemented; canonicalized via §6.3.2.2 below before commit.
+
+### What ships
+
+**Module** (`src/outcomes/calibration.ts`):
+
+- `extractCalibrationTriples(db, options)` joins `approvals_log` against `outcome_signals` and projects the shape calibration consumers (offline logistic regression, A/B sweeps) need:
+  - Required `installId` scope — calibration on a shared DB without it mixes populations and biases derived weights.
+  - Optional half-open time window `[sinceMs, untilMs)` on `approvals_log.ts`.
+  - Default decision filter `['confirm-allowed', 'confirm-denied']` per §6.3.2.1 limitations (clean human labels); `'*'` widens to every row.
+  - `limit` hard cap (default 100k). Returns `Array<CalibrationTriple>` with each row carrying the approval seq/ts/tool_name/decision/score/score_components plus the joined `OutcomeAggregate`.
+  - Defensive parse on `score_components_json` — malformed JSON or non-number values degrade silently to `{}` with a stderr warn, never aborting the sweep.
+- `summarizeCalibrationCoverage(db, options)` — same filter set, returns counts by outcome label + decision + signal coverage. Lets a CLI report low-coverage states ("<100 triples in window — calibration sweep recommended at ≥100+ rows") without dragging the full triple set across the boundary.
+
+**CLI verb** (`agent permission calibration-export`):
+
+- Flags: `--json` (NDJSON triples on stdout, summary on stderr), `--since-days N` (default 30 per spec), `--all-decisions` (widens to `'*'`).
+- Text mode: coverage summary on stdout — install_id, window, counts, by-decision, with-signal, sparse-window note.
+- JSON mode: NDJSON with one flattened triple per line (`{approval_seq, ts, tool_name, decision, score, score_components, outcome, composite, signal_kinds}`) on stdout; the same summary goes to stderr so pipes consuming stdout see only data.
+
+**Pre-existing bug fixed** (`src/cli/index.ts`):
+
+- The promptOptional check didn't list `args.permission !== undefined`, so EVERY permission verb (`verify`, `seal-now`, etc., now also `calibration-export`) hit the empty-prompt branch first. Through index.ts, `agent permission verify --json` produced "--json requires a prompt" instead of the chain integrity report. The dispatcher in run.ts was correct; the gate in index.ts had a missing condition. Added `args.permission !== undefined` to the list. The existing unit tests bypass index.ts (they call `runPermissionVerify` directly), which is why the gap survived to slice 138.
+
+### Tests added
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/outcomes/calibration.test.ts` | 22 | empty DB, install scope, decision filter (default/explicit/`'*'`), time window (sinceMs/untilMs half-open), outcome join (no signals → harmless, single/multi-signal), score_components (valid/empty/malformed JSON/non-number values), limit cap, coverage summary shape |
+| `tests/cli/permission-calibration.test.ts` | 18 | parse-side (verb + flags + scope guards + positional refusal), text output, NDJSON output (stdout/stderr split), window filter via `now` seam, `--all-decisions` widening, install isolation, error paths (install_id failure, malformed --since-days) |
+
+**Total: +40 tests across 2 new files.**
+
+### Files changed
+
+- Spec: `docs/spec/PERMISSION_ENGINE.md` — new §6.3.2.2 documenting the CLI surface (verb + 3 flags + text/NDJSON envelopes + exit codes + scope contract + score-components-malformed degradation + out-of-scope list for steps 2-5).
+- New: `src/outcomes/calibration.ts`, `src/cli/permission-calibration.ts`, `tests/outcomes/calibration.test.ts`, `tests/cli/permission-calibration.test.ts`
+- Wired: `src/cli/args.ts` (verb + flags), `src/cli/run.ts` (dispatch), `src/cli/index.ts` (promptOptional fix), `src/outcomes/index.ts` (barrel re-exports)
+- Regression net: `tests/cli/index.test.ts` (+2 e2e tests for the promptOptional fix — exercise the binary through `runCliWithRun`, so a future revert of `args.permission !== undefined` from the list trips immediately).
+
+### Review fixes folded in (pre-commit code review)
+
+A code-review pass before commit surfaced three actionable findings, all folded in:
+
+- **🟠 Perf** — `runPermissionCalibrationExport` was calling `summarizeCalibrationCoverage` AND `extractCalibrationTriples` back-to-back with identical filters. At the 100k retention ceiling that's ~200k SQL round-trips per CLI call. Fix: extract once, derive coverage from the in-memory result via a pure fold. The `summarizeCalibrationCoverage` module surface stays as-is for non-CLI callers.
+- **🟠 Test gap** — every permission-verb unit test bypasses index.ts by calling its runner directly, so a regression to the promptOptional list wouldn't be caught. Added two end-to-end regression tests in `tests/cli/index.test.ts` (`permission verify --json` + `permission calibration-export`) that spawn the real binary.
+- **🟠 Spec drift** — the CLI verb wasn't documented in spec. Added §6.3.2.2 as part of this slice (above).
+- **🟡 Test honesty** — install-scope test in `tests/outcomes/calibration.test.ts` was relying on row count alone for cross-install isolation. Pinned the contract tighter with sentinel ts values + a positive "MUST NOT appear" assertion.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (unchanged)
+- `bun test` — **6810 pass / 10 skip / 0 fail** (6820 total / 309 files); +42 tests over slice 137 (40 calibration + 2 e2e regression nets)
+- End-to-end smoke: `cd /tmp/forja-smoke && HOME=$PWD bun src/cli/index.ts permission calibration-export --since-days 7` prints the coverage summary; `--json` emits NDJSON on stdout + summary on stderr
+
+### What's next (§6.3.2 steps 2-5)
+
+- Step 2 (logistic regression) is offline-tooling work — operator's choice of Python / R / etc. consuming the NDJSON exported here. No in-process regression in scope for this slice.
+- Step 3 (re-derive weights) lands when calibration data is available; the `DEFAULT_SIGNAL_WEIGHTS` constants in `src/outcomes/codes.ts` are the swap point.
+- Step 4 (A/B test) needs a side-by-side scoring harness — a future slice.
+- Step 5 (engine version bump) ties to the `outcome-baseline-v2.0` audit string.
+
+The remaining 12 deferred items from the slice 134 review (3 P1 + 9 P2) stay pending until a focused review surfaces concerns.
+
+---
+
 ## [2026-05-13] tests — slice 137: P1 security + operator clusters (10/13)
 
 **Done.** One-hundred-thirty-seventh slice. Continues the slice 134 4-agent test-coverage review punch list. Closes the **P1 security-critical cluster (6/7)** + **P1 operator-facing cluster (4/5)**. Tests only — no production code changes.
