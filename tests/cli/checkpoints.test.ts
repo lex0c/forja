@@ -485,6 +485,47 @@ describe('runCheckpointsCli', () => {
       expect(code).toBe(1);
       expect(c.err.join('')).toContain('no checkpoints');
     });
+
+    // Slice 135 P1 ops-4: bogus session id (the session was never
+    // recorded in the DB). The cwd-mismatch test covers a real
+    // session in the wrong cwd; this covers a completely unknown
+    // id. Pre-fixup the surface could leak NULL through
+    // `getSession → null` into `ensureSessionForCwd → false` flow,
+    // exiting with code 1 but the stderr line had to be checked
+    // for clarity. Pin the message + code.
+    test('undo on unknown session id reports "not found" and exits 1', async () => {
+      await initRepoWithSeed(repo);
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'undo',
+        positionals: ['session-that-was-never-created'],
+        json: false,
+        yes: false,
+        cwd: repo,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      expect(c.err.join('')).toContain('session-that-was-never-created');
+      expect(c.err.join('')).toContain('not found');
+    });
+
+    test('undo on empty positional argv fails parse-like with code 1', async () => {
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'undo',
+        positionals: [],
+        json: false,
+        yes: false,
+        cwd: repo,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      expect(c.err.join('')).toContain('session');
+    });
   });
 
   describe('purge', () => {

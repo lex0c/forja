@@ -143,6 +143,72 @@ describe('fetch_url resolver', () => {
     expect(resolveCapabilities('fetch_url', { url: 'ftp://example.com' }, CTX).kind).toBe('refuse');
     expect(resolveCapabilities('fetch_url', { url: 'gopher://x' }, CTX).kind).toBe('refuse');
   });
+
+  // Slice 135 P1 sec-7: fetch_url protocol-gate parametric matrix.
+  // The resolver's `ALLOWED_PROTOCOLS` set permits only `http:`
+  // and `https:`. Every other scheme — file/ftp/ws/data/etc. —
+  // MUST refuse with a protocol-not-supported reason. The shallow
+  // test above covers 3 schemes inline; this matrix exhausts the
+  // realistic attack surface so a regression that widened the
+  // allowlist (e.g., adding `data:` for "convenience" or accepting
+  // `ws:` thinking it's safe) gets caught.
+  describe('protocol gate matrix (slice 135 P1 sec-7)', () => {
+    const refusedProtocols = [
+      // file:// — local FS read via fetch
+      'file:///etc/passwd',
+      'FILE:///etc/passwd', // case variant
+      // ftp / sftp / ftps — older transfer protocols
+      'ftp://example.com/data',
+      'sftp://example.com/data',
+      'ftps://example.com/data',
+      // gopher — historical, exploitable for SMTP/Redis smuggling
+      'gopher://x:70/',
+      // ws / wss — websocket upgrade not modeled by the http handler
+      'ws://example.com/',
+      'wss://example.com/',
+      // data: — would inline arbitrary content under fetch
+      'data:text/plain,inline',
+      // javascript: — script eval surface
+      'javascript:alert(1)',
+      // mailto: — protocol handler dispatch
+      'mailto:victim@example.com',
+      // about: / chrome: / chrome-extension: — browser internals
+      'about:blank',
+      'chrome://settings/',
+      // ssh:// — could be intercepted by libcurl's ssh handler
+      'ssh://user@example.com/',
+      // ldap / ldaps — LDAP injection surface
+      'ldap://example.com/',
+      'ldaps://example.com/',
+      // smb / cifs — Windows network share
+      'smb://example.com/share',
+      'cifs://example.com/share',
+      // telnet — old text protocol with credential leakage
+      'telnet://example.com:23/',
+      // dict — RFC2229, exploitable like gopher
+      'dict://example.com/',
+    ];
+    for (const url of refusedProtocols) {
+      test(`refuses ${url}`, () => {
+        const r = resolveCapabilities('fetch_url', { url }, CTX);
+        expect(r.kind).toBe('refuse');
+        if (r.kind === 'refuse') {
+          // Either the dedicated protocol-gate reason or the URL
+          // parser rejecting it earlier — both shapes satisfy
+          // the contract "this URL never reaches the network".
+          expect(r.reason).toMatch(/protocol|fetch_url|invalid|unsupported/i);
+        }
+      });
+    }
+
+    // Inverse: http(s) variants ALL allow (case-insensitive scheme).
+    test('http and HTTPS (uppercase) both allow', () => {
+      const lower = resolveCapabilities('fetch_url', { url: 'http://example.com/' }, CTX);
+      expect(lower.kind).toBe('ok');
+      const upper = resolveCapabilities('fetch_url', { url: 'HTTPS://example.com/' }, CTX);
+      expect(upper.kind).toBe('ok');
+    });
+  });
   test('malformed URL refuses', () => {
     expect(resolveCapabilities('fetch_url', { url: 'not a url' }, CTX).kind).toBe('refuse');
   });
@@ -382,6 +448,102 @@ describe('bash resolver — adversarial shapes are Refused (slice 6: whitelist +
     const r = resolveCapabilities('bash', { command: 'cmd1; cmd2' }, CTX);
     expect(r.kind).toBe('refuse');
   });
+});
+
+// Slice 135 P1 sec-2: RED_FLAG_NODES parametric coverage. The bash
+// resolver's RED_FLAG_NODES map (22 entries in bash.ts) is the
+// adversarial-shape blacklist — every node type here triggers a
+// refuse with a stable reason. The shallow tests above cover
+// command_substitution / process_substitution / parameter
+// expansion. This block pins the remaining shapes so a regression
+// that shrinks the map silently lets one through.
+describe('bash resolver — RED_FLAG_NODES exhaustive (slice 135 P1 sec-2)', () => {
+  const cases: Array<{ name: string; cmd: string; reasonContains: string }> = [
+    {
+      name: 'simple_expansion ($var) is Refused',
+      cmd: 'ls $HOME',
+      reasonContains: 'variable_expansion',
+    },
+    {
+      name: 'arithmetic_expansion ($((...))) is Refused',
+      cmd: 'echo $((1 + 2))',
+      reasonContains: 'arithmetic_expansion',
+    },
+    {
+      name: 'function_definition is Refused',
+      cmd: 'foo() { ls; }',
+      reasonContains: 'function_definition',
+    },
+    {
+      name: 'variable_assignment prefix is Refused',
+      cmd: 'PATH=/tmp ls',
+      reasonContains: 'variable_assignment',
+    },
+    {
+      name: "ansi_c_string ($'...') is Refused",
+      cmd: "echo $'\\x41'",
+      reasonContains: 'ansi_c_string',
+    },
+    {
+      name: 'heredoc_redirect (<<DELIM) is Refused',
+      cmd: 'cat <<EOF\nbody\nEOF',
+      reasonContains: 'heredoc_redirect',
+    },
+    {
+      name: 'herestring_redirect (<<<) is Refused',
+      cmd: 'cat <<< "data"',
+      reasonContains: 'herestring_redirect',
+    },
+    {
+      name: 'if_statement is Refused',
+      cmd: 'if true; then ls; fi',
+      reasonContains: 'if_statement',
+    },
+    {
+      name: 'while_statement is Refused',
+      cmd: 'while true; do ls; done',
+      reasonContains: 'while_statement',
+    },
+    {
+      name: 'for_statement is Refused',
+      cmd: 'for i in a b; do echo $i; done',
+      reasonContains: 'for_statement',
+    },
+    {
+      name: 'case_statement is Refused',
+      cmd: 'case $x in a) ls;; esac',
+      reasonContains: 'case_statement',
+    },
+    {
+      name: 'subshell ((cmd)) is Refused',
+      cmd: '(ls)',
+      reasonContains: 'subshell',
+    },
+    {
+      name: 'compound_statement ({cmd;}) is Refused',
+      cmd: '{ ls; pwd; }',
+      reasonContains: 'compound_statement',
+    },
+    {
+      name: 'negated_command (!cmd) is Refused',
+      cmd: '! ls',
+      reasonContains: 'negated_command',
+    },
+    {
+      name: 'test_command ([[ ]]) is Refused',
+      cmd: '[[ -e /tmp ]]',
+      reasonContains: 'test_command',
+    },
+  ];
+  for (const c of cases) {
+    test(c.name, () => {
+      const r = resolveCapabilities('bash', { command: c.cmd }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') {
+        expect(r.reason).toContain(c.reasonContains);
+      }
+    });
+  }
 });
 
 describe('bash resolver — well-known compound shapes resolve to Ok', () => {

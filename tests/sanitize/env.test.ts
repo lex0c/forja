@@ -82,6 +82,65 @@ describe('scrubEnv', () => {
     expect(out).not.toBe(env);
   });
 
+  // Slice 135 P1 sec-1: slice 128 R4 P1 added 7 credential-/
+  // session-bearing env vars that don't match the standard
+  // suffix patterns. Pin each one so a future regression that
+  // shortens the SCRUB_PATTERNS list (or refactors to a single
+  // mega-regex) doesn't silently let one through.
+  describe('slice 128 R4 P1 — credential/session vars without standard suffix', () => {
+    test('drops SSH_AUTH_SOCK (ssh-agent socket path)', () => {
+      const out = scrubEnv({ SSH_AUTH_SOCK: '/tmp/ssh-XXX/agent.123', KEEP: 'v' });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops GPG_AGENT_INFO and GNUPGHOME', () => {
+      const out = scrubEnv({
+        GPG_AGENT_INFO: '/run/user/1000/gnupg/S.gpg-agent:0:1',
+        GNUPGHOME: '/home/me/.gnupg-evil',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops KUBECONFIG (k8s credential file path)', () => {
+      const out = scrubEnv({ KUBECONFIG: '/home/me/.kube/config', KEEP: 'v' });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops DOCKER_AUTH_CONFIG (base64 registry creds)', () => {
+      const out = scrubEnv({ DOCKER_AUTH_CONFIG: 'base64-blob', KEEP: 'v' });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops OP_SESSION_* (1Password CLI per-account sessions)', () => {
+      const out = scrubEnv({
+        OP_SESSION_account_a: 'session-token-a',
+        OP_SESSION_account_b: 'session-token-b',
+        OP_session_lower: 'lower-case',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops CLOUDSDK_* (gcloud config + auth tokens)', () => {
+      const out = scrubEnv({
+        CLOUDSDK_AUTH_ACCESS_TOKEN: 'tok',
+        CLOUDSDK_CORE_PROJECT: 'prj',
+        cloudsdk_lower_case: 'still-dropped',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('all slice-128 vars together: every one stripped, KEEP survives', () => {
+      const out = scrubEnv({
+        SSH_AUTH_SOCK: 'a',
+        GPG_AGENT_INFO: 'b',
+        GNUPGHOME: 'c',
+        KUBECONFIG: 'd',
+        DOCKER_AUTH_CONFIG: 'e',
+        OP_SESSION_x: 'f',
+        CLOUDSDK_y: 'g',
+        KEEP: 'survive',
+      });
+      expect(out).toEqual({ KEEP: 'survive' });
+    });
+  });
+
   // Slice 129 (R5 P0-3): GIT_CONFIG_* env vars bypass the slice 128
   // `-c` argv refuse path. Confirm every git-config-via-env shape
   // is scrubbed.

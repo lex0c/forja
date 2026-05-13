@@ -1730,6 +1730,71 @@ describe('engine — risk score in audit row (§6.3 integration)', () => {
     expect(collected[1]?.score_components?.untrusted_egress).toBeGreaterThan(0);
   });
 
+  // Slice 135 P1 sec-4: trustedHosts is "engine-immune" — it only
+  // affects the `untrusted_egress` risk feature (score side), NOT
+  // the decision (allow/deny/confirm). A policy that denies a tool
+  // call to a host MUST keep denying it even when the host is in
+  // trustedHosts; trustedHosts can't unilaterally promote a denial
+  // to an allow. Symmetric: a policy that allows a call doesn't
+  // get re-denied by trustedHosts being empty.
+  test('trustedHosts cannot escalate a policy-denied call to allow', () => {
+    const collected: CapturedEmit[] = [];
+    // Strict default-deny with NO bash allow rule: every call to
+    // bash denies regardless of target host.
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: {} } }),
+      {
+        cwd: PROJ,
+        home: HOME,
+        audit: captureSink(collected),
+        // Add the target host to trustedHosts. Should not promote
+        // the denial.
+        trustedHosts: ['internal.corp', 'github.com'],
+      },
+    );
+    const r = eng.check('bash', 'bash', { command: 'curl https://github.com/repo' });
+    expect(r.kind).not.toBe('allow');
+    // Trusted host means no untrusted_egress score component, but
+    // the decision is still denial-rooted.
+    expect(collected[0]?.score_components?.untrusted_egress).toBeUndefined();
+  });
+
+  test('empty trustedHosts cannot demote a policy-allowed call', () => {
+    // Inverse: even with `trustedHosts: []`, a policy allow stays
+    // allowed. trustedHosts only feeds the score; the score can
+    // upgrade allow→confirm via the threshold, but it CAN'T turn
+    // an allow into a deny.
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['curl *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      trustedHosts: [], // nothing trusted
+    });
+    const r = eng.check('bash', 'bash', { command: 'curl https://example.com/data' });
+    // Could be allow OR confirm (score may upgrade via threshold).
+    // Critical contract: NOT deny — empty trustedHosts doesn't add
+    // a deny-vector.
+    expect(['allow', 'confirm']).toContain(r.kind);
+  });
+
+  test('default trustedHosts (github.com etc.) does not change a deny', () => {
+    // Sanity check on the default list: even with the bundled
+    // trusted hosts, a denial stays a denial.
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { deny: ['curl *'] } } }),
+      {
+        cwd: PROJ,
+        home: HOME,
+        audit: captureSink(collected),
+        // No explicit trustedHosts — uses default.
+      },
+    );
+    const r = eng.check('bash', 'bash', { command: 'curl https://github.com/repo' });
+    expect(r.kind).toBe('deny');
+  });
+
   test('reason chain gets a risk-score entry when score > 0', () => {
     const collected: CapturedEmit[] = [];
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
@@ -1926,6 +1991,62 @@ describe('engine — classifier hint (§6.4 integration)', () => {
     expect(eng.state()).toBe('ready');
     eng.check('bash', 'bash', { command: 'ls -la' });
     expect(eng.state()).toBe('degraded');
+  });
+
+  // Slice 135 P1 sec-5: classifier null degraded — strict mode
+  // degrade path covers the THREE failure shapes uniformly.
+  // The "returns null" case is pinned above; THROWS and MALFORMED
+  // share the same code path (`validated === null`) but route
+  // through distinct telemetry reasons (`threw`, `invalid` vs
+  // `unavailable`) so a regression that special-cased one path
+  // could silently leave the others non-degrading.
+  test('strict mode: classifier THROWS also degrades engine', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => {
+        throw new Error('inference timeout');
+      },
+      classifierRequired: true,
+    });
+    expect(eng.state()).toBe('ready');
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(eng.state()).toBe('degraded');
+  });
+
+  test('strict mode: classifier MALFORMED output also degrades engine', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      // biome-ignore lint/suspicious/noExplicitAny: deliberately wrong shape
+      classifier: () => ({ wrong_field: 0.1 }) as any,
+      classifierRequired: true,
+    });
+    expect(eng.state()).toBe('ready');
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(eng.state()).toBe('degraded');
+  });
+
+  test('strict mode: classifier success keeps engine ready', () => {
+    // Inverse check — a healthy classifier in strict mode does
+    // not artificially degrade. Pin so a future regression that
+    // misreads "classifierRequired" as "auto-degrade-on-strict"
+    // doesn't pass.
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => ({ score_adjust: 0.05, reason: 'looks ok' }),
+      classifierRequired: true,
+    });
+    expect(eng.state()).toBe('ready');
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(eng.state()).toBe('ready');
   });
 
   test('no classifier wired → classifier_hash="none", classifier_adjust=null', () => {

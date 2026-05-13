@@ -55,6 +55,48 @@ describe('selectSandboxProfile — basic coverage', () => {
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') expect(r.profile).toBe('home-rw');
   });
+
+  // Slice 135 P1 sec-3: secret-access + net-egress combo is the
+  // canonical refusal-without-host scenario. home-rw covers
+  // secrets but NOT net-egress; cwd-rw-net covers net but not
+  // secrets. The ONLY profile that covers both is `host`, and
+  // host requires the operator flag + host-passthrough capability.
+  // Without those gates, the combination refuses.
+  test('secret-access + net-egress without host flag → refuse (no profile covers both)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('secret-access:gpg', 'net-egress:api.example.com'),
+      hostExplicitlyAllowed: false,
+    });
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toBe('no_viable_sandbox');
+      // Whichever cap the chosen-candidate-set fails to cover lands
+      // in `uncovered`. Both are plausible depending on the
+      // candidate-walk order; assert one of them appears.
+      const u = r.uncovered;
+      expect(u.includes('secret-access') || u.includes('net-egress')).toBe(true);
+    }
+  });
+
+  test('secret-access + net-egress WITH host flag but NO host-passthrough still refuses', () => {
+    // host needs BOTH the flag AND the capability per §6.5. The
+    // combo only escalates to host when the resolver added
+    // `host-passthrough` to the capability set.
+    const r = selectSandboxProfile({
+      capabilities: caps('secret-access:gpg', 'net-egress:api.example.com'),
+      hostExplicitlyAllowed: true,
+    });
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('secret-access + net-egress + host-passthrough + flag → host', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('secret-access:gpg', 'net-egress:api.example.com', 'host-passthrough'),
+      hostExplicitlyAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('host');
+  });
 });
 
 describe('selectSandboxProfile — host gates (§6.5)', () => {

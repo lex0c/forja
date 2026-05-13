@@ -938,6 +938,136 @@ describe('askMemoryUserScope (memory:user-scope:ask producer, spec §7.2.5)', ()
   });
 });
 
+// Slice 135 P1 ops-1/2/3: direct modal-manager coverage for the
+// three confirm flavors that have a CLI/REPL caller but no
+// modal-manager-level test. The producer-side tests
+// (tests/cli/slash/history.test.ts etc.) stub the manager out, so
+// the manager's own event-shape + option-table + answer-resolution
+// behavior was unpinned. Pin the event payload + hotkey mappings
+// + default selection so a regression to the option table or
+// answer-value mapping gets caught at the modal-manager unit
+// boundary.
+describe('askHistoryClear (history-clear:ask producer, spec HISTORY.md §2.3) — slice 135 P1 ops-1', () => {
+  test('emits history-clear:ask with entryCount + projectRoot', () => {
+    const s = make();
+    s.manager.askHistoryClear({ entryCount: 42, projectRoot: '/proj' });
+    const ask = s.events.find((e) => e.type === 'history-clear:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'history-clear:ask') throw new Error('wrong event type');
+    expect(ask.entryCount).toBe(42);
+    expect(ask.projectRoot).toBe('/proj');
+  });
+
+  test('hotkey "1" resolves "yes"', async () => {
+    const s = make();
+    const promise = s.manager.askHistoryClear({ entryCount: 1, projectRoot: '/p' });
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('hotkey "2" resolves "yes-disable"', async () => {
+    const s = make();
+    const promise = s.manager.askHistoryClear({ entryCount: 1, projectRoot: '/p' });
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('yes-disable');
+  });
+
+  test('hotkey "3" resolves "no"', async () => {
+    const s = make();
+    const promise = s.manager.askHistoryClear({ entryCount: 1, projectRoot: '/p' });
+    s.fs.dispatch(charKey('3'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Esc resolves "cancel" (distinct from "no")', async () => {
+    const s = make();
+    const promise = s.manager.askHistoryClear({ entryCount: 1, projectRoot: '/p' });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+
+  test('default selectedIndex = last (No); plain Enter resolves "no"', async () => {
+    const s = make();
+    const promise = s.manager.askHistoryClear({ entryCount: 1, projectRoot: '/p' });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('no');
+  });
+});
+
+describe('askMemoryAction (memory:action:ask producer) — slice 135 P1 ops-2', () => {
+  const sampleAction = {
+    action: 'delete' as const,
+    title: 'Delete memory',
+    subject: 'no-console-log',
+    preview: ['Avoid console.log in committed code'],
+    question: 'Delete this memory?',
+  };
+
+  test('emits memory:action:ask carrying action + title + subject + preview', () => {
+    const s = make();
+    s.manager.askMemoryAction(sampleAction);
+    const ask = s.events.find((e) => e.type === 'memory:action:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'memory:action:ask') throw new Error('wrong event type');
+    expect(ask.action).toBe('delete');
+    expect(ask.title).toBe('Delete memory');
+    expect(ask.subject).toBe('no-console-log');
+  });
+
+  test('hotkey "1" resolves "yes"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryAction(sampleAction);
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('hotkey "2" resolves "no"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryAction(sampleAction);
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Esc resolves "cancel"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryAction(sampleAction);
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});
+
+describe('askTrust (trust:ask producer, spec §9.1) — slice 135 P1 ops-3', () => {
+  test('emits trust:ask carrying the path', () => {
+    const s = make();
+    s.manager.askTrust({ path: '/work/forja' });
+    const ask = s.events.find((e) => e.type === 'trust:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'trust:ask') throw new Error('wrong event type');
+    expect(ask.path).toBe('/work/forja');
+  });
+
+  test('hotkey "1" resolves "yes"', async () => {
+    const s = make();
+    const promise = s.manager.askTrust({ path: '/p' });
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('hotkey "2" resolves "no" (exit-the-session option)', async () => {
+    const s = make();
+    const promise = s.manager.askTrust({ path: '/p' });
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Esc resolves "cancel" (Ctrl+C / Esc → equivalent to "no")', async () => {
+    const s = make();
+    const promise = s.manager.askTrust({ path: '/p' });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});
+
 describe('askCritique (critique:ask producer, spec AGENTIC_CLI.md §5.4)', () => {
   const sampleIssues = [
     { severity: 'high' as const, confidence: 0.9, message: 'unsafe rm -rf' },

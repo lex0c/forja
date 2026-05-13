@@ -2,6 +2,75 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] tests — slice 137: P1 security + operator clusters (10/13)
+
+**Done.** One-hundred-thirty-seventh slice. Continues the slice 134 4-agent test-coverage review punch list. Closes the **P1 security-critical cluster (6/7)** + **P1 operator-facing cluster (4/5)**. Tests only — no production code changes.
+
+### Tests added
+
+**P1 security-critical (6/7 closed):**
+
+| # | Test | File | Why |
+|---|---|---|---|
+| sec-1 | scrubEnv slice 128 R4 P1 vars | `tests/sanitize/env.test.ts` | The slice 128 R4 P1 commit added 7 credential/session-bearing env vars that don't match the standard `_TOKEN`/`_SECRET`/`_KEY`/`_PASSWORD` suffix — SSH_AUTH_SOCK, GPG_AGENT_INFO, GNUPGHOME, KUBECONFIG, DOCKER_AUTH_CONFIG, OP_SESSION_*, CLOUDSDK_*. Existing tests only covered the slice 129 GIT_CONFIG additions; this pins the 128 set so a regression to the SCRUB_PATTERNS list catches each (7 tests). |
+| sec-2 | RED_FLAG_NODES exhaustive | `tests/permissions/resolvers.test.ts` | Bash resolver's RED_FLAG_NODES map has 22 entries; shallow tests covered command_substitution / process_substitution / parameter expansion. Parametric matrix exhausts the rest: simple_expansion, arithmetic_expansion, function_definition, variable_assignment, ansi_c_string, heredoc/herestring, if/while/for/case, subshell, compound_statement, negated_command, test_command (15 tests). |
+| sec-3 | secret-access + net-egress refuses without host | `tests/permissions/sandbox-plan.test.ts` | Only `host` profile covers both caps; without `--sandbox-host` flag the combination refuses with `no_viable_sandbox`. Pins the refuse + the host-escalation path (3 tests). |
+| sec-4 | trustedHosts engine-immune | `tests/permissions/engine.test.ts` | trustedHosts only feeds the score's `untrusted_egress` feature — it CAN'T escalate a policy-denied call to allow, nor demote a policy-allowed call to deny. Pin the contract (3 tests). |
+| sec-5 | classifier null/threw/malformed all degrade in strict mode | `tests/permissions/engine.test.ts` | Strict-mode test covered the null-return case; pin that classifier THROWS + classifier MALFORMED also degrade the engine. Plus inverse: healthy classifier in strict mode does NOT artificially degrade (3 tests). |
+| sec-6 | symlink cwd integration | (deferred) | Needs deeper spec analysis on what's actually testable at this layer (bwrap follows symlinks at bind time per slice 125 R2 P0-4 known limitation; the spec leaves cwd-realpath as operator responsibility). Deferred to a future slice with spec PR. |
+| sec-7 | fetch_url protocol gate parametric | `tests/permissions/resolvers.test.ts` | Existing test inlined 3 protocols (file/ftp/gopher). Parametric matrix exhausts the realistic attack surface: file, sftp, ftps, ws, wss, data, javascript, mailto, about, chrome, ssh, ldap, ldaps, smb, cifs, telnet, dict — plus case variant and inverse http(s)-uppercase passes (21 tests). |
+
+**P1 operator-facing (4/5 closed):**
+
+| # | Test | File | Why |
+|---|---|---|---|
+| ops-1 | askHistoryClear modal-manager unit coverage | `tests/tui/modal-manager.test.ts` | Producer-side tests (history.test.ts) stub the manager out, so the manager's own event-shape + option-table + answer-resolution behavior was unpinned. Pin event payload + four hotkeys + Esc + default selection (6 tests). |
+| ops-2 | askMemoryAction modal-manager unit coverage | `tests/tui/modal-manager.test.ts` | Same gap shape as ops-1. Pin event payload (action / title / subject / preview) + hotkey 1/2/Esc resolution (4 tests). |
+| ops-3 | askTrust modal-manager unit coverage | `tests/tui/modal-manager.test.ts` | Same gap shape as ops-1/2. Pin event payload (path) + yes/no/cancel resolution (4 tests). |
+| ops-4 | --undo bogus session id | `tests/cli/checkpoints.test.ts` | cwd-mismatch covered; unknown-session-id and empty-positional cases weren't (2 tests). |
+| ops-5 | confirmCritique severity gate | (deferred) | Severity is metadata threaded through to the modal; the gate logic (does engine call confirmCritique at all?) lives at a layer that requires more harness wiring. Deferred to future slice. |
+
+### Test scope summary
+
+- `tests/sanitize/env.test.ts`: +7 tests (20 total, was 13)
+- `tests/permissions/resolvers.test.ts`: +36 tests (246 total, was 210) — 15 RED_FLAG_NODES + 21 fetch_url protocol matrix
+- `tests/permissions/sandbox-plan.test.ts`: +3 tests (20 total, was 17)
+- `tests/permissions/engine.test.ts`: +6 tests (207 total, was 201) — 3 trustedHosts immunity + 3 classifier-degrade variants
+- `tests/tui/modal-manager.test.ts`: +14 tests (66 total, was 52) — 6 askHistoryClear + 4 askMemoryAction + 4 askTrust
+- `tests/cli/checkpoints.test.ts`: +2 tests (25 total, was 23)
+
+**Total: +68 tests across 6 files.**
+
+### Deferred (3 items)
+
+- **sec-6** symlink cwd integration — needs spec interpretation; the slice 125 R2 P0-4 comment documents the bwrap-follows-symlinks limitation but the realpath enforcement boundary is fuzzy.
+- **ops-5** confirmCritique severity — needs harness-level fixture wiring.
+- **conc-6** resume after rotate-chain (deferred from slice 136) — needs CLI subprocess infra.
+
+These three are the residue of the original 46-finding punch list. The remaining work is concentrated in test-infrastructure (subprocess wiring) or spec-interpretation calls that warrant their own focused slice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (unchanged)
+- `bun test` — **6768 pass / 10 skip / 0 fail** (6778 total / 307 files); +68 tests over slice 136
+
+### Punch list status (cumulative across slices 134/135/136/137)
+
+| Cluster | Findings | Closed | Deferred |
+|---|---|---|---|
+| P0 | 14 | 14 (slice 134 ×7 + slice 135 ×7) | 0 |
+| P1 audit integrity | 5 | 5 (slice 136) | 0 |
+| P1 concurrency / lifecycle | 6 | 5 (slice 136) | 1 (conc-6) |
+| P1 security-critical | 7 | 6 (slice 137) | 1 (sec-6) |
+| P1 operator-facing | 5 | 4 (slice 137) | 1 (ops-5) |
+| P2 | 9 | 0 (per slice 134 plan: P2 batch only if P0+P1 demands surface) | 9 |
+| **Total** | **46** | **34 (74%)** | **12** |
+
+**Next.** Return to outcome_signals calibration script work per slice 134 plan. The remaining 3 P1 + 9 P2 stay pending until a focused review slice surfaces actual concerns.
+
+---
+
 ## [2026-05-13] tests — slice 136: P1 cluster (audit integrity + concurrency partial)
 
 **Done.** One-hundred-thirty-sixth slice. Tests only — closes the **P1 audit integrity cluster (5/5)** + **5 of 6 P1 concurrency findings** from the slice 134 4-agent test-coverage review. Each fixture exercises an existing production path; no source changes.
