@@ -1883,8 +1883,20 @@ export const createPermissionEngine = (
     // also work but loses Date/Map shapes if a future Policy
     // grows them; structuredClone preserves them.
     policy: () => structuredClone(policy),
-    effectiveCapabilities: () =>
-      effectiveCapabilities === undefined ? null : effectiveCapabilities.map((c) => ({ ...c })),
+    effectiveCapabilities: () => {
+      if (effectiveCapabilities === undefined) return null;
+      // Slice 129 (R5 P1 immutability): callers consume this to
+      // build child-engine constraint envelopes and to render
+      // /perms introspection — both should treat the value as
+      // read-only. Pre-slice the per-call `.map((c) => ({ ...c }))`
+      // produced a fresh mutable array of fresh mutable objects.
+      // A caller could mutate an element and pass the array back
+      // into another engine constructor, silently widening the
+      // child's constraint set. freeze the elements AND the array
+      // so any such mutation throws in strict mode.
+      const cloned = effectiveCapabilities.map((c) => Object.freeze({ ...c }));
+      return Object.freeze(cloned);
+    },
     // Same defensive-clone strategy as `policy()`. The returned
     // provenance is consumed by /perms-style introspection; callers
     // mutating it shouldn't corrupt the engine's enforcement

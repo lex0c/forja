@@ -102,6 +102,36 @@ describe('ensureInstallId', () => {
     expect(existsSync(join(tmp, '.config', 'agent', 'install_id'))).toBe(true);
     expect(id.install_id).toBe('discovered-path-uuid');
   });
+
+  // Slice 129 (R5 P1 proto-pollution): the install_id file is on
+  // a user-writable path. A malicious shell rc or rogue install
+  // script could plant `__proto__` keys. After this slice the
+  // parse path strips the three dangerous keys at every depth.
+  test('strips __proto__ / constructor / prototype keys when reading the file', () => {
+    const { writeFileSync } = require('node:fs') as typeof import('node:fs');
+    const path = join(tmp, 'install_id');
+    writeFileSync(
+      path,
+      JSON.stringify({
+        __proto__: { isAdmin: true },
+        constructor: { polluted: true },
+        prototype: { also: true },
+        install_id: 'good-uuid',
+        created_at_ms: 1731000000000,
+      }),
+      { mode: 0o600 },
+    );
+
+    const id = ensureInstallId({ pathOverride: path });
+    expect(id.install_id).toBe('good-uuid');
+    expect(id.created_at_ms).toBe(1731000000000);
+
+    // Crucial assertion: a downstream `Object.assign({}, id)` must
+    // NOT pollute Object.prototype.
+    const fresh = Object.assign({}, id) as unknown as Record<string, unknown>;
+    expect(fresh.isAdmin).toBeUndefined();
+    expect(({} as Record<string, unknown>).isAdmin).toBeUndefined();
+  });
 });
 
 describe('isFirstBoot (slice 46)', () => {

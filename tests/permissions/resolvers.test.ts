@@ -149,6 +149,58 @@ describe('fetch_url resolver', () => {
   test('missing arg refuses', () => {
     expect(resolveCapabilities('fetch_url', {}, CTX).kind).toBe('refuse');
   });
+
+  // Slice 129 (R5 SSRF P0): unconditional blocklist gates BEFORE
+  // engine consults operator allow/deny lists. Each entry below
+  // covers a class from SECURITY_GUIDELINE.md §9.1.6.
+  describe('SSRF blocklist (slice 129)', () => {
+    const blocked = [
+      'http://localhost/',
+      'http://LOCALHOST/',
+      'http://x.localhost/',
+      'http://metadata.google.internal/',
+      'http://metadata.azure.com/',
+      'http://my.metadata.azure.com/',
+      'http://metadata/',
+      'http://127.0.0.1/',
+      'http://127.42.0.99/',
+      'http://0.0.0.0/',
+      'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+      'http://169.254.42.7/',
+      'http://10.0.0.1/',
+      'http://10.255.255.255/',
+      'http://172.16.0.1/',
+      'http://172.31.255.254/',
+      'http://192.168.1.1/',
+      'http://100.64.0.1/',
+      'http://224.0.0.1/',
+      'http://[::1]/',
+      'http://[::]/',
+      'http://[fe80::1]/',
+      'http://[fc00::1]/',
+      'http://[fd12:3456:789a::1]/',
+      'http://[::ffff:127.0.0.1]/',
+    ];
+    for (const url of blocked) {
+      test(`refuses ${url}`, () => {
+        const r = resolveCapabilities('fetch_url', { url }, CTX);
+        expect(r.kind).toBe('refuse');
+        if (r.kind === 'refuse') {
+          expect(r.reason).toMatch(/SSRF/i);
+        }
+      });
+    }
+    // Boundary: 172.32.x.x is OUTSIDE the 172.16/12 RFC1918 range
+    // and must NOT be blocked.
+    test('allows 172.32.0.1 (outside RFC1918 172.16/12)', () => {
+      const r = resolveCapabilities('fetch_url', { url: 'http://172.32.0.1/' }, CTX);
+      expect(r.kind).toBe('ok');
+    });
+    test('allows public host', () => {
+      const r = resolveCapabilities('fetch_url', { url: 'https://example.com/' }, CTX);
+      expect(r.kind).toBe('ok');
+    });
+  });
 });
 
 describe('bash resolver — simple commands', () => {
@@ -1754,5 +1806,26 @@ describe('bash resolver — slice 128 R4 P1 fixes', () => {
       const s = capStrings(r.capabilities);
       expect(s).toContain('net-ingress:*');
     }
+  });
+});
+
+// Slice 129 (R5) — security review #5 fixes.
+describe('bash resolver — slice 129 R5 P0 fixes', () => {
+  test('R5 P0-2: `git --git-dir=/tmp/evil ...` refused', () => {
+    const r = resolveCapabilities('bash', { command: 'git --git-dir=/tmp/evil log' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('--git-dir');
+  });
+
+  test('R5 P0-2: `git --git-dir /tmp/evil ...` (space-separated) refused', () => {
+    const r = resolveCapabilities('bash', { command: 'git --git-dir /tmp/evil log' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('--git-dir');
+  });
+
+  test('R5 P0-2: `git --work-tree=/tmp/evil ...` refused', () => {
+    const r = resolveCapabilities('bash', { command: 'git --work-tree=/tmp/evil status' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('--work-tree');
   });
 });

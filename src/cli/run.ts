@@ -1,5 +1,6 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
 import { defaultDbPath, getSession, listSessions, migrate, openDb } from '../storage/index.ts';
+import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
 import { runCheckpointsCli } from './checkpoints.ts';
@@ -607,6 +608,45 @@ export const run = async (options: RunOptions): Promise<number> => {
         return 1;
       }
       resumeFromSessionId = resolved.id;
+
+      // Slice 129 (R5 P0 crash): settle any subagent handles
+      // left in `running` from the previous (crashed) run of
+      // this session. Pre-slice `settleRunningSubagentHandles`
+      // was DEFINED but never called — a parent that crashed
+      // mid-`task_async` left `subagent_handles.status='running'`
+      // forever; `task_await(handle_id)` post-resume returned
+      // `unknown_handle` and the cached child output in
+      // `subagent_outputs` was unreachable.
+      //
+      // The payload describes the interruption shape so any
+      // operator-facing UI rendering the settled envelope sees
+      // a coherent "this session was interrupted" message.
+      try {
+        const db = openDb(dbPath);
+        try {
+          const settled = settleRunningSubagentHandles(db, resolved.id, {
+            status: 'interrupted',
+            reason: 'parent_session_resumed_after_crash',
+            interrupted_at_ms: Date.now(),
+          });
+          if (settled > 0) {
+            errSink(
+              `forja: --resume settled ${settled} subagent handle(s) left running from the previous (crashed) run.\n`,
+            );
+          }
+        } finally {
+          db.close();
+        }
+      } catch (e) {
+        // Non-fatal: resume can still proceed even if the
+        // settle pass fails. Surface the diagnostic so operator
+        // sees that some handles MIGHT still be stranded.
+        errSink(
+          `forja: --resume could not settle stale subagent handles: ${
+            e instanceof Error ? e.message : String(e)
+          }\n`,
+        );
+      }
     }
 
     const renderer = options.rendererOverride ?? pickRenderer(args);

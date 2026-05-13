@@ -348,3 +348,36 @@ describe('listChainBreakAcceptedRows — §7.2 --accept-broken-chain visibility'
     expect(listChainBreakAcceptedRows(db, 'OTHER').length).toBe(1);
   });
 });
+
+// Slice 129 (R5 P0 time): the wall-clock ts on AuditEmitInput is
+// caller-supplied. Before this slice, an attacker-controlled tool
+// path could inject a ts arbitrarily far in the future, causing
+// time-based filters / rate-limits / quarantine windows to misfire.
+describe('createSqliteSink — slice 129 R5 ts validation', () => {
+  test('refuses ts more than 1h ahead of wall clock', () => {
+    const { sink } = fresh();
+    const future = Date.now() + 2 * 60 * 60 * 1000;
+    expect(() => sink.emit(baseInput({ ts: future }))).toThrow(/forgery/);
+  });
+
+  test('refuses NaN ts', () => {
+    const { sink } = fresh();
+    expect(() => sink.emit(baseInput({ ts: Number.NaN }))).toThrow(/non-negative/);
+  });
+
+  test('refuses negative ts', () => {
+    const { sink } = fresh();
+    expect(() => sink.emit(baseInput({ ts: -1 }))).toThrow(/non-negative/);
+  });
+
+  test('refuses non-integer ts', () => {
+    const { sink } = fresh();
+    expect(() => sink.emit(baseInput({ ts: 1.5 }))).toThrow(/non-negative/);
+  });
+
+  test('accepts ts within the 1h future-skew window', () => {
+    const { sink } = fresh();
+    const nearFuture = Date.now() + 30 * 60 * 1000;
+    expect(() => sink.emit(baseInput({ ts: nearFuture }))).not.toThrow();
+  });
+});

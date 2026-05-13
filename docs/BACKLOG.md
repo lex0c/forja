@@ -15,6 +15,75 @@ Format:
 
 ---
 
+## [2026-05-13] permission-engine-v2 — slice 129: REVIEW_NOTES_R5 surgical security pass (5 P0 + 6 P1 + tests)
+
+**Done.** One-hundred-twenty-ninth slice. Closes the surgical (T1+T2) tier of `docs/REVIEW_NOTES_R5.md` — the fifth multi-agent review pass (6 reviewers: bypass hunter, capability launderer, sandbox escapee, audit corruptor, race hunter, injection/parsing). Bundled small, low-risk fixes into one slice; deferred Tier 3-4 findings that need their own design (failure_events table, RFC3161 TSR signature verify, git-anchored commit verify, classifier-restore reasoning, monotonic-TTL migration, mid-session sandbox-loss telemetry).
+
+### P0 fixes (5)
+
+| # | File | Symptom → Fix |
+|---|---|---|
+| Launder-2-bis (git-meta) | `src/permissions/resolvers/bash.ts` cmdGit | Slice 128 refused `git -c key=value` but missed `--git-dir=<path>` and `--work-tree=<path>`. Both re-point git's metadata / working tree to attacker-controlled directories whose `.git/config` could carry `core.sshCommand` / `core.pager`. Refuse loop now rejects both, in `=` and space-separated shapes. |
+| Launder-2-bis (git-env) | `src/sanitize/env.ts` SCRUB_PATTERNS | Slice 128's `-c` argv refuse was bypassable via env: `GIT_CONFIG_PARAMETERS`, indexed `GIT_CONFIG_COUNT/KEY/VALUE`, plus `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_EDITOR`, `GIT_PAGER`, `GIT_PROXY_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_TEMPLATE_DIR`. All eight patterns added to scrubEnv (covers bash + bg + subagent spawn surfaces uniformly). |
+| Audit-Time-1 | `src/permissions/audit.ts` emit() | The caller-supplied `ts` field had no validation. NaN / negative / arbitrary-future ts could land in the chain row — breaking time-based filters, rate limiters, quarantine windows, and forensics. New `validateTs` helper: rejects non-integer / non-finite / negative, plus rejects ts > now + 1h (clock-skew tolerance). Throws before any DB write. |
+| Crash-1 | `src/cli/run.ts` | `settleRunningSubagentHandles` existed in the storage layer but was never wired into `--resume`. After a parent-process crash, child handle rows stayed `status='running'` forever — the engine treated them as live, blocking new subagent slots and producing dangling rows. The resume path now opens the DB, settles stale handles with `interrupted` + `parent_session_resumed_after_crash`, and reports the count to stderr. |
+| SSRF | `src/permissions/resolvers/fetch.ts` | Resolver did only protocol whitelist + lowercase host; nothing blocked localhost / cloud metadata / RFC1918. Operator allow_hosts could even permit them. New `checkSsrfBlocklist` runs at resolver-refuse level (before engine policy applies), denying `localhost` / `*.localhost`, `metadata.google.internal`, `metadata.azure.com`, IPv4 loopback (127/8) / unspecified / link-local (169.254/16 including AWS+GCP metadata) / RFC1918 (10/8, 172.16/12, 192.168/16) / CGNAT (100.64/10) / multicast (224/4), IPv6 ::1 / :: / fe80::/10 / fc00::/7, plus IPv4-mapped IPv6 in both dotted (`::ffff:127.0.0.1`) and hex-normalized (`::ffff:7f00:1`) forms. Same gate covers `wait_for`'s `port_open` + `http_response` since both route through `permissionCheck('fetch_url', ...)`. |
+
+### P1 fixes (6)
+
+- **`src/permissions/install_id.ts`**: bare `JSON.parse` on the user-writable install_id file → routed through `safeJsonParse` (slice 104 helper). Closes proto-pollution via planted `__proto__` keys in the identity file.
+- **`src/tools/builtin/write-file.ts`**: 10 MiB cap on encoded UTF-8 content, mirroring `read_file` (slice 7). Pre-cap, the model could disk-fill with a single tool call. Checks both `.length` (chars) and `Buffer.byteLength` (bytes) BEFORE touching disk.
+- **`src/permissions/resolvers/bash.ts` expandBraces**: added `MAX_BRACE_DEPTH=64` recursion-depth cap orthogonal to the existing `MAX_BRACE_EXPANSIONS=1024` output cap. Without it, pathological deeply-nested patterns (e.g., `a{b{c{...}}}`) could blow the JS stack despite low total output. 64 covers every realistic shell pattern; V8 frame budget stays untouched.
+- **`src/permissions/engine.ts` effectiveCapabilities()**: returned shallow-cloned but mutable. Now `Object.freeze`s each element and the array itself, so a caller who passes it back into a child-engine constructor cannot mutate it between calls and silently widen the envelope.
+- **`src/bg/manager.ts` sleep()**: every call registered an `abort` listener on the AbortSignal that was never removed on the natural-timeout path. Long-lived signals would accumulate listeners and trip `MaxListenersExceededWarning`. Listener now `{once:true}` AND `removeEventListener` runs in the timeout branch.
+- **`src/permissions/sealing.ts` verifySealAgainstChain**: a hostile / corrupted SealStore could surface two entries with the same `seq` + same `hash` — the verifier reported OK because each entry validated independently against the same DB row. Added a `Set<number>` to detect duplicates outright; refuses with `firstMismatchAt=<duplicateSeq>` and `replay or store corruption suspected`.
+
+### Test coverage
+
+- `tests/permissions/resolvers.test.ts` +28 tests:
+  - R5 SSRF: 24 blocked-host cases (per blocklist class), 1 boundary (172.32 outside RFC1918), 1 positive (public host), 3 git --git-dir/--work-tree refuse cases.
+- `tests/sanitize/env.test.ts` +4 tests: GIT_CONFIG_PARAMETERS, indexed GIT_CONFIG_KEY/VALUE, GIT_SSH/SSH_COMMAND/EDITOR/PAGER/PROXY_COMMAND, GIT_EXTERNAL_DIFF/GIT_TEMPLATE_DIR.
+- `tests/permissions/audit.test.ts` +5 tests: future-skew rejection, NaN, negative, non-integer, near-future boundary accept.
+- `tests/tools/write-file.test.ts` +2 tests: 10 MiB + 1 byte rejection (no file created), exact-cap acceptance.
+- `tests/permissions/install_id.test.ts` +1 test: `__proto__`-bearing install_id file → key stripped, Object.assign downstream does NOT pollute Object.prototype.
+- `tests/permissions/sealing.test.ts` +1 test: duplicate seq in seal file → ok:false with firstMismatchAt.
+
+### Deferred (R5 Tier 3-4)
+
+| # | Reason |
+|---|---|
+| R5 failure_events table + writers | Spec §13.10 names the table but the migration / writers / reader were never landed. Needs a dedicated slice with new migration + integration tests. |
+| R5 mid-session chain-verify scheduler | Add periodic `verifyChain` between writes so chain breaks surface before exit. Needs state-machine reasoning. |
+| R5 RFC3161 TSR signature verification | ASN.1 / TSTInfo parser + trust anchor management. Feature work, not a patch. |
+| R5 git-anchored commit verification | git plumbing layer + signed-commit trust anchor. Feature work. |
+| R5 classifier-restore design | The current restore-by-resolver path is brittle on state transitions; needs reasoning + design before implementation. |
+| R5 monotonic-TTL floor | Storage migration to track monotonic alongside wall-clock for security-relevant TTLs; deferred to a clock-handling slice. |
+| R5 mid-session sandbox-loss telemetry | Detect runtime sandbox disable; emit failure_event. Depends on failure_events. |
+
+### Decisions
+
+- **SSRF blocklist lives in the resolver, not in `engine.check`.** Spec §9.1.6 says "Override de deny_hosts é proibido em config" — putting it at the resolver-refuse layer makes it precede operator policy unconditionally, which is the strongest place to enforce. Placing it in engine.check would expose it to allow-list override.
+- **IPv4-mapped IPv6 hex form must be decoded, not refused blindly.** `::ffff:8.8.8.8` is a legitimate public-IP path; refusing all `::ffff:` would over-block. The decoder converts the hex pair back to dotted form and recurses through `checkSsrfBlocklist` so the loopback/RFC1918/etc rules apply to the underlying IPv4 only.
+- **audit ts validation throws, doesn't silently clamp.** A future-skew ts is either a clock bug (operator should see it loud) or a forgery (we must surface it loud). Silently overwriting with `Date.now()` would mask both. The 1h tolerance window handles legitimate NTP/VM-pause skew.
+- **install_id retries via `ensureInstallId(options)` on EEXIST race** — same recursive pattern slice 128 added. No change here; just adding the safeJsonParse to the existsSync branch.
+- **bg manager sleep listener uses BOTH `{once:true}` AND explicit `removeEventListener`.** Either alone is enough but doubling up costs nothing and protects against runtime variation in `{once:true}` semantics on the abort branch (the listener is removed BEFORE the event fires).
+
+### Trap navigated
+
+- **WHATWG URL hex-normalizes IPv4-mapped IPv6.** First test pass for `http://[::ffff:127.0.0.1]/` failed because `new URL(...).hostname` returned `[::ffff:7f00:1]` (hex form), not the dotted form. Added a hex-pair decoder that handles both `7f00:1` and `7f00:0001` shapes via the `([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?` pattern. Bash regression test then validated 127.0.0.1 → loopback block.
+- **Worm-file wire format has `key=` prefix on each tab-separated field.** Initial duplicate-seq test wrote `${seq}\t100\t${hash}` directly — parseLine returned null and list() threw "corrupted". Fixed to use `seq=N\tts=N\thash=...` format and the duplicate detection path then fired correctly.
+- **TS shadow on `depth`.** First pass added `depth: number` parameter to `expandBraces.visit`, but the function had a local `let depth = 1` for nesting tracking. Renamed the new parameter to `recursionDepth` and threaded through all 4 call sites.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from slice 128)
+- `bun test` — **6497 pass / 10 skip / 0 fail** (6507 total across 293 files); +43 tests on top of slice 128's 6454
+
+**Next.** R5 Tier 3 cluster — start with failure_events table (migration + writers + reader) since it unblocks the mid-session sandbox-loss telemetry P0.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 128: REVIEW_NOTES_R4 security pass (13 P0 + 5 P1 + tests)
 
 **Done.** One-hundred-twenty-eighth slice. Closes 13 of 16 P0 + 5 of 14 P1 findings from `docs/REVIEW_NOTES_R4.md` — the fourth review pass, security-focused with six attacker-hat reviewers (bypass hunter, capability launderer, sandbox escapee, audit corruptor, race hunter, injection/parsing). Deferred: 3 P0 audit findings that require substantial feature work (RFC3161 TSR signature verification, git-anchored commit verification, full audit-row hash payload reshape) plus residual P1s that are either P2-grade polish or need architectural rethink.

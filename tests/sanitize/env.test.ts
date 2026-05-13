@@ -81,4 +81,45 @@ describe('scrubEnv', () => {
     const out = scrubEnv(env);
     expect(out).not.toBe(env);
   });
+
+  // Slice 129 (R5 P0-3): GIT_CONFIG_* env vars bypass the slice 128
+  // `-c` argv refuse path. Confirm every git-config-via-env shape
+  // is scrubbed.
+  describe('slice 129 — git config via env', () => {
+    test('drops GIT_CONFIG_PARAMETERS', () => {
+      const out = scrubEnv({
+        GIT_CONFIG_PARAMETERS: "'core.sshCommand=sh -c id'",
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops indexed GIT_CONFIG_COUNT / KEY / VALUE', () => {
+      const out = scrubEnv({
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.sshCommand',
+        GIT_CONFIG_VALUE_0: 'sh -c id',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops GIT_SSH / GIT_SSH_COMMAND / GIT_PAGER / GIT_EDITOR / GIT_PROXY_COMMAND', () => {
+      const out = scrubEnv({
+        GIT_SSH: '/tmp/evil',
+        GIT_SSH_COMMAND: 'sh -c id',
+        GIT_PAGER: 'sh -c id',
+        GIT_EDITOR: 'sh -c id',
+        GIT_PROXY_COMMAND: 'sh -c id',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops GIT_EXTERNAL_DIFF and GIT_TEMPLATE_DIR', () => {
+      const out = scrubEnv({
+        GIT_EXTERNAL_DIFF: '/tmp/evil',
+        GIT_TEMPLATE_DIR: '/tmp/templates',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+  });
 });

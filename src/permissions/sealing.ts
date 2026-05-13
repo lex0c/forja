@@ -465,7 +465,33 @@ export const verifySealAgainstChain = (
       reason: `seal file corrupted: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
+  // Slice 129 (R5 P1 duplicate-seq): the SealStore append path is
+  // best-effort idempotent (writers de-dupe before flush) but a
+  // hostile or corrupted backend (e.g., S3 versioned object replay,
+  // disk recovery merge, manually-edited file) can surface two
+  // entries with the SAME seq + different hashes. Pre-slice the
+  // loop validated each entry against the DB row independently;
+  // the FIRST entry's hash matched, the second's hash mismatched
+  // but the verify code returned OK because the first check
+  // passed and the second was tested against a DIFFERENT lookup
+  // (rows ARE keyed by seq alone, so DB query returns same row
+  // each time). Actually re-reading: a duplicate seq with a
+  // different hash WOULD trip the `row.this_hash !== entry.hash`
+  // branch on the second entry. But a duplicate seq with the
+  // SAME hash slips through silently — and that's the canonical
+  // "replay attack": attacker controls the seal store, replays
+  // a known-good entry to inflate `entriesChecked` and mask a
+  // gap elsewhere. Refuse duplicates outright.
+  const seenSeqs = new Set<number>();
   for (const entry of entries) {
+    if (seenSeqs.has(entry.seq)) {
+      return {
+        ok: false,
+        reason: `seal contains duplicate entry for seq=${entry.seq} — replay or store corruption suspected`,
+        firstMismatchAt: entry.seq,
+      };
+    }
+    seenSeqs.add(entry.seq);
     const row = getApprovalsLogBySeq(db, entry.seq);
     if (row === null) {
       return {

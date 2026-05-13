@@ -38,6 +38,22 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /^DOCKER_AUTH_CONFIG$/, // base64 registry creds
   /^OP_SESSION_/i, // 1Password CLI session tokens (per-account)
   /^CLOUDSDK_/i, // gcloud SDK config + auth tokens
+  // Slice 129 (R5 P0-3): git config-via-env. GIT_CONFIG_PARAMETERS
+  // is a semicolon-separated `key='value';...` list git applies as
+  // if each pair were `-c key=value`. GIT_CONFIG_COUNT + indexed
+  // GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n is the newer (git ≥ 2.31)
+  // structured form. Both bypass slice 128's `-c` argv refuse —
+  // attacker uses ENV instead of flag. GIT_SSH / GIT_EDITOR /
+  // GIT_PAGER / GIT_PROXY_COMMAND / GIT_EXTERNAL_DIFF all execute
+  // attacker-controlled commands during normal git operations.
+  /^GIT_CONFIG_/i,
+  /^GIT_SSH$/i,
+  /^GIT_SSH_COMMAND$/i,
+  /^GIT_EDITOR$/i,
+  /^GIT_PAGER$/i,
+  /^GIT_PROXY_COMMAND$/i,
+  /^GIT_EXTERNAL_DIFF$/i,
+  /^GIT_TEMPLATE_DIR$/i, // templates can carry hooks
 ];
 
 // Returns a defensive copy with credential-like vars removed. Undefined

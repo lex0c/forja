@@ -258,8 +258,39 @@ export const createSqliteSink = ({
       ? computeGenesisHash(identity)
       : computeRotatedGenesisHash(identity, latestMeta.rotation_id, latestMeta.rotated_at_ms);
 
+  // Slice 129 (R5 P0 time): caller-supplied `ts` must be a sane
+  // wall-clock integer. Pre-slice `input.ts` (a documented test
+  // seam on the public AuditEmitInput) accepted ANY value including
+  // Number.MAX_SAFE_INTEGER, negatives, NaN, or a value before the
+  // previous row's ts — `verifyChain` doesn't check monotonic
+  // ordering, so a forged row with `ts=2099-01-01` was
+  // indistinguishable from a real one. Clamp to a sane window:
+  //   - integer
+  //   - finite
+  //   - non-negative
+  //   - not in the far future (more than 1h ahead of wall clock)
+  // The skew window is forgiving on the past side (operator clocks
+  // run backwards routinely under NTP correction) but tight on
+  // the future side because forgery-forward is the dangerous
+  // direction — a future ts makes the row look "newest" to any
+  // tooling sorting by time. 1h tolerance covers NTP smear and
+  // light skew without admitting "datestamp in 2099" forgeries.
+  const TS_FUTURE_SKEW_MS = 60 * 60 * 1000;
+  const validateTs = (input: AuditEmitInput, now: number): number => {
+    const ts = input.ts ?? now;
+    if (!Number.isFinite(ts) || !Number.isInteger(ts) || ts < 0) {
+      throw new Error(`audit: ts must be a non-negative finite integer (got ${String(ts)})`);
+    }
+    if (ts > now + TS_FUTURE_SKEW_MS) {
+      throw new Error(
+        `audit: ts is more than ${TS_FUTURE_SKEW_MS}ms ahead of wall clock (got ${ts}, now ${now}) — suspected forgery`,
+      );
+    }
+    return ts;
+  };
+
   const emit = (input: AuditEmitInput): EmittedRow => {
-    const ts = input.ts ?? Date.now();
+    const ts = validateTs(input, Date.now());
     const args_hash = sha256Hex(canonicalize(input.args ?? {}));
 
     // Slice 127 (R3 P0-A): wrap read-prev-hash + insert-this-row in

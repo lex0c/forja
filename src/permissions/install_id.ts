@@ -32,6 +32,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
+import { safeJsonParse } from '../broker/safe-json.ts';
 import { installIdPath } from './paths.ts';
 
 export interface InstallIdentity {
@@ -107,7 +108,13 @@ export const ensureInstallId = (options: EnsureInstallIdOptions = {}): InstallId
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      // Slice 129 (R5 P1 proto-pollution): the install_id file lives
+      // under user-writable XDG paths; a malicious shell rc or rogue
+      // install script could plant `{"__proto__":{...}}` here. Bare
+      // JSON.parse leaves `__proto__` as an own property — downstream
+      // `Object.assign({}, identity)` would pollute Object.prototype.
+      // safeJsonParse strips the three dangerous keys at every depth.
+      parsed = safeJsonParse(raw);
     } catch (err) {
       throw new Error(`install_id: ${path} is not valid JSON: ${(err as Error).message}`);
     }

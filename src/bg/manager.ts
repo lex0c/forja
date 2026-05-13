@@ -238,17 +238,32 @@ const readWindow = async (
   }
 };
 
+// Slice 129 (R5 P1 leak): the prior shape registered an `abort`
+// listener on every sleep but never removed it on the natural-
+// timeout path. A long-lived AbortSignal (e.g., the harness-
+// level abortSignal threaded through many kill cycles) would
+// accumulate one listener per sleep — leaking memory and
+// triggering Node's MaxListenersExceededWarning around the
+// 11th call. Fix: both `{ once: true }` (auto-detaches if abort
+// DOES fire) and an explicit `removeEventListener` on the
+// natural-resolve branch (so the listener detaches BEFORE the
+// signal might ever fire). Either path cleans up; doubling up
+// is defensive but free.
 const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error('aborted'));
       return;
     }
-    const timer = setTimeout(() => resolve(), ms);
-    signal?.addEventListener('abort', () => {
+    const onAbort = (): void => {
       clearTimeout(timer);
       reject(new Error('aborted'));
-    });
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 
 export const createBgManager = (options: CreateBgManagerOptions): BgManager => {

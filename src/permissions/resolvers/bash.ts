@@ -549,6 +549,24 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
           'git: --exec-path overrides git helper-binary lookup path — refusing static analysis',
       };
     }
+    // Slice 129 (R5 P0-2): --git-dir / --work-tree re-point git
+    // to an attacker-controlled metadata location. The targeted
+    // `.git/config` at that path can carry core.sshCommand /
+    // core.pager / core.fsmonitor — same threat shape as `-c`
+    // but via path indirection. Slice 128 closed `-c`; this
+    // closes the sibling.
+    if (t === '--git-dir' || t.startsWith('--git-dir=')) {
+      return {
+        refuse:
+          "git: --git-dir re-points git's metadata dir; attacker-controlled .git/config can carry core.sshCommand / core.pager — refusing static analysis",
+      };
+    }
+    if (t === '--work-tree' || t.startsWith('--work-tree=')) {
+      return {
+        refuse:
+          "git: --work-tree re-points git's working tree to an attacker-controlled location — refusing static analysis",
+      };
+    }
   }
   const sub = positional[0];
   const REPO = ctx.cwd;
@@ -1794,10 +1812,26 @@ const globLiteralPrefix = (arg: string): string => {
 // as "could be anything"; combine with the glob-metachar refuse
 // path for safety.
 const MAX_BRACE_EXPANSIONS = 1024;
+// Slice 129 (R5 P1 stack): recursion-depth cap orthogonal to the
+// total-output cap. A pathological input shape like
+// `a{b{c{d{...}}}}` (deep nesting, single comma each level) stays
+// well under MAX_BRACE_EXPANSIONS — each level emits one string —
+// but the visit() function recurses once per nest. Without a depth
+// guard, hostile inputs of e.g. 100_000 nested braces blow the JS
+// stack. 64 covers every realistic shell pattern (Bash itself
+// stops being useful around 8-10 levels) while keeping recursion
+// well inside V8's ~10k frame budget.
+const MAX_BRACE_DEPTH = 64;
 const expandBraces = (arg: string): string[] => {
   const out: string[] = [];
-  const visit = (s: string): void => {
+  const visit = (s: string, recursionDepth: number): void => {
     if (out.length >= MAX_BRACE_EXPANSIONS) return;
+    if (recursionDepth > MAX_BRACE_DEPTH) {
+      // Bail to literal — caller's classifier still picks up the
+      // glob-metachar refuse path if any `{` remains.
+      out.push(s);
+      return;
+    }
     const open = s.indexOf('{');
     if (open === -1) {
       out.push(s);
@@ -1863,7 +1897,7 @@ const expandBraces = (arg: string): string[] => {
           // check inside the loop; large ranges fall through to
           // the literal-prefix glob defense.
           for (let v = lo; v <= hi; v += 1) {
-            visit(prefix + String(v) + suffix);
+            visit(prefix + String(v) + suffix, recursionDepth + 1);
             if (out.length >= MAX_BRACE_EXPANSIONS) return;
           }
           return;
@@ -1874,7 +1908,7 @@ const expandBraces = (arg: string): string[] => {
           const lo = Math.min(start.charCodeAt(0), end.charCodeAt(0));
           const hi = Math.max(start.charCodeAt(0), end.charCodeAt(0));
           for (let v = lo; v <= hi; v += 1) {
-            visit(prefix + String.fromCharCode(v) + suffix);
+            visit(prefix + String.fromCharCode(v) + suffix, recursionDepth + 1);
             if (out.length >= MAX_BRACE_EXPANSIONS) return;
           }
           return;
@@ -1886,11 +1920,11 @@ const expandBraces = (arg: string): string[] => {
       return;
     }
     for (const p of parts) {
-      visit(prefix + p + suffix);
+      visit(prefix + p + suffix, recursionDepth + 1);
       if (out.length >= MAX_BRACE_EXPANSIONS) return;
     }
   };
-  visit(arg);
+  visit(arg, 0);
   return out;
 };
 

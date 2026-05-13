@@ -369,6 +369,40 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
     expect(v.ok).toBe(true);
     if (v.ok) expect(v.entriesChecked).toBe(0);
   });
+
+  // Slice 129 (R5 P1): a hostile or corrupted seal backend can
+  // surface two entries with the SAME seq. Pre-slice the
+  // verifier reported OK when the duplicate's hash also matched
+  // the DB row — that's a replay-attack vector (inflate
+  // entriesChecked to mask a gap). Refuse duplicates outright.
+  test('duplicate seq in seal file → ok:false (slice 129 replay defense)', () => {
+    const { db, identity, emitted } = setupChain(2);
+    const first = emitted[0];
+    if (first === undefined) throw new Error('setup');
+    const fs = makeFakeFs();
+    // Bypass createWormFileSealer's own dedup-on-write and place
+    // duplicate entries directly into the underlying file. Wire
+    // format (slice 63): `seq=N\tts=N\thash=...\n`.
+    const path = join(tmpRoot, 'seal.log');
+    fs.contents.set(
+      path,
+      `seq=${first.seq}\tts=100\thash=${first.this_hash}\n` +
+        `seq=${first.seq}\tts=101\thash=${first.this_hash}\n`,
+    );
+    const sealer = createWormFileSealer({
+      path,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      ensureDir: fs.ensureDir,
+    });
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
+    expect(v.ok).toBe(false);
+    if (!v.ok) {
+      expect(v.firstMismatchAt).toBe(first.seq);
+      expect(v.reason).toMatch(/duplicate/);
+    }
+  });
 });
 
 describe('createWormFileSealer — close', () => {
