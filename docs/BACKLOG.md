@@ -2,6 +2,57 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(tools) — slice 150: bash tool surface input validation
+
+**Done.** One-hundred-fiftieth slice. Closes the 🟠 important bash tool surface gaps flagged in the bash-tools code review: `label`/`cwd` arrived from the LLM unvalidated at the tool boundary and landed deep in the manager / storage layer with wrong types (label=42 in audit logs, cwd=42 throws ERR_INVALID_ARG_TYPE inside `isAbsolute` and surfaces as `internalError` instead of a clean tool error). Plus a comment clarification on `bash-kill`'s `escapesCwd` flag (misnamed but correct under the documented semantics).
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **val-cwd-bash** | `bash.execute` passed `args.cwd` straight to `isAbsolute(args.cwd)`. Model JSON arrives unvalidated; `args.cwd = 42` threw ERR_INVALID_ARG_TYPE inside path resolution → harness surfaced it as `tool.internal_error` instead of `tool.invalid_arg`. | `src/tools/builtin/bash.ts` | Added `typeof args.cwd !== 'string'` guard before `isAbsolute`. Returns `tool.invalid_arg` with "cwd must be a string" message. |
+| **val-cwd-bg** | Same gap in `bash_background.execute` — `args.cwd` reached `isAbsolute` without a type guard. | `src/tools/builtin/bash-background.ts` | Same pattern: pre-`isAbsolute` type-check returning `tool.invalid_arg`. |
+| **val-label-bg** | `bash_background.execute` forwarded `args.label` verbatim to `manager.spawn({ label })`. Storage's `bg_processes.label` column expects `string \| null`; a non-string (`label: 42`, `label: {x:1}`) landed in audit logs / UI tray as a non-string, breaking downstream renders that expect string semantics. | `src/tools/builtin/bash-background.ts` | `typeof args.label !== 'string'` guard returning `tool.invalid_arg` with "label must be a string". Undefined still passes (it's optional). |
+| **kill-cmt** | `bash-kill.ts` set `escapesCwd: true` to flag "side effect that doesn't revert" — but the field NAME is about FS escape (`bash`, `bash_background`, anything that writes outside cwd). Kill sends a signal; touches no FS. The field's documented SEMANTICS at `tools/types.ts:79` are broader ("side effects ... NOT reversed by a working-tree restore"), so the flag IS correct under the documented intent, just confusing under the name. | `src/tools/builtin/bash-kill.ts` | Comment expanded to explain the trade-off explicitly. Field rename deferred (touches every consumer; bundling with broader cleanup). |
+
+### Tests added (+4)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/tools/bash.test.ts` | +1 | `bash` rejects non-string `cwd` with `tool.invalid_arg`. |
+| `tests/tools/bash-background.test.ts` | +3 | `bash_background` rejects non-string `label`; rejects non-string `cwd`; explicit "label undefined passes through" sanity check. |
+
+### Files changed
+
+- Code: `src/tools/builtin/bash.ts`, `src/tools/builtin/bash-background.ts`, `src/tools/builtin/bash-kill.ts` (comment only)
+- Tests: `tests/tools/bash.test.ts`, `tests/tools/bash-background.test.ts`
+- Spec: none (additive surface; tool contract unchanged)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6937 pass / 10 skip / 0 fail / 17684 expect()** across 309 files (+4 over slice 149)
+
+### Defense layering
+
+The bash tool boundary now rejects malformed input BEFORE the broker / manager handoff. Pre-slice the layered defenses (broker handler's own validation, schema docs, storage column constraints) caught most malformed inputs eventually, but the error PATH was inconsistent: `cwd=42` came back as `tool.internal_error` (suggests a bug in our code), while `cwd=""` came back as `tool.invalid_arg` (suggests bad input). Slice 150 unifies the surface: every type mismatch at the tool boundary is `tool.invalid_arg` with a structured message, so the model gets the same signal regardless of which field was malformed.
+
+### Considered + deferred
+
+- **`bash_output` / `bash_kill` cross-subagent ACL** (review finding) — verified the existing defense via `manager.readOutput` / `manager.kill` which reject "not in this session" already gives per-session isolation. Subagents each have their own bgManager with their own session; a process_id from the parent session is rejected at the manager layer with the existing "not in this session" check. The finding was based on a misread of the surface; no additional ACL needed.
+- **`escapesCwd` field rename** — out of scope. Touches every consumer (`harness/loop.ts`, every tool with the flag); bundling with broader metadata cleanup makes a cleaner PR.
+
+### Remaining from bash-tools review
+
+After slice 150:
+- **slice 151** — bg correctness cluster (stdout/stderr unbounded growth; concurrent kill() race; cleanup count double-counts; exitCode dropped in kill path) — 🟠
+- **slice 152** — resolver calibration (cmdGit unknown subcommand → low confidence; cmdCd false-positive read-fs; cmdSysInfo false readFs('/etc') for date/uptime/hostname) — 🟡
+
+The 🔴 critical column has been empty since slice 148. Remaining work is the bg correctness cluster + resolver calibration polish.
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 149: HIDE_PATHS expansion (rustup / subversion auth / gitconfig / cargo creds)
 
 **Done.** One-hundred-forty-ninth slice. Closes the 🟠 important HIDE_PATHS gaps flagged in the bash-tools code review. Each path is a credential / executable-hook leak that the slice 118 baseline and slice 125's expansion missed. Pure additive — same shape as the slice 140 (XDG_DATA_HOME) and slice 146 (XDG_CONFIG_HOME) overlays.

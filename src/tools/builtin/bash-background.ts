@@ -112,6 +112,23 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
         return toolError(ERROR_CODES.invalidArg, 'max_runtime_ms must be an integer >= 100 (ms)');
       }
     }
+    // Slice 150 (review): type-check label and cwd. Pre-slice both
+    // were forwarded to the manager without a runtime type guard.
+    //   - `label` non-string (e.g. `label: 42` or `label: {x: 1}`)
+    //     reached the storage layer and landed in audit logs / UI
+    //     tray as a non-string, breaking downstream renders that
+    //     expect string|null. Spec §17.4 documents label as a
+    //     human-readable name.
+    //   - `cwd` non-string would throw ERR_INVALID_ARG_TYPE inside
+    //     `isAbsolute(args.cwd)`, surfaced as `internalError` from
+    //     the harness instead of a clean tool error. Same gap the
+    //     sync bash tool had pre-slice; fixed here in parallel.
+    if (args.label !== undefined && typeof args.label !== 'string') {
+      return toolError(ERROR_CODES.invalidArg, 'label must be a string');
+    }
+    if (args.cwd !== undefined && typeof args.cwd !== 'string') {
+      return toolError(ERROR_CODES.invalidArg, 'cwd must be a string');
+    }
     // Resolve cwd against the session: undefined → session cwd;
     // absolute → as-is; relative → resolve from session cwd. Same
     // pattern as the synchronous bash tool. Forwarding args.cwd

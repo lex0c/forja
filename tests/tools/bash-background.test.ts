@@ -177,4 +177,43 @@ describe('bash_background tool', () => {
     expect(typeof r.process_id).toBe('string');
     await waitForExit(r.process_id);
   });
+
+  // Slice 150 (review): type-check label and cwd. Pre-slice these
+  // arrived from the LLM unvalidated and reached the manager /
+  // storage layer with wrong types (label=42 landed in audit logs
+  // as a non-string; cwd=42 threw ERR_INVALID_ARG_TYPE inside
+  // isAbsolute and surfaced as `internalError` instead of a clean
+  // tool error).
+  test('rejects non-string label', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: synthesizing bad model input
+      { command: 'true', label: 42 as any },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('label must be a string');
+  });
+
+  test('rejects non-string cwd', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: synthesizing bad model input
+      { command: 'true', cwd: 42 as any },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('cwd must be a string');
+  });
+
+  test('accepts label as null-ish (undefined)', async () => {
+    // label is optional; omitting must not trip the type check.
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute({ command: 'true' }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.label).toBeNull();
+    await waitForExit(r.process_id);
+  });
 });

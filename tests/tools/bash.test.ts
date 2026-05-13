@@ -174,6 +174,22 @@ describe('bashTool', () => {
     expect(out.stdout.trim().endsWith(`${dir}/sub`)).toBe(true);
   });
 
+  // Slice 150 (review): type-check cwd before isAbsolute. Pre-slice
+  // a non-string cwd (e.g. cwd: 42) threw ERR_INVALID_ARG_TYPE
+  // inside the path resolution and the harness surfaced it as
+  // internalError; now it surfaces as tool.invalid_arg with a
+  // clean message the model can react to.
+  test('rejects non-string cwd', async () => {
+    const out = await bashTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: synthesizing bad model input
+      { command: 'pwd', cwd: 42 as any },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('cwd must be a string');
+  });
+
   test('caller abort mid-exec returns tool.aborted (not exit_code 143)', async () => {
     // Bun.spawn already honors signal natively (sends SIGTERM), but
     // the tool used to surface the resulting exit_code 143 as a

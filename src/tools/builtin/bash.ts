@@ -134,6 +134,18 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       );
     }
 
+    // Slice 150 (review): type-check cwd BEFORE `isAbsolute`. Model
+    // JSON arrives unvalidated by the provider; if `args.cwd` is a
+    // number / object / null, `isAbsolute(args.cwd)` throws
+    // ERR_INVALID_ARG_TYPE deep inside path resolution and the
+    // harness surfaces it as `internalError` rather than a clean
+    // tool error. Pre-validate so the error code matches schema
+    // intent and the model sees a structured "fix your input"
+    // signal instead of a stack trace.
+    if (args.cwd !== undefined && typeof args.cwd !== 'string') {
+      return toolError(ERROR_CODES.invalidArg, 'cwd must be a string');
+    }
+
     // Resolve cwd to absolute BEFORE handing off to the broker —
     // the broker handler resolves relative paths against its own
     // baseCwd (process.cwd() of the worker), which is NOT the same
