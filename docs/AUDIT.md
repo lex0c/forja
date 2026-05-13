@@ -40,6 +40,7 @@ The first three are the **forensic floor**; the last three support lifecycle (ro
 | `agent permission revoke <id>` | Revoke a grant by ID |
 | `agent permission policy-list` | List archived policy snapshots |
 | `agent permission policy-rollback <hash>` | Restore an archived policy |
+| `agent permission calibration-export [--json] [--since-days N] [--all-decisions]` | Export `(score, decision, outcome)` triples for offline regression (spec §6.3.2.2, slice 138) |
 | `agent perms` / `--explain-permissions` | Render merged effective policy with per-section layer attribution |
 
 ### 1.3 Deferred (spec-only, not yet implemented)
@@ -52,7 +53,7 @@ The first three are the **forensic floor**; the last three support lifecycle (ro
 | `agent forensics <session>` | AUDIT.md §5 | Bundle generation deferred |
 | `agent gc` | AUDIT.md §10.3 | Retention sweep deferred |
 | `redaction_events` table | AUDIT.md §3.3 | Pipeline partial (`telemetry/scrubbing.ts` exists); dedicated table not migrated |
-| Calibration script (`agent audit calibrate`) | PERMISSION_ENGINE.md §6.3.2 | Out-of-tree; consumes `outcome_signals` |
+| Offline calibration regression (steps 2-5 of §6.3.2 plan) | PERMISSION_ENGINE.md §6.3.2 | Out-of-tree (operator tooling — Python/R/etc.) consumes the NDJSON emitted by `agent permission calibration-export --json` (slice 138, §6.3.2.2). Step 1 (triple extraction) is in-tree as of slice 138. |
 
 When operators ask about these features, the answer today is "the data is there, the CLI verb to surface it isn't". Reader functions are exported from `src/permissions/index.ts`, `src/failures/index.ts`, `src/outcomes/index.ts` for script-side use.
 
@@ -90,6 +91,35 @@ Add to crontab for production environments:
 ```
 
 The `--json` output is stable across versions (audit schema versioning per AUDIT.md §8). Operators who want JSON-only output for piping to alerting systems can request it on any read verb.
+
+### 2.2 Calibration sweep (slice 138)
+
+The risk-score `baseline-v2.0` weights (PERMISSION_ENGINE.md §6.3.2) are an informed guess. Once a pilot deployment has run for ~30 days, the spec calls for re-deriving the weights via logistic regression over `(score, decision, outcome)` triples.
+
+**Step 1 (in-tree, slice 138)** — extract the triples for the current install:
+
+```bash
+# Text summary on stdout: how much data is in the window?
+$ agent permission calibration-export --since-days 30
+calibration export — install_id=68ac9b74-b6d2-4683-ac42-3c96026f7fcb
+window: last 30 days
+triples: 1423
+  harmful : 87
+  harmless: 1336
+  with at least one outcome_signal: 312
+by decision:
+  confirm-allowed: 891
+  confirm-denied: 532
+
+# NDJSON on stdout for offline analysis; coverage summary on stderr.
+$ agent permission calibration-export --json --since-days 30 > triples.ndjson 2> coverage.txt
+```
+
+The default decision filter keeps `confirm-allowed` + `confirm-denied` only — those are the clean human labels. Auto-allow / auto-deny rows have zero direct outcome signal and would skew the regression; widen with `--all-decisions` only if your offline pipeline accounts for selection bias.
+
+**Steps 2-5 (out-of-tree)** — logistic regression on the NDJSON, A/B test the derived weights against the baseline, and bump `DEFAULT_SIGNAL_WEIGHTS` in `src/outcomes/codes.ts` (audit-log marker advances to `outcome-baseline-v2.1`). The regression tooling itself is the operator's choice (Python / R / etc.) consuming the NDJSON envelope documented in spec §6.3.2.2.
+
+Sparse window (`<100` triples) triggers a soft hint in the text output — running the regression on too little data overfits the baseline. The hint is advisory only; the verb still emits whatever triples exist.
 
 ---
 

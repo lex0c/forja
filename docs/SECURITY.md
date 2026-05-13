@@ -244,7 +244,7 @@ if confidence != 'high':           upgrade to confirm
 otherwise:                          allow stays allow
 ```
 
-Weights are documented as `baseline-v2.0`. Calibration plan (spec §6.3.2) collects 30 days of `(score, decision_humano, outcome)` triples (slice 131's `outcome_signals` materializes the third element) and derives `v2.1` via logistic regression.
+Weights are documented as `baseline-v2.0`. Calibration plan (spec §6.3.2) collects 30 days of `(score, decision_humano, outcome)` triples (slice 131's `outcome_signals` materializes the third element) and derives `v2.1` via logistic regression. Step 1 of the plan — triple extraction — is in-tree as of slice 138 via `agent permission calibration-export` (spec §6.3.2.2, operator guide in `docs/AUDIT.md §2.2`); the regression itself stays offline.
 
 ### 3.6 Decision shape + audit emission
 
@@ -667,7 +667,7 @@ Slice 131 materializes the calibration triples spec §6.3.2 specifies. Each sign
 | `checkpoint_reverted` | 0.90 | cli/checkpoints `--undo` for each approval after the restored checkpoint | Strong |
 | `session_aborted` | 0.20 | harness/loop `finish()` last 5 approvals when terminal is interrupted/error | Weak |
 
-`computeOutcomeForApproval(seq)` walks signals via max-wins composite. Threshold 0.5 → `harmful`. Calibration scripts consume `(score, score_components_json, decision, outcome)` triples for logistic regression — see spec §6.3.2.1 for the baseline-v2.0 contract.
+`computeOutcomeForApproval(seq)` walks signals via max-wins composite. Threshold 0.5 → `harmful`. Calibration scripts consume `(score, score_components_json, decision, outcome)` triples for logistic regression — see spec §6.3.2.1 for the baseline-v2.0 contract. Slice 138 ships the in-tree triple extractor + CLI verb (`agent permission calibration-export`, spec §6.3.2.2); offline regression on the NDJSON output stays operator-tooling.
 
 **Derived-audit semantics** (spec AUDIT.md §4.2.3): no `chain_hash` column. Every signal derives 100% from already-chained events in `approvals_log` + `failure_events` — re-hashing here would duplicate integrity without adding evidence. FK existence is validated at INSERT (sink probe `getApprovalsLogBySeq`), but **not** enforced via `ON DELETE CASCADE` — chain rotation deletes `approvals_log` rows, and cascading the deletion would silently wipe calibration data (slice 131 fixup #1). `install_id` is denormalized into the signal row so calibration scripts can join across `approvals_log` + `approvals_log_archived` post-rotation.
 
