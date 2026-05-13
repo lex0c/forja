@@ -1958,3 +1958,467 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
     expect(outPartial.result.output).toBe('partial');
   });
 });
+
+// Slice 135 P0-7: FIFO ordering of the slot semaphore under
+// realistic microtask interleaving. The store enqueues waiters
+// in `waiters.push(...)` and dequeues with `waiters.shift()` —
+// data-structure FIFO. But the dispatch ORDER observable to the
+// spawnFn caller is what the model relies on for "task_async
+// calls in order Q1, Q2, Q3 run children in that order once
+// slots free." A regression that switched the queue to a Set,
+// LIFO, or used a Promise.race resolver pattern would silently
+// reorder dispatches and the model's tool flow would lose its
+// invariant. This block pins the contract from the spawnFn's
+// point of view.
+describe('SubagentHandleStore — FIFO slot semaphore (slice 135 P0-7)', () => {
+  test('5 spawns at cap=2 dispatch in spawn order, even with microtask interleaving', async () => {
+    const dispatchOrder: string[] = [];
+    // Each spawnFn is a manual barrier — only resolves when the
+    // test releases it. Lets the test control exactly when each
+    // record settles so we can observe dispatch order without
+    // wall-clock flakiness.
+    const releasers: Map<string, () => void> = new Map();
+    const releasePromises: Map<string, Promise<void>> = new Map();
+    const buildBarrier = (name: string): void => {
+      const p = new Promise<void>((resolve) => releasers.set(name, resolve));
+      releasePromises.set(name, p);
+    };
+    for (const name of ['a', 'b', 'c', 'd', 'e']) buildBarrier(name);
+
+    const store = createSubagentHandleStore({
+      cap: 2,
+      spawnFn: async (args) => {
+        dispatchOrder.push(args.name);
+        // Wait for the test to release this specific child.
+        await releasePromises.get(args.name);
+        return okResult(args);
+      },
+    });
+
+    // Spawn 5 handles with microtask "noise" interleaved between
+    // calls — `await Promise.resolve()` pumps the microtask
+    // queue and flushes any pending then-callbacks. Without
+    // FIFO guarantees, the second `acquireSlot` could resolve
+    // before the first if waiters' resolvers fired in any
+    // non-deterministic order.
+    const handles: Array<{ name: string; id: string }> = [];
+    for (const name of ['a', 'b', 'c', 'd', 'e']) {
+      const h = store.spawn({ name, prompt: `p-${name}` }, { estimateCostUsd: 0 });
+      handles.push({ name, id: h.id });
+      // Microtask interleaving — flushes the resolved-promise
+      // chains queued by acquireSlot's immediate path. If the
+      // first two spawns hadn't taken their slots yet, this
+      // gives them a chance to run before the next spawn lands
+      // — observable proof that microtask order doesn't reorder
+      // the waiter queue.
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+
+    // At this point: a, b dispatched (cap=2); c, d, e queued.
+    // Yield once more so any straggling microtasks settle.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b']);
+    expect(store.queuedCount()).toBe(3);
+
+    // Release a → c should dispatch next (NOT d or e).
+    releasers.get('a')?.();
+    await store.awaitHandle(handles[0]?.id ?? '');
+    // Pump microtasks so c's acquireSlot resolves + spawnFn enters.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c']);
+
+    // Release b → d dispatches.
+    releasers.get('b')?.();
+    await store.awaitHandle(handles[1]?.id ?? '');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c', 'd']);
+
+    // Release c → e dispatches.
+    releasers.get('c')?.();
+    await store.awaitHandle(handles[2]?.id ?? '');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c', 'd', 'e']);
+
+    // Drain remaining barriers.
+    releasers.get('d')?.();
+    releasers.get('e')?.();
+    await Promise.all(handles.map((h) => store.awaitHandle(h.id)));
+    expect(store.queuedCount()).toBe(0);
+    expect(store.inFlightCount()).toBe(0);
+  });
+
+  test('settle order ≠ spawn order: queue still FIFO on the dispatch side', async () => {
+    // Demonstrates the contract: FIFO is on DISPATCH, not on
+    // SETTLE. If `a` and `b` dispatch but `b` settles first, c
+    // takes b's slot. Then if `a` settles, d takes a's slot.
+    // Critically: c MUST dispatch before d (FIFO over the
+    // waiter queue), regardless of which slot they end up in.
+    const dispatchOrder: string[] = [];
+    const releasers: Map<string, () => void> = new Map();
+    const releasePromises: Map<string, Promise<void>> = new Map();
+    for (const name of ['a', 'b', 'c', 'd']) {
+      releasePromises.set(name, new Promise<void>((resolve) => releasers.set(name, resolve)));
+    }
+    const store = createSubagentHandleStore({
+      cap: 2,
+      spawnFn: async (args) => {
+        dispatchOrder.push(args.name);
+        await releasePromises.get(args.name);
+        return okResult(args);
+      },
+    });
+    const handles = ['a', 'b', 'c', 'd'].map((name) =>
+      store.spawn({ name, prompt: 'p' }, { estimateCostUsd: 0 }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b']);
+
+    // Settle b first (out of spawn order). c should dispatch
+    // — NOT d, even though d was spawned later. The queue is
+    // FIFO over INSERT order, not over slot-vacancy order.
+    releasers.get('b')?.();
+    await store.awaitHandle(handles[1]?.id ?? '');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c']);
+
+    // Now settle a — d should dispatch.
+    releasers.get('a')?.();
+    await store.awaitHandle(handles[0]?.id ?? '');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c', 'd']);
+
+    releasers.get('c')?.();
+    releasers.get('d')?.();
+    await Promise.all(handles.map((h) => store.awaitHandle(h.id)));
+  });
+
+  test('synchronous burst (no awaits between spawns) preserves FIFO', async () => {
+    // The most adversarial case: 10 spawns in a tight loop with
+    // ZERO microtask flushes between them. Every acquireSlot
+    // beyond the cap pushes to `waiters` synchronously; the
+    // resolution order when slots free must still match push
+    // order. This is the canonical "model emitted 10 task_async
+    // calls in one turn" scenario.
+    const dispatchOrder: string[] = [];
+    const releasers: Map<string, () => void> = new Map();
+    const releasePromises: Map<string, Promise<void>> = new Map();
+    const names = Array.from({ length: 10 }, (_, i) => `worker_${i.toString().padStart(2, '0')}`);
+    for (const name of names) {
+      releasePromises.set(name, new Promise<void>((resolve) => releasers.set(name, resolve)));
+    }
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => {
+        dispatchOrder.push(args.name);
+        await releasePromises.get(args.name);
+        return okResult(args);
+      },
+    });
+    // Synchronous burst — no awaits.
+    const handles = names.map((name) => store.spawn({ name, prompt: 'p' }, { estimateCostUsd: 0 }));
+    // Initial dispatch — first 3 enter immediately.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['worker_00', 'worker_01', 'worker_02']);
+    expect(store.queuedCount()).toBe(7);
+
+    // Release them in REVERSE order to maximally stress the
+    // queue: settles happen in [02, 01, 00] order; dispatches
+    // MUST still happen in [03, 04, 05] order (queue position,
+    // not slot vacancy).
+    for (const i of [2, 1, 0]) {
+      releasers.get(names[i] ?? '')?.();
+      await store.awaitHandle(handles[i]?.id ?? '');
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual([
+      'worker_00',
+      'worker_01',
+      'worker_02',
+      'worker_03',
+      'worker_04',
+      'worker_05',
+    ]);
+
+    // Now release the middle three in some random order; tail
+    // must dispatch in queue order regardless.
+    for (const i of [4, 3, 5]) {
+      releasers.get(names[i] ?? '')?.();
+      await store.awaitHandle(handles[i]?.id ?? '');
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual([
+      'worker_00',
+      'worker_01',
+      'worker_02',
+      'worker_03',
+      'worker_04',
+      'worker_05',
+      'worker_06',
+      'worker_07',
+      'worker_08',
+    ]);
+
+    // Drain final 4.
+    for (let i = 6; i < 10; i++) releasers.get(names[i] ?? '')?.();
+    await Promise.all(handles.map((h) => store.awaitHandle(h.id)));
+    expect(dispatchOrder).toEqual(names);
+  });
+
+  test('cancellation while queued does not reorder remaining waiters', async () => {
+    // Cancel the MIDDLE queued waiter. The records before it
+    // (already dispatched) and after it (still queued) MUST
+    // retain their relative dispatch order. The cancelled
+    // record settles via `cancelled_before_dispatch` without
+    // calling spawnFn — so it never appears in dispatchOrder.
+    const dispatchOrder: string[] = [];
+    const releasers: Map<string, () => void> = new Map();
+    const releasePromises: Map<string, Promise<void>> = new Map();
+    for (const name of ['a', 'b', 'c', 'd', 'e']) {
+      releasePromises.set(name, new Promise<void>((resolve) => releasers.set(name, resolve)));
+    }
+    const store = createSubagentHandleStore({
+      cap: 2,
+      spawnFn: async (args) => {
+        dispatchOrder.push(args.name);
+        await releasePromises.get(args.name);
+        return okResult(args);
+      },
+    });
+    const handles = ['a', 'b', 'c', 'd', 'e'].map((name) =>
+      store.spawn({ name, prompt: 'p' }, { estimateCostUsd: 0 }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b']);
+
+    // Cancel the middle queued waiter (d, index 3).
+    const cancelResult = store.cancel(handles[3]?.id ?? '', 'model');
+    expect(cancelResult.cancelled).toBe(true);
+
+    // Release a — c dispatches next (NOT e, queue order
+    // preserved despite d's cancel).
+    releasers.get('a')?.();
+    await store.awaitHandle(handles[0]?.id ?? '');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c']);
+
+    // Release b — e dispatches next (d skipped because cancelled
+    // before dispatch; the IIFE wakes from acquireSlot, sees
+    // signal.aborted, returns cancelled_before_dispatch without
+    // entering spawnFn).
+    releasers.get('b')?.();
+    await store.awaitHandle(handles[1]?.id ?? '');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(dispatchOrder).toEqual(['a', 'b', 'c', 'e']);
+
+    // d's settled outcome is the cancelled-before-dispatch envelope.
+    const dOutcome = await store.awaitHandle(handles[3]?.id ?? '');
+    expect(dOutcome.kind).toBe('done');
+    if (dOutcome.kind === 'done' && dOutcome.result.kind === 'ran') {
+      expect(dOutcome.result.reason).toBe('cancelled_before_dispatch');
+      expect(dOutcome.result.cancelSource).toBe('model');
+    }
+
+    releasers.get('c')?.();
+    releasers.get('e')?.();
+    await Promise.all(handles.map((h) => store.awaitHandle(h.id)));
+  });
+});
+
+// Slice 135 P0-8: cancelAll vs. stale `cost_update` race. The
+// pre-fix shape — where `cancelAll` zeroed `estimateCostUsd`
+// but did NOT set the `cancelled` flag — let a `cost_update`
+// already in flight on the IPC pipe re-inflate `liveCostUsd`
+// after the watchdog had released the reservation. The current
+// implementation sets `record.cancelled = true` in cancelAll
+// and `recordLiveCost` short-circuits on cancelled records.
+// This block hammers the race from several angles.
+describe('SubagentHandleStore — cancelAll vs. cost_update race (slice 135 P0-8)', () => {
+  test('cost_update arriving after cancelAll is dropped (single handle)', async () => {
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered();
+        await sleep(500, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 2 });
+    await inFlight;
+    store.recordLiveCost(h.id, 1.5);
+    expect(store.getReservedChildCostUsd()).toBe(2); // floor at estimate
+    expect(store.getLiveCostUsd(h.id)).toBe(1.5);
+
+    // Watchdog fires.
+    store.cancelAll('cap_watchdog');
+    expect(store.getReservedChildCostUsd()).toBe(0);
+
+    // Three back-to-back stale cost_updates from the IPC pipe.
+    // None must re-inflate the reservation OR the live tracker.
+    store.recordLiveCost(h.id, 5);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    store.recordLiveCost(h.id, 100);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    store.recordLiveCost(h.id, 999_999);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    // Live tracker also frozen at the pre-cancel value — the
+    // post-cancel cost_updates were no-ops so getLiveCostUsd
+    // still returns 1.5 (the value captured before cancel).
+    expect(store.getLiveCostUsd(h.id)).toBe(1.5);
+
+    await store.awaitHandle(h.id);
+  });
+
+  test('cancelAll over a mixed set: dispatched + queued + already-settled', async () => {
+    // Three handles in three distinct states:
+    //   - h1: dispatched, will receive a stale cost_update
+    //   - h2: queued (cap=1 forces it to wait)
+    //   - h3: already settled before cancelAll fires
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    let h3Done: () => void = () => {};
+    const h3Settled = new Promise<void>((r) => {
+      h3Done = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 1,
+      spawnFn: async (args, signal) => {
+        if (args.name === 'h3') {
+          // h3 settles fast.
+          return okResult(args);
+        }
+        if (args.name === 'h1') {
+          entered();
+          await sleep(500, signal).catch(() => undefined);
+          return okResult(args);
+        }
+        // h2 should never dispatch (cancelled while queued).
+        await sleep(500, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+
+    // Run h3 to completion first so it's settled.
+    const h3 = store.spawn({ name: 'h3', prompt: 'p' }, { estimateCostUsd: 1 });
+    await store.awaitHandle(h3.id);
+    h3Done();
+    await h3Settled;
+    expect(store.getSettledChildCostUsd()).toBe(0); // okResult returns costUsd: 0
+
+    // Now spawn h1 (dispatches at cap=1) + h2 (queued).
+    const h1 = store.spawn({ name: 'h1', prompt: 'p' }, { estimateCostUsd: 2 });
+    const h2 = store.spawn({ name: 'h2', prompt: 'p' }, { estimateCostUsd: 3 });
+    await inFlight;
+    store.recordLiveCost(h1.id, 1);
+    expect(store.getReservedChildCostUsd()).toBe(2 + 3); // both running: h1 floor=2, h2 estimate=3
+
+    // Watchdog cancelAll.
+    store.cancelAll('cap_watchdog');
+    expect(store.getReservedChildCostUsd()).toBe(0);
+
+    // Stale cost_updates for each of the three:
+    //   - h1: was dispatched, cancelled → cost_update no-op
+    //   - h2: was queued + cancelled → cost_update no-op
+    //   - h3: already settled (not cancelled) → cost_update is
+    //     dropped by the !running guard, not by !cancelled.
+    //     Either way: reservation stays 0.
+    store.recordLiveCost(h1.id, 999);
+    store.recordLiveCost(h2.id, 999);
+    store.recordLiveCost(h3.id, 999);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+
+    // h2 was cancelled while queued — its outcome is
+    // cancelled_before_dispatch with cancelSource='cap_watchdog'.
+    const out2 = await store.awaitHandle(h2.id);
+    expect(out2.kind).toBe('done');
+    if (out2.kind === 'done' && out2.result.kind === 'ran') {
+      expect(out2.result.reason).toBe('cancelled_before_dispatch');
+      expect(out2.result.cancelSource).toBe('cap_watchdog');
+    }
+    await store.awaitHandle(h1.id);
+  });
+
+  test('cancelAll is idempotent: second call does not re-trigger nor wake stale costs', async () => {
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered();
+        await sleep(500, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'h', prompt: 'p' }, { estimateCostUsd: 4 });
+    await inFlight;
+    store.recordLiveCost(h.id, 2);
+    store.cancelAll('cap_watchdog');
+    expect(store.getReservedChildCostUsd()).toBe(0);
+
+    // Second cancelAll — no-op (record already cancelled). Then
+    // another stale cost_update. Reservation must still be 0.
+    store.cancelAll('cap_watchdog');
+    store.recordLiveCost(h.id, 50);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    await store.awaitHandle(h.id);
+  });
+
+  test('cancelAll preserves cancelReason attribution against late cost_update', async () => {
+    // The race scenario: cancelAll stamps cancelReason='cap_watchdog'.
+    // A stray cost_update lands after. The cost_update path must
+    // not silently overwrite the attribution — cancelReason is
+    // owned by the cancel paths only. The audit envelope keeps
+    // the original source.
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered();
+        await sleep(50, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'h', prompt: 'p' }, { estimateCostUsd: 1 });
+    await inFlight;
+    store.cancelAll('cap_watchdog');
+    store.recordLiveCost(h.id, 999);
+    const outcome = await store.awaitHandle(h.id);
+    expect(outcome.kind).toBe('done');
+    if (outcome.kind === 'done' && outcome.result.kind === 'ran') {
+      // Stamped by the post-IIFE cancelSource-attribution path.
+      // The runtime returned 'done' here (mock spawnFn doesn't
+      // respect abort), so cancelSource may or may not be set —
+      // the contract is that it's NEVER 'model' when the cancel
+      // came from cancelAll('cap_watchdog'). Either undefined
+      // (status='done' branch skips stamping) or 'cap_watchdog'
+      // is acceptable; 'model' would be a bug.
+      if (outcome.result.cancelSource !== undefined) {
+        expect(outcome.result.cancelSource).toBe('cap_watchdog');
+      }
+    }
+  });
+});

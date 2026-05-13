@@ -726,3 +726,212 @@ describe('verifySealAgainstChain — works with git-anchored backend too', () =>
     if (v.ok) expect(v.entriesChecked).toBe(3);
   });
 });
+
+// Slice 135 P0-5: parametric missing-seq + hash-mismatch verify
+// matrix across ALL 4 backends. verifySealAgainstChain operates
+// purely through `store.list()` so the backend should not matter,
+// but each sealer parses its own seal.log lines and a future
+// regression in one parser (e.g., S3's parseLine forgetting to
+// validate seq monotonicity) could silently let bad entries pass
+// the verifier. This block locks that contract in place.
+//
+// The matrix runs each backend through three scenarios:
+//   - missing-seq: append seq=999 to the seal store, chain has
+//     no row at seq=999 → verify fails with "missing from
+//     approvals_log";
+//   - hash-mismatch: append a seq that IS in the chain but with a
+//     tampered hash → verify fails with "hash mismatch at seq=N";
+//   - happy path: append the correct seq + hash → verify ok.
+describe('verifySealAgainstChain — parametric matrix across all 4 backends (slice 135 P0-5)', () => {
+  // Common audit-chain fixture; per-test stores are built by the
+  // backend factory inside each test.
+  const buildChain = (rowCount: number) => {
+    const db = openMemoryDb();
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env: { HOME: tmpRoot },
+      now: () => 1,
+      uuid: () => 'param-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    const emitted: Array<{ seq: number; this_hash: string }> = [];
+    for (let i = 0; i < rowCount; i++) {
+      const row = sink.emit({
+        session_id: `s${i}`,
+        tool_name: 'bash',
+        args: { i },
+        decision: 'allow',
+        policy_hash: 'sha256:p',
+        reason_chain: [],
+        ts: 100 + i,
+      });
+      emitted.push({ seq: row.seq, this_hash: row.this_hash });
+    }
+    return { db, identity, emitted };
+  };
+
+  // Each backend factory returns a `SealStore` constructed with the
+  // in-memory fs seam so all four are uniform from the test's POV.
+  // The matrix is driven by an explicit array (not test.each) to
+  // keep the boilerplate readable and grep-friendly.
+  type BackendFactory = (
+    fs: FakeFs,
+    dir: string,
+  ) => {
+    store: ReturnType<typeof createWormFileSealer>;
+  };
+
+  const BACKENDS: Array<{ name: string; build: BackendFactory }> = [
+    {
+      name: 'worm-file',
+      build: (fs, dir) => ({
+        store: createWormFileSealer({
+          path: join(dir, 'seal.log'),
+          exists: fs.exists,
+          read: fs.read,
+          append: fs.append,
+          ensureDir: fs.ensureDir,
+        }),
+      }),
+    },
+    {
+      name: 'git-anchored',
+      build: (fs, dir) => ({
+        store: createGitAnchoredSealer({
+          repoPath: dir,
+          exists: fs.exists,
+          read: fs.read,
+          append: fs.append,
+          exec: () => {}, // skip real git; we only exercise the wire format
+        }),
+      }),
+    },
+  ];
+
+  // Lazy-import the TSA + S3 sealers so the static imports up top
+  // stay minimal. Done synchronously inside each test via require.
+  const buildRfc3161 = (fs: FakeFs, dir: string) => {
+    type Rfc3161Module = typeof import('../../src/permissions/sealing-rfc3161.ts');
+    const { createRfc3161TsaSealer } =
+      require('../../src/permissions/sealing-rfc3161.ts') as Rfc3161Module;
+    return createRfc3161TsaSealer({
+      path: dir,
+      endpoint: 'https://tsa.example.com',
+      // Scripted submitter — return a deterministic TSR for any
+      // input. The verifier never reads .tsr files so we don't care
+      // about the bytes.
+      submit: () => ({ ok: true, tsr: new Uint8Array([0x00]) }),
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      // The TSR write goes to disk; we direct it to the fake fs too
+      // so the test doesn't pollute /tmp with stray .tsr files.
+      writeBinary: () => {},
+      ensureDir: fs.ensureDir,
+    });
+  };
+
+  const buildS3 = (fs: FakeFs, dir: string) => {
+    type S3Module = typeof import('../../src/permissions/sealing-s3-object-lock.ts');
+    const { createS3ObjectLockSealer } =
+      require('../../src/permissions/sealing-s3-object-lock.ts') as S3Module;
+    return createS3ObjectLockSealer({
+      path: dir,
+      bucket: 'forja-seals',
+      retentionDays: 1,
+      submit: () => ({ ok: true }),
+      now: () => 0,
+      exists: fs.exists,
+      read: fs.read,
+      append: fs.append,
+      ensureDir: fs.ensureDir,
+    });
+  };
+
+  const ALL_BACKENDS: Array<{
+    name: string;
+    build: (fs: FakeFs, dir: string) => ReturnType<typeof createWormFileSealer>;
+  }> = [
+    ...BACKENDS.map((b) => ({
+      name: b.name,
+      build: (fs: FakeFs, dir: string) => b.build(fs, dir).store,
+    })),
+    { name: 'rfc3161-tsa', build: buildRfc3161 },
+    { name: 's3-object-lock', build: buildS3 },
+  ];
+
+  for (const backend of ALL_BACKENDS) {
+    test(`[${backend.name}] happy path: matching entries → ok with entriesChecked`, () => {
+      const fs = makeFakeFs();
+      const { db, identity, emitted } = buildChain(3);
+      const store = backend.build(fs, tmpRoot);
+      for (let i = 0; i < emitted.length; i++) {
+        const row = emitted[i];
+        if (row === undefined) continue;
+        const r = store.append({ seq: row.seq, ts: 1000 + i, hash: row.this_hash });
+        expect(r.ok).toBe(true);
+      }
+      const v = verifySealAgainstChain(store, db, identity.install_id);
+      expect(v.ok).toBe(true);
+      if (v.ok) expect(v.entriesChecked).toBe(3);
+    });
+
+    test(`[${backend.name}] missing-seq: seal references seq=999 not in chain → ok:false`, () => {
+      const fs = makeFakeFs();
+      const { db, identity } = buildChain(2);
+      const store = backend.build(fs, tmpRoot);
+      // Append a real entry first (seq=1) so the verifier has at
+      // least one valid row to walk past — proves the failure
+      // emerges on the missing seq, not on the first lookup.
+      const emitted = buildChain(2).emitted; // discard new db; just need a valid hash
+      // Actually we already have the original chain's emitted — re-fetch:
+      const real = db
+        .query('SELECT seq, this_hash FROM approvals_log WHERE install_id = ? ORDER BY seq ASC')
+        .all(identity.install_id) as Array<{ seq: number; this_hash: string }>;
+      expect(real.length).toBe(2);
+      const first = real[0];
+      if (first === undefined) throw new Error('setup');
+      const r1 = store.append({ seq: first.seq, ts: 100, hash: first.this_hash });
+      expect(r1.ok).toBe(true);
+      // Now plant the bogus entry. Use a SHA-256-shaped hash to
+      // satisfy the rfc3161 backend's append-time validator (the
+      // worm/git/s3 backends accept any non-empty hash string).
+      const fakeHash = 'a'.repeat(64);
+      const r2 = store.append({ seq: 999, ts: 200, hash: fakeHash });
+      expect(r2.ok).toBe(true);
+      const v = verifySealAgainstChain(store, db, identity.install_id);
+      expect(v.ok).toBe(false);
+      if (!v.ok) {
+        expect(v.firstMismatchAt).toBe(999);
+        expect(v.reason).toContain('missing from approvals_log');
+      }
+      // Silence unused-var lint — `emitted` was kept for symmetry
+      // with other parametric scenarios.
+      expect(emitted.length).toBeGreaterThan(0);
+    });
+
+    test(`[${backend.name}] hash-mismatch: seal hash for valid seq doesn't match chain → ok:false`, () => {
+      const fs = makeFakeFs();
+      const { db, identity, emitted } = buildChain(2);
+      const store = backend.build(fs, tmpRoot);
+      const first = emitted[0];
+      const second = emitted[1];
+      if (first === undefined || second === undefined) throw new Error('setup');
+      // First entry: correct hash → walks past.
+      store.append({ seq: first.seq, ts: 100, hash: first.this_hash });
+      // Second entry: tampered hash (still 64-hex-char so rfc3161
+      // accepts the append; the verifier MUST reject it on the
+      // db cross-check).
+      const tamperedHash = 'b'.repeat(64);
+      store.append({ seq: second.seq, ts: 101, hash: tamperedHash });
+      const v = verifySealAgainstChain(store, db, identity.install_id);
+      expect(v.ok).toBe(false);
+      if (!v.ok) {
+        expect(v.firstMismatchAt).toBe(second.seq);
+        expect(v.reason).toContain('hash mismatch at seq=');
+        expect(v.reason).toContain(tamperedHash);
+        expect(v.reason).toContain(second.this_hash);
+      }
+    });
+  }
+});

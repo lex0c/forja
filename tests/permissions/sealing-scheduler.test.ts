@@ -545,3 +545,221 @@ describe('createSealingScheduler — integration with real worm-file + verifySea
     scheduler.close();
   });
 });
+
+// Slice 135 P0-4: pin the multi-process seed behavior introduced
+// in slice 128 (R4 P0-Race-1). Two `forja` processes on the same
+// install share `approvals_log` (DB) AND the seal store on disk.
+// Without seeding `lastSealedSeq` from `store.list()`, both
+// processes start at seq=0 and both append `seq=N` lines at the
+// same chain head → duplicate seal entries. The seed reads the
+// max seq already in the store; the second process now noops on
+// the head it would have re-sealed.
+describe('createSealingScheduler — multi-process seed (slice 128 R4 P0-Race-1)', () => {
+  test("second scheduler over same store sees first scheduler's seal as the seed", () => {
+    const { db, identity } = setupChain(5);
+    const mem = makeMemStore();
+    // Process A: tick threshold=1, seals seq=5.
+    const schedA = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 1,
+      intervalSeconds: 0,
+      now: () => 1000,
+      ...noopTimerSeams(),
+    });
+    schedA.tick();
+    expect(mem.entries).toHaveLength(1);
+    expect(mem.entries[0]?.seq).toBe(5);
+    schedA.close();
+    // Process B: fresh scheduler, SAME store. Construction should
+    // seed lastSealedSeq=5 from store.list(). A sealNow() on the
+    // unchanged chain head must report `sealed: null` — NOT a
+    // duplicate entry.
+    const schedB = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 1,
+      intervalSeconds: 0,
+      now: () => 2000,
+      ...noopTimerSeams(),
+    });
+    const r = schedB.sealNow();
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.sealed).toBeNull();
+    expect(mem.entries).toHaveLength(1); // still only A's entry
+    // And tick-driven path also noops at the seeded seq.
+    schedB.tick();
+    expect(mem.entries).toHaveLength(1);
+    schedB.close();
+  });
+
+  test('seed picks the MAX seq when store entries are out of order', () => {
+    const { db, identity } = setupChain(7);
+    // Hand-craft an out-of-order entries list — the worm file may
+    // legitimately be ordered, but TSA / git-anchored backends can
+    // return entries in non-monotonic order during operator splices.
+    const entries: SealEntry[] = [
+      { seq: 3, ts: 1, hash: 'h3' },
+      { seq: 7, ts: 2, hash: 'h7' },
+      { seq: 5, ts: 3, hash: 'h5' },
+      { seq: 4, ts: 4, hash: 'h4' },
+    ];
+    const store: SealStore = {
+      append: (e) => {
+        entries.push(e);
+        return { ok: true };
+      },
+      list: () => entries.slice(),
+      close: () => {},
+    };
+    const scheduler = createSealingScheduler({
+      store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 1,
+      intervalSeconds: 0,
+      ...noopTimerSeams(),
+    });
+    // Chain head is seq=7. Seed is max(3,7,5,4)=7 → noop on tick.
+    scheduler.tick();
+    expect(entries).toHaveLength(4); // no new entry
+    scheduler.close();
+  });
+
+  test('seed correctly distinguishes head>seed (seals) vs head=seed (noop)', () => {
+    const { db, identity, sink } = setupChain(3);
+    const mem = makeMemStore();
+    // Pre-populate the store with a stale seal at seq=2 (as if a
+    // prior process sealed an earlier point of the chain).
+    mem.entries.push({ seq: 2, ts: 50, hash: 'old-hash' });
+    const scheduler = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 1,
+      intervalSeconds: 0,
+      now: () => 500,
+      ...noopTimerSeams(),
+    });
+    // Chain head is seq=3, seed is seq=2 → first tick seals the
+    // gap (the new head).
+    scheduler.tick();
+    expect(mem.entries).toHaveLength(2);
+    expect(mem.entries[1]?.seq).toBe(3);
+    // Next tick on the same head → noop (lastSealedSeq now = 3).
+    scheduler.tick();
+    expect(mem.entries).toHaveLength(2);
+    // Add a new row, tick → seal the new head.
+    sink.emit({
+      session_id: 'extra',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:p',
+      reason_chain: [],
+      ts: 999,
+    });
+    scheduler.tick();
+    expect(mem.entries).toHaveLength(3);
+    expect(mem.entries[2]?.seq).toBe(4);
+    scheduler.close();
+  });
+
+  test('store.list() throwing at construction → falls back to seed=0 (defensive)', () => {
+    const { db, identity } = setupChain(2);
+    // Store whose list() always throws — simulates a corrupted
+    // worm file the operator hasn't repaired yet.
+    const appended: SealEntry[] = [];
+    const store: SealStore = {
+      append: (e) => {
+        appended.push(e);
+        return { ok: true };
+      },
+      list: () => {
+        throw new Error('seal log corrupted: bad magic at offset 0');
+      },
+      close: () => {},
+    };
+    // Construction must NOT throw (defensive fallback in the
+    // scheduler swallows the error).
+    const scheduler = createSealingScheduler({
+      store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 1,
+      intervalSeconds: 0,
+      now: () => 1234,
+      ...noopTimerSeams(),
+    });
+    // With seed=0, first tick should seal the chain head (seq=2).
+    scheduler.tick();
+    expect(appended).toHaveLength(1);
+    expect(appended[0]?.seq).toBe(2);
+    expect(appended[0]?.ts).toBe(1234);
+    scheduler.close();
+  });
+
+  test('two sequential schedulers over an evolving chain produce monotonic seals', () => {
+    // End-to-end multi-process simulation: two scheduler lifecycles
+    // sharing one DB + one store. After process A seals up to seq=N,
+    // process B should pick up from seq=N+1 (never re-emit N).
+    const { db, identity, sink } = setupChain(0);
+    const mem = makeMemStore();
+    // Process A: emit 5 rows, tick after each, threshold=5 → 1 seal at seq=5.
+    const schedA = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 5,
+      intervalSeconds: 0,
+      ...noopTimerSeams(),
+    });
+    for (let i = 0; i < 5; i++) {
+      sink.emit({
+        session_id: `a-${i}`,
+        tool_name: 'bash',
+        args: {},
+        decision: 'allow',
+        policy_hash: 'sha256:p',
+        reason_chain: [],
+        ts: 100 + i,
+      });
+      schedA.tick();
+    }
+    expect(mem.entries).toHaveLength(1);
+    expect(mem.entries[0]?.seq).toBe(5);
+    schedA.close();
+    // Process B: 5 more rows, threshold=5 → seal at seq=10.
+    // CRITICAL: seq=5 must NOT be sealed again — that would be
+    // the duplicate the seed fix prevents.
+    const schedB = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 5,
+      intervalSeconds: 0,
+      ...noopTimerSeams(),
+    });
+    for (let i = 0; i < 5; i++) {
+      sink.emit({
+        session_id: `b-${i}`,
+        tool_name: 'bash',
+        args: {},
+        decision: 'allow',
+        policy_hash: 'sha256:p',
+        reason_chain: [],
+        ts: 200 + i,
+      });
+      schedB.tick();
+    }
+    expect(mem.entries).toHaveLength(2);
+    expect(mem.entries[0]?.seq).toBe(5);
+    expect(mem.entries[1]?.seq).toBe(10);
+    // Seqs are strictly monotonic — no duplicates.
+    const seqs = mem.entries.map((e) => e.seq);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    schedB.close();
+  });
+});

@@ -124,9 +124,12 @@ describe('migrate', () => {
     // Plant an extra row in _migrations pretending a newer
     // migration (id=9999) ran on this DB. Re-run migrate — must
     // refuse loud rather than silently proceed.
-    db.query(
-      'INSERT INTO _migrations (id, name, hash, applied_at) VALUES (?, ?, ?, ?)',
-    ).run(9999, '099-future-version', 'a'.repeat(64), Date.now());
+    db.query('INSERT INTO _migrations (id, name, hash, applied_at) VALUES (?, ?, ?, ?)').run(
+      9999,
+      '099-future-version',
+      'a'.repeat(64),
+      Date.now(),
+    );
     expect(() => migrate(db, MIGRATIONS)).toThrow(/id=9999.*NEWER Forja/);
     db.close();
   });

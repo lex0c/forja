@@ -334,3 +334,67 @@ describe('cli entrypoint: prompt requirement', () => {
     }
   });
 });
+
+// Slice 135 P0-14: pin the first-boot nudge (slice 46 §13.5).
+// The line "forja: first run detected — try `agent welcome`..."
+// fires when install_id doesn't exist, EXCEPT on setup verbs
+// (welcome/doctor/sandbox). The once-only contract is the whole
+// UX promise — a regression that flips the condition silently
+// spams every invocation OR drops the nudge entirely. Without
+// this test the CI passes either way.
+describe('first-boot nudge (slice 46 §13.5)', () => {
+  // Isolated install dir via XDG_CONFIG_HOME so the test never
+  // touches the developer's ~/.config/agent/install_id.
+  const runWithIsolatedConfig = async (
+    args: string[],
+    options: { preinstalledIdentity?: boolean } = {},
+  ): Promise<CliResult> => {
+    const configDir = mkdtempSync(join(tmpdir(), 'forja-firstboot-'));
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-firstboot-data-'));
+    try {
+      if (options.preinstalledIdentity === true) {
+        // Pre-plant install_id so isFirstBoot returns false.
+        mkdirSync(join(configDir, 'agent'), { recursive: true, mode: 0o700 });
+        writeFileSync(
+          join(configDir, 'agent', 'install_id'),
+          JSON.stringify({ install_id: 'pre-existing', created_at_ms: 1 }),
+          { mode: 0o600 },
+        );
+      }
+      const proc = Bun.spawn(['bun', entry, ...args], {
+        cwd: repoRoot,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...process.env,
+          XDG_CONFIG_HOME: configDir,
+          XDG_DATA_HOME: dataDir,
+          // Strip $HOME-rooted discovery to force XDG_CONFIG_HOME path
+          // (installIdPath prefers XDG when set).
+        },
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      return { exitCode, stdout, stderr };
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  };
+
+  test('missing identity + normal verb (--list-sessions) → nudge on stderr', async () => {
+    const r = await runWithIsolatedConfig(['--list-sessions']);
+    expect(r.stderr).toContain('first run detected');
+    expect(r.stderr).toContain('agent welcome');
+  });
+
+  test('present identity → no nudge', async () => {
+    const r = await runWithIsolatedConfig(['--list-sessions'], {
+      preinstalledIdentity: true,
+    });
+    expect(r.stderr).not.toContain('first run detected');
+  });
+});

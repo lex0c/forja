@@ -2,6 +2,48 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] tests — slice 135: 4-agent test-coverage review punch list (P0 remaining)
+
+**Done.** One-hundred-thirty-fifth slice. Closes the **7 P0 findings deferred from slice 134**. Tests only — every fixture exercises an existing production code path; no source changes in this slice. The slice 134 commit shipped 7 P0s + 2 code changes (macOS sandbox parity + migrations forward-compat); this slice ships the remaining 7 P0s, which share test-infrastructure (real subprocesses, microtask race patterns, multi-process SQLite contention, sealing scheduler state).
+
+### Tests added
+
+| # | Test | File | Why |
+|---|---|---|---|
+| P0-4 | sealing-scheduler multi-process seed | `tests/permissions/sealing-scheduler.test.ts` | Pin slice 128 R4 P0-Race-1 — `lastSealedSeq` seeds from `store.list()` so two parallel processes don't both seal the same chain head as duplicate entries. Covers: cross-instance seed, out-of-order entries → max(seq), head > seed seals + head == seed noops, `store.list()` throw → fallback to 0, two sequential schedulers produce monotonic seqs. |
+| P0-5 | parametric missing-seq + hash-mismatch across all 4 seal backends | `tests/permissions/sealing.test.ts` | `verifySealAgainstChain` operates through `store.list()` so backend should not matter — but each sealer parses its own seal.log lines and a regression in any one parser (e.g., S3's parseLine accepting bad entries) could silently let bad rows pass verify. 4 backends × 3 scenarios (happy / missing seq=999 / tampered hash). |
+| P0-7 | handle-store FIFO under microtask-interleaved spawn | `tests/subagents/handle-store.test.ts` | Pin: `waiters.push/shift` produces dispatch order matching insertion order — even with microtask noise between spawn calls, even when settles race in reverse order, even when a queued waiter is cancelled mid-queue. 4 tests covering: microtask interleaving, out-of-order settle still FIFO dispatch, 10-handle synchronous burst with reverse-order settles, cancellation preserves remaining-queue order. |
+| P0-8 | cancelAll racing cost_update IPC | `tests/subagents/handle-store.test.ts` | Pre-fix shape (zero estimate but no cancelled flag) let stale `cost_update` re-inflate `liveCostUsd`. Tests: single-handle race, mixed-state cancelAll (dispatched + queued + already-settled), idempotent second cancelAll, attribution preserved across late cost_update. |
+| P0-9 | subprocessTransport against real Bun.spawn child | `tests/subagents/ipc.test.ts` | In-memory stream pair tests don't catch regressions in the FileSink vs WritableStream branch when Bun changes stdin shape. 4 end-to-end real-subprocess tests: child exit → onClose + lines in order, parent ends stdin → child sees EOF, parent writes → child reads via processTransport (round-trip), SIGKILL → broken-pipe EOF. |
+| P0-10 | cross-process audit chain coherence | `tests/permissions/audit.test.ts` + `tests/permissions/_cross-proc-emitter.ts` | In-process `Promise.all` (P0-1) pins JS-side serialization; the cross-process path is fundamentally different — two `Database` handles on one file, locking mediated by SQLite WAL writer lock + busy_timeout=5000. Forks two real Bun processes emitting 5 rows each, asserts: 10 rows total, contiguous seqs, distinct hashes, both workers contributed, `verifyChain` ok. Catches a hypothetical regression that swaps `withImmediateTransaction` for `withTransaction` (DEFERRED). |
+| P0-14 | first-boot nudge in cli/index.ts | `tests/cli/index.test.ts` | Spec §13.5 slice 46 wired the "first run detected" stderr nudge when no `install_id` exists. Tests use a `runWithIsolatedConfig` helper with isolated `XDG_CONFIG_HOME` and assert: missing identity + `--list-sessions` → stderr contains nudge; pre-planted identity → no nudge. |
+
+### Test scope summary
+
+- `tests/permissions/sealing-scheduler.test.ts`: +5 tests (24 total, was 19)
+- `tests/permissions/sealing.test.ts`: +12 tests = 4 backends × 3 scenarios (43 total, was 31)
+- `tests/subagents/handle-store.test.ts`: +8 tests = 4 FIFO + 4 cancelAll race (55 total, was 47)
+- `tests/subagents/ipc.test.ts`: +4 real-subprocess tests (58 total, was 54)
+- `tests/permissions/audit.test.ts`: +1 cross-process test (26 total, was 25)
+- `tests/cli/index.test.ts`: +2 first-boot nudge tests (17 total, was 15)
+- `tests/permissions/_cross-proc-emitter.ts`: new worker fixture (52 lines, ignored by test runner via underscore prefix)
+
+### Deferred to slice 136 (P1 cluster, 23 items)
+
+The four-axis P1 cluster (5 audit / 6 concurrency / 7 security / 5 operator) remains pending. Each cluster shares review-context that needs to be re-derived from the original 4-reviewer punch list before honest test scaffolding can begin. Splitting them off keeps this slice tightly scoped to the P0 remediation.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (unchanged from slice 134)
+- `bun test` — **6663 pass / 10 skip / 0 fail** (6673 total / 307 files); +32 tests over slice 134
+
+**Next.** Slice 136: P1 cluster (23 items across audit / concurrency / security / operator axes), or return to outcome_signals calibration script work per slice 134 plan.
+
+---
+
+
+
 Format:
 
 ```

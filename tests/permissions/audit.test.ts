@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   type AuditEmitInput,
   type AuditSink,
@@ -9,7 +12,7 @@ import {
 } from '../../src/permissions/audit.ts';
 import { sha256Hex } from '../../src/permissions/canonical.ts';
 import type { InstallIdentity } from '../../src/permissions/install_id.ts';
-import { type DB, MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
+import { type DB, MIGRATIONS, migrate, openDb, openMemoryDb } from '../../src/storage/index.ts';
 import {
   getApprovalsLogBySeq,
   listApprovalsLogByInstall,
@@ -416,4 +419,111 @@ describe('createSqliteSink — slice 129 R5 ts validation', () => {
     const nearFuture = Date.now() + 30 * 60 * 1000;
     expect(() => sink.emit(baseInput({ ts: nearFuture }))).not.toThrow();
   });
+});
+
+// Slice 135 P0-10: cross-process audit chain coherence. The in-
+// process concurrent test (P0-1, above) covers `Promise.all` over
+// one DB connection inside one process — that pins the JS-side
+// serialization of `withImmediateTransaction`. The cross-process
+// path is fundamentally different: each child has its OWN
+// `Database` handle on the SAME file, lock contention is mediated
+// by SQLite's WAL writer lock + `busy_timeout = 5000` (set in
+// `openDb`), and the BEGIN IMMEDIATE semantics ensure each
+// child's read-modify-write sequence is atomic against the other.
+// This test forks two real Bun processes, has each emit N rows
+// concurrently, and verifies:
+//   - total row count = 2N
+//   - all seqs distinct and contiguous (PK monotonic)
+//   - all this_hash unique (UNIQUE constraint)
+//   - chain verifies (every row's prev_hash links to the seq-1
+//     row's this_hash)
+//
+// Failure mode this would catch: dropping `withImmediateTransaction`
+// for `withTransaction` (DEFERRED), which lets two concurrent
+// emits both see the same chain head and produce a UNIQUE-violation
+// or — worse — a fork in the chain that masquerades as valid until
+// verifyChain runs.
+describe('createSqliteSink — slice 135 P0-10 cross-process emit', () => {
+  test('two Bun processes emit 5 rows each → chain stays coherent', async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'forja-cross-proc-'));
+    try {
+      const dbPath = join(tmpRoot, 'audit.db');
+      // Parent: migrate once. The workers don't run migrations
+      // (their `openDb` would race the schema apply); the parent
+      // owns schema setup.
+      const parentDb = openDb(dbPath);
+      migrate(parentDb, MIGRATIONS);
+      parentDb.close();
+
+      const identity: InstallIdentity = {
+        install_id: 'cross-proc-uuid-aaaa-bbbb',
+        created_at_ms: 1731000000000,
+      };
+      const workerScript = new URL('./_cross-proc-emitter.ts', import.meta.url).pathname;
+      const N = 5;
+
+      // Spawn two workers in parallel — both will compete for the
+      // WAL writer lock. The chain insert is wrapped in BEGIN
+      // IMMEDIATE so they serialize cleanly even though they
+      // started simultaneously.
+      const spawnEmitter = (sessionPrefix: string) =>
+        Bun.spawn({
+          cmd: [
+            'bun',
+            workerScript,
+            dbPath,
+            identity.install_id,
+            String(identity.created_at_ms),
+            sessionPrefix,
+            String(N),
+          ],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+      const procA = spawnEmitter('alpha');
+      const procB = spawnEmitter('beta');
+      const [codeA, codeB] = await Promise.all([procA.exited, procB.exited]);
+      // Helpful diagnostics if either failed.
+      if (codeA !== 0 || codeB !== 0) {
+        const errA = await new Response(procA.stderr).text();
+        const errB = await new Response(procB.stderr).text();
+        throw new Error(
+          `emitters failed: codeA=${codeA} stderrA="${errA}" codeB=${codeB} stderrB="${errB}"`,
+        );
+      }
+      expect(codeA).toBe(0);
+      expect(codeB).toBe(0);
+
+      // Re-open the DB and inspect the chain.
+      const db = openDb(dbPath);
+      try {
+        const rows = listApprovalsLogByInstall(db, identity.install_id);
+        expect(rows.length).toBe(2 * N);
+        // Seqs are PK-monotonic starting at 1.
+        const seqs = rows.map((r) => r.seq);
+        expect(seqs).toEqual(Array.from({ length: 2 * N }, (_, i) => i + 1));
+        // All this_hash distinct.
+        const hashes = new Set(rows.map((r) => r.this_hash));
+        expect(hashes.size).toBe(2 * N);
+        // Both workers contributed rows (no starvation).
+        const fromAlpha = rows.filter((r) => r.session_id.startsWith('alpha-')).length;
+        const fromBeta = rows.filter((r) => r.session_id.startsWith('beta-')).length;
+        expect(fromAlpha).toBe(N);
+        expect(fromBeta).toBe(N);
+        // Chain verifies (re-attach a sink to the parent connection
+        // to call verifyChain — the sink is just a façade over
+        // SELECTs, so the identity must match what the workers used).
+        const sink = createSqliteSink({ db, identity });
+        const verify = sink.verifyChain();
+        expect(verify.ok).toBe(true);
+        if (verify.ok) {
+          expect(verify.rows).toBe(2 * N);
+        }
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }, 15_000); // generous timeout — spawning two Bun runtimes is slow on cold CI
 });
