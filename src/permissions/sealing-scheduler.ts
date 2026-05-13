@@ -81,7 +81,32 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
     opts.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>));
 
   let decisionCounter = 0;
+  // Slice 128 (R4 P0-Race-1): seed lastSealedSeq from the existing
+  // seal store. Pre-slice it initialized to 0 in memory; two
+  // parallel `forja` processes on the same install both fire tick
+  // at the same chain head and both append the SAME `seq=N hash=H`
+  // line to the worm/git/tsa file → duplicate seal entries. Seeded
+  // from store.list() max-seq, the second process sees its own
+  // last-sealed already matches the chain head → noop.
+  //
+  // store.list() can throw (corrupted file); on failure we fall
+  // back to 0 and accept the duplicate-on-first-tick risk. The
+  // alternative (refuse to construct the scheduler) would break
+  // the audit pipeline entirely on a single bad seal file —
+  // overcorrection.
   let lastSealedSeq = 0;
+  try {
+    const existing = opts.store.list();
+    let maxSeq = 0;
+    for (const e of existing) {
+      if (e.seq > maxSeq) maxSeq = e.seq;
+    }
+    lastSealedSeq = maxSeq;
+  } catch {
+    // Defensive fallback. The store will surface the corruption
+    // again on the first append; that path already produces a
+    // failure event the operator can act on.
+  }
   let timerHandle: unknown = null;
   let closed = false;
 

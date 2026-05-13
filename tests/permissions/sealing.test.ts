@@ -271,7 +271,7 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
   };
 
   test('matching seal entries → ok with entriesChecked count', () => {
-    const { db, emitted } = setupChain(5);
+    const { db, identity, emitted } = setupChain(5);
     const fs = makeFakeFs();
     const sealer = createWormFileSealer({
       path: join(tmpRoot, 'seal.log'),
@@ -286,13 +286,13 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
       if (row === undefined) continue;
       sealer.append({ seq: row.seq, ts: 100 + i, hash: row.this_hash });
     }
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(true);
     if (v.ok) expect(v.entriesChecked).toBe(3);
   });
 
   test('seal references missing seq → ok:false with firstMismatchAt', () => {
-    const { db } = setupChain(2);
+    const { db, identity } = setupChain(2);
     const fs = makeFakeFs();
     const sealer = createWormFileSealer({
       path: join(tmpRoot, 'seal.log'),
@@ -303,7 +303,7 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
     });
     // Reference seq=999 which doesn't exist in the chain.
     sealer.append({ seq: 999, ts: 1000, hash: 'sha256:abc' });
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(false);
     if (!v.ok) {
       expect(v.firstMismatchAt).toBe(999);
@@ -312,7 +312,7 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
   });
 
   test('hash mismatch → ok:false with firstMismatchAt and both hashes in reason', () => {
-    const { db, emitted } = setupChain(3);
+    const { db, identity, emitted } = setupChain(3);
     const fs = makeFakeFs();
     const sealer = createWormFileSealer({
       path: join(tmpRoot, 'seal.log'),
@@ -329,7 +329,7 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
     if (first === undefined || second === undefined) throw new Error('setup');
     sealer.append({ seq: first.seq, ts: 100, hash: first.this_hash });
     sealer.append({ seq: second.seq, ts: 101, hash: 'sha256:tampered000000000000000000' });
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(false);
     if (!v.ok) {
       expect(v.firstMismatchAt).toBe(second.seq);
@@ -339,7 +339,7 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
   });
 
   test('corrupted seal file → ok:false (caught at list)', () => {
-    const { db } = setupChain(1);
+    const { db, identity } = setupChain(1);
     const fs = makeFakeFs();
     const path = join(tmpRoot, 'seal.log');
     fs.contents.set(path, 'GARBAGE LINE WITH NO TABS\n');
@@ -350,13 +350,13 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
       append: fs.append,
       ensureDir: fs.ensureDir,
     });
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.reason).toContain('seal file corrupted');
   });
 
   test('empty seal file verifies as ok with entriesChecked=0', () => {
-    const { db } = setupChain(3);
+    const { db, identity } = setupChain(3);
     const fs = makeFakeFs();
     const sealer = createWormFileSealer({
       path: join(tmpRoot, 'seal.log'),
@@ -365,7 +365,7 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
       append: fs.append,
       ensureDir: fs.ensureDir,
     });
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(true);
     if (v.ok) expect(v.entriesChecked).toBe(0);
   });
@@ -622,7 +622,7 @@ describe('verifySealAgainstChain — works with git-anchored backend too', () =>
     for (const r of rows) {
       sealer.append({ seq: r.seq, ts: 100 + r.seq, hash: r.this_hash });
     }
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(true);
     if (v.ok) expect(v.entriesChecked).toBe(3);
   });

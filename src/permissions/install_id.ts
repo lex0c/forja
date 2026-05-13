@@ -22,7 +22,15 @@
 // genesis hash that's globally unique even if `crypto.randomUUID`
 // is somehow biased (it isn't, but defense in depth costs nothing).
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 import { installIdPath } from './paths.ts';
 
@@ -117,13 +125,47 @@ export const ensureInstallId = (options: EnsureInstallIdOptions = {}): InstallId
   // match the file mode; if the dir already exists at a wider
   // mode we leave it (don't tighten silently, an operator's
   // umask might be deliberate).
+  //
+  // Slice 128 (R4 P0-Race-2): atomic write via O_WRONLY | O_CREAT |
+  // O_EXCL. Pre-slice the existsSync→writeFileSync sequence had a
+  // TOCTOU: two parallel `forja` first-boots both pass the
+  // existsSync false check, each generates its own UUID, last-
+  // writer wins. The loser's audit rows are orphaned on next
+  // start because the genesis hash derived from their UUID
+  // mismatches the file on disk. The fix mirrors slice 122's
+  // sandbox-skip pattern: openSync with O_EXCL fails EEXIST when
+  // someone else won the race; the loser then re-reads the
+  // winner's identity and returns it.
   const now = options.now ?? Date.now;
   const uuid = options.uuid ?? (() => crypto.randomUUID());
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+
   const identity: InstallIdentity = {
     install_id: uuid(),
     created_at_ms: now(),
   };
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, JSON.stringify(identity), { mode: 0o600 });
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL;
+  let fd: number;
+  try {
+    fd = openSync(path, flags, 0o600);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') {
+      // Someone else won the race; re-read their identity. Recurse
+      // through the existsSync branch this time (the file now
+      // exists). One re-entry is enough — if THAT read also fails
+      // ENOENT (the rare delete-between-the-write-and-our-read
+      // case), we let the error propagate so the operator sees
+      // the real problem rather than masking it with a fresh
+      // identity that would orphan even more rows.
+      return ensureInstallId(options);
+    }
+    throw err;
+  }
+  try {
+    writeSync(fd, JSON.stringify(identity));
+  } finally {
+    closeSync(fd);
+  }
   return identity;
 };

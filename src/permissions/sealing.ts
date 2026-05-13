@@ -260,6 +260,20 @@ export const defaultWormFileFactory = (config: SealPolicy): SealStore => {
     // contract visible at the call site.
     throw new Error('defaultWormFileFactory: config.path is required for worm-file mode');
   }
+  // Slice 128 (R4 P0-Audit-4): worm-file's tamper-evidence depends
+  // on chattr +a (or platform-equivalent). On non-Linux platforms
+  // chattr doesn't exist; pre-slice `execFileSync('/usr/bin/chattr',
+  // ...)` threw at first append, sealer returned ok:false, the
+  // scheduler degraded silently — leaving an UNPROTECTED seal file
+  // on disk that `verifySealAgainstChain` still trusts. Refuse to
+  // construct the worm-file sealer on non-Linux; operators must
+  // pick `rfc3161-tsa`, `git-anchored`, or `s3-object-lock`
+  // explicitly for these platforms.
+  if (process.platform !== 'linux') {
+    throw new Error(
+      `worm-file sealing requires Linux (chattr +a). On ${process.platform}, configure seal.mode to 'rfc3161-tsa', 'git-anchored', or 's3-object-lock'.`,
+    );
+  }
   return createWormFileSealer({
     path: config.path,
     onCreate: (p) => {
@@ -422,7 +436,26 @@ export const factoryForSealMode = (mode: SealMode): ((c: SealPolicy) => SealStor
   return null;
 };
 
-export const verifySealAgainstChain = (store: SealStore, db: DB): VerifySealResult => {
+// Slice 128 (R4 P0-Audit-1): verifySealAgainstChain now takes an
+// `installId` parameter and rejects rows whose `install_id`
+// doesn't match. Pre-slice the function called
+// `getApprovalsLogBySeq(db, entry.seq)` which returns the row
+// regardless of install_id — an attacker with DB-write could
+// insert a row for install_B with a controlled hash + edit the
+// seal file for install_A to match → verify cross-checks against
+// install_B's row, succeeds, install_A's actual chain can be
+// tampered freely. Binding seal entries to the verifying
+// identity closes the cross-install forgery vector.
+//
+// `installId` is required (no default) so callers MUST pin the
+// identity at the verify boundary. CLI callers (`agent permission
+// seal-verify`) resolve identity via `ensureInstallId({ env })`
+// then pass through.
+export const verifySealAgainstChain = (
+  store: SealStore,
+  db: DB,
+  installId: string,
+): VerifySealResult => {
   let entries: readonly SealEntry[];
   try {
     entries = store.list();
@@ -438,6 +471,13 @@ export const verifySealAgainstChain = (store: SealStore, db: DB): VerifySealResu
       return {
         ok: false,
         reason: `seal references seq=${entry.seq} which is missing from approvals_log`,
+        firstMismatchAt: entry.seq,
+      };
+    }
+    if (row.install_id !== installId) {
+      return {
+        ok: false,
+        reason: `seal references seq=${entry.seq} but row belongs to install_id=${row.install_id} (expected ${installId}) — cross-install forgery suspected`,
         firstMismatchAt: entry.seq,
       };
     }

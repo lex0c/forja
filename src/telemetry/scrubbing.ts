@@ -93,7 +93,10 @@ const PLACEHOLDER_HOST = '<host>';
 // Conservative on length: posix and tilde shapes require >= 2
 // non-empty chars after the prefix to avoid over-redacting short
 // tokens like `/etc` written as keys in operator-readable text.
-const PATH_REGEX_POSIX = /\/[^\s'":\\]{2,}/g;
+// Slice 128 (R4 P1-Inj): exclude `<>|()` from the negated class so
+// paths containing shell-metachar-like chars don't truncate
+// mid-redaction. Aligns with the Windows variant below.
+const PATH_REGEX_POSIX = /\/[^\s'":\\<>|()]{2,}/g;
 const PATH_REGEX_WINDOWS = /[A-Za-z]:[\\/][^\s'":<>|]+/g;
 const PATH_REGEX_UNC = /\\\\[^\s'":<>|]+/g;
 const PATH_REGEX_TILDE = /~[A-Za-z0-9_-]*\/[^\s'":\\]+/g;
@@ -119,7 +122,13 @@ const PATH_REGEX_TILDE = /~[A-Za-z0-9_-]*\/[^\s'":\\]+/g;
 // Falling back to the audit log for those is acceptable; the
 // metric label loses fidelity but doesn't gain false-positive
 // redaction noise that would hide real signals.
-const URL_REGEX = /\b(?:https?|ftps?|sftp|ssh|file):\/\/[^\s'"<>\]\)]+/gi;
+// Slice 128 (R4 P1-Inj): RFC 3986 scheme grammar `[a-z][a-z0-9+.-]*`
+// captures any well-formed URL scheme — pre-slice the explicit
+// allowlist missed `s3://`, `postgres://`, `redis://`, `vault://`,
+// `mongodb+srv://`, `data:`, `git+ssh://`, etc. The captured-and-
+// replaced text is operator-visible reason fields where the
+// scheme + host together are the secret-bearing context.
+const URL_REGEX = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>\]\)]+/g;
 const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g;
 // Slice 125 (R2 P1): IPv6 with optional bracketed port.
 // Matches `[::1]:8080`, `[2001:db8::1]:443`, also bare
@@ -132,7 +141,12 @@ const IPV6_BRACKETED_REGEX = /\[[0-9a-fA-F:]+\](?::\d{1,5})?/g;
 // `/` (that would be `host:/abs` which is rare and could
 // confuse with scp's local-path-with-colon shape; the user@
 // prefix here is the discriminator).
-const GIT_SSH_REGEX = /\b[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+/g;
+//
+// Slice 128 (R4 P1-Inj): `+` added to the username class to
+// match email-as-username shapes (`firstname+tag@example.com`).
+// Email local-parts legally include `+`; some operators ssh
+// as `user+alias@host`. Pre-slice these slipped redaction.
+const GIT_SSH_REGEX = /\b[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+/g;
 // Domain-only hostname with port: `internal.corp:443`,
 // `db.example.com:5432`. Matches `<dnsname>:<port>` where the
 // dnsname contains at least one dot. Conservative on dots to

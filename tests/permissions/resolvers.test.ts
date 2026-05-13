@@ -1648,3 +1648,111 @@ describe('bash resolver — mv/cp -t target-directory (slice 125 P1)', () => {
     }
   });
 });
+
+// Slice 128 (R4) — security review #4 fixes.
+describe('bash resolver — slice 128 R4 P0 fixes', () => {
+  test('R4 P0-Launder-1: `command rm -rf` is hard-refused', () => {
+    const r = resolveCapabilities('bash', { command: 'command rm -rf /tmp/x' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('R4 P0-Launder-1: `builtin echo hi` is hard-refused', () => {
+    const r = resolveCapabilities('bash', { command: 'builtin echo hi' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('R4 P0-Launder-2: `git -c core.sshCommand=...` refused', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: "git -c core.sshCommand='sh -c id' clone https://x/y" },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('-c');
+  });
+
+  test('R4 P0-Launder-2: `git --exec-path=/tmp/evil` refused', () => {
+    const r = resolveCapabilities('bash', { command: 'git --exec-path=/tmp/evil log' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('R4 P0-Launder-3: `cat < /proc/self/environ` refused (input redirect classifier)', () => {
+    const r = resolveCapabilities('bash', { command: 'cat < /proc/self/environ' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('input redirect');
+  });
+
+  test('R4 P0-Launder-3: input redirect from safe path emits read-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'cat < /work/proj/data.txt' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/data.txt');
+    }
+  });
+
+  test('R4 P0-Launder-4: `find -execdir` emits exec:arbitrary (was -exec-only)', () => {
+    const r = resolveCapabilities('bash', { command: 'find /tmp -execdir bash {} \\;' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('exec:arbitrary');
+    }
+  });
+
+  test('R4 P0-Launder-4: `find -ok` emits exec:arbitrary', () => {
+    const r = resolveCapabilities('bash', { command: 'find /tmp -ok bash {} \\;' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('exec:arbitrary');
+    }
+  });
+});
+
+describe('bash resolver — slice 128 R4 P1 fixes', () => {
+  test('R4 P1-Launder: curl --upload-file=<path> attributes read-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl --upload-file=/work/proj/data.bin https://example.com' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/data.bin');
+    }
+  });
+
+  test('R4 P1-Launder: curl --cookie-jar=<path> attributes write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl --cookie-jar=/tmp/jar.txt https://example.com' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/jar.txt');
+    }
+  });
+
+  test('R4 P1-Launder: node --eval refused (long form of -e)', () => {
+    const r = resolveCapabilities('bash', { command: 'node --eval' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('inline code');
+  });
+
+  test('R4 P1-Launder: node --inspect=0.0.0.0:9229 emits net-ingress', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'node --inspect=0.0.0.0:9229 script.js' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-ingress:*');
+    }
+  });
+});

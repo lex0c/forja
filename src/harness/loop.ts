@@ -1030,10 +1030,30 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (args.declaredCapabilities !== undefined) {
             try {
               const declared = args.declaredCapabilities.map(parseCapability);
+              // Slice 128 (R4 P0-Bypass-2): when the engine has a
+              // narrowed envelope (i.e., it's a CHILD engine
+              // spawning a grandchild), use the engine's actual
+              // effective set as the parent caps for the
+              // intersection. Pre-slice we derived from
+              // `engine.policy()` which is the INHERITED policy
+              // snapshot (parent's full set), not the child's
+              // narrowed envelope — grandchild intersection then
+              // succeeded against a wider set than the child
+              // itself was allowed, violating §10.3 "escape
+              // impossível" across depth-2.
+              //
+              // `engine.effectiveCapabilities()` returns null on
+              // a ROOT engine (no envelope applied at
+              // construction) → fall back to the legacy
+              // deriveParentCapabilities path. Caller-supplied
+              // `parentCapabilities` still wins (tests).
+              const envelopeOverride = config.permissionEngine.effectiveCapabilities();
               const parentCaps =
                 args.parentCapabilities !== undefined
                   ? args.parentCapabilities.map(parseCapability)
-                  : deriveParentCapabilities(config.permissionEngine.policy());
+                  : envelopeOverride !== null
+                    ? envelopeOverride
+                    : deriveParentCapabilities(config.permissionEngine.policy());
               const { effective, excess } = intersectCapabilities(parentCaps, declared);
               if (excess.length > 0) {
                 return {

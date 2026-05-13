@@ -29,6 +29,7 @@
 // `rotate-chain`: DB-only, no provider, no session start. Exit 0
 // on a row found, 1 on bootstrap/DB/missing-row errors.
 
+import { safeJsonParse } from '../broker/safe-json.ts';
 import {
   DEFAULT_SCORE_CONFIRM_THRESHOLD,
   createNoopSink,
@@ -36,6 +37,16 @@ import {
   ensureInstallId,
 } from '../permissions/index.ts';
 import { type Policy, canonicalHash, resolvePolicy } from '../permissions/index.ts';
+
+// Slice 128 (R4 P0-Inj-2): strip CC0+CC1 control characters from
+// audit-row-derived strings before stdout interpolation. The
+// renderer writes operator-rendered text (notes, rule patterns,
+// capability scope strings) directly; a polluted row with
+// `note: "\x1b]0;evil\x07"` would corrupt the operator's terminal
+// title. Symmetric with welcome.ts and slice 127's pattern.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: rule's purpose IS to match control chars
+const REPLAY_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
+const stripControlChars = (s: string): string => s.replace(REPLAY_CONTROL_CHAR_RE, '');
 import type { ToolArgs } from '../permissions/index.ts';
 import type { Decision, PolicyCategory } from '../permissions/types.ts';
 import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
@@ -61,7 +72,7 @@ const analyzeClassifierImpact = (
 ): ClassifierImpactAnalysis => {
   let components: Record<string, number>;
   try {
-    components = JSON.parse(row.score_components_json) as Record<string, number>;
+    components = safeJsonParse(row.score_components_json) as Record<string, number>;
   } catch {
     components = {};
   }
@@ -429,7 +440,7 @@ const analyzeAgainstArchivedPolicy = (params: {
 
   let archivedPolicy: Policy;
   try {
-    archivedPolicy = JSON.parse(archive.canonical_json) as Policy;
+    archivedPolicy = safeJsonParse(archive.canonical_json) as Policy;
   } catch (e) {
     return {
       verdict: 'skipped',
@@ -515,18 +526,24 @@ const renderReasonChain = (json: string): string => {
   };
   let entries: Entry[];
   try {
-    entries = JSON.parse(json) as Entry[];
+    entries = safeJsonParse(json) as Entry[];
   } catch {
     return `  reason chain: <malformed JSON: ${json}>`;
   }
   if (!Array.isArray(entries) || entries.length === 0) return '  reason chain: (empty)';
   const lines: string[] = ['  reason chain:'];
   for (const e of entries) {
-    const fragments: string[] = [`stage=${e.stage}`];
-    if (e.layer !== undefined) fragments.push(`layer=${e.layer}`);
-    if (e.rule !== undefined) fragments.push(`rule="${e.rule}"`);
-    if (e.section !== undefined) fragments.push(`section=${e.section}`);
-    if (e.note !== undefined) fragments.push(`note="${e.note}"`);
+    // Slice 128 (R4 P0-Inj-2): strip CC0/CC1 from every field
+    // interpolated into stdout. The audit row's reason_chain is
+    // a JSON-derived structure; a polluted row with `note:
+    // "\x1b]0;evil\x07"` would have corrupted the operator's
+    // terminal title pre-slice. Same posture as welcome.ts
+    // (slice 125) and audit-row-read paths.
+    const fragments: string[] = [`stage=${stripControlChars(String(e.stage ?? ''))}`];
+    if (e.layer !== undefined) fragments.push(`layer=${stripControlChars(String(e.layer))}`);
+    if (e.rule !== undefined) fragments.push(`rule="${stripControlChars(String(e.rule))}"`);
+    if (e.section !== undefined) fragments.push(`section=${stripControlChars(String(e.section))}`);
+    if (e.note !== undefined) fragments.push(`note="${stripControlChars(String(e.note))}"`);
     lines.push(`    - ${fragments.join(' ')}`);
   }
   return lines.join('\n');
@@ -535,7 +552,7 @@ const renderReasonChain = (json: string): string => {
 const renderScoreComponents = (json: string): string => {
   let components: Record<string, number>;
   try {
-    components = JSON.parse(json) as Record<string, number>;
+    components = safeJsonParse(json) as Record<string, number>;
   } catch {
     return `  score components: <malformed JSON: ${json}>`;
   }
@@ -559,7 +576,7 @@ const renderScoreComponents = (json: string): string => {
 const renderCapabilities = (json: string): string => {
   let caps: string[];
   try {
-    caps = JSON.parse(json) as string[];
+    caps = safeJsonParse(json) as string[];
   } catch {
     return `  capabilities: <malformed JSON: ${json}>`;
   }
@@ -709,21 +726,21 @@ const renderJson = (result: ReplayResult, out: (s: string) => void): void => {
   const r = result.row;
   const reasonChain = (() => {
     try {
-      return JSON.parse(r.reason_chain_json) as unknown;
+      return safeJsonParse(r.reason_chain_json) as unknown;
     } catch {
       return r.reason_chain_json;
     }
   })();
   const scoreComponents = (() => {
     try {
-      return JSON.parse(r.score_components_json) as unknown;
+      return safeJsonParse(r.score_components_json) as unknown;
     } catch {
       return r.score_components_json;
     }
   })();
   const capabilities = (() => {
     try {
-      return JSON.parse(r.capabilities_json) as unknown;
+      return safeJsonParse(r.capabilities_json) as unknown;
     } catch {
       return r.capabilities_json;
     }

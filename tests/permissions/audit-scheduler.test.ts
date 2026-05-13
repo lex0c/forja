@@ -150,7 +150,7 @@ describe('createSqliteSink — §7.3 scheduler integration', () => {
     expect(sealedRows).toHaveLength(2);
     expect(sealedRows[0]?.seq).toBe(4);
     expect(sealedRows[1]?.seq).toBe(8);
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(true);
     if (v.ok) expect(v.entriesChecked).toBe(2);
     scheduler.close();

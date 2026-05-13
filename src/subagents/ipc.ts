@@ -15,6 +15,8 @@
 //      and DO NOT close the channel — spec §4.5: "log warning,
 //      descarta a linha".
 //
+import { safeJsonParse } from '../broker/safe-json.ts';
+
 export const IPC_PROTOCOL_VERSION = 1;
 
 // Exit code the child uses when refusing on protocol version
@@ -135,7 +137,16 @@ export const parseLine = (line: string): ParseResult => {
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(stripped);
+    // Slice 128 (R4 P0-Inj-1): safeJsonParse strips __proto__ /
+    // constructor / prototype keys at every nesting level. Pre-
+    // slice the parent↔child IPC channel was a parallel attacker-
+    // controllable parse boundary (slice 104 fixed the broker wire
+    // but missed this one). A compromised subagent sending
+    // `{"type":"event","__proto__":{...}, ...}` would have
+    // landed __proto__ as own property; downstream Object.assign
+    // in permission-bridge or modal renderers would pollute the
+    // prototype chain.
+    parsed = safeJsonParse(stripped);
   } catch {
     return { ok: false, reason: 'json_parse_failed' };
   }

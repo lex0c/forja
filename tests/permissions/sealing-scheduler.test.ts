@@ -539,7 +539,7 @@ describe('createSealingScheduler — integration with real worm-file + verifySea
     expect(sealedRows[0]?.seq).toBe(5);
     expect(sealedRows[1]?.seq).toBe(10);
     // verify ok
-    const v = verifySealAgainstChain(sealer, db);
+    const v = verifySealAgainstChain(sealer, db, identity.install_id);
     expect(v.ok).toBe(true);
     if (v.ok) expect(v.entriesChecked).toBe(2);
     scheduler.close();

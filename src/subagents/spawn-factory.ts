@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { scrubEnv } from '../sanitize/env.ts';
 import {
   IPC_PROTOCOL_VERSION,
   type IpcChannel,
@@ -343,10 +344,17 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   //     attach to the channel. Spec §2.3 requires the parent
   //     to drain stdout continuously — the channel's pump loop
   //     does this from the moment subprocessTransport binds.
+  // Slice 128 (R4 P1): subagent spawn now applies scrubEnv (slice
+  // 105 already wired this for the broker spawn). Pre-slice the
+  // child inherited every operator secret (API keys, vault tokens,
+  // ssh-agent socket — the new R4 P1 additions). A child whose
+  // whitelist allowed bash could `env | grep -i token` and recover
+  // credentials the parent meant to strip. Symmetric coverage at
+  // the subagent boundary closes the gap.
   const proc = Bun.spawn({
     cmd,
     cwd: opts.cwd,
-    env: process.env,
+    env: scrubEnv(process.env),
     ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',
   });

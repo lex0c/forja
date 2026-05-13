@@ -323,6 +323,13 @@ export interface PermissionEngine {
   // (typical policies are sub-10KB) compared to the latent-bug
   // surface a shared reference would expose.
   policy(): Policy;
+  // Slice 128 (R4 P0-Bypass-2): expose the engine's narrowed
+  // capability envelope (if any). Subagent harness loop reads
+  // this BEFORE falling back to `deriveParentCapabilities(policy)`
+  // so a grandchild's intersection happens against the CHILD's
+  // narrowed set, not the parent's full policy. Returns null when
+  // no envelope was applied at construction (root engine).
+  effectiveCapabilities(): readonly Capability[] | null;
   // Returns a deep copy of the section-by-section layer attribution
   // captured at policy resolution time. Operator-facing surfaces
   // (`/perms why <section>`, `agent perms`) render this to answer
@@ -1876,6 +1883,8 @@ export const createPermissionEngine = (
     // also work but loses Date/Map shapes if a future Policy
     // grows them; structuredClone preserves them.
     policy: () => structuredClone(policy),
+    effectiveCapabilities: () =>
+      effectiveCapabilities === undefined ? null : effectiveCapabilities.map((c) => ({ ...c })),
     // Same defensive-clone strategy as `policy()`. The returned
     // provenance is consumed by /perms-style introspection; callers
     // mutating it shouldn't corrupt the engine's enforcement

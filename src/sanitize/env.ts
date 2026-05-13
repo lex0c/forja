@@ -26,6 +26,18 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /^GH_TOKEN$/i,
   /^NPM_TOKEN$/i,
   /^DOCKER_PASSWORD$/i,
+  // Slice 128 (R4 P1): credential / session vars that DON'T match
+  // the standard `_TOKEN`/`_SECRET`/`_KEY`/`_PASSWORD` suffix
+  // patterns. Each is documented to carry a credential or session
+  // socket path that the LLM could use to sign/authenticate to a
+  // remote service from inside the sandbox.
+  /^SSH_AUTH_SOCK$/, // ssh-agent socket — sandbox can ssh-add -l + sign
+  /^GPG_AGENT_INFO$/, // gpg-agent socket
+  /^GNUPGHOME$/, // gpg dir override
+  /^KUBECONFIG$/, // kubernetes credentials file path
+  /^DOCKER_AUTH_CONFIG$/, // base64 registry creds
+  /^OP_SESSION_/i, // 1Password CLI session tokens (per-account)
+  /^CLOUDSDK_/i, // gcloud SDK config + auth tokens
 ];
 
 // Returns a defensive copy with credential-like vars removed. Undefined

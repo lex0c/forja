@@ -36,6 +36,20 @@
 //   .boto                Boto / legacy AWS SDK creds
 
 // Directories masked as opaque empty directories inside the sandbox.
+//
+// Slice 128 (R4 P0-Sand-1/2): added `.config/agent` and `.config/forja`.
+// The sandbox boundary isn't a one-way valve — `home-rw` profile
+// gives writable home, and the sandboxed process can plant config
+// that the NEXT boot's bootstrap reads as authoritative:
+//   - `.config/agent/permissions.yaml` is the user-scope policy
+//     layer. A sandboxed call can rewrite it to disable sandbox,
+//     broaden allows, or set hostAllowed:true. Session N+1 boots
+//     under the tampered policy.
+//   - `.config/forja/sandbox_skip` is the marker that suppresses
+//     the welcome prompt (slice 122). Sandboxed process forges
+//     it; operator's next forja silently runs in unsafe mode
+//     without ever opting in.
+// Masking both dirs at sandbox boundary closes the plant vector.
 export const HIDE_PATHS_DIRS: readonly string[] = [
   '.ssh',
   '.aws',
@@ -43,6 +57,8 @@ export const HIDE_PATHS_DIRS: readonly string[] = [
   '.config/azure',
   '.config/op',
   '.config/sops',
+  '.config/agent',
+  '.config/forja',
   '.gnupg',
   '.kube',
   '.terraform.d',

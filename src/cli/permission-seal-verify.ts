@@ -127,7 +127,12 @@ export const runPermissionSealVerify = async (
     return 1;
   }
 
-  const result: VerifySealResult = verifySealAgainstChain(store, db);
+  // Slice 128 (R4 P0-Audit-1): pass identity.install_id so seal
+  // entries are bound to THIS install's chain. Cross-install
+  // forgery (attacker plants row for install_B that matches the
+  // seal entry while install_A's actual chain is tampered) now
+  // fails loud.
+  const result: VerifySealResult = verifySealAgainstChain(store, db, identity.install_id);
 
   if (json) {
     out(`${JSON.stringify({ install_id: identity.install_id, ...result })}\n`);
