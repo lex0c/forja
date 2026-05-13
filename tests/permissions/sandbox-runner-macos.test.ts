@@ -234,6 +234,11 @@ describe('buildSbplProfile — hide_paths defense (slice 119, R4)', () => {
     expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.gnupg"))');
     expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.kube"))');
     expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.kube"))');
+    // Slice 149 (review): rustup toolchain dir + subversion auth cache.
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.rustup"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.rustup"))');
+    expect(profileStr).toContain('(deny file-read* (subpath "/Users/op/.subversion/auth"))');
+    expect(profileStr).toContain('(deny file-write* (subpath "/Users/op/.subversion/auth"))');
     // Canonical file list (literal form — exact path match).
     expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.netrc"))');
     expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.netrc"))');
@@ -243,6 +248,14 @@ describe('buildSbplProfile — hide_paths defense (slice 119, R4)', () => {
     expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.npmrc"))');
     expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.pypirc"))');
     expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.pypirc"))');
+    // Slice 149 (review): gitconfig executable hooks + cargo
+    // credentials.toml token.
+    expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.gitconfig"))');
+    expect(profileStr).toContain('(deny file-write* (literal "/Users/op/.gitconfig"))');
+    expect(profileStr).toContain('(deny file-read* (literal "/Users/op/.cargo/credentials.toml"))');
+    expect(profileStr).toContain(
+      '(deny file-write* (literal "/Users/op/.cargo/credentials.toml"))',
+    );
   };
 
   test('ro profile emits hide_paths deny rules', () => {

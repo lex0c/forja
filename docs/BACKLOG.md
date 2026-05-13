@@ -2,6 +2,48 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 149: HIDE_PATHS expansion (rustup / subversion auth / gitconfig / cargo creds)
+
+**Done.** One-hundred-forty-ninth slice. Closes the 🟠 important HIDE_PATHS gaps flagged in the bash-tools code review. Each path is a credential / executable-hook leak that the slice 118 baseline and slice 125's expansion missed. Pure additive — same shape as the slice 140 (XDG_DATA_HOME) and slice 146 (XDG_CONFIG_HOME) overlays.
+
+### New entries
+
+| # | Path | Kind | Threat |
+|---|---|---|---|
+| 1 | `.rustup` | dir | Holds installed Rust toolchains + `settings.toml`. A hostile bg process plants a malicious default-toolchain pointing at a binary in `.rustup/toolchains/<x>/bin/`; the operator's next `cargo build` outside the sandbox resolves `cargo` through `~/.rustup`'s shim and runs the planted binary. |
+| 2 | `.subversion/auth` | dir (subdir of `.subversion`) | svn's credentials cache. Mask the `auth` subdir only — the rest of `.subversion` is legitimate config (servers, ssl, etc). Plain-text base64 in older svn; modern svn still leaks enough to ship to a remote. |
+| 3 | `.gitconfig` | file | NOT just config — `core.sshCommand`, `core.pager`, `core.editor`, `core.askpass`, `[alias] *`, `credential.helper` are all executable hooks fired on standard git operations. Sandboxed WRITE to `~/.gitconfig` followed by an outside-sandbox `git pull` runs the planted `core.sshCommand` value as a shell. Read access alone leaks `[user] email` / `[github] user`. |
+| 4 | `.cargo/credentials.toml` | file | crates.io API token. The slice-125 expansion covered `.npmrc` (npm token) and `.pypirc` (pypi); cargo was an oversight. A read leak grants the LLM publish rights on every crate the operator owns. |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6933 pass / 10 skip / 0 fail / 17677 expect()** across 309 files (+50 expect() over slice 148 — same test count, but the two `expectHidePaths` helpers each got 6 new assertions × multiple profile-iterations)
+
+### Files changed
+
+- Code: `src/permissions/sandbox-hide-paths.ts`
+- Tests: `tests/permissions/sandbox-runner.test.ts`, `tests/permissions/sandbox-runner-macos.test.ts`
+
+### Defense layering
+
+Same as slice 118/125/146: the engine-side §11 protected-paths classifier (`classifyProtectedPath`) catches FS-tool driven attempts (`read_file`, `write_file`); the bwrap/SBPL overlay catches BASH-driven attempts that bypass the resolver entirely (`cat ~/.gitconfig`). Both layers list the same canonical paths via the single `sandbox-hide-paths.ts` source of truth.
+
+### Remaining from bash-tools review
+
+After slice 149:
+- **slice 150** — bash tools surface (input validation for `label`/`cwd` types in `bash-background`; `escapesCwd: true` semantically wrong in `bash-kill`; consider ACL for `bash_output`/`bash_kill` to gate subagent-inherited PIDs) — 🟠
+- **slice 151** — bg correctness cluster (stdout/stderr unbounded growth; concurrent kill() race; cleanup count double-counts; exitCode dropped in kill path) — 🟠 (follows slice 148 same subsystem)
+- **slice 152** — resolver calibration (cmdGit unknown subcommand → low confidence; cmdCd false-positive read-fs; cmdSysInfo false readFs('/etc') for date/uptime/hostname) — 🟡
+
+### Considered + deferred
+
+- **XDG_STATE_HOME / XDG_CACHE_HOME unmask** — no HIDE_PATHS_DIRS entries currently live under `~/.local/state/` or `~/.cache/`, so the XDG overlay would be a no-op today. Comes back if a future HIDE_PATHS addition lands under those XDG roots (e.g., `.local/state/forja/<x>`).
+- **`.local/share/forja`** is the only existing `.local/share/*` entry and is already covered by the slice 140 XDG_DATA_HOME overlay.
+
+---
+
 ## [2026-05-13] fix(bg) — slice 148: process-group isolation + expanded signal coverage
 
 **Done.** One-hundred-forty-eighth slice. Closes the last 🔴 critical correctness finding from the bash-tools code review: bg manager orphans grandchildren when killed, signal handler only covers SIGINT/SIGTERM (SIGHUP/SIGQUIT/uncaughtException leak every bg job to PID 1). Both fixes together: the bg lifecycle is now actually a lifecycle — every path that ends the harness drains the children deterministically.

@@ -50,6 +50,21 @@
 //     it; operator's next forja silently runs in unsafe mode
 //     without ever opting in.
 // Masking both dirs at sandbox boundary closes the plant vector.
+//
+// Slice 149 (review): added `.rustup` and `.subversion/auth`.
+//   - `.rustup` holds the operator's installed toolchains AND
+//     `settings.toml` (defaults, proxies, profile metadata). A
+//     hostile bg process could pin a malicious default-toolchain
+//     pointing at a planted binary in `.rustup/toolchains/<x>/bin/`.
+//     `cargo`'s shim resolves via `~/.rustup` so the planted binary
+//     runs on the operator's next `cargo build` outside the sandbox.
+//   - `.subversion/auth` is the credentials cache (Windows-style
+//     keyring fallback path, used on Linux/macOS when no system
+//     keyring is available). Plain-text base64'd plaintext on disk
+//     before slice 2.x svn versions; even modern svn stores enough
+//     in this dir to ship to a remote. Mask the `auth` subdir only,
+//     not all of `.subversion` — the rest of svn config (servers,
+//     config, ssl/...) is legitimate to read but not credentials.
 export const HIDE_PATHS_DIRS: readonly string[] = [
   '.ssh',
   '.aws',
@@ -64,9 +79,24 @@ export const HIDE_PATHS_DIRS: readonly string[] = [
   '.terraform.d',
   '.ansible',
   '.local/share/forja',
+  '.rustup',
+  '.subversion/auth',
 ];
 
 // Individual files masked as non-existent / empty inside the sandbox.
+//
+// Slice 149 (review): added `.gitconfig` and `.cargo/credentials.toml`.
+//   - `.gitconfig` is NOT just config — `core.sshCommand`,
+//     `core.pager`, `core.editor`, `core.askpass`, `[alias] *`,
+//     `credential.helper` are ALL executable hooks that fire on
+//     standard git operations. A sandboxed write to ~/.gitconfig
+//     followed by an outside-sandbox `git pull` runs the planted
+//     `core.sshCommand` value as a shell. Read access alone leaks
+//     `[user] email` / `[github] user` PII; write access is RCE.
+//   - `.cargo/credentials.toml` holds the crates.io API token; a
+//     read leak grants the LLM publish rights on every crate the
+//     operator owns. The slice-125 expansion added `.npmrc` and
+//     `.pypirc` (npm + pypi tokens); cargo was an oversight.
 export const HIDE_PATHS_FILES: readonly string[] = [
   '.netrc',
   '.docker/config.json',
@@ -74,4 +104,6 @@ export const HIDE_PATHS_FILES: readonly string[] = [
   '.pypirc',
   '.git-credentials',
   '.boto',
+  '.gitconfig',
+  '.cargo/credentials.toml',
 ];

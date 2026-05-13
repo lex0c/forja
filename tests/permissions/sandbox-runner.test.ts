@@ -413,11 +413,18 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
     expect(argvStr).toContain('--tmpfs /home/op/.config/gcloud');
     expect(argvStr).toContain('--tmpfs /home/op/.gnupg');
     expect(argvStr).toContain('--tmpfs /home/op/.kube');
+    // Slice 149 (review): rustup toolchain + subversion auth cache.
+    expect(argvStr).toContain('--tmpfs /home/op/.rustup');
+    expect(argvStr).toContain('--tmpfs /home/op/.subversion/auth');
     // Canonical file list — masked via /dev/null overlay.
     expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.netrc');
     expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.docker/config.json');
     expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.npmrc');
     expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.pypirc');
+    // Slice 149 (review): gitconfig (executable hooks) + cargo
+    // credentials.toml (crates.io API token).
+    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.gitconfig');
+    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.cargo/credentials.toml');
   };
 
   test('ro profile emits hide_paths flags', () => {
