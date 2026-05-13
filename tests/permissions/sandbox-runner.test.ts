@@ -555,3 +555,88 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
     ).not.toThrow();
   });
 });
+
+// Slice 140 sec-1: XDG_DATA_HOME unmask. `defaultDataDir()` honors
+// $XDG_DATA_HOME at runtime; without an XDG-aware tmpfs overlay
+// the canonical literal `.local/share/forja` covers the WRONG
+// path when the operator sets XDG to anything else, and the
+// sandboxed process on `home-rw` would have writable access to
+// the live audit DB at the XDG location.
+describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', () => {
+  const originalXdg = process.env.XDG_DATA_HOME;
+
+  // Restore env in afterEach to avoid leaking state.
+  const restoreEnv = (): void => {
+    if (originalXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdg;
+  };
+
+  test('XDG_DATA_HOME unset: no extra tmpfs beyond the canonical home-relative literal', () => {
+    delete process.env.XDG_DATA_HOME;
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+      });
+      const argvStr = argv.join(' ');
+      // The canonical home-relative overlay IS present.
+      expect(argvStr).toContain('--tmpfs /home/op/.local/share/forja');
+      // No extra tmpfs for an XDG path (count occurrences of
+      // `.local/share/forja` — exactly one).
+      const matches = argv.filter(
+        (v) => v.endsWith('/share/forja') || v.includes('share/forja '),
+      ).length;
+      expect(matches).toBeGreaterThan(0);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_DATA_HOME set to a NON-HOME path: extra tmpfs overlay added for the live data dir', () => {
+    process.env.XDG_DATA_HOME = '/tmp/data';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+      });
+      const argvStr = argv.join(' ');
+      // Both overlays present: the canonical home-relative one
+      // (always there from HIDE_PATHS_DIRS) AND the XDG-driven
+      // one (added by the sec-1 fix).
+      expect(argvStr).toContain('--tmpfs /home/op/.local/share/forja');
+      expect(argvStr).toContain('--tmpfs /tmp/data/forja');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_DATA_HOME set to the home-relative default: no duplicate overlay', () => {
+    // When XDG matches the default, the live data dir EQUALS the
+    // home-relative path and the sec-1 fix skips the extra overlay
+    // (de-dup at the path-string level).
+    process.env.XDG_DATA_HOME = '/home/op/.local/share';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+      });
+      // Count tmpfs flags pointing at the data dir (`share/forja`).
+      // Should be exactly 1: the canonical home-relative one. sec-1
+      // skipped because liveDataDir === homeRelativeDataDir. Filter
+      // by `share/forja` specifically — `.config/forja` is a
+      // separate HIDE_PATHS_DIRS entry that also ends with `/forja`.
+      const dataDirTmpfsCount = argv.filter(
+        (v, i) => v === '--tmpfs' && argv[i + 1]?.endsWith('/share/forja'),
+      ).length;
+      expect(dataDirTmpfsCount).toBe(1);
+    } finally {
+      restoreEnv();
+    }
+  });
+});

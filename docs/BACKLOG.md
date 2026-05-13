@@ -2,6 +2,50 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 140: P1 security cluster (4 items)
+
+**Done.** One-hundred-fortieth slice. Closes the **4 🟠 important security findings** deferred from the slice 139 review: SBPL nested sandbox-exec, XDG_DATA_HOME unmask, git-anchored bare-repo advisory, IPv4-compatible IPv6 SSRF gap.
+
+### Fixes
+
+| # | Finding | File:line | Fix |
+|---|---|---|---|
+| **sec-1** | XDG_DATA_HOME unmask. `defaultDataDir()` honors `$XDG_DATA_HOME` at runtime; canonical `.local/share/forja` HIDE_PATHS overlay covers the WRONG path when operator points XDG elsewhere. Sandboxed bash on `home-rw` then has writable access to the live audit DB. | `sandbox-runner.ts:200-215` (Linux bwrap) + `sandbox-runner-macos.ts:215-229` (SBPL) | Both runners now compute `defaultDataDir()` at build time and inject an EXTRA overlay when it differs from `joinPath(home, '.local/share/forja')`. Idempotent: when XDG_DATA_HOME is unset, paths match and the extra rule is skipped. |
+| **sec-2** | SBPL `(allow process-exec)` permits a wrapped process to spawn nested `sandbox-exec` with a permissive profile — escape vector. | `sandbox-runner-macos.ts:111-122` | Added `(deny process-exec (literal "/usr/bin/sandbox-exec"))` AFTER the broad allow. SBPL last-match-wins strands the specific binary. |
+| **sec-3** | Git-anchored sealer doesn't verify repo is bare. Sandboxed bash with cwd-rw / home-rw access to the repo can `git reset --hard HEAD~N` and wipe prior seal commits. | `sealing.ts:336+ createGitAnchoredSealer` | One-time bare-repo advisory at sealer construction via `probeBare()` + `onNonBareRepo()` callback. Default writes a stderr warning when probe returns `false`; probe failure (no git, bad path) silently skips. Advisory is informational only — sealing proceeds either way. Tests inject spies via the test seam. |
+| **sec-4** | IPv4-compatible IPv6 (`::a.b.c.d`, RFC 4291 deprecated) bypasses SSRF blocklist. Pre-fix only the `::ffff:` mapped form was decoded; bare `::` form with same hex semantics slipped through. WHATWG URL parser normalizes `http://[::127.0.0.1]/` → `[::7f00:1]`. | `resolvers/fetch.ts:123-150` | Added decoder branch that matches `^::([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?$` (with `ffff:` exclusion via negative check), recurses into the dotted-IPv4 path of `checkSsrfBlocklist`. |
+
+### Tests added (+15)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/permissions/resolvers.test.ts` | +8 | 7 IPv4-compatible IPv6 bypass variants (`::7f00:1` loopback, RFC1918, AWS metadata, multicast, etc.) + 1 regression net (`::ffff:` mapped form still refuses). |
+| `tests/permissions/sandbox-runner.test.ts` | +3 | XDG_DATA_HOME unset (canonical overlay only), XDG set to non-home path (extra overlay added), XDG equal to home-relative default (de-dup, no duplicate overlay). |
+| `tests/permissions/sandbox-runner-macos.test.ts` | +3 (sec-1) + 1 (sec-2) | macOS parity for XDG unmask + SBPL nested sandbox-exec deny + ordering check (deny comes AFTER `(allow process-exec)`). |
+| `tests/permissions/sealing.test.ts` | +5 | Non-bare repo fires advisory; bare repo doesn't; probe failure skips silently; advisory fires once per sealer (not per append); whitespace normalization. |
+
+### Files changed
+
+- Code: `src/permissions/resolvers/fetch.ts`, `src/permissions/sandbox-runner.ts`, `src/permissions/sandbox-runner-macos.ts`, `src/permissions/sealing.ts`
+- Tests: 4 files above
+- Spec: none (these are runtime defenses, not protocol changes)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6851 pass / 10 skip / 0 fail** (6861 total / 309 files); +20 tests over slice 139 (15 new tests above + 5 from sealing — wait, +20 = sealing 5 + macos 4 + linux 3 + fetch 8 = 20)
+
+### Remaining from slice 139 review
+
+After slice 140 closes the 4 security items:
+- 🟠 important: 11 left (2 correctness latent, 5 spec drift PRs, 3 API surface, + 1 unaccounted from earlier count)
+- 🟡 minor: ~15 items
+
+Slice 141 will tackle the 5 spec drift PRs (all in `docs/spec/PERMISSION_ENGINE.md`; batchable in one doc edit). Slice 142 will tackle the 2 correctness latent items (both in `audit.ts`).
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 139: 4 code fixes + 2 spec PRs from fresh 4-agent review
 
 **Done.** One-hundred-thirty-ninth slice. A fresh 4-agent code-review pass over `src/permissions/` (axes: Security, Spec drift, Correctness, API surface) surfaced ~40 findings. This slice closes the **6 critical** items: 4 code fixes + 2 spec amendments.

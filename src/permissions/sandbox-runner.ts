@@ -63,6 +63,7 @@
 // caller's expected working directory.
 
 import { join as joinPath } from 'node:path';
+import { defaultDataDir } from '../storage/paths.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
@@ -199,6 +200,20 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // happens to have `~/.gnupg` set up.
   for (const dir of HIDE_PATHS_DIRS) {
     flags.push('--tmpfs', joinPath(home, dir));
+  }
+  // Slice 140 sec-1: XDG_DATA_HOME unmask. `defaultDataDir()`
+  // honors $XDG_DATA_HOME at runtime; when the operator sets it
+  // outside `$HOME/.local/share`, the canonical
+  // `.local/share/forja` overlay above covers the WRONG path —
+  // the sandboxed process on `home-rw` would have writable access
+  // to the live audit DB at the XDG location. Inject an extra
+  // overlay for the live data dir when it differs from the
+  // home-relative default. Idempotent: when XDG_DATA_HOME is
+  // unset, `liveDataDir === homeRelativeDataDir` and we skip.
+  const liveDataDir = defaultDataDir();
+  const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
+  if (liveDataDir !== homeRelativeDataDir) {
+    flags.push('--tmpfs', liveDataDir);
   }
   // For files we use `--ro-bind /dev/null <file>`. bwrap can
   // bind char devices over regular files (the mount makes the

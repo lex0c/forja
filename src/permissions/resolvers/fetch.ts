@@ -120,6 +120,35 @@ const checkSsrfBlocklist = (rawHost: string): string | null => {
       }
     }
   }
+  // Slice 140 sec-4: IPv4-COMPATIBLE IPv6 (deprecated RFC 4291).
+  // `::a.b.c.d` was the pre-RFC-4291 way to embed IPv4 into IPv6;
+  // most modern kernels reject these but `::7f00:1` (compact hex
+  // form of `::127.0.0.1`) still resolves to 127.0.0.1 on some
+  // systems with permissive socket libraries. The WHATWG URL parser
+  // normalizes `http://[::127.0.0.1]/` to `[::7f00:1]` — same hex
+  // shape as the mapped form, just without the `ffff:` prefix
+  // marker. Slice 129 SSRF blocklist documented "any IPv6 form
+  // that reaches loopback" as the intent; this branch closes the
+  // gap. Skipped when `h === '::1'` (already returned above as
+  // canonical loopback) or `h === '::'` (unspecified).
+  //
+  // Pattern: bare `::` followed by 1-2 hex groups. Explicit
+  // negative lookahead for `ffff` so we don't double-check the
+  // mapped form already handled above.
+  const compatMatch = /^::([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?$/i.exec(h);
+  if (compatMatch !== null && (compatMatch[1] ?? '').toLowerCase() !== 'ffff') {
+    const high = Number.parseInt(compatMatch[1] ?? '0', 16);
+    const low = Number.parseInt(compatMatch[2] ?? '0', 16);
+    if (Number.isFinite(high) && Number.isFinite(low)) {
+      const a = (high >> 8) & 0xff;
+      const b = high & 0xff;
+      const c = (low >> 8) & 0xff;
+      const d = low & 0xff;
+      const dotted = `${a}.${b}.${c}.${d}`;
+      const inner = checkSsrfBlocklist(dotted);
+      if (inner !== null) return `IPv4-compatible IPv6 (deprecated RFC 4291) of ${inner}`;
+    }
+  }
   // fe80::/10 link-local (first 10 bits = 1111 1110 10 → fe80..febf).
   if (/^fe[89ab][0-9a-f]:/i.test(h) || /^fe[89ab][0-9a-f]$/i.test(h)) {
     return 'IPv6 link-local fe80::/10';

@@ -324,6 +324,25 @@ export interface CreateGitAnchoredSealerOptions {
   // repo. Throws on git failure; the sealer's catch translates to
   // SealAppendResult.
   exec?: (cmd: string, args: readonly string[], opts: { cwd: string }) => void;
+  // Read-only git probe used by the bare-repo advisory (slice 140
+  // sec-3). Returns the stdout of `git rev-parse
+  // --is-bare-repository` for the configured repoPath — "true\n"
+  // for a bare repo, "false\n" for a non-bare one, or throws on
+  // any error (the advisory then silently skips; sealing
+  // continues). Tests inject a stub; production wires execFileSync
+  // with stdio: 'pipe'.
+  probeBare?: (repoPath: string) => string;
+  // Advisory callback fired AT SEALER CREATION when the repo is
+  // non-bare. Default writes a one-time stderr warning. Tests
+  // capture into a spy. The advisory is purely informational —
+  // sealing proceeds either way. Bare repos are recommended for
+  // tamper-evidence because a non-bare repo lets a sandboxed
+  // process (under cwd-rw / home-rw profiles where the repoPath
+  // is reachable) run `git reset --hard HEAD~N` to wipe prior
+  // seal commits. The threat model assumes the operator's repo
+  // is reasonably protected; this advisory makes the assumption
+  // visible at boot.
+  onNonBareRepo?: (repoPath: string) => void;
   exists?: (path: string) => boolean;
   read?: (path: string) => string;
   append?: (path: string, content: string) => void;
@@ -333,6 +352,26 @@ const defaultGitExec = (cmd: string, args: readonly string[], opts: { cwd: strin
   execFileSync(cmd, args, { cwd: opts.cwd, stdio: 'ignore' });
 };
 
+const defaultProbeBare = (repoPath: string): string => {
+  // Capture stdout (vs. defaultGitExec which discards it). Throws on
+  // non-zero exit; caller treats that as "skip the advisory" rather
+  // than abort sealer creation.
+  return execFileSync('git', ['rev-parse', '--is-bare-repository'], {
+    cwd: repoPath,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+};
+
+const defaultNonBareWarn = (repoPath: string): void => {
+  // One-time stderr warning at sealer creation. Operators piping
+  // stdout to `jq` etc. won't see stdout pollution; stderr is the
+  // documented diagnostic channel (CLAUDE.md / spec §2.6).
+  process.stderr.write(
+    `forja seal (git-anchored): repo at ${repoPath} is NOT bare — a sandboxed process with access to this path can rewrite history (git reset --hard) and erase prior seals. Use a bare repo OR pre-receive hook for tamper-evidence.\n`,
+  );
+};
+
 export const createGitAnchoredSealer = (opts: CreateGitAnchoredSealerOptions): SealStore => {
   const sealFile = opts.sealFile ?? 'seal.log';
   const fullPath = `${opts.repoPath.replace(/\/+$/, '')}/${sealFile}`;
@@ -340,6 +379,24 @@ export const createGitAnchoredSealer = (opts: CreateGitAnchoredSealerOptions): S
   const read = opts.read ?? defaultRead;
   const append = opts.append ?? defaultAppend;
   const exec = opts.exec ?? defaultGitExec;
+  const probeBare = opts.probeBare ?? defaultProbeBare;
+  const onNonBareRepo = opts.onNonBareRepo ?? defaultNonBareWarn;
+
+  // Slice 140 sec-3: bare-repo advisory. Fires once at sealer
+  // creation. Probe failure (no git, bad repoPath, permission
+  // denied) silently skips — sealing's main path doesn't depend
+  // on this; we're just surfacing a known threat shape to the
+  // operator. SealStore.append below will still surface its own
+  // failures via SealAppendResult.
+  try {
+    const out = probeBare(opts.repoPath).trim();
+    if (out === 'false') {
+      onNonBareRepo(opts.repoPath);
+    }
+  } catch {
+    // probe failed; skip advisory. Don't break sealer creation
+    // for the diagnostic.
+  }
 
   return {
     append: (entry: SealEntry): SealAppendResult => {

@@ -41,6 +41,7 @@
 //                 the innerArgv unchanged.
 
 import { join as joinPath } from 'node:path';
+import { defaultDataDir } from '../storage/paths.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import type { SandboxProfile } from './sandbox-plan.ts';
 
@@ -107,6 +108,18 @@ export const buildSbplProfile = (
     '(allow process-exec)',
     '(allow process-fork)',
     '(allow signal (target same-sandbox))',
+    // Slice 140 sec-2: deny nested sandbox-exec. The `(allow
+    // process-exec)` above lets the wrapped process spawn
+    // arbitrary binaries; an LLM-driven bash could
+    // `sandbox-exec -p '(version 1)(allow default)' /bin/sh` to
+    // wrap itself in a permissive profile and escape the outer
+    // one. macOS DOES intersect nested sandbox profiles for the
+    // FS/network gates, but the inner profile can still toggle
+    // mach-lookup / signal / process semantics within the outer
+    // profile's allowed set. Cheaper to refuse the launch
+    // outright. SBPL last-match-wins means this deny comes AFTER
+    // (allow process-exec) and wins for the specific literal.
+    '(deny process-exec (literal "/usr/bin/sandbox-exec"))',
     // sysctl-read is required for stdlib operations on macOS
     // (every shell invocation reads sysctl values during init).
     // Read-only — no sysctl-write granted.
@@ -198,6 +211,22 @@ export const buildSbplProfile = (
     const escaped = escapeSbplLiteral(absFile);
     denyRules.push(`(deny file-read* (literal "${escaped}"))`);
     denyRules.push(`(deny file-write* (literal "${escaped}"))`);
+  }
+  // Slice 140 sec-1: XDG_DATA_HOME unmask. Same gap as the Linux
+  // runner — `.local/share/forja` is only the home-relative
+  // default; `defaultDataDir()` honors $XDG_DATA_HOME at runtime.
+  // When the operator sets XDG_DATA_HOME outside $HOME/.local/share,
+  // the canonical literal deny covers the wrong subpath and the
+  // sandboxed process on `home-rw` can read/write the live audit DB.
+  // Idempotent: when XDG_DATA_HOME is unset, liveDataDir matches
+  // the home-relative default and the extra rule is redundant
+  // (SBPL accepts duplicate denies; last-match-wins).
+  const liveDataDir = defaultDataDir();
+  const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
+  if (liveDataDir !== homeRelativeDataDir) {
+    const escaped = escapeSbplLiteral(liveDataDir);
+    denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
+    denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
   }
 
   return [...header, ...readRules, ...writeRules, ...netRules, ...denyRules].join('\n');

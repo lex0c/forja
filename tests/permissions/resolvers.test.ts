@@ -267,6 +267,39 @@ describe('fetch_url resolver', () => {
       expect(r.kind).toBe('ok');
     });
 
+    // Slice 140 sec-4: IPv4-compatible IPv6 (deprecated RFC 4291).
+    // `::a.b.c.d` was the pre-RFC-4291 form for embedding IPv4
+    // into IPv6; the WHATWG URL parser normalizes the dotted
+    // form to compact hex (`http://[::127.0.0.1]/` →
+    // `[::7f00:1]`). Pre-fix the SSRF blocklist only decoded the
+    // `::ffff:` mapped form; the bare `::` form slipped through.
+    // Modern kernels reject most of these but defense-in-depth
+    // demands blocking any form that decodes to a private/loopback
+    // IPv4.
+    const ipv4CompatibleHosts = [
+      'http://[::7f00:1]/', // ::127.0.0.1 (loopback)
+      'http://[::7f7f:7f7f]/', // ::127.127.127.127 (loopback /8)
+      'http://[::a00:1]/', // ::10.0.0.1 (RFC1918)
+      'http://[::ac10:1]/', // ::172.16.0.1 (RFC1918)
+      'http://[::c0a8:1]/', // ::192.168.0.1 (RFC1918)
+      'http://[::a9fe:a9fe]/', // ::169.254.169.254 (AWS metadata)
+      'http://[::e000:1]/', // ::224.0.0.1 (multicast)
+    ];
+    for (const url of ipv4CompatibleHosts) {
+      test(`refuses ${url} (IPv4-compatible IPv6 — slice 140 sec-4)`, () => {
+        const r = resolveCapabilities('fetch_url', { url }, CTX);
+        expect(r.kind).toBe('refuse');
+        if (r.kind === 'refuse') {
+          expect(r.reason).toMatch(/SSRF|IPv4-compatible/i);
+        }
+      });
+    }
+    test('IPv4-mapped (with ffff prefix) still refuses (slice 140 sec-4 regression net)', () => {
+      const r = resolveCapabilities('fetch_url', { url: 'http://[::ffff:7f00:1]/' }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') expect(r.reason).toMatch(/SSRF|mapped/i);
+    });
+
     // Slice 139 C2: trailing-dot FQDN bypass. `new URL('http://localhost.')`
     // returns hostname `localhost.` literally. DNS resolves via root-anchor
     // expansion to 127.0.0.1. Pre-fix the string comparisons against

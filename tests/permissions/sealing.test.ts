@@ -484,6 +484,81 @@ describe('createWormFileSealer — close', () => {
   });
 });
 
+// Slice 140 sec-3: bare-repo advisory. The git-anchored sealer
+// can have its history erased by a sandboxed process running
+// `git reset --hard HEAD~N` on a non-bare repo. A one-time
+// advisory at sealer creation surfaces the threat shape so the
+// operator can switch to a bare repo or add a pre-receive hook.
+// Advisory is informational only — sealing proceeds either way.
+describe('createGitAnchoredSealer — bare-repo advisory (slice 140 sec-3)', () => {
+  test('non-bare repo fires onNonBareRepo callback at creation', () => {
+    const calls: string[] = [];
+    createGitAnchoredSealer({
+      repoPath: '/work/proj',
+      probeBare: () => 'false\n',
+      onNonBareRepo: (p) => calls.push(p),
+      exec: () => {},
+    });
+    expect(calls).toEqual(['/work/proj']);
+  });
+
+  test('bare repo does NOT fire the advisory', () => {
+    const calls: string[] = [];
+    createGitAnchoredSealer({
+      repoPath: '/srv/seal.git',
+      probeBare: () => 'true\n',
+      onNonBareRepo: (p) => calls.push(p),
+      exec: () => {},
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test('probe failure (no git, bad path) silently skips — sealer still constructs', () => {
+    const calls: string[] = [];
+    const sealer = createGitAnchoredSealer({
+      repoPath: '/nonexistent',
+      probeBare: () => {
+        throw new Error('git not found');
+      },
+      onNonBareRepo: (p) => calls.push(p),
+      exec: () => {},
+    });
+    expect(calls).toEqual([]);
+    // Sealer is fully usable despite the probe failure.
+    expect(typeof sealer.append).toBe('function');
+  });
+
+  test('advisory fires exactly once per sealer (not per append)', () => {
+    const calls: string[] = [];
+    const sealer = createGitAnchoredSealer({
+      repoPath: '/work/proj',
+      probeBare: () => 'false\n',
+      onNonBareRepo: (p) => calls.push(p),
+      exec: () => {},
+      append: () => {},
+    });
+    sealer.append({ seq: 1, ts: 1000, hash: 'h1' });
+    sealer.append({ seq: 2, ts: 2000, hash: 'h2' });
+    sealer.append({ seq: 3, ts: 3000, hash: 'h3' });
+    // Probe ran at construction; subsequent appends don't re-probe.
+    expect(calls.length).toBe(1);
+  });
+
+  test('probe stdout with whitespace / trailing newline normalizes correctly', () => {
+    // `git rev-parse --is-bare-repository` outputs `true\n` or
+    // `false\n`. Trim handles the trailing newline; the equality
+    // check against `'false'` works either way.
+    const calls: string[] = [];
+    createGitAnchoredSealer({
+      repoPath: '/work/proj',
+      probeBare: () => '  false  \n',
+      onNonBareRepo: (p) => calls.push(p),
+      exec: () => {},
+    });
+    expect(calls).toEqual(['/work/proj']);
+  });
+});
+
 describe('createGitAnchoredSealer — append (§7.3 slice 63)', () => {
   // Capture git invocations via the exec seam so unit tests don't
   // need a real repo. Same content map for fs so list() reflects

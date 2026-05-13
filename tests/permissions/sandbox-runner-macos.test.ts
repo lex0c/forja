@@ -24,6 +24,26 @@ describe('buildSbplProfile — common header + base rules', () => {
     }
   });
 
+  // Slice 140 sec-2: nested sandbox-exec defense. `(allow
+  // process-exec)` above grants exec of arbitrary binaries; an
+  // LLM-driven bash could spawn `sandbox-exec -p '(version 1)
+  // (allow default)' /bin/sh` to wrap itself in a permissive
+  // profile, escaping the outer one. SBPL last-match-wins means
+  // a literal-targeted deny of `/usr/bin/sandbox-exec` AFTER the
+  // broad allow vetoes the specific exec.
+  test('every sandboxed profile denies nested sandbox-exec (slice 140 sec-2)', () => {
+    for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
+      const profile = buildSbplProfile(p, '/work/proj', '/home/op');
+      expect(profile).toContain('(deny process-exec (literal "/usr/bin/sandbox-exec"))');
+      // Sanity: the deny comes AFTER the allow so SBPL's
+      // last-match-wins evaluation strands the specific path.
+      const allowIdx = profile.indexOf('(allow process-exec)');
+      const denyIdx = profile.indexOf('(deny process-exec (literal "/usr/bin/sandbox-exec"))');
+      expect(allowIdx).toBeGreaterThanOrEqual(0);
+      expect(denyIdx).toBeGreaterThan(allowIdx);
+    }
+  });
+
   test('file-read* always granted (read-only baseline)', () => {
     for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
       const profile = buildSbplProfile(p, '/work/proj', '/home/op');
@@ -390,5 +410,56 @@ describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 pa
       innerArgv: INNER,
     });
     expect(argv).toEqual(INNER);
+  });
+});
+
+// Slice 140 sec-1: XDG_DATA_HOME unmask — macOS parity with Linux.
+// `defaultDataDir()` honors $XDG_DATA_HOME on macOS too; the
+// canonical literal `.local/share/forja` deny covers the wrong
+// subpath when the operator points XDG elsewhere.
+describe('buildSbplProfile — XDG_DATA_HOME unmask defense (slice 140 sec-1)', () => {
+  const originalXdg = process.env.XDG_DATA_HOME;
+  const restoreEnv = (): void => {
+    if (originalXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdg;
+  };
+
+  test('XDG_DATA_HOME set to a NON-HOME path: extra deny rules added', () => {
+    process.env.XDG_DATA_HOME = '/tmp/data';
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      // Both the canonical home-relative deny AND the XDG-driven
+      // deny appear.
+      expect(profile).toContain('(deny file-read* (subpath "/Users/op/.local/share/forja"))');
+      expect(profile).toContain('(deny file-read* (subpath "/tmp/data/forja"))');
+      expect(profile).toContain('(deny file-write* (subpath "/tmp/data/forja"))');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_DATA_HOME unset: no extra subpath beyond canonical', () => {
+    delete process.env.XDG_DATA_HOME;
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      expect(profile).toContain('(deny file-read* (subpath "/Users/op/.local/share/forja"))');
+      // No /tmp/data path (operator didn't set XDG).
+      expect(profile).not.toContain('/tmp/data/forja');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_DATA_HOME equal to home-relative default: skip extra rule (de-dup)', () => {
+    process.env.XDG_DATA_HOME = '/Users/op/.local/share';
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      // Exactly one deny rule on the share/forja subpath.
+      const matches =
+        profile.match(/\(deny file-read\* \(subpath "[^"]*\/share\/forja"\)\)/g) ?? [];
+      expect(matches.length).toBe(1);
+    } finally {
+      restoreEnv();
+    }
   });
 });
