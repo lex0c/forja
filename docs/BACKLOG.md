@@ -15,6 +15,127 @@ Format:
 
 ---
 
+## [2026-05-13] permission-engine-v2 — slice 130: failure_events table + sink + 3 wire-up sites
+
+**Done.** One-hundred-thirtieth slice. Closes R5 Tier 3 P0-1 (failure_events table absent) — spec FAILURE_MODES.md §19 + AUDIT.md §1/§4.2/§10.1 defined the table since v2 but it was never materialized. Pre-slice failures vanished into stderr (`subagent handle X: persist failed`) or audit chain with ad-hoc decision='deny'; no structured query surface, no separable observation of sandbox loss from generic deny. Slice 130 lands the floor: schema + per-session hash chain + sink + 3 high-value emit sites. Future slices wire the remaining 17 codes from the spec catalog when their owning subsystems get refactor passes.
+
+### New module: `src/failures/`
+
+- `codes.ts` — `FailureClass` enum (10 top-level classes per spec), `CODE_VOCABULARY` map (4 slice-130 codes), format validator (`^[a-z_]+(\.[a-z_]+){1,3}$`), recovery_action shape validator, `BOOTSTRAP_SESSION_ID` sentinel for pre-session failures.
+- `scrub.ts` — `scrubFailurePayload`: proto-pollution scrub (slice 121's `scrubProtoPollution`) + recursive string scrub via new `scrubFreeformText` export from `telemetry/scrubbing.ts` + 8 KiB cap with `_truncated` marker on overflow.
+- `sink.ts` — `FailureEventSink` interface + `createSqliteFailureSink` + `createNoopFailureSink` + `verifyChain(session_id)`. Per-session hash chain (spec §4.2 verbatim: `prev_chain_hash_for_session.first_row = SHA256(session_id)`). Strict-monotonic `created_at` within a session (bumps `+1ms` past previous row when same-ms collision) so the chain walk's `ORDER BY created_at ASC, id ASC` matches insertion order without serializing the writer. Validates: code in vocabulary, recovery_action shape, created_at non-negative finite integer within 1h future-skew tolerance (mirrors slice 129 audit ts validation).
+- `index.ts` — public re-exports + storage repo re-exports (`listFailureEventsByCode`, `listFailureEventsBySession`, `countFailuresByCodeSince`).
+
+### Schema (migration `041-failure-events.ts`)
+
+```sql
+CREATE TABLE failure_events (
+  id              TEXT PRIMARY KEY,           -- ULID
+  session_id      TEXT NOT NULL,              -- 'bootstrap' sentinel for pre-session
+  step_id         TEXT,
+  code            TEXT NOT NULL,              -- <classe>.<subtipo>.<detalhe>
+  classe          TEXT NOT NULL CHECK (classe IN (10 enum values)),
+  recovery_action TEXT NOT NULL,              -- TS validates shape
+  user_visible    INTEGER NOT NULL CHECK (user_visible IN (0,1)),
+  payload_json    TEXT,                       -- scrubbed JSON, 8 KiB cap
+  created_at      INTEGER NOT NULL,
+  prev_chain_hash TEXT NOT NULL,
+  this_chain_hash TEXT NOT NULL UNIQUE
+);
+CREATE INDEX idx_failure_events_code    ON failure_events(code, created_at DESC);
+CREATE INDEX idx_failure_events_session ON failure_events(session_id, created_at DESC);
+```
+
+`install_id` intentionally absent (decision documented in `041-failure-events.ts` header): per-session chain makes cross-install forge a misattributed-row problem, not a chain-break vector. ALTER to add later if multi-install DB sharing becomes load-bearing.
+
+### Wire-up sites (3)
+
+1. **`sandbox.tool_unavailable`** at `bootstrap-engine.ts` — when `detectSandboxAvailability` returns `available=false`. `recovery_action='fatal'` when `policy.sandbox.required=true` (engine transitions to refusing), `'degraded'` otherwise. Payload: `{platform, policy_required, host_explicitly_allowed}`. Bootstrap absorbs sink throws — never crashes boot on failure-pipeline error.
+2. **`sandbox.mid_session_loss`** at `bg/manager.ts` spawn site — probes `Bun.which(sandboxBootTool)` BEFORE each spawn, compares to boot state. First call when tool was present at boot but no longer present → emits. State cache (`{emittedAt: number | null}`) suppresses duplicates until tool reappears (then clears, so future loss produces fresh event). Payload: `{tool, planned_profile, detected_at_site}`. Probe is no-op when `failureSink` or `sandboxBootTool` not wired (legacy callers stay unchanged). Probe skipped for `host` profile (no wrap planned).
+3. **`storage.lock_contention`** + **`storage.persist_failed`** at `handle-store.ts:899` — when subagent handle persistence catches an exception, error message matched against `SQLITE_BUSY` discriminates between contention (own code, ops queries can separate trends) and other DB errors. Payload: `{table, handle_id, error_message}`. Stderr line preserved alongside structured event.
+
+### Outcome-signals forward-compat hook
+
+Convention documented in `scrub.ts` + `codes.ts`: when a failure is downstream of a permission decision, callers SHOULD include `payload.approval_seq = <approvals_log.seq>`. Slice 131 (outcome_signals) will aggregate via `json_extract(payload_json, '$.approval_seq')` to derive `(score, decision, outcome)` triples for v2.1 calibration per spec §6.3.2. Convention only — no schema enforcement; adding typed wrapper later is straightforward.
+
+### Tests (+61 across 6 files)
+
+- `tests/failures/codes.test.ts` (10 cases): format regex accept/reject, vocabulary registration, recovery_action exact + parameterized patterns, BOOTSTRAP_SESSION_ID literal pinned.
+- `tests/failures/scrub.test.ts` (10 cases): null/undefined pass-through, paths/URLs/IPv4/git-SSH redaction, recursive descent into objects + arrays, proto-pollution strip (using `Object.hasOwn` to bypass `__proto__` getter), 8 KiB cap + truncation marker, primitives pass-through.
+- `tests/failures/sink.test.ts` (16 cases): noop sink, validation rejections (unregistered code / unknown recovery / NaN/negative/non-integer/future ts), chain genesis = SHA256(session_id), chain extension, session isolation, verifyChain ok + tamper detection (this_chain_hash + prev_chain_hash), bootstrap-tier session default, bootstrap chain extends across calls, read primitives (listByCode DESC ordering), payload scrub in DB row.
+- `tests/failures/bootstrap-wire.test.ts` (5 cases): emits with classe=sandbox + correct recovery on required/lenient sandbox-required+unavailable, no-emit on happy path, no-emit when sink not wired, broken sink doesn't crash bootstrap.
+- `tests/failures/bg-mid-session-loss.test.ts` (6 cases): emits on lost tool, suppresses duplicates within loss window, resumes after recovery+loss cycle, no-emit for host profile, no-emit when sandboxBootTool undefined, no-emit on happy path.
+- `tests/storage/migrations/041-failure-events.test.ts` (6 cases): table created, indices created, CHECK on classe + user_visible, UNIQUE on this_chain_hash, idempotent re-apply.
+- `tests/subagents/handle-store.test.ts` +2: SQLITE_BUSY error → `storage.lock_contention`; FK violation → `storage.persist_failed`; both carry `error_message` in payload.
+
+### Decisions
+
+- **Per-session chain (not per-install like approvals_log).** Spec §4.2 explicit. Tradeoff accepted: session-scoped chain means `agent failures verify` is per-session (not global ordering), but corruption in one session never invalidates another. Matches forensics-bundle shape (per-session NDJSON).
+- **`id` is ULID, not autoinc seq.** Spec FAILURE_MODES.md §19 ("id TEXT PRIMARY KEY") + global uniqueness across DB copies. Sortable by time, no seq collision risk across installs.
+- **Strict-monotonic `created_at` within a session.** Two emits in the same wall-clock ms otherwise tie on `created_at` AND the ULID random-suffix tiebreak disagrees with insertion order, breaking the chain walk's ASC ordering. Bumping `+1ms` past previous row when collision is detected is cheap (in-process map lookup), correct, and avoids serializing the writer.
+- **Vocabulary registry, not free-form codes.** `isFailureCode` checks both format AND registration. A format-valid but unregistered code throws — forces explicit PR when subsystems add new codes (prevents typo'd codes from silently fragmenting audit history).
+- **`recovery_action` is TEXT-free at DB layer + TS-validated shape.** `retried_3x`, `retried_5x`, `fallback_to_anthropic_haiku` would explode any CHECK list; TS regex on `retried_\d+x` + `fallback_to_[a-z0-9_-]+` catches typos like `retired_3x` before the row writes.
+- **3 emit sites only (sandbox×2 + storage).** Spec catalog has 20+ codes across provider/mcp/parse/classifier/index. Wiring all in one slice = 15+ files changed without end-to-end smoke per subsystem. Floor approach: land the pipeline + 3 high-value sites that prove the wire works, defer the rest to slices that already touch their subsystem.
+- **Probe state cache lives inside `bg/manager` closure.** Per-manager singleton state. The probe is a localized impurity on `maybeWrapSandboxArgv`'s pure-function contract; keeping the cache here (and the probe call site adjacent to the wrap) makes the audit trail's source explicit.
+- **Bootstrap sink-throw absorbed silently.** Same posture as `scheduler.tick()` in audit.ts (slice 56): the audit/failure paths are critical, but a failure of the failure pipeline itself must not crash the operation it observes. Operator still gets stderr banner + state transition; only the structured row is lost.
+
+### Trap navigated
+
+- **Same-ms ULID disorder broke chain walk.** First test pass: two rapid emits at same `Date.now()` produced ULIDs sorted by random suffix — sometimes second emit's ULID < first's. `listFailureEventsBySession ORDER BY created_at ASC, id ASC` returned rows out of insertion order. `verifyChain` walked expecting genesis at rows[0], saw the second emit's prev_chain_hash (= first's this_chain_hash) instead. Fixed via strict-monotonic `created_at` bump in `emit()` (Math.max(now, last.created_at + 1)); alternative was a hash-walk verify (Map<prev_hash, row>) that's more robust but heavier — deferred since timestamp bump solves the visible bug.
+- **`__proto__` access bypasses scrub.** Initial test asserted `parsed.__proto__ === undefined` after scrub — but `__proto__` is a getter on Object.prototype that returns the prototype chain, NOT the own property. Fixed via `Object.hasOwn(parsed, '__proto__')` which is the actual invariant the scrub guarantees.
+- **`scrubFreeformText` export needed.** `telemetry/scrubbing.ts` had `scrubReason` as a private helper; the failure_events payload scrub needed the same regex set. Exported a public wrapper `scrubFreeformText(text, opts)` that delegates with the medium-sensitivity defaults (both redactPaths + redactHosts on). Single source for path/URL/IP/git-SSH/domain-port regexes across all consumers.
+
+### Deferred
+
+- **Mid-session loss probe at `broker/handlers/bash.ts`** — runs in a worker subprocess (no in-process sink reference, IPC required). Defer until failure_events IPC protocol is designed.
+- **`agent audit failures` CLI verb** — spec AUDIT.md §6 mentions. Reader API exists (`listFailureEventsByCode`, `countFailuresByCodeSince`); the CLI surface lands when the `agent audit` subsystem ships.
+- **Forensics bundle inclusion** (spec §5.1: `failure_events.ndjson`) — bundle generation is its own slice.
+- **`agent gc` retention** (spec §1.2: 365d) — gc subsystem doesn't exist yet.
+- **17+ codes from spec catalog** — provider/mcp/parse/classifier/index/etc. Each wires when its subsystem gets a refactor slice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged from slice 129)
+- `bun test` — **6574 pass / 10 skip / 0 fail** (6584 total across 299 files); +77 tests on top of slice 129's 6497
+
+### Slice 130 fixup (post-review punch list)
+
+Multi-agent review (4 parallel reviewers: security/chain integrity, reliability/concurrency, spec compliance, test coverage gaps) surfaced **1 critical wire-up gap + 4 P0/P1 hardenings + 9 missing tests** before commit. Resolved in-place rather than landing slice 130 + slice 130.1 separately:
+
+| # | Severity | What broke | Fix |
+|---|---|---|---|
+| 1 | **Critical** | `harness/loop.ts:832` never passed `failureSink` / `sandboxBootTool` to `createBgManager`. Tests wired the seams directly, masking the gap; in production every probe short-circuited on `failureSink === undefined`. **Entire `sandbox.mid_session_loss` path was dead code.** | `HarnessConfig` gained two optional fields; `cli/bootstrap.ts` constructs `createSqliteFailureSink({ db })` once and threads through; `harness/loop.ts` propagates to `createBgManager` AND `createSubagentHandleStore.persistTo`. |
+| 2 | P0 | Chain insert (read-last → compute prev → INSERT) ran in autocommit. Two parallel emits in the same session would both observe `last=X`, both write the same `prev_chain_hash`, one wins UNIQUE on `this_chain_hash`, the other throws into a swallowed catch — **silently dropping the audit row about another failure**. | Wrapped emit in `withImmediateTransaction(db, ...)` (mirrors slice 127's approvals_log fix). Test: `Promise.all` of 10 parallel emits, all persist, `verifyChain` returns `ok:true rows:10`. |
+| 3 | P0 | `EmitFailureEventInput.id` was documented "test only" but had no enforcement. Any in-process caller could plant an attacker-chosen ULID, dictating `verifyChain`'s `(created_at, id)` tiebreak independently of insertion order. | Removed `id` from the public type entirely. Sink always generates server-side via `generateUlid({ now: () => created_at })`. Test: runtime-typed caller plants `id`, sink ignores. |
+| 4 | P0 | `last.created_at + 1` bump was unbounded. A caller passing `created_at: now + 3.59M` (just under 1h skew) burns the chain's monotonic floor near the cap; the NEXT emit's bumped value exceeds the cap silently because `validateInput` only checks INPUT, not BUMPED. Forensic queries poisoned. | After bump, re-check against `now + TS_FUTURE_SKEW_MS`. If exceeded, throw with a "chain timestamp drift" message. Future slice can add a `--accept-chain-drift` recovery path mirroring slice 127's broken-chain accept. Added `now` test seam to `createSqliteFailureSink` so chain-drift tests are deterministic vs system clock. |
+| 5 | P1 | `scrubProtoPollution` (broker/safe-json.ts) and `scrubStringsRecursive` (failures/scrub.ts) had NO cycle guard. A payload `{self: <cycle>}` would recurse until stack overflow; the RangeError escapes through the wire-site's try/catch, silently dropping the row meant to report another failure. Same shape with BigInt (JSON.stringify throws). | Added `WeakSet` cycle guard to both; cycles replaced with `__forja_cycle__` sentinel string. JSON.stringify wrapped in try/catch in `scrubFailurePayload`; on throw → `{_scrub_failed: {reason: <ErrorClass>}}` marker so the row still lands. Tests: cyclic object, cyclic array, BigInt all persist as non-empty rows. |
+| 6 | P1 | Bootstrap emit catch was empty — `DROP TABLE failure_events` followed by every future emit returned "success" silently. No operator signal that infra-level audit corruption happened. | Added `process.stderr.write(...)` fallback in the catch with the original error message. Matches handle-store.ts:899 posture (stderr first, structured event attempt second). |
+
+### Tests added in fixup (+16 cases, +77 total over slice 129)
+
+- `tests/failures/scrub.test.ts` (+5): cycle in object, cycle in array, BigInt → `_scrub_failed` marker, cap boundary at exactly 8 KiB (not truncated), cap boundary at 8 KiB + 1 byte (truncated).
+- `tests/failures/sink.test.ts` (+8): verifyChain on empty session, verifyChain detects DELETED middle row (chain break in prev links), two installs sharing `BOOTSTRAP_SESSION_ID` (pins the design tradeoff), `countFailureEvents` exercises barrel re-export, `countFailuresByCodeSince` groups + DESC, parallel emits (10x) all persist, refuses emit when bumped exceeds skew (deterministic via `now` seam), caller-supplied `id` at runtime is ignored.
+- `tests/storage/migrations/041-failure-events.test.ts` (+2): `EXPLAIN QUERY PLAN` confirms `idx_failure_events_code` AND `idx_failure_events_session` are actually USED by realistic queries (catches future column reorder silently disabling indices).
+- `tests/subagents/handle-store.test.ts` (+1): happy-path persist with failureSink wired emits ZERO rows (pins the inverse — pre-fixup the no-throw path was uncovered).
+
+### Decisions revised in fixup
+
+- **`now: () => number` test seam on the sink.** The original design left `Date.now()` un-seamed because `validateInput`'s future-skew check was the only consumer. After fixup #4 added the bumped-ts ceiling check (also clock-relative), the test-side determinism became load-bearing — full suite timing pressure was flipping the chain-drift test. Seam mirrors `AuditSink`'s pattern from `audit.ts`.
+- **Sink throw on chain drift, not clamp.** Reviewer offered "clamp to now (breaking strict monotonicity)" as an alternative. Chose throw because clamping would put a new row's `created_at` LESS than an existing row, and the chain walk's `created_at ASC, id ASC` ordering would walk new BEFORE existing — chain integrity breaks. Throw surfaces the drift loud; recovery path (chain rotation / accept-drift) lands separately.
+- **`__forja_cycle__` sentinel as a literal string.** Operator could `grep` audit logs for the literal to find every emit site that fed cyclic data. Cheap forensics; alternative was a typed object `{__cycle__: true}` but JSON.stringify size + scrub-pass alignment makes the string simpler.
+
+### Deferred from fixup (intentional)
+
+- **P2 nits**: regex bound on `retried_Nx`, `Bun.which` seam asymmetry between probe and wrap, `appendFailureEvent` repo-bypass guard. None affect correctness; defer to a polish slice.
+- **Object KEYS scrub bypass** (security review P1-5): convention "keys are vocabulary" is enforced by code review on emit sites, not by scrub. All 3 current emit sites use static keys. Future emit sites that build dynamic keys should be flagged in PR review.
+- **Spec PRs** (compliance review F1-F5): five divergences to register in `FAILURE_MODES.md §19` (`payload`→`payload_json`, chain construction text, `recovery_action` vocab `ignored/degraded/pending_repair`, `classe` enum vs spec's `external` example, `session_id NOT NULL` with bootstrap sentinel). Batch as one spec PR — doesn't gate code.
+- **Hash-walk verifyChain** (an alternative to created_at ASC ordering, follows `prev_chain_hash` links). More robust but heavier refactor; defer until a test fails the timestamp-bump ordering (none does today, post-fixup #2 + #4).
+
+**Next.** Slice 131: `outcome_signals` table + aggregator. Joins `approvals_log.seq` ↔ `failure_events.payload.approval_seq` to derive `(score, decision, outcome)` triples for spec §6.3.2 calibration. Unblocks v2.1 weight learning.
+
+---
+
 ## [2026-05-13] permission-engine-v2 — slice 129: REVIEW_NOTES_R5 surgical security pass (5 P0 + 6 P1 + tests)
 
 **Done.** One-hundred-twenty-ninth slice. Closes the surgical (T1+T2) tier of `docs/REVIEW_NOTES_R5.md` — the fifth multi-agent review pass (6 reviewers: bypass hunter, capability launderer, sandbox escapee, audit corruptor, race hunter, injection/parsing). Bundled small, low-risk fixes into one slice; deferred Tier 3-4 findings that need their own design (failure_events table, RFC3161 TSR signature verify, git-anchored commit verify, classifier-restore reasoning, monotonic-TTL migration, mid-session sandbox-loss telemetry).

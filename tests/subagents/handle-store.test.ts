@@ -1341,6 +1341,120 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
     expect(store.list()).toHaveLength(2);
   });
 
+  test('slice 130 fixup: happy-path persist does NOT emit any failure_event', async () => {
+    // Pre-fixup the catch path emitted only on throw; the
+    // no-throw path was UNCOVERED. Pin the inverse: when
+    // persistence succeeds, no rows land in failure_events.
+    const { createSqliteFailureSink } = await import('../../src/failures/index.ts');
+    const { countFailureEvents } = await import('../../src/storage/repos/failure-events.ts');
+    const failureSink = createSqliteFailureSink({ db });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      persistTo: { db, parentSessionId: parentId, failureSink },
+    });
+    const h = store.spawn({ name: 'happy', prompt: 'p' }, { estimateCostUsd: 0 });
+    const out = await store.awaitHandle(h.id);
+    expect(out.kind).toBe('done');
+    expect(countFailureEvents(db)).toBe(0);
+  });
+
+  test('slice 130: persistence failure emits storage.lock_contention via failureSink (SQLITE_BUSY)', async () => {
+    // Same throwing-DB shape as the existing review-fix test, but
+    // with a failureSink wired so we can assert the structured
+    // event lands AND the error_message reaches payload.
+    const { createSqliteFailureSink } = await import('../../src/failures/index.ts');
+    const { listFailureEventsByCode } = await import('../../src/storage/repos/failure-events.ts');
+    const failureSink = createSqliteFailureSink({ db });
+    const throwingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (sql: string) => {
+            const stmt = target.query(sql);
+            if (sql.includes('UPDATE subagent_handles')) {
+              return new Proxy(stmt, {
+                get(s, p) {
+                  if (p === 'run') {
+                    return () => {
+                      throw new Error('SQLITE_BUSY: simulated contention');
+                    };
+                  }
+                  // biome-ignore lint/suspicious/noExplicitAny: passthrough
+                  return (s as any)[p];
+                },
+              });
+            }
+            return stmt;
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      // biome-ignore lint/suspicious/noExplicitAny: test seam
+      persistTo: { db: throwingDb as any, parentSessionId: parentId, failureSink },
+    });
+    const h = store.spawn({ name: 'will-fail', prompt: 'p' }, { estimateCostUsd: 0 });
+    await store.awaitHandle(h.id);
+
+    const rows = listFailureEventsByCode(db, 'storage.lock_contention', 0, 10);
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.classe).toBe('storage');
+    expect(rows[0]?.recovery_action).toBe('ignored');
+    expect(rows[0]?.user_visible).toBe(0);
+    expect(rows[0]?.session_id).toBe(parentId);
+    const payload = JSON.parse(rows[0]?.payload_json as string);
+    expect(payload.table).toBe('subagent_handles');
+    expect(payload.handle_id).toBe(h.id);
+    expect(payload.error_message).toContain('SQLITE_BUSY');
+  });
+
+  test('slice 130: non-SQLITE_BUSY persist throw emits storage.persist_failed', async () => {
+    const { createSqliteFailureSink } = await import('../../src/failures/index.ts');
+    const { listFailureEventsByCode } = await import('../../src/storage/repos/failure-events.ts');
+    const failureSink = createSqliteFailureSink({ db });
+    const throwingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (sql: string) => {
+            const stmt = target.query(sql);
+            if (sql.includes('UPDATE subagent_handles')) {
+              return new Proxy(stmt, {
+                get(s, p) {
+                  if (p === 'run') {
+                    return () => {
+                      throw new Error('FOREIGN KEY constraint failed');
+                    };
+                  }
+                  // biome-ignore lint/suspicious/noExplicitAny: passthrough
+                  return (s as any)[p];
+                },
+              });
+            }
+            return stmt;
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      // biome-ignore lint/suspicious/noExplicitAny: test seam
+      persistTo: { db: throwingDb as any, parentSessionId: parentId, failureSink },
+    });
+    const h = store.spawn({ name: 'fk-fail', prompt: 'p' }, { estimateCostUsd: 0 });
+    await store.awaitHandle(h.id);
+
+    const rows = listFailureEventsByCode(db, 'storage.persist_failed', 0, 10);
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.classe).toBe('storage');
+    const payload = JSON.parse(rows[0]?.payload_json as string);
+    expect(payload.error_message).toContain('FOREIGN KEY');
+  });
+
   test('persistence throw does NOT crash the harness (review fix #1)', async () => {
     // Build a DB proxy that throws on the first UPDATE
     // (child_session_id update OR settle, whichever fires).

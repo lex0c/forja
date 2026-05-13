@@ -9,6 +9,7 @@ import {
   createSpawnBroker,
 } from '../broker/index.ts';
 import { loadCritiqueConfig } from '../critique/index.ts';
+import { createSqliteFailureSink } from '../failures/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
   type HookConfigWarning,
@@ -309,12 +310,22 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   //     capabilities.
   const sandboxAvail = detectSandboxAvailability();
   const policySandbox = preflight.resolved.policy.sandbox;
+  // Slice 130 fixup #1: construct the failure_events sink ONCE
+  // at the CLI bootstrap level. Thread it through both (a) the
+  // permission-engine bootstrap so `sandbox.tool_unavailable`
+  // emits at boot, and (b) the HarnessConfig so the harness loop
+  // can pass it to createBgManager + createSubagentHandleStore.
+  // Pre-fixup the sink type existed but no production caller
+  // constructed one — slice 130's wire sites were inert at
+  // runtime.
+  const failureSink = createSqliteFailureSink({ db });
   const permResult = await bootstrapPermissionEngine({
     cwd,
     home,
     db,
     sessionId: 'session-bootstrap',
     preflight,
+    failureSink,
     ...(input.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
     sandbox: {
       available: sandboxAvail.available,
@@ -626,6 +637,16 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(input.resumeFromSessionId !== undefined
       ? { resumeFromSessionId: input.resumeFromSessionId }
       : {}),
+    // Slice 130 fixup #1: pass the failure-events sink + boot-time
+    // sandbox tool through to the harness. The harness loop then
+    // wires both into createBgManager (mid-session loss probe) and
+    // createSubagentHandleStore (storage.lock_contention / persist
+    // failed). When `sandboxAvail.tool` is null, sandboxBootTool
+    // stays undefined — the probe short-circuits and emits stay
+    // off, matching pre-slice-130 behavior on hosts without
+    // bwrap/sandbox-exec.
+    failureSink,
+    ...(sandboxAvail.tool !== null ? { sandboxBootTool: sandboxAvail.tool } : {}),
   };
 
   return {

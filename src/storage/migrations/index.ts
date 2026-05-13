@@ -38,6 +38,7 @@ import { migration037PolicyArchive } from './037-policy-archive.ts';
 import { migration038ApprovalCallLinks } from './038-approval-call-links.ts';
 import { migration039Grants } from './039-grants.ts';
 import { migration040SubagentRunsEffectiveCapabilities } from './040-subagent-runs-effective-capabilities.ts';
+import { migration041FailureEvents } from './041-failure-events.ts';
 
 export interface Migration {
   id: number;
@@ -86,4 +87,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration038ApprovalCallLinks,
   migration039Grants,
   migration040SubagentRunsEffectiveCapabilities,
+  migration041FailureEvents,
 ];

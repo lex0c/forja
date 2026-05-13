@@ -216,6 +216,17 @@ const scrubReason = (text: string, opts: Required<ScrubOptions>): string => {
   return scrubbed;
 };
 
+// Exposed (slice 130) so failure_events payload scrub can share
+// the canonical regex set instead of forking. Caller passes
+// optional ScrubOptions; defaults to both axes on (path + host)
+// matching the medium-sensitivity profile of audit rows per
+// AUDIT.md §1.
+export const scrubFreeformText = (text: string, opts: ScrubOptions = {}): string =>
+  scrubReason(text, {
+    redactPaths: opts.redactPaths ?? true,
+    redactHosts: opts.redactHosts ?? true,
+  });
+
 const scrubPermissionDecision = (
   e: PermissionDecisionEvent,
   opts: Required<ScrubOptions>,

@@ -19,6 +19,7 @@
 //                                                audit row (audit-loud)
 //   - all of the above clean                   → state=ready
 
+import type { FailureEventSink } from '../failures/index.ts';
 import type { DB } from '../storage/db.ts';
 import { archivePolicy } from '../storage/repos/policy-archive.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
@@ -126,6 +127,16 @@ export interface BootstrapPermissionEngineInput {
   // `permission.decision` event. Production: pass an OTEL
   // adapter (future slice). Tests: pass a recording sink.
   telemetry?: { emit: (event: TelemetryEvent) => void };
+  // failure_events sink (slice 130). Spec FAILURE_MODES.md §19 +
+  // AUDIT.md §1: every classified failure (sandbox loss, storage
+  // contention, provider timeout, parse error, ...) lands in this
+  // tamper-evident table. Default in production: SQLite sink
+  // backed by the same DB; tests pass a recording sink or noop.
+  // The bootstrap uses it to emit `sandbox.tool_unavailable` when
+  // sandbox tooling is missing at probe time (the only direct
+  // emit site in slice 130; other classes wire from their own
+  // subsystems).
+  failureSink?: FailureEventSink;
 }
 
 export interface PreflightResult {
@@ -478,6 +489,42 @@ export const bootstrapPermissionEngine = async (
   });
 
   if (sandbox !== undefined && !sandbox.available) {
+    // Slice 130 (R5 Tier 3 P0-1): structured failure_event so
+    // ops queries can answer "which sessions booted without
+    // sandbox tooling?" without parsing stderr. recovery_action
+    // reflects the state-machine branch we're about to take:
+    // fatal when policy required sandbox (engine goes refusing),
+    // degraded otherwise (engine still answers checks but every
+    // would-be allow becomes confirm per spec §6.5).
+    if (input.failureSink !== undefined) {
+      try {
+        input.failureSink.emit({
+          code: 'sandbox.tool_unavailable',
+          classe: 'sandbox',
+          recovery_action: sandbox.required ? 'fatal' : 'degraded',
+          user_visible: true,
+          session_id: input.sessionId,
+          payload: {
+            platform: process.platform,
+            policy_required: sandbox.required,
+            host_explicitly_allowed: sandbox.hostExplicitlyAllowed,
+          },
+        });
+      } catch (e) {
+        // failure_events emit must NOT crash bootstrap (the row
+        // is observability of the unavailable-sandbox event, not
+        // the event itself). Slice 130 fixup #6: but DO surface
+        // the sink failure to stderr so an infra-level break
+        // (missing migration, disk full, locked DB) doesn't
+        // silently suppress audit. Pre-fixup the catch was empty,
+        // which let `DROP TABLE failure_events` followed by every
+        // future emit return success — operator had no signal.
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(
+          `forja bootstrap: failure_events emit failed (${msg}); transition still firing\n`,
+        );
+      }
+    }
     if (sandbox.required) {
       controller.transition('refusing', 'sandbox_required_but_unavailable');
     } else {

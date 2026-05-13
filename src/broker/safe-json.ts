@@ -71,13 +71,34 @@ export const safeJsonParse = (text: string): unknown => {
 // three keys (`__proto__`, `constructor`, `prototype`) at every
 // nesting depth so the IPC perimeter and the in-process boundary
 // share one threat model.
+// Slice 130 fixup #5: a WeakSet cycle guard sentinel. Replaces a
+// cyclic reference with this string in the output so downstream
+// callers (e.g., the failure_events scrub pipeline) still produce
+// valid JSON instead of throwing on JSON.stringify or recursing
+// until stack overflow.
+const CYCLE_SENTINEL = '__forja_cycle__';
+
 export const scrubProtoPollution = (value: unknown): unknown => {
+  return scrubProtoPollutionWithGuard(value, new WeakSet());
+};
+
+const scrubProtoPollutionWithGuard = (value: unknown, seen: WeakSet<object>): unknown => {
   if (value === null || typeof value !== 'object') return value;
+  // Slice 130 fixup #5: cycle guard. Without this, a payload
+  // containing `{ self: <cycle> }` would recurse until the JS
+  // stack runs out; the RangeError escapes the proto-scrub call
+  // and the caller's outer try/catch (e.g., a failure_events
+  // wire site) swallows it, silently dropping the audit row that
+  // was meant to report another failure. Returning a sentinel
+  // string keeps the output JSON-stringifiable + preserves the
+  // signal that a cycle was elided at this position.
+  if (seen.has(value as object)) return CYCLE_SENTINEL;
+  seen.add(value as object);
   if (Array.isArray(value)) {
     let changed = false;
     const out: unknown[] = [];
     for (const v of value) {
-      const r = scrubProtoPollution(v);
+      const r = scrubProtoPollutionWithGuard(v, seen);
       if (r !== v) changed = true;
       out.push(r);
     }
@@ -90,7 +111,7 @@ export const scrubProtoPollution = (value: unknown): unknown => {
       changed = true;
       continue;
     }
-    const r = scrubProtoPollution(v);
+    const r = scrubProtoPollutionWithGuard(v, seen);
     if (r !== v) changed = true;
     out[k] = r;
   }

@@ -839,6 +839,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // finally to fire — matters when the loop is mid-provider-
           // request, where finally can be seconds away.
           abortSignal: signal,
+          // Slice 130 fixup #1: thread failure_events sink +
+          // boot-time sandbox tool so the `sandbox.mid_session_loss`
+          // probe in bg/manager actually fires in production.
+          // Pre-fixup the manager was constructed without either,
+          // so the entire probe path was dead code at runtime
+          // (tests wired the seams directly, masking the gap).
+          // Both fields are optional on CreateBgManagerOptions, so
+          // headless/SDK callers that don't supply them keep
+          // pre-slice-130 behavior.
+          ...(config.failureSink !== undefined ? { failureSink: config.failureSink } : {}),
+          ...(config.sandboxBootTool !== undefined
+            ? { sandboxBootTool: config.sandboxBootTool }
+            : {}),
           // Lifecycle observer: translate bg manager events into
           // HarnessEvents so the renderer can update its `bg N`
           // footer counter (spec UI.md §4.10.6) and audit captures
@@ -1372,7 +1385,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         subagentHandleStore = createSubagentHandleStore({
           cap: subagentCap,
           spawnFn: async (args, perHandleSignal, handleId) => impl(args, perHandleSignal, handleId),
-          persistTo: { db: config.db, parentSessionId: sessionId },
+          // Slice 130 fixup #1: thread failure_events sink so the
+          // catch path in handle-store (around the settle persist
+          // call) emits structured `storage.lock_contention` /
+          // `storage.persist_failed` rows. Field is optional —
+          // when caller doesn't wire failureSink, persistence
+          // failures still log to stderr (pre-slice-130 posture).
+          persistTo: {
+            db: config.db,
+            parentSessionId: sessionId,
+            ...(config.failureSink !== undefined ? { failureSink: config.failureSink } : {}),
+          },
           // Re-emit parallel_status whenever the queued or
           // running count shifts — keeps the TUI footer's
           // `subagents R+Q/cap` chip in sync without polling.

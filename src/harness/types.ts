@@ -5,6 +5,7 @@ import type {
   CritiqueConfig,
   CritiqueStrategy,
 } from '../critique/index.ts';
+import type { FailureEventSink } from '../failures/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
@@ -952,6 +953,27 @@ export interface HarnessConfig {
   // try/catch defensively (slice 70 contract). When undefined,
   // every telemetry event is dropped silently.
   telemetry?: TelemetrySink;
+  // failure_events sink (slice 130). When wired, the harness threads
+  // this through `createBgManager` so `sandbox.mid_session_loss`
+  // probes hit a real sink + into `handle-store`'s `persistTo` so
+  // `storage.lock_contention`/`storage.persist_failed` rows land.
+  // Bootstrap also receives a sink directly so `sandbox.tool_unavailable`
+  // emits at boot. Without this field wired by the CLI / SDK caller,
+  // the slice-130 emit sites stay inert — every probe / catch path
+  // short-circuits on `failureSink === undefined`. Production CLI
+  // bootstrap (slice 130 fixup) constructs `createSqliteFailureSink({
+  // db })` and passes here. Tests can wire a noop sink to keep the
+  // suite hermetic.
+  failureSink?: FailureEventSink;
+  // The sandbox tool detected at boot (bwrap | sandbox-exec | null).
+  // Paired with `failureSink` to enable the bg manager's mid-session
+  // loss probe — comparing CURRENT `Bun.which(...)` against this
+  // BOOT state is what distinguishes "always unavailable" (audited
+  // at bootstrap as `sandbox.tool_unavailable`) from "available
+  // then lost" (audited from bg manager as `sandbox.mid_session_loss`).
+  // CLI bootstrap sources via `detectSandboxAvailability` and
+  // forwards here; tests pin a constant.
+  sandboxBootTool?: 'bwrap' | 'sandbox-exec';
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

@@ -39,6 +39,7 @@
 // `cancelled_before_dispatch` — no child session row is
 // created.
 
+import type { FailureEventSink } from '../failures/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
   insertSubagentHandle,
@@ -308,7 +309,17 @@ export interface CreateSubagentHandleStoreOptions {
   // a coherent envelope instead of `unknown_handle`. Production
   // callers pass this; tests use the in-memory variant by
   // omitting it.
-  persistTo?: { db: DB; parentSessionId: string };
+  persistTo?: {
+    db: DB;
+    parentSessionId: string;
+    // Slice 130 (R5 Tier 3): when set, persistence failures emit
+    // a structured `storage.lock_contention` (SQLITE_BUSY) or
+    // `storage.persist_failed` (other DB errors) row instead of
+    // ONLY the stderr line. Optional so tests can wire the noop
+    // sink + production code stays best-effort if the failure
+    // pipeline itself misbehaves.
+    failureSink?: FailureEventSink;
+  };
   // Optional id factory for tests; production uses crypto.randomUUID.
   newId?: () => string;
   // Optional clock; production uses Date.now. Tests override to
@@ -898,6 +909,31 @@ export const createSubagentHandleStore = (
           console.error(
             `subagent handle ${id}: persist failed (${message}); audit row may be stale`,
           );
+          // Slice 130 (R5 Tier 3): structured event so audit
+          // consumers can query "did persistence fail this
+          // session?" without parsing stderr. SQLITE_BUSY gets
+          // its own code so contention metrics stay separable
+          // from other DB error trends. Best-effort: failure of
+          // the failure path must not crash the handle store.
+          if (persistTo.failureSink !== undefined) {
+            try {
+              const isBusy = message.includes('SQLITE_BUSY');
+              persistTo.failureSink.emit({
+                code: isBusy ? 'storage.lock_contention' : 'storage.persist_failed',
+                classe: 'storage',
+                recovery_action: 'ignored',
+                user_visible: false,
+                session_id: persistTo.parentSessionId,
+                payload: {
+                  table: 'subagent_handles',
+                  handle_id: id,
+                  error_message: message,
+                },
+              });
+            } catch {
+              // Failure_events itself failed — fully best-effort.
+            }
+          }
         }
       }
       return result;

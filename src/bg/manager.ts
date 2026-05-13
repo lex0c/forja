@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { FailureEventSink } from '../failures/index.ts';
 import type { SandboxProfile } from '../permissions/index.ts';
 import { maybeWrapSandboxArgv } from '../permissions/index.ts';
 import { scrubEnv } from '../sanitize/index.ts';
@@ -194,6 +195,25 @@ export interface CreateBgManagerOptions {
   // are caught and discarded so a buggy observer can't break the
   // process lifecycle (mirrors HarnessConfig.onEvent's contract).
   onEvent?: (event: BgManagerEvent) => void;
+  // failure_events sink (slice 130). When set + sandboxBootTool is
+  // also set, the manager probes sandbox-tool availability before
+  // each spawn and emits `sandbox.mid_session_loss` the first time
+  // the boot-time tool is no longer present (subsequent spawns in
+  // the same loss window suppress; cleared when the tool reappears).
+  // Without the sink + boot tool, the probe is skipped entirely
+  // and behavior matches pre-slice-130.
+  failureSink?: FailureEventSink;
+  // The sandbox tool that was available at boot. Used by the
+  // mid-session-loss probe — comparing CURRENT `which()` against
+  // this BOOT state is what distinguishes "always unavailable"
+  // (audited at bootstrap as sandbox.tool_unavailable) from
+  // "available then lost" (audited here as sandbox.mid_session_loss).
+  // Caller sources via `detectSandboxAvailability` at bootstrap.
+  sandboxBootTool?: 'bwrap' | 'sandbox-exec';
+  // Test seam for the mid-session-loss probe. Production uses
+  // `Bun.which`; tests pin a fake that flips the return value
+  // between calls to simulate boot-vs-spawn-time divergence.
+  sandboxWhich?: (name: string) => string | null;
 }
 
 const ensureDir = (dir: string): void => {
@@ -266,13 +286,77 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 
+// Slice 130 (R5 Tier 3): probe state cache for sandbox-loss
+// detection. Held by reference inside the closure so duplicate
+// emits are suppressed within a single manager instance. The
+// cache flips back to `false` if the tool reappears, so a
+// transient outage produces one event; a permanent loss
+// produces one event regardless of how many spawns happen.
+interface SandboxLossCache {
+  emittedAt: number | null;
+}
+
+const probeSandboxLoss = (
+  bootTool: 'bwrap' | 'sandbox-exec' | undefined,
+  cache: SandboxLossCache,
+  failureSink: FailureEventSink | undefined,
+  sessionId: string,
+  plannedProfile: SandboxProfile | undefined,
+  which: (name: string) => string | null,
+): void => {
+  if (bootTool === undefined || failureSink === undefined) return;
+  if (plannedProfile === undefined || plannedProfile === 'host') return;
+  const stillAvailable = which(bootTool) !== null;
+  if (stillAvailable) {
+    // Tool came back (or never left) — clear the suppression so
+    // a future loss produces a fresh event.
+    cache.emittedAt = null;
+    return;
+  }
+  if (cache.emittedAt !== null) {
+    // Already emitted for this loss window; suppress.
+    return;
+  }
+  try {
+    failureSink.emit({
+      code: 'sandbox.mid_session_loss',
+      classe: 'sandbox',
+      recovery_action: 'degraded',
+      user_visible: true,
+      session_id: sessionId,
+      payload: {
+        tool: bootTool,
+        planned_profile: plannedProfile,
+        detected_at_site: 'bg_manager.spawn',
+      },
+    });
+    cache.emittedAt = Date.now();
+  } catch {
+    // Best-effort — never break spawn on failure_events error.
+  }
+};
+
 export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
-  const { db, sessionId, logDir, abortSignal, onEvent } = options;
+  const {
+    db,
+    sessionId,
+    logDir,
+    abortSignal,
+    onEvent,
+    failureSink,
+    sandboxBootTool,
+    sandboxWhich,
+  } = options;
+  const whichFn = sandboxWhich ?? ((name: string) => Bun.which(name));
   // In-memory map of live handles, keyed by internal process id. The
   // DB is the source of truth for status across restarts; this map
   // is the in-flight reference we need to actually call .kill() on
   // a Bun subprocess.
   const live = new Map<string, LiveHandle>();
+  // Slice 130: sandbox-loss probe state. Persists across spawns of
+  // this manager so duplicate emits suppress until the tool
+  // reappears.
+  const sandboxLossCache: SandboxLossCache = { emittedAt: null };
 
   // Tracks ids whose termination was operator-initiated (kill() or
   // cleanup()), so the exitedSettled handler can emit `ended` with
@@ -319,6 +403,21 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // running bg processes get the same isolation when the
     // operator configured a sandbox and the planner chose a
     // non-host profile.
+    //
+    // Slice 130 (R5 Tier 3): probe boot vs current sandbox-tool
+    // state BEFORE the wrap. If the tool was available at boot
+    // but isn't now, maybeWrapSandboxArgv silently degrades to
+    // passthrough — operator-invisible without this audit trail.
+    // Probe is no-op when failureSink or sandboxBootTool aren't
+    // wired (test / pre-slice-130 callers).
+    probeSandboxLoss(
+      sandboxBootTool,
+      sandboxLossCache,
+      failureSink,
+      sessionId,
+      input.sandboxProfile,
+      whichFn,
+    );
     const cmd = maybeWrapSandboxArgv({
       ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
       cwd,
