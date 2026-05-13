@@ -40,6 +40,7 @@ import { migration039Grants } from './039-grants.ts';
 import { migration040SubagentRunsEffectiveCapabilities } from './040-subagent-runs-effective-capabilities.ts';
 import { migration041FailureEvents } from './041-failure-events.ts';
 import { migration042OutcomeSignals } from './042-outcome-signals.ts';
+import { migration043BgBytesDropped } from './043-bg-bytes-dropped.ts';
 
 export interface Migration {
   id: number;
@@ -90,4 +91,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration040SubagentRunsEffectiveCapabilities,
   migration041FailureEvents,
   migration042OutcomeSignals,
+  migration043BgBytesDropped,
 ];

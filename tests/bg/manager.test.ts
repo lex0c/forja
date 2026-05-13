@@ -573,6 +573,110 @@ describe('bg manager: kill', () => {
     expect(getBgProcess(db, r.id)?.exitCode).toBe(42);
   });
 
+  // Slice 153 (review): per-stream on-disk cap with truncate-head.
+  // Pre-slice bg manager wrote stdout/stderr directly via
+  // Bun.spawn's Bun.file(path) redirection — no upper bound,
+  // FS exhaustion on multi-hour dev servers. New drainer owns
+  // the fd and truncates the head when file would exceed
+  // maxLogBytes, preserving the tail (most-relevant bytes for
+  // the LLM's read-the-latest pattern).
+  test('stdout cap truncates head when file would exceed maxLogBytes (slice 153)', async () => {
+    // Use a tight cap (16 KB) and a command that emits >2x that
+    // before exiting. Drainer must truncate.
+    const r = await mgr.spawn({
+      // Emit 32 KB of "X" — twice the cap. Drainer must truncate
+      // the head and retain ~16 KB of tail.
+      command: "yes 'X' | head -c 32768",
+      maxLogBytes: 16384,
+    });
+    await waitForExit(r.id);
+    // File on disk should be ≤ cap.
+    const { statSync } = await import('node:fs');
+    const fileSize = statSync(`${logDir}/${r.id}.stdout.log`).size;
+    expect(fileSize).toBeLessThanOrEqual(16384);
+    // Readback: the LLM sees a single window of the file. Since
+    // we already drained 32 KB and capped at 16 KB, ≥16 KB was
+    // dropped from the head.
+    const out = await mgr.readOutput(r.id, { sinceStdout: 0, maxBytes: 100_000 });
+    // The returned bytes are the TAIL of the original output.
+    // They're all 'X\n' alternations — every byte is 'X' or '\n'.
+    expect(out.stdout.length).toBeGreaterThan(0);
+    for (const ch of out.stdout) {
+      expect(['X', '\n']).toContain(ch);
+    }
+  });
+
+  test('stdout cap: cursor advances absolute over truncation (slice 153)', async () => {
+    // Test the absolute-cursor semantics: after truncation, a
+    // canonical read advances to the absolute end (file_offset +
+    // dropped). The pending count reflects the absolute total.
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 32768",
+      maxLogBytes: 16384,
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    // Cursor end is absolute — should be close to 32768 (the
+    // total bytes emitted), not the file size (~16 KB).
+    expect(out.stdoutCursor).toBeGreaterThan(16384);
+    // No pending because we just consumed everything to the
+    // absolute end. (After-exit, drainer.done, file static.)
+    expect(out.stdoutPending).toBe(0);
+  });
+
+  test('stdout cap: subsequent canonical read returns empty (slice 153)', async () => {
+    // After a canonical read consumes everything, the next read
+    // sees pending=0 and stdout=''. The absolute cursor + dropped
+    // mapping correctly identifies "all consumed".
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 32768",
+      maxLogBytes: 16384,
+    });
+    await waitForExit(r.id);
+    await mgr.readOutput(r.id); // canonical consume
+    const second = await mgr.readOutput(r.id);
+    expect(second.stdout).toBe('');
+    expect(second.stdoutPending).toBe(0);
+  });
+
+  test('stdout cap: under-cap output is not truncated (slice 153)', async () => {
+    // Regression: the truncate-head logic must NOT fire when the
+    // file size stays under cap. The drainer should behave like
+    // a plain append.
+    const r = await mgr.spawn({
+      command: "echo 'hello cap'",
+      maxLogBytes: 1024 * 1024, // 1 MB cap, tiny output
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdout.trim()).toBe('hello cap');
+    expect(out.stdoutCursor).toBeLessThan(1024 * 1024);
+  });
+
+  test('stdout cap: rejects sub-1KB maxLogBytes at spawn (slice 153)', async () => {
+    // Defensive: a cap of 0 or a tiny number is almost certainly
+    // a programmer bug. Reject at the spawn boundary.
+    await expect(
+      mgr.spawn({
+        command: 'true',
+        maxLogBytes: 100,
+      }),
+    ).rejects.toThrow(/maxLogBytes/);
+  });
+
+  test('stdout cap: Infinity disables cap (file grows unbounded) (slice 153)', async () => {
+    // Opt-out path for operator workflows that genuinely need
+    // the full log retained. Pass Number.POSITIVE_INFINITY.
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 4096",
+      maxLogBytes: Number.POSITIVE_INFINITY,
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdoutCursor).toBe(4096);
+    expect(out.stdoutPending).toBe(0);
+  });
+
   test('kill cascades to grandchildren via process-group signal (BG1)', async () => {
     // The motivating shape: bash spawns a subshell that runs sleep.
     // Pre-slice `proc.kill('SIGTERM')` would signal bash only —

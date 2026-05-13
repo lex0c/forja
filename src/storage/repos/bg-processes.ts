@@ -15,11 +15,26 @@ export interface BgProcess {
   status: BgProcessStatus;
   stdoutLogPath: string;
   stderrLogPath: string;
-  // Byte offset on each stream already returned to the model.
-  // Stdout and stderr advance independently so a noisy stdout
-  // can't strand stderr writes (see migration 006).
+  // Slice 153 (review): cursors are now ABSOLUTE bytes-since-spawn,
+  // not file offsets. The bg manager's drainer (slice 153)
+  // truncates the on-disk log's head when it would exceed the
+  // per-stream cap (`maxLogBytes`, default 50 MB); a cursor that
+  // was 49 MB pre-truncate would point past the new file's end
+  // (~20 MB after dropping 30 MB of head). Keeping the cursor
+  // absolute lets readOutput compute `file_offset = max(0,
+  // cursor - dropped)` consistently across truncations, and lets
+  // a `since=N` arg from a previous response still map cleanly
+  // after the drainer ran. The dropped count lives in the
+  // `*_bytes_dropped` columns (migration 043) so it survives
+  // session restart.
   stdoutCursorPosition: number;
   stderrCursorPosition: number;
+  // Slice 153 (review): bytes dropped from the head of each
+  // stream's log file by the drainer's truncate-head. Always
+  // monotonic increasing; defaults to 0 for rows created before
+  // migration 043.
+  stdoutBytesDropped: number;
+  stderrBytesDropped: number;
 }
 
 interface BgProcessRow {
@@ -37,6 +52,8 @@ interface BgProcessRow {
   stderr_log_path: string;
   cursor_position: number;
   stderr_cursor_position: number;
+  stdout_bytes_dropped: number;
+  stderr_bytes_dropped: number;
 }
 
 const fromRow = (row: BgProcessRow): BgProcess => ({
@@ -54,6 +71,8 @@ const fromRow = (row: BgProcessRow): BgProcess => ({
   stderrLogPath: row.stderr_log_path,
   stdoutCursorPosition: row.cursor_position,
   stderrCursorPosition: row.stderr_cursor_position,
+  stdoutBytesDropped: row.stdout_bytes_dropped,
+  stderrBytesDropped: row.stderr_bytes_dropped,
 });
 
 export interface InsertBgProcessInput {
@@ -104,6 +123,8 @@ export const insertBgProcess = (db: DB, input: InsertBgProcessInput): BgProcess 
     stderrLogPath: input.stderrLogPath,
     stdoutCursorPosition: 0,
     stderrCursorPosition: 0,
+    stdoutBytesDropped: 0,
+    stderrBytesDropped: 0,
   };
 };
 
@@ -112,7 +133,8 @@ export const getBgProcess = (db: DB, id: string): BgProcess | null => {
     .query(
       `SELECT id, session_id, os_pid, label, command, cwd, spawned_at,
               exited_at, exit_code, status, stdout_log_path, stderr_log_path,
-              cursor_position, stderr_cursor_position
+              cursor_position, stderr_cursor_position,
+              stdout_bytes_dropped, stderr_bytes_dropped
        FROM background_processes
        WHERE id = ?`,
     )
@@ -142,7 +164,8 @@ export const listBgProcessesBySession = (
       .query(
         `SELECT id, session_id, os_pid, label, command, cwd, spawned_at,
                 exited_at, exit_code, status, stdout_log_path, stderr_log_path,
-                cursor_position, stderr_cursor_position
+                cursor_position, stderr_cursor_position,
+              stdout_bytes_dropped, stderr_bytes_dropped
          FROM background_processes
          WHERE session_id = ?
          ORDER BY spawned_at DESC, id ASC`,
@@ -155,7 +178,8 @@ export const listBgProcessesBySession = (
     .query(
       `SELECT id, session_id, os_pid, label, command, cwd, spawned_at,
               exited_at, exit_code, status, stdout_log_path, stderr_log_path,
-              cursor_position, stderr_cursor_position
+              cursor_position, stderr_cursor_position,
+              stdout_bytes_dropped, stderr_bytes_dropped
        FROM background_processes
        WHERE session_id = ? AND status IN (${placeholders})
        ORDER BY spawned_at DESC, id ASC`,
@@ -199,6 +223,29 @@ export const advanceBgProcessStderrCursor = (db: DB, id: string, newCursor: numb
      SET stderr_cursor_position = ?
      WHERE id = ? AND stderr_cursor_position < ?`,
   ).run(newCursor, id, newCursor);
+};
+
+// Slice 153 (review): increment the per-stream bytes-dropped
+// counter when the bg manager's drainer truncates the head of
+// the log file. The increment is atomic (+= via SQL expression)
+// so two truncates from independent drainer invocations on the
+// same row would compose, but in practice only ONE drainer per
+// stream exists per spawn. The counter is monotonic increasing;
+// no guard needed.
+export const incrementBgProcessStdoutBytesDropped = (db: DB, id: string, delta: number): void => {
+  db.query(
+    `UPDATE background_processes
+     SET stdout_bytes_dropped = stdout_bytes_dropped + ?
+     WHERE id = ?`,
+  ).run(delta, id);
+};
+
+export const incrementBgProcessStderrBytesDropped = (db: DB, id: string, delta: number): void => {
+  db.query(
+    `UPDATE background_processes
+     SET stderr_bytes_dropped = stderr_bytes_dropped + ?
+     WHERE id = ?`,
+  ).run(delta, id);
 };
 
 // Mark a process as exited or killed. exit_code may be null on signal-

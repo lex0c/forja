@@ -2,6 +2,80 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(bg) — slice 153: per-stream on-disk cap with truncate-head
+
+**Done.** One-hundred-fifty-third slice. Closes the LAST 🟠 important finding from the bash-tools code review: bg manager stdout/stderr grow unbounded → FS exhaustion on long-running dev servers. The fix required a real architectural shift (pipe + drainer instead of `Bun.file(path)` direct redirection), a new migration for persisted bytes-dropped bookkeeping, and a spec amend documenting the cap policy + cursor semantics flip from file-offset to absolute. All ⭕ flagged items from the original review are now closed.
+
+### Design decisions (alinhadas com user pré-slice)
+
+| Decisão | Valor escolhido |
+|---|---|
+| Cap default por stream | 50 MB |
+| Política on-overflow | truncate-head automático + persisted `bytes_dropped` bookkeeping |
+| Spec amend timing | concurrent (slice 153 inclui amend §7.3) |
+| Opt-out | `maxLogBytes: Number.POSITIVE_INFINITY` |
+| Min cap | 1024 bytes (sub-1KB rejeita no spawn) |
+
+### Fixes
+
+| # | Componente | Mudança |
+|---|---|---|
+| **drainer** | `src/bg/manager.ts` — new `drainStream` helper | Owns the file fd directly. Loops on `source.getReader().read()`; for each chunk decides: append (sob cap), ou truncate-head (sobre cap — lê tail em mem, `fd.truncate(0)`, rescreve tail + new chunk). Pathological case "chunk >= cap" descarta file inteiro + chunk prefix; rare em prática (Bun.spawn returns ~64KB chunks, default cap 50MB). |
+| **spawn** | `src/bg/manager.ts` — Bun.spawn now uses `stdout: 'pipe'` / `stderr: 'pipe'` | Spawn dois drainer tasks; capture handle.drainersSettled. exitedSettled aguarda drainers antes de emit 'ended' (com timeout defensive 2s) — readOutput após 'ended' vê file totalmente flushed. Type-narrows `proc.stdout` from `number \| ReadableStream \| undefined` via instanceof check (defesa contra future Bun version drift). |
+| **cursor semantics** | `src/bg/manager.ts` `readOutput` + `src/storage/repos/bg-processes.ts` | Cursors agora são ABSOLUTE bytes-since-spawn (não file offset). `file_offset = max(0, cursor - dropped)`; `total_absolute = file_size + dropped`. Um `since=N` de uma resposta anterior permanece válido após truncate. Persisted via 2 new columns `stdout_bytes_dropped` / `stderr_bytes_dropped` (migration 043). |
+| **migration** | `src/storage/migrations/043-bg-bytes-dropped.ts` | ADD COLUMN `stdout_bytes_dropped`, `stderr_bytes_dropped` (INTEGER NOT NULL DEFAULT 0). Rows criados pré-migration têm dropped=0; cursors antigos (file-offset) continuam válidos porque dropped=0 reduz a fórmula a `file_offset = max(0, cursor) = cursor` — passthrough do comportamento anterior. |
+| **repo** | `src/storage/repos/bg-processes.ts` | New `incrementBgProcessStdoutBytesDropped` / `incrementBgProcessStderrBytesDropped` helpers; SQL: `UPDATE SET col = col + ?` (atomic increment, no monotonic guard needed since dropped is monotonic by construction). `fromRow` + INSERT both populate new columns. |
+| **spec** | `docs/spec/AGENTIC_CLI.md §7.3` | Amend documenta cap policy: default 50 MB, opt-out via `Number.POSITIVE_INFINITY`, min 1024 bytes refused no spawn. Cursor semantics absolute-since-spawn explicitamente declaradas. |
+
+### Tests added (+6)
+
+| Test | Coverage |
+|---|---|
+| `stdout cap truncates head when file would exceed maxLogBytes` | 32KB output + 16KB cap → file size ≤ 16KB; tail bytes returned são 'X' ou '\n'. |
+| `stdout cap: cursor advances absolute over truncation` | Após exit, cursor > 16384 (absolute = file + dropped ~= 32KB). |
+| `stdout cap: subsequent canonical read returns empty` | Após primeiro consume, segundo retorna `stdout=''`, `pending=0`. |
+| `stdout cap: under-cap output is not truncated` | Regression: drainer não trunca quando file fica sob cap (`echo "hello cap"` + cap=1MB). |
+| `stdout cap: rejects sub-1KB maxLogBytes at spawn` | `maxLogBytes: 100` rejeita com `/maxLogBytes/`. |
+| `stdout cap: Infinity disables cap` | Opt-out path: `Number.POSITIVE_INFINITY` permite file unbounded. |
+
+### Files changed
+
+- Code: `src/bg/manager.ts`, `src/storage/repos/bg-processes.ts`, `src/storage/migrations/043-bg-bytes-dropped.ts` (new), `src/storage/migrations/index.ts`
+- Tests: `tests/bg/manager.test.ts`
+- Spec: `docs/spec/AGENTIC_CLI.md` §7.3
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`)
+- `bun test` — **6952 pass / 10 skip / 0 fail / 34127 expect()** across 309 files (+6 over slice 152; expect count inflated by per-char assertions in truncate test, ~16K per case)
+
+### Defesa em profundidade
+
+A cobertura do gap "FS exhaustion via bg log growth" agora é completa:
+1. **Default cap (50 MB)** — protege a maioria dos casos sem configuração.
+2. **Truncate-head automático** — mantém o estado atual visível ao LLM sem perda de funcionalidade.
+3. **Persisted bookkeeping** — `since=N` continua válido após truncate; absolute cursor sobrevive session restart.
+4. **Min cap (1KB) enforcement** — refuse spawn-side, não-blocker de runtime.
+5. **Opt-out explicit** — operadores com workflow específico podem desligar via `Number.POSITIVE_INFINITY`.
+
+### Remaining from bash-tools review
+
+Após slice 153 — **bash-tools review fechado**:
+- 🔴 critical: vazio (desde slice 148)
+- 🟠 important: vazio (slice 153 fechou)
+- 🟡 minor: vazio (slice 152 fechou)
+
+### Deferred (precisam design discussion antes de impl)
+
+- macOS `/tmp` shared sandbox+host — mktemp + TMPDIR= override vs documented divergence.
+- bwrap PATH-shim resistance — hard-pin `/usr/bin/bwrap` vs operator-relocatable PATH.
+- Symlink/realpath canonicalization para cwd guard — realpath failure modes.
+
+Esses itens não são bloqueadores da branch atual; podem ser abertos como issues separadas quando o usuário decidir o trade-off.
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 152: resolver calibration (cmdGit + cmdCd + cmdSysInfo)
 
 **Done.** One-hundred-fifty-second slice. Closes the 3 🟡 resolver-calibration findings from the bash-tools code review. Each one was a false-positive capability emission that fired the score gate's `workspace_escape` (+0.15) for noop calls — operators saw confirm prompts for `cd subdir`, `date`, `uptime`, etc. Not a security issue (over-conservative), but a UX one that erodes the signal/noise ratio of the gate. With the gate's threshold at 0.4, every false +0.15 is a step closer to spurious confirmation. The fixes restore accuracy.

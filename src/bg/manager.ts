@@ -12,6 +12,8 @@ import {
   advanceBgProcessStdoutCursor,
   finalizeBgProcess,
   getBgProcess,
+  incrementBgProcessStderrBytesDropped,
+  incrementBgProcessStdoutBytesDropped,
   insertBgProcess,
   listBgProcessesBySession,
   markRunningAsKilled,
@@ -81,6 +83,128 @@ const killProcessGroup = (proc: ReturnType<typeof Bun.spawn>, signal: NodeJS.Sig
   }
 };
 
+// Slice 153 (review): drain a Bun.spawn pipe into a file with a
+// truncate-head cap. Owns the file descriptor for its whole
+// lifetime so a truncate from inside doesn't race with the
+// kernel writer (which is exactly the race that made
+// `Bun.file(path)` redirection unsafe to truncate — the spawn's
+// fd would keep writing at a stale position and the kernel would
+// sparse-pad the resulting hole with zeros). Drainer fully owns
+// the fd: the spawn writes into a pipe, this loop reads from the
+// pipe and writes to the file at offsets we control.
+//
+// On each chunk:
+//   - If currentSize + chunk.length <= cap: append chunk, advance.
+//   - Else: compute how much tail (existing bytes) we can keep,
+//     read that tail in memory, truncate the file to 0, rewrite
+//     the tail + new chunk. Call `onDropped(droppedBytes)` so the
+//     LiveHandle's bookkeeping advances and `readOutput` knows
+//     to skip dropped offsets when computing the file position
+//     for a given persisted cursor.
+//
+// One pathological case: a single chunk >= cap. We can't keep
+// any of the prior file content; we keep only the LAST `cap`
+// bytes of the chunk itself. The whole prior file + the chunk
+// prefix are dropped. Rare in practice (Bun.spawn returns
+// chunks of at most ~64 KB, and the default cap is 50 MB).
+const drainStream = async (
+  source: ReadableStream<Uint8Array>,
+  filePath: string,
+  cap: number,
+  onDropped: (bytes: number) => void,
+): Promise<void> => {
+  const { open } = await import('node:fs/promises');
+  const fd = await open(filePath, 'r+');
+  let currentSize = 0;
+  const reader = source.getReader();
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      if (chunk === undefined || chunk.length === 0) continue;
+
+      // Special-case: cap disabled (Number.POSITIVE_INFINITY) or
+      // chunk fits comfortably under the budget. Append at end.
+      if (cap === Number.POSITIVE_INFINITY || currentSize + chunk.length <= cap) {
+        await fd.write(chunk, 0, chunk.length, currentSize);
+        currentSize += chunk.length;
+        continue;
+      }
+
+      // Over-cap path: truncate-head. Decide how much existing
+      // tail we keep (could be 0 if the new chunk alone is >=
+      // cap), read it into memory, truncate, rewrite.
+      const headroomForOld = Math.max(0, cap - chunk.length);
+      let droppedFromOld = 0;
+      let keptOldBytes: Buffer | null = null;
+      if (headroomForOld > 0 && currentSize > headroomForOld) {
+        // Keep the LAST headroomForOld bytes of the existing file;
+        // drop the prefix.
+        droppedFromOld = currentSize - headroomForOld;
+        keptOldBytes = Buffer.alloc(headroomForOld);
+        await fd.read(keptOldBytes, 0, headroomForOld, droppedFromOld);
+      } else if (headroomForOld > 0 && currentSize > 0) {
+        // The whole existing file fits in the new headroom; keep
+        // it all.
+        keptOldBytes = Buffer.alloc(currentSize);
+        await fd.read(keptOldBytes, 0, currentSize, 0);
+      } else {
+        // headroomForOld == 0 → the new chunk alone exceeds cap.
+        // Drop the entire existing file.
+        droppedFromOld = currentSize;
+      }
+
+      // Determine which slice of the new chunk we keep. Almost
+      // always the whole thing, but if chunk.length > cap we keep
+      // only the last `cap` bytes.
+      const chunkKeepStart = Math.max(0, chunk.length - cap);
+      const chunkKept = chunkKeepStart === 0 ? chunk : chunk.subarray(chunkKeepStart);
+      const droppedFromChunk = chunkKeepStart;
+
+      // Apply the truncation + rewrite atomically from the file's
+      // perspective: the fd is the only writer.
+      await fd.truncate(0);
+      let writePos = 0;
+      if (keptOldBytes !== null) {
+        await fd.write(keptOldBytes, 0, keptOldBytes.length, writePos);
+        writePos += keptOldBytes.length;
+      }
+      await fd.write(chunkKept, 0, chunkKept.length, writePos);
+      currentSize = writePos + chunkKept.length;
+
+      onDropped(droppedFromOld + droppedFromChunk);
+    }
+  } finally {
+    await fd.close();
+  }
+};
+
+// Slice 153 (review): per-stream on-disk cap. Pre-slice the bg
+// manager wrote stdout/stderr directly into `Bun.file(path)` via
+// Bun.spawn's redirection — kernel-side append-only with no upper
+// bound. A multi-hour `npm run watch` with chatty warnings would
+// grow the log file indefinitely until the filesystem ran out.
+// The model-facing `maxBytes` cap on bash_output only bounded
+// what the LLM SAW, not what was on disk.
+//
+// Slice 153 switches the spawn to `stdout: 'pipe'` / `stderr:
+// 'pipe'` plus a drainer task per stream that owns the file fd
+// directly. When the on-disk file size would exceed
+// `DEFAULT_LOG_CAP_BYTES`, the drainer truncates the head and
+// rewrites the tail — preserving the most-recent bytes (which
+// matter most for the LLM's read-the-latest pattern) while
+// dropping the oldest. The drainer tracks how many bytes were
+// dropped per stream so `readOutput` can map an absolute "bytes
+// emitted since spawn" cursor onto the current file offset
+// (`file_offset = max(0, cursor - dropped)`).
+//
+// 50 MB per stream is the default — generous enough to capture
+// hours of typical dev-server output, tight enough to bound the
+// FS impact at ~100 MB per concurrent bg job (stdout + stderr).
+// `maxLogBytes` on SpawnInput overrides per call.
+const DEFAULT_LOG_CAP_BYTES = 50 * 1024 * 1024;
+
 export interface SpawnInput {
   command: string;
   label?: string;
@@ -99,6 +223,13 @@ export interface SpawnInput {
   // AND profile ≠ `host`, the manager wraps the spawn argv via
   // `maybeWrapSandboxArgv`. Undefined → status quo direct spawn.
   sandboxProfile?: SandboxProfile;
+  // Slice 153 (review): per-stream cap in bytes. When the on-disk
+  // log file would grow past this, the drainer truncates the
+  // head and retains the tail. Default DEFAULT_LOG_CAP_BYTES.
+  // Set explicitly when the spawn is short-lived and the operator
+  // wants the full log retained (use 0 to disable the cap — file
+  // grows unbounded, same as pre-slice behavior).
+  maxLogBytes?: number;
 }
 
 export interface SpawnResult {
@@ -187,6 +318,15 @@ export interface BgManager {
 interface LiveHandle {
   proc: ReturnType<typeof Bun.spawn>;
   exitedSettled: Promise<void>;
+  // Slice 153 (review): promise that resolves when BOTH drainer
+  // tasks have finished reading their pipes (proc exit closes
+  // the pipes → drainers loop returns done). exitedSettled
+  // awaits this before emitting 'ended' so readOutput run AFTER
+  // the ended event sees a fully flushed file with the final
+  // bytes captured. The per-stream bytes-dropped count lives in
+  // the DB row (migration 043) so it survives process exit + the
+  // handle being deleted from `live`.
+  drainersSettled: Promise<void>;
 }
 
 // Lifecycle observation. Fires once per process for `started` (right
@@ -468,6 +608,15 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       innerArgv: ['bash', '-c', input.command],
     });
 
+    // Slice 153 (review): switch to piped streams + drainer tasks.
+    // Bun.file(path) redirection is kernel-direct (fast, but the
+    // file fd belongs to the kernel and we can't truncate without
+    // racing). Piped streams give the manager full fd control.
+    const logCap = input.maxLogBytes ?? DEFAULT_LOG_CAP_BYTES;
+    if (logCap !== Number.POSITIVE_INFINITY && (!Number.isFinite(logCap) || logCap < 1024)) {
+      throw new Error(`bg spawn: maxLogBytes must be >= 1024 or Infinity (got ${String(logCap)})`);
+    }
+
     let proc: ReturnType<typeof Bun.spawn>;
     try {
       proc = Bun.spawn({
@@ -479,8 +628,12 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         // log file and exfiltrate via bash_output. Defense in depth;
         // sandbox (M3+) is the next layer.
         env: scrubEnv(process.env),
-        stdout: Bun.file(stdoutPath),
-        stderr: Bun.file(stderrPath),
+        // Slice 153 (review): pipes instead of Bun.file(path). The
+        // manager drains each pipe into the corresponding log file
+        // via `drainStream`, owning the fd directly so it can apply
+        // the truncate-head cap without racing the kernel writer.
+        stdout: 'pipe',
+        stderr: 'pipe',
         // Slice 148 (BG1 — process-group isolation): `detached: true`
         // wraps the child in setsid() on Unix, placing it in a fresh
         // process group whose group leader is the child itself. That
@@ -539,6 +692,60 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       spawnedAt,
     });
 
+    // Slice 153 (review): spawn the two drainer tasks. Each owns
+    // its file fd; truncate-head when the on-disk size would
+    // exceed `logCap`. `dropped` is mutated by reference and read
+    // by `readOutput` to map persisted absolute cursors onto the
+    // current file offset.
+    //
+    // Type-narrow proc.stdout / proc.stderr: Bun.spawn returns
+    // `number | ReadableStream | undefined` depending on the
+    // redirection mode. We just passed 'pipe' for both, so they
+    // MUST be ReadableStreams; the runtime guard is defense in
+    // depth against a future Bun version that returns a different
+    // shape for 'pipe'.
+    const stdoutStream = proc.stdout as unknown;
+    const stderrStream = proc.stderr as unknown;
+    if (!(stdoutStream instanceof ReadableStream) || !(stderrStream instanceof ReadableStream)) {
+      throw new Error(
+        `bg spawn: expected stdout/stderr to be piped ReadableStreams (got stdout=${typeof stdoutStream}, stderr=${typeof stderrStream})`,
+      );
+    }
+    // Slice 153 (review): drainer notifies on truncate-head via
+    // DB increment. Survives process exit + session restart;
+    // readOutput reads the persisted counter from the row.
+    const stdoutDrainer = drainStream(stdoutStream, stdoutPath, logCap, (n) => {
+      try {
+        incrementBgProcessStdoutBytesDropped(db, id, n);
+      } catch {
+        // DB may have closed mid-shutdown. Drainer's own counter
+        // is canonical for the live session via the row lookup
+        // in readOutput; a failed DB write loses the increment
+        // but doesn't corrupt anything else.
+      }
+    }).catch((e) => {
+      // Drainer crash is best-effort — surface as stderr (operator-
+      // visible) and let the process continue. The bash output the
+      // operator sees may stop advancing, but the process is alive
+      // and a future readOutput will still read whatever made it
+      // to disk before the drainer died.
+      process.stderr.write(
+        `forja bg: stdout drainer failed for pid=${proc.pid} id=${id}: ${e instanceof Error ? e.message : String(e)}\n`,
+      );
+    });
+    const stderrDrainer = drainStream(stderrStream, stderrPath, logCap, (n) => {
+      try {
+        incrementBgProcessStderrBytesDropped(db, id, n);
+      } catch {
+        // see stdout comment
+      }
+    }).catch((e) => {
+      process.stderr.write(
+        `forja bg: stderr drainer failed for pid=${proc.pid} id=${id}: ${e instanceof Error ? e.message : String(e)}\n`,
+      );
+    });
+    const drainersSettled = Promise.all([stdoutDrainer, stderrDrainer]).then(() => undefined);
+
     // Optional runtime cap. Schedules a SIGTERM (with normal grace
     // → SIGKILL escalation) after maxRuntimeMs. Stored locally so
     // the exit handler can clear it on natural exit and we don't
@@ -577,6 +784,22 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         // pointless task in the loop and keeps the timer
         // referenced for its full duration).
         if (runtimeTimer !== undefined) clearTimeout(runtimeTimer);
+        // Slice 153 (review): wait for the drainers to finish
+        // reading the pipes before we declare the process ended.
+        // Bun.spawn closes the pipes when the child exits;
+        // drainStream loops break on read.done. Awaiting here
+        // guarantees that any readOutput call AFTER the `ended`
+        // event sees the final bytes on disk. Skip the await if
+        // it takes more than ~2s — defensive against a pathological
+        // drainer (shouldn't happen with the design but a stuck
+        // disk write shouldn't block the manager's lifecycle).
+        try {
+          await Promise.race([drainersSettled, sleep(2000)]);
+        } catch {
+          // sleep abort or drainer reject — both are swallowed
+          // because the manager's lifecycle shouldn't depend on
+          // drainer success.
+        }
         try {
           const current = getBgProcess(db, id);
           // If status was already moved to 'killed' or 'failed',
@@ -620,7 +843,7 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       }
     })();
 
-    live.set(id, { proc, exitedSettled });
+    live.set(id, { proc, exitedSettled, drainersSettled });
     // Emit AFTER live.set so getStatus() called from within the
     // observer is consistent with the in-memory state.
     safeEmit({
@@ -666,20 +889,49 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // end < cursor cannot drag the cursor backward.
     const isExplicitStdoutSince = opts.sinceStdout !== undefined;
     const isExplicitStderrSince = opts.sinceStderr !== undefined;
-    const stdoutStart = opts.sinceStdout ?? row.stdoutCursorPosition;
-    const stderrStart = opts.sinceStderr ?? row.stderrCursorPosition;
+    // Slice 153 (review): cursors are ABSOLUTE bytes-since-spawn.
+    // Pre-slice they were file offsets, which broke under truncate-
+    // head: a cursor of 50MB before truncate pointed past the new
+    // file end after the drainer dropped 30MB of head. Now the
+    // file offset is derived by subtracting the persisted dropped
+    // count from the absolute cursor.
+    //   file_offset = max(0, cursor - dropped)
+    //   total_absolute = file_size + dropped
+    // Reads happen relative to the file's current state but the
+    // accounting is in absolute bytes-since-spawn space, so a
+    // since= value from a previous response remains valid after a
+    // truncate.
+    const stdoutDropped = row.stdoutBytesDropped;
+    const stderrDropped = row.stderrBytesDropped;
+    const stdoutAbsStart = opts.sinceStdout ?? row.stdoutCursorPosition;
+    const stderrAbsStart = opts.sinceStderr ?? row.stderrCursorPosition;
+    const stdoutFileStart = Math.max(0, stdoutAbsStart - stdoutDropped);
+    const stderrFileStart = Math.max(0, stderrAbsStart - stderrDropped);
     const maxBytes = opts.maxBytes ?? DEFAULT_OUTPUT_READ_LIMIT_BYTES;
 
-    const stdoutTotal = fileSize(row.stdoutLogPath);
-    const stderrTotal = fileSize(row.stderrLogPath);
+    const stdoutFileSize = fileSize(row.stdoutLogPath);
+    const stderrFileSize = fileSize(row.stderrLogPath);
+    // Total absolute = file size + dropped (bytes truncated from
+    // head). Pending = total - current cursor.
+    const stdoutTotalAbs = stdoutFileSize + stdoutDropped;
+    const stderrTotalAbs = stderrFileSize + stderrDropped;
 
     // Two cursors, two windows. Each stream advances independently
     // — without this, a noisy stdout would strand stderr writes
     // (see migration 006 for the failure trace). Spec §7.3 surface
     // (`bash_output(process_id, since?)`) was vague on multiple
     // streams; we extend it to dual since.
-    const stdoutWin = await readWindow(row.stdoutLogPath, stdoutStart, maxBytes);
-    const stderrWin = await readWindow(row.stderrLogPath, stderrStart, maxBytes);
+    const stdoutWin = await readWindow(row.stdoutLogPath, stdoutFileStart, maxBytes);
+    const stderrWin = await readWindow(row.stderrLogPath, stderrFileStart, maxBytes);
+
+    // Convert file-offset ends back to absolute for cursor advance
+    // + return value. dropped read here may be slightly newer than
+    // when we computed start — drainer truncate concurrent with
+    // read advances dropped, but readWindow's end is in the file
+    // coords of when the read happened. Adding the CURRENT dropped
+    // would over-count. Use the same dropped values captured above.
+    const stdoutAbsEnd = stdoutWin.end + stdoutDropped;
+    const stderrAbsEnd = stderrWin.end + stderrDropped;
 
     // Cursor advance for canonical reads (no explicit `since`).
     // The local `> row.X` check is intentionally absent: the row
@@ -692,21 +944,21 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // layer via `WHERE <cursor_col> < ?`; out-of-order writes
     // from concurrent readers become no-ops there.
     if (!isExplicitStdoutSince) {
-      advanceBgProcessStdoutCursor(db, id, stdoutWin.end);
+      advanceBgProcessStdoutCursor(db, id, stdoutAbsEnd);
     }
     if (!isExplicitStderrSince) {
-      advanceBgProcessStderrCursor(db, id, stderrWin.end);
+      advanceBgProcessStderrCursor(db, id, stderrAbsEnd);
     }
 
     return {
       stdout: stdoutWin.text,
       stderr: stderrWin.text,
-      stdoutCursor: stdoutWin.end,
-      stderrCursor: stderrWin.end,
+      stdoutCursor: stdoutAbsEnd,
+      stderrCursor: stderrAbsEnd,
       status: row.status,
       exitCode: row.exitCode,
-      stdoutPending: Math.max(0, stdoutTotal - stdoutWin.end),
-      stderrPending: Math.max(0, stderrTotal - stderrWin.end),
+      stdoutPending: Math.max(0, stdoutTotalAbs - stdoutAbsEnd),
+      stderrPending: Math.max(0, stderrTotalAbs - stderrAbsEnd),
     };
   };
 

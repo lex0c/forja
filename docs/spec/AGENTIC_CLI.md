@@ -703,13 +703,22 @@ Transport: stdio (default), SSE, e streamable HTTP. Conexão é **lazy** — ser
 
 Para processos longos (`npm run dev`, `pytest --watch`, builds), tools dedicadas:
 
-- `bash_background(cmd, label)` — spawna, retorna `process_id`, não bloqueia
+- `bash_background(cmd, label, max_log_bytes?)` — spawna, retorna `process_id`, não bloqueia
 - `bash_output(process_id, since?)` — incremental, com cursor
 - `bash_kill(process_id)` — graceful → forced
 
 Estado dos processos: tabela `background_processes`. Persistido entre steps. Limpo no fim da sessão (ou via `/bg cleanup`).
 
 UI: status line mostra tray de background processes (`bg N` com counts; detalhes via `/bg list`). Ver UI.md §4.4.
+
+**Per-stream on-disk cap (slice 153):** stdout/stderr de um bg process são drenados para `<log_dir>/<id>.{stdout,stderr}.log` via pipe-+-drainer próprio (não `Bun.file(path)` direct redirection). Cada stream tem um cap configurável (`max_log_bytes`, default 50 MB). Quando o file alcançaria o cap, o drainer trunca a CABEÇA do file (os bytes mais antigos) e retém a CAUDA (mais recente) — preserve o estado atual do processo, que é o que o LLM lê primeiro.
+
+Cursor semantics são **absolutos** (bytes-since-spawn), não file-offset. Coluna `*_bytes_dropped` (migration 043) registra quantos bytes foram descartados do head. `bash_output` mapeia `since=N` para o file-offset corrente via `file_offset = max(0, N - bytes_dropped)`. Um `since` value de uma resposta anterior continua válido depois de uma truncate.
+
+`max_log_bytes`:
+- Default: 50 MB por stream
+- Mínimo: 1024 bytes (caps sub-1KB são bug do caller; refuse no spawn)
+- Opt-out: `Number.POSITIVE_INFINITY` desliga o cap (file cresce sem limite — workflows que precisam log completo retido).
 
 ### 7.3.1 Wait & Monitor primitives
 
