@@ -63,20 +63,27 @@ export interface BuildSandboxExecArgvOptions {
 //
 // Rejects on:
 //   - NUL bytes — invalid in filesystem paths; indicates caller bug.
-//   - Newlines (`\n`/`\r`) — slice 125 (R2 P1): the SBPL profile is
-//     line-joined with `\n` (see buildSbplProfile's `.join('\n')`).
-//     A path containing a literal newline would break the line
-//     structure and could land attacker-controlled tokens at the
-//     start of a fresh line (e.g. `(allow file-read*)` injection).
-//     POSIX permits newlines in paths but they're extraordinarily
-//     rare in practice; rejecting defends against a real injection
-//     vector with negligible legitimate cost.
+//   - Slice 127 (R3 P1): the full CC0 (U+0000-U+001F) + CC1
+//     (U+0080-U+009F) control-character ranges. Pre-slice 125
+//     only `\n`/`\r` were rejected (the line-structure-injection
+//     case), but the SAME class of attacker-controllable bytes
+//     (ANSI ESC `\x1b`, BEL `\x07`, OSC opening `\x9d`) could
+//     produce equally bad outcomes — terminal-side escapes when
+//     the operator views the rendered profile error, or unknown
+//     SBPL parser behavior on its own escape semantics. Symmetric
+//     with welcome.ts's CONTROL_CHAR_RE (slice 125 R2 P2) which
+//     strips the same ranges from operator-visible output.
+//     POSIX permits these in paths but they're extraordinarily
+//     rare; rejecting forecloses an entire injection class for
+//     negligible legitimate cost.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: rule's purpose IS to match control chars (defense intent)
+const SBPL_CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f]/;
 const escapeSbplLiteral = (s: string): string => {
   if (s.includes('\0')) {
     throw new Error('sandbox-runner-macos: path contains NUL byte');
   }
-  if (s.includes('\n') || s.includes('\r')) {
-    throw new Error('sandbox-runner-macos: path contains newline (CR/LF)');
+  if (SBPL_CONTROL_CHAR_RE.test(s)) {
+    throw new Error('sandbox-runner-macos: path contains a control character (CC0 / CC1)');
   }
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 };

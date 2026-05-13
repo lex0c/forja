@@ -433,6 +433,70 @@ describe('scrubEvent — slice 99 R10 hardening', () => {
     expect(out.reason).not.toContain('corp.example');
   });
 
+  // Slice 125 (R2 P1) + Slice 127 (R3 P1): URL_REGEX siblings —
+  // IPv6 brackets, git SSH, domain:port. Pre-slice scrubReason
+  // only matched http(s)://, IPv4, and the path family.
+  describe('URL_REGEX siblings — IPv6 / git SSH / domain:port (slices 125 + 127)', () => {
+    test('IPv6 bracketed scrubs', () => {
+      const out = scrubEvent({
+        kind: 'sandbox.degraded_active',
+        ts: 1,
+        sessionId: 'sess',
+        reason: 'request to [::1]:8080 refused',
+        firstEmission: true,
+      }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
+      expect(out.reason).not.toContain('[::1]:8080');
+    });
+
+    test('IPv6 longer address scrubs', () => {
+      const out = scrubEvent({
+        kind: 'sandbox.degraded_active',
+        ts: 1,
+        sessionId: 'sess',
+        reason: 'gateway at [2001:db8::dead:beef]:443 unreachable',
+        firstEmission: true,
+      }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
+      expect(out.reason).not.toContain('2001:db8');
+    });
+
+    test('git SSH (user@host:path) scrubs', () => {
+      const out = scrubEvent({
+        kind: 'sandbox.degraded_active',
+        ts: 1,
+        sessionId: 'sess',
+        reason: 'clone from git@github.com:internal/private-repo.git refused',
+        firstEmission: true,
+      }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
+      expect(out.reason).not.toContain('github.com');
+      expect(out.reason).not.toContain('private-repo');
+    });
+
+    test('domain:port scrubs', () => {
+      const out = scrubEvent({
+        kind: 'sandbox.degraded_active',
+        ts: 1,
+        sessionId: 'sess',
+        reason: 'db at internal.corp.example:5432 down',
+        firstEmission: true,
+      }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
+      expect(out.reason).not.toContain('internal.corp.example');
+    });
+
+    test('single-token (no-dot) host is NOT scrubbed (DOMAIN_PORT_REGEX requires a dot)', () => {
+      // Conservative trade-off documented in slice 125: avoid
+      // false-positives on `tool.version:1.2.3` style strings.
+      // `localhost:8080` passes through.
+      const out = scrubEvent({
+        kind: 'sandbox.degraded_active',
+        ts: 1,
+        sessionId: 'sess',
+        reason: 'binding localhost:8080',
+        firstEmission: true,
+      }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
+      expect(out.reason).toContain('localhost:8080');
+    });
+  });
+
   test('exec-fs (removed dead code) no longer scrubs (R10 #51)', () => {
     // Defensive: ensure a hypothetical `exec-fs:<path>` cap
     // is NOT scrubbed — the kind isn't real and the entry was

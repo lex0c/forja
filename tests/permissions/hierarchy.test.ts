@@ -631,6 +631,50 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
     expect(result.lockConflicts[0]?.attemptedBy).toBe('session');
   });
 
+  // Slice 125 (R2 P1) + Slice 127 (R3): canonical JSON for
+  // seal-lock deep-equal. The bug: programmatic embedders building
+  // `{ path, mode, locked }` (different key order vs YAML-loaded
+  // `{ mode, path, locked }`) spurious-flag lockConflict. Both
+  // tests use a PROGRAMMATIC session policy to exercise the
+  // exact code path stableJsonStringify guards.
+  test('programmatic session policy with reversed key order does NOT trigger lockConflict (R3)', () => {
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n',
+    );
+    const result = resolvePolicy({
+      cwd: workdir,
+      enterprisePath: null,
+      userPath: null,
+      session: {
+        defaults: {},
+        tools: {},
+        // Different key order vs YAML canonical (mode, path, locked).
+        seal: { path: '/var/log/seal.log', mode: 'worm-file', locked: true },
+      },
+    });
+    expect(result.lockConflicts).toEqual([]);
+  });
+
+  test('programmatic session policy with DIFFERENT content DOES trigger lockConflict (R3 negative)', () => {
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n',
+    );
+    const result = resolvePolicy({
+      cwd: workdir,
+      enterprisePath: null,
+      userPath: null,
+      session: {
+        defaults: {},
+        tools: {},
+        seal: { mode: 'worm-file', path: '/different/path.log', locked: true },
+      },
+    });
+    expect(result.lockConflicts.length).toBe(1);
+    expect(result.lockConflicts[0]?.section).toBe('seal');
+  });
+
   test('unlocked seal still follows last-writer-wins (no regression)', () => {
     // Default seal behavior unchanged when no layer sets
     // `locked: true`. Project overrides enterprise; the

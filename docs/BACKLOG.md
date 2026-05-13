@@ -15,6 +15,82 @@ Format:
 
 ---
 
+## [2026-05-12] permission-engine-v2 — slice 127: REVIEW_NOTES_R3 punch list (4 P0 + 8 P1 + tests)
+
+**Done.** One-hundred-twenty-seventh slice. Closes every actionable finding from `docs/REVIEW_NOTES_R3.md` — the third multi-agent review pass over slices 125+126. Four P0s, eight P1s, one P2, plus ~50 new tests filling the coverage gap that R3 surfaced.
+
+### P0 fixes
+
+| # | File | Symptom → Fix |
+|---|---|---|
+| A | `src/permissions/audit.ts:261-292` + `src/storage/db.ts` | `emit()` SELECT+INSERT was not transactional → parent + parallel `task_async` children racing on prev_hash read-modify-write. Slice 125 P0-9 wired the child sink, UNMASKING the latent race. New `withImmediateTransaction(db, fn)` helper in `src/storage/db.ts` wraps the read-prev-hash + insert-this-row block in BEGIN IMMEDIATE; concurrent writers serialize via WAL writer lock + busy_timeout=5000. scheduler.tick + telemetry.emit stay OUTSIDE the transaction. |
+| 1 | `src/permissions/resolvers/bash.ts:698` cmdTar | Short-bundle `tar -zIf prog archive` packed `I` into the flag bundle; the standalone-only refuse missed it. Extended the bundle decoder to refuse when the bundle contains `I` (alias for `--use-compress-program`). |
+| 2 | `src/permissions/resolvers/bash.ts:1664` couldGlobReachProtected | Byte-wise `t.startsWith(absLiteralPrefix)` produced false-refuses when `cwd === $HOME`: glob `*` resolved to literal prefix `/home/op` (no trailing `/`), and `/home/op/.ssh`.startsWith(`/home/op`) returned true → refused `ls *` / `cat *` from `~`. **High-traffic regression**. Rewrote with segment-aware match: the literal prefix must overlap a protected target at a segment boundary (prefix ends in `/`, OR target extends prefix within the same filename segment). |
+| 3 | `src/permissions/resolvers/bash.ts:921` ssh -w any | `ssh -w any` (documented ssh syntax for auto-pick tun device). `any` has no `:`, so the portForwardFlags colon-discriminator left it unconsumed → next iteration picked `any` as target → emitted `net-egress:any`. Added explicit `t === '-w' && next === 'any'` to the consume condition. |
+
+### P1 fixes
+
+- **`src/permissions/resolvers/bash.ts:1644` expandBraces ranges** — `{a..z}` and `{1..10}` single-element braces returned `[arg]` unchanged pre-slice; `rm /e{a..z}c/passwd` then bypassed the deterministic classifier (the brace-expanded `/etc/passwd` was never produced for classifyProtectedPath to see). Now single-char ranges (`{a..z}`) and integer ranges (`{1..10}`) expand deterministically. Step syntax / multi-char endpoints fall through to literal (rare in practice).
+- **`src/permissions/sandbox-runner-macos.ts:75-80` escapeSbplLiteral** — extended CR/LF reject to the full CC0 (`\x00-\x1F`) + CC1 (`\x7F-\x9F`) range. Symmetric with `welcome.ts` CONTROL_CHAR_RE (slice 125). Forecloses ANSI ESC / BEL / OSC injection into the SBPL profile.
+- **`src/cli/doctor.ts:430` chainCheck remediation** — pre-slice "run `agent permission verify` for details" was misleading because that command silently migrates the schema. Reworded to "check ${dbPath} for corruption / permissions, OR run `agent permission verify` which migrates the schema AND re-verifies the chain". The asymmetry is now explicit.
+- **`src/permissions/resolvers/bash.ts:1075` cmdRsync** — `--password-file=<path>` / `--password-file <path>` now emits `read-fs(path)` so operator allow rules on credential files fire.
+- **`src/cli/subagent-child.ts:627` audit sink fallback** — `ensureInstallId` failure no longer silent. Logs to `errSink` with explicit "child running with noop audit (decisions will NOT enter approvals_log chain)" + error message.
+- **`src/permissions/resolvers/bash.ts:1932` analyzeCommand classifier loop** — added `expandTilde(exp, ctx.home)` before resolvePath in BOTH the glob-bypass branch and the per-expansion classifier branch. Pre-slice `~/.ssh/id_rsa` resolved to `/work/proj/~/.ssh/id_rsa` (literal `~` under cwd) which never matched the tilde-rooted protected targets. The discovered-by-test gap when writing R3 tests for `~/.s*`.
+
+### P2 fix
+
+- **`src/permissions/resolvers/bash.ts:697` cmdTar** — added refuses for `--rmt-command`, `--info-script` (alias `--new-volume-script`), `--owner-map`, `--group-map`. All documented GTFOBins exec / path-read vectors.
+
+### Test coverage backfill
+
+R3 reviewer's core finding: slice 125 added ~250 LoC of security logic with effectively zero direct tests. This slice fills the gap with ~50 new tests across 4 files:
+
+| File | Tests added |
+|---|---|
+| `tests/permissions/resolvers.test.ts` | +34 — tar GTFOBins (8: each flag + bundle + benign control), rsync transport (5), glob/brace bypass (7 including cwd=$HOME regression pin), ssh edge cases (6), cargo edge (2), mv/cp -t (3), tar additional flags from R3 P2. |
+| `tests/permissions/sandbox-runner.test.ts` | +5 — `buildBwrapArgv` cwd-in-hide_paths refuse + boundary (`.ssh-backup` sibling NOT refused) + host-profile bypass. |
+| `tests/permissions/sandbox-runner-macos.test.ts` | +7 — `escapeSbplLiteral` CC0/CC1 rejection across NUL, LF, CR, ESC, BEL, OSC, plus benign-path passthrough. |
+| `tests/permissions/hierarchy.test.ts` | +2 — programmatic session policy with reversed key order does NOT trigger lockConflict (R2 P1 fix); negative test for real divergence. |
+| `tests/telemetry/scrubbing.test.ts` | +5 — IPv6 bracketed, IPv6 longer, git SSH, domain:port, single-token-no-dot passthrough (conservative). |
+
+### Decisions
+
+- **One slice, four reviewer-buckets.** Pattern from slice 125. The fixes touch disjoint surfaces and unifying the review pass into a single commit unit matches the multi-reviewer fan-out shape.
+- **`withImmediateTransaction` as a separate helper, not a flag on `withTransaction`.** Read-modify-write paths are rare in this codebase (audit chain emit, future seal-state writes); calling them out at the call site makes the lock semantics visible. The default `withTransaction` stays cheap (DEFERRED) for the common write-only batch case.
+- **Glob segment-aware match adds complexity but is the correct fix.** The naïve byte-wise startsWith was wrong in both directions (false-refuses on `ls *` from `~`; false-passes on glob shapes that descend into protected subdirs from a parent prefix). The new logic distinguishes "prefix ends in `/`" (parent-dir case, glob fills next segment) from "prefix is filename-style" (glob completes the filename, can't cross `/`).
+- **`expandTilde` added to analyzeCommand classifier loop, not just the glob branch.** Discovered when testing `~/.s*`: the same gap exists in the per-expansion classifyProtectedPath call. Slice 97 added tilde-expansion to `resolveArg` (used by per-command resolvers), but analyzeCommand's classifier-only loop had a separate `resolvePath(ctx.cwd, ...)` that bypassed it. Now fixed in both branches.
+- **`ensureInstallId` fallback NOW logs but still falls through to noop.** Could refuse to start the child entirely (fail-closed), but that breaks fleets where parent's HOME is set + child's process.env is somehow stripped. The conservative trade-off: log loud, run with chain-blindness. Operator forensics has a clear signal.
+- **`-I` bundle detection mirrors the standalone detection style.** Refuses ANY bundle containing `I`, even if other bundle chars are benign (`-cIf` etc.). False-positive: a future tar release adding an unrelated `-I` semantic in a bundle would refuse spuriously. Acceptable — `-I` historically means only `--use-compress-program`.
+- **expandBraces ranges: integer + single-char only.** Step syntax (`{1..10..2}`) and multi-char (`{aa..zz}`) fall through to literal. Step syntax is rare; multi-char is bash-extension and itself ambiguous. The 1024-expansion cap from slice 125 still applies.
+- **No spec edits.** Same posture as slice 125.
+
+### Trap navigated
+
+- **`~/.s*` test caught a missing tilde-expansion.** First pass of slice 127 added the segment-aware fix to `couldGlobReachProtected` and the new tests passed for `/e*/passwd` but failed for `~/.s*`. The trace: `~/.s*` → `globLiteralPrefix` returns `~/.s` → `resolvePath('/work/proj', '~/.s')` returns `/work/proj/~/.s` (resolvePath doesn't expand `~`) → no protected match → no refuse. Added `expandTilde` to BOTH the glob-bypass and per-expansion paths. Lesson: `resolveArg` is the single source-of-truth for path resolution semantics; ad-hoc `resolvePath` calls in classifier-adjacent code must mirror its tilde-expansion behavior.
+- **`/dev/null` in test commands trips the protected-path classifier before the GTFOBins refuse fires.** Initial test for `--rmt-command` used `tar --rmt-command=evil -cf /dev/null /etc` — the `/dev/null` positional hit the `/dev` deny tier first. Swapped to `/tmp/x.tar src`.
+- **Hierarchy YAML canonicalization made the seal-lock equality test pass before the fix was needed.** YAML-loaded policies are key-order-canonical by construction; the bug only manifests when an embedder PROGRAMMATICALLY builds a `Policy` object. The R3 fence test uses `options.session: { seal: { path, mode, locked } }` (object literal, reversed key order) to actually exercise stableJsonStringify.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (unchanged)
+- `bun test` — **6442 pass / 10 skip / 0 fail** (6452 total across 293 files); +53 tests on top of slice 125's 6389
+- Targeted suites all green: bash resolvers (168/168 — was 134), sandbox runners (75/75), hierarchy (43/43), scrubbing (34/34), audit (219/219)
+
+### Next
+
+R3 punch list fully drained. Cumulative R-bucket status across all three review rounds:
+
+- **REVIEW_NOTES.md** (R1): 56 P0/P1 closed in slices 95-124
+- **REVIEW_NOTES_R2.md** (R2): 10 P0 + 12 P1 closed in slice 125
+- **REVIEW_NOTES_R3.md** (R3): 4 P0 + 8 P1 + 1 P2 closed in slice 127
+- **R9 P0 #10**: deferred-with-rationale in slice 126
+- **R12**: aspirational fuzz CI workflow remains as non-source-bug roadmap
+
+Slices 95-127 (33 consecutive) drained 70 P0 + 32 P1 + 1 P2 from three review rounds + recorded one design-deferral. Branch is at a clean state for merge or further review.
+
+---
+
 ## [2026-05-12] permission-engine-v2 — slice 126: R9 P0 #10 deferred-decision (hybrid)
 
 **Done.** One-hundred-twenty-sixth slice. Records the design decision on the last open R-bucket finding: R9 P0 #10 — §13.4/§13.5 interactive menu NOT implemented.

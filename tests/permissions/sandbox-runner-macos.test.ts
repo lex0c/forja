@@ -289,3 +289,37 @@ describe('buildSbplProfile — hide_paths defense (slice 119, R4)', () => {
     expect(profile).toContain('(deny file-read* (literal "/Users/op\\"injected/.netrc"))');
   });
 });
+
+// Slice 125 (R2 P1) + Slice 127 (R3 P1): escapeSbplLiteral rejects
+// the full CC0/CC1 control-character range. Pre-slice 125 only
+// NUL was rejected; slice 125 added \n/\r; slice 127 expanded to
+// the full CC0 + CC1 set (symmetric with welcome.ts).
+describe('escapeSbplLiteral control-char rejection (slices 125 + 127)', () => {
+  test('NUL byte throws (slice 119 pre-existing)', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work\0', '/home/op')).toThrow(/NUL byte/);
+  });
+
+  test('newline (LF) throws (slice 125)', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work\n', '/home/op')).toThrow(/control character/);
+  });
+
+  test('carriage return throws (slice 125)', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work\r', '/home/op')).toThrow(/control character/);
+  });
+
+  test('ESC byte (0x1B) throws (slice 127)', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work\x1b', '/home/op')).toThrow(/control character/);
+  });
+
+  test('BEL byte (0x07) throws (slice 127)', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work\x07', '/home/op')).toThrow(/control character/);
+  });
+
+  test('CC1 control char (0x9d, OSC) throws (slice 127)', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work\x9d', '/home/op')).toThrow(/control character/);
+  });
+
+  test('benign paths (no control chars) succeed', () => {
+    expect(() => buildSbplProfile('cwd-rw', '/work/proj', '/home/op')).not.toThrow();
+  });
+});

@@ -1,4 +1,10 @@
-export { MEMORY_DB, openDb, openMemoryDb, withTransaction } from './db.ts';
+export {
+  MEMORY_DB,
+  openDb,
+  openMemoryDb,
+  withImmediateTransaction,
+  withTransaction,
+} from './db.ts';
 export type { DB } from './db.ts';
 export { StorageJsonError } from './json-safe.ts';
 

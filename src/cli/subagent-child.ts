@@ -624,13 +624,22 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     try {
       const identity = ensureInstallId({ env: process.env });
       childSink = createSqliteSink({ db, identity });
-    } catch {
+    } catch (e) {
       // ensureInstallId can fail if HOME/$XDG_CONFIG_HOME aren't
       // writable. We fall through to a noop audit (preserves pre-
       // slice behavior); the child still runs but its decisions
       // won't enter the chain. The parent's spawn path would have
       // already caught the same fs issue, so this branch is
       // exceptionally rare in practice.
+      //
+      // Slice 127 (R3 P1): log the failure to errSink so operator
+      // forensics has a signal. Pre-slice the catch was silent;
+      // a stuck-in-this-branch child runs invisibly to the chain
+      // with no operator-visible diagnostic.
+      const msg = e instanceof Error ? e.message : String(e);
+      errSink(
+        `forja subagent-child: install_id discovery failed — child running with noop audit (decisions will NOT enter approvals_log chain): ${msg}\n`,
+      );
       childSink = undefined;
     }
 

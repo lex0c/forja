@@ -491,3 +491,67 @@ describe('isSandboxProfile (slice 103)', () => {
     expect(isSandboxProfile({})).toBe(false);
   });
 });
+
+// Slice 125 (R2 P0-4) + Slice 127 (R3): cwd-in-hide_paths precondition
+// refuse + boundary semantics.
+describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverage)', () => {
+  test('refuses when cwd === a hide_paths dir', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/.ssh',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).toThrow(/inside hide_paths dir/);
+  });
+
+  test('refuses when cwd is INSIDE a hide_paths dir', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/.ssh/audit',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).toThrow(/inside hide_paths dir/);
+  });
+
+  test('does NOT refuse for a sibling whose name shares a prefix with a hide_paths dir', () => {
+    // R3 P2: pin the boundary. `~/.ssh-backup` is NOT inside
+    // `~/.ssh` (different segment); the `${hiddenAbs}/` suffix
+    // in the startsWith check protects against this.
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/.ssh-backup',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).not.toThrow();
+  });
+
+  test('does NOT refuse when cwd is outside all hide_paths dirs', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/home/op/work',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).not.toThrow();
+  });
+
+  test('host profile bypasses the guard (innerArgv passthrough)', () => {
+    // Host profile short-circuits before the hide_paths check
+    // because the runner returns innerArgv unchanged.
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'host',
+        cwd: '/home/op/.ssh',
+        home: '/home/op',
+        innerArgv: INNER,
+      }),
+    ).not.toThrow();
+  });
+});

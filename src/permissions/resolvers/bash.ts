@@ -695,12 +695,59 @@ const cmdTar: CommandResolver = (positional, tokens, ctx) => {
         refuse: 'tar: --to-command runs an arbitrary command per entry — refusing static analysis',
       };
     }
+    // Slice 127 (R3 P2): additional GTFOBins exec / path-read vectors
+    // per `man tar` — all admit attacker-controlled exec or
+    // attacker-controlled file reads via the flag value.
+    if (t === '--rmt-command' || t.startsWith('--rmt-command=')) {
+      return {
+        refuse: 'tar: --rmt-command executes an arbitrary rmt program — refusing static analysis',
+      };
+    }
+    if (
+      t === '--info-script' ||
+      t.startsWith('--info-script=') ||
+      t === '--new-volume-script' ||
+      t.startsWith('--new-volume-script=')
+    ) {
+      return {
+        refuse:
+          'tar: --info-script / --new-volume-script run an arbitrary command at volume change — refusing static analysis',
+      };
+    }
+    if (t === '--owner-map' || t.startsWith('--owner-map=')) {
+      return {
+        refuse:
+          'tar: --owner-map reads an attacker-controllable mapping file — refusing static analysis',
+      };
+    }
+    if (t === '--group-map' || t.startsWith('--group-map=')) {
+      return {
+        refuse:
+          'tar: --group-map reads an attacker-controllable mapping file — refusing static analysis',
+      };
+    }
     if (t === '-I') {
       // Short-form alias for --use-compress-program.
       return {
         refuse:
           'tar: -I (alias of --use-compress-program) executes an arbitrary compressor — refusing static analysis',
       };
+    }
+    // Slice 127 (R3 P0-1): the bundle form `tar -zIf prog archive`
+    // packs `I` into the short-flag bundle and consumes `prog` as
+    // its value via positional lookahead. Pre-slice the bundle
+    // decoder (further down) only inspected `c`/`x`/`t`/`f` chars;
+    // `I` slipped through and the resolver emitted a normal tar
+    // shape with `prog` mis-attributed as an input path. Detect
+    // the bundle form here and refuse.
+    if (t.startsWith('-') && !t.startsWith('--') && t.length > 1) {
+      const bundle = t.slice(1);
+      if (bundle.includes('I')) {
+        return {
+          refuse:
+            'tar: -I (alias of --use-compress-program) in bundled-flag form executes an arbitrary compressor — refusing static analysis',
+        };
+      }
     }
   }
 
@@ -902,7 +949,14 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
       // `:` in next → colon-shaped port-forward spec (consume).
       // No `:` → bare numeric port (stripped) OR the target host
       // (don't consume; let the next iteration pick it as target).
-      if (next?.includes(':')) i += 1;
+      //
+      // Slice 127 (R3 P0-3): for `-w`, the value `any` is the
+      // documented ssh syntax ("auto-pick tun device"). It's a
+      // word (survives tree-sitter strip) without a colon, so
+      // pre-slice it leaked into the target-detection branch as
+      // a host → emitted `net-egress:any`. Consume it like a
+      // colon-shape spec.
+      if (next?.includes(':') || (t === '-w' && next === 'any')) i += 1;
       continue;
     }
     if (t.startsWith('-')) continue;
@@ -1046,12 +1100,32 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
   // destination deletion.
   const hasDelete = tokens.some((t) => t === '--delete' || t.startsWith('--delete-'));
 
+  // Slice 127 (R3 P1): `--password-file=<path>` reads daemon
+  // credentials from <path>. Pre-slice the resolver attributed
+  // no read-fs for this; operator allow rules on ~/.aws/passwords
+  // or similar credential files never fired. Detect both `=`
+  // and space-separated forms.
+  let passwordFile: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--password-file=')) {
+      passwordFile = t.slice('--password-file='.length);
+      break;
+    }
+    if (t === '--password-file') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) passwordFile = next;
+      break;
+    }
+  }
+
   const dest = positional[positional.length - 1] as string;
   const sources = positional.slice(0, -1);
   const anyRemote = isRemote(dest) || sources.some(isRemote);
 
   const caps: Capability[] = [];
   if (anyRemote) caps.push(readFs(resolveArg('~/.ssh', ctx)));
+  if (passwordFile !== null) caps.push(readFs(resolveArg(passwordFile, ctx)));
 
   if (isRemote(dest)) {
     caps.push(netEgress(extractHost(dest)));
@@ -1618,14 +1692,55 @@ const expandBraces = (arg: string): string[] => {
       }
     }
     parts.push(middle.slice(last));
+    const prefix = s.slice(0, open);
+    const suffix = s.slice(close + 1);
     if (parts.length < 2) {
-      // Numeric range or single-element brace — refuse to expand;
-      // emit the literal so the glob-metachar branch picks it up.
+      // Slice 127 (R3 P1): single-element brace MAY be a range
+      // (`{a..z}`, `{1..10}`). Bash expands these deterministically
+      // — `rm /e{a..z}c/passwd` includes `/etc/passwd`. Pre-slice
+      // we emitted the literal which doesn't classify as protected.
+      // Detect single-char `start..end` and integer `start..end`
+      // (no step support; bash's `..N` step is rare in agent code).
+      const rangeMatch = middle.match(/^(.+?)\.\.(.+?)$/);
+      if (rangeMatch !== null) {
+        const [, start, end] = rangeMatch as [string, string, string];
+        const startNum = Number.parseInt(start, 10);
+        const endNum = Number.parseInt(end, 10);
+        // Integer range.
+        if (
+          start === String(startNum) &&
+          end === String(endNum) &&
+          Number.isFinite(startNum) &&
+          Number.isFinite(endNum)
+        ) {
+          const lo = Math.min(startNum, endNum);
+          const hi = Math.max(startNum, endNum);
+          // Cap iteration via the global MAX_BRACE_EXPANSIONS
+          // check inside the loop; large ranges fall through to
+          // the literal-prefix glob defense.
+          for (let v = lo; v <= hi; v += 1) {
+            visit(prefix + String(v) + suffix);
+            if (out.length >= MAX_BRACE_EXPANSIONS) return;
+          }
+          return;
+        }
+        // Single-char range — bash semantics: `{a..z}` expands
+        // 26 chars. Multi-char endpoints stay literal.
+        if (start.length === 1 && end.length === 1) {
+          const lo = Math.min(start.charCodeAt(0), end.charCodeAt(0));
+          const hi = Math.max(start.charCodeAt(0), end.charCodeAt(0));
+          for (let v = lo; v <= hi; v += 1) {
+            visit(prefix + String.fromCharCode(v) + suffix);
+            if (out.length >= MAX_BRACE_EXPANSIONS) return;
+          }
+          return;
+        }
+        // Malformed range (e.g., `aa..zz`, mixed types) — fall
+        // through to literal; glob-metachar branch picks it up.
+      }
       out.push(s);
       return;
     }
-    const prefix = s.slice(0, open);
-    const suffix = s.slice(close + 1);
     for (const p of parts) {
       visit(prefix + p + suffix);
       if (out.length >= MAX_BRACE_EXPANSIONS) return;
@@ -1637,9 +1752,10 @@ const expandBraces = (arg: string): string[] => {
 
 // Test whether a literal-prefix path could reach any SYSTEM-level
 // protected target via glob expansion. True iff some protected
-// target's absolute path overlaps with the literal prefix (either
-// the target starts with the prefix, OR the prefix is inside the
-// target).
+// target's absolute path overlaps with the literal prefix at a
+// SEGMENT BOUNDARY (either the target equals the prefix, OR the
+// target is a strict prefix-extension of the prefix that COULD
+// be reached by glob expansion at the next segment).
 //
 // Deliberately EXCLUDES `cwdEscalateDirs` (`.git`, `.agent`,
 // `.claude` under cwd): a legitimate glob like `*.ts` in cwd
@@ -1651,6 +1767,20 @@ const expandBraces = (arg: string): string[] => {
 // targets are caught by the per-expansion classifyProtectedPath
 // path when the glob is brace-expanded (or by the operator's
 // explicit allow/confirm rule shape).
+//
+// Slice 127 (R3 P0-2): segment-aware match instead of byte-wise
+// startsWith. Pre-slice: when `cwd === $HOME` (e.g., `/home/op`),
+// glob `*` resolves to literal prefix `/home/op` (NO trailing
+// slash); tildeEscalateDirs `/home/op/.ssh` matched via
+// `t.startsWith(absLiteralPrefix)` because `/home/op/.ssh`
+// literally starts with `/home/op` (consecutive bytes). That made
+// `ls *` / `cat *` from `~` refuse — a high-traffic regression.
+// The fix: the literal prefix must overlap a protected target at
+// a SEGMENT BOUNDARY (the protected target shares the prefix AND
+// the next byte in the target is `/` OR the prefix already ends
+// in `/`). Bare `/home/op` does NOT segment-match `/home/op/.ssh`
+// — the glob `*` from cwd `/home/op` matches FILENAMES under
+// `/home/op`, not paths that descend into a subdir.
 const couldGlobReachProtected = (
   absLiteralPrefix: string,
   targets: ReturnType<typeof protectedTargets>,
@@ -1661,9 +1791,46 @@ const couldGlobReachProtected = (
     ...targets.tildeEscalateFiles,
     ...targets.tildeEscalateDirs,
   ];
+  // Normalize: a literal-prefix that ends in `/` is "in a parent
+  // directory; glob fills in the next segment". A literal-prefix
+  // that does NOT end in `/` is "matching a filename in some
+  // parent dir; glob fills in the rest of the filename".
+  const prefixEndsAtSeparator = absLiteralPrefix.endsWith('/');
   for (const t of all) {
-    if (t === absLiteralPrefix || t.startsWith(absLiteralPrefix)) return true;
+    // Exact match — the prefix IS the protected target.
+    if (t === absLiteralPrefix) return true;
+    // Prefix is INSIDE a protected target — glob could match
+    // arbitrary descendants. The `t/`-prefix form is the segment
+    // boundary on the target side.
     if (absLiteralPrefix.startsWith(`${t}/`)) return true;
+    // Protected target is inside the prefix's "next-segment" zone.
+    // Discriminator: target must extend the prefix at a segment
+    // boundary — either prefix ends in `/` (next segment is being
+    // glob-expanded) OR target has more characters before a `/`
+    // boundary that the glob filename-match could cover.
+    if (t.startsWith(absLiteralPrefix)) {
+      const rest = t.slice(absLiteralPrefix.length);
+      if (prefixEndsAtSeparator) {
+        // Prefix is parent-dir-style. Glob next segment could
+        // match any filename including those that lead into
+        // protected subtrees. Match.
+        return true;
+      }
+      // Prefix is filename-style (no trailing `/`). The protected
+      // target is reachable only if `rest` extends within the SAME
+      // filename segment — i.e., `rest` contains no `/`. If `rest`
+      // starts with `/`, the protected target is in a SUBDIR of the
+      // prefix's parent, which the filename glob can't reach.
+      if (!rest.startsWith('/') && !rest.includes('/')) {
+        // Glob could complete the filename to match the protected
+        // target. E.g., prefix `/etc/passw` (from `/etc/passw*`)
+        // could complete to `/etc/passwd`. Match.
+        return true;
+      }
+      // rest starts with `/` (e.g., prefix `/home/op`, target
+      // `/home/op/.ssh`). Filename glob can't traverse into
+      // subdirs. NOT a bypass — slice 127 R3 P0-2 fix.
+    }
   }
   return false;
 };
@@ -1735,7 +1902,12 @@ const analyzeCommand = (
       const expansions = expandBraces(candidate);
       for (const exp of expansions) {
         if (containsGlobMetachar(exp)) {
-          const absLiteralPrefix = resolvePath(ctx.cwd, globLiteralPrefix(exp));
+          // Slice 127 (R3): expand tilde BEFORE absolutizing so
+          // `~/.s*` resolves to `/home/op/.s*` (matching protected
+          // tilde-dirs) instead of `/work/proj/~/.s*` which never
+          // overlaps any classifier target.
+          const literalPrefix = globLiteralPrefix(exp);
+          const absLiteralPrefix = resolvePath(ctx.cwd, expandTilde(literalPrefix, ctx.home));
           if (couldGlobReachProtected(absLiteralPrefix, targets)) {
             return {
               refuse: `bash: ${shape.name} target '${exp}' uses a shell glob (*/?/[) whose literal prefix could expand into a protected zone — refusing static analysis`,
@@ -1746,7 +1918,13 @@ const analyzeCommand = (
           escalated = true;
           continue;
         }
-        const abs = resolvePath(ctx.cwd, exp);
+        // Slice 127 (R3): expand tilde so `~/.ssh/id_rsa` resolves
+        // to the home-relative absolute that classifyProtectedPath
+        // recognizes, rather than a literal `~/...` under cwd.
+        // resolveArg already does this for the per-resolver
+        // attribution path; the analyzeCommand classifier loop
+        // wasn't doing it.
+        const abs = resolvePath(ctx.cwd, expandTilde(exp, ctx.home));
         const tier = classifyProtectedPath({ absPath: abs, op, home: ctx.home, cwd: ctx.cwd });
         if (tier === 'deny') {
           return {

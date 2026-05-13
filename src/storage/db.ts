@@ -65,4 +65,27 @@ export const openMemoryDb = (): DB => openDb(MEMORY_DB);
 // Bun's Database.transaction wraps `fn` in a function that opens a SAVEPOINT,
 // runs the body, and commits or rolls back. This helper exposes that as a
 // single call so callers don't need to know about the curried form.
+//
+// Default `db.transaction(fn)()` opens DEFERRED — no lock held until the
+// first write. That's fine for write-only sequences (multiple INSERTs in
+// a row) but UNSAFE for read-modify-write under concurrency: another
+// process can commit between our SELECT and our INSERT, invalidating our
+// snapshot with SQLITE_BUSY_SNAPSHOT (which busy_timeout does NOT retry).
 export const withTransaction = <T>(db: DB, fn: () => T): T => db.transaction(fn)();
+
+// Slice 127 (R3 P0-A): IMMEDIATE transaction variant for
+// read-modify-write paths. Acquires the writer lock at BEGIN so the
+// SELECT inside the transaction sees a snapshot that's guaranteed
+// stable through to COMMIT. Multiple concurrent BEGIN IMMEDIATEs
+// serialize via busy_timeout=5000 (set in openDb) — the second
+// caller waits up to 5s for the first to commit, then proceeds.
+//
+// Use for: audit chain append (read prev_hash, compute new hash,
+// insert). Any sequence where the write payload depends on data
+// read inside the same transaction.
+//
+// Do NOT use for: pure SELECTs (overhead with no benefit), pure
+// INSERTs (deferred works fine), or long-running operations
+// (serializing the writer lock for >100ms starves the rest).
+export const withImmediateTransaction = <T>(db: DB, fn: () => T): T =>
+  db.transaction(fn).immediate();

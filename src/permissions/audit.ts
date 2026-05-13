@@ -30,7 +30,7 @@
 // because the genesis can't be reproduced without the matching
 // identity file.
 
-import type { DB } from '../storage/db.ts';
+import { type DB, withImmediateTransaction } from '../storage/db.ts';
 import {
   type ApprovalLogConfidence,
   type ApprovalLogDecision,
@@ -259,37 +259,59 @@ export const createSqliteSink = ({
       : computeRotatedGenesisHash(identity, latestMeta.rotation_id, latestMeta.rotated_at_ms);
 
   const emit = (input: AuditEmitInput): EmittedRow => {
-    const last = getLastApprovalsLogByInstall(db, identity.install_id);
-    const prev_hash = last === null ? genesisHash : last.this_hash;
-
-    const args_hash = sha256Hex(canonicalize(input.args ?? {}));
     const ts = input.ts ?? Date.now();
+    const args_hash = sha256Hex(canonicalize(input.args ?? {}));
 
-    const persistedExceptHash: Omit<ApprovalLogRow, 'seq' | 'this_hash'> = {
-      ts,
-      install_id: identity.install_id,
-      session_id: input.session_id,
-      parent_approval_id: input.parent_approval_id ?? null,
-      tool_name: input.tool_name,
-      tool_version: input.tool_version ?? 'v1',
-      resolver_version: input.resolver_version ?? 'v1',
-      args_hash,
-      capabilities_json: JSON.stringify(input.capabilities ?? []),
-      decision: input.decision as ApprovalLogDecision,
-      score: input.score ?? 0,
-      score_components_json: JSON.stringify(input.score_components ?? {}),
-      confidence: input.confidence ?? 'high',
-      classifier_hash: input.classifier_hash ?? null,
-      classifier_adjust: input.classifier_adjust ?? null,
-      policy_hash: input.policy_hash,
-      sandbox_profile: input.sandbox_profile ?? null,
-      ttl_expires_at: input.ttl_expires_at ?? null,
-      reason_chain_json: JSON.stringify(input.reason_chain),
-      prev_hash,
-    };
+    // Slice 127 (R3 P0-A): wrap read-prev-hash + insert-this-row in
+    // a single IMMEDIATE transaction. Pre-slice the SELECT and
+    // INSERT were both in autocommit mode; parent + parallel
+    // task_async child processes sharing the same install_id could
+    // both read `prev_hash=X` and both insert with that prev_hash,
+    // breaking chain continuity (`verifyChain` then fails). The
+    // child sink was wired in slice 125 P0-9 which UNMASKED this
+    // pre-existing race.
+    //
+    // BEGIN IMMEDIATE acquires the writer lock at transaction
+    // start so the SELECT's snapshot stays stable through to
+    // COMMIT. Concurrent BEGIN IMMEDIATEs serialize via
+    // busy_timeout=5000 (set in openDb): the second caller waits
+    // up to 5s for the first to commit, then proceeds with a
+    // fresh snapshot.
+    //
+    // scheduler.tick() + telemetry.emit() stay OUTSIDE the
+    // transaction — they're observability paths that mustn't
+    // hold the writer lock or block other audit emitters.
+    const { inserted, this_hash, persistedExceptHash } = withImmediateTransaction(db, () => {
+      const last = getLastApprovalsLogByInstall(db, identity.install_id);
+      const prev_hash = last === null ? genesisHash : last.this_hash;
 
-    const this_hash = sha256Hex(prev_hash + canonicalize(buildHashPayload(persistedExceptHash)));
-    const inserted = appendApprovalsLog(db, { ...persistedExceptHash, this_hash });
+      const persisted: Omit<ApprovalLogRow, 'seq' | 'this_hash'> = {
+        ts,
+        install_id: identity.install_id,
+        session_id: input.session_id,
+        parent_approval_id: input.parent_approval_id ?? null,
+        tool_name: input.tool_name,
+        tool_version: input.tool_version ?? 'v1',
+        resolver_version: input.resolver_version ?? 'v1',
+        args_hash,
+        capabilities_json: JSON.stringify(input.capabilities ?? []),
+        decision: input.decision as ApprovalLogDecision,
+        score: input.score ?? 0,
+        score_components_json: JSON.stringify(input.score_components ?? {}),
+        confidence: input.confidence ?? 'high',
+        classifier_hash: input.classifier_hash ?? null,
+        classifier_adjust: input.classifier_adjust ?? null,
+        policy_hash: input.policy_hash,
+        sandbox_profile: input.sandbox_profile ?? null,
+        ttl_expires_at: input.ttl_expires_at ?? null,
+        reason_chain_json: JSON.stringify(input.reason_chain),
+        prev_hash,
+      };
+
+      const hash = sha256Hex(prev_hash + canonicalize(buildHashPayload(persisted)));
+      const row = appendApprovalsLog(db, { ...persisted, this_hash: hash });
+      return { inserted: row, this_hash: hash, persistedExceptHash: persisted };
+    });
     // §7.3 sealing tick (slice 56). ORDER MATTERS: the row is
     // already persisted, so the scheduler's `sealLatestInternal`
     // sees the up-to-date chain head when it queries

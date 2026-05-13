@@ -427,7 +427,16 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       name: 'hash_chain',
       status: 'fail',
       detail: `DB error: ${(e as Error).message}`,
-      remediation: `check ${options.dbPath} for corruption, permissions, or schema mismatch (run \`agent permission verify\` for details)`,
+      // Slice 127 (R3 P1): rename remediation so the operator
+      // knows that `agent permission verify` ALSO migrates the
+      // schema as a side effect (it's the operator-invoked verb
+      // that brings the local DB up to spec). Pre-slice the
+      // remediation said "for details" — misleading because the
+      // verify run silently upgrades the schema, fixing the gap
+      // doctor just flagged. The honest framing is "run verify
+      // — it will migrate the schema if needed AND verify the
+      // chain".
+      remediation: `check ${options.dbPath} for corruption / permissions, OR run \`agent permission verify\` which migrates the schema to the current spec and re-verifies the chain`,
     };
   } finally {
     if (db !== null) {

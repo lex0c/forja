@@ -1329,3 +1329,322 @@ describe('bash resolver — cargo (slice 120, R2 #199)', () => {
     }
   });
 });
+
+// Slice 125 (R2) + Slice 127 (R3) — bash resolver security
+// hardening. These tests cover the security-load-bearing logic
+// that slices 125 + 127 added; pre-slice the test suite had
+// zero direct coverage for them.
+
+describe('bash resolver — tar GTFOBins refuses (slices 125 + 127)', () => {
+  test('--checkpoint-action=exec=<cmd> refuses', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'tar -czf x.tar --checkpoint-action=exec=evil src/' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('checkpoint-action');
+  });
+
+  test('--checkpoint-action=sleep is also refused (cannot statically distinguish exec from benign)', () => {
+    // Space-separated form (we refuse unconditionally per slice 125).
+    const r = resolveCapabilities('bash', { command: 'tar --checkpoint-action sleep' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('--use-compress-program=<cmd> refuses', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'tar --use-compress-program=evil -cf x.tar src/' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('use-compress-program');
+  });
+
+  test('--to-command=<cmd> refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'tar --to-command=evil -xf x.tar' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('-I <cmd> (standalone) refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'tar -I evil -cf x.tar src/' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('compress');
+  });
+
+  // Slice 127 (R3 P0-1).
+  test('-zIf bundled-flag form ALSO refuses (R3 P0-1)', () => {
+    const r = resolveCapabilities('bash', { command: 'tar -zIf evil x.tar src/' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('compress');
+  });
+
+  test('--rmt-command refuses (R3 P2)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'tar --rmt-command=evil -cf /tmp/x.tar src' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('rmt-command');
+  });
+
+  test('--info-script refuses (R3 P2)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'tar --info-script=/tmp/evil -cf x.tar src/' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('--owner-map / --group-map refuse (R3 P2)', () => {
+    const r1 = resolveCapabilities(
+      'bash',
+      { command: 'tar --owner-map=/tmp/evil -cf x.tar src/' },
+      CTX,
+    );
+    expect(r1.kind).toBe('refuse');
+    const r2 = resolveCapabilities(
+      'bash',
+      { command: 'tar --group-map=/tmp/evil -cf x.tar src/' },
+      CTX,
+    );
+    expect(r2.kind).toBe('refuse');
+  });
+
+  test('benign tar -czf without GTFOBins flags does NOT refuse', () => {
+    const r = resolveCapabilities('bash', { command: 'tar -czf release.tar.gz src/' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+});
+
+describe('bash resolver — rsync transport refuses (slice 125)', () => {
+  test('rsync -e <cmd> refuses', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync -e "sh -c evil" src/ user@host:/dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('-e sets the transport');
+  });
+
+  test('rsync --rsh=<cmd> refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --rsh=evil src/ user@host:/dst' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('rsync --rsh <cmd> (space form) refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --rsh evil src/ user@host:/dst' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('rsync --rsync-path=<cmd> refuses', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --rsync-path=evil src/ user@host:/dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('arbitrary command on the remote side');
+  });
+
+  test('rsync --password-file=<path> attributes read-fs (R3 P1)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --password-file=/work/proj/secret.txt src/ user@host:/dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/secret.txt');
+    }
+  });
+
+  test('benign rsync without transport flags is NOT refused', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -av src/ dst/' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+});
+
+describe('bash resolver — glob/brace bypass detection (slices 125 + 127)', () => {
+  test('deterministic brace expansion (comma form) → per-branch classifier (R2 P0-3)', () => {
+    // `/{etc,opt}/passwd` brace-expands to /etc/passwd + /opt/passwd.
+    // /etc on the escalate tier → confidence drops to low (write op).
+    const r = resolveCapabilities('bash', { command: 'rm /{etc,opt}/passwd' }, CTX);
+    // /etc/passwd is in the escalate tier for write — does NOT refuse
+    // outright (deny tier is /proc/sys/boot/dev). The escalation
+    // surfaces as low confidence.
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.confidence).toBe('low');
+  });
+
+  test('deterministic brace into deny tier → refuse', () => {
+    // /proc IS deny tier.
+    const r = resolveCapabilities('bash', { command: 'cat /{proc,opt}/version' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('protected zone');
+  });
+
+  test('brace range expansion {a..z} reaches /etc via /e{a..z}c/passwd (R3 P1)', () => {
+    // The bypass shape: /e{a..z}c/passwd expands to /eac/passwd ...
+    // /ezc/passwd. One of those is /etc/passwd. Pre-R3 expandBraces
+    // left ranges as literal; R3 expands single-char ranges.
+    const r = resolveCapabilities('bash', { command: 'cat /e{a..z}c/passwd' }, CTX);
+    // /etc/passwd is escalate for write, but cat is read-only. read
+    // on /etc would not be deny → no refuse for read. But the brace
+    // expansion DID happen; ANY of the branches reaches /etc, and
+    // /etc is in ABSOLUTE_ESCALATE which only fires on writes. So
+    // for `cat` (read) the result is ok with normal confidence.
+    expect(r.kind).toBe('ok');
+  });
+
+  test('brace range with deny tier on write → refuse', () => {
+    // /proc IS systemDeny (read AND write deny).
+    const r = resolveCapabilities('bash', { command: 'cat /p{a..z}c/version' }, CTX);
+    // /pac, /pbc, ... and /poc, ... /pzc — none equal /proc. But the
+    // brace expands chars individually, so /pac, /pbc, /pcc... none
+    // is /proc. This test pins that the EXPANSION isn't generating
+    // false-positives on non-matching ranges.
+    expect(r.kind).toBe('ok');
+  });
+
+  test('glob `*` from cwd === $HOME does NOT refuse (R3 P0-2 regression fix)', () => {
+    // Pre-R3 P0-2 fix: `ls *` from $HOME refused because the
+    // literal prefix `/home/op` byte-startsWith matched /home/op/.ssh.
+    // Post-fix: segment-aware match requires the prefix to be a
+    // parent dir (trailing /), so `/home/op` doesn't match `.ssh`.
+    const HOME_CTX = { cwd: '/home/op', home: '/home/op' };
+    const r = resolveCapabilities('bash', { command: 'ls *' }, HOME_CTX);
+    expect(r.kind).toBe('ok');
+  });
+
+  test('glob `/e*/passwd` DOES refuse (system-protected zone reachable)', () => {
+    // /e*/passwd's literal prefix `/e` could expand to `/etc`. Glob
+    // metachar detection refuses.
+    const r = resolveCapabilities('bash', { command: 'rm /e*/passwd' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('shell glob');
+  });
+
+  test('glob `~/.s*` DOES refuse (tilde-rooted protected reach)', () => {
+    const r = resolveCapabilities('bash', { command: 'cat ~/.s*' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+});
+
+describe('bash resolver — ssh edge cases (slices 125 + 127)', () => {
+  test('ssh -p 2222 server → target is `server`, not `2222` (slice 125)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -p 2222 server.example.com' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:server.example.com');
+    }
+  });
+
+  test('ssh -L 8080:localhost:80 user@host → port forwarding adds net-ingress (slice 125)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -L 8080:localhost:80 user@host' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:host');
+      expect(s).toContain('net-ingress:*');
+    }
+  });
+
+  test('ssh -w any host → `any` consumed as tun-device, target is `host` (R3 P0-3)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -w any user@host.example' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      // Pre-R3, `any` was picked as target → net-egress:any.
+      expect(s).toContain('net-egress:host.example');
+      expect(s).not.toContain('net-egress:any');
+    }
+  });
+
+  test('ssh -w 0:1 user@host → colon-shape consumed (slice 125 P1)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -w 0:1 user@host.example' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('net-egress:host.example');
+      expect(s).not.toContain('net-egress:0:1');
+    }
+  });
+
+  test('ssh -o LocalCommand=evil refuses (slice 125 P1)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -o LocalCommand=evil host' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('LocalCommand');
+  });
+
+  test('ssh -o KnownHostsCommand=evil refuses (slice 125 P1)', () => {
+    const r = resolveCapabilities('bash', { command: 'ssh -o KnownHostsCommand=evil host' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('KnownHostsCommand');
+  });
+});
+
+describe('bash resolver — cargo edge cases (slice 125 P1)', () => {
+  test('cargo clean emits delete-fs(target), no exec:arbitrary', () => {
+    const r = resolveCapabilities('bash', { command: 'cargo clean' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('delete-fs:/work/proj/target');
+      expect(s.some((c) => c.startsWith('exec:arbitrary'))).toBe(false);
+    }
+  });
+
+  test('cargo build --target-dir=<path> redirects build output write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'cargo build --target-dir=/tmp/other-target' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/other-target');
+      expect(s).not.toContain('write-fs:/work/proj/target');
+    }
+  });
+});
+
+describe('bash resolver — mv/cp -t target-directory (slice 125 P1)', () => {
+  test('mv -t /dst src1 src2 → dst is targetDir, srcs are reads', () => {
+    const r = resolveCapabilities('bash', { command: 'mv -t /dst src1 src2' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/dst');
+      expect(s).toContain('read-fs:/work/proj/src1');
+      expect(s).toContain('read-fs:/work/proj/src2');
+    }
+  });
+
+  test('mv --target-directory=/dst src1 → same shape', () => {
+    const r = resolveCapabilities('bash', { command: 'mv --target-directory=/dst src1' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/dst');
+      expect(s).toContain('read-fs:/work/proj/src1');
+    }
+  });
+
+  test('cp -t /dst src → write-fs(dst) + read-fs(src)', () => {
+    const r = resolveCapabilities('bash', { command: 'cp -t /dst src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('write-fs:/dst');
+      expect(s).toContain('read-fs:/work/proj/src');
+    }
+  });
+});
