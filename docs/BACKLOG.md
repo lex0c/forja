@@ -15,6 +15,71 @@ Format:
 
 ---
 
+## [2026-05-13] docs — slice 133: operator-facing security + audit guides + repo-root disclosure policy
+
+**Done.** One-hundred-thirty-third slice. Docs-only. Three new files filling three distinct audiences that the spec docs (PT-BR, protocol-level) don't address: operators reading architecture, operators running audit, and security researchers wanting to report a vulnerability.
+
+### Files added
+
+- **`docs/SECURITY.md`** (769 lines) — security architecture in English. Companion to `docs/spec/AGENTIC_CLI.md §1` (PT-BR protocol). Covers:
+  - §1 Threat model — what Forja defends against, what it does NOT, honest instrumentation limits.
+  - §2 Core principles — measure-twice-cut-once, reject-early-loud, whitelist-as-policy-surface, reversible-by-design, trace-everything, defense-in-depth.
+  - §3 Permission engine — pipeline ASCII diagram, resolver layer (bash AST, fetch SSRF, fs paths), capability model (12 kinds), policy layers (default→enterprise→user→project→session), risk score (11 features baseline-v2.0), Decision shape.
+  - §4 Sandbox — profile selection algorithm, Linux bwrap argv, macOS sandbox-exec SBPL, HIDE_PATHS (13 dirs + 6 files), capability→profile map, wire-up via maybeWrapSandboxArgv, availability + degradation, 6 documented limitations.
+  - §5 Defense in depth — 12-layer table.
+  - §5.5 Privilege surfaces beyond engine/sandbox triad — 12 subsections: cwd trust list (slice 122), hooks, subagent IPC permission proxy, MCP servers, plan mode, memory_write modal, budget gates, broker JSON IPC, env scrubbing detailed, sandbox_skip marker, operator introspection verbs, TUI modal as security surface.
+  - §6 Audit trail — approvals_log per-install chain, failure_events per-session chain, outcome_signals derived audit, external sealing, privacy via args_hash split.
+  - §7 Failure modes — state machine + codes + catch-site stderr fallback.
+  - §8 Out of scope — 9 declared limits.
+  - §9 References.
+  - §10 Reporting — points at repo-root `SECURITY.md` for disclosure policy.
+
+- **`docs/AUDIT.md`** (678 lines) — operator audit guide in English. Companion to `docs/spec/AUDIT.md` (PT-BR protocol). Covers:
+  - §1 Quick reference — implemented CLI verbs (11) vs deferred (`agent audit timeline/failures/costs`, `agent forensics`, `agent gc`, `redaction_events`).
+  - §2 Daily workflow — `agent permission verify` + `seal-verify` + cron suggestion.
+  - §3 Post-incident review — find session → walk decisions → replay specific seq → join with tool_calls for raw args → failure_events + outcome_signals in same session.
+  - §4 Sealing backends — worm-file, RFC3161, git-anchored, S3 object lock; setup + threat model + cost + decision matrix.
+  - §5 Chain rotation — what it does, running, inspecting + quarantine clearance (rotations default quarantined=1, require `--clear`), `--accept-broken-chain`.
+  - §6 Forensics — marked deferred, ad-hoc bundle script provided.
+  - §7 Compliance integration — NDJSON export, audit modes (deferred runtime knob), cost queries.
+  - §8 Retention + GC — deferred; manual cleanup pattern.
+  - §9 Privacy + redaction — regex catalog, redaction_events table noted as deferred.
+  - §10 Verification decision tree — verify failed, now what?
+  - §11 Schema reference — pointers to migrations + PERSISTED_COLUMNS.
+  - §12 References.
+
+- **`SECURITY.md`** (repo root, 80 lines) — disclosure policy. GitHub renders this as "Security policy" link in sidebar. Covers:
+  - Supported versions: main + latest tag only.
+  - Reporting channel: GitHub Security Advisory (private). Not public issues.
+  - What to include: version, repro, impact, PoC.
+  - Response timeline (solo-maintained, realistic): 72h ack, 30d critical fix target, coordinated disclosure 7–14d post-fix.
+  - In-scope: 9 categories (permission engine bypass, sandbox escape, audit chain forgery, credential exfil, cross-session pollution, MCP injection, subagent envelope escape, resolver bypass, proto-pollution, TOCTOU).
+  - Out-of-scope: 8 categories (kernel-level adversary, multi-tenant, side channels, social engineering, third-party deps, provider-side, DoS via budget, Windows platform).
+  - Acknowledgments + past-disclosure placeholders.
+
+### Decisions
+
+- **Three files, three audiences.** Mixing disclosure inside the architecture doc (single `docs/SECURITY.md` covering both) confuses operators reading architecture and reporters wanting a quick contact path. Repo-root `SECURITY.md` is GitHub-conventional (auto-rendered as sidebar link). `docs/SECURITY.md` becomes the architectural depth; `docs/AUDIT.md` the operational playbook.
+- **Honest about deferred features.** `docs/AUDIT.md` §1.3 explicitly tables what's implemented vs spec-only. Operators reading the doc see immediately that `agent audit timeline` doesn't ship yet and can plan accordingly (use direct sqlite3 queries today). No marketing-aspirational claims.
+- **Multi-agent self-review iteration.** Before committing, I asked the user (twice) "is this coherent with the code?" and re-audited each doc against the source. Found 5 inaccuracies in AUDIT.md (quarantine semantics inverted, missing `--clear` flag, fabricated output samples, wrong file path) and fixed all five. Found 13 gaps in SECURITY.md (trust list, hooks, subagent IPC, MCP, plan mode, memory_write modal, budget gates, broker IPC, env scrub detailed, sandbox_skip, operator introspection, TUI modal as defense) and added §5.5 covering all 12. The "ask before committing whether the doc matches the code" cycle is itself the slice's process contribution.
+
+### Limits declared
+
+- The repo-root `SECURITY.md` references a contact channel (GitHub Security Advisory) that the operator must verify is enabled in repo settings. If "Private vulnerability reporting" isn't turned on in repo Settings → Code security, the advisory URL 404s — orthogonal to this slice; flagged for operator setup.
+- The acknowledgments + past-disclosures sections are placeholders. Will populate as reports come in.
+- `docs/SECURITY.md` §5.5.4 references MCP failure event codes (mcp.transport.broken etc.) reserved in slice 130's `FailureClass` enum but not yet wired at emit sites. The reservation IS shipped; the emit sites are deferred per the failure_events catalog rollout policy.
+
+### Verification
+
+- `bun run typecheck` — clean (no source changes)
+- `bun run lint` — clean (no source changes)
+- `bun test` — unchanged from slice 132 (no source changes)
+- Manual cross-reference of doc claims against `git grep` for line counts, schema columns, CLI verbs, file paths — all verified inline before commit.
+
+**Next.** Calibration script (out-of-tree initially, consuming the `(score, score_components_json, decision, outcome)` triples slice 131 makes computable). Once a deployment hits 30 days of telemetry, derive `v2.1` weights via logistic regression per spec §6.3.2. Could also bundle into a future `agent audit calibrate` CLI verb when the `agent audit` subsystem ships.
+
+---
+
 ## [2026-05-13] permission-engine-v2 — slice 132: spec PR batch — register slice 130 + 131 divergences
 
 **Done.** One-hundred-thirty-second slice. Spec-only. Registers as canonical the implementation divergences from slices 130 (failure_events) and 131 (outcome_signals) that the multi-agent reviews flagged for spec PRs. No code changes; the implementation stays as-is — this slice updates `docs/spec/` so future reviewers don't re-flag the same divergences.
