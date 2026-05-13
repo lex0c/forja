@@ -54,6 +54,23 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /^GIT_PROXY_COMMAND$/i,
   /^GIT_EXTERNAL_DIFF$/i,
   /^GIT_TEMPLATE_DIR$/i, // templates can carry hooks
+  // Slice 142 (review minor): dynamic linker injection. An LLM-
+  // driven bash inherits whatever the operator's parent shell
+  // had; if a malicious .bashrc set `LD_PRELOAD=/tmp/x.so`, every
+  // wrapped exec loads the rogue library and bypasses syscall-
+  // level sandbox protections (the .so runs as the process's own
+  // library code). Same threat shape for macOS DYLD_*. Defense-
+  // in-depth: scrub at every spawn boundary so the sandboxed
+  // process can't inherit + can't set them either. Plus
+  // SUDO_ASKPASS (could run a credential-prompting helper of
+  // attacker's choice during a sudo invocation).
+  /^LD_PRELOAD$/,
+  /^LD_LIBRARY_PATH$/,
+  /^LD_AUDIT$/,
+  /^DYLD_INSERT_LIBRARIES$/,
+  /^DYLD_FALLBACK_LIBRARY_PATH$/,
+  /^DYLD_LIBRARY_PATH$/,
+  /^SUDO_ASKPASS$/,
 ];
 
 // Returns a defensive copy with credential-like vars removed. Undefined

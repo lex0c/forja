@@ -2,6 +2,56 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 142: latent correctness + minor hoists
+
+**Done.** One-hundred-forty-second slice. Closes the **2 correctness latent items in `audit.ts`** flagged at the end of slice 141, plus a focused batch of 🟡 minor findings from the slice 139 review punch list. Strategy: do the bug fixes first (clear shape), then the safe additive items (new exported consts, new scrub patterns, barrel surface). Deeper API surface refactors (EngineOptions split, GrantSnapshot dedup, AuditEmitInput tightening) deferred — they merit their own slice once the immediate correctness gap is closed.
+
+### Correctness fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **C-lat-1** | `verifyChain` captured `genesisHash` at sink construction time. If `audit_chain_meta` rotates between construction and verify call, the live tip's `prev_hash` chains against the rotated genesis while verify still expects the pre-rotation one — spurious mismatch. | `src/permissions/audit.ts` (verifyChain body) | Recompute genesis from the LIVE `tipMeta` row inside `verifyChain` instead of the closed-over constructor value. New helper `computeRotatedGenesisHash(identity, rotation_id, rotated_at_ms)` mirrors the rotated-genesis shape from the schema layer. |
+| **C-lat-2** | `canonicalize(input.args)` throws on `undefined` properties (`canonicalize` strict-rejects undefined to match JCS). Real-world callers commonly pass `{ command, env: undefined }` — emit currently rejects the row. | `src/permissions/audit.ts` (emit body) | New `stripUndefined(value, seen)` helper mirroring `JSON.stringify` semantics: drops undefined keys at object level, converts array undefined slots to `null`, cycle-guarded with `WeakSet`. `args_hash` is now stable for the JSON-projection of the input — what a future replay reading the row's JSON would canonicalize to. |
+
+### Minor (additive surface)
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **min-1** | LD_PRELOAD / DYLD_INSERT_LIBRARIES inheritance is a defense-in-depth gap. A sandboxed process inheriting them loads attacker's `.so` / `.dylib` as its own library code, sidestepping syscall-level sandbox boundaries. | `src/sanitize/env.ts` | +7 SCRUB_PATTERNS: `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `DYLD_FALLBACK_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `SUDO_ASKPASS`. |
+| **min-2** | Magic-number `60 * 60 * 1000` inlined in `audit.emit` future-skew check (spec §15). Calibration / test imports had to duplicate the value. | `src/permissions/audit.ts` | Hoisted as `export const AUDIT_TS_FUTURE_SKEW_MS = 60 * 60 * 1000`. Re-exported from barrel. |
+| **min-3** | Magic-number `?? 100` / `?? 3600` inlined in `createSealingScheduler` factory. Spec §7.3 + parsePolicy + tests had three copies of the same defaults. | `src/permissions/sealing-scheduler.ts` | Hoisted as `export const DEFAULT_SEAL_INTERVAL_DECISIONS = 100` and `DEFAULT_SEAL_INTERVAL_SECONDS = 3600`. Re-exported from barrel. |
+| **min-4** | Magic-number `>= 3` inlined in `computeRiskScore` recent-errors feature (spec §6.3.1 baseline-v2.0). Calibration slice would need a second knob alongside `RISK_SCORE_WEIGHTS`. | `src/permissions/risk-score.ts` | Hoisted as `export const RECENT_ERRORS_THRESHOLD = 3`. Re-exported from barrel. |
+| **min-5** | Barrel inconsistency: `capabilities`, `ulid`, `risk-score`, `classifier`, `degraded-banner`, sealing-scheduler defaults reachable only via deep imports. Tests, bootstrap, and future playbooks had no canonical entry point. | `src/permissions/index.ts` | +6 module exports: capabilities (types + 22 helpers), ulid (`generateUlid`, `isUlid`, options type), risk-score (types + `RISK_SCORE_WEIGHTS` + `RECENT_ERRORS_THRESHOLD` + `computeRiskScore`), classifier (types + `CLASSIFIER_ADJUST_BOUNDS` + helpers), degraded-banner (emitter + types), `AUDIT_TS_FUTURE_SKEW_MS`, `DEFAULT_SEAL_INTERVAL_*`. |
+
+### Tests added (+9)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/permissions/audit.test.ts` | +6 | C-lat-1: 1 test (rotation between sink construction and verify does not produce spurious mismatch). C-lat-2: 5 tests — top-level `undefined` value, nested `undefined` value, `args_hash` stability vs `JSON.parse(JSON.stringify())`, cycle guard (no infinite recursion), arrays with sparse `undefined` slots (rendered as `null`). |
+| `tests/sanitize/env.test.ts` | +3 | LD_* (Linux linker injection — `LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`), DYLD_* (macOS — `DYLD_INSERT_LIBRARIES`/`DYLD_FALLBACK_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`), SUDO_ASKPASS. |
+
+### Files changed
+
+- Code: `src/permissions/audit.ts`, `src/permissions/sealing-scheduler.ts`, `src/permissions/risk-score.ts`, `src/permissions/index.ts`, `src/sanitize/env.ts`
+- Tests: `tests/permissions/audit.test.ts`, `tests/sanitize/env.test.ts`
+- Spec: none (runtime fixes + additive surface; protocol unchanged)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (unchanged from slice 141)
+- `bun test tests/permissions tests/sanitize` — **1417 pass / 0 fail / 3089 expect()** (+9 over slice 141)
+
+### Remaining from slice 139 review
+
+After slice 142 closes 2 correctness + 4 minor:
+- 🟠 important: 3 API surface refactors left (EngineOptions god-object split; GrantSnapshot vs GrantRow snake_case duplicate; AuditEmitInput tightening — narrow the 17 optional fields to the 6 that are actually load-bearing).
+- 🟡 minor: ~10 items left (SealMode comment vs code; `RiskScoreConfidence` vs `ApprovalLogConfidence` type dup; `SandboxProfile` capability-map exposure; `ExecClass` union duplication; `EmittedRow.this_hash` sentinel; worm-file chattr first-write race).
+
+API surface refactors deferred to slice 143 — they shift downstream type signatures and merit a single coordinated PR rather than being squeezed alongside latent bug fixes.
+
+---
+
 ## [2026-05-13] spec(permission-engine) — slice 141: 5 spec drift PRs batched
 
 **Done.** One-hundred-forty-first slice. Closes the **5 🟠 spec drift findings** from the slice 139 fresh review. All amendments in `docs/spec/PERMISSION_ENGINE.md`. Spec-only; no code touched.

@@ -678,3 +678,123 @@ describe('createSqliteSink — slice 135 P0-10 cross-process emit', () => {
     }
   }, 15_000); // generous timeout — spawning two Bun runtimes is slow on cold CI
 });
+
+// Slice 142 C-lat-2: stripUndefined defense at audit.emit boundary.
+// `canonicalize` throws on undefined values; pre-fix, a caller
+// passing `{ foo: undefined }` (legal TS, illegal JSON) crashed
+// emit BEFORE the transaction opened, propagating to the harness
+// as internalError. Strip pass at the boundary closes that path.
+describe('createSqliteSink — stripUndefined defense (slice 142 C-lat-2)', () => {
+  test('args with top-level undefined value does not throw', () => {
+    const { sink } = fresh();
+    // Construct args with undefined directly (bypasses model-emitted
+    // JSON which couldn't carry undefined). Cast through unknown to
+    // satisfy ToolArgs's `[k: string]: unknown` while letting the
+    // undefined live in the value position.
+    const args: Record<string, unknown> = { real: 'value', missing: undefined };
+    expect(() => sink.emit(baseInput({ args }))).not.toThrow();
+  });
+
+  test('args with nested undefined value does not throw', () => {
+    const { sink } = fresh();
+    const args: Record<string, unknown> = {
+      outer: {
+        keep: 1,
+        drop: undefined,
+        deep: { also_drop: undefined, also_keep: 2 },
+      },
+    };
+    expect(() => sink.emit(baseInput({ args }))).not.toThrow();
+  });
+
+  test('args_hash is stable: stripped row has the same hash as the explicitly-omitted row', () => {
+    // The strip is shape-preserving in the JSON sense: stripping
+    // an undefined value produces the same canonical hash as if
+    // the caller had omitted the key entirely.
+    const { sink, db } = fresh();
+    sink.emit(baseInput({ ts: 1, args: { a: 1 } }));
+    sink.emit(baseInput({ ts: 2, args: { a: 1, b: undefined } as Record<string, unknown> }));
+    const row1 = getApprovalsLogBySeq(db, 1);
+    const row2 = getApprovalsLogBySeq(db, 2);
+    // Same canonical input → same args_hash.
+    expect(row1?.args_hash).toBe(row2?.args_hash);
+  });
+
+  test('args with cycle does not blow stack (cycle guard)', () => {
+    const { sink } = fresh();
+    const args: Record<string, unknown> = { id: 'a' };
+    args.self = args; // cycle
+    expect(() => sink.emit(baseInput({ args }))).not.toThrow();
+  });
+
+  test('arrays containing undefined slots: each undefined becomes null', () => {
+    // JSON.stringify behavior: [1, undefined, 2] → "[1,null,2]".
+    // The strip mirrors this so canonical hash matches what a
+    // JSON-emitting caller would have produced.
+    const { sink } = fresh();
+    const args: Record<string, unknown> = { items: [1, undefined, 2] };
+    expect(() => sink.emit(baseInput({ args }))).not.toThrow();
+  });
+
+  test('DAG-sharing: a node referenced from two siblings is NOT treated as a cycle', () => {
+    // Path-based seen-set: `shared` enters/leaves cleanly on the
+    // first traversal, so the second traversal walks it fully
+    // instead of returning the cycle stand-in (`null`). The
+    // resulting args_hash must equal the hash produced by the same
+    // structure with each branch holding an independent copy of
+    // `shared` — JSON.stringify treats both shapes as identical.
+    const { sink, db } = fresh();
+    const shared: Record<string, unknown> = { x: 1 };
+    const argsShared: Record<string, unknown> = { a: shared, b: shared };
+    const argsCopies: Record<string, unknown> = { a: { x: 1 }, b: { x: 1 } };
+    sink.emit(baseInput({ ts: 10, args: argsShared }));
+    sink.emit(baseInput({ ts: 20, args: argsCopies }));
+    const row1 = getApprovalsLogBySeq(db, 1);
+    const row2 = getApprovalsLogBySeq(db, 2);
+    expect(row1?.args_hash).toBe(row2?.args_hash);
+  });
+});
+
+// Slice 142 C-lat-1: verifyChain post-rotation race. Pre-fix, the
+// sink captured `genesisHash` at construction time. An
+// out-of-process `--rotate-chain` between construction and verify
+// (long-lived REPL + operator running rotate in another terminal)
+// left the live approvals_log rows belonging to the NEW chain
+// (first row's prev_hash = rotated genesis) while expectedPrev
+// started at the STALE construction-time hash — spurious
+// prev_hash_mismatch on a perfectly intact post-rotation chain.
+// Fix recomputes genesis from the live tipMeta on every verify.
+describe('createSqliteSink — verifyChain post-rotation race (slice 142 C-lat-1)', () => {
+  test('rotation between sink construction and verify does not produce spurious mismatch', async () => {
+    const { rotateChain } = await import('../../src/storage/repos/chain-rotation.ts');
+    const { db, sink, identity } = fresh();
+    sink.emit(baseInput({ ts: 100 }));
+    // Construct a SECOND sink BEFORE rotation. This sink captures
+    // the pre-rotation genesis at line 256-259. If `verifyChain`
+    // uses that captured value instead of re-deriving, the post-
+    // rotation chain (with rotated genesis) will trigger
+    // prev_hash_mismatch.
+    const earlySink = createSqliteSink({ db, identity });
+    // Verify clean before rotation — sanity.
+    expect(earlySink.verifyChain().ok).toBe(true);
+    // Operator rotates in another terminal.
+    rotateChain(db, {
+      install_id: identity.install_id,
+      reason: 'live-rotation-test',
+      rotated_at_ms: 200,
+    });
+    // Add one row to the NEW chain (post-rotation; its prev_hash
+    // is the rotated-genesis).
+    const sink2 = createSqliteSink({ db, identity });
+    sink2.emit(baseInput({ ts: 300 }));
+    // Critical: the EARLY sink (constructed pre-rotation) must
+    // still verify cleanly. Pre-fix it would use the pre-rotation
+    // genesis and fail to match the new chain's first row.
+    const v = earlySink.verifyChain();
+    expect(v.ok).toBe(true);
+    if (v.ok) {
+      expect(v.rows).toBe(1); // only the post-rotation row
+      expect(v.current_rotation_id).toBe(1);
+    }
+  });
+});

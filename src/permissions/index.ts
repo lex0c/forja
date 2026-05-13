@@ -163,7 +163,79 @@ export type {
   SealingScheduler,
   SealNowResult,
 } from './sealing-scheduler.ts';
-export { createSealingScheduler } from './sealing-scheduler.ts';
+export {
+  DEFAULT_SEAL_INTERVAL_DECISIONS,
+  DEFAULT_SEAL_INTERVAL_SECONDS,
+  createSealingScheduler,
+} from './sealing-scheduler.ts';
+
+// Slice 142 (review minor): canonical export surface for symbols
+// referenced by tests, bootstrap, and future playbooks that were
+// previously reachable only via deep imports. Keeping them on the
+// barrel avoids re-introducing the same finding on the next review.
+export { AUDIT_TS_FUTURE_SKEW_MS } from './audit.ts';
+
+export type { Capability, CapabilityKind } from './capabilities.ts';
+export type { EffectiveCoverResult, IntersectionResult } from './capabilities.ts';
+export {
+  TOOL_CAPABILITY_FOOTPRINTS,
+  agentMutate,
+  capabilityCovers,
+  capabilityCoversCwdAware,
+  capabilityEquals,
+  deleteFs,
+  deriveParentCapabilities,
+  effectiveCovers,
+  envMutate,
+  exec,
+  formatCapability,
+  gitWrite,
+  hostPassthrough,
+  intersectCapabilities,
+  isCapabilityKind,
+  netEgress,
+  netIngress,
+  parseCapability,
+  readFs,
+  secretAccess,
+  sortCapabilities,
+  writeFs,
+} from './capabilities.ts';
+
+export type { GenerateUlidOptions } from './ulid.ts';
+export { generateUlid, isUlid } from './ulid.ts';
+
+export type {
+  RiskScoreConfidence,
+  RiskScoreInput,
+  RiskScoreOutput,
+} from './risk-score.ts';
+export {
+  RECENT_ERRORS_THRESHOLD,
+  RISK_SCORE_WEIGHTS,
+  computeRiskScore,
+} from './risk-score.ts';
+
+export type {
+  BuildClassifierInputArgs,
+  Classifier,
+  ClassifierInput,
+  ClassifierOutput,
+} from './classifier.ts';
+export {
+  CLASSIFIER_ADJUST_BOUNDS,
+  buildClassifierInput,
+  clampAdjust,
+  createNoopClassifier,
+  validateClassifierOutput,
+} from './classifier.ts';
+
+export type {
+  CreateDegradedBannerEmitterOptions,
+  DegradedBannerEmitter,
+  DegradedBannerEvent,
+} from './degraded-banner.ts';
+export { createDegradedBannerEmitter } from './degraded-banner.ts';
 
 export {
   RULE_LIST_CAP,

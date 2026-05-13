@@ -29,6 +29,14 @@ import type { DB } from '../storage/db.ts';
 import { getLastApprovalsLogByInstall } from '../storage/repos/approvals-log.ts';
 import type { SealEntry, SealStore } from './sealing.ts';
 
+// Slice 142 (review minor): hoist the scheduler interval defaults
+// as exported constants. Spec §7.3, parsePolicy, docs/AUDIT.md, and
+// the runtime factory should all reference the same canonical
+// values — pre-fix they were inlined as `?? 100` / `?? 3600` in
+// the factory body.
+export const DEFAULT_SEAL_INTERVAL_DECISIONS = 100;
+export const DEFAULT_SEAL_INTERVAL_SECONDS = 3600;
+
 export type SealNowResult = { ok: true; sealed: SealEntry | null } | { ok: false; reason: string };
 
 export interface SealingScheduler {
@@ -73,8 +81,8 @@ type SealLatestOutcome =
   | { kind: 'failed'; reason: string };
 
 export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): SealingScheduler => {
-  const intervalDecisions = opts.intervalDecisions ?? 100;
-  const intervalSeconds = opts.intervalSeconds ?? 3600;
+  const intervalDecisions = opts.intervalDecisions ?? DEFAULT_SEAL_INTERVAL_DECISIONS;
+  const intervalSeconds = opts.intervalSeconds ?? DEFAULT_SEAL_INTERVAL_SECONDS;
   const now = opts.now ?? Date.now;
   const setTimer = opts.setTimer ?? ((cb: () => void, ms: number) => setTimeout(cb, ms));
   const clearTimer =

@@ -141,6 +141,36 @@ describe('scrubEnv', () => {
     });
   });
 
+  // Slice 142 (review minor): dynamic linker injection. LD_PRELOAD
+  // / DYLD_INSERT_LIBRARIES are the canonical defense-in-depth gap
+  // — a sandboxed process inheriting them loads the operator's
+  // rogue .so as its own library code, bypassing syscall-level
+  // sandbox boundaries.
+  describe('slice 142 — dynamic linker / askpass scrub', () => {
+    test('drops LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT (Linux linker injection)', () => {
+      const out = scrubEnv({
+        LD_PRELOAD: '/tmp/evil.so',
+        LD_LIBRARY_PATH: '/tmp/evil-lib',
+        LD_AUDIT: '/tmp/audit.so',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops DYLD_INSERT_LIBRARIES / DYLD_FALLBACK_LIBRARY_PATH / DYLD_LIBRARY_PATH (macOS linker)', () => {
+      const out = scrubEnv({
+        DYLD_INSERT_LIBRARIES: '/tmp/evil.dylib',
+        DYLD_FALLBACK_LIBRARY_PATH: '/tmp/evil',
+        DYLD_LIBRARY_PATH: '/tmp/lib',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops SUDO_ASKPASS (credential-prompt helper hijack)', () => {
+      const out = scrubEnv({ SUDO_ASKPASS: '/tmp/evil-prompt', KEEP: 'v' });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+  });
+
   // Slice 129 (R5 P0-3): GIT_CONFIG_* env vars bypass the slice 128
   // `-c` argv refuse path. Confirm every git-config-via-env shape
   // is scrubbed.

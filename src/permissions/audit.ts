@@ -123,10 +123,53 @@ export interface AuditSink {
 
 const NOOP_ROW: EmittedRow = { seq: 0, this_hash: '' };
 
+// Slice 142 (review minor): hoist the audit ts future-skew window
+// as an exported constant so spec (§15) + docs + tests reference
+// one canonical value. 1h forgiving window — see validateTs
+// rationale inline for the past-vs-future asymmetry.
+export const AUDIT_TS_FUTURE_SKEW_MS = 60 * 60 * 1000;
+
 export const createNoopSink = (): AuditSink => ({
   emit: () => NOOP_ROW,
   verifyChain: () => ({ ok: true, rows: 0, current_rotation_id: 0, quarantined: false }),
 });
+
+// Slice 142 C-lat-2: recursive strip of undefined values before
+// canonicalize. JSON has no `undefined`; canonicalize.ts throws on
+// any undefined encountered. Programmatic callers spreading
+// `{ ...rest, optional: maybeUndef }` would throw out of
+// `audit.emit` before the BEGIN IMMEDIATE transaction. The strip
+// pass is shape-preserving — keys with undefined values are
+// silently dropped (matches JSON.stringify semantics), nested
+// objects are recursed. Arrays preserve undefined elements as
+// `null` (JSON.stringify behavior). Non-object inputs pass
+// through.
+//
+// Path-based cycle guard: a node is in `seen` only while its
+// recursion is active. We `add` on entry and `delete` on exit, so
+// a true cycle (A → B → A) hits a hot path entry and returns null,
+// while DAG-sharing (root references `shared` twice without
+// looping) walks `shared` cleanly the second time. This matches
+// JSON.stringify, which silently serializes DAGs and only throws
+// on real cycles.
+const stripUndefined = (value: unknown, seen: WeakSet<object> = new WeakSet()): unknown => {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value as object)) return null; // true cycle → null stand-in (JSON.stringify would throw; the chain hash needs a stable payload, not a throw)
+  seen.add(value as object);
+  let out: unknown;
+  if (Array.isArray(value)) {
+    out = value.map((v) => (v === undefined ? null : stripUndefined(v, seen)));
+  } else {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v === undefined) continue;
+      obj[k] = stripUndefined(v, seen);
+    }
+    out = obj;
+  }
+  seen.delete(value as object);
+  return out;
+};
 
 // Build the canonical-hash payload from a row's persisted columns.
 // Pulls fields in the order declared by `PERSISTED_COLUMNS` except
@@ -275,15 +318,14 @@ export const createSqliteSink = ({
   // direction — a future ts makes the row look "newest" to any
   // tooling sorting by time. 1h tolerance covers NTP smear and
   // light skew without admitting "datestamp in 2099" forgeries.
-  const TS_FUTURE_SKEW_MS = 60 * 60 * 1000;
   const validateTs = (input: AuditEmitInput, now: number): number => {
     const ts = input.ts ?? now;
     if (!Number.isFinite(ts) || !Number.isInteger(ts) || ts < 0) {
       throw new Error(`audit: ts must be a non-negative finite integer (got ${String(ts)})`);
     }
-    if (ts > now + TS_FUTURE_SKEW_MS) {
+    if (ts > now + AUDIT_TS_FUTURE_SKEW_MS) {
       throw new Error(
-        `audit: ts is more than ${TS_FUTURE_SKEW_MS}ms ahead of wall clock (got ${ts}, now ${now}) — suspected forgery`,
+        `audit: ts is more than ${AUDIT_TS_FUTURE_SKEW_MS}ms ahead of wall clock (got ${ts}, now ${now}) — suspected forgery`,
       );
     }
     return ts;
@@ -291,7 +333,17 @@ export const createSqliteSink = ({
 
   const emit = (input: AuditEmitInput): EmittedRow => {
     const ts = validateTs(input, Date.now());
-    const args_hash = sha256Hex(canonicalize(input.args ?? {}));
+    // Slice 142 C-lat-2: strip undefined values from args before
+    // canonicalize. JSON has no `undefined`; canonicalize.ts:46
+    // throws on any undefined encountered. Pre-fix, a caller
+    // spreading `{ ...rest, optional: maybeUndef }` (legal TS,
+    // illegal JSON) would throw out of `audit.emit` AFTER
+    // validateTs but BEFORE `withImmediateTransaction` —
+    // engine.check() has no try/catch, so the throw propagates to
+    // the harness as `internalError`. Today model-emitted JSON
+    // can't carry undefined, so production path is safe; this
+    // shields programmatic callers and future emit sites.
+    const args_hash = sha256Hex(canonicalize(stripUndefined(input.args ?? {})));
 
     // Slice 127 (R3 P0-A): wrap read-prev-hash + insert-this-row in
     // a single IMMEDIATE transaction. Pre-slice the SELECT and
@@ -418,8 +470,24 @@ export const createSqliteSink = ({
     const tipMeta = getLatestChainMeta(db, identity.install_id);
     const tipRotationId = tipMeta?.rotation_id ?? 0;
     const tipQuarantined = tipMeta?.quarantined === 1;
+    // Slice 142 C-lat-1: recompute genesis from the LIVE rotation
+    // tip, not the construction-time snapshot. Pre-fix the sink
+    // captured `genesisHash` at construction (line 256-259) and
+    // verify used it verbatim. If an out-of-process
+    // `--rotate-chain` fired between sink construction and
+    // verify (long-lived REPL + operator running rotate in another
+    // terminal), the live approvals_log rows belonged to the NEW
+    // chain whose first row's prev_hash is the rotated genesis,
+    // but `expectedPrev` started at the STALE construction-time
+    // hash. Result: spurious `prev_hash_mismatch` on a perfectly
+    // intact post-rotation chain. Recomputing from `tipMeta` here
+    // closes the staleness window.
+    const liveGenesisHash =
+      tipMeta === null
+        ? computeGenesisHash(identity)
+        : computeRotatedGenesisHash(identity, tipMeta.rotation_id, tipMeta.rotated_at_ms);
     const rows = listApprovalsLogByInstall(db, identity.install_id);
-    let expectedPrev = genesisHash;
+    let expectedPrev = liveGenesisHash;
     for (const row of rows) {
       if (row.prev_hash !== expectedPrev) {
         return {

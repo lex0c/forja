@@ -129,6 +129,14 @@ const isUntrustedEgressHost = (host: string | null, trusted: readonly string[]):
   return !trusted.includes(host);
 };
 
+// Threshold at which the `recent_errors` feature fires — spec
+// §6.3.1: "three consecutive tool errors immediately preceding
+// this call". Hoisted from an inlined `>= 3` so calibration can
+// adjust both the WEIGHT (above) and the TRIGGER (here) from one
+// audited location, and so tests can import the same canonical
+// boundary value.
+export const RECENT_ERRORS_THRESHOLD = 3;
+
 // Feature weights — spec §6.3.1 baseline-v2.0. Centralized so the
 // calibration slice can swap them via a single object rather than
 // hunting through the compute function. Adjusting weights here is
@@ -194,7 +202,7 @@ export const computeRiskScore = (input: RiskScoreInput): RiskScoreOutput => {
   }
 
   // Recent errors — caller-supplied counter. Threshold per spec.
-  if (input.recentToolErrors >= 3) {
+  if (input.recentToolErrors >= RECENT_ERRORS_THRESHOLD) {
     components.recent_errors = RISK_SCORE_WEIGHTS.recent_errors;
   }
 
