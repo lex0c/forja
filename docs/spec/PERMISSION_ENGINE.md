@@ -395,6 +395,33 @@ Pesos do baseline são **chute informado**. Plano de calibração:
 
 Sem calibração: baseline é defensável mas não otimal. Documentado como `calibration: baseline-v2.0`.
 
+##### 6.3.2.1 outcome-baseline-v2.0 (slice 131)
+
+A spec §6.3.2 plano define INPUT (triples) e MÉTODO (logistic regression) mas deixa em aberto **como** o sistema deriva `outcome ∈ {harmful, harmless}` a partir dos sinais observáveis. Slice 131 materializa a derivação em `outcome_signals` (AUDIT.md §1) + `computeOutcomeForApproval` (aggregator) com o seguinte baseline congelado pra reprodutibilidade:
+
+**Proxies de outcome** (signal kinds, cada um liga via `approval_seq` ao row de `approvals_log`):
+
+| `signal_kind` | Weight default | Wire site | Rationale |
+|---|---:|---|---|
+| `tool_error` | 0.30 | harness/loop: tool authorized → executed → returned error | Fraco — tool errors são frequentemente benignos (retry, missing file, transient network). Single error rarely implies a decisão estava errada. |
+| `failure_event` | 0.50 | failures/sink dual-write quando `payload.approval_seq` matches session | Médio — failure_event downstream (sandbox loss, storage contention) correlaciona com a decision mas não prova causalidade. |
+| `checkpoint_reverted` | 0.90 | cli/checkpoints `--undo` / restore | Forte — operator `--undo` é o sinal mais valioso: julgamento humano explícito de que a mudança não deveria ter acontecido. |
+| `session_aborted` | 0.20 | harness/loop `finish()` quando exit ∈ {interrupted, error}, last 5 approvals | Fraco — sessions abort por muitos motivos (Ctrl+C, timeout, cost cap, crash); maioria não implica decision errada. Incluído pra completude do set de proxies; calibração pode zerar. |
+
+**Composite policy:** `max-wins`. `composite = max(signal_weight ∀ signal ∈ approval)`. O sinal mais damning ancora o composite — `checkpoint_reverted` (0.9) domina um `tool_error` (0.3) coexistente, porque o operator `--undo` carrega evidence forte enquanto o tool error pode ser ruído. Somar diluiria; mediar diluiria. Max-wins prioriza evidence-quality.
+
+**Binary mapping:** `composite >= COMPOSITE_HARMFUL_THRESHOLD` → `harmful`, else `harmless`. `COMPOSITE_HARMFUL_THRESHOLD = 0.5`. Defensável (matches o score's `scoreConfirmThreshold` default) mas não ótimo — o threshold em si é parâmetro de calibração na §6.3.2 step 3.
+
+**Reproducibility:** baseline-v2.0 pesos + threshold são `const`s exportadas em `src/outcomes/codes.ts` (`DEFAULT_SIGNAL_WEIGHTS`, `COMPOSITE_HARMFUL_THRESHOLD`, `DEFAULT_SIGNAL_TTL_DAYS`). Audit log de calibração registra qual versão dos pesos foi usada em cada sweep — `outcome-baseline-v2.0` é o piso fixo até v2.1 ser derivada via §6.3.2 plan.
+
+**Per-kind retention:** `outcome_signals.ttl_expires_at` é per-row, não table-wide. `checkpoint_reverted` retém **730d** (padrão §1.2 é 365d) — sinal forte vale janela maior pra regressões anuais. Demais kinds = 365d. Ver AUDIT.md §1.2.1.
+
+**Limitations declaradas:**
+
+- Triples disponíveis hoje cobrem só `approvals_log.decision ∈ {confirm-allowed, confirm-denied}` com labels limpos. Auto-allow/auto-deny representam a maioria das decisions mas têm zero outcome signal direto — calibration vai sofrer selection bias até `agent gc` + `outcome_signals` ttl-floor permitirem inverse-propensity-weighting.
+- Sinais `tool_error` e `session_aborted` carregam ambiguidade não-causal alta (tool error por bug do código vs decision errada). Calibration sweep deve esperar `checkpoint_reverted` ser o sinal dominante; outros são complemento.
+- `confirm-allowed` seguido de `--undo` dentro do mesmo session é o caminho mais forte pra `outcome=harmful` com baixa false-positive rate.
+
 ### 6.4 Classifier (opcional, hint-only)
 
 Se habilitado e disponível, recebe:

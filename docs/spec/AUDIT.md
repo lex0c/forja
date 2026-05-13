@@ -25,16 +25,18 @@ Sem audit consolidado, "compliance" e "debug forense" viram intenção sem entre
 
 ## 1. Tables canônicas
 
-Lista canônica das **19 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
+Lista canônica das **23 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
 
 | Tabela | Escopo | Retention default | Sensitivity | Redaction |
 |---|---|---|---|---|
 | `sessions` | metadata de sessão | 90d | low | path → `~/...` |
 | `messages` | conversation history | 90d | **high** (PII potential) | full redaction (secrets, paths) |
 | `tool_calls` | invocações de tool | 90d | **high** (args + output) | full redaction |
-| `approvals` | decisões permission | 365d | medium | nenhuma (decision-level apenas) |
+| `approvals` | decisões permission (v1) | 365d | medium | nenhuma (decision-level apenas) |
+| `approvals_log` | ledger hash-chained de decisões (v2, §7.1; install-scoped) | 365d | medium | nenhuma (`args_hash` em vez de args; capabilities + reason_chain em JSON) |
 | `hook_runs` | execução de hooks | 90d | medium | redact stdout |
-| `failure_events` | falhas classificadas | 365d | medium | redact `details` |
+| `failure_events` | falhas classificadas (FAILURE_MODES §19; chain per-session §4.2) | 365d | medium | redact `payload_json` |
+| `outcome_signals` | sinais derivados (`tool_error`, `failure_event`, `checkpoint_reverted`, `session_aborted`) ligados a `approvals_log.seq` — input pra calibração §6.3.2 | per-kind (ver §1.2) | medium | redact `payload_json` |
 | `memory_events` | memory ops | 365d | low (action+name only; sem body) | nenhuma |
 | `recap_runs` | recap executions | 90d | low | nenhuma |
 | `checkpoints` | FS snapshots metadata | 30d | low | path → `~/...` |
@@ -65,15 +67,30 @@ Lista canônica das **19 tabelas de audit**, com escopo, retention, sensitivity,
 default_days = 90
 sessions = 90
 messages = 90
-approvals = 365         # compliance
+approvals = 365              # compliance
+approvals_log = 365           # v2 hash-chained ledger
 failure_events = 365
+outcome_signals = "per-kind"  # ver §1.2.1
 memory_events = 365
-recap_cache = "1h"      # TTL especial
+recap_cache = "1h"            # TTL especial
 pending_decisions = 7
 prompt_versions = "forever"   # nunca limpar; rastreabilidade load-bearing
 ```
 
 Cleanup via cron user-side (`agent gc`) ou hook `Stop` (configurable).
+
+#### 1.2.1 Retention per-kind para `outcome_signals`
+
+`outcome_signals.ttl_expires_at` é per-row, não table-wide. Cada `signal_kind` carrega TTL próprio em `DEFAULT_SIGNAL_TTL_DAYS`:
+
+| `signal_kind` | TTL default | Rationale |
+|---|---|---|
+| `tool_error` | 365d | Sinal fraco (0.30); padrão §1.2. |
+| `failure_event` | 365d | Sinal médio (0.50); padrão §1.2. |
+| `checkpoint_reverted` | **730d** | Sinal forte (0.90) — operator `--undo` é o proxy mais valioso pra calibração §6.3.2. Janela maior permite regressões anuais comparando `baseline-v2.0` vs `v2.1` derivado. |
+| `session_aborted` | 365d | Sinal fraco (0.20); padrão §1.2. |
+
+`agent gc` filtra via `WHERE ttl_expires_at < now()` (não via tabela inteira). Override per-row possível via `EmitOutcomeSignalInput.ttl_days` quando calibration sweep precisa de janela alternativa.
 
 ### 1.3 Prompt versioning (`prompt_versions`)
 
@@ -891,12 +908,12 @@ Enforcement: lint custom em CI verifica que código não tem `UPDATE audit_table
 
 ### 4.2 Hash chain (tamper-evident)
 
-Cada row em audit tables tem coluna `chain_hash`:
+Cada row em audit tables **primárias** tem coluna `chain_hash`:
 
 ```sql
 ALTER TABLE approvals ADD COLUMN chain_hash TEXT;
 ALTER TABLE failure_events ADD COLUMN chain_hash TEXT;
--- (idem outras tabelas críticas)
+-- (idem outras tabelas primárias)
 ```
 
 Computed em INSERT:
@@ -908,6 +925,36 @@ chain_hash = SHA256(
 ```
 
 Primeira row da sessão: `prev = SHA256(session_id)`.
+
+#### 4.2.1 Construção de hash (convenção Forja)
+
+A spec define `chain_hash = SHA256(prev || canonical_json(row))` — concatenação binária do prev hash com a serialização canônica do resto da linha.
+
+Implementação Forja diverge em duas dimensões, ambas defensáveis e usadas consistentemente em `approvals_log` (slice 34) e `failure_events` (slice 130):
+
+1. **`prev_chain_hash` entra como COLUNA do payload canônico**, não como bytes pré-concatenados. `buildHashPayload` itera `HASH_INPUT_COLUMNS` (todas exceto `this_chain_hash`), gera `canonical_json(payload_completo)`, e produz `SHA256(...)`. Matematicamente equivalente à concatenação porque (a) `prev_chain_hash` é uma string única no input, (b) `canonicalize` ordena chaves lexicograficamente, e (c) `prev` aparece exatamente uma vez. A vantagem operacional é que o mesmo `canonicalize` + `sha256Hex` que atende a outras checagens da chain serve aqui sem branch especial.
+
+2. **A "este row menos chain_hash" da spec significa excluir `chain_hash` (singular) do canonical**. A implementação exclui especificamente o nome da coluna OUTPUT (`this_chain_hash` em failure_events, `this_hash` em approvals_log) — equivalente, mas literal aos nomes do schema.
+
+#### 4.2.2 Escopo da chain — `install`-scoped vs `session`-scoped
+
+A spec menciona "first row da sessão" implicando escopo per-session. A implementação usa:
+
+- **`approvals_log`** (slice 34) — **per-install** chain. Genesis = `SHA256(install_id || created_at_ms)`. Defende contra cross-install forgery (slice 128 R4 P0-Audit-1). Rotação de chain (slice 35) reseta o genesis mantendo install_id.
+- **`failure_events`** (slice 130) — **per-session** chain (segue spec). Genesis = `SHA256(session_id)`. Sessão isolada — corrupção em uma não cascateia em outras.
+
+Ambos escopos são válidos sob §4.2; o escopo apropriado depende do threat model (forge cross-install vs cross-session). Slices futuras adicionando audit tables devem documentar o escopo escolhido no header da migration.
+
+#### 4.2.3 Derived-audit tables (exceção declarada)
+
+`outcome_signals` (slice 131) é o caso paradigmático de **derived-audit table**: cada row deriva 100% de eventos já encadeados em tabelas-fonte (`approvals_log` + `failure_events`). Re-hashar aqui duplicaria garantia de integridade sem adicionar evidência. O regime alternativo:
+
+- Sem coluna `chain_hash`.
+- FK lógica via `approval_seq` validada at INSERT (sink probe `getApprovalsLogBySeq`) mas **não** enforçada por `ON DELETE CASCADE` (chain rotation deletaria signals sem aviso — slice 131 fixup #1).
+- `install_id` denormalizado pra preservar atribuição cross-table mesmo quando approval row é deletada (chain rotation).
+- Forensic reconstruction: "signal row → source table → chained row" — a integridade vem das tabelas-fonte; cada signal é uma referência verificável a uma row já protegida.
+
+Critério pra uma future tabela qualificar como derived-audit: (a) todo conteúdo derivável de queries sobre tabelas chained, (b) row never carries primary forensic evidence (apenas correlação), (c) header de migration declara explicitamente o regime.
 
 ### 4.3 Verification
 

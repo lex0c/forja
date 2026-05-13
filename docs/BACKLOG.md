@@ -15,6 +15,48 @@ Format:
 
 ---
 
+## [2026-05-13] permission-engine-v2 — slice 132: spec PR batch — register slice 130 + 131 divergences
+
+**Done.** One-hundred-thirty-second slice. Spec-only. Registers as canonical the implementation divergences from slices 130 (failure_events) and 131 (outcome_signals) that the multi-agent reviews flagged for spec PRs. No code changes; the implementation stays as-is — this slice updates `docs/spec/` so future reviewers don't re-flag the same divergences.
+
+### Files touched
+
+- `docs/spec/AUDIT.md`
+  - §1 — bumped "19 tabelas" → "23 tabelas". Added `approvals_log` row (slice 34 hash-chained ledger that the spec never registered) and `outcome_signals` row (slice 131). `failure_events` line refined to reference §4.2 per-session chain + `payload_json` redaction.
+  - §1.2 — added `approvals_log` (365d) and `outcome_signals` ("per-kind", see §1.2.1) to the retention block.
+  - §1.2.1 — NEW. Per-kind retention table for outcome_signals: `checkpoint_reverted = 730d` (strong signal, annual regressions need the window), rest = 365d.
+  - §4.2 — clarified "audit tables **primárias**" carry chain_hash (vs derived).
+  - §4.2.1 — NEW. Forja's chain construction convention: `prev_chain_hash` enters as COLUMN of canonical payload (not pre-concatenated). Mathematically equivalent; canonical-json approach.
+  - §4.2.2 — NEW. Chain scope: `approvals_log` is per-install (slice 128 cross-install forgery defense); `failure_events` is per-session (spec verbatim). Both valid under §4.2; scope documented per migration.
+  - §4.2.3 — NEW. Derived-audit tables (outcome_signals) explicitly exempt from chain_hash — integrity inherits from source tables (`approvals_log` + `failure_events`). Three criteria for qualifying as derived-audit.
+
+- `docs/spec/FAILURE_MODES.md`
+  - §19 — updated schema to slice 130's actual implementation: `id ULID`, `session_id NOT NULL` with `'bootstrap'` sentinel, `classe` CHECK enum (10 values), `recovery_action` (text + writer-validated shape), `user_visible INTEGER 0/1`, `payload_json` (TEXT not JSONB), `prev_chain_hash` + `this_chain_hash` + indices.
+  - §19.1 — NEW. "Notas de implementação vs pseudo-código original" enumerating each divergence with rationale (TEXT vs JSONB, NOT NULL + sentinel, CHECK enum, etc.).
+  - §19.2 — NEW. `recovery_action` vocabulary table: exact set (`fatal | ignored | degraded | pending_repair`) + parameterized patterns (`retried_<N>x`, `fallback_to_<name>`). Validates at writer, not DB CHECK.
+  - §19.3 — NEW. `code` vocabulary registration policy: format regex + CODE_VOCABULARY registry. Emit with unregistered code fails loud at writer.
+
+- `docs/spec/PERMISSION_ENGINE.md`
+  - §6.3.2.1 — NEW. `outcome-baseline-v2.0`: per-kind weights table (tool_error 0.30, failure_event 0.50, checkpoint_reverted 0.90, session_aborted 0.20), max-wins composite policy, `COMPOSITE_HARMFUL_THRESHOLD = 0.5` binary mapping, reproducibility constants, per-kind retention pointer (AUDIT.md §1.2.1), declared limitations (selection bias on auto-allow/auto-deny, non-causal noise in `tool_error`/`session_aborted`, `confirm-allowed → --undo` as cleanest path to `outcome=harmful`).
+
+### Decisions
+
+- **Spec follows code (post-hoc), not blocks it.** The slices 130/131 reviews had `Defer spec PR` as the explicit policy — divergences land in code with rationale comments + BACKLOG notes, then a dedicated spec slice batches them. This is slice 132. Going forward, divergences should still be flagged at review time but documented as known + deferred, not re-flagged in subsequent reviews. The slice 132 entry IS the registration that closes the loop.
+- **No code changes in this slice.** The implementation stays bit-identical; only `docs/spec/` is touched. `bun test` doesn't exercise spec docs, but typecheck + lint stay clean because no .ts files moved.
+- **`approvals_log` was missing from AUDIT.md §1.** Slice 34 introduced it, the spec table list never got the entry. Slice 132 closes that older debt while we're in here.
+- **Forja chain convention (§4.2.1) is the SECOND defensible-divergence the spec gains.** The first was slice 128's `install_id`-scoped chain for `approvals_log` (§4.2.2). Both: equivalent semantics, different operational shape. Documenting prevents future reviewers from re-flagging.
+
+### Verification
+
+- `bun run typecheck` — clean (no source changes)
+- `bun run lint` — clean (no source changes)
+- `bun test` — unchanged from slice 131 (6617 / 0 fail / 10 skip)
+- Spec docs render cleanly in Markdown viewers (visual check)
+
+**Next.** Calibration script (out-of-tree initially, consuming the `(score, score_components_json, decision, outcome)` triples now materializable via `computeOutcomeForApproval`). Once telemetry hits 30 days in a pilot deployment, derive `v2.1` weights via logistic regression and ship the engine bump per spec §6.3.2 step 5.
+
+---
+
 ## [2026-05-13] permission-engine-v2 — slice 131: outcome_signals + aggregator + 4 wire sites + post-review fixup
 
 **Done.** One-hundred-thirty-first slice. Materializes spec §6.3.2's calibration plan — the `(score, decision_humano, outcome)` triples needed to derive v2.1 risk-score weights via logistic regression. Slice 130 planted the `payload.approval_seq` convention hook; slice 131 closes the loop with a new `outcome_signals` audit table, an aggregator (`computeOutcomeForApproval`), and four push sites that capture observable outcomes (tool errors, downstream failures, checkpoint reverts, session aborts).
