@@ -81,6 +81,13 @@ const seedChain = (
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 100 + i,
     });
   }

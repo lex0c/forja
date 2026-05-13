@@ -28,6 +28,16 @@ const emitN = (sink: ReturnType<typeof createSqliteSink>, n: number, base = 1000
       decision: 'allow',
       policy_hash: 'sha256:policy',
       reason_chain: [{ stage: 'engine-default' }],
+      // Slice 143 (API-3): the 7 load-bearing fields below are now
+      // required on AuditEmitInput; rotation tests don't exercise
+      // the score/classifier/sandbox columns so "no signal" defaults.
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: base + i,
     };
     sink.emit(input);

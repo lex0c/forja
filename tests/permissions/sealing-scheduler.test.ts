@@ -65,6 +65,13 @@ const setupChain = (rowCount: number) => {
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 100 + i,
     });
   }
@@ -274,6 +281,13 @@ describe('createSealingScheduler — wall-clock timer', () => {
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 999,
     });
     // 4 ticks — counter goes from 0 to 4, no seal yet.
@@ -530,6 +544,13 @@ describe('createSealingScheduler — integration with real worm-file + verifySea
         decision: 'allow',
         policy_hash: 'sha256:p',
         reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
         ts: 200 + i,
       });
       scheduler.tick();
@@ -659,6 +680,13 @@ describe('createSealingScheduler — multi-process seed (slice 128 R4 P0-Race-1)
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 999,
     });
     scheduler.tick();
@@ -724,6 +752,13 @@ describe('createSealingScheduler — multi-process seed (slice 128 R4 P0-Race-1)
         decision: 'allow',
         policy_hash: 'sha256:p',
         reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
         ts: 100 + i,
       });
       schedA.tick();
@@ -750,6 +785,13 @@ describe('createSealingScheduler — multi-process seed (slice 128 R4 P0-Race-1)
         decision: 'allow',
         policy_hash: 'sha256:p',
         reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
         ts: 200 + i,
       });
       schedB.tick();

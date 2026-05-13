@@ -137,6 +137,13 @@ tools:
       decision: 'allow',
       policy_hash: 'sha256:x',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
@@ -162,6 +169,13 @@ tools:
       decision: 'allow',
       policy_hash: 'sha256:x',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
@@ -677,6 +691,13 @@ describe('bootstrapPermissionEngine — §7.3 sealing wire-up', () => {
       decision: 'allow',
       policy_hash: 'sha256:x',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
@@ -930,6 +951,13 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
       decision: 'allow',
       policy_hash: 'sha256:x',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
@@ -969,6 +997,13 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
       decision: 'allow',
       policy_hash: 'sha256:x',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);

@@ -62,6 +62,13 @@ const main = async (): Promise<void> => {
       reason_chain: [
         { stage: 'static-rule', layer: 'project', rule: 'cross-proc', section: 'bash' },
       ],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: ts + i,
     });
   }

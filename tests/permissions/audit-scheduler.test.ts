@@ -34,7 +34,18 @@ const setupBase = () => {
   return { db, identity };
 };
 
+// Slice 143 (API-3): the 7 load-bearing fields below are now
+// required on AuditEmitInput; this fixture covers the scheduler
+// integration so the field values themselves are irrelevant —
+// default to "no signal" values.
 const emitArgs = {
+  capabilities: [] as readonly string[],
+  score: 0,
+  score_components: {},
+  classifier_hash: 'none' as string | null,
+  classifier_adjust: null as number | null,
+  sandbox_profile: null as string | null,
+  ttl_expires_at: null as number | null,
   session_id: 's',
   tool_name: 'bash',
   args: {},

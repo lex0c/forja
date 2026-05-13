@@ -38,6 +38,17 @@ const baseEmitArgs = {
   decision: 'allow' as const,
   policy_hash: 'sha256:p',
   reason_chain: [],
+  // Slice 143 (API-3): the 7 load-bearing fields below are now
+  // required on AuditEmitInput — default to "no signal" values
+  // since this fixture exercises the telemetry hook, not the
+  // score / classifier / sandbox columns.
+  capabilities: [] as readonly string[],
+  score: 0,
+  score_components: {},
+  classifier_hash: 'none' as string | null,
+  classifier_adjust: null as number | null,
+  sandbox_profile: null as string | null,
+  ttl_expires_at: null as number | null,
 };
 
 describe('createSqliteSink — §18 telemetry integration (slice 70)', () => {

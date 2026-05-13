@@ -155,6 +155,7 @@ export const runPermissionPolicyRollback = async (
         note: `to_hash=${archiveRow.policy_hash} target=${target}`,
       },
     ];
+    // Slice 143 (API-3): admin row — no pipeline signal.
     sink.emit({
       session_id: 'cli-policy-rollback',
       tool_name: 'permission-engine',
@@ -162,6 +163,13 @@ export const runPermissionPolicyRollback = async (
       decision: 'allow',
       policy_hash: archiveRow.policy_hash,
       reason_chain: reasonChain,
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: now(),
     });
 

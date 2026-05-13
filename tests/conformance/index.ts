@@ -410,6 +410,17 @@ const runHashChainCase = (c: ConformanceCase): CaseRunResult => {
       decision: e.decision,
       policy_hash: 'sha256:policy-fixture',
       reason_chain: [{ stage: 'static-rule', layer: 'project', section: 'bash' }],
+      // Slice 143 (API-3): the 7 load-bearing fields below are now
+      // required on AuditEmitInput; conformance seeds default to
+      // "no signal" since YAML cases pin chain integrity rather than
+      // score/classifier/sandbox forensics.
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: e.ts ?? 1731000001000 + i,
     };
     sink.emit(input);

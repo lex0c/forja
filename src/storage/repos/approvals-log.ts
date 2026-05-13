@@ -5,6 +5,7 @@
 // `approvals_log_archived` and is not implemented in this slice.
 
 import type { SQLQueryBindings } from 'bun:sqlite';
+import type { Confidence } from '../../permissions/grant-types.ts';
 import type { DB } from '../db.ts';
 
 export type ApprovalLogDecision =
@@ -14,7 +15,12 @@ export type ApprovalLogDecision =
   | 'confirm-allowed'
   | 'confirm-denied';
 
-export type ApprovalLogConfidence = 'high' | 'medium' | 'low';
+// Slice 143 (minor dedup): aliased onto the shared `Confidence` in
+// `src/permissions/grant-types.ts` (`RiskScoreConfidence` aliases
+// it too). Pre-slice the two literal unions were declared
+// independently — drift risk if a future slice extended one side
+// (e.g., adding `'unknown'`) without touching the other.
+export type ApprovalLogConfidence = Confidence;
 
 export interface ApprovalLogRow {
   seq: number;

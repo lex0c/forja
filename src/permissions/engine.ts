@@ -23,6 +23,7 @@ import {
   buildContextSummary,
   createContextSummaryBuffer,
 } from './context-summary.ts';
+import type { GrantSnapshot } from './grant-types.ts';
 import type { SectionProvenance } from './hierarchy.ts';
 import {
   containsShellInjection,
@@ -240,18 +241,12 @@ export interface EngineOptions {
   effectiveCapabilities?: readonly Capability[];
 }
 
-// Minimal subset of `GrantRow` the engine consumes. Storage layer
-// (src/storage/repos/grants.ts) returns the full row; engine reads
-// only the fields needed for matching + attribution. Keeping the
-// type slim here avoids dragging the SQL repo's shape into the
-// engine module.
-export interface GrantSnapshot {
-  id: string;
-  scope_kind: 'pattern' | 'capability';
-  scope_value: string;
-  capability: string;
-  expires_at: number;
-}
+// Slice 143 (API-2): `GrantSnapshot` moved to
+// `src/permissions/grant-types.ts` — single source of truth shared
+// with `src/storage/repos/grants.ts`. Re-exported here so external
+// importers (CLI, tests, conformance harness) that pulled the type
+// from this module pre-slice continue to work without churn.
+export type { GrantSnapshot } from './grant-types.ts';
 
 // §6.6 baseline. Sourced here (not inlined at the call site) so
 // tests, audit replays, and future calibration sweeps can read the

@@ -263,6 +263,13 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
         decision: 'allow',
         policy_hash: 'sha256:p',
         reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
         ts: 100 + i,
       });
       emitted.push({ seq: row.seq, this_hash: row.this_hash });
@@ -396,6 +403,13 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 100,
     });
     const rowB = sinkB.emit({
@@ -405,6 +419,13 @@ describe('verifySealAgainstChain — integrates with real audit DB', () => {
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 200,
     });
     // Seal references row from install B (a hostile seal store
@@ -781,6 +802,13 @@ describe('verifySealAgainstChain — works with git-anchored backend too', () =>
         decision: 'allow',
         policy_hash: 'sha256:p',
         reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
         ts: 100 + i,
       });
       rows.push({ seq: row.seq, this_hash: row.this_hash });
@@ -838,6 +866,13 @@ describe('verifySealAgainstChain — parametric matrix across all 4 backends (sl
         decision: 'allow',
         policy_hash: 'sha256:p',
         reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
         ts: 100 + i,
       });
       emitted.push({ seq: row.seq, this_hash: row.this_hash });
@@ -1043,6 +1078,13 @@ describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 a
           decision: 'allow',
           policy_hash: 'sha256:p',
           reason_chain: [],
+          capabilities: [],
+          score: 0,
+          score_components: {},
+          classifier_hash: 'none',
+          classifier_adjust: null,
+          sandbox_profile: null,
+          ttl_expires_at: null,
           ts: 100 + i,
         }),
       );
@@ -1104,6 +1146,13 @@ describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 a
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 100,
     });
     rotateChain(db, {
@@ -1120,6 +1169,13 @@ describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 a
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 300,
     });
     sealer.append({ seq: post.seq, ts: 400, hash: post.this_hash });
@@ -1154,6 +1210,13 @@ describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 a
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 100,
     });
     sealer.append({ seq: pre.seq, ts: 150, hash: pre.this_hash });
@@ -1171,6 +1234,13 @@ describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 a
       decision: 'allow',
       policy_hash: 'sha256:p',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 300,
     });
     sealer.append({ seq: post.seq, ts: 400, hash: post.this_hash });

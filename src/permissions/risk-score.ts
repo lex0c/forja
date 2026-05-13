@@ -20,10 +20,17 @@
 // rely on stable keys across slices.
 
 import type { Capability } from './capabilities.ts';
+import type { Confidence } from './grant-types.ts';
 import { containsShellInjection } from './matcher.ts';
 import type { EngineState } from './state-machine.ts';
 
-export type RiskScoreConfidence = 'high' | 'medium' | 'low';
+// Slice 143 (minor dedup): `RiskScoreConfidence` is the same domain
+// as `ApprovalLogConfidence` in `src/storage/repos/approvals-log.ts`
+// — the resolver's certainty about its capability emission. Both are
+// now type aliases of `Confidence` from `grant-types.ts`. Keeping the
+// historical name here as a re-export preserves every import site
+// while making the shared origin discoverable.
+export type RiskScoreConfidence = Confidence;
 
 export interface RiskScoreInput {
   // Resolved capabilities from the resolver (slice 3). Empty when

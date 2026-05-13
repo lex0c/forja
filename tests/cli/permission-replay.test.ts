@@ -298,6 +298,7 @@ describe('runPermissionReplay', () => {
       classifier_hash: 'fixture-v1',
       classifier_adjust: -0.05,
       sandbox_profile: 'cwd-rw',
+      ttl_expires_at: null,
       ts: 1700000000000,
     });
     db.close();
@@ -454,6 +455,13 @@ describe('runPermissionReplay', () => {
       decision: 'allow',
       policy_hash: activeHash,
       reason_chain: [{ stage: 'engine-default' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.close();
@@ -550,6 +558,8 @@ describe('runPermissionReplay — --without-classifier analysis', () => {
       confidence: 'high',
       classifier_hash: params.classifierAdjust === null ? null : 'v1',
       classifier_adjust: params.classifierAdjust,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.close();
@@ -756,6 +766,7 @@ describe('runPermissionReplay — --against-current-policy re-execution (slice 1
       classifier_hash: null,
       classifier_adjust: null,
       sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     linkApprovalToToolCall(db, {
@@ -844,6 +855,13 @@ tools:
       decision: 'allow',
       policy_hash: 'sha256:fixture',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.close();
@@ -991,6 +1009,7 @@ describe('runPermissionReplay — --against-current-policy decision coverage (sl
       classifier_hash: null,
       classifier_adjust: null,
       sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     linkApprovalToToolCall(db, { approvalSeq: emitted.seq, toolCallId: toolCall.id });
@@ -1259,6 +1278,7 @@ describe('runPermissionReplay — --against-archived-policy (slice 96, R11 #34)'
       classifier_hash: null,
       classifier_adjust: null,
       sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     linkApprovalToToolCall(db, { approvalSeq: emitted.seq, toolCallId: toolCall.id });
@@ -1372,6 +1392,13 @@ tools:
       decision: 'allow',
       policy_hash: 'sha256:never-archived',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.close();

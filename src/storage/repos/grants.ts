@@ -14,10 +14,14 @@
 // first so `/perms list-grants` puts recent operator decisions at
 // the top.
 
+import type { GrantGrantedBy, GrantScopeKind } from '../../permissions/grant-types.ts';
 import type { DB } from '../db.ts';
 
-export type GrantScopeKind = 'pattern' | 'capability';
-export type GrantGrantedBy = 'user' | 'enterprise' | 'project';
+// Slice 143 (API-2): `GrantScopeKind` and `GrantGrantedBy` are
+// shared with the engine via `src/permissions/grant-types.ts`. The
+// re-exports below preserve the import sites that referenced them
+// from this module pre-slice (CLI, tests, conformance harness).
+export type { GrantGrantedBy, GrantScopeKind };
 
 export interface GrantRow {
   id: string;

@@ -115,6 +115,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fixture',
       reason_chain: [{ stage: 'static-rule' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     sink.emit({
@@ -124,6 +131,13 @@ describe('runPermissionVerify', () => {
       decision: 'deny',
       policy_hash: 'sha256:fixture',
       reason_chain: [{ stage: 'default-deny' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 2,
     });
     db.close();
@@ -153,6 +167,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fixture',
       reason_chain: [{ stage: 'static-rule' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     sink.emit({
@@ -162,6 +183,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fixture',
       reason_chain: [{ stage: 'static-rule' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 2,
     });
     // Tamper row 2's prev_hash
@@ -211,6 +239,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fixture',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
@@ -274,6 +309,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fix',
       reason_chain: [{ stage: 'chain-break-accepted' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     sink.emit({
@@ -283,6 +325,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fix',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 2,
     });
     db.close();
@@ -313,6 +362,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fix',
       reason_chain: [{ stage: 'chain-break-accepted' }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.close();
@@ -346,6 +402,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fix',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     db.close();
@@ -378,6 +441,13 @@ describe('runPermissionVerify', () => {
       decision: 'allow',
       policy_hash: 'sha256:fix',
       reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
       ts: 1,
     });
     // Tamper.

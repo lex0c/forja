@@ -2,6 +2,54 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] refactor(permission-engine) — slice 143: API surface dedup + tighten
+
+**Done.** One-hundred-forty-third slice. Closes 2 of the 3 🟠 API surface refactors from the slice 139 review (GrantSnapshot duplicate, AuditEmitInput tighten) plus 2 minor type-dedup findings (SealMode comment drift, RiskScoreConfidence/ApprovalLogConfidence duplicate). Strategy: bug-shaped fixes first (the 7-field tighten reaches into every audit-emit call site across src + tests), then the cosmetic dedups, then defer the EngineOptions god-object split to slice 144 — the split decision (flat vs sub-object) needs a design alignment that doesn't belong squeezed alongside a 26-file refactor.
+
+### API surface fixes
+
+| # | Finding | Fix |
+|---|---|---|
+| **API-2** | `GrantSnapshot` in `src/permissions/engine.ts:248-254` declared `scope_kind: 'pattern' \| 'capability'` inline — a hand-spelled re-statement of `GrantScopeKind` in `src/storage/repos/grants.ts:19`. Adding a new scope kind required updating both literal unions in lockstep with no compiler signal. | New `src/permissions/grant-types.ts` holds `GrantScopeKind`, `GrantGrantedBy`, `GrantSnapshot`. Storage and permissions both import. The module imports nothing — breaks the would-be circular storage⇄engine dependency. Engine.ts now `export type { GrantSnapshot } from './grant-types.ts'` so external importers (CLI, tests, conformance) continue working via the historical path. |
+| **API-3** | `AuditEmitInput` in `src/permissions/audit.ts:64-92` had 17 fields, 12 optional. `engine.emitAudit` (production) ALWAYS populated 7 of those optionals — `capabilities`, `score`, `score_components`, `classifier_hash`, `classifier_adjust`, `sandbox_profile`, `ttl_expires_at` — and the sink silently coerced absent fields to defaults that hid forensic bugs ("0 score" ≠ "score absent" but both rendered as `score=0` in the row). | Promoted those 7 to required. Sink's `?? <default>` fallbacks gone. Remaining optionals (`parent_approval_id`, `confidence`, `tool_version`, `resolver_version`, `ts`) are genuinely call-site-conditional and documented as such on the interface. |
+
+### Minor dedups
+
+| # | Finding | Fix |
+|---|---|---|
+| **min-A** | `src/permissions/types.ts:108-119` SealMode comment said `s3-object-lock` and `rfc3161-tsa` were "reserved for future slices; parsing rejects them now" — but the TYPE itself listed all 5 modes (line 141) and `sealing-rfc3161.ts` + `sealing-s3-object-lock.ts` had shipped. Operators reading the comment would think the modes were paper. | Rewrote the comment block to describe all 5 modes (including TSA + S3 Object Lock + their path semantics) so spec ↔ comment ↔ code agree. |
+| **min-B** | `RiskScoreConfidence` (`risk-score.ts:26`) and `ApprovalLogConfidence` (`approvals-log.ts:17`) were both `'high' \| 'medium' \| 'low'` — same domain (resolver certainty), two literal unions. | New `Confidence` type in `grant-types.ts`. Both historical names alias it. Re-exports keep every import site compiling without a churn pass. |
+
+### Production touch points (admin audit emits)
+
+3 admin-internal sink.emit sites — `bootstrap-engine.ts` (chain-break-accepted, policy-reloaded, policy-reload-failed) and `permission-policy-rollback.ts` (CLI rollback verb) — now explicitly pass the 7 required fields with "no signal" values (`capabilities: []`, `score: 0`, etc.). Pre-slice they relied on the sink's silent defaults. Same for the fuzz harness (`src/fuzz/targets/chain.ts`).
+
+### Tests
+
+22 test files touched. Approach was 2-step: bulk-inject the 7 defaults via a Bun regex pass anchored on `reason_chain: ..., ts:`; then deduplicate the few sites where the script over-injected on top of existing per-test values (e.g., a test that pinned `classifier_hash: 'fixture-v1'` got the default `'none'` overlaid). The audit fixture in `tests/permissions/audit.test.ts` was the only place that asserted "sink fills defaults"; that test now asserts "sink persists exactly what `baseInput()` supplies" since the contract changed.
+
+### Files changed
+
+- New: `src/permissions/grant-types.ts`
+- Modified (src): `src/permissions/audit.ts`, `src/permissions/engine.ts`, `src/permissions/risk-score.ts`, `src/permissions/types.ts`, `src/permissions/bootstrap-engine.ts`, `src/storage/repos/grants.ts`, `src/storage/repos/approvals-log.ts`, `src/cli/permission-policy-rollback.ts`, `src/fuzz/targets/chain.ts`
+- Modified (tests): 17 files across `tests/permissions/`, `tests/cli/`, `tests/conformance/`
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`, unrelated)
+- `bun test` — **6861 pass / 10 skip / 0 fail / 17467 expect()** across 309 files (unchanged total from slice 142 — net 0 new tests, 22 fixtures updated to satisfy the tightened type)
+
+### Remaining from slice 139 review
+
+After slice 143 closes 2 API + 2 minor:
+- 🟠 important: 1 left — **API-1 EngineOptions god-object split** (`engine.ts:72-241`, 25+ fields mixing test seams + policy knobs + wiring). Deferred deliberately: needs design alignment on flat-vs-sub-object before execution. Slice 144 will open with a focused proposal.
+- 🟡 minor: ~8 left — `SandboxProfile` capability-map exposure, `ExecClass` union duplication (grep shows it may already be unique; verify on next pass), `EmittedRow.this_hash` sentinel, worm-file chattr first-write race, a few barrel-export consistency items.
+
+`grant-types.ts` was meant for grants but ended up holding `Confidence` too. If a third type lands there, rename to `shared-types.ts` — for now the name still mostly tracks the content.
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 142: latent correctness + minor hoists
 
 **Done.** One-hundred-forty-second slice. Closes the **2 correctness latent items in `audit.ts`** flagged at the end of slice 141, plus a focused batch of 🟡 minor findings from the slice 139 review punch list. Strategy: do the bug fixes first (clear shape), then the safe additive items (new exported consts, new scrub patterns, barrel surface). Deeper API surface refactors (EngineOptions split, GrantSnapshot dedup, AuditEmitInput tightening) deferred — they merit their own slice once the immediate correctness gap is closed.

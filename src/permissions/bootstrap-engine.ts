@@ -232,6 +232,11 @@ const emitChainBreakAcceptedRow = (
       note: `broken_at=${verify.brokenAt} reason=${verify.reason} expected=${verify.expected} actual=${verify.actual}`,
     },
   ];
+  // Slice 143 (API-3): admin rows like this one don't traverse the
+  // resolver / risk / classifier / sandbox pipeline — their 7
+  // load-bearing fields are all "no signal". Forensic replays see
+  // an admin-internal row by `tool_name='permission-engine'` and
+  // these explicit empties.
   sink.emit({
     session_id: sessionId,
     tool_name: 'permission-engine',
@@ -239,6 +244,13 @@ const emitChainBreakAcceptedRow = (
     decision: 'allow',
     policy_hash: policyHash,
     reason_chain: reasonChain,
+    capabilities: [],
+    score: 0,
+    score_components: {},
+    classifier_hash: 'none',
+    classifier_adjust: null,
+    sandbox_profile: null,
+    ttl_expires_at: null,
   });
 };
 
@@ -260,6 +272,7 @@ const emitPolicyReloadedRow = (
       note: `old_hash=${oldHash} new_hash=${newHash}`,
     },
   ];
+  // Slice 143 (API-3): admin row — no pipeline signal.
   sink.emit({
     session_id: sessionId,
     tool_name: 'permission-engine',
@@ -267,6 +280,13 @@ const emitPolicyReloadedRow = (
     decision: 'allow',
     policy_hash: newHash,
     reason_chain: reasonChain,
+    capabilities: [],
+    score: 0,
+    score_components: {},
+    classifier_hash: 'none',
+    classifier_adjust: null,
+    sandbox_profile: null,
+    ttl_expires_at: null,
   });
 };
 
@@ -290,6 +310,7 @@ const emitPolicyReloadFailedRow = (
       note: reason,
     },
   ];
+  // Slice 143 (API-3): admin row — no pipeline signal.
   sink.emit({
     session_id: sessionId,
     tool_name: 'permission-engine',
@@ -297,6 +318,13 @@ const emitPolicyReloadFailedRow = (
     decision: 'deny',
     policy_hash: currentHash,
     reason_chain: reasonChain,
+    capabilities: [],
+    score: 0,
+    score_components: {},
+    classifier_hash: 'none',
+    classifier_adjust: null,
+    sandbox_profile: null,
+    ttl_expires_at: null,
   });
 };
 

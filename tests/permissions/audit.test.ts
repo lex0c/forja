@@ -30,6 +30,17 @@ const baseInput = (overrides: Partial<AuditEmitInput> = {}): AuditEmitInput => (
   decision: 'allow',
   policy_hash: 'sha256:policy-fixture',
   reason_chain: [{ stage: 'static-rule', layer: 'project', rule: 'ls *', section: 'bash' }],
+  // Slice 143 (API-3): the 7 load-bearing fields below are now
+  // required on `AuditEmitInput`. `baseInput` supplies "no signal"
+  // defaults for every required field so tests can override only
+  // the fields under assertion.
+  capabilities: [],
+  score: 0,
+  score_components: {},
+  classifier_hash: 'none',
+  classifier_adjust: null,
+  sandbox_profile: null,
+  ttl_expires_at: null,
   ts: 1731000001000,
   ...overrides,
 });
@@ -94,24 +105,35 @@ describe('createSqliteSink — emit + chain', () => {
     expect(row2?.prev_hash).toBe(first.this_hash);
   });
 
-  test('emits populate every NOT NULL column with sensible defaults', () => {
+  test('emits populate every NOT NULL column with the values the caller supplied', () => {
+    // Slice 143 (API-3) tightened `AuditEmitInput`: capabilities,
+    // score, score_components, classifier_hash, classifier_adjust,
+    // sandbox_profile and ttl_expires_at are now REQUIRED — the
+    // sink no longer silently substitutes "?? <default>" when the
+    // caller omits one. The test below pins the contract under
+    // `baseInput()` (the shared fixture in this file) which feeds
+    // every required field with a "no signal" value. The
+    // still-optional columns (parent_approval_id, confidence,
+    // tool_version, resolver_version) retain their persistence-layer
+    // defaults documented at audit.ts.
     const { sink, db } = fresh();
     sink.emit(baseInput());
     const row = getApprovalsLogBySeq(db, 1);
     expect(row).not.toBeNull();
-    // Stubs (filled by future slices)
+    // Still-optional fields keep their persistence defaults.
     expect(row?.tool_version).toBe('v1');
     expect(row?.resolver_version).toBe('v1');
+    expect(row?.parent_approval_id).toBeNull();
+    expect(row?.confidence).toBe('high');
+    // Required fields persist exactly what baseInput passed in.
     expect(row?.capabilities_json).toBe('[]');
     expect(row?.score).toBe(0);
     expect(row?.score_components_json).toBe('{}');
-    expect(row?.confidence).toBe('high');
-    expect(row?.classifier_hash).toBeNull();
+    expect(row?.classifier_hash).toBe('none');
     expect(row?.classifier_adjust).toBeNull();
     expect(row?.sandbox_profile).toBeNull();
     expect(row?.ttl_expires_at).toBeNull();
-    expect(row?.parent_approval_id).toBeNull();
-    // Populated by this slice
+    // Populated by this slice (the carrier fields).
     expect(row?.tool_name).toBe('bash');
     expect(row?.decision).toBe('allow');
     expect(row?.policy_hash).toBe('sha256:policy-fixture');
@@ -293,35 +315,35 @@ describe('listChainBreakAcceptedRows — §7.2 --accept-broken-chain visibility'
     const id = { install_id: 'inst-acc', created_at_ms: 1000 };
     const sink = createSqliteSink({ db, identity: id });
     // Unrelated tool row first.
-    sink.emit({
-      session_id: 's',
-      tool_name: 'bash',
-      args: { command: 'ls' },
-      decision: 'allow',
-      policy_hash: 'sha256:fix',
-      reason_chain: [{ stage: 'static-rule' }],
-      ts: 1,
-    });
+    sink.emit(
+      baseInput({
+        policy_hash: 'sha256:fix',
+        reason_chain: [{ stage: 'static-rule' }],
+        ts: 1,
+      }),
+    );
     // Engine-emitted chain-break-accepted (mimics what
     // bootstrap-engine writes on the override path).
-    sink.emit({
-      session_id: 'pre',
-      tool_name: 'permission-engine',
-      args: { acceptBrokenChain: true },
-      decision: 'allow',
-      policy_hash: 'sha256:fix',
-      reason_chain: [{ stage: 'chain-break-accepted', note: 'broken_at=1' }],
-      ts: 2,
-    });
-    sink.emit({
-      session_id: 'pre',
-      tool_name: 'permission-engine',
-      args: { acceptBrokenChain: true },
-      decision: 'allow',
-      policy_hash: 'sha256:fix',
-      reason_chain: [{ stage: 'chain-break-accepted', note: 'broken_at=5' }],
-      ts: 3,
-    });
+    sink.emit(
+      baseInput({
+        session_id: 'pre',
+        tool_name: 'permission-engine',
+        args: { acceptBrokenChain: true },
+        policy_hash: 'sha256:fix',
+        reason_chain: [{ stage: 'chain-break-accepted', note: 'broken_at=1' }],
+        ts: 2,
+      }),
+    );
+    sink.emit(
+      baseInput({
+        session_id: 'pre',
+        tool_name: 'permission-engine',
+        args: { acceptBrokenChain: true },
+        policy_hash: 'sha256:fix',
+        reason_chain: [{ stage: 'chain-break-accepted', note: 'broken_at=5' }],
+        ts: 3,
+      }),
+    );
 
     const rows = listChainBreakAcceptedRows(db, id.install_id);
     expect(rows.length).toBe(2);
@@ -337,15 +359,16 @@ describe('listChainBreakAcceptedRows — §7.2 --accept-broken-chain visibility'
       db,
       identity: { install_id: 'OTHER', created_at_ms: 1 },
     });
-    sink.emit({
-      session_id: 'pre',
-      tool_name: 'permission-engine',
-      args: {},
-      decision: 'allow',
-      policy_hash: 'sha256:x',
-      reason_chain: [{ stage: 'chain-break-accepted' }],
-      ts: 1,
-    });
+    sink.emit(
+      baseInput({
+        session_id: 'pre',
+        tool_name: 'permission-engine',
+        args: {},
+        policy_hash: 'sha256:x',
+        reason_chain: [{ stage: 'chain-break-accepted' }],
+        ts: 1,
+      }),
+    );
 
     expect(listChainBreakAcceptedRows(db, 'NOT-OTHER')).toEqual([]);
     expect(listChainBreakAcceptedRows(db, 'OTHER').length).toBe(1);

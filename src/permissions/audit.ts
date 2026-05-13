@@ -62,6 +62,7 @@ export interface ReasonChainEntry {
 }
 
 export interface AuditEmitInput {
+  // ---- Always required: the minimum carrier of decision identity.
   session_id: string;
   tool_name: string;
   // Tool args before they reach the tool. Engine hashes this with
@@ -75,16 +76,42 @@ export interface AuditEmitInput {
   policy_hash: string;
   reason_chain: readonly ReasonChainEntry[];
 
-  // Optional fields — future slices populate.
+  // ---- Load-bearing — `engine.emitAudit` ALWAYS populates these
+  // in production (often with explicit `null` when not applicable
+  // to the call, e.g. `classifier_adjust=null` when no classifier
+  // consulted). Slice 143 (API-3) promoted them from optional to
+  // required so the type system rejects sites that forget to
+  // supply a value; the audit row's column for each of these has
+  // a non-default semantic meaning ("0 score" ≠ "score not set"),
+  // so silently defaulting was masking a class of forensic bugs.
+  capabilities: readonly string[];
+  score: number;
+  score_components: Record<string, number>;
+  // Classifier metadata. `classifier_hash` is `'none'` when no
+  // classifier wired; `classifier_adjust` is null when the
+  // classifier didn't run OR returned null/threw. Forensically
+  // distinct from "consulted and returned 0".
+  classifier_hash: string | null;
+  classifier_adjust: number | null;
+  // §6.5 sandbox planner result. Null when no planner ran
+  // (legacy path / refused before planner) OR no profile covered.
+  sandbox_profile: string | null;
+  // §8 grant TTL. Set when this decision was authorized by a
+  // pattern grant — replays correlate against `grant-match` reason
+  // chain stage. Null otherwise.
+  ttl_expires_at: number | null;
+
+  // ---- Optional — future slices populate; engine doesn't set
+  // them yet so leaving them optional keeps the present call sites
+  // ergonomic while documenting the planned surface.
+  //
+  // `parent_approval_id`: subagent IPC link (slice 95 wiring).
+  // `confidence`: classifier promotion from `medium`/`low` —
+  //               default `'high'` retains current behavior.
+  // `tool_version` / `resolver_version`: engine version pin for
+  //                forensic replay across slice boundaries.
   parent_approval_id?: string | null;
-  capabilities?: readonly string[];
-  score?: number;
-  score_components?: Record<string, number>;
   confidence?: ApprovalLogConfidence;
-  classifier_hash?: string | null;
-  classifier_adjust?: number | null;
-  sandbox_profile?: string | null;
-  ttl_expires_at?: number | null;
   tool_version?: string;
   resolver_version?: string;
   // Test seam — pin the wall clock for deterministic chain hashes.
@@ -368,6 +395,13 @@ export const createSqliteSink = ({
       const last = getLastApprovalsLogByInstall(db, identity.install_id);
       const prev_hash = last === null ? genesisHash : last.this_hash;
 
+      // Slice 143 (API-3): the 7 load-bearing fields below
+      // (capabilities, score, score_components, classifier_hash,
+      // classifier_adjust, sandbox_profile, ttl_expires_at) are now
+      // required on `AuditEmitInput`, so the pre-slice `?? <default>`
+      // fallbacks are gone. The 4 still-optional fields
+      // (parent_approval_id, confidence, tool_version,
+      // resolver_version) keep their persistence defaults here.
       const persisted: Omit<ApprovalLogRow, 'seq' | 'this_hash'> = {
         ts,
         install_id: identity.install_id,
@@ -377,16 +411,16 @@ export const createSqliteSink = ({
         tool_version: input.tool_version ?? 'v1',
         resolver_version: input.resolver_version ?? 'v1',
         args_hash,
-        capabilities_json: JSON.stringify(input.capabilities ?? []),
+        capabilities_json: JSON.stringify(input.capabilities),
         decision: input.decision as ApprovalLogDecision,
-        score: input.score ?? 0,
-        score_components_json: JSON.stringify(input.score_components ?? {}),
+        score: input.score,
+        score_components_json: JSON.stringify(input.score_components),
         confidence: input.confidence ?? 'high',
-        classifier_hash: input.classifier_hash ?? null,
-        classifier_adjust: input.classifier_adjust ?? null,
+        classifier_hash: input.classifier_hash,
+        classifier_adjust: input.classifier_adjust,
         policy_hash: input.policy_hash,
-        sandbox_profile: input.sandbox_profile ?? null,
-        ttl_expires_at: input.ttl_expires_at ?? null,
+        sandbox_profile: input.sandbox_profile,
+        ttl_expires_at: input.ttl_expires_at,
         reason_chain_json: JSON.stringify(input.reason_chain),
         prev_hash,
       };
