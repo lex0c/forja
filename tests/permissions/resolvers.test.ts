@@ -688,12 +688,18 @@ describe('bash resolver — env launderer defense (slice 139 C1)', () => {
     });
   }
 
-  test('printenv (kept on sysinfo — not a launcher) still resolves to read-fs', () => {
+  test('printenv (no launcher, no /etc — slice 152 moved off cmdSysInfo)', () => {
+    // Slice 152 (review calibration): printenv reads its own environ,
+    // not /etc. Pre-slice it shared cmdSysInfo with whoami/id/groups
+    // which DO read /etc/passwd; printenv was a false positive that
+    // tripped score gate's workspace_escape (+0.15) for a noop call.
+    // Now it lands on cmdSysInfoNoEtc with an empty capability set.
     const r = resolveCapabilities('bash', { command: 'printenv PATH' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
       // exec:shell is added by the bash aggregator for every command.
-      expect(capStrings(r.capabilities).sort()).toEqual(['exec:shell', 'read-fs:/etc']);
+      // No read-fs:/etc anymore — printenv doesn't touch /etc.
+      expect(capStrings(r.capabilities).sort()).toEqual(['exec:shell']);
     }
   });
 });
@@ -2237,5 +2243,90 @@ describe('bash resolver — slice 129 R5 P0 fixes', () => {
     const r = resolveCapabilities('bash', { command: 'git --work-tree=/tmp/evil status' }, CTX);
     expect(r.kind).toBe('refuse');
     if (r.kind === 'refuse') expect(r.reason).toContain('--work-tree');
+  });
+});
+
+// Slice 152 (review calibration): cmdGit unknown-subcommand
+// confidence drop, cmdCd false-read removal, cmdSysInfo split
+// for /etc-touching vs not.
+describe('bash resolver — slice 152 calibration', () => {
+  test('cmdGit unknown subcommand returns confidence=low (forces confirm gate)', () => {
+    // `git annex` is not in the known-subcommand switch — falls
+    // to the default branch. Pre-slice 152 the default returned
+    // 'medium' (+0.10), which slipped under the 0.4 confirm
+    // threshold for some compositions. Now 'low' (+0.30) lands
+    // it firmly above the gate.
+    const r = resolveCapabilities('bash', { command: 'git annex sync' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+      // Capability shape stays the same — conservative max-effect set.
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('exec:shell');
+      expect(s.some((c) => c.startsWith('git-write:'))).toBe(true);
+      expect(s).toContain('net-egress:*');
+    }
+  });
+
+  test('cmdGit known subcommands keep confidence=high', () => {
+    // Regression: the 'low' default doesn't bleed into the known
+    // switch arms.
+    for (const known of ['status', 'commit', 'push']) {
+      const r = resolveCapabilities('bash', { command: `git ${known}` }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('cmdCd emits no capabilities (cd is chdir, not read)', () => {
+    // Pre-slice 152 cmdCd emitted readFs(target). `cd /etc`
+    // looked like `cat /etc/passwd` to the score gate, tripping
+    // workspace_escape (+0.15) and potentially escalation via
+    // protected-path classifier — operators saw confirm prompts
+    // for noop directory changes. Now empty capability set; only
+    // exec:shell from the aggregator survives.
+    const r = resolveCapabilities('bash', { command: 'cd /work/proj/src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      // Bash aggregator adds exec:shell for every call; cd
+      // itself contributes nothing.
+      expect(capStrings(r.capabilities).sort()).toEqual(['exec:shell']);
+    }
+  });
+
+  test('cmdCd with no arg also emits no capabilities', () => {
+    const r = resolveCapabilities('bash', { command: 'cd' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities).sort()).toEqual(['exec:shell']);
+    }
+  });
+
+  test('cmdSysInfoNoEtc: date / uptime / hostname / uname do NOT emit read-fs:/etc', () => {
+    // Pre-slice 152 these shared cmdSysInfo with whoami/id/groups
+    // which DO read /etc/passwd. Result: a bare `date` call
+    // emitted read-fs:/etc → workspace_escape (+0.15) under the
+    // score gate. Now empty capability set.
+    for (const cmd of ['date', 'uptime', 'hostname', 'uname -a']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).not.toContain('read-fs:/etc');
+      }
+    }
+  });
+
+  test('cmdSysInfo (kept on /etc): whoami / id / groups still emit read-fs:/etc', () => {
+    // Regression: the split doesn't accidentally remove /etc
+    // from the commands that genuinely read it. whoami / id /
+    // groups translate uid → name via /etc/passwd, which IS a
+    // real read of /etc. We want the audit row to reflect that.
+    for (const cmd of ['whoami', 'id', 'groups']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).toContain('read-fs:/etc');
+      }
+    }
   });
 });

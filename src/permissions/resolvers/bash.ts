@@ -273,8 +273,14 @@ const SHELL_INTERPRETERS: ReadonlySet<string> = new Set([
 // args + flags + ctx, returns capabilities + confidence OR refuse
 // reason. The whitelist walk decomposes the AST into these inputs
 // per `command` node.
+// Slice 152 (review calibration): expanded the confidence union to
+// include 'low'. Pre-slice every CommandResolver returned 'high'
+// or 'medium' — there was no expressible "I'm guessing, force the
+// confirm gate" path. cmdGit unknown subcommand needed it; the
+// risk-score system already had `confidence_low: 0.3` waiting for
+// a resolver-side emitter.
 type CommandResolverResult =
-  | { capabilities: Capability[]; confidence: 'high' | 'medium' }
+  | { capabilities: Capability[]; confidence: 'high' | 'medium' | 'low' }
   | { refuse: string };
 
 type CommandResolver = (
@@ -687,9 +693,22 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       }
       return { capabilities: [readFs(REPO)], confidence: 'high' };
     default:
+      // Slice 152 (review calibration): unknown git subcommand
+      // drops to confidence='low', not 'medium'. The known
+      // subcommands above carry 'high' because we've verified
+      // their side-effect shape; an unknown subcommand (`git lfs`,
+      // `git subtree`, `git svn`, `git p4`, `git annex`, or a
+      // typo) is genuinely "we don't know what this touches".
+      // Spec §5.2's confidence ladder maps 'low' to "I'm
+      // guessing, escalate the gate" — combined with the
+      // conservative capability set (gitWrite + readFs +
+      // netEgress:*) the score crosses the 0.4 confirm threshold
+      // by a wide margin. Pre-slice the default branch was
+      // 'medium' (+0.10) which slipped under the threshold for
+      // some compositions; 'low' (+0.30) hardens that.
       return {
         capabilities: [gitWrite(REPO), readFs(REPO), netEgress('*')],
-        confidence: 'medium',
+        confidence: 'low',
       };
   }
 };
@@ -800,8 +819,33 @@ const cmdNoOp: CommandResolver = () => ({ capabilities: [], confidence: 'high' }
 // resolution); resolver attributes a coarse read-fs of /etc as
 // the worst case. The classifier_protected_paths will still
 // catch any caller-supplied paths.
+// `cmdSysInfo` covers commands that DO read /etc — `whoami` /
+// `id` / `groups` read `/etc/passwd` to translate uid → name.
+// Emitting readFs('/etc') is the conservative super-set of what
+// they actually open (could be `/etc/nsswitch.conf`, `/etc/passwd`,
+// `/etc/group`); the protected_paths classifier still gates
+// caller-supplied paths.
 const cmdSysInfo: CommandResolver = () => ({
   capabilities: [readFs('/etc')],
+  confidence: 'high',
+});
+
+// Slice 152 (review calibration): commands that DON'T touch /etc
+// despite being grouped under "sysinfo" in the COMMAND_TABLE.
+//   date          — clock_gettime syscall
+//   uptime        — /proc/uptime + utmp on Linux, sysctl on macOS;
+//                   neither path is under /etc
+//   hostname      — gethostname syscall; reads kernel hostname
+//   uname         — uname syscall
+//   printenv      — reads its own environ; touches nothing on disk
+//
+// Pre-slice all five emitted readFs('/etc') via cmdSysInfo —
+// false positive that bloated the resolved capability set,
+// tripped `workspace_escape` (+0.15) in the score gate for a
+// `date` call, and forced unnecessary confirm prompts. Empty
+// capability set is the honest characterization.
+const cmdSysInfoNoEtc: CommandResolver = () => ({
+  capabilities: [],
   confidence: 'high',
 });
 
@@ -848,16 +892,24 @@ const cmdMkdir: CommandResolver = (positional, _tokens, ctx) => {
 
 // `cd` is a builtin; in a tool-call context the cwd change doesn't
 // persist between invocations, so there's no observable fs side
-// effect. We attribute read-fs of the target dir for completeness.
-const cmdCd: CommandResolver = (positional, _tokens, ctx) => {
-  if (positional.length === 0) {
-    return { capabilities: [readFs(ctx.cwd)], confidence: 'high' };
-  }
-  return {
-    capabilities: [readFs(resolveArg(positional[0] as string, ctx))],
-    confidence: 'high',
-  };
-};
+// effect.
+//
+// Slice 152 (review calibration): pre-slice cmdCd emitted
+// `readFs(target)`. The reasoning was "for completeness" — but
+// `cd /etc` doesn't read /etc/*, only validates the dir exists
+// and is searchable (the chdir syscall). The false read-fs
+// poisoned downstream score calculations: `cd /etc` looked like
+// `cat /etc/passwd` to the score gate, tripping `workspace_escape`
+// (+0.15) and potentially `classifyProtectedPath`-driven
+// escalation on `/etc/agent`. Operators saw confirm prompts for
+// noop directory changes. Emit an empty capability set instead —
+// the chdir itself is observable to the surrounding bash command,
+// but the resolver's job is to characterize SIDE EFFECTS, and
+// cd has none in tool-call context.
+const cmdCd: CommandResolver = () => ({
+  capabilities: [],
+  confidence: 'high',
+});
 
 // ─── Slice 120 (R2 #199) — archive / remote / build resolvers ───
 //
@@ -1543,20 +1595,39 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['sleep', cmdNoOp],
   ['true', cmdNoOp],
   ['false', cmdNoOp],
-  // System-info / identity / lookup
+  // System-info / identity / lookup.
+  //
+  // Slice 152 (review calibration): split into two resolvers based
+  // on whether the command actually reads /etc.
+  //   cmdSysInfo      (reads /etc) — whoami / id / groups (uid →
+  //                                    name via /etc/passwd /
+  //                                    /etc/group), which / type
+  //                                    (PATH lookup may consult
+  //                                    /etc/profile.d/* in some
+  //                                    shells — over-conservative
+  //                                    but cheap).
+  //   cmdSysInfoNoEtc (no /etc)    — date / uptime / hostname /
+  //                                    uname / printenv (kernel
+  //                                    syscalls + own environ).
+  //
+  // Pre-slice all of them shared cmdSysInfo's readFs('/etc'),
+  // which was a false positive that bloated the resolved
+  // capability set and tripped `workspace_escape` in the score
+  // gate for `date`.
   ['whoami', cmdSysInfo],
   ['id', cmdSysInfo],
   ['groups', cmdSysInfo],
-  ['hostname', cmdSysInfo],
-  ['uname', cmdSysInfo],
-  ['uptime', cmdSysInfo],
-  ['date', cmdSysInfo],
+  ['hostname', cmdSysInfoNoEtc],
+  ['uname', cmdSysInfoNoEtc],
+  ['uptime', cmdSysInfoNoEtc],
+  ['date', cmdSysInfoNoEtc],
   // Slice 139 C1: `env` moved to its own resolver — was on
   // cmdSysInfo, which laundered exec attribution for
-  // `env <prog> [args]` shapes. `printenv` stays on cmdSysInfo
-  // (read-only, not a launcher).
+  // `env <prog> [args]` shapes.
   ['env', cmdEnv],
-  ['printenv', cmdSysInfo],
+  // printenv reads its own environ, not /etc — slice 152 moves
+  // it to cmdSysInfoNoEtc to match its actual surface.
+  ['printenv', cmdSysInfoNoEtc],
   ['which', cmdSysInfo],
   ['type', cmdSysInfo],
   // `command` removed slice 128 (R4 P0-Launder-1) — now hard-refused

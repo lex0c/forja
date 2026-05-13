@@ -2,6 +2,62 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 152: resolver calibration (cmdGit + cmdCd + cmdSysInfo)
+
+**Done.** One-hundred-fifty-second slice. Closes the 3 🟡 resolver-calibration findings from the bash-tools code review. Each one was a false-positive capability emission that fired the score gate's `workspace_escape` (+0.15) for noop calls — operators saw confirm prompts for `cd subdir`, `date`, `uptime`, etc. Not a security issue (over-conservative), but a UX one that erodes the signal/noise ratio of the gate. With the gate's threshold at 0.4, every false +0.15 is a step closer to spurious confirmation. The fixes restore accuracy.
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **cal-git** | `cmdGit` default branch (unknown subcommand: `git lfs`, `git subtree`, `git annex`, typo) returned `confidence: 'medium'`. Per the §5.2 confidence ladder, 'medium' (+0.10) is "I think this is safe, but log it"; 'low' (+0.30) is "I'm guessing, force the confirm gate". Unknown git subcommand is the latter case — we don't know its side-effect shape. Pre-slice the composition with the conservative cap set (gitWrite + readFs + netEgress:*) MIGHT cross the 0.4 confirm threshold via other features, but it depended on what the rest of the gate fired. Now 'low' lands it above the gate by a wide margin. | `src/permissions/resolvers/bash.ts` (`cmdGit` default branch) | Switch default case from `confidence: 'medium'` to `confidence: 'low'`. Also expanded `CommandResolverResult` confidence union to include 'low' (was 'high' \| 'medium' only — the risk-score system already had `confidence_low: 0.3` waiting for a resolver-side emitter). |
+| **cal-cd** | `cmdCd` emitted `readFs(target)`. cd is a builtin chdir syscall — it doesn't read the directory's contents, only validates existence + search permission. The false readFs poisoned the score gate: `cd /etc` looked like `cat /etc/passwd`, tripping workspace_escape (+0.15) and potentially escalation via classifyProtectedPath. Operators saw confirm prompts for noop directory changes. | `src/permissions/resolvers/bash.ts` (`cmdCd`) | Emit empty capability set. The chdir is observable to the surrounding bash command, but the resolver's job is to characterize SIDE EFFECTS, and cd has none in tool-call context (cwd change doesn't persist between invocations). |
+| **cal-sysinfo** | `cmdSysInfo` emitted `readFs('/etc')` for all 9 commands wired through it. But `date` / `uptime` / `hostname` / `uname` / `printenv` don't touch /etc — they read kernel time, /proc/uptime + utmp, gethostname syscall, uname syscall, and their own environ respectively. Only `whoami` / `id` / `groups` / `which` / `type` actually consult /etc files (passwd / group / profile.d). | `src/permissions/resolvers/bash.ts` (`cmdSysInfo` + `cmdSysInfoNoEtc`) + COMMAND_TABLE re-mapping | Split into two resolvers: `cmdSysInfo` (keeps `readFs('/etc')`) for whoami / id / groups / which / type, and new `cmdSysInfoNoEtc` (empty cap set) for date / uptime / hostname / uname / printenv. COMMAND_TABLE updated to route each command to the right resolver. |
+
+### Tests added (+6)
+
+| Test | Coverage |
+|---|---|
+| `cmdGit unknown subcommand returns confidence=low` | `git annex sync` falls to default branch with confidence='low' + conservative cap set. |
+| `cmdGit known subcommands keep confidence=high` | Regression: 'low' default doesn't bleed into status/commit/push arms. |
+| `cmdCd emits no capabilities (cd is chdir, not read)` | `cd /work/proj/src` emits only `exec:shell` (from aggregator); no readFs. |
+| `cmdCd with no arg also emits no capabilities` | Bare `cd` same shape. |
+| `cmdSysInfoNoEtc: date / uptime / hostname / uname do NOT emit read-fs:/etc` | The split's "no /etc" side. |
+| `cmdSysInfo (kept on /etc): whoami / id / groups still emit read-fs:/etc` | Regression: the split doesn't accidentally remove /etc from commands that genuinely read it. |
+
+Plus updated 1 existing test (`printenv (kept on sysinfo)` → renamed `printenv (no launcher, no /etc — slice 152 moved off cmdSysInfo)`) to match the new shape — printenv reads its own environ, not /etc.
+
+### Files changed
+
+- Code: `src/permissions/resolvers/bash.ts`
+- Tests: `tests/permissions/resolvers.test.ts`
+- Spec: none (calibration; not a protocol change)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6946 pass / 10 skip / 0 fail / 17730 expect()** across 309 files (+6 over slice 151)
+
+### Defense layering / behavioral impact
+
+The score gate's confirm threshold (0.4) is now hit by genuine signals (delete-fs, git-write, blocklist commands, unknown executables) rather than by additive false-positives from sysinfo / cd false-attribution. Operators see fewer "Confirm `date`?" prompts. Audit row's capabilities_json no longer lies about what /etc lookups happened — replays + forensic queries can trust the recorded set.
+
+### Remaining from bash-tools review
+
+After slice 152:
+- **slice 153** — bg stdout/stderr cap (design + impl). Last 🟠. Bun.spawn fd lifecycle complicates in-place truncation; needs pipe+drainer refactor + likely a spec PR.
+
+🔴 critical column: empty since slice 148. 🟡 minor column: empty after this slice.
+
+### Deferred items (design discussion needed before impl)
+
+- macOS `/tmp` shared sandbox+host — mktemp + TMPDIR= override vs documented divergence.
+- bwrap PATH-shim resistance — hard-pin `/usr/bin/bwrap` vs operator-relocatable PATH.
+- Symlink/realpath canonicalization for cwd guard — realpath failure modes (broken symlink, EPERM).
+
+---
+
 ## [2026-05-13] fix(bg) — slice 151: kill dedup + cleanup count + exitCode preservation
 
 **Done.** One-hundred-fifty-first slice. Closes 3 of the 4 🟠 bg correctness items from the bash-tools code review. The 4th (stdout/stderr unbounded growth) needs design — Bun.spawn writes via `Bun.file(path)` which holds an open fd; truncating from outside leaves the fd writing at a stale offset, and the existing cursor + race semantics interact poorly with rotation. Deferred to a dedicated slice with discussion. The 3 mechanical fixes are correctness wins regardless.
