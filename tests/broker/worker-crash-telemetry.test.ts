@@ -129,10 +129,13 @@ describe('createSpawnBroker — worker.crashed telemetry: does NOT emit', () => 
 
   test('timeout: no crash event (operator-known failure)', async () => {
     const sink = createRecordingTelemetrySink();
-    // Use real Bun.spawn with a /bin/sh that sleeps longer than timeout
+    // Use real Bun.spawn with a /bin/sh that sleeps longer than timeout.
+    // `exec sleep` replaces sh with sleep so SIGTERM goes directly
+    // to sleep — avoids the orphan-child issue on shells that don't
+    // propagate signals (dash on Ubuntu).
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 10'],
+      args: ['-c', 'IFS= read -r _; exec sleep 10'],
       timeoutMs: 50,
       telemetry: sink,
     });
@@ -146,7 +149,8 @@ describe('createSpawnBroker — worker.crashed telemetry: does NOT emit', () => 
     const sink = createRecordingTelemetrySink();
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'sleep 10'],
+      // `exec sleep` — see the timeout test above for rationale.
+      args: ['-c', 'exec sleep 10'],
       timeoutMs: 30_000,
       telemetry: sink,
     });

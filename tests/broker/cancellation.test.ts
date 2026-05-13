@@ -187,9 +187,14 @@ describe('createSpawnBroker — signal propagation', () => {
 
   test('mid-exec abort sends SIGTERM to the worker and returns aborted', async () => {
     // Long-running worker that ignores stdin (sleeps so abort fires).
+    // `exec sleep` replaces the shell with sleep so SIGTERM goes
+    // directly to sleep (no orphaned child holding the stdout
+    // pipe open). On shells like dash that don't propagate signals
+    // to the process group, the orphan would block the broker's
+    // drain pump until bun's test timeout.
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'sleep 10'],
+      args: ['-c', 'exec sleep 10'],
       timeoutMs: 30_000,
     });
     const ac = new AbortController();

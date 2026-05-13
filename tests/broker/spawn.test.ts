@@ -136,11 +136,22 @@ describe('createSpawnBroker — real subprocess happy path', () => {
 
 // ─── timeout (real subprocess) ─────────────────────────────────────────────
 
+// Worker script template. `IFS= read -r _; exec sleep N` is the
+// canonical "wait for our request then block" pattern. `exec`
+// replaces the shell with sleep (no fork) so `proc.exited` is
+// tied to sleep directly — SIGTERM/SIGKILL goes to sleep, sleep
+// dies, the stdout pipe closes, and the broker's drain pump
+// completes. Pre-fixup the tests used `sh -c '... sleep N'`
+// (sh forks sleep as a child). On shells that propagate signals
+// to the process group (bash on Arch/Manjaro) the orphaned sleep
+// died with sh; on dash (Ubuntu's /bin/sh, GitHub Actions runner)
+// it didn't — sleep stayed alive with stdout FD open, drain pump
+// hung, and the test timed out at bun's 5000ms ceiling.
 describe('createSpawnBroker — timeout', () => {
   test('kills worker that exceeds timeoutMs and returns timeout error', async () => {
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 10'],
+      args: ['-c', 'IFS= read -r _; exec sleep 10'],
       timeoutMs: 50,
     });
     const start = Date.now();
@@ -174,7 +185,7 @@ describe('createSpawnBroker — per-call timeoutMs override', () => {
     // fires first, response error message reflects the override.
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 10'],
+      args: ['-c', 'IFS= read -r _; exec sleep 10'],
       timeoutMs: 10_000,
     });
     const start = Date.now();
@@ -189,7 +200,7 @@ describe('createSpawnBroker — per-call timeoutMs override', () => {
   test('per-call timeoutMs omitted falls back to broker default', async () => {
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 10'],
+      args: ['-c', 'IFS= read -r _; exec sleep 10'],
       timeoutMs: 50,
     });
     const r = await broker.execute(baseRequest());
@@ -990,7 +1001,11 @@ describe('createSpawnBroker — SIGTERM → SIGKILL escalation (slice 113, R6 P1
     // fires after timeoutGraceMs and the call completes.
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'trap "" TERM; IFS= read -r _; sleep 60'],
+      // `trap '' TERM` ignores SIGTERM, then a pure-shell busy
+      // loop blocks without forking — SIGKILL (which can't be
+      // trapped) is the only thing that kills sh, and there's
+      // no child holding the stdout pipe open after death.
+      args: ['-c', "trap '' TERM; IFS= read -r _; while :; do :; done"],
       timeoutMs: 50,
       timeoutGraceMs: 100, // short grace for fast test
     });
@@ -1008,7 +1023,11 @@ describe('createSpawnBroker — SIGTERM → SIGKILL escalation (slice 113, R6 P1
   test('abort sends SIGTERM and follows with SIGKILL after grace', async () => {
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'trap "" TERM; IFS= read -r _; sleep 60'],
+      // `trap '' TERM` ignores SIGTERM, then a pure-shell busy
+      // loop blocks without forking — SIGKILL (which can't be
+      // trapped) is the only thing that kills sh, and there's
+      // no child holding the stdout pipe open after death.
+      args: ['-c', "trap '' TERM; IFS= read -r _; while :; do :; done"],
       timeoutGraceMs: 100,
     });
     const ac = new AbortController();
@@ -1028,7 +1047,7 @@ describe('createSpawnBroker — SIGTERM → SIGKILL escalation (slice 113, R6 P1
     // cleared in the finally before SIGKILL would fire.
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 60'],
+      args: ['-c', 'IFS= read -r _; exec sleep 60'],
       timeoutMs: 50,
       timeoutGraceMs: 5000, // long grace; should NOT be needed
     });
@@ -1050,7 +1069,7 @@ describe('createSpawnBroker — SIGTERM → SIGKILL escalation (slice 113, R6 P1
     // but the exact ms isn't asserted (test would take 5s).
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 60'],
+      args: ['-c', 'IFS= read -r _; exec sleep 60'],
       timeoutMs: 50,
     });
     const r = await broker.execute(baseRequest());
@@ -1076,7 +1095,7 @@ describe('createSpawnBroker — default timeout floor (slice 106, R6 #41)', () =
     // next test via a synthetic seam.
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 10'],
+      args: ['-c', 'IFS= read -r _; exec sleep 10'],
       timeoutMs: 50,
     });
     const start = Date.now();
@@ -1135,7 +1154,7 @@ describe('createSpawnBroker — default timeout floor (slice 106, R6 #41)', () =
 
     const broker = createSpawnBroker({
       command: '/bin/sh',
-      args: ['-c', 'IFS= read -r _; sleep 10'],
+      args: ['-c', 'IFS= read -r _; exec sleep 10'],
       // NO broker-level timeoutMs.
     });
     const start = Date.now();

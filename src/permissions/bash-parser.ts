@@ -25,7 +25,6 @@
 //      release. No `node:fs` / `fileURLToPath` shenanigans.
 
 import { Language, Parser } from 'web-tree-sitter';
-import wasmFilePath from './grammars/tree-sitter-bash.wasm' with { type: 'file' };
 // The web-tree-sitter package ships an emscripten-built engine
 // wasm next to its JS entry; the runtime loader resolves it via
 // `import.meta.url + 'web-tree-sitter.wasm'`. Under `bun build
@@ -36,6 +35,7 @@ import wasmFilePath from './grammars/tree-sitter-bash.wasm' with { type: 'file' 
 // compiled binary aborts at `Parser.init()` with
 // `ENOENT: /$bunfs/root/web-tree-sitter.wasm`.
 import engineWasmPath from 'web-tree-sitter/web-tree-sitter.wasm' with { type: 'file' };
+import wasmFilePath from './grammars/tree-sitter-bash.wasm' with { type: 'file' };
 
 let cachedParser: Parser | null = null;
 let initInFlight: Promise<Parser> | null = null;
