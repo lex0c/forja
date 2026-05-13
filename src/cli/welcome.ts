@@ -56,6 +56,9 @@ export interface RunWelcomeOptions {
   // re-declaring shape.
   env?: NodeJS.ProcessEnv;
   which?: (cmd: string) => string | null;
+  // Slice 154 (review): forward canonical-first resolver seams.
+  exists?: (path: string) => boolean;
+  stat?: (path: string) => { uid: number; mode: number } | null;
   readOsRelease?: () => string | null;
   platform?: NodeJS.Platform;
   arch?: string;
@@ -127,6 +130,8 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
   const doctorCode = await runDoctor({
     ...(options.env !== undefined ? { env: options.env } : {}),
     ...(options.which !== undefined ? { which: options.which } : {}),
+    ...(options.exists !== undefined ? { exists: options.exists } : {}),
+    ...(options.stat !== undefined ? { stat: options.stat } : {}),
     out,
     err,
   });
@@ -189,6 +194,8 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
   } else {
     setupCode = await runSandboxSetup({
       ...(options.which !== undefined ? { which: options.which } : {}),
+      ...(options.exists !== undefined ? { exists: options.exists } : {}),
+      ...(options.stat !== undefined ? { stat: options.stat } : {}),
       ...(options.readOsRelease !== undefined ? { readOsRelease: options.readOsRelease } : {}),
       ...(options.platform !== undefined ? { platform: options.platform } : {}),
       ...(options.arch !== undefined ? { arch: options.arch } : {}),

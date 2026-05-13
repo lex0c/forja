@@ -277,8 +277,16 @@ describe('runDoctor — §13.8 cache integration (slice 124)', () => {
   // writability — these detect active state changes and MUST
   // bypass the cache. Pin that they're called on every runDoctor
   // even within the TTL window.
+  //
+  // Slice 154 (review): instrument the `exists` seam instead of
+  // `which`. Pre-slice the detect probe called `which('bwrap')`
+  // every time; pos-slice it tries canonical `/usr/bin/bwrap`
+  // first via `exists()` and SKIPS the `which` call when canonical
+  // wins. The cache-bypass contract is the same either way — the
+  // probe runs — but the test must instrument the path it
+  // actually takes.
   test('critical checks (sandbox, config_dir) re-run on every call regardless of cache', async () => {
-    let whichCallsForSandbox = 0;
+    let sandboxProbeCount = 0;
     const cache = createInMemoryDoctorCache();
     const sharedSeams = {
       readFile: seamsAllOk.readFile,
@@ -287,12 +295,18 @@ describe('runDoctor — §13.8 cache integration (slice 124)', () => {
         return null;
       },
       which: (cmd: string) => {
-        if (cmd === 'bwrap' || cmd === 'sandbox-exec') {
-          whichCallsForSandbox += 1;
-          return `/usr/bin/${cmd}`;
-        }
         if (cmd === 'getenforce' || cmd === 'aa-status') return null;
         return `/usr/bin/${cmd}`;
+      },
+      // Slice 154: instrument the canonical-first probe. Every
+      // sandboxCheck call hits `exists('/usr/bin/bwrap')` (and
+      // /usr/bin/sandbox-exec on darwin).
+      exists: (p: string): boolean => {
+        if (p === '/usr/bin/bwrap' || p === '/usr/bin/sandbox-exec') {
+          sandboxProbeCount += 1;
+          return true;
+        }
+        return p.startsWith('/usr/bin/');
       },
     };
     const t0 = 1_000_000;
@@ -307,7 +321,7 @@ describe('runDoctor — §13.8 cache integration (slice 124)', () => {
       ...sharedSeams,
       out: captured().write,
     });
-    const firstCount = whichCallsForSandbox;
+    const firstCount = sandboxProbeCount;
     expect(firstCount).toBeGreaterThan(0);
 
     await runDoctor({
@@ -319,9 +333,8 @@ describe('runDoctor — §13.8 cache integration (slice 124)', () => {
       ...sharedSeams,
       out: captured().write,
     });
-    // sandbox check ran AGAIN — `which` was invoked at least
-    // once more for the bwrap/sandbox-exec probe.
-    expect(whichCallsForSandbox).toBeGreaterThan(firstCount);
+    // sandbox check ran AGAIN — canonical-first probe re-invoked.
+    expect(sandboxProbeCount).toBeGreaterThan(firstCount);
   });
 
   // Pin that the cache stores the actual check results, not a

@@ -89,6 +89,7 @@ describe('runDoctor', () => {
       // Stub which() so the sandbox + git checks pass regardless of
       // the runner's $PATH (CI hosts often lack bwrap).
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -120,6 +121,7 @@ describe('runDoctor', () => {
         json: true,
         env,
         which: (cmd) => `/usr/bin/${cmd}`,
+        exists: (p) => p.startsWith('/usr/bin/'),
         readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
         runCmd: () => null,
         engineVersion: '0.0.0',
@@ -145,6 +147,8 @@ describe('runDoctor', () => {
     const code = await runDoctor({
       env,
       which: (cmd) => (cmd === 'bwrap' || cmd === 'sandbox-exec' ? null : `/usr/bin/${cmd}`),
+      exists: (p) =>
+        p !== '/usr/bin/bwrap' && p !== '/usr/bin/sandbox-exec' && p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -175,6 +179,7 @@ describe('runDoctor', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       // Slice 90 seams: stub the new probe sites so every check
       // lands OK on a runner that may not have nft / SELinux /
       // AppArmor / /proc/sys/user/max_user_namespaces.
@@ -218,6 +223,7 @@ describe('runDoctor', () => {
       json: true,
       env: noHome,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -235,6 +241,7 @@ describe('runDoctor', () => {
     await runDoctor({
       env: noHome,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -284,6 +291,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       enterprisePath: null,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -300,6 +308,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       enterprisePath: null,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -317,6 +326,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       userPath,
       sealStoreFactory: makeStaticStore([]),
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -343,6 +353,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       // Now = 4 hours after the last seal (4 * 3600 * 1000 ms).
       now: () => 1_000_000_600_000 + 4 * 3600 * 1000,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -364,6 +375,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       sealStoreFactory: makeStaticStore([{ seq: 1, ts: 1_000_000_000_000, hash: 'sha256:a' }]),
       now: () => 1_000_000_000_000 + 30 * 1000, // 30s after
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -390,6 +402,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       userPath,
       sealStoreFactory: factory,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -418,6 +431,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
         sealStoreFactory: makeStaticStore([{ seq: 1, ts: baseTs, hash: 'sha256:a' }]),
         now: () => baseTs + c.deltaMs,
         which: (cmd) => `/usr/bin/${cmd}`,
+        exists: (p) => p.startsWith('/usr/bin/'),
         out: out.write,
         err: captured().write,
       });
@@ -437,6 +451,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
       now: () => 1_000_000_000_000 + 5 * 1000,
       json: true,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -471,6 +486,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath: null, // explicitly disabled (no file to look for)
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -488,6 +504,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath: null,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -509,6 +526,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -531,6 +549,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -548,6 +567,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath: null,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -573,6 +593,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -596,6 +617,7 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
       enterprisePath: null,
       userPath,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -666,6 +688,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -683,6 +706,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -700,6 +724,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -717,6 +742,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -738,6 +764,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -760,6 +787,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -780,6 +808,7 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
       enterprisePath: null,
       userPath: null,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       out: out.write,
       err: captured().write,
     });
@@ -831,6 +860,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       engineVersion: '0.0.0',
       out: out.write,
@@ -846,6 +876,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '0\n' : null),
       engineVersion: '0.0.0',
@@ -863,6 +894,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       readFile: () => null,
       engineVersion: '0.0.0',
@@ -880,6 +912,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? 'garbage\n' : null),
       engineVersion: '0.0.0',
@@ -896,6 +929,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       engineVersion: '0.0.0',
       out: out.write,
@@ -928,6 +962,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       readFile: seamsAllOk.readFile,
       runCmd: (cmd) => (cmd === 'getenforce' ? 'Enforcing\n' : null), // nft → null
       engineVersion: '0.0.0',
@@ -944,6 +979,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       engineVersion: '0.0.0',
       out: out.write,
@@ -959,6 +995,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       readFile: seamsAllOk.readFile,
       runCmd: (cmd) => {
         if (cmd === 'nft') return 'nftables v1.0\n';
@@ -1054,6 +1091,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       engineVersion: '0.0.0',
       out: out.write,
@@ -1079,6 +1117,7 @@ describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
     await runDoctor({
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
       ...seamsAllOk,
       engineVersion: '1.2.3',
       out: out.write,

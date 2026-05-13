@@ -602,6 +602,20 @@ return first profile in order from candidates
 
 Sandbox indisponível (kernel sem unshare, bwrap binary missing) → state = `degraded`. Em `degraded`, profile mais alto disponível é `host` com confirm forçado em **toda** call. Se sandbox é `required: true` em policy → state = `refusing`.
 
+**Trust model do sandbox binary (slice 154).** A resolução do binary do sandbox segue uma ordem canonical-first:
+
+1. **Canonical literal** — `/usr/bin/bwrap` (Linux) ou `/usr/bin/sandbox-exec` (macOS). Se existe, é usado direto (`trustLevel = 'canonical'`). Defesa contra PATH-shim: o operator (ou attacker com $HOME) que plante `/tmp/evilbin/bwrap` early em `$PATH` perde para o canonical.
+
+2. **PATH-resolved fallback** — quando o canonical não existe (Nix, Homebrew on Linux, custom build), `Bun.which()` resolve via `$PATH`. O path resolvido passa por **stat-check**:
+   - Owner deve ser `root` (uid=0)
+   - Mode bits **não** podem incluir world-write (0o002) nem group-write (0o020)
+   
+   Se algum dos checks falha, `trustLevel = 'path-resolved'` + warning(s) operator-visíveis. **NÃO refuse** — o sandbox ainda é montado; o operator vê a warning e decide. Trust model: "operator owns their own $HOME — se attacker comprometeu $HOME, sandbox é teatro de qualquer forma".
+
+3. **Argv discipline** — o path resolvido (canonical OU path-resolved) é passado **literal** como `argv[0]` no `Bun.spawn(...)`. Kernel `execve()` não re-walk `$PATH`. Sem essa disciplina, o shim attack reabriria pelo lado do exec.
+
+Trust marker + warnings persistem no `SandboxAvailability` retornado por `detectSandboxAvailability()` → telemetry → audit. `agent doctor` e `agent sandbox setup` renderizam as warnings para que postmortems correlacionem "rodava com bwrap não-canonical em /opt/bin" com qualquer incident downstream.
+
 ### 6.6 Approval gate
 
 | Condição | Decisão |

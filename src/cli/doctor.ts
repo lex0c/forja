@@ -65,6 +65,10 @@ export interface RunDoctorOptions {
   // Test seam for `which()` so unit tests can simulate missing
   // binaries without touching $PATH on the runner host.
   which?: (cmd: string) => string | null;
+  // Slice 154 (review): forward canonical-first resolver seams to
+  // detectSandboxAvailability.
+  exists?: (path: string) => boolean;
+  stat?: (path: string) => { uid: number; mode: number } | null;
   // Working directory used by the sealing check's policy resolution.
   // Defaults to process.cwd() in production; tests pin a specific
   // directory containing the relevant `.agent/permissions.yaml`.
@@ -153,8 +157,16 @@ const platformCheck = (env: NodeJS.ProcessEnv): DoctorCheck => {
   };
 };
 
-const sandboxCheck = (which: (cmd: string) => string | null): DoctorCheck => {
-  const availability = detectSandboxAvailability({ which });
+const sandboxCheck = (
+  which: (cmd: string) => string | null,
+  exists?: (path: string) => boolean,
+  stat?: (path: string) => { uid: number; mode: number } | null,
+): DoctorCheck => {
+  // Slice 154 (review): forward canonical-first resolver seams.
+  const detectOpts: Parameters<typeof detectSandboxAvailability>[0] = { which };
+  if (exists !== undefined) detectOpts.exists = exists;
+  if (stat !== undefined) detectOpts.stat = stat;
+  const availability = detectSandboxAvailability(detectOpts);
   if (availability.available) {
     return {
       name: 'sandbox',
@@ -911,7 +923,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   // hash_chain, sealing) bypass the cache and ALWAYS run live.
   // Non-critical (platform, user_namespaces, net_filtering,
   // mac_lsm, git) get the 60s cache treatment per §13.8.
-  const sandboxResult = sandboxCheck(which); // critical
+  const sandboxResult = sandboxCheck(which, options.exists, options.stat); // critical
   const userNsResult = withDoctorCache(
     'user_namespaces',
     () => userNamespacesCheck(readFile),

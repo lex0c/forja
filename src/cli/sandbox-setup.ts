@@ -40,6 +40,13 @@ export interface RunSandboxSetupOptions {
   // Test seam for `which()` so unit tests can simulate missing
   // binaries deterministically.
   which?: (cmd: string) => string | null;
+  // Slice 154 (review — PATH-shim resistance): test seams for the
+  // canonical-first resolver in detectSandboxAvailability. Pin
+  // `exists` to deterministic answers so tests don't depend on
+  // the host having /usr/bin/bwrap (or NOT having it). `stat` is
+  // forwarded but the cli rarely needs it directly.
+  exists?: (path: string) => boolean;
+  stat?: (path: string) => { uid: number; mode: number } | null;
   // Test seam for the /etc/os-release file. Production reads from
   // disk; tests pin to a fixed string.
   readOsRelease?: () => string | null;
@@ -152,7 +159,11 @@ const computeRecommendation = (opts: RunSandboxSetupOptions): Recommendation => 
   const platform = opts.platform ?? nodePlatform();
   const arch = opts.arch ?? nodeArch();
   const which = opts.which ?? ((cmd: string) => Bun.which(cmd));
-  const availability = detectSandboxAvailability({ which });
+  // Slice 154 (review): forward optional canonical-first seams.
+  const detectOpts: Parameters<typeof detectSandboxAvailability>[0] = { which };
+  if (opts.exists !== undefined) detectOpts.exists = opts.exists;
+  if (opts.stat !== undefined) detectOpts.stat = opts.stat;
+  const availability = detectSandboxAvailability(detectOpts);
 
   if (availability.available) {
     return {

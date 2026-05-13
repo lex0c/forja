@@ -189,7 +189,10 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       innerArgv: INNER,
     });
     if (bwrapInstalled && onLinux) {
-      expect(argv[0]).toBe('bwrap');
+      // Slice 154 (review): argv[0] is the resolved absolute path.
+      // On Linux the canonical /usr/bin/bwrap wins if present;
+      // otherwise the PATH-resolved fallback applies.
+      expect(argv[0]).toMatch(/bwrap$/);
       expect(argv.slice(-3)).toEqual(['bash', '-c', 'echo hi']);
     } else {
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
@@ -207,8 +210,12 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'darwin',
         which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+        // Slice 154: pin exists() so canonical-first hits /usr/bin/sandbox-exec
+        // deterministically regardless of host filesystem.
+        exists: (p) => p === '/usr/bin/sandbox-exec',
       });
-      expect(argv[0]).toBe('sandbox-exec');
+      // Slice 154 (review): argv[0] is the absolute resolved path.
+      expect(argv[0]).toBe('/usr/bin/sandbox-exec');
       expect(argv[1]).toBe('-p');
       // Profile string is the third element; contains the SBPL
       // version + the cwd writable subpath.
@@ -227,6 +234,9 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'darwin',
         which: () => null,
+        // Slice 154: deterministic absent — canonical /usr/bin/<tool>
+        // must report as missing regardless of host filesystem.
+        exists: () => false,
       });
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     });
@@ -239,6 +249,9 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'linux',
         which: () => null,
+        // Slice 154: deterministic absent (test host may have bwrap
+        // at /usr/bin/bwrap; pin to make this a true "missing" probe).
+        exists: () => false,
       });
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     });
@@ -316,7 +329,11 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
         platform: 'linux',
         which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
       });
-      expect(argv[0]).toBe('bwrap');
+      // Slice 154 (review — PATH-shim resistance): argv[0] is now
+      // the absolute resolved bwrap path, not the bare name. This
+      // is the defense — kernel execve doesn't re-walk $PATH at
+      // spawn time.
+      expect(argv[0]).toBe('/usr/bin/bwrap');
     }
   });
 

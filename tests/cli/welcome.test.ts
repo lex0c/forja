@@ -64,6 +64,7 @@ describe('runWelcome', () => {
       platform: 'linux',
       arch: 'x64',
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       readOsRelease: () => 'ID=ubuntu\nPRETTY_NAME="Ubuntu 22.04"\n',
       out: out.write,
       err: captured().write,
@@ -86,6 +87,7 @@ describe('runWelcome', () => {
       platform: 'linux',
       arch: 'x64',
       which: NEVER_WHICH, // bwrap + git both missing
+      exists: () => false,
       readOsRelease: () => 'ID=ubuntu\nPRETTY_NAME="Ubuntu 22.04 LTS"\n',
       out: out.write,
       err: captured().write,
@@ -107,6 +109,7 @@ describe('runWelcome', () => {
       platform: 'linux',
       arch: 'x64',
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       readOsRelease: () => 'ID=ubuntu\n',
       out: out.write,
       err: captured().write,
@@ -123,6 +126,7 @@ describe('runWelcome', () => {
       platform: 'linux',
       arch: 'x64',
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       readOsRelease: () => 'ID=ubuntu\n',
       out: out.write,
       err: captured().write,
@@ -140,6 +144,7 @@ describe('runWelcome', () => {
       platform: 'darwin',
       arch: 'arm64',
       which: NEVER_WHICH,
+      exists: () => false,
       out: out.write,
       err: captured().write,
     });
@@ -184,6 +189,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       iKnowWhatImDoing: true,
       hasSkipMarker: () => false,
       createSkipMarker: (env) => {
@@ -212,6 +218,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       iKnowWhatImDoing: true,
       hasSkipMarker: () => true,
       createSkipMarker: () => {
@@ -233,6 +240,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       hasSkipMarker: () => true,
       // Slice 123 (R9 P1): readSkipMarker is injected as null so the
       // fallback "marker present" message fires (covers the
@@ -259,6 +267,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       hasSkipMarker: () => true,
       readSkipMarker: () => ({
         path: '/cfg/forja/sandbox_skip',
@@ -282,6 +291,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       hasSkipMarker: () => true,
       readSkipMarker: () => ({
         path: '/cfg/forja/sandbox_skip',
@@ -302,6 +312,7 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
     await runWelcome({
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
+      exists: (p) => p.startsWith('/usr/bin/'),
       hasSkipMarker: () => false,
       readSkipMarker: () => null,
       createSkipMarker: () => {

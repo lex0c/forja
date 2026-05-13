@@ -2,6 +2,87 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 154: bwrap/sandbox-exec PATH-shim resistance
+
+**Done.** One-hundred-fifty-fourth slice. Closes the first of the 3 design-deferred items from the bash-tools review. The other two (macOS `/tmp` shared, symlink canonicalization) still need design discussion. This slice was the most isolated of the three — single helper + cli plumbing + spec amend.
+
+### Threat shape
+
+Pre-slice the sandbox runner trusted `Bun.which('bwrap')` (which walks `$PATH`). An operator (or attacker who could plant in $HOME) putting `/tmp/evilbin` early in PATH with:
+
+```bash
+#!/bin/sh
+# Hostile bwrap shim
+shift; while [ "$1" != "--" ]; do shift; done; shift
+exec "$@"
+```
+
+…would silently bypass the sandbox: harness saw `bwrap` available, wrapped the inner argv, but the wrap was a no-op. Slice 145's kernel-level defenses (--clearenv, --new-session, IPC/UTS unshare) all assumed the bwrap binary was real bwrap.
+
+### Approach: canonical-first + stat-check fallback (option D from design discussion)
+
+1. **Canonical literal first** — try `/usr/bin/bwrap` (Linux) or `/usr/bin/sandbox-exec` (macOS). If exists, use directly. `trustLevel = 'canonical'`.
+2. **PATH-resolved fallback** — `Bun.which()` walks PATH. Stat-check the result:
+   - Owner must be root (uid=0)
+   - Mode bits must not include world-write (0o002) or group-write (0o020)
+   - On failure: keep `trustLevel = 'path-resolved'` + emit warnings to telemetry / operator UI. Do NOT refuse — Nix/Homebrew installs are legitimate and stat-clean in 95% of cases.
+3. **Argv discipline** — pass the resolved absolute path as `argv[0]` directly. Kernel `execve()` doesn't re-walk PATH at spawn time, closing the loop. Pre-slice argv used the bare name `'bwrap'`, re-exposing the shim attack at the exec boundary.
+
+Trust model (documented in PERMISSION_ENGINE.md §6.5): "operator owns their own $HOME — if attacker compromised $HOME, the sandbox is theater regardless." Warnings exist so a postmortem can correlate "ran with non-canonical bwrap at /opt/bin" with downstream incidents.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **resolver** | `src/permissions/sandbox-availability.ts` — new `resolveSandboxBinary(name, opts)` helper | Canonical-first lookup with stat-check fallback. Returns `{ path, trustLevel, trustWarnings }`. Used by both `detectSandboxAvailability` AND the runtime spawn path so the resolved path is consistent. New `stat` + `exists` test seams; non-absolute paths from `which` rejected as `absent` (defensive against a hostile `which` shim that could itself be PATH-shimmed). |
+| **availability** | `src/permissions/sandbox-availability.ts` — `detectSandboxAvailability` augmented | Returns new fields: `path: string \| null` (resolved absolute, used as argv[0]), `trustLevel: 'canonical' \| 'path-resolved' \| 'absent'`, `trustWarnings: readonly string[]`. Forwarded through to telemetry / audit / operator UI. |
+| **runner** | `src/permissions/sandbox-runner.ts` — `maybeWrapSandboxArgv` + `buildBwrapArgv` accept `bwrapPath` | Pre-slice argv was `['bwrap', ...flags, '--', ...inner]`; now `[resolvedAbsolutePath, ...flags, '--', ...inner]`. Default falls back to the bare name for tests building argv directly without going through `maybeWrapSandboxArgv`. Same shape mirrored in `src/permissions/sandbox-runner-macos.ts` for `sandbox-exec`. |
+| **cli plumbing** | `src/cli/doctor.ts`, `src/cli/sandbox-setup.ts`, `src/cli/welcome.ts` | All three callers of `detectSandboxAvailability` now accept + forward `exists` and `stat` seams. Tests can deterministically force "canonical absent" without touching the host filesystem. |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §6.5` | Documented the trust model: canonical-first resolution order, stat-check rules, argv discipline, warning policy (warn-not-refuse on non-canonical), trust model assumption ("operator owns $HOME"). |
+
+### Tests added (+8)
+
+| Test | Coverage |
+|---|---|
+| `canonical /usr/bin/bwrap exists → trustLevel canonical, no warnings` | Hot path; canonical wins over PATH. |
+| `canonical missing → PATH-resolved with clean stat → trustLevel path-resolved + non-canonical warning` | Nix-style install path. |
+| `PATH-resolved with non-root owner → trustWarning includes owner` | User-installed bwrap (e.g. ~/.local/bin). |
+| `PATH-resolved with world-writable mode → trustWarning includes mode` | `/tmp/evilbin/bwrap` mode=0o777 case. |
+| `PATH-resolved with group-writable → trustWarning includes group-writable` | Mode 0o775 — common in shared /opt installs. |
+| `PATH-resolved with stat failure → trustWarning includes stat failure` | Binary removed between which() and stat(). |
+| `which returns non-absolute path → treated as absent` | Defense against hostile `which` shim returning relative paths. |
+| `which returns null → absent` | Standard "not installed" case. |
+
+Plus 4 tests refactored to use the new resolver (`sandbox-availability.test.ts` rewritten end-to-end), 5 tests in `sandbox-runner.test.ts` updated for the resolved-path argv shape, 49 tests across `doctor.test.ts` / `welcome.test.ts` / `sandbox-setup.test.ts` / `doctor-cache.test.ts` got `exists:` seams added (bulk regex pass) so they no longer depend on the host having or not having `/usr/bin/bwrap`.
+
+### Files changed
+
+- Code: `src/permissions/sandbox-availability.ts`, `src/permissions/sandbox-runner.ts`, `src/permissions/sandbox-runner-macos.ts`, `src/cli/doctor.ts`, `src/cli/sandbox-setup.ts`, `src/cli/welcome.ts`
+- Tests: `tests/permissions/sandbox-availability.test.ts`, `tests/permissions/sandbox-runner.test.ts`, `tests/cli/doctor.test.ts`, `tests/cli/welcome.test.ts`, `tests/cli/sandbox-setup.test.ts`, `tests/cli/doctor-cache.test.ts`
+- Spec: `docs/spec/PERMISSION_ENGINE.md §6.5`
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6960 pass / 10 skip / 0 fail / 34161 expect()** across 309 files (+8 net new tests + many existing tests updated for new shape)
+
+### Defense layering
+
+After slice 154 the sandbox binary surface has 4 independent layers:
+1. **Canonical hard-pin** — `/usr/bin/<tool>` literal wins by default.
+2. **Stat-check** — PATH-resolved fallback validates ownership + mode.
+3. **Argv discipline** — absolute path passed to `execve()`; no PATH re-walk.
+4. **Operator visibility** — trust warnings persisted to telemetry + rendered in `agent doctor` / `agent sandbox setup`. Forensic trail.
+
+### Deferred items from bash-tools review (status)
+
+- ✅ **slice 154 — bwrap PATH-shim resistance** — done.
+- ⏳ **macOS `/tmp` shared sandbox+host** — still deferred. Needs design decision on TMPDIR override + which paths to filter via SBPL (Approach A+B from design discussion).
+- ⏳ **Symlink/realpath canonicalization para cwd guard** — still deferred. Needs failure-mode policy decision (broken symlink → refuse? EPERM → refuse?).
+
+---
+
 ## [2026-05-13] fix(bg) — slice 153: per-stream on-disk cap with truncate-head
 
 **Done.** One-hundred-fifty-third slice. Closes the LAST 🟠 important finding from the bash-tools code review: bg manager stdout/stderr grow unbounded → FS exhaustion on long-running dev servers. The fix required a real architectural shift (pipe + drainer instead of `Bun.file(path)` direct redirection), a new migration for persisted bytes-dropped bookkeeping, and a spec amend documenting the cap policy + cursor semantics flip from file-offset to absolute. All ⭕ flagged items from the original review are now closed.

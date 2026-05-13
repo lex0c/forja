@@ -64,6 +64,7 @@
 
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
+import { resolveSandboxBinary } from './sandbox-availability.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
@@ -90,6 +91,13 @@ export interface BuildBwrapArgvOptions {
   // Callers SHOULD still pass `scrubEnv(process.env)` here
   // — defense in depth — but a missing scrub no longer leaks.
   env: NodeJS.ProcessEnv;
+  // Slice 154 (review — PATH-shim resistance): absolute path to
+  // the bwrap binary. Default is the bare name 'bwrap' (kernel
+  // resolves via $PATH at execve time — re-exposes the shim
+  // attack). Production callers via maybeWrapSandboxArgv pass the
+  // canonical-first resolved path. Tests building argv directly
+  // can omit (passthrough = legacy behavior).
+  bwrapPath?: string;
 }
 
 // Slice 145 (S2): env vars the sandboxed inner process is allowed
@@ -373,7 +381,17 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // Start the inner process in cwd.
   flags.push('--chdir', cwd);
 
-  return ['bwrap', ...flags, '--', ...innerArgv];
+  // Slice 154 (review — PATH-shim resistance): the bwrap binary
+  // path is provided by the caller. `maybeWrapSandboxArgv` resolves
+  // it via `resolveSandboxBinary` (canonical /usr/bin/bwrap first;
+  // PATH-resolved fallback with trust check). Passing the absolute
+  // path here, rather than the bare name 'bwrap', means the kernel
+  // execve() loads exactly that file — no re-walk of $PATH at
+  // spawn time that would re-expose a shim attack. Default is the
+  // bare name for backward compatibility with tests that build
+  // argv without going through maybeWrapSandboxArgv.
+  const bwrapPath = options.bwrapPath ?? 'bwrap';
+  return [bwrapPath, ...flags, '--', ...innerArgv];
 };
 
 // Per-spawn-site consume primitive (§6.5 runtime wire-up).
@@ -425,6 +443,13 @@ export interface MaybeWrapSandboxArgvOptions {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   which?: (name: string) => string | null;
+  // Slice 154 (review — PATH-shim resistance): test seams for the
+  // canonical-first resolver. Production callers omit; tests pin
+  // `exists` to force the PATH-resolved fallback path (without
+  // having to remove /usr/bin/bwrap from the host) and `stat` to
+  // exercise the trust-check branches.
+  stat?: (path: string) => { uid: number; mode: number } | null;
+  exists?: (path: string) => boolean;
 }
 
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
@@ -432,6 +457,8 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const which = options.which ?? ((name) => Bun.which(name));
+  const stat = options.stat;
+  const exists = options.exists;
 
   // Wire-validation gate (slice 103, R6 #9). The TypeScript
   // `SandboxProfile` annotation is erased at runtime — any caller
@@ -451,23 +478,41 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
 
   if (profile === undefined || profile === 'host') return innerArgv.slice();
 
-  if (platform === 'linux' && which('bwrap') !== null) {
-    return buildBwrapArgv({
-      profile: profile as Exclude<SandboxProfile, 'host'>,
-      cwd,
-      home: home ?? env.HOME ?? cwd,
-      innerArgv,
-      env,
-    });
+  // Slice 154 (review — PATH-shim resistance): use the canonical-
+  // first resolver. /usr/bin/<tool> wins by default; PATH-resolved
+  // fallback applies stat-check + trust marker. The resolved
+  // absolute path becomes argv[0] of the spawn, so the kernel's
+  // execve doesn't re-walk $PATH at exec time and a shim earlier
+  // in PATH no longer hijacks the wrap.
+  const resolveOpts: Parameters<typeof resolveSandboxBinary>[1] = { which };
+  if (stat !== undefined) resolveOpts.stat = stat;
+  if (exists !== undefined) resolveOpts.exists = exists;
+
+  if (platform === 'linux') {
+    const r = resolveSandboxBinary('bwrap', resolveOpts);
+    if (r.path !== null) {
+      return buildBwrapArgv({
+        profile: profile as Exclude<SandboxProfile, 'host'>,
+        cwd,
+        home: home ?? env.HOME ?? cwd,
+        innerArgv,
+        env,
+        bwrapPath: r.path,
+      });
+    }
   }
 
-  if (platform === 'darwin' && which('sandbox-exec') !== null) {
-    return buildSandboxExecArgv({
-      profile: profile as Exclude<SandboxProfile, 'host'>,
-      cwd,
-      home: home ?? process.env.HOME ?? cwd,
-      innerArgv,
-    });
+  if (platform === 'darwin') {
+    const r = resolveSandboxBinary('sandbox-exec', resolveOpts);
+    if (r.path !== null) {
+      return buildSandboxExecArgv({
+        profile: profile as Exclude<SandboxProfile, 'host'>,
+        cwd,
+        home: home ?? process.env.HOME ?? cwd,
+        innerArgv,
+        sandboxExecPath: r.path,
+      });
+    }
   }
 
   // No sandbox tool available — degraded passthrough. The engine's

@@ -54,6 +54,12 @@ export interface BuildSandboxExecArgvOptions {
   home: string;
   // The inner command + args the sandbox-exec wraps. Cannot be empty.
   innerArgv: readonly string[];
+  // Slice 154 (review — PATH-shim resistance): absolute path to
+  // the sandbox-exec binary. Default is the bare name (kernel
+  // resolves via $PATH at execve — re-exposes shim attack).
+  // Production callers via maybeWrapSandboxArgv pass the
+  // canonical-first resolved path.
+  sandboxExecPath?: string;
 }
 
 // SBPL string escaping. Apple's profile parser accepts double-quoted
@@ -313,5 +319,9 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   }
 
   const profileString = buildSbplProfile(profile, cwd, home);
-  return ['sandbox-exec', '-p', profileString, ...innerArgv];
+  // Slice 154 (review — PATH-shim resistance): use the resolved
+  // absolute path when provided (production via maybeWrapSandboxArgv);
+  // fall back to the bare binary name for direct-build test callers.
+  const sandboxExecPath = options.sandboxExecPath ?? 'sandbox-exec';
+  return [sandboxExecPath, '-p', profileString, ...innerArgv];
 };
