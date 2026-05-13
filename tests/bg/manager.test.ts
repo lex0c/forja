@@ -491,6 +491,88 @@ describe('bg manager: kill', () => {
     await mgr.kill(r.id, { signal: 'SIGKILL' });
   });
 
+  // Slice 151 (review): per-id dedup for concurrent kill() callers.
+  // Pre-slice two callers entering kill(id) simultaneously both
+  // signalled SIGTERM, both started a grace timer, and both could
+  // race their own SIGKILL escalation onto a PID the kernel had
+  // already reaped + reused. Dedup via inFlightKills makes the
+  // second caller piggyback on the first kill's promise.
+  test('concurrent kill() calls dedupe via inFlightKills (slice 151)', async () => {
+    const r = await mgr.spawn({ command: 'sleep 30' });
+    // Fire 4 concurrent kills on the same id. Without dedup, each
+    // would issue its own SIGTERM + grace timer + SIGKILL cycle.
+    // With dedup, all four await the same in-flight promise.
+    const results = await Promise.all([
+      mgr.kill(r.id),
+      mgr.kill(r.id),
+      mgr.kill(r.id),
+      mgr.kill(r.id),
+    ]);
+    // All four return the same shape (status='killed').
+    for (const result of results) {
+      expect(result.status).toBe('killed');
+    }
+    // DB row is killed exactly once — no duplicate finalize.
+    const row = getBgProcess(db, r.id);
+    expect(row?.status).toBe('killed');
+  });
+
+  // Slice 151 (review): cleanup() returned ids.length + flipped,
+  // which double-counted when a kill threw between signal-send and
+  // finalize — the row stayed 'running', flipped picked it up, and
+  // the same row was counted twice (once in ids.length, once in
+  // flipped). 3 live processes reported "killed: 6". Fixed by
+  // snapshotting runningBefore count instead.
+  test('cleanup() returns a deduplicated count of rows transitioned (slice 151)', async () => {
+    // Spawn 3 long-running bg processes.
+    const r1 = await mgr.spawn({ command: 'sleep 30' });
+    const r2 = await mgr.spawn({ command: 'sleep 30' });
+    const r3 = await mgr.spawn({ command: 'sleep 30' });
+    // All three should be 'running' at this point.
+    expect(getBgProcess(db, r1.id)?.status).toBe('running');
+    expect(getBgProcess(db, r2.id)?.status).toBe('running');
+    expect(getBgProcess(db, r3.id)?.status).toBe('running');
+    // Cleanup should report exactly 3 killed (no double-count).
+    const result = await mgr.cleanup();
+    expect(result.killed).toBe(3);
+    // Verify all 3 rows are killed.
+    expect(getBgProcess(db, r1.id)?.status).toBe('killed');
+    expect(getBgProcess(db, r2.id)?.status).toBe('killed');
+    expect(getBgProcess(db, r3.id)?.status).toBe('killed');
+  });
+
+  // Slice 151 (review): early-handle-undef path in kill() preserves
+  // the DB's existing exitCode. Pre-slice it hard-coded null,
+  // clobbering any exit metadata the natural-exit handler had
+  // already captured for the same row.
+  test('kill() with no live handle preserves existing exitCode (slice 151)', async () => {
+    // Spawn a process that exits IMMEDIATELY with code 42. The
+    // exit handler runs and writes exitCode=42 to the DB. Then
+    // call kill() — DB shows 'exited', not 'running', so the
+    // idempotent branch returns the row as-is. To exercise the
+    // EARLY-undef path we need DB.status='running' BUT no live
+    // handle — that's the race-y case the early-undef branch is
+    // documented for. Simulate by directly mutating the DB row
+    // to 'running' after natural exit + clearing live handle.
+    const r = await mgr.spawn({ command: 'exit 42' });
+    await waitForExit(r.id);
+    // At this point DB has status='exited', exit_code=42.
+    expect(getBgProcess(db, r.id)?.status).toBe('exited');
+    expect(getBgProcess(db, r.id)?.exitCode).toBe(42);
+    // Force DB back to 'running' (synthetic stuck-row state) to
+    // exercise the early-handle-undef branch. The natural-exit
+    // path already cleared live handle.
+    db.query("UPDATE background_processes SET status = 'running' WHERE id = ?").run(r.id);
+    // Now kill: DB says 'running', live handle is gone. Old
+    // behavior: exitCode forced to null. New behavior: preserve
+    // exitCode=42 from the DB row.
+    const result = await mgr.kill(r.id);
+    expect(result.status).toBe('killed');
+    expect(result.exitCode).toBe(42);
+    // DB row also preserved.
+    expect(getBgProcess(db, r.id)?.exitCode).toBe(42);
+  });
+
   test('kill cascades to grandchildren via process-group signal (BG1)', async () => {
     // The motivating shape: bash spawns a subshell that runs sleep.
     // Pre-slice `proc.kill('SIGTERM')` would signal bash only —

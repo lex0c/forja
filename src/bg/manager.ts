@@ -13,6 +13,7 @@ import {
   finalizeBgProcess,
   getBgProcess,
   insertBgProcess,
+  listBgProcessesBySession,
   markRunningAsKilled,
 } from '../storage/repos/bg-processes.ts';
 
@@ -709,91 +710,165 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     };
   };
 
+  // Slice 151 (review): per-id dedup for concurrent kill() callers.
+  // Pre-slice two callers entering kill(id) simultaneously both saw
+  // status='running', both called handle.proc.kill('SIGTERM'), both
+  // awaited exitedSettled, both called finalizeBgProcess. The
+  // second escalation timer (after grace) could fire SIGKILL on an
+  // already-dead PID; on Linux the kernel filters and it's
+  // harmless, but with PID reuse it would signal an unrelated
+  // victim. Dedupe by caching the in-flight kill promise per id;
+  // concurrent callers AWAIT the same promise rather than racing
+  // their own signal+grace cycles.
+  const inFlightKills = new Map<string, Promise<KillResult>>();
+
   const kill = async (id: string, opts: KillInput = {}): Promise<KillResult> => {
-    const row = getBgProcess(db, id);
-    if (row === null) {
-      throw new Error(`bg process not found: ${id}`);
-    }
-    if (row.sessionId !== sessionId) {
-      throw new Error(`bg process not in this session: ${id}`);
-    }
+    // Concurrent caller: piggyback on the in-flight kill. Same
+    // result, no second SIGTERM/SIGKILL cycle, no PID-reuse race.
+    const inFlight = inFlightKills.get(id);
+    if (inFlight !== undefined) return inFlight;
 
-    // Idempotent on already-finished processes: report current
-    // state, no signals sent, no DB writes.
-    if (row.status !== 'running') {
-      return {
-        status: row.status,
-        exitCode: row.exitCode,
-        exitedAt: row.exitedAt,
-      };
-    }
-
-    const handle = live.get(id);
-    if (handle === undefined) {
-      // DB says running but no live handle — possible if a prior
-      // kill raced or the process exited between getBgProcess and
-      // here. Mark as killed in DB to converge state and return.
-      finalizeBgProcess(db, { id, status: 'killed' });
-      return { status: 'killed', exitCode: null, exitedAt: Date.now() };
-    }
-
-    const initialSignal = opts.signal ?? 'SIGTERM';
-    const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_KILL_GRACE_MS;
-
-    // Mark BEFORE sending the signal so the exitedSettled handler
-    // (which races us to the finish line) sees the marker and emits
-    // status='killed' instead of 'exited'. Cleared in exitedSettled's
-    // finally — no leak even if kill() throws between here and the
-    // signal taking effect.
-    killing.add(id);
-    // Slice 148 (BG1): kill the whole process group so grandchildren
-    // are reaped along with the bash wrapper.
-    killProcessGroup(handle.proc, initialSignal);
-
-    if (initialSignal !== 'SIGKILL') {
-      // Wait up to gracePeriodMs for graceful exit. Promise.race so
-      // a fast-exiting process doesn't pay the full grace; an abort
-      // of the sleep on graceful exit avoids a leaked timer.
-      const ac = new AbortController();
-      try {
-        await Promise.race([
-          handle.exitedSettled.then(() => ac.abort()),
-          sleep(gracePeriodMs, ac.signal),
-        ]);
-      } catch {
-        // sleep aborted on graceful exit — that's the success path
+    const killPromise = (async (): Promise<KillResult> => {
+      const row = getBgProcess(db, id);
+      if (row === null) {
+        throw new Error(`bg process not found: ${id}`);
       }
-      // If still running after grace, escalate.
-      const stillRunning = getBgProcess(db, id)?.status === 'running';
-      if (stillRunning) {
-        // Slice 148 (BG1): SIGKILL the whole process group. ESRCH
-        // (race with natural exit) is handled inside the helper.
-        killProcessGroup(handle.proc, 'SIGKILL');
+      if (row.sessionId !== sessionId) {
+        throw new Error(`bg process not in this session: ${id}`);
+      }
+
+      // Idempotent on already-finished processes: report current
+      // state, no signals sent, no DB writes.
+      if (row.status !== 'running') {
+        return {
+          status: row.status,
+          exitCode: row.exitCode,
+          exitedAt: row.exitedAt,
+        };
+      }
+
+      const handle = live.get(id);
+      if (handle === undefined) {
+        // DB says running but no live handle — possible if a prior
+        // kill raced or the process exited between getBgProcess and
+        // here. Slice 151: preserve the DB's existing exitCode +
+        // exitedAt if the natural-exit handler ran between the
+        // getBgProcess snapshot above (line 713) and this point.
+        // Pre-slice the DB write hard-coded null and clobbered any
+        // exit metadata the handler captured.
+        const existing = getBgProcess(db, id);
+        const preservedExitCode = existing?.exitCode ?? null;
+        const preservedExitedAt = existing?.exitedAt ?? Date.now();
+        finalizeBgProcess(db, {
+          id,
+          status: 'killed',
+          exitCode: preservedExitCode,
+          exitedAt: preservedExitedAt,
+        });
+        return { status: 'killed', exitCode: preservedExitCode, exitedAt: preservedExitedAt };
+      }
+
+      const initialSignal = opts.signal ?? 'SIGTERM';
+      const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_KILL_GRACE_MS;
+
+      // Mark BEFORE sending the signal so the exitedSettled handler
+      // (which races us to the finish line) sees the marker and emits
+      // status='killed' instead of 'exited'. Cleared in exitedSettled's
+      // finally — no leak even if kill() throws between here and the
+      // signal taking effect.
+      killing.add(id);
+      // Slice 148 (BG1): kill the whole process group so grandchildren
+      // are reaped along with the bash wrapper.
+      killProcessGroup(handle.proc, initialSignal);
+
+      if (initialSignal !== 'SIGKILL') {
+        // Wait up to gracePeriodMs for graceful exit. Promise.race so
+        // a fast-exiting process doesn't pay the full grace; an abort
+        // of the sleep on graceful exit avoids a leaked timer.
+        const ac = new AbortController();
+        try {
+          await Promise.race([
+            handle.exitedSettled.then(() => ac.abort()),
+            sleep(gracePeriodMs, ac.signal),
+          ]);
+        } catch {
+          // sleep aborted on graceful exit — that's the success path
+        }
+        // If still running after grace, escalate.
+        const stillRunning = getBgProcess(db, id)?.status === 'running';
+        if (stillRunning) {
+          // Slice 148 (BG1): SIGKILL the whole process group. ESRCH
+          // (race with natural exit) is handled inside the helper.
+          killProcessGroup(handle.proc, 'SIGKILL');
+          await handle.exitedSettled;
+        }
+      } else {
         await handle.exitedSettled;
       }
-    } else {
-      await handle.exitedSettled;
-    }
 
-    // Force-mark as killed even if the natural-exit handler beat us
-    // to 'exited' — operator-initiated termination is the correct
-    // status for the audit log regardless of signal timing.
-    const exitedAt = Date.now();
-    finalizeBgProcess(db, {
-      id,
-      status: 'killed',
-      exitCode: handle.proc.exitCode ?? null,
-      exitedAt,
-    });
+      // Force-mark as killed even if the natural-exit handler beat us
+      // to 'exited' — operator-initiated termination is the correct
+      // status for the audit log regardless of signal timing.
+      const exitedAt = Date.now();
+      finalizeBgProcess(db, {
+        id,
+        status: 'killed',
+        exitCode: handle.proc.exitCode ?? null,
+        exitedAt,
+      });
 
-    return {
-      status: 'killed',
-      exitCode: handle.proc.exitCode ?? null,
-      exitedAt,
+      return {
+        status: 'killed',
+        exitCode: handle.proc.exitCode ?? null,
+        exitedAt,
+      };
+    })();
+
+    // Register the in-flight promise + clear on settle. We use
+    // `then(cleanup, cleanup)` rather than `.finally(cleanup)`
+    // because `.finally` returns a NEW promise that mirrors the
+    // original rejection; without a catch on that derived promise,
+    // a kill that throws (e.g. `bg process not found`) surfaces as
+    // an unhandled rejection event. `then(handler, handler)`
+    // attaches the SAME cleanup to both resolve and reject paths
+    // without creating a derived chain that needs its own catch.
+    // The original killPromise is the only one returned to the
+    // caller — they handle its rejection (or not) on the surface
+    // they care about.
+    inFlightKills.set(id, killPromise);
+    const cleanup = (): void => {
+      // Only delete if this is still the registered promise — a
+      // future kill cycle for the same id should not be cleared
+      // by an old completion. (Same id can't have two in-flight
+      // kills at once by construction, but defense in depth.)
+      if (inFlightKills.get(id) === killPromise) {
+        inFlightKills.delete(id);
+      }
     };
+    killPromise.then(cleanup, cleanup);
+    return killPromise;
   };
 
   const cleanup = async (): Promise<{ killed: number }> => {
+    // Slice 151 (review): count distinct rows we transitioned, not
+    // the sum of `ids.length + flipped`. Pre-slice cleanup returned
+    // `ids.length + flipped`: for a typical scenario where 3 live
+    // handles all get killed cleanly, `kill()` for each marks
+    // status='killed' on its DB row, then `markRunningAsKilled`
+    // touches 0 rows → flipped=0 → total=3. Correct. But when a
+    // kill THREW between signal-sent and finalize (Promise.allSettled
+    // swallows the rejection), the row stayed 'running';
+    // `markRunningAsKilled` then flipped it, and `ids.length + flipped`
+    // double-counted: ids.length counted the killed-attempt, flipped
+    // counted the same row in its straggler-pass. Reported "6 killed"
+    // for 3 live processes.
+    //
+    // Fix: snapshot ALL session rows with status='running' BEFORE
+    // touching anything, then run kills + flip, then return the
+    // snapshot count. That's the definition that matches operator
+    // intent: "rows we transitioned out of running".
+    const runningBefore = listBgProcessesBySession(db, sessionId, { status: 'running' });
+    const runningBeforeCount = runningBefore.length;
     const ids = [...live.keys()];
     // Send SIGTERM to all in parallel, then wait for the grace cycle
     // collectively. Sequential kill would multiply wall-clock by N
@@ -805,8 +880,8 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // Defensive: any DB row still 'running' after the kill round
     // gets flipped. Catches the case where a kill threw (process
     // disappeared, etc.) — DB shouldn't lie.
-    const flipped = markRunningAsKilled(db, sessionId);
-    return { killed: ids.length + flipped };
+    markRunningAsKilled(db, sessionId);
+    return { killed: runningBeforeCount };
   };
 
   const liveCount = (): number => live.size;

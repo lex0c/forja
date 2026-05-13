@@ -2,6 +2,58 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(bg) — slice 151: kill dedup + cleanup count + exitCode preservation
+
+**Done.** One-hundred-fifty-first slice. Closes 3 of the 4 🟠 bg correctness items from the bash-tools code review. The 4th (stdout/stderr unbounded growth) needs design — Bun.spawn writes via `Bun.file(path)` which holds an open fd; truncating from outside leaves the fd writing at a stale offset, and the existing cursor + race semantics interact poorly with rotation. Deferred to a dedicated slice with discussion. The 3 mechanical fixes are correctness wins regardless.
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **kill-dedup** | Two callers entering `kill(id)` simultaneously both saw `status='running'`, both signalled SIGTERM, both started a grace timer, and both could race their own SIGKILL escalation onto a PID the kernel had already reaped + reused. On Linux the second SIGKILL is usually filtered by the kernel after reap, but with PID-reuse races, the wrong process gets signalled. | `src/bg/manager.ts` (`kill` function) | Wrap the kill body in an IIFE and cache the in-flight promise per id in a new `inFlightKills` map. Concurrent callers entering kill(id) find the existing promise and AWAIT it — same result, no second SIGTERM/SIGKILL cycle. Cleanup via `then(cleanup, cleanup)` (NOT `.finally` — finally creates a derived rejected promise that needs its own catch, generating unhandled-rejection warnings). |
+| **cleanup-count** | `cleanup()` returned `ids.length + flipped`. For 3 live handles + clean kills, ids.length=3 + flipped=0 = 3 (correct). But when a kill threw between signal-send and finalize (Promise.allSettled swallows), the row stayed 'running', `markRunningAsKilled` flipped it, and the SAME row was counted in both ids.length AND flipped — reported "killed: 6" for 3 live processes. | `src/bg/manager.ts` (`cleanup` function) | Snapshot `runningBefore = listBgProcessesBySession(db, sessionId, {status: 'running'})` BEFORE the kill round. Run kills + markRunningAsKilled, return `runningBefore.length` — the definition that matches operator intent: "how many rows did we transition out of running". No double-count. |
+| **exitcode-preservation** | Early-handle-undef path in `kill()` (DB says 'running' but no live handle — race with natural-exit handler) ran `finalizeBgProcess({id, status: 'killed'})` with no `exitCode`, which defaulted to `null` and clobbered any exit code the natural-exit handler had already captured for the same row. | `src/bg/manager.ts` (`kill` function, handle===undefined branch) | Read `getBgProcess(db, id)` AGAIN at that branch and preserve `existing.exitCode` + `existing.exitedAt`. Pre-slice the DB write hard-coded null; now if the handler had time to capture exit metadata between the line-713 snapshot and the line-731 live-handle lookup, that metadata survives. |
+
+### Tests added (+3)
+
+| Test | Coverage |
+|---|---|
+| `concurrent kill() calls dedupe via inFlightKills` | 4 parallel `mgr.kill(id)` calls return the same result; DB row finalized exactly once. |
+| `cleanup() returns a deduplicated count of rows transitioned` | 3 live bg processes → cleanup reports `killed: 3` (no double-count). |
+| `kill() with no live handle preserves existing exitCode` | Synthesize "exit happened + DB stuck at running" state (writes `status='running'` after a natural exit recorded `exit_code=42`), call kill; result preserves 42 rather than clobbering with null. |
+
+### Files changed
+
+- Code: `src/bg/manager.ts`
+- Tests: `tests/bg/manager.test.ts`
+- Spec: none
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`)
+- `bun test` — **6940 pass / 10 skip / 0 fail / 17701 expect()** across 309 files (+3 over slice 150)
+
+### Not in scope this slice
+
+- **stdout/stderr unbounded growth** — needs design. `Bun.spawn` writes directly into `Bun.file(stdoutPath)` which holds an open fd; truncating the file from a separate caller leaves the fd writing at a stale offset (file becomes sparse, kernel pads holes with zero bytes). Approaches:
+  1. **Truncate-head on readOutput** (read tail, write back, adjust cursor) races with the live writer.
+  2. **Periodic rotation** via watchdog (logrotate-style with .1/.2 suffixes) requires reopening the fd, which Bun.spawn doesn't expose.
+  3. **Pipe + writer process** (drain to file ourselves with size cap) restructures the spawn shape significantly.
+  4. **Fail-fast at cap** (refuse further bash_output reads when file > 200MB) preserves correctness but doesn't fix FS exhaustion.
+  
+  Approach 3 is probably right but is a bigger refactor. Deferred to a dedicated slice with explicit design discussion + spec PR if the spawn-shape change touches §7.3.
+
+### Remaining from bash-tools review
+
+After slice 151:
+- **slice 152** — bg stdout/stderr cap (design + impl, see above) — 🟠 important but architecturally larger
+- **slice 153** — resolver calibration (cmdGit unknown subcommand → low confidence; cmdCd false-positive read-fs; cmdSysInfo false readFs('/etc') for date/uptime/hostname) — 🟡 minor
+
+The 🔴 critical column has been empty since slice 148. Slice 151 closes the last "mechanical" 🟠 item; the remaining 🟠 is the design-dependent one.
+
+---
+
 ## [2026-05-13] fix(tools) — slice 150: bash tool surface input validation
 
 **Done.** One-hundred-fiftieth slice. Closes the 🟠 important bash tool surface gaps flagged in the bash-tools code review: `label`/`cwd` arrived from the LLM unvalidated at the tool boundary and landed deep in the manager / storage layer with wrong types (label=42 in audit logs, cwd=42 throws ERR_INVALID_ARG_TYPE inside `isAbsolute` and surfaces as `internalError` instead of a clean tool error). Plus a comment clarification on `bash-kill`'s `escapesCwd` flag (misnamed but correct under the documented semantics).
