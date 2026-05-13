@@ -539,6 +539,35 @@ Slice 104 (R6 #42) hardened both wire boundaries with `safeJsonParse` that strip
 
 The broker also calls `scrubEnv` on the worker's env so credentials don't leak through process spawn even if the bash command itself does `env | nc attacker ...`.
 
+**Two modes**, selectable via `--broker <in-process|spawn>` at boot (default `in-process`):
+
+| Property | `in-process` (default) | `spawn` |
+|---|---|---|
+| Where bash runs | Main process (same Bun runtime as the harness) | Fresh worker subprocess per `execute` call (`src/broker/worker.ts`) |
+| Spec line 928 ("main não tem exec privilege") | Not enforced — `Bun.spawn` is reachable from main | Enforced — main only writes a request; the worker holds the exec primitive |
+| Latency overhead per call | ~zero (function call) | ~30–80ms (Bun cold-start per worker) |
+| Process state across calls | Shared (the same node — but tools don't store state intentionally) | Isolated (every call is a fresh subprocess; nothing survives) |
+| Worker crash blast radius | Crashes the agent | Confined to the one `execute` call → `{ok:false, error:'worker crashed: ...'}` |
+| Env scrubbing | Applied at each `Bun.spawn` inside the handler | Applied to the worker's own env at spawn time AND the worker re-scrubs before its inner bash |
+| Proto-pollution defense | `safeJsonParse` on the handler's args reviver | `safeJsonParse` on BOTH wire directions (broker→worker request, worker→broker response) |
+
+**When to pick which:**
+
+- **Stay on `in-process`** for the 99% case — local dev, CI, single-tenant deployments. The latency floor matters when you do dozens of short bash calls per turn.
+- **Switch to `spawn`** when (a) the threat model values exec-privilege isolation between main and bash (multi-tenant agents, regulated environments where spec §13.7 line 928 is load-bearing), (b) you want crash isolation so a bash handler bug cannot take the whole agent down, or (c) you're profiling bash-heavy workflows and want clean process snapshots per call.
+
+**Both modes** are FIFO-serialized per broker instance: concurrent `execute` calls queue. Spec line 928's "single-writer" property is preserved either way. A future worker-pool slice may add parallelism inside `spawn` mode without changing the public `Broker` contract.
+
+**Failure mode mapping** (both modes return `BrokerResponse`, never throw):
+
+| Failure | `in-process` | `spawn` |
+|---|---|---|
+| sandbox wrap throws | `error: 'sandbox wrap failed: ...'` | `error: 'sandbox wrap failed: ...'` |
+| spawn / fork throws | `error: 'spawn failed: ...'` | `error: 'spawn failed: ...'` |
+| timeout | child killed, `error: 'timeout after Nms'` | worker killed, `error: 'timeout after Nms'` |
+| worker crash / no response | n/a | `error: 'worker produced no response'`, `exitCode` set |
+| malformed worker response | n/a | `error: 'invalid response: ...'`, `exitCode` set; `worker.crashed` telemetry emitted |
+
 ### 5.5.9 Env scrubbing
 
 `src/sanitize/env.ts`. Applied at every spawn boundary (bash tool, bg/manager, broker worker, subagent spawn).
