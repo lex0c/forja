@@ -266,6 +266,31 @@ describe('fetch_url resolver', () => {
       const r = resolveCapabilities('fetch_url', { url: 'https://example.com/' }, CTX);
       expect(r.kind).toBe('ok');
     });
+
+    // Slice 139 C2: trailing-dot FQDN bypass. `new URL('http://localhost.')`
+    // returns hostname `localhost.` literally. DNS resolves via root-anchor
+    // expansion to 127.0.0.1. Pre-fix the string comparisons against
+    // `'localhost'` / `'.localhost'` / `'metadata.google.internal'` /
+    // `'metadata.azure.com'` all missed the trailing-dot form. Fix strips
+    // one trailing dot at the top of `checkSsrfBlocklist`.
+    const trailingDotHosts = [
+      'http://localhost./',
+      'http://LOCALHOST./',
+      'http://x.localhost./',
+      'http://metadata.google.internal./',
+      'http://metadata.azure.com./',
+      'http://my.metadata.azure.com./',
+      'http://metadata./',
+    ];
+    for (const url of trailingDotHosts) {
+      test(`refuses ${url} (trailing dot bypass — slice 139 C2)`, () => {
+        const r = resolveCapabilities('fetch_url', { url }, CTX);
+        expect(r.kind).toBe('refuse');
+        if (r.kind === 'refuse') {
+          expect(r.reason).toMatch(/SSRF/i);
+        }
+      });
+    }
   });
 });
 
@@ -447,6 +472,54 @@ describe('bash resolver — adversarial shapes are Refused (slice 6: whitelist +
   test('cmd1; cmd2 with one unknown is Refused', () => {
     const r = resolveCapabilities('bash', { command: 'cmd1; cmd2' }, CTX);
     expect(r.kind).toBe('refuse');
+  });
+});
+
+// Slice 139 C1: `env` launderer. `env <prog> [args]` runs the
+// trailing program, bypassing COMMAND_TABLE resolution for that
+// program. A narrow operator allow like `bash: env *` would
+// silently admit arbitrary execution via `env python -c '...'`
+// / `env perl -e '...'` etc. Same launder class slice 128 closed
+// for `command` / `builtin`. Bare `env` (zero positionals) still
+// works as the sysinfo listing.
+describe('bash resolver — env launderer defense (slice 139 C1)', () => {
+  test('bare `env` (no positionals) resolves to read-fs:/etc', () => {
+    const r = resolveCapabilities('bash', { command: 'env' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      // exec:shell is added by the bash aggregator for every command.
+      expect(capStrings(r.capabilities).sort()).toEqual(['exec:shell', 'read-fs:/etc']);
+    }
+  });
+
+  const launderShapes = [
+    'env python -c "import os; os.system(\'id\')"',
+    'env perl -e "system(\\"id\\")"',
+    "env node --eval \"require('child_process').execSync('id')\"",
+    'env tar --to-command=sh -cf /tmp/x.tar /etc',
+    "env bash -c 'id'",
+    'env sh /tmp/script.sh',
+    "env KEY=value bash -c 'id'", // launderer with env prefix
+    'env -i bash', // -i flag + program — clears env then runs bash
+    'env -u PATH bash', // -u VAR + program
+  ];
+  for (const cmd of launderShapes) {
+    test(`refuses launder shape: ${cmd}`, () => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') {
+        expect(r.reason).toMatch(/env: positional usage|launder/i);
+      }
+    });
+  }
+
+  test('printenv (kept on sysinfo — not a launcher) still resolves to read-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'printenv PATH' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      // exec:shell is added by the bash aggregator for every command.
+      expect(capStrings(r.capabilities).sort()).toEqual(['exec:shell', 'read-fs:/etc']);
+    }
   });
 });
 

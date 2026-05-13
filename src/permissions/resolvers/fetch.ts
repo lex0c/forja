@@ -49,6 +49,14 @@ const checkSsrfBlocklist = (rawHost: string): string | null => {
   // across runtimes (Node returns with brackets; the WHATWG URL
   // spec returns without). Normalize.
   if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  // Slice 139 C2: strip trailing dot (FQDN absolute form).
+  // `new URL('http://localhost.').hostname` returns the literal
+  // `localhost.` — DNS resolves it to 127.0.0.1 via root-anchor
+  // expansion, but pre-fix the string comparisons below missed it.
+  // Same threat for `metadata.google.internal.`, `metadata.azure.com.`,
+  // etc. Stripping once at the boundary normalizes every comparison
+  // below to the canonical no-trailing-dot form.
+  if (h.endsWith('.')) h = h.slice(0, -1);
 
   // DNS names that always lead to local / metadata services.
   if (h === 'localhost' || h.endsWith('.localhost')) {

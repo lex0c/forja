@@ -1483,6 +1483,26 @@ describe('engine.check — audit emission', () => {
 describe('engine — state machine integration (§2)', () => {
   const PROJ = '/work/proj';
   const HOME = '/home/op';
+  // Local emit shape — narrower than the audit-emission block's
+  // CapturedEmit but enough for the slice 139 C3 ttl_expires_at /
+  // sandbox_profile assertions.
+  interface StateMachineEmit {
+    ttl_expires_at?: number | null;
+    sandbox_profile?: string | null;
+    decision: string;
+  }
+  const captureSink = (collected: StateMachineEmit[]) => ({
+    emit: (input: StateMachineEmit) => {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `h-${collected.length}` };
+    },
+    verifyChain: () => ({
+      ok: true as const,
+      rows: collected.length,
+      current_rotation_id: 0,
+      quarantined: false,
+    }),
+  });
 
   test('state() defaults to ready', () => {
     const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
@@ -1532,6 +1552,65 @@ describe('engine — state machine integration (§2)', () => {
       // Original rule attribution preserved
       expect(d.source?.rule).toBe('ls *');
       expect(d.source?.section).toBe('bash');
+    }
+  });
+
+  // Slice 139 C3: `degradeAllowToConfirm` rebuilds the Decision. Pre-fix
+  // it copied only `source` — dropping `ttlExpiresAt`, `sandboxProfile`,
+  // `approvalSeq`. When a grant-match produced `allow` with TTL and the
+  // engine was degraded, the audit row's `ttl_expires_at` column wrote
+  // `null` even though the grant authorized the call. Fix: spread the
+  // pre-degrade Decision first, then override `kind`/`prompt`/`reason`.
+  test('degraded preserves ttlExpiresAt from grant-match (slice 139 C3)', () => {
+    const collected: StateMachineEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: {} } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      initialState: 'degraded',
+      grants: {
+        listActive: () => [
+          {
+            id: '01JN00000000000000000000C3',
+            scope_kind: 'pattern' as const,
+            scope_value: 'git status*',
+            capability: 'exec:shell',
+            expires_at: 1_900_000_000_000,
+          },
+        ],
+      },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status -s' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      // ttlExpiresAt MUST survive the allow→confirm upgrade.
+      expect(d.ttlExpiresAt).toBe(1_900_000_000_000);
+      // Source attribution preserved (the existing test pinned this; we
+      // re-check to ensure the spread didn't break it).
+      expect(d.source?.section).toBe('grants');
+      expect(d.source?.rule).toBe('01JN00000000000000000000C3');
+    }
+    // Audit row carries the TTL too — the forensic correlation between
+    // grant-match and TTL is the load-bearing invariant.
+    expect(collected[0]?.ttl_expires_at).toBe(1_900_000_000_000);
+  });
+
+  test('degraded preserves sandboxProfile from the planner', () => {
+    const collected: StateMachineEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
+      initialState: 'degraded',
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      // sandboxProfile MUST survive the upgrade — pre-fix the rebuild
+      // copied only `source`; the operator's modal would not know
+      // which profile the engine planned to run under.
+      expect(d.sandboxProfile).toBeDefined();
     }
   });
 

@@ -282,7 +282,20 @@ export interface PermissionEngine {
   // missing required fields. Single-threaded JS means no in-flight
   // check() can be interrupted — the swap takes effect on the
   // NEXT check() call.
-  reloadPolicy(newPolicy: Policy): ReloadPolicyResult;
+  //
+  // Slice 139 C4: the optional `newProvenance` argument lets the
+  // caller swap the per-section layer attribution alongside the
+  // policy. Pre-slice the engine captured `provenance` at
+  // construction time and `reloadPolicy` updated only `policy`
+  // and `mode`, leaving the stale provenance in place. Result:
+  // every audit row's `source.layer` and `/perms why` output
+  // referenced the PRE-reload hierarchy. The watcher (policy-
+  // watcher.ts) re-resolves the full hierarchy on each YAML
+  // change and now forwards the fresh `SectionProvenance` here.
+  // Callers without dynamic provenance (tests / one-shot uses)
+  // can omit the argument and the engine keeps the construction-
+  // time provenance.
+  reloadPolicy(newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult;
   // Current state per PERMISSION_ENGINE.md §2. Bootstrap walks the
   // engine through `init → loading-policy → validating-chain → ready`
   // before exposing it to the harness; runtime can transition between
@@ -970,13 +983,21 @@ const decisionToAuditEnum = (kind: Decision['kind']): 'allow' | 'deny' | 'confir
 // so operators see why a normally-silent allow surfaced as a prompt.
 // Non-allow decisions pass through unchanged — degraded never
 // downgrades a `deny` or `confirm`.
+//
+// Slice 139 C3: spread `decision` so non-source fields survive
+// — `approvalSeq`, `sandboxProfile`, `ttlExpiresAt` (load-bearing
+// for grant-match audit rows: pre-fix the rebuild dropped them and
+// `ttl_expires_at` in `approvals_log` landed `null` even when a
+// grant authorized the call). The `kind`, `prompt`, and `reason`
+// fields below intentionally override the spread values — we want
+// the post-degrade shape, not the pre-degrade allow shape.
 const degradeAllowToConfirm = (decision: Decision): Decision => {
   if (decision.kind !== 'allow') return decision;
   return {
+    ...decision,
     kind: 'confirm',
     prompt: 'Engine is in degraded mode — confirm before continuing.',
     reason: `degraded state forced confirm (was: ${decision.reason ?? 'allow'})`,
-    ...(decision.source !== undefined ? { source: decision.source } : {}),
   };
 };
 
@@ -1125,7 +1146,12 @@ export const createPermissionEngine = (
   let mode: PolicyMode = policy.defaults.mode ?? 'strict';
   const cwd = options.cwd;
   const home = options.home ?? process.env.HOME ?? cwd;
-  const provenance = options.provenance;
+  // Slice 139 C4: mutable so reloadPolicy can swap. Pre-slice this
+  // was `const`, which made every `/perms why` and `source.layer`
+  // audit field stale post-reload — the engine kept the
+  // construction-time hierarchy attribution even when the watcher
+  // resolved a fresh policy from a different layer.
+  let provenance = options.provenance;
   const audit = options.audit ?? createNoopSink();
   const sessionId = options.sessionId ?? 'session-anon';
   // State controller — caller-supplied (production: bootstrap walks
@@ -1913,7 +1939,7 @@ export const createPermissionEngine = (
     // field present) and either commits the swap or returns a
     // diagnostic. Single-threaded JS means in-flight check() calls
     // run to completion before this fires.
-    reloadPolicy: (newPolicy: Policy): ReloadPolicyResult => {
+    reloadPolicy: (newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult => {
       if (newPolicy === null || typeof newPolicy !== 'object') {
         return { ok: false, reason: 'reloadPolicy: newPolicy must be a non-null object' };
       }
@@ -1933,6 +1959,12 @@ export const createPermissionEngine = (
       policy = newPolicy;
       policyHash = newHash;
       mode = newPolicy.defaults.mode ?? 'strict';
+      // Slice 139 C4: swap provenance alongside policy when the
+      // caller forwards a fresh one. Omitting `newProvenance` (or
+      // passing undefined) preserves the construction-time
+      // provenance — backward-compatible for callers that don't
+      // know about layered policy attribution.
+      if (newProvenance !== undefined) provenance = newProvenance;
       return { ok: true, oldHash, newHash };
     },
   };

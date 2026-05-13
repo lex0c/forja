@@ -283,6 +283,55 @@ describe('watchAndReload', () => {
     expect(failures[0]).toContain('inotify exhausted');
   });
 
+  // Slice 139 C4: provenance staleness post-reload. Pre-fix the
+  // watcher discarded resolved.provenance, so every audit row's
+  // source.layer and `/perms why` output kept pointing at the
+  // construction-time hierarchy — even after the operator moved
+  // a section between layers (added an enterprise YAML, edited
+  // session YAML, etc.). Fix: forward resolved.provenance to
+  // engine.reloadPolicy as the second argument.
+  test('forwards resolved provenance to engine.reloadPolicy (slice 139 C4)', () => {
+    const projectFile = join(tmp, '.agent', 'permissions.yaml');
+    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    writeFileSync(
+      projectFile,
+      'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["initial"]\n',
+    );
+
+    const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
+    // Spy on reloadPolicy to capture the args the watcher passes.
+    const reloadCalls: Array<{
+      hasProvenance: boolean;
+      provenanceBash: string | undefined;
+    }> = [];
+    const original = eng.reloadPolicy.bind(eng);
+    eng.reloadPolicy = ((newPolicy, newProvenance) => {
+      reloadCalls.push({
+        hasProvenance: newProvenance !== undefined,
+        provenanceBash: newProvenance?.bash,
+      });
+      return original(newPolicy, newProvenance);
+    }) as typeof eng.reloadPolicy;
+
+    const fake = makeFakeWatcher();
+    const timer = makeSyncTimer();
+    watchAndReload({
+      engine: eng,
+      resolveOptions: { cwd: tmp, enterprisePath: null, userPath: null },
+      watcher: fake.watcher,
+      setTimer: timer.setTimer,
+      clearTimer: timer.clearTimer,
+    });
+
+    fake.trigger(projectFile);
+    timer.fire();
+    expect(reloadCalls.length).toBe(1);
+    expect(reloadCalls[0]?.hasProvenance).toBe(true);
+    // The project-local YAML defines the `bash` section, so its
+    // provenance layer is 'project'.
+    expect(reloadCalls[0]?.provenanceBash).toBe('project');
+  });
+
   test('successive reloads: each one fires its own callback', () => {
     const projectFile = join(tmp, '.agent', 'permissions.yaml');
     mkdirSync(join(tmp, '.agent'), { recursive: true });

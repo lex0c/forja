@@ -119,7 +119,15 @@ export const watchAndReload = (options: WatchAndReloadOptions): PolicyWatcher =>
         options.onReloadFailed?.(`lock conflicts: ${formatLockConflicts(resolved.lockConflicts)}`);
         return;
       }
-      const result = options.engine.reloadPolicy(resolved.policy);
+      // Slice 139 C4: forward the freshly-resolved per-section
+      // provenance alongside the policy. Pre-fix the watcher
+      // discarded `resolved.provenance`, leaving every subsequent
+      // audit row's `source.layer` and `/perms why` output
+      // pointing at the construction-time hierarchy — which lies
+      // after the first YAML edit that moved a section between
+      // layers (e.g. session → project, or operator added an
+      // enterprise file).
+      const result = options.engine.reloadPolicy(resolved.policy, resolved.provenance);
       if (result.ok) {
         options.onReload?.(result);
       } else {

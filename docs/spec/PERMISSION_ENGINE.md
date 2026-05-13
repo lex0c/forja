@@ -202,7 +202,12 @@ ResolverResult :=
   | Refuse { reason: string }                                      # resolver não consegue decidir; deny
 ```
 
-Confidence < `high` força aprovação humana mesmo se static rule daria `allow`.
+Confidence força aprovação humana conforme tabela §6.6:
+- `confidence = low` → upgrade allow→confirm (sempre).
+- `confidence = medium` → **NÃO** força upgrade automático (slice 139 D1).
+- `confidence = high` → silent allow.
+
+Decisão de calibração: medium foi originalmente listado como triggering upgrade (linha histórica deste documento), mas operadores observaram fadiga excessiva com workloads multi-step onde resolvers caem em medium por motivos benignos (cwd-relativo não-canônico, expansão de path simples). A regra atual é "só `low` força confirm"; calibração via outcome_signals (§6.3.2) pode tunar o threshold de score em vez de gate por confidence — score já compõe confidence-low (+0.30) e classifier-hint num único float [0,1] que cruza `scoreConfirmThreshold` (default 0.40). Engine reference: `src/permissions/engine.ts:1020-1030` (`scoreForcesConfirm`).
 
 ### 5.2 Resolvers builtin (exemplos)
 
@@ -247,7 +252,7 @@ Resolver bash usa **AST parsing** (lib `tree-sitter-bash`), não regex. Pipeline
 |---|---|
 | `rm` | `delete-fs(args após flags)`; `-rf` → confidence=high; `-rf /` ou `~` direto → bloqueado em §11 |
 | `mv`, `cp` | `read-fs(src) + write-fs(dst)` |
-| `curl`, `wget` | `net-egress(extract_host(args))`; pipe pra shell (`| sh`, `| bash`) → confidence=low + flag `pipe-to-shell` |
+| `curl`, `wget` | `net-egress(extract_host(args))`; pipe pra shell (`\| sh`, `\| bash`, `\| zsh`, `\| python -c`, etc.) → **Refuse** com reason `pipe-to-shell` (slice 139 D2, antes era `confidence=low + flag`). Justificativa: a tabela adversarial mais abaixo nesta mesma §5.2 já lista `$(curl ... \| sh)` como Refuse; pipe-direct-to-shell tem o mesmo threat shape (output controlado pelo remoto vai pra interpretador) e calibração empírica mostrou zero falsos positivos legítimos. Engine reference: `src/permissions/resolvers/bash.ts:2218-2222`. |
 | `git` | switch por subcomando: `commit`/`push` → `git-write(repo)`; `clean -f` → `delete-fs(repo) + git-write(repo)` |
 | `npm`, `yarn`, `bun`, `pip` | `exec:arbitrary + write-fs(node_modules \| venv) + net-egress(registry hosts)` |
 | `cat`, `ls`, `head`, `tail`, `wc`, `grep`, `find` (sem `-exec`) | `read-fs(args)` |
@@ -554,10 +559,12 @@ Sandbox indisponível (kernel sem unshare, bwrap binary missing) → state = `de
 | static rule `deny` matched | `deny` |
 | state == `refusing` | `deny` (fatal) |
 | state == `degraded` **e** decision seria `allow` | `confirm` (forçado) |
-| static rule `allow` matched **e** score < 0.4 **e** confidence == high | `allow` |
-| static rule `allow` matched **e** (score ≥ 0.4 ou confidence < high) | `confirm` |
+| static rule `allow` matched **e** score < 0.4 **e** confidence != low | `allow` |
+| static rule `allow` matched **e** (score ≥ 0.4 ou confidence == low) | `confirm` |
 | static rule `ask` matched | `confirm` |
 | nenhum match | `deny` (fail closed) |
+
+**Slice 139 D1 nota:** linhas 4-5 acima foram revisadas. Anteriormente: "confidence == high" required for silent allow; "confidence < high" (incluindo medium) → confirm. Hoje: só `low` força confirm; `medium` é tratado como `high` para fim de gate (a contribuição da confidence-low pro score já está em §6.3 — `+0.30`, que sozinho cruza o `scoreConfirmThreshold = 0.4` quando combinado com qualquer outra feature mesmo benigna). Justificativa de calibração em §5.1.
 
 Confirm produz preview estruturado:
 

@@ -723,6 +723,35 @@ const cmdSysInfo: CommandResolver = () => ({
   confidence: 'high',
 });
 
+// Slice 139 C1: `env` is structurally a program launcher, not a
+// sysinfo verb. With ANY positional it runs the trailing program
+// with the surrounding env: `env python -c '...'`, `env perl -e
+// '...'`, `env tar --to-command='...'`, `env node --eval '...'`
+// — every one bypasses COMMAND_TABLE resolution for the actual
+// program. Same launder class slice 128 closed for `command` and
+// `builtin` via HARD_REFUSE_COMMANDS; `env` was missed because it
+// sat in `cmdSysInfo` (which returns the noop sysinfo shape
+// regardless of positionals). A narrow operator allow like
+// `bash: env *` then silently admits arbitrary execution.
+//
+// Defensive cut: refuse any positional usage. Bare `env` (listing
+// every var) is the only legitimate LLM-emitted shape and still
+// resolves to `readFs('/etc')`. Operators with a `env -u FOO bash`
+// workflow can express it as the bare `bash` invocation; the env-
+// stripping pre-step has no security value at the policy layer.
+//
+// `printenv [VAR]` is NOT a launcher (it only reads); kept on
+// `cmdSysInfo`.
+const cmdEnv: CommandResolver = (positional) => {
+  if (positional.length > 0) {
+    return {
+      refuse:
+        'env: positional usage is a program launcher; refusing to launder exec attribution (use the wrapped tool directly)',
+    };
+  }
+  return { capabilities: [readFs('/etc')], confidence: 'high' };
+};
+
 // Filesystem-mutating utilities that create or touch a target.
 // mkdir / touch / ln / mktemp: positional args are the targets.
 const cmdMkdir: CommandResolver = (positional, _tokens, ctx) => {
@@ -1440,7 +1469,11 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['uname', cmdSysInfo],
   ['uptime', cmdSysInfo],
   ['date', cmdSysInfo],
-  ['env', cmdSysInfo],
+  // Slice 139 C1: `env` moved to its own resolver — was on
+  // cmdSysInfo, which laundered exec attribution for
+  // `env <prog> [args]` shapes. `printenv` stays on cmdSysInfo
+  // (read-only, not a launcher).
+  ['env', cmdEnv],
   ['printenv', cmdSysInfo],
   ['which', cmdSysInfo],
   ['type', cmdSysInfo],

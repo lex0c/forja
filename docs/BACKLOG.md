@@ -2,6 +2,53 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 139: 4 code fixes + 2 spec PRs from fresh 4-agent review
+
+**Done.** One-hundred-thirty-ninth slice. A fresh 4-agent code-review pass over `src/permissions/` (axes: Security, Spec drift, Correctness, API surface) surfaced ~40 findings. This slice closes the **6 critical** items: 4 code fixes + 2 spec amendments.
+
+### Code fixes
+
+| # | Finding | File:line | Fix |
+|---|---|---|---|
+| **C1** | `env <prog>` launders exec attribution via `cmdSysInfo`. Same class slice 128 closed for `command`/`builtin`. Operator allow `bash: env *` then admits arbitrary exec via `env python -c '...'` / `env perl -e '...'` / `env node --eval`. | `resolvers/bash.ts:1443` + new `cmdEnv` at `:716-754` | New `cmdEnv` resolver: bare `env` → `readFs('/etc')`; any positional → `Refuse`. `printenv` stays on `cmdSysInfo` (not a launcher). |
+| **C2** | SSRF blocklist misses trailing-dot FQDN. `new URL('http://localhost.').hostname` → `localhost.` literal → string compares against `'localhost'` / `'.localhost'` / `'metadata.google.internal'` / `'metadata.azure.com'` all miss; DNS root-anchor expands to 127.0.0.1. | `resolvers/fetch.ts:54` | Strip one trailing dot at the top of `checkSsrfBlocklist`. 1 line. |
+| **C3** | `degradeAllowToConfirm` rebuilds Decision with only `source`, dropping `ttlExpiresAt`, `sandboxProfile`, `approvalSeq`. When grant-match produced allow + TTL and engine degraded, audit row's `ttl_expires_at` wrote `null` — forensic grant↔TTL correlation broken. | `engine.ts:973-981` | Spread `decision` first, then override `kind`/`prompt`/`reason`. |
+| **C4** | `policy-watcher` re-resolves hierarchy on every YAML edit but only forwards `resolved.policy` to `engine.reloadPolicy`, discarding `resolved.provenance`. Every audit row's `source.layer` and `/perms why` output points at construction-time hierarchy after the first reload — silently lies. | `engine.ts:1136` (const→let) + `:285` (signature) + `:1924-1949` (impl); `policy-watcher.ts:122` | Make engine's `provenance` mutable; extend `reloadPolicy(newPolicy, newProvenance?)`; watcher forwards `resolved.provenance`. Backward-compatible (arg is optional). |
+
+### Spec PRs
+
+| # | Finding | Resolution |
+|---|---|---|
+| **D1** | `PERMISSION_ENGINE.md §5.1` says "confidence < high força aprovação humana" (incluindo medium); code at `engine.ts:1020-1030` (`scoreForcesConfirm`) só escalates allow→confirm em `low`. Engine comment explicitly cita como "decisão a revisitar". | Amend §5.1 + §6.6 to document the calibrated behavior: only `low` forces upgrade. Medium's risk contribution flows through the score (+0.30 from `confidence-low` feature can cross `scoreConfirmThreshold = 0.4` when combined with any benign feature). Code stays as-is. |
+| **D2** | §5.2 main table row for `curl/wget` says "pipe pra shell → confidence=low + flag `pipe-to-shell`"; code at `resolvers/bash.ts:2218-2222` hard-refuses; spec §5.2 adversarial table separately lists `$(curl ... \| sh)` as Refuse — spec contradicts itself. | Amend §5.2 main row to "Refuse with reason `pipe-to-shell`" (matches adversarial row + matches code; pipe-direct-to-shell has same threat shape as command-substitution-then-shell). |
+
+### Tests added (~21 total)
+
+| File | Count | Coverage |
+|---|---|---|
+| `tests/permissions/resolvers.test.ts` | 11 (C1) + 7 (C2) | C1: bare `env` allow + 9 launder shapes refuse + `printenv` non-launderer. C2: 7 trailing-dot bypass variants (localhost., uppercase, subdomain., metadata fqdns., bare metadata.). |
+| `tests/permissions/engine.test.ts` | 2 (C3) | TTL survives allow→confirm degrade with grant-match; sandboxProfile survives allow→confirm degrade with planner. |
+| `tests/permissions/policy-watcher.test.ts` | 1 (C4) | Watcher forwards `resolved.provenance` to `engine.reloadPolicy` as second arg; `provenance.bash === 'project'` after a project-YAML edit. |
+
+### Other findings deferred
+
+The fresh review surfaced ~34 additional findings across the 4 axes that DIDN'T make this slice:
+
+- **🟠 important (15 items)**: 4 security (XDG_DATA_HOME unmask, SBPL nested sandbox-exec, git-anchored mutable working tree, IPv6 IPv4-compatible SSRF gap), 2 correctness latent (verifyChain construction-time genesis, canonicalize undefined throws), 5 spec drift PRs (SealStore contract, state machine throws-on-invalid, SSRF resolver pre-policy override, audit ts future-skew, reason-chain stage taxonomy), 3 API surface (EngineOptions god-object, GrantSnapshot duplicates GrantRow, AuditEmitInput 17 `?` fields).
+- **🟡 minor (~15 items)**: barrel-export inconsistencies, deep imports pervasive, magic numbers, worm-file first-write race, LD_PRELOAD/DYLD_* not scrubbed.
+
+These will batch into slice 140 (security cluster) + 141 (correctness latent + spec PRs) + 142 (API surface refactor) per the consolidated punch list.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6831 pass / 10 skip / 0 fail** (6841 total / 309 files); +21 tests over slice 138
+
+---
+
+
+
 ## [2026-05-13] eval — branch-wide smoke validation + 2 fixture issues to fix
 
 **Done.** Ran the full smoke suite (`bun run eval:smoke`) against the cumulative `feat/permission-engine` branch (34 commits since main: slices 105-138 covering permission engine v2 + sandbox + sealing + bash AST resolver + audit chain rotation + failure_events + outcome_signals + calibration). The branch had not been smoke-validated end-to-end with a real provider since before slice 105.
