@@ -44,58 +44,71 @@ fix is mechanical.
 
 ---
 
-## Trust prompt for new directories (`AGENTIC_CLI §9.1`)
+## Trust prompt: aggregate-hash re-prompt on `.agent/` / `AGENTS.md` change (`AGENTIC_CLI §9.1`)
 
-**Status:** deferred from M2 / Step 4. Hierarchy resolution (the other
-half of Step 4) ships standalone; trust prompt waits for the
-interactive UI.
+**Status:** the primary trust-prompt work is **done**. Both original
+pull-in signals fired during M3/M4: the modal UI landed (`modalManager`
++ `askTrust` in `src/cli/repl.ts`), and multiple trust-relevant
+artifacts are loaded today (permissions YAML, hooks, playbooks,
+AGENTS.md). The full TODO entry was substantially closed without an
+explicit close-out; this entry now tracks only the **residual**.
 
-**What it is:** first time the agent opens a new directory (or detects
-an aggregate-hash mismatch in trusted artifacts), prompt the user
-before loading any of the following:
+**What's already in:**
 
-- `AGENTS.md`
-- `.agent/config.toml`
-- `.agent/permissions.yaml`
-- `.agent/hooks.toml`
-- `.agent/memory/shared/**`
-- `.agent/playbooks/**`
-- `.agent/agents/**`
-- `.agent/orchestrators/**`
+- `src/trust/` subsystem (`paths.ts`, `storage.ts`, `index.ts`).
+- `~/.config/agent/trusted_dirs.json` persisted with absolute paths.
+- `askTrust` modal wired in REPL boot **before** opening the editor
+  or loading the rest of `.agent/` — fires on first-boot in a new
+  cwd; subsequent boots in a trusted cwd skip the prompt.
+- `[y/N]` answer flow with timeout + cancel paths covered by
+  `tests/tui/modal-manager.test.ts` (slice 137 ops-3) and the
+  REPL integration tests.
 
-Trusted entries persisted in `~/.config/agent/trusted_dirs` with the
-aggregate hash. Mismatch on subsequent run = re-prompt.
+**What's still deferred — aggregate hash + re-prompt:**
 
-**Why deferred:**
+Spec §9.1 calls for a hash of every loaded `.agent/` artifact +
+`AGENTS.md`, stored alongside the trusted-dir entry. Re-prompt on
+any subsequent boot where the hash diverges (operator updated
+`.agent/permissions.yaml`, a new hook landed, AGENTS.md grew a
+section). Storage explicitly documents this gap at
+`src/trust/storage.ts:8-13`:
 
-1. **No interactive UI yet.** M2 is one-shot CLI. A "headless trust"
-   workaround (fail-closed unless `agent trust .` ran first) would
-   force a manual approval step on every `git clone` for marginal
-   value: the only artifact we currently load is `.agent/permissions.yaml`,
-   a single project-local file the user is already editing.
-2. **Threat surface today is narrow.** AGENTS.md, hooks, playbooks,
-   orchestrators, and MCP manifests don't exist in code yet — they
-   land in M3/M4. Trust mechanics ship with their consumers, not
-   ahead of them, so the implementation doesn't get rewritten
-   when those subsystems land with their own spec details.
-3. **Real prompt deserves a real UI.** Spec wires the prompt to a
-   `[y/N/inspecionar]` choice; "inspect" lets the user diff the
-   artifacts before approving. That's interactive territory.
+> "Spec §9.1 also calls for an aggregate hash of the project's
+> `.agent/` content + `AGENTS.md`, with re-prompt on any change.
+> That hardening is deferred to a follow-up slice; absent it, an
+> operator who clones into a previously-trusted path inherits the
+> trust without a re-confirm."
+
+**Why this remainder is deferred:**
+
+1. **Threat shape today is narrow.** Operator types `agent` in
+   their own repo, not in arbitrary cloned trees from third parties.
+   The hash-mismatch class of attack assumes a trusted cwd whose
+   `.agent/` was rewritten between boots (by a co-located process or
+   by `git pull`-ing changes); plausible but not currently observed.
+2. **`inspect` mode is the real UX answer.** Spec wires the
+   re-prompt to a `[y/N/inspecionar]` choice — "inspect" diffs
+   `.agent/` against the trusted hash and renders what changed.
+   That's a TUI subsystem of its own. Re-prompt without inspect is
+   useless friction (operator just re-clicks `y`); inspect needs a
+   diff renderer the project doesn't have yet.
+3. **Spec §9.1 sub-hash for MCP.** `AUDIT.md §1.5`
+   `mcp_manifest_history` is the same shape (hash + re-prompt) for
+   MCP manifests. Bundle the two — the diff renderer and the hash
+   scheme are shared.
 
 **Pull-in signal:**
 
 Pull this back into scope when EITHER:
 
-- The interactive Ink UI lands (likely M3+) — trust prompt nasce
-  com prompt humano de verdade, tem `inspecionar` mode.
-- A second trust-relevant artifact starts being loaded (AGENTS.md,
-  playbooks, hooks, MCP manifests) — at that point the threat
-  surface widens enough that a headless `agent trust` subcommand
-  becomes worth the friction.
-
-**Whichever lands first** triggers a fresh design pass (the headless
-flow vs full UI flow are different enough that we shouldn't pre-build
-the wrong one).
+- A team-shared trust storage scenario surfaces (more than one
+  operator, or a cwd that team members `git pull` updates into).
+  Hash mismatch becomes load-bearing the moment "an artifact under
+  `.agent/` changed between trusted boot and now" stops being a
+  hypothetical.
+- MCP manifest trust lands. The `mcp_manifest_history` work
+  expects the same hash-and-re-prompt machinery; bundle the work
+  rather than building two parallel implementations.
 
 **Spec reference:** `AGENTIC_CLI.md §9.1`, `SECURITY_GUIDELINE.md §9.1`,
 `AUDIT.md §1.5` for `mcp_manifest_history` table that the MCP-trust
@@ -689,8 +702,12 @@ Pull when ANY of:
 
 **Pre-requisites the project should have first:**
 
-- Sandbox of tool execution (`AGENTIC_CLI §9.1` M4.x). Cheaper
-  defense, larger impact.
+- ✅ ~~Sandbox of tool execution (`AGENTIC_CLI §9.1` M4.x). Cheaper
+  defense, larger impact.~~ — **Met as of slices 118-119** (Linux
+  bwrap + macOS `sandbox-exec` `hide_paths` defense), slice 119
+  closes the macOS half via SBPL. Sandbox profile selection +
+  hide_paths cover the structural defense the original TODO
+  expected to land first. The other two pre-reqs below remain.
 - Static analysis of operator-supplied policy (warn at boot
   when a policy contains `*` in allow patterns alongside
   metachars in deny — pedagogical, lighter than AST).
@@ -698,6 +715,12 @@ Pull when ANY of:
   templates, etc) closer to landing — those build a base of
   operator-edited policies that an AST migration would
   need to handle.
+
+With the sandbox pre-req met, the primary pull-in signal
+remaining is operator-articulated demand for semantic policy
+rules — a concrete complaint like "I want to allow any safe git
+command but block destructive ones" or "deny redirect to `/etc/**`
+keeping cwd redirects" that glob can't express precisely.
 
 **Estimated work (when pulled):**
 
