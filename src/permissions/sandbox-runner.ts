@@ -335,6 +335,32 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   if (liveDataDir !== homeRelativeDataDir) {
     flags.push('--tmpfs', liveDataDir);
   }
+  // Slice 146 (review minor): XDG_CONFIG_HOME unmask. Analog of
+  // slice 140 sec-1's XDG_DATA_HOME fix, extended to XDG_CONFIG_HOME.
+  // When the operator relocates XDG_CONFIG_HOME outside `~/.config`
+  // (e.g. `/srv/conf`), the canonical HIDE_PATHS_DIRS entries
+  // beginning with `.config/` cover the WRONG path on disk:
+  // bwrap masks `<home>/.config/{gcloud,azure,op,sops,agent,forja}`
+  // while the REAL credentials live at
+  // `<xdg-config>/{gcloud,azure,op,sops,agent,forja}`. Add a
+  // tmpfs overlay at the relocated location for each `.config/*`
+  // entry. Idempotent: when XDG_CONFIG_HOME is unset (or set to
+  // exactly `<home>/.config`), the effective path matches the
+  // home-relative default and we skip.
+  const xdgConfig = options.env.XDG_CONFIG_HOME;
+  const homeRelativeConfig = joinPath(home, '.config');
+  if (
+    xdgConfig !== undefined &&
+    xdgConfig.length > 0 &&
+    xdgConfig.startsWith('/') &&
+    xdgConfig !== homeRelativeConfig
+  ) {
+    for (const dir of HIDE_PATHS_DIRS) {
+      if (!dir.startsWith('.config/')) continue;
+      const sub = dir.slice('.config/'.length);
+      flags.push('--tmpfs', joinPath(xdgConfig, sub));
+    }
+  }
   // For files we use `--ro-bind /dev/null <file>`. bwrap can
   // bind char devices over regular files (the mount makes the
   // file appear as /dev/null — reads return EOF, writes are

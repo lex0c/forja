@@ -2,6 +2,63 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 146: env scrub + XDG_CONFIG_HOME unmask (defense in depth)
+
+**Done.** One-hundred-forty-sixth slice. Closes the 🟠 important findings from the bash-tools code review that complement slice 145's kernel-level enforcement: userspace env scrub gaps + path-overlay coverage when XDG_CONFIG_HOME is relocated. Slice 145 closed these vectors for SANDBOXED processes via the `--clearenv` + `--setenv` allowlist; slice 146 closes them for host-profile / non-sandboxed spawn sites and any future caller that bypasses the runner. Defense in depth, not redundancy.
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **env-1** | `src/sanitize/env.ts` was missing application-runtime injection vectors flagged in the review: `NODE_OPTIONS` (Node `--require` injection), `PYTHONPATH`/`PYTHONSTARTUP`/`PYTHONUSERBASE` (Python module + startup hooks), `RUBYOPT`/`RUBYLIB` (Ruby), `PERL5OPT`/`PERL5LIB`/`PERL5DB` (Perl `-d:Module=arg` debugger injection), `BASH_ENV`/`ENV` (auto-source at every non-interactive shell start — exactly the `bash -c` shape), `PROMPT_COMMAND`, `BASH_FUNC_*` (Shellshock surface). Plus credential / egress redirect vectors: `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (egress MITM, case-insensitive — lowercase `http_proxy` is the canonical curl form), `DBUS_SESSION_BUS_ADDRESS` (host service access via secret-service / systemd dbus), `XDG_RUNTIME_DIR` (UNIX socket dir for user services). | `src/sanitize/env.ts` | +18 SCRUB_PATTERNS with documented rationale per family. `NO_PROXY` deliberately kept (exclusion list, not redirect). |
+| **xdg-cfg** | When operator relocates `XDG_CONFIG_HOME` away from `~/.config`, the 6 `.config/*` HIDE_PATHS_DIRS entries (gcloud, azure, op, sops, agent, forja) cover the WRONG path on disk: bwrap masks `<home>/.config/<sub>` while the REAL credentials sit at `$XDG_CONFIG_HOME/<sub>`. Analog of slice 140 sec-1's XDG_DATA_HOME fix, missed for the config base dir. | `src/permissions/sandbox-runner.ts` (Linux) + `src/permissions/sandbox-runner-macos.ts` (macOS parity) | Added per-runner XDG_CONFIG_HOME unmask blocks. Iterate `HIDE_PATHS_DIRS`; for each entry starting with `.config/`, emit an extra overlay rooted at the relocated XDG_CONFIG_HOME. Idempotent: when XDG_CONFIG_HOME is unset / empty / equal to `<home>/.config`, the effective path matches the canonical default and the extra rule is skipped. Defensive: non-absolute XDG values are ignored (spec-illegal). |
+
+### Defense-in-depth posture
+
+slice 145 (kernel-level via `--clearenv` + `SAFE_ENV_VARS` allowlist) is the AUTHORITATIVE shaper for sandboxed processes; nothing leaks through bwrap's argv-passed env regardless of what the caller passes. slice 146 (userspace SCRUB_PATTERNS) is the FALLBACK for the cases bwrap doesn't reach:
+
+- `host` profile (operator-opted-in passthrough, no wrap)
+- Spawn sites that don't go through `maybeWrapSandboxArgv` (future tools, MCP, etc.)
+- Pre-sandbox bootstrap when the planner picks `cwd-rw-net` but bwrap is missing (slice 145 still enforces, but multiple layers cost nothing extra)
+
+If either layer alone is bypassed by a future code path, the other still catches the injection.
+
+### Tests added (+20)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/sanitize/env.test.ts` | +11 | NODE_OPTIONS, PYTHON_*, RUBY_*, PERL5_*, BASH_ENV/ENV/PROMPT_COMMAND, BASH_FUNC_*, HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (case-insensitive), DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, NO_PROXY survives, PATH/HOME/USER/TERM survive (control). |
+| `tests/permissions/sandbox-runner.test.ts` | +5 | XDG_CONFIG_HOME unset (only canonical overlays); relocated (extra `--tmpfs` per `.config/*` entry); equal-to-default (no duplicate); non-absolute value ignored; empty string ignored. Plus cleanup-restore guard. |
+| `tests/permissions/sandbox-runner-macos.test.ts` | +4 | macOS parity: XDG_CONFIG_HOME unset / relocated / equal-to-default / non-absolute ignored. SBPL deny pairs emitted for each `.config/*` entry. |
+
+### Files changed
+
+- Code: `src/sanitize/env.ts`, `src/permissions/sandbox-runner.ts`, `src/permissions/sandbox-runner-macos.ts`
+- Tests: `tests/sanitize/env.test.ts`, `tests/permissions/sandbox-runner.test.ts`, `tests/permissions/sandbox-runner-macos.test.ts`
+- Spec: none (additive surface; protocol unchanged)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`)
+- `bun test` — **6895 pass / 10 skip / 0 fail / 17569 expect()** across 309 files (+20 over slice 145)
+
+### Remaining from bash-tools review
+
+After slice 146:
+- **slice 147** — bg lifecycle (BG1 no process-group isolation, BG2 SIGHUP/SIGKILL leaks) — 🔴 critical correctness, defer for separate slice because it touches signal handlers and lifecycle code that risks shutdown regressions
+- **slice 148** — resolver tightening (R1 pipe-to-`python -c` not detected; `exec:arbitrary` not in score weights; `cmdGit` unknown-subcommand falls to non-confirm medium; hardcoded `rm -rf /` refuse + correct `protected_paths.ts:30` comment) — 🔴 critical policy
+- **slice 149** — bash tools surface (input validation for `label`/`cwd`, ACL for `bash_output`/`bash_kill`) — 🟠 important
+- **slice 150** — resolver calibration (cmdCd / cmdSysInfo false-positive read-fs entries; cmdGit default-branch confidence; XDG_STATE_HOME / XDG_CACHE_HOME unmask when HIDE_PATHS gains entries under those dirs) — 🟡 minor
+
+### Not in scope this slice
+
+- **Symlink/realpath canonicalization for cwd guard** (review finding) — defer; needs careful design around `realpath` failure modes (broken symlink, permissions error) and a decision on whether to refuse vs degrade.
+- **`bwrap` detection shim resistance** (review finding) — defer; needs spec PR on whether to hard-pin `/usr/bin/bwrap` or accept PATH lookup.
+- **NO_PROXY allow-list** — explicitly NOT scrubbed because it's an exclusion list (hosts that bypass the proxy), not a redirect vector. Test pins this distinction.
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 145: bwrap/SBPL kernel-boundary hardening (3 critical)
 
 **Done.** One-hundred-forty-fifth slice. Closes the 3 🔴 critical sandbox findings from the bash-tools code review (slice 143 follow-up). Each one was an exploit primitive — kernel-level isolation gaps that the userspace `scrubEnv` and the single-literal SBPL deny could not cover.

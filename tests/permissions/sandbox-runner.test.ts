@@ -682,6 +682,116 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
   });
 });
 
+// Slice 146 (review minor): XDG_CONFIG_HOME unmask — same shape as
+// slice 140 sec-1 but for the config-XDG root. The 6 `.config/*`
+// HIDE_PATHS_DIRS entries (gcloud, azure, op, sops, agent, forja)
+// all live under `$XDG_CONFIG_HOME/<sub>` when the operator
+// relocates the config dir away from `~/.config`. Pre-slice the
+// bwrap overlay masked `<home>/.config/<sub>` while the REAL
+// credentials sat at the relocated XDG path. Build-time overlay
+// closes the gap.
+describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => {
+  const restoreEnv = (): void => {
+    delete process.env.XDG_CONFIG_HOME;
+  };
+
+  test('XDG_CONFIG_HOME unset: only canonical home-relative overlays', () => {
+    delete process.env.XDG_CONFIG_HOME;
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: INNER,
+      env: {},
+    });
+    const argvStr = argv.join(' ');
+    // The canonical home-relative overlays ARE present.
+    expect(argvStr).toContain('--tmpfs /home/op/.config/gcloud');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/forja');
+    // No tmpfs pointing at `/srv/conf/...` etc. (XDG unset).
+    expect(argvStr).not.toContain('/srv/conf');
+  });
+
+  test('XDG_CONFIG_HOME relocated: extra overlay for each .config/* entry', () => {
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: INNER,
+      env: { XDG_CONFIG_HOME: '/srv/conf' },
+    });
+    const argvStr = argv.join(' ');
+    // Canonical home-relative overlays still present (defense
+    // against process-env override at runtime).
+    expect(argvStr).toContain('--tmpfs /home/op/.config/gcloud');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/azure');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/op');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/sops');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/agent');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/forja');
+    // Plus the XDG-relocated overlays, one per .config/* entry.
+    expect(argvStr).toContain('--tmpfs /srv/conf/gcloud');
+    expect(argvStr).toContain('--tmpfs /srv/conf/azure');
+    expect(argvStr).toContain('--tmpfs /srv/conf/op');
+    expect(argvStr).toContain('--tmpfs /srv/conf/sops');
+    expect(argvStr).toContain('--tmpfs /srv/conf/agent');
+    expect(argvStr).toContain('--tmpfs /srv/conf/forja');
+  });
+
+  test('XDG_CONFIG_HOME equal to home-relative default: no duplicate overlays', () => {
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: INNER,
+      env: { XDG_CONFIG_HOME: '/home/op/.config' },
+    });
+    // Each .config/* HIDE entry should produce EXACTLY one
+    // --tmpfs. Slice 146 skipped because effective path matches
+    // the home-relative default.
+    const gcloudTmpfsCount = argv.filter(
+      (v, i) => v === '--tmpfs' && argv[i + 1] === '/home/op/.config/gcloud',
+    ).length;
+    expect(gcloudTmpfsCount).toBe(1);
+  });
+
+  test('XDG_CONFIG_HOME with non-absolute value is ignored (defensive)', () => {
+    // Relative XDG paths are spec-illegal; treat as unset to avoid
+    // building an undefined overlay. POSIX consumers also skip.
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: INNER,
+      env: { XDG_CONFIG_HOME: 'relative/path' },
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).not.toContain('relative/path');
+  });
+
+  test('XDG_CONFIG_HOME empty string is ignored', () => {
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: INNER,
+      env: { XDG_CONFIG_HOME: '' },
+    });
+    // No extra overlays beyond the canonical home-relative ones.
+    const gcloudTmpfsCount = argv.filter(
+      (v, i) => v === '--tmpfs' && argv[i + 1] === '/home/op/.config/gcloud',
+    ).length;
+    expect(gcloudTmpfsCount).toBe(1);
+  });
+
+  // Restore env in afterAll so other test files don't see leakage.
+  // No beforeEach reset needed — each test sets XDG explicitly.
+  test('cleanup: restore process.env.XDG_CONFIG_HOME', () => {
+    restoreEnv();
+    expect(process.env.XDG_CONFIG_HOME).toBeUndefined();
+  });
+});
+
 // Slice 145 (S1 — sandbox hardening): the four sandboxed profiles
 // MUST unshare UTS / IPC / cgroup namespaces and start a new
 // session. Pre-slice only pid was unshared, leaving four escape

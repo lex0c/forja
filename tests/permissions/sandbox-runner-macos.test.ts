@@ -485,3 +485,72 @@ describe('buildSbplProfile — XDG_DATA_HOME unmask defense (slice 140 sec-1)', 
     }
   });
 });
+
+// Slice 146: XDG_CONFIG_HOME unmask — macOS parity with the Linux
+// runner. Same threat: the 6 `.config/*` HIDE_PATHS_DIRS entries
+// (gcloud, azure, op, sops, agent, forja) live under
+// `$XDG_CONFIG_HOME/<sub>` when relocated. Pre-slice the SBPL deny
+// covered `<home>/.config/<sub>` only.
+describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () => {
+  const originalXdg = process.env.XDG_CONFIG_HOME;
+
+  const restoreEnv = (): void => {
+    if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = originalXdg;
+  };
+
+  test('XDG_CONFIG_HOME unset: only canonical home-relative denys', () => {
+    delete process.env.XDG_CONFIG_HOME;
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      // Canonical home-relative subpath deny present.
+      expect(profile).toContain('(deny file-read* (subpath "/Users/op/.config/gcloud"))');
+      // No /srv/conf path (XDG unset).
+      expect(profile).not.toContain('/srv/conf');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_CONFIG_HOME relocated: extra deny pair for each .config/* entry', () => {
+    process.env.XDG_CONFIG_HOME = '/srv/conf';
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      // Canonical home-relative denys still present (defense in depth).
+      expect(profile).toContain('(deny file-read* (subpath "/Users/op/.config/gcloud"))');
+      // Plus XDG-relocated denys, one read + one write per entry.
+      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/gcloud"))');
+      expect(profile).toContain('(deny file-write* (subpath "/srv/conf/gcloud"))');
+      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/azure"))');
+      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/op"))');
+      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/sops"))');
+      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/agent"))');
+      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/forja"))');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_CONFIG_HOME equal to home-relative default: no duplicate rules', () => {
+    process.env.XDG_CONFIG_HOME = '/Users/op/.config';
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      // Exactly one read+write pair on each .config/* subpath.
+      const gcloudReadMatches =
+        profile.match(/\(deny file-read\* \(subpath "[^"]*\.config\/gcloud"\)\)/g) ?? [];
+      expect(gcloudReadMatches.length).toBe(1);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_CONFIG_HOME with non-absolute value is ignored (defensive)', () => {
+    process.env.XDG_CONFIG_HOME = 'relative/path';
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      expect(profile).not.toContain('relative/path');
+    } finally {
+      restoreEnv();
+    }
+  });
+});

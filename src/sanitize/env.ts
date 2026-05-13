@@ -71,6 +71,75 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /^DYLD_FALLBACK_LIBRARY_PATH$/,
   /^DYLD_LIBRARY_PATH$/,
   /^SUDO_ASKPASS$/,
+  // Slice 146 (review minor): application-runtime injection points.
+  // Slice 142 closed the dynamic-linker surface; these are the
+  // same threat shape one level up — language runtime startup
+  // hooks that execute attacker-controlled code BEFORE the user
+  // script runs.
+  //
+  //   NODE_OPTIONS         `--require /tmp/x.js` runs in every
+  //                        Node child inheriting the env.
+  //   PYTHONPATH           injects modules into Python's import
+  //                        search path; `usercustomize.py` /
+  //                        `sitecustomize.py` then run automatically.
+  //   PYTHONSTARTUP        path to a script Python runs at REPL
+  //                        startup; abused by interactive python -i.
+  //   PYTHONUSERBASE       relocates user-site packages — a copy
+  //                        of `usercustomize.py` lands here.
+  //   RUBYOPT / RUBYLIB    Ruby equivalent of NODE_OPTIONS /
+  //                        PYTHONPATH (`-rmodule` autorequires).
+  //   PERL5OPT / PERL5LIB / PERL5DB
+  //                        Perl injection (`-d:Module=arg` runs
+  //                        Module->import('arg') in debugger).
+  //   BASH_ENV             bash auto-sources this file at every
+  //                        non-interactive shell start — exactly
+  //                        the shape `bash -c "..."` takes.
+  //   ENV                  sh/ksh equivalent of BASH_ENV.
+  //   PROMPT_COMMAND       bash evaluates this on every prompt
+  //                        in interactive shells (lower threat
+  //                        for our non-interactive use, but
+  //                        defense in depth).
+  //   BASH_FUNC_*          Shellshock surface — bash imports
+  //                        functions from env via this prefix on
+  //                        old enough bash; defending even on
+  //                        patched systems is cheap.
+  //
+  // Plus proxy + dbus + XDG runtime — these don't run code on
+  // their own but redirect / hand the LLM a privileged channel:
+  //   HTTP_PROXY / HTTPS_PROXY / ALL_PROXY
+  //                        any HTTP-aware tool the sandbox spawns
+  //                        (curl, wget, fetch APIs) honors these
+  //                        and redirects all egress through
+  //                        attacker.example.com — MITM the
+  //                        sandbox's network on a cwd-rw-net
+  //                        profile. Case-insensitive: lowercase
+  //                        `http_proxy` is the canonical curl form.
+  //   DBUS_SESSION_BUS_ADDRESS
+  //                        path to the operator's session DBus
+  //                        socket. A sandboxed process can ask
+  //                        secret-service / org.freedesktop.systemd1
+  //                        / gnome-keyring to act on its behalf.
+  //   XDG_RUNTIME_DIR      `/run/user/<uid>` typically — holds
+  //                        UNIX sockets for active user services
+  //                        (gpg-agent, ssh-agent variants, etc.).
+  /^NODE_OPTIONS$/,
+  /^PYTHONPATH$/,
+  /^PYTHONSTARTUP$/,
+  /^PYTHONUSERBASE$/,
+  /^RUBYOPT$/,
+  /^RUBYLIB$/,
+  /^PERL5OPT$/,
+  /^PERL5LIB$/,
+  /^PERL5DB$/,
+  /^BASH_ENV$/,
+  /^ENV$/,
+  /^PROMPT_COMMAND$/,
+  /^BASH_FUNC_/,
+  /^HTTP_PROXY$/i,
+  /^HTTPS_PROXY$/i,
+  /^ALL_PROXY$/i,
+  /^DBUS_SESSION_BUS_ADDRESS$/,
+  /^XDG_RUNTIME_DIR$/,
 ];
 
 // Returns a defensive copy with credential-like vars removed. Undefined

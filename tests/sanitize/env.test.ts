@@ -171,6 +171,109 @@ describe('scrubEnv', () => {
     });
   });
 
+  // Slice 146 (review minor): runtime injection vectors one level
+  // above the dynamic linker — language startup hooks (NODE_OPTIONS,
+  // PYTHONPATH, RUBYOPT, PERL5OPT, BASH_ENV) and credential /
+  // egress redirect (HTTP_PROXY, DBUS_SESSION_BUS_ADDRESS,
+  // XDG_RUNTIME_DIR). Defense in depth: the bwrap kernel allowlist
+  // (slice 145 S2) handles SANDBOXED processes; this list handles
+  // host-profile / non-sandboxed spawn sites + any future spawn
+  // site that bypasses the runner.
+  describe('slice 146 — application-runtime injection points', () => {
+    test('drops NODE_OPTIONS (Node --require injection)', () => {
+      const out = scrubEnv({ NODE_OPTIONS: '--require /tmp/x.js', KEEP: 'v' });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops PYTHONPATH / PYTHONSTARTUP / PYTHONUSERBASE', () => {
+      const out = scrubEnv({
+        PYTHONPATH: '/tmp/py',
+        PYTHONSTARTUP: '/tmp/start.py',
+        PYTHONUSERBASE: '/tmp/userbase',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops RUBYOPT / RUBYLIB', () => {
+      const out = scrubEnv({
+        RUBYOPT: '-rmodule',
+        RUBYLIB: '/tmp/rb',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops PERL5OPT / PERL5LIB / PERL5DB', () => {
+      const out = scrubEnv({
+        PERL5OPT: '-d:Module=arg',
+        PERL5LIB: '/tmp/perl',
+        PERL5DB: 'BEGIN{system("id")}',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops BASH_ENV / ENV / PROMPT_COMMAND', () => {
+      const out = scrubEnv({
+        BASH_ENV: '/tmp/bashenv',
+        ENV: '/tmp/env',
+        PROMPT_COMMAND: 'echo pwned',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops BASH_FUNC_* (Shellshock surface)', () => {
+      // `BASH_FUNC_foo%%` is the canonical Shellshock injection
+      // shape; any var starting with BASH_FUNC_ is suspect.
+      const out = scrubEnv({
+        'BASH_FUNC_x%%': '() { :; }; id',
+        BASH_FUNC_legitimate: 'something',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (case-insensitive)', () => {
+      // curl honors lowercase forms; uppercase + lowercase both.
+      const out = scrubEnv({
+        HTTP_PROXY: 'http://attacker.example.com',
+        HTTPS_PROXY: 'http://attacker.example.com',
+        ALL_PROXY: 'socks5://attacker.example.com:1080',
+        http_proxy: 'http://attacker.example.com',
+        https_proxy: 'http://attacker.example.com',
+        all_proxy: 'socks5://attacker.example.com',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('drops DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR (host service access)', () => {
+      const out = scrubEnv({
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
+        XDG_RUNTIME_DIR: '/run/user/1000',
+        KEEP: 'v',
+      });
+      expect(out).toEqual({ KEEP: 'v' });
+    });
+    test('NO_PROXY survives (exclusion list, not redirect)', () => {
+      // NO_PROXY is an allow-list of hosts that bypass the proxy,
+      // not a redirect vector. Defensible to keep.
+      const out = scrubEnv({ NO_PROXY: 'localhost,127.0.0.1', KEEP: 'v' });
+      expect(out).toEqual({ NO_PROXY: 'localhost,127.0.0.1', KEEP: 'v' });
+    });
+    test('PATH / HOME / USER / TERM still survive (control: scope discipline)', () => {
+      // Make sure the new patterns don't accidentally over-match
+      // legitimate vars. Common-name vars must still pass.
+      const out = scrubEnv({
+        PATH: '/usr/bin',
+        HOME: '/home/op',
+        USER: 'op',
+        TERM: 'xterm',
+      });
+      expect(out).toEqual({
+        PATH: '/usr/bin',
+        HOME: '/home/op',
+        USER: 'op',
+        TERM: 'xterm',
+      });
+    });
+  });
+
   // Slice 129 (R5 P0-3): GIT_CONFIG_* env vars bypass the slice 128
   // `-c` argv refuse path. Confirm every git-config-via-env shape
   // is scrubbed.

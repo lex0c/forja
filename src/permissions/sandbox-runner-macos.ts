@@ -245,6 +245,30 @@ export const buildSbplProfile = (
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
     denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
   }
+  // Slice 146 (review minor): XDG_CONFIG_HOME unmask — macOS
+  // parity with the Linux runner. Same shape as the XDG_DATA_HOME
+  // block above; covers `.config/*` HIDE_PATHS_DIRS entries when
+  // the operator relocated XDG_CONFIG_HOME outside `~/.config`.
+  // Read env directly here for parity with `defaultDataDir()`
+  // above (the macOS SBPL builder doesn't take an env param
+  // because it doesn't need `--clearenv` / `--setenv` like bwrap).
+  const xdgConfig = process.env.XDG_CONFIG_HOME;
+  const homeRelativeConfig = joinPath(home, '.config');
+  if (
+    xdgConfig !== undefined &&
+    xdgConfig.length > 0 &&
+    xdgConfig.startsWith('/') &&
+    xdgConfig !== homeRelativeConfig
+  ) {
+    for (const dir of HIDE_PATHS_DIRS) {
+      if (!dir.startsWith('.config/')) continue;
+      const sub = dir.slice('.config/'.length);
+      const absDir = joinPath(xdgConfig, sub);
+      const escaped = escapeSbplLiteral(absDir);
+      denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
+      denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
+    }
+  }
 
   return [...header, ...readRules, ...writeRules, ...netRules, ...denyRules].join('\n');
 };
