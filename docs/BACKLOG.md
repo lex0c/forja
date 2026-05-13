@@ -2,6 +2,65 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 147: resolver tightening (R1 + exec:arbitrary score + rm-rf root)
+
+**Done.** One-hundred-forty-seventh slice. Closes the 🔴 critical policy findings from the bash-tools code review: pipe-to-interpreter detection gap, `exec:arbitrary` missing from the score weights (package managers auto-allow), and the absent hardcoded refuse for `rm -rf /` (despite a comment in `protected_paths.ts:30` claiming one existed). Each fix is small but high-impact: the existing defenses (score gate + default-deny + classifyProtectedPath) held under default config, but a permissive `allow delete-fs:/**` rule would have silently auto-allowed catastrophic deletions.
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **R1** | `... \| python -c '...'` / `... \| node` / `... \| xargs sh -c '...'` were not detected as pipe-to-shell. `SHELL_INTERPRETERS` covered only shell binaries (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`), letting interpreters that read stdin as code slip through. Spec §5.2 lists `python -c` explicitly as Refuse. | `src/permissions/resolvers/bash.ts:234-262` | Expanded `SHELL_INTERPRETERS` to include `python`, `python3`, `node`, `nodejs`, `ruby`, `perl`, `php`, `lua`, `luajit`. Added `xargs <interpreter>` detection: when the last pipe stage is `xargs`, scan its arg children for any embedded shell-interpreter literal. Over-refuses for `xargs --some-flag bash` (where bash isn't actually exec'd) but under-refuses nothing dangerous. |
+| **exec-arb** | `cmdNpmLike` / `cmdPip` / `cmdMake` / `cmdCargo` and the conservative-fallback for unknown commands emit `exec:arbitrary` + `medium` confidence. `exec:arbitrary` didn't qualify under `capability_risk` (which gates on delete-fs / git-write / env-mutate / agent-mutate) and had no dedicated weight. Total score: `confidence_medium` (+0.10) alone — well under the 0.4 confirm threshold. `npm install` / `pip install` / `cargo build` / `make` auto-allowed under default policy. | `src/permissions/risk-score.ts` | Added `exec_arbitrary: 0.3` to `RISK_SCORE_WEIGHTS`. New feature in `computeRiskScore` matches any capability with `kind: 'exec'` and `scope: 'arbitrary'` (intentionally excludes `exec:shell`/`exec:python`/`exec:node`). Total now: exec_arbitrary (0.30) + confidence_medium (0.10) = 0.40, hitting the threshold for confirm upgrade. |
+| **rm-root** | `cmdRm` emitted `delete-fs(<resolved-path>)` without a literal blocklist. `classifyProtectedPath('/', 'write')` returned `null` because `SYSTEM_DENY_ROOTS = ['/proc', '/sys', '/boot', '/dev']` didn't include `/`, `/etc`, `/home`, etc. `/etc` was an `escalate` (confirm), but `/`, `/home`, `/usr`, `/root` were classified-null. Score gate + default-deny vetoed `rm -rf /` under default config (capability_risk + workspace_escape + blocklist_command ≈ 0.85 → confirm), but a permissive `allow delete-fs:/**` would have auto-allowed. The comment in `protected_paths.ts:30` even CLAIMED a "bash deny list" caught `rm -rf /` — that list didn't exist. | `src/permissions/resolvers/bash.ts` (`cmdRm`) + `src/permissions/protected_paths.ts:30-35` (comment fix) | New `RM_REFUSE_ROOTS` set (`/`, `/etc`, `/usr`, `/var`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/boot`, `/root`, `/opt`, `/home`, `/dev`, `/proc`, `/sys`). `cmdRm` refuses BEFORE emitting `delete-fs` if any positional resolves to a member, OR resolves to `ctx.home` (catches `rm -rf ~` and `rm -rf $HOME`). Policy-independent: a permissive `allow delete-fs:/**` no longer bypasses this. Comment in `protected_paths.ts` rewritten to reflect the actual defense surface. |
+
+### Tests added (+34)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/permissions/resolvers.test.ts` | +21 | R1: 8 tests pinning pipe-to-python / -python3 / -node / -nodejs / -ruby / -perl / -php / -lua + xargs-wrapped sh / bash / python / `-I {} sh -c` + xargs-without-interpreter NOT caught. rm-root: 13 tests pinning each member of `RM_REFUSE_ROOTS` as Refused, `rm -rf ~` as Refused (operator home), legitimate cwd file still passes through as Ok, descendants (`rm -rf /var/log/oldfile`) NOT root-refused. |
+| `tests/permissions/risk-score.test.ts` | +5 | exec:arbitrary triggers the weight; exec:shell / exec:python / exec:node do NOT; combined with medium confidence the total crosses 0.4 (the motivating shape); multiple exec:arbitrary caps don't double-count. |
+| `tests/conformance/cases/static_rules.yaml` | 2 updated | Two lock-semantics test cases that used `rm -rf /` as a "dangerous command policy-denies" example — now use `rm -rf /work/proj/junk` so the resolver passes through to the policy stage. The RM_REFUSE_ROOTS path is exercised in the resolver suite. |
+| `tests/permissions/engine.test.ts` | 3 updated | Bypass-mode test, deny-rule source attribution, and provenance fallback — same reason as conformance: `rm -rf /` is now resolver-refused BEFORE policy attribution, so testing policy semantics requires a path the resolver accepts. |
+| `tests/cli/slash/commands.test.ts` | 1 updated | `/perms why` deny-rule rendering test: same path swap. |
+
+### Files changed
+
+- Code: `src/permissions/resolvers/bash.ts`, `src/permissions/risk-score.ts`, `src/permissions/protected_paths.ts`
+- Tests: 5 files above
+- Spec: none (runtime fixes; spec §5.2 / §6.3 / §6.6 already documented the desired behavior)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`)
+- `bun test` — **6927 pass / 10 skip / 0 fail / 17611 expect()** across 309 files (+32 net new tests over slice 146 — 34 new minus 2 reattributed lock-semantics tests that retained their count)
+
+### Defense layering
+
+After slice 147, `rm -rf /` is rejected through THREE independent layers:
+1. **Resolver-level refuse** (NEW) — `cmdRm` Refuses via `RM_REFUSE_ROOTS` before emitting capabilities. Policy-independent.
+2. **Score gate** — `capability_risk` (delete-fs is dangerous) + `workspace_escape` (`/` is outside cwd) + `blocklist_command` (`rm -rf` substring) = 0.85, far above the 0.4 confirm threshold.
+3. **Default-deny** — without an explicit `allow delete-fs:/**` rule in policy, the engine's default-deny vetoes.
+
+Same triple-layer protection now applies to `npm install` / `pip install` / `cargo build` / `make`: resolver emits `exec:arbitrary` + `medium`, score gate fires the new `exec_arbitrary` weight + `confidence_medium`, total 0.40 → confirm. Operators who want package managers to run without prompt add `allow exec:arbitrary` explicitly (eyes-open).
+
+### Remaining from bash-tools review
+
+After slice 147:
+- **slice 148** — bg lifecycle (BG1 no process-group isolation, BG2 SIGHUP/SIGKILL leaks) — 🔴 critical correctness, defer for separate slice (touches signal handlers / process groups, risks shutdown regressions)
+- **slice 149** — bash tools surface (input validation for `label`/`cwd` types; ACL for `bash_output`/`bash_kill` to gate subagent inherited PIDs) — 🟠 important
+- **slice 150** — resolver calibration (cmdGit unknown subcommand confidence drop to low; cmdCd false-positive read-fs; cmdSysInfo false-positive readFs('/etc') for date/uptime/hostname; XDG_STATE_HOME / XDG_CACHE_HOME unmask when HIDE_PATHS gains entries under those dirs) — 🟡 minor
+
+### Not in scope this slice
+
+- **bg stdout/stderr unbounded growth** — defer to slice 148 (same bg subsystem)
+- **bg concurrent kill() race** — defer to slice 148
+- **HIDE_PATHS expansion** (`.gitconfig`, `.cargo/credentials.toml`, etc.) — separate cluster from policy tightening, defer
+- **macOS `/tmp` shared between sandbox+host** — needs design (mktemp + TMPDIR= override or accept as documented divergence)
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 146: env scrub + XDG_CONFIG_HOME unmask (defense in depth)
 
 **Done.** One-hundred-forty-sixth slice. Closes the 🟠 important findings from the bash-tools code review that complement slice 145's kernel-level enforcement: userspace env scrub gaps + path-overlay coverage when XDG_CONFIG_HOME is relocated. Slice 145 closed these vectors for SANDBOXED processes via the `--clearenv` + `--setenv` allowlist; slice 146 closes them for host-profile / non-sandboxed spawn sites and any future caller that bypasses the runner. Defense in depth, not redundancy.

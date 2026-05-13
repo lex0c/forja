@@ -148,6 +148,53 @@ describe('computeRiskScore — untrusted_egress', () => {
   });
 });
 
+// Slice 147 (review): `exec:arbitrary` had no dedicated score
+// weight. `cmdNpmLike`/`cmdPip`/`cmdMake`/`cmdCargo` and the
+// Conservative-fallback for unknown commands emit it at medium
+// confidence (+0.10 only); without a weight the total stayed ~0.10,
+// auto-allowing every package-manager invocation under default
+// policy. New 0.30 weight pushes the total above the 0.4 confirm
+// threshold when combined with medium confidence.
+describe('computeRiskScore — exec_arbitrary (slice 147)', () => {
+  test('exec:arbitrary capability triggers the weight', () => {
+    const r = computeRiskScore(baseInput({ capabilities: [exec('arbitrary')] }));
+    expect(r.components.exec_arbitrary).toBe(RISK_SCORE_WEIGHTS.exec_arbitrary);
+  });
+
+  test('exec:shell does NOT trigger exec_arbitrary (every bash call emits it)', () => {
+    const r = computeRiskScore(baseInput({ capabilities: [exec('shell')] }));
+    expect(r.components.exec_arbitrary).toBeUndefined();
+  });
+
+  test('exec:python / exec:node do NOT trigger exec_arbitrary (interpreter-specific)', () => {
+    expect(
+      computeRiskScore(baseInput({ capabilities: [exec('python')] })).components.exec_arbitrary,
+    ).toBeUndefined();
+    expect(
+      computeRiskScore(baseInput({ capabilities: [exec('node')] })).components.exec_arbitrary,
+    ).toBeUndefined();
+  });
+
+  test('exec:arbitrary + medium confidence crosses 0.4 confirm threshold', () => {
+    // The motivating shape: npm install / pip install / cargo build
+    // / make → cmdNpmLike etc. return exec:arbitrary + 'medium'.
+    // Total: exec_arbitrary (0.30) + confidence_medium (0.10) = 0.40.
+    // At default scoreConfirmThreshold (0.4), the >= comparison fires
+    // and allow upgrades to confirm.
+    const r = computeRiskScore(
+      baseInput({ capabilities: [exec('arbitrary')], confidence: 'medium' }),
+    );
+    expect(r.score).toBeCloseTo(0.4, 5);
+  });
+
+  test('multiple exec:arbitrary caps do not double-count', () => {
+    // Score features are boolean (presence), not additive over
+    // capability count — same as capability_risk, wildcard_scope, etc.
+    const r = computeRiskScore(baseInput({ capabilities: [exec('arbitrary'), exec('arbitrary')] }));
+    expect(r.components.exec_arbitrary).toBe(RISK_SCORE_WEIGHTS.exec_arbitrary);
+  });
+});
+
 describe('computeRiskScore — recent_errors', () => {
   test('counter < 3 does not trigger', () => {
     expect(

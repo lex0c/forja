@@ -118,7 +118,12 @@ describe('engine modes', () => {
       }),
       { cwd: CWD },
     );
-    expect(eng.check('bash', 'bash', { command: 'rm -rf /' }).kind).toBe('allow');
+    // Slice 147: use a cwd-relative path that passes the resolver
+    // (the hardcoded RM_REFUSE_ROOTS blocklist now Refuses `rm -rf /`
+    // BEFORE policy is consulted; that's a separate test in the
+    // resolver suite). The point here is bypass mode allows past
+    // policy deny rules.
+    expect(eng.check('bash', 'bash', { command: 'rm -rf /work/proj/junk' }).kind).toBe('allow');
   });
 
   // Slice 97 — R1 #4: bypass mode previously skipped §11 protected
@@ -775,7 +780,12 @@ describe('Decision.source provenance', () => {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
-    const d = eng.check('bash', 'bash', { command: 'rm -rf /' });
+    // Slice 147: use cwd-relative path; the hardcoded RM_REFUSE_ROOTS
+    // blocklist catches `rm -rf /` BEFORE policy attribution, so the
+    // source ends up `{ section: 'resolver-refuse' }` instead of the
+    // policy layer. Asserting the policy attribution requires a
+    // command the resolver passes through.
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /work/proj/junk' });
     expect(d.kind).toBe('deny');
     expect(d.source).toEqual({ layer: 'project', rule: 'rm -rf *', section: 'bash' });
   });
@@ -924,7 +934,9 @@ describe('Decision.source provenance', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
       cwd: CWD,
     });
-    const d = eng.check('bash', 'bash', { command: 'rm -rf /' });
+    // Slice 147: cwd-relative path so the policy attribution path
+    // wins over the resolver's RM_REFUSE_ROOTS hardcoded refuse.
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /work/proj/junk' });
     expect(d.kind).toBe('deny');
     expect(d.source).toEqual({ layer: 'default', rule: 'rm -rf *', section: 'bash' });
   });

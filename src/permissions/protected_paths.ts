@@ -26,9 +26,14 @@
 // Bash-side enforcement (a `bash` tool running `rm -rf /etc`) is NOT
 // covered here: bash invocations consult `tools.bash`, not `tools.*_file`.
 // Closing that gap requires the bash AST resolver (PERMISSION_ENGINE.md
-// §5.2). The current `agent init` baseline catches the obvious shapes
-// (`rm -rf /*`, `rm -rf /`) via the bash deny list; this module catches
-// fs-tool-driven attempts.
+// §5.2). Slice 147 (review fix): the bash resolver's `cmdRm` carries
+// the hardcoded `RM_REFUSE_ROOTS` blocklist for `rm` arguments that
+// resolve to `/`, `/etc`, `/usr`, `/home`, `~`, etc. — the literal
+// blocklist this comment pre-slice CLAIMED existed but didn't. The
+// score gate (capability_risk + workspace_escape + blocklist_command)
+// still adds defense in depth for non-rm shapes (e.g. `find / -delete`).
+// This module catches fs-tool-driven attempts (`write_file`, `edit_file`,
+// `glob`, `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
 

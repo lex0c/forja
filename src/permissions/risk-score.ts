@@ -150,12 +150,28 @@ export const RECENT_ERRORS_THRESHOLD = 3;
 // the way to evolve the score; the score field in audit_log
 // version-tags via the engine version line so historical replays
 // stay reproducible.
+//
+// Slice 147 (review minor): `exec_arbitrary` added. Pre-slice the
+// `exec:arbitrary` capability (emitted by `cmdNpmLike`, `cmdPip`,
+// `cmdMake`, `cmdCargo`, and the conservative-fallback for unknown
+// commands) had no dedicated weight; it didn't qualify under
+// `capability_risk` either (which is gated on delete-fs / git-write
+// / env-mutate / agent-mutate). Result: `npm install`, `pip install`,
+// `cargo build` resolved to `exec:arbitrary` + medium confidence
+// (+0.10) for a total score of ~0.10 — silently auto-allowed even
+// though every one of those commands is a supply-chain attack
+// surface. New 0.30 weight pushes the total to 0.40, exactly at
+// the §6.6 confirm threshold; combined with medium confidence
+// (+0.10) it crosses cleanly into confirm. Operators who want
+// package managers to run without prompt can add an explicit
+// `allow exec:arbitrary` rule (eyes-open) or use grants.
 export const RISK_SCORE_WEIGHTS = {
   capability_risk: 0.4,
   wildcard_scope: 0.2,
   workspace_escape: 0.15,
   blocklist_command: 0.3,
   untrusted_egress: 0.25,
+  exec_arbitrary: 0.3,
   recent_errors: 0.15,
   shell_complex: 0.2,
   mcp_tool: 0.1,
@@ -206,6 +222,20 @@ export const computeRiskScore = (input: RiskScoreInput): RiskScoreOutput => {
     )
   ) {
     components.untrusted_egress = RISK_SCORE_WEIGHTS.untrusted_egress;
+  }
+
+  // Slice 147 (review minor): `exec:arbitrary` capability lacks a
+  // dedicated DANGEROUS_KIND entry above (it doesn't write/delete
+  // by itself), but it IS the canonical "I'm about to run code
+  // you didn't whitelist" signal. cmdNpmLike / cmdPip / cmdMake /
+  // cmdCargo emit it for package install + build commands; the
+  // bash resolver's Conservative fallback also emits it for
+  // unknown commands. Without this weight those calls slipped
+  // under the confirm threshold. `exec:shell` (every plain `bash`
+  // call) and `exec:python` / `exec:node` (interpreter w/ `-c`)
+  // are explicitly excluded — they're routine.
+  if (input.capabilities.some((c) => c.kind === 'exec' && c.scope === 'arbitrary')) {
+    components.exec_arbitrary = RISK_SCORE_WEIGHTS.exec_arbitrary;
   }
 
   // Recent errors — caller-supplied counter. Threshold per spec.

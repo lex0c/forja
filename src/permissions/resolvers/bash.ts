@@ -231,6 +231,24 @@ const isHardRefuseCommand = (name: string): boolean => {
 // Pipe-to-shell pattern detection. A pipeline whose final stage is a
 // shell interpreter (`sh`, `bash`, `zsh`, etc.) reads its stdin as a
 // script — fully arbitrary. Refuse.
+//
+// Slice 147 (review R1): expanded beyond shells. Spec §5.2's
+// "pipe-to-X" pattern is canonical for `... | sh`, but the same
+// vector applies to ANY interpreter that reads stdin as code when
+// invoked without an explicit script argument:
+//
+//   python / python3   — `python` no-arg reads stdin as Python script
+//   node / nodejs      — `node` no-arg drops to REPL but `node -` reads
+//                        stdin as JS; pipe-to-node is the same threat
+//   ruby               — `ruby` no-arg reads stdin as Ruby script
+//   perl               — `perl` no-arg reads stdin as Perl script
+//   php                — `php --` reads stdin as PHP script
+//   lua / luajit       — `lua` no-arg reads stdin
+//
+// `tee` / `xargs` / `awk` / `sed` are NOT in the list — they take
+// their script from arguments, not from stdin. `xargs sh -c` is a
+// separate shape: the last-pipe-stage's command_name is `xargs`,
+// not the inner interpreter. Caught below via `detectXargsToShell`.
 const SHELL_INTERPRETERS: ReadonlySet<string> = new Set([
   'sh',
   'bash',
@@ -238,6 +256,15 @@ const SHELL_INTERPRETERS: ReadonlySet<string> = new Set([
   'dash',
   'ksh',
   'fish',
+  'python',
+  'python3',
+  'node',
+  'nodejs',
+  'ruby',
+  'perl',
+  'php',
+  'lua',
+  'luajit',
 ]);
 
 // ─── COMMAND_TABLE ─────────────────────────────────────────────
@@ -328,9 +355,64 @@ const cmdFind: CommandResolver = (positional, tokens, ctx) => {
   };
 };
 
+// Slice 147 (review): hardcoded refuse list for `rm` arguments
+// that point at system roots or the operator's home. Spec §5.2
+// and the comment in `protected_paths.ts:30` BOTH claim a "bash
+// deny list" catches `rm -rf /` — pre-slice that list didn't
+// exist. Defense in depth: `classifyProtectedPath` covers
+// individual sensitive subpaths (`/etc`, `~/.ssh`, etc.) as
+// `escalate` (write upgrades to confirm), but `/` itself wasn't
+// in any list. The score gate (capability_risk + workspace_escape
+// + blocklist_command ≈ 0.85) DID push `rm -rf /` to confirm under
+// default policy, and default-deny vetoed without an allow rule —
+// but a permissive `allow delete-fs:/**` (which `parsePolicy`
+// doesn't reject for glob shapes) would silently auto-allow.
+// Hardcoded refuse is policy-independent.
+//
+// Entries are POSIX system root dirs whose deletion catastrophically
+// breaks the host. The list intentionally OMITS `/tmp`, `/var/log`,
+// `/var/tmp` — those are legitimately rm-able under workflows.
+const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
+  '/',
+  '/etc',
+  '/usr',
+  '/var',
+  '/lib',
+  '/lib64',
+  '/bin',
+  '/sbin',
+  '/boot',
+  '/root',
+  '/opt',
+  '/home',
+  '/dev',
+  '/proc',
+  '/sys',
+]);
+
 const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
   if (positional.length === 0) {
     return { refuse: 'rm: missing target' };
+  }
+  // Slice 147 (review): hardcoded refuse for catastrophic targets.
+  // Runs BEFORE delete-fs capability emission so the refusal is
+  // attributed to the resolver (forensically traceable to a
+  // specific spec line) rather than to a downstream policy check
+  // that could be misconfigured away.
+  for (const arg of positional) {
+    const resolved = resolveArg(arg, ctx);
+    if (RM_REFUSE_ROOTS.has(resolved)) {
+      return {
+        refuse: `rm: refuse to delete system root '${resolved}' (hardcoded blocklist; spec §5.2)`,
+      };
+    }
+    // `rm -rf ~` resolves to `ctx.home`. `rm -rf $HOME` also.
+    // Catching the resolved home value covers both shapes.
+    if (resolved === ctx.home && ctx.home !== '') {
+      return {
+        refuse: `rm: refuse to delete operator home '${resolved}' (hardcoded blocklist; spec §5.2)`,
+      };
+    }
   }
   return {
     capabilities: positional.map((p) => deleteFs(resolveArg(p, ctx))),
@@ -1766,6 +1848,16 @@ const walkAst = (root: Node): WalkResult => {
 
 // Detect pipe-to-shell on a `pipeline` node. Returns the offending
 // stage name when found.
+//
+// Slice 147 (review R1): added xargs-to-interpreter detection.
+// `... | xargs sh -c '<arg>'` is the canonical xargs-as-exec
+// pattern: xargs reads stdin lines and passes each as positional
+// args to the inner command. When that inner command is a shell
+// or interpreter, every line becomes an exec'd script. The last
+// pipe stage's command_name is `xargs`, not the inner interpreter
+// — pre-slice the detection bailed out on `xargs` because it
+// wasn't in `SHELL_INTERPRETERS`. Now we additionally scan the
+// xargs argv for any embedded interpreter token.
 const detectPipeToShell = (root: Node): string | null => {
   const pipelines = root.descendantsOfType('pipeline');
   for (const pipeline of pipelines) {
@@ -1776,7 +1868,30 @@ const detectPipeToShell = (root: Node): string | null => {
     const nameNode = last.childForFieldName('name') ?? last.namedChild(0);
     if (nameNode === null || nameNode === undefined) continue;
     const text = literalText(nameNode.children[0] ?? nameNode) ?? nameNode.text;
+
+    // Direct pipe-to-interpreter: last stage IS a known
+    // stdin-reading interpreter (`sh`, `bash`, `python`, `node`, etc.).
     if (SHELL_INTERPRETERS.has(text)) return text;
+
+    // xargs-wrapped exec: `... | xargs sh -c '<arg>'`,
+    // `... | xargs python -c '<arg>'`, etc. xargs's positional
+    // structure is fiddly — flags can take values (`-I {}`,
+    // `-n 1`, `--max-procs 4`) — so rather than parse it
+    // precisely, scan EVERY namedChild after the command_name
+    // and refuse if any of them resolves to an interpreter
+    // literal. Over-refuses for hypothetical `xargs --some-flag
+    // bash` where bash isn't actually exec'd; underrefuses
+    // nothing dangerous.
+    if (text === 'xargs') {
+      const argChildren = last.namedChildren.slice(1);
+      for (const child of argChildren) {
+        if (child === null || child === undefined) continue;
+        const argText = literalText(child) ?? child.text;
+        if (SHELL_INTERPRETERS.has(argText)) {
+          return `xargs ${argText}`;
+        }
+      }
+    }
   }
   return null;
 };

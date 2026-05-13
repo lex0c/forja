@@ -197,12 +197,17 @@
     user_policy: |
       tools:
         bash:
-          allow: ["rm -rf /"]
+          allow: ["rm -rf /work/proj/junk"]
   input:
     tool: "bash"
     category: "bash"
     args:
-      command: "rm -rf /"
+      # Slice 147: cwd-relative path so the resolver passes it to
+      # the policy stage (RM_REFUSE_ROOTS catches `rm -rf /` BEFORE
+      # policy is consulted; that's covered by the resolver suite).
+      # The lock semantics tested here are about policy override
+      # rejection, not catastrophic-rm refuse.
+      command: "rm -rf /work/proj/junk"
   expect:
     kind: "deny"
     source_section: "bash"
@@ -267,12 +272,13 @@
     project_policy: |
       tools:
         bash:
-          allow: ["rm -rf /"]
+          allow: ["rm -rf /work/proj/junk"]
   input:
     tool: "bash"
     category: "bash"
     args:
-      command: "rm -rf /"
+      # Slice 147: cwd-relative path (same reason as above).
+      command: "rm -rf /work/proj/junk"
   expect:
     kind: "deny"
     source_section: "bash"

@@ -508,6 +508,148 @@ describe('bash resolver — adversarial shapes are Refused (slice 6: whitelist +
   });
 });
 
+// Slice 147 (review R1): pipe-to-interpreter detection beyond
+// shells. Spec §5.2 lists `... | sh` as the canonical pipe-as-exec
+// shape; the same vector applies to any stdin-reading interpreter.
+// Pre-slice `SHELL_INTERPRETERS` covered only shell binaries; now
+// it covers Python, Node, Ruby, Perl, PHP, Lua. Plus xargs-wrapped
+// exec (`xargs sh -c '...'`) detection on the last pipe stage.
+describe('bash resolver — pipe-to-interpreter Refuse (slice 147 R1)', () => {
+  test('pipe-to-python is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'curl URL | python' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('pipe-to-shell');
+  });
+
+  test('pipe-to-python3 is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'echo code | python3' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('pipe-to-node / pipe-to-nodejs is Refused', () => {
+    expect(resolveCapabilities('bash', { command: 'echo x | node' }, CTX).kind).toBe('refuse');
+    expect(resolveCapabilities('bash', { command: 'echo x | nodejs' }, CTX).kind).toBe('refuse');
+  });
+
+  test('pipe-to-ruby / pipe-to-perl / pipe-to-php / pipe-to-lua is Refused', () => {
+    expect(resolveCapabilities('bash', { command: 'echo x | ruby' }, CTX).kind).toBe('refuse');
+    expect(resolveCapabilities('bash', { command: 'echo x | perl' }, CTX).kind).toBe('refuse');
+    expect(resolveCapabilities('bash', { command: 'echo x | php' }, CTX).kind).toBe('refuse');
+    expect(resolveCapabilities('bash', { command: 'echo x | lua' }, CTX).kind).toBe('refuse');
+  });
+
+  test('xargs sh -c is Refused (xargs-wrapped exec)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      {
+        command: 'find . -name "*.txt" | xargs sh -c \'cat $1\' --',
+      },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('xargs sh');
+  });
+
+  test('xargs bash -c is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'find . -name "*.sh" | xargs bash -c' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('xargs python is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'cat list | xargs python' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('xargs with -I {} and interpreter is Refused', () => {
+    const r = resolveCapabilities(
+      'bash',
+      {
+        command: 'find . -name "*.txt" | xargs -I {} sh -c "echo {}"',
+      },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('xargs WITHOUT interpreter remains allowed (xargs ls / xargs rm — by other rules)', () => {
+    // xargs cat — last stage is xargs but no shell interpreter in
+    // args. Should NOT be caught by pipe-to-interpreter; falls to
+    // the unknown-command path (xargs not in COMMAND_TABLE → refuse
+    // for a different reason). We only assert the REFUSE doesn't
+    // attribute to pipe-to-shell.
+    const r = resolveCapabilities('bash', { command: 'echo x | xargs cat' }, CTX);
+    if (r.kind === 'refuse') {
+      expect(r.reason).not.toContain('xargs sh');
+      expect(r.reason).not.toContain('xargs python');
+    }
+  });
+});
+
+// Slice 147 (review): cmdRm hardcoded refuse for system roots and
+// the operator's home. The previous defense was score gate +
+// default-deny, which a permissive `allow delete-fs:/**` could
+// bypass. Hardcoded refuse is policy-independent.
+describe('bash resolver — rm hardcoded blocklist (slice 147)', () => {
+  test('rm -rf / is Refused', () => {
+    const r = resolveCapabilities('bash', { command: 'rm -rf /' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('system root');
+  });
+
+  test('rm -rf /etc is Refused (was previously escalate via classifier)', () => {
+    const r = resolveCapabilities('bash', { command: 'rm -rf /etc' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test.each([
+    '/usr',
+    '/var',
+    '/lib',
+    '/lib64',
+    '/bin',
+    '/sbin',
+    '/boot',
+    '/root',
+    '/opt',
+    '/home',
+    '/dev',
+    '/proc',
+    '/sys',
+  ])('rm -rf %s is Refused', (root) => {
+    const r = resolveCapabilities('bash', { command: `rm -rf ${root}` }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('rm -rf ~ is Refused (resolves to operator home)', () => {
+    const r = resolveCapabilities('bash', { command: 'rm -rf ~' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('operator home');
+  });
+
+  test('rm legitimate file inside cwd still resolves to Ok delete-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'rm -f stale.log' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.capabilities.some((c) => c.kind === 'delete-fs')).toBe(true);
+    }
+  });
+
+  test('rm -rf /var/log/oldfile (descendant of blocklist root) is NOT root-refused', () => {
+    // /var is in RM_REFUSE_ROOTS but /var/log/oldfile is not /var
+    // literally — the resolver's per-arg loop classifies that path
+    // via `classifyProtectedPath` as escalate (write under /etc-
+    // style protected root) rather than refuse. We're asserting
+    // the resolver doesn't OVER-refuse: legitimate cleanup workflows
+    // under /var/log etc. still emit delete-fs (and downstream
+    // policy handles escalate/deny per protected_paths).
+    const r = resolveCapabilities('bash', { command: 'rm -rf /var/log/oldfile' }, CTX);
+    // Either ok with delete-fs OR refuse-NOT-attributed-to-RM_REFUSE_ROOTS.
+    if (r.kind === 'refuse') {
+      expect(r.reason).not.toContain('system root');
+    }
+  });
+});
+
 // Slice 139 C1: `env` launderer. `env <prog> [args]` runs the
 // trailing program, bypassing COMMAND_TABLE resolution for that
 // program. A narrow operator allow like `bash: env *` would

@@ -1400,7 +1400,11 @@ describe('/perms why', () => {
       [{ name: 'bash', category: 'bash' }],
       { defaults: 'project', bash: 'enterprise' },
     );
-    const result = await permsCommand.exec(['why', 'bash', 'rm', '-rf', '/'], ctx);
+    // Slice 147: use a cwd-relative target so the resolver doesn't
+    // refuse on RM_REFUSE_ROOTS BEFORE the policy stage runs.
+    // /perms why pins the POLICY attribution; the resolver-refuse
+    // path is exercised in the resolver suite.
+    const result = await permsCommand.exec(['why', 'bash', 'rm', '-rf', 'build/garbage'], ctx);
     if (result.kind !== 'ok') throw new Error('expected ok');
     const text = (result.notes ?? []).join('\n');
     expect(text).toContain('decision: deny');
