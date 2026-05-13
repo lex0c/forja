@@ -449,6 +449,86 @@ describe('bg manager: kill', () => {
     expect(after.status).toBe('killed');
     expect(after.stdoutCursor).toBeGreaterThanOrEqual(before.stdoutCursor);
   });
+
+  // Slice 148 (BG1 — process-group isolation). Pre-slice the bg
+  // manager spawned via `Bun.spawn` WITHOUT `detached: true`. The
+  // shape was `bash -c "<cmd>"` where `<cmd>` typically forks
+  // (npm run dev → node → webpack, pytest --watch → many subprocs).
+  // `proc.kill('SIGTERM')` signalled ONLY the wrapping bash; the
+  // grandchildren got orphaned to PID 1, holding ports + file
+  // locks until the next system reboot. Slice 148 adds setsid
+  // (`detached: true`) on spawn + group-kill (`process.kill(-pid)`)
+  // on kill, cascading the signal across every descendant.
+  test('spawn places the child in its own process group (BG1)', async () => {
+    // Spawn a process whose grandchild writes its own pid + pgid
+    // (process group) to a temp file. After the spawn we read the
+    // file and assert the child's PGID equals the child's own PID
+    // (setsid succeeded — the child IS the group leader, distinct
+    // from the harness's PGID).
+    const tmpFile = join(logDir, `pgid-${Date.now()}.txt`);
+    const r = await mgr.spawn({
+      command: `(echo "pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ')" > ${tmpFile}; sleep 5)`,
+    });
+    // Wait for the echo to land.
+    await new Promise((res) => setTimeout(res, 200));
+    const fs = await import('node:fs/promises');
+    const content = await fs.readFile(tmpFile, 'utf8');
+    // Parse pid=<n> pgid=<n>
+    const match = content.match(/pid=(\d+) pgid=(\d+)/);
+    expect(match).not.toBeNull();
+    if (match === null) throw new Error('output parse failed');
+    const childPid = Number(match[1]);
+    const childPgid = Number(match[2]);
+    // The grandchild's PGID equals the spawned shell's PID (the bash
+    // wrapper). `osPid` returned by spawn is the bash PID; PGID of
+    // the grandchild's process tree must match it. Pre-slice this
+    // would have been the HARNESS's PGID instead.
+    expect(childPgid).toBe(r.osPid);
+    // PGID also distinct from harness's own PGID — defense in depth.
+    expect(childPgid).not.toBe(process.pid);
+    expect(childPid).toBeGreaterThan(0);
+    // Cleanup the lingering sleep.
+    await mgr.kill(r.id, { signal: 'SIGKILL' });
+  });
+
+  test('kill cascades to grandchildren via process-group signal (BG1)', async () => {
+    // The motivating shape: bash spawns a subshell that runs sleep.
+    // Pre-slice `proc.kill('SIGTERM')` would signal bash only —
+    // sleep survives as an orphan. With group-kill, sleep also dies.
+    //
+    // Verification trick: the inner sleep writes its own PID to a
+    // file BEFORE sleeping. After mgr.kill() we use `kill -0 <pid>`
+    // to check whether sleep still lives (kill -0 = signal 0,
+    // "exists check"). If the grandchild was orphaned, kill -0 would
+    // succeed for several more seconds; with group-kill it fails
+    // immediately with ESRCH.
+    const tmpFile = join(logDir, `sleep-pid-${Date.now()}.txt`);
+    const r = await mgr.spawn({
+      command: `(sleep 30 & echo $! > ${tmpFile}; wait)`,
+    });
+    // Wait for the inner sleep to launch + write its PID.
+    await new Promise((res) => setTimeout(res, 200));
+    const fs = await import('node:fs/promises');
+    const pidContent = await fs.readFile(tmpFile, 'utf8');
+    const sleepPid = Number(pidContent.trim());
+    expect(sleepPid).toBeGreaterThan(0);
+    // Sanity: sleep is alive right now.
+    expect(() => process.kill(sleepPid, 0)).not.toThrow();
+    // Kill the bg via the manager.
+    await mgr.kill(r.id, { signal: 'SIGTERM', gracePeriodMs: 1000 });
+    // Give the OS a beat to process the group signal.
+    await new Promise((res) => setTimeout(res, 100));
+    // The grandchild MUST be gone (group-kill cascaded). Pre-slice
+    // it would still be alive, requiring its own SIGTERM.
+    let stillAlive = false;
+    try {
+      process.kill(sleepPid, 0);
+      stillAlive = true;
+    } catch {
+      // ESRCH expected — process is gone.
+    }
+    expect(stillAlive).toBe(false);
+  });
 });
 
 describe('bg manager: maxRuntimeMs', () => {

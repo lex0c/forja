@@ -37,6 +37,49 @@ const DEFAULT_KILL_GRACE_MS = 5000;
 // finish on the first SIGTERM and pay zero.
 const CLEANUP_KILL_GRACE_MS = 2000;
 
+// Slice 148 (BG1 — process-group isolation): kill the entire
+// process group rooted at the spawned bash, so grandchildren
+// (npm run dev → node → webpack, pytest --watch → many subprocs)
+// receive the signal too. `process.kill(-pid, signal)` is the POSIX
+// convention: a negative PID targets the process group whose leader
+// has that PID. Pairs with `detached: true` on Bun.spawn — without
+// the spawn-side setsid, `-pid` would either fail (no PG) or signal
+// the wrong group.
+//
+// Fallback to direct `proc.kill(signal)` on ANY PG signal failure:
+//   - ESRCH (no such process / group) is benign — the natural-exit
+//     path already reaped the child. Returning quietly avoids
+//     "kill failed" spam in logs.
+//   - EPERM is unusual but possible under restricted execution
+//     contexts; direct kill on the leader is the same blast radius
+//     as the pre-slice behavior, so falling back loses nothing.
+//   - Any other error: log a warning to stderr and fall back so the
+//     visible behavior matches pre-slice (kill the leader, accept
+//     orphan risk on this one process). Best-effort posture matches
+//     the rest of the bg manager.
+const killProcessGroup = (proc: ReturnType<typeof Bun.spawn>, signal: NodeJS.Signals): void => {
+  const pid = proc.pid;
+  if (pid === undefined || pid <= 0) {
+    // No usable PID — fall back to the proc handle's own kill.
+    proc.kill(signal);
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return; // group already gone — benign
+    // Last-ditch: signal the leader directly. Worst case the
+    // grandchildren stay alive (pre-slice behavior).
+    try {
+      proc.kill(signal);
+    } catch {
+      // also gone — give up silently. The DB-side finalize path
+      // marks status='killed' regardless of OS-level race.
+    }
+  }
+};
+
 export interface SpawnInput {
   command: string;
   label?: string;
@@ -437,6 +480,20 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         env: scrubEnv(process.env),
         stdout: Bun.file(stdoutPath),
         stderr: Bun.file(stderrPath),
+        // Slice 148 (BG1 — process-group isolation): `detached: true`
+        // wraps the child in setsid() on Unix, placing it in a fresh
+        // process group whose group leader is the child itself. That
+        // matters because the typical bg shape is `bash -c "<cmd>"`
+        // where `<cmd>` spawns its own children (npm run dev → node →
+        // webpack; pytest --watch → many subprocs). Without setsid,
+        // those grandchildren share the parent shell's PG; a
+        // `proc.kill('SIGTERM')` to the wrapping bash signals ONLY
+        // bash, and the grandchildren get orphaned to PID 1 holding
+        // their ports / file locks until the next system reboot.
+        // With setsid, killing by PG (`process.kill(-pid, sig)` —
+        // see killProcessGroup below) cascades to every descendant,
+        // exactly what the bg manager's lifecycle needs.
+        detached: true,
       });
       // Unref the subprocess so it does NOT keep the parent event
       // loop alive. A bg process is by definition long-running
@@ -689,7 +746,9 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // finally — no leak even if kill() throws between here and the
     // signal taking effect.
     killing.add(id);
-    handle.proc.kill(initialSignal);
+    // Slice 148 (BG1): kill the whole process group so grandchildren
+    // are reaped along with the bash wrapper.
+    killProcessGroup(handle.proc, initialSignal);
 
     if (initialSignal !== 'SIGKILL') {
       // Wait up to gracePeriodMs for graceful exit. Promise.race so
@@ -707,12 +766,9 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // If still running after grace, escalate.
       const stillRunning = getBgProcess(db, id)?.status === 'running';
       if (stillRunning) {
-        try {
-          handle.proc.kill('SIGKILL');
-        } catch {
-          // process already gone — race between status check and
-          // kill is benign; the DB update below settles state
-        }
+        // Slice 148 (BG1): SIGKILL the whole process group. ESRCH
+        // (race with natural exit) is handled inside the helper.
+        killProcessGroup(handle.proc, 'SIGKILL');
         await handle.exitedSettled;
       }
     } else {

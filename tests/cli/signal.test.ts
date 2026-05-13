@@ -137,3 +137,87 @@ describe('installSignalHandler — restore', () => {
     }
   });
 });
+
+// Slice 148 (BG2 — expanded signal coverage). Pre-slice only SIGINT
+// and SIGTERM aborted the controller; SIGHUP (terminal closed) and
+// SIGQUIT (Ctrl+\ or service manager) escaped uncaught, exiting
+// the harness without running the finally chain — bg processes
+// the LLM spawned were orphaned to PID 1. Same shape for
+// uncaughtException / unhandledRejection: a throw escapes every
+// finally block and the bg jobs survive. Pin each path.
+describe('installSignalHandler — SIGHUP (slice 148)', () => {
+  test('SIGHUP aborts the controller (graceful shutdown)', () => {
+    const restoreStderr = silenceStderr();
+    try {
+      const ctrl = new AbortController();
+      const restore = installSignalHandler(ctrl);
+      try {
+        expect(ctrl.signal.aborted).toBe(false);
+        process.emit('SIGHUP' as NodeJS.Signals);
+        expect(ctrl.signal.aborted).toBe(true);
+      } finally {
+        restore();
+      }
+    } finally {
+      restoreStderr();
+    }
+  });
+});
+
+describe('installSignalHandler — SIGQUIT (slice 148)', () => {
+  test('SIGQUIT aborts the controller (graceful shutdown)', () => {
+    const restoreStderr = silenceStderr();
+    try {
+      const ctrl = new AbortController();
+      const restore = installSignalHandler(ctrl);
+      try {
+        expect(ctrl.signal.aborted).toBe(false);
+        process.emit('SIGQUIT' as NodeJS.Signals);
+        expect(ctrl.signal.aborted).toBe(true);
+      } finally {
+        restore();
+      }
+    } finally {
+      restoreStderr();
+    }
+  });
+});
+
+describe('installSignalHandler — restore unwires every new signal (slice 148)', () => {
+  test('SIGHUP / SIGQUIT listeners removed by restore', () => {
+    const restoreStderr = silenceStderr();
+    try {
+      const ctrl = new AbortController();
+      const restore = installSignalHandler(ctrl);
+      restore();
+      // After restore the controller must NOT abort on SIGHUP/SIGQUIT.
+      process.emit('SIGHUP' as NodeJS.Signals);
+      process.emit('SIGQUIT' as NodeJS.Signals);
+      expect(ctrl.signal.aborted).toBe(false);
+    } finally {
+      restoreStderr();
+    }
+  });
+
+  test('uncaughtException / unhandledRejection listeners registered and removed', () => {
+    // We cannot synthetically emit `uncaughtException` (Node forces
+    // a hard exit when the event has no other listener) — instead
+    // pin via `listenerCount` that install adds a listener and
+    // restore removes it. Symmetry across multiple cycles is the
+    // load-bearing property; without it leakage would accumulate.
+    const restoreStderr = silenceStderr();
+    try {
+      const baselineUncaught = process.listenerCount('uncaughtException');
+      const baselineRejection = process.listenerCount('unhandledRejection');
+      const ctrl = new AbortController();
+      const restore = installSignalHandler(ctrl);
+      expect(process.listenerCount('uncaughtException')).toBe(baselineUncaught + 1);
+      expect(process.listenerCount('unhandledRejection')).toBe(baselineRejection + 1);
+      restore();
+      expect(process.listenerCount('uncaughtException')).toBe(baselineUncaught);
+      expect(process.listenerCount('unhandledRejection')).toBe(baselineRejection);
+    } finally {
+      restoreStderr();
+    }
+  });
+});

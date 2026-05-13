@@ -2,6 +2,62 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(bg) — slice 148: process-group isolation + expanded signal coverage
+
+**Done.** One-hundred-forty-eighth slice. Closes the last 🔴 critical correctness finding from the bash-tools code review: bg manager orphans grandchildren when killed, signal handler only covers SIGINT/SIGTERM (SIGHUP/SIGQUIT/uncaughtException leak every bg job to PID 1). Both fixes together: the bg lifecycle is now actually a lifecycle — every path that ends the harness drains the children deterministically.
+
+### Fixes
+
+| # | Finding | File | Fix |
+|---|---|---|---|
+| **BG1** | `Bun.spawn` lacked `detached: true`. Typical bg shape is `bash -c "<cmd>"` where `<cmd>` forks (npm run dev → node → webpack, pytest --watch → many subprocs); `proc.kill('SIGTERM')` signalled ONLY the wrapping bash, leaving grandchildren orphaned to PID 1 holding ports + file locks until system reboot. | `src/bg/manager.ts` | Added `detached: true` to `Bun.spawn` (= setsid() on Unix, places the child in a fresh process group whose leader is the child itself). New `killProcessGroup(proc, signal)` helper uses `process.kill(-pid, signal)` (negative PID = whole process group) instead of `proc.kill(signal)`. ESRCH is treated as benign (group already gone). Falls back to direct leader-kill on EPERM or other errors — worst case pre-slice behavior, never worse. |
+| **BG2** | `installSignalHandler` only wired SIGINT (with escalation) and SIGTERM. SIGHUP (terminal closed), SIGQUIT (Ctrl+\), uncaughtException, and unhandledRejection bypassed the abort path entirely — the harness died without running the finally chain that closes broker + DB + bg manager, leaving bg jobs orphaned. | `src/cli/signal.ts` | Added handlers for SIGHUP / SIGQUIT (graceful abort, same shape as SIGTERM), uncaughtException + unhandledRejection (abort → log → `queueMicrotask(() => process.exit(1))` so finally chains get one tick to start cleanup before the hard exit). The `restore` function now unwires all six listeners. |
+
+### Defense layering after slice 148
+
+A bg process started by the LLM is now reaped through TWO independent paths:
+1. **Explicit kill** — `mgr.kill(id)` signals the whole process group via `killProcessGroup`. Slice 148 BG1 turned this from "leader-only signal" into "cascade to every descendant".
+2. **Harness exit** — every path that ends the harness (SIGINT/SIGTERM/SIGHUP/SIGQUIT/uncaughtException/unhandledRejection) now aborts the controller, which triggers the run.ts / repl.ts finally chain, which calls `bgManager.cleanup()`, which calls path 1 for each live bg. Slice 148 BG2 added the four previously-uncovered termination paths.
+
+Path 1 alone was insufficient pre-slice (leader-only). Path 2 alone was insufficient pre-slice (SIGHUP escaped). Both paths matter: e.g., when the operator's terminal closes, SIGHUP triggers path 2 → cleanup → path 1 for each bg → group-kill cascades to grandchildren.
+
+### Tests added (+8)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `tests/bg/manager.test.ts` | +2 | BG1 spawn places child in own process group: spawn a `(echo "pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ')" > tmpfile; sleep)` shape and assert the child's PGID matches the spawned shell's PID (setsid succeeded) AND is distinct from the harness's PGID. BG1 kill cascades: spawn `(sleep 30 & echo $! > tmpfile; wait)`, kill via mgr.kill, then `process.kill(<sleep-pid>, 0)` MUST throw ESRCH — pre-slice the inner sleep survived as an orphan. |
+| `tests/cli/signal.test.ts` | +4 | BG2 SIGHUP aborts controller; SIGQUIT aborts controller; restore unwires SIGHUP/SIGQUIT (no abort after restore); restore unwires uncaughtException + unhandledRejection (listenerCount baseline → +1 on install → baseline on restore). Symmetric: confirms no listener leak across install/restore cycles. |
+
+uncaughtException not synthesized in tests — Node forces hard-exit when the event has no other listener, so we pin registration via `listenerCount()` instead of emitting.
+
+### Files changed
+
+- Code: `src/bg/manager.ts`, `src/cli/signal.ts`
+- Tests: `tests/bg/manager.test.ts`, `tests/cli/signal.test.ts`
+- Spec: none (runtime fix; PERMISSION_ENGINE.md §7.3 already implied the desired lifecycle)
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (`abortable.test.ts`)
+- `bun test` — **6933 pass / 10 skip / 0 fail / 17627 expect()** across 309 files (+6 over slice 147)
+
+### Remaining from bash-tools review
+
+After slice 148 the 🔴 critical column is empty. Remaining 🟠 / 🟡:
+- **slice 149** — bash tools surface (input validation for `label`/`cwd` types; `escapesCwd: true` semantically wrong in `bash-kill`; ACL for `bash_output`/`bash_kill` to gate subagent-inherited PIDs) — 🟠
+- **slice 150** — HIDE_PATHS expansion (`~/.gitconfig`, `~/.cargo/credentials.toml`, `~/.subversion/auth`, `~/.rustup/`) — 🟠
+- **slice 151** — bg correctness (stdout/stderr unbounded growth; concurrent kill() race; cleanup count double-counts; exitCode dropped in kill path) — 🟠
+- **slice 152** — resolver calibration (cmdGit unknown subcommand → low confidence; cmdCd false-positive read-fs; cmdSysInfo false-positive readFs('/etc') for date/uptime/hostname) — 🟡
+
+### Not in scope this slice
+
+- **bg stdout/stderr unbounded growth + concurrent kill race + cleanup count double-count + exitCode dropped** — deferred to slice 151. Same subsystem (bg/manager.ts) as slice 148 but each issue needs its own targeted fix + test; bundling four 🟠s would inflate the slice unnecessarily after the 🔴s are closed.
+- **macOS `/tmp` shared between sandbox+host** — needs design (mktemp + TMPDIR= override or accept as documented divergence).
+- **`bwrap` PATH-shim resistance** — needs spec PR on hard-pinning `/usr/bin/bwrap`.
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 147: resolver tightening (R1 + exec:arbitrary score + rm-rf root)
 
 **Done.** One-hundred-forty-seventh slice. Closes the 🔴 critical policy findings from the bash-tools code review: pipe-to-interpreter detection gap, `exec:arbitrary` missing from the score weights (package managers auto-allow), and the absent hardcoded refuse for `rm -rf /` (despite a comment in `protected_paths.ts:30` claiming one existed). Each fix is small but high-impact: the existing defenses (score gate + default-deny + classifyProtectedPath) held under default config, but a permissive `allow delete-fs:/**` rule would have silently auto-allowed catastrophic deletions.
