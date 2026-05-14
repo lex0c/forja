@@ -60,6 +60,30 @@ describe('sandboxSkipPath', () => {
     const path = sandboxSkipPath({ XDG_CONFIG_HOME: '', HOME: '/home/op' });
     expect(path).toBe('/home/op/.config/forja/sandbox_skip');
   });
+
+  test('relative XDG_CONFIG_HOME is ignored — falls back to $HOME/.config (review fix)', () => {
+    // Per XDG Base Directory Spec, a relative XDG_CONFIG_HOME is to
+    // be ignored. Pre-review-fix the path was joined verbatim, so
+    // `XDG_CONFIG_HOME=tmpcfg` produced the CWD-relative
+    // `tmpcfg/forja/sandbox_skip` — `--i-know-what-im-doing` wrote
+    // the marker into the current project, and a session started
+    // from a different cwd never saw it (fragmenting the
+    // acknowledgment state across the filesystem).
+    const path = sandboxSkipPath({ XDG_CONFIG_HOME: 'tmpcfg', HOME: '/home/op' });
+    expect(path).toBe('/home/op/.config/forja/sandbox_skip');
+  });
+
+  test('relative XDG_CONFIG_HOME with ./ prefix also ignored', () => {
+    const path = sandboxSkipPath({ XDG_CONFIG_HOME: './local-cfg', HOME: '/home/op' });
+    expect(path).toBe('/home/op/.config/forja/sandbox_skip');
+  });
+
+  test('absolute XDG_CONFIG_HOME continues to win over $HOME/.config', () => {
+    // Sanity-check that the guard doesn't regress the canonical
+    // XDG behavior — an absolute value still overrides.
+    const path = sandboxSkipPath({ XDG_CONFIG_HOME: '/custom/cfg', HOME: '/home/op' });
+    expect(path).toBe('/custom/cfg/forja/sandbox_skip');
+  });
 });
 
 describe('hasSandboxSkip', () => {

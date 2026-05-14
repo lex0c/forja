@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(cli/sandbox-skip) — reject relative XDG_CONFIG_HOME values when computing marker path
+
+**Done.** `sandboxSkipPath` honored any non-empty `XDG_CONFIG_HOME` and joined it directly to `forja/sandbox_skip`. A relative value like `XDG_CONFIG_HOME=tmpcfg` produced a CWD-relative marker path (`tmpcfg/forja/sandbox_skip`). Two consequences:
+
+1. **Inconsistent skip behavior across sessions.** Operator running `--i-know-what-im-doing` from `/work/proj-A` writes the marker into `proj-A/tmpcfg/forja/sandbox_skip`. The next session, started from `/work/proj-B`, looks at `proj-B/tmpcfg/forja/sandbox_skip` — absent. Welcome prompt re-fires. Operator acknowledges again, writes a second marker into `proj-B`. The "I've acknowledged unsafe mode" state fragments across project directories.
+2. **Unexpected writes outside the user config location.** `~/.config/forja/` (the documented location, owner-mode 0o700) is bypassed entirely. The marker — whose presence is operator-visible-to-audit acknowledgment — lands in arbitrary project dirs that may be group-readable, world-readable, or committed to git.
+
+Fix: gate the XDG branch behind `isAbsolute(xdgConfig)`. Per XDG Base Directory Spec, "If $XDG_CONFIG_HOME is set to a relative path, the variable is to be ignored." Relative or unset values fall through to the existing `$HOME/.config` branch, restoring the canonical marker location. Mirrors the same absolute-path guard already in `sandbox-runner.ts` for the bwrap XDG_CONFIG_HOME overlay.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/sandbox-skip.ts` | `sandboxSkipPath` requires `XDG_CONFIG_HOME` to be absolute before honoring it |
+| `tests/cli/sandbox-skip.test.ts` | +3 tests: relative `tmpcfg` falls back to `$HOME/.config`, `./local-cfg` prefix also ignored, absolute path continues to win over the fallback (regression guard) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7287 pass / 10 skip / 0 fail (+3 from baseline 7284)
+
 ## [2026-05-14] fix(tools/_bash-cwd) — narrow cwd-escape check to real parent traversals
 
 **Done.** `resolveAndValidateBashCwd` rejected any `path.relative()` output starting with `..` via `rel.startsWith('..')`. That prefix match conflates two unrelated shapes:

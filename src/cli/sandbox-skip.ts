@@ -45,7 +45,7 @@
 import { constants, closeSync, lstatSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 
 // File mode for the marker — owner read/write only. Multi-tenant
 // hosts: other users can't probe whether `--i-know-what-im-doing`
@@ -61,14 +61,28 @@ const MARKER_DIR_MODE = 0o700;
 // freedesktop spec; falls back to `$HOME/.config` (env-provided
 // HOME, then `homedir()` system call). Linux/macOS only —
 // Windows operators are out-of-scope per §13.2.
+//
+// The XDG branch requires `xdgConfig` to be ABSOLUTE. Per XDG
+// Base Directory Spec, "if $XDG_CONFIG_HOME is either not set or
+// empty, [...]. If $XDG_CONFIG_HOME is set to a relative path,
+// the variable is to be ignored as defined in the spec." Without
+// the guard, a relative value like `tmpcfg` would produce a
+// CWD-relative marker path: `--i-know-what-im-doing` writes the
+// marker into the current project, and a later session started
+// from a different cwd never sees it — the operator would be
+// re-prompted, then writing a second marker into a second
+// project dir, fragmenting the "I've acknowledged unsafe mode"
+// state across the filesystem.
 export const sandboxSkipPath = (env: NodeJS.ProcessEnv = process.env): string => {
   const xdgConfig = env.XDG_CONFIG_HOME;
-  if (xdgConfig !== undefined && xdgConfig.length > 0) {
+  if (xdgConfig !== undefined && xdgConfig.length > 0 && isAbsolute(xdgConfig)) {
     return join(xdgConfig, 'forja', 'sandbox_skip');
   }
   // Prefer env.HOME so tests can pin the path without setting the
   // OS-level home directory; fall back to homedir() for runtime
-  // production callers that haven't overridden env.
+  // production callers that haven't overridden env. Reached when
+  // XDG_CONFIG_HOME is unset, empty, OR a relative value (treated
+  // as "ignored" per the XDG spec).
   const home = env.HOME !== undefined && env.HOME.length > 0 ? env.HOME : homedir();
   return join(home, '.config', 'forja', 'sandbox_skip');
 };
