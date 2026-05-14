@@ -2,6 +2,46 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] spec(memory/context) — stitch RETRIEVAL/FEEDBACK_ADAPTATION/EVICTION into existing docs (Phase 0)
+
+**Done.** Three new spec docs landed in `docs/spec/` (`RETRIEVAL.md`, `FEEDBACK_ADAPTATION.md`, `EVICTION.md`) covering context selection pipeline, harness-side adaptation loops, and typed lifecycle/eviction governance. They referenced sections in `AUDIT.md`, `MEMORY.md`, `CONTEXT_TUNING.md`, and `AGENTIC_CLI.md` that didn't yet have the corresponding hooks, leaving the architecture as three islands.
+
+This is the **non-code Phase 0**: weave the three new specs into the existing surface so schemas, lifecycle, and indices are coherent. No source-tree changes; spec-only. Phase 1 (implementation of pinned context + eviction skeleton + memory lifecycle) is gated on this stitching.
+
+Six incremental sub-steps, each with explicit user approval before applying:
+
+- **0.1 — AUDIT §1 schema canon.** Table count 23 → 28: added `outcomes` (FEEDBACK generalist, tier 1-5), `eviction_events`, `policies` (forever retention), `retrieval_trace`, `context_pins` (canonical home for the schema declared in CONTEXT_TUNING §12.4.2). New §1.1.1 declares the `outcome_signals` × `outcomes` coexistence rule (no dual-write; permission-engine emits to `outcome_signals`, generalist callers emit to `outcomes`). TOML retention block updated.
+- **0.2 — FEEDBACK_ADAPTATION §3.1 cross-ref.** Blockquote at top of §3.1 anchoring the `outcomes` table scope and linking back to AUDIT §1.1.1 and PERMISSION_ENGINE §6.3.2. Reinforces "no dual-write" and JOIN-explicit pattern.
+- **0.3 — MEMORY lifecycle.** New §3.1.1 introduces optional `state` field on the frontmatter (subset of EVICTION §3: `proposed | active | quarantined | invalidated | evicted | purged`; `shadow` deliberately excluded — semantic overlap with `trust: untrusted`). New §6.5 with 7 sub-subsections covers admission gate, `active → quarantined`, `quarantined → evicted`, retention windows per sub-scope, restore semantics, `invalidated` corner case, and irreversible purge. `.tombstones/` directories added to §2.1 (user scope) and §2.2 (project scope, with the explicit call-out that shared tombstones are versioned in git while local ones cascade-ignore). §5.3 `action` enum extended with state-transition values; new paragraph documents the paired emission (`memory_events` + `eviction_events`).
+- **0.4 — CONTEXT_TUNING §12.4 consistency.** Header cross-refs extended to AUDIT §1 (audit-table canon) and EVICTION §6.2 / §9.5 (absolute protection gate). §12.4.2 gains an audit-table note. §12.4.4 first guarantee ("Nunca elididos") now explicitly cites EVICTION §6.2 and §9.5.
+- **0.5 — AGENTIC_CLI index + Context Engine overview.** §0.1 docs index gets three new rows positioned thematically: `EVICTION.md` (after AUDIT), `RETRIEVAL.md` (after CONTEXT_TUNING), `FEEDBACK_ADAPTATION.md` (after FEATURE_FLAGS). §6 overview gains a "Driver de seleção" blockquote (WHAT vs HOW split: RETRIEVAL decides what enters context; CONTEXT_TUNING formats what already entered). The Compaction sub-section gets a closing paragraph declaring "Compaction = retrieval re-query with smaller budget" and cross-refs RETRIEVAL §15.5, EVICTION §9, CONTEXT_TUNING §12.4, and the ORCHESTRATION §4.6 fallback.
+- **0.6 — Cross-doc consistency pass.** Scripted validation across all numbered refs in the three new specs (and the 26 refs introduced during 0.1-0.5). Found two broken refs — both `§0.N` shapes pointing at items inside the numbered "Princípios" list rather than real subsections (`RETRIEVAL §0` cited `CODE_INDEX.md §0.8`; `EVICTION §0` cited `RETRIEVAL.md §0.10`). Rewrote both to `§0 princípio N` so the link target is unambiguous. Final pass: zero broken refs.
+
+### Key architectural decisions captured in the stitching
+
+- **`outcome_signals` and `outcomes` coexist.** Kept the two tables separate (reversing an earlier consideration to unify). `outcome_signals` stays derived-audit (hash-chained via `approvals_log.seq`) and scoped to permission-engine calibration; `outcomes` is generalist (tier 1-5, `action_signature` L1-L4) for the FEEDBACK adaptation loops. Coexistence rule lives in AUDIT §1.1.1.
+- **Memory state in the frontmatter, not in a separate table.** Keeps memory files self-contained, auditable via `cat`/`vim`/`git diff`, and consistent with MEMORY §0 principle 9 (markdown, not vector). Audit goes through `memory_events` (action enum extended) plus `eviction_events` (cross-substrate); they're emitted as a pair on every transition.
+- **Shared tombstones are versioned in git, local tombstones cascade-ignore.** Surfaces eviction history cross-team for shared memory (restorable via `git checkout` even past the retention window); preserves per-dev privacy for local. Mirrors the existing `shared` vs `local` split in §2.2.
+- **Phase 1 scope frozen as conservative v1.** Pinned context + eviction skeleton + full memory lifecycle. RETRIEVAL v1 (no embedding) and FEEDBACK_ADAPTATION v1 (L1-L2 only) deferred to the next wave so the foundation can settle first.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `docs/spec/AUDIT.md` | §1 table +5 rows; new §1.1.1 (`outcome_signals` × `outcomes` coexistence); §1.2 TOML retention extended |
+| `docs/spec/FEEDBACK_ADAPTATION.md` | §3.1 scope blockquote with cross-refs to AUDIT §1.1.1 and PERMISSION_ENGINE §6.3.2 |
+| `docs/spec/MEMORY.md` | §3.1 frontmatter + new §3.1.1; §2.1/§2.2 `.tombstones/` paths; §5.3 action enum extended + paired-event note; new §6.5 with 7 sub-subsections |
+| `docs/spec/CONTEXT_TUNING.md` | §12.4 header cross-refs; §12.4.2 audit-table note; §12.4.4 first guarantee re-anchored on EVICTION §6.2/§9.5 |
+| `docs/spec/AGENTIC_CLI.md` | §0.1 index +3 rows; §6 overview blockquote + Compaction integration paragraph |
+| `docs/spec/RETRIEVAL.md` | §0 princípio 2: broken ref `CODE_INDEX.md §0.8` → `CODE_INDEX.md §0 princípio 8` |
+| `docs/spec/EVICTION.md` | §0 princípio 5: broken ref `RETRIEVAL.md §0.10` → `RETRIEVAL.md §0 princípio 10` |
+
+### Verification
+
+- Cross-doc ref audit: scripted check of every numbered ref in the three new specs and every cross-ref added during 0.1-0.5. Final count: 0 broken refs.
+- File-existence check across all markdown links: 100% resolved.
+- No code, no test impact: spec-only change. `bun test` / `bun run typecheck` / `bun run lint` not relevant for this entry.
+
 ## [2026-05-14] fix(bg/manager) — honor documented `maxLogBytes: 0` unbounded sentinel
 
 **Done.** `SpawnInput.maxLogBytes` doc said: "use 0 to disable the cap — file grows unbounded, same as pre-cap behavior." The runtime validator rejected `0` with `bg spawn: maxLogBytes must be >= 1024 or Infinity` because `0 < 1024`. Internal/tooling callers following the interface docs hit a hard error on the documented unbounded shape.

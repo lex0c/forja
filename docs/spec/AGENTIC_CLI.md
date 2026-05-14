@@ -36,10 +36,12 @@ Este documento (`AGENTIC_CLI.md`) é a spec arquitetural de alto nível. Detalhe
 | [`FAILURE_MODES.md`](./FAILURE_MODES.md) | Catálogo de falhas com playbook de recovery, audit, mensagens-template | Ao implementar tratamento de erro, ou triagem de incidente |
 | [`SECURITY_GUIDELINE.md`](./SECURITY_GUIDELINE.md) | Threat model STRIDE, trust boundaries, attack vectors, defense layers, secret handling, supply chain, signing, disclosure process | Antes de implementar qualquer feature com side effect; ao revisar PR de segurança; pré-release |
 | [`AUDIT.md`](./AUDIT.md) | Append-only convention, timeline unificada, PII redaction antes-de-persistir, hash chain (tamper-evident), forensics bundle format, `agent audit` CLI, schema versioning, GDPR hooks | Ao implementar audit/forensics; ao definir retention; ao adicionar tabela de audit nova |
+| [`EVICTION.md`](./EVICTION.md) | Lifecycle e despejo tipado cross-substrato (memory, policy, candidate, slot item) — 7 estados canônicos, state machine, gates de evidência + proteção, tombstones com retention window, decay × eviction separados, compaction como eviction efêmera | Ao implementar lifecycle de qualquer substrato persistente; ao auditar "por que isso sumiu?"; antes de adicionar mecanismo de "esquecimento" |
 | [`PROVIDERS.md`](./PROVIDERS.md) | Catálogo de providers, capabilities matrix, quirks documentados, recomendações por workflow, eval multi-model strategy | Ao adicionar provider novo, ou ao escolher provider pra workflow específico |
 | [`LOCAL_MODELS.md`](./LOCAL_MODELS.md) | Hardware detection, model lifecycle, tool calling adapters, constrained generation, embeddings strategy, prompt template dialects, setup/bootstrap, remote Ollama, failure modes locais, privacy verifiable | Ao rodar com Ollama/llama.cpp; pra detalhamento operacional além do PROVIDERS.md |
 | [`TOKEN_TUNING.md`](./TOKEN_TUNING.md) | Sampling params (temperature, top_p, top_k, penalties, seed), output budget per call, stop sequences, reasoning effort, multi-sample, truncation strategies, tokenizer accuracy, per-workflow defaults, eval-driven tuning | Ao definir sampling em playbook novo; ao adicionar provider; ao tunar workflow com eval |
 | [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) | Shape do prompt: system prompt architecture, layout + cache breakpoints, memory loading, tool palette, few-shot strategy, format choices, attention positioning, per-step shaping, goal re-injection, repo map injection, selective inclusion, per-workflow recipes | Ao desenhar/tunar contexto de prompt; pareceria com TOKEN_TUNING (tuning de generation) |
+| [`RETRIEVAL.md`](./RETRIEVAL.md) | Pipeline `query → candidates → expansion → ranking → compression → context slot` em três views (workspace, session, memory). Decide **WHAT** entra no contexto dado um goal. Ranking auditável (lexical/estrutural primeiro, embedding opt-in v2), expansion bounded, trace obrigatório | Ao decidir o que entra no contexto; antes de propor "memória infinita" ou RAG; ao integrar compaction = retrieval re-query |
 | [`PERFORMANCE.md`](./PERFORMANCE.md) | SLOs, budgets de latência, custo por tarefa, regression strategy | Ao otimizar hot path, ou definir threshold de regressão em CI |
 | [`UI.md`](./UI.md) | Modelo inline, event bus, render funcional, componentes (tool card, modais, status line), paleta/glyphs/microcopy, headless `--json`, fallbacks. Sem framework. | Ao implementar qualquer parte da TUI ou definir microcopy de erro |
 | [`RECAP.md`](./RECAP.md) | Vista projetada de sessões (PR/changelog/slack/etc), source-of-truth determinística + LLM renderer | Ao implementar `/recap`, ou gerar artefato a partir de sessão |
@@ -49,6 +51,7 @@ Este documento (`AGENTIC_CLI.md`) é a spec arquitetural de alto nível. Detalhe
 | [`CODE_INDEX.md`](./CODE_INDEX.md) | Subsistema de indexação de código — schema SQLite (symbols/references/imports), pipeline (initial scan + incremental + FS watcher opt-in), API queryable, multi-language tree-sitter, integração com repo map, tools simbólicas candidatas, invalidação, privacy | Ao implementar code index; ao adicionar tool simbólica nova; ao tunar repo map ou estratégia de retrieval |
 | [`CODE_GENERATION.md`](./CODE_GENERATION.md) | Pipeline canônico de geração — generate → format → lint → test → checkpoint → accept; modos de strictness; integração com playbooks; per-language config; audit footprint; anti-patterns | Ao implementar PostToolUse hooks de generation; ao definir strict mode em playbook; ao debugar pipeline failure |
 | [`FEATURE_FLAGS.md`](./FEATURE_FLAGS.md) | Governance mínima de flags — categorias (CLI/config/slash/state), lifecycle (experimental→staged→stable→deprecated), inventário canônico, audit (`feature_flags_active`), discovery (`agent --list-flags`, `/flags`), eval integration, anti-patterns | Ao introduzir flag nova; ao promover/depreciar; ao auditar bypass flags em CI |
+| [`FEEDBACK_ADAPTATION.md`](./FEEDBACK_ADAPTATION.md) | Aprendizado operacional harness-side — dois loops (quente per-action / frio per-trigger), tiers de feedback (1-5), unidade adaptável (L1 alias → L4 strategy), calibração bayesiana com prior, invalidação > decay, escopo hierárquico (session → repo → user → language → global). Modelo nunca é notificado da adaptação | Ao propor "agent que aprende"; ao calibrar policies de permission/retrieval/context; antes de adicionar LLM-as-judge |
 
 Spec arquitetural sem esses docs é descrição de uma implementação. **Com** esses docs vira protocolo que múltiplas implementações respeitam.
 
@@ -581,6 +584,8 @@ Sem eval, critic vira ruído (warnings constantes que user aprende a ignorar).
 ## 6. Context Engine
 
 > **Detalhamento operacional:** [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) — system prompt architecture, layout + cache breakpoints, memory loading, tool palette, few-shot strategy, format choices, attention positioning, per-step shaping, goal re-injection mechanics, repo map injection, selective inclusion, per-workflow recipes. Esta seção é overview.
+>
+> **Driver de seleção:** [`RETRIEVAL.md`](./RETRIEVAL.md) decide **WHAT** entra no contexto dado um goal (pipeline `candidates → expansion → ranking → compression`); CONTEXT_TUNING decide **HOW** formatar o que já entrou. Sem retrieval declarado, "memória infinita"/RAG vira cargo cult ([`ANTI_PATTERNS.md §2.2`](./ANTI_PATTERNS.md)).
 
 Estrutura do prompt **fixa, ordem importa, cache breakpoints conscientes**:
 
@@ -610,6 +615,8 @@ Estratégia em camadas:
 Compaction é uma chamada LLM separada — modelo configurado em `compaction.model`, **não vendor-locked**. Default por profile: `autonomous` usa modelo cheap-but-capable do mesmo provider (Haiku se Anthropic, gpt-4o-mini se OpenAI, etc); `orchestrated` usa o backend local; `hybrid` é declarado em config. Prompt versionado, **testada por eval**. Sem isso degrada silenciosamente.
 
 Em profile `orchestrated`, compaction usa modelo do próprio backend (não Haiku) com prompt mais agressivo e schema fixo (`goal`, `decisions`, `files_touched`, `errors`).
+
+**Compaction = retrieval re-query com budget menor.** Critério de "o que fica" delega ao [`RETRIEVAL.md §15.5`](./RETRIEVAL.md) — re-rank dos candidatos do contexto atual com `budget' < budget`; o que cai fora do top-K vira candidato a eviction efêmera ([`EVICTION.md §9`](./EVICTION.md)). Pinned items são gate absoluto ([`CONTEXT_TUNING.md §12.4`](./CONTEXT_TUNING.md)). Fallback determinístico (`drop_oldest`) preservado em [`ORCHESTRATION.md §4.6`](./ORCHESTRATION.md) quando retrieval indisponível.
 
 ### Repo Map (essencial em `orchestrated`, opcional em `autonomous`)
 

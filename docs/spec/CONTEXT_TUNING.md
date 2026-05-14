@@ -943,7 +943,7 @@ sessions.elided_tool_results_count INTEGER
 
 ### 12.4 Pinned context primitive
 
-> **Cross-refs:** consumido pelo fallback determinístico em `ORCHESTRATION.md §4.6`; re-injetado em auto-rehydrate em `STATE_MACHINE.md §7.6`; goal re-injection em §10.
+> **Cross-refs:** consumido pelo fallback determinístico em `ORCHESTRATION.md §4.6`; re-injetado em auto-rehydrate em `STATE_MACHINE.md §7.6`; goal re-injection em §10; audit table canônica em [`AUDIT.md §1`](./AUDIT.md) (retention 90d, cascade com sessions); gate de proteção absoluta em [`EVICTION.md §6.2`](./EVICTION.md) e [`§9.5`](./EVICTION.md) (compaction).
 
 Contraints invisíveis matam sessão longa. "Não mudar API pública", "sempre rodar `pnpm fmt` antes de commitar", "evitar import circular em `src/auth/`" — fatos que valem para a sessão inteira mas que ficam soterrados em `decisions[]` no checkpoint, não são re-injetados a cada compaction, e desaparecem em fallback estático.
 
@@ -992,6 +992,8 @@ context_pins(
 
 Cap: **10 pins por sessão**. Pin #11 → erro com sugestão de remover algum primeiro. Limite força priorização.
 
+Audit table canônica em [`AUDIT.md §1`](./AUDIT.md): retention 90d com cascade `ON DELETE CASCADE` em `sessions(id)`; sensitivity `low`; sem redaction (texto curto declarado pelo user; não esperar PII como em `messages`).
+
 #### 12.4.3 Onde injeta
 
 Pins são re-injetados em **três pontos**, sempre literais:
@@ -1011,7 +1013,7 @@ Pinned context (always-include):
 
 #### 12.4.4 Garantias
 
-- **Nunca elididos.** §12.1 heurísticas de elision **excluem** pins — eviction policy os pula.
+- **Nunca elididos.** §12.1 heurísticas de elision **excluem** pins; [`EVICTION.md §6.2`](./EVICTION.md) lista pin como gate de proteção absoluta cross-substrato. Em compaction ([`EVICTION.md §9.5`](./EVICTION.md)), pin desabilita eviction sobre o item mesmo fora do top-K na re-rank — operador resolve via `/pin --remove`, não silent drop.
 - **Nunca truncados.** Auto-rehydrate (`STATE_MACHINE.md §7.6`) trunca decisions/todos se exceder budget; pins ficam fora do truncamento. Se 10 pins juntos > budget, é erro de configuração — warning explícito ao user.
 - **Auditados.** Cada pin entra em `recap_intermediate.pinned_context[]` (extensão a `RECAP.md §3`). `/recap` mostra pins ativos.
 - **Persistidos cross-resume.** Pins sobrevivem crash/`/resume`; tabela `context_pins` é durable.

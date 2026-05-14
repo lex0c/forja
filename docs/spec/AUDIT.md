@@ -25,7 +25,7 @@ Sem audit consolidado, "compliance" e "debug forense" viram intenção sem entre
 
 ## 1. Tables canônicas
 
-Lista canônica das **23 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
+Lista canônica das **28 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
 
 | Tabela | Escopo | Retention default | Sensitivity | Redaction |
 |---|---|---|---|---|
@@ -37,6 +37,11 @@ Lista canônica das **23 tabelas de audit**, com escopo, retention, sensitivity,
 | `hook_runs` | execução de hooks | 90d | medium | redact stdout |
 | `failure_events` | falhas classificadas (FAILURE_MODES §19; chain per-session §4.2) | 365d | medium | redact `payload_json` |
 | `outcome_signals` | sinais derivados (`tool_error`, `failure_event`, `checkpoint_reverted`, `session_aborted`) ligados a `approvals_log.seq` — input pra calibração §6.3.2 | per-kind (ver §1.2) | medium | redact `payload_json` |
+| `outcomes` | outcomes operacionais cross-substrato (tier 1-5, `action_signature`, `scope_kind`) — input pra loop frio de adaptação (FEEDBACK_ADAPTATION §3.1) | 90d default | medium | redact `evidence_json` |
+| `eviction_events` | transições de lifecycle (proposed/active/shadow/quarantined/invalidated/evicted/purged) cross-substrato (EVICTION §10.1) | 365d | medium | redact `evidence_json` |
+| `policies` | policies adaptadas commit-like (id, parent, scope, state) — produzidas pelo loop frio (FEEDBACK_ADAPTATION §3.2) | **forever** (no auto-cleanup) | low | nenhuma (conteúdo é a policy) |
+| `retrieval_trace` | trace per-query do pipeline `candidates → expansion → ranking → compression` (RETRIEVAL §10.1) | 90d | medium | redact attrs com path/conteúdo |
+| `context_pins` | pinned context per-sessão (constraint/workflow/invariant/reminder) — re-injetado em goal/compaction/auto-rehydrate (CONTEXT_TUNING §12.4.2) | 90d (cascade com sessions) | low | nenhuma (texto curto, ≤500 chars) |
 | `memory_events` | memory ops | 365d | low (action+name only; sem body) | nenhuma |
 | `recap_runs` | recap executions | 90d | low | nenhuma |
 | `checkpoints` | FS snapshots metadata | 30d | low | path → `~/...` |
@@ -59,6 +64,23 @@ Lista canônica das **23 tabelas de audit**, com escopo, retention, sensitivity,
 - **medium**: pode conter info sensível em payload; redaction parcial
 - **high**: alta probabilidade de PII/secrets; redaction obrigatória completa
 
+#### 1.1.1 `outcome_signals` × `outcomes` — coexistência declarada
+
+As duas tabelas registram **outcomes de ações**, mas vivem em níveis arquiteturais distintos. Coexistem por design; não unificar é decisão consciente.
+
+| | `outcome_signals` | `outcomes` |
+|---|---|---|
+| Owner | `PERMISSION_ENGINE.md §6.3.2` | `FEEDBACK_ADAPTATION.md §3.1` |
+| Escopo | calibração do permission engine | adaptação operacional cross-substrato |
+| Integridade | derived-audit (FK lógica via `approvals_log.seq`; sem chain própria — `§4.2.3`) | append-only convention `§4.1`; sem hash chain própria |
+| Schema | `signal_kind` enumerado (`tool_error`, `failure_event`, `checkpoint_reverted`, `session_aborted`) | `tier` (1-5) + `action_signature` (L1-L4) + `scope_kind` (session/repo/user/language/global) |
+| Granularidade | per-approval | per-action genérica |
+| Consumidor | composite harmful score (`PERMISSION_ENGINE §6.3.2`) | bayesian update no loop frio (`FEEDBACK_ADAPTATION §3.2`) |
+
+Caller que registra sinal de permission deve emitir **apenas** em `outcome_signals`. Caller que registra outcome operacional genérico (não-permission) emite **apenas** em `outcomes`. Não há dual-write — duplicaria estado sem ganho.
+
+Cross-ref: queries que precisam combinar dimensões (ex.: "policy adaptada degradou taxa de aprovação?") fazem JOIN explícito via `session_id` ou `tool_call_id`, não via reificação intermediária.
+
 ### 1.2 Retention configurável
 
 ```toml
@@ -71,6 +93,11 @@ approvals = 365              # compliance
 approvals_log = 365           # v2 hash-chained ledger
 failure_events = 365
 outcome_signals = "per-kind"  # ver §1.2.1
+outcomes = 90                 # FEEDBACK_ADAPTATION §3.1 (default; override per-scope possível)
+eviction_events = 365         # EVICTION §10.1
+policies = "forever"          # FEEDBACK_ADAPTATION §3.2 (commit-like; nunca limpar)
+retrieval_trace = 90          # RETRIEVAL §10.1
+context_pins = 90             # CONTEXT_TUNING §12.4 (cascade com sessions)
 memory_events = 365
 recap_cache = "1h"            # TTL especial
 pending_decisions = 7

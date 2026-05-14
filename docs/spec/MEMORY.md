@@ -133,6 +133,8 @@ Sugerir buscar lá antes de palpitar.
   user_role.md
   feedback_commit_style.md
   reference_linear_ingest.md
+  .tombstones/             # arquivos evicted dentro da retention window (§6.5)
+    feedback_commit_style.1714138800.md
 ```
 
 Carregado em **toda sessão**, independente do diretório. Cuidado: cada entrada nesse scope custa contexto em todas as sessões pra sempre.
@@ -148,10 +150,14 @@ Project scope é dividido em duas sub-pastas com semântica distinta:
     project_q3_milestone.md
     feedback_team_conventions.md
     reference_linear_ingest.md
+    .tombstones/             # VERSIONADO — eviction history cross-team (§6.5)
+      project_old_milestone.1714138800.md
   local/                     # GITIGNORED (per-user dentro do projeto)
     MEMORY.md                # índice local
     feedback_my_quirks.md
     project_in_progress.md
+    .tombstones/             # GITIGNORED (cascade com local/)
+      project_obsolete.1714138800.md
 ```
 
 #### `.agent/memory/shared/` — versionado
@@ -223,6 +229,7 @@ type: <user | feedback | project | reference>
 source: <user_explicit | inferred | imported>
 expires: <YYYY-MM-DD opcional>
 trust: <trusted | untrusted opcional, default trusted>
+state: <active | proposed | quarantined | invalidated | evicted | purged opcional, default active>
 ---
 
 <corpo em markdown>
@@ -231,6 +238,21 @@ trust: <trusted | untrusted opcional, default trusted>
 **Why:** ...
 **How to apply:** ...
 ```
+
+#### 3.1.1 Campo `state` — lifecycle herdado de EVICTION
+
+Subset declarado dos 7 estados canônicos de [`EVICTION.md §3`](./EVICTION.md). Memory não usa `shadow` (overlap semântico com `trust: untrusted`, que já existe — ver §6.5).
+
+| Estado | Quando | Visível em context? | Carrega em índice? |
+|---|---|---|---|
+| `proposed` | escrita aguardando admission gate (modal ou hook) | não | não |
+| `active` (default) | em uso normal | sim | sim |
+| `quarantined` | verify-before-act falhou OU user override 3× OU conflito detectado | sim com flag visual | sim (com penalty) |
+| `invalidated` | invariante quebrado (referência aponta pra symbol removido, stack mudou) | não | não |
+| `evicted` | despejada; arquivo movido pra `.tombstones/`; retention window ticking | não | não |
+| `purged` | retention window estourou OU `user_purge`/`security`; só metadata em `eviction_events` | não | não |
+
+Ausência do campo equivale a `state: active`. Transições legais em [`EVICTION.md §4.1`](./EVICTION.md); cada transição emite event em `memory_events` (§5.3) e `eviction_events` (audit cross-substrato).
 
 ### 3.2 Index (`MEMORY.md`)
 
@@ -353,17 +375,23 @@ UI distingue. `inferred` requer confirmação extra — é o vetor de injection 
 memory_events(
   id TEXT PRIMARY KEY,
   scope TEXT NOT NULL,          -- user | project_local | project_shared
-  action TEXT NOT NULL,         -- proposed | created | edited | deleted | read | refused | promoted | demoted
+  action TEXT NOT NULL,         -- proposed | created | edited | deleted | read | refused
+                                -- | promoted | demoted
+                                -- | quarantined | invalidated | evicted | restored | purged
+                                --   (transições de §3.1.1 / EVICTION §3)
   memory_name TEXT NOT NULL,
   source TEXT NOT NULL,
   session_id TEXT,
   cwd TEXT,
   created_at INTEGER NOT NULL,
-  details JSONB                 -- diff, motivo de refuse, hash do source, ref do PR, etc
+  details JSONB                 -- diff, motivo de refuse, hash do source, ref do PR,
+                                -- from_state/to_state em transições, eviction_event_id quando aplicável
 );
 ```
 
 Conteúdo das memórias **não vai pro SQLite** — fica em arquivo. SQLite só rastreia eventos.
+
+Transições de estado emitem **par** de events: `memory_events` (local, com `details.from_state`/`details.to_state`) e `eviction_events` (cross-substrato, [`AUDIT.md §1`](./AUDIT.md) e [`EVICTION.md §10.1`](./EVICTION.md)). `details.eviction_event_id` permite JOIN explícito.
 
 ### 5.4 Promoção (local → shared)
 
@@ -454,6 +482,74 @@ Promoção entre scopes nunca é silenciosa. Cada uma cria mudança que aparece 
 ### 6.4 Hook `PreCompact`
 
 Antes de compaction, hook opcional pode revisar memória ("alguma estale?"). Útil em sessão longa onde memória recém-escrita virou redundante.
+
+### 6.5 Integração com EVICTION — transições e tombstones
+
+Memory é um dos quatro substratos sob governance de [`EVICTION.md §2`](./EVICTION.md). Esta seção mapeia o lifecycle de memory para o contrato genérico de EVICTION.
+
+#### 6.5.1 Admission gate (escrita → `active`)
+
+Toda escrita normal (§5) entra como `state: active`. Dois casos produzem `state: proposed`:
+
+- **`inferred` write em diretório untrusted** ([`§7.2`](#71-mitigações-obrigatórias) regra 1): permanece `proposed` até user confirmar manualmente; sem confirmação, vira `evicted` no fim da sessão.
+- **Hook `MemoryWrite` (§7.2 regra 4) que retorna soft-block**: mesma janela de confirmação.
+
+`user_explicit` write é admitido direto como `active` (gate já passou via UI prompt §5.1).
+
+#### 6.5.2 `active` → `quarantined`
+
+Triggers herdados de [`EVICTION.md §5.1`](./EVICTION.md), aplicados a memory:
+
+| Trigger EVICTION | Detector em memory | Motivo emitido |
+|---|---|---|
+| `verify_failed` | §6.1 verify-before-act falhou (factual entry contradisse FS) | `shift` |
+| `user_override_repeated` | user editou/rejeitou ação derivada desta memory 3× em janela de 24h | `conflict` |
+| `conflict_detected` | duas entries do mesmo scope com fatos incompatíveis (resolver em [`EVICTION.md §6.3`](./EVICTION.md)) | `conflict` |
+| `trust_revoked` | trust prompt re-fires e user revoga (§7.2 regra 8) | `security` |
+
+Memory `quarantined` continua no índice **com flag visual** (`[memory: quarantined — verify failed 2026-05-12]`) e penalty de ranking ([`EVICTION.md §9.7`](./EVICTION.md)). Não é evictada automaticamente — TTL mínimo de 7d antes de qualquer transição terminal.
+
+#### 6.5.3 `quarantined` → `evicted`
+
+Caminhos:
+
+1. **TTL de quarentena estourou** sem restauração ([`EVICTION.md §4.1`](./EVICTION.md); default 7d em memory).
+2. **Loop frio** ([`FEEDBACK_ADAPTATION.md §3.2`](./FEEDBACK_ADAPTATION.md)) confirma `low_roi` com evidence sample suficiente.
+3. **User explícito**: `/memory delete <name>` ou `/memory evict <name>`.
+
+Em todos os casos: arquivo movido pra `.tombstones/<name>.<unix_ts>.md` preservando frontmatter original (`state` atualizado pra `evicted`, `details` em event registra motivo). Index entry removida.
+
+#### 6.5.4 `evicted` → `purged` (retention window)
+
+Retention default ([`EVICTION.md §7.1`](./EVICTION.md)):
+
+| Sub-scope | Window |
+|---|---|
+| User (`~/.config/agent/memory/.tombstones/`) | 30d |
+| Project shared (`./.agent/memory/shared/.tombstones/`) | 30d, mas tombstones **versionados em git** — restore via `git checkout` mesmo fora da window |
+| Project local (`./.agent/memory/local/.tombstones/`) | 30d, gitignored — fora da window é definitivo |
+| Invalidados (todos os scopes) | 7d (mais curto; re-promoção exige re-medição completa) |
+
+Window estourada ⇒ arquivo deletado de `.tombstones/`; metadata permanece em `eviction_events` para forensics.
+
+#### 6.5.5 Restore (`evicted` → `proposed`)
+
+`/memory restore <name>` copia conteúdo do tombstone mais recente, re-cria entry em `state: proposed` (não `active`). Razão: condição que causou eviction pode ainda valer; restore é **re-admissão**, não bypass. User passa pelo prompt de confirmação normal de §5.1.
+
+Restore de tombstone versionado em shared: `git checkout <commit> -- .agent/memory/shared/.tombstones/<name>.<ts>.md` resgata histórico arbitrário; o flow de restore então roda normal.
+
+#### 6.5.6 `invalidated` — caso especial
+
+Diferente de `evicted`, `invalidated` significa **invariante externo quebrado** (e.g., reference memory aponta pra Linear project removido; project memory cita symbol que não existe mais no codebase). Não há retention window útil; window default 7d antes de virar `evicted` automaticamente.
+
+Re-promoção **não reaproveita evidence antiga** ([`EVICTION.md §4.2`](./EVICTION.md)): restore re-entra como `proposed` e re-precisa passar gate. Reaproveitar contaminaria com dados de um contexto que não existe mais.
+
+#### 6.5.7 `purged` irreversível — flows especiais
+
+- `/memory purge <name> --force`: bypass da window, confirmação dupla, registrado em `eviction_events` com `motivo: user_purge`.
+- Hook `Eviction` com `reason=security` ([`AUDIT.md §10.3`](./AUDIT.md) reuso de hook): bypass da window com `--security-purge`. Útil quando memory entry contém secret detectado tarde.
+
+Metadata em `eviction_events` **nunca** é purgada — só conteúdo. Garante prova de despejo para compliance/forensics.
 
 ---
 
