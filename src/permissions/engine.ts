@@ -50,6 +50,7 @@ import {
   isSandboxProfile,
   selectSandboxProfile,
 } from './sandbox-plan.ts';
+import { matchSensitivePath } from './sensitive-paths.ts';
 import {
   type EngineState,
   type StateController,
@@ -734,6 +735,37 @@ const checkPath = (
     return {
       kind: 'deny',
       reason: `path is in protected zone (deny tier): ${protectedAbsPath}`,
+      source: { layer: 'default', section: 'protected' },
+    };
+  }
+
+  // SEC §8.4 sensitive-path engine-floor refuse (slice 159). Pairs
+  // with the §11 protected-zone check above: §11 covers system-root
+  // paths fixed by OS layout, §8.4 covers content-based secrets that
+  // match by NAME regardless of where they live in the fs (.env,
+  // *.pem, id_rsa*, .aws/credentials, **/credentials*.json, etc.).
+  //
+  // This fires BEFORE deny_paths / session_allow / allow_paths
+  // because the spec is explicit: "Paths nessa lista são bloqueados
+  // de: 1. read_file (qualquer tool de leitura); 2. write_file
+  // (qualquer tool de write)". Operator cannot widen via policy —
+  // same engine-floor posture as HARD_REFUSE_COMMANDS in the bash
+  // resolver. Threat: model emits `read_file('.env')` against a
+  // policy with `allow_paths: ['**']` (the "let it work" config many
+  // operators write); without this gate the read succeeds and
+  // secrets land in `tool_calls.output`. Spec §8.4 explicitly says
+  // "Por que isso não vira redaction: checkpoint precisa conteúdo
+  // literal" — refuse is the only correct posture.
+  //
+  // Match against the canonical absolute (already symlink-resolved
+  // by resolveForProtected) AND the operator-supplied path form, so
+  // both a request for `~/.ssh/id_rsa` and one for a symlink
+  // pointing at it land in the same refuse.
+  const sensitiveMatch = matchSensitivePath(protectedAbsPath) ?? matchSensitivePath(path);
+  if (sensitiveMatch !== null) {
+    return {
+      kind: 'deny',
+      reason: `path matches sensitive-path deny-list (SEC §8.4): ${sensitiveMatch}`,
       source: { layer: 'default', section: 'protected' },
     };
   }
@@ -1611,6 +1643,36 @@ export const createPermissionEngine = (
           const decision: Decision = {
             kind: 'deny',
             reason: `path is in protected zone (deny tier): ${protectedAbsPath} (bypass mode does NOT override §11)`,
+            source: { layer: 'default', section: 'protected' },
+          };
+          const stages: ReasonChainEntry[] = [];
+          if (classifierStage !== null) stages.push(classifierStage);
+          if (sandboxStage !== null) stages.push(sandboxStage);
+          const e = emitAudit(
+            toolName,
+            args,
+            decision,
+            resolvedCapabilities,
+            score,
+            scoreComponents,
+            classifierAdjust,
+            stages,
+            sandboxProfile,
+          );
+          return withSandboxProfile(withApprovalSeq(decision, e.seq), sandboxProfile);
+        }
+        // SEC §8.4 sensitive-path engine-floor refuse (slice 159).
+        // Mirror the checkPath wire above — bypass mode does NOT
+        // override the sensitive-path deny list. Operator who set
+        // mode=bypass intends to skip CONFIRM prompts and policy
+        // matching, NOT to widen access to credentials. §8.4 patterns
+        // remain a hard floor.
+        const sensitiveBypassMatch =
+          matchSensitivePath(protectedAbsPath) ?? matchSensitivePath(cap.scope);
+        if (sensitiveBypassMatch !== null) {
+          const decision: Decision = {
+            kind: 'deny',
+            reason: `path matches sensitive-path deny-list (SEC §8.4): ${sensitiveBypassMatch} (bypass mode does NOT override §8.4)`,
             source: { layer: 'default', section: 'protected' },
           };
           const stages: ReasonChainEntry[] = [];

@@ -117,6 +117,13 @@ export {
   classifyProtectedPath,
   protectedTargets,
 } from './protected_paths.ts';
+
+// Slice 159 (review — SEC §8.4 wire): sensitive-path deny-list as
+// engine-floor refuse. Canonical home moved from `src/subagents/`
+// to `src/permissions/` when the permission engine became a
+// consumer (fs-tool checkPath + bash bypass-mode capability loop).
+// `src/subagents/sensitive-paths.ts` is now a re-export shim.
+export { SENSITIVE_PATH_DENY_LIST, matchSensitivePath } from './sensitive-paths.ts';
 export type {
   ProtectedClassifyInput,
   ProtectedOp,

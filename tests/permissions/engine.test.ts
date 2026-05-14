@@ -178,7 +178,12 @@ describe('engine modes', () => {
     expect(d.reason).toContain('bypass mode still escalates §11');
   });
 
-  test('bypass mode UPGRADES write to ~/.ssh/authorized_keys to confirm', () => {
+  test('bypass mode REFUSES write to ~/.ssh/authorized_keys outright (SEC §8.4 — slice 159)', () => {
+    // Pre-slice 159 this UPGRADED the bypass write to a confirm (§11
+    // escalate tier). Post-slice the §8.4 deny-list fires before the
+    // §11 escalate logic: `.ssh/**` is in the sensitive-path patterns,
+    // bypass mode does NOT override §8.4. Stronger posture — operator
+    // who set mode=bypass still cannot write to authorized_keys.
     const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
       cwd: CWD,
       home: '/home/op',
@@ -187,8 +192,11 @@ describe('engine modes', () => {
       file_path: '~/.ssh/authorized_keys',
       content: 'c',
     });
-    expect(d.kind).toBe('confirm');
-    expect(d.source?.section).toBe('protected');
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.reason).toContain('SEC §8.4');
+      expect(d.reason).toContain('bypass mode does NOT override');
+    }
   });
 
   test('bypass mode allows READ of /etc/hosts (escalate tier only fires on write)', () => {
@@ -857,15 +865,20 @@ describe('Decision.source provenance', () => {
   });
 
   test('fs.read deny rule carries source per-section (read_file)', () => {
+    // Slice 159 (review): test uses a non-§8.4 path so the operator's
+    // deny rule actually wins. Pre-slice this used `.env.production`
+    // which now hits the SEC §8.4 engine-floor refuse first
+    // (source.section='protected', not operator's section). Patterns
+    // and assertions for §8.4 live in sensitive-paths-engine.test.ts.
     const eng = createPermissionEngine(
-      policy({ tools: { read_file: { deny_paths: ['**/.env*'] } } }),
+      policy({ tools: { read_file: { deny_paths: ['**/forbidden/*'] } } }),
       { cwd: CWD, provenance: { defaults: 'project', read_file: 'enterprise' } },
     );
-    const d = eng.check('read_file', 'fs.read', { path: '.env.production' });
+    const d = eng.check('read_file', 'fs.read', { path: 'src/forbidden/data.txt' });
     expect(d.kind).toBe('deny');
     expect(d.source).toEqual({
       layer: 'enterprise',
-      rule: '**/.env*',
+      rule: '**/forbidden/*',
       section: 'read_file',
     });
   });

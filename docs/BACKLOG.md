@@ -2,6 +2,105 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 159: wire SEC §8.4 sensitive-paths deny-list into fs tools
+
+**Done.** Second P0 from the 5-axis code review (cross-confirmed by both the security-in-depth and threat-model agents). Pre-slice the canonical `SENSITIVE_PATH_DENY_LIST` patterns (defined in `src/subagents/sensitive-paths.ts` per SECURITY_GUIDELINE.md §8.4) were enforced ONLY by the subagent worktree pre-spawn filter. The runtime fs tools (`read_file`, `write_file`, `edit_file`, `grep`, `glob`) bypassed them entirely. Concrete attack: model emits `read_file('.env')` against an operator policy with `allow_paths: ['**']` (the most common "let it work" config) — request authorized end-to-end, secrets land in `tool_calls.output` which is persisted to the DB. SEC §8.4 explicitly says "Por que isso não vira redaction: checkpoint precisa conteúdo literal" — refuse is the only correct posture, not redaction.
+
+### Why the gap existed
+
+The §8.4 patterns are NAME-based ("anything matching `.env*`, `*.pem`, `id_rsa*`, `**/credentials*.json`, etc."), not LOCATION-based. The existing `protected_paths.ts` engine wire covers LOCATION-based protected zones (`/proc`, `/sys`, `~/.ssh/`, `.git/`, etc.) but explicitly does NOT cover content-shape patterns. The two layers serve different threats: protected_paths prevents tool access to system roots; sensitive-paths prevents tool access to credentials by file-name shape regardless of where they live.
+
+The matcher lived under `src/subagents/` because its first consumer (worktree filter) was a subagent-side gate. The original docstring even acknowledged "Future consumers — `read_file` / `write_file` runtime checks (§8.4 points 1 and 2) — will import the same constant and matcher". Slice 159 is that wire-up.
+
+### Fix: engine-floor refuse, operator-policy not overridable
+
+**Wire 1 — fs tools (`engine.ts:checkPath` around line 740).** Right after the §11 protected-zone deny tier and BEFORE policy lookup (deny_paths / session_allow / allow_paths / confirm_paths), call `matchSensitivePath(protectedAbsPath) ?? matchSensitivePath(path)`. The double-probe covers both the symlink-resolved canonical form AND the operator-supplied form so a symlink pointing at a sensitive file still denies (defense in depth on top of slice 155's canonicalization). On match return `{ kind: 'deny', reason: 'path matches sensitive-path deny-list (SEC §8.4): <pattern>', source: { layer: 'default', section: 'protected' } }`. The `default` layer makes it explicit to operators that NO YAML authorized — it's engine-floor.
+
+**Wire 2 — bypass-mode capability loop (`engine.ts:1660+`).** The bypass branch is shared across all tools (not just bash) — `if (mode === 'bypass')` runs at the dispatch layer BEFORE the per-category switch, iterating resolved capabilities for `read-fs`/`write-fs`/`delete-fs`. The §11 protected-zone deny check (already wired) now has a SEC §8.4 sibling. Bypass mode does NOT override §8.4 — same posture as the §11 message ("bypass mode does NOT override §11"). Covers both `bash {command: "cat .env"}` (resolver emits read-fs cap) AND `read_file({path: ".env"})` (fs.read resolver emits read-fs cap) — both go through this loop in bypass mode. Stronger than the pre-slice behavior, which would have UPGRADED bypass writes to `.ssh/authorized_keys` to a confirm modal instead of refusing.
+
+### Canonical home move
+
+`src/subagents/sensitive-paths.ts` → `src/permissions/sensitive-paths.ts`. Permission engine should not import from subagents/ (architectural layering: permissions is a lower layer). The subagents-side file becomes a 3-line re-export shim so existing importers (`worktree-validation.ts` + tests) work unchanged. Future cleanup can remove the shim once those callers migrate.
+
+### Hot-path memoization (self-review of this slice)
+
+Pre-slice the matcher built `new Glob(pattern)` inside the loop on every invocation. That was fine when the only caller was the worktree pre-spawn filter (once per subagent — completely cold). Slice 159 moves the matcher into the engine's `checkPath` AND the bypass capability loop, both per-tool-call hot paths. 23 patterns × 2 forms = up to 46 `new Glob()` constructions per fs check, which would regress the spec performance budget (5ms target, 15ms p95 per `PERFORMANCE.md`).
+
+The fix is a module-scoped `Map<string, Glob>` keyed by literal pattern string. First call against a pattern compiles the Glob; subsequent calls hit the cache. Default `SENSITIVE_PATH_DENY_LIST` warms after the first fs-tool call; custom-pattern callers (worktree's `opts.denyListPatterns`) share the cache when their strings overlap (typical — most extension lists add patterns rather than replacing them).
+
+Pattern strings are short and bounded by the union of all distinct strings the process sees — realistic ceiling ~50 entries. No eviction needed.
+
+Slice 161 will memoize the broader `matcher.ts` Glob churn (a separate hot-path finding from the 5-axis review). This local cache addresses slice 159's regression risk now so the §8.4 wire doesn't sit in the hot path with naive compilation while waiting for slice 161 to land.
+
+### Self-review fixups before commit
+
+While reviewing the diff, three issues surfaced and were addressed in the same slice:
+
+1. **BACKLOG/spec narrative incorrectly attributed Wire 2 to "bash bypass-mode".** The `if (mode === 'bypass')` branch is shared across ALL tools at the dispatch layer (`engine.ts:1605`), not bash-specific. Updated narrative and the test description to clarify that both `bash {command:"cat .env"}` AND `read_file({path:".env"})` go through the same wire in bypass mode.
+2. **Bypass-fs test was squishy** (`expect(['deny','allow']).toContain(d.kind)`). The wire actually covers fs-tools in bypass too (same shared branch). Tightened the assertion to definitive deny + reason match.
+3. **Memoization regression risk** flagged above. Closed in the same slice.
+
+### Why bash in strict/permissive mode is NOT covered (scope boundary)
+
+Bash policy is command-string-based: `checkBash` evaluates the full `command` string against `bash.allow/deny/confirm` patterns. It does NOT iterate individual file paths the command might touch — that's a known architectural reality, not a slice 159 gap.
+
+So `bash {command: "cat .env"}` in strict mode goes through `bash.allow`/`bash.deny` patterns, NOT through `matchSensitivePath`. Operators who want symmetric defense add `bash.deny: ['cat *\\.env*', 'cat *.pem', ...]` to their YAML — the spec's §8.4 mandate is specifically scoped to fs-tools (`read_file`, `write_file`, etc.) by tool name.
+
+Bash bypass-mode does honor §8.4 (Wire 2 above) because bypass mode iterates capabilities and the sensitive-path check fires on each `read-fs:/write-fs:/delete-fs:` cap. Strict/permissive bash would need command-string-aware §8.4 detection, which is a different scope (out of slice 159; possibly future).
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **canonical home** | `src/permissions/sensitive-paths.ts` | New file. Full copy of patterns + matcher with updated docstring documenting the engine-floor refuse posture. |
+| **re-export shim** | `src/subagents/sensitive-paths.ts` | Reduced to 3 lines that re-export from `../permissions/sensitive-paths.ts`. Existing subagents-side importers (worktree-validation.ts, tests) work unchanged. |
+| **fs-tool wire** | `src/permissions/engine.ts:checkPath` | New `matchSensitivePath` call between protected-zone deny and deny_paths. Refuses on match with `source.section='protected'`. |
+| **bypass-mode capability loop wire** | `src/permissions/engine.ts` (`mode === 'bypass'` branch ~line 1660+) | Symmetric refuse inside the per-capability iteration. Covers ALL tools that emit fs caps in bypass mode (bash AND fs-tools — bypass branch is shared at dispatch layer). Bypass mode does NOT override §8.4. |
+| **barrel** | `src/permissions/index.ts` | Exports `SENSITIVE_PATH_DENY_LIST` + `matchSensitivePath` from the new permissions/sensitive-paths.ts. |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §6.2` | Documents both engine-floor refuse sets (HARD_REFUSE_COMMANDS + SEC §8.4) BEFORE the operator hierarchy section. Explicitly enumerates which tools are covered + flags bash-in-strict-mode as scope boundary. |
+
+### Tests added (+24)
+
+New file `tests/permissions/sensitive-paths-engine.test.ts` covers the engine-floor refuse end-to-end:
+
+| Describe block | Coverage |
+|---|---|
+| **read tools** | `.env`, `.env.production`, `.envrc`, `deep/subdir/.env` (any-depth), `*.pem` in nested dirs, `id_rsa*` family, `.aws/credentials`, `.aws/config`, `.netrc`, `**/credentials*.json`, `**/secrets.yml`+`yaml`, `.git-credentials` — 12 patterns × refuse-with-§8.4-reason assertions. |
+| **write tools** | Same patterns × write_file/edit_file. Verifies §8.4 point 2 ("writes blocked too"). |
+| **operator policy cannot widen** | Explicit `allow_paths: ['.env', '.env.*']` still refuses. Session-allow cannot widen. `mode=permissive` does NOT override. `mode=bypass` does NOT override either — bypass branch shares the capability loop wire across all tools. |
+| **bypass capability loop (all tools)** | `bash {command:'cat .env'}` in bypass → deny with "bypass mode does NOT override". `bash {command:'cp foo.pem dest/'}` → deny. `read_file({path:'.env'})` in bypass → deny (same wire). |
+| **non-sensitive paths flow through normally** | Regression: `src/foo.ts`, `docs/readme.md` allowed by policy. `envconfig.json`, `pemfile.txt` (similar-named non-matches) still allowed. |
+| **audit row provenance** | Refuse rows carry `source.section='protected'`, `source.layer='default'` so audit consumers can distinguish §8.4 refuses from operator-policy refuses. |
+
+### Existing tests updated (2)
+
+| Test | Why updated |
+|---|---|
+| **`engine.test.ts`: "bypass mode UPGRADES write to ~/.ssh/authorized_keys to confirm"** | Renamed to "bypass mode REFUSES write to ~/.ssh/authorized_keys outright (SEC §8.4 — slice 159)". The path matches `.ssh/**`; bypass mode does NOT override §8.4. Stronger posture — operator setting `mode=bypass` still cannot write authorized_keys via the agent. |
+| **`engine.test.ts`: "fs.read deny rule carries source per-section (read_file)"** | Used `.env.production` which now hits §8.4 (`source.section='protected'`) before the operator deny rule. Switched to a non-§8.4 path (`'src/forbidden/data.txt'` with `deny_paths: ['**/forbidden/*']`) so the test exercises operator-policy provenance attribution. Patterns and §8.4 source assertions live in sensitive-paths-engine.test.ts. |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7022 pass / 10 skip / 0 fail** (was 6995 → +27 net new: 24 in sensitive-paths-engine.test.ts + 3 in subagents/sensitive-paths.test.ts for the Glob cache; 2 existing tests updated for new behavior)
+
+### Defense layering
+
+After slice 159 the model→read_file→.env attack surface is closed by:
+
+1. **Engine-floor §8.4 refuse** — name-shape patterns. Operator policy cannot widen. Source of truth for "what counts as a secret by name".
+2. **§11 protected_paths deny tier** — location-based system roots (`/proc`, `/sys`, `~/.ssh/`, `.git/`). Different patterns, fires alongside §8.4.
+3. **Symlink canonicalization (slice 155)** — `realpath()` at build-time so a symlink `/tmp/foo → ~/.ssh/id_rsa` is classified against the canonical hidden path.
+4. **Operator policy `deny_paths`** — runs AFTER engine-floor; can ADD restrictions but cannot remove. Defense in depth for non-§8.4 patterns.
+5. **Worktree pre-spawn filter** (unchanged from pre-slice) — subagent worktrees containing §8.4 patterns refuse to spawn. Catches the threat at a different boundary.
+
+### Bash-tools / 5-axis review status
+
+This closes finding #3 from the 5-axis review round (cross-confirmed P0 between sec-in-depth and threat-model agents). Pending: slice 160 (bash args.cwd bypass), slice 161 (matchPath realpath storm), slice 162 (env scrub allowlist), slice 163+ P1 batches.
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 158: sealing scheduler crash on 2nd consecutive seal failure
 
 **Done.** First P0 from the 5-axis code review (concurrency / state-machine axis). Pre-slice, a sustained seal failure (worm-file disk full, `chattr +a` dropped, EROFS remount, etc.) would terminate the REPL mid-tool-call on the 2nd consecutive failure. Root cause: the bootstrap's `onSealFailed` callback in `bootstrap-engine.ts:666-697` called `engine.degrade(...)` / `engine.refuse(...)` unconditionally, claiming idempotence via a docstring that read "Repeated failures re-issue the same transition — harmless". That claim was factually wrong against `state-machine.ts:97-101` which throws on invalid edges:

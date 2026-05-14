@@ -370,7 +370,26 @@ Já especificado em §5.
 
 ### 6.2 Static rules
 
-Hierarquia: `enterprise → user → project → session`. Em cada nível, ordem `deny → ask → allow`. Match no nível mais alto vence; primeiro match dentro do nível vence.
+**Engine-floor refuses (operator-policy não-overridable).** Antes da hierarquia operator-driven, dois conjuntos de patterns hardcoded fixam o piso de segurança:
+
+1. **Bash hard-refuse commands** (já documentado acima §5.2): `eval`, `exec`, `source`, `dd`, `fdisk`, etc. Operator `allow: "*"` não autoriza.
+2. **SEC §8.4 sensitive paths** (slice 159 wire): `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.ssh/**`, `.aws/credentials`, `**/credentials*.json`, `**/secrets.yml`, etc. Lista canônica em `src/permissions/sensitive-paths.ts:SENSITIVE_PATH_DENY_LIST`, mirror direto de `SECURITY_GUIDELINE.md §8.4`. Wired em `engine.ts:checkPath` (fs-tools: `read_file`, `write_file`, `edit_file`, `grep`, `glob`) e na branch bypass-mode do bash capability loop (`engine.ts:1660+`). Engine-floor refuse fire ANTES de `deny_paths`/`session_allow`/`allow_paths`/`confirm_paths` — operator policy não pode widen access.
+
+Patterns são name-shape (não path-prefix), com normalização `**/<pattern>` pra qualquer profundidade. Por design, dois caminhos diferentes pra um `.env`:
+
+- `read_file('.env')` (operador no cwd raiz) — refuse.
+- `read_file('deep/nested/path/.env')` (em subdir) — refuse.
+
+Ambos retornam decision `{ kind: 'deny', source: { layer: 'default', section: 'protected' } }` com `reason` citando o pattern que casou. Source.layer='default' deixa explícito ao operador que NENHUM YAML autorizou — é piso engine.
+
+Coverage do wire na phase 1 de slice 159:
+
+- ✅ `read_file` / `write_file` / `edit_file` em `strict`/`permissive` (via `checkPath`).
+- ✅ `grep` / `glob` em `strict`/`permissive` (via `checkPath`, mesma seção fs.read/fs.write).
+- ✅ **Todos os tools em `mode=bypass`** (via capability loop compartilhado em `engine.ts:1660+`). O branch `if (mode === 'bypass')` roda ao nível de dispatch ANTES do switch por categoria, iterando `read-fs`/`write-fs`/`delete-fs` caps. Cobre `bash {command:"cat .env"}` (resolver emite read-fs) E `read_file({path:".env"})` (fs.read resolver idem). Bypass NÃO override §8.4.
+- ⚠️ `bash` em `strict`/`permissive`: command-string evaluation only — `cat .env` é avaliado contra `bash.allow/deny` patterns, NÃO contra §8.4. Operator que quer defesa simétrica adiciona `bash.deny: ['cat *\\.env*', 'cat *.pem', ...]` no YAML. Spec §8.4 obriga §8.4-patterns SÓ em fs-tools por design (o nome do tool é o gate; bash é uma superfície separada com sua própria policy surface).
+
+**Hierarquia operator-driven (continua):** `enterprise → user → project → session`. Em cada nível, ordem `deny → ask → allow`. Match no nível mais alto vence; primeiro match dentro do nível vence.
 
 ```toml
 [[deny]]

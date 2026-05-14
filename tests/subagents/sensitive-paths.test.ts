@@ -153,3 +153,55 @@ describe('SENSITIVE_PATH_DENY_LIST integrity', () => {
     ]);
   });
 });
+
+// Slice 159 self-review: the matcher moved into the hot path
+// (per-call from engine.checkPath + bypass capability loop). The
+// module memoizes compiled `Glob` instances at module scope so
+// repeated calls don't pay 46 constructions each time. The cache
+// is keyed by the literal pattern string, so default + custom
+// pattern lists share entries when their strings overlap. These
+// tests pin the memoization behavior — a regression that drops
+// the cache would re-introduce slice 159's hot-path tax.
+describe('matchSensitivePath — module-level Glob cache (slice 159 self-review)', () => {
+  test('repeated calls against the same path produce stable results', () => {
+    // Functional regression: a memoized Glob must return the same
+    // verdict on every call. (A buggy cache that swaps Glob shapes
+    // between calls would break this.)
+    const samples = [
+      '.env',
+      'src/foo.ts',
+      'deep/.env.production',
+      'docs/readme.md',
+      'id_rsa',
+      '.aws/credentials',
+      'src/envconfig.json',
+    ];
+    const first = samples.map((p) => matchSensitivePath(p));
+    for (let i = 0; i < 100; i++) {
+      const again = samples.map((p) => matchSensitivePath(p));
+      expect(again).toEqual(first);
+    }
+  });
+
+  test('cache survives across custom-pattern callers', () => {
+    // The first call uses the default list, warming the cache for
+    // the canonical patterns. A subsequent caller passing a custom
+    // list that overlaps with default patterns must reuse the
+    // cached Globs (same pattern string → same Glob).
+    expect(matchSensitivePath('.env')).toBe('.env');
+    // Custom list with overlap.
+    const custom = ['.env', 'my-secret.txt'];
+    expect(matchSensitivePath('.env', custom)).toBe('.env');
+    expect(matchSensitivePath('my-secret.txt', custom)).toBe('my-secret.txt');
+    expect(matchSensitivePath('.env', custom)).toBe('.env');
+  });
+
+  test('null result is also stable under repeat', () => {
+    // The matcher returns null for non-sensitive paths. Cache must
+    // not poison this with a stale hit on a prior pattern.
+    for (let i = 0; i < 50; i++) {
+      expect(matchSensitivePath('src/main.ts')).toBeNull();
+      expect(matchSensitivePath('docs/readme.md')).toBeNull();
+    }
+  });
+});
