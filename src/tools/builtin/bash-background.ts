@@ -1,5 +1,5 @@
-import { isAbsolute, resolve } from 'node:path';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { resolveAndValidateBashCwd } from './_bash-cwd.ts';
 
 export interface BashBackgroundInput {
   command: string;
@@ -129,20 +129,17 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
     if (args.cwd !== undefined && typeof args.cwd !== 'string') {
       return toolError(ERROR_CODES.invalidArg, 'cwd must be a string');
     }
-    // Resolve cwd against the session: undefined → session cwd;
-    // absolute → as-is; relative → resolve from session cwd. Same
-    // pattern as the synchronous bash tool. Forwarding args.cwd
-    // verbatim (or omitting it) makes the manager fall back to
-    // process.cwd(), which silently runs commands in the wrong
-    // directory whenever the harness was launched with a different
-    // working dir than the session — e.g. evals (each case has its
-    // own tmp cwd) and worktree subagents (M3+).
-    const wd =
-      args.cwd === undefined
-        ? ctx.cwd
-        : isAbsolute(args.cwd)
-          ? args.cwd
-          : resolve(ctx.cwd, args.cwd);
+    // Slice 160 (review): same cwd-subtree refuse as the synchronous
+    // bash tool. Pre-slice forwarding args.cwd verbatim let a model
+    // emit `bash_background {command:"...", cwd:"/etc"}` and run a
+    // long-lived process outside the engine's capability attribution.
+    // The helper resolves + canonicalizes + refuses cwd outside the
+    // session subtree. See _bash-cwd.ts.
+    const cwdResult = resolveAndValidateBashCwd({ argsCwd: args.cwd, sessionCwd: ctx.cwd });
+    if (!cwdResult.ok) {
+      return toolError(ERROR_CODES.invalidArg, cwdResult.error);
+    }
+    const wd = cwdResult.cwd;
 
     try {
       const r = await ctx.bgManager.spawn({

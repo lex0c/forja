@@ -65,6 +65,13 @@
 import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
+// Slice 162 (review — env scrub allowlist parity). Canonical
+// allowlist moved to a shared module so the macOS runner uses the
+// same source of truth via `/usr/bin/env -i KEY=VAL ...` wrap.
+// Pre-slice the list lived inline here; macOS had no equivalent
+// kernel-boundary clearenv, so 3rd-party credential vars off the
+// scrub denylist leaked into the sandboxed bash on darwin.
+import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
 import { resolveSandboxBinary } from './sandbox-availability.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
@@ -169,55 +176,11 @@ export interface BuildBwrapArgvOptions {
   realpath?: (p: string) => string;
 }
 
-// Slice 145 (S2): env vars the sandboxed inner process is allowed
-// to inherit. Everything else is blocked at the kernel boundary
-// via `--clearenv`. This is INTENTIONALLY a narrow list — the
-// goal is "enough for bash + common posix tooling to function",
-// not "convenient for arbitrary scripts".
-//
-// What's IN:
-//   PATH        — binary lookup
-//   HOME        — tilde expansion + tools that read $HOME
-//   USER/LOGNAME— identity for tools that look it up
-//   SHELL       — bash uses $SHELL for sub-shell invocation
-//   TERM        — terminal type; mostly cosmetic but cheap
-//   LANG/LC_*   — locale; affects sort order, date format, etc.
-//   TZ          — timezone for date/time output
-//   TMPDIR      — temp dir; bash + many tools honor this
-//
-// What's OUT (and why):
-//   LD_*, DYLD_*  — linker injection (sanitize/env.ts blocks too)
-//   NODE_OPTIONS  — Node code injection
-//   PYTHON*       — Python module / startup injection
-//   PERL5*, RUBY* — same threat for those interpreters
-//   BASH_ENV, ENV — bash auto-source on every non-interactive shell
-//   HTTPS_PROXY, HTTP_PROXY, ALL_PROXY — egress MITM redirect
-//   XDG_*         — user dirs; defaults are fine
-//   DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR — host service access
-//   GIT_*         — git config-via-env injection
-//   SSH_AUTH_SOCK, GPG_AGENT_INFO, etc. — agent socket access
-//   *_TOKEN, *_KEY, *_PASS, *_SECRET    — credentials
-//
-// Adding a new entry requires explicit justification in this
-// comment block + a corresponding test in sandbox-runner.test.ts.
-const SAFE_ENV_VARS: readonly string[] = [
-  'PATH',
-  'HOME',
-  'USER',
-  'LOGNAME',
-  'SHELL',
-  'TERM',
-  'LANG',
-  'LC_ALL',
-  'LC_CTYPE',
-  'LC_COLLATE',
-  'LC_MESSAGES',
-  'LC_NUMERIC',
-  'LC_TIME',
-  'LC_MONETARY',
-  'TZ',
-  'TMPDIR',
-];
+// Slice 162: the env allowlist (`SAFE_ENV_VARS`) and the membership
+// rules (what's IN / what's OUT / why) moved to
+// `src/permissions/safe-env-vars.ts` — single source of truth shared
+// with the macOS runner. See that file for the canonical list +
+// rationale; this module just consumes it via the import at the top.
 
 // Push `--clearenv` + `--setenv KEY VALUE` for each allowed var
 // present in `env`. Vars with NUL bytes are skipped (bwrap argv
@@ -517,13 +480,16 @@ export interface MaybeWrapSandboxArgvOptions {
   cwd: string;
   home?: string;
   innerArgv: readonly string[];
-  // Slice 145 (S2): env handed to the kernel-level allowlist (bwrap
-  // `--clearenv` + `--setenv` on Linux; macOS sandbox-exec doesn't
-  // need it — it doesn't strip env). When unset the helper falls back
-  // to `process.env`, which the caller is expected to have already
-  // scrubbed via `scrubEnv` before reaching here. Defense in depth:
-  // even if the caller forgets to scrub, only the SAFE_ENV_VARS
-  // allowlist is forwarded into the bwrap'd inner process.
+  // Slice 145 (S2): env handed to the kernel-level allowlist
+  // (bwrap `--clearenv` + `--setenv` on Linux). Slice 162 extends
+  // the same defense to macOS via `/usr/bin/env -i KEY=VAL ... --`
+  // wrap of the inner argv — sandbox-exec doesn't have a native
+  // clearenv flag, so we userland-clear right before the inner
+  // exec. When unset the helper falls back to `process.env`, which
+  // the caller is expected to have already scrubbed via `scrubEnv`
+  // before reaching here. Defense in depth: even if the caller
+  // forgets to scrub, only the SAFE_ENV_VARS allowlist is forwarded
+  // into the wrapped inner process on EITHER platform.
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   which?: (name: string) => string | null;
@@ -628,6 +594,13 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
       // restrict SBPL write allow to that subpath. Linux ignores
       // tmpdir entirely (--tmpfs /tmp already gives isolation).
       if (options.tmpdir !== undefined) macOpts.tmpdir = options.tmpdir;
+      // Slice 162 (review — env scrub allowlist parity). Forward
+      // the (already-resolved) env so `buildSandboxExecArgv` can
+      // wrap the inner argv with `/usr/bin/env -i KEY=VAL ... --`
+      // and emulate Linux's `--clearenv` kernel boundary. `env`
+      // here is the resolved value from line 554 (caller-supplied
+      // or fallback to `process.env`).
+      macOpts.env = env;
       return buildSandboxExecArgv(macOpts);
     }
   }

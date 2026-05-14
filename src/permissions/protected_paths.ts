@@ -120,10 +120,48 @@ const startsWithSegment = (path: string, prefix: string): boolean =>
 const resolveTildeFile = (home: string, file: string): string => resolve(home, file);
 const resolveCwdDir = (cwd: string, dir: string): string => resolve(cwd, dir);
 
+// Slice 161 (review — hot-path memoization). `classifyProtectedPath`
+// runs in the per-tool-call hot path AND inside the bash bypass
+// capability loop (per-cap). Pre-slice it called `resolve(home, file)`
+// 6 times for `TILDE_ESCALATE_FILES`, `resolve(home, dir)` 2 times for
+// `TILDE_ESCALATE_DIRS`, and `resolve(cwd, dir)` 3 times for
+// `CWD_ESCALATE_DIRS` on every invocation. `home` is frozen at
+// SessionStart per spec §4.3; `cwd` is also frozen. So the resolves
+// are pure on the (home, cwd) tuple and can be memoized.
+//
+// Cache key = `home + '\0' + cwd` (NUL byte separator avoids
+// collisions where one of the strings ends with the other). Cache
+// entries are bounded by the union of distinct (home, cwd) tuples
+// the process ever sees — for a typical agent session that's ONE
+// entry; even for tests bootstrapping many engines it's tens.
+
+interface ResolvedProtectedTargets {
+  tildeEscalateFiles: readonly string[];
+  tildeEscalateDirs: readonly string[];
+  cwdEscalateDirs: readonly string[];
+}
+
+const targetCache = new Map<string, ResolvedProtectedTargets>();
+
+const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets => {
+  const key = `${home}\0${cwd}`;
+  let entry = targetCache.get(key);
+  if (entry === undefined) {
+    entry = {
+      tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
+      tildeEscalateDirs: TILDE_ESCALATE_DIRS.map((d) => resolveTildeFile(home, d)),
+      cwdEscalateDirs: CWD_ESCALATE_DIRS.map((d) => resolveCwdDir(cwd, d)),
+    };
+    targetCache.set(key, entry);
+  }
+  return entry;
+};
+
 export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedTier | null => {
   const { absPath, op, home, cwd } = input;
 
-  // Tier `deny` — applies to reads and writes alike.
+  // Tier `deny` — applies to reads and writes alike. SYSTEM_DENY_ROOTS
+  // is a constant (no per-call resolve needed).
   for (const root of SYSTEM_DENY_ROOTS) {
     if (startsWithSegment(absPath, root)) return 'deny';
   }
@@ -132,17 +170,20 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
   // through; the engine's regular allow/confirm/deny chain still runs.
   if (op === 'read') return null;
 
+  // ABSOLUTE_ESCALATE_ROOTS is constant too.
   for (const root of ABSOLUTE_ESCALATE_ROOTS) {
     if (startsWithSegment(absPath, root)) return 'escalate';
   }
-  for (const file of TILDE_ESCALATE_FILES) {
-    if (absPath === resolveTildeFile(home, file)) return 'escalate';
+  // Tilde + cwd resolves come from the (home, cwd) cache — slice 161.
+  const targets = getResolvedTargets(home, cwd);
+  for (const file of targets.tildeEscalateFiles) {
+    if (absPath === file) return 'escalate';
   }
-  for (const dir of TILDE_ESCALATE_DIRS) {
-    if (startsWithSegment(absPath, resolveTildeFile(home, dir))) return 'escalate';
+  for (const dir of targets.tildeEscalateDirs) {
+    if (startsWithSegment(absPath, dir)) return 'escalate';
   }
-  for (const dir of CWD_ESCALATE_DIRS) {
-    if (startsWithSegment(absPath, resolveCwdDir(cwd, dir))) return 'escalate';
+  for (const dir of targets.cwdEscalateDirs) {
+    if (startsWithSegment(absPath, dir)) return 'escalate';
   }
 
   return null;

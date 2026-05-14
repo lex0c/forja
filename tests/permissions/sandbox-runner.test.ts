@@ -226,12 +226,21 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
   // Test seams added in slice 48: pin a darwin scenario from a
   // Linux runner. Production callers leave platform/which undefined.
   describe('platform dispatch (slice 48 seams)', () => {
-    test('darwin + sandbox-exec available → wraps via sandbox-exec', () => {
+    test('darwin + sandbox-exec available → wraps via sandbox-exec + env -i clearenv (slice 162)', () => {
+      // Slice 162 (review — env scrub allowlist parity on macOS).
+      // Pre-slice the argv was `['sandbox-exec', '-p', profile,
+      // 'bash', '-c', 'echo hi']` — no userland clearenv, sandbox-exec
+      // inherited the spawner's env verbatim. Post-slice the inner
+      // argv is wrapped with `/usr/bin/env -i KEY=VAL ... --` so
+      // only the SANDBOX_SAFE_ENV_VARS allowlist values present in
+      // the env reach the inner bash.
       const argv = maybeWrapSandboxArgv({
         profile: 'cwd-rw',
         cwd: CWD,
         home: HOME,
         innerArgv: INNER,
+        // Pin a minimal env so the assertion below is deterministic.
+        env: { PATH: '/usr/bin:/bin', HOME: '/home/test', UNSAFE_TOKEN: 'leak' },
         platform: 'darwin',
         which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
         // Slice 154: pin exists() so canonical-first hits /usr/bin/sandbox-exec
@@ -246,9 +255,20 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       // version + the cwd writable subpath.
       expect(argv[2]).toContain('(version 1)');
       expect(argv[2]).toContain('(allow file-write* (subpath "/work/proj"))');
-      // Inner argv follows the profile, no `--` separator (unlike
-      // bwrap).
-      expect(argv.slice(3)).toEqual(['bash', '-c', 'echo hi']);
+      // Slice 162: argv[3] is the canonical /usr/bin/env path
+      // (PATH-shim resistance, mirrors slice 154's pattern).
+      expect(argv[3]).toBe('/usr/bin/env');
+      expect(argv[4]).toBe('-i');
+      // env -i assignments. Only allowlisted vars present in env.
+      // UNSAFE_TOKEN must NOT appear — that's the slice 162 fix.
+      const innerStart = argv.indexOf('--');
+      expect(innerStart).toBeGreaterThan(4);
+      const envAssignments = argv.slice(5, innerStart);
+      expect(envAssignments).toContain('PATH=/usr/bin:/bin');
+      expect(envAssignments).toContain('HOME=/home/test');
+      expect(envAssignments.some((a) => a.startsWith('UNSAFE_TOKEN='))).toBe(false);
+      // After `--` the original innerArgv.
+      expect(argv.slice(innerStart + 1)).toEqual(['bash', '-c', 'echo hi']);
     });
 
     test('darwin without sandbox-exec → passthrough (degraded)', () => {

@@ -576,3 +576,78 @@ describe('first* helpers', () => {
     expect(firstMatchingHost([], 'example.com')).toBeNull();
   });
 });
+
+// Slice 161 (review — hot-path memoization). The matcher caches
+// compiled Globs / RegExps at module scope and hoists realpath +
+// resolve(cwd) into `prepareTarget` so iterating N patterns against
+// one target pays the resolution cost once. These tests pin the
+// public contract: semantic equivalence vs the pre-slice
+// `matchPath`, and stable behavior under repeated invocation.
+describe('matchPath — slice 161 prepared target API', () => {
+  test('matchPathPrepared returns the same result as matchPath', async () => {
+    const { matchPathPrepared, prepareTarget } = await import('../../src/permissions/matcher.ts');
+    const cases: Array<{ pattern: string; target: string; cwd: string }> = [
+      { pattern: 'src/**', target: 'src/foo.ts', cwd: '/work' },
+      { pattern: 'src/**', target: 'docs/foo.ts', cwd: '/work' },
+      { pattern: '*.ts', target: 'src/foo.ts', cwd: '/work' },
+      { pattern: '/etc/**', target: '/etc/passwd', cwd: '/work' },
+      { pattern: 'src/*.ts', target: 'src/foo.ts', cwd: '/work' },
+      { pattern: 'src/*.ts', target: 'src/nested/foo.ts', cwd: '/work' },
+    ];
+    for (const c of cases) {
+      const direct = matchPath(c.pattern, c.target, c.cwd);
+      const prepared = matchPathPrepared(c.pattern, prepareTarget(c.target, c.cwd));
+      expect(prepared).toBe(direct);
+    }
+  });
+
+  test('prepareTarget result is stable across calls (idempotent)', async () => {
+    const { prepareTarget } = await import('../../src/permissions/matcher.ts');
+    const a = prepareTarget('src/foo.ts', '/work');
+    const b = prepareTarget('src/foo.ts', '/work');
+    expect(a.absTarget).toBe(b.absTarget);
+    expect(a.absCwd).toBe(b.absCwd);
+  });
+
+  test('firstMatchingPath: repeated identical calls stay deterministic under the cache', () => {
+    // The cache must NOT poison subsequent calls with stale state.
+    // Drive the same call 100 times and assert the result is always
+    // the matching pattern (or null).
+    for (let i = 0; i < 100; i++) {
+      expect(firstMatchingPath(['src/**', 'docs/**'], 'src/foo.ts', '/work')).toBe('src/**');
+      expect(firstMatchingPath(['src/**', 'docs/**'], 'lib/foo.ts', '/work')).toBeNull();
+    }
+  });
+
+  test('firstMatchingPath: rapidly alternating cwd/pattern keeps correctness', () => {
+    // The cache is keyed by literal pattern strings post-resolve.
+    // Different cwds produce different resolved keys so cross-cwd
+    // results don't bleed.
+    const r1 = firstMatchingPath(['src/**'], 'src/foo.ts', '/work');
+    const r2 = firstMatchingPath(['src/**'], 'src/foo.ts', '/other');
+    expect(r1).toBe('src/**');
+    expect(r2).toBe('src/**');
+    // Pattern that matches in one cwd but not another:
+    const r3 = firstMatchingPath(['foo.ts'], 'foo.ts', '/work');
+    const r4 = firstMatchingPath(['foo.ts'], 'sub/foo.ts', '/work');
+    expect(r3).toBe('foo.ts');
+    expect(r4).toBeNull();
+  });
+
+  test('matchCommand cache: same pattern reused across many invocations stays stable', () => {
+    for (let i = 0; i < 100; i++) {
+      expect(matchCommand('ls *', 'ls -la')).toBe(true);
+      expect(matchCommand('ls *', 'rm -rf /')).toBe(false);
+      expect(matchCommand('git status', 'git status')).toBe(true);
+      expect(matchCommand('git status', 'git commit')).toBe(false);
+    }
+  });
+
+  test('matchHost cache: case-insensitive same pattern stays stable', () => {
+    for (let i = 0; i < 50; i++) {
+      expect(matchHost('*.internal', 'foo.internal')).toBe(true);
+      expect(matchHost('*.internal', 'FOO.INTERNAL')).toBe(true);
+      expect(matchHost('*.internal', 'foo.external')).toBe(false);
+    }
+  });
+});

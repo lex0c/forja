@@ -182,6 +182,14 @@ Path em scope ou em arg do tool é resolvido **antes** do match:
 
 Path em arg que falha qualquer passo → `deny(reason="path_resolution_failed", detail=...)`.
 
+**`args.cwd` em bash family (slice 160).** O bash resolver atribui capabilities relativo a `ctx.cwd` (a session cwd frozen at SessionStart). O bash tool aceita também um `args.cwd` opcional pra mudar o working dir do spawn. Pré-slice 160 isso era um bypass: model emitia `bash {command:"cat foo", cwd:"/etc"}`, resolver atribuía `read-fs:<session>/foo`, broker honrava o absoluto, bash executava em `/etc/foo`. Engine nunca via `/etc/...` em nenhuma capability.
+
+Slice 160 fix: `src/tools/builtin/_bash-cwd.ts` resolve + canonicaliza (realpath) ambos os lados e refuse se a forma canonical do `args.cwd` NÃO está em (ou abaixo de) o subtree canonical do `ctx.cwd`. `bash` e `bash_background` consomem o helper. Equal-to-session é OK; descendant é OK; ancestor/sibling/disjoint refuse com `tool.invalid_arg` e error message citando o canonical proposto.
+
+Operator que precisa de cwd diferente: usa `cd <dir>` dentro do command (o resolver vê o command text e atribui caps pro cd target). Operators que precisam cross-project deveriam iniciar uma session separada com `--cwd <other>`.
+
+Defese em camadas com slice 155 (canonicalization do sandbox runner): slice 155 protege a wrap layer pós-engine; slice 160 protege a tool-handler entry pré-engine. Os dois fecham diferentes pontos de symlink-escape no fluxo do bash.
+
 ### 4.4 Compilação e validação
 
 Policy carrega → compila glob → falha de compilação = policy inválida = engine vai pra `refusing`. Erros comuns:
@@ -666,6 +674,14 @@ Trust marker + warnings persistem no `SandboxAvailability` retornado por `detect
 - **Granularidade per-CLI-run uniforme:** todos os spawns (worker + grep + bg subagents) compartilham `/tmp/forja-sb-<ULID>` da mesma invocação. Cross-spawn-same-session NÃO é boundary de segurança (mesmo operator) — o threat é sandbox↔host, fechado pelo scoped SBPL allow. Cache locality bonus: spawns sequenciais reaproveitam o mesmo dir (npm cache, pip wheels etc.) sem race entre processos paralelos do mesmo `forja`.
 - **Env discipline:** cada Bun.spawn callsite faz merge explícito `{ ...scrubEnv(process.env), TMPDIR: tmpdir }` (bg) ou `{ ...process.env, TMPDIR: tmpdir }` (grep). TMPDIR fica fora do scrubEnv allowlist por padrão — o overlay é AFTER scrubEnv, garantindo que um attacker injetando TMPDIR via env não vença a scrub (scrub já dropou) E o overlay seta o valor correto.
 - **Cleanup:** registrado pelo bootstrap em 3 signal handlers (`exit`, `SIGINT`, `SIGTERM`). Best-effort: rm errors são silenciados (a dir pode ter sido removida por concurrent signal, ou pelo operator). Orphans `/tmp/forja-sb-*` ficam pro `agent worktree gc` (slice futuro) ou pra varredura de OS `tmpwatch`. Idempotente — segundo cleanup é no-op.
+
+**Env-scrub kernel-boundary parity macOS ↔ Linux (slice 162).** Linux usa `bwrap --clearenv --setenv KEY VAL ...` pra impor uma allowlist de env vars no kernel boundary do `execve`. macOS sandbox-exec não tem flag equivalente — pre-slice o inner process herdava o env do spawner verbatim, fazendo userspace `scrubEnv` ser a ÚNICA defesa contra exfil de credenciais que NÃO matchassem a denylist (`VAULT_ADDR`, `BW_SESSION`, `OP_CONNECT_TOKEN`, etc.).
+
+- **Fix slice 162:** `buildSandboxExecArgv` (macOS) aceita `env?: NodeJS.ProcessEnv` e, quando set, wrappa o inner argv com `/usr/bin/env -i KEY=VAL ... --` no argv passado pro sandbox-exec. `env -i` é o userland clearenv POSIX — limpa o env e executa o próximo argv com APENAS os `KEY=VAL` literais explicitados. Resultado: o inner bash dentro do sandbox-exec vê SÓ os vars da `SANDBOX_SAFE_ENV_VARS` allowlist que estavam presentes no env fornecido.
+- **Source of truth única:** `src/permissions/safe-env-vars.ts:SANDBOX_SAFE_ENV_VARS` é a lista canônica, consumida tanto pelo `appendEnvFlags` (Linux `--setenv`) quanto pelo `buildSandboxExecArgv` (macOS `env -i`). Mudanças na lista propagam pras duas plataformas via mesmo import.
+- **PATH-shim resistance:** o wrapper usa `/usr/bin/env` literal (não bare `env`). Mirror de slice 154 — `execve` não re-walk `$PATH`, atacante não consegue plantar `/tmp/evilbin/env` pra interceptar o clearenv.
+- **NUL byte safety:** vars com NUL no value são puladas (não roubam outros tokens da argv). Mesma defesa do `appendEnvFlags` Linux.
+- **scrubEnv denylist expansion (slice 162 part 2):** complementa o sandbox-side com novas patterns no `src/sanitize/env.ts`: suffixes `_KEY`/`_AUTH`/`_BEARER`/`_CRED(S)?`/`_SESSION`/`_COOKIE`/`_PRIVATE_KEY` + service prefixes `VAULT_`/`BW_`/`LPASS_`/`LASTPASS_`/`OP_CONNECT_` + specific names `DOPPLER_TOKEN`/`INFISICAL_TOKEN`/`TWILIO_ACCOUNT_SID`. Defense in depth pros paths `host`/`degraded passthrough` onde sandbox wrap não fire — userspace scrub é a única camada.
 
 ### 6.6 Approval gate
 

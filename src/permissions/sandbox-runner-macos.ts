@@ -43,6 +43,7 @@
 import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
+import { SANDBOX_SAFE_ENV_VARS } from './safe-env-vars.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import type { SandboxProfile } from './sandbox-plan.ts';
 
@@ -97,6 +98,26 @@ export interface BuildSandboxExecArgvOptions {
   // exists here for operator-driven workflows that pre-create a
   // session-scoped tmpdir.
   tmpdir?: string;
+  // Slice 162 (review — env scrub allowlist parity). When set,
+  // the inner argv is wrapped with `/usr/bin/env -i KEY=VAL ... --`
+  // so the inner process starts with ONLY the allowlisted vars
+  // (`SANDBOX_SAFE_ENV_VARS`) populated from this env. Matches the
+  // Linux runner's `--clearenv --setenv KEY VAL` kernel-boundary
+  // behavior — without this wrap, sandbox-exec inherits the
+  // spawner's env verbatim and any var off the userspace scrub
+  // denylist (e.g. VAULT_ADDR, BW_SESSION, novel SaaS tokens)
+  // leaks into the sandboxed bash.
+  //
+  // Path-shim hardening (mirror of slice 154): the inner wrapper
+  // uses the canonical `/usr/bin/env` path verbatim instead of
+  // the bare `env` name so the kernel `execve` doesn't re-walk
+  // $PATH at exec time and resolve to a `/tmp/evilbin/env` shim.
+  //
+  // When omitted (test seam, legacy callers): inner argv is not
+  // wrapped — `sandbox-exec` execs the inner directly and it
+  // inherits whatever env `Bun.spawn({env})` passed. Production
+  // wiring via `maybeWrapSandboxArgv` always sets this.
+  env?: NodeJS.ProcessEnv;
 }
 
 // SBPL string escaping. Apple's profile parser accepts double-quoted
@@ -427,5 +448,34 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   // absolute path when provided (production via maybeWrapSandboxArgv);
   // fall back to the bare binary name for direct-build test callers.
   const sandboxExecPath = options.sandboxExecPath ?? 'sandbox-exec';
-  return [sandboxExecPath, '-p', profileString, ...innerArgv];
+
+  // Slice 162 (review — env scrub allowlist parity on macOS).
+  // sandbox-exec inherits the spawner's env verbatim; without an
+  // equivalent of `bwrap --clearenv`, userspace scrubEnv was the
+  // SOLE env barrier on darwin. We wrap the inner argv with
+  // `/usr/bin/env -i KEY=VAL ... --` so the inner process starts
+  // with ONLY the allowlisted vars. The wrap is opt-in via the
+  // `env` option — when omitted (legacy / test callers), inner
+  // argv is execed verbatim and the spawner's env passes through.
+  // Production via `maybeWrapSandboxArgv` always sets it.
+  //
+  // Canonical /usr/bin/env path: same PATH-shim rationale as slice
+  // 154 — bare `env` lets `execve` re-resolve via $PATH at exec
+  // time, exposing the shim attack. `/usr/bin/env` is canonical
+  // on every supported macOS version.
+  let effectiveInner: readonly string[] = innerArgv;
+  if (options.env !== undefined) {
+    const envAssignments: string[] = [];
+    for (const key of SANDBOX_SAFE_ENV_VARS) {
+      const value = options.env[key];
+      if (value === undefined) continue;
+      // NUL bytes inside env values would silently truncate at the
+      // execve layer. Skip — same defense the Linux runner's
+      // appendEnvFlags applies for the bwrap --setenv path.
+      if (value.includes('\0')) continue;
+      envAssignments.push(`${key}=${value}`);
+    }
+    effectiveInner = ['/usr/bin/env', '-i', ...envAssignments, '--', ...innerArgv];
+  }
+  return [sandboxExecPath, '-p', profileString, ...effectiveInner];
 };

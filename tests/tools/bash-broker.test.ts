@@ -7,6 +7,9 @@
 // branch.
 
 import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Broker, BrokerRequest, BrokerResponse } from '../../src/broker/index.ts';
 import { bashTool } from '../../src/tools/builtin/bash.ts';
 import { isToolError } from '../../src/tools/types.ts';
@@ -62,13 +65,42 @@ describe('bashTool — broker routing contract', () => {
     expect(getRequest().args.cwd).toBe('/work/proj/sub/dir');
   });
 
-  test('absolute args.cwd is passed through unchanged', async () => {
+  test('absolute args.cwd outside session subtree refuses (slice 160)', async () => {
+    // Pre-slice 160: bash tool forwarded absolute cwd verbatim,
+    // letting a model bypass the engine's path-attribution by
+    // pointing at /etc, /abs/path, etc. The new helper refuses
+    // cwd outside ctx.cwd subtree at the tool-handler boundary.
     const { broker, getRequest } = capturing();
-    await bashTool.execute(
+    const r = await bashTool.execute(
       { command: 'pwd', cwd: '/abs/path' },
       makeCtx({ broker, cwd: '/work/proj' }),
     );
-    expect(getRequest().args.cwd).toBe('/abs/path');
+    expect(typeof r).toBe('object');
+    expect((r as { error_code?: string }).error_code).toBe('tool.invalid_arg');
+    expect((r as { error_message?: string }).error_message).toContain('outside session subtree');
+    // Broker was never invoked — refuse fires before BrokerRequest
+    // construction.
+    expect(() => getRequest()).toThrow();
+  });
+
+  test('absolute args.cwd INSIDE session subtree is passed through unchanged', async () => {
+    // The legitimate case: model wants to run in a subdir of the
+    // session, addresses it absolutely. Engine sees the absolute
+    // form on the wire (the helper returns the canonical absolute).
+    const sessionCwd = realpathSync(mkdtempSync(join(tmpdir(), 'forja-bash-cwd-')));
+    try {
+      const innerPath = `${sessionCwd}/inner`;
+      mkdirSync(innerPath, { recursive: true });
+      const { broker, getRequest } = capturing();
+      await bashTool.execute(
+        { command: 'pwd', cwd: innerPath },
+        makeCtx({ broker, cwd: sessionCwd }),
+      );
+      // Helper canonicalizes; the wire shows the canonical absolute.
+      expect(getRequest().args.cwd).toBe(realpathSync(innerPath));
+    } finally {
+      rmSync(sessionCwd, { recursive: true, force: true });
+    }
   });
 
   test('missing args.cwd: ctx.cwd substituted', async () => {

@@ -1,4 +1,3 @@
-import { isAbsolute, resolve as resolvePath } from 'node:path';
 import {
   BASH_DEFAULT_TIMEOUT_MS,
   BASH_TIMEOUT_GRACE_MS,
@@ -6,6 +5,7 @@ import {
   type BrokerResponse,
 } from '../../broker/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { resolveAndValidateBashCwd } from './_bash-cwd.ts';
 
 // Buffer above the handler's effective timeout for the broker
 // outer guard. Covers worker startup (~100ms), JSON parse, bash
@@ -146,16 +146,17 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       return toolError(ERROR_CODES.invalidArg, 'cwd must be a string');
     }
 
-    // Resolve cwd to absolute BEFORE handing off to the broker —
-    // the broker handler resolves relative paths against its own
-    // baseCwd (process.cwd() of the worker), which is NOT the same
-    // as ctx.cwd. Passing an absolute path bypasses that.
-    const resolvedCwd =
-      args.cwd === undefined
-        ? ctx.cwd
-        : isAbsolute(args.cwd)
-          ? args.cwd
-          : resolvePath(ctx.cwd, args.cwd);
+    // Slice 160 (review): resolve + validate cwd against the session
+    // subtree. Pre-slice this accepted any absolute path, letting a
+    // model emit `bash {command:"cat foo", cwd:"/etc"}` to read
+    // outside the engine's attribution of `read-fs:<session>/foo`.
+    // The helper canonicalizes (defeating symlink escapes) and
+    // refuses cwd outside session subtree. See _bash-cwd.ts.
+    const cwdResult = resolveAndValidateBashCwd({ argsCwd: args.cwd, sessionCwd: ctx.cwd });
+    if (!cwdResult.ok) {
+      return toolError(ERROR_CODES.invalidArg, cwdResult.error);
+    }
+    const resolvedCwd = cwdResult.cwd;
 
     const request: BrokerRequest = {
       toolName: 'bash',
