@@ -3432,3 +3432,111 @@ describe('engine — slice 169 confirm cause + stage attribution', () => {
     }
   });
 });
+
+// Review fixes — engine.ts:
+//   1) provenance() returned the construction-time options.provenance
+//      even after reloadPolicy swapped it (half-fix of slice 139 C4 —
+//      mutable local was updated but getter still read options.*).
+//   2) recentToolErrors was snapshotted at construction, so the
+//      risk-score `recent_errors` component never observed errors
+//      accumulating mid-session.
+describe('engine.provenance() — live read after reloadPolicy', () => {
+  test('reflects newProvenance forwarded via reloadPolicy', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'enterprise', bash: 'project' },
+    });
+    expect(eng.provenance()).toEqual({ defaults: 'enterprise', bash: 'project' });
+
+    // Hot reload moves the bash section to the user layer + replaces
+    // defaults attribution with the user layer.
+    const result = eng.reloadPolicy(policy({ tools: { bash: { allow: ['*'] } } }), {
+      defaults: 'user',
+      bash: 'user',
+    });
+    expect(result.ok).toBe(true);
+    expect(eng.provenance()).toEqual({ defaults: 'user', bash: 'user' });
+  });
+
+  test('preserves prior provenance when reloadPolicy omits the new one', () => {
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      provenance: { defaults: 'project' },
+    });
+    eng.reloadPolicy(policy({ tools: { bash: { allow: ['*'] } } })); // no newProvenance arg
+    expect(eng.provenance()).toEqual({ defaults: 'project' });
+  });
+
+  test('returns a deep clone — caller mutation does not corrupt engine state', () => {
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      provenance: { defaults: 'enterprise' },
+    });
+    const snap = eng.provenance();
+    snap.defaults = 'project';
+    expect(eng.provenance()).toEqual({ defaults: 'enterprise' });
+  });
+});
+
+describe('engine — recentToolErrors getter is read fresh on each check', () => {
+  // The risk-score component `recent_errors` thresholds at 3
+  // consecutive errors and contributes 0.15 (see risk-score.ts
+  // RECENT_ERRORS_THRESHOLD). A frozen snapshot defeats it.
+  interface CapturedEmit {
+    score_components?: Record<string, number>;
+  }
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
+    },
+  });
+
+  test('number argument: legacy frozen-snapshot semantics still work', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+      audit: captureSink(collected),
+      recentToolErrors: 5,
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[0]?.score_components?.recent_errors).toBe(0.15);
+  });
+
+  test('function argument: each check() reads the live counter', () => {
+    let counter = 0;
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+      audit: captureSink(collected),
+      recentToolErrors: () => counter,
+    });
+
+    // First check: no errors yet → component below threshold, key
+    // omitted from score_components (risk-score.ts RECENT_ERRORS_
+    // THRESHOLD = 3).
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[0]?.score_components?.recent_errors).toBeUndefined();
+
+    // Simulate the harness accumulating consecutive errors mid-
+    // session. A frozen snapshot would still see counter=0 below;
+    // a live getter sees the new value and the component fires.
+    counter = 4;
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[1]?.score_components?.recent_errors).toBe(0.15);
+
+    // Harness clears the counter after a successful call —
+    // component drops back below threshold.
+    counter = 0;
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[2]?.score_components?.recent_errors).toBeUndefined();
+  });
+});

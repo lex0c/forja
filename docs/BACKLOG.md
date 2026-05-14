@@ -2,6 +2,40 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(permissions/engine) — live provenance after reload + live recentToolErrors getter
+
+**Done.** Two engine bugs reported by review: both involved frozen snapshots that should have been live reads.
+
+### Bug 1 — `provenance()` returned stale snapshot after `reloadPolicy`
+
+Slice 139 C4 made the local `provenance` variable mutable so `reloadPolicy(_, newProvenance)` could swap it alongside `policy` and `mode`. The swap landed correctly (`reloadPolicy` assigns to the mutable `provenance` local) but the public getter still read from `options.provenance` (construction-time value):
+
+```ts
+provenance: () =>
+  structuredClone(options.provenance ?? ({ defaults: 'default' } as SectionProvenance)),
+```
+
+After a hot reload moved a section between layers, `/perms`-style diagnostics and audit interpretation kept reporting the old attribution while enforcement + policy_hash had already swapped — operators verifying a reload took effect saw stale layer attribution. Fix: getter reads from the mutable `provenance` local instead of `options.provenance`. The default-fallback shape (`{ defaults: 'default' }`) and the defensive `structuredClone` are preserved.
+
+### Bug 2 — `recentToolErrors` snapshotted at construction
+
+The engine captured `options.recentToolErrors` once at construction and reused that frozen value for every `check()` call. The comment in `EngineOptions` even acknowledged the gap: "Default 0 — the `recent_errors` feature contributes 0 until a harness-side counter slice wires this through." The wire-up was waiting on a harness slice, but a frozen-at-construction signature would have made the wire-up wrong anyway — a long-running session that captured `0` at boot would never observe consecutive errors accumulating mid-session, so the `recent_errors` risk component would silently contribute 0 forever and score-based confirm escalation would be missed when the model started looping on failures.
+
+Fix: widened `EngineOptions.recentToolErrors` to `number | (() => number)`. A number literal keeps the old frozen-snapshot semantics (existing tests + headless one-shots stay unchanged); a getter function is invoked fresh on every `check()`. The construction normalizes to a getter (`typeof === 'function' ? rawGetter : () => frozenLiteral`) so the hot-path call site stays uniform — one indirect call per check, no per-call branch.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/engine.ts` | `provenance()` reads mutable local; `recentToolErrors` accepts `number \| (() => number)` and is read fresh per check |
+| `tests/permissions/engine.test.ts` | +5 tests: provenance live after reload, provenance preserved when newProvenance omitted, deep-clone isolation, recentToolErrors number-form snapshot semantics, recentToolErrors getter-form live read across multiple checks |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7255 pass / 10 skip / 0 fail (+5 net tests from 7250 baseline)
+
 ## [2026-05-14] fix(hooks) — slice 181 review fixes: matched_tool audit, disableAllHooks + `if` + PostToolUseFailure config wiring, engine re-check on updatedInput, schema CHECK constraint
 
 **Done.** Code review on slice 181 surfaced 5 bugs and 1 stale doc — slice 181 added the dispatcher-level features but never wired them through to the operator-facing config layer or the SQLite schema, so half of slice 181 was dead code at the production boundary.

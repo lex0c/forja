@@ -139,10 +139,18 @@ export interface EngineOptions {
   isMcpTool?: (toolName: string) => boolean;
   // `recentToolErrors`: number of consecutive errored tool calls
   // preceding this one. Caller-supplied because the engine doesn't
-  // track outcomes (harness's job). Default 0 — the
-  // `recent_errors` feature contributes 0 until a harness-side
-  // counter slice wires this through.
-  recentToolErrors?: number;
+  // track outcomes (harness's job). Default 0.
+  //
+  // Accepts EITHER a number (frozen snapshot — suitable for tests /
+  // one-shot calls / engines that never persist across check()
+  // invocations) OR a `() => number` getter (read fresh on every
+  // check). Long-running harness sessions must pass the getter
+  // form: a frozen number captured at construction would never
+  // observe consecutive errors accumulating mid-session, and the
+  // `recent_errors` risk component would silently contribute 0
+  // forever, missing score-based confirm escalation when the model
+  // starts looping on failures.
+  recentToolErrors?: number | (() => number);
   // Classifier hint (PERMISSION_ENGINE.md §6.4). Optional sync
   // function; receives capabilities + deterministic score + a
   // version pin, returns a clamped adjust. NEVER sees raw args /
@@ -1294,7 +1302,20 @@ export const createPermissionEngine = (
     options.stateController ?? createStateController({ initial: options.initialState ?? 'ready' });
   const trustedHosts = options.trustedHosts ?? DEFAULT_TRUSTED_HOSTS;
   const isMcpTool = options.isMcpTool ?? defaultIsMcpTool;
-  const recentToolErrors = options.recentToolErrors ?? 0;
+  // Normalize `recentToolErrors` to a getter. The number form is
+  // wrapped in a closure capturing the literal value (preserves
+  // frozen-snapshot semantics for test callers), while a getter
+  // passed by a long-running harness is invoked fresh on every
+  // check() — see the EngineOptions doc for why a frozen snapshot
+  // breaks risk scoring in long sessions.
+  const recentToolErrorsRaw = options.recentToolErrors;
+  const getRecentToolErrors: () => number =
+    typeof recentToolErrorsRaw === 'function'
+      ? recentToolErrorsRaw
+      : (() => {
+          const frozen = recentToolErrorsRaw ?? 0;
+          return () => frozen;
+        })();
   const classifier = options.classifier;
   const classifierHash = options.classifierHash ?? 'none';
   const classifierRequired = options.classifierRequired ?? false;
@@ -1543,7 +1564,9 @@ export const createPermissionEngine = (
       isMcp: isMcpTool(toolName),
       confidence: scoreConfidence,
       engineState: currentState,
-      recentToolErrors,
+      // Read live — see `getRecentToolErrors` construction site for
+      // why a snapshotted value would defeat the risk component.
+      recentToolErrors: getRecentToolErrors(),
       trustedHosts,
       cwd,
       home,
@@ -2144,8 +2167,16 @@ export const createPermissionEngine = (
     // attribution. When no provenance was supplied at construction
     // (test-built engines, headless dry-runs), default to the
     // sentinel "everything is the built-in default" shape.
-    provenance: () =>
-      structuredClone(options.provenance ?? ({ defaults: 'default' } as SectionProvenance)),
+    //
+    // Reads from the MUTABLE `provenance` local — slice 139 C4 made
+    // it swappable via `reloadPolicy(_, newProvenance)` but the
+    // earlier cut still read from `options.provenance` here,
+    // returning the construction-time snapshot. After a hot reload
+    // moved a section between layers, `/perms` and audit
+    // interpretation would keep reporting the OLD attribution while
+    // enforcement + hashes had already swapped — diagnostic drift
+    // visible to operators trying to verify a reload took effect.
+    provenance: () => structuredClone(provenance ?? ({ defaults: 'default' } as SectionProvenance)),
     addSessionAllow,
     // §12.3 hot reload — atomic swap of policy + recompute hash +
     // mode. Caller responsibility: resolve hierarchy, validate
