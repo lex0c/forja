@@ -530,12 +530,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // here too, so adding them to the set is a no-op cost.
   const pendingHookChains = new Set<Promise<unknown>>();
   const dispatchHooks = async (payload: HookEventPayload): Promise<HookChainResult | null> => {
+    // Slice 181 — disableAllHooks short-circuit. Skip the chain
+    // entirely when the kill switch is on, even with hooks
+    // configured. The dispatcher honors the flag too (defense in
+    // depth), but short-circuiting here avoids the wrapper
+    // Promise + cleanup churn. Returning null mirrors the
+    // "no hooks configured" path so call sites don't branch on
+    // the discriminator.
+    if (config.disableAllHooks === true) return null;
     if (config.hooks === undefined || config.hooks.length === 0) return null;
     const chain = (async (): Promise<HookChainResult | null> => {
       try {
         return await dispatchChain(config.hooks ?? [], payload, config.cwd, {
           db: config.db,
           sessionId: sessionId.length > 0 ? sessionId : null,
+          ...(config.disableAllHooks !== undefined
+            ? { disableAllHooks: config.disableAllHooks }
+            : {}),
         });
       } catch (err) {
         // Defense-in-depth: dispatchChain wraps each hook's

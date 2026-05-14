@@ -2,6 +2,140 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(hooks) — slice 181 review fixes: matched_tool audit, disableAllHooks + `if` + PostToolUseFailure config wiring, engine re-check on updatedInput, schema CHECK constraint
+
+**Done.** Code review on slice 181 surfaced 5 bugs and 1 stale doc — slice 181 added the dispatcher-level features but never wired them through to the operator-facing config layer or the SQLite schema, so half of slice 181 was dead code at the production boundary.
+
+### Bugs found + fixed
+
+1. **`hook_runs.matched_tool` is NULL for PostToolUseFailure** (`src/hooks/dispatcher.ts:187`). `emitAudit` gated `matcherTool` on `'PreToolUse' || 'PostToolUse'` only. Forensic queries `WHERE event='PostToolUseFailure' AND matched_tool='bash'` returned empty. Fix: add `'PostToolUseFailure'` to the disjunction (mirrors `toolNameFromPayload` in dispatcher-matching.ts).
+
+2. **`disableAllHooks` was dead code** (`src/harness/loop.ts:dispatchHooks`). Flag honored in `dispatchChain` and tested at the dispatcher level, but no caller threaded it through from config. No TOML key, no CLI flag, no env var. Fix: added `disable_all_hooks` top-level key to per-layer hooks.toml; `resolveHookConfig` OR's the per-layer flags into `ResolvedHookConfig.disableAllHooks`; `HarnessConfig.disableAllHooks` carries it; `dispatchHooks` short-circuits AND forwards to `dispatchChain` (defense in depth).
+
+3. **`if` per-handler field was dead code** (`src/hooks/config.ts:validateEntry`). Slice 181 added `HookSpec.if` to the type and honored it in `ifFilterMatches`, but the TOML parser never extracted the field. Operators writing `if = "Bash(rm *)"` had it silently ignored. Fix: parse `if` as optional non-empty string in `validateEntry`.
+
+4. **`PostToolUseFailure` rejected by config validator** (`src/hooks/config.ts:VALID_EVENTS`). Operators writing `event = "PostToolUseFailure"` got `invalid_entry` warning + the hook dropped. Fix: add `'PostToolUseFailure'` to `VALID_EVENTS`.
+
+5. **`hook_runs.event` CHECK constraint rejected PostToolUseFailure** (`src/storage/migrations/019-hook-runs.ts`). Even with the dispatcher willing to write the audit row, SQLite rejected it with `CHECK constraint failed`. The dispatcher's defensive `emitAudit` try/catch swallowed the throw and emitted a stderr "AUDIT DRIFT" line, but no row landed. Fix: migration 044 rebuilds the table with the updated CHECK (SQLite doesn't ALTER CHECK in place).
+
+### Security concern fixed
+
+6. **PreToolUse `updatedInput` bypassed the permission engine** (`src/harness/invoke-tool.ts`). Pre-fix: `engine.check()` ran on `input.args` (original), then a PreToolUse hook could mutate `effectiveArgs` to ANYTHING and the tool executed against the mutated input without re-validation. Concrete elevation path: model asks `bash(ls)` (allowed) → operator hook returns `updatedInput: { command: 'rm -rf /tmp/x' }` → tool runs the `rm`. `tool_calls.input` row was locked pre-mutation so audit didn't show the elevation. Fix: re-run `engine.check(toolName, category, effectiveArgs)` after mutation; on deny/confirm refuse the call, record a second approval row (`decidedBy='hook'`, `decision='deny'`) with reason "blocked: PreToolUse hook updatedInput failed re-check (<reason>)", and surface model-facing "denied: PreToolUse hook updatedInput would require denied/additional confirmation". confirm-shaped results refuse rather than re-prompt (hook-driven mutation must not silently ask the user for permission the model never requested).
+
+### Stale doc fixed
+
+7. **"Fire-and-forget per spec line 1041 — non-blocking, can't undo the tool"** comment on `firePostToolUse` (`src/harness/invoke-tool.ts:696-718`). Slice 181 made the chain awaited (to capture `additionalContext`) but left the comment claiming fire-and-forget. Updated to reflect the AWAITED semantics + 15s/30s ceilings (success/failure path).
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/hooks/dispatcher.ts` | `emitAudit.matcherTool` now also covers PostToolUseFailure |
+| `src/hooks/types.ts` | `ResolvedHookConfig.disableAllHooks: boolean` field |
+| `src/hooks/config.ts` | Parse `if` field, parse `disable_all_hooks` top-level, add PostToolUseFailure to VALID_EVENTS, OR disableAllHooks across layers |
+| `src/harness/types.ts` | `HarnessConfig.disableAllHooks?: boolean` |
+| `src/harness/loop.ts` | Short-circuit + forward disableAllHooks in `dispatchHooks` |
+| `src/harness/invoke-tool.ts` | Re-check engine on `chain.updatedInput`; updated stale fire-and-forget comment |
+| `src/storage/migrations/044-hook-runs-post-tool-use-failure.ts` | Rebuild `hook_runs` table with updated CHECK constraint |
+| `src/storage/migrations/index.ts` | Register migration 044 |
+| `tests/hooks/config.test.ts` | +8 tests: PostToolUseFailure valid, `if` parsed/validated, `disable_all_hooks` parsed/OR'd/type-checked |
+| `tests/hooks/dispatcher.test.ts` | +1 test: PostToolUseFailure audit row carries matchedTool |
+| `tests/harness/invoke-tool.test.ts` | +3 tests: re-check allow → mutated args reach tool; re-check deny → refuse + second approval row; re-check confirm → refuse (no re-prompt) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7250 pass / 10 skip / 0 fail (+12 from 7238 baseline; 2 pre-existing flaky plan-mode tests passed this run)
+
+### What's still deferred
+
+- `PreCheckpoint` payload-shape spec gap (separate work)
+- `parseHookJsonOutput` doesn't validate `additionalContext` length — the dispatcher's upstream 4KB stdout truncation is the de-facto cap. Operators wanting more than 4KB of context per hook must split across hooks. Documented in `dispatcher-matching.ts` parser docstring.
+- `tool_calls.input` immutable baseline is intentional — audit replay sees the model's original ask. Operators wanting to forensically reconstruct the mutated args can join with `hook_runs` rows for the same `tool_call_id`'s PreToolUse chain (the `updatedInput` is in the hook's stdout, captured in `hook_runs.stdout`).
+
+## [2026-05-14] feat(hooks) — slice 181: hook system feature expansion (additionalContext + updatedInput + PostToolUseFailure + `if` per-handler + disableAllHooks)
+
+**Done.** Review of `docs/spec/AGENTIC_CLI.md §10` against Claude Code's hook reference identified that Forja's hook system was a minimal floor — strong on observability (hash-chained `hook_runs`, `failure_events` integration, `failClosed` per-hook, `MAX_HOOK_CHAIN_MS` wall-clock cap) but missing the **enrichment** features that make hooks production-useful: hooks could only ALLOW or BLOCK, never enrich/modify. Single-slice batched commit landing the 4 highest-impact prioritized gaps.
+
+### Threat shape — pre-slice limitations
+
+Operator who wanted to use hooks for anything beyond binary gating had no clean path:
+
+1. **No context injection.** A hook that "knows" the current branch / CI status / open PR can't pass that info to the LLM. Operators worked around with system prompts or out-of-band channels.
+2. **No tool-input modification.** A hook that wants to normalize `npm test` → `npm test -- --quiet --reporter=tap` had to either (a) block the call with a message asking the model to retry, or (b) modify the shell command via env tricks. Both ugly.
+3. **`PostToolUse` carries `failed: bool` flag.** Operators who only care about failures (alerts, retry logic) had to inspect the boolean in every PostToolUse handler — wasteful + error-prone.
+4. **No per-handler conditional.** Matcher filters by tool name only. An operator who wants "this hook only for `rm`-shaped bash commands" had to filter inside the script body, paying the spawn cost on every match.
+5. **No global disable.** Debug workflow "temporarily turn off hooks" required editing every config file.
+
+### Changes
+
+| Surface | Pre-slice | Post-slice |
+|---|---|---|
+| `HookEvent` union | 9 events | 10 events (+ `PostToolUseFailure`) |
+| `HookRunResult.allow` shape | `{ kind, stdoutTruncated, durationMs }` | + `additionalContext?`, `updatedInput?`, `suppressOutput?` parsed from stdout JSON |
+| `HookChainResult` shape | `{ blockedBy, runs }` | + `additionalContext: string` (concatenated across allow results), `updatedInput?: Record<string, unknown>` (last-wins) |
+| `HookSpec` shape | `{ event, matcher, command, timeoutMs, failClosed, locked, layer, sourcePath, entryIndex }` | + `if?: string` (permission-rule syntax filter) |
+| `DispatcherDeps` | `{ db, sessionId, now, spawn, shell, effectiveTimeoutMs }` | + `disableAllHooks?: boolean` (kill switch) |
+
+### Wiring
+
+**`src/hooks/dispatcher-matching.ts`:**
+- `parseHookJsonOutput(stdout)` — defensive JSON parser. Recognizes `additionalContext`/`updatedInput`/`suppressOutput`. Malformed JSON, wrong field types, or arrays-in-place-of-strings return null; hook is treated as plain stdout. Hot path: cheap pre-filter (must start with `{`).
+- `ifFilterMatches(spec, payload)` — per-handler filter using permission-rule syntax. Tool-name normalization (Bash↔bash, Edit↔edit_file, Write↔write_file, Read↔read_file). Bash patterns route through `matcher.ts:matchCommand` (subcommand-aware). FS patterns use Bun Glob with two-shot match (full path + basename fallback for patterns without `/`). Malformed `if` → fail-open. `if` on non-tool events → skipped (filter unsatisfiable).
+- `matchesPayload(spec, payload)` extended to call `ifFilterMatches` after matcher passes.
+- `classifyExitCode` on exit 0 calls `parseHookJsonOutput` and merges the parsed fields into the `allow` result.
+
+**`src/hooks/dispatcher.ts`:**
+- `dispatchChain` aggregates `additionalContext` from all allow results (`\n\n`-joined in execution order) and tracks last-wins `updatedInput`. Result shape exposes both.
+- `disableAllHooks` short-circuit: when true, returns empty chain immediately without spawning, matcher evaluation, or audit emission.
+
+**`src/harness/invoke-tool.ts`:**
+- `PreToolUse` hook chain result is captured (was previously only checked for blocking decision). `additionalContext` is stashed; `updatedInput` replaces `effectiveArgs` before `tool.execute(...)`. Audit row's `args_hash` is locked PRE-mutation so forensic queries see the original args, but the tool body executes against the mutated input.
+- `firePostToolUse(failed: boolean): Promise<string>` now ALSO fires `PostToolUseFailure` when `failed === true` (paralelo, both events emit). Returns chain's `additionalContext` so the caller can inject into model-facing content.
+- Success path: tool_result content gets appended `[forja:hook-context event=PreToolUse]<text>[/forja:hook-context]` AND/OR `event=PostToolUse` markers. Failure path: error JSON gets failure-chain additionalContext appended.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/hooks/types.ts` | Add `PostToolUseFailure` event, `PostToolUseFailureData`, `HookSpec.if`, `HookRunResult.allow` extension fields, `HookChainResult.additionalContext` + `.updatedInput` |
+| `src/hooks/dispatcher-matching.ts` | Add `parseHookJsonOutput`, `ifFilterMatches`, glob cache, tool-name normalization |
+| `src/hooks/dispatcher.ts` | Aggregate additionalContext + updatedInput; disableAllHooks short-circuit |
+| `src/harness/invoke-tool.ts` | Wire `updatedInput` into `effectiveArgs`, fire `PostToolUseFailure`, inject `additionalContext` into tool_result content |
+| `src/storage/repos/hook-runs.ts` | Add `PostToolUseFailure` to `HookRunsEvent` enum |
+| `docs/spec/AGENTIC_CLI.md` §10 | Add `PostToolUseFailure` row to event table; §10.3.1 JSON output contract; §10.3.2 `if` filter contract; §10.3.3 `disableAllHooks` kill switch |
+| `tests/hooks/dispatcher.test.ts` | +21 new tests covering JSON output parsing, chain aggregation, disableAllHooks, `if` filter (Bash + Edit + malformed + non-tool event), PostToolUseFailure event |
+| `tests/tools/memory-write-hook.test.ts` | Update `HookChainResult` fixture for new shape |
+
+### Verification
+
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 0 warnings.
+- `bun test` — **7238 pass / 10 skip / 0 fail** (+21 tests from pre-slice 7217).
+
+### Backward-compat caveats
+
+These are user-visible behavior changes:
+
+- `PostToolUse` hooks that previously inspected `tool.failed` to react to errors still work, BUT operators authoring new hooks should prefer `PostToolUseFailure` for failure-specific reactions (cleaner, no boolean inspection).
+- Hooks emitting JSON in stdout on exit 0 previously were ignored as opaque text. Now the JSON is parsed when shape matches; operators with hooks that COINCIDENTALLY emit JSON-like text but expect it to be displayed verbatim will see those fields stripped from display (the text still lands in `hook_runs.stdout` for audit). Defensive — the parser only acts on known fields.
+- `updatedInput` replaces the tool's input verbatim. Operator hook owns responsibility to include unchanged fields alongside mutated ones. Pre-slice no hook could mutate input; this is additive behavior.
+
+### Gaps deferred (from review)
+
+- **HTTP hooks** (P1 strategic) — 2-3 slices of work; deferred to a dedicated slice when there's concrete demand.
+- **MCP tool hooks** (P3) — depends on M3+ MCP maturity.
+- **Prompt/agent hooks** (P3 strategic) — depends on provider budget integration + reproducibility design (LLM classifier not-determinístico viola the audit-chain replay contract).
+- **`ConfigChange` event** (P1) — pre-existing item from earlier review; remains queued.
+- **`SessionEnd` event** (P2) — paralelo a `SessionStart`; small but unrelated to slice scope.
+
+### Spec PR
+
+Updates `AGENTIC_CLI.md §10` with the new event row + three new subsections (10.3.1 JSON output, 10.3.2 `if` filter, 10.3.3 `disableAllHooks`). PT-BR.
+
+---
+
 ## [2026-05-14] sec(perm-engine) — slice 180: hardcoded list expansion (protected paths + commands + sensitive patterns)
 
 **Done.** Self-review of the four hardcoded defense lists in `docs/SECURITY.md` and the code identified 5 P1 gaps with known attack vectors, ~10 P2 defensive-completeness gaps, and one systemic inconsistency between `HIDE_PATHS` (sandbox-side, 15 dirs / 8 files) and `TILDE_ESCALATE` (engine-side, 6 dirs / 6 files). Single-slice batched commit closes all P1+P2.

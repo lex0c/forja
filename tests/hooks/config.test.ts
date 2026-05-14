@@ -333,3 +333,99 @@ describe('resolveHookConfig — locking semantics', () => {
     expect(result.warnings[0]?.kind).toBe('lock_ignored');
   });
 });
+
+describe('resolveHookConfig — slice 181', () => {
+  test('PostToolUseFailure is a valid event', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `[[hooks]]
+       event = "PostToolUseFailure"
+       command = "notify-send 'tool failed'"`,
+    );
+    const result = resolveHookConfig(paths({ project: prj }));
+    expect(result.hooks).toHaveLength(1);
+    expect(result.hooks[0]?.event).toBe('PostToolUseFailure');
+    expect(result.warnings).toEqual([]);
+  });
+
+  test('if field is parsed from TOML', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `[[hooks]]
+       event = "PreToolUse"
+       command = "block-dangerous.sh"
+       matcher = { tool = "bash" }
+       if = "Bash(rm *)"`,
+    );
+    const result = resolveHookConfig(paths({ project: prj }));
+    expect(result.hooks).toHaveLength(1);
+    expect(result.hooks[0]?.if).toBe('Bash(rm *)');
+  });
+
+  test('if must be non-empty string when present', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `[[hooks]]
+       event = "PreToolUse"
+       command = "x"
+       if = ""`,
+    );
+    const result = resolveHookConfig(paths({ project: prj }));
+    expect(result.hooks).toHaveLength(0);
+    expect(result.warnings[0]?.kind).toBe('invalid_entry');
+    expect(result.warnings[0]?.message).toContain('if must be a non-empty string');
+  });
+
+  test('disable_all_hooks top-level flag parsed (project layer)', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(prj, 'disable_all_hooks = true\n');
+    const result = resolveHookConfig(paths({ project: prj }));
+    expect(result.disableAllHooks).toBe(true);
+    expect(result.warnings).toEqual([]);
+  });
+
+  test('disable_all_hooks default false when absent', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(prj, `[[hooks]]\nevent = "Stop"\ncommand = "x"`);
+    const result = resolveHookConfig(paths({ project: prj }));
+    expect(result.disableAllHooks).toBe(false);
+  });
+
+  test("disable_all_hooks OR'd across layers (enterprise alone disables)", () => {
+    const tmp = makeTmp();
+    const ent = join(tmp, 'ent.toml');
+    const usr = join(tmp, 'usr.toml');
+    writeToml(ent, 'disable_all_hooks = true\n');
+    writeToml(usr, `[[hooks]]\nevent = "Stop"\ncommand = "still-here"`);
+    const result = resolveHookConfig({ enterprise: ent, user: usr, project: '/never' });
+    expect(result.disableAllHooks).toBe(true);
+    // Hooks still parsed (dispatcher honors the kill switch).
+    expect(result.hooks).toHaveLength(1);
+  });
+
+  test("disable_all_hooks OR'd across layers (user alone disables)", () => {
+    const tmp = makeTmp();
+    const usr = join(tmp, 'usr.toml');
+    writeToml(usr, 'disable_all_hooks = true\n');
+    const result = resolveHookConfig({ enterprise: null, user: usr, project: '/never' });
+    expect(result.disableAllHooks).toBe(true);
+  });
+
+  test('disable_all_hooks non-boolean produces warning and is ignored', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(prj, `disable_all_hooks = "true"\n`);
+    const result = resolveHookConfig(paths({ project: prj }));
+    expect(result.disableAllHooks).toBe(false);
+    expect(result.warnings[0]?.kind).toBe('invalid_entry');
+    expect(result.warnings[0]?.message).toContain('disable_all_hooks must be a boolean');
+  });
+});

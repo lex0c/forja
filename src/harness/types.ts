@@ -892,6 +892,14 @@ export interface HarnessConfig {
   // into a no-op filter — no perf cost beyond an empty array
   // walk.
   hooks?: readonly HookSpec[];
+  // Slice 181 — global kill switch resolved at boot via
+  // `resolveHookConfig`. When true, the dispatcher short-circuits
+  // the chain (no spawn, no audit, no matcher evaluation) even
+  // when `hooks` is non-empty. Bootstrap reads this from the
+  // top-level `disable_all_hooks` key in any hooks.toml layer
+  // (OR'd across layers). Default false. Spec AGENTIC_CLI.md
+  // §10.3.3.
+  disableAllHooks?: boolean;
   // Test seam: subprocess spawn factory threaded through
   // `runSubagent` so the harness can exercise the full
   // `task` / `task_async` chain without forking a real Bun

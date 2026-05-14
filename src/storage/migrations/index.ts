@@ -41,6 +41,7 @@ import { migration040SubagentRunsEffectiveCapabilities } from './040-subagent-ru
 import { migration041FailureEvents } from './041-failure-events.ts';
 import { migration042OutcomeSignals } from './042-outcome-signals.ts';
 import { migration043BgBytesDropped } from './043-bg-bytes-dropped.ts';
+import { migration044HookRunsPostToolUseFailure } from './044-hook-runs-post-tool-use-failure.ts';
 
 export interface Migration {
   id: number;
@@ -92,4 +93,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration041FailureEvents,
   migration042OutcomeSignals,
   migration043BgBytesDropped,
+  migration044HookRunsPostToolUseFailure,
 ];
