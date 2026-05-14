@@ -2,6 +2,39 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] chore(permissions): comment cleanup pass — drop slice refs + spec citations, keep substantive WHY
+
+**Done.** Comments across `src/permissions/` had accumulated heavy slice-number ("Slice 178 (review — P2): ...") and spec-citation ("Per CONTRACTS.md §3 line 706-709: ...") noise that added no value to a reader of the current code. Comments described what the code USED to do, who fixed what in which review round, and pointed at spec sections as appeals to authority — all things that belong in commit messages / the spec itself, not in working comments.
+
+Single cleanup pass following the project's comment best-practices:
+
+- **Removed**: bare slice prefixes, pure spec citations, history narration ("Pre-slice X did Y; now Z does W"), what-explanations that duplicate the code, stale TODOs referencing slice deadlines.
+- **Rewrote**: "Slice 140 sec-1: XDG_DATA_HOME unmask. <reason>" → "XDG_DATA_HOME unmask: <reason>" (keep the topic + reason; drop the slice ref).
+- **Kept**: concrete threat shapes, TOCTOU/race explanations, kernel/OS behavior notes, algorithmic choices with reasoning, security contracts, hidden invariants.
+
+### Coverage
+
+| Metric | Before | After |
+|---|---|---|
+| Files with slice/spec refs in `src/permissions/` | 30 / 40 | 5 |
+| Total slice/spec ref occurrences | 2335 | 11 |
+| Net comment lines | (baseline) | −363 |
+
+The 11 remaining refs are all justified:
+- 8 are in `Decision.reason` error-message strings that the test suite asserts on (e.g., `path matches sensitive-path deny-list (SEC §8.4)`, `escalated to confirm per §11`). Migrating those substrings requires test changes first.
+- 2 are external RFC pointers (`RFC 3161 §2.4.x`) — legitimate references to IETF specs the code is implementing.
+- 1 is a `PERMISSION_ENGINE.md §11` substring in a `parsePolicy` thrown error message that tests assert on.
+
+### Files modified
+
+33 of 40 `src/permissions/*.ts` files. Highest deltas: `engine.ts` (−109 net), `sandbox-runner.ts` (−25 net), `bootstrap-engine.ts` (−42 net), `sandbox-runner-macos.ts` (−33 net), `protected_paths.ts` (−16 net), `audit.ts` (−39 net), `capabilities.ts` (−10 net), `matcher.ts` (−14 net). Tests untouched; this is a comments-only refactor.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7287 pass / 10 skip / 0 fail (identical to pre-cleanup baseline — no functional changes)
+
 ## [2026-05-14] fix(cli/sandbox-skip) — reject relative XDG_CONFIG_HOME values when computing marker path
 
 **Done.** `sandboxSkipPath` honored any non-empty `XDG_CONFIG_HOME` and joined it directly to `forja/sandbox_skip`. A relative value like `XDG_CONFIG_HOME=tmpcfg` produced a CWD-relative marker path (`tmpcfg/forja/sandbox_skip`). Two consequences:

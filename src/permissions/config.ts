@@ -5,11 +5,12 @@ import type { Policy, PolicyMode, SealMode, SealOnFailure } from './types.ts';
 
 // Optional validation context for parsePolicy. When supplied, the
 // validator additionally rejects allow/confirm patterns that
-// redefine a protected path (PERMISSION_ENGINE.md §11 — "Tentativa
-// de remoção em policy load → policy_invalid: protected_paths_redefined").
-// Production bootstrap supplies `{ home: os.homedir(), cwd:
-// process.cwd() }`; tests that build raw policy objects skip the
-// context to keep cross-platform setup-free.
+// redefine a protected path (any attempt to widen a protected
+// target at policy load is `policy_invalid:
+// protected_paths_redefined`). Production bootstrap supplies
+// `{ home: os.homedir(), cwd: process.cwd() }`; tests that build
+// raw policy objects skip the context to keep cross-platform
+// setup-free.
 export interface ParsePolicyContext {
   home?: string;
   cwd?: string;
@@ -29,7 +30,7 @@ const expandTilde = (pattern: string, home: string): string => {
 //   - pattern that starts at the protected root and continues with
 //     a glob metacharacter (`/etc*`, `/proc?`, `/etc[abc]`) —
 //     these match the bare root via glob expansion even though
-//     they don't carry the `/` boundary (slice 101, R8 #321).
+//     they don't carry the `/` boundary.
 //
 // Engine-wide catch-alls (`/**`, `**`) are not flagged here — the
 // runtime classifier in protected_paths.ts catches their matches
@@ -76,16 +77,6 @@ const enforceProtectedPathInvariants = (
   //   - cwdEscalateDirs (`<cwd>/.git`, …) require `cwd`. Enforced
   //     only when `cwd` is supplied.
   //
-  // Pre-review-fix the validator early-returned when either `home`
-  // OR `cwd` was missing, silently disabling EVERY tier including
-  // the absolute ones. A policy file that redefined `/etc` (no
-  // context dependency) sailed through any non-bootstrap parse —
-  // operator tooling and CI checks reported "valid" for policies
-  // bootstrap would then reject at startup. The tiered design
-  // closes that gap while preserving the original "tests don't
-  // need to construct platform-specific paths" affordance for the
-  // tilde + cwd tiers.
-  //
   // Empty-string fallbacks below are safe: when `home`/`cwd` is
   // unset, the corresponding tier's roots are NOT added to the
   // check list (the gated `if` blocks), so the garbage paths
@@ -121,12 +112,9 @@ const enforceProtectedPathInvariants = (
 
 const VALID_MODES: ReadonlySet<string> = new Set(['strict', 'acceptEdits', 'bypass']);
 
-// §7.3 sealing modes. Currently 'none' (default), 'worm-file'
-// (Linux ext4 + chattr +a, slice 54), 'git-anchored' (append to
-// file inside a git repo + commit per entry, slice 63). The
-// remaining §7.3 backends ship in later slices; listing them as
-// RESERVED makes config errors specific ("not yet implemented")
-// rather than generic enum-mismatch.
+// Sealing modes: 'none' (default), 'worm-file' (Linux ext4 +
+// chattr +a), 'git-anchored' (append to file inside a git repo +
+// commit per entry), 'rfc3161-tsa', 's3-object-lock'.
 const VALID_SEAL_MODES: ReadonlySet<string> = new Set([
   'none',
   'worm-file',
@@ -134,10 +122,9 @@ const VALID_SEAL_MODES: ReadonlySet<string> = new Set([
   'rfc3161-tsa',
   's3-object-lock',
 ]);
-// All §7.3 backends shipped as of slice 89. The set stays for the
-// branch in parsePolicy that emits the "reserved for a future
-// slice" diagnostic when ops type a mode that's documented but
-// unimplemented; today it's empty.
+// Empty today (every documented mode is implemented). The branch
+// in parsePolicy that emits the "reserved for a future revision"
+// diagnostic stays in place for future additions.
 const RESERVED_SEAL_MODES: ReadonlySet<string> = new Set();
 const VALID_SEAL_ON_FAILURE: ReadonlySet<string> = new Set(['degrade', 'refuse']);
 
@@ -145,20 +132,16 @@ const isStringArray = (v: unknown): v is string[] =>
   Array.isArray(v) && v.every((e) => typeof e === 'string');
 
 // Reject keys not in the known set. The motivating bug class is
-// silent-allow-everything from typos: `allow_path` (singular), `lockd`
-// (missing 'e'), etc. A typed-out-of-spec key means the user thought
-// they were setting a real rule but actually got nothing. We refuse
-// to load a policy with such typos rather than fall through.
+// silent-allow-everything from typos: `allow_path` (singular),
+// `lockd` (missing 'e'), etc. A typed-out-of-spec key means the
+// user thought they were setting a real rule but actually got
+// nothing. We refuse to load a policy with such typos rather than
+// fall through.
 //
-// Slice 101 (R8 #318): pre-slice this added `'locked'` to every
-// section unconditionally. `seal: {..., locked: true}` parsed
-// silently even though seal has no lock semantics — the operator
-// who authored that line thought they locked the seal but got
-// nothing. The fix: callers list every supported key explicitly.
-// Sections that support locking pass `'locked'`; sections that
-// don't (seal today) leave it out and an authored `locked: true`
-// surfaces as an unknown-key error pointing the operator at the
-// actual supported set.
+// Callers list every supported key explicitly. Sections that
+// support locking pass `'locked'`; sections that don't leave it
+// out so an authored `locked: true` surfaces as an unknown-key
+// error pointing the operator at the actual supported set.
 const rejectUnknownKeys = (
   r: Record<string, unknown>,
   knownKeys: readonly string[],
@@ -228,30 +211,23 @@ const validateFetchPolicy = (raw: unknown, toolName: string): void => {
 
 // Strict-but-tolerant validator. We refuse to load a policy with a
 // malformed shape rather than silently ignoring fields — a typo in
-// `allow_path` (singular) instead of `allow_paths` is the kind of mistake
-// that turns into a silent allow-everything in production.
+// `allow_path` (singular) instead of `allow_paths` is the kind of
+// mistake that turns into a silent allow-everything in production.
 //
 // When `context.home` and `context.cwd` are provided, the validator
-// also enforces the §11 protected-paths invariants: allow/confirm
-// patterns that redefine a protected path fail load. Tests building
-// hand-crafted policies in-memory typically skip the context;
-// production bootstrap supplies both.
-// Top-level keys the parser knows about. Slice 101 (R8 #319):
-// pre-slice an authored `defualts: { mode: 'bypass' }` (typo for
-// `defaults`) silently dropped because the top-level only matched
-// specific known keys via `if (r.X !== undefined)` blocks; everything
-// else was ignored. The operator who authored that line thought
-// they were setting bypass mode but actually got the empty-defaults
-// policy. The fix surfaces top-level typos at parse time with the
-// same shape used for nested sections.
+// also enforces the protected-paths invariants: allow/confirm
+// patterns that redefine a protected path fail load. Tests
+// building hand-crafted policies in-memory typically skip the
+// context; production bootstrap supplies both.
+
+// Top-level keys the parser knows about. Surfaces typos like
+// `defualts:` at parse time instead of silently producing an
+// empty-defaults policy.
 const TOP_LEVEL_KEYS: readonly string[] = ['defaults', 'tools', 'sandbox', 'seal'];
 
-// Tool keys the `tools.*` section accepts. Slice 101 (R8 #320):
-// pre-slice `tools.bsh: { deny: ['rm -rf *'] }` (typo for `bash`)
-// parsed silently — the validator dispatched on specific names
-// and ignored everything else. The operator thought they were
-// blocking rm but actually authored a no-op section. Same typo
-// surface as top-level keys.
+// Tool keys the `tools.*` section accepts. Surfaces typos like
+// `tools.bsh:` at parse time instead of silently producing a no-op
+// section.
 const KNOWN_TOOL_KEYS: readonly string[] = [
   'bash',
   'read_file',
@@ -314,12 +290,12 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
   validatePathPolicy(tools.grep, 'grep', context);
   validateFetchPolicy(tools.fetch_url, 'fetch_url');
 
-  // PERMISSION_ENGINE.md §6.5 policy-layer sandbox section. Optional;
-  // when absent, the bootstrap falls back to hardcoded defaults
-  // (`required: false`, hostAllowed: false). Booleans only; YAML
-  // uses snake_case (`host_allowed`) and we map to camelCase
-  // (`hostAllowed`) at parse time for consistency with the rest of
-  // the TS-facing policy shape.
+  // Policy-layer sandbox section. Optional; when absent, the
+  // bootstrap falls back to hardcoded defaults (`required: false`,
+  // hostAllowed: false). Booleans only; YAML uses snake_case
+  // (`host_allowed`) and we map to camelCase (`hostAllowed`) at
+  // parse time for consistency with the rest of the TS-facing
+  // policy shape.
   let sandbox: Policy['sandbox'];
   if (r.sandbox !== undefined) {
     if (typeof r.sandbox !== 'object' || r.sandbox === null || Array.isArray(r.sandbox)) {
@@ -342,10 +318,11 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       }
       hostAllowed = s.host_allowed;
     }
-    // Section-level lock (slice 34) — mirrors `defaults.locked` /
+    // Section-level lock — mirrors `defaults.locked` /
     // `BashPolicy.locked` / `PathPolicy.locked`. When set in a
-    // higher-precedence layer, lower layers cannot change `required`
-    // or `hostAllowed`. Re-affirming the same values is silent.
+    // higher-precedence layer, lower layers cannot change
+    // `required` or `hostAllowed`. Re-affirming the same values is
+    // silent.
     if (s.locked !== undefined) {
       if (typeof s.locked !== 'boolean') {
         throw new Error('policy: sandbox.locked must be boolean');
@@ -361,12 +338,12 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     }
   }
 
-  // PERMISSION_ENGINE.md §7.3 sealing section (slice 57).
-  // Required field: `mode`. Required IF `mode='worm-file'`: `path`.
-  // All other fields optional with documented defaults applied at
-  // bootstrap-time (not here — keeping the parsed shape minimal so
-  // the hierarchy resolver can tell "operator silenced this field"
-  // from "operator chose the default value").
+  // Sealing section. Required field: `mode`. Required IF
+  // `mode='worm-file'`: `path`. All other fields optional with
+  // documented defaults applied at bootstrap-time (not here —
+  // keeping the parsed shape minimal so the hierarchy resolver can
+  // tell "operator silenced this field" from "operator chose the
+  // default value").
   let seal: Policy['seal'];
   if (r.seal !== undefined) {
     if (typeof r.seal !== 'object' || r.seal === null || Array.isArray(r.seal)) {
@@ -386,11 +363,8 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
         'interval_decisions',
         'interval_seconds',
         'on_failure',
-        // §12.2 enterprise lock (slice 112, R8 #322). Slice 101
-        // deliberately omitted this key, refusing authored
-        // `locked: true` with the actual supported set. Slice 112
-        // adds support: hierarchy.ts now flags lockConflict when
-        // a lower-precedence layer attempts to override a sealed
+        // Enterprise lock. hierarchy.ts flags lockConflict when a
+        // lower-precedence layer attempts to override a sealed
         // seal config.
         'locked',
       ],
@@ -400,15 +374,14 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       throw new Error('policy: seal.mode is required');
     }
     if (typeof s.mode !== 'string' || !VALID_SEAL_MODES.has(s.mode)) {
-      // Reserved modes (currently empty after slice 89) get a
-      // deliberately specific error so an operator copy-pasting
-      // from a future spec revision gets a clear "not yet
-      // implemented" rather than a generic enum mismatch. The
-      // branch stays even when the set is empty so future
-      // additions are one-line.
+      // Reserved modes (currently empty) get a deliberately
+      // specific error so an operator copy-pasting from a future
+      // spec revision gets a clear "not yet implemented" rather
+      // than a generic enum mismatch. The branch stays even when
+      // the set is empty so future additions are one-line.
       if (RESERVED_SEAL_MODES.has(String(s.mode))) {
         throw new Error(
-          `policy: seal.mode='${String(s.mode)}' is reserved for a future slice; current support: none|worm-file|git-anchored|rfc3161-tsa|s3-object-lock`,
+          `policy: seal.mode='${String(s.mode)}' is reserved for a future revision; current support: none|worm-file|git-anchored|rfc3161-tsa|s3-object-lock`,
         );
       }
       throw new Error(
@@ -447,7 +420,7 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
     if (mode === 'rfc3161-tsa' && endpoint === undefined) {
       throw new Error("policy: seal.endpoint is required when seal.mode is 'rfc3161-tsa'");
     }
-    // §7.3 s3-object-lock fields (slice 89).
+    // s3-object-lock fields.
     let bucket: string | undefined;
     if (s.bucket !== undefined) {
       if (typeof s.bucket !== 'string' || s.bucket.length === 0) {
@@ -524,13 +497,12 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       }
       on_failure = s.on_failure as SealOnFailure;
     }
-    // §12.2 lock field (slice 112, R8 #322). Mirrors the pattern
-    // every other section uses: `locked: true` at a higher layer
-    // (enterprise) prevents lower layers (user / project /
-    // session) from changing the seal config. Re-asserting the
-    // same config is silent; field changes flag a lockConflict
-    // in the hierarchy resolver and the lower layer's version
-    // is discarded.
+    // Lock field. Mirrors the pattern every other section uses:
+    // `locked: true` at a higher layer (enterprise) prevents lower
+    // layers (user / project / session) from changing the seal
+    // config. Re-asserting the same config is silent; field
+    // changes flag a lockConflict in the hierarchy resolver and
+    // the lower layer's version is discarded.
     let locked: boolean | undefined;
     if (s.locked !== undefined) {
       if (typeof s.locked !== 'boolean') {

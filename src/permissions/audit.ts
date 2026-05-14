@@ -1,5 +1,5 @@
 // Audit sink — appends every engine decision to `approvals_log` with
-// a sha256 hash chain (PERMISSION_ENGINE.md §7). Two implementations:
+// a sha256 hash chain. Two implementations:
 //
 //   - createNoopSink()   — for tests and the bypass path. Returns
 //                          sentinel seq=0 / empty hash; verifyChain
@@ -21,10 +21,10 @@
 // encoded via the canonical JSON encoder (RFC 8785 essentials, see
 // `canonical.ts`). Two writers given the same logical row produce
 // the same bytes; two readers given the same row produce the same
-// hash on verify. Determinism is load-bearing — the spec §1.8
-// requires "toda decisão é replay-able".
+// hash on verify. Determinism is load-bearing — every decision
+// must be replay-able.
 //
-// Genesis: per spec §7.2, the first row's `prev_hash` is
+// Genesis: the first row's `prev_hash` is
 // `"GENESIS:" ‖ sha256(install_id ‖ created_at_ms)`. Bound to the
 // installation: a DB copied from another machine fails verify
 // because the genesis can't be reproduced without the matching
@@ -45,11 +45,10 @@ import type { TelemetryEvent } from '../telemetry/index.ts';
 import { canonicalize, sha256Hex } from './canonical.ts';
 import type { InstallIdentity } from './install_id.ts';
 
-// One entry in the decision's reason chain. Stages are documented
-// in PERMISSION_ENGINE.md §6: 'resolve' → 'static-rule' → 'risk-score'
-// → 'classifier' → 'sandbox-plan' → 'approval-gate'. Earlier slices
-// emit a subset; the field stays string so new stages don't require
-// a schema bump.
+// One entry in the decision's reason chain. Common stages:
+// 'resolve' → 'static-rule' → 'risk-score' → 'classifier' →
+// 'sandbox-plan' → 'approval-gate'. The field stays string so new
+// stages don't require a schema bump.
 export interface ReasonChainEntry {
   stage: string;
   // Optional context — origin layer in the hierarchy, the matched
@@ -79,11 +78,10 @@ export interface AuditEmitInput {
   // ---- Load-bearing — `engine.emitAudit` ALWAYS populates these
   // in production (often with explicit `null` when not applicable
   // to the call, e.g. `classifier_adjust=null` when no classifier
-  // consulted). Slice 143 (API-3) promoted them from optional to
-  // required so the type system rejects sites that forget to
-  // supply a value; the audit row's column for each of these has
-  // a non-default semantic meaning ("0 score" ≠ "score not set"),
-  // so silently defaulting was masking a class of forensic bugs.
+  // consulted). The audit row's column for each has a non-default
+  // semantic meaning ("0 score" ≠ "score not set"), so silently
+  // defaulting would mask forensic bugs — these are required, not
+  // optional.
   capabilities: readonly string[];
   score: number;
   score_components: Record<string, number>;
@@ -93,23 +91,22 @@ export interface AuditEmitInput {
   // distinct from "consulted and returned 0".
   classifier_hash: string | null;
   classifier_adjust: number | null;
-  // §6.5 sandbox planner result. Null when no planner ran
-  // (legacy path / refused before planner) OR no profile covered.
+  // Sandbox planner result. Null when no planner ran (refused
+  // before planner) OR no profile covered.
   sandbox_profile: string | null;
-  // §8 grant TTL. Set when this decision was authorized by a
-  // pattern grant — replays correlate against `grant-match` reason
-  // chain stage. Null otherwise.
+  // Grant TTL. Set when this decision was authorized by a pattern
+  // grant — replays correlate against `grant-match` reason chain
+  // stage. Null otherwise.
   ttl_expires_at: number | null;
 
-  // ---- Optional — future slices populate; engine doesn't set
-  // them yet so leaving them optional keeps the present call sites
-  // ergonomic while documenting the planned surface.
+  // ---- Optional fields. Leaving them optional keeps the present
+  // call sites ergonomic while documenting the planned surface.
   //
-  // `parent_approval_id`: subagent IPC link (slice 95 wiring).
+  // `parent_approval_id`: subagent IPC link.
   // `confidence`: classifier promotion from `medium`/`low` —
   //               default `'high'` retains current behavior.
   // `tool_version` / `resolver_version`: engine version pin for
-  //                forensic replay across slice boundaries.
+  //                forensic replay across versions.
   parent_approval_id?: string | null;
   confidence?: ApprovalLogConfidence;
   tool_version?: string;
@@ -127,8 +124,8 @@ export type VerifyResult =
   | {
       ok: true;
       rows: number;
-      // Rotation metadata (§7.2). Present for every result so the
-      // caller can render quarantine status without a second query.
+      // Rotation metadata. Present for every result so the caller
+      // can render quarantine status without a second query.
       // `current_rotation_id` is 0 for chains that never rotated.
       current_rotation_id: number;
       quarantined: boolean;
@@ -136,11 +133,11 @@ export type VerifyResult =
   | {
       ok: false;
       brokenAt: number;
-      // Slice 163: `ts_monotonic_break` flags a row whose `ts` is
-      // more than AUDIT_TS_PAST_SKEW_MS earlier than the previous
-      // row's `ts` — a forged-back-date shape. Hash chain may still
-      // be intact (attacker rebuilds hashes), so this is a second
-      // independent check during verify.
+      // `ts_monotonic_break` flags a row whose `ts` is more than
+      // AUDIT_TS_PAST_SKEW_MS earlier than the previous row's `ts`
+      // — a forged-back-date shape. Hash chain may still be intact
+      // (attacker rebuilds hashes), so this is a second independent
+      // check during verify.
       reason: 'prev_hash_mismatch' | 'this_hash_mismatch' | 'ts_monotonic_break';
       expected: string;
       actual: string;
@@ -155,21 +152,18 @@ export interface AuditSink {
 
 const NOOP_ROW: EmittedRow = { seq: 0, this_hash: '' };
 
-// Slice 142 (review minor): hoist the audit ts future-skew window
-// as an exported constant so spec (§15) + docs + tests reference
-// one canonical value. 1h forgiving window — see validateTs
+// Audit ts future-skew window. 1h forgiving — see validateTs
 // rationale inline for the past-vs-future asymmetry.
 export const AUDIT_TS_FUTURE_SKEW_MS = 60 * 60 * 1000;
 
-// Slice 163 (review — Batch A audit hardening). Symmetric past-side
-// skew window: a forged row whose `ts` lands BEFORE the previous
-// row's wall clock is also a forgery shape (drops a row "into the
-// past" of the audit timeline, breaking forensic ordering). Pre-
-// slice `validateTs` only checked the future side, so an attacker
-// with DB write could insert a row with `ts = previous_row.ts -
-// 86400000` and `verifyChain` accepted it because the hash chain
-// stayed intact. The seal didn't catch this either — sealing is
-// per-decision-count keyed on the hash chain, not on ts monotonic.
+// Symmetric past-side skew window: a forged row whose `ts` lands
+// BEFORE the previous row's wall clock is also a forgery shape
+// (drops a row "into the past" of the audit timeline, breaking
+// forensic ordering). Without this guard, an attacker with DB write
+// can insert a row with `ts = previous_row.ts - 86400000` and
+// `verifyChain` accepts it because the hash chain stays intact. The
+// seal doesn't catch this either — sealing is per-decision-count
+// keyed on the hash chain, not on ts monotonic.
 //
 // Window matches the future side (1h) so legitimate NTP smear /
 // suspend-resume time jumps don't trip false positives, but a
@@ -182,16 +176,15 @@ export const createNoopSink = (): AuditSink => ({
   verifyChain: () => ({ ok: true, rows: 0, current_rotation_id: 0, quarantined: false }),
 });
 
-// Slice 142 C-lat-2: recursive strip of undefined values before
-// canonicalize. JSON has no `undefined`; canonicalize.ts throws on
-// any undefined encountered. Programmatic callers spreading
+// Recursive strip of undefined values before canonicalize. JSON has
+// no `undefined`; canonicalize.ts throws on any undefined
+// encountered. Without this strip, programmatic callers spreading
 // `{ ...rest, optional: maybeUndef }` would throw out of
 // `audit.emit` before the BEGIN IMMEDIATE transaction. The strip
 // pass is shape-preserving — keys with undefined values are
 // silently dropped (matches JSON.stringify semantics), nested
 // objects are recursed. Arrays preserve undefined elements as
-// `null` (JSON.stringify behavior). Non-object inputs pass
-// through.
+// `null` (JSON.stringify behavior). Non-object inputs pass through.
 //
 // Path-based cycle guard: a node is in `seen` only while its
 // recursion is active. We `add` on entry and `delete` on exit, so
@@ -228,12 +221,12 @@ const stripUndefined = (value: unknown, seen: WeakSet<object> = new WeakSet()): 
 // `verifyChain` build the SAME object shape from the SAME source.
 const HASH_INPUT_COLUMNS = PERSISTED_COLUMNS.filter((c) => c !== 'this_hash');
 
-// Slice 163 (review — Batch A): exported so tamper-test fixtures can
-// construct rows with valid-but-back-dated hashes (the threat
-// `ts_monotonic_break` defends against). The function is pure +
-// deterministic; exposing it for tests carries no security cost — an
-// attacker who can already write the DB can compute hashes by hand or
-// import this same module.
+// Exported so tamper-test fixtures can construct rows with valid-
+// but-back-dated hashes (the threat `ts_monotonic_break` defends
+// against). The function is pure + deterministic; exposing it for
+// tests carries no security cost — an attacker who can already
+// write the DB can compute hashes by hand or import this same
+// module.
 export const buildHashPayload = (
   row: Omit<ApprovalLogRow, 'seq' | 'this_hash'>,
 ): Record<string, unknown> => {
@@ -244,12 +237,12 @@ export const buildHashPayload = (
   return payload;
 };
 
-// Spec §7.2: `prev_hash = "GENESIS:" || sha256(install_id || created_at_ms)`
-// for the first row of each installation. The genesis hash is stable
-// for a given identity. A chain rotation keeps the same install_id
-// (per spec §7.2 "nova genesis com same install_id") so the genesis
-// MUST shift to remain distinct from the pre-rotation chain;
-// `computeRotatedGenesisHash` below carries that shift.
+// `prev_hash = "GENESIS:" || sha256(install_id || created_at_ms)`
+// for the first row of each installation. The genesis hash is
+// stable for a given identity. A chain rotation keeps the same
+// install_id so the genesis MUST shift to remain distinct from the
+// pre-rotation chain; `computeRotatedGenesisHash` below carries
+// that shift.
 export const computeGenesisHash = (identity: InstallIdentity): string =>
   `GENESIS:${sha256Hex(`${identity.install_id}${identity.created_at_ms}`)}`;
 
@@ -265,21 +258,20 @@ export const computeRotatedGenesisHash = (
   rotated_at_ms: number,
 ): string => `GENESIS-ROTATED:${sha256Hex(`${identity.install_id}${rotated_at_ms}${rotation_id}`)}`;
 
-// PERMISSION_ENGINE.md §7.2 `--accept-broken-chain` lookup. Returns
-// (seq, ts) for every audit row emitted by the bootstrap when the
-// operator opted to continue under a known-broken chain. The
-// `bootstrapPermissionEngine` flow writes one such row PER acceptance
-// (so multiple resumes under different breaks all stack visibly in
-// the chain).
+// `--accept-broken-chain` lookup. Returns (seq, ts) for every audit
+// row emitted by the bootstrap when the operator opted to continue
+// under a known-broken chain. The `bootstrapPermissionEngine` flow
+// writes one such row PER acceptance (so multiple resumes under
+// different breaks all stack visibly in the chain).
 //
-// Filter strategy: `tool_name = 'permission-engine'` narrows the scan
-// to engine-emitted rows (the only path that produces these), then a
-// LIKE on `reason_chain_json` matches the `chain-break-accepted`
-// stage marker. The LIKE is acceptable here because (a) the prefix
-// filter on tool_name keeps the scanned set tiny in production
-// (typically zero or single-digit rows), and (b) the chain stage
-// marker is a stable string literal the engine writes verbatim — no
-// JSON-shape sensitivity.
+// Filter strategy: `tool_name = 'permission-engine'` narrows the
+// scan to engine-emitted rows (the only path that produces these),
+// then a LIKE on `reason_chain_json` matches the
+// `chain-break-accepted` stage marker. The LIKE is acceptable here
+// because (a) the prefix filter on tool_name keeps the scanned set
+// tiny in production (typically zero or single-digit rows), and
+// (b) the chain stage marker is a stable string literal the engine
+// writes verbatim — no JSON-shape sensitivity.
 export interface ChainBreakAcceptedRow {
   seq: number;
   ts: number;
@@ -301,33 +293,30 @@ export const listChainBreakAcceptedRows = (db: DB, installId: string): ChainBrea
 export interface CreateSqliteSinkOptions {
   identity: InstallIdentity;
   db: DB;
-  // §7.3 sealing integration (slice 56). When set, every successful
-  // `emit` notifies the scheduler via `tick()` so the scheduler can
-  // count decisions toward `interval_decisions` and seal at the
+  // Sealing integration. When set, every successful `emit`
+  // notifies the scheduler via `tick()` so the scheduler can count
+  // decisions toward `interval_decisions` and seal at the
   // appropriate threshold. Optional — sinks created without a
-  // scheduler simply skip the notification and behave exactly as
-  // before slice 56. Production wiring lives in the bootstrap
-  // (slice 57): construct the scheduler from `[seal]` Policy config,
-  // pass it here.
+  // scheduler simply skip the notification. Production wiring
+  // lives in the bootstrap: construct the scheduler from `[seal]`
+  // Policy config, pass it here.
   scheduler?: { tick(): void };
-  // §18 telemetry integration (slice 70). When set, every
-  // successful `emit` produces a typed `permission.decision`
-  // telemetry event mirroring the audit row's content. Structurally-
-  // typed `{emit: (event: TelemetryEvent) => void}` so the sink
-  // doesn't import from src/telemetry (peer modules — same
+  // Telemetry integration. When set, every successful `emit`
+  // produces a typed `permission.decision` telemetry event
+  // mirroring the audit row's content. Structurally-typed so the
+  // sink doesn't import from src/telemetry (peer modules — same
   // posture as the scheduler tick option). Production wires the
   // OTEL adapter; tests inject a recording sink. Failures in the
   // telemetry sink NEVER break audit emit — wrapped in try/catch
   // identical to the scheduler.tick handling.
   telemetry?: { emit: (event: TelemetryEvent) => void };
-  // §18 engine_state bridge (slice 75). Optional getter that
-  // populates the `permission.decision` event's `engine_state`
-  // field. The audit sink doesn't own a state controller — the
-  // bootstrap (which constructs both the sink and the controller)
-  // plumbs `controller.get` through here. Production wiring:
+  // Engine state bridge. Optional getter that populates the
+  // `permission.decision` event's `engine_state` field. The audit
+  // sink doesn't own a state controller — the bootstrap (which
+  // constructs both the sink and the controller) plumbs
+  // `controller.get` through here. Production wiring:
   // `engineState: () => controller.get()`. Without this getter,
-  // the event's `engine_state` field is omitted (slice 70 left
-  // it as optional for forward compatibility).
+  // the event's `engine_state` field is omitted.
   //
   // Wrapped in try/catch at emit time — a thrown getter does not
   // break the audit path nor the telemetry emission; the event
@@ -355,13 +344,11 @@ export const createSqliteSink = ({
       ? computeGenesisHash(identity)
       : computeRotatedGenesisHash(identity, latestMeta.rotation_id, latestMeta.rotated_at_ms);
 
-  // Slice 129 (R5 P0 time): caller-supplied `ts` must be a sane
-  // wall-clock integer. Pre-slice `input.ts` (a documented test
-  // seam on the public AuditEmitInput) accepted ANY value including
-  // Number.MAX_SAFE_INTEGER, negatives, NaN, or a value before the
-  // previous row's ts — `verifyChain` doesn't check monotonic
-  // ordering, so a forged row with `ts=2099-01-01` was
-  // indistinguishable from a real one. Clamp to a sane window:
+  // Caller-supplied `ts` must be a sane wall-clock integer. The
+  // test seam on `AuditEmitInput` accepts any number, so without
+  // this validation a forged row with `ts=2099-01-01` would be
+  // indistinguishable from a real one (verifyChain doesn't check
+  // monotonic ordering across the chain). Clamp to a sane window:
   //   - integer
   //   - finite
   //   - non-negative
@@ -387,26 +374,24 @@ export const createSqliteSink = ({
 
   const emit = (input: AuditEmitInput): EmittedRow => {
     const ts = validateTs(input, Date.now());
-    // Slice 142 C-lat-2: strip undefined values from args before
-    // canonicalize. JSON has no `undefined`; canonicalize.ts:46
-    // throws on any undefined encountered. Pre-fix, a caller
-    // spreading `{ ...rest, optional: maybeUndef }` (legal TS,
-    // illegal JSON) would throw out of `audit.emit` AFTER
-    // validateTs but BEFORE `withImmediateTransaction` —
-    // engine.check() has no try/catch, so the throw propagates to
-    // the harness as `internalError`. Today model-emitted JSON
-    // can't carry undefined, so production path is safe; this
-    // shields programmatic callers and future emit sites.
+    // Strip undefined values from args before canonicalize. JSON
+    // has no `undefined`; canonicalize.ts throws on any undefined
+    // encountered. Without this strip, a caller spreading
+    // `{ ...rest, optional: maybeUndef }` (legal TS, illegal JSON)
+    // throws out of `audit.emit` AFTER validateTs but BEFORE
+    // `withImmediateTransaction` — engine.check() has no
+    // try/catch, so the throw propagates to the harness as
+    // `internalError`. Today model-emitted JSON can't carry
+    // undefined, so production path is safe; this shields
+    // programmatic callers and future emit sites.
     const args_hash = sha256Hex(canonicalize(stripUndefined(input.args ?? {})));
 
-    // Slice 127 (R3 P0-A): wrap read-prev-hash + insert-this-row in
-    // a single IMMEDIATE transaction. Pre-slice the SELECT and
-    // INSERT were both in autocommit mode; parent + parallel
-    // task_async child processes sharing the same install_id could
-    // both read `prev_hash=X` and both insert with that prev_hash,
-    // breaking chain continuity (`verifyChain` then fails). The
-    // child sink was wired in slice 125 P0-9 which UNMASKED this
-    // pre-existing race.
+    // Wrap read-prev-hash + insert-this-row in a single IMMEDIATE
+    // transaction. Without this, the SELECT and INSERT in
+    // autocommit mode let parent + parallel task_async child
+    // processes sharing the same install_id both read `prev_hash=X`
+    // and both insert with that prev_hash, breaking chain
+    // continuity (`verifyChain` then fails).
     //
     // BEGIN IMMEDIATE acquires the writer lock at transaction
     // start so the SELECT's snapshot stays stable through to
@@ -422,26 +407,25 @@ export const createSqliteSink = ({
       const last = getLastApprovalsLogByInstall(db, identity.install_id);
       const prev_hash = last === null ? genesisHash : last.this_hash;
 
-      // Slice 163 (review — Batch A): past-side ts monotonicity guard.
-      // The future-side check in `validateTs` (above, before the
-      // transaction) catches forward-dated forgeries; this catches
-      // backward-dated ones. AUDIT_TS_PAST_SKEW_MS gives an hour of
-      // tolerance for NTP smear / suspend-resume jumps so we don't
-      // false-positive on legitimate clock corrections. Beyond that
-      // window, the row's ts is treated as a forgery attempt —
-      // refuse the insert. The chain has now been read inside the
-      // IMMEDIATE writer lock, so the comparison is race-free.
+      // Past-side ts monotonicity guard. The future-side check in
+      // `validateTs` (above, before the transaction) catches
+      // forward-dated forgeries; this catches backward-dated ones.
+      // AUDIT_TS_PAST_SKEW_MS gives an hour of tolerance for NTP
+      // smear / suspend-resume jumps so we don't false-positive on
+      // legitimate clock corrections. Beyond that window, the
+      // row's ts is treated as a forgery attempt — refuse the
+      // insert. The chain has now been read inside the IMMEDIATE
+      // writer lock, so the comparison is race-free.
       if (last !== null && ts < last.ts - AUDIT_TS_PAST_SKEW_MS) {
         throw new Error(
-          `audit: ts ${ts} is more than ${AUDIT_TS_PAST_SKEW_MS}ms before previous row's ts ${last.ts} (forgery suspected; see PERMISSION_ENGINE.md §15)`,
+          `audit: ts ${ts} is more than ${AUDIT_TS_PAST_SKEW_MS}ms before previous row's ts ${last.ts} (forgery suspected)`,
         );
       }
 
-      // Slice 143 (API-3): the 7 load-bearing fields below
-      // (capabilities, score, score_components, classifier_hash,
-      // classifier_adjust, sandbox_profile, ttl_expires_at) are now
-      // required on `AuditEmitInput`, so the pre-slice `?? <default>`
-      // fallbacks are gone. The 4 still-optional fields
+      // The 7 load-bearing fields below (capabilities, score,
+      // score_components, classifier_hash, classifier_adjust,
+      // sandbox_profile, ttl_expires_at) are required on
+      // `AuditEmitInput`. The 4 still-optional fields
       // (parent_approval_id, confidence, tool_version,
       // resolver_version) keep their persistence defaults here.
       const persisted: Omit<ApprovalLogRow, 'seq' | 'this_hash'> = {
@@ -471,13 +455,13 @@ export const createSqliteSink = ({
       const row = appendApprovalsLog(db, { ...persisted, this_hash: hash });
       return { inserted: row, this_hash: hash, persistedExceptHash: persisted };
     });
-    // §7.3 sealing tick (slice 56). ORDER MATTERS: the row is
-    // already persisted, so the scheduler's `sealLatestInternal`
-    // sees the up-to-date chain head when it queries
-    // `getLastApprovalsLogByInstall`. Wrapped in try/catch because
-    // the audit path is critical and sealing is best-effort —
-    // scheduler internals OR a user-supplied `onSealFailed`
-    // callback throwing must NOT break audit emission.
+    // Sealing tick. ORDER MATTERS: the row is already persisted,
+    // so the scheduler's `sealLatestInternal` sees the up-to-date
+    // chain head when it queries `getLastApprovalsLogByInstall`.
+    // Wrapped in try/catch because the audit path is critical and
+    // sealing is best-effort — scheduler internals OR a user-
+    // supplied `onSealFailed` callback throwing must NOT break
+    // audit emission.
     if (scheduler !== undefined) {
       try {
         scheduler.tick();
@@ -487,19 +471,19 @@ export const createSqliteSink = ({
         // is in the DB, but emit() threw. Silently swallow.
       }
     }
-    // §18 telemetry emission (slice 70). Same posture as the
-    // scheduler tick: AFTER persist so the event's approval_id
-    // (= row.seq) is stable, wrapped in try/catch because
-    // observability MUST NOT break audit emit. The event carries
-    // the row's content minus secrets-bearing fields (args + raw
-    // chain hashes); resolved capabilities + decision + score +
-    // policy_hash + classifier_hash are operator-facing
-    // diagnostics, safe to export.
+    // Telemetry emission. Same posture as the scheduler tick:
+    // AFTER persist so the event's approval_id (= row.seq) is
+    // stable, wrapped in try/catch because observability MUST NOT
+    // break audit emit. The event carries the row's content minus
+    // secrets-bearing fields (args + raw chain hashes); resolved
+    // capabilities + decision + score + policy_hash +
+    // classifier_hash are operator-facing diagnostics, safe to
+    // export.
     if (telemetry !== undefined) {
       try {
-        // §18 engine_state bridge (slice 75). Resolve the state
-        // via the optional getter; failures inside the getter
-        // surface as an omitted field, not a corrupted event.
+        // Resolve the engine state via the optional getter;
+        // failures inside the getter surface as an omitted field,
+        // not a corrupted event.
         let resolvedEngineState: string | undefined;
         if (engineState !== undefined) {
           try {
@@ -546,30 +530,26 @@ export const createSqliteSink = ({
     const tipMeta = getLatestChainMeta(db, identity.install_id);
     const tipRotationId = tipMeta?.rotation_id ?? 0;
     const tipQuarantined = tipMeta?.quarantined === 1;
-    // Slice 142 C-lat-1: recompute genesis from the LIVE rotation
-    // tip, not the construction-time snapshot. Pre-fix the sink
-    // captured `genesisHash` at construction (line 256-259) and
-    // verify used it verbatim. If an out-of-process
-    // `--rotate-chain` fired between sink construction and
-    // verify (long-lived REPL + operator running rotate in another
-    // terminal), the live approvals_log rows belonged to the NEW
-    // chain whose first row's prev_hash is the rotated genesis,
-    // but `expectedPrev` started at the STALE construction-time
-    // hash. Result: spurious `prev_hash_mismatch` on a perfectly
-    // intact post-rotation chain. Recomputing from `tipMeta` here
-    // closes the staleness window.
+    // Recompute genesis from the LIVE rotation tip, not the
+    // construction-time snapshot. Without this recompute, an
+    // out-of-process `--rotate-chain` between sink construction
+    // and verify (long-lived REPL + operator running rotate in
+    // another terminal) produces a spurious `prev_hash_mismatch`
+    // on a perfectly intact post-rotation chain: the live
+    // approvals_log rows belong to the NEW chain whose first
+    // row's prev_hash is the rotated genesis, but `expectedPrev`
+    // would start at the STALE construction-time hash.
     const liveGenesisHash =
       tipMeta === null
         ? computeGenesisHash(identity)
         : computeRotatedGenesisHash(identity, tipMeta.rotation_id, tipMeta.rotated_at_ms);
     const rows = listApprovalsLogByInstall(db, identity.install_id);
     let expectedPrev = liveGenesisHash;
-    // Slice 163: ts monotonic floor for the current walk position.
-    // `lastTs` tracks the previous row's ts; the next row must not
-    // be more than AUDIT_TS_PAST_SKEW_MS earlier. Same semantics as
-    // the emit-time guard (validateTs + the past-ts check inside
-    // the IMMEDIATE transaction), reapplied post-hoc to catch DB-
-    // tamper that bypassed emit.
+    // ts monotonic floor for the current walk position. `lastTs`
+    // tracks the previous row's ts; the next row must not be more
+    // than AUDIT_TS_PAST_SKEW_MS earlier. Same semantics as the
+    // emit-time guard, reapplied post-hoc to catch DB-tamper that
+    // bypassed emit.
     let lastTs: number | null = null;
     for (const row of rows) {
       if (row.prev_hash !== expectedPrev) {
@@ -595,10 +575,10 @@ export const createSqliteSink = ({
           quarantined: tipQuarantined,
         };
       }
-      // Slice 163 (review — Batch A): ts monotonic break detection.
-      // Hash chain can stay intact while ts is forged backward
-      // (attacker with DB write recomputes hashes). The verify path
-      // is the second-line check.
+      // ts monotonic break detection. Hash chain can stay intact
+      // while ts is forged backward (attacker with DB write
+      // recomputes hashes). The verify path is the second-line
+      // check.
       if (lastTs !== null && row.ts < lastTs - AUDIT_TS_PAST_SKEW_MS) {
         return {
           ok: false,

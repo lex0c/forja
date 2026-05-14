@@ -2,10 +2,9 @@
 //   - 10 chars: 48-bit unix-ms timestamp, Crockford base32, MSB first.
 //   - 16 chars: 80-bit cryptographic randomness, Crockford base32.
 //
-// Used by `grants.id` (§8) and any future audit row that needs a
-// stable, URL-safe, time-sortable public identifier independent of
-// the SQLite autoincrement `seq` integer. Crockford base32 omits
-// the visually-ambiguous `I`, `L`, `O`, `U` glyphs so a ULID printed
+// Stable, URL-safe, time-sortable public identifier independent of
+// any DB autoincrement `seq` integer. Crockford base32 omits the
+// visually-ambiguous `I`, `L`, `O`, `U` glyphs so a ULID printed
 // in a terminal can be re-typed reliably.
 //
 // Time-sortability is a spec property: lexicographic order on the

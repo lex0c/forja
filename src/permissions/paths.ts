@@ -6,10 +6,10 @@ import { posix, win32 } from 'node:path';
 // `node:path` reflects host platform and would mis-classify.
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
-// Path discovery for the permission hierarchy (AGENTIC_CLI §8). Each
-// layer points to a single permissions.yaml; absent files are simply
-// skipped. The order here doesn't dictate precedence (that's the
-// hierarchy resolver's job); these are just "where to look".
+// Path discovery for the permission hierarchy. Each layer points
+// to a single permissions.yaml; absent files are simply skipped.
+// The order here doesn't dictate precedence (that's the hierarchy
+// resolver's job); these are just "where to look".
 //
 // Platform handling:
 //   - Linux/macOS: XDG-style for user, /etc/agent for enterprise.

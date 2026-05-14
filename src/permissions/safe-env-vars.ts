@@ -1,18 +1,14 @@
-// Canonical env-var allowlist for the sandbox kernel-boundary clearenv.
-// Pre-slice 162 the list lived under `sandbox-runner.ts` and the
-// macOS runner had no equivalent (relied entirely on userspace
-// `scrubEnv`'s denylist). The asymmetry was the structural P0 from
-// the 5-axis security-in-depth review: Linux had a kernel-level
-// allowlist via `bwrap --clearenv --setenv KEY VAL`, macOS had only
-// the denylist, so ad-hoc credential vars (VAULT_ADDR, BW_SESSION,
-// OP_CONNECT_TOKEN, FLY_API_TOKEN_*, RAILWAY_TOKEN, novel SaaS
-// tokens) reached the sandboxed bash on darwin.
-//
-// Slice 162 closes the asymmetry: extract the list here, the macOS
-// runner emits `/usr/bin/env -i KEY=VAL ... -- <inner>` as a
-// userland clearenv. The inner process inherits ONLY the allowed
-// vars regardless of what the spawner's `Bun.spawn({env})` passed
-// in. Symmetric with the Linux bwrap path.
+// Canonical env-var allowlist for the sandbox kernel-boundary
+// clearenv. Shared between the Linux bwrap runner (via `--clearenv
+// --setenv KEY VAL`) and the macOS sandbox-exec runner (via a
+// `/usr/bin/env -i KEY=VAL ... -- <inner>` userland clearenv).
+// The inner process inherits ONLY the allowed vars regardless of
+// what the spawner's `Bun.spawn({env})` passed in. Without this
+// allowlist, the asymmetry between Linux's kernel-level allowlist
+// and macOS's previous userspace-only denylist would let ad-hoc
+// credential vars (VAULT_ADDR, BW_SESSION, OP_CONNECT_TOKEN,
+// FLY_API_TOKEN_*, RAILWAY_TOKEN, novel SaaS tokens) reach the
+// sandboxed bash on darwin.
 //
 // Membership rules (must hold for every entry):
 //   - Var is required by common Unix utilities to function at all
@@ -52,7 +48,7 @@
 //   XDG_*           — user dirs; defaults are fine
 //   DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR — host service access
 //                     (secret-service, gnome-keyring, etc.)
-//   GIT_*           — git config-via-env injection (slice 129)
+//   GIT_*           — git config-via-env injection
 //   SSH_AUTH_SOCK,
 //   GPG_AGENT_INFO  — agent socket access; sandbox could ssh-add -l
 //                     or have gpg-agent sign on its behalf
@@ -93,12 +89,11 @@ export const SANDBOX_SAFE_ENV_VARS: readonly string[] = [
   // Timezone — without TZ, `date` reports UTC; tools that infer
   // local time (git log timestamps, log-emitters) report wrong
   // offsets. Operator's TZ leaks via this — acceptable trade-off
-  // (no credential content; per spec §8 timezone is operator
-  // metadata, not secret).
+  // (no credential content; timezone is operator metadata, not
+  // secret).
   'TZ',
-  // Temp dir hint. Slices 156/157 establish per-sandbox TMPDIR on
-  // darwin; the inner process honors it via this var. Linux: the
-  // bwrap `--tmpfs /tmp` mount already redirects; TMPDIR set here
-  // is harmless additional hint.
+  // Temp dir hint. On darwin the per-sandbox TMPDIR is honored
+  // via this var. Linux: the bwrap `--tmpfs /tmp` mount already
+  // redirects; TMPDIR set here is harmless additional hint.
   'TMPDIR',
 ];

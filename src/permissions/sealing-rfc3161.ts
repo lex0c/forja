@@ -1,4 +1,4 @@
-// §7.3 RFC 3161 Time-Stamp Authority sealing backend (slice 88).
+// RFC 3161 Time-Stamp Authority sealing backend.
 //
 // External anchoring via the Time-Stamp Protocol (RFC 3161). For
 // each seal event the backend:
@@ -12,11 +12,11 @@
 //
 // The TSR is the auditable proof: a CMS SignedData blob whose
 // embedded TSTInfo carries the TSA's timestamp + our hash. A
-// verifier (future slice) parses the SignedData, validates the
+// verifier (future work) parses the SignedData, validates the
 // signature against the TSA's certificate chain, and confirms the
-// TSTInfo.messageImprint matches our recomputed chain hash. Slice
-// 88 ships SUBMIT + STORE only; verification is a separate concern
-// (RFC 3161 §2.4.2 + CMS parsing are substantial).
+// TSTInfo.messageImprint matches our recomputed chain hash. This
+// module ships SUBMIT + STORE only; verification is a separate
+// concern (RFC 3161 §2.4.2 + CMS parsing are substantial).
 //
 // Threat model:
 //   - In-scope: retroactive editing of past seal entries — the
@@ -32,10 +32,10 @@
 //     policy (degrade vs refuse) decides what happens.
 //   - Out-of-scope: replay of an older TSR — the TSA's TSTInfo
 //     carries a fresh `nonce` when we set one + the TSA's
-//     timestamp is monotonic per the TSA's clock. Slice 88's
-//     encoder omits the nonce for simplicity; a verifier would
-//     check the timestamp falls within the seal's expected
-//     window (interval_seconds bound).
+//     timestamp is monotonic per the TSA's clock. Our encoder
+//     omits the nonce for simplicity; a verifier would check the
+//     timestamp falls within the seal's expected window
+//     (interval_seconds bound).
 //
 // Sync interface: SealStore.append() is synchronous (matches the
 // scheduler's sealNow() contract). The TSA HTTP call is therefore
@@ -128,7 +128,7 @@ const messageImprint = (hashBytes: Uint8Array): Uint8Array =>
 // The optional fields are omitted; the resulting payload is the
 // minimum-valid TSQ. Operators who need certReq=TRUE (TSA cert
 // returned inline) or nonce binding (replay defense) can extend
-// the encoder in a follow-up — slice 88 ships the baseline.
+// the encoder later.
 export const encodeTimestampQuery = (hashHex: string): Uint8Array => {
   if (!/^[0-9a-fA-F]{64}$/.test(hashHex)) {
     throw new Error(`encodeTimestampQuery: hash must be 64 hex chars (sha256), got '${hashHex}'`);
@@ -248,13 +248,13 @@ const defaultEnsureDir = (d: string): void => {
 };
 
 export const createRfc3161TsaSealer = (opts: CreateRfc3161TsaSealerOptions): SealStore => {
-  // Strip trailing slashes so join(dir, 'seal.log') doesn't produce
-  // double-slash paths. The /^\/+$/ guard preserves "/" (and other
-  // all-slashes values like "//") as the filesystem root — without
-  // it, the naive replace collapses "/" to "" and every subsequent
-  // join() becomes a CWD-relative path, silently writing seal
-  // artifacts to the wrong place when an operator deliberately
-  // configures seal.path = "/".
+  // Strip trailing slashes so join(dir, 'seal.log') doesn't
+  // produce double-slash paths. The /^\/+$/ guard preserves "/"
+  // (and other all-slashes values like "//") as the filesystem
+  // root — without it, the naive replace collapses "/" to "" and
+  // every subsequent join() becomes a CWD-relative path, silently
+  // writing seal artifacts to the wrong place when an operator
+  // deliberately configures seal.path = "/".
   const dir = /^\/+$/.test(opts.path) ? '/' : opts.path.replace(/\/+$/, '');
   const sealLogPath = join(dir, 'seal.log');
   const submit = opts.submit ?? defaultRfc3161Submitter();
@@ -278,8 +278,7 @@ export const createRfc3161TsaSealer = (opts: CreateRfc3161TsaSealerOptions): Sea
         return { ok: false, reason: `invalid seal entry: ${JSON.stringify(entry)}` };
       }
       // Hash MUST be SHA-256 (64 hex chars) for this backend — the
-      // TSQ encoder hardcodes the algorithm OID. A future slice
-      // could parameterize by digest algorithm.
+      // TSQ encoder hardcodes the algorithm OID.
       if (!/^[0-9a-fA-F]{64}$/.test(entry.hash)) {
         return {
           ok: false,

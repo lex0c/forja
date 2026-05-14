@@ -1,7 +1,7 @@
-// Sandbox argv synthesis per PERMISSION_ENGINE.md §6.5 (macOS /
-// sandbox-exec). Parallel to `sandbox-runner.ts`'s Linux/bwrap
-// surface — same input shape, same per-profile mounting/network
-// rules, different OS-level enforcement primitive.
+// Sandbox argv synthesis for macOS / sandbox-exec. Parallel to
+// `sandbox-runner.ts`'s Linux/bwrap surface — same input shape,
+// same per-profile mounting/network rules, different OS-level
+// enforcement primitive.
 //
 // macOS ships `sandbox-exec` at /usr/bin/sandbox-exec on every
 // supported version (10.5+). Profile syntax is SBPL — Apple's
@@ -17,14 +17,7 @@
 // or -f <file>. We use -p; the profile is small (<1 KB per
 // profile) so the inline form avoids a tempfile.
 //
-// Out of scope for THIS slice (slice 47): wiring the builder into
-// the spawn-site dispatch (`maybeWrapSandboxArgv`). Decision +
-// platform-dispatch land in the next slice (paralleling slice 19
-// for Linux). This file is pure-function today; one helper per
-// profile, all returning string[] for the caller to hand to
-// Bun.spawn.
-//
-// Profile flag rationale (spec §6.5 mounts/network/process columns):
+// Profile flag rationale (mounts/network/process columns):
 //
 //   ro          — read-only filesystem (deny file-write*). No
 //                 network (deny network*). process-exec allowed
@@ -56,31 +49,26 @@ export interface BuildSandboxExecArgvOptions {
   home: string;
   // The inner command + args the sandbox-exec wraps. Cannot be empty.
   innerArgv: readonly string[];
-  // Slice 154 (review — PATH-shim resistance): absolute path to
-  // the sandbox-exec binary. Default is the bare name (kernel
-  // resolves via $PATH at execve — re-exposes shim attack).
-  // Production callers via maybeWrapSandboxArgv pass the
+  // Absolute path to the sandbox-exec binary. Default is the bare
+  // name (kernel resolves via $PATH at execve — re-exposes shim
+  // attack). Production callers via maybeWrapSandboxArgv pass the
   // canonical-first resolved path.
   sandboxExecPath?: string;
-  // Slice 155 (review — symlink canonicalization): test seam for
-  // `realpath()`. Production omits and uses `node:fs.realpathSync`.
-  // See sandbox-runner.ts canonicalizeCwd block for the threat
-  // shape + failure-mode policy; this option mirrors that for
-  // macOS parity (SBPL deny rules on the literal cwd path would
-  // be bypassed by the same symlink-to-hidden-dir trick).
+  // Test seam for `realpath()`. Production omits and uses
+  // `node:fs.realpathSync`. See sandbox-runner.ts canonicalizeCwd
+  // block for the threat shape + failure-mode policy; SBPL deny
+  // rules on the literal cwd path would be bypassed by the same
+  // symlink-to-hidden-dir trick without canonicalization.
   realpath?: (p: string) => string;
-  // Slice 156 (review — macOS /tmp shared sandbox+host): per-
-  // sandbox tmpdir subpath. When set, the SBPL `file-write*` allow
-  // for the tmp tree is restricted to this subpath rather than the
-  // host's `/tmp` blanket (plus the `/private/tmp` firmlink form).
+  // Per-sandbox tmpdir subpath. When set, the SBPL `file-write*`
+  // allow for the tmp tree is restricted to this subpath rather
+  // than the host's `/tmp` blanket (plus the `/private/tmp`
+  // firmlink form).
   //
-  // Pre-slice the SBPL profile granted `(allow file-write*
-  // (subpath "/tmp"))` and `(allow file-write* (subpath
-  // "/private/tmp"))` unconditionally — matching Linux's
-  // `--tmpfs /tmp` ergonomics but missing Linux's isolation. macOS
-  // `/tmp` is the host's `/tmp`, shared across every process the
-  // operator runs. Sandbox A writes `/tmp/secret`, operator's
-  // non-sandboxed app B reads it. Cross-tenancy leak.
+  // macOS `/tmp` is the host's `/tmp`, shared across every process
+  // the operator runs — granting blanket `(allow file-write*
+  // (subpath "/tmp"))` lets sandbox A write `/tmp/secret` and
+  // operator's non-sandboxed app B read it. Cross-tenancy leak.
   //
   // When `tmpdir` is set:
   //   - Caller MUST pre-create the directory (mkdir + mode 0o700
@@ -92,26 +80,24 @@ export interface BuildSandboxExecArgvOptions {
   //     plus the `/private/<tmpdir-after-/tmp>` firmlink-equivalent
   //     form when tmpdir starts with `/tmp/`. No blanket /tmp.
   //
-  // When omitted (default): pre-slice behavior — full `/tmp` +
-  // `/private/tmp` allowed. Spec §6.5 documents this as a known
-  // divergence from Linux's per-sandbox isolation; the capability
-  // exists here for operator-driven workflows that pre-create a
-  // session-scoped tmpdir.
+  // When omitted (default): full `/tmp` + `/private/tmp` allowed.
+  // Documented divergence from Linux's per-sandbox isolation; this
+  // capability exists for operator-driven workflows that pre-create
+  // a session-scoped tmpdir.
   tmpdir?: string;
-  // Slice 162 (review — env scrub allowlist parity). When set,
-  // the inner argv is wrapped with `/usr/bin/env -i KEY=VAL ... --`
-  // so the inner process starts with ONLY the allowlisted vars
-  // (`SANDBOX_SAFE_ENV_VARS`) populated from this env. Matches the
-  // Linux runner's `--clearenv --setenv KEY VAL` kernel-boundary
-  // behavior — without this wrap, sandbox-exec inherits the
-  // spawner's env verbatim and any var off the userspace scrub
-  // denylist (e.g. VAULT_ADDR, BW_SESSION, novel SaaS tokens)
-  // leaks into the sandboxed bash.
+  // When set, the inner argv is wrapped with `/usr/bin/env -i
+  // KEY=VAL ... --` so the inner process starts with ONLY the
+  // allowlisted vars (`SANDBOX_SAFE_ENV_VARS`) populated from this
+  // env. Matches the Linux runner's `--clearenv --setenv KEY VAL`
+  // kernel-boundary behavior — without this wrap, sandbox-exec
+  // inherits the spawner's env verbatim and any var off the
+  // userspace scrub denylist (e.g. VAULT_ADDR, BW_SESSION, novel
+  // SaaS tokens) leaks into the sandboxed bash.
   //
-  // Path-shim hardening (mirror of slice 154): the inner wrapper
-  // uses the canonical `/usr/bin/env` path verbatim instead of
-  // the bare `env` name so the kernel `execve` doesn't re-walk
-  // $PATH at exec time and resolve to a `/tmp/evilbin/env` shim.
+  // Path-shim hardening: the inner wrapper uses the canonical
+  // `/usr/bin/env` path verbatim instead of the bare `env` name so
+  // the kernel `execve` doesn't re-walk $PATH at exec time and
+  // resolve to a `/tmp/evilbin/env` shim.
   //
   // When omitted (test seam, legacy callers): inner argv is not
   // wrapped — `sandbox-exec` execs the inner directly and it
@@ -128,19 +114,15 @@ export interface BuildSandboxExecArgvOptions {
 //
 // Rejects on:
 //   - NUL bytes — invalid in filesystem paths; indicates caller bug.
-//   - Slice 127 (R3 P1): the full CC0 (U+0000-U+001F) + CC1
-//     (U+0080-U+009F) control-character ranges. Pre-slice 125
-//     only `\n`/`\r` were rejected (the line-structure-injection
-//     case), but the SAME class of attacker-controllable bytes
-//     (ANSI ESC `\x1b`, BEL `\x07`, OSC opening `\x9d`) could
-//     produce equally bad outcomes — terminal-side escapes when
-//     the operator views the rendered profile error, or unknown
-//     SBPL parser behavior on its own escape semantics. Symmetric
-//     with welcome.ts's CONTROL_CHAR_RE (slice 125 R2 P2) which
-//     strips the same ranges from operator-visible output.
-//     POSIX permits these in paths but they're extraordinarily
-//     rare; rejecting forecloses an entire injection class for
-//     negligible legitimate cost.
+//   - Full CC0 (U+0000-U+001F) + CC1 (U+0080-U+009F) control-
+//     character ranges. Beyond line-structure injection (`\n`/`\r`),
+//     the same class of attacker-controllable bytes (ANSI ESC
+//     `\x1b`, BEL `\x07`, OSC opening `\x9d`) could produce
+//     terminal-side escapes when the operator views the rendered
+//     profile error, or unknown SBPL parser behavior on its own
+//     escape semantics. POSIX permits these in paths but they're
+//     extraordinarily rare; rejecting forecloses an entire
+//     injection class for negligible legitimate cost.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: rule's purpose IS to match control chars (defense intent)
 const SBPL_CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f]/;
 const escapeSbplLiteral = (s: string): string => {
@@ -160,10 +142,9 @@ export const buildSbplProfile = (
   profile: Exclude<SandboxProfile, 'host'>,
   cwd: string,
   home: string,
-  // Slice 156 (review — macOS /tmp shared): per-sandbox tmpdir
-  // subpath. When set, replaces the blanket `/tmp` + `/private/tmp`
-  // write allow with a subpath-scoped allow. See
-  // BuildSandboxExecArgvOptions.tmpdir docstring for the threat
+  // Per-sandbox tmpdir subpath. When set, replaces the blanket
+  // `/tmp` + `/private/tmp` write allow with a subpath-scoped
+  // allow. See BuildSandboxExecArgvOptions.tmpdir for the threat
   // shape + caller-responsibility contract.
   tmpdir?: string,
 ): string => {
@@ -178,32 +159,31 @@ export const buildSbplProfile = (
     '(allow process-exec)',
     '(allow process-fork)',
     '(allow signal (target same-sandbox))',
-    // Slice 140 sec-2 + slice 145 S3: deny nested sandbox-exec.
-    // The `(allow process-exec)` above lets the wrapped process
-    // spawn arbitrary binaries; an LLM-driven bash could
-    // `sandbox-exec -p '(version 1)(allow default)' /bin/sh` to
-    // wrap itself in a permissive profile and escape the outer
-    // one. macOS DOES intersect nested sandbox profiles for the
-    // FS/network gates, but the inner profile can still toggle
-    // mach-lookup / signal / process semantics within the outer
-    // profile's allowed set. Cheaper to refuse the launch
+    // Deny nested sandbox-exec. The `(allow process-exec)` above
+    // lets the wrapped process spawn arbitrary binaries; an LLM-
+    // driven bash could `sandbox-exec -p '(version 1)(allow
+    // default)' /bin/sh` to wrap itself in a permissive profile and
+    // escape the outer one. macOS DOES intersect nested sandbox
+    // profiles for the FS/network gates, but the inner profile can
+    // still toggle mach-lookup / signal / process semantics within
+    // the outer profile's allowed set. Cheaper to refuse the launch
     // outright.
     //
-    // Slice 140 used only `(literal "/usr/bin/sandbox-exec")` —
-    // bypassable via `cp /usr/bin/sandbox-exec /tmp/se && /tmp/se
-    // ...` since both `/tmp` and cwd are writable in cwd-rw /
-    // cwd-rw-net profiles. Slice 145 adds a regex deny matching
-    // any path whose basename is exactly `sandbox-exec`:
+    // A single `(literal "/usr/bin/sandbox-exec")` is bypassable via
+    // `cp /usr/bin/sandbox-exec /tmp/se && /tmp/se ...` (both `/tmp`
+    // and cwd are writable in cwd-rw / cwd-rw-net profiles). The
+    // regex denies match any path whose basename is exactly
+    // `sandbox-exec`:
     //   `^/.*/sandbox-exec$` (any directory + trailing
     //                          "/sandbox-exec")
     //   `^/sandbox-exec$`     (root-level binary)
     //
     // SBPL last-match-wins, so both denys come AFTER
     // (allow process-exec) and win. The regex is a SBPL primitive
-    // (not the Forja-side glob/prefix matcher) — the CLAUDE.md
-    // "no regex in policy/permissions" rule applies to operator-
-    // facing policy YAML, not to a kernel DSL where regex is the
-    // documented primitive. The literal deny stays for clarity.
+    // (not the Forja-side glob/prefix matcher) — the "no regex in
+    // policy/permissions" rule applies to operator-facing policy
+    // YAML, not to a kernel DSL where regex is the documented
+    // primitive. The literal deny stays for clarity.
     '(deny process-exec (literal "/usr/bin/sandbox-exec"))',
     '(deny process-exec (regex #"^/.*/sandbox-exec$"))',
     '(deny process-exec (regex #"^/sandbox-exec$"))',
@@ -214,21 +194,21 @@ export const buildSbplProfile = (
     // mach-lookup is required for system services (e.g. dyld);
     // omitting it makes EVERY exec fail with mach-style errors.
     '(allow mach-lookup)',
-    // Slice 175 (review — sandbox escape P1). `(allow mach-lookup)`
-    // is blanket — every mach service the sandboxed process names
-    // resolves, including LaunchServices. That lets the inner bash
-    // call `open -a Mail file://exfil.html` or `open -a
-    // 'TextEdit.app' /etc/shadow`; the `open` call is brokered
-    // OUTSIDE the sandbox by `lsd` / `coreservicesd`, which then
-    // spawn the target app un-sandboxed with the operator's full
-    // privileges. The sandboxed process effectively requested an
-    // arbitrary exec via mach-IPC, escaping the SBPL.
+    // `(allow mach-lookup)` is blanket — every mach service the
+    // sandboxed process names resolves, including LaunchServices.
+    // That lets the inner bash call `open -a Mail
+    // file://exfil.html` or `open -a 'TextEdit.app' /etc/shadow`;
+    // the `open` call is brokered OUTSIDE the sandbox by `lsd` /
+    // `coreservicesd`, which then spawn the target app un-sandboxed
+    // with the operator's full privileges. The sandboxed process
+    // effectively requested an arbitrary exec via mach-IPC,
+    // escaping the SBPL.
     //
     // SBPL evaluates rules top-to-bottom and the LAST matching rule
-    // wins. We emit explicit denies for the LaunchServices /
-    // app-launch mach surface AFTER the blanket allow so dyld /
-    // libc still resolve normal services but `open(1)`'s helper
-    // calls hit a refusal.
+    // wins. Explicit denies for the LaunchServices / app-launch
+    // mach surface come AFTER the blanket allow so dyld / libc
+    // still resolve normal services but `open(1)`'s helper calls
+    // hit a refusal.
     //
     // Service-name selection: each entry below is documented in
     // public Apple sources OR appears in well-known `dtrace -n
@@ -243,7 +223,7 @@ export const buildSbplProfile = (
     //     `task_for_pid` cross-process call. A sandboxed bash
     //     reaching this could request a sibling's task port and
     //     inject code, escaping the SBPL completely.
-    // The conservative posture is: name the surfaces we KNOW are
+    // Conservative posture: name the surfaces we KNOW are
     // load-bearing for the escape, accept that an undocumented
     // `lsd.*` subservice we missed could still leak. Future audit
     // sweep can add more — names are additive (each is an extra
@@ -262,11 +242,10 @@ export const buildSbplProfile = (
   // Filesystem writes — profile-specific. /tmp is always writable
   // (matches Linux's --tmpfs /tmp). Then cwd or home per profile.
   //
-  // Slice 156 (review — macOS /tmp shared): when `tmpdir` is set,
-  // the SBPL allow is restricted to that subpath ONLY (plus the
-  // /private firmlink-equivalent form when tmpdir starts with
-  // /tmp/). No blanket /tmp + /private/tmp allow. When `tmpdir`
-  // is unset (default), pre-slice behavior — full /tmp tree
+  // When `tmpdir` is set, the SBPL allow is restricted to that
+  // subpath ONLY (plus the /private firmlink-equivalent form when
+  // tmpdir starts with /tmp/). No blanket /tmp + /private/tmp
+  // allow. When `tmpdir` is unset (default), the full /tmp tree is
   // allowed. The caller is responsible for pre-creating the
   // directory and setting `TMPDIR=<tmpdir>` in the wrapped
   // process's env so mktemp / NSTemporaryDirectory honor the
@@ -290,23 +269,20 @@ export const buildSbplProfile = (
   // macOS routes /tmp through /private/tmp via a firmlink; some
   // operations resolve one form, some the other. Allow both.
   //
-  // Slice 125 (R2 P0-6): pre-slice we also allowed write to
-  // `/private/var/folders` (macOS per-user TMPDIR root) for
-  // mktemp / NSTemporaryDirectory compatibility. But that root
-  // is SHARED across every app the user runs — includes
-  // `com.apple.Keychain.*` ephemeral state, `com.apple.security.*`
-  // caches, credential-helper sockets. The Linux equivalent uses
-  // `--tmpfs /tmp` (fresh isolated tmpfs per-sandbox); macOS
-  // just unlocked the host path. Removed.
+  // We do NOT allow write to `/private/var/folders` (macOS per-user
+  // TMPDIR root). That root is SHARED across every app the user
+  // runs — includes `com.apple.Keychain.*` ephemeral state,
+  // `com.apple.security.*` caches, credential-helper sockets.
+  // Granting it would defeat the per-sandbox isolation the Linux
+  // `--tmpfs /tmp` provides.
   //
   // Cost: wrapped tools that hard-code NSTemporaryDirectory
   // (Swift/Obj-C apps; some Python/Ruby/Node tools via system
-  // libs) will fail at exec time. Workaround: operator can
-  // prefix `TMPDIR=/tmp <cmd>` to redirect, OR opt into
-  // `host-passthrough` for that specific call. Future slice
-  // could mint a per-sandbox tempdir + bind it as TMPDIR; that
-  // requires runtime side effects beyond the current pure-
-  // function runner contract.
+  // libs) will fail at exec time. Workaround: operator can prefix
+  // `TMPDIR=/tmp <cmd>` to redirect, OR opt into `host-passthrough`
+  // for that specific call. A future per-sandbox tempdir bind as
+  // TMPDIR would close this gap but requires runtime side effects
+  // beyond the current pure-function runner contract.
   if (profile === 'cwd-rw' || profile === 'cwd-rw-net') {
     writeRules.push(`(allow file-write* (subpath "${escapeSbplLiteral(cwd)}"))`);
   } else if (profile === 'home-rw') {
@@ -322,14 +298,13 @@ export const buildSbplProfile = (
     netRules.push('(allow network*)');
   }
 
-  // §9 hide_paths — credential dirs + files masked inside every
-  // sandbox profile (slice 119, R4). The `(allow file-read*)`
-  // baseline above exposes the operator's entire home read-only
-  // inside the sandbox; the LLM could `cat ~/.ssh/id_rsa` from a
-  // `ro` profile without this defense. Engine-side §11 protected
-  // paths (slice 97) only catches calls that surface as resolved
-  // capabilities — a sandboxed bash reading the file directly
-  // bypasses the classifier.
+  // hide_paths — credential dirs + files masked inside every
+  // sandbox profile. The `(allow file-read*)` baseline above
+  // exposes the operator's entire home read-only inside the
+  // sandbox; the LLM could `cat ~/.ssh/id_rsa` from a `ro` profile
+  // without this defense. The engine-side protected-paths classifier
+  // only catches calls that surface as resolved capabilities — a
+  // sandboxed bash reading the file directly bypasses it.
   //
   // SBPL evaluation: rules apply top-to-bottom and the LAST
   // matching rule wins for that operation. The deny clauses
@@ -361,24 +336,22 @@ export const buildSbplProfile = (
     denyRules.push(`(deny file-read* (literal "${escaped}"))`);
     denyRules.push(`(deny file-write* (literal "${escaped}"))`);
   }
-  // Slice 140 sec-1: XDG_DATA_HOME unmask. Same gap as the Linux
-  // runner — `.local/share/forja` is only the home-relative
-  // default; `defaultDataDir()` honors $XDG_DATA_HOME at runtime.
-  // When the operator sets XDG_DATA_HOME outside $HOME/.local/share,
-  // the canonical literal deny covers the wrong subpath and the
-  // sandboxed process on `home-rw` can read/write the live audit DB.
-  // Idempotent: when XDG_DATA_HOME is unset, liveDataDir matches
-  // the home-relative default and the extra rule is redundant
-  // (SBPL accepts duplicate denies; last-match-wins).
+  // XDG_DATA_HOME unmask. Same gap as the Linux runner —
+  // `.local/share/forja` is only the home-relative default;
+  // `defaultDataDir()` honors $XDG_DATA_HOME at runtime. When the
+  // operator sets XDG_DATA_HOME outside $HOME/.local/share, the
+  // canonical literal deny covers the wrong subpath and the
+  // sandboxed process on `home-rw` can read/write the live audit
+  // DB. Idempotent: when XDG_DATA_HOME is unset, liveDataDir
+  // matches the home-relative default and the extra rule is
+  // redundant (SBPL accepts duplicate denies; last-match-wins).
   //
-  // Absolute-path guard mirrors the XDG_CONFIG_HOME branch below
-  // and the same fix on the bwrap side. Per XDG Base Directory
-  // Spec, relative values SHOULD be ignored — SBPL subpath rules
-  // require absolute paths, and a relative `liveDataDir` like
-  // `relative/forja` would either be rejected by `sandbox-exec`
-  // at profile-load time OR silently fail to match the actual
-  // data dir (worse: silent unmask). Skip the extra rule when
-  // XDG_DATA_HOME is non-absolute; the home-relative deny for
+  // Absolute-path guard: per XDG Base Directory Spec, relative
+  // values SHOULD be ignored. SBPL subpath rules require absolute
+  // paths, and a relative `liveDataDir` would either be rejected by
+  // `sandbox-exec` at profile-load time OR silently fail to match
+  // the actual data dir (worse: silent unmask). Skip the extra rule
+  // when XDG_DATA_HOME is non-absolute; the home-relative deny for
   // `.local/share/forja` above still covers the canonical path.
   const liveDataDir = defaultDataDir();
   const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
@@ -387,13 +360,13 @@ export const buildSbplProfile = (
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
     denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
   }
-  // Slice 146 (review minor): XDG_CONFIG_HOME unmask — macOS
-  // parity with the Linux runner. Same shape as the XDG_DATA_HOME
-  // block above; covers `.config/*` HIDE_PATHS_DIRS entries when
-  // the operator relocated XDG_CONFIG_HOME outside `~/.config`.
-  // Read env directly here for parity with `defaultDataDir()`
-  // above (the macOS SBPL builder doesn't take an env param
-  // because it doesn't need `--clearenv` / `--setenv` like bwrap).
+  // XDG_CONFIG_HOME unmask — macOS parity with the Linux runner.
+  // Same shape as the XDG_DATA_HOME block above; covers
+  // `.config/*` HIDE_PATHS_DIRS entries when the operator
+  // relocated XDG_CONFIG_HOME outside `~/.config`. Read env
+  // directly here for parity with `defaultDataDir()` above (the
+  // macOS SBPL builder doesn't take an env param because it
+  // doesn't need `--clearenv` / `--setenv` like bwrap).
   const xdgConfig = process.env.XDG_CONFIG_HOME;
   const homeRelativeConfig = joinPath(home, '.config');
   if (
@@ -418,7 +391,7 @@ export const buildSbplProfile = (
 // Build the `sandbox-exec` argv for a given profile. Pure function.
 //
 // For `host`: returns `innerArgv` unchanged. The operator already
-// confirmed at the §6.5 host gate AND the planner already required
+// confirmed at the host gate AND the planner already required
 // `host-passthrough` in the resolved set; the runner trusts both
 // and runs without any wrap.
 //
@@ -434,16 +407,14 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   }
   if (profile === 'host') return innerArgv.slice();
 
-  // Slice 155 (review — symlink canonicalization for cwd guard):
-  // canonicalize the cwd via realpath BEFORE the hide_paths check
-  // and the SBPL profile generation. Same threat as the Linux
-  // runner (sandbox-runner.ts): a `/tmp/work → ~/.ssh/audit/`
-  // symlink slips past the literal string check and the SBPL
-  // allow-rule generated for the original cwd path lets the
-  // sandboxed process write to the symlink target — which the
-  // deny rules thought were masked. Canonicalizing here lines
-  // the check, the allow rule, and the operator's actual cwd up
-  // on the same resolved absolute path.
+  // Canonicalize the cwd via realpath BEFORE the hide_paths check
+  // and the SBPL profile generation. Without this, a
+  // `/tmp/work → ~/.ssh/audit/` symlink slips past the literal
+  // string check and the SBPL allow-rule generated for the
+  // original cwd path lets the sandboxed process write to the
+  // symlink target — which the deny rules thought were masked.
+  // Canonicalizing here lines the check, the allow rule, and the
+  // operator's actual cwd up on the same resolved absolute path.
   const realpath = options.realpath ?? realpathSync;
   let cwd: string;
   try {
@@ -472,16 +443,15 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
     throw new Error(`sandbox: ${detail}`);
   }
 
-  // Slice 171 (review — sandbox P1): canonicalize `home` so SBPL
-  // deny rules at `(literal "${home}/.ssh/id_rsa")` and HIDE_PATHS
-  // overlays target the canonical path. Symlinked-home layouts
-  // (`/home/op → /data/users/op`) previously left the canonical
-  // `.ssh` exposed via the base `(allow file-read*)` while the
-  // deny only matched the symlink path. Best-effort fallback: on
-  // realpath failure, fall back to the literal input (cwd
-  // canonicalization above already proved the kernel can resolve
-  // most paths; home not existing at canonical time is rare and
-  // doesn't justify refusing the wrap).
+  // Canonicalize `home` so SBPL deny rules at
+  // `(literal "${home}/.ssh/id_rsa")` and HIDE_PATHS overlays
+  // target the canonical path. Symlinked-home layouts
+  // (`/home/op → /data/users/op`) would otherwise leave the
+  // canonical `.ssh` exposed via the base `(allow file-read*)`
+  // while the deny only matches the symlink path. Best-effort
+  // fallback: on realpath failure, use the literal input — home
+  // not existing at canonical time is rare and doesn't justify
+  // refusing the wrap.
   let home: string;
   try {
     home = realpath(options.home);
@@ -489,17 +459,16 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
     home = options.home;
   }
 
-  // Slice 134 P0-12 (cross-platform parity with sandbox-runner.ts:147-154):
-  // SBPL evaluates rules top-to-bottom with last-match-wins. An operator
-  // running Forja from `~/.ssh/audit/` (or any cwd nested under a
-  // hide_paths root) would build a profile where
-  // `(allow file-write* (subpath cwd))` is followed by `(deny file-write*
-  // (subpath ~/.ssh))` — deny wins. The inner process receives a working
-  // dir that "vanishes" inside the sandbox, exec then fails with an
-  // opaque SBPL error rather than a clear build-time refuse. The Linux
-  // bwrap runner refuses here pre-slice 134; macOS silently produced
-  // the broken profile until this guard landed. Refuse at build time
-  // for parity. Slice 155: applies to the canonicalized cwd.
+  // Refuse at build time when cwd is inside a hide_paths root.
+  // SBPL evaluates rules top-to-bottom with last-match-wins. An
+  // operator running Forja from `~/.ssh/audit/` (or any cwd nested
+  // under a hide_paths root) would build a profile where
+  // `(allow file-write* (subpath cwd))` is followed by
+  // `(deny file-write* (subpath ~/.ssh))` — deny wins. The inner
+  // process receives a working dir that "vanishes" inside the
+  // sandbox, exec then fails with an opaque SBPL error rather than
+  // a clear build-time refuse. Mirrors the Linux bwrap runner's
+  // refuse. Applies to the canonicalized cwd computed above.
   for (const dir of HIDE_PATHS_DIRS) {
     const hiddenAbs = joinPath(home, dir);
     if (cwd === hiddenAbs || cwd.startsWith(`${hiddenAbs}/`)) {
@@ -510,25 +479,25 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   }
 
   const profileString = buildSbplProfile(profile, cwd, home, options.tmpdir);
-  // Slice 154 (review — PATH-shim resistance): use the resolved
-  // absolute path when provided (production via maybeWrapSandboxArgv);
-  // fall back to the bare binary name for direct-build test callers.
+  // Use the resolved absolute path when provided (production via
+  // maybeWrapSandboxArgv); fall back to the bare binary name for
+  // direct-build test callers.
   const sandboxExecPath = options.sandboxExecPath ?? 'sandbox-exec';
 
-  // Slice 162 (review — env scrub allowlist parity on macOS).
-  // sandbox-exec inherits the spawner's env verbatim; without an
-  // equivalent of `bwrap --clearenv`, userspace scrubEnv was the
-  // SOLE env barrier on darwin. We wrap the inner argv with
-  // `/usr/bin/env -i KEY=VAL ... --` so the inner process starts
-  // with ONLY the allowlisted vars. The wrap is opt-in via the
-  // `env` option — when omitted (legacy / test callers), inner
-  // argv is execed verbatim and the spawner's env passes through.
-  // Production via `maybeWrapSandboxArgv` always sets it.
+  // Env scrub allowlist. sandbox-exec inherits the spawner's env
+  // verbatim; without an equivalent of `bwrap --clearenv`,
+  // userspace scrubEnv would be the SOLE env barrier on darwin.
+  // Wrapping the inner argv with `/usr/bin/env -i KEY=VAL ... --`
+  // ensures the inner process starts with ONLY the allowlisted
+  // vars. The wrap is opt-in via the `env` option — when omitted
+  // (test callers), inner argv is execed verbatim and the
+  // spawner's env passes through. Production via
+  // `maybeWrapSandboxArgv` always sets it.
   //
-  // Canonical /usr/bin/env path: same PATH-shim rationale as slice
-  // 154 — bare `env` lets `execve` re-resolve via $PATH at exec
-  // time, exposing the shim attack. `/usr/bin/env` is canonical
-  // on every supported macOS version.
+  // Canonical /usr/bin/env path: same PATH-shim rationale as the
+  // sandbox-exec resolver — bare `env` lets `execve` re-resolve
+  // via $PATH at exec time, exposing the shim attack.
+  // `/usr/bin/env` is canonical on every supported macOS version.
   let effectiveInner: readonly string[] = innerArgv;
   if (options.env !== undefined) {
     const envAssignments: string[] = [];

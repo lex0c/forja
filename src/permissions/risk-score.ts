@@ -1,55 +1,53 @@
-// Deterministic risk score per PERMISSION_ENGINE.md §6.3.
+// Deterministic risk score.
 //
-// Eleven features over the resolved capabilities + command shape +
-// engine state, each contributing a fixed weight. Sum capped at 1.0.
-// Weights are the spec §6.3.1 baseline-v2.0 — defensible but not
-// optimal (spec §6.3.2 documents the calibration plan: collect
-// (score, decisão_humana, outcome) triples for 30 days, derive
-// weights via logistic regression, ship as v2.1).
+// Features over the resolved capabilities + command shape + engine
+// state, each contributing a fixed weight. Sum capped at 1.0.
+// Weights are the v2.0 baseline — defensible but not optimal; the
+// calibration plan collects (score, human_decision, outcome)
+// triples and derives weights via logistic regression for a v2.1
+// shipment.
 //
 // The function is PURE and DETERMINISTIC. Same input → same output
 // every time, no randomness, no clock, no IO. Determinism is
-// load-bearing because the score lands in the audit row which feeds
-// the hash chain; two replays of the same decision must produce
-// identical chain entries.
+// load-bearing because the score lands in the audit row which
+// feeds the hash chain; two replays of the same decision must
+// produce identical chain entries.
 //
 // Components are surfaced as a plain object so the audit row can
 // store them via `JSON.stringify` and the modal preview can render
 // the breakdown ("capability_risk: 0.40, shell_chain: 0.20, …").
-// Field names match the spec table verbatim so audit consumers can
-// rely on stable keys across slices.
+// Field names are stable across versions so audit consumers can
+// rely on them.
 
 import type { Capability } from './capabilities.ts';
 import type { Confidence } from './grant-types.ts';
 import { containsShellInjection } from './matcher.ts';
 import type { EngineState } from './state-machine.ts';
 
-// Slice 143 (minor dedup): `RiskScoreConfidence` is the same domain
-// as `ApprovalLogConfidence` in `src/storage/repos/approvals-log.ts`
-// — the resolver's certainty about its capability emission. Both are
-// now type aliases of `Confidence` from `grant-types.ts`. Keeping the
-// historical name here as a re-export preserves every import site
-// while making the shared origin discoverable.
+// Same domain as `ApprovalLogConfidence` in
+// `src/storage/repos/approvals-log.ts` — the resolver's certainty
+// about its capability emission. Both are type aliases of
+// `Confidence` from `grant-types.ts`. Re-exported under this name
+// for callers that pull from this module.
 export type RiskScoreConfidence = Confidence;
 
 export interface RiskScoreInput {
-  // Resolved capabilities from the resolver (slice 3). Empty when
-  // the resolver returned an empty Ok (e.g. bash with missing
-  // command) — score contribution is zero in that case.
+  // Resolved capabilities from the resolver. Empty when the
+  // resolver returned an empty Ok (e.g. bash with missing command)
+  // — score contribution is zero in that case.
   capabilities: readonly Capability[];
   // For bash: the literal command string. Other tools pass
   // undefined. Used by the `blocklist_command` and `shell_complex`
   // features which inspect the textual shape.
   command?: string;
   toolName: string;
-  // Whether this tool is an MCP server tool (slice 6 mounts the
-  // canonical channel; until then, the caller decides via
-  // `EngineOptions.isMcpTool`).
+  // Whether this tool is an MCP server tool. Caller decides via
+  // `EngineOptions.isMcpTool`.
   isMcp: boolean;
   // Resolver's confidence — `high` contributes 0 to the score,
   // `medium` +0.10, `low` +0.30.
   confidence: RiskScoreConfidence;
-  // Engine state from the §2 controller. `degraded` adds +0.20
+  // Engine state from the controller. `degraded` adds +0.20
   // ("system in fallback"). `ready` contributes 0.
   engineState: EngineState;
   // Count of consecutive tool errors immediately preceding this
@@ -82,8 +80,7 @@ export interface RiskScoreOutput {
 }
 
 // Capability kinds that, by their presence alone, indicate the
-// call will touch high-impact surface. Aligned with spec §6.3.1
-// first row.
+// call will touch high-impact surface.
 const DANGEROUS_KINDS = new Set<Capability['kind']>([
   'delete-fs',
   'git-write',
@@ -91,10 +88,10 @@ const DANGEROUS_KINDS = new Set<Capability['kind']>([
   'agent-mutate',
 ]);
 
-// Substrings flagged as "letal patterns" in spec §6.3.1. The match
-// is plain substring — operators chaining `rm -rf` inside quotes
-// still get flagged; the bash AST resolver slice will refine this
-// once it can distinguish quoted-literal from literal-execution.
+// Substrings flagged as lethal patterns. Match is plain substring —
+// operators chaining `rm -rf` inside quotes still get flagged; the
+// bash AST resolver refines this where it can distinguish
+// quoted-literal from literal-execution.
 const BLOCKLIST_SUBSTRINGS: readonly string[] = [
   'rm -rf',
   'chmod -R',
@@ -109,9 +106,9 @@ const BLOCKLIST_SUBSTRINGS: readonly string[] = [
 
 // True when the capability's scope text would lift the call OUT
 // of the working directory subtree. Heuristic only — the
-// protected-path classifier from slice 1 is the actual escape
-// defense; this feature exists to add a score increment when the
-// resolver pinned a scope that's plausibly off-workspace.
+// protected-path classifier is the actual escape defense; this
+// feature exists to add a score increment when the resolver
+// pinned a scope that's plausibly off-workspace.
 const isOutsideWorkspace = (scope: string | null, cwd: string, home: string): boolean => {
   if (scope === null) return false;
   if (scope === '*' || scope.startsWith('*')) return false; // covered by wildcard_scope
@@ -136,35 +133,32 @@ const isUntrustedEgressHost = (host: string | null, trusted: readonly string[]):
   return !trusted.includes(host);
 };
 
-// Threshold at which the `recent_errors` feature fires — spec
-// §6.3.1: "three consecutive tool errors immediately preceding
-// this call". Hoisted from an inlined `>= 3` so calibration can
-// adjust both the WEIGHT (above) and the TRIGGER (here) from one
-// audited location, and so tests can import the same canonical
-// boundary value.
+// Threshold at which the `recent_errors` feature fires: three
+// consecutive tool errors immediately preceding this call.
+// Hoisted from an inlined `>= 3` so calibration can adjust both
+// the weight and the trigger from one audited location, and so
+// tests can import the same canonical boundary value.
 export const RECENT_ERRORS_THRESHOLD = 3;
 
-// Feature weights — spec §6.3.1 baseline-v2.0. Centralized so the
-// calibration slice can swap them via a single object rather than
-// hunting through the compute function. Adjusting weights here is
-// the way to evolve the score; the score field in audit_log
-// version-tags via the engine version line so historical replays
-// stay reproducible.
+// Feature weights — v2.0 baseline. Centralized so calibration can
+// swap them via a single object rather than hunting through the
+// compute function. Adjusting weights here is the way to evolve
+// the score; the score field in audit_log version-tags via the
+// engine version line so historical replays stay reproducible.
 //
-// Slice 147 (review minor): `exec_arbitrary` added. Pre-slice the
-// `exec:arbitrary` capability (emitted by `cmdNpmLike`, `cmdPip`,
-// `cmdMake`, `cmdCargo`, and the conservative-fallback for unknown
-// commands) had no dedicated weight; it didn't qualify under
-// `capability_risk` either (which is gated on delete-fs / git-write
-// / env-mutate / agent-mutate). Result: `npm install`, `pip install`,
-// `cargo build` resolved to `exec:arbitrary` + medium confidence
-// (+0.10) for a total score of ~0.10 — silently auto-allowed even
-// though every one of those commands is a supply-chain attack
-// surface. New 0.30 weight pushes the total to 0.40, exactly at
-// the §6.6 confirm threshold; combined with medium confidence
-// (+0.10) it crosses cleanly into confirm. Operators who want
-// package managers to run without prompt can add an explicit
-// `allow exec:arbitrary` rule (eyes-open) or use grants.
+// `exec_arbitrary` weight: the `exec:arbitrary` capability
+// (emitted by `cmdNpmLike`, `cmdPip`, `cmdMake`, `cmdCargo`, and
+// the conservative-fallback for unknown commands) doesn't
+// qualify under `capability_risk` (which gates on
+// delete-fs / git-write / env-mutate / agent-mutate), so without
+// a dedicated weight `npm install` / `pip install` / `cargo build`
+// would resolve to ~0.10 (just medium confidence) and silently
+// auto-allow — every one of those commands is a supply-chain
+// attack surface. 0.30 pushes the total to the confirm threshold;
+// combined with medium confidence (+0.10) it crosses cleanly into
+// confirm. Operators who want package managers to run without
+// prompt can add an explicit `allow exec:arbitrary` rule
+// (eyes-open) or use grants.
 export const RISK_SCORE_WEIGHTS = {
   capability_risk: 0.4,
   wildcard_scope: 0.2,
@@ -224,21 +218,20 @@ export const computeRiskScore = (input: RiskScoreInput): RiskScoreOutput => {
     components.untrusted_egress = RISK_SCORE_WEIGHTS.untrusted_egress;
   }
 
-  // Slice 147 (review minor): `exec:arbitrary` capability lacks a
-  // dedicated DANGEROUS_KIND entry above (it doesn't write/delete
-  // by itself), but it IS the canonical "I'm about to run code
-  // you didn't whitelist" signal. cmdNpmLike / cmdPip / cmdMake /
-  // cmdCargo emit it for package install + build commands; the
-  // bash resolver's Conservative fallback also emits it for
-  // unknown commands. Without this weight those calls slipped
-  // under the confirm threshold. `exec:shell` (every plain `bash`
-  // call) and `exec:python` / `exec:node` (interpreter w/ `-c`)
-  // are explicitly excluded — they're routine.
+  // `exec:arbitrary` lacks a dedicated DANGEROUS_KIND entry (it
+  // doesn't write/delete by itself), but it IS the canonical "I'm
+  // about to run code you didn't whitelist" signal. cmdNpmLike /
+  // cmdPip / cmdMake / cmdCargo emit it for package install +
+  // build commands; the bash resolver's Conservative fallback
+  // also emits it for unknown commands. Without this weight those
+  // calls slipped under the confirm threshold. `exec:shell`
+  // (every plain `bash` call) and `exec:python` / `exec:node`
+  // (interpreter w/ `-c`) are explicitly excluded — routine.
   if (input.capabilities.some((c) => c.kind === 'exec' && c.scope === 'arbitrary')) {
     components.exec_arbitrary = RISK_SCORE_WEIGHTS.exec_arbitrary;
   }
 
-  // Recent errors — caller-supplied counter. Threshold per spec.
+  // Recent errors — caller-supplied counter.
   if (input.recentToolErrors >= RECENT_ERRORS_THRESHOLD) {
     components.recent_errors = RISK_SCORE_WEIGHTS.recent_errors;
   }
@@ -283,7 +276,7 @@ export const DEFAULT_TRUSTED_HOSTS: readonly string[] = [
   'crates.io',
 ];
 
-// Default MCP-tool detector — spec §13.1 has tools surface as
+// Default MCP-tool detector. Tools surface as
 // `mcp__<server>__<tool>` from the MCP loader. The detector is
 // caller-overridable; this default is the fallback when no
 // override is supplied to the engine.

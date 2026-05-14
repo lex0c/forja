@@ -1,15 +1,15 @@
-// §7.3 sealing scheduler — bridges the decision flow + wall clock
-// to the SealStore primitive from slice 54.
+// Sealing scheduler — bridges the decision flow + wall clock to
+// the SealStore primitive.
 //
 // Three trigger paths fire a seal:
-//   - `tick()`: called by the audit sink after every emit (slice 56);
+//   - `tick()`: called by the audit sink after every emit;
 //     increments a decision counter, fires a seal when the counter
 //     crosses `intervalDecisions`.
 //   - Wall-clock timer: fires every `intervalSeconds` (when > 0),
 //     seals the latest chain row, restarts itself.
 //   - `sealNow()`: manual trigger. Used by SessionEnd / SIGTERM
 //     final-seal handlers and the `agent permission seal-now` CLI
-//     verb in slice 58.
+//     verb.
 //
 // All paths converge on `sealLatestInternal`: query the latest
 // `approvals_log` row for this install, build a `SealEntry`, hand
@@ -19,21 +19,18 @@
 //
 // Failure: `store.append` returning ok:false invokes
 // `onSealFailed(reason)`. The scheduler does NOT enforce
-// degrade/refuse — that wiring is the bootstrap's job (slice 57),
-// driven by the policy's `[seal] on_failure` knob.
+// degrade/refuse — that wiring is the bootstrap's job, driven by
+// the policy's `[seal] on_failure` knob.
 //
-// Test seams: `now`, `setTimer`, `clearTimer` mirror the watcher's
-// pattern from slice 52. Production callers leave them undefined.
+// Test seams: `now`, `setTimer`, `clearTimer`. Production callers
+// leave them undefined.
 
 import type { DB } from '../storage/db.ts';
 import { getLastApprovalsLogByInstall } from '../storage/repos/approvals-log.ts';
 import type { SealEntry, SealStore } from './sealing.ts';
 
-// Slice 142 (review minor): hoist the scheduler interval defaults
-// as exported constants. Spec §7.3, parsePolicy, docs/AUDIT.md, and
-// the runtime factory should all reference the same canonical
-// values — pre-fix they were inlined as `?? 100` / `?? 3600` in
-// the factory body.
+// Scheduler interval defaults. parsePolicy and the runtime
+// factory share these canonical values.
 export const DEFAULT_SEAL_INTERVAL_DECISIONS = 100;
 export const DEFAULT_SEAL_INTERVAL_SECONDS = 3600;
 
@@ -89,19 +86,18 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
     opts.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>));
 
   let decisionCounter = 0;
-  // Slice 128 (R4 P0-Race-1): seed lastSealedSeq from the existing
-  // seal store. Pre-slice it initialized to 0 in memory; two
-  // parallel `forja` processes on the same install both fire tick
-  // at the same chain head and both append the SAME `seq=N hash=H`
-  // line to the worm/git/tsa file → duplicate seal entries. Seeded
-  // from store.list() max-seq, the second process sees its own
-  // last-sealed already matches the chain head → noop.
+  // Seed lastSealedSeq from the existing seal store. A memory-only
+  // counter would let two parallel `forja` processes on the same
+  // install both fire tick at the same chain head and both append
+  // the SAME `seq=N hash=H` line to the worm/git/tsa file →
+  // duplicate seal entries. Seeded from store.list() max-seq, the
+  // second process sees its own last-sealed already matches the
+  // chain head → noop.
   //
-  // store.list() can throw (corrupted file); on failure we fall
-  // back to 0 and accept the duplicate-on-first-tick risk. The
-  // alternative (refuse to construct the scheduler) would break
-  // the audit pipeline entirely on a single bad seal file —
-  // overcorrection.
+  // store.list() can throw (corrupted file); on failure fall back
+  // to 0 and accept the duplicate-on-first-tick risk. Refusing to
+  // construct the scheduler would break the audit pipeline
+  // entirely on a single bad seal file — overcorrection.
   let lastSealedSeq = 0;
   try {
     const existing = opts.store.list();
@@ -131,21 +127,15 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
     return { kind: 'failed', reason: result.reason };
   };
 
-  // Slice 158 (review): defense-in-depth wrapper around the caller-
-  // supplied onSealFailed callback. The bootstrap's onSealFailed
-  // gates engine.degrade/refuse on the current state so the
-  // documented "harmless re-issue" property actually holds, but a
-  // future caller might wire a callback that still throws (custom
-  // telemetry / 3rd-party integration / test stub). The timer path
-  // runs inside setTimer's callback where an uncaught throw
-  // propagates as uncaughtException → signal.ts → process.exit(1),
-  // killing the REPL mid-tool. The tick path runs inside audit.emit
-  // which already try/catches scheduler.tick(), but invoking the
-  // callback safely there too keeps the contract symmetric. sealNow
-  // returns the failure to its caller (CLI verb / SessionEnd) and
-  // doesn't need the wrapper to avoid a crash, but uses it for the
-  // same symmetry + so a buggy callback can't tear down session
-  // shutdown.
+  // Defense-in-depth wrapper around the caller-supplied
+  // onSealFailed callback. A callback that throws would propagate
+  // through whichever caller didn't guard: the timer path runs
+  // inside setTimer's callback (uncaughtException → process exit,
+  // killing the REPL mid-tool); the tick path is wrapped by
+  // audit.emit's try/catch around scheduler.tick(); sealNow
+  // returns the failure to its caller and doesn't strictly need
+  // this wrapper. Keeping the wrapper symmetric across all paths
+  // ensures a buggy callback can't tear down session shutdown.
   const safeOnSealFailed = (reason: string): void => {
     if (opts.onSealFailed === undefined) return;
     try {

@@ -1,4 +1,4 @@
-// Sandbox profile selection per PERMISSION_ENGINE.md §6.5.
+// Sandbox profile selection.
 //
 // Five profiles arranged from most restrictive to least:
 //
@@ -12,13 +12,13 @@
 //                 in the resolved set.
 //
 // This module owns the SELECTION primitive — given a resolved
-// capability set and a host-allowed flag, pick the most restrictive
-// viable profile. Actual sandbox execution (bwrap argv synthesis,
-// nftables rule loading, etc.) is a separate slice; this is purely
-// the planning step that feeds the audit row, the reason chain,
-// and (later) the runner.
+// capability set and a host-allowed flag, pick the most
+// restrictive viable profile. Actual sandbox execution (bwrap
+// argv synthesis, nftables rule loading, etc.) lives in the
+// runner modules; this is purely the planning step that feeds the
+// audit row, the reason chain, and the runner.
 //
-// Algorithm (spec §6.5):
+// Algorithm:
 //   1. candidates = { profile | resolved_capabilities ⊆ profile.allowed }
 //   2. if candidates empty → refuse with `no_viable_sandbox`
 //   3. if `host` ∈ candidates AND other ∈ candidates → drop host
@@ -48,15 +48,15 @@ export const SANDBOX_PROFILE_ORDER: readonly SandboxProfile[] = [
   'host',
 ] as const;
 
-// Set form for runtime membership checks. Used by `isSandboxProfile`
-// (slice 103, R6 #9) at every wire boundary that receives an
+// Set form for runtime membership checks. Used by
+// `isSandboxProfile` at every wire boundary that receives an
 // untrusted `sandboxProfile` string — the broker validates inbound
-// requests, the worker runtime validates parsed BrokerRequest, the
-// sandbox runner validates before wrap. Without this set, an
+// requests, the worker runtime validates parsed BrokerRequest,
+// the sandbox runner validates before wrap. Without this set, an
 // attacker passing an unknown string would slip past the typed
-// `SandboxProfile` annotation (TS casts are erased at runtime) and
-// either bypass the wrap (`'host'` shape) or land malformed bwrap
-// args that fail mid-spawn.
+// `SandboxProfile` annotation (TS casts are erased at runtime)
+// and either bypass the wrap (`'host'` shape) or land malformed
+// bwrap args that fail mid-spawn.
 const SANDBOX_PROFILE_SET: ReadonlySet<string> = new Set(SANDBOX_PROFILE_ORDER);
 
 export const isSandboxProfile = (s: unknown): s is SandboxProfile =>
@@ -65,9 +65,9 @@ export const isSandboxProfile = (s: unknown): s is SandboxProfile =>
 // Capability kinds each profile allows the tool to exercise.
 // Modeled at the KIND level (read-fs, write-fs, etc.) rather than
 // per-scope: scope-aware filtering is a separate concern handled
-// by the policy/static-rule layer (slice 1-3); this table answers
-// "if the tool wants to write the filesystem somewhere, does this
-// profile permit any writes at all?".
+// by the policy/static-rule layer; this table answers "if the
+// tool wants to write the filesystem somewhere, does this profile
+// permit any writes at all?".
 //
 // Notes:
 //   - All profiles allow `read-fs` (every sandbox can read; the
@@ -77,9 +77,7 @@ export const isSandboxProfile = (s: unknown): s is SandboxProfile =>
 //     the process inherits the sandbox constraints. `host` is
 //     the only profile that grants `host-passthrough`.
 //   - `secret-access` requires either `home-rw` or `host` because
-//     secrets live under `$HOME` (e.g. `~/.config/agent/secrets`)
-//     — the spec's "secret paths hidden EXCEPT if capability
-//     authorized" clause maps onto profile coverage at this layer.
+//     secrets live under `$HOME` (e.g. `~/.config/agent/secrets`).
 const PROFILE_ALLOWED_CAPABILITIES: Record<SandboxProfile, ReadonlySet<CapabilityKind>> = {
   ro: new Set<CapabilityKind>(['read-fs', 'exec']),
   'cwd-rw': new Set<CapabilityKind>(['read-fs', 'write-fs', 'delete-fs', 'exec', 'git-write']),
@@ -172,8 +170,8 @@ export const selectSandboxProfile = (
     };
   }
 
-  // Drop host when alternatives exist — host is the last-resort
-  // profile. Spec §6.5: "host é sempre último recurso".
+  // Drop host when alternatives exist — host is always the last-
+  // resort profile.
   const nonHost = candidates.filter((p) => p !== 'host');
   const finalists = nonHost.length > 0 ? nonHost : candidates;
 

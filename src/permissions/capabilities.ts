@@ -1,9 +1,9 @@
-// Canonical capability model per PERMISSION_ENGINE.md §3.
+// Canonical capability model.
 //
 // The engine reasons about WHAT a tool will consume (read a file,
 // write a file, exec a process, reach a host) instead of opaque
-// tool names. A capability has a `kind` (drawn from §3.1) and an
-// optional `scope` whose grammar depends on the kind:
+// tool names. A capability has a `kind` and an optional `scope`
+// whose grammar depends on the kind:
 //
 //   read-fs / write-fs / delete-fs  → path-pattern
 //   exec                            → class: 'shell' | 'python' |
@@ -22,9 +22,9 @@
 // emits with semantically equal capabilities produce byte-identical
 // chain hashes.
 //
-// Capability VALIDATION (does the scope satisfy the grammar from
-// §4) lands when capability-based static rules ship — until then,
-// the resolvers produce well-formed strings by construction.
+// Capability VALIDATION (does the scope satisfy the grammar) lands
+// when capability-based static rules ship; until then, resolvers
+// produce well-formed strings by construction.
 
 export type CapabilityKind =
   | 'read-fs'
@@ -41,7 +41,7 @@ export type CapabilityKind =
 
 // Whether the kind carries a scope component. Scope-less kinds
 // stand alone (`env-mutate` is the full capability string); the
-// rest require a scope (`read-fs:./src/**`, `exec:shell`).
+// rest require a scope (`read-fs:src/**`, `exec:shell`).
 const KINDS_WITHOUT_SCOPE: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
   'env-mutate',
   'agent-mutate',
@@ -64,11 +64,11 @@ const ALL_KINDS: ReadonlySet<string> = new Set<CapabilityKind>([
 
 export interface Capability {
   kind: CapabilityKind;
-  // Scope value verbatim. `null` for the scope-less kinds (§3.1
-  // table). Resolver authors should keep scopes textually stable
-  // (resolved abs path or canonical host) so two equivalent emits
-  // produce identical capability strings — chain hash determinism
-  // depends on it.
+  // Scope value verbatim. `null` for the scope-less kinds.
+  // Resolver authors should keep scopes textually stable (resolved
+  // abs path or canonical host) so two equivalent emits produce
+  // identical capability strings — chain hash determinism depends
+  // on it.
   scope: string | null;
 }
 
@@ -137,13 +137,10 @@ export const sortCapabilities = (caps: readonly Capability[]): Capability[] => {
   return formatted.map((entry) => entry.c);
 };
 
-// Convenience helpers for resolver authors. Read most resolvers as:
-//   readFs(path) → { kind: 'read-fs', scope: path }
-// instead of literal object literals — keeps shape consistent.
-// Does a `parent` capability cover a `child` capability per
-// PERMISSION_ENGINE.md §10.1 ("declared_caps ⊆ parent_caps")?
-// Coverage rules (deliberately small — extending the surface
-// requires a spec PR + conformance case):
+// Does a `parent` capability cover a `child` capability
+// ("declared_caps ⊆ parent_caps")? Coverage rules (deliberately
+// small — extending the surface requires a spec change +
+// conformance case):
 //
 //   1. Different kinds → never. exec doesn't cover read-fs, etc.
 //   2. Scope-less kinds (env-mutate, agent-mutate, host-passthrough):
@@ -163,11 +160,10 @@ export const sortCapabilities = (caps: readonly Capability[]): Capability[] => {
 //      use a supported shape, or the child capability cannot be
 //      proven safely covered.
 //
-// Rules 4.c handles the common policy idiom (`read-fs:src/**`
+// Rule 4.c handles the common policy idiom (`read-fs:src/**`
 // covers `read-fs:src/index.ts`) without bringing in a full
-// glob-vs-glob containment solver. The slice 9 spec PR records this
-// minimal-but-sound stance; broader patterns escalate to a future
-// slice with a real subset checker.
+// glob-vs-glob containment solver. Broader patterns would need a
+// real subset checker.
 export const capabilityCovers = (parent: Capability, child: Capability): boolean => {
   if (parent.kind !== child.kind) return false;
 
@@ -201,37 +197,33 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
   return false;
 };
 
-// Cwd-aware coverage variant for PERMISSION_ENGINE.md §10.1 child-side
-// enforcement (slice 95). The spawn-time intersection (`capabilityCovers`
-// above) is string-symmetric — both `parent_caps` and `declared_caps`
-// arrive in the SAME form (relative scopes, model + policy YAML
-// authored). The child engine's evaluation case is asymmetric: the
-// persisted effective set is the model's relative declared form
+// Cwd-aware coverage variant for child-side enforcement. The
+// spawn-time intersection (`capabilityCovers` above) is string-
+// symmetric — both `parent_caps` and `declared_caps` arrive in the
+// SAME form (relative scopes, model + policy YAML authored). The
+// child engine's evaluation case is asymmetric: the persisted
+// effective set is the model's relative declared form
 // (`read-fs:src/**`), while the resolver-emitted capability is the
-// LEXICAL-ABSOLUTE form (`read-fs:/abs/cwd/src/auth/login.ts`) that
-// the FS resolvers produce via `path.resolve(cwd, ...)`.
+// LEXICAL-ABSOLUTE form (`read-fs:/abs/cwd/src/auth/login.ts`)
+// that the FS resolvers produce via `path.resolve(cwd, ...)`.
 //
-// Pure string prefix matching fails this combination: `src/**` is not
-// a prefix of `/abs/cwd/src/auth/login.ts`. The cwd-aware variant
-// resolves both scopes against the engine's cwd via `matchPath`
-// (matcher.ts) so the relative pattern admits the absolute target
-// when the absolute target lives inside cwd's subtree. Non-fs kinds
-// (exec, net-egress, env-mutate, etc.) defer to the existing
-// `capabilityCovers` — those scopes are textual identities (class
-// names, host strings) that don't need cwd resolution.
+// Pure string prefix matching fails this combination: `src/**` is
+// not a prefix of `/abs/cwd/src/auth/login.ts`. The cwd-aware
+// variant resolves both scopes against the engine's cwd via
+// `matchPath` so the relative pattern admits the absolute target
+// when the target lives inside cwd's subtree. Non-fs kinds (exec,
+// net-egress, env-mutate, etc.) defer to `capabilityCovers` —
+// those scopes are textual identities (class names, host strings)
+// that don't need cwd resolution.
 //
 // Symlink defense: `matchPath` already resolves symlinks on the
-// target. A symlink inside cwd pointing at `/etc/passwd` is treated
-// as `/etc/passwd` here, which doesn't lie under the cwd subtree, so
-// `relativize` returns null and the Glob falls back to absolute
-// matching — the relative pattern `src/**` resolves to `/abs/cwd/src/**`
-// and won't match `/etc/passwd`. Same property the engine's path
-// rules already enforce.
+// target. A symlink inside cwd pointing at `/etc/passwd` is
+// treated as `/etc/passwd` here, which doesn't lie under the cwd
+// subtree, so the relative pattern `src/**` won't match it. Same
+// property the engine's path rules enforce.
 //
-// Spec contract: this helper IS the §10.1 evaluation-side check. A
-// child with effective=['read-fs:src/**'] that emits `read-fs:/abs/cwd/
-// src/auth/login.ts` passes; a child that emits `read-fs:/etc/passwd`
-// fails. No flag / config / prompt can override.
+// This helper is the evaluation-side check for the child-envelope
+// constraint. No flag / config / prompt can override.
 import { matchPath } from './matcher.ts';
 
 const FS_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
@@ -251,30 +243,31 @@ export const capabilityCoversCwdAware = (
   const cScope = child.scope;
   if (pScope === null || cScope === null) return false;
   // Universal wildcards short-circuit — `matchPath` would resolve
-  // `**` against cwd and miss targets OUTSIDE cwd that the universal
-  // form should cover (e.g. a system-wide `read-fs:**` from a parent
-  // policy that allowed reads under `/usr/share/`). The slice-9
-  // semantics of `capabilityCovers` treat `**`/`*` as "covers
+  // `**` against cwd and miss targets OUTSIDE cwd that the
+  // universal form should cover (e.g. a system-wide `read-fs:**`
+  // from a parent policy that allowed reads under `/usr/share/`).
+  // The semantics of `capabilityCovers` treat `**`/`*` as "covers
   // everything of this kind" — preserve that contract here.
   if (pScope === '**' || pScope === '*') return true;
   // Literal equality wins before the matcher — covers the textual-
-  // identity case (declared `read-fs:src/index.ts` against resolved
-  // `read-fs:src/index.ts` without absolutization). Cheap pre-check.
+  // identity case (declared `read-fs:src/index.ts` against
+  // resolved `read-fs:src/index.ts` without absolutization).
+  // Cheap pre-check.
   if (pScope === cScope) return true;
   return matchPath(pScope, cScope, cwd);
 };
 
-// §10.1 evaluation: split a resolved capability set into (covered,
-// uncovered) against an effective bound. The engine's `check()`
-// stage consumes the `uncovered` list to build the deny envelope's
+// Split a resolved capability set into (covered, uncovered)
+// against an effective bound. The engine's `check()` stage
+// consumes the `uncovered` list to build the deny envelope's
 // reason and the audit row's `capabilities_json` (the uncovered
 // caps are the ones that pushed the child over its declared
 // envelope).
 //
-// Empty `effective` is the pure-LLM case: every non-empty resolved
-// cap is uncovered. An empty `resolved` (misc category) is trivially
-// covered regardless of effective — no side-effect capability was
-// requested, so the effective bound doesn't apply.
+// Empty `effective` is the pure-LLM case: every non-empty
+// resolved cap is uncovered. An empty `resolved` (misc category)
+// is trivially covered regardless of effective — no side-effect
+// capability was requested, so the effective bound doesn't apply.
 export interface EffectiveCoverResult {
   covered: Capability[];
   uncovered: Capability[];
@@ -295,18 +288,18 @@ export const effectiveCovers = (
   return { covered, uncovered };
 };
 
-// Apply the §10.1 intersection rule. Each `declared` capability that
-// IS covered by some `parent` capability survives into `effective`;
-// anything NOT covered lands in `excess`. The caller decides the
-// outcome (the spec says ANY excess → deny with `subagent_escalation`),
-// but exposing both arrays keeps the primitive composable.
+// Apply the intersection rule. Each `declared` capability covered
+// by some `parent` capability survives into `effective`; anything
+// NOT covered lands in `excess`. The caller decides the outcome
+// (ANY excess → deny with `subagent_escalation`), but exposing
+// both arrays keeps the primitive composable.
 //
 // Behavior on empty inputs:
-//   - declared=[] → effective=[], excess=[]. Spec §10.1 maps this to
-//     "subagent receives NO capability" (pure-LLM); the empty
-//     effective list is exactly that signal.
-//   - parent=[] AND declared=[X, Y] → effective=[], excess=[X, Y].
-//     Every declared capability is unbacked.
+//   - declared=[] → effective=[], excess=[]. Maps to "subagent
+//     receives NO capability" (pure-LLM); the empty effective
+//     list is exactly that signal.
+//   - parent=[] AND declared=[X, Y] → effective=[],
+//     excess=[X, Y]. Every declared capability is unbacked.
 //
 // Order: `effective` preserves declared order so a downstream
 // audit/format step renders capabilities in the order the model
@@ -330,13 +323,7 @@ export const intersectCapabilities = (
   return { effective, excess };
 };
 
-// PERMISSION_ENGINE.md §10 parent-capability derivation.
-//
-// Slice 9 introduced the `intersectCapabilities` primitive with
-// caller-supplied parent + declared sets. Slice 25 added automatic
-// derivation from the live policy at kind-level (every footprint
-// kind at universal scope). Slice 26 narrows: scope-shaped allow
-// rules become scope-shaped parent capabilities.
+// Parent-capability derivation from the live policy.
 //
 // Per-section mapping:
 //   - BashPolicy.allow         → command patterns (NOT path globs),
@@ -351,19 +338,21 @@ export const intersectCapabilities = (
 //   2. Subsumption via `capabilityCovers`. A cap is dropped if
 //      ANY other cap in the set covers it — `read-fs:**` from
 //      bash subsumes `read-fs:src/**` from read_file. The
-//      intersection step doesn't need the narrower entry; dropping
-//      it keeps the parent set readable in `/perms inspect`.
+//      intersection step doesn't need the narrower entry;
+//      dropping it keeps the parent set readable in
+//      `/perms inspect`.
 //
-// Result: parent capabilities reflect what the operator authorized
-// AT THE SCOPE LEVEL. A subagent declaring `read-fs:/etc/passwd`
-// no longer slips through just because read_file has any allow
-// rule — the declared scope must lie inside an `allow_paths`
-// entry (or under a universal bash footprint, if bash is allowed).
+// Result: parent capabilities reflect what the operator
+// authorized AT THE SCOPE LEVEL. A subagent declaring
+// `read-fs:/etc/passwd` doesn't slip through just because
+// read_file has any allow rule — the declared scope must lie
+// inside an `allow_paths` entry (or under a universal bash
+// footprint, if bash is allowed).
 //
-// `bash` remains the broadest section — its command-shaped `allow`
-// can't be projected into path scopes without re-parsing shell, so
-// each kind in the bash footprint emits at universal scope. A
-// policy that opens bash explicitly accepts that breadth.
+// `bash` remains the broadest section — its command-shaped
+// `allow` can't be projected into path scopes without re-parsing
+// shell, so each kind in the bash footprint emits at universal
+// scope. A policy that opens bash explicitly accepts that breadth.
 import type { Policy } from './types.ts';
 
 export const TOOL_CAPABILITY_FOOTPRINTS: Record<

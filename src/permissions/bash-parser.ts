@@ -3,26 +3,24 @@
 // `src/permissions/grammars/tree-sitter-bash.wasm`) into a
 // synchronous parse interface backed by an async one-time init.
 //
-// Design per `docs/spec/TREE_SITTER.md` and
-// `docs/spec/TREE_SITTER_SHELL.md`:
+// Design:
 //
 //   1. Tree-sitter is the entry-point, NOT the authority. The
-//      resolver walks the AST against a whitelist of nodes; anything
-//      outside the whitelist is `Refuse` with a specific reason
-//      (`TREE_SITTER_SHELL.md §9`).
+//      resolver walks the AST against a whitelist of nodes;
+//      anything outside the whitelist is `Refuse` with a specific
+//      reason.
 //   2. Init is async (Wasm runtime + grammar load), parse is sync
-//      after init. Bootstrap (`bootstrapPermissionEngine`) calls
-//      `initBashParser()` once during the `validating-chain` phase;
-//      `engine.check()` stays synchronous because the parser is
-//      already warm.
+//      after init. Bootstrap calls `initBashParser()` once during
+//      the `validating-chain` phase; `engine.check()` stays
+//      synchronous because the parser is already warm.
 //   3. Grammar wasm is vendored in-tree, not fetched at runtime.
 //      The release pipeline (`bun build --compile`) embeds it
-//      deterministically via Bun's `import … with { type: 'file' }`
-//      attribute: the import resolves to a runtime path that points
-//      at the on-disk file in dev mode and at the embedded asset in
-//      compiled binaries. `Bun.file(path).bytes()` reads either case
-//      without branching, so the same code path is used in dev and
-//      release. No `node:fs` / `fileURLToPath` shenanigans.
+//      deterministically via Bun's
+//      `import … with { type: 'file' }` attribute: the import
+//      resolves to a runtime path that points at the on-disk file
+//      in dev mode and at the embedded asset in compiled
+//      binaries. `Bun.file(path).bytes()` reads either case
+//      without branching.
 
 import { Language, Parser } from 'web-tree-sitter';
 // The web-tree-sitter package ships an emscripten-built engine
@@ -100,17 +98,16 @@ export const __resetBashParserForTest = (): void => {
 // always produces a tree). Callers should treat null as Refuse.
 import type { Node, Tree } from 'web-tree-sitter';
 
-// Defensive timeout ceiling on tree-sitter parse (slice 110, R2
-// #204). Spec-side concern: tree-sitter's error recovery is
-// usually fast, but pathological adversarial input (deeply
-// recursive shapes with unbalanced delimiters, malformed
-// here-docs, or carefully crafted Unicode sequences that confuse
-// the LR(1) state machine) can drive parsing into a slow path
-// that approaches O(N²) or worse. A 5 s cap is well above any
-// legitimate bash command size (operator-typed commands typically
-// parse sub-millisecond; even a 100 KB script parses in <100 ms
-// on modern hardware) and well below "operator notices the hang"
-// thresholds.
+// Defensive timeout ceiling on tree-sitter parse. Tree-sitter's
+// error recovery is usually fast, but pathological adversarial
+// input (deeply recursive shapes with unbalanced delimiters,
+// malformed here-docs, or carefully crafted Unicode sequences
+// that confuse the LR(1) state machine) can drive parsing into a
+// slow path approaching O(N²) or worse. A 5 s cap is well above
+// any legitimate bash command size (operator-typed commands
+// typically parse sub-millisecond; even a 100 KB script parses in
+// <100 ms on modern hardware) and well below "operator notices
+// the hang" thresholds.
 //
 // Implementation: `parser.parse(source, oldTree, { progressCallback })`
 // — web-tree-sitter calls the callback periodically during parse.

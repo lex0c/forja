@@ -1,12 +1,11 @@
-// Context summary for the classifier hint per PERMISSION_ENGINE.md §6.4.
+// Context summary for the classifier hint.
 //
-// The classifier receives, among other inputs, "contexto resumido
-// (últimos N steps, sumarizados pela engine)". This module owns the
-// SUMMARIZATION primitive: given an engine-controlled ring buffer of
-// recent decisions, render a model-readable string the classifier
-// can branch on WITHOUT ever seeing adversary-controlled bytes.
+// The classifier receives, among other inputs, a summary of the
+// last N steps. This module renders a model-readable string the
+// classifier can branch on WITHOUT ever seeing adversary-
+// controlled bytes.
 //
-// Spec §6.4 invariants enforced here:
+// Invariants enforced here:
 //
 //   - NO raw args (the resolver already canonicalized capability
 //     STRINGS; we strip further to capability KINDS only).
@@ -53,11 +52,11 @@ export interface BuildContextSummaryOptions {
 // reference the canonical value rather than re-encoding the literal.
 export const DEFAULT_CONTEXT_SUMMARY_MAX_BYTES = 1024;
 
-// Default ring-buffer depth (number of entries retained). Spec §6.4
-// says "últimos N steps"; the v2 baseline picks 10 — enough recent
-// activity to surface a "this is the 4th `bash rm` in a row" pattern,
-// small enough that the classifier doesn't pay a token tax for stale
-// context. Calibration can adjust the constant via the option below.
+// Default ring-buffer depth (number of entries retained). v2
+// baseline picks 10 — enough recent activity to surface a "this
+// is the 4th `bash rm` in a row" pattern, small enough that the
+// classifier doesn't pay a token tax for stale context.
+// Calibration can adjust via the option below.
 export const DEFAULT_CONTEXT_SUMMARY_DEPTH = 10;
 
 // Format a single entry. Stable, parseable shape so the classifier
@@ -76,9 +75,9 @@ const formatEntry = (entry: ContextSummaryEntry, index: number): string => {
 };
 
 // Build the summary string from the buffer's chronological order
-// (oldest first → newest last). Spec §6.4 "últimos N steps" — the
-// caller is responsible for retaining only the last N entries; this
-// renderer assumes the caller already trimmed.
+// (oldest first → newest last). The caller is responsible for
+// retaining only the last N entries; this renderer assumes the
+// caller already trimmed.
 //
 // Byte cap enforcement: we walk entries in order and stop AS SOON AS
 // the next line would push the running total past `maxBytes`. The

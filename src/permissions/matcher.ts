@@ -2,27 +2,15 @@ import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { Glob } from 'bun';
 
-// Slice 161 (review — hot-path memoization). The matcher runs in the
-// per-tool-call hot path. Spec budget is 5ms target / 15ms p95 per
-// PERFORMANCE.md §X. Three pre-slice issues compounded:
+// Hot-path memoization. The matcher runs in the per-tool-call hot
+// path; without these caches each fs check would (a) re-compile
+// N×2 Globs and N RegExps for the policy's rules, (b) re-realpath
+// the same target N times across `firstMatchingPath`'s loop, and
+// (c) re-resolve cwd + the pattern per call. Three accommodations:
 //
-//   1. `new Glob(pattern)` and `new RegExp(...)` constructed PER
-//      CALL inside the matcher functions. With N rules in a policy
-//      and one fs check, that's N×2 Glob constructions and N
-//      RegExp compilations every time.
-//   2. `realpathSync(target)` called inside `matchPath` itself, so
-//      `firstMatchingPath` looping over N rules re-realpaths the
-//      SAME target N times. On hot FS or large rule lists this
-//      dominates the budget.
-//   3. `resolve(cwd, pattern)` called per call even though the
-//      pattern and cwd are static within a check.
-//
-// Fixes:
-//   - Module-level Map caches for compiled Glob/RegExp keyed by the
-//     literal pattern (path matcher) or by the resolved-relative
-//     form (when cwd-dependent). Caches are bounded by the union
-//     of distinct pattern strings the process sees (~policy size
-//     × hot cwds; realistic ceiling < few hundred entries).
+//   - Module-level Map caches for compiled Glob/RegExp keyed by
+//     the literal pattern. Bounded by the union of distinct
+//     pattern strings the process sees.
 //   - `prepareTarget(target, cwd)` resolves + canonicalizes ONCE
 //     per check; `matchPathPrepared(pattern, prepared)` consumes
 //     the prepared form without re-resolving. `firstMatchingPath`
@@ -53,10 +41,9 @@ const getCommandRegex = (pattern: string): RegExp => {
   return r;
 };
 
-// Host regex cache. Hosts are lower-cased before compilation, so the
-// key is the lowered form. Pre-slice every host check compiled twice
-// (one for pattern, one for the host string) — now both share the
-// same lower-cased canonical key.
+// Host regex cache. Hosts are lower-cased before compilation, so
+// the key is the lowered form; pattern and host string share the
+// same canonical key.
 const hostRegexCache = new Map<string, RegExp>();
 const getHostRegex = (pattern: string): RegExp => {
   const lowered = pattern.toLowerCase();
@@ -89,12 +76,12 @@ const resolveSymlinks = (abs: string): string => {
   }
 };
 
-// Slice 161: prepared target shape. Holds the canonical (realpath-
-// resolved) absolute form alongside the absolute cwd. Computed ONCE
-// per check by `prepareTarget`; consumed by `matchPathPrepared`
-// without re-realpathing. Engine.ts's `firstMatchingPath` calls
-// build one of these per fs decision and iterate patterns against
-// the same prepared instance.
+// Prepared target shape. Holds the canonical (realpath-resolved)
+// absolute form alongside the absolute cwd. Computed ONCE per
+// check by `prepareTarget`; consumed by `matchPathPrepared`
+// without re-realpathing. `firstMatchingPath` builds one of these
+// per fs decision and iterates patterns against the same prepared
+// instance.
 export interface PreparedPathTarget {
   // Resolved + symlink-followed absolute. Source of truth for
   // matching — pattern checks evaluate against this string.
@@ -111,27 +98,29 @@ export const prepareTarget = (target: string, cwd: string): PreparedPathTarget =
   return { absTarget, absCwd };
 };
 
-// Path matching: every pattern and every input is normalized to a path
-// relative to `cwd`, then matched with Bun.Glob. Absolute paths outside
-// cwd never match cwd-relative patterns (a bare `**/foo` won't reach into
-// `/etc/passwd`), which is the security property we want. Symlinks are
-// resolved on the target before matching, so a symlink inside cwd that
-// points outside cwd won't sneak past.
+// Path matching: every pattern and every input is normalized to a
+// path relative to `cwd`, then matched with Bun.Glob. Absolute
+// paths outside cwd never match cwd-relative patterns (a bare
+// `**/foo` won't reach into `/etc/passwd`), which is the security
+// property we want. Symlinks are resolved on the target before
+// matching, so a symlink inside cwd that points outside cwd
+// won't sneak past.
 //
-// `path.resolve(cwd, ...)` is called unconditionally on both target and
-// pattern — even when the input is already absolute — so `..`/`./`
-// components are lexically normalized BEFORE realpath. Without this
-// (pre-slice-29 behavior), an absolute input like `/work/proj/../../etc/x`
-// would survive both realpath fallbacks when intermediate dirs don't
-// exist on the live FS, and the matcher would then strip the textual
-// `/work/proj/` prefix via relativize and match the residual
-// `../../etc/x` against the cwd-relative pattern.
+// `path.resolve(cwd, ...)` is called unconditionally on both
+// target and pattern — even when the input is already absolute —
+// so `..`/`./` components are lexically normalized BEFORE
+// realpath. Without this, an absolute input like
+// `/work/proj/../../etc/x` would survive both realpath fallbacks
+// when intermediate dirs don't exist on the live FS, and the
+// matcher would then strip the textual `/work/proj/` prefix via
+// relativize and match the residual `../../etc/x` against the
+// cwd-relative pattern.
 export const matchPath = (pattern: string, target: string, cwd: string): boolean =>
   matchPathPrepared(pattern, prepareTarget(target, cwd));
 
-// Slice 161: per-pattern matcher that consumes a pre-prepared
-// target. Compatible semantics with `matchPath` — same pattern,
-// same target, same cwd produces the same result — but skips the
+// Per-pattern matcher that consumes a pre-prepared target.
+// Compatible semantics with `matchPath` — same pattern, same
+// target, same cwd produces the same result — but skips the
 // realpath + resolve(cwd) costs because the prepared form already
 // holds them. Use from `firstMatchingPath` when iterating many
 // patterns against one target.
@@ -154,14 +143,15 @@ const relativize = (base: string, abs: string): string | null => {
   return null;
 };
 
-// Command and host matching can't use Bun.Glob directly because Glob's `*`
-// stops at `/` (correct for paths, wrong for commands like `curl * | sh`
-// where the URL contains slashes). We translate the pattern to a regex
-// where `*` means "any character" and `?` means "exactly one character".
-// All other regex metachars are escaped, and the result is anchored.
+// Command and host matching can't use Bun.Glob directly because
+// Glob's `*` stops at `/` (correct for paths, wrong for commands
+// like `curl * | sh` where the URL contains slashes). We translate
+// the pattern to a regex where `*` means "any character" and `?`
+// means "exactly one character". All other regex metachars are
+// escaped, and the result is anchored.
 //
-// This is an *implementation* detail — policies still author with glob
-// syntax, the "no regex in policy" rule (CLAUDE.md) is preserved.
+// This is an implementation detail — policies still author with
+// glob syntax, the "no regex in policy" rule is preserved.
 const REGEX_META = /[.+^${}()|[\]\\]/g;
 
 const compileGlobToRegex = (pattern: string): RegExp => {
@@ -246,12 +236,13 @@ const GLOB_META = /[\\*?]/g;
 export const escapeGlobMetacharacters = (literal: string): string =>
   literal.replace(GLOB_META, '\\$&');
 
-// Command matching: pattern with `*` matches any sequence of characters
-// (including spaces and slashes). Patterns without `*` must match the full
-// command exactly. Trailing whitespace in input is trimmed.
+// Command matching: pattern with `*` matches any sequence of
+// characters (including spaces and slashes). Patterns without `*`
+// must match the full command exactly. Trailing whitespace in
+// input is trimmed.
 //
-// Slice 161: route through the module-level RegExp cache so the same
-// pattern doesn't recompile on every check. Cache survives policy
+// Routes through the module-level RegExp cache so the same pattern
+// doesn't recompile on every check. Cache survives policy
 // reloads — patterns are stable strings, and the next reload's
 // pattern set is either a subset or a superset; either way the
 // retained entries are still valid.
@@ -469,26 +460,24 @@ export const containsShellInjection = (command: string): boolean => {
   return false;
 };
 
-// Host matching for fetch URLs. Same compile semantics as commands —
-// hostnames don't contain `/`, but we want consistent behavior across
-// command/host matching (and `*` in `*.internal` should not be limited
-// by anything other than the literal `.`).
+// Host matching for fetch URLs. Same compile semantics as
+// commands — hostnames don't contain `/`, but we want consistent
+// behavior across command/host matching (and `*` in `*.internal`
+// should not be limited by anything other than the literal `.`).
 //
-// Slice 161: separate host regex cache (lower-cased keys) so case-
-// insensitive matching doesn't burn duplicate cache entries against
-// the command cache.
+// Separate host regex cache (lower-cased keys) so case-
+// insensitive matching doesn't burn duplicate cache entries
+// against the command cache.
 export const matchHost = (pattern: string, host: string): boolean =>
   getHostRegex(pattern).test(host.toLowerCase());
 
-// Returns the first pattern that matches, or null. Useful for diagnostics
-// (which rule fired?).
+// Returns the first pattern that matches, or null. Useful for
+// diagnostics (which rule fired?).
 //
-// Slice 161: prepare the target ONCE for the whole iteration. Pre-
-// slice each `matchPath` call re-realpathed + re-resolved cwd, so a
-// 10-rule policy paid 10× the cost. Now realpath fires once and the
-// patterns reuse the prepared form via `matchPathPrepared`. Short-
-// circuit on undefined patterns avoids the realpath altogether when
-// the policy section is empty.
+// Prepares the target ONCE for the whole iteration so realpath
+// fires once instead of once per pattern. Short-circuits on
+// undefined patterns to avoid realpath altogether when the policy
+// section is empty.
 export const firstMatchingPath = (
   patterns: readonly string[] | undefined,
   target: string,

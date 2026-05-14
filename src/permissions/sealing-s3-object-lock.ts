@@ -1,11 +1,11 @@
-// §7.3 S3 Object Lock sealing backend (slice 89).
+// S3 Object Lock sealing backend.
 //
 // External anchoring via AWS S3 Object Lock in COMPLIANCE mode.
 // For each seal event the backend:
 //
 //   1. canonicalizes the entry into a seal record byte string
 //      (same `seq=N\tts=N\thash=H\n` line format used by the
-//      other §7.3 backends);
+//      other sealing backends);
 //   2. uploads the bytes as an S3 object under
 //      `<bucket>/<key_prefix>/<seq>-<ts>.seal` with Object Lock
 //      retention set to `now + retention_days` in COMPLIANCE
@@ -34,8 +34,8 @@
 //   - Out-of-scope: bucket-level configuration drift (Object
 //     Lock disabled on the bucket itself). The bucket MUST be
 //     created with Object Lock enabled — this engine doesn't
-//     bootstrap it; doctor expansion (§13.3, future slice) can
-//     verify the bucket's GetObjectLockConfiguration on startup.
+//     bootstrap it; a future doctor check can verify the
+//     bucket's GetObjectLockConfiguration on startup.
 //   - Out-of-scope: clock skew between operator and AWS. The
 //     RetainUntilDate is computed locally + sent verbatim;
 //     AWS accepts whatever timestamp you provide as long as
@@ -44,11 +44,10 @@
 //     surfaces via the standard SealStore error path.
 //
 // Sync interface: SealStore.append() is synchronous (matches the
-// scheduler's sealNow() contract, see sealing.ts). The S3 PUT
-// is invoked via `execFileSync('aws', ...)` — same posture as
-// rfc3161-tsa's curl-based submitter. Operators bind to whatever
-// `aws` CLI version is on their PATH; production-quality
-// `aws --version 2.x+` is assumed.
+// scheduler's sealNow() contract). The S3 PUT is invoked via
+// `execFileSync('aws', ...)` — same posture as rfc3161-tsa's
+// curl-based submitter. Operators bind to whatever `aws` CLI
+// version is on their PATH; `aws --version 2.x+` is assumed.
 //
 // Test seam `submit`: tests inject a deterministic submitter so
 // the suite runs without AWS credentials or network. Production
@@ -208,14 +207,13 @@ const defaultEnsureDir = (d: string): void => {
 };
 
 export const createS3ObjectLockSealer = (opts: CreateS3ObjectLockSealerOptions): SealStore => {
-  // Strip trailing slashes so join(dir, 'seal.log') doesn't produce
-  // double-slash paths. The /^\/+$/ guard preserves "/" (and other
-  // all-slashes values like "//") as the filesystem root — without
-  // it, the naive replace collapses "/" to "" and every subsequent
-  // join() becomes a CWD-relative path, silently writing the local
-  // seal index file to the wrong place when an operator
-  // deliberately configures seal.path = "/". Mirrors the same fix
-  // in sealing-rfc3161.ts.
+  // Strip trailing slashes so join(dir, 'seal.log') doesn't
+  // produce double-slash paths. The /^\/+$/ guard preserves "/"
+  // (and other all-slashes values like "//") as the filesystem
+  // root — without it, the naive replace collapses "/" to "" and
+  // every subsequent join() becomes a CWD-relative path, silently
+  // writing the local seal index file to the wrong place when an
+  // operator deliberately configures seal.path = "/".
   const dir = /^\/+$/.test(opts.path) ? '/' : opts.path.replace(/\/+$/, '');
   const sealLogPath = join(dir, 'seal.log');
   const submit = opts.submit ?? defaultS3Submitter;

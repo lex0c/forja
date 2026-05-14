@@ -1,13 +1,14 @@
-// Classifier hint per PERMISSION_ENGINE.md §6.4.
+// Classifier hint.
 //
-// An optional, hint-only signal that adjusts the deterministic score
-// by ±0.2 clamped. The classifier exists to catch patterns the
-// deterministic rules don't enumerate — novel attack shapes, "benign
-// looking but malicious" sequences, etc. — but it can NEVER produce
-// a decision the deterministic floor wouldn't already produce. Its
-// job is to nudge borderline scores, not to gate.
+// An optional, hint-only signal that adjusts the deterministic
+// score by ±0.2 clamped. The classifier exists to catch patterns
+// the deterministic rules don't enumerate — novel attack shapes,
+// "benign looking but malicious" sequences, etc. — but it can
+// NEVER produce a decision the deterministic floor wouldn't
+// already produce. Its job is to nudge borderline scores, not to
+// gate.
 //
-// Three invariants from the spec, all enforced here:
+// Three invariants enforced here:
 //
 //   1. The classifier NEVER sees raw args, tool outputs, file
 //      contents, or web fetches. Its input carries only:
@@ -33,10 +34,11 @@
 //      score is kept as-is and the call proceeds.
 //
 // The interface is SYNC. The engine's check() is sync; making the
-// classifier async cascades into every consumer (audit, modal, REPL,
-// CLI). When a real ML classifier with inference latency lands, the
-// caller wraps it with a precomputed cache or a sync stub that
-// defers to a background worker — the engine doesn't model that.
+// classifier async would cascade into every consumer (audit,
+// modal, REPL, CLI). When a real ML classifier with inference
+// latency lands, the caller wraps it with a precomputed cache or
+// a sync stub that defers to a background worker — the engine
+// doesn't model that.
 
 import type { Capability } from './capabilities.ts';
 import { formatCapability } from './capabilities.ts';
@@ -47,7 +49,7 @@ export interface ClassifierInput {
   // can branch on capability kinds and on scope structure without
   // touching raw paths or hosts the model controlled.
   capabilities: readonly string[];
-  // Deterministic score from §6.3. Classifier sees what the rules
+  // Deterministic risk score. Classifier sees what the rules
   // already concluded so its adjust is RELATIVE to that floor.
   score: number;
   // Version pin for the classifier model. Audit row records this so
@@ -76,8 +78,9 @@ export interface ClassifierOutput {
 // strict → degrade.
 export type Classifier = (input: ClassifierInput) => ClassifierOutput | null;
 
-// Clamp bounds per spec §6.4. Exported so tests + callers can
-// reference the canonical values rather than re-encoding them.
+// Clamp bounds for the classifier's score_adjust. Exported so
+// tests + callers can reference the canonical values rather than
+// re-encoding them.
 export const CLASSIFIER_ADJUST_BOUNDS = { min: -0.2, max: 0.2 } as const;
 
 // Clamp an arbitrary number into the score-adjust range. Treats

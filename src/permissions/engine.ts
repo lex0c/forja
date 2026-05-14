@@ -93,14 +93,14 @@ export interface EngineOptions {
   // DB; production bootstrap injects `createSqliteSink({ db,
   // identity })`.
   audit?: AuditSink;
-  // §18 telemetry sink (slice 74). When set, the engine emits
-  // typed events for in-line signals that don't fit the audit row
-  // shape — currently `classifier.unavailable` (slice 74). The
-  // audit sink emits `permission.decision` events separately via
-  // its own telemetry hook (slice 70). Production wiring passes
-  // the SAME sink through both paths so a single observer sees
-  // every event type. Structurally-typed `{emit(event)}` to keep
-  // the engine module from importing concrete sink classes.
+  // Telemetry sink. When set, the engine emits typed events for
+  // in-line signals that don't fit the audit row shape — currently
+  // `classifier.unavailable`. The audit sink emits
+  // `permission.decision` events separately via its own telemetry
+  // hook. Production wiring passes the SAME sink through both paths
+  // so a single observer sees every event type. Structurally-typed
+  // `{emit(event)}` to keep the engine module from importing
+  // concrete sink classes.
   telemetry?: { emit: (event: TelemetryEvent) => void };
   // Timestamp seam for telemetry events emitted in-line from
   // `check` (currently `classifier.unavailable`). Production:
@@ -111,11 +111,11 @@ export interface EngineOptions {
   // for tests; production bootstrap passes the active session id
   // from the harness loop.
   sessionId?: string;
-  // Initial state (PERMISSION_ENGINE.md §2). Default `ready` for
-  // backward-compatible test ergonomics — every existing test that
-  // builds an engine directly keeps working. Production bootstrap
-  // injects a `stateController` instead and walks the machine
-  // explicitly through init → loading-policy → validating-chain.
+  // Initial state. Default `ready` for backward-compatible test
+  // ergonomics — every existing test that builds an engine
+  // directly keeps working. Production bootstrap injects a
+  // `stateController` instead and walks the machine explicitly
+  // through init → loading-policy → validating-chain.
   initialState?: EngineState;
   // External state controller. When supplied, the engine reads
   // state from this controller instead of owning its own — letting
@@ -123,12 +123,11 @@ export interface EngineOptions {
   // is even constructed. Mutually exclusive with `initialState`;
   // when both are present, the controller wins.
   stateController?: StateController;
-  // Risk-score inputs (PERMISSION_ENGINE.md §6.3). All optional;
-  // defaults are documented at each field. The score is computed
-  // for every check, recorded in the audit row, and consulted by
-  // the §6.6 approval gate via `scoreConfirmThreshold` below; a
-  // would-be allow whose score crosses the threshold upgrades to
-  // confirm.
+  // Risk-score inputs. All optional; defaults are documented at
+  // each field. The score is computed for every check, recorded in
+  // the audit row, and consulted by the approval gate via
+  // `scoreConfirmThreshold` below; a would-be allow whose score
+  // crosses the threshold upgrades to confirm.
   //
   // `trustedHosts`: hosts whose net-egress capabilities do NOT
   // trigger the `untrusted_egress` feature. Default:
@@ -151,12 +150,11 @@ export interface EngineOptions {
   // forever, missing score-based confirm escalation when the model
   // starts looping on failures.
   recentToolErrors?: number | (() => number);
-  // Classifier hint (PERMISSION_ENGINE.md §6.4). Optional sync
-  // function; receives capabilities + deterministic score + a
-  // version pin, returns a clamped adjust. NEVER sees raw args /
-  // tool outputs / file contents — that's the prompt-injection
-  // defense. Absent or returning null counts as
-  // `classifier_unavailable`. Default: no classifier wired.
+  // Classifier hint. Optional sync function; receives capabilities
+  // + deterministic score + a version pin, returns a clamped
+  // adjust. NEVER sees raw args / tool outputs / file contents —
+  // that's the prompt-injection defense. Absent or returning null
+  // counts as `classifier_unavailable`. Default: no classifier wired.
   classifier?: Classifier;
   // Version pin for the active classifier. Recorded in every audit
   // row that consults the classifier so model swaps mid-install
@@ -168,26 +166,26 @@ export interface EngineOptions {
   // call proceeds. Regulated deployments set this to true; local
   // CLI rides lenient.
   classifierRequired?: boolean;
-  // Approval-gate score threshold (PERMISSION_ENGINE.md §6.6).
-  // A would-be `allow` whose final score (deterministic + clamped
-  // classifier adjust) reaches this value is upgraded to `confirm`.
-  // Default DEFAULT_SCORE_CONFIRM_THRESHOLD (0.4) — the v2 baseline
-  // calibration point per §6.3.2. Calibration phase (post-pilot)
-  // re-derives the value; the knob exists so a redeployment can ship
-  // the new constant without rebuilding the engine module.
+  // Approval-gate score threshold. A would-be `allow` whose final
+  // score (deterministic + clamped classifier adjust) reaches this
+  // value is upgraded to `confirm`. Default
+  // DEFAULT_SCORE_CONFIRM_THRESHOLD (0.4) — the v2 baseline
+  // calibration point. Calibration phase (post-pilot) re-derives
+  // the value; the knob exists so a redeployment can ship the new
+  // constant without rebuilding the engine module.
   scoreConfirmThreshold?: number;
-  // Classifier context-summary tuning (PERMISSION_ENGINE.md §6.4).
-  // The engine retains the last `contextSummaryDepth` decisions in
-  // an in-memory ring buffer and renders them into a sanitized
-  // string (capability KINDS only, never scopes/args/outputs) that
-  // the classifier receives. Both knobs ship at the v2 baseline
-  // (10 entries, 1 KiB cap); calibration sweeps can tune.
+  // Classifier context-summary tuning. The engine retains the last
+  // `contextSummaryDepth` decisions in an in-memory ring buffer and
+  // renders them into a sanitized string (capability KINDS only,
+  // never scopes/args/outputs) that the classifier receives. Both
+  // knobs ship at the v2 baseline (10 entries, 1 KiB cap);
+  // calibration sweeps can tune.
   contextSummaryDepth?: number;
   contextSummaryMaxBytes?: number;
-  // Sandbox planning inputs (PERMISSION_ENGINE.md §6.5). Optional —
-  // when omitted, the sandbox-plan stage is skipped entirely (legacy
-  // path; engine.check() never refuses for `no_viable_sandbox` and
-  // never populates the audit row's sandbox_profile column).
+  // Sandbox planning inputs. Optional — when omitted, the
+  // sandbox-plan stage is skipped entirely; engine.check() never
+  // refuses for `no_viable_sandbox` and never populates the audit
+  // row's sandbox_profile column.
   //
   //   - `available`: whether the host has bwrap / sandbox-exec
   //     present (see `detectSandboxAvailability`). When false AND
@@ -207,25 +205,25 @@ export interface EngineOptions {
     hostExplicitlyAllowed: boolean;
     required: boolean;
   };
-  // §8 grants. Optional grants snapshot provider. Engine calls
+  // Optional grants snapshot provider. Engine calls
   // `listActive(Date.now())` on each `check()` so long-running
   // sessions see grants revoked or expired mid-flight. Implementations:
   //   - Production: `(ts) => listActiveGrants(db, installId, ts)`
   //   - Tests: a closure over a fixed array; mutable for revocation tests.
-  // When omitted, the grant-match phase is a no-op — engine behaves
-  // as before slice 40. Persisted grants (pattern scope) authorize
-  // matching tool calls, short-circuiting AFTER deny rules and
-  // BEFORE the in-memory session-allow / base allow / confirm chain.
+  // When omitted, the grant-match phase is a no-op. Persisted grants
+  // (pattern scope) authorize matching tool calls, short-circuiting
+  // AFTER deny rules and BEFORE the in-memory session-allow / base
+  // allow / confirm chain.
   grants?: {
     listActive: (snapshotTs: number) => readonly GrantSnapshot[];
   };
-  // PERMISSION_ENGINE.md §10.1 — subagent effective capability bound
-  // (slice 95, R11 P0-3). When present, the engine treats itself as
-  // a CHILD engine constrained to this set. Every resolved capability
-  // (from the slice 5 resolver pipeline) must be covered by some
-  // entry per `effectiveCovers`; any uncovered capability lands a
-  // structural deny with `source.section='subagent-effective'`
-  // BEFORE the static rule / bypass / grant pipeline runs.
+  // Subagent effective capability bound. When present, the engine
+  // treats itself as a CHILD engine constrained to this set. Every
+  // resolved capability (from the resolver pipeline) must be
+  // covered by some entry per `effectiveCovers`; any uncovered
+  // capability lands a structural deny with
+  // `source.section='subagent-effective'` BEFORE the static rule /
+  // bypass / grant pipeline runs.
   //
   // Three states matter:
   //   - `undefined` — root agent / legacy spawn. No bound, every
@@ -246,30 +244,28 @@ export interface EngineOptions {
   //
   // The check is structural (fires AFTER resolver, BEFORE bypass /
   // static rules / classifier / sandbox plan). A subagent cannot
-  // escape its declared envelope via any rule-pipeline path. Spec
-  // §10.3 ("Escape impossível").
+  // escape its declared envelope via any rule-pipeline path.
   effectiveCapabilities?: readonly Capability[];
 }
 
-// Slice 143 (API-2): `GrantSnapshot` moved to
-// `src/permissions/grant-types.ts` — single source of truth shared
-// with `src/storage/repos/grants.ts`. Re-exported here so external
-// importers (CLI, tests, conformance harness) that pulled the type
-// from this module pre-slice continue to work without churn.
+// `GrantSnapshot` lives in `src/permissions/grant-types.ts` — single
+// source of truth shared with `src/storage/repos/grants.ts`. Re-
+// exported here so external importers (CLI, tests, conformance
+// harness) can continue pulling the type from this module.
 export type { GrantSnapshot } from './grant-types.ts';
 
-// §6.6 baseline. Sourced here (not inlined at the call site) so
-// tests, audit replays, and future calibration sweeps can read the
-// exact threshold the engine is enforcing. Calibration plan is in
-// §6.3.2; the knob is `EngineOptions.scoreConfirmThreshold`.
+// Approval-gate score threshold baseline. Sourced here (not inlined
+// at the call site) so tests, audit replays, and future calibration
+// sweeps can read the exact threshold the engine is enforcing. The
+// knob is `EngineOptions.scoreConfirmThreshold`.
 export const DEFAULT_SCORE_CONFIRM_THRESHOLD = 0.4;
 
-// §12.3 hot reload result. Discriminated union mirroring the
-// `verifyChain` pattern: callers branch on `ok` and consume the
-// hash transition on success or the diagnostic reason on failure.
-// The engine's responsibility is atomic swap + minimal sanity
-// validation; the caller (file watcher, policy resolver) is
-// responsible for upstream resolution + lock-conflict checks.
+// Hot reload result. Discriminated union mirroring the `verifyChain`
+// pattern: callers branch on `ok` and consume the hash transition on
+// success or the diagnostic reason on failure. The engine's
+// responsibility is atomic swap + minimal sanity validation; the
+// caller (file watcher, policy resolver) is responsible for upstream
+// resolution + lock-conflict checks.
 export type ReloadPolicyResult =
   | { ok: true; oldHash: string; newHash: string }
   | { ok: false; reason: string };
@@ -278,32 +274,26 @@ export interface PermissionEngine {
   check(toolName: string, category: PolicyCategory, args: ToolArgs): Decision;
   view(): PermissionsView;
   mode(): PolicyMode;
-  // §12.3 atomic policy swap. The new policy MUST be a Policy
-  // object the caller already resolved + validated (lock conflicts,
-  // hierarchy merge, etc); the engine does minimal shape checks
-  // and recomputes `policy_hash` for subsequent audit rows. Returns
+  // Atomic policy swap. The new policy MUST be a Policy object the
+  // caller already resolved + validated (lock conflicts, hierarchy
+  // merge, etc); the engine does minimal shape checks and
+  // recomputes `policy_hash` for subsequent audit rows. Returns
   // {ok: true, oldHash, newHash} on success; {ok: false, reason}
-  // when the policy fails canonical-hash computation or is
-  // missing required fields. Single-threaded JS means no in-flight
-  // check() can be interrupted — the swap takes effect on the
-  // NEXT check() call.
+  // when the policy fails canonical-hash computation or is missing
+  // required fields. Single-threaded JS means no in-flight check()
+  // can be interrupted — the swap takes effect on the NEXT check()
+  // call.
   //
-  // Slice 139 C4: the optional `newProvenance` argument lets the
-  // caller swap the per-section layer attribution alongside the
-  // policy. Pre-slice the engine captured `provenance` at
-  // construction time and `reloadPolicy` updated only `policy`
-  // and `mode`, leaving the stale provenance in place. Result:
-  // every audit row's `source.layer` and `/perms why` output
-  // referenced the PRE-reload hierarchy. The watcher (policy-
-  // watcher.ts) re-resolves the full hierarchy on each YAML
-  // change and now forwards the fresh `SectionProvenance` here.
-  // Callers without dynamic provenance (tests / one-shot uses)
-  // can omit the argument and the engine keeps the construction-
-  // time provenance.
+  // The optional `newProvenance` argument lets the caller swap the
+  // per-section layer attribution alongside the policy. The watcher
+  // (policy-watcher.ts) re-resolves the full hierarchy on each YAML
+  // change and forwards the fresh `SectionProvenance` here. Callers
+  // without dynamic provenance (tests / one-shot uses) can omit the
+  // argument and the engine keeps the construction-time provenance.
   reloadPolicy(newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult;
-  // Current state per PERMISSION_ENGINE.md §2. Bootstrap walks the
-  // engine through `init → loading-policy → validating-chain → ready`
-  // before exposing it to the harness; runtime can transition between
+  // Current state. Bootstrap walks the engine through
+  // `init → loading-policy → validating-chain → ready` before
+  // exposing it to the harness; runtime can transition between
   // `ready` and `degraded` based on subsystem health, or fall to
   // `refusing` on a fatal event (chain break, policy reload failure
   // in strict mode).
@@ -311,12 +301,12 @@ export interface PermissionEngine {
   // Returns the reason associated with the most recent ready→degraded
   // (or any-state→degraded) transition while the engine IS currently
   // degraded. Returns `undefined` when the engine is not degraded,
-  // OR when it's degraded but never had an explicit reason (legacy
-  // path; shouldn't happen in practice — `degrade(reason)` always
-  // supplies one). The §13.6 degraded-banner emitter (slice 92)
-  // consumes this so the operator-facing banner can quote the
-  // root cause ("⚠ Sandbox no longer available (bwrap binary missing)").
-  // Reads from the state controller's history; no extra storage.
+  // OR when it's degraded but never had an explicit reason
+  // (shouldn't happen in practice — `degrade(reason)` always
+  // supplies one). The degraded-banner emitter consumes this so the
+  // operator-facing banner can quote the root cause ("Sandbox no
+  // longer available (bwrap binary missing)"). Reads from the state
+  // controller's history; no extra storage.
   getDegradedReason(): string | undefined;
   // Transition the engine to a degraded state — happens when an
   // auxiliary subsystem (classifier, sandbox, sealing target) goes
@@ -341,12 +331,12 @@ export interface PermissionEngine {
   // (typical policies are sub-10KB) compared to the latent-bug
   // surface a shared reference would expose.
   policy(): Policy;
-  // Slice 128 (R4 P0-Bypass-2): expose the engine's narrowed
-  // capability envelope (if any). Subagent harness loop reads
-  // this BEFORE falling back to `deriveParentCapabilities(policy)`
-  // so a grandchild's intersection happens against the CHILD's
-  // narrowed set, not the parent's full policy. Returns null when
-  // no envelope was applied at construction (root engine).
+  // Expose the engine's narrowed capability envelope (if any). The
+  // subagent harness loop reads this BEFORE falling back to
+  // `deriveParentCapabilities(policy)` so a grandchild's
+  // intersection happens against the CHILD's narrowed set, not the
+  // parent's full policy. Returns null when no envelope was applied
+  // at construction (root engine).
   effectiveCapabilities(): readonly Capability[] | null;
   // Returns a deep copy of the section-by-section layer attribution
   // captured at policy resolution time. Operator-facing surfaces
@@ -380,8 +370,7 @@ export interface PermissionEngine {
   //
   // In-memory only — the engine's session state vanishes when the
   // process exits. Promoting session rules to a persistent layer
-  // is a separate slice (TODO: permission ergonomics Tier 5
-  // `/perms commit`).
+  // (`/perms commit`) is future work.
   addSessionAllow(section: keyof PolicyToolsSection, pattern: string): void;
 }
 
@@ -404,9 +393,9 @@ export interface ToolArgs {
 
 // Resolves the policy-relevant filesystem target per tool semantics.
 // read_file/write_file/edit_file all operate on a single path (named
-// `file_path` in slice-3+ tools per Anthropic SDK convention, named
-// `path` in the v1 contract). grep and glob are search tools whose
-// effective root differs:
+// `file_path` per Anthropic SDK convention, or `path` in the v1
+// contract). grep and glob are search tools whose effective root
+// differs:
 //   - grep: `args.path` (optional; defaults to session cwd)
 //   - glob: `args.cwd` (optional; defaults to session cwd; the `pattern`
 //     argument defines what's matched, not what's allowed)
@@ -426,8 +415,7 @@ export interface ToolArgs {
 const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
 
 // Resolve the path arg for non-search tools. Accepts either
-// `file_path` (slice-3+ convention) or `path` (v1 contract) — same
-// dual-name compat as the FS resolvers.
+// `file_path` or `path` — same dual-name compat as the FS resolvers.
 const filePathOf = (args: ToolArgs): string | null => {
   if (isNonEmptyString(args.file_path)) return args.file_path as string;
   if (isNonEmptyString(args.path)) return args.path;
@@ -466,14 +454,14 @@ const denyDefault = (toolName: string, mode: PolicyMode, source: PolicySource): 
   source,
 });
 
-// §8 grants — per-section relevance filter. A pattern grant
-// authorizes a tool call only when its `capability` kind aligns
-// with what the tool is doing. A `read-fs:src/**` grant does NOT
-// authorize a `write_file` call (write_file emits write-fs, not just
-// read-fs), even though the path glob matches.
+// Grants — per-section relevance filter. A pattern grant authorizes
+// a tool call only when its `capability` kind aligns with what the
+// tool is doing. A `read-fs:src/**` grant does NOT authorize a
+// `write_file` call (write_file emits write-fs, not just read-fs),
+// even though the path glob matches.
 //
-// Slice 40 ships scope_kind='pattern' only; scope_kind='capability'
-// is a follow-up. Pattern grants check ONE direction (kind prefix);
+// Today only scope_kind='pattern' is wired; scope_kind='capability'
+// is future work. Pattern grants check ONE direction (kind prefix);
 // capability grants will use `capabilityCovers` against the resolved
 // caps.
 const grantRelevantForSection = (
@@ -485,9 +473,9 @@ const grantRelevantForSection = (
   switch (section) {
     case 'bash':
       // Bash multi-emits (exec/read-fs/write-fs/delete-fs/net-egress/
-      // git-write per slice 26 footprint). Slice 40 narrows: only
-      // `exec:`-prefixed grants authorize bash commands. Future
-      // capability-scope grants can cover the other kinds.
+      // git-write footprint). Only `exec:`-prefixed grants authorize
+      // bash commands here. Future capability-scope grants can cover
+      // the other kinds.
       return kindPrefix === 'exec';
     case 'read_file':
     case 'glob':
@@ -505,9 +493,9 @@ const grantRelevantForSection = (
   }
 };
 
-// §8 grants — first matching grant for the given target. Returns
-// the full snapshot (not just the pattern) so the caller can record
-// the grant id and expires_at on the Decision / audit row.
+// First matching grant for the given target. Returns the full
+// snapshot (not just the pattern) so the caller can record the
+// grant id and expires_at on the Decision / audit row.
 const firstMatchingGrant = (
   grants: readonly GrantSnapshot[] | undefined,
   section: keyof PolicyToolsSection,
@@ -574,8 +562,8 @@ const checkBash = (
     };
   }
 
-  // §8 persisted grant check. Runs AFTER deny (deny always wins,
-  // even over an operator-granted exemption) and BEFORE the in-memory
+  // Persisted grant check. Runs AFTER deny (deny always wins, even
+  // over an operator-granted exemption) and BEFORE the in-memory
   // session-allow + compound guard. A matching grant carries the
   // operator's prior approval forward across session boundaries.
   // Compound guard is intentionally bypassed — same rationale as
@@ -619,15 +607,16 @@ const checkBash = (
   // silenced narrows the policy with a deny exception, runs the
   // commands separately, or session-allows the literal pattern
   // (the path that already cleared the modal once).
-  // Slice 177 (review — P1). The bash prompt previously interpolated
-  // the literal command into the operator-visible `prompt` field:
-  // `Run bash: curl -H "Authorization: Bearer SECRET" ...`. The IPC
-  // envelope (for subagent confirm) carries this prompt verbatim;
-  // future telemetry / structured-event consumers can log it. Redact
-  // BEFORE interpolation so secrets never reach the prompt string.
-  // The operator's modal STILL renders the raw `args` block alongside
-  // the prompt, so the operator can see the literal command for the
-  // decision; only the prompt-line hint is sanitized.
+  //
+  // The bash prompt interpolates the literal command into the
+  // operator-visible `prompt` field: `Run bash: curl -H
+  // "Authorization: Bearer SECRET" ...`. The IPC envelope (for
+  // subagent confirm) carries this prompt verbatim; structured-event
+  // consumers can log it. Redact BEFORE interpolation so secrets
+  // never reach the prompt string. The operator's modal STILL
+  // renders the raw `args` block alongside the prompt, so the
+  // operator can see the literal command for the decision; only the
+  // prompt-line hint is sanitized.
   const promptCommand = redactSecrets(command);
   if (containsShellInjection(command)) {
     return {
@@ -684,14 +673,14 @@ const matchTargetForRules = (toolName: string, path: string): string =>
 // just like the matcher catches it for rule matching.
 //
 // Always normalizes lexically via `path.resolve(cwd, rawPath)` first
-// — even when `rawPath` is already absolute. This closes the slice-28
-// finding where `/work/proj/data/../../etc/hosts` in a fictional cwd
-// stayed un-normalized (both realpath fallbacks ENOENT-failed,
-// textual abs was returned with the `/work/proj/` prefix intact, and
-// the protected classifier missed the underlying `/etc/` target).
-// `path.resolve` does the .. and `./` resolution lexically without
-// touching the filesystem; realpath then refines for symlinks if the
-// resolved target exists.
+// — even when `rawPath` is already absolute. Without this,
+// `/work/proj/data/../../etc/hosts` in a fictional cwd stays
+// un-normalized (both realpath fallbacks ENOENT-fail, textual abs
+// returns with the `/work/proj/` prefix intact, and the protected
+// classifier misses the underlying `/etc/` target). `path.resolve`
+// does the .. and `./` resolution lexically without touching the
+// filesystem; realpath then refines for symlinks if the resolved
+// target exists.
 //
 // realpath fails on paths that don't exist (write_file creating a
 // new file); fall back to realpathing the parent + joining the
@@ -735,14 +724,14 @@ const checkPath = (
   const layer = sectionLayer(provenance, sectionKey);
   const sectionName = sectionKey;
 
-  // Protected-path classification per PERMISSION_ENGINE.md §11.
-  // Runs against the SYMLINK-RESOLVED absolute form so a symlink
-  // inside cwd pointing at /etc/passwd is still classified as
-  // protected. Tier `deny` returns immediately (any op, any rule).
-  // Tier `escalate` is carried as a flag — if downstream rule
-  // lookup produces `allow`, we upgrade it to `confirm` per
-  // §11's "write/delete sempre escala pra confirm no mínimo".
-  // Reads of escalate-tier paths pass through unchanged.
+  // Protected-path classification. Runs against the SYMLINK-RESOLVED
+  // absolute form so a symlink inside cwd pointing at /etc/passwd is
+  // still classified as protected. Tier `deny` returns immediately
+  // (any op, any rule). Tier `escalate` is carried as a flag — if
+  // downstream rule lookup produces `allow`, we upgrade it to
+  // `confirm` (write/delete on a protected path always escalates to
+  // confirm at minimum). Reads of escalate-tier paths pass through
+  // unchanged.
   const protectedAbsPath = resolveForProtected(path, cwd);
   const protectedTier: ProtectedTier | null = classifyProtectedPath({
     absPath: protectedAbsPath,
@@ -758,23 +747,23 @@ const checkPath = (
     };
   }
 
-  // SEC §8.4 sensitive-path engine-floor refuse (slice 159). Pairs
-  // with the §11 protected-zone check above: §11 covers system-root
-  // paths fixed by OS layout, §8.4 covers content-based secrets that
+  // Sensitive-path engine-floor refuse. Pairs with the protected-
+  // zone check above: protected-zone covers system-root paths fixed
+  // by OS layout, sensitive-path covers content-based secrets that
   // match by NAME regardless of where they live in the fs (.env,
   // *.pem, id_rsa*, .aws/credentials, **/credentials*.json, etc.).
   //
   // This fires BEFORE deny_paths / session_allow / allow_paths
-  // because the spec is explicit: "Paths nessa lista são bloqueados
-  // de: 1. read_file (qualquer tool de leitura); 2. write_file
-  // (qualquer tool de write)". Operator cannot widen via policy —
-  // same engine-floor posture as HARD_REFUSE_COMMANDS in the bash
-  // resolver. Threat: model emits `read_file('.env')` against a
-  // policy with `allow_paths: ['**']` (the "let it work" config many
-  // operators write); without this gate the read succeeds and
-  // secrets land in `tool_calls.output`. Spec §8.4 explicitly says
-  // "Por que isso não vira redaction: checkpoint precisa conteúdo
-  // literal" — refuse is the only correct posture.
+  // because the deny is an engine-floor: paths on this list are
+  // blocked from read_file (any read tool) and write_file (any write
+  // tool). Operator cannot widen via policy — same engine-floor
+  // posture as HARD_REFUSE_COMMANDS in the bash resolver. Threat:
+  // model emits `read_file('.env')` against a policy with
+  // `allow_paths: ['**']` (the "let it work" config many operators
+  // write); without this gate the read succeeds and secrets land in
+  // `tool_calls.output`. Redaction is not an option because
+  // checkpoint needs literal content — refuse is the only correct
+  // posture.
   //
   // Match against the canonical absolute (already symlink-resolved
   // by resolveForProtected) AND the operator-supplied path form, so
@@ -805,12 +794,12 @@ const checkPath = (
       source: { layer, rule: denied, section: sectionName },
     };
   }
-  // §8 persisted grant check. Same position as for bash: after deny,
+  // Persisted grant check. Same position as for bash: after deny,
   // before session-allow. A grant carrying a path pattern that
   // matches the resolved fs target authorizes the call. Protected-
   // path `escalate` tier still upgrades the decision to confirm —
-  // the grant authorizes the WRITE attempt, but §11 demands a
-  // confirm-on-protected even with prior approval.
+  // the grant authorizes the WRITE attempt, but a confirm-on-
+  // protected is mandatory even with prior approval.
   const grantMatch = firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd);
   if (grantMatch !== null) {
     if (protectedTier === 'escalate') {
@@ -868,11 +857,12 @@ const checkPath = (
   }
   const confirm = firstMatchingPath(rules?.confirm_paths, matchTarget, cwd);
   if (confirm !== null) {
-    // acceptEdits per AGENTIC_CLI §8: "aceita edits sem confirmação".
-    // For writes, a confirm_paths match becomes an auto-allow — that IS
-    // the convenience the mode promises. Reads still require confirmation.
+    // acceptEdits accepts edits without confirmation. For writes, a
+    // confirm_paths match becomes an auto-allow — that IS the
+    // convenience the mode promises. Reads still require confirmation.
     // BUT: protected-tier `escalate` paths block the auto-accept —
-    // §11's "no mínimo confirm" wins over acceptEdits's convenience.
+    // the "at minimum, confirm" floor wins over acceptEdits's
+    // convenience.
     if (mode === 'acceptEdits' && isWrite && protectedTier !== 'escalate') {
       return {
         kind: 'allow',
@@ -931,7 +921,7 @@ const checkFetch = (
       source: { layer, rule: denied, section: 'fetch_url' },
     };
   }
-  // §8 persisted grant check. Pattern grants targeting hosts use the
+  // Persisted grant check. Pattern grants targeting hosts use the
   // same matcher as `allow_hosts` (case-insensitive host glob).
   const grantMatch = firstMatchingGrant(activeGrants, 'fetch_url', host, '');
   if (grantMatch !== null) {
@@ -1000,58 +990,30 @@ const policySectionFor = (
 
 // Map an engine Decision to the discrete audit row enum. The audit
 // log distinguishes pre-modal 'confirm' from post-modal 'confirm-
-// allowed' / 'confirm-denied' — the post-modal update path lands
-// in the modal-bridge slice. Today every `confirm` returned from
-// `check()` is the pre-modal form.
+// allowed' / 'confirm-denied' — the post-modal update path lives
+// elsewhere. Every `confirm` returned from `check()` is the pre-
+// modal form.
 const decisionToAuditEnum = (kind: Decision['kind']): 'allow' | 'deny' | 'confirm' => kind;
 
-// Build the reason chain entry for a Decision. Each stage produces
-// one entry — for now the engine emits a single entry capturing the
-// final stage. Future slices append entries from `resolve`,
-// `risk-score`, `classifier`, `sandbox-plan`, `approval-gate` per
-// spec §6.
-//
-// Stage selection order:
-//   - 'protected-path' — Decision was produced by §11 (deny or
-//     escalate). Detected via `source.section === 'protected'`.
-//   - 'session-allow' — operator promoted a rule into the in-memory
-//     session allowlist (`source.layer === 'session'`).
-//   - 'static-rule' — a configured allow/deny/confirm rule matched
-//     (rule literal present in `source`).
-//   - 'default-deny' — no rule matched and the engine fell through
-//     to default-deny (`kind === 'deny'` AND no rule).
-//   - 'engine-default' — engine-internal allow path (bypass mode,
-//     misc category) with no rule consulted.
-// Upgrade an `allow` Decision into a `confirm` for the degraded path
-// (spec §2: "toda decisão `allow` automática vira `confirm`").
-// Preserves source attribution so the modal still shows the rule that
-// would have fired; the reason explicitly cites the degraded state
-// so operators see why a normally-silent allow surfaced as a prompt.
-// Non-allow decisions pass through unchanged — degraded never
-// downgrades a `deny` or `confirm`.
-//
-// Slice 139 C3: spread `decision` so non-source fields survive
-// — `approvalSeq`, `sandboxProfile`, `ttlExpiresAt` (load-bearing
-// for grant-match audit rows: pre-fix the rebuild dropped them and
-// `ttl_expires_at` in `approvals_log` landed `null` even when a
-// grant authorized the call). The `kind`, `prompt`, and `reason`
-// fields below intentionally override the spread values — we want
-// the post-degrade shape, not the pre-degrade allow shape.
-// Slice 169 (review — wrong-info P0 #1). Pre-slice this function
-// hardcoded "degraded state" prompt + reason regardless of cause —
-// it was also invoked when the score gate or resolver-confidence
-// gate forced an upgrade with a perfectly READY engine. Audit row +
-// modal text claimed the engine was degraded; `agent doctor` /
-// `state.transition` events disagreed. Operators saw conflicting
-// signals and could dismiss legitimate score-driven confirms as
-// "stuck degraded modal".
-//
-// Post-slice the cause is explicit. Three flavors:
+// Upgrade an `allow` Decision into a `confirm`. The cause is
+// explicit so the modal prompt + audit row accurately name what
+// fired (a previous version hardcoded "degraded state" regardless of
+// cause, so score-gated confirms on a perfectly READY engine were
+// mis-labeled). Three flavors:
 //   - 'degraded' — engine actually in degraded state.
 //   - 'score'    — risk score crossed threshold OR resolver
-//                  confidence was low (the §6.6 approval gate).
+//                  confidence was low (the approval gate).
 //   - 'resolver' — resolver returned conservative / low confidence
-//                  via the slice 92 forced-confirm path.
+//                  via the forced-confirm path.
+//
+// Preserves source attribution so the modal still shows the rule
+// that would have fired. Non-allow decisions pass through unchanged
+// — never downgrades a `deny` or `confirm`. Spreads `decision` so
+// non-source fields survive — `approvalSeq`, `sandboxProfile`,
+// `ttlExpiresAt` (load-bearing for grant-match audit rows: dropping
+// them would leave `ttl_expires_at` null even when a grant
+// authorized the call). The `kind`, `prompt`, and `reason` fields
+// below intentionally override the spread values.
 //
 // `detail` carries the metric for the audit row + modal preview
 // (e.g., `score=0.62 >= 0.40`, `confidence=low`, `conservative: <reason>`).
@@ -1110,23 +1072,18 @@ const resolverStageEntry = (result: ResolverResult | null): ReasonChainEntry | u
   return undefined;
 };
 
-// §6.6 row 4-5: a would-be `allow` upgrades to `confirm` when EITHER
-// the final score (deterministic + clamped classifier adjust) crosses
-// the threshold OR the resolver confidence is `low`. The two
-// conditions are independent — high/medium-confidence + low-score
-// allows pass through; only score≥threshold or confidence='low'
-// escalates. Only `allow` is gated (deny/confirm are already terminal
-// for this purpose). Misc tools skip the resolver and run at `high`
-// confidence with score 0, so they never trigger this gate. Caller
-// passes `null` confidence for misc to short-circuit.
-//
-// Slice 169 (review — wrong-info P0 #2). Pre-slice this returned
-// true for `confidence !== 'high'` (matching both `medium` and
-// `low`). Spec §5.1 lines 224-228 + the in-file comment at the
-// gateConfidence derivation explicitly stated medium does NOT
-// force. The code disagreed → every medium-confidence allow got
-// escalated, generating approval fatigue + poisoning the §6.3.2
-// calibration plan's `confidence` signal. Fixed to `=== 'low'`.
+// A would-be `allow` upgrades to `confirm` when EITHER the final
+// score (deterministic + clamped classifier adjust) crosses the
+// threshold OR the resolver confidence is `low`. The two conditions
+// are independent — high/medium-confidence + low-score allows pass
+// through; only score≥threshold or confidence='low' escalates.
+// medium confidence intentionally does NOT force (over-escalating
+// medium would generate approval fatigue and poison the calibration
+// plan's `confidence` signal). Only `allow` is gated (deny/confirm
+// are already terminal for this purpose). Misc tools skip the
+// resolver and run at `high` confidence with score 0, so they never
+// trigger this gate. Caller passes `null` confidence for misc to
+// short-circuit.
 const scoreForcesConfirm = (
   decision: Decision,
   score: number,
@@ -1144,7 +1101,7 @@ const scoreForcesConfirm = (
 // `confidence=Y`) so the modal preview can render "Risk score: 0.62
 // (above 0.40 threshold)" verbatim. Distinct from `resolve` (which
 // fires on Conservative/low specifically — those are still attributed
-// to the resolver) because §6.6's score-threshold rule is an engine-
+// to the resolver) because the score-threshold rule is an engine-
 // level gate over a successful resolver result, not a resolver
 // outcome itself.
 const approvalGateStageEntry = (
@@ -1158,18 +1115,18 @@ const approvalGateStageEntry = (
       note: `score=${score.toFixed(2)} >= threshold=${threshold.toFixed(2)}`,
     };
   }
-  // Slice 169: parallel to the `scoreForcesConfirm` fix — only
-  // `low` confidence forces the gate, not `medium`.
+  // Only `low` confidence forces the gate, not `medium` (parallel to
+  // the `scoreForcesConfirm` rule).
   if (confidence === 'low') {
     return { stage: 'approval-gate', note: 'confidence=low' };
   }
   return undefined;
 };
 
-// Slice 169: compute the detail string passed into
-// `degradeAllowToConfirm` so the modal/audit accurately names what
-// caused the upgrade. Returns null when neither side fired (caller
-// shouldn't be calling us then).
+// Compute the detail string passed into `degradeAllowToConfirm` so
+// the modal/audit accurately names what caused the upgrade. Returns
+// 'unspecified' when neither side fired (caller shouldn't be calling
+// us then).
 const approvalGateDetail = (
   score: number,
   confidence: RiskScoreConfidence | null,
@@ -1182,9 +1139,9 @@ const approvalGateDetail = (
   return 'unspecified';
 };
 
-// Slice 169: detail for the resolver-driven confirm path. Mirrors
-// the existing `resolverStageEntry` shape so the modal prompt
-// matches the reason-chain note.
+// Detail for the resolver-driven confirm path. Mirrors the existing
+// `resolverStageEntry` shape so the modal prompt matches the
+// reason-chain note.
 const resolverDetail = (result: ResolverResult | null): string => {
   if (result === null) return 'unspecified';
   if (result.kind === 'conservative') return `conservative: ${result.reason}`;
@@ -1192,12 +1149,11 @@ const resolverDetail = (result: ResolverResult | null): string => {
   return 'unspecified';
 };
 
-// Reason-chain entry tagged `sandbox-plan` (PERMISSION_ENGINE.md §6.5).
-// Fires every time the sandbox planner runs — for both ok (chosen
-// profile recorded) and refuse (uncovered capability kinds named)
-// outcomes. Lets `/perms why` render "this call needed delete-fs +
-// net-egress but no profile permits both" without re-running the
-// planner.
+// Reason-chain entry tagged `sandbox-plan`. Fires every time the
+// sandbox planner runs — for both ok (chosen profile recorded) and
+// refuse (uncovered capability kinds named) outcomes. Lets
+// `/perms why` render "this call needed delete-fs + net-egress but
+// no profile permits both" without re-running the planner.
 const sandboxPlanStageEntry = (result: SelectSandboxProfileResult): ReasonChainEntry => {
   if (result.kind === 'ok') {
     return { stage: 'sandbox-plan', note: `profile=${result.profile}` };
@@ -1213,41 +1169,38 @@ const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   if (decision.source?.section === 'protected') {
     stage = 'protected-path';
   } else if (decision.source?.section === 'engine-state') {
-    // Slice 169 (review — wrong-info P0 #3). State-rejecting denies
-    // (engine in init/loading/validating/refusing) used to fall
-    // through to `default-deny` — forensic queries for "decisions
-    // refused while engine was in state X" returned zero rows.
-    // Per spec §6.0 canonical taxonomy this is `engine-state`.
+    // State-rejecting denies (engine in
+    // init/loading/validating/refusing). Distinct from
+    // `default-deny` so forensic queries for "decisions refused
+    // while engine was in state X" can find them.
     stage = 'engine-state';
   } else if (decision.source?.section === 'resolver-refuse') {
-    // Slice 169: resolver-floor refuses (HARD_REFUSE_COMMANDS,
-    // RED_FLAG_NODES, SSRF blocklist, etc. — §5.2 M3) used to be
-    // labeled `default-deny`. Per spec §6.0 they are distinct from
-    // operator-policy denies because operator cannot widen them.
+    // Resolver-floor refuses (HARD_REFUSE_COMMANDS, RED_FLAG_NODES,
+    // SSRF blocklist, etc). Distinct from operator-policy denies
+    // because operator cannot widen them.
     stage = 'resolver-refuse';
   } else if (decision.source?.section === 'sandbox-plan' && decision.kind === 'deny') {
-    // Slice 169: sandbox-plan REFUSE (uncovered capability set or
-    // sandbox required + unavailable). The existing
-    // `sandboxPlanStageEntry` appends a second `sandbox-plan` entry
-    // describing the planner state. The FIRST entry's stage should
-    // reflect that the call was REFUSED at sandbox-plan time, not
-    // mis-labeled as `default-deny`. Per spec §6.0: `sandbox-refused`.
+    // Sandbox-plan REFUSE (uncovered capability set or sandbox
+    // required + unavailable). The existing `sandboxPlanStageEntry`
+    // appends a second `sandbox-plan` entry describing the planner
+    // state. The FIRST entry's stage reflects that the call was
+    // REFUSED at sandbox-plan time, not `default-deny`.
     stage = 'sandbox-refused';
   } else if (decision.source?.section === 'subagent-effective') {
-    // §10.1 child-envelope deny (slice 95). Distinct stage so audit
-    // replays and `/perms why` rendering can tell the operator the
-    // call was refused because it stepped OUTSIDE what the subagent
-    // declared — not because the parent's policy refused it. The
-    // distinction matters for triage: the operator's policy might
-    // already authorize the requested cap, but the SUBAGENT's
-    // declared envelope didn't.
+    // Child-envelope deny. Distinct stage so audit replays and
+    // `/perms why` rendering can tell the operator the call was
+    // refused because it stepped OUTSIDE what the subagent declared
+    // — not because the parent's policy refused it. The distinction
+    // matters for triage: the operator's policy might already
+    // authorize the requested cap, but the SUBAGENT's declared
+    // envelope didn't.
     stage = 'subagent-effective';
   } else if (decision.source?.section === 'grants') {
-    // §8 grant match — checked before the generic session-allow
-    // branch (grant decisions carry both `section='grants'` and
+    // Grant match — checked before the generic session-allow branch
+    // (grant decisions carry both `section='grants'` and
     // `layer='session'`). Distinct stage so audit replays and
-    // `/perms why` rendering can distinguish a PERSISTED grant
-    // from a transient session-allow.
+    // `/perms why` rendering can distinguish a PERSISTED grant from
+    // a transient session-allow.
     stage = 'grant-match';
   } else if (decision.source?.layer === 'session') {
     stage = 'session-allow';
@@ -1270,12 +1223,12 @@ export const createPermissionEngine = (
   initialPolicy: Policy,
   options: EngineOptions,
 ): PermissionEngine => {
-  // §12.3 hot reload: policy / mode / policyHash are mutable cells
-  // so `reloadPolicy()` can swap them atomically. JS `let` bindings
-  // are by-reference in closures, so check() (and every helper it
-  // calls through this scope) reads the CURRENT value on each
-  // access — no extra plumbing needed. The reloadPolicy method at
-  // the bottom of this factory updates all three.
+  // Hot reload: policy / mode / policyHash are mutable cells so
+  // `reloadPolicy()` can swap them atomically. JS `let` bindings are
+  // by-reference in closures, so check() (and every helper it calls
+  // through this scope) reads the CURRENT value on each access — no
+  // extra plumbing needed. The reloadPolicy method at the bottom of
+  // this factory updates all three.
   let policy = initialPolicy;
   // Mode is optional on parsed policies (so the resolver can tell
   // "user file was silent" from "user file said strict explicitly")
@@ -1284,11 +1237,11 @@ export const createPermissionEngine = (
   let mode: PolicyMode = policy.defaults.mode ?? 'strict';
   const cwd = options.cwd;
   const home = options.home ?? process.env.HOME ?? cwd;
-  // Slice 139 C4: mutable so reloadPolicy can swap. Pre-slice this
-  // was `const`, which made every `/perms why` and `source.layer`
-  // audit field stale post-reload — the engine kept the
-  // construction-time hierarchy attribution even when the watcher
-  // resolved a fresh policy from a different layer.
+  // Mutable so reloadPolicy can swap. A const would make every
+  // `/perms why` and `source.layer` audit field stale post-reload —
+  // the engine would keep the construction-time hierarchy
+  // attribution even when the watcher resolved a fresh policy from a
+  // different layer.
   let provenance = options.provenance;
   const audit = options.audit ?? createNoopSink();
   const sessionId = options.sessionId ?? 'session-anon';
@@ -1321,24 +1274,23 @@ export const createPermissionEngine = (
   const classifierRequired = options.classifierRequired ?? false;
   const telemetry = options.telemetry;
   const telemetryNow = options.now ?? Date.now;
-  // §6.6 score threshold. Caller can override for calibration sweeps
-  // or per-deployment tuning; default is the v2 baseline (0.4).
+  // Score threshold. Caller can override for calibration sweeps or
+  // per-deployment tuning; default is the v2 baseline (0.4).
   const scoreConfirmThreshold = options.scoreConfirmThreshold ?? DEFAULT_SCORE_CONFIRM_THRESHOLD;
   const contextSummaryDepth = options.contextSummaryDepth ?? DEFAULT_CONTEXT_SUMMARY_DEPTH;
   const contextSummaryMaxBytes =
     options.contextSummaryMaxBytes ?? DEFAULT_CONTEXT_SUMMARY_MAX_BYTES;
   const contextSummaryBuffer = createContextSummaryBuffer(contextSummaryDepth);
   const sandboxOptions = options.sandbox;
-  // §10.1 child-envelope bound (slice 95). `undefined` ⇒ root /
-  // legacy: skip the stage entirely. Empty array ⇒ pure-LLM child:
-  // any non-empty resolved cap is uncovered → deny. Non-empty
-  // ⇒ narrowed envelope: every resolved cap must be covered by
-  // `effectiveCovers`.
+  // Child-envelope bound. `undefined` ⇒ root: skip the stage
+  // entirely. Empty array ⇒ pure-LLM child: any non-empty resolved
+  // cap is uncovered → deny. Non-empty ⇒ narrowed envelope: every
+  // resolved cap must be covered by `effectiveCovers`.
   const effectiveCapabilities = options.effectiveCapabilities;
   // policy_hash is stamped on every audit row. Recomputed on hot
-  // reload (§12.3 / slice 51) so post-swap rows carry the new
-  // hash. Canonical hash so two engines with semantically
-  // equivalent policies produce the same hash.
+  // reload so post-swap rows carry the new hash. Canonical hash so
+  // two engines with semantically equivalent policies produce the
+  // same hash.
   let policyHash = `sha256:${canonicalHash(policy)}`;
 
   // Session-scoped allowlist: per-section list of patterns the
@@ -1392,13 +1344,13 @@ export const createPermissionEngine = (
       // forensically distinct from "consulted but returned 0".
       classifier_hash: classifierHash,
       classifier_adjust: classifierAdjust,
-      // §6.5 chosen profile. Null when the sandbox planner didn't
+      // Chosen sandbox profile. Null when the sandbox planner didn't
       // run (no EngineOptions.sandbox) OR when the call refused
       // before it reached the planner. A `sandbox-plan` reason-
       // chain entry pairs with this column on every row where the
       // planner ran (success or refusal).
       sandbox_profile: sandboxProfileForRow,
-      // §8 grant expiry. Populated when the Decision was produced
+      // Grant TTL expiry. Populated when the Decision was produced
       // by a persisted grant match (`decision.ttlExpiresAt`); null
       // otherwise. Future replay can correlate `ttl_expires_at` +
       // the `grant-match` reason chain stage to reconstruct the
@@ -1407,12 +1359,12 @@ export const createPermissionEngine = (
     };
     const emitted = audit.emit(input);
 
-    // §6.4: record THIS decision in the ring buffer so the NEXT
-    // check's classifier sees it. Capability KINDS only — scopes
-    // never enter the buffer (defense against leaking adversary-
-    // visible paths/hosts to a sometimes-remote classifier). Dedup
-    // kinds so a call with five `read-fs:...` capabilities lands
-    // as a single `read-fs` kind in the summary.
+    // Record THIS decision in the ring buffer so the NEXT check's
+    // classifier sees it. Capability KINDS only — scopes never
+    // enter the buffer (defense against leaking adversary-visible
+    // paths/hosts to a sometimes-remote classifier). Dedup kinds so
+    // a call with five `read-fs:...` capabilities lands as a single
+    // `read-fs` kind in the summary.
     const kindSet = new Set<CapabilityKind>();
     for (const cap of capabilities) kindSet.add(cap.kind);
     contextSummaryBuffer.push({
@@ -1424,29 +1376,29 @@ export const createPermissionEngine = (
   };
 
   // Attach `approvalSeq` to a Decision so the harness can link the
-  // audit row with the matching `tool_calls` row (§17 prerequisite).
-  // The noop sink returns seq=0 (no row persisted); we omit the field
-  // in that case so a downstream `linkApprovalToToolCall(seq=0)` call
-  // never fires under tests/headless paths.
+  // audit row with the matching `tool_calls` row. The noop sink
+  // returns seq=0 (no row persisted); we omit the field in that case
+  // so a downstream `linkApprovalToToolCall(seq=0)` call never fires
+  // under tests/headless paths.
   const withApprovalSeq = (decision: Decision, seq: number): Decision => {
     if (seq === 0) return decision;
     return { ...decision, approvalSeq: seq };
   };
 
   // Attach `sandboxProfile` to a Decision so the harness can thread
-  // it into ToolContext for runtime enforcement (§6.5 part 2). Omits
-  // the field when the planner didn't run (no `EngineOptions.sandbox`
-  // or refused branch); the runner-side wrap is a no-op without the
+  // it into ToolContext for runtime enforcement. Omits the field
+  // when the planner didn't run (no `EngineOptions.sandbox` or
+  // refused branch); the runner-side wrap is a no-op without the
   // hint.
   const withSandboxProfile = (decision: Decision, profile: string | null): Decision => {
     if (profile === null) return decision;
-    // Slice 125 (R2 P1): defense-in-depth validation. The
-    // `profile` param's domain is `selectSandboxProfile`'s return
-    // type, but a future code path that wires an external string
-    // here would silently launder past the type system via the
-    // cast. `isSandboxProfile` matches the wire-validation gate
-    // slice 103 added at the runner boundary; keeping the engine
-    // boundary symmetric ensures both sides refuse the same way.
+    // Defense-in-depth validation. The `profile` param's domain is
+    // `selectSandboxProfile`'s return type, but a future code path
+    // wiring an external string here would silently launder past the
+    // type system via the cast. `isSandboxProfile` matches the
+    // wire-validation gate at the runner boundary; keeping the
+    // engine boundary symmetric ensures both sides refuse the same
+    // way.
     if (!isSandboxProfile(profile)) {
       throw new Error(
         `withSandboxProfile: invalid profile '${profile}' — expected ro|cwd-rw|cwd-rw-net|home-rw|host`,
@@ -1456,14 +1408,14 @@ export const createPermissionEngine = (
   };
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
-    // State machine gate (PERMISSION_ENGINE.md §2 + §6 approval-gate).
-    // Runs BEFORE bypass and before any rule lookup: an engine in
-    // init / loading-policy / validating-chain hasn't proven it can
-    // safely decide anything; refusing is the fatal sink. In each
-    // of those states return deny with a state-specific reason so
-    // the operator (and audit log) sees exactly why. degraded falls
-    // through to the normal pipeline but with an allow → confirm
-    // upgrade after the decision is built.
+    // State machine gate. Runs BEFORE bypass and before any rule
+    // lookup: an engine in init / loading-policy / validating-chain
+    // hasn't proven it can safely decide anything; refusing is the
+    // fatal sink. In each of those states return deny with a
+    // state-specific reason so the operator (and audit log) sees
+    // exactly why. degraded falls through to the normal pipeline
+    // but with an allow → confirm upgrade after the decision is
+    // built.
     const currentState = stateController.get();
     if (isRejectingState(currentState)) {
       const decision: Decision = {
@@ -1475,14 +1427,13 @@ export const createPermissionEngine = (
       return withApprovalSeq(decision, e.seq);
     }
 
-    // Resolve capabilities (PERMISSION_ENGINE.md §5). Runs BEFORE
-    // bypass, before rule lookup — `Refuse` is structural rejection
-    // (dynamic eval, malformed args, no-safe-resolution commands
-    // like `dd`/`mkfs`) and trumps any allow rule. The resolved
-    // capabilities flow into the audit row and into the modal's
-    // preview; even a `bypass` mode decision carries an honest
-    // capability set so the operator can see what the model
-    // intended to consume.
+    // Resolve capabilities. Runs BEFORE bypass, before rule lookup —
+    // `Refuse` is structural rejection (dynamic eval, malformed
+    // args, no-safe-resolution commands like `dd`/`mkfs`) and trumps
+    // any allow rule. The resolved capabilities flow into the audit
+    // row and into the modal's preview; even a `bypass` mode
+    // decision carries an honest capability set so the operator can
+    // see what the model intended to consume.
     //
     // `misc` category skips resolution entirely — those tools are
     // declared "no side effects worth gating" and shouldn't pay
@@ -1495,16 +1446,15 @@ export const createPermissionEngine = (
       resolverResult = resolveCapabilities(toolName, args as Record<string, unknown>, {
         cwd,
         home,
-        // Slice 176 (review — command-bypass P0 #5). Wire realpath
-        // so the bash analyzer's per-arg classifier can detect
-        // symlink-shaped bypasses (e.g., `/work/proj/innocent.txt`
-        // → `/etc/shadow`). Best-effort: `realpathSync` throws for
-        // paths that don't exist (write-creates-new-file) and the
-        // resolver's helper falls back to the lexical form. The
-        // engine doesn't need to centralize the try/catch; the
-        // helper handles it. Production wiring only — tests that
-        // build ResolverContext directly omit `realpath` and stay
-        // on the lexical-only path.
+        // Wire realpath so the bash analyzer's per-arg classifier
+        // can detect symlink-shaped bypasses (e.g.,
+        // `/work/proj/innocent.txt` → `/etc/shadow`). Best-effort:
+        // `realpathSync` throws for paths that don't exist (write-
+        // creates-new-file) and the resolver's helper falls back to
+        // the lexical form. The engine doesn't need to centralize
+        // the try/catch; the helper handles it. Production wiring
+        // only — tests that build ResolverContext directly omit
+        // `realpath` and stay on the lexical-only path.
         realpath: realpathSync,
       });
       if (resolverResult.kind === 'refuse') {
@@ -1519,11 +1469,11 @@ export const createPermissionEngine = (
       resolvedCapabilities = resolverResult.capabilities;
     }
 
-    // §10.1 child-envelope check (slice 95). Runs AFTER resolver and
-    // BEFORE every downstream stage (risk score, classifier, sandbox
-    // plan, bypass, static rules, grants, session-allow). A subagent
-    // that emits a resolved capability OUTSIDE its declared envelope
-    // is structurally rejected — no policy rule can override.
+    // Child-envelope check. Runs AFTER resolver and BEFORE every
+    // downstream stage (risk score, classifier, sandbox plan,
+    // bypass, static rules, grants, session-allow). A subagent that
+    // emits a resolved capability OUTSIDE its declared envelope is
+    // structurally rejected — no policy rule can override.
     //
     // Misc-category tools land here with `resolvedCapabilities = []`
     // and trivially pass; pure-LLM children stay free to invoke
@@ -1544,13 +1494,12 @@ export const createPermissionEngine = (
       }
     }
 
-    // Compute the deterministic risk score (PERMISSION_ENGINE.md §6.3)
-    // once per check, from the resolved state. Used both for the
-    // audit row and (in a future slice) for the approval-gate
-    // escalation. Conservative resolver outcomes feed `low`
-    // confidence into the score; `null` resolver (misc category)
-    // feeds `high` since misc tools have no side effects worth
-    // scoring.
+    // Compute the deterministic risk score once per check, from the
+    // resolved state. Used both for the audit row and for the
+    // approval-gate escalation. Conservative resolver outcomes feed
+    // `low` confidence into the score; `null` resolver (misc
+    // category) feeds `high` since misc tools have no side effects
+    // worth scoring.
     const scoreConfidence: RiskScoreConfidence =
       resolverResult === null
         ? 'high'
@@ -1573,24 +1522,23 @@ export const createPermissionEngine = (
     };
     const { score: deterministicScore, components: scoreComponents } = computeRiskScore(riskInput);
 
-    // Classifier hint (PERMISSION_ENGINE.md §6.4). Hint-only — the
-    // classifier can adjust the score by ±0.2 clamped but cannot
-    // independently force a deny. Failures (offline, exception,
-    // schema invalid) emit `classifier-unavailable` in the reason
-    // chain and either continue (lenient default) or degrade the
-    // engine (strict mode). Misc category skips the classifier
-    // alongside the resolver — no side effects worth scoring AND
-    // no need to consult a hint.
+    // Classifier hint. Hint-only — the classifier can adjust the
+    // score by ±0.2 clamped but cannot independently force a deny.
+    // Failures (offline, exception, schema invalid) emit
+    // `classifier-unavailable` in the reason chain and either
+    // continue (lenient default) or degrade the engine (strict
+    // mode). Misc category skips the classifier alongside the
+    // resolver — no side effects worth scoring AND no need to
+    // consult a hint.
     let score = deterministicScore;
     let classifierAdjust: number | null = null;
     let classifierStage: ReasonChainEntry | null = null;
     if (classifier !== undefined && category !== 'misc') {
-      // PERMISSION_ENGINE.md §6.4: classifier sees a sanitized
-      // summary of recent activity. Built from the engine's ring
-      // buffer (capability KINDS only, never scopes/args/outputs)
-      // capped by `contextSummaryMaxBytes`. Empty string when the
-      // session has no prior decisions yet — the classifier degrades
-      // gracefully on absent context.
+      // Classifier sees a sanitized summary of recent activity.
+      // Built from the engine's ring buffer (capability KINDS only,
+      // never scopes/args/outputs) capped by `contextSummaryMaxBytes`.
+      // Empty string when the session has no prior decisions yet —
+      // the classifier degrades gracefully on absent context.
       const contextSummary = buildContextSummary(contextSummaryBuffer.snapshot(), {
         maxBytes: contextSummaryMaxBytes,
       });
@@ -1619,17 +1567,16 @@ export const createPermissionEngine = (
         // continues with the deterministic score.
         const reason = failed ? failureReason : 'unavailable';
         classifierStage = { stage: 'classifier-unavailable', note: reason };
-        // §18 classifier.unavailable telemetry (slice 74). Fires
-        // regardless of strict mode — the metric counts EVERY
-        // unavailable response across the install; the `strict`
-        // field distinguishes the operational impact. Wrapped in
-        // try/catch — observability cannot break engine.check.
-        // Categorize the failure mode: threw, unavailable
-        // (returned null), or invalid (returned non-conformant
-        // schema). The two non-throwing failures collapse here
-        // under `validated === null`, so we differentiate by
-        // whether rawOutput was non-null (invalid schema) or
-        // null (genuinely unavailable).
+        // Telemetry for classifier.unavailable. Fires regardless of
+        // strict mode — the metric counts EVERY unavailable response
+        // across the install; the `strict` field distinguishes the
+        // operational impact. Wrapped in try/catch — observability
+        // cannot break engine.check. Categorize the failure mode:
+        // threw, unavailable (returned null), or invalid (returned
+        // non-conformant schema). The two non-throwing failures
+        // collapse here under `validated === null`, so we
+        // differentiate by whether rawOutput was non-null (invalid
+        // schema) or null (genuinely unavailable).
         if (telemetry !== undefined) {
           try {
             const eventReason: 'unavailable' | 'threw' | 'invalid' = failed
@@ -1665,13 +1612,12 @@ export const createPermissionEngine = (
         };
       }
     }
-    // Sandbox plan stage (PERMISSION_ENGINE.md §6.5). Runs AFTER the
-    // classifier hint and BEFORE the bypass / static-rule branches.
-    // Optional — wired only when the caller passed `EngineOptions
-    // .sandbox`. When absent, the audit row's `sandbox_profile`
-    // stays null and the reason chain has no `sandbox-plan` entry
-    // (legacy callers / harness paths that don't yet snapshot
-    // sandbox availability skip the stage cleanly).
+    // Sandbox plan stage. Runs AFTER the classifier hint and BEFORE
+    // the bypass / static-rule branches. Optional — wired only when
+    // the caller passed `EngineOptions.sandbox`. When absent, the
+    // audit row's `sandbox_profile` stays null and the reason chain
+    // has no `sandbox-plan` entry (callers / harness paths that
+    // don't snapshot sandbox availability skip the stage cleanly).
     //
     // Refusal cases:
     //   - no_viable_sandbox → deny outright with
@@ -1725,14 +1671,12 @@ export const createPermissionEngine = (
     //   - Conservative outcome (the resolver couldn't pin a precise
     //     set; the operator deserves the modal).
     //   - Ok with `confidence: low` (genuinely ambiguous).
-    // We intentionally do NOT upgrade on `confidence: medium`.
-    // Spec §5.1 says "Confidence < high force human approval", but
-    // calibrating that against operator fatigue is the risk-score
-    // slice's job — medium covers "well-understood read-only with
-    // some uncertainty" (e.g. `find` against a path) and shouldn't
-    // pop the modal on every invocation. The slice 3 BACKLOG entry
-    // calls this out as an explicit decision to revisit when the
-    // scoring formula lands.
+    // Medium confidence intentionally does NOT upgrade. Calibrating
+    // that against operator fatigue is the risk-score's job —
+    // medium covers "well-understood read-only with some
+    // uncertainty" (e.g. `find` against a path) and shouldn't pop
+    // the modal on every invocation. Revisit when the scoring
+    // formula stabilizes.
     const resolverForcesConfirm =
       resolverResult !== null &&
       (resolverResult.kind === 'conservative' ||
@@ -1744,46 +1688,41 @@ export const createPermissionEngine = (
       // can find and undo it. No section/rule (mode-driven, not
       // rule-driven).
       //
-      // degraded loses the bypass shortcut (spec §2: "toda decisão
-      // `allow` automática vira `confirm`"). Resolver-driven
-      // confirm is a softer signal — operators who explicitly
-      // chose bypass are committing to the broader risk surface,
-      // and a Conservative result shouldn't undo that decision.
-      // The audit row still carries the resolved capabilities so
-      // the row remains a faithful summary of what the tool will
-      // touch, even when the decision was `allow`.
+      // degraded loses the bypass shortcut (every automatic `allow`
+      // becomes `confirm`). Resolver-driven confirm is a softer
+      // signal — operators who explicitly chose bypass are
+      // committing to the broader risk surface, and a Conservative
+      // result shouldn't undo that decision. The audit row still
+      // carries the resolved capabilities so the row remains a
+      // faithful summary of what the tool will touch, even when the
+      // decision was `allow`.
       //
-      // §11 protected-path classification (slice 97, R1 #4): spec
-      // §11 declares the protected paths as HARDCODED, not
-      // flexible-via-policy. Bypass is a policy mode, not an
-      // override of §11. Walk the resolved capability set and
-      // classify each fs-shaped scope: a `deny` tier (system
-      // pseudofs like /proc, /sys, /boot, /dev) refuses even
-      // under bypass; an `escalate` tier on a write op upgrades
-      // the bypass-allow to confirm so the operator sees the
-      // literal target before the rewrite commits. Reads of
-      // escalate-tier paths pass through unchanged — bypass is
-      // still bypass for the routine surface; only the §11
-      // hardcoded list trumps it.
+      // Protected-path classification: the protected paths are
+      // HARDCODED, not flexible-via-policy. Bypass is a policy mode,
+      // not an override of the protected-path floor. Walk the
+      // resolved capability set and classify each fs-shaped scope: a
+      // `deny` tier (system pseudofs like /proc, /sys, /boot, /dev)
+      // refuses even under bypass; an `escalate` tier on a write op
+      // upgrades the bypass-allow to confirm so the operator sees
+      // the literal target before the rewrite commits. Reads of
+      // escalate-tier paths pass through unchanged — bypass is still
+      // bypass for the routine surface; only the hardcoded protected
+      // list trumps it.
       let bypassProtectedTier: ProtectedTier | null = null;
       let bypassProtectedTarget = '';
       for (const cap of resolvedCapabilities) {
-        // Slice 179 (review — permission-bypass P2). `git-write`
-        // capability carries a fs-path scope (the target repo);
-        // pre-slice the loop only iterated the three direct fs
-        // kinds and a `git-write:<protected-path>` slipped past
-        // the bypass-mode §11 floor. Bypass mode skipping policy
-        // confirms is intentional; skipping the protected-path
-        // hardcoded floor is NOT — git-write to a path in §11's
-        // deny / escalate tier should refuse / confirm under
-        // bypass, same as a direct write-fs would.
+        // `git-write` capability carries an fs-path scope (the
+        // target repo). The protected-path floor must apply here
+        // too — git-write to a path in the deny / escalate tier
+        // should refuse / confirm under bypass, same as a direct
+        // write-fs would.
         //
         // Treat git-write as the WRITE op for classifier purposes
         // (a git push / commit / clone writes the repo's objects
         // dir; reading is not the dangerous side). Other non-fs
         // kinds (exec, net-egress, env-mutate, host-passthrough,
         // etc.) stay out of this loop by design — they're not
-        // path-shaped and the §11 classifier is path-only.
+        // path-shaped and the protected classifier is path-only.
         if (
           cap.kind !== 'read-fs' &&
           cap.kind !== 'write-fs' &&
@@ -1806,13 +1745,9 @@ export const createPermissionEngine = (
           const stages: ReasonChainEntry[] = [];
           if (classifierStage !== null) stages.push(classifierStage);
           if (sandboxStage !== null) stages.push(sandboxStage);
-          // Slice 177 (review — P1). The general bypass-mode exit
-          // below appends `degradedStageEntry` so the audit row
-          // surfaces whether the engine was in `degraded` /
-          // `boot-deny-all` at decision time. The bypass-deny
-          // short-circuit was omitting it — operator forensics on
-          // a deny row under bypass had no way to see the engine
-          // state. Match the general exit's chain shape.
+          // Match the general bypass-mode exit's chain shape so
+          // forensics on a deny row under bypass still surfaces the
+          // engine state (`degraded` / `boot-deny-all`).
           const degradedStage = degradedStageEntry(currentState);
           if (degradedStage !== undefined) stages.push(degradedStage);
           const e = emitAudit(
@@ -1828,12 +1763,11 @@ export const createPermissionEngine = (
           );
           return withSandboxProfile(withApprovalSeq(decision, e.seq), sandboxProfile);
         }
-        // SEC §8.4 sensitive-path engine-floor refuse (slice 159).
-        // Mirror the checkPath wire above — bypass mode does NOT
-        // override the sensitive-path deny list. Operator who set
-        // mode=bypass intends to skip CONFIRM prompts and policy
-        // matching, NOT to widen access to credentials. §8.4 patterns
-        // remain a hard floor.
+        // Sensitive-path engine-floor refuse. Mirror the checkPath
+        // wire above — bypass mode does NOT override the sensitive-
+        // path deny list. Operator who set mode=bypass intends to
+        // skip CONFIRM prompts and policy matching, NOT to widen
+        // access to credentials. These patterns remain a hard floor.
         const sensitiveBypassMatch =
           matchSensitivePath(protectedAbsPath) ?? matchSensitivePath(cap.scope);
         if (sensitiveBypassMatch !== null) {
@@ -1845,9 +1779,8 @@ export const createPermissionEngine = (
           const stages: ReasonChainEntry[] = [];
           if (classifierStage !== null) stages.push(classifierStage);
           if (sandboxStage !== null) stages.push(sandboxStage);
-          // Slice 177 (review — P1). Same engine-state stage gap as
-          // the bypass-deny path above. Add the entry for parity so
-          // a §8.4 deny under bypass shows the engine state too.
+          // Match the bypass-deny path above so a sensitive-path
+          // deny under bypass shows the engine state too.
           const degradedStage = degradedStageEntry(currentState);
           if (degradedStage !== undefined) stages.push(degradedStage);
           const e = emitAudit(
@@ -1923,8 +1856,8 @@ export const createPermissionEngine = (
         ? undefined
         : (policy.tools as unknown as Record<string, unknown>)[sectionKey];
 
-    // §8 grants snapshot. Sampled once per `check()` call against
-    // the current wall-clock so a long-running session sees a grant
+    // Grants snapshot. Sampled once per `check()` call against the
+    // current wall-clock so a long-running session sees a grant
     // revoked or expired mid-flight on its NEXT tool call (not this
     // one — atomicity is per-check, not per-tool-execution). When
     // `options.grants` is undefined, the snapshot is undefined and
@@ -2008,7 +1941,7 @@ export const createPermissionEngine = (
     // — the operator sees "rule X matched, but engine is degraded
     // so I'm asking anyway" in the modal. Same shape for
     // resolver-driven upgrade (Conservative or low confidence) and
-    // for the §6.6 approval-gate score/confidence rule.
+    // for the approval-gate score/confidence rule.
     //
     // Session-allow is intentionally exempt from the resolver AND
     // score upgrades: the operator already saw the modal once for
@@ -2036,10 +1969,10 @@ export const createPermissionEngine = (
       gateConfidence,
       scoreConfirmThreshold,
     );
-    // Slice 169 (review — wrong-info P0 #1): pass the actual cause
-    // so the modal prompt + audit reason name what really fired.
-    // Priority: degraded > resolver-forced > score-gated (matches
-    // the tailStage selection below for consistency).
+    // Pass the actual cause so the modal prompt + audit reason name
+    // what really fired. Priority: degraded > resolver-forced >
+    // score-gated (matches the tailStage selection below for
+    // consistency).
     if (currentState === 'degraded') {
       decision = degradeAllowToConfirm(decision, 'degraded', `state=${currentState}`);
     } else if (resolverForcesConfirm && !sessionAllowed) {
@@ -2113,11 +2046,10 @@ export const createPermissionEngine = (
     view,
     mode: () => mode,
     state: () => stateController.get(),
-    // §13.6 reason plumbing (slice 93). Walks history backwards
-    // for the most recent transition INTO degraded — that's the
-    // root cause until a `restore()` flips state back to ready
-    // (which itself produces a transition pair, so the next
-    // degrade after restore overwrites this lookup).
+    // Walks history backwards for the most recent transition INTO
+    // degraded — that's the root cause until a `restore()` flips
+    // state back to ready (which itself produces a transition pair,
+    // so the next degrade after restore overwrites this lookup).
     getDegradedReason: (): string | undefined => {
       if (stateController.get() !== 'degraded') return undefined;
       const history = stateController.history();
@@ -2149,15 +2081,14 @@ export const createPermissionEngine = (
     policy: () => structuredClone(policy),
     effectiveCapabilities: () => {
       if (effectiveCapabilities === undefined) return null;
-      // Slice 129 (R5 P1 immutability): callers consume this to
-      // build child-engine constraint envelopes and to render
-      // /perms introspection — both should treat the value as
-      // read-only. Pre-slice the per-call `.map((c) => ({ ...c }))`
-      // produced a fresh mutable array of fresh mutable objects.
-      // A caller could mutate an element and pass the array back
-      // into another engine constructor, silently widening the
-      // child's constraint set. freeze the elements AND the array
-      // so any such mutation throws in strict mode.
+      // Callers consume this to build child-engine constraint
+      // envelopes and to render /perms introspection — both should
+      // treat the value as read-only. A naive `.map((c) => ({ ...c
+      // }))` produces a fresh mutable array of fresh mutable
+      // objects; a caller could mutate an element and pass the
+      // array back into another engine constructor, silently
+      // widening the child's constraint set. Freeze the elements
+      // AND the array so any such mutation throws in strict mode.
       const cloned = effectiveCapabilities.map((c) => Object.freeze({ ...c }));
       return Object.freeze(cloned);
     },
@@ -2168,35 +2099,31 @@ export const createPermissionEngine = (
     // (test-built engines, headless dry-runs), default to the
     // sentinel "everything is the built-in default" shape.
     //
-    // Reads from the MUTABLE `provenance` local — slice 139 C4 made
-    // it swappable via `reloadPolicy(_, newProvenance)` but the
-    // earlier cut still read from `options.provenance` here,
-    // returning the construction-time snapshot. After a hot reload
-    // moved a section between layers, `/perms` and audit
-    // interpretation would keep reporting the OLD attribution while
-    // enforcement + hashes had already swapped — diagnostic drift
-    // visible to operators trying to verify a reload took effect.
+    // Reads from the MUTABLE `provenance` local so `reloadPolicy(_,
+    // newProvenance)` swaps take effect here too — otherwise
+    // `/perms` and audit interpretation would keep reporting the
+    // OLD attribution while enforcement + hashes had already
+    // swapped.
     provenance: () => structuredClone(provenance ?? ({ defaults: 'default' } as SectionProvenance)),
     addSessionAllow,
-    // §12.3 hot reload — atomic swap of policy + recompute hash +
-    // mode. Caller responsibility: resolve hierarchy, validate
-    // shape, check lock conflicts BEFORE invoking. Engine does
-    // minimal defensive checks (`canonicalHash` succeeds, `defaults`
-    // field present) and either commits the swap or returns a
-    // diagnostic. Single-threaded JS means in-flight check() calls
-    // run to completion before this fires.
+    // Hot reload — atomic swap of policy + recompute hash + mode.
+    // Caller responsibility: resolve hierarchy, validate shape,
+    // check lock conflicts BEFORE invoking. Engine does minimal
+    // defensive checks (`canonicalHash` succeeds, `defaults` field
+    // present) and either commits the swap or returns a diagnostic.
+    // Single-threaded JS means in-flight check() calls run to
+    // completion before this fires.
     reloadPolicy: (newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult => {
-      // Slice 163 (review — Batch A audit hardening). Refuse the
-      // reload when the engine is in `refusing` state. Pre-slice the
-      // policy-watcher would keep firing reloads on YAML edits even
-      // after the engine refused (sealing failure, chain break,
-      // mandatory-sandbox-unavailable, etc.). Each reload swapped
-      // policy/policyHash/mode/provenance and emitted a
-      // `policy-reloaded` audit row with `decision: 'allow'` — but
-      // every actual `check()` returned deny ("engine not ready").
-      // Forensic tools (`permission diff`, `permission replay`)
-      // would later believe the engine operated under the new
-      // policy when it was actually refusing.
+      // Refuse the reload when the engine is in `refusing` state.
+      // Otherwise the policy-watcher would keep firing reloads on
+      // YAML edits after a sealing failure / chain break /
+      // mandatory-sandbox-unavailable, swapping policy / policyHash
+      // / mode / provenance and emitting `policy-reloaded` audit
+      // rows with `decision: 'allow'` — while every actual
+      // `check()` returned deny. Forensic tools (`permission diff`,
+      // `permission replay`) would later believe the engine
+      // operated under the new policy when it was actually
+      // refusing.
       //
       // Refusing is terminal; the only path out is a fresh engine
       // (CLI reset, --accept-broken-chain, etc.). While in this
@@ -2228,11 +2155,10 @@ export const createPermissionEngine = (
       policy = newPolicy;
       policyHash = newHash;
       mode = newPolicy.defaults.mode ?? 'strict';
-      // Slice 139 C4: swap provenance alongside policy when the
-      // caller forwards a fresh one. Omitting `newProvenance` (or
-      // passing undefined) preserves the construction-time
-      // provenance — backward-compatible for callers that don't
-      // know about layered policy attribution.
+      // Swap provenance alongside policy when the caller forwards a
+      // fresh one. Omitting `newProvenance` (or passing undefined)
+      // preserves the construction-time provenance — callers that
+      // don't know about layered policy attribution stay correct.
       if (newProvenance !== undefined) provenance = newProvenance;
       return { ok: true, oldHash, newHash };
     },

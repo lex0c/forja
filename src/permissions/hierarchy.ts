@@ -3,12 +3,12 @@ import { type ParsePolicyContext, defaultPolicy, loadPolicyFromFile } from './co
 import { enterprisePolicyPath, projectPolicyPath, userPolicyPath } from './paths.ts';
 import type { Policy, PolicyDefaults, PolicyMode, PolicyToolsSection } from './types.ts';
 
-// Slice 125 (R2 P1): structural JSON stringify that sorts keys at
-// every nesting level. Used by the seal-lock deep-equal compare
-// so two semantically-equal seal objects with different property
-// ordering (e.g., disk-loaded YAML in `{ mode, path, locked }`
-// canonical order vs programmatic embedder building `{ path,
-// mode, locked }`) produce the same string.
+// Structural JSON stringify that sorts keys at every nesting
+// level. Used by the seal-lock deep-equal compare so two
+// semantically-equal seal objects with different property ordering
+// (e.g., disk-loaded YAML in `{ mode, path, locked }` canonical
+// order vs programmatic embedder building `{ path, mode, locked }`)
+// produce the same string.
 const stableJsonStringify = (value: unknown): string => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) {
@@ -24,9 +24,9 @@ const stableJsonStringify = (value: unknown): string => {
   return `{${parts.join(',')}}`;
 };
 
-// Hierarchy resolution per AGENTIC_CLI §8: enterprise → user → project
-// → session, with `locked` semantics. Higher-precedence layers can
-// mark sections as locked, preventing lower layers from overriding
+// Hierarchy resolution: enterprise → user → project → session,
+// with `locked` semantics. Higher-precedence layers can mark
+// sections as locked, preventing lower layers from overriding
 // them. Absent files at any layer are skipped (no error).
 //
 // Merge semantics for non-locked sections: REPLACE, not extend. A
@@ -55,11 +55,10 @@ export interface LockConflict {
   attemptedBy: Layer;
 }
 
-// Provenance of each merged section (PolicyLayer in types.ts).
-// Tracks which layer was the LAST WRITER for each section in the
-// final merged policy. The modal layer + `/perms why` consume
-// this to answer "which YAML file holds this rule" without
-// replaying the merge.
+// Provenance of each merged section. Tracks which layer was the
+// LAST WRITER for each section in the final merged policy. The
+// modal layer + `/perms why` consume this to answer "which YAML
+// file holds this rule" without replaying the merge.
 //
 // `defaults` covers `defaults.mode`. Set to:
 //   - the layer that explicitly wrote `defaults.mode`
@@ -68,19 +67,20 @@ export interface LockConflict {
 //
 // Per-section keys are absent when no layer wrote that section.
 // The engine reads provenance for whatever section it consults;
-// an absent entry means "no policy section exists" → engine
-// fell into default-deny, source.layer='default'.
-// Per-field provenance for the §6.5 sandbox section (slice 35).
-// Each field tracks the layer that LAST wrote it; a lock conflict
-// does NOT update the writer (the lower layer's change was discarded).
-// `/perms why sandbox.required` reads `required`; `/perms why
+// an absent entry means "no policy section exists" → engine fell
+// into default-deny, source.layer='default'.
+
+// Per-field provenance for the sandbox section. Each field tracks
+// the layer that LAST wrote it; a lock conflict does NOT update
+// the writer (the lower layer's change was discarded). `/perms
+// why sandbox.required` reads `required`; `/perms why
 // sandbox.locked` reads `locked` — operators get field-level
-// attribution instead of a single "last writer of anything" Layer.
+// attribution instead of a single "last writer of anything"
+// Layer.
 //
-// Aggregate "did anything write this section?" check: any of the
-// three fields being present (use `Object.keys().length > 0` or
+// Aggregate "did anything write this section?" check:
 // `provenance.sandbox !== undefined` since the resolver omits the
-// whole sub-object when no field was written).
+// whole sub-object when no field was written.
 export interface SandboxProvenance {
   required?: Layer;
   hostAllowed?: Layer;
@@ -96,13 +96,12 @@ export interface SectionProvenance {
   glob?: Layer;
   grep?: Layer;
   fetch_url?: Layer;
-  // PERMISSION_ENGINE.md §6.5 policy-layer sandbox section.
-  // Per-field writer attribution per slice 35 — replaces the slice-23
-  // single-Layer shape. Absent when no layer wrote any sandbox field.
+  // Policy-layer sandbox section. Per-field writer attribution.
+  // Absent when no layer wrote any sandbox field.
   sandbox?: SandboxProvenance;
-  // PERMISSION_ENGINE.md §7.3 sealing section (slice 57). Single-
-  // layer-wins — the layer that LAST set `seal: {...}` is the writer.
-  // Absent when no layer wrote a seal section.
+  // Sealing section. Single-layer-wins — the layer that LAST set
+  // `seal: {...}` is the writer. Absent when no layer wrote a
+  // seal section.
   seal?: Layer;
 }
 
@@ -126,11 +125,10 @@ export interface ResolveOptions {
   // controlled XDG_CONFIG_HOME without touching process.env.
   env?: NodeJS.ProcessEnv;
   // Home directory used by parsePolicy when validating protected
-  // path patterns (PERMISSION_ENGINE.md §11). When omitted, the
-  // protected-paths check is skipped — tests typically omit; the
-  // production bootstrap passes the operator's HOME explicitly so
-  // a malformed policy file fails load instead of failing at first
-  // tool call.
+  // path patterns. When omitted, the protected-paths check is
+  // skipped — tests typically omit; production bootstrap passes
+  // the operator's HOME explicitly so a malformed policy file
+  // fails load instead of failing at first tool call.
   home?: string;
 }
 
@@ -149,10 +147,10 @@ const SECTION_KEYS: readonly (keyof PolicyToolsSection)[] = [
 const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
   const out: LayerPolicy[] = [];
 
-  // Same parse context for every layer. Each loaded policy file runs
-  // through the same §11 validation; a higher layer (e.g. enterprise)
-  // that ships a protected-path redefinition fails the entire boot,
-  // not just its own layer.
+  // Same parse context for every layer. Each loaded policy file
+  // runs through the same protected-paths validation; a higher
+  // layer (e.g. enterprise) that ships a protected-path
+  // redefinition fails the entire boot, not just its own layer.
   const parseCtx: ParsePolicyContext = {
     cwd: options.cwd,
     ...(options.home !== undefined ? { home: options.home } : {}),
@@ -217,11 +215,11 @@ const merge = (
   const mergedTools: PolicyToolsSection = {};
   const sectionLockedBy: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
   const sectionWriter: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
-  // §6.5 sandbox section. Field-by-field last-writer wins UNTIL a
+  // Sandbox section. Field-by-field last-writer wins UNTIL a
   // layer sets `locked: true`; from that point lower layers can't
   // change `required` or `hostAllowed` (re-affirming the same
   // values is silent; an actual change records a `lockConflict`).
-  // Per-field writers tracked separately per slice 35 — `/perms why
+  // Per-field writers tracked separately so `/perms why
   // sandbox.required` reads the `required` writer, etc.
   let sandboxRequired: boolean | undefined;
   let sandboxHostAllowed: boolean | undefined;
@@ -229,21 +227,20 @@ const merge = (
   let sandboxRequiredWriter: Layer | null = null;
   let sandboxHostAllowedWriter: Layer | null = null;
   let sandboxLockedWriter: Layer | null = null;
-  // §7.3 seal section. Single-layer-wins semantics — whatever
-  // layer is LAST to set `seal: { ... }` defines the entire
-  // section. Cross-layer field merge would create surprising
-  // configs (enterprise sets mode, user accidentally overrides
-  // path); all-or-nothing keeps operator intent obvious.
+  // Seal section. Single-layer-wins semantics — whatever layer is
+  // LAST to set `seal: { ... }` defines the entire section.
+  // Cross-layer field merge would create surprising configs
+  // (enterprise sets mode, user accidentally overrides path);
+  // all-or-nothing keeps operator intent obvious.
   //
-  // §12.2 lock semantics added in slice 112 (R8 #322). Pre-slice
-  // seal was unconditionally last-writer-wins — an enterprise-
+  // Lock semantics: with `locked: true` at a higher layer, lower
+  // layers can't override; re-asserting the EXACT same config is
+  // silent (compared via canonical-JSON deep equality); actual
+  // differences flag a `lockConflict` and the lower layer's
+  // version is discarded. Without this lock, an enterprise-
   // mandated `worm-file` config could be silently swapped for
-  // `mode: none` by project policy, defeating the §7.3 forensic
-  // guarantee. With `locked: true` at a higher layer, lower
-  // layers can't override; re-asserting the EXACT same config
-  // is silent (compared via canonical-JSON deep equality);
-  // actual differences flag a `lockConflict` and the lower
-  // layer's version is discarded.
+  // `mode: none` by project policy, defeating the forensic
+  // guarantee.
   let mergedSeal: Policy['seal'];
   let sealWriter: Layer | null = null;
   let sealLockedBy: Layer | null = null;
@@ -289,8 +286,8 @@ const merge = (
       }
     }
 
-    // §6.5 sandbox section — field-by-field last-writer wins until
-    // a layer sets `locked: true`. After that, lower layers can
+    // Sandbox section — field-by-field last-writer wins until a
+    // layer sets `locked: true`. After that, lower layers can
     // re-affirm the same field values silently, but any actual
     // change records a `lockConflict` and is discarded.
     if (policy.sandbox !== undefined) {
@@ -333,12 +330,11 @@ const merge = (
       }
     }
 
-    // §7.3 seal section — last-writer-wins for the whole
-    // section, with §12.2 lock semantics layered on (slice 112,
-    // R8 #322). When a higher layer set `locked: true`, lower
-    // layers can re-affirm the same seal config silently
-    // (deep-equal compare via canonical JSON) but actual
-    // differences flag a lockConflict.
+    // Seal section — last-writer-wins for the whole section, with
+    // lock semantics layered on. When a higher layer set
+    // `locked: true`, lower layers can re-affirm the same seal
+    // config silently (deep-equal compare via canonical JSON) but
+    // actual differences flag a lockConflict.
     if (policy.seal !== undefined) {
       const incoming = policy.seal;
       if (sealLockedBy !== null) {
@@ -350,8 +346,8 @@ const merge = (
         // re-parsing — a programmatic caller building `{ path,
         // mode, locked }` (different key order vs the canonical
         // `{ mode, path, locked }`) would spurious-flag
-        // lockConflict pre-slice. Slice 125 (R2 P1): sort keys
-        // before stringify so the equality is structural.
+        // lockConflict. Sort keys before stringify so the
+        // equality is structural.
         const incomingJson = stableJsonStringify(incoming);
         const mergedJson = mergedSeal === undefined ? undefined : stableJsonStringify(mergedSeal);
         if (incomingJson !== mergedJson) {
@@ -406,14 +402,14 @@ const merge = (
   };
 
   // Build provenance from the writer trackers. `defaults` falls
-  // back to 'default' when no layer wrote mode (so the engine
-  // can render "default-deny — strict mode (built-in default)"
+  // back to 'default' when no layer wrote mode (so the engine can
+  // render "default-deny — strict mode (built-in default)"
   // honestly, distinct from "user policy chose strict mode").
   //
-  // Sandbox provenance is per-field (slice 35) — `/perms why
-  // sandbox.required` and `.hostAllowed` and `.locked` each read
-  // their own writer. The aggregate sub-object is omitted entirely
-  // when no field was written.
+  // Sandbox provenance is per-field — `/perms why sandbox.required`
+  // and `.hostAllowed` and `.locked` each read their own writer.
+  // The aggregate sub-object is omitted entirely when no field was
+  // written.
   const sandboxProvenance: SandboxProvenance | undefined =
     sandboxRequiredWriter !== null ||
     sandboxHostAllowedWriter !== null ||
@@ -436,7 +432,7 @@ const merge = (
     ...(sandboxProvenance !== undefined ? { sandbox: sandboxProvenance } : {}),
   };
 
-  // §6.5 sandbox section: emit only when at least one field was
+  // Sandbox section: emit only when at least one field was
   // written by some layer OR when a layer activated the lock.
   // Bootstrap's defaults (`required: false`, `hostAllowed: false`)
   // handle the absent case. The `locked` flag flows through so

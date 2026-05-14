@@ -118,11 +118,7 @@ export {
   protectedTargets,
 } from './protected_paths.ts';
 
-// Slice 159 (review — SEC §8.4 wire): sensitive-path deny-list as
-// engine-floor refuse. Canonical home moved from `src/subagents/`
-// to `src/permissions/` when the permission engine became a
-// consumer (fs-tool checkPath + bash bypass-mode capability loop).
-// `src/subagents/sensitive-paths.ts` is now a re-export shim.
+// Sensitive-path deny-list as an engine-floor refuse.
 export { SENSITIVE_PATH_DENY_LIST, matchSensitivePath } from './sensitive-paths.ts';
 export type {
   ProtectedClassifyInput,
@@ -182,10 +178,9 @@ export {
   createSealingScheduler,
 } from './sealing-scheduler.ts';
 
-// Slice 142 (review minor): canonical export surface for symbols
-// referenced by tests, bootstrap, and future playbooks that were
-// previously reachable only via deep imports. Keeping them on the
-// barrel avoids re-introducing the same finding on the next review.
+// Canonical export surface for symbols referenced by tests,
+// bootstrap, and playbooks. Keeping them on the barrel avoids deep
+// imports.
 export { AUDIT_TS_FUTURE_SKEW_MS } from './audit.ts';
 
 export type { Capability, CapabilityKind } from './capabilities.ts';

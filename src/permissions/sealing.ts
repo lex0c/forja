@@ -1,4 +1,5 @@
-// §7.3 external sealing — worm-file backend primitive.
+// External sealing primitives — worm-file, git-anchored, and
+// dispatcher.
 //
 // The local hash chain in `approvals_log` defends against
 // piecemeal-silent edits (flip one row, chain breaks at verify).
@@ -7,29 +8,26 @@
 // bar: periodically write the latest chain hash to a write-once-
 // read-many surface that the adversary cannot retroactively edit.
 //
-// `worm-file` backend: append a line per seal event to a file that
-// has been `chattr +a`'d. On ext4 with the IMMUTABLE_FILE_ATTRS
-// allowed, append-only files reject any non-append write (truncate,
-// edit, delete) — even from root, unless they FIRST run `chattr -a`
-// (which a process can detect via lsattr). Mounted-WORM filesystems
-// give a similar guarantee at the mount layer (no chattr needed).
+// `worm-file` backend: append a line per seal event to a file
+// that has been `chattr +a`'d. On ext4 with the
+// IMMUTABLE_FILE_ATTRS allowed, append-only files reject any
+// non-append write (truncate, edit, delete) — even from root,
+// unless they FIRST run `chattr -a` (detectable via lsattr).
+// Mounted-WORM filesystems give a similar guarantee at the mount
+// layer (no chattr needed).
 //
 // Threat model:
 //   - In-scope: silently rewriting old seal entries.
 //   - Out-of-scope: removing `chattr +a` before tampering (the
 //     attacker leaves a trail — lsattr at audit time catches this).
 //   - Out-of-scope: tampering with the LIVE chain in the SQLite DB
-//     before the next seal lands; that's mitigated by frequent seals
-//     (per-100-decisions / per-hour, configured in §7.3 [seal] block).
-//
-// This file is the PRIMITIVE only. Future slices wire:
-//   - Sealing scheduler (interval_decisions + interval_seconds).
-//   - Audit sink integration (auto-seal on emit when interval hits).
-//   - Bootstrap wire-up + `[seal]` Policy section.
+//     before the next seal lands; mitigated by frequent seals
+//     (per-100-decisions / per-hour, configured in [seal] block).
 //
 // Test seams: `onCreate` (chattr injection), `exists`, `read`,
 // `append`. Production callers wire `onCreate` to `execFileSync
-// ('/usr/bin/chattr', ['+a', path])`; tests mock as no-op or capture.
+// ('/usr/bin/chattr', ['+a', path])`; tests mock as no-op or
+// capture.
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
@@ -219,9 +217,9 @@ export const createWormFileSealer = (opts: CreateWormFileSealerOptions): SealSto
   };
 };
 
-// §7.3 verification — cross-references each seal entry against the
-// `approvals_log` chain. Mismatch ⇒ either the seal was tampered
-// (entry edited) OR the chain was tampered (DB row mutated) OR a
+// Cross-references each seal entry against the `approvals_log`
+// chain. Mismatch means either the seal was tampered (entry
+// edited) OR the chain was tampered (DB row mutated) OR a
 // rotation reset the chain between seal and verify (rare but
 // documented).
 //
@@ -247,12 +245,10 @@ export type VerifySealResult =
 // which `createWormFileSealer` wraps into the standard ok:false
 // reason string.
 //
-// Slice 58 hoisted this from bootstrap-engine.ts so both the
-// bootstrap wire-up AND the `agent permission seal-*` CLI verbs
-// can construct the same store without duplication. Future
-// backends (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) ship
-// alongside this factory with their own `defaultXFactory`
-// functions; the CLI dispatch reads `config.mode` to pick.
+// Shared between bootstrap wire-up AND the `agent permission
+// seal-*` CLI verbs. Future backends ship alongside this factory
+// with their own `defaultXFactory` functions; the CLI dispatch
+// reads `config.mode` to pick.
 export const defaultWormFileFactory = (config: SealPolicy): SealStore => {
   if (config.path === undefined) {
     // parsePolicy enforces this for mode='worm-file' — branch is
@@ -260,12 +256,12 @@ export const defaultWormFileFactory = (config: SealPolicy): SealStore => {
     // contract visible at the call site.
     throw new Error('defaultWormFileFactory: config.path is required for worm-file mode');
   }
-  // Slice 128 (R4 P0-Audit-4): worm-file's tamper-evidence depends
-  // on chattr +a (or platform-equivalent). On non-Linux platforms
-  // chattr doesn't exist; pre-slice `execFileSync('/usr/bin/chattr',
-  // ...)` threw at first append, sealer returned ok:false, the
-  // scheduler degraded silently — leaving an UNPROTECTED seal file
-  // on disk that `verifySealAgainstChain` still trusts. Refuse to
+  // worm-file's tamper-evidence depends on chattr +a (or platform-
+  // equivalent). On non-Linux platforms chattr doesn't exist —
+  // `execFileSync('/usr/bin/chattr', ...)` would throw at first
+  // append, sealer would return ok:false, the scheduler would
+  // degrade silently — leaving an UNPROTECTED seal file on disk
+  // that `verifySealAgainstChain` still trusts. Refuse to
   // construct the worm-file sealer on non-Linux; operators must
   // pick `rfc3161-tsa`, `git-anchored`, or `s3-object-lock`
   // explicitly for these platforms.
@@ -282,14 +278,14 @@ export const defaultWormFileFactory = (config: SealPolicy): SealStore => {
   });
 };
 
-// §7.3 git-anchored backend (slice 63). Append-only by virtue of
-// git's commit semantics: each `append` writes the entry to a
-// designated file inside a pre-initialized git repository, then
-// runs `git add + git commit` so the seal entry is also recorded
-// as an immutable commit in the repo's history. An operator who
-// later pushes the repo to a remote (out-of-band — slice 63 keeps
-// it local) gets external anchoring without the chattr / WORM-FS
-// dependencies the worm-file backend requires.
+// git-anchored backend. Append-only by virtue of git's commit
+// semantics: each `append` writes the entry to a designated file
+// inside a pre-initialized git repository, then runs
+// `git add + git commit` so the seal entry is also recorded as an
+// immutable commit in the repo's history. An operator who later
+// pushes the repo to a remote (out-of-band) gets external
+// anchoring without the chattr / WORM-FS dependencies the worm-
+// file backend requires.
 //
 // Threat model:
 //   - In-scope: silent edits to past seal entries. `git status`
@@ -324,13 +320,12 @@ export interface CreateGitAnchoredSealerOptions {
   // repo. Throws on git failure; the sealer's catch translates to
   // SealAppendResult.
   exec?: (cmd: string, args: readonly string[], opts: { cwd: string }) => void;
-  // Read-only git probe used by the bare-repo advisory (slice 140
-  // sec-3). Returns the stdout of `git rev-parse
-  // --is-bare-repository` for the configured repoPath — "true\n"
-  // for a bare repo, "false\n" for a non-bare one, or throws on
-  // any error (the advisory then silently skips; sealing
-  // continues). Tests inject a stub; production wires execFileSync
-  // with stdio: 'pipe'.
+  // Read-only git probe used by the bare-repo advisory. Returns
+  // the stdout of `git rev-parse --is-bare-repository` for the
+  // configured repoPath — "true\n" for a bare repo, "false\n" for
+  // a non-bare one, or throws on any error (the advisory then
+  // silently skips; sealing continues). Tests inject a stub;
+  // production wires execFileSync with stdio: 'pipe'.
   probeBare?: (repoPath: string) => string;
   // Advisory callback fired AT SEALER CREATION when the repo is
   // non-bare. Default writes a one-time stderr warning. Tests
@@ -366,7 +361,7 @@ const defaultProbeBare = (repoPath: string): string => {
 const defaultNonBareWarn = (repoPath: string): void => {
   // One-time stderr warning at sealer creation. Operators piping
   // stdout to `jq` etc. won't see stdout pollution; stderr is the
-  // documented diagnostic channel (CLAUDE.md / spec §2.6).
+  // documented diagnostic channel.
   process.stderr.write(
     `forja seal (git-anchored): repo at ${repoPath} is NOT bare — a sandboxed process with access to this path can rewrite history (git reset --hard) and erase prior seals. Use a bare repo OR pre-receive hook for tamper-evidence.\n`,
   );
@@ -382,12 +377,12 @@ export const createGitAnchoredSealer = (opts: CreateGitAnchoredSealerOptions): S
   const probeBare = opts.probeBare ?? defaultProbeBare;
   const onNonBareRepo = opts.onNonBareRepo ?? defaultNonBareWarn;
 
-  // Slice 140 sec-3: bare-repo advisory. Fires once at sealer
-  // creation. Probe failure (no git, bad repoPath, permission
-  // denied) silently skips — sealing's main path doesn't depend
-  // on this; we're just surfacing a known threat shape to the
-  // operator. SealStore.append below will still surface its own
-  // failures via SealAppendResult.
+  // Bare-repo advisory. Fires once at sealer creation. Probe
+  // failure (no git, bad repoPath, permission denied) silently
+  // skips — sealing's main path doesn't depend on this; we're
+  // just surfacing a known threat shape to the operator.
+  // SealStore.append below still surfaces its own failures via
+  // SealAppendResult.
   try {
     const out = probeBare(opts.repoPath).trim();
     if (out === 'false') {
@@ -493,15 +488,14 @@ export const factoryForSealMode = (mode: SealMode): ((c: SealPolicy) => SealStor
   return null;
 };
 
-// Slice 128 (R4 P0-Audit-1): verifySealAgainstChain now takes an
-// `installId` parameter and rejects rows whose `install_id`
-// doesn't match. Pre-slice the function called
-// `getApprovalsLogBySeq(db, entry.seq)` which returns the row
+// verifySealAgainstChain takes an `installId` parameter and
+// rejects rows whose `install_id` doesn't match. Without this,
+// `getApprovalsLogBySeq(db, entry.seq)` would return the row
 // regardless of install_id — an attacker with DB-write could
 // insert a row for install_B with a controlled hash + edit the
-// seal file for install_A to match → verify cross-checks against
-// install_B's row, succeeds, install_A's actual chain can be
-// tampered freely. Binding seal entries to the verifying
+// seal file for install_A to match → verify would cross-check
+// against install_B's row, succeed, and install_A's actual chain
+// could be tampered freely. Binding seal entries to the verifying
 // identity closes the cross-install forgery vector.
 //
 // `installId` is required (no default) so callers MUST pin the
@@ -522,23 +516,16 @@ export const verifySealAgainstChain = (
       reason: `seal file corrupted: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
-  // Slice 129 (R5 P1 duplicate-seq): the SealStore append path is
-  // best-effort idempotent (writers de-dupe before flush) but a
-  // hostile or corrupted backend (e.g., S3 versioned object replay,
-  // disk recovery merge, manually-edited file) can surface two
-  // entries with the SAME seq + different hashes. Pre-slice the
-  // loop validated each entry against the DB row independently;
-  // the FIRST entry's hash matched, the second's hash mismatched
-  // but the verify code returned OK because the first check
-  // passed and the second was tested against a DIFFERENT lookup
-  // (rows ARE keyed by seq alone, so DB query returns same row
-  // each time). Actually re-reading: a duplicate seq with a
-  // different hash WOULD trip the `row.this_hash !== entry.hash`
-  // branch on the second entry. But a duplicate seq with the
-  // SAME hash slips through silently — and that's the canonical
-  // "replay attack": attacker controls the seal store, replays
-  // a known-good entry to inflate `entriesChecked` and mask a
-  // gap elsewhere. Refuse duplicates outright.
+  // Duplicate-seq detection. The SealStore append path is best-
+  // effort idempotent (writers de-dupe before flush) but a hostile
+  // or corrupted backend (S3 versioned object replay, disk
+  // recovery merge, manually-edited file) can surface two entries
+  // with the SAME seq. A duplicate with a different hash trips the
+  // hash-mismatch branch below, but a duplicate with the SAME hash
+  // would slip through silently — the canonical replay attack:
+  // attacker controls the seal store and replays a known-good
+  // entry to inflate `entriesChecked` and mask a gap elsewhere.
+  // Refuse duplicates outright.
   const seenSeqs = new Set<number>();
   for (const entry of entries) {
     if (seenSeqs.has(entry.seq)) {

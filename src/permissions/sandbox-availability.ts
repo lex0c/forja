@@ -1,19 +1,20 @@
-// Sandbox tooling availability detection per PERMISSION_ENGINE.md §6.5.
-// "Sandbox indisponível (kernel sem unshare, bwrap binary missing) →
-// state = degraded. Em degraded, profile mais alto disponível é
-// host com confirm forçado em toda call. Se sandbox é
-// `required: true` em policy → state = refusing."
-//
-// This module owns the DETECTION primitive — answer "is the
+// Sandbox tooling availability detection. Answers "is the
 // sandboxing toolchain even present?" at engine bootstrap so the
-// state machine + selection layer can branch accordingly. Cheap
-// synchronous binary lookup; no privileged probes, no spawned
-// subprocesses, no kernel checks. A future slice can extend the
-// probe (e.g. test `unshare(CLONE_NEWNET)` actually works on this
-// kernel) when the runner side lands; for now, binary-on-PATH is
-// the floor.
+// state machine + selection layer can branch accordingly.
 //
-// Platform mapping per spec §6.5:
+// State branches:
+//   - sandbox indisponível (kernel sem unshare, bwrap binary
+//     missing) → state = degraded; highest profile available is
+//     host with confirm forced on every call.
+//   - sandbox `required: true` in policy AND unavailable →
+//     state = refusing.
+//
+// Cheap synchronous binary lookup; no privileged probes, no
+// spawned subprocesses, no kernel checks. A future revision can
+// extend the probe (e.g. test `unshare(CLONE_NEWNET)` actually
+// works on this kernel); for now, binary-on-PATH is the floor.
+//
+// Platform mapping:
 //   - Linux  → `bwrap`
 //   - macOS  → `sandbox-exec`
 //   - Windows → not supported in v2 (always unavailable)
@@ -22,20 +23,20 @@
 // result in EngineOptions.sandbox; tests inject a fixed value via
 // the `which` seam.
 //
-// Slice 154 (review — bwrap PATH-shim resistance): the canonical
-// system binary path is preferred over a `Bun.which()` PATH lookup.
-// Pre-slice an operator (or attacker) with `/tmp/evilbin` early on
-// $PATH could plant a `bwrap` shim that `exec`s the inner argv
-// without sandboxing — the harness saw `bwrap` available, wrapped
-// the call, but the wrapping was a no-op. Hard-pinning the
-// canonical path (`/usr/bin/bwrap` / `/usr/bin/sandbox-exec`)
-// closes the trivial case. Operators with `bwrap` installed
-// outside `/usr/bin` (Nix, Homebrew on Linux, custom build) still
-// work via the PATH-resolved fallback, but the result carries a
-// trust marker and a warning if the binary fails simple ownership
-// + mode checks. Bootstrap logs / telemetry surface the warning so
-// the operator sees "running with non-canonical bwrap" rather than
-// a silent downgrade.
+// PATH-shim resistance: the canonical system binary path is
+// preferred over a `Bun.which()` PATH lookup. Without this, an
+// operator (or attacker) with `/tmp/evilbin` early on $PATH could
+// plant a `bwrap` shim that `exec`s the inner argv without
+// sandboxing — the harness would see `bwrap` available, wrap the
+// call, but the wrap would be a no-op. Hard-pinning the canonical
+// path (`/usr/bin/bwrap` / `/usr/bin/sandbox-exec`) closes the
+// trivial case. Operators with `bwrap` installed outside
+// `/usr/bin` (Nix, Homebrew on Linux, custom build) still work
+// via the PATH-resolved fallback, but the result carries a trust
+// marker and a warning if the binary fails simple ownership +
+// mode checks. Bootstrap logs / telemetry surface the warning so
+// the operator sees "running with non-canonical bwrap" rather
+// than a silent downgrade.
 
 import {
   accessSync,
@@ -65,13 +66,13 @@ export interface SandboxAvailability {
   // postmortems can distinguish "Linux without bwrap installed"
   // from "macOS happy path" without re-running the probe.
   tool: 'bwrap' | 'sandbox-exec' | null;
-  // Slice 154: absolute path the wrapper will actually exec. Null
-  // when unavailable. ALWAYS passed verbatim to Bun.spawn instead of
+  // Absolute path the wrapper will actually exec. Null when
+  // unavailable. ALWAYS passed verbatim to Bun.spawn instead of
   // the bare binary name, so the kernel `execve` resolves to this
   // path rather than re-walking $PATH at spawn time (which would
   // re-expose the shim attack).
   path: string | null;
-  // Slice 154: trust marker.
+  // Trust marker.
   //   - 'canonical'      → hit /usr/bin/<tool> literal. Highest trust.
   //   - 'path-resolved'  → PATH lookup found <tool> outside /usr/bin.
   //                        Stat-checked for owner + mode; falls back
@@ -82,7 +83,7 @@ export interface SandboxAvailability {
   // operator-facing error / degraded notice. Empty string when
   // available (the tool name is the affirmative signal).
   reason: string;
-  // Slice 154: trust warnings (operator-facing). Populated when
+  // Trust warnings (operator-facing). Populated when
   // trustLevel='path-resolved' AND the stat-check failed any rule
   // (non-root owner, world-writable, group-writable). Empty array
   // when trust is canonical or warnings don't apply. Telemetry /
@@ -100,14 +101,14 @@ export interface DetectSandboxAvailabilityOptions {
   // pin to a fake that returns null/string for specific names so
   // the suite doesn't depend on the host having bwrap installed.
   which?: (name: string) => string | null;
-  // Slice 154: stat seam. Production uses `node:fs.statSync`; tests
-  // pin owner + mode to exercise canonical vs warning paths
-  // without needing a real binary on disk.
+  // Stat seam. Production uses `node:fs.statSync`; tests pin owner
+  // + mode to exercise canonical vs warning paths without needing
+  // a real binary on disk.
   stat?: (path: string) => { uid: number; mode: number } | null;
-  // Slice 154: filesystem-existence seam. Used by the canonical-path
-  // probe to distinguish "canonical exists" from "canonical missing,
-  // fall back to PATH". Production uses statSync existence check;
-  // tests inject deterministic answers.
+  // Filesystem-existence seam. Used by the canonical-path probe to
+  // distinguish "canonical exists" from "canonical missing, fall
+  // back to PATH". Production uses statSync existence check; tests
+  // inject deterministic answers.
   exists?: (path: string) => boolean;
   // Executability seam. Used by the canonical-path probe to confirm
   // the binary is actually usable for execve(2) by the current user
@@ -128,16 +129,16 @@ const defaultWhich = (name: string): string | null => {
   return Bun.which(name);
 };
 
-// Slice 178 (review — P2 defense in depth). `statSync` follows
-// symlinks and reports the target's metadata; we report mode from
-// the target because that IS what the kernel respects for the
-// `execve` access check. But OWNERSHIP needs both: a non-root-
-// owned symlink at a PATH-walk location (e.g.
-// `/tmp/evilbin/bwrap -> /usr/bin/bwrap`) is supply-chain expansion
-// regardless of how trustworthy the target is — the attacker
-// controls which target gets called via the link's name resolution.
-// `lstatSync` reports the LINK's owner; combining via max(uid)
-// surfaces "non-root owner anywhere in the resolution chain".
+// `statSync` follows symlinks and reports the target's metadata;
+// we report mode from the target because that IS what the kernel
+// respects for the `execve` access check. But OWNERSHIP needs
+// both: a non-root-owned symlink at a PATH-walk location (e.g.
+// `/tmp/evilbin/bwrap -> /usr/bin/bwrap`) is supply-chain
+// expansion regardless of how trustworthy the target is — the
+// attacker controls which target gets called via the link's name
+// resolution. `lstatSync` reports the LINK's owner; combining via
+// max(uid) surfaces "non-root owner anywhere in the resolution
+// chain".
 //
 // We deliberately do NOT OR the LINK mode bits into the target
 // mode. POSIX symlinks have mode 0o777 by convention (the kernel
@@ -198,23 +199,23 @@ const defaultIsExecutable = (path: string): boolean => {
   }
 };
 
-// Slice 154: assess trust of a resolved sandbox-tool binary. Two
-// rules, both must hold for a clean trust report:
+// Assess trust of a resolved sandbox-tool binary. Two rules, both
+// must hold for a clean trust report:
 //   1. Owner is root (uid 0). Non-root ownership means a non-
 //      privileged user (the operator OR an attacker with $HOME
 //      access) placed the binary; the kernel still respects its
 //      contents but the supply chain is wider.
-//   2. Mode bits exclude world-write (0o002) AND group-write (0o020).
-//      A world-writable binary can be replaced by ANY local user;
-//      group-writable opens it to the group's members.
+//   2. Mode bits exclude world-write (0o002) AND group-write
+//      (0o020). A world-writable binary can be replaced by ANY
+//      local user; group-writable opens it to the group's members.
 //
-// The trust check is ADVISORY — it produces warnings, not refuses.
-// Operators with intentional non-canonical installs (Nix, Homebrew)
-// will see warnings AND a working sandbox. Hard-rejecting would
-// break those installs; the trust model documented in
-// PERMISSION_ENGINE.md §6.5 is that "operator owns their own $HOME,
-// but running with a non-canonical bwrap is worth flagging so any
-// later forensic review can correlate."
+// The trust check is ADVISORY — it produces warnings, not
+// refuses. Operators with intentional non-canonical installs
+// (Nix, Homebrew) will see warnings AND a working sandbox. Hard-
+// rejecting would break those installs; the trust model is
+// "operator owns their own $HOME, but running with a non-canonical
+// bwrap is worth flagging so any later forensic review can
+// correlate".
 const assessTrust = (
   path: string,
   stat: (p: string) => { uid: number; mode: number } | null,
@@ -239,10 +240,10 @@ const assessTrust = (
   return { ok: false, warnings };
 };
 
-// Slice 154: canonical-first resolver. Tries the hard-coded
-// /usr/bin path; if that exists, uses it (highest trust). Otherwise
-// falls back to PATH lookup and runs the stat-check, returning the
-// result with the appropriate trust marker. Used by both
+// Canonical-first resolver. Tries the hard-coded /usr/bin path;
+// if that exists, uses it (highest trust). Otherwise falls back to
+// PATH lookup and runs the stat-check, returning the result with
+// the appropriate trust marker. Used by both
 // detectSandboxAvailability AND the runtime spawn path so the
 // resolved path is consistent and the kernel never re-walks $PATH
 // for the sandbox binary at exec time.
@@ -272,14 +273,15 @@ export const resolveSandboxBinary = (
 
   const canonical = CANONICAL_PATHS[name];
   // Canonical fast path requires BOTH existence AND executability.
-  // The earlier cut returned canonical on existence alone, so a
-  // /usr/bin/<tool> that existed but wasn't executable for the
-  // current user (mode stripped, ACL deny, owner mismatch) was
-  // reported as available — every wrapped spawn then failed with
-  // EACCES even when `which()` could resolve a working binary
+  // Returning canonical on existence alone would let a
+  // /usr/bin/<tool> that exists but isn't executable for the
+  // current user (mode stripped, ACL deny, owner mismatch) get
+  // reported as available — every wrapped spawn would then fail
+  // with EACCES even when `which()` could resolve a working binary
   // elsewhere on PATH. Falling through to the PATH lookup when
   // canonical isn't usable lets the operator's Nix/Homebrew/custom
-  // install take over (with the appropriate trust marker + warning).
+  // install take over (with the appropriate trust marker +
+  // warning).
   if (canonical !== undefined && exists(canonical) && isExecutable(canonical)) {
     // Hot path: canonical install. No trust warnings because the
     // path itself is the trust marker.
@@ -314,14 +316,13 @@ export const resolveSandboxBinary = (
   };
 };
 
-// Slice 156 (review — macOS /tmp shared sandbox+host): canonical
-// scheme for the per-sandbox tmpdir path. Used by callers that
-// pre-create a session-scoped tmpdir + pass it via
+// Canonical scheme for the per-sandbox tmpdir path. Used by
+// callers that pre-create a session-scoped tmpdir + pass it via
 // `MaybeWrapSandboxArgvOptions.tmpdir` to restrict the macOS SBPL
 // allow-rule. The path lives directly under `/tmp` (not under
 // `/private/var/folders/...`) because the SBPL filter's firmlink
 // resolution between `/tmp` and `/private/tmp` is the only path
-// where the slice 156 builder emits the matching `/private` form.
+// where the SBPL builder emits the matching `/private` form.
 //
 // `sessionId` is the harness's session UUID. Embedding it ties
 // the tmpdir to a single Forja session: two parallel `forja`
@@ -336,23 +337,20 @@ export const defaultSandboxTmpdir = (sessionId: string): string => {
   return `/tmp/forja-sb-${sessionId}`;
 };
 
-// Slice 157 (review — phase 2 of macOS /tmp isolation). Pairs with
-// the phase 1 capability landed in slice 156: the SBPL builder
-// already accepts `tmpdir?`, here we pre-create the directory so
-// production callers can wire it up safely.
+// Pre-creates the per-sandbox tmpdir so production callers can
+// wire it up safely.
 //
 // What this owns (darwin only — non-darwin returns the no-op
 // shape):
 //   1. mkdir(tmpdir, mode=0o700, recursive=true). 0o700 so a
 //      non-Forja user on the same host can't read the sandbox's
-//      temp files (the original threat shape inverted — operator's
-//      OTHER apps shouldn't see Forja's tmp either). recursive=true
-//      makes the call idempotent across resumes / re-runs that
-//      reuse the sessionId.
+//      temp files (operator's OTHER apps shouldn't see Forja's
+//      tmp either). recursive=true makes the call idempotent
+//      across resumes / re-runs that reuse the sessionId.
 //   2. cleanup callback (rm -rf, best-effort). Caller registers
 //      this on process exit / session end so the directory doesn't
 //      orphan. Failure to clean up doesn't refuse — orphans get
-//      swept by `agent worktree gc` (offline) in a future slice.
+//      swept by `agent worktree gc` (offline) later.
 //
 // What this does NOT own:
 //   - sessionId generation (caller decides; CLI bootstrap uses a
@@ -361,16 +359,15 @@ export const defaultSandboxTmpdir = (sessionId: string): string => {
 //   - TMPDIR env propagation (caller merges into spawn env; the
 //     env layout differs per callsite).
 //   - SBPL profile wiring (handled by maybeWrapSandboxArgv with
-//     the `tmpdir` field from phase 1).
+//     the `tmpdir` field).
 //
 // Failure mode: if mkdir throws (EACCES on /tmp, ENOSPC, anything
 // non-EEXIST that recursive=true can't paper over), the helper
 // invokes the `warn` callback and returns `tmpdir=undefined`. The
 // caller then passes undefined to maybeWrapSandboxArgv, which
-// degrades to the pre-slice-156 blanket allow. This is the same
-// safety floor pre-slice-156 ran under for the full release — a
-// graceful fallback, not a refuse. Operators with broken /tmp get
-// a warning row in audit instead of a hard-down agent.
+// degrades to the blanket /tmp allow — graceful fallback, not a
+// refuse. Operators with broken /tmp get a warning row in audit
+// instead of a hard-down agent.
 export interface AcquireSandboxTmpdirOptions {
   // ULID / UUID / any stable string the caller wants embedded in
   // the tmpdir path. The CLI bootstrap generates one ULID per
@@ -396,9 +393,9 @@ export interface AcquireSandboxTmpdirOptions {
 export interface SandboxTmpdir {
   // Directory path to pass into `MaybeWrapSandboxArgvOptions.tmpdir`
   // AND into the wrapped process's `TMPDIR` env. `undefined` on
-  // non-darwin (no work to do — Linux already isolates) OR on mkdir
-  // failure (callers degrade gracefully to the pre-slice-156
-  // blanket allow).
+  // non-darwin (no work to do — Linux already isolates) OR on
+  // mkdir failure (callers degrade gracefully to the blanket /tmp
+  // allow).
   tmpdir: string | undefined;
   // Best-effort `rm -rf <tmpdir>`. Idempotent — calling twice is
   // safe; the second call is a no-op. Caller registers this on
@@ -429,7 +426,7 @@ export const acquireSandboxTmpdir = (opts: AcquireSandboxTmpdirOptions): Sandbox
     const message = err.message ?? String(e);
     if (opts.warn !== undefined) {
       opts.warn(
-        `sandbox tmpdir mkdir failed for '${tmpdir}' (${code}: ${message}); falling back to shared /tmp (pre-slice-156 behavior, no per-sandbox isolation on macOS)`,
+        `sandbox tmpdir mkdir failed for '${tmpdir}' (${code}: ${message}); falling back to shared /tmp (no per-sandbox isolation on macOS)`,
       );
     }
     return { tmpdir: undefined, cleanup: () => {} };

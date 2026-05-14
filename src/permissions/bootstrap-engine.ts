@@ -1,4 +1,4 @@
-// Production bootstrap for the permission engine. Walks the §2 state
+// Production bootstrap for the permission engine. Walks the state
 // machine explicitly (init → loading-policy → validating-chain →
 // ready) so every phase is auditable and every failure can be
 // pinpointed by the operator.
@@ -48,7 +48,7 @@ import type { Policy, SealPolicy } from './types.ts';
 
 export interface BootstrapPermissionEngineInput {
   cwd: string;
-  // Operator home for §11 protected-paths context + install_id
+  // Operator home for protected-paths context + install_id
   // discovery. Defaults to `env.HOME` (or platform equivalent) via
   // `installIdPath`. Tests pin both fields.
   home?: string;
@@ -60,25 +60,20 @@ export interface BootstrapPermissionEngineInput {
   // accepting new decisions, so retrospective audits see the
   // operator's authorization on the chain itself.
   acceptBrokenChain?: boolean;
-  // Sandbox-plan inputs (PERMISSION_ENGINE.md §6.5). When provided,
-  // the engine's check() runs the §6.5 planner and refuses on
-  // `no_viable_sandbox`; when omitted, the stage is skipped (legacy
-  // path). The bootstrap probes `bwrap` / `sandbox-exec`
-  // availability and forwards the result here; CLI's
+  // Sandbox-plan inputs. When provided, the engine's check() runs
+  // the planner and refuses on `no_viable_sandbox`; when omitted,
+  // the stage is skipped. The bootstrap probes `bwrap` /
+  // `sandbox-exec` availability and forwards the result here; CLI's
   // `--sandbox-host` flag flows into `hostExplicitlyAllowed`.
   sandbox?: {
     available: boolean;
     hostExplicitlyAllowed: boolean;
     required: boolean;
-    // Slice 165 (review — Batch C sandbox observability): forward
-    // the resolver's trust marker so bootstrap can emit a
+    // Resolver's trust marker so bootstrap can emit a
     // `sandbox.path_resolved` failure_event when the sandbox tool
-    // was resolved via $PATH (non-canonical install). Pre-slice the
-    // trust signal lived only on `detectSandboxAvailability`'s
-    // return; bootstrap saw only the `available` boolean and lost
-    // the asymmetric-trust dimension. Optional for backward compat
-    // with callers that don't pass the full SandboxAvailability
-    // shape (legacy tests).
+    // was resolved via $PATH (non-canonical install). Optional for
+    // backward compat with callers that don't pass the full
+    // SandboxAvailability shape.
     trustLevel?: 'canonical' | 'path-resolved' | 'absent';
     // Resolved binary path (when available). Surfaced into the
     // failure_event payload so operators see "the agent wrapped
@@ -107,13 +102,13 @@ export interface BootstrapPermissionEngineInput {
   // preflight, bootstrap performs the two phases inline; either
   // path produces the same final state.
   preflight?: PreflightResult;
-  // §12.3 hot reload opt-in (slice 53). When true, the bootstrap
-  // sets up `watchAndReload` on the discovered policy paths AND
-  // emits `policy-reloaded` / `policy-reload-failed` audit rows on
-  // every reload event. Default false — one-shot CLI verbs
+  // Hot reload opt-in. When true, the bootstrap sets up
+  // `watchAndReload` on the discovered policy paths AND emits
+  // `policy-reloaded` / `policy-reload-failed` audit rows on every
+  // reload event. Default false — one-shot CLI verbs
   // (`agent permission verify` etc.) don't pay the inotify cost.
-  // The REPL bootstrap is the primary caller; it owns the
-  // returned `policyWatcher` and closes it on session end.
+  // The REPL bootstrap is the primary caller; it owns the returned
+  // `policyWatcher` and closes it on session end.
   watchPolicy?: boolean;
   // Test seams for the watcher's debounce + fs.watch + setTimeout
   // hooks. Forwarded verbatim to watchAndReload; production
@@ -123,38 +118,34 @@ export interface BootstrapPermissionEngineInput {
   policyWatcherSetTimer?: (cb: () => void, ms: number) => unknown;
   policyWatcherClearTimer?: (handle: unknown) => void;
   policyWatcherExists?: (path: string) => boolean;
-  // §7.3 sealing wire-up (slice 57). When the resolved policy has
-  // a `seal` section with `mode='worm-file'`, the bootstrap builds
-  // a `SealStore` via this factory, constructs a
-  // `SealingScheduler`, and wires the scheduler into the audit
-  // sink so every emit ticks toward `interval_decisions`. The
-  // scheduler's `onSealFailed` callback transitions the engine to
-  // `degraded` or `refusing` per `seal.on_failure`. Production
-  // callers leave `sealStoreFactory` undefined → default factory
-  // constructs a worm-file sealer that runs `/usr/bin/chattr +a`
-  // on first creation. Tests override to inject a mem-store and
-  // skip the chattr call.
+  // Sealing wire-up. When the resolved policy has a `seal` section
+  // with `mode='worm-file'`, the bootstrap builds a `SealStore` via
+  // this factory, constructs a `SealingScheduler`, and wires the
+  // scheduler into the audit sink so every emit ticks toward
+  // `interval_decisions`. The scheduler's `onSealFailed` callback
+  // transitions the engine to `degraded` or `refusing` per
+  // `seal.on_failure`. Production callers leave `sealStoreFactory`
+  // undefined → default factory constructs a worm-file sealer that
+  // runs `/usr/bin/chattr +a` on first creation. Tests override to
+  // inject a mem-store and skip the chattr call.
   sealStoreFactory?: (config: SealPolicy) => SealStore;
   sealSchedulerNow?: () => number;
   sealSchedulerSetTimer?: (cb: () => void, ms: number) => unknown;
   sealSchedulerClearTimer?: (handle: unknown) => void;
-  // §18 telemetry sink (slice 70 foundation + slice 71 state
-  // transitions). When set, the bootstrap wires the sink into
+  // Telemetry sink. When set, the bootstrap wires the sink into
   // (a) the state controller's `onTransition` listener so every
   // engine state change emits a `state.transition` event, and
   // (b) the audit sink so every emit produces a
   // `permission.decision` event. Production: pass an OTEL
-  // adapter (future slice). Tests: pass a recording sink.
+  // adapter. Tests: pass a recording sink.
   telemetry?: { emit: (event: TelemetryEvent) => void };
-  // failure_events sink (slice 130). Spec FAILURE_MODES.md §19 +
-  // AUDIT.md §1: every classified failure (sandbox loss, storage
-  // contention, provider timeout, parse error, ...) lands in this
-  // tamper-evident table. Default in production: SQLite sink
-  // backed by the same DB; tests pass a recording sink or noop.
-  // The bootstrap uses it to emit `sandbox.tool_unavailable` when
-  // sandbox tooling is missing at probe time (the only direct
-  // emit site in slice 130; other classes wire from their own
-  // subsystems).
+  // failure_events sink. Every classified failure (sandbox loss,
+  // storage contention, provider timeout, parse error, ...) lands
+  // in this tamper-evident table. Default in production: SQLite
+  // sink backed by the same DB; tests pass a recording sink or
+  // noop. The bootstrap uses it to emit `sandbox.tool_unavailable`
+  // when sandbox tooling is missing at probe time (other failure
+  // classes wire from their own subsystems).
   failureSink?: FailureEventSink;
 }
 
@@ -221,20 +212,20 @@ export interface BootstrapPermissionEngineResult {
   // Set when refusing — operator-facing description of what failed.
   // Empty when state is ready.
   refusingReason?: string;
-  // §12.3 file watcher (slice 53). Set when `watchPolicy: true`
-  // was passed to bootstrap. Caller MUST call `.close()` on session
-  // end — leaking the inotify handle keeps the engine resident +
-  // keeps writing audit rows on every editor save. Undefined when
+  // File watcher. Set when `watchPolicy: true` was passed to
+  // bootstrap. Caller MUST call `.close()` on session end —
+  // leaking the inotify handle keeps the engine resident + keeps
+  // writing audit rows on every editor save. Undefined when
   // `watchPolicy` was false / omitted.
   policyWatcher?: PolicyWatcher;
-  // §7.3 sealing (slice 57). Set when the resolved policy has a
-  // `seal` section with `mode='worm-file'` AND the bootstrap
-  // reached a non-refusing state. Caller MUST call
-  // `sealingScheduler.close()` AND `sealStore.close()` on session
-  // end — the scheduler's wall-clock timer keeps the process alive
-  // (per Node's libuv semantics) and the store may hold backend
-  // handles in future modes. Both undefined when sealing was off,
-  // mode=none, or bootstrap ended refusing.
+  // Sealing. Set when the resolved policy has a `seal` section
+  // with `mode='worm-file'` AND the bootstrap reached a
+  // non-refusing state. Caller MUST call `sealingScheduler.close()`
+  // AND `sealStore.close()` on session end — the scheduler's
+  // wall-clock timer keeps the process alive (per Node's libuv
+  // semantics) and the store may hold backend handles in future
+  // modes. Both undefined when sealing was off, mode=none, or
+  // bootstrap ended refusing.
   sealStore?: SealStore;
   sealingScheduler?: SealingScheduler;
 }
@@ -251,11 +242,11 @@ const emitChainBreakAcceptedRow = (
       note: `broken_at=${verify.brokenAt} reason=${verify.reason} expected=${verify.expected} actual=${verify.actual}`,
     },
   ];
-  // Slice 143 (API-3): admin rows like this one don't traverse the
-  // resolver / risk / classifier / sandbox pipeline — their 7
-  // load-bearing fields are all "no signal". Forensic replays see
-  // an admin-internal row by `tool_name='permission-engine'` and
-  // these explicit empties.
+  // Admin rows like this one don't traverse the resolver / risk /
+  // classifier / sandbox pipeline — their 7 load-bearing fields
+  // are all "no signal". Forensic replays see an admin-internal
+  // row by `tool_name='permission-engine'` and these explicit
+  // empties.
   sink.emit({
     session_id: sessionId,
     tool_name: 'permission-engine',
@@ -273,12 +264,12 @@ const emitChainBreakAcceptedRow = (
   });
 };
 
-// §12.3 audit emission — spec line 743 demands "emit policy_reloaded
-// event with old_hash, new_hash". Mirrors `emitChainBreakAcceptedRow`:
-// tool_name='permission-engine', decision='allow' (operator
-// authorized the reload by editing the file), reasonChain captures
-// the hash transition. policy_hash on the row is the NEW hash —
-// the reload IS the act of authorizing the new policy.
+// Policy-reloaded audit emission. Mirrors
+// `emitChainBreakAcceptedRow`: tool_name='permission-engine',
+// decision='allow' (operator authorized the reload by editing the
+// file), reasonChain captures the hash transition. policy_hash on
+// the row is the NEW hash — the reload IS the act of authorizing
+// the new policy.
 const emitPolicyReloadedRow = (
   sink: AuditSink,
   sessionId: string,
@@ -291,7 +282,7 @@ const emitPolicyReloadedRow = (
       note: `old_hash=${oldHash} new_hash=${newHash}`,
     },
   ];
-  // Slice 143 (API-3): admin row — no pipeline signal.
+  // Admin row — no pipeline signal.
   sink.emit({
     session_id: sessionId,
     tool_name: 'permission-engine',
@@ -309,14 +300,13 @@ const emitPolicyReloadedRow = (
   });
 };
 
-// §12.3 audit emission — spec line 737 demands "emit
-// policy_reload_failed event with details / keep old_policy".
-// decision='deny' because the new policy WAS rejected (the old
-// stays authoritative). The reason chain carries the specific
-// failure surface (parse error / lock conflict / engine
-// reloadPolicy ok:false) so operators see WHY in the audit log.
-// policy_hash on the row is the CURRENT (old, still-authoritative)
-// hash — the failed candidate has no archive entry.
+// Policy-reload-failed audit emission. decision='deny' because the
+// new policy WAS rejected (the old stays authoritative). The reason
+// chain carries the specific failure surface (parse error / lock
+// conflict / engine reloadPolicy ok:false) so operators see WHY in
+// the audit log. policy_hash on the row is the CURRENT (old,
+// still-authoritative) hash — the failed candidate has no archive
+// entry.
 const emitPolicyReloadFailedRow = (
   sink: AuditSink,
   sessionId: string,
@@ -329,7 +319,7 @@ const emitPolicyReloadFailedRow = (
       note: reason,
     },
   ];
-  // Slice 143 (API-3): admin row — no pipeline signal.
+  // Admin row — no pipeline signal.
   sink.emit({
     session_id: sessionId,
     tool_name: 'permission-engine',
@@ -363,11 +353,10 @@ export const bootstrapPermissionEngine = async (
     ...(input.now !== undefined ? { now: input.now } : {}),
     onTransition: (e) => {
       events.push(e);
-      // §18 state.transition telemetry (slice 71). Wrapped in
-      // try/catch — observability failures must not break the
-      // state machine itself (a thrown emit would corrupt the
-      // events trail). Same posture as the audit sink's
-      // telemetry handling (slice 70).
+      // state.transition telemetry. Wrapped in try/catch —
+      // observability failures must not break the state machine
+      // itself (a thrown emit would corrupt the events trail).
+      // Same posture as the audit sink's telemetry handling.
       if (input.telemetry !== undefined) {
         try {
           input.telemetry.emit({
@@ -388,11 +377,11 @@ export const bootstrapPermissionEngine = async (
 
   // Phases 1 + 2: install_id + policy load. Pre-flight (callable
   // separately by the CLI driver) lets a malformed policy throw
-  // BEFORE any SQLite handle is opened, preserving the v1
-  // leak-test invariant. When the caller supplied a `preflight`
-  // result, we trust it and skip the work. Either way we still
-  // record the explicit transitions so the events trail mirrors
-  // the spec §2 walk.
+  // BEFORE any SQLite handle is opened, preserving the leak-test
+  // invariant. When the caller supplied a `preflight` result, we
+  // trust it and skip the work. Either way we still record the
+  // explicit transitions so the events trail mirrors the state-
+  // machine walk.
   controller.transition('loading-policy', 'bootstrap_start');
   let identity: InstallIdentity;
   let resolveResult: ReturnType<typeof resolvePolicy>;
@@ -431,9 +420,9 @@ export const bootstrapPermissionEngine = async (
   // same one the engine will emit through, so a single SQLite handle
   // backs the entire lifetime.
   //
-  // §7.3 sealing proxy (slice 57). The sink takes a structurally-
-  // typed `{ tick(): void }` from slice 56. We can't construct the
-  // real `SealingScheduler` yet — it needs the engine for its
+  // Sealing proxy. The sink takes a structurally-typed
+  // `{ tick(): void }`. We can't construct the real
+  // `SealingScheduler` yet — it needs the engine for its
   // `onSealFailed` callback, and the engine doesn't exist until
   // Phase 4. The proxy defers to a mutable `liveScheduler` slot;
   // any emit during Phase 3 (`chain-break-accepted`) hits a no-op
@@ -450,26 +439,26 @@ export const bootstrapPermissionEngine = async (
     identity,
     scheduler: schedulerProxy,
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
-    // §18 engine_state bridge (slice 75). Telemetry events for
-    // permission.decision now carry the current state alongside
-    // the decision so an OTEL consumer can correlate decision
-    // outcomes with engine health (e.g., "every confirm-allowed
-    // happened while degraded — operator should fix the
-    // underlying subsystem"). Plumbing the getter (not the value)
-    // here means the event captures state AT EMIT TIME — accurate
-    // even if the state changed between bootstrap and the
-    // individual check (which happens via engine.degrade /
-    // engine.refuse fired from anywhere with a controller ref).
+    // engine_state bridge. Telemetry events for
+    // permission.decision carry the current state alongside the
+    // decision so an OTEL consumer can correlate decision outcomes
+    // with engine health (e.g., "every confirm-allowed happened
+    // while degraded — operator should fix the underlying
+    // subsystem"). Plumbing the getter (not the value) here means
+    // the event captures state AT EMIT TIME — accurate even if the
+    // state changed between bootstrap and the individual check
+    // (which happens via engine.degrade / engine.refuse fired from
+    // anywhere with a controller ref).
     engineState: () => controller.get(),
   });
   const chain = sink.verifyChain();
 
-  // §18 chain.verify_failed telemetry (slice 73). Fires on EITHER
-  // chain-broken path BEFORE the state transition / audit row so
-  // OTEL consumers see the diagnostic context before the resulting
-  // refusing-transition (state.transition event) OR chain-break-
-  // accepted audit row. Wrapped in try/catch — observability cannot
-  // break the chain-verify gate.
+  // chain.verify_failed telemetry. Fires on EITHER chain-broken
+  // path BEFORE the state transition / audit row so OTEL consumers
+  // see the diagnostic context before the resulting refusing-
+  // transition (state.transition event) OR chain-break-accepted
+  // audit row. Wrapped in try/catch — observability cannot break
+  // the chain-verify gate.
   if (!chain.ok && input.telemetry !== undefined) {
     try {
       input.telemetry.emit({
@@ -516,10 +505,10 @@ export const bootstrapPermissionEngine = async (
     emitChainBreakAcceptedRow(sink, input.sessionId, policyHash, chain);
   }
 
-  // §6.5: sandbox availability + the operator's host flag flow into
-  // the engine's planner. When `sandbox.required` is true AND the
-  // host has no sandboxing tool, the engine never reaches `ready` —
-  // we transition straight to refusing with a forensic reason. When
+  // Sandbox availability + the operator's host flag flow into the
+  // engine's planner. When `sandbox.required` is true AND the host
+  // has no sandboxing tool, the engine never reaches `ready` — we
+  // transition straight to refusing with a forensic reason. When
   // lenient, the bootstrap transitions to `degraded` instead so
   // `check()` keeps running but every would-be allow becomes confirm.
   const sandbox = input.sandbox;
@@ -535,13 +524,13 @@ export const bootstrapPermissionEngine = async (
     ...(input.now !== undefined ? { now: input.now } : {}),
   });
 
-  // Slice 165 (review — Batch C): emit `sandbox.path_resolved`
-  // when the resolver flagged the install as non-canonical. Fires
-  // BEFORE the unavailable check below — non-canonical-but-present
-  // is a SEPARATE concern from absent. Postmortem trail: operators
-  // who later see "compromise traced to sandbox bypass" can query
-  // `failure_events WHERE code='sandbox.path_resolved'` and
-  // correlate against the install path on the affected host.
+  // Emit `sandbox.path_resolved` when the resolver flagged the
+  // install as non-canonical. Fires BEFORE the unavailable check
+  // below — non-canonical-but-present is a SEPARATE concern from
+  // absent. Postmortem trail: operators who later see "compromise
+  // traced to sandbox bypass" can query `failure_events WHERE
+  // code='sandbox.path_resolved'` and correlate against the install
+  // path on the affected host.
   if (
     sandbox?.available &&
     sandbox.trustLevel !== undefined &&
@@ -571,13 +560,12 @@ export const bootstrapPermissionEngine = async (
   }
 
   if (sandbox !== undefined && !sandbox.available) {
-    // Slice 130 (R5 Tier 3 P0-1): structured failure_event so
-    // ops queries can answer "which sessions booted without
-    // sandbox tooling?" without parsing stderr. recovery_action
-    // reflects the state-machine branch we're about to take:
-    // fatal when policy required sandbox (engine goes refusing),
-    // degraded otherwise (engine still answers checks but every
-    // would-be allow becomes confirm per spec §6.5).
+    // Structured failure_event so ops queries can answer "which
+    // sessions booted without sandbox tooling?" without parsing
+    // stderr. recovery_action reflects the state-machine branch
+    // we're about to take: fatal when policy required sandbox
+    // (engine goes refusing), degraded otherwise (engine still
+    // answers checks but every would-be allow becomes confirm).
     if (input.failureSink !== undefined) {
       try {
         input.failureSink.emit({
@@ -595,12 +583,12 @@ export const bootstrapPermissionEngine = async (
       } catch (e) {
         // failure_events emit must NOT crash bootstrap (the row
         // is observability of the unavailable-sandbox event, not
-        // the event itself). Slice 130 fixup #6: but DO surface
-        // the sink failure to stderr so an infra-level break
-        // (missing migration, disk full, locked DB) doesn't
-        // silently suppress audit. Pre-fixup the catch was empty,
-        // which let `DROP TABLE failure_events` followed by every
-        // future emit return success — operator had no signal.
+        // the event itself). DO surface the sink failure to
+        // stderr so an infra-level break (missing migration, disk
+        // full, locked DB) doesn't silently suppress audit — an
+        // empty catch would let `DROP TABLE failure_events` +
+        // every future emit return success with no signal to the
+        // operator.
         const msg = e instanceof Error ? e.message : String(e);
         process.stderr.write(
           `forja bootstrap: failure_events emit failed (${msg}); transition still firing\n`,
@@ -616,12 +604,11 @@ export const bootstrapPermissionEngine = async (
     controller.transition('ready', chain.ok ? 'chain_intact' : 'chain_break_accepted');
   }
 
-  // PERMISSION_ENGINE.md §17 prerequisite: snapshot the canonical
-  // policy bytes into `policy_archive` so future replay modes
-  // (`--against-current-policy`, `--without-classifier`,
-  // `permission diff`) can reconstruct the original policy from its
-  // hash. Skip when the engine ended up `refusing` — that state never
-  // produces replay-worthy decisions.
+  // Snapshot the canonical policy bytes into `policy_archive` so
+  // future replay modes (`--against-current-policy`,
+  // `--without-classifier`, `permission diff`) can reconstruct the
+  // original policy from its hash. Skip when the engine ended up
+  // `refusing` — that state never produces replay-worthy decisions.
   //
   // Uses the SAME bytes the engine hashed (`canonicalize(policy)`)
   // so the roundtrip invariant
@@ -637,13 +624,12 @@ export const bootstrapPermissionEngine = async (
     });
   }
 
-  // §12.3 file-watch wire-up (slice 53). Only fires when the
-  // caller opted in (`watchPolicy: true`) AND the engine reached a
-  // non-refusing state — refusing engines have no policy worth
-  // hot-reloading. The watcher's callbacks emit audit rows per spec
-  // line 743 (policy_reloaded with old/new hashes) and line 737
-  // (policy_reload_failed with reason). Caller owns the returned
-  // handle and MUST close() it on session end.
+  // File-watch wire-up. Only fires when the caller opted in
+  // (`watchPolicy: true`) AND the engine reached a non-refusing
+  // state — refusing engines have no policy worth hot-reloading.
+  // The watcher's callbacks emit audit rows for policy_reloaded
+  // (old/new hashes) and policy_reload_failed (reason). Caller
+  // owns the returned handle and MUST close() it on session end.
   let policyWatcher: PolicyWatcher | undefined;
   if (input.watchPolicy === true && archiveState !== 'refusing') {
     const resolveOptionsForWatcher: Parameters<typeof watchAndReload>[0]['resolveOptions'] = {
@@ -658,19 +644,13 @@ export const bootstrapPermissionEngine = async (
       engine,
       resolveOptions: resolveOptionsForWatcher,
       onReload: (result) => {
-        // Slice 170 (review — wrong-info P0 #4). Archive the
-        // post-reload policy bytes BEFORE emitting the audit row.
-        // Pre-slice only the initial bootstrap archive ran (line
-        // 633); subsequent hot-reloads emitted `policy-reloaded`
-        // audit rows whose `policy_hash` had no matching entry in
-        // `policy_archive`. `agent permission replay <seq>
-        // --against-archived-policy` then reported
-        // `skipped_reason: 'policy hash <H> not in policy_archive'`
-        // for every post-reload row — wrong cause attributed to
-        // "boot predates slice 16" or "archive GC'd" when the real
-        // cause was the watcher never archived. The canonical §17
-        // reproducibility check silently no-op'd for the entire
-        // post-reload session.
+        // Archive the post-reload policy bytes BEFORE emitting the
+        // audit row. Without this, post-reload `policy-reloaded`
+        // audit rows have no matching entry in `policy_archive`,
+        // and `agent permission replay <seq>
+        // --against-archived-policy` later reports `skipped_reason:
+        // 'policy hash <H> not in policy_archive'` for every
+        // post-reload row.
         //
         // Re-canonicalize via engine.policy() (deep-clone return
         // from the engine API). Hash matches result.newHash by
@@ -688,7 +668,7 @@ export const bootstrapPermissionEngine = async (
           // Best-effort. Archive failures shouldn't suppress the
           // policy-reloaded audit row — the operator should still
           // see the reload event even if archive storage is broken.
-          // A future slice may add a failure_event emit here.
+          // TODO: emit a failure_event here.
         }
         emitPolicyReloadedRow(sink, input.sessionId, result.oldHash, result.newHash);
       },
@@ -714,16 +694,16 @@ export const bootstrapPermissionEngine = async (
     });
   }
 
-  // §7.3 sealing wire-up (slice 57). Construct the real
-  // `SealStore` + `SealingScheduler` when (a) policy has a
-  // `seal` section with mode='worm-file', AND (b) the engine
-  // didn't end up refusing. Mode='none' (or omitted) bypasses
-  // sealing entirely. The scheduler's `onSealFailed` captures
-  // `engine` by closure and transitions the state machine per
-  // `seal.on_failure` (degrade default, refuse strict). The
-  // schedulerProxy declared in Phase 3 wires through to the
-  // newly-assigned `liveScheduler` from this point onward, so the
-  // sink's emit→tick path becomes live.
+  // Sealing wire-up. Construct the real `SealStore` +
+  // `SealingScheduler` when (a) policy has a `seal` section with
+  // mode='worm-file', AND (b) the engine didn't end up refusing.
+  // Mode='none' (or omitted) bypasses sealing entirely. The
+  // scheduler's `onSealFailed` captures `engine` by closure and
+  // transitions the state machine per `seal.on_failure` (degrade
+  // default, refuse strict). The schedulerProxy declared in
+  // Phase 3 wires through to the newly-assigned `liveScheduler`
+  // from this point onward, so the sink's emit→tick path becomes
+  // live.
   let sealStore: SealStore | undefined;
   let sealingScheduler: SealingScheduler | undefined;
   const sealConfig = resolveResult.policy.seal;
@@ -750,12 +730,12 @@ export const bootstrapPermissionEngine = async (
         ? { intervalSeconds: sealConfig.interval_seconds }
         : {}),
       onSealFailed: (reason: string): void => {
-        // §18 telemetry — emit a structured sealing.failure
-        // event BEFORE the state transition so an OTEL consumer
-        // sees the diagnostic context (mode + path + reason)
-        // paired with the subsequent state.transition event.
-        // Wrapped in try/catch — observability cannot break the
-        // degrade/refuse path.
+        // Emit a structured sealing.failure telemetry event BEFORE
+        // the state transition so an OTEL consumer sees the
+        // diagnostic context (mode + path + reason) paired with
+        // the subsequent state.transition event. Wrapped in
+        // try/catch — observability cannot break the degrade/refuse
+        // path.
         if (input.telemetry !== undefined) {
           try {
             input.telemetry.emit({
@@ -770,43 +750,37 @@ export const bootstrapPermissionEngine = async (
             // Best-effort.
           }
         }
-        // Slice 158 (review): gate the state transition on the
-        // CURRENT state. The pre-slice comment claimed degrade()
-        // and refuse() were idempotent, but state-machine.ts:97-101
-        // throws on invalid edges — `degraded → degraded` is NOT in
-        // VALID_TRANSITIONS, and `refusing` is terminal with an
-        // empty allowed set. So on the 2nd consecutive seal failure
-        // (timer path: an hour after the first; tick path: another
-        // 100 audit emits after the first), the second `engine.degrade`
-        // would throw. From the tick path the throw was swallowed by
-        // audit.ts's try-around-scheduler.tick(); from the timer path
-        // it propagated as uncaughtException → signal.ts:70 →
-        // process.exit(1). A sustained worm-file outage (disk full,
-        // chattr +a dropped, EROFS) would kill the REPL mid-tool.
+        // Gate the state transition on the CURRENT state.
+        // `degraded → degraded` is NOT in VALID_TRANSITIONS, and
+        // `refusing` is terminal. Without this gate the 2nd
+        // consecutive seal failure (timer path: an hour after the
+        // first; tick path: another 100 audit emits after the
+        // first) throws from `engine.degrade`. The throw from the
+        // tick path is swallowed by audit.ts's try-around-
+        // scheduler.tick(); the throw from the timer path
+        // propagates as uncaughtException → signal handler →
+        // process.exit(1). A sustained worm-file outage (disk
+        // full, chattr +a dropped, EROFS) would kill the REPL
+        // mid-tool.
         //
-        // Fix: read the current state and only attempt a transition
-        // when the edge is allowed. The state-machine module owns
-        // the edge table — we use isRejectingState as a proxy for
-        // "refusing or pre-ready phases" (where degrade is invalid
-        // anyway). When already in the target state, this is a
-        // no-op; telemetry already fired above so operators still
-        // see every failure event.
+        // Read the current state and only attempt a transition
+        // when the edge is allowed. When already in the target
+        // state, this is a no-op; telemetry already fired above so
+        // operators still see every failure event.
         const currentState = engine.state();
         if (onFailure === 'refuse') {
           // refusing is terminal — skip if already there. Other
           // states (init/loading-policy/validating-chain/ready/
-          // degraded) can all transition to refusing per the
-          // VALID_TRANSITIONS table.
+          // degraded) can all transition to refusing.
           if (currentState !== 'refusing') {
             engine.refuse(`seal_failed: ${reason}`);
           }
         } else {
           // degraded is reachable only from `ready` and
-          // `validating-chain` (per state-machine.ts:52-53). If
-          // we're already degraded OR refusing OR in a pre-ready
-          // phase that doesn't allow this edge, skip silently —
-          // the telemetry event above is the operator-visible
-          // record.
+          // `validating-chain`. If we're already degraded OR
+          // refusing OR in a pre-ready phase that doesn't allow
+          // this edge, skip silently — the telemetry event above
+          // is the operator-visible record.
           if (currentState === 'ready') {
             engine.degrade(`seal_failed: ${reason}`);
           }

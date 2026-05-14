@@ -1,7 +1,7 @@
-// §12.3 file-watch wire-up for hot reload. Consumes slice 51's
-// `engine.reloadPolicy()` primitive: when any of the policy YAML
-// files on disk changes, re-resolve the hierarchy + push the new
-// Policy to the engine.
+// File-watch wire-up for hot reload. Consumes the engine's
+// `reloadPolicy()` primitive: when any of the policy YAML files
+// on disk changes, re-resolve the hierarchy + push the new Policy
+// to the engine.
 //
 // Watched paths (per `paths.ts`):
 //   - Enterprise: /etc/agent/permissions.yaml (or %PROGRAMDATA% on Windows)
@@ -96,28 +96,29 @@ const formatLockConflicts = (conflicts: readonly LockConflict[]): string => {
     .join('; ');
 };
 
-// Slice 166 (review — Batch D subagent IPC concurrency, second item).
-// Watch the PARENT DIRECTORY + filter by basename instead of watching
-// the file inode directly. Pre-slice the watcher used
-// `fs.watch(path, cb)` — when an editor saves via atomic rename
-// (vim with `backupcopy=no`, IntelliJ "safe save", VS Code default),
-// the file's inode is replaced. The OS's inotify / FSEvents
-// subscription was attached to the OLD inode, which is now unlinked
-// — every subsequent save hits the new inode that nobody is watching.
-// Operator edits policy, expects the reload audit row, sees nothing,
-// doesn't know the engine is still enforcing stale rules.
+// Watch the PARENT DIRECTORY + filter by basename instead of
+// watching the file inode directly. `fs.watch(path, cb)` against
+// the file itself fails on atomic rename saves (vim with
+// `backupcopy=no`, IntelliJ "safe save", VS Code default): the
+// file's inode is replaced, the OS's inotify / FSEvents
+// subscription stays attached to the OLD (unlinked) inode, and
+// every subsequent save hits the new inode that nobody is
+// watching. Operator edits policy, expects the reload audit row,
+// sees nothing, doesn't know the engine is still enforcing stale
+// rules.
 //
 // Dir-watch + basename filter survives rename: the dir's inode is
 // stable; rename + create + delete events all land on the dir
 // watcher; we filter to the ONE filename we care about. Standard
 // pattern, supported by both inotify (Linux) and FSEvents (macOS).
 //
-// Intermediate-state caveat: during a rename save the file briefly
-// doesn't exist (tmp → renamed-to-final). reloadNow's resolvePolicy
-// throws ENOENT on read → onReloadFailed fires with the diagnostic.
-// The debounce coalesces follow-up events; the final state (file
-// fully written) reloads cleanly. The brief failure is a known
-// noisy edge but not a security or correctness concern.
+// Intermediate-state caveat: during a rename save the file
+// briefly doesn't exist (tmp → renamed-to-final). reloadNow's
+// resolvePolicy throws ENOENT on read → onReloadFailed fires with
+// the diagnostic. The debounce coalesces follow-up events; the
+// final state (file fully written) reloads cleanly. The brief
+// failure is a known noisy edge but not a security or correctness
+// concern.
 const defaultWatcher = (path: string, cb: () => void): { close: () => void } => {
   const dir = dirname(path);
   const base = basename(path);
@@ -151,14 +152,11 @@ export const watchAndReload = (options: WatchAndReloadOptions): PolicyWatcher =>
         options.onReloadFailed?.(`lock conflicts: ${formatLockConflicts(resolved.lockConflicts)}`);
         return;
       }
-      // Slice 139 C4: forward the freshly-resolved per-section
-      // provenance alongside the policy. Pre-fix the watcher
-      // discarded `resolved.provenance`, leaving every subsequent
-      // audit row's `source.layer` and `/perms why` output
-      // pointing at the construction-time hierarchy — which lies
-      // after the first YAML edit that moved a section between
-      // layers (e.g. session → project, or operator added an
-      // enterprise file).
+      // Forward the freshly-resolved per-section provenance
+      // alongside the policy. Without this, every subsequent
+      // audit row's `source.layer` and `/perms why` output would
+      // point at the construction-time hierarchy — wrong after
+      // the first YAML edit that moves a section between layers.
       const result = options.engine.reloadPolicy(resolved.policy, resolved.provenance);
       if (result.ok) {
         options.onReload?.(result);

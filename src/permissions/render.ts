@@ -104,12 +104,13 @@ export const formatSections = (tools: PolicyToolsSection): string[] => {
   return out;
 };
 
-// Render the §6.5 sandbox section. Used by both `renderPolicy`
-// (in-REPL `/perms`, no provenance available) and
-// `renderExplainPermissions` (headless `agent perms`, with provenance
-// from the layer resolver). When provenance is undefined every field
-// renders bare (`required: true`); when provided the per-field
-// writer becomes a `[from <layer> policy]` hint.
+// Render the sandbox section. Used by both `renderPolicy` (in-REPL
+// `/perms`, no provenance available) and
+// `renderExplainPermissions` (headless `agent perms`, with
+// provenance from the layer resolver). When provenance is
+// undefined every field renders bare (`required: true`); when
+// provided the per-field writer becomes a `[from <layer> policy]`
+// hint.
 //
 // Lock renders as a footer line (`(locked by <layer> policy)`) — the
 // lock is conceptually about the section, not a field value. With no

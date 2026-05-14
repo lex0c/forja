@@ -76,9 +76,9 @@ export const canonicalize = (value: unknown): string => {
   throw new TypeError(`canonical: unsupported type ${typeof value}`);
 };
 
-// Sha256 of the canonical encoding, hex-lowercased. Used directly in
-// audit chain assembly: `this_hash = sha256(prev_hash || canonical_row)`
-// per PERMISSION_ENGINE.md §7.2.
+// Sha256 of the canonical encoding, hex-lowercased. Used directly
+// in audit chain assembly: `this_hash = sha256(prev_hash ||
+// canonical_row)`.
 export const sha256Hex = (input: string): string => {
   const hasher = new CryptoHasher('sha256');
   hasher.update(input);

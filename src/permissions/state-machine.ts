@@ -1,8 +1,8 @@
-// Engine state machine per PERMISSION_ENGINE.md §2. The engine walks
-// through explicit phases at bootstrap and can dynamically transition
-// between `ready` and `degraded` while running. `refusing` is the
-// fatal sink — once entered, only an operator-driven reset (new
-// session, --accept-broken-chain bypass, --rotate-chain) gets out.
+// Engine state machine. The engine walks through explicit phases
+// at bootstrap and can dynamically transition between `ready` and
+// `degraded` while running. `refusing` is the fatal sink — once
+// entered, only an operator-driven reset (new session,
+// --accept-broken-chain bypass, --rotate-chain) gets out.
 //
 //   init → loading-policy → validating-chain → ready ↔ degraded
 //                                       ↓
@@ -16,7 +16,7 @@
 //   ready                                    → pipeline runs normally
 //   degraded                                 → pipeline runs, but every
 //                                              `allow` is upgraded to
-//                                              `confirm` (spec §2)
+//                                              `confirm`
 //
 // The controller is a stand-alone object so bootstrap code can drive
 // transitions externally (the engine holds a reference and reads the
@@ -43,32 +43,22 @@ export interface StateTransition {
   ts: number;
 }
 
-// Valid edges per spec §2. Anything not listed throws on attempt —
-// silent "stay where you are" semantics would mask programming bugs
+// Valid edges. Anything not listed throws on attempt — silent
+// "stay where you are" semantics would mask programming bugs
 // (e.g. trying `refusing → ready` without a reset path).
 const VALID_TRANSITIONS: ReadonlyMap<EngineState, ReadonlySet<EngineState>> = new Map([
   ['init', new Set<EngineState>(['loading-policy', 'refusing'])],
   ['loading-policy', new Set<EngineState>(['validating-chain', 'refusing'])],
   ['validating-chain', new Set<EngineState>(['ready', 'degraded', 'refusing'])],
   ['ready', new Set<EngineState>(['degraded', 'refusing'])],
-  // Slice 177 (review — P1). `degraded → degraded` is now a valid
-  // self-edge. Pre-slice 158 papered over the missing edge at the
-  // seal-scheduler call site (gated transitions on currentState ===
-  // 'ready'). But other paths still call `engine.degrade()` blindly:
-  //   - the classifier-failure path in engine.ts re-degrades if
-  //     the classifier throws twice in a row (rare; the path is
-  //     guarded on `currentState === 'ready'`, but the guard
-  //     coverage is at-call-site, not structural).
-  //   - the public `engine.degrade(reason)` method (line ~2077)
-  //     called from sandbox-availability fallback and other
-  //     places that don't all guard.
-  // A throw from the state machine on a re-degrade would bubble as
-  // uncaughtException through whichever caller hadn't guarded
-  // (telemetry hooks, audit emit paths). The self-edge accepts the
-  // re-entry, records the reason in `history()` for forensics, and
-  // stays in `degraded`. The trail grows by one entry per re-degrade
-  // — that's the OBSERVABILITY we want (operators see WHY the
-  // engine kept hitting the same failure).
+  // `degraded → degraded` is a valid self-edge. Several callers
+  // invoke `engine.degrade()` without guarding on the current
+  // state (telemetry hooks, audit emit paths from the seal
+  // scheduler, etc.); a throw on re-degrade would bubble as
+  // uncaughtException. The self-edge accepts the re-entry, records
+  // the reason in `history()` for forensics, and stays in
+  // `degraded`. The trail grows by one entry per re-degrade —
+  // operators see WHY the engine kept hitting the same failure.
   ['degraded', new Set<EngineState>(['ready', 'refusing', 'degraded'])],
   // `refusing` is terminal. The state controller refuses every
   // attempt to leave it; recovery requires building a fresh
@@ -113,9 +103,7 @@ export const createStateController = (options: StateControllerOptions = {}): Sta
     get: () => current,
     transition(to, reason) {
       if (!canTransition(current, to)) {
-        throw new Error(
-          `state-machine: invalid transition ${current} → ${to} (reason: ${reason}); see PERMISSION_ENGINE.md §2`,
-        );
+        throw new Error(`state-machine: invalid transition ${current} → ${to} (reason: ${reason})`);
       }
       const event: StateTransition = { from: current, to, reason, ts: now() };
       current = to;

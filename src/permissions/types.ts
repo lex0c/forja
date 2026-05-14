@@ -1,8 +1,9 @@
-// Permission engine types per AGENTIC_CLI §8.
+// Permission engine types.
 //
-// Categories group tools by what they do, so policy rules can target the
-// behavior rather than every individual tool name. New tools join an
-// existing category instead of inventing a new section.
+// Categories group tools by what they do, so policy rules can
+// target the behavior rather than every individual tool name. New
+// tools join an existing category instead of inventing a new
+// section.
 import type { SandboxProfile } from './sandbox-plan.ts';
 
 export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc';
@@ -12,10 +13,11 @@ export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 // Policy rules per category. Each section is optional; absence means "no
 // opinion at this layer" (engine falls through to defaults).
 //
-// `locked` (per AGENTIC_CLI §8): when set in a higher-precedence layer
-// (enterprise > user > project > session), lower layers cannot override
-// this section. Used by enterprise admins to enforce non-negotiable
-// rules like "deny rm -rf" or "deny outbound web fetch to internal IPs".
+// `locked`: when set in a higher-precedence layer (enterprise >
+// user > project > session), lower layers cannot override this
+// section. Used by enterprise admins to enforce non-negotiable
+// rules like "deny rm -rf" or "deny outbound web fetch to internal
+// IPs".
 export interface BashPolicy {
   allow?: readonly string[];
   confirm?: readonly string[];
@@ -57,15 +59,15 @@ export interface PolicyDefaults {
   // resolver's final default.
   mode?: PolicyMode;
   // When set in a higher-precedence layer, lower layers cannot
-  // change `mode`. Apply at the same hierarchy granularity as
-  // section-level lock (per AGENTIC_CLI §8).
+  // change `mode`. Applies at the same hierarchy granularity as
+  // section-level lock.
   locked?: boolean;
 }
 
-// PERMISSION_ENGINE.md §6.5 policy-layer counterpart to the CLI
-// `--sandbox-host` flag and the bootstrap-hardcoded `required=false`.
-// All fields optional so the hierarchy resolver can distinguish
-// "silent" from "explicit false" (same convention as PolicyDefaults).
+// Policy-layer counterpart to the CLI `--sandbox-host` flag and
+// the bootstrap-hardcoded `required=false`. All fields optional so
+// the hierarchy resolver can distinguish "silent" from "explicit
+// false" (same convention as PolicyDefaults).
 //
 //   - `required`: when true AND `detectSandboxAvailability` returns
 //     unavailable, the bootstrap transitions the engine straight to
@@ -92,10 +94,10 @@ export interface PolicySandbox {
   locked?: boolean;
 }
 
-// PERMISSION_ENGINE.md §7.3 external sealing. Configures how the
-// engine snapshots the local hash chain to a write-once surface
-// so a root adversary who rewrites every audit row + recomputes
-// hashes still leaves a trail.
+// External sealing. Configures how the engine snapshots the local
+// hash chain to a write-once surface so a root adversary who
+// rewrites every audit row + recomputes hashes still leaves a
+// trail.
 //
 // `mode`:
 //   - 'none'           — default; no sealing. Local hash chain only.
@@ -168,23 +170,23 @@ export interface SealPolicy {
   //   - `s3-object-lock`: OPTIONAL custom S3 endpoint (e.g., MinIO
   //     `http://minio:9000`). Absent → AWS default for the region.
   endpoint?: string;
-  // §7.3 `s3-object-lock` mode (slice 89). S3 bucket holding the
-  // sealed objects. REQUIRED for that mode. Bucket MUST have
-  // Object Lock enabled at creation (`aws s3api
-  // create-bucket --object-lock-enabled-for-bucket`); this engine
-  // doesn't bootstrap that.
+  // `s3-object-lock` mode. S3 bucket holding the sealed objects.
+  // REQUIRED for that mode. Bucket MUST have Object Lock enabled
+  // at creation (`aws s3api create-bucket
+  // --object-lock-enabled-for-bucket`); this engine doesn't
+  // bootstrap that.
   bucket?: string;
-  // §7.3 `s3-object-lock`. AWS region. Optional — when absent,
-  // the `aws` CLI uses the operator's profile default
-  // (`AWS_REGION` env var, `~/.aws/config`, etc.).
+  // `s3-object-lock`. AWS region. Optional — when absent, the
+  // `aws` CLI uses the operator's profile default (`AWS_REGION`
+  // env var, `~/.aws/config`, etc.).
   region?: string;
-  // §7.3 `s3-object-lock`. S3 key prefix for sealed objects.
-  // Each entry lands at `${prefix}${seq}-${ts}.seal`. Operators
+  // `s3-object-lock`. S3 key prefix for sealed objects. Each
+  // entry lands at `${prefix}${seq}-${ts}.seal`. Operators
   // typically scope by install_id (e.g., `forja/<install-id>/`).
   // Optional — defaults to empty (bucket root). MUST NOT start or
   // end with `/`; the sealer always inserts the separator.
   key_prefix?: string;
-  // §7.3 `s3-object-lock`. Retention window for the Object Lock
+  // `s3-object-lock`. Retention window for the Object Lock
   // (COMPLIANCE mode). REQUIRED for s3-object-lock — no default,
   // because the lock makes the objects undeletable by anyone
   // (including root) until expiry. Operators MUST choose
@@ -194,15 +196,14 @@ export interface SealPolicy {
   interval_decisions?: number;
   interval_seconds?: number;
   on_failure?: SealOnFailure;
-  // §12.2 enterprise locking semantics (slice 112, R8 #322).
-  // When `true` at any layer, lower-precedence layers can't
-  // override the seal section. Re-asserting the exact same
-  // seal config is silent (no conflict); any field change
-  // records a `lockConflict` and the lower layer's version is
-  // discarded. Pre-slice the seal section was last-writer-wins
-  // with no lock semantics — enterprise-mandated `worm-file`
-  // sealing could be silently swapped for `mode: none` by
-  // project policy, defeating the §7.3 forensic guarantee.
+  // Enterprise locking. When `true` at any layer, lower-
+  // precedence layers can't override the seal section.
+  // Re-asserting the exact same seal config is silent (no
+  // conflict); any field change records a `lockConflict` and the
+  // lower layer's version is discarded. Without this lock, an
+  // enterprise-mandated `worm-file` sealing config could be
+  // silently swapped for `mode: none` by project policy,
+  // defeating the forensic guarantee.
   locked?: boolean;
 }
 
@@ -249,30 +250,31 @@ export interface PolicySource {
   section?: string;
 }
 
-// Fields common to every Decision variant. PERMISSION_ENGINE.md §17
-// linkage: `approvalSeq` is populated when the engine's audit sink
-// wrote a row to `approvals_log` (production path with the SQLite
-// sink). Omitted under the noop sink (tests, headless paths that
-// skip persistence). The harness uses it to link `approvals_log.seq`
-// with the matching `tool_calls.id` via the `approval_call_links`
-// table, so future replay modes (`--against-current-policy`,
-// `permission diff`) can recover raw args from `tool_calls.input`.
+// Fields common to every Decision variant. `approvalSeq` is
+// populated when the engine's audit sink wrote a row to
+// `approvals_log` (production path with the SQLite sink). Omitted
+// under the noop sink (tests, headless paths that skip
+// persistence). The harness uses it to link `approvals_log.seq`
+// with the matching `tool_calls.id` via the
+// `approval_call_links` table, so future replay modes
+// (`--against-current-policy`, `permission diff`) can recover
+// raw args from `tool_calls.input`.
 //
-// §6.5 sandbox profile populated when EngineOptions.sandbox is set
+// `sandboxProfile` is populated when EngineOptions.sandbox is set
 // (production bootstrap wires it from `detectSandboxAvailability`).
 // The harness propagates it into ToolContext so tools that spawn
 // child processes (currently bash) can wrap with the bwrap argv
-// from `buildBwrapArgv`. Omitted on misc category (resolver skipped,
-// no profile to plan) or when the engine was constructed without
-// sandbox inputs (legacy / test path).
+// from `buildBwrapArgv`. Omitted on misc category (resolver
+// skipped, no profile to plan) or when the engine was constructed
+// without sandbox inputs.
 interface DecisionBase {
   approvalSeq?: number;
   sandboxProfile?: SandboxProfile;
-  // §8 TTL — when this Decision was produced by matching a persisted
-  // grant, the grant's `expires_at` flows through here so the audit
-  // row's `ttl_expires_at` column records when the granted authority
-  // lapses. Undefined for non-grant decisions (the default deny /
-  // session-allow / policy-rule paths).
+  // Grant TTL — when this Decision was produced by matching a
+  // persisted grant, the grant's `expires_at` flows through here
+  // so the audit row's `ttl_expires_at` column records when the
+  // granted authority lapses. Undefined for non-grant decisions
+  // (the default deny / session-allow / policy-rule paths).
   ttlExpiresAt?: number;
 }
 
@@ -285,12 +287,12 @@ export type Decision =
   | (DecisionBase & { kind: 'deny'; reason: string; source?: PolicySource })
   | (DecisionBase & { kind: 'confirm'; prompt: string; reason?: string; source?: PolicySource });
 
-// Snapshot view of permissions handed to a tool's ToolContext (per
-// CONTRACTS §2 line 63). Read-only — tools must not mutate. Currently
-// just exposes the active mode; tools that need to short-circuit a
-// multi-step plan should call back into the engine via the harness with
-// the right tool name (the view can't know which tool's per-tool rules
-// to consult by category alone).
+// Snapshot view of permissions handed to a tool's ToolContext.
+// Read-only — tools must not mutate. Currently exposes only the
+// active mode; tools that need to short-circuit a multi-step plan
+// should call back into the engine via the harness with the right
+// tool name (the view can't know which tool's per-tool rules to
+// consult by category alone).
 export interface PermissionsView {
   mode: PolicyMode;
 }
