@@ -37,7 +37,7 @@
 // the operator sees "running with non-canonical bwrap" rather than
 // a silent downgrade.
 
-import { mkdirSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 
 // Canonical system paths for each sandbox tool. Hard-coded because
@@ -110,10 +110,40 @@ const defaultWhich = (name: string): string | null => {
   return Bun.which(name);
 };
 
+// Slice 178 (review — P2 defense in depth). `statSync` follows
+// symlinks and reports the target's metadata; we report mode from
+// the target because that IS what the kernel respects for the
+// `execve` access check. But OWNERSHIP needs both: a non-root-
+// owned symlink at a PATH-walk location (e.g.
+// `/tmp/evilbin/bwrap -> /usr/bin/bwrap`) is supply-chain expansion
+// regardless of how trustworthy the target is — the attacker
+// controls which target gets called via the link's name resolution.
+// `lstatSync` reports the LINK's owner; combining via max(uid)
+// surfaces "non-root owner anywhere in the resolution chain".
+//
+// We deliberately do NOT OR the LINK mode bits into the target
+// mode. POSIX symlinks have mode 0o777 by convention (the kernel
+// ignores them and respects only target-mode for access); OR-ing
+// would force every symlink-resolved path into "group/world
+// writable" and trip the trust check downstream on perfectly fine
+// distro layouts (e.g. `/usr/bin/bwrap → /usr/lib/.../bwrap`).
 const defaultStat = (path: string): { uid: number; mode: number } | null => {
   try {
-    const s = statSync(path);
-    return { uid: s.uid, mode: s.mode };
+    const target = statSync(path);
+    let linkUid: number | null = null;
+    try {
+      linkUid = lstatSync(path).uid;
+    } catch {
+      linkUid = null;
+    }
+    // If lstat failed (rare — usually means target stat already
+    // succeeded so this is some racy unlink), trust just the
+    // target shape.
+    if (linkUid === null) return { uid: target.uid, mode: target.mode };
+    // Combine UID only: pick the LESS trustworthy (any non-root
+    // in the chain shows up). Mode stays target-only.
+    const combinedUid = target.uid !== 0 || linkUid !== 0 ? Math.max(target.uid, linkUid) : 0;
+    return { uid: combinedUid, mode: target.mode };
   } catch {
     return null;
   }

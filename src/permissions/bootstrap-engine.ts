@@ -658,6 +658,38 @@ export const bootstrapPermissionEngine = async (
       engine,
       resolveOptions: resolveOptionsForWatcher,
       onReload: (result) => {
+        // Slice 170 (review — wrong-info P0 #4). Archive the
+        // post-reload policy bytes BEFORE emitting the audit row.
+        // Pre-slice only the initial bootstrap archive ran (line
+        // 633); subsequent hot-reloads emitted `policy-reloaded`
+        // audit rows whose `policy_hash` had no matching entry in
+        // `policy_archive`. `agent permission replay <seq>
+        // --against-archived-policy` then reported
+        // `skipped_reason: 'policy hash <H> not in policy_archive'`
+        // for every post-reload row — wrong cause attributed to
+        // "boot predates slice 16" or "archive GC'd" when the real
+        // cause was the watcher never archived. The canonical §17
+        // reproducibility check silently no-op'd for the entire
+        // post-reload session.
+        //
+        // Re-canonicalize via engine.policy() (deep-clone return
+        // from the engine API). Hash matches result.newHash by
+        // construction (engine swapped both atomically); the
+        // canonical_json bytes are the source of truth the engine
+        // used for the new hash.
+        const archiveNow = input.now?.() ?? Date.now();
+        try {
+          archivePolicy(input.db, {
+            policy_hash: result.newHash,
+            canonical_json: canonicalize(engine.policy()),
+            now: archiveNow,
+          });
+        } catch {
+          // Best-effort. Archive failures shouldn't suppress the
+          // policy-reloaded audit row — the operator should still
+          // see the reload event even if archive storage is broken.
+          // A future slice may add a failure_event emit here.
+        }
         emitPolicyReloadedRow(sink, input.sessionId, result.oldHash, result.newHash);
       },
       onReloadFailed: (reason) => {

@@ -19,6 +19,22 @@ export type ResolverResult =
 export interface ResolverContext {
   cwd: string;
   home: string;
+  // Slice 176 (review — command-bypass P0). Optional realpath seam
+  // for the bash analyzer's per-arg protected-path classifier. When
+  // set, the resolver canonicalizes lexically-resolved paths before
+  // classification so a symlink shape like
+  //   /work/proj/legit.txt → /etc/shadow
+  // (created by the operator or by a prior write) doesn't slip past
+  // the §11 deny tier when `cat legit.txt` is analyzed. Without
+  // canonicalization, the lexical `/work/proj/legit.txt` doesn't
+  // match any protected zone, but the kernel follows the symlink at
+  // exec time and reads `/etc/shadow`. The seam is optional so
+  // tests (which build paths that don't exist on disk) can omit it
+  // and stay on the lexical-only path; production wiring (engine
+  // proper) passes `fs.realpathSync` wrapped in try/catch so missing
+  // paths fall back to the lexical form (correct for write-creates-
+  // new-file).
+  realpath?: (p: string) => string;
 }
 
 export type Resolver = (args: Record<string, unknown>, ctx: ResolverContext) => ResolverResult;

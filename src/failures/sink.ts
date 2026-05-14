@@ -30,6 +30,7 @@ import type { OutcomeSink } from '../outcomes/sink.ts';
 import { sha256Hex } from '../permissions/canonical.ts';
 import { canonicalize } from '../permissions/canonical.ts';
 import { generateUlid } from '../permissions/ulid.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { withImmediateTransaction } from '../storage/db.ts';
 import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
@@ -318,8 +319,14 @@ export const createSqliteFailureSink = (options: {
           }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
+          // Slice 178 (review — P2). Same redaction rationale as the
+          // hooks/memory AUDIT DRIFT lines: a db-level exception
+          // message can include bound parameter values from the
+          // dual-write payload (failure_id, failure_code), and the
+          // outcome sink itself wraps further metadata. Redact
+          // secrets to keep the stderr line operator-safe.
           process.stderr.write(
-            `forja failure_events: outcome_signal dual-write failed for approval_seq=${approval_seq} (${msg}); failure row persisted\n`,
+            `forja failure_events: outcome_signal dual-write failed for approval_seq=${approval_seq} (${redactSecrets(msg)}); failure row persisted\n`,
           );
         }
       }

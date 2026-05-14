@@ -991,8 +991,18 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   //     state. Pure derivation; no extra probing.
   //   - Engine version: read once at module load from
   //     package.json (production) or overridden by tests.
+  // Slice 170 (review — wrong-info P1): pre-slice this gated on
+  // `sandboxResult.status === 'ok'`. After slice 165, doctor returns
+  // `status='warn'` for non-canonical sandbox (Nix/Homebrew install)
+  // — the planner still picks the sandboxed profiles, but doctor's
+  // ceiling collapsed to `[host]`, falsely claiming the install was
+  // downgraded to host-passthrough. Gate on availability (not on
+  // the trust-marker warn), so the ceiling reflects the actual
+  // engine planner state. `userNsResult` stays strict: its `warn`
+  // means "couldn't parse max_user_namespaces" — genuine uncertainty
+  // about whether bwrap will start, not a trust-only marker.
   const capabilityCeiling = computeCapabilityCeiling(
-    sandboxResult.status === 'ok',
+    sandboxResult.status !== 'fail',
     userNsResult.status === 'ok',
   );
 

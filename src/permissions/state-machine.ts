@@ -51,7 +51,25 @@ const VALID_TRANSITIONS: ReadonlyMap<EngineState, ReadonlySet<EngineState>> = ne
   ['loading-policy', new Set<EngineState>(['validating-chain', 'refusing'])],
   ['validating-chain', new Set<EngineState>(['ready', 'degraded', 'refusing'])],
   ['ready', new Set<EngineState>(['degraded', 'refusing'])],
-  ['degraded', new Set<EngineState>(['ready', 'refusing'])],
+  // Slice 177 (review — P1). `degraded → degraded` is now a valid
+  // self-edge. Pre-slice 158 papered over the missing edge at the
+  // seal-scheduler call site (gated transitions on currentState ===
+  // 'ready'). But other paths still call `engine.degrade()` blindly:
+  //   - the classifier-failure path in engine.ts re-degrades if
+  //     the classifier throws twice in a row (rare; the path is
+  //     guarded on `currentState === 'ready'`, but the guard
+  //     coverage is at-call-site, not structural).
+  //   - the public `engine.degrade(reason)` method (line ~2077)
+  //     called from sandbox-availability fallback and other
+  //     places that don't all guard.
+  // A throw from the state machine on a re-degrade would bubble as
+  // uncaughtException through whichever caller hadn't guarded
+  // (telemetry hooks, audit emit paths). The self-edge accepts the
+  // re-entry, records the reason in `history()` for forensics, and
+  // stays in `degraded`. The trail grows by one entry per re-degrade
+  // — that's the OBSERVABILITY we want (operators see WHY the
+  // engine kept hitting the same failure).
+  ['degraded', new Set<EngineState>(['ready', 'refusing', 'degraded'])],
   // `refusing` is terminal. The state controller refuses every
   // attempt to leave it; recovery requires building a fresh
   // controller (which the bootstrap does, gated on the

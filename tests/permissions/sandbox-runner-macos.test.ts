@@ -66,6 +66,44 @@ describe('buildSbplProfile — common header + base rules', () => {
     }
   });
 
+  // Slice 175 (review — sandbox escape P1). `(allow mach-lookup)`
+  // is required for dyld + libc + ordinary stdlib calls, but the
+  // blanket grant lets the inner bash call `open -a Mail
+  // file://exfil.html` — `open` brokers through `lsd` /
+  // `coreservicesd`, which spawns the target app OUTSIDE the
+  // sandbox with the operator's full privileges. The targeted
+  // deny list strands LaunchServices + taskgated mach surfaces
+  // while keeping the broad allow for everything else.
+  test('every sandboxed profile denies the LaunchServices mach surface (slice 175)', () => {
+    const requiredDenies = [
+      '(deny mach-lookup (global-name "com.apple.lsd"))',
+      '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))',
+      '(deny mach-lookup (global-name "com.apple.LSOpenApplication"))',
+    ];
+    for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
+      const profile = buildSbplProfile(p, '/work/proj', '/home/op');
+      const allowIdx = profile.indexOf('(allow mach-lookup)');
+      expect(allowIdx).toBeGreaterThanOrEqual(0);
+      for (const deny of requiredDenies) {
+        expect(profile).toContain(deny);
+        // Each deny lands AFTER the broad allow so SBPL's
+        // last-match-wins refuses the specific service.
+        expect(profile.indexOf(deny)).toBeGreaterThan(allowIdx);
+      }
+    }
+  });
+
+  test('every sandboxed profile denies the taskgated mach surface (slice 175)', () => {
+    // taskgated brokers TASK_FOR_PID; access from inside the
+    // sandbox would let the wrapped process inject code into a
+    // sibling un-sandboxed process. Refuse the lookup.
+    for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
+      const profile = buildSbplProfile(p, '/work/proj', '/home/op');
+      expect(profile).toContain('(deny mach-lookup (global-name "com.apple.taskgated"))');
+      expect(profile).toContain('(deny mach-lookup (global-name "com.apple.taskgated-helper"))');
+    }
+  });
+
   test('file-read* always granted (read-only baseline)', () => {
     for (const p of ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const) {
       const profile = buildSbplProfile(p, '/work/proj', '/home/op');

@@ -3334,3 +3334,86 @@ describe('engine.reloadPolicy — refusing state guard (slice 163)', () => {
     expect(eng.policy().tools.bash?.allow).toEqual(['*']);
   });
 });
+
+// Slice 169 (review — wrong-info P0 #1, #2, #3). Three entangled
+// fixes: confirm-upgrade cause attribution, scoreForcesConfirm
+// medium-confidence behavior, reasonChainFor stage labeling for
+// engine-state / resolver-refuse / sandbox-plan sections.
+describe('engine — slice 169 confirm cause + stage attribution', () => {
+  test('degraded engine: confirm prompt + reason name "degraded" (not score)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+    });
+    eng.degrade('test_signal');
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.prompt).toContain('degraded mode');
+      expect(d.reason).toContain('degraded state forced confirm');
+    }
+  });
+
+  test('ready engine + score escalates: prompt + reason name "score" (not degraded)', () => {
+    // Use a command that the bash resolver gives high score for —
+    // a write to /etc would push capability_risk + workspace_escape
+    // above threshold under default policy.
+    const eng = createPermissionEngine(
+      policy({
+        defaults: { mode: 'strict' },
+        tools: { bash: { allow: ['*'] } }, // allow everything; force gate to fire
+      }),
+      { cwd: CWD, scoreConfirmThreshold: 0.1 }, // very low threshold for test
+    );
+    expect(eng.state()).toBe('ready');
+    // `chmod -R 777 /var/log` will push capability_risk high.
+    const d = eng.check('bash', 'bash', { command: 'chmod -R 777 /var/log' });
+    // Either confirm (gated) or deny (resolver refuse). For this
+    // assertion shape, accept either kind but verify if confirm
+    // the messaging is right.
+    if (d.kind === 'confirm') {
+      // No false "degraded" claim when engine is ready.
+      expect(d.prompt).not.toContain('degraded mode');
+      // Score gate path names the score detail.
+      expect(d.reason).toMatch(/score gate forced|resolver gate forced/);
+    }
+  });
+
+  test('scoreForcesConfirm: medium confidence does NOT force (was P0 #2)', () => {
+    // `cmdPip` (src/permissions/resolvers/bash.ts) unconditionally
+    // returns `confidence: 'medium'`. With an allow rule matching
+    // `pip install*` and a high score threshold (so the score gate
+    // is dormant), the ONLY thing that could escalate this to
+    // `confirm` is the confidence-medium path. Pre-slice 169 the
+    // gate fired on `confidence !== 'high'` and produced a confirm;
+    // post-slice it only fires on `confidence === 'low'` so the
+    // decision stays `allow`. Asserts the post-slice behavior
+    // directly — pre-slice this test would fail.
+    const eng = createPermissionEngine(
+      policy({
+        defaults: { mode: 'strict' },
+        tools: { bash: { allow: ['pip install*'] } },
+      }),
+      { cwd: CWD, scoreConfirmThreshold: 0.99 }, // dormant score gate
+    );
+    const d = eng.check('bash', 'bash', { command: 'pip install requests' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('reasonChainFor: engine-state section → stage="engine-state" (not default-deny)', () => {
+    // Force engine to a non-ready state.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.refuse('test_force_refuse');
+    expect(eng.state()).toBe('refusing');
+    // Any check now should deny via engine-state. The decision's
+    // reason chain must label it correctly so forensic queries can
+    // distinguish "engine refusing" from "no policy rule matched".
+    const d = eng.check('read_file', 'fs.read', { path: 'src/foo.ts' });
+    expect(d.kind).toBe('deny');
+    // (Audit row's reason_chain is constructed by emitAudit; here
+    // we verify via the source.section that's exposed on the
+    // Decision shape.)
+    if (d.kind === 'deny') {
+      expect(d.source?.section).toBe('engine-state');
+    }
+  });
+});

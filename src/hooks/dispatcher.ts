@@ -1,3 +1,4 @@
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { createHookRun } from '../storage/repos/hook-runs.ts';
 import { classifyExitCode, matchesPayload } from './dispatcher-matching.ts';
@@ -195,8 +196,17 @@ export const dispatchOne = async (
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Slice 178 (review — P2 defense in depth). The audit-drift
+      // stderr line is operator-visible AND captured by any
+      // process supervisor / log aggregator the operator runs
+      // (journald, container log drivers, etc). A db-side error
+      // can include the offending SQL statement, which can include
+      // bound-parameter values from the hook's stdout/stderr (a
+      // hook that printed a Bearer token would land in the error).
+      // Redact secrets in the message; the operator still gets
+      // the structural failure shape and the spec hint.
       process.stderr.write(
-        `hooks: AUDIT DRIFT: failed to record ${spec.event} run (${spec.sourcePath}#${hookIndex}): ${msg}\n`,
+        `hooks: AUDIT DRIFT: failed to record ${spec.event} run (${spec.sourcePath}#${hookIndex}): ${redactSecrets(msg)}\n`,
       );
     }
   };

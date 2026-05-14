@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
@@ -610,10 +611,20 @@ const checkBash = (
   // silenced narrows the policy with a deny exception, runs the
   // commands separately, or session-allows the literal pattern
   // (the path that already cleared the modal once).
+  // Slice 177 (review — P1). The bash prompt previously interpolated
+  // the literal command into the operator-visible `prompt` field:
+  // `Run bash: curl -H "Authorization: Bearer SECRET" ...`. The IPC
+  // envelope (for subagent confirm) carries this prompt verbatim;
+  // future telemetry / structured-event consumers can log it. Redact
+  // BEFORE interpolation so secrets never reach the prompt string.
+  // The operator's modal STILL renders the raw `args` block alongside
+  // the prompt, so the operator can see the literal command for the
+  // decision; only the prompt-line hint is sanitized.
+  const promptCommand = redactSecrets(command);
   if (containsShellInjection(command)) {
     return {
       kind: 'confirm',
-      prompt: `Run bash: ${command}`,
+      prompt: `Run bash: ${promptCommand}`,
       reason:
         'compound shell command (contains ; && || | $(...) or backticks) — confirming explicitly to surface the literal command',
       source: { layer, section: 'bash' },
@@ -632,7 +643,7 @@ const checkBash = (
   if (confirm !== null) {
     return {
       kind: 'confirm',
-      prompt: `Run bash: ${command}`,
+      prompt: `Run bash: ${promptCommand}`,
       reason: `matched confirm rule: ${confirm}`,
       source: { layer, rule: confirm, section: 'bash' },
     };
@@ -1018,13 +1029,48 @@ const decisionToAuditEnum = (kind: Decision['kind']): 'allow' | 'deny' | 'confir
 // grant authorized the call). The `kind`, `prompt`, and `reason`
 // fields below intentionally override the spread values — we want
 // the post-degrade shape, not the pre-degrade allow shape.
-const degradeAllowToConfirm = (decision: Decision): Decision => {
+// Slice 169 (review — wrong-info P0 #1). Pre-slice this function
+// hardcoded "degraded state" prompt + reason regardless of cause —
+// it was also invoked when the score gate or resolver-confidence
+// gate forced an upgrade with a perfectly READY engine. Audit row +
+// modal text claimed the engine was degraded; `agent doctor` /
+// `state.transition` events disagreed. Operators saw conflicting
+// signals and could dismiss legitimate score-driven confirms as
+// "stuck degraded modal".
+//
+// Post-slice the cause is explicit. Three flavors:
+//   - 'degraded' — engine actually in degraded state.
+//   - 'score'    — risk score crossed threshold OR resolver
+//                  confidence was low (the §6.6 approval gate).
+//   - 'resolver' — resolver returned conservative / low confidence
+//                  via the slice 92 forced-confirm path.
+//
+// `detail` carries the metric for the audit row + modal preview
+// (e.g., `score=0.62 >= 0.40`, `confidence=low`, `conservative: <reason>`).
+type ConfirmCause = 'degraded' | 'score' | 'resolver';
+
+const degradeAllowToConfirm = (
+  decision: Decision,
+  cause: ConfirmCause,
+  detail: string,
+): Decision => {
   if (decision.kind !== 'allow') return decision;
+  const baseReason = decision.reason ?? 'allow';
+  const prompts: Record<ConfirmCause, string> = {
+    degraded: 'Engine is in degraded mode — confirm before continuing.',
+    score: `Risk score forced confirm (${detail}). Review before continuing.`,
+    resolver: `Resolver forced confirm (${detail}). Review before continuing.`,
+  };
+  const reasons: Record<ConfirmCause, string> = {
+    degraded: `degraded state forced confirm (was: ${baseReason})`,
+    score: `score gate forced confirm (${detail}; was: ${baseReason})`,
+    resolver: `resolver gate forced confirm (${detail}; was: ${baseReason})`,
+  };
   return {
     ...decision,
     kind: 'confirm',
-    prompt: 'Engine is in degraded mode — confirm before continuing.',
-    reason: `degraded state forced confirm (was: ${decision.reason ?? 'allow'})`,
+    prompt: prompts[cause],
+    reason: reasons[cause],
   };
 };
 
@@ -1058,13 +1104,21 @@ const resolverStageEntry = (result: ResolverResult | null): ReasonChainEntry | u
 
 // §6.6 row 4-5: a would-be `allow` upgrades to `confirm` when EITHER
 // the final score (deterministic + clamped classifier adjust) crosses
-// the threshold OR the resolver confidence dropped below `high`. The
-// two conditions are independent — high-confidence/low-score allows
-// pass through; everything else escalates. Only `allow` is gated
-// (deny/confirm are already terminal for this purpose). Misc tools
-// skip the resolver and run at `high` confidence with score 0, so
-// they never trigger this gate. Caller passes `null` confidence for
-// misc to short-circuit.
+// the threshold OR the resolver confidence is `low`. The two
+// conditions are independent — high/medium-confidence + low-score
+// allows pass through; only score≥threshold or confidence='low'
+// escalates. Only `allow` is gated (deny/confirm are already terminal
+// for this purpose). Misc tools skip the resolver and run at `high`
+// confidence with score 0, so they never trigger this gate. Caller
+// passes `null` confidence for misc to short-circuit.
+//
+// Slice 169 (review — wrong-info P0 #2). Pre-slice this returned
+// true for `confidence !== 'high'` (matching both `medium` and
+// `low`). Spec §5.1 lines 224-228 + the in-file comment at the
+// gateConfidence derivation explicitly stated medium does NOT
+// force. The code disagreed → every medium-confidence allow got
+// escalated, generating approval fatigue + poisoning the §6.3.2
+// calibration plan's `confidence` signal. Fixed to `=== 'low'`.
 const scoreForcesConfirm = (
   decision: Decision,
   score: number,
@@ -1073,7 +1127,7 @@ const scoreForcesConfirm = (
 ): boolean => {
   if (decision.kind !== 'allow') return false;
   if (score >= threshold) return true;
-  if (confidence !== null && confidence !== 'high') return true;
+  if (confidence === 'low') return true;
   return false;
 };
 
@@ -1096,10 +1150,38 @@ const approvalGateStageEntry = (
       note: `score=${score.toFixed(2)} >= threshold=${threshold.toFixed(2)}`,
     };
   }
-  if (confidence !== null && confidence !== 'high') {
-    return { stage: 'approval-gate', note: `confidence=${confidence}` };
+  // Slice 169: parallel to the `scoreForcesConfirm` fix — only
+  // `low` confidence forces the gate, not `medium`.
+  if (confidence === 'low') {
+    return { stage: 'approval-gate', note: 'confidence=low' };
   }
   return undefined;
+};
+
+// Slice 169: compute the detail string passed into
+// `degradeAllowToConfirm` so the modal/audit accurately names what
+// caused the upgrade. Returns null when neither side fired (caller
+// shouldn't be calling us then).
+const approvalGateDetail = (
+  score: number,
+  confidence: RiskScoreConfidence | null,
+  threshold: number,
+): string => {
+  if (score >= threshold) {
+    return `score=${score.toFixed(2)} >= threshold=${threshold.toFixed(2)}`;
+  }
+  if (confidence === 'low') return 'confidence=low';
+  return 'unspecified';
+};
+
+// Slice 169: detail for the resolver-driven confirm path. Mirrors
+// the existing `resolverStageEntry` shape so the modal prompt
+// matches the reason-chain note.
+const resolverDetail = (result: ResolverResult | null): string => {
+  if (result === null) return 'unspecified';
+  if (result.kind === 'conservative') return `conservative: ${result.reason}`;
+  if (result.kind === 'ok' && result.confidence === 'low') return 'confidence=low';
+  return 'unspecified';
 };
 
 // Reason-chain entry tagged `sandbox-plan` (PERMISSION_ENGINE.md §6.5).
@@ -1122,6 +1204,27 @@ const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
     stage = 'protected-path';
+  } else if (decision.source?.section === 'engine-state') {
+    // Slice 169 (review — wrong-info P0 #3). State-rejecting denies
+    // (engine in init/loading/validating/refusing) used to fall
+    // through to `default-deny` — forensic queries for "decisions
+    // refused while engine was in state X" returned zero rows.
+    // Per spec §6.0 canonical taxonomy this is `engine-state`.
+    stage = 'engine-state';
+  } else if (decision.source?.section === 'resolver-refuse') {
+    // Slice 169: resolver-floor refuses (HARD_REFUSE_COMMANDS,
+    // RED_FLAG_NODES, SSRF blocklist, etc. — §5.2 M3) used to be
+    // labeled `default-deny`. Per spec §6.0 they are distinct from
+    // operator-policy denies because operator cannot widen them.
+    stage = 'resolver-refuse';
+  } else if (decision.source?.section === 'sandbox-plan' && decision.kind === 'deny') {
+    // Slice 169: sandbox-plan REFUSE (uncovered capability set or
+    // sandbox required + unavailable). The existing
+    // `sandboxPlanStageEntry` appends a second `sandbox-plan` entry
+    // describing the planner state. The FIRST entry's stage should
+    // reflect that the call was REFUSED at sandbox-plan time, not
+    // mis-labeled as `default-deny`. Per spec §6.0: `sandbox-refused`.
+    stage = 'sandbox-refused';
   } else if (decision.source?.section === 'subagent-effective') {
     // §10.1 child-envelope deny (slice 95). Distinct stage so audit
     // replays and `/perms why` rendering can tell the operator the
@@ -1371,6 +1474,17 @@ export const createPermissionEngine = (
       resolverResult = resolveCapabilities(toolName, args as Record<string, unknown>, {
         cwd,
         home,
+        // Slice 176 (review — command-bypass P0 #5). Wire realpath
+        // so the bash analyzer's per-arg classifier can detect
+        // symlink-shaped bypasses (e.g., `/work/proj/innocent.txt`
+        // → `/etc/shadow`). Best-effort: `realpathSync` throws for
+        // paths that don't exist (write-creates-new-file) and the
+        // resolver's helper falls back to the lexical form. The
+        // engine doesn't need to centralize the try/catch; the
+        // helper handles it. Production wiring only — tests that
+        // build ResolverContext directly omit `realpath` and stay
+        // on the lexical-only path.
+        realpath: realpathSync,
       });
       if (resolverResult.kind === 'refuse') {
         const decision: Decision = {
@@ -1648,6 +1762,15 @@ export const createPermissionEngine = (
           const stages: ReasonChainEntry[] = [];
           if (classifierStage !== null) stages.push(classifierStage);
           if (sandboxStage !== null) stages.push(sandboxStage);
+          // Slice 177 (review — P1). The general bypass-mode exit
+          // below appends `degradedStageEntry` so the audit row
+          // surfaces whether the engine was in `degraded` /
+          // `boot-deny-all` at decision time. The bypass-deny
+          // short-circuit was omitting it — operator forensics on
+          // a deny row under bypass had no way to see the engine
+          // state. Match the general exit's chain shape.
+          const degradedStage = degradedStageEntry(currentState);
+          if (degradedStage !== undefined) stages.push(degradedStage);
           const e = emitAudit(
             toolName,
             args,
@@ -1678,6 +1801,11 @@ export const createPermissionEngine = (
           const stages: ReasonChainEntry[] = [];
           if (classifierStage !== null) stages.push(classifierStage);
           if (sandboxStage !== null) stages.push(sandboxStage);
+          // Slice 177 (review — P1). Same engine-state stage gap as
+          // the bypass-deny path above. Add the entry for parity so
+          // a §8.4 deny under bypass shows the engine state too.
+          const degradedStage = degradedStageEntry(currentState);
+          if (degradedStage !== undefined) stages.push(degradedStage);
           const e = emitAudit(
             toolName,
             args,
@@ -1719,7 +1847,7 @@ export const createPermissionEngine = (
       }
       const upgraded =
         currentState === 'degraded' && bypassDecision.kind === 'allow'
-          ? degradeAllowToConfirm(bypassDecision)
+          ? degradeAllowToConfirm(bypassDecision, 'degraded', `state=${currentState}`)
           : bypassDecision;
       const stages: ReasonChainEntry[] = [];
       if (classifierStage !== null) stages.push(classifierStage);
@@ -1864,11 +1992,20 @@ export const createPermissionEngine = (
       gateConfidence,
       scoreConfirmThreshold,
     );
-    if (
-      currentState === 'degraded' ||
-      ((resolverForcesConfirm || scoreEscalates) && !sessionAllowed)
-    ) {
-      decision = degradeAllowToConfirm(decision);
+    // Slice 169 (review — wrong-info P0 #1): pass the actual cause
+    // so the modal prompt + audit reason name what really fired.
+    // Priority: degraded > resolver-forced > score-gated (matches
+    // the tailStage selection below for consistency).
+    if (currentState === 'degraded') {
+      decision = degradeAllowToConfirm(decision, 'degraded', `state=${currentState}`);
+    } else if (resolverForcesConfirm && !sessionAllowed) {
+      decision = degradeAllowToConfirm(decision, 'resolver', resolverDetail(resolverResult));
+    } else if (scoreEscalates && !sessionAllowed) {
+      decision = degradeAllowToConfirm(
+        decision,
+        'score',
+        approvalGateDetail(score, gateConfidence, scoreConfirmThreshold),
+      );
     }
     const stages: ReasonChainEntry[] = [];
     if (classifierStage !== null) stages.push(classifierStage);

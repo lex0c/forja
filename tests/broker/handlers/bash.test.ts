@@ -215,7 +215,7 @@ describe('createBashHandler — spawn failure mapping', () => {
 // ─── argv shape forwarded to spawn ─────────────────────────────────────────
 
 describe('createBashHandler — spawn invocation shape', () => {
-  test('forwards argv as ["bash", "-c", command]', async () => {
+  test('forwards argv as ["bash", "-s"] (slice 173 — command body is piped via stdin, not argv)', async () => {
     const captured: { argv: readonly string[] | null } = { argv: null };
     const spawn: BashSpawnFn = (argv) => {
       captured.argv = argv;
@@ -223,7 +223,34 @@ describe('createBashHandler — spawn invocation shape', () => {
     };
     const handler = createBashHandler({ spawn });
     await handler.execute(baseRequest({ args: { command: 'ls -la' } }));
-    expect(captured.argv).toEqual(['bash', '-c', 'ls -la']);
+    expect(captured.argv).toEqual(['bash', '-s']);
+  });
+
+  test('command body is delivered to spawn via stdinScript, not argv (slice 173)', async () => {
+    // Threat: with `bash -c '<cmd>'`, the command body (including
+    // any interpolated tokens — Bearer auth headers, API keys,
+    // signed URLs) appears in `/proc/<pid>/cmdline` and is readable
+    // by any other local user via `ps aux`. Switching to `bash -s`
+    // and piping the script over stdin removes the body from argv
+    // entirely. Test asserts the call site honors that split: argv
+    // contains ONLY the bash invocation, the body lives in
+    // stdinScript.
+    const captured: { argv: readonly string[] | null; stdinScript: string | null } = {
+      argv: null,
+      stdinScript: null,
+    };
+    const spawn: BashSpawnFn = (argv, opts) => {
+      captured.argv = argv;
+      captured.stdinScript = opts.stdinScript;
+      return makeMockProc();
+    };
+    const handler = createBashHandler({ spawn });
+    await handler.execute(
+      baseRequest({ args: { command: 'curl -H "Authorization: Bearer SECRET" https://x' } }),
+    );
+    expect(captured.argv).toEqual(['bash', '-s']);
+    expect(captured.argv).not.toContain('curl -H "Authorization: Bearer SECRET" https://x');
+    expect(captured.stdinScript).toBe('curl -H "Authorization: Bearer SECRET" https://x');
   });
 
   test('forwards cwd + scrubbed env to spawn options', async () => {
@@ -235,7 +262,13 @@ describe('createBashHandler — spawn invocation shape', () => {
     const scrubEnv = (): Record<string, string> => ({ SAFE: 'value' });
     const handler = createBashHandler({ spawn, scrubEnv, baseCwd: '/work/proj' });
     await handler.execute(baseRequest({ args: { command: 'echo' } }));
-    expect(captured.opts).toEqual({ cwd: '/work/proj', env: { SAFE: 'value' } });
+    // Slice 173 — stdinScript is now part of the options surface;
+    // we deep-check including the script alongside cwd/env.
+    expect(captured.opts).toEqual({
+      cwd: '/work/proj',
+      env: { SAFE: 'value' },
+      stdinScript: 'echo',
+    });
   });
 
   test('scrubEnv receives process.env', async () => {

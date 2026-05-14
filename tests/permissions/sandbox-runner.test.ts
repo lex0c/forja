@@ -217,7 +217,16 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       // On Linux the canonical /usr/bin/bwrap wins if present;
       // otherwise the PATH-resolved fallback applies.
       expect(argv[0]).toMatch(/bwrap$/);
-      expect(argv.slice(-3)).toEqual(['bash', '-c', 'echo hi']);
+      // Slice 175 (review): inner argv[0] (bare `bash`) is now
+      // canonicalized to an absolute path BEFORE the wrap, so the
+      // kernel-side execve inside the sandbox doesn't re-walk
+      // $PATH and pick a writable-mount shim. Assert the final
+      // three argv elements via the absolute-bash regex; legacy
+      // tail-shape `['bash', '-c', 'echo hi']` was pre-slice 175.
+      const tail = argv.slice(-3);
+      expect(tail[0]).toMatch(/\/bash$/);
+      expect(tail[1]).toBe('-c');
+      expect(tail[2]).toBe('echo hi');
     } else {
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     }
@@ -269,6 +278,80 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       expect(envAssignments.some((a) => a.startsWith('UNSAFE_TOKEN='))).toBe(false);
       // After `--` the original innerArgv.
       expect(argv.slice(innerStart + 1)).toEqual(['bash', '-c', 'echo hi']);
+    });
+
+    // Slice 175 (review — sandbox escape P1, PATH-walk hijack).
+    // Bare `innerArgv[0]` (e.g. `bash`) lets the kernel's execve
+    // inside the sandbox re-walk $PATH at exec time. cwd-rw makes
+    // cwd writable, and if cwd happens to be on PATH a prior
+    // sandboxed call could plant a `bash` shim there; the next
+    // call's bare `bash` would resolve to the shim. Wrapper now
+    // pins innerArgv[0] to an absolute path AT WRAP TIME using
+    // the OUTER process's $PATH (trusted by the operator). The
+    // sandboxed exec sees `/bin/bash`, no $PATH walk, no shim.
+    test('inner argv[0] is canonicalized to absolute path before wrap (slice 175)', () => {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: ['bash', '-s'], // bare; would be PATH-resolved inside sandbox
+        env: { PATH: '/usr/bin:/bin' },
+        platform: 'linux',
+        which: (name) => {
+          if (name === 'bwrap') return '/usr/bin/bwrap';
+          if (name === 'bash') return '/bin/bash'; // operator's canonical bash
+          return null;
+        },
+        exists: (p) => p === '/usr/bin/bwrap',
+        realpath: (p) => p,
+      });
+      // bwrap argv ends with `-- <inner>`. The first inner element
+      // must be the absolute /bin/bash, not the bare name.
+      const sepIdx = argv.indexOf('--');
+      expect(sepIdx).toBeGreaterThan(0);
+      expect(argv[sepIdx + 1]).toBe('/bin/bash');
+      expect(argv[sepIdx + 2]).toBe('-s');
+    });
+
+    test('inner argv[0] already absolute is passed through unchanged (slice 175)', () => {
+      // If the caller already gave an absolute path, the canonicalizer
+      // shouldn't double-resolve or alter it.
+      const argv = maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: ['/opt/custom/bash', '-s'],
+        env: { PATH: '/usr/bin:/bin' },
+        platform: 'linux',
+        which: (name) => {
+          if (name === 'bwrap') return '/usr/bin/bwrap';
+          return null;
+        },
+        exists: (p) => p === '/usr/bin/bwrap',
+        realpath: (p) => p,
+      });
+      const sepIdx = argv.indexOf('--');
+      expect(argv[sepIdx + 1]).toBe('/opt/custom/bash');
+    });
+
+    test('inner argv[0] unresolvable falls back to original (slice 175 — best-effort)', () => {
+      // If which() can't resolve the bare name, we keep the original
+      // argv and let the sandboxed exec fail loudly rather than
+      // silently picking up whatever the kernel resolves first.
+      const argv = maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: ['some-tool-that-doesnt-exist', 'arg'],
+        env: { PATH: '/usr/bin:/bin' },
+        platform: 'linux',
+        which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+        exists: (p) => p === '/usr/bin/bwrap',
+        realpath: (p) => p,
+      });
+      const sepIdx = argv.indexOf('--');
+      // Argv pinned literally; no synthetic absolute path invented.
+      expect(argv[sepIdx + 1]).toBe('some-tool-that-doesnt-exist');
     });
 
     test('darwin without sandbox-exec → passthrough (degraded)', () => {

@@ -214,6 +214,45 @@ export const buildSbplProfile = (
     // mach-lookup is required for system services (e.g. dyld);
     // omitting it makes EVERY exec fail with mach-style errors.
     '(allow mach-lookup)',
+    // Slice 175 (review — sandbox escape P1). `(allow mach-lookup)`
+    // is blanket — every mach service the sandboxed process names
+    // resolves, including LaunchServices. That lets the inner bash
+    // call `open -a Mail file://exfil.html` or `open -a
+    // 'TextEdit.app' /etc/shadow`; the `open` call is brokered
+    // OUTSIDE the sandbox by `lsd` / `coreservicesd`, which then
+    // spawn the target app un-sandboxed with the operator's full
+    // privileges. The sandboxed process effectively requested an
+    // arbitrary exec via mach-IPC, escaping the SBPL.
+    //
+    // SBPL evaluates rules top-to-bottom and the LAST matching rule
+    // wins. We emit explicit denies for the LaunchServices /
+    // app-launch mach surface AFTER the blanket allow so dyld /
+    // libc still resolve normal services but `open(1)`'s helper
+    // calls hit a refusal.
+    //
+    // Service-name selection: each entry below is documented in
+    // public Apple sources OR appears in well-known `dtrace -n
+    // 'pid$target::*mach_lookup*'` traces of `open(1)`:
+    //   - `com.apple.lsd` — LaunchServicesD primary mach port.
+    //   - `com.apple.coreservices.launchservicesd` — newer
+    //     launchd-named variant on macOS 12+.
+    //   - `com.apple.LSOpenApplication` — public LaunchServices
+    //     open-app API; targeted by `LSOpenFromURLSpec` and the
+    //     deprecated `LSOpenApplication` selectors.
+    //   - `com.apple.taskgated` + `-helper` — task-port broker;
+    //     `task_for_pid` cross-process call. A sandboxed bash
+    //     reaching this could request a sibling's task port and
+    //     inject code, escaping the SBPL completely.
+    // The conservative posture is: name the surfaces we KNOW are
+    // load-bearing for the escape, accept that an undocumented
+    // `lsd.*` subservice we missed could still leak. Future audit
+    // sweep can add more — names are additive (each is an extra
+    // deny, never relaxes the blanket allow).
+    '(deny mach-lookup (global-name "com.apple.lsd"))',
+    '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))',
+    '(deny mach-lookup (global-name "com.apple.LSOpenApplication"))',
+    '(deny mach-lookup (global-name "com.apple.taskgated"))',
+    '(deny mach-lookup (global-name "com.apple.taskgated-helper"))',
   ];
 
   // Filesystem reads — always allowed (every profile inherits the
@@ -379,7 +418,7 @@ export const buildSbplProfile = (
 // passed directly to exec(). Caller's innerArgv must be a complete
 // executable + args list.
 export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): string[] => {
-  const { profile, home, innerArgv } = options;
+  const { profile, innerArgv } = options;
   if (innerArgv.length === 0) {
     throw new Error('buildSandboxExecArgv: innerArgv must not be empty');
   }
@@ -421,6 +460,23 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
         detail = `cwd '${options.cwd}' cannot be canonicalized (code=${code ?? 'unknown'}: ${err.message})`;
     }
     throw new Error(`sandbox: ${detail}`);
+  }
+
+  // Slice 171 (review — sandbox P1): canonicalize `home` so SBPL
+  // deny rules at `(literal "${home}/.ssh/id_rsa")` and HIDE_PATHS
+  // overlays target the canonical path. Symlinked-home layouts
+  // (`/home/op → /data/users/op`) previously left the canonical
+  // `.ssh` exposed via the base `(allow file-read*)` while the
+  // deny only matched the symlink path. Best-effort fallback: on
+  // realpath failure, fall back to the literal input (cwd
+  // canonicalization above already proved the kernel can resolve
+  // most paths; home not existing at canonical time is rare and
+  // doesn't justify refusing the wrap).
+  let home: string;
+  try {
+    home = realpath(options.home);
+  } catch {
+    home = options.home;
   }
 
   // Slice 134 P0-12 (cross-platform parity with sandbox-runner.ts:147-154):

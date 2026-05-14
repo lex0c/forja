@@ -139,6 +139,29 @@ const canonicalizeCwd = (cwd: string, realpath: (p: string) => string): string =
   }
 };
 
+// Slice 171 (review — sandbox P1): canonicalize `home` BEFORE the
+// HIDE_PATHS overlays and `--bind home home` use it. Symmetric with
+// `canonicalizeCwd`. Pre-slice a managed-NFS-style symlink
+// `/home/op → /data/users/op` left the canonical `.ssh` exposed via
+// the base `--ro-bind / /` while HIDE_PATHS only masked the symlink-
+// path form. Failure modes degrade to the literal input (best-effort
+// — the wrap proceeds with the operator's stated home, the kernel
+// resolves at exec time anyway). The bwrap / SBPL overlays at the
+// literal `home` path then catch the most common case (operator with
+// no symlinked home) without breaking the symlinked-home case
+// either (because the HIDE_PATHS at canonical home now masks the
+// real target).
+const canonicalizeHome = (home: string, realpath: (p: string) => string): string => {
+  try {
+    return realpath(home);
+  } catch {
+    // Best-effort. Unlike cwd, we don't refuse on home-canonicalize
+    // failure — the operator's home may legitimately not exist at
+    // canonical-resolve time on tightly-namespaced installs.
+    return home;
+  }
+};
+
 export interface BuildBwrapArgvOptions {
   profile: SandboxProfile;
   // Working directory the wrapped process should start in. For
@@ -147,7 +170,11 @@ export interface BuildBwrapArgvOptions {
   // Operator's home. For home-rw, this is the writable mount target.
   home: string;
   // The inner command + args the bwrap wraps. Typical bash tool
-  // shape: `['bash', '-c', '<command>']`. Cannot be empty.
+  // shape (slice 173): `['bash', '-s']` — the script body is piped
+  // to the child's stdin by the caller to avoid argv exposure in
+  // `/proc/<pid>/cmdline`. bwrap forwards its own stdin to the
+  // wrapped child by default, so the script reaches bash even
+  // through the wrap. Cannot be empty.
   innerArgv: readonly string[];
   // Slice 145 (S2 — env-scrub defense in depth): the env from which
   // the SAFE_ENV_VARS allowlist is extracted. Pre-slice the wrap
@@ -287,7 +314,7 @@ const COMMON_PROFILE_FLAGS: readonly string[] = [
 // for "inner command starts here" — caller doesn't need to escape
 // its own argv.
 export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
-  const { profile, home, innerArgv } = options;
+  const { profile, innerArgv } = options;
   if (innerArgv.length === 0) {
     throw new Error('buildBwrapArgv: innerArgv must not be empty');
   }
@@ -307,6 +334,11 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // on the same resolved absolute path, closing the bypass.
   const realpath = options.realpath ?? realpathSync;
   const cwd = canonicalizeCwd(options.cwd, realpath);
+  // Slice 171 (review — sandbox P1): same canonicalization for home,
+  // so HIDE_PATHS overlays + `--bind home home` apply at the real
+  // path. Symlink-to-elsewhere home (managed-NFS layout) no longer
+  // leaves the canonical tree exposed.
+  const home = canonicalizeHome(options.home, realpath);
 
   // Slice 125 (R2 P0-4 guard): cwd-inside-hidden-dir precondition.
   // If the operator happens to run Forja from `~/.ssh/audit/` (or
@@ -526,6 +558,38 @@ export interface MaybeWrapSandboxArgvOptions {
   tmpdir?: string;
 }
 
+// Slice 175 (review — sandbox escape P1, PATH-walk hijack). The
+// sandbox wrapper resolves and pins the SANDBOX binary path via
+// resolveSandboxBinary (slice 154), but the INNER argv[0] (typically
+// `bash`, `grep`, `env`) was left as a bare name. Inside the
+// sandbox, the kernel's execve re-walks $PATH at exec time to
+// resolve it. cwd-rw profiles grant write to cwd; if cwd happens to
+// be on PATH (uncommon, but possible — operators with cwd=`/tmp`
+// + `PATH=/tmp:...` exist), a prior sandboxed call could plant
+// `/tmp/bash` and the next call's `bash` resolves to the shim.
+//
+// Fix: resolve `innerArgv[0]` to an absolute path AT WRAP TIME
+// using the OUTER process's $PATH (which is trusted by the
+// operator). The kernel inside the sandbox then execve's the
+// resolved absolute path verbatim, no $PATH re-walk, no shim
+// hijack. Best-effort: if `which` can't resolve (rare; the
+// `availability` probe already validated the wrap can succeed),
+// fall back to the literal argv — the sandboxed exec will fail
+// loudly rather than silently picking a shim.
+//
+// Absolute paths are passed through unchanged.
+const canonicalizeInnerArgv = (
+  innerArgv: readonly string[],
+  which: (name: string) => string | null,
+): readonly string[] => {
+  if (innerArgv.length === 0) return innerArgv;
+  const head = innerArgv[0] ?? '';
+  if (head.length === 0 || head.startsWith('/')) return innerArgv;
+  const resolved = which(head);
+  if (resolved === null || !resolved.startsWith('/')) return innerArgv;
+  return [resolved, ...innerArgv.slice(1)];
+};
+
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
   const { profile, cwd, home, innerArgv } = options;
   const env = options.env ?? process.env;
@@ -563,14 +627,46 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
   if (stat !== undefined) resolveOpts.stat = stat;
   if (exists !== undefined) resolveOpts.exists = exists;
 
+  // Slice 171 (review — sandbox P0): pre-slice the fallback chain
+  // `home ?? env.HOME ?? cwd` silently landed on `cwd` when no caller
+  // passed `home` AND `env.HOME` was unset. Common scenarios: Docker
+  // `CMD` without `-e HOME`, systemd-run --user one-shot, GitHub
+  // Actions with `HOME` explicitly unset. The downstream
+  // `buildBwrapArgv` / `buildSandboxExecArgv` would then construct
+  // HIDE_PATHS overlays at `joinPath(cwd, '.ssh')` (empty paths
+  // inside cwd) while the REAL `/home/operator/.ssh/id_rsa` stayed
+  // exposed via the base `--ro-bind / /` overlay. An LLM-driven
+  // bash inside the sandbox could `cat /home/operator/.ssh/id_rsa`
+  // and exfiltrate.
+  //
+  // Post-slice: refuse the wrap when home cannot be resolved.
+  // Operators who actually want to run without a home dir set
+  // (extremely rare) get a clear refuse with a diagnostic instead
+  // of a silent demotion. Production callers (CLI bootstrap)
+  // always resolve home via `homedir()` and pass it explicitly;
+  // bg/manager and grep currently don't pass home, but the
+  // `env.HOME` fallback covers the common case.
+  const resolvedHome = home ?? env.HOME ?? process.env.HOME;
+  if (resolvedHome === undefined || resolvedHome.length === 0) {
+    throw new Error(
+      'sandbox: cannot resolve operator home (no `home` option, no $HOME env). Refusing wrap to avoid HIDE_PATHS landing in the wrong tree (slice 171).',
+    );
+  }
+
+  // Slice 175: pin innerArgv[0] to an absolute path BEFORE the
+  // builders see it, so the kernel-side execve inside the sandbox
+  // doesn't re-walk $PATH and pick up a shim from a writable
+  // profile-mount. See canonicalizeInnerArgv docstring above.
+  const canonicalInner = canonicalizeInnerArgv(innerArgv, which);
+
   if (platform === 'linux') {
     const r = resolveSandboxBinary('bwrap', resolveOpts);
     if (r.path !== null) {
       const bwrapOpts: Parameters<typeof buildBwrapArgv>[0] = {
         profile: profile as Exclude<SandboxProfile, 'host'>,
         cwd,
-        home: home ?? env.HOME ?? cwd,
-        innerArgv,
+        home: resolvedHome,
+        innerArgv: canonicalInner,
         env,
         bwrapPath: r.path,
       };
@@ -585,8 +681,8 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
       const macOpts: Parameters<typeof buildSandboxExecArgv>[0] = {
         profile: profile as Exclude<SandboxProfile, 'host'>,
         cwd,
-        home: home ?? process.env.HOME ?? cwd,
-        innerArgv,
+        home: resolvedHome,
+        innerArgv: canonicalInner,
         sandboxExecPath: r.path,
       };
       if (realpath !== undefined) macOpts.realpath = realpath;

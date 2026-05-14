@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { FailureEventSink } from '../failures/index.ts';
 import type { SandboxProfile } from '../permissions/index.ts';
 import { maybeWrapSandboxArgv } from '../permissions/index.ts';
-import { scrubEnv } from '../sanitize/index.ts';
+import { redactSecrets, scrubEnv } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
   type BgProcess,
@@ -410,6 +410,21 @@ export interface CreateBgManagerOptions {
 
 const ensureDir = (dir: string): void => {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Slice 172 (review — information-leak P0): bg log dir contains
+  // up to 50 MB/stream of captured stdout/stderr from arbitrary
+  // bash commands — npm-install network secrets, curl Bearer tokens,
+  // env dumps that echo provider API keys. Default umask leaves the
+  // dir 0755 (other local users read) and files 0644. Slice 163
+  // tightened sessions.db perms but not `.agent/bg/`. Lock down
+  // here; the dir lives under `<cwd>/.agent/bg/` per spec §2.7
+  // (or per-subagent under `<cwd>/.agent/bg/subagents/<id>/`),
+  // both of which are operator-owned trees.
+  // Best-effort — exotic FS (FAT/exFAT) ignore chmod.
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // Best-effort lockdown.
+  }
 };
 
 const fileSize = (path: string): number => {
@@ -587,6 +602,19 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // (future wait_for) from racing on file_exists.
     await Bun.write(stdoutPath, '');
     await Bun.write(stderrPath, '');
+    // Slice 172 (review — information-leak P0). Bg log files
+    // capture up to 50 MB/stream of unredacted stdout/stderr —
+    // npm-install dependencies' API keys, curl `-H "Authorization:
+    // Bearer <token>"` traces, dev-server logs that echo provider
+    // tokens. Default umask leaves them 0644 (any other local user
+    // on the host can read). Lock down to 0600. Best-effort
+    // mirrors the dir chmod above.
+    try {
+      chmodSync(stdoutPath, 0o600);
+      chmodSync(stderrPath, 0o600);
+    } catch {
+      // Best-effort.
+    }
 
     const cwd = input.cwd ?? process.cwd();
     const spawnedAt = Date.now();
@@ -611,10 +639,19 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       input.sandboxProfile,
       whichFn,
     );
+    // Slice 173 — info-leak fix mirrors the broker bash handler.
+    // Pre-slice `['bash', '-c', input.command]` leaked the full
+    // command body (including any interpolated secrets) into
+    // `/proc/<pid>/cmdline`, readable by any local user via
+    // `ps aux`. Switching to `['bash', '-s']` and piping the
+    // script over stdin removes the body from argv entirely. Both
+    // bwrap (Linux) and sandbox-exec (macOS) forward stdin from
+    // their own stdin to the wrapped child by default, so the
+    // script reaches bash even when wrapped.
     const cmd = maybeWrapSandboxArgv({
       ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
       cwd,
-      innerArgv: ['bash', '-c', input.command],
+      innerArgv: ['bash', '-s'],
       // Slice 157 (phase 2): forward per-CLI-run sandbox tmpdir so
       // the SBPL profile on darwin scopes write access. No-op on
       // linux (the option is ignored by the bwrap path) and when
@@ -654,6 +691,11 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
           ...scrubEnv(process.env),
           ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
         },
+        // Slice 173 — `bash -s` reads the script from stdin. We
+        // pipe `input.command` into the child and close stdin so
+        // bash sees EOF and processes the script. The body never
+        // appears in `/proc/<pid>/cmdline`.
+        stdin: 'pipe',
         // Slice 153 (review): pipes instead of Bun.file(path). The
         // manager drains each pipe into the corresponding log file
         // via `drainStream`, owning the fd directly so it can apply
@@ -685,6 +727,23 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // exit handler subscribes via `proc.exited` which still
       // resolves on detached children — no reaping regression.
       proc.unref();
+
+      // Slice 173 — feed the bash script over stdin and close so
+      // the child sees EOF and runs the script. Best-effort: if
+      // the pipe broke before we could write (child crashed on
+      // exec), the child exits non-zero and `proc.exited`
+      // surfaces it through the normal lifecycle. We do NOT want
+      // a failed stdin write to mask a `proc spawn ok` row.
+      try {
+        const stdin = (
+          proc as unknown as { stdin: { write: (s: string) => unknown; end: () => unknown } }
+        ).stdin;
+        stdin.write(input.command);
+        stdin.end();
+      } catch {
+        // Best-effort. proc.exited still resolves with the child's
+        // actual exit code; finalize will record it.
+      }
     } catch (e) {
       // Spawn-time failure (typical: bash not on PATH — vanishingly
       // rare on this stack — or cwd doesn't exist). Record the
@@ -755,8 +814,14 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // operator sees may stop advancing, but the process is alive
       // and a future readOutput will still read whatever made it
       // to disk before the drainer died.
+      // Slice 178 (review — P2). Redact secrets in the error
+      // message: a write/truncate failure on the log fd can include
+      // bound parameter values from internal Bun/Node error shapes
+      // that wrapped the on-disk content (rare but possible). The
+      // log file itself is already chmod 0600 (slice 172) so
+      // operator's stderr is the only fanout vector.
       process.stderr.write(
-        `forja bg: stdout drainer failed for pid=${proc.pid} id=${id}: ${e instanceof Error ? e.message : String(e)}\n`,
+        `forja bg: stdout drainer failed for pid=${proc.pid} id=${id}: ${redactSecrets(e instanceof Error ? e.message : String(e))}\n`,
       );
     });
     const stderrDrainer = drainStream(stderrStream, stderrPath, logCap, (n) => {
@@ -766,8 +831,9 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         // see stdout comment
       }
     }).catch((e) => {
+      // Slice 178: parallel redaction with the stdout drainer above.
       process.stderr.write(
-        `forja bg: stderr drainer failed for pid=${proc.pid} id=${id}: ${e instanceof Error ? e.message : String(e)}\n`,
+        `forja bg: stderr drainer failed for pid=${proc.pid} id=${id}: ${redactSecrets(e instanceof Error ? e.message : String(e))}\n`,
       );
     });
     const drainersSettled = Promise.all([stdoutDrainer, stderrDrainer]).then(() => undefined);

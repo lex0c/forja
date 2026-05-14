@@ -20,6 +20,7 @@
 // data leaks across installs sharing a DB file (rare but possible
 // during a restore).
 
+import type { ReasonChainEntry } from '../permissions/audit.ts';
 import { ensureInstallId } from '../permissions/index.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type ApprovalLogRow, getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
@@ -61,12 +62,38 @@ interface ScoreComponentsDiff {
   deltas: Record<string, { v1: number; v2: number; delta: number }>;
 }
 
+// Slice 177 (review — P1). Reason chain diff: the engine's
+// reason_chain_json is the operator's most direct insight into WHY
+// the decision landed, but pre-slice permission-diff skipped it.
+// Two reason chains with the same final decision can have totally
+// different stage paths — e.g. one row got there via static-allow,
+// the other via policy-allow → §6.6 confirm-upgrade → session-allow.
+// The diff renders the chains as ordered stage lists so the operator
+// can see where they diverged. Heavy structural diff would lock the
+// CLI into a fragile JSON shape; instead we render both chains
+// verbatim and let the operator eyeball.
+//
+// Reuses `ReasonChainEntry` from `permissions/audit.ts` — the
+// canonical shape is `{ stage: required, layer?, rule?, section?,
+// note? }`. Most stages (risk-score, sandbox-plan, classifier,
+// approval-gate) emit `stage + note` only; layer/section/rule are
+// populated by the FIRST chain entry from `reasonChainFor` when the
+// decision has a source attribution. A previous draft of this
+// module redefined the type locally with `layer + section` required
+// — that filtered out most entries; using the canonical type fixes
+// the diff to surface every stage in the chain.
+interface ReasonChainDiff {
+  seq1_chain: ReasonChainEntry[];
+  seq2_chain: ReasonChainEntry[];
+}
+
 interface DiffResult {
   row1: ApprovalLogRow;
   row2: ApprovalLogRow;
   fieldDiffs: FieldDiff[];
   capabilities: CapabilitiesDiff;
   scoreComponents: ScoreComponentsDiff;
+  reasonChain: ReasonChainDiff;
 }
 
 const fmtValue = (v: unknown): string => {
@@ -99,6 +126,24 @@ const buildFieldDiffs = (r1: ApprovalLogRow, r2: ApprovalLogRow): FieldDiff[] =>
     { name: 'sandbox_profile', v1: r1.sandbox_profile, v2: r2.sandbox_profile },
     { name: 'args_hash', v1: r1.args_hash, v2: r2.args_hash },
     { name: 'session_id', v1: r1.session_id, v2: r2.session_id },
+    // Slice 177 (review — P1). Three field families that operators
+    // rely on for forensic triage but pre-slice the diff was
+    // omitting:
+    //   - parent_approval_id ties a subagent's decision back to
+    //     the parent call; comparing two rows where one is a child
+    //     and one a parent is a common confused-context shape and
+    //     the field surfaces it immediately.
+    //   - ttl_expires_at distinguishes a session-allow grant
+    //     (positive ttl) from a permanent allow (null); two rows
+    //     with the same `decision='allow'` can have very different
+    //     scopes depending on this field.
+    //   - install_id is technically the same across the cross-
+    //     install-refuse check (line 307+), but operators
+    //     dumping rows by-hand into the diff surface it for parity
+    //     with the JSON renderer's `install_id` field.
+    { name: 'parent_approval_id', v1: r1.parent_approval_id, v2: r2.parent_approval_id },
+    { name: 'ttl_expires_at', v1: r1.ttl_expires_at, v2: r2.ttl_expires_at },
+    { name: 'install_id', v1: r1.install_id, v2: r2.install_id },
   ];
   return fields.map((f) => ({
     field: f.name,
@@ -152,6 +197,40 @@ const parseComponents = (json: string): Record<string, number> => {
   return {};
 };
 
+// Slice 177 — parse reason chain entries. Defensive: every entry
+// requires `stage` (the only field the engine guarantees for every
+// stage in the chain — see `permissions/audit.ts:48`). Optional
+// fields `layer`, `rule`, `section`, `note` are copied only when
+// the source value is a string. Malformed rows render an empty
+// list rather than crashing the diff command.
+const parseReasonChain = (json: string): ReasonChainEntry[] => {
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const out: ReasonChainEntry[] = [];
+    for (const e of parsed) {
+      if (e === null || typeof e !== 'object') continue;
+      const obj = e as Record<string, unknown>;
+      const stage = typeof obj.stage === 'string' ? obj.stage : null;
+      if (stage === null) continue;
+      const entry: ReasonChainEntry = { stage };
+      if (typeof obj.layer === 'string') entry.layer = obj.layer;
+      if (typeof obj.rule === 'string') entry.rule = obj.rule;
+      if (typeof obj.section === 'string') entry.section = obj.section;
+      if (typeof obj.note === 'string') entry.note = obj.note;
+      out.push(entry);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+};
+
+const buildReasonChainDiff = (r1: ApprovalLogRow, r2: ApprovalLogRow): ReasonChainDiff => ({
+  seq1_chain: parseReasonChain(r1.reason_chain_json),
+  seq2_chain: parseReasonChain(r2.reason_chain_json),
+});
+
 const buildScoreComponentsDiff = (r1: ApprovalLogRow, r2: ApprovalLogRow): ScoreComponentsDiff => {
   const c1 = parseComponents(r1.score_components_json);
   const c2 = parseComponents(r2.score_components_json);
@@ -203,6 +282,35 @@ const renderText = (result: DiffResult, out: (s: string) => void): void => {
   );
   out(`    common:           ${c.common.length === 0 ? '(none)' : c.common.join(', ')}\n`);
 
+  // Slice 177 — reason chain renderer. Both chains rendered as an
+  // ordered list so the operator can read where the two rows
+  // diverged stage-by-stage. Each entry surfaces its `stage` (always
+  // present) plus the most-decision-informative trailing attribute
+  // when set: `rule` for static-rule stages, `layer:section` for
+  // attributed denies, `note` for free-form (risk-score, classifier).
+  // Empty chain renders `(empty)`.
+  out('\n');
+  out('  reason_chain:\n');
+  const renderEntry = (e: ReasonChainEntry): string => {
+    const parts: string[] = [e.stage];
+    if (e.rule !== undefined) parts.push(`rule=${e.rule}`);
+    if (e.layer !== undefined && e.section !== undefined) {
+      parts.push(`${e.layer}:${e.section}`);
+    } else if (e.layer !== undefined) {
+      parts.push(`layer=${e.layer}`);
+    } else if (e.section !== undefined) {
+      parts.push(`section=${e.section}`);
+    }
+    if (e.note !== undefined) parts.push(e.note);
+    return parts.join(' ');
+  };
+  const renderChain = (chain: ReasonChainEntry[]): string => {
+    if (chain.length === 0) return '(empty)';
+    return chain.map(renderEntry).join(' → ');
+  };
+  out(`    seq=${r1.seq}: ${renderChain(result.reasonChain.seq1_chain)}\n`);
+  out(`    seq=${r2.seq}: ${renderChain(result.reasonChain.seq2_chain)}\n`);
+
   // Score-components diff.
   out('\n');
   out('  score_components diff:\n');
@@ -244,6 +352,8 @@ const renderJson = (result: DiffResult, out: (s: string) => void): void => {
         fields: result.fieldDiffs,
         capabilities: result.capabilities,
         score_components: result.scoreComponents,
+        // Slice 177 — JSON renderer parity for the reason chain.
+        reason_chain: result.reasonChain,
       },
     })}\n`,
   );
@@ -351,6 +461,7 @@ export const runPermissionDiff = async (options: RunPermissionDiffOptions): Prom
     fieldDiffs: buildFieldDiffs(row1, row2),
     capabilities: buildCapabilitiesDiff(row1, row2),
     scoreComponents: buildScoreComponentsDiff(row1, row2),
+    reasonChain: buildReasonChainDiff(row1, row2),
   };
   if (json) renderJson(result, out);
   else renderText(result, out);

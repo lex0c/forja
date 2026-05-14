@@ -1,12 +1,13 @@
 // Bash worker handler — PERMISSION_ENGINE.md §13.7 slice 81.
 // Runs inside the spawned worker process; the broker has already
 // applied the sandbox wrap to the worker itself (slice 79's
-// sandboxRunner), so this handler spawns `bash -c <command>`
-// without any wrapping of its own.
+// sandboxRunner), so this handler spawns `bash -s` with the
+// command body piped to stdin (slice 173 — argv-leak fix) and
+// applies no wrapping of its own.
 //
 // What this handler owns:
 //   - argument validation (command, timeout_ms, cwd shape)
-//   - Bun.spawn of `bash -c <command>` with scrubbed env
+//   - Bun.spawn of `bash -s` with scrubbed env + stdin-piped script
 //   - SIGTERM → SIGKILL escalation on timeout
 //   - bounded output capture (4 MiB cap per stream)
 //   - mapping the spawn result into BrokerResponse
@@ -69,6 +70,17 @@ export interface BashSpawnedProcess {
 export interface BashSpawnFnOptions {
   cwd: string;
   env: Record<string, string>;
+  // Slice 173 — info-leak fix. The bash command body is piped to
+  // the child's stdin (via `bash -s`) instead of being passed as
+  // an argv element (`bash -c '<cmd>'`). Argv is visible in
+  // `/proc/<pid>/cmdline` to any local user via `ps aux`; with
+  // `-c`, secrets interpolated into the command (Bearer tokens,
+  // API keys, signed URLs) leaked there. With `-s` the body
+  // never lands in argv. The spawn implementation is responsible
+  // for writing this string to the child's stdin and closing it.
+  // Tests that stub `spawn` can ignore this field — the assertion
+  // surface for the command body moved here from argv.
+  stdinScript: string;
 }
 
 export type BashSpawnFn = (
@@ -96,12 +108,31 @@ export interface CreateBashHandlerOptions {
 }
 
 const defaultSpawn: BashSpawnFn = (argv, opts) => {
+  // Slice 173 — `bash -s` reads the script from stdin. We pipe
+  // `opts.stdinScript` into the child and close stdin so bash
+  // sees EOF and exits when the script ends. The body never
+  // appears in `/proc/<pid>/cmdline`. If the stdin write throws
+  // (e.g. child died before consuming the pipe), we still return
+  // the proc — the handler's wait path will surface the failure
+  // through the normal exitCode/stderr channels.
   const proc = Bun.spawn([...argv], {
     cwd: opts.cwd,
     env: opts.env,
+    stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  try {
+    const stdin = (
+      proc as unknown as { stdin: { write: (s: string) => unknown; end: () => unknown } }
+    ).stdin;
+    stdin.write(opts.stdinScript);
+    stdin.end();
+  } catch {
+    // Best-effort. If the pipe broke before we could write, the
+    // child will read empty input and exit; the handler reports
+    // it through the normal exitCode path.
+  }
   return proc as unknown as BashSpawnedProcess;
 };
 
@@ -201,9 +232,17 @@ export const createBashHandler = (options: CreateBashHandlerOptions = {}): Worke
 
       let proc: BashSpawnedProcess;
       try {
-        proc = spawnFn(['bash', '-c', rawCommand], {
+        // Slice 173 — argv is `['bash', '-s']`; command body is
+        // handed to the spawn fn via `stdinScript` and piped to
+        // the child's stdin. The pre-slice shape `['bash', '-c',
+        // rawCommand]` leaked rawCommand (and any interpolated
+        // tokens) into `/proc/<pid>/cmdline`, where any local
+        // user could read it via `ps aux`. With `-s` the script
+        // arrives on stdin and never appears in argv.
+        proc = spawnFn(['bash', '-s'], {
           cwd,
           env: scrubEnvFn(process.env),
+          stdinScript: rawCommand,
         });
       } catch (e) {
         return errorResponse(

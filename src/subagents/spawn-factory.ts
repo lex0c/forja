@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { scrubEnv } from '../sanitize/env.ts';
 import {
@@ -253,7 +253,25 @@ export const drainStderrToLogFile = (
           }
           try {
             mkdirSync(logDir, { recursive: true });
-            const writer = Bun.file(join(logDir, 'stderr.log')).writer();
+            // Slice 172 (review — information-leak P1): subagent
+            // stderr can carry the same secret-shaped payloads as
+            // bg logs (panics with env dumps, stack traces from
+            // tools that echoed Bearer tokens). Lock down dir +
+            // file to operator-only. Best-effort across exotic FS.
+            try {
+              chmodSync(logDir, 0o700);
+            } catch {
+              // Best-effort.
+            }
+            const stderrPath = join(logDir, 'stderr.log');
+            const writer = Bun.file(stderrPath).writer();
+            try {
+              chmodSync(stderrPath, 0o600);
+            } catch {
+              // Best-effort. Bun.file().writer() lazy-creates the
+              // file on first write — chmod here may race the
+              // create. The dir 0700 is the load-bearing barrier.
+            }
             sink = {
               write: (chunk) => {
                 writer.write(chunk);

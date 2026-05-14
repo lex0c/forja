@@ -39,12 +39,27 @@ describe('canTransition', () => {
     expect(canTransition('refusing', 'degraded')).toBe(false);
     expect(canTransition('refusing', 'refusing')).toBe(false);
   });
-  test('self-loops not allowed (no ready→ready, etc.)', () => {
+  test('self-loops not allowed for most states (ready, init, etc.)', () => {
     // No-op transitions are masked from the audit log by refusing
     // them outright — a caller asking "transition to ready" while
-    // already there is signaling a bug.
+    // already there is signaling a bug. Exception: degraded gets
+    // a self-edge so re-degrade calls from telemetry/sandbox paths
+    // don't throw (slice 177).
     expect(canTransition('ready', 'ready')).toBe(false);
-    expect(canTransition('degraded', 'degraded')).toBe(false);
+    expect(canTransition('init', 'init')).toBe(false);
+    expect(canTransition('loading-policy', 'loading-policy')).toBe(false);
+    expect(canTransition('validating-chain', 'validating-chain')).toBe(false);
+    expect(canTransition('refusing', 'refusing')).toBe(false);
+  });
+
+  // Slice 177 (review — P1). The `degraded → degraded` self-edge is
+  // explicitly valid so callers re-degrading the engine (e.g. seal
+  // scheduler hitting a 2nd failure, sandbox availability re-probed
+  // mid-session and still missing) don't throw. The transition is
+  // RECORDED in history so the operator can see WHY the engine kept
+  // re-degrading.
+  test('degraded→degraded is a valid self-edge (slice 177)', () => {
+    expect(canTransition('degraded', 'degraded')).toBe(true);
   });
 });
 
