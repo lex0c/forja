@@ -2,6 +2,62 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] chore(deps) — slice 168: Batch F dependency pin lockstep
+
+**Done.** Last batch from task #268. Dependency surface tightened to match the lockfile and the actual Bun feature floor used by the codebase.
+
+### Findings closed (from the deps-surface 5-axis review)
+
+| # | Pre-slice | Post-slice | Why |
+|---|---|---|---|
+| **engines.bun** | `>=1.1.0` | `>=1.1.30` | `src/permissions/bash-parser.ts:37-38` uses `import ... with { type: 'file' }` which landed in Bun 1.1.30. Pre-slice an operator running Bun 1.1.0-1.1.29 (allowed by the engines floor) would have the parser bootstrap silently break at install/run. |
+| **@types/bun** | `"latest"` | `"~1.3.13"` | `latest` is a floating dist-tag — `bun install` on a fresh checkout or a CI run on a different day could resolve a different major. Bun ambient types power `Bun.spawn` / `Bun.file` / `Bun.Glob` signatures used across 30+ files. Pinned to the lockfile-resolved minor with tilde so patch-level fixes still flow. |
+| **@anthropic-ai/sdk** | `^0.91.1` | `~0.91.1` | Pre-1.0 SDK; caret on 0.x effectively pins inside 0.91.x but pre-1.0 SDKs commonly publish breaking changes within `0.x.y` regardless of caret semantics. Tilde restricts to patch-level — `0.91.x` only. |
+| **openai** | `^6.34.0` | `~6.34.0` | OpenAI Node SDK ships frequent additive minors but occasional removed surface within a major. Tilde keeps us on `6.34.x` until we deliberately adopt a new minor (with the chance to read its CHANGELOG first). Also stabilizes the transitive `ws` peer the SDK pulls. |
+| **@google/genai** | `^1.50.1` | `~1.50.1` | Active 1.x churn on Vertex/Gemini surface. Same rationale: tilde-pin to `1.50.x` so new minors don't auto-land mid-release. |
+
+### Items NOT changed in this slice (deliberate)
+
+- **`wrap-ansi` declared but unused** (P2 from deps review). The dependency is listed in `docs/spec/UI.md:33` AND `docs/spec/AGENTIC_CLI.md:268` as part of the locked-stack minimal-deps set. Removing it is a stack change per CLAUDE.md's hard rule "stack changes require a PR against `docs/spec/AGENTIC_CLI.md §3`" — too big for slice 168's scope. The TUI's `state.ts:1639` comment references wrap-ansi as the wrap engine, but the actual wrap path uses `string-width` only. Three resolutions are possible, all bigger than this slice:
+  1. **Wire wrap-ansi for real** — replace the existing `string-width`-only wrap path with proper ANSI-aware wrapping. UI work.
+  2. **Drop the dep + spec amend** — remove from package.json AND update UI.md / AGENTIC_CLI.md to reflect the actual single-dep posture.
+  3. **Keep as documented spec-future** — accept the unused dep until (1) lands.
+  
+  Documented here for the next operator who runs the deps review to know it's a known-waste, not a new finding.
+
+- **Biome native binaries** + **@google/genai heavy subtree** — informational, no action.
+
+- **Pre-existing regex usage in resolvers / sealing** (P2 from deps review) — NOT a violation of "no regex in policy/permissions" per CLAUDE.md hard rule. These regexes are internal implementation details (glob-to-regex compilation in `matcher.ts`, IPv6 shape validators in `fetch.ts`, sealing checksum format guards). Operators write GLOB-only patterns; the regex usage is invisible to them. Documented here so future deps reviews don't re-flag.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **dep pins** | `package.json` | `engines.bun` bumped; `@types/bun` "latest" → "~1.3.13"; `@anthropic-ai/sdk` / `openai` / `@google/genai` caret → tilde. |
+| **lockfile** | `bun.lock` | Re-resolved via `bun install` — all packages remained at lockfile-resolved versions (no churn). |
+
+### Verification
+
+- `bun install` — clean (no install errors, all packages at lockfile-resolved versions).
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors / 2 pre-existing warnings.
+- `bun test` — **7087 pass / 10 skip / 0 fail** (unchanged from pre-slice — pure dependency-version tightening, no runtime change).
+
+### 5-axis review status — Task #268 COMPLETE
+
+All 6 batches closed (some with deferred sub-items, documented):
+
+- ✅ **Batch A** (slice 163) — audit chain hardening: reloadPolicy refusing guard + ts monotonicity + PRAGMA integrity_check + chmod 0600.
+- 🟡 **Batch B** — perm engine hot path: items #1+#2 (analyzeCommand memo + classifyProtectedPath precompute) already done in slice 161. Items #3 (prev_hash cache) + #4 (3-tx merge) deferred as architectural — multi-writer sinks share install_id; merging async transactions would hold writer lock across user-confirm waits.
+- 🟡 **Batch C** (slice 165) — sandbox observability: items #1 (doctor trustWarnings) + #2 (bootstrap path_resolved emit) done. Items #3 (silent_passthrough emit) + #4 (darwin bg-reaper fallback) deferred — both need cross-module plumbing.
+- ✅ **Batch D** (slice 166) — subagent IPC concurrency: permission-bridge race + policy-watcher atomic-rename.
+- 🟡 **Batch E** (slice 167) — threat surface: items #1 (injection scanner) + #4 (find -delete) done. Items #2 (trust hash-aggregate) + #3 (hook script hash) deferred as dedicated slices.
+- ✅ **Batch F** (slice 168) — dependency pin lockstep.
+
+The deferred items split naturally into 4 future slices (silent_passthrough emit, darwin bg-reaper, trust hash-aggregate, hook script hash) plus the 2 architectural Batch B items that may not ship as written. Branch `feat/permission-engine` is in a coherent state to merge OR continue with the deferred items.
+
+---
+
 ## [2026-05-14] fix(harness/resolvers) — slice 167: Batch E threat surface (injection scanner + find -delete)
 
 **Done.** Two of four items from Batch E (threat surface) of task #268. The remaining two (trust hash-aggregate on `.agent/**`, hook-script trust-hash check) are substantial enough to deserve their own slices — deferred with notes below.
