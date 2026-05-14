@@ -149,6 +149,15 @@ export interface ToolContext {
   // when the decision didn't reach the planner stage (state-reject,
   // resolver-refuse).
   sandboxProfile?: SandboxProfile;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
+  // tmpdir on macOS, undefined elsewhere. Tools that spawn child
+  // processes via `maybeWrapSandboxArgv` forward this into the
+  // `tmpdir` field so the SBPL profile scopes write access. Tools
+  // ALSO merge `TMPDIR=<this>` into the child's env so
+  // mktemp / NSTemporaryDirectory / Python tempfile honor the scope.
+  // Plumbed by the harness from `HarnessConfig.sandboxTmpdir`. See
+  // `PERMISSION_ENGINE.md §6.5` for the threat model.
+  sandboxTmpdir?: string;
   // Recursion depth of the CURRENT run inside a subagent chain.
   // 0 (or unset) = top-level user session. The harness threads
   // this from `HarnessConfig.subagentDepth` so tools that spawn

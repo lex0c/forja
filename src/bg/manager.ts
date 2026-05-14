@@ -398,6 +398,14 @@ export interface CreateBgManagerOptions {
   // `Bun.which`; tests pin a fake that flips the return value
   // between calls to simulate boot-vs-spawn-time divergence.
   sandboxWhich?: (name: string) => string | null;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
+  // tmpdir, plumbed from `HarnessConfig.sandboxTmpdir`. When set, the
+  // bg spawn passes it to `maybeWrapSandboxArgv.tmpdir` AND merges
+  // `TMPDIR=<this>` into the child's env so the sandboxed bg process
+  // confines temp writes to the scoped path on darwin. Undefined on
+  // linux (`bwrap --tmpfs /tmp` already isolates) or on darwin when
+  // bootstrap mkdir failed (graceful pre-slice-156 fallback).
+  sandboxTmpdir?: string;
 }
 
 const ensureDir = (dir: string): void => {
@@ -530,6 +538,7 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     failureSink,
     sandboxBootTool,
     sandboxWhich,
+    sandboxTmpdir,
   } = options;
   const whichFn = sandboxWhich ?? ((name: string) => Bun.which(name));
   // In-memory map of live handles, keyed by internal process id. The
@@ -606,6 +615,12 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
       cwd,
       innerArgv: ['bash', '-c', input.command],
+      // Slice 157 (phase 2): forward per-CLI-run sandbox tmpdir so
+      // the SBPL profile on darwin scopes write access. No-op on
+      // linux (the option is ignored by the bwrap path) and when
+      // bootstrap mkdir failed (sandboxTmpdir is undefined; the
+      // wrap degrades to pre-slice-156 blanket allow).
+      ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
     });
 
     // Slice 153 (review): switch to piped streams + drainer tasks.
@@ -627,7 +642,18 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         // process whose command echoes the harness's API keys to the
         // log file and exfiltrate via bash_output. Defense in depth;
         // sandbox (M3+) is the next layer.
-        env: scrubEnv(process.env),
+        //
+        // Slice 157 (phase 2): overlay `TMPDIR=<sandboxTmpdir>` on
+        // darwin so mktemp / NSTemporaryDirectory in the sandboxed
+        // bash inherit the scoped path. The TMPDIR override sits on
+        // top of scrubEnv because scrubEnv only allowlists; TMPDIR
+        // isn't on the allowlist by default. Merged AFTER scrubEnv
+        // so an attacker injecting TMPDIR via env wouldn't get past
+        // scrub anyway.
+        env: {
+          ...scrubEnv(process.env),
+          ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
+        },
         // Slice 153 (review): pipes instead of Bun.file(path). The
         // manager drains each pipe into the corresponding log file
         // via `drainStream`, owning the fd directly so it can apply

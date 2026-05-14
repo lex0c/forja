@@ -53,10 +53,16 @@ export {
 } from './audit.ts';
 
 export type {
+  AcquireSandboxTmpdirOptions,
   SandboxAvailability,
+  SandboxTmpdir,
   DetectSandboxAvailabilityOptions,
 } from './sandbox-availability.ts';
-export { defaultSandboxTmpdir, detectSandboxAvailability } from './sandbox-availability.ts';
+export {
+  acquireSandboxTmpdir,
+  defaultSandboxTmpdir,
+  detectSandboxAvailability,
+} from './sandbox-availability.ts';
 
 export type {
   SandboxProfile,

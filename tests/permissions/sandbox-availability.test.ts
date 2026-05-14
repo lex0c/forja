@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  acquireSandboxTmpdir,
   detectSandboxAvailability,
   resolveSandboxBinary,
 } from '../../src/permissions/sandbox-availability.ts';
@@ -218,5 +219,159 @@ describe('resolveSandboxBinary — canonical-first + stat-check (slice 154)', ()
     });
     expect(r.path).toBeNull();
     expect(r.trustLevel).toBe('absent');
+  });
+});
+
+// Slice 157 (review — phase 2 of macOS /tmp isolation). The helper
+// pre-creates a per-CLI-run tmpdir on darwin so production callers
+// can scope the SBPL allow-rule (phase 1) WITHOUT each callsite
+// re-implementing mkdir + cleanup. Tests pin the platform via the
+// seam and inject mkdir/rm spies to assert call shape without
+// touching the host's /tmp.
+describe('acquireSandboxTmpdir — slice 157 per-CLI-run scope', () => {
+  test('non-darwin: returns no-op shape (linux already isolated via --tmpfs /tmp)', () => {
+    let mkdirCalls = 0;
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-LINUX',
+      platform: 'linux',
+      mkdir: () => {
+        mkdirCalls += 1;
+      },
+    });
+    expect(result.tmpdir).toBeUndefined();
+    expect(mkdirCalls).toBe(0);
+    // cleanup is a no-op but must be callable.
+    result.cleanup();
+    result.cleanup();
+  });
+
+  test('non-darwin (win32): also no-op shape', () => {
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-WIN',
+      platform: 'win32',
+    });
+    expect(result.tmpdir).toBeUndefined();
+  });
+
+  test('darwin happy path: mkdir(0o700, recursive) called with /tmp/forja-sb-<sessionId>', () => {
+    const calls: { path: string; opts: { recursive: true; mode: number } }[] = [];
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-DARWIN',
+      platform: 'darwin',
+      mkdir: (path, opts) => {
+        calls.push({ path, opts });
+      },
+      rm: () => {},
+    });
+    expect(result.tmpdir).toBe('/tmp/forja-sb-sess-DARWIN');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe('/tmp/forja-sb-sess-DARWIN');
+    expect(calls[0]?.opts.recursive).toBe(true);
+    expect(calls[0]?.opts.mode).toBe(0o700);
+  });
+
+  test('darwin mkdir failure: warn invoked, tmpdir falls back to undefined', () => {
+    const warnings: string[] = [];
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-FAIL',
+      platform: 'darwin',
+      mkdir: () => {
+        const err = new Error('permission denied') as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        throw err;
+      },
+      warn: (m) => {
+        warnings.push(m);
+      },
+    });
+    expect(result.tmpdir).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    // Warning message names the path, the error code, and the
+    // graceful-fallback intent so the operator sees the full
+    // diagnostic.
+    expect(warnings[0]).toContain('/tmp/forja-sb-sess-FAIL');
+    expect(warnings[0]).toContain('EACCES');
+    expect(warnings[0]).toContain('falling back');
+    // cleanup is still callable.
+    result.cleanup();
+  });
+
+  test('darwin mkdir failure without warn callback: silent fallback (no crash)', () => {
+    // Defensive: callers may not wire a warn channel (tests, headless
+    // SDK invocations). Helper must not crash when warn is undefined.
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-NOWARN',
+      platform: 'darwin',
+      mkdir: () => {
+        throw new Error('nope');
+      },
+    });
+    expect(result.tmpdir).toBeUndefined();
+  });
+
+  test('darwin cleanup: rm invoked with recursive + force', () => {
+    const rmCalls: { path: string; opts: { recursive: true; force: true } }[] = [];
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-RM',
+      platform: 'darwin',
+      mkdir: () => {},
+      rm: (path, opts) => {
+        rmCalls.push({ path, opts });
+      },
+    });
+    result.cleanup();
+    expect(rmCalls).toHaveLength(1);
+    expect(rmCalls[0]?.path).toBe('/tmp/forja-sb-sess-RM');
+    expect(rmCalls[0]?.opts.recursive).toBe(true);
+    expect(rmCalls[0]?.opts.force).toBe(true);
+  });
+
+  test('darwin cleanup is idempotent — second call is no-op', () => {
+    let rmCalls = 0;
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-IDEMP',
+      platform: 'darwin',
+      mkdir: () => {},
+      rm: () => {
+        rmCalls += 1;
+      },
+    });
+    result.cleanup();
+    result.cleanup();
+    result.cleanup();
+    expect(rmCalls).toBe(1);
+  });
+
+  test('darwin cleanup swallows rm errors (best-effort)', () => {
+    // The directory may already be gone — concurrent cleanup, or the
+    // operator nuked it. rm throwing must not crash the cleanup path.
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-RMFAIL',
+      platform: 'darwin',
+      mkdir: () => {},
+      rm: () => {
+        const err = new Error('not found') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      },
+    });
+    // Should not throw.
+    expect(() => result.cleanup()).not.toThrow();
+  });
+
+  test('darwin mkdir EEXIST is silently absorbed by recursive=true (idempotent across re-runs)', () => {
+    // node:fs mkdir with recursive=true does NOT throw on EEXIST.
+    // We model that by having the spy NOT throw — same as the real
+    // call. The helper sees no error and returns the tmpdir.
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-EXIST',
+      platform: 'darwin',
+      mkdir: () => {
+        // Simulate "directory already there" — recursive=true silences
+        // it at the libuv layer.
+      },
+      rm: () => {},
+    });
+    expect(result.tmpdir).toBe('/tmp/forja-sb-sess-EXIST');
   });
 });

@@ -27,8 +27,11 @@ import {
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type LockConflict,
+  type SandboxTmpdir,
+  acquireSandboxTmpdir,
   bootstrapPermissionEngine,
   detectSandboxAvailability,
+  generateUlid,
   maybeWrapSandboxArgv,
   preflightPermissionEngine,
 } from '../permissions/index.ts';
@@ -311,6 +314,49 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   //     capabilities.
   const sandboxAvail = detectSandboxAvailability();
   const policySandbox = preflight.resolved.policy.sandbox;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Acquire a
+  // per-CLI-run sandbox tmpdir right after we know the platform has
+  // sandbox tooling. On darwin: mkdir /tmp/forja-sb-<ULID> with 0o700
+  // and stash the cleanup callback. On linux: returns the no-op shape
+  // — bwrap's `--tmpfs /tmp` already isolates per spawn.
+  //
+  // The ULID is fresh per CLI invocation so two parallel `forja`
+  // processes never collide on the path, and a postmortem can
+  // correlate `ls -ld /tmp/forja-sb-*` against `agent doctor` /
+  // session log timelines.
+  //
+  // mkdir failure → falls back to undefined tmpdir, which downstream
+  // callers treat as "no scoping". The pre-slice-156 behavior (blanket
+  // /tmp allow) is the safety floor — graceful, never refuse.
+  //
+  // Cleanup: only registered when `tmpdir !== undefined` (darwin happy
+  // path) — there's nothing to clean on linux/win and on darwin failure
+  // paths, and registering a no-op listener per `bootstrap()` invocation
+  // would trip MaxListenersExceededWarning under test fixtures that
+  // bootstrap repeatedly (R5 review of slice 157).
+  //
+  // Why ONLY the 'exit' event, not also SIGINT/SIGTERM (R5 review):
+  //   - In production, `src/cli/signal.ts:installSignalHandler` (called
+  //     from `run.ts`) already wires SIGINT/SIGTERM/SIGHUP/SIGQUIT +
+  //     uncaughtException + unhandledRejection to abort the harness
+  //     controller, which then drains and calls `process.exit(N)`.
+  //     `process.exit` fires the 'exit' event synchronously → cleanup
+  //     runs. No double-handler needed.
+  //   - In test paths that skip `installSignalHandler` (custom signal
+  //     passed in), registering our own SIGINT handler here would
+  //     PREVENT Node's default-kill on Ctrl+C without itself calling
+  //     `process.exit`, hanging the test process. 'exit' alone avoids
+  //     that footgun — it only fires when something else has already
+  //     decided to exit.
+  const sandboxTmpdirHandle: SandboxTmpdir = acquireSandboxTmpdir({
+    sessionId: generateUlid(),
+    warn: (m) => {
+      process.stderr.write(`forja: ${m}\n`);
+    },
+  });
+  if (sandboxTmpdirHandle.tmpdir !== undefined) {
+    process.once('exit', sandboxTmpdirHandle.cleanup);
+  }
   // Slice 130 fixup #1: construct the failure_events sink ONCE
   // at the CLI bootstrap level. Thread it through both (a) the
   // permission-engine bootstrap so `sandbox.tool_unavailable`
@@ -598,7 +644,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // privilege"). Default `'in-process'` keeps the bash exec in
   // main via the degenerate in-process broker — bit-for-bit
   // equivalent to the pre-§13.7 path.
-  const broker = constructBroker(input.brokerMode ?? 'in-process', cwd);
+  const broker = constructBroker(input.brokerMode ?? 'in-process', cwd, sandboxTmpdirHandle.tmpdir);
 
   const config: HarnessConfig = {
     provider,
@@ -656,6 +702,14 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // bwrap/sandbox-exec.
     failureSink,
     ...(sandboxAvail.tool !== null ? { sandboxBootTool: sandboxAvail.tool } : {}),
+    // Slice 157 (phase 2): forward the per-CLI-run sandbox tmpdir
+    // into HarnessConfig so the harness loop can thread it into
+    // every ToolContext + the bg manager. Undefined on linux and
+    // when bootstrap mkdir failed — downstream callers degrade
+    // gracefully to the pre-slice-156 blanket allow.
+    ...(sandboxTmpdirHandle.tmpdir !== undefined
+      ? { sandboxTmpdir: sandboxTmpdirHandle.tmpdir }
+      : {}),
     // Slice 131: outcome_signals sink for tool_error +
     // checkpoint_reverted wires (failure_event dual-write is
     // handled internally by failureSink which received outcomeSink
@@ -704,7 +758,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
 // broker-construction `timeoutMs` is the fallback ceiling for
 // callers that don't override (60s is generous for the bash
 // family + headroom for handler startup).
-const constructBroker = (mode: 'in-process' | 'spawn', cwd: string): Broker => {
+const constructBroker = (
+  mode: 'in-process' | 'spawn',
+  cwd: string,
+  sandboxTmpdir: string | undefined,
+): Broker => {
   if (mode === 'spawn') {
     const workerPath = resolve(import.meta.dir, '../broker/worker.ts');
     if (!existsSync(workerPath)) {
@@ -721,18 +779,35 @@ const constructBroker = (mode: 'in-process' | 'spawn', cwd: string): Broker => {
     // validates the enum membership at the gate and throws on
     // unknown values; the broker's per-call try/catch maps the
     // throw to a structured `sandbox wrap failed` response.
+    //
+    // Slice 157 (phase 2): forward the per-CLI-run sandbox tmpdir
+    // into every wrap. The closure captures it from bootstrap so a
+    // single broker handles many calls with the same scoped tmpdir.
     const sandboxRunner: SandboxRunner = ({ profile, cwd: callCwd, innerArgv }) =>
       maybeWrapSandboxArgv({
         profile,
         cwd: callCwd,
         innerArgv,
+        ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
       });
+    // Slice 157 (phase 2): also overlay TMPDIR on the worker spawn's
+    // env. The wrap above scopes WHERE the sandbox lets writes land;
+    // this overlay tells mktemp / NSTemporaryDirectory / Python
+    // tempfile inside the wrapped worker which subpath to use. Both
+    // are required: without the wrap, the SBPL still allows blanket
+    // /tmp; without the env, tools still pick /tmp/<random> and hit
+    // the SBPL deny.
+    const workerEnv =
+      sandboxTmpdir !== undefined
+        ? { ...scrubEnv(process.env), TMPDIR: sandboxTmpdir }
+        : scrubEnv(process.env);
     return createSpawnBroker({
       command: process.execPath,
       args: ['run', workerPath],
       cwd,
       timeoutMs: 60_000,
       sandboxRunner,
+      env: workerEnv,
     });
   }
   const bashHandler = createBashHandler({ scrubEnv });

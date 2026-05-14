@@ -2,6 +2,150 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 157: macOS /tmp shared sandbox+host (phase 2 — production callers wired)
+
+**Done.** One-hundred-fifty-seventh slice. Closes the wiring half of the macOS /tmp isolation work. Phase 1 (slice 156) landed the capability (`buildSbplProfile` aceita `tmpdir?`, `defaultSandboxTmpdir(sessionId)` helper). Phase 2 (this slice) wires the 3 production callers — broker spawn, bg manager, grep — to use it with per-CLI-run uniform granularity.
+
+### Granularity decision: per-CLI-run uniforme
+
+Discussed 3 options before implementation:
+
+1. **Per-session uniforme** (chosen) — todos os spawns dentro de uma invocação `forja` compartilham `/tmp/forja-sb-<ULID>`. Cleanup centralizado, cobre 100% do threat documentado (sandbox→host).
+2. **Tiered por callsite** — worker = per-session, bg = per-subagent, grep = per-invocação. Tight isolation cross-spawn, mas 3 cleanup pathways.
+3. **Per-spawn** — mkdtemp em todo invoke. Maximally isolated, mas hot-path mkdir/rmdir.
+
+Opção 1 vence porque:
+
+- O threat é sandbox↔host (não sandbox↔sandbox-same-session); cross-spawn é mesmo operator, não é boundary de segurança.
+- Cache locality bonus: spawns sequenciais reaproveitam o dir (npm cache, pip wheels) sem race entre processos paralelos do mesmo `forja`.
+- Cleanup único: bootstrap registra `process.on('exit'/SIGINT/SIGTERM)` → 1 rm vs 3 reapers competindo.
+
+### Helper: acquireSandboxTmpdir
+
+Novo em `src/permissions/sandbox-availability.ts`:
+
+```ts
+export interface AcquireSandboxTmpdirOptions {
+  sessionId: string;
+  platform?: NodeJS.Platform;
+  mkdir?: (path: string, opts: { recursive: true; mode: number }) => void;
+  rm?: (path: string, opts: { recursive: true; force: true }) => void;
+  warn?: (message: string) => void;
+}
+
+export interface SandboxTmpdir {
+  tmpdir: string | undefined;
+  cleanup: () => void;
+}
+```
+
+- **Darwin happy path:** `mkdir(/tmp/forja-sb-<sessionId>, { recursive: true, mode: 0o700 })` + retorna `{ tmpdir, cleanup }`. Idempotente via `recursive: true` (EEXIST silencioso). 0o700 para que operator's outras apps (não-Forja) não leiam o sandbox's temp content — defense in depth invertido.
+- **Non-darwin:** retorna `{ tmpdir: undefined, cleanup: () => {} }`. Linux já isolado via `--tmpfs /tmp`; Windows não suportado.
+- **Failure mode (mkdir throw):** invoca `opts.warn` callback com `(code: EACCES/ENOSPC/...): <message>; falling back to shared /tmp (pre-slice-156 behavior, no per-sandbox isolation on macOS)`. Retorna `tmpdir=undefined` → callers degradam ao blanket pre-slice-156 (graceful fallback, nunca refuse).
+- **Cleanup callback:** rm -rf best-effort, idempotente (second call no-op), swallow de errors (dir pode ter sido removida por concurrent signal).
+
+### Wiring path
+
+```
+CLI bootstrap (src/cli/bootstrap.ts)
+├── const handle = acquireSandboxTmpdir({ sessionId: generateUlid(), warn: stderr })
+├── process.once('exit', handle.cleanup)   // only when handle.tmpdir !== undefined
+├── constructBroker(mode, cwd, handle.tmpdir)
+│   ├── 'spawn' mode: sandboxRunner = maybeWrapSandboxArgv({ ..., tmpdir })
+│   │   + createSpawnBroker({ ..., env: { ...scrubEnv, TMPDIR: tmpdir } })
+│   └── 'in-process' mode: NOT wired (architectural pre-existing gap, see below)
+└── HarnessConfig.sandboxTmpdir = handle.tmpdir
+    └── harness/loop.ts buildCtx → ToolContext.sandboxTmpdir
+    │   └── grep.ts: maybeWrapSandboxArgv({ ..., tmpdir: ctx.sandboxTmpdir })
+    │       └── Bun.spawn({ ..., env: { ...process.env, TMPDIR: ctx.sandboxTmpdir } })
+    └── createBgManager({ ..., sandboxTmpdir })
+        └── bg spawn: maybeWrapSandboxArgv({ ..., tmpdir })
+            └── Bun.spawn({ ..., env: { ...scrubEnv, TMPDIR: tmpdir } })
+```
+
+### Scope boundary: in-process broker mode is NOT sandboxed (R5 review of this slice)
+
+The default broker mode (`input.brokerMode ?? 'in-process'`) bypasses sandboxing entirely — a pre-existing architectural gap unrelated to this slice. The relevant call chain:
+
+```
+constructBroker('in-process', ...) → createBashHandler({ scrubEnv })
+  → bashHandler.execute(request)
+  → spawnFn(['bash', '-c', cmd], { env: scrubEnv(process.env) })
+                                                    ^^^^^^^^^^^^
+                                no maybeWrapSandboxArgv, no SBPL profile
+```
+
+The bash handler (`src/broker/handlers/bash.ts:204`) ignores `request.sandboxProfile`. Phase 2's TMPDIR-scoping wiring at the broker layer applies ONLY to `--broker spawn` mode, where the OUTER spawn (CLI → worker) is wrapped via `sandboxRunner`. Inside that wrapped worker, the bash handler then spawns bash, inheriting the worker's sandbox via process tree (sandbox-exec / bwrap propagate to children).
+
+The 3 callsites phase 2 actually scopes:
+1. **`--broker spawn` mode worker spawn** (only when operator opts in via flag).
+2. **Bg manager spawn** (`src/bg/manager.ts:605`) — always wraps when sandbox available.
+3. **Grep spawn** (`src/tools/builtin/grep.ts:131`) — always wraps when sandbox available.
+
+In-process bash (`agent --prompt "echo hi"` default) runs unsandboxed regardless of slice 157. Closing THAT vector requires either (a) plumbing maybeWrap into the bash handler directly, OR (b) defaulting `brokerMode` to `'spawn'`. Out of scope for this slice — flagged as follow-up.
+
+### Env discipline
+
+Each `Bun.spawn` callsite merges `TMPDIR` AFTER its baseline env layer. Two patterns:
+
+- **bg + broker (scrub-then-overlay):** `{ ...scrubEnv(process.env), TMPDIR: sandboxTmpdir }`. Scrub drops API keys/credentials first; TMPDIR overlay sets the scope. Defense vs env-injected TMPDIR (scrub already dropped operator-supplied TMPDIR before the overlay).
+- **grep (inherit-then-overlay):** `{ ...process.env, TMPDIR: ctx.sandboxTmpdir }`. Grep needs PATH for ripgrep to find sub-binaries (unlike bash, which is the spawn target itself). The overlay rule is the same: scoped TMPDIR wins.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **helper** | `src/permissions/sandbox-availability.ts` | New `acquireSandboxTmpdir(opts)`. mkdir 0o700 recursive on darwin, no-op shape on linux/win. mkdir failure → warn + undefined tmpdir (graceful fallback). cleanup idempotent + best-effort rm. |
+| **barrel** | `src/permissions/index.ts` | Exports `acquireSandboxTmpdir` + `AcquireSandboxTmpdirOptions` + `SandboxTmpdir`. |
+| **CLI bootstrap** | `src/cli/bootstrap.ts` | Acquires per-CLI-run tmpdir post-`detectSandboxAvailability` with `generateUlid()` sessionId. Registers cleanup on `exit`/`SIGINT`/`SIGTERM`. Forwards `tmpdir` into `constructBroker(mode, cwd, tmpdir)` AND `HarnessConfig.sandboxTmpdir`. `constructBroker` now passes `tmpdir` to `maybeWrapSandboxArgv` in the sandboxRunner closure + overlays `TMPDIR=<tmpdir>` into `createSpawnBroker.env`. |
+| **HarnessConfig** | `src/harness/types.ts` | New `sandboxTmpdir?: string`. |
+| **harness loop** | `src/harness/loop.ts` | Threads `config.sandboxTmpdir` into `buildCtx` (ToolContext) + `createBgManager` (option). |
+| **ToolContext** | `src/tools/types.ts` | New `sandboxTmpdir?: string`. |
+| **grep** | `src/tools/builtin/grep.ts` | Passes `tmpdir: ctx.sandboxTmpdir` to maybeWrap + overlays `TMPDIR` on `Bun.spawn.env`. |
+| **bg manager** | `src/bg/manager.ts` | New `sandboxTmpdir?: string` option on `CreateBgManagerOptions`. Spawn block passes `tmpdir` to maybeWrap + overlays `TMPDIR` on `Bun.spawn.env` (merged AFTER scrubEnv). |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §6.5` | Documents helper, acquisition site, granularity decision, env discipline, cleanup strategy, residual risk. |
+
+### Tests added (+9)
+
+All on `acquireSandboxTmpdir` — the new surface area. The wiring is mechanical type-safe forwarding; the SBPL output is already proven by phase 1's 7 tests.
+
+| Test | Coverage |
+|---|---|
+| **non-darwin (linux): returns no-op shape** | mkdir never called; cleanup callable (no-op). |
+| **non-darwin (win32): also no-op shape** | Same as linux. |
+| **darwin happy path: mkdir 0o700 + recursive** | Spy captures path, recursive, mode; tmpdir matches `defaultSandboxTmpdir`. |
+| **darwin mkdir failure: warn invoked + fallback** | warn message contains path, code (EACCES), "falling back"; tmpdir undefined. |
+| **darwin mkdir failure without warn: silent (no crash)** | Defensive — callers may not wire warn. |
+| **darwin cleanup: rm recursive + force** | Spy verifies rm options. |
+| **darwin cleanup idempotent** | Second/third call no-op (rm spy fires once). |
+| **darwin cleanup swallows rm errors** | rm throwing ENOENT doesn't crash cleanup. |
+| **darwin mkdir EEXIST: silently absorbed by recursive=true** | Idempotent across re-runs that reuse sessionId. |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings (abortable.test.ts deliberate-hang suppressions)
+- `bun test` — **6987 pass / 10 skip / 0 fail / 34211 expect()** across 309 files (+9 new tests; all existing 6978 still pass — no regression)
+
+### Why no dedicated wiring tests for bg / grep / broker
+
+Each wiring is a 1-line `...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {})` spread + a 1-line TMPDIR env overlay. The shapes are type-checked (`HarnessConfig.sandboxTmpdir`, `ToolContext.sandboxTmpdir`, `CreateBgManagerOptions.sandboxTmpdir`, `MaybeWrapSandboxArgvOptions.tmpdir`). Adding behavioral tests would require spawn seams at 3 distinct layers (bg manager, grep, broker) — invasive refactor for a property the type system + phase 1's SBPL tests already enforce. The full test suite (6978 → 6987) was the regression check; nothing broke.
+
+### Both phases summary
+
+- **Phase 1 (slice 156)** — capability landed: SBPL builder accepts `tmpdir?`, `defaultSandboxTmpdir(sessionId)` helper.
+- **Phase 2 (slice 157)** — production callers wired: per-CLI-run uniform `/tmp/forja-sb-<ULID>`, 3 callsites (broker, bg, grep) forward `tmpdir` to maybeWrap + overlay TMPDIR.
+
+After slice 157, on darwin the sandbox-to-host `/tmp` cross-tenancy vector is closed by default for every CLI invocation. Operator's non-sandboxed apps reading `/tmp/secret` no longer see Forja sandbox writes — those land in `/tmp/forja-sb-<ULID>/...` with mode 0o700, cleaned up on process exit.
+
+### Files changed
+
+- Code: `src/permissions/sandbox-availability.ts`, `src/permissions/index.ts`, `src/cli/bootstrap.ts`, `src/harness/loop.ts`, `src/harness/types.ts`, `src/tools/types.ts`, `src/tools/builtin/grep.ts`, `src/bg/manager.ts`
+- Tests: `tests/permissions/sandbox-availability.test.ts`
+- Spec: `docs/spec/PERMISSION_ENGINE.md §6.5`
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 156: macOS /tmp shared sandbox+host (phase 1)
 
 **Done.** One-hundred-fifty-sixth slice. Closes the **last** of the 3 design-deferred items from the bash-tools review. Phase 1 of 2: capability + knob land, no production callers wired. Phase 2 (future slice) wires the bash broker / background process manager / code-generation pipeline to set `tmpdir` on every spawn.

@@ -985,6 +985,21 @@ export interface HarnessConfig {
   // CLI bootstrap constructs `createSqliteOutcomeSink({ db })`
   // and passes here.
   outcomeSink?: OutcomeSink;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
+  // tmpdir that scoped-sandbox spawns redirect their TMPDIR into.
+  // CLI bootstrap calls `acquireSandboxTmpdir({ sessionId: <ULID> })`
+  // once, registers cleanup at process exit, and forwards the
+  // resolved path here. The harness then:
+  //   1. Builds it into every ToolContext so tools like `grep` /
+  //      `bash` pass it to `maybeWrapSandboxArgv.tmpdir`.
+  //   2. Forwards it into `createBgManager` so background spawns
+  //      apply the same scoping.
+  //
+  // `undefined` on linux (bwrap's `--tmpfs /tmp` already isolates)
+  // and on darwin when mkdir failed at bootstrap (graceful fallback
+  // to the pre-slice-156 blanket /tmp allow). Tools that read this
+  // and find undefined just omit the tmpdir option to maybeWrap.
+  sandboxTmpdir?: string;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

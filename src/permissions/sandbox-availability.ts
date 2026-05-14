@@ -37,7 +37,7 @@
 // the operator sees "running with non-canonical bwrap" rather than
 // a silent downgrade.
 
-import { statSync } from 'node:fs';
+import { mkdirSync, rmSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 
 // Canonical system paths for each sandbox tool. Hard-coded because
@@ -253,6 +253,125 @@ export const resolveSandboxBinary = (
 // free.
 export const defaultSandboxTmpdir = (sessionId: string): string => {
   return `/tmp/forja-sb-${sessionId}`;
+};
+
+// Slice 157 (review — phase 2 of macOS /tmp isolation). Pairs with
+// the phase 1 capability landed in slice 156: the SBPL builder
+// already accepts `tmpdir?`, here we pre-create the directory so
+// production callers can wire it up safely.
+//
+// What this owns (darwin only — non-darwin returns the no-op
+// shape):
+//   1. mkdir(tmpdir, mode=0o700, recursive=true). 0o700 so a
+//      non-Forja user on the same host can't read the sandbox's
+//      temp files (the original threat shape inverted — operator's
+//      OTHER apps shouldn't see Forja's tmp either). recursive=true
+//      makes the call idempotent across resumes / re-runs that
+//      reuse the sessionId.
+//   2. cleanup callback (rm -rf, best-effort). Caller registers
+//      this on process exit / session end so the directory doesn't
+//      orphan. Failure to clean up doesn't refuse — orphans get
+//      swept by `agent worktree gc` (offline) in a future slice.
+//
+// What this does NOT own:
+//   - sessionId generation (caller decides; CLI bootstrap uses a
+//     fresh ULID per CLI invocation so two parallel `forja`s never
+//     collide).
+//   - TMPDIR env propagation (caller merges into spawn env; the
+//     env layout differs per callsite).
+//   - SBPL profile wiring (handled by maybeWrapSandboxArgv with
+//     the `tmpdir` field from phase 1).
+//
+// Failure mode: if mkdir throws (EACCES on /tmp, ENOSPC, anything
+// non-EEXIST that recursive=true can't paper over), the helper
+// invokes the `warn` callback and returns `tmpdir=undefined`. The
+// caller then passes undefined to maybeWrapSandboxArgv, which
+// degrades to the pre-slice-156 blanket allow. This is the same
+// safety floor pre-slice-156 ran under for the full release — a
+// graceful fallback, not a refuse. Operators with broken /tmp get
+// a warning row in audit instead of a hard-down agent.
+export interface AcquireSandboxTmpdirOptions {
+  // ULID / UUID / any stable string the caller wants embedded in
+  // the tmpdir path. The CLI bootstrap generates one ULID per
+  // process invocation; tests pass a fixture string.
+  sessionId: string;
+  // Platform override for tests. Production omits and reads
+  // `process.platform`. Non-darwin paths return the no-op shape
+  // because Linux already isolates /tmp via bwrap's `--tmpfs /tmp`
+  // and Windows isn't supported.
+  platform?: NodeJS.Platform;
+  // mkdir seam. Production uses node:fs.mkdirSync; tests inject
+  // a spy that records calls without touching the real /tmp.
+  mkdir?: (path: string, opts: { recursive: true; mode: number }) => void;
+  // rm seam (cleanup path). Production uses node:fs.rmSync; tests
+  // inject a spy to verify cleanup is called exactly once.
+  rm?: (path: string, opts: { recursive: true; force: true }) => void;
+  // Operator-visible warning channel. Invoked when mkdir fails;
+  // the caller routes this to stderr / a structured failure sink /
+  // audit. Defaults to a no-op so unit tests stay quiet.
+  warn?: (message: string) => void;
+}
+
+export interface SandboxTmpdir {
+  // Directory path to pass into `MaybeWrapSandboxArgvOptions.tmpdir`
+  // AND into the wrapped process's `TMPDIR` env. `undefined` on
+  // non-darwin (no work to do — Linux already isolates) OR on mkdir
+  // failure (callers degrade gracefully to the pre-slice-156
+  // blanket allow).
+  tmpdir: string | undefined;
+  // Best-effort `rm -rf <tmpdir>`. Idempotent — calling twice is
+  // safe; the second call is a no-op. Caller registers this on
+  // process exit / session end. Failure inside the rm is swallowed
+  // (best-effort cleanup; orphans get swept by `agent worktree gc`).
+  cleanup: () => void;
+}
+
+export const acquireSandboxTmpdir = (opts: AcquireSandboxTmpdirOptions): SandboxTmpdir => {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== 'darwin') {
+    // Linux: `bwrap --tmpfs /tmp` already isolates per sandbox.
+    // Windows: sandbox not supported in v2.
+    return { tmpdir: undefined, cleanup: () => {} };
+  }
+
+  const tmpdir = defaultSandboxTmpdir(opts.sessionId);
+  const mkdir =
+    opts.mkdir ??
+    ((p, o) => {
+      mkdirSync(p, o);
+    });
+  try {
+    mkdir(tmpdir, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    const code = err.code ?? 'UNKNOWN';
+    const message = err.message ?? String(e);
+    if (opts.warn !== undefined) {
+      opts.warn(
+        `sandbox tmpdir mkdir failed for '${tmpdir}' (${code}: ${message}); falling back to shared /tmp (pre-slice-156 behavior, no per-sandbox isolation on macOS)`,
+      );
+    }
+    return { tmpdir: undefined, cleanup: () => {} };
+  }
+
+  const rm =
+    opts.rm ??
+    ((p, o) => {
+      rmSync(p, o);
+    });
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      rm(tmpdir, { recursive: true, force: true });
+    } catch {
+      // Best-effort. The directory may already be gone (concurrent
+      // cleanup signal) or the operator may have rm'd it. Either
+      // way, swallowing the error is correct: cleanup is advisory.
+    }
+  };
+  return { tmpdir, cleanup };
 };
 
 export const detectSandboxAvailability = (

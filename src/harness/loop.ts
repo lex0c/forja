@@ -893,6 +893,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.sandboxBootTool !== undefined
             ? { sandboxBootTool: config.sandboxBootTool }
             : {}),
+          // Slice 157 (phase 2): bg manager threads the per-CLI-run
+          // sandbox tmpdir into every bg spawn so long-running bg
+          // processes get the same scoped /tmp on darwin as
+          // foreground tools.
+          ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
           // Lifecycle observer: translate bg manager events into
           // HarnessEvents so the renderer can update its `bg N`
           // footer counter (spec UI.md §4.10.6) and audit captures
@@ -2432,6 +2437,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(bgManager !== undefined ? { bgManager } : {}),
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
+          // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-
+          // CLI-run sandbox tmpdir. Tools that wrap argv via
+          // `maybeWrapSandboxArgv` forward this so the SBPL profile
+          // scopes write access on darwin. Undefined on linux (already
+          // isolated by `bwrap --tmpfs /tmp`) or when bootstrap mkdir
+          // failed (graceful fallback to pre-slice-156 behavior).
+          ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
           subagentDepth: config.subagentDepth ?? 0,
           // Cost budget tracker (spec ORCHESTRATION.md §3.5).
           // Returns the cumulative spend (parent self-cost +
