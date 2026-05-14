@@ -33,7 +33,7 @@ The first three are the **forensic floor**; the last three support lifecycle (ro
 | `agent permission seal-verify` | Cross-reference seal store against the chain (install_id bound, slice 128) |
 | `agent permission inspect <rotation_id> [--clear]` | Inspect a rotation segment (head, tail, row count, motive). `--clear` flips `chain_meta.quarantined=0` after operator review — REQUIRED to fully accept a rotation (every rotation defaults to quarantined). |
 | `agent permission replay <seq>` | Render a single audit row + reason chain + score + classifier + sandbox profile |
-| `agent permission diff <seq1> <seq2>` | Diff two rows field by field |
+| `agent permission diff <seq1> <seq2>` | Diff two rows field by field — primary scalars (tool, decision, confidence, score, classifier_hash, policy_hash, sandbox_profile, args_hash, session_id, plus `parent_approval_id` / `ttl_expires_at` / `install_id` added by slice 177), capabilities set diff (only-in-seq1 / only-in-seq2 / common), score_components per-key deltas, and the FULL reason chain rendered stage-by-stage (slice 177 — pre-slice the diff filtered out most chain entries via a mismatched local type) |
 | `agent permission rotate-chain --reason "<msg>"` | Archive current chain, start a new genesis (audit-loud) |
 | `agent permission seal-now` | Force an immediate seal of the current chain head |
 | `agent permission grants [--all]` | List active grants (operator-issued time-bound allow rules) |
@@ -672,6 +672,7 @@ The implementation is the source of truth. Migrations:
 - `src/storage/migrations/039-grants.ts` — operator-issued time-bound allow rules.
 - `src/storage/migrations/041-failure-events.ts` — slice 130.
 - `src/storage/migrations/042-outcome-signals.ts` — slice 131.
+- `src/storage/migrations/043-bg-bytes-dropped.ts` — bg-process bookkeeping (truncate-head byte counters for stdout/stderr log caps; not an audit table per se, listed here for migration completeness — slice 153).
 
 Inspect any table's columns:
 

@@ -94,7 +94,13 @@ LLM emits tool_use
            ├── 5. Mode default
            │       strict → deny
            │       acceptEdits → allow (non-protected writes)
-           │       bypass → allow (except §11 + §9.1.6 SSRF)
+           │       bypass → allow (except §11 hardcoded deny tier,
+           │                       §8.4 sensitive-path deny-list,
+           │                       and §9.1.6 SSRF — operator-set
+           │                       bypass cannot widen any of those.
+           │                       git-write capability scopes are
+           │                       classified against §11 too —
+           │                       slice 179.)
            │
            ├── 6. Risk score (§6.3)
            │       11 features, max 1.0, baseline-v2.0 weights
@@ -122,16 +128,27 @@ Every step writes a `reason_chain` entry into `approvals_log`. The full chain �
 
 Resolvers decompose tool inputs into a typed list of `Capability` values plus a `confidence` rating. Located in `src/permissions/resolvers/`.
 
-**`bash` resolver** (`bash.ts`, 2266 LOC, the most complex):
-- Walks the tree-sitter-bash AST against a closed whitelist of node types (`SIMPLE_COMMAND`, `SIMPLE_PIPELINE`, `SIMPLE_SEQUENCE`, file redirects). Anything outside (`command_substitution`, `process_substitution`, `function_definition`, etc.) returns `Refuse`.
+**`bash` resolver** (`bash.ts`, ~3100 LOC, the most complex):
+- Walks the tree-sitter-bash AST against a closed whitelist of node types (`command`, `pipeline`, `list`, file redirects, plus a small set of word/string/concatenation literals). Anything outside (`command_substitution`, `process_substitution`, `function_definition`, `array_assignment`, `coproc_statement`, `last_pipe`, etc.) returns `Refuse` via `RED_FLAG_NODES`.
 - COMMAND_TABLE maps recognized commands (~50: `ls`, `cat`, `git`, `npm`, `curl`, `python`, `node`, `tar`, `ssh`, `make`, `cargo`, ...) to per-command resolvers that emit appropriate capabilities.
 - HARD_REFUSE_COMMANDS bypasses the table for fundamentally unsafe builtins: `eval`, `exec`, `source`, `.`, `trap`, `alias`, `shopt`, `set`, `unset`, `declare`, `export`, `typeset`, `readonly`, `local`, `dd`, `fdisk`, `parted`, `mkswap`, `shred`, `mkfs.*`, plus `command` and `builtin` (which would silently bypass the COMMAND_TABLE — slice 128 R4 P0-Launder-1).
-- Per-command GTFOBins flags refused: `git -c key=value`, `git --git-dir`, `git --work-tree`, `find -execdir`, `tar --rmt-command`, `curl --upload-file`, `node --eval`, etc.
+- Per-command GTFOBins flags refused (shell-escape vectors): `git -c key=value` / `--config-env`, `git --git-dir`, `git --work-tree`, `git --exec-path`, `find -exec*` / `-ok*` (routes to `exec:arbitrary` with `confidence='medium'`), `tar --rmt-command` / `--checkpoint-action`, `rsync -e` / `--rsh` / `--rsync-path`, `ssh -o ProxyCommand=` / `LocalCommand=` / `KnownHostsCommand=`, `node --eval` / `-e`, `python -c`, `curl --proxy` / `-x`, etc.
+- **Per-command flag-DECODE battery** (slices 98, 128, 174, 179) — distinct from refuses, these flags don't shell-escape but redirect READS and WRITES that the resolver must emit as capabilities so operator policy sees them:
+  - `curl`: `-o` / `--output` / `-O` / `--output-document` / `--cookie-jar` / `--dump-header` / `--trace` / `--trace-ascii` (write); `--upload-file` / `-T` / `--config` / `-K` / `--netrc-file` / `--cacert` / `--data @file` / `--data-binary @file` / `--data-ascii @file` / `--data-urlencode @file` / `--data-urlencode name@file` / `--form key=@file` / `--form key=<file` (read).
+  - `find`: `-fprint` / `-fprintf` / `-fls` (write), `-delete` (delete-fs).
+  - `grep` / `rg`: `-f` / `--file` / `--include-from` / `--exclude-from` / `--exclude-dir-from` (read pattern files).
+  - `rsync`: `--password-file` / `--files-from` / `--include-from` / `--exclude-from` (read).
+  - `ssh`: `-F` config / `-i` identity / `-S` ctlsocket (read).
+  - `npm`/`yarn`/`pnpm`/`bun`: `--prefix` / `--pack-destination` / `--cache` / `--modules-folder` (write redirect), `-g`/`--global` (marker write).
+  - `pip`/`pip3`: `--target`/`-t` / `--prefix` / `--root` / `--user` / `--cache-dir` / `-d`/`--download` (write).
+  - `make`: `-C` / `--directory` (shifts read/write scope away from cwd).
 - Unicode hostile bytes (fullwidth `；`, ZWJ inside command names, bidi U+202E) refused at the literal-classifier layer (slice 98).
 - Brace expansion is bounded: `MAX_BRACE_EXPANSIONS=1024` outputs, `MAX_BRACE_DEPTH=64` recursion (slice 129 R5 P1 stack defense).
+- **Symlink-aware per-arg classification** (slice 176): the per-arg + per-redirect §11 classifier in `analyzeCommand` runs both LEXICAL and CANONICAL checks. When `ctx.realpath` is wired (engine production path), any arg whose lexical form looks safe but whose canonical form (or canonicalized parent + leaf) lands in a deny-tier path refuses. Closes the `<cwd>/innocent.txt → /proc/self/environ` bypass shape.
 
 **`fetch_url` resolver** (`fetch.ts`):
-- Protocol whitelist: `http` and `https` only. Other schemes (`file`, `gopher`, `ftp`, `ws`) refuse at the protocol check.
+- Protocol whitelist: `http` and `https` only. Other schemes refuse at the protocol check.
+- **Dangerous-protocol naming** (slice 179): `data:` / `javascript:` / `file:` / `ftp:` / `ftps:` / `gopher:` / `dict:` / `tftp:` / `ldap:` / `ldaps:` each refuse with a security-framed reason (`<scheme> blocked as URL-smuggling vector` / `code-injection vector` / `SSRF gadget` / `use the fs.read tool for local reads`). The allowlist would refuse them all with a generic "protocol not supported"; this layer makes the SECURITY intent visible in audit + modal.
 - **SSRF blocklist** (slice 129 R5 P0, `checkSsrfBlocklist`): unconditional refuse for localhost, RFC1918 ranges (10/8, 172.16/12, 192.168/16), link-local 169.254/16 (covers AWS/GCP metadata 169.254.169.254), IPv6 loopback (`::1`) + link-local (`fe80::/10`) + ULA (`fc00::/7`), IPv4-mapped IPv6 in both dotted and hex forms (`::ffff:127.0.0.1` and `::ffff:7f00:1`), cloud metadata FQDNs (`metadata.google.internal`, `metadata.azure.com`), bare-name `metadata`. Resolver-level refuse short-circuits the engine — **operator policy cannot override it.**
 - `wait_for` tool routes `port_open` + `http_response` through `fetch_url` permission, so the SSRF blocklist gates both surfaces.
 
@@ -293,28 +310,35 @@ Five profiles, ordered most-restrictive to least:
 `src/permissions/sandbox-runner.ts` synthesizes `bwrap` argv:
 
 ```
-bwrap \
+/usr/bin/bwrap \                    # canonical path (slice 154), not bare name
   --ro-bind / / \                   # entire FS readable
   --tmpfs /tmp \                     # fresh isolated /tmp
   --proc /proc \                     # procfs of the new namespace
   --dev /dev \                       # minimal /dev (random, null, urandom, zero, tty)
   --unshare-pid \                    # PID namespace (cannot see/signal host pids)
   --die-with-parent \                # kernel reaps child if agent dies
+  --clearenv --setenv KEY VALUE ...  # kernel-boundary env allowlist (slice 145)
   [--unshare-net]                    # for ro / cwd-rw / home-rw
   [--bind <cwd> <cwd>]               # writable for cwd-rw / cwd-rw-net
   [--bind <home> <home>]             # writable for home-rw
-  --tmpfs ~/.ssh                     # HIDE_PATHS_DIRS (one per credential dir)
-  --tmpfs ~/.aws
+  --tmpfs <canonical_home>/.ssh      # HIDE_PATHS_DIRS (one per credential dir,
+  --tmpfs <canonical_home>/.aws      #   applied at the realpath-resolved home —
+  ...                                 #   slice 171 closed the symlink-home gap)
+  --ro-bind-try /dev/null <chome>/.netrc   # HIDE_PATHS_FILES (one per credential file)
+  --ro-bind-try /dev/null <chome>/.docker/config.json
   ...
-  --ro-bind-try /dev/null ~/.netrc   # HIDE_PATHS_FILES (one per credential file)
-  --ro-bind-try /dev/null ~/.docker/config.json
-  ...
-  --chdir <cwd> \                    # start in correct working dir
+  --chdir <canonical_cwd> \          # canonicalized cwd (slice 155)
   -- \
-  bash -c "<command>"
+  /bin/bash -s                       # slice 173: argv is `bash -s`, the command body
+                                      # is piped to stdin (closes /proc/<pid>/cmdline
+                                      # leak). Argv[0] is the absolute path so the
+                                      # kernel inside the sandbox can't re-walk
+                                      # $PATH and pick a shim (slice 175).
 ```
 
 `--ro-bind / /` exposes the entire host filesystem read-only by default. HIDE_PATHS mounts apply AFTER and override (bwrap applies mounts in argv order; later wins). On `home-rw` profile, the `--bind $HOME $HOME` makes home writable, then the credential-path overlays restore read-only / empty semantics on the masked paths.
+
+**Stdin-piped script body.** The bash command body is delivered via stdin (`bash -s` reads its script from stdin) rather than as `bash -c '<cmd>'`. Argv would otherwise show in `/proc/<pid>/cmdline` for any local user via `ps aux`; an LLM-driven `curl -H "Authorization: Bearer TOKEN"` would leak the token there. bwrap forwards its own stdin to the wrapped child by default, so the pipe traverses the sandbox transparently.
 
 ### 4.3 macOS: sandbox-exec / SBPL
 
@@ -326,19 +350,39 @@ bwrap \
 (allow process-exec)
 (allow process-fork)
 (allow signal (target same-sandbox))
+; Slice 140 sec-2 + slice 145 S3: deny nested sandbox-exec
+; (literal + basename-regex; closes the cp-to-/tmp bypass).
+(deny process-exec (literal "/usr/bin/sandbox-exec"))
+(deny process-exec (regex #"^/.*/sandbox-exec$"))
+(deny process-exec (regex #"^/sandbox-exec$"))
 (allow sysctl-read)
 (allow mach-lookup)
+; Slice 175 sandbox-escape P1: explicit denies AFTER the blanket
+; allow strand LaunchServices + taskgated even though dyld can
+; still resolve normal services. `open -a Mail file://exfil.html`
+; from inside the sandbox brokers through `lsd` /
+; `coreservicesd` and would spawn the target app UN-sandboxed
+; otherwise. taskgated brokers task_for_pid; access from inside
+; the sandbox would let the wrapped process inject code into a
+; sibling. Last-match-wins refuses each named service.
+(deny mach-lookup (global-name "com.apple.lsd"))
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))
+(deny mach-lookup (global-name "com.apple.LSOpenApplication"))
+(deny mach-lookup (global-name "com.apple.taskgated"))
+(deny mach-lookup (global-name "com.apple.taskgated-helper"))
 (allow file-read*)                          ; everything readable...
-(allow file-write* (subpath "/tmp"))
-(allow file-write* (subpath "/private/tmp"))
-(allow file-write* (subpath "<cwd>"))        ; or <home> for home-rw
+(allow file-write* (subpath "/tmp"))        ; or restricted to per-session
+(allow file-write* (subpath "/private/tmp"))  ; tmpdir when slice 156 wires it
+(allow file-write* (subpath "<canonical_cwd>"))  ; or <home> for home-rw
 (allow network*)                             ; cwd-rw-net only
-(deny file-read* (subpath "~/.ssh"))         ; ...except HIDE_PATHS
-(deny file-write* (subpath "~/.ssh"))
-(deny file-read* (literal "~/.netrc"))
-(deny file-write* (literal "~/.netrc"))
+(deny file-read* (subpath "<chome>/.ssh"))   ; HIDE_PATHS, applied at the
+(deny file-write* (subpath "<chome>/.ssh"))  ; CANONICALIZED home (slice 171)
+(deny file-read* (literal "<chome>/.netrc"))
+(deny file-write* (literal "<chome>/.netrc"))
 ...
 ```
+
+The inner argv passed to `sandbox-exec` is wrapped with `/usr/bin/env -i KEY=VAL ... -- /bin/bash -s` (slice 162: `env -i` clears env, allowlist sets only `SANDBOX_SAFE_ENV_VARS`; slice 173: `bash -s` reads the script from stdin to avoid argv leakage; slice 175: `/bin/bash` is the canonicalized absolute path so the kernel inside the sandbox doesn't re-walk `$PATH`).
 
 SBPL evaluates top-to-bottom and **last-matching-rule wins** for each operation. The `(allow file-read*)` baseline is overridden by the `(deny file-read* (subpath "..."))` clauses appended at the end, including on `home-rw` where the `(allow file-write* (subpath home))` precedes the credential denies.
 
@@ -352,12 +396,12 @@ SBPL evaluates top-to-bottom and **last-matching-rule wins** for each operation.
 - `.ssh` — SSH keys + known_hosts
 - `.aws` — AWS credentials
 - `.config/gcloud`, `.config/azure`, `.config/op` (1Password), `.config/sops` — cloud CLI creds
-- `.config/agent`, `.config/forja` — Forja's own policy files (sandboxed process must not plant tampered config for next boot — slice 128 R4 P0-Sand-1/2)
+- `.config/agent`, `.config/forja` — Forja's own policy files + `sandbox_skip` marker (sandboxed process must not plant tampered config for next boot — slices 122 + 128 R4 P0-Sand-1/2). `.config/forja` was explicitly added in slice 128 R4 P0-Sand-2 to prevent forging the `sandbox_skip` marker.
 - `.gnupg` — PGP keyring
 - `.kube` — Kubernetes credentials
 - `.terraform.d` — Terraform creds + credential cache
 - `.ansible` — Ansible vault password file location
-- `.local/share/forja` — Forja's audit DB (prevents direct sqlite tampering bypassing the hash chain)
+- `.local/share/forja` — Forja's audit DB (prevents direct sqlite tampering bypassing the hash chain). The runners also overlay `defaultDataDir()` at runtime so a custom `XDG_DATA_HOME` outside `$HOME/.local/share` gets the same mask (slice 140 sec-1 on Linux; slice 146 on macOS).
 
 **Files** (replaced with `/dev/null` bind-mount):
 - `.netrc` — HTTP basic-auth credentials
@@ -394,12 +438,19 @@ maybeWrapSandboxArgv({
   profile: 'cwd-rw',           // from Decision.sandboxProfile
   cwd: '/work/proj',
   home: '/home/lex',
-  innerArgv: ['bash', '-c', '<command>'],
+  innerArgv: ['bash', '-s'],   // slice 173: command body piped to stdin
+  env: process.env,             // forwarded for the kernel-boundary allowlist
 })
-// → ['bwrap', '--ro-bind', '/', '/', '--tmpfs', '/tmp', ..., '--', 'bash', '-c', '<command>']
+// → ['/usr/bin/bwrap',         // canonical path resolved at boot (slice 154)
+//    '--ro-bind', '/', '/', '--tmpfs', '/tmp', ...,
+//    '--clearenv', '--setenv', 'PATH', '/usr/bin:/bin', ...,
+//    '--',
+//    '/bin/bash', '-s']         // innerArgv[0] canonicalized (slice 175)
 ```
 
-Three production call sites: `broker/handlers/bash.ts` (bash family), `bg/manager.ts` (background processes), `tools/builtin/grep.ts` (grep). When `profile` is `host` or undefined, or the sandbox tool isn't on PATH, the function returns `innerArgv.slice()` unchanged.
+Three production call sites: `broker/handlers/bash.ts` (bash family — also writes the script to the child's stdin), `bg/manager.ts` (background processes — same stdin pattern), `tools/builtin/grep.ts` (grep). When `profile` is `host` or undefined, or the sandbox tool isn't on PATH, the function returns `innerArgv.slice()` unchanged (canonicalized but not wrapped).
+
+**HOME-unset refuse** (slice 171): when neither `home` nor `env.HOME` resolves, the wrapper THROWS rather than fall back to `cwd`. Pre-slice the fallback silently put HIDE_PATHS overlays in the wrong tree (Docker `CMD` without `-e HOME` / systemd-run `--user` etc.); refusing surfaces the misconfiguration loudly.
 
 ### 4.7 Availability + degradation
 
@@ -414,7 +465,10 @@ When unavailable:
 
 ### 4.8 Limitations
 
-1. **Symlinks in cwd.** `bwrap --bind <cwd> <cwd>` follows symlinks at the source. A symlink inside the cwd pointing outside the cwd (e.g., `node_modules → ~/.cache/npm`) bypasses the writable-only-cwd boundary in `cwd-rw` profile. Documented; operators advised to `realpath` the cwd before running.
+1. **Symlinks in cwd.** Slices 155 + 171 + 176 added three layers of canonicalization:
+   - `canonicalizeCwd` / `canonicalizeHome` run `realpath` on both before HIDE_PATHS overlays + cwd/home binds are emitted — so a symlinked home (`/home/op → /data/users/op`) gets the deny rules at the actual target.
+   - The bash analyzer's per-arg + per-redirect classifier (`analyzeCommand` in `resolvers/bash.ts`) now runs both lexical AND canonical-form checks against §11. A `<cwd>/innocent.txt → /proc/self/environ` symlink lexically looks safe but canonically resolves to a deny-tier path and refuses.
+   - `cwd-rw` profiles still grant write to the canonical cwd; a NEW symlink CREATED inside cwd pointing outside still resolves at the kernel level when the wrapped process follows it. Operators relying on cwd-rw as a hard write boundary should treat symlinks inside cwd as a known risk and either (a) avoid creating them, or (b) accept that anything writable from cwd is reachable.
 2. **No nftables/pf egress filter.** `cwd-rw-net` inherits the parent network namespace; the only egress filter is the `fetch_url` resolver's SSRF blocklist, which protects only fetch_url + wait_for surfaces. Direct bash `curl http://10.0.0.1/` inside `cwd-rw-net` reaches the network.
 3. **`/private/var/folders` not writable on macOS.** Apps using `NSTemporaryDirectory()` (Swift/Cocoa, some Python/Ruby tooling) fail at exec time. Slice 125 removed this writable mount because the path is shared across host apps and includes Keychain ephemeral state. Workaround: prefix `TMPDIR=/tmp`.
 4. **`host` profile is a passthrough.** Operator-authorized `--sandbox-host` runs unsandboxed. Audit records `sandbox_profile=host`; the bwrap argv is `innerArgv` unchanged.
@@ -587,6 +641,12 @@ The bash AST resolver's `-c` argv refuse (slice 128 R4 P0-Launder-2) + `--git-di
 
 False positives (e.g., a legitimate `BUILD_TOKEN`) are acceptable cost — scripts that genuinely need a redacted variable pass it inline (`SOMEKEY=value command`).
 
+**Companion module: in-text secret redaction** (`src/sanitize/secrets.ts`, slice 177). The env-scrub above runs at spawn boundaries; the secrets module runs over operator-visible FREE TEXT. Same pattern catalog (Anthropic / OpenAI / AWS / GitHub / Google / Slack / JWT / Bearer / KEY=VALUE-shaped env-secrets), applied to:
+
+- Engine bash decision prompts before the modal renders (slice 177 — pre-slice a `curl -H "Authorization: Bearer SECRET" ...` interpolated the literal Bearer token into the operator-visible prompt).
+- AUDIT DRIFT stderr lines from `hooks/dispatcher.ts`, `memory/registry.ts` (3 sites), `failures/sink.ts` dual-write, `bg/manager.ts` drainer-crash (5 sites total — slice 178).
+- The recap renderer (`src/recap/format.ts:redactSecretsInIntermediate`) — pre-slice 177 the patterns lived there; promoted to `sanitize/` to avoid a `permissions → recap` layering reversal.
+
 ### 5.5.10 `sandbox_skip` marker
 
 `~/.config/forja/sandbox_skip`. Slice 122.
@@ -625,6 +685,19 @@ The modal renderer itself implements several anti-confusion defenses (slice 125 
 - **No keyboard shortcuts for dangerous answers.** "Yes, don't ask again" has the `shift+tab` shortcut (deliberate two-key chord); plain Tab moves selection cursor. Single-key fat-finger doesn't promote a rule to session-wide.
 
 The modal is the human-in-the-loop. Every prior layer's job is to ensure it's REACHED for high-uncertainty calls and BYPASSED for clearly-allow / clearly-deny ones — operator fatigue from too many confirmations is itself the failure mode.
+
+### 5.5.13 On-disk permissions hardening
+
+Several Forja-owned files capture secret-shaped payloads (raw bash stdout/stderr, subagent stderr panics, git checkpoints). Default umask leaves them world-readable (0644) inside a 0755 dir — any cohabitant local user reads them via `cat`. Slices 163 + 172 close the gap:
+
+| Surface | Mode | Slice |
+|---|---|---|
+| `audit.db` (and sidecar `-wal`/`-shm`) | 0o600 | 163 |
+| `.agent/bg/**` log dir + `stdout.log` / `stderr.log` | dir 0o700, files 0o600 | 172 |
+| `.agent/bg/subagents/<id>/stderr.log` + parent dir | dir 0o700, file 0o600 | 172 |
+| Git checkpoint tree contents | sensitive-pattern files dropped from the temp index before `write-tree` via `matchSensitivePath` (`.env*`, `id_rsa*`, `*.pem`, `*.kdbx`, `*.key`, etc.) so they never land in loose git objects under `.git/objects/` | 172 |
+
+All chmod calls are best-effort (try/catch swallow). Exotic filesystems (FAT, exFAT) ignore mode bits but the dir-mode `0o700` is the load-bearing layer; even if the file chmod fails for any reason, the parent dir's mode blocks cohabitant access. The checkpoint filter is hard-fail — `git ls-files -z` failure aborts the checkpoint rather than silently committing potentially-sensitive content.
 
 ---
 
@@ -767,7 +840,7 @@ Spec §1 principle: "declare what was NOT measured." This section lists what For
 1. **Kernel-level adversary.** Root on the operator's machine defeats every layer above. Forja's response is audit (the chain detects post-facto rewrites) + the recommendation to seal externally via RFC3161 or S3 object lock.
 2. **Multi-tenant code execution.** The sandbox profiles are sized for "agent edits source code on developer's machine", not "isolate untrusted tenant A from tenant B". For multi-tenant use, layer container isolation (Docker, Firecracker, gVisor) BENEATH Forja.
 3. **Network egress at the packet layer.** `cwd-rw-net` inherits the parent network namespace. `fetch_url`'s SSRF blocklist + per-host `allow_hosts` / `deny_hosts` in policy are the only egress controls. Operators needing kernel-level filter must run Forja inside a network namespace they control.
-4. **Sandbox argv recording.** The chosen profile is in `approvals_log.sandbox_profile`. The exact `bwrap --ro-bind / / --tmpfs /tmp ... -- bash -c <cmd>` argv is reconstructible deterministically from `(profile, cwd, home)` but not recorded per-call. Forensic reconstruction trusts that `maybeWrapSandboxArgv` is bit-stable.
+4. **Sandbox argv recording.** The chosen profile is in `approvals_log.sandbox_profile`. The exact `/usr/bin/bwrap --ro-bind / / --tmpfs /tmp ... -- /bin/bash -s` argv is reconstructible deterministically from `(profile, canonical_cwd, canonical_home, env-allowlist snapshot)` but not recorded per-call. The bash script body itself (piped to stdin since slice 173) is captured separately: `approvals_log.args_hash` joins to `tool_calls.input` (`{"command": "<body>"}`). Forensic reconstruction trusts that `maybeWrapSandboxArgv` is bit-stable.
 5. **In-sandbox behavior.** Audit covers decisions, failures, outcomes. It does NOT cover which files were read/written, sockets opened, subprocesses spawned, CPU/RAM consumed. strace/eBPF instrumentation is platform-specific and performance-costly; deliberately out of scope.
 6. **Cross-install fleet aggregation.** Each install has its own DB + chain. Multi-install audit aggregation requires DB-level joins; no built-in CLI surface today.
 7. **Provider-side prompt injection.** Forja defends against LLM-driven malicious actions but cannot prevent the LLM being prompt-injected. Defense is "every decision must surface through the engine + audit" — even if the model is compromised, its actions land in the chain and the operator's policy gates them.
