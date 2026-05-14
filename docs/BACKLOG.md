@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(permissions/sealing) — preserve filesystem root in seal-dir path normalization (rfc3161 + s3-object-lock backends)
+
+**Done.** Same bug, two backends. Both `createRfc3161TsaSealer` and `createS3ObjectLockSealer` stripped trailing slashes from `opts.path` via `opts.path.replace(/\/+$/, '')`. The naive replace collapsed all-slashes inputs (`"/"`, `"//"`) to the empty string, then `join("", "seal.log")` (and `join("", "<seq>-<ts>.tsr")` in rfc3161) produced CWD-relative paths instead of root-relative. A deployment configuring `seal.path = "/"` would pass shape validation, then silently write seal artifacts under whatever directory the agent happened to be running from (or fail outright on `ensureDir("")` — depends on underlying mkdir behavior).
+
+Verified the same pattern is NOT present in the other two sealing backends:
+
+- **worm-file** (`sealing.ts:165`) uses `dirname(opts.path)` which correctly returns `"/"` for `"/"`.
+- **git-anchored** (`sealing.ts:377`) uses template-literal concat `${stripped}/${sealFile}` — the literal `/` inside the template means a stripped-to-empty `repoPath` still produces `"/seal.log"` (absolute, not CWD-relative). Different shape, no bug.
+
+Fix: guarded the regex with `/^\/+$/.test(opts.path)` that catches all-slashes inputs and returns `"/"` instead. Other paths (`"/var/lib/agent/"` → `"/var/lib/agent"`, `"/var/lib/agent"` → unchanged) preserve their existing semantics.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/sealing-rfc3161.ts` | `dir` normalization preserves filesystem root |
+| `src/permissions/sealing-s3-object-lock.ts` | Same fix (mirror) |
+| `tests/permissions/sealing-rfc3161.test.ts` | +4 tests using injected seams (ensureDir/writeBinary/append mocks) — root preservation without touching real `/` |
+| `tests/permissions/sealing-s3-object-lock.test.ts` | +4 mirror tests (S3 backend has no TSR step but same dir+seal.log surface) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7263 pass / 10 skip / 0 fail (+8 from 7255 baseline)
+
 ## [2026-05-14] fix(permissions/engine) — live provenance after reload + live recentToolErrors getter
 
 **Done.** Two engine bugs reported by review: both involved frozen snapshots that should have been live reads.

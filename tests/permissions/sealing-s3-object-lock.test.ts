@@ -378,3 +378,98 @@ describe('createS3ObjectLockSealer — local fs hygiene', () => {
     expect(readdirSync(dir).sort()).toEqual(['seal.log']);
   });
 });
+
+// ─── path normalization (review fix, mirrors rfc3161) ─────────────────────
+
+describe('createS3ObjectLockSealer — path normalization preserves filesystem root', () => {
+  // Bug pre-review-fix: `opts.path.replace(/\/+$/, '')` collapsed
+  // "/" to "" — subsequent join(dir, 'seal.log') yielded the
+  // CWD-relative "seal.log" instead of "/seal.log". An operator
+  // configuring seal.path = "/" passed validation, then the local
+  // seal index file landed in whatever directory the agent
+  // happened to be running from. Mirror of the rfc3161 fix; the
+  // S3 backend keeps a LOCAL append-only seal.log alongside the
+  // remote bucket objects (see CONTRACTS sealing chapter), so the
+  // same path bug applies. Injected seams so we don't touch real /.
+
+  const captureSeams = () => {
+    const calls = {
+      ensureDirArg: null as string | null,
+      appendArg: null as string | null,
+    };
+    return {
+      calls,
+      seams: {
+        ensureDir: (d: string) => {
+          calls.ensureDirArg = d;
+        },
+        append: (p: string, _c: string) => {
+          calls.appendArg = p;
+        },
+        exists: () => false,
+        read: () => '',
+      },
+    };
+  };
+
+  test('opts.path = "/" stays rooted (not collapsed to CWD)', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createS3ObjectLockSealer({
+      path: '/',
+      bucket: 'b',
+      retentionDays: 1,
+      submit: () => ({ ok: true }),
+      now: () => 0,
+      ...seams,
+    });
+    const r = sealer.append({ seq: 1, ts: 100, hash: SHA256_HASH });
+    expect(r.ok).toBe(true);
+    expect(calls.ensureDirArg).toBe('/');
+    expect(calls.appendArg).toBe('/seal.log');
+  });
+
+  test('opts.path = "//" collapses to "/" (not "")', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createS3ObjectLockSealer({
+      path: '//',
+      bucket: 'b',
+      retentionDays: 1,
+      submit: () => ({ ok: true }),
+      now: () => 0,
+      ...seams,
+    });
+    sealer.append({ seq: 1, ts: 100, hash: SHA256_HASH });
+    expect(calls.ensureDirArg).toBe('/');
+    expect(calls.appendArg).toBe('/seal.log');
+  });
+
+  test('opts.path = "/var/lib/agent/" strips trailing slash (regression)', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createS3ObjectLockSealer({
+      path: '/var/lib/agent/',
+      bucket: 'b',
+      retentionDays: 1,
+      submit: () => ({ ok: true }),
+      now: () => 0,
+      ...seams,
+    });
+    sealer.append({ seq: 1, ts: 100, hash: SHA256_HASH });
+    expect(calls.ensureDirArg).toBe('/var/lib/agent');
+    expect(calls.appendArg).toBe('/var/lib/agent/seal.log');
+  });
+
+  test('opts.path with no trailing slash is unchanged (regression)', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createS3ObjectLockSealer({
+      path: '/var/lib/agent',
+      bucket: 'b',
+      retentionDays: 1,
+      submit: () => ({ ok: true }),
+      now: () => 0,
+      ...seams,
+    });
+    sealer.append({ seq: 1, ts: 100, hash: SHA256_HASH });
+    expect(calls.ensureDirArg).toBe('/var/lib/agent');
+    expect(calls.appendArg).toBe('/var/lib/agent/seal.log');
+  });
+});

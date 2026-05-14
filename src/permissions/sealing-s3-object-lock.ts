@@ -208,7 +208,15 @@ const defaultEnsureDir = (d: string): void => {
 };
 
 export const createS3ObjectLockSealer = (opts: CreateS3ObjectLockSealerOptions): SealStore => {
-  const dir = opts.path.replace(/\/+$/, '');
+  // Strip trailing slashes so join(dir, 'seal.log') doesn't produce
+  // double-slash paths. The /^\/+$/ guard preserves "/" (and other
+  // all-slashes values like "//") as the filesystem root — without
+  // it, the naive replace collapses "/" to "" and every subsequent
+  // join() becomes a CWD-relative path, silently writing the local
+  // seal index file to the wrong place when an operator
+  // deliberately configures seal.path = "/". Mirrors the same fix
+  // in sealing-rfc3161.ts.
+  const dir = /^\/+$/.test(opts.path) ? '/' : opts.path.replace(/\/+$/, '');
   const sealLogPath = join(dir, 'seal.log');
   const submit = opts.submit ?? defaultS3Submitter;
   const now = opts.now ?? (() => Date.now());

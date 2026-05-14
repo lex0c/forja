@@ -215,6 +215,98 @@ describe('createRfc3161TsaSealer — append flow', () => {
   });
 });
 
+// ─── path normalization (review fix) ──────────────────────────────────────
+
+describe('createRfc3161TsaSealer — path normalization preserves filesystem root', () => {
+  // Bug pre-review-fix: `opts.path.replace(/\/+$/, '')` collapsed
+  // "/" to "" — subsequent join(dir, 'seal.log') yielded the
+  // CWD-relative "seal.log" instead of "/seal.log". A deployment
+  // configuring seal.path = "/" passed shape validation, then
+  // wrote seal artifacts under whatever directory the agent
+  // happened to be running from. Tests use injected seams so we
+  // don't touch the actual filesystem root.
+
+  const captureSeams = () => {
+    const calls = {
+      ensureDirArg: null as string | null,
+      writeBinaryArg: null as string | null,
+      appendArg: null as string | null,
+    };
+    return {
+      calls,
+      seams: {
+        ensureDir: (d: string) => {
+          calls.ensureDirArg = d;
+        },
+        writeBinary: (p: string, _c: Uint8Array) => {
+          calls.writeBinaryArg = p;
+        },
+        append: (p: string, _c: string) => {
+          calls.appendArg = p;
+        },
+        // Stub the read/exists paths so list() / dedup logic never
+        // touch real FS (not exercised by append, but defensive).
+        exists: () => false,
+        read: () => '',
+      },
+    };
+  };
+
+  test('opts.path = "/" stays rooted (not collapsed to CWD)', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createRfc3161TsaSealer({
+      path: '/',
+      endpoint: 'https://tsa.example.com',
+      submit: () => ({ ok: true, tsr: new Uint8Array([0x01]) }),
+      ...seams,
+    });
+    const r = sealer.append({ seq: 1, ts: 100, hash: ZERO_HASH });
+    expect(r.ok).toBe(true);
+    expect(calls.ensureDirArg).toBe('/');
+    expect(calls.writeBinaryArg).toBe('/1-100.tsr');
+    expect(calls.appendArg).toBe('/seal.log');
+  });
+
+  test('opts.path = "//" collapses to "/" (not "")', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createRfc3161TsaSealer({
+      path: '//',
+      endpoint: 'https://tsa.example.com',
+      submit: () => ({ ok: true, tsr: new Uint8Array([0x01]) }),
+      ...seams,
+    });
+    sealer.append({ seq: 1, ts: 100, hash: ZERO_HASH });
+    expect(calls.ensureDirArg).toBe('/');
+    expect(calls.writeBinaryArg).toBe('/1-100.tsr');
+  });
+
+  test('opts.path = "/var/lib/agent/" strips trailing slash (regression)', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createRfc3161TsaSealer({
+      path: '/var/lib/agent/',
+      endpoint: 'https://tsa.example.com',
+      submit: () => ({ ok: true, tsr: new Uint8Array([0x01]) }),
+      ...seams,
+    });
+    sealer.append({ seq: 1, ts: 100, hash: ZERO_HASH });
+    expect(calls.ensureDirArg).toBe('/var/lib/agent');
+    expect(calls.writeBinaryArg).toBe('/var/lib/agent/1-100.tsr');
+  });
+
+  test('opts.path with no trailing slash is unchanged (regression)', () => {
+    const { calls, seams } = captureSeams();
+    const sealer = createRfc3161TsaSealer({
+      path: '/var/lib/agent',
+      endpoint: 'https://tsa.example.com',
+      submit: () => ({ ok: true, tsr: new Uint8Array([0x01]) }),
+      ...seams,
+    });
+    sealer.append({ seq: 1, ts: 100, hash: ZERO_HASH });
+    expect(calls.ensureDirArg).toBe('/var/lib/agent');
+    expect(calls.writeBinaryArg).toBe('/var/lib/agent/1-100.tsr');
+  });
+});
+
 // ─── list() across multiple appends ───────────────────────────────────────
 
 describe('createRfc3161TsaSealer — list()', () => {

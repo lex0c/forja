@@ -248,7 +248,14 @@ const defaultEnsureDir = (d: string): void => {
 };
 
 export const createRfc3161TsaSealer = (opts: CreateRfc3161TsaSealerOptions): SealStore => {
-  const dir = opts.path.replace(/\/+$/, '');
+  // Strip trailing slashes so join(dir, 'seal.log') doesn't produce
+  // double-slash paths. The /^\/+$/ guard preserves "/" (and other
+  // all-slashes values like "//") as the filesystem root — without
+  // it, the naive replace collapses "/" to "" and every subsequent
+  // join() becomes a CWD-relative path, silently writing seal
+  // artifacts to the wrong place when an operator deliberately
+  // configures seal.path = "/".
+  const dir = /^\/+$/.test(opts.path) ? '/' : opts.path.replace(/\/+$/, '');
   const sealLogPath = join(dir, 'seal.log');
   const submit = opts.submit ?? defaultRfc3161Submitter();
   const exists = opts.exists ?? defaultExists;
