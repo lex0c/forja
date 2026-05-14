@@ -664,9 +664,17 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // Bun.file(path) redirection is kernel-direct (fast, but the
     // file fd belongs to the kernel and we can't truncate without
     // racing). Piped streams give the manager full fd control.
-    const logCap = input.maxLogBytes ?? DEFAULT_LOG_CAP_BYTES;
+    // `maxLogBytes: 0` is documented on SpawnInput as the unbounded
+    // sentinel ("file grows unbounded, same as pre-cap behavior").
+    // Translate to Infinity here so the drainer's existing no-cap
+    // branch handles it — without this normalization the validator
+    // below saw `0 < 1024` and rejected the documented call shape.
+    const requestedCap = input.maxLogBytes ?? DEFAULT_LOG_CAP_BYTES;
+    const logCap = requestedCap === 0 ? Number.POSITIVE_INFINITY : requestedCap;
     if (logCap !== Number.POSITIVE_INFINITY && (!Number.isFinite(logCap) || logCap < 1024)) {
-      throw new Error(`bg spawn: maxLogBytes must be >= 1024 or Infinity (got ${String(logCap)})`);
+      throw new Error(
+        `bg spawn: maxLogBytes must be 0, Infinity, or >= 1024 (got ${String(requestedCap)})`,
+      );
     }
 
     let proc: ReturnType<typeof Bun.spawn>;

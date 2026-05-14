@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(bg/manager) — honor documented `maxLogBytes: 0` unbounded sentinel
+
+**Done.** `SpawnInput.maxLogBytes` doc said: "use 0 to disable the cap — file grows unbounded, same as pre-cap behavior." The runtime validator rejected `0` with `bg spawn: maxLogBytes must be >= 1024 or Infinity` because `0 < 1024`. Internal/tooling callers following the interface docs hit a hard error on the documented unbounded shape.
+
+Doc/code drift. The drainer at `drainStream` already special-cased `Number.POSITIVE_INFINITY` as "no cap, append at end" — it just needed `0` mapped to that sentinel at the entry point.
+
+Fix: normalize `requestedCap === 0 ? Number.POSITIVE_INFINITY : requestedCap` before the threshold validator. The validator still rejects other sub-1KB values (`100`, `512`, etc.) as programmer bugs — only `0` gets the documented unbounded path. Error-message text updated to mention `0` is valid: `"maxLogBytes must be 0, Infinity, or >= 1024"`.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/bg/manager.ts` | Normalize `0` → `Infinity` before threshold check; error message lists `0` as valid |
+| `tests/bg/manager.test.ts` | Existing "rejects sub-1KB" test's comment narrowed to non-zero (it tests with 100, which still rejects); +1 test pinning `maxLogBytes: 0` produces the unbounded behavior (4096 bytes retained verbatim) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7288 pass / 10 skip / 0 fail (+1 from baseline 7287)
+
 ## [2026-05-14] chore(permissions): comment cleanup pass — drop slice refs + spec citations, keep substantive WHY
 
 **Done.** Comments across `src/permissions/` had accumulated heavy slice-number ("Slice 178 (review — P2): ...") and spec-citation ("Per CONTRACTS.md §3 line 706-709: ...") noise that added no value to a reader of the current code. Comments described what the code USED to do, who fixed what in which review round, and pointed at spec sections as appeals to authority — all things that belong in commit messages / the spec itself, not in working comments.

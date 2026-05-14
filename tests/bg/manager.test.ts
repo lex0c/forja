@@ -653,9 +653,11 @@ describe('bg manager: kill', () => {
     expect(out.stdoutCursor).toBeLessThan(1024 * 1024);
   });
 
-  test('stdout cap: rejects sub-1KB maxLogBytes at spawn (slice 153)', async () => {
-    // Defensive: a cap of 0 or a tiny number is almost certainly
-    // a programmer bug. Reject at the spawn boundary.
+  test('stdout cap: rejects sub-1KB non-zero maxLogBytes at spawn', async () => {
+    // A non-zero cap smaller than 1KB is almost certainly a
+    // programmer bug — too small to retain useful tail. Reject at
+    // the spawn boundary. `0` is handled separately as the
+    // documented unbounded sentinel (see next test).
     await expect(
       mgr.spawn({
         command: 'true',
@@ -664,12 +666,28 @@ describe('bg manager: kill', () => {
     ).rejects.toThrow(/maxLogBytes/);
   });
 
-  test('stdout cap: Infinity disables cap (file grows unbounded) (slice 153)', async () => {
+  test('stdout cap: Infinity disables cap (file grows unbounded)', async () => {
     // Opt-out path for operator workflows that genuinely need
     // the full log retained. Pass Number.POSITIVE_INFINITY.
     const r = await mgr.spawn({
       command: "yes 'X' | head -c 4096",
       maxLogBytes: Number.POSITIVE_INFINITY,
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdoutCursor).toBe(4096);
+    expect(out.stdoutPending).toBe(0);
+  });
+
+  test('stdout cap: `0` is the documented unbounded sentinel (review fix)', async () => {
+    // SpawnInput documents `maxLogBytes: 0` as the way to disable
+    // truncation and keep pre-cap behavior. The validator used to
+    // reject it as `0 < 1024`, breaking the documented contract for
+    // tooling callers. Now `0` is normalized to Infinity internally
+    // and the drainer's no-cap branch handles it.
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 4096",
+      maxLogBytes: 0,
     });
     await waitForExit(r.id);
     const out = await mgr.readOutput(r.id);
