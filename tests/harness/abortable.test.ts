@@ -267,7 +267,6 @@ describe('stallWatchdog composed with abortableIterable', () => {
     const ctrl = new AbortController();
     // Source that NEVER yields (would otherwise stall forever).
     const hung: AsyncIterable<number> = {
-      // biome-ignore lint/suspicious/useAwait: deliberate hang
       [Symbol.asyncIterator]: async function* () {
         await new Promise<never>(() => {
           // never resolves
@@ -292,7 +291,6 @@ describe('stallWatchdog composed with abortableIterable', () => {
     const ctrl = new AbortController();
     // No abort — only stall can end the loop.
     const hung: AsyncIterable<number> = {
-      // biome-ignore lint/suspicious/useAwait: deliberate hang
       [Symbol.asyncIterator]: async function* () {
         await new Promise<never>(() => {
           // never resolves
