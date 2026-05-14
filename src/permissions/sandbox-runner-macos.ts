@@ -370,9 +370,19 @@ export const buildSbplProfile = (
   // Idempotent: when XDG_DATA_HOME is unset, liveDataDir matches
   // the home-relative default and the extra rule is redundant
   // (SBPL accepts duplicate denies; last-match-wins).
+  //
+  // Absolute-path guard mirrors the XDG_CONFIG_HOME branch below
+  // and the same fix on the bwrap side. Per XDG Base Directory
+  // Spec, relative values SHOULD be ignored — SBPL subpath rules
+  // require absolute paths, and a relative `liveDataDir` like
+  // `relative/forja` would either be rejected by `sandbox-exec`
+  // at profile-load time OR silently fail to match the actual
+  // data dir (worse: silent unmask). Skip the extra rule when
+  // XDG_DATA_HOME is non-absolute; the home-relative deny for
+  // `.local/share/forja` above still covers the canonical path.
   const liveDataDir = defaultDataDir();
   const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
-  if (liveDataDir !== homeRelativeDataDir) {
+  if (liveDataDir.startsWith('/') && liveDataDir !== homeRelativeDataDir) {
     const escaped = escapeSbplLiteral(liveDataDir);
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
     denyRules.push(`(deny file-write* (subpath "${escaped}"))`);

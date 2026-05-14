@@ -417,9 +417,18 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // overlay for the live data dir when it differs from the
   // home-relative default. Idempotent: when XDG_DATA_HOME is
   // unset, `liveDataDir === homeRelativeDataDir` and we skip.
+  //
+  // Absolute-path guard mirrors the XDG_CONFIG_HOME branch below.
+  // Per XDG Base Directory Spec, implementations SHOULD ignore
+  // relative values — without the guard, a relative XDG_DATA_HOME
+  // produces a relative `liveDataDir` like `relative/forja`,
+  // which becomes an invalid bwrap mount target and crashes the
+  // sandbox at spawn time instead of falling back to the
+  // home-relative default (which is already masked by the
+  // HIDE_PATHS_DIRS loop above — `.local/share/forja` covers it).
   const liveDataDir = defaultDataDir();
   const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
-  if (liveDataDir !== homeRelativeDataDir) {
+  if (liveDataDir.startsWith('/') && liveDataDir !== homeRelativeDataDir) {
     flags.push('--tmpfs', liveDataDir);
   }
   // Slice 146 (review minor): XDG_CONFIG_HOME unmask. Analog of

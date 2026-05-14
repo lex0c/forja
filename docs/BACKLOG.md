@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(permissions/sandbox-runner) — validate XDG_DATA_HOME is absolute before adding bwrap/SBPL overlay (Linux + macOS)
+
+**Done.** `defaultDataDir()` returns `join(xdg, 'forja')` when `XDG_DATA_HOME` is set, with no absolute-path validation. The slice 140 sec-1 branches in both sandbox builders unconditionally consumed that path:
+
+- **bwrap (Linux):** `flags.push('--tmpfs', liveDataDir)` — a relative target like `relative/path/forja` is an invalid bwrap mount and crashes the sandbox at spawn time.
+- **SBPL (macOS):** `denyRules.push('(deny ... (subpath "<relative>"))')` — SBPL `subpath` requires absolute paths; sandbox-exec either rejects the profile at load OR silently fails to match the real data dir (worse: unmask).
+
+The sibling `XDG_CONFIG_HOME` branches in both builders already had the `xdgConfig.startsWith('/')` guard — the data-dir branches just missed it.
+
+Fix: add the same absolute-path guard before pushing the overlay. Per XDG Base Directory Spec, implementations SHOULD ignore relative values; the home-relative `.local/share/forja` is still masked by the canonical HIDE_PATHS_DIRS loop, so operator protection is preserved without the bwrap crash / SBPL silent-unmask.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-runner.ts` | bwrap branch: `liveDataDir.startsWith('/')` guard before `--tmpfs` push |
+| `src/permissions/sandbox-runner-macos.ts` | SBPL branch: same guard before `(deny ... subpath ...)` push |
+| `tests/permissions/sandbox-runner.test.ts` | +2 tests: `XDG_DATA_HOME=relative/path` skips overlay (no relative `--tmpfs` lands), `XDG_DATA_HOME=./local-data` covers `./` shape |
+| `tests/permissions/sandbox-runner-macos.test.ts` | +1 mirror test: relative XDG_DATA_HOME doesn't produce relative SBPL subpath rule |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7271 pass / 10 skip / 0 fail (+3 from baseline 7268)
+
 ## [2026-05-14] fix(cli/args) — anchor welcome subcommand detection to argv[0]
 
 **Done.** `parseWelcomeSubcommand` scanned the entire argv via `findIndex(t => t === 'welcome')`, intended to accept `agent --i-know-what-im-doing welcome` (welcome after a flag). That ergonomic relaxation regression-broke any normal prompt containing the literal word `welcome`:

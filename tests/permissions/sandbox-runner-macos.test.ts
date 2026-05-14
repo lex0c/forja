@@ -545,6 +545,27 @@ describe('buildSbplProfile — XDG_DATA_HOME unmask defense (slice 140 sec-1)', 
       restoreEnv();
     }
   });
+
+  test('XDG_DATA_HOME set to a RELATIVE path: extra deny skipped (review fix)', () => {
+    // Pre-review-fix: defaultDataDir() returned `relative/forja`,
+    // which the SBPL builder pushed verbatim into a `(deny ...
+    // (subpath "relative/forja"))` rule. SBPL requires absolute
+    // paths for subpath rules — sandbox-exec would either reject
+    // the profile at load OR silently fail to match the real data
+    // dir (worse: unmask). Per XDG spec, relative values are
+    // ignored; the home-relative deny still covers the canonical
+    // `.local/share/forja`.
+    process.env.XDG_DATA_HOME = 'relative/path';
+    try {
+      const profile = buildSbplProfile('home-rw', '/work/proj', '/Users/op');
+      // No deny rule should reference the relative path.
+      expect(profile).not.toMatch(/\(subpath "relative\/[^"]*"\)/);
+      // Canonical home-relative deny still present.
+      expect(profile).toContain('(deny file-read* (subpath "/Users/op/.local/share/forja"))');
+    } finally {
+      restoreEnv();
+    }
+  });
 });
 
 // Slice 146: XDG_CONFIG_HOME unmask — macOS parity with the Linux

@@ -864,6 +864,62 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
       restoreEnv();
     }
   });
+
+  test('XDG_DATA_HOME set to a RELATIVE path: extra overlay skipped (review fix)', () => {
+    // Pre-review-fix: defaultDataDir() returned `relative/forja`,
+    // which the branch unconditionally pushed as `--tmpfs
+    // relative/forja` — an invalid bwrap mount target that crashed
+    // sandboxed executions at spawn time. Per XDG spec, relative
+    // values SHOULD be ignored; the home-relative `.local/share/forja`
+    // is still masked by the HIDE_PATHS_DIRS loop, so the operator
+    // remains protected without the bwrap error.
+    process.env.XDG_DATA_HOME = 'relative/path';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+      });
+      // No --tmpfs argument should carry the relative path.
+      const relativeTmpfs = argv.some(
+        (v, i) => v === '--tmpfs' && (argv[i + 1] ?? '').startsWith('relative/'),
+      );
+      expect(relativeTmpfs).toBe(false);
+      // Canonical home-relative overlay still present (defense in
+      // depth — the operator's data dir at .local/share/forja is
+      // still masked even though XDG was malformed).
+      expect(argv.join(' ')).toContain('--tmpfs /home/op/.local/share/forja');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_DATA_HOME = "./local-data": relative-prefix variant also skipped', () => {
+    // Cover the `./` and `../` shapes too — defaultDataDir would
+    // produce `./local-data/forja` (still relative); the absolute
+    // guard rejects it. No bwrap-crashing tmpfs target lands in argv.
+    process.env.XDG_DATA_HOME = './local-data';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+      });
+      const relativeTmpfs = argv.some((v, i) => {
+        const next = argv[i + 1] ?? '';
+        return v === '--tmpfs' && !next.startsWith('/') && next.length > 0;
+      });
+      expect(relativeTmpfs).toBe(false);
+    } finally {
+      restoreEnv();
+    }
+  });
 });
 
 // Slice 146 (review minor): XDG_CONFIG_HOME unmask — same shape as
