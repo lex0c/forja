@@ -154,6 +154,7 @@ describe('buildSandboxExecArgv', () => {
       cwd: '/work/proj',
       home: '/home/op',
       innerArgv: ['bash', '-c', 'echo hi'],
+      realpath: (p) => p,
     });
     expect(argv).toEqual(['bash', '-c', 'echo hi']);
   });
@@ -164,6 +165,7 @@ describe('buildSandboxExecArgv', () => {
       cwd: '/work/proj',
       home: '/home/op',
       innerArgv: ['ls', '-la'],
+      realpath: (p) => p,
     });
     expect(argv[0]).toBe('sandbox-exec');
     expect(argv[1]).toBe('-p');
@@ -178,6 +180,7 @@ describe('buildSandboxExecArgv', () => {
       cwd: '/work/proj',
       home: '/home/op',
       innerArgv: ['bash', '-c', 'touch src/x'],
+      realpath: (p) => p,
     });
     expect(argv[2]).toContain('(allow file-write* (subpath "/work/proj"))');
   });
@@ -191,6 +194,7 @@ describe('buildSandboxExecArgv', () => {
       cwd: '/work/proj',
       home: '/home/op',
       innerArgv: ['echo', 'hi'],
+      realpath: (p) => p,
     });
     expect(argv).not.toContain('--');
   });
@@ -202,6 +206,7 @@ describe('buildSandboxExecArgv', () => {
         cwd: '/work/proj',
         home: '/home/op',
         innerArgv: [],
+        realpath: (p) => p,
       }),
     ).toThrow(/must not be empty/);
   });
@@ -395,6 +400,7 @@ describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 pa
         cwd: '/home/op/.ssh',
         home: '/home/op',
         innerArgv: INNER,
+        realpath: (p) => p,
       }),
     ).toThrow(/inside hide_paths dir/);
   });
@@ -406,6 +412,7 @@ describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 pa
         cwd: '/home/op/.ssh/audit',
         home: '/home/op',
         innerArgv: INNER,
+        realpath: (p) => p,
       }),
     ).toThrow(/inside hide_paths dir/);
   });
@@ -420,6 +427,7 @@ describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 pa
         cwd: '/home/op/.ssh-backup',
         home: '/home/op',
         innerArgv: INNER,
+        realpath: (p) => p,
       }),
     ).not.toThrow();
   });
@@ -431,6 +439,7 @@ describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 pa
         cwd: '/home/op/work',
         home: '/home/op',
         innerArgv: INNER,
+        realpath: (p) => p,
       }),
     ).not.toThrow();
   });
@@ -443,6 +452,7 @@ describe('buildSandboxExecArgv — cwd inside hide_paths dir (slice 134 P0-12 pa
       cwd: '/home/op/.ssh/audit',
       home: '/home/op',
       innerArgv: INNER,
+      realpath: (p) => p,
     });
     expect(argv).toEqual(INNER);
   });
@@ -565,5 +575,56 @@ describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () =
     } finally {
       restoreEnv();
     }
+  });
+});
+
+// Slice 155 (review — symlink canonicalization for cwd guard,
+// macOS parity). The Linux runner refuses cwd symlinks pointing
+// into hide_paths after canonicalization; macOS must do the same
+// because SBPL allow-rules generated for the original (uncanonical)
+// path would let the sandboxed process write the symlink TARGET,
+// bypassing the deny rules that were generated against the
+// canonical hidden path.
+describe('buildSandboxExecArgv — symlink canonicalization (slice 155)', () => {
+  test('symlink cwd pointing to hide_paths dir → refused after realpath', () => {
+    expect(() =>
+      buildSandboxExecArgv({
+        profile: 'home-rw',
+        cwd: '/tmp/work',
+        home: '/Users/op',
+        innerArgv: ['bash', '-c', 'echo hi'],
+        realpath: (p) => (p === '/tmp/work' ? '/Users/op/.ssh/audit' : p),
+      }),
+    ).toThrow(/inside hide_paths dir/);
+  });
+
+  test('symlink cwd pointing outside hide_paths → SBPL profile uses canonical target', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'cwd-rw',
+      cwd: '/tmp/work',
+      home: '/Users/op',
+      innerArgv: ['bash', '-c', 'echo hi'],
+      realpath: (p) => (p === '/tmp/work' ? '/var/build/project' : p),
+    });
+    // SBPL profile generated from the canonical cwd.
+    expect(argv[2]).toContain('/var/build/project');
+    // Original symlink path absent from the profile.
+    expect(argv[2]).not.toContain('/tmp/work');
+  });
+
+  test('broken symlink → refused with clear message', () => {
+    expect(() =>
+      buildSandboxExecArgv({
+        profile: 'cwd-rw',
+        cwd: '/tmp/dangling',
+        home: '/Users/op',
+        innerArgv: ['bash', '-c', 'echo hi'],
+        realpath: () => {
+          const e = new Error('ENOENT') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        },
+      }),
+    ).toThrow(/does not exist/);
   });
 });

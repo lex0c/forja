@@ -62,12 +62,75 @@
 // `--chdir <cwd>` is added so the wrapped process starts in the
 // caller's expected working directory.
 
+import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
 import { resolveSandboxBinary } from './sandbox-availability.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
+
+// Slice 155 (review — symlink canonicalization for cwd guard):
+// resolve symlinks in the cwd path BEFORE the hide_paths check +
+// mount + chdir. Pre-slice the runner did a literal-string
+// `cwd.startsWith(hiddenAbs)` check against HIDE_PATHS_DIRS. An
+// operator (or attacker with write access to a non-sensitive dir)
+// could plant `/tmp/work` as a symlink to `~/.ssh/audit/`. The
+// guard saw the string "/tmp/work" — distinct from "/home/op/.ssh"
+// — and let it through. bwrap's `--bind /tmp/work /tmp/work` then
+// followed the symlink at source-bind time, mounting the wrapped
+// process's cwd ON TOP OF the real ~/.ssh/audit directory. The
+// sandbox effectively had write access to a path the hide_paths
+// overlay was supposed to mask.
+//
+// Fix: realpath() the cwd at build-time so the hide_paths check,
+// the `--bind`, and the `--chdir` all see the same canonical
+// absolute path. The check then catches the symlink-to-hidden
+// case via string match on the canonical target.
+//
+// Failure-mode policy (all → refuse with diagnostic message):
+//   - ENOENT       cwd or an ancestor doesn't exist (e.g. broken
+//                  symlink target).
+//   - ELOOP        symlink chain loops back on itself.
+//   - EACCES/EPERM  some ancestor isn't readable (cwd unreachable
+//                  to the realpath syscall).
+//   - everything else  refuse defensively; the operator sees the
+//                  underlying error code in the message.
+//
+// Scope: cwd itself only. Symlinks INSIDE cwd (e.g. `cwd/cache →
+// ~/.aws/sso/cache`) are NOT canonicalized — that's a known
+// limitation documented in the slice 125 comment block, and
+// closing it requires either a recursive realpath sweep at every
+// spawn (expensive) or a bwrap-level no-follow flag (doesn't
+// exist). Operators are advised to canonicalize cwd before
+// launching (`cd "$(realpath .)"`).
+const canonicalizeCwd = (cwd: string, realpath: (p: string) => string): string => {
+  try {
+    return realpath(cwd);
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    const code = err.code;
+    let detail: string;
+    switch (code) {
+      case 'ENOENT':
+        detail = `cwd '${cwd}' does not exist (broken symlink target?)`;
+        break;
+      case 'ELOOP':
+        detail = `cwd '${cwd}' symlink chain loops`;
+        break;
+      case 'EACCES':
+      case 'EPERM':
+        detail = `cwd '${cwd}' cannot be canonicalized: permission denied (ancestor unreadable?)`;
+        break;
+      case 'ENOTDIR':
+        detail = `cwd '${cwd}' or an ancestor is not a directory`;
+        break;
+      default:
+        detail = `cwd '${cwd}' cannot be canonicalized (code=${code ?? 'unknown'}: ${err.message})`;
+    }
+    throw new Error(`sandbox: ${detail}`);
+  }
+};
 
 export interface BuildBwrapArgvOptions {
   profile: SandboxProfile;
@@ -98,6 +161,12 @@ export interface BuildBwrapArgvOptions {
   // canonical-first resolved path. Tests building argv directly
   // can omit (passthrough = legacy behavior).
   bwrapPath?: string;
+  // Slice 155 (review — symlink canonicalization): test seam for
+  // `realpath()`. Production omits and uses `node:fs.realpathSync`;
+  // tests inject a deterministic mapping so the suite can pin a
+  // symlink-to-hidden-dir scenario without creating real symlinks
+  // on the test runner's filesystem.
+  realpath?: (p: string) => string;
 }
 
 // Slice 145 (S2): env vars the sandboxed inner process is allowed
@@ -255,11 +324,26 @@ const COMMON_PROFILE_FLAGS: readonly string[] = [
 // for "inner command starts here" — caller doesn't need to escape
 // its own argv.
 export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
-  const { profile, cwd, home, innerArgv } = options;
+  const { profile, home, innerArgv } = options;
   if (innerArgv.length === 0) {
     throw new Error('buildBwrapArgv: innerArgv must not be empty');
   }
   if (profile === 'host') return innerArgv.slice();
+
+  // Slice 155 (review — symlink canonicalization for cwd guard):
+  // canonicalize the cwd via realpath BEFORE the hide_paths check
+  // and downstream `--bind` / `--chdir`. Pre-slice the guard was a
+  // literal-string `startsWith` against the operator-supplied cwd,
+  // which an operator (or attacker with write access to a non-
+  // sensitive dir) could bypass via a symlink like `/tmp/work`
+  // pointing at `~/.ssh/audit/`. bwrap's `--bind <src> <dst>`
+  // follows symlinks at source-bind time, mounting the wrapped
+  // process's cwd ON TOP OF the real hidden directory. The string
+  // check saw "/tmp/work" and let it through. Canonicalizing here
+  // makes all downstream operations (check + bind + chdir) agree
+  // on the same resolved absolute path, closing the bypass.
+  const realpath = options.realpath ?? realpathSync;
+  const cwd = canonicalizeCwd(options.cwd, realpath);
 
   // Slice 125 (R2 P0-4 guard): cwd-inside-hidden-dir precondition.
   // If the operator happens to run Forja from `~/.ssh/audit/` (or
@@ -450,6 +534,11 @@ export interface MaybeWrapSandboxArgvOptions {
   // exercise the trust-check branches.
   stat?: (path: string) => { uid: number; mode: number } | null;
   exists?: (path: string) => boolean;
+  // Slice 155 (review — symlink canonicalization): test seam for
+  // realpath. Production omits (uses `node:fs.realpathSync`); tests
+  // pass identity `(p) => p` to skip canonicalization OR a custom
+  // mapping to exercise the symlink-to-hidden-dir Refuse path.
+  realpath?: (p: string) => string;
 }
 
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
@@ -459,6 +548,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
   const which = options.which ?? ((name) => Bun.which(name));
   const stat = options.stat;
   const exists = options.exists;
+  const realpath = options.realpath;
 
   // Wire-validation gate (slice 103, R6 #9). The TypeScript
   // `SandboxProfile` annotation is erased at runtime — any caller
@@ -491,27 +581,31 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
   if (platform === 'linux') {
     const r = resolveSandboxBinary('bwrap', resolveOpts);
     if (r.path !== null) {
-      return buildBwrapArgv({
+      const bwrapOpts: Parameters<typeof buildBwrapArgv>[0] = {
         profile: profile as Exclude<SandboxProfile, 'host'>,
         cwd,
         home: home ?? env.HOME ?? cwd,
         innerArgv,
         env,
         bwrapPath: r.path,
-      });
+      };
+      if (realpath !== undefined) bwrapOpts.realpath = realpath;
+      return buildBwrapArgv(bwrapOpts);
     }
   }
 
   if (platform === 'darwin') {
     const r = resolveSandboxBinary('sandbox-exec', resolveOpts);
     if (r.path !== null) {
-      return buildSandboxExecArgv({
+      const macOpts: Parameters<typeof buildSandboxExecArgv>[0] = {
         profile: profile as Exclude<SandboxProfile, 'host'>,
         cwd,
         home: home ?? process.env.HOME ?? cwd,
         innerArgv,
         sandboxExecPath: r.path,
-      });
+      };
+      if (realpath !== undefined) macOpts.realpath = realpath;
+      return buildSandboxExecArgv(macOpts);
     }
   }
 

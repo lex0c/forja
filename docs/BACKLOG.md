@@ -2,6 +2,94 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 155: cwd symlink canonicalization
+
+**Done.** One-hundred-fifty-fifth slice. Closes the second of the 3 design-deferred items from the bash-tools review. The last one (macOS `/tmp` shared sandbox+host) still needs design discussion. Slice 155 was the most surgical of the three remaining — a single `realpath()` call at the right boundary plus failure-mode policy.
+
+### Threat shape
+
+Pre-slice the runner did a literal-string `cwd.startsWith(hiddenAbs)` check against `HIDE_PATHS_DIRS`. An operator (or attacker with write access to a non-sensitive dir) could plant `/tmp/work → ~/.ssh/audit/`. The guard saw the string "/tmp/work" — distinct from "/home/op/.ssh" — and let it through. Two failure paths downstream:
+
+1. **Linux (bwrap):** `--bind /tmp/work /tmp/work` follows symlinks at source-bind time. The wrapped process's cwd is mounted ON TOP OF the real `~/.ssh/audit/` directory. The sandbox effectively has write access to a path the hide_paths overlay was supposed to mask.
+2. **macOS (SBPL):** the generated `(allow file-write* (subpath "/tmp/work"))` clause lets the sandboxed process write the symlink target via `/tmp/work/whatever`. The deny rules that targeted the canonical hidden path are pattern-matched on `/Users/op/.ssh` — last-match SBPL evaluation favors the allow on the literal path.
+
+### Fix: realpath() the cwd at build-time
+
+Both runners (`buildBwrapArgv`, `buildSandboxExecArgv`) call `realpath(cwd)` BEFORE the hide_paths check, the `--bind` / SBPL allow-rule generation, and the `--chdir`. The check then catches the symlink-to-hidden case via string match on the canonical target. The kernel `execve()` mounts the canonical path; no source-bind symlink follow.
+
+### Failure-mode policy (all → refuse with diagnostic message)
+
+| Code | Cause | Message |
+|---|---|---|
+| `ENOENT` | broken symlink / dir gone | `cwd '<cwd>' does not exist (broken symlink target?)` |
+| `ELOOP` | symlink cycle | `cwd '<cwd>' symlink chain loops` |
+| `EACCES` / `EPERM` | ancestor unreadable | `cwd '<cwd>' cannot be canonicalized: permission denied (ancestor unreadable?)` |
+| `ENOTDIR` | ancestor not a dir | `cwd '<cwd>' or an ancestor is not a directory` |
+| other | unexpected | `cwd '<cwd>' cannot be canonicalized (code=<code>: <message>)` |
+
+### Scope: cwd root only
+
+Symlinks INSIDE cwd (e.g. `cwd/cache → ~/.aws/sso/cache`) are NOT canonicalized. Known limitation already documented at sandbox-runner.ts:201-221:
+
+- Recursive realpath sweep at every spawn would be cost-prohibitive on cwds with many descendants.
+- bwrap exposes no flag to refuse following symlinks at bind time.
+- Engine-side §4.3 `symlink_escape` deny still fires on resolver-detected symlink targets (defense in depth for the FS-tool path).
+- Operator mitigation: pre-realpath cwd before invoking Forja (`cd "$(realpath .)"`).
+
+Slice 155 closes the cwd-ROOT case; the cwd-INTERIOR case stays a documented operator-action item.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **bwrap canonicalize** | `src/permissions/sandbox-runner.ts` | New `canonicalizeCwd(cwd, realpath)` helper with failure-mode switch returning typed Error messages. `buildBwrapArgv` calls it BEFORE the hide_paths loop; new `realpath?` option (test seam, defaults to `fs.realpathSync`). All downstream `cwd` references in the function body use the canonical value. |
+| **maybeWrap forwarding** | `src/permissions/sandbox-runner.ts` | `MaybeWrapSandboxArgvOptions.realpath?` test seam. Forwarded into both `buildBwrapArgv` (Linux) and `buildSandboxExecArgv` (macOS) when set. Production callers omit; tests pass identity `(p) => p` to bypass canonicalization for shape-of-argv assertions. |
+| **macOS canonicalize** | `src/permissions/sandbox-runner-macos.ts` | Mirror of the Linux logic: canonicalize cwd via `realpath` BEFORE hide_paths check + SBPL profile generation. Same failure-mode switch. |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §6.5` | Documents the threat shape (symlink-to-hidden-dir bypass), the fix (canonicalization at build-time), the failure-mode policy (every error → refuse), and the explicit scope (cwd root only, interior symlinks remain operator-action). |
+
+### Tests added (+11)
+
+| Test | Coverage |
+|---|---|
+| **symlink to hide_paths dir → refused** (Linux + macOS) | `/tmp/work → ~/.ssh/audit/` triggers the hide_paths guard on the canonical target. |
+| **symlink outside hide_paths → accepted with canonical path** | `/tmp/work → /var/build/project` resolves; argv uses `/var/build/project`, NOT `/tmp/work`. |
+| **non-symlink cwd: identity** | Common case unchanged. |
+| **broken symlink (ENOENT)** | Refuse with "does not exist" message. |
+| **symlink cycle (ELOOP)** | Refuse with "loops" message. |
+| **EACCES on ancestor** | Refuse with "permission denied". |
+| **ENOTDIR on ancestor** | Refuse with "not a directory". |
+| **unknown realpath error** | Defensive refuse with code + message. |
+
+Plus ~24 existing test sites updated via bulk regex to pass `realpath: (p) => p` (identity) — tests use fictitious paths like `/work/proj` that don't exist on the test host's filesystem. Without the seam they'd all fail with ENOENT.
+
+### Files changed
+
+- Code: `src/permissions/sandbox-runner.ts`, `src/permissions/sandbox-runner-macos.ts`
+- Tests: `tests/permissions/sandbox-runner.test.ts`, `tests/permissions/sandbox-runner-macos.test.ts`
+- Spec: `docs/spec/PERMISSION_ENGINE.md §6.5`
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6971 pass / 10 skip / 0 fail / 34176 expect()** across 309 files (+11 net new tests, ~24 existing tests updated for new shape)
+
+### Defense layering
+
+After slice 155 the symlink-bypass cwd vector is closed through 3 layers:
+
+1. **Canonical resolution** — `realpath(cwd)` at build-time so all downstream consumers see the same target.
+2. **Argv discipline** — bwrap `--bind` / `--chdir` use canonical path; kernel execve sees same target as the guard. (Slice 154's argv discipline for the bwrap binary path mirrors this for the binary itself.)
+3. **Operator visibility** — refuse comes with a diagnostic that names the canonical resolved path. Postmortem trail.
+
+### Deferred items from bash-tools review (status)
+
+- ✅ **slice 154 — bwrap PATH-shim resistance** — done.
+- ✅ **slice 155 — cwd symlink canonicalization** — done.
+- ⏳ **macOS `/tmp` shared sandbox+host** — last one. Needs design decision on TMPDIR override scope (sessionid vs spawnid) + which paths to filter via SBPL.
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 154: bwrap/sandbox-exec PATH-shim resistance
 
 **Done.** One-hundred-fifty-fourth slice. Closes the first of the 3 design-deferred items from the bash-tools review. The other two (macOS `/tmp` shared, symlink canonicalization) still need design discussion. This slice was the most isolated of the three — single helper + cli plumbing + spec amend.

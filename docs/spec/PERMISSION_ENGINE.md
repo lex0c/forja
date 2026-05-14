@@ -602,6 +602,21 @@ return first profile in order from candidates
 
 Sandbox indisponível (kernel sem unshare, bwrap binary missing) → state = `degraded`. Em `degraded`, profile mais alto disponível é `host` com confirm forçado em **toda** call. Se sandbox é `required: true` em policy → state = `refusing`.
 
+**cwd canonicalization (slice 155).** Antes do hide_paths check, do `--bind` / `--chdir` (Linux) ou da geração do SBPL profile (macOS), o runner `realpath()` o `cwd` recebido. Defesa contra symlink-to-hidden-dir:
+
+- **Threat shape:** operator (ou attacker com write access a um dir não-sensível) planta `/tmp/work → ~/.ssh/audit/`. Pré-slice o guard literal-string `cwd.startsWith('/home/op/.ssh')` não casava com "/tmp/work" e let it through. bwrap's `--bind` segue symlinks at source, montando cwd ON TOP OF o real `.ssh/audit/`. SBPL no macOS gera allow-rule sobre o literal cwd path enquanto deny rules apontam para o canonical hidden path — last-match favor allow.
+- **Fix:** `realpath(cwd)` resolve a symlink chain. O canonical path passa por todos os downstream consumers (check + bind + chdir + SBPL profile).
+- **Failure modes** (todos → refuse com diagnostic):
+  - `ENOENT` → "cwd does not exist (broken symlink target?)"
+  - `ELOOP` → "cwd symlink chain loops"
+  - `EACCES`/`EPERM` → "cwd cannot be canonicalized: permission denied"
+  - `ENOTDIR` → "cwd or ancestor is not a directory"
+  - Outros → refuse defensivo com code + message
+- **Escopo:** apenas o cwd raiz. Symlinks INSIDE cwd (e.g. `cwd/cache → ~/.aws/sso/cache`) NÃO são canonicalizados — known limitation. Mitigações:
+  - Operator preserva cwd canonical antes de iniciar (`cd "$(realpath .)"`).
+  - Engine-side §4.3 `symlink_escape` deny ainda fire em resolver-detected symlink targets.
+  - Recursive realpath sweep at every spawn é cost-prohibitive; bwrap não expõe no-follow flag pra essa semântica.
+
 **Trust model do sandbox binary (slice 154).** A resolução do binary do sandbox segue uma ordem canonical-first:
 
 1. **Canonical literal** — `/usr/bin/bwrap` (Linux) ou `/usr/bin/sandbox-exec` (macOS). Se existe, é usado direto (`trustLevel = 'canonical'`). Defesa contra PATH-shim: o operator (ou attacker com $HOME) que plante `/tmp/evilbin/bwrap` early em `$PATH` perde para o canonical.

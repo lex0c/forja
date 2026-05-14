@@ -40,6 +40,7 @@
 //                 includes `host-passthrough`. The runner returns
 //                 the innerArgv unchanged.
 
+import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
@@ -60,6 +61,13 @@ export interface BuildSandboxExecArgvOptions {
   // Production callers via maybeWrapSandboxArgv pass the
   // canonical-first resolved path.
   sandboxExecPath?: string;
+  // Slice 155 (review — symlink canonicalization): test seam for
+  // `realpath()`. Production omits and uses `node:fs.realpathSync`.
+  // See sandbox-runner.ts canonicalizeCwd block for the threat
+  // shape + failure-mode policy; this option mirrors that for
+  // macOS parity (SBPL deny rules on the literal cwd path would
+  // be bypassed by the same symlink-to-hidden-dir trick).
+  realpath?: (p: string) => string;
 }
 
 // SBPL string escaping. Apple's profile parser accepts double-quoted
@@ -292,11 +300,49 @@ export const buildSbplProfile = (
 // passed directly to exec(). Caller's innerArgv must be a complete
 // executable + args list.
 export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): string[] => {
-  const { profile, cwd, home, innerArgv } = options;
+  const { profile, home, innerArgv } = options;
   if (innerArgv.length === 0) {
     throw new Error('buildSandboxExecArgv: innerArgv must not be empty');
   }
   if (profile === 'host') return innerArgv.slice();
+
+  // Slice 155 (review — symlink canonicalization for cwd guard):
+  // canonicalize the cwd via realpath BEFORE the hide_paths check
+  // and the SBPL profile generation. Same threat as the Linux
+  // runner (sandbox-runner.ts): a `/tmp/work → ~/.ssh/audit/`
+  // symlink slips past the literal string check and the SBPL
+  // allow-rule generated for the original cwd path lets the
+  // sandboxed process write to the symlink target — which the
+  // deny rules thought were masked. Canonicalizing here lines
+  // the check, the allow rule, and the operator's actual cwd up
+  // on the same resolved absolute path.
+  const realpath = options.realpath ?? realpathSync;
+  let cwd: string;
+  try {
+    cwd = realpath(options.cwd);
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    const code = err.code;
+    let detail: string;
+    switch (code) {
+      case 'ENOENT':
+        detail = `cwd '${options.cwd}' does not exist (broken symlink target?)`;
+        break;
+      case 'ELOOP':
+        detail = `cwd '${options.cwd}' symlink chain loops`;
+        break;
+      case 'EACCES':
+      case 'EPERM':
+        detail = `cwd '${options.cwd}' cannot be canonicalized: permission denied (ancestor unreadable?)`;
+        break;
+      case 'ENOTDIR':
+        detail = `cwd '${options.cwd}' or an ancestor is not a directory`;
+        break;
+      default:
+        detail = `cwd '${options.cwd}' cannot be canonicalized (code=${code ?? 'unknown'}: ${err.message})`;
+    }
+    throw new Error(`sandbox: ${detail}`);
+  }
 
   // Slice 134 P0-12 (cross-platform parity with sandbox-runner.ts:147-154):
   // SBPL evaluates rules top-to-bottom with last-match-wins. An operator
@@ -308,7 +354,7 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   // opaque SBPL error rather than a clear build-time refuse. The Linux
   // bwrap runner refuses here pre-slice 134; macOS silently produced
   // the broken profile until this guard landed. Refuse at build time
-  // for parity.
+  // for parity. Slice 155: applies to the canonicalized cwd.
   for (const dir of HIDE_PATHS_DIRS) {
     const hiddenAbs = joinPath(home, dir);
     if (cwd === hiddenAbs || cwd.startsWith(`${hiddenAbs}/`)) {

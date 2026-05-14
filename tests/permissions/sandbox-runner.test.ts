@@ -14,6 +14,7 @@ describe('buildBwrapArgv — host profile (passthrough)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv).toEqual(['bash', '-c', 'echo hi']);
   });
@@ -25,6 +26,7 @@ describe('buildBwrapArgv — host profile (passthrough)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     argv.push('mutated');
     // Calling again returns a fresh array — the previous mutation
@@ -35,6 +37,7 @@ describe('buildBwrapArgv — host profile (passthrough)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv2).toEqual(['bash', '-c', 'echo hi']);
   });
@@ -48,6 +51,7 @@ describe('buildBwrapArgv — ro profile', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv[0]).toBe('bwrap');
     expect(argv).toContain('--ro-bind');
@@ -71,6 +75,7 @@ describe('buildBwrapArgv — cwd-rw profile', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv).toContain('--bind');
     // bind cwd→cwd appears as adjacent pair.
@@ -90,6 +95,7 @@ describe('buildBwrapArgv — cwd-rw-net profile', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv).toContain('--bind');
     expect(argv).not.toContain('--unshare-net');
@@ -106,6 +112,7 @@ describe('buildBwrapArgv — home-rw profile', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     const bindIdx = argv.indexOf('--bind');
     expect(argv[bindIdx + 1]).toBe(HOME);
@@ -121,7 +128,14 @@ describe('buildBwrapArgv — common flags', () => {
   test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
     'profile %s has die-with-parent + tmpfs/proc/dev + chdir',
     (profile) => {
-      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
+      const argv = buildBwrapArgv({
+        profile,
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+      });
       expect(argv).toContain('--die-with-parent');
       expect(argv).toContain('--tmpfs');
       expect(argv).toContain('--proc');
@@ -140,6 +154,7 @@ describe('buildBwrapArgv — innerArgv preservation', () => {
       home: HOME,
       innerArgv,
       env: {},
+      realpath: (p) => p,
     });
     const dashIdx = argv.indexOf('--');
     expect(argv.slice(dashIdx + 1)).toEqual(innerArgv);
@@ -147,14 +162,21 @@ describe('buildBwrapArgv — innerArgv preservation', () => {
 
   test('empty innerArgv throws (programmer bug, fail loud)', () => {
     expect(() =>
-      buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: [], env: {} }),
+      buildBwrapArgv({
+        profile: 'ro',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: [],
+        env: {},
+        realpath: (p) => p,
+      }),
     ).toThrow('innerArgv must not be empty');
   });
 });
 
 describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
   test('omitted profile → returns innerArgv (no wrap)', () => {
-    const argv = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER });
+    const argv = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER, realpath: (p) => p });
     expect(argv).toEqual(['bash', '-c', 'echo hi']);
   });
 
@@ -163,14 +185,15 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       profile: 'host',
       cwd: CWD,
       innerArgv: INNER,
+      realpath: (p) => p,
     });
     expect(argv).toEqual(['bash', '-c', 'echo hi']);
   });
 
   test('returned array is a defensive copy (caller mutation safe)', () => {
-    const argv = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER });
+    const argv = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER, realpath: (p) => p });
     argv.push('mutated');
-    const argv2 = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER });
+    const argv2 = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER, realpath: (p) => p });
     expect(argv2).toEqual(['bash', '-c', 'echo hi']);
   });
 
@@ -187,6 +210,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
       cwd: CWD,
       home: HOME,
       innerArgv: INNER,
+      realpath: (p) => p,
     });
     if (bwrapInstalled && onLinux) {
       // Slice 154 (review): argv[0] is the resolved absolute path.
@@ -213,6 +237,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         // Slice 154: pin exists() so canonical-first hits /usr/bin/sandbox-exec
         // deterministically regardless of host filesystem.
         exists: (p) => p === '/usr/bin/sandbox-exec',
+        realpath: (p) => p,
       });
       // Slice 154 (review): argv[0] is the absolute resolved path.
       expect(argv[0]).toBe('/usr/bin/sandbox-exec');
@@ -237,6 +262,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         // Slice 154: deterministic absent — canonical /usr/bin/<tool>
         // must report as missing regardless of host filesystem.
         exists: () => false,
+        realpath: (p) => p,
       });
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     });
@@ -252,6 +278,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         // Slice 154: deterministic absent (test host may have bwrap
         // at /usr/bin/bwrap; pin to make this a true "missing" probe).
         exists: () => false,
+        realpath: (p) => p,
       });
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     });
@@ -266,6 +293,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'darwin',
         which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+        realpath: (p) => p,
       });
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     });
@@ -282,6 +310,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'freebsd' as NodeJS.Platform,
         which: () => '/usr/bin/whatever',
+        realpath: (p) => p,
       });
       expect(argv).toEqual(['bash', '-c', 'echo hi']);
     });
@@ -294,6 +323,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'darwin',
         which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+        realpath: (p) => p,
       });
       expect(argv[2]).toContain('(allow file-write* (subpath "/home/op"))');
       // cwd should NOT be writable under home-rw.
@@ -308,6 +338,7 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
         innerArgv: INNER,
         platform: 'darwin',
         which: (name) => (name === 'sandbox-exec' ? '/usr/bin/sandbox-exec' : null),
+        realpath: (p) => p,
       });
       expect(argv[2]).toContain('(allow network*)');
     });
@@ -328,6 +359,7 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
         innerArgv: INNER,
         platform: 'linux',
         which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+        realpath: (p) => p,
       });
       // Slice 154 (review — PATH-shim resistance): argv[0] is now
       // the absolute resolved bwrap path, not the bare name. This
@@ -348,6 +380,7 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
       cwd: CWD,
       innerArgv: INNER,
       platform: 'linux',
+      realpath: (p) => p,
     });
     expect(argv).toEqual([...INNER]);
   });
@@ -357,6 +390,7 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
       cwd: CWD,
       innerArgv: INNER,
       platform: 'linux',
+      realpath: (p) => p,
     });
     expect(argv).toEqual([...INNER]);
   });
@@ -372,6 +406,7 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
         innerArgv: INNER,
         platform: 'linux',
         which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+        realpath: (p) => p,
       }),
     ).toThrow(/unknown profile 'attacker'/);
   });
@@ -382,6 +417,7 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
         profile: 'nope',
         cwd: CWD,
         innerArgv: INNER,
+        realpath: (p) => p,
       });
       throw new Error('expected throw');
     } catch (e) {
@@ -406,6 +442,7 @@ describe('maybeWrapSandboxArgv — wire validation (slice 103, R6 #9)', () => {
         innerArgv: INNER,
         platform: 'win32' as NodeJS.Platform,
         which: () => null,
+        realpath: (p) => p,
       }),
     ).toThrow(/unknown profile/);
   });
@@ -445,7 +482,14 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
   };
 
   test('ro profile emits hide_paths flags', () => {
-    const argv = buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+    });
     expectHidePaths(argv);
   });
 
@@ -456,6 +500,7 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expectHidePaths(argv);
   });
@@ -467,6 +512,7 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expectHidePaths(argv);
   });
@@ -483,6 +529,7 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expectHidePaths(argv);
     // Verify the order: --bind home home appears BEFORE --tmpfs
@@ -506,6 +553,7 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     // Should be just innerArgv, no bwrap.
     expect(argv).toEqual([...INNER]);
@@ -521,6 +569,7 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       home: '/Users/devloper',
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     const argvStr = argv.join(' ');
     expect(argvStr).toContain('--tmpfs /Users/devloper/.ssh');
@@ -560,6 +609,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       }),
     ).toThrow(/inside hide_paths dir/);
   });
@@ -572,6 +622,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       }),
     ).toThrow(/inside hide_paths dir/);
   });
@@ -587,6 +638,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       }),
     ).not.toThrow();
   });
@@ -599,6 +651,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       }),
     ).not.toThrow();
   });
@@ -613,6 +666,7 @@ describe('buildBwrapArgv — cwd inside hide_paths dir (slice 125, R3 P1 coverag
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       }),
     ).not.toThrow();
   });
@@ -642,6 +696,7 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       });
       const argvStr = argv.join(' ');
       // The canonical home-relative overlay IS present.
@@ -666,6 +721,7 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       });
       const argvStr = argv.join(' ');
       // Both overlays present: the canonical home-relative one
@@ -690,6 +746,7 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         home: '/home/op',
         innerArgv: INNER,
         env: {},
+        realpath: (p) => p,
       });
       // Count tmpfs flags pointing at the data dir (`share/forja`).
       // Should be exactly 1: the canonical home-relative one. sec-1
@@ -727,6 +784,7 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
       home: '/home/op',
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     const argvStr = argv.join(' ');
     // The canonical home-relative overlays ARE present.
@@ -743,6 +801,7 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
       home: '/home/op',
       innerArgv: INNER,
       env: { XDG_CONFIG_HOME: '/srv/conf' },
+      realpath: (p) => p,
     });
     const argvStr = argv.join(' ');
     // Canonical home-relative overlays still present (defense
@@ -769,6 +828,7 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
       home: '/home/op',
       innerArgv: INNER,
       env: { XDG_CONFIG_HOME: '/home/op/.config' },
+      realpath: (p) => p,
     });
     // Each .config/* HIDE entry should produce EXACTLY one
     // --tmpfs. Slice 146 skipped because effective path matches
@@ -788,6 +848,7 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
       home: '/home/op',
       innerArgv: INNER,
       env: { XDG_CONFIG_HOME: 'relative/path' },
+      realpath: (p) => p,
     });
     const argvStr = argv.join(' ');
     expect(argvStr).not.toContain('relative/path');
@@ -800,6 +861,7 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
       home: '/home/op',
       innerArgv: INNER,
       env: { XDG_CONFIG_HOME: '' },
+      realpath: (p) => p,
     });
     // No extra overlays beyond the canonical home-relative ones.
     const gcloudTmpfsCount = argv.filter(
@@ -828,7 +890,14 @@ describe('buildBwrapArgv — slice 145 S1 namespace + session isolation', () => 
   test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
     '%s profile includes --unshare-uts / --unshare-ipc / --unshare-cgroup-try / --new-session',
     (profile) => {
-      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
+      const argv = buildBwrapArgv({
+        profile,
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+      });
       expect(argv).toContain('--unshare-uts');
       expect(argv).toContain('--unshare-ipc');
       expect(argv).toContain('--unshare-cgroup-try');
@@ -843,6 +912,7 @@ describe('buildBwrapArgv — slice 145 S1 namespace + session isolation', () => 
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv).toEqual([...INNER]);
     expect(argv).not.toContain('--new-session');
@@ -861,7 +931,14 @@ describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --seten
   test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
     '%s profile starts with --clearenv',
     (profile) => {
-      const argv = buildBwrapArgv({ profile, cwd: CWD, home: HOME, innerArgv: INNER, env: {} });
+      const argv = buildBwrapArgv({
+        profile,
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+      });
       expect(argv).toContain('--clearenv');
     },
   );
@@ -880,6 +957,7 @@ describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --seten
         TZ: 'UTC',
         SHELL: '/bin/bash',
       },
+      realpath: (p) => p,
     });
     // Each var should appear as `--setenv KEY VALUE` in argv order.
     const setenvAt = (key: string, value: string): boolean => {
@@ -919,6 +997,7 @@ describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --seten
         AWS_SECRET_ACCESS_KEY: 'leaked',
         PATH: '/usr/bin', // control: allowed, must still appear
       },
+      realpath: (p) => p,
     });
     const setenvKeys: string[] = [];
     for (let i = 0; i < argv.length - 1; i++) {
@@ -951,6 +1030,7 @@ describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --seten
         // malformed value. Skip rather than crash bwrap.
         HOME: '/home/op /extra',
       },
+      realpath: (p) => p,
     });
     const setenvKeys: string[] = [];
     for (let i = 0; i < argv.length - 1; i++) {
@@ -967,9 +1047,156 @@ describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --seten
       home: HOME,
       innerArgv: INNER,
       env: {},
+      realpath: (p) => p,
     });
     expect(argv).toContain('--clearenv');
     const setenvCount = argv.filter((v) => v === '--setenv').length;
     expect(setenvCount).toBe(0);
+  });
+});
+
+// Slice 155 (review — symlink canonicalization for cwd guard).
+// The literal-string `cwd.startsWith(hiddenAbs)` check pre-slice
+// could be bypassed via a symlink like `/tmp/work → ~/.ssh/audit/`.
+// `realpath()` resolves the symlink before the guard runs; the
+// resolved canonical target either still bypasses the hide_paths
+// check (legitimate workflow) or hits it as the canonical hidden
+// path (and the existing guard refuses cleanly).
+describe('buildBwrapArgv — symlink canonicalization (slice 155)', () => {
+  test('symlink cwd pointing to hide_paths dir → refused after realpath', () => {
+    // Simulate: /tmp/work is a symlink to /home/op/.ssh/audit.
+    // realpath() returns the canonical target; the hide_paths
+    // check then sees a path INSIDE .ssh and refuses.
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/tmp/work',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => (p === '/tmp/work' ? '/home/op/.ssh/audit' : p),
+      }),
+    ).toThrow(/inside hide_paths dir/);
+  });
+
+  test('symlink cwd pointing outside hide_paths → accepted with canonical path', () => {
+    // /tmp/work → /var/build/project. Canonical target is outside
+    // any hide_paths dir, so build succeeds with the canonical
+    // path used as --chdir + --bind.
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: '/tmp/work',
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => (p === '/tmp/work' ? '/var/build/project' : p),
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).toContain('--bind /var/build/project /var/build/project');
+    expect(argvStr).toContain('--chdir /var/build/project');
+    // The original symlink path does NOT appear — the kernel exec'd
+    // path is canonical.
+    expect(argvStr).not.toContain('/tmp/work');
+  });
+
+  test('non-symlink cwd: realpath returns same path → no change in argv', () => {
+    // realpath of a non-symlink is the path itself. argv must
+    // reflect the same shape as pre-slice for the common case.
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: '/work/proj',
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).toContain('--bind /work/proj /work/proj');
+    expect(argvStr).toContain('--chdir /work/proj');
+  });
+
+  test('broken symlink (ENOENT) → refused with clear message', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: '/tmp/dangling',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: () => {
+          const e = new Error('ENOENT') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        },
+      }),
+    ).toThrow(/does not exist.*broken symlink/);
+  });
+
+  test('symlink cycle (ELOOP) → refused with clear message', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: '/tmp/cycle',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: () => {
+          const e = new Error('ELOOP') as NodeJS.ErrnoException;
+          e.code = 'ELOOP';
+          throw e;
+        },
+      }),
+    ).toThrow(/symlink chain loops/);
+  });
+
+  test('EACCES on ancestor → refused with permission-denied message', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: '/restricted/work',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: () => {
+          const e = new Error('EACCES') as NodeJS.ErrnoException;
+          e.code = 'EACCES';
+          throw e;
+        },
+      }),
+    ).toThrow(/permission denied/);
+  });
+
+  test('ENOTDIR on ancestor → refused with not-a-directory message', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: '/etc/passwd/subdir',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: () => {
+          const e = new Error('ENOTDIR') as NodeJS.ErrnoException;
+          e.code = 'ENOTDIR';
+          throw e;
+        },
+      }),
+    ).toThrow(/not a directory/);
+  });
+
+  test('unknown realpath error → refused with diagnostic', () => {
+    expect(() =>
+      buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: '/some/path',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: () => {
+          const e = new Error('arbitrary failure') as NodeJS.ErrnoException;
+          e.code = 'EWHATEVER';
+          throw e;
+        },
+      }),
+    ).toThrow(/cannot be canonicalized/);
   });
 });
