@@ -2176,6 +2176,62 @@ describe('bash resolver — slice 128 R4 P0 fixes', () => {
       expect(s).toContain('exec:arbitrary');
     }
   });
+
+  // Slice 167 (review — Batch E threat surface): `-delete` is find's
+  // built-in deletion primitive (no external exec invocation). Pre-
+  // slice the resolver missed it entirely — `find / -name '*.config'
+  // -delete` resolved as readFs(/) with confidence='high', no
+  // delete-fs attribution. An operator policy allowing read-fs but
+  // not delete-fs would have admitted the call.
+  test('slice 167: find -delete emits delete-fs capability', () => {
+    const r = resolveCapabilities('bash', { command: 'find /tmp/scratch -delete' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/tmp/scratch');
+      expect(s).toContain('delete-fs:/tmp/scratch');
+    }
+  });
+
+  test('slice 167: find -delete on RM_REFUSE_ROOTS refuses (parity with cmdRm)', () => {
+    const r = resolveCapabilities('bash', { command: 'find / -delete' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('refuse to delete');
+      expect(r.reason).toContain("'/'");
+    }
+  });
+
+  test('slice 167: find -delete on /etc refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'find /etc -delete' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain("'/etc'");
+    }
+  });
+
+  test('slice 167: find WITHOUT -delete still emits only read-fs (regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'find /tmp/scratch -name "*.log"' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/tmp/scratch');
+      // No delete-fs without the flag.
+      expect(s.some((c) => c.startsWith('delete-fs:'))).toBe(false);
+    }
+  });
+
+  test('slice 167: find -delete with multiple positionals emits delete-fs for each', () => {
+    const r = resolveCapabilities('bash', { command: 'find src tests -name "*.bak" -delete' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities).sort();
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('read-fs:/work/proj/tests');
+      expect(s).toContain('delete-fs:/work/proj/src');
+      expect(s).toContain('delete-fs:/work/proj/tests');
+    }
+  });
 });
 
 describe('bash resolver — slice 128 R4 P1 fixes', () => {

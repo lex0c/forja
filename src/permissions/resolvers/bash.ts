@@ -347,6 +347,22 @@ const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
 
 // find: all positionals are filesystem paths (find DIR1 DIR2 -name ...).
 // Pattern-style filters arrive as flags and are excluded by stripFlags.
+//
+// Slice 167 (review — Batch E threat surface). The `-delete` flag is
+// find's built-in deletion primitive — it removes every match without
+// invoking an external binary, so the existing FIND_EXEC_FLAGS check
+// (which routes through exec:arbitrary) misses it entirely. Pre-slice
+// `find / -name '*.config' -delete` resolved to `[readFs(/)]` with
+// `confidence: 'high'` — no delete-fs attribution, no RM_REFUSE_ROOTS
+// gate. A `deny: read-fs:**` operator policy didn't fire because the
+// resolver didn't emit a delete capability. Now `-delete` emits
+// `delete-fs:<path>` for each positional + reuses RM_REFUSE_ROOTS as
+// a hardcoded refuse for catastrophic targets (`find / -delete`,
+// `find /etc -delete`, etc.) — same posture as `cmdRm`.
+//
+// `-delete` is a positional-style filter from find's grammar (not a
+// flag with a value); stripFlags leaves it in the `tokens` array. We
+// scan tokens to detect it.
 const cmdFind: CommandResolver = (positional, tokens, ctx) => {
   if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
@@ -355,6 +371,25 @@ const cmdFind: CommandResolver = (positional, tokens, ctx) => {
     };
   }
   const paths = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
+  // Slice 167: -delete attribution.
+  if (tokens.some((t) => t === '-delete')) {
+    // Hardcoded refuse for catastrophic targets (parity with cmdRm).
+    for (const p of paths) {
+      if (RM_REFUSE_ROOTS.has(p)) {
+        return {
+          refuse: `find -delete: refuse to delete under system root '${p}' (hardcoded blocklist; spec §5.2)`,
+        };
+      }
+    }
+    // Emit delete-fs for each positional (write-fs implied for
+    // policy callers that only filter by kind prefix). Read-fs
+    // also emitted because find still walks the tree before
+    // deleting — operator policy on read can still gate the call.
+    return {
+      capabilities: [...paths.map((p) => readFs(p)), ...paths.map((p) => deleteFs(p))],
+      confidence: 'high',
+    };
+  }
   return {
     capabilities: paths.map((p) => readFs(p)),
     confidence: 'high',
