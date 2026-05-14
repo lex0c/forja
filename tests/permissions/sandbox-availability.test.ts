@@ -22,6 +22,7 @@ describe('detectSandboxAvailability', () => {
       which: () => '/usr/bin/bwrap',
       stat: cleanStat,
       exists: (p) => p === '/usr/bin/bwrap',
+      isExecutable: (p) => p === '/usr/bin/bwrap',
     });
     expect(r.available).toBe(true);
     expect(r.tool).toBe('bwrap');
@@ -47,11 +48,15 @@ describe('detectSandboxAvailability', () => {
   });
 
   test('darwin + canonical /usr/bin/sandbox-exec present → trustLevel canonical', () => {
+    // Mock isExecutable alongside exists so the test isn't dependent
+    // on the host actually having /usr/bin/sandbox-exec installed
+    // (e.g., this test runs on Linux CI where the file is absent).
     const r = detectSandboxAvailability({
       platform: 'darwin',
       which: () => '/usr/bin/sandbox-exec',
       stat: cleanStat,
       exists: (p) => p === '/usr/bin/sandbox-exec',
+      isExecutable: (p) => p === '/usr/bin/sandbox-exec',
     });
     expect(r.available).toBe(true);
     expect(r.tool).toBe('sandbox-exec');
@@ -133,6 +138,7 @@ describe('resolveSandboxBinary — canonical-first + stat-check (slice 154)', ()
       which: () => '/some/other/path/bwrap', // would lose to canonical
       stat: cleanStat,
       exists: (p) => p === '/usr/bin/bwrap',
+      isExecutable: (p) => p === '/usr/bin/bwrap',
     });
     expect(r.path).toBe('/usr/bin/bwrap');
     expect(r.trustLevel).toBe('canonical');
@@ -219,6 +225,74 @@ describe('resolveSandboxBinary — canonical-first + stat-check (slice 154)', ()
     });
     expect(r.path).toBeNull();
     expect(r.trustLevel).toBe('absent');
+  });
+});
+
+// Review fix: a canonical /usr/bin/<tool> that exists but is NOT
+// executable for the current user (mode stripped, ACL deny, owner
+// mismatch) used to be returned as `canonical` because the branch
+// only probed existence. Every wrapped spawn then failed with
+// EACCES even when `which()` could resolve a working binary
+// elsewhere on PATH. The fix gates the canonical branch behind an
+// executability probe (defaults to `accessSync(p, X_OK)`); when
+// that fails, the resolver falls through to the PATH lookup.
+describe('resolveSandboxBinary — canonical fall-through when not executable (review fix)', () => {
+  test('canonical exists but not executable + PATH resolves → falls through to path-resolved', () => {
+    // Operator's /usr/bin/bwrap has mode 0o644 (or ACL deny);
+    // /home/op/.nix-profile/bin/bwrap is a clean working install.
+    // Resolver should pick the working one with the appropriate
+    // path-resolved warning.
+    const r = resolveSandboxBinary('bwrap', {
+      which: () => '/home/op/.nix-profile/bin/bwrap',
+      stat: cleanStat,
+      exists: (p) => p === '/usr/bin/bwrap', // canonical exists
+      isExecutable: () => false, // but not usable
+    });
+    expect(r.path).toBe('/home/op/.nix-profile/bin/bwrap');
+    expect(r.trustLevel).toBe('path-resolved');
+    expect(r.trustWarnings.some((w) => w.includes('using non-canonical'))).toBe(true);
+  });
+
+  test('canonical exists but not executable + no PATH fallback → absent', () => {
+    // Worst case: canonical broken, no working bwrap elsewhere.
+    // Operator gets an honest "absent" answer instead of a fake
+    // "canonical" that fails at every spawn.
+    const r = resolveSandboxBinary('bwrap', {
+      which: () => null,
+      stat: cleanStat,
+      exists: (p) => p === '/usr/bin/bwrap',
+      isExecutable: () => false,
+    });
+    expect(r.path).toBeNull();
+    expect(r.trustLevel).toBe('absent');
+  });
+
+  test('canonical exists AND executable → canonical (sanity, fix preserves existing behavior)', () => {
+    const r = resolveSandboxBinary('bwrap', {
+      which: () => '/usr/bin/bwrap',
+      stat: cleanStat,
+      exists: () => true,
+      isExecutable: () => true,
+    });
+    expect(r.path).toBe('/usr/bin/bwrap');
+    expect(r.trustLevel).toBe('canonical');
+  });
+
+  test('detectSandboxAvailability surfaces fall-through trust marker', () => {
+    // The same fall-through visible through the higher-level
+    // detector — operator-visible `path-resolved` instead of
+    // misleading `canonical`.
+    const r = detectSandboxAvailability({
+      platform: 'linux',
+      which: () => '/usr/local/bin/bwrap',
+      stat: cleanStat,
+      exists: (p) => p === '/usr/bin/bwrap',
+      isExecutable: () => false,
+    });
+    expect(r.available).toBe(true);
+    expect(r.path).toBe('/usr/local/bin/bwrap');
+    expect(r.trustLevel).toBe('path-resolved');
+    expect(r.trustWarnings.length).toBeGreaterThan(0);
   });
 });
 

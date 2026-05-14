@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(permissions/sandbox-availability) — gate canonical-path fast path behind executability check
+
+**Done.** `resolveSandboxBinary` returned `/usr/bin/<tool>` as `canonical` based on `exists()` alone — a `statSync` probe that only verifies the file is present. If the canonical path existed but wasn't executable for the current user (mode stripped, ACL deny, owner mismatch on `/usr/bin/bwrap`), the resolver still returned it as `canonical` and `available: true`. Every wrapped spawn then failed with `EACCES` at `execve(2)` time — even when a working binary lived elsewhere on PATH (Nix, Homebrew, custom build), because the canonical branch monopolized the answer and never consulted `which()`.
+
+Fix: added an `isExecutable` seam defaulting to `accessSync(path, X_OK)` (the kernel's own execute-access predicate — exactly what `execve` uses, so the fast path's answer matches spawn-time outcome). The canonical branch now requires BOTH `exists(canonical) && isExecutable(canonical)`. When canonical exists but is unusable, the resolver falls through to the PATH lookup, surfacing the operator's working binary with the `path-resolved` trust marker + non-canonical warning.
+
+Threaded through `detectSandboxAvailability` too so callers (production bootstrap + tests) can inject the seam.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-availability.ts` | `isExecutable` seam, canonical branch gated on both predicates, `detectSandboxAvailability` forwards the seam |
+| `tests/permissions/sandbox-availability.test.ts` | Existing canonical-trust tests now mock `isExecutable` alongside `exists` (decoupled from host); +4 new tests: canonical-but-unexecutable falls through to PATH-resolved, fall-through to absent when no PATH alternative, sanity-check executable canonical still works, fall-through visible through `detectSandboxAvailability` |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7275 pass / 10 skip / 0 fail (+4 from baseline 7271)
+
 ## [2026-05-14] fix(permissions/sandbox-runner) — validate XDG_DATA_HOME is absolute before adding bwrap/SBPL overlay (Linux + macOS)
 
 **Done.** `defaultDataDir()` returns `join(xdg, 'forja')` when `XDG_DATA_HOME` is set, with no absolute-path validation. The slice 140 sec-1 branches in both sandbox builders unconditionally consumed that path:

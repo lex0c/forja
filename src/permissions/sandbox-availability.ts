@@ -37,7 +37,14 @@
 // the operator sees "running with non-canonical bwrap" rather than
 // a silent downgrade.
 
-import { lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import {
+  accessSync,
+  constants as fsConstants,
+  lstatSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { isAbsolute } from 'node:path';
 
 // Canonical system paths for each sandbox tool. Hard-coded because
@@ -102,6 +109,17 @@ export interface DetectSandboxAvailabilityOptions {
   // fall back to PATH". Production uses statSync existence check;
   // tests inject deterministic answers.
   exists?: (path: string) => boolean;
+  // Executability seam. Used by the canonical-path probe to confirm
+  // the binary is actually usable for execve(2) by the current user
+  // BEFORE returning it as "available." Production uses
+  // `accessSync(p, X_OK)` (the kernel's own execute-access predicate);
+  // tests inject deterministic answers. Without this gate, a
+  // canonical /usr/bin/<tool> that exists but isn't executable
+  // (mode stripped, owner mismatch, ACLs, etc.) would be reported as
+  // available, then every wrapped spawn would fail with EACCES even
+  // when a working binary is on PATH elsewhere — the fast path
+  // monopolized the answer without verifying usability.
+  isExecutable?: (path: string) => boolean;
 }
 
 const defaultWhich = (name: string): string | null => {
@@ -152,6 +170,28 @@ const defaultStat = (path: string): { uid: number; mode: number } | null => {
 const defaultExists = (path: string): boolean => {
   try {
     statSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Default executability probe: does the current user have +x on
+// the path AS A USER (kernel's own X_OK check)? This is what
+// `execve(2)` itself uses, so the canonical fast path's answer
+// matches the spawn-time outcome — no false positives.
+//
+// `accessSync` throws on rejection (EACCES, ENOENT, etc.). Wrapping
+// in try/catch + returning bool keeps the seam contract simple. A
+// thrown error from ENOENT is the natural "not there + not
+// executable" answer; we don't need to distinguish that from a
+// real permission denial here because the canonical branch already
+// checked existence via `exists()` upstream — by the time we get
+// here we know the file is present, so any error is a usability
+// failure.
+const defaultIsExecutable = (path: string): boolean => {
+  try {
+    accessSync(path, fsConstants.X_OK);
     return true;
   } catch {
     return false;
@@ -222,14 +262,25 @@ export const resolveSandboxBinary = (
     which?: (name: string) => string | null;
     stat?: (path: string) => { uid: number; mode: number } | null;
     exists?: (path: string) => boolean;
+    isExecutable?: (path: string) => boolean;
   } = {},
 ): ResolvedTool => {
   const which = options.which ?? defaultWhich;
   const stat = options.stat ?? defaultStat;
   const exists = options.exists ?? defaultExists;
+  const isExecutable = options.isExecutable ?? defaultIsExecutable;
 
   const canonical = CANONICAL_PATHS[name];
-  if (canonical !== undefined && exists(canonical)) {
+  // Canonical fast path requires BOTH existence AND executability.
+  // The earlier cut returned canonical on existence alone, so a
+  // /usr/bin/<tool> that existed but wasn't executable for the
+  // current user (mode stripped, ACL deny, owner mismatch) was
+  // reported as available — every wrapped spawn then failed with
+  // EACCES even when `which()` could resolve a working binary
+  // elsewhere on PATH. Falling through to the PATH lookup when
+  // canonical isn't usable lets the operator's Nix/Homebrew/custom
+  // install take over (with the appropriate trust marker + warning).
+  if (canonical !== undefined && exists(canonical) && isExecutable(canonical)) {
     // Hot path: canonical install. No trust warnings because the
     // path itself is the trust marker.
     return { path: canonical, trustLevel: 'canonical', trustWarnings: [] };
@@ -411,9 +462,10 @@ export const detectSandboxAvailability = (
   const which = options.which ?? defaultWhich;
   const stat = options.stat ?? defaultStat;
   const exists = options.exists ?? defaultExists;
+  const isExecutable = options.isExecutable ?? defaultIsExecutable;
 
   if (platform === 'linux') {
-    const r = resolveSandboxBinary('bwrap', { which, stat, exists });
+    const r = resolveSandboxBinary('bwrap', { which, stat, exists, isExecutable });
     if (r.path === null) {
       return {
         available: false,
@@ -434,7 +486,7 @@ export const detectSandboxAvailability = (
     };
   }
   if (platform === 'darwin') {
-    const r = resolveSandboxBinary('sandbox-exec', { which, stat, exists });
+    const r = resolveSandboxBinary('sandbox-exec', { which, stat, exists, isExecutable });
     if (r.path === null) {
       return {
         available: false,
