@@ -42,6 +42,7 @@ import { migration041FailureEvents } from './041-failure-events.ts';
 import { migration042OutcomeSignals } from './042-outcome-signals.ts';
 import { migration043BgBytesDropped } from './043-bg-bytes-dropped.ts';
 import { migration044HookRunsPostToolUseFailure } from './044-hook-runs-post-tool-use-failure.ts';
+import { migration045ContextPins } from './045-context-pins.ts';
 
 export interface Migration {
   id: number;
@@ -94,4 +95,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration042OutcomeSignals,
   migration043BgBytesDropped,
   migration044HookRunsPostToolUseFailure,
+  migration045ContextPins,
 ];

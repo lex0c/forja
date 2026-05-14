@@ -2,6 +2,50 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] feat(storage/context-pins) — schema + repo + validation (Phase 1.1.a)
+
+**Done.** First implementation slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the persistence contract — table, repo, validation, duration parser — without yet wiring it to a tool / slash / projection (those are 1.1.b–d). Pinned context is the primitive that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate; without persistence there's nothing for downstream consumers to read.
+
+`context_pins` is the canonical home announced in Phase 0 (AUDIT §1 row, retention 90d, cascade with sessions). This slice materializes that row.
+
+### Key implementation decisions
+
+- **Cap of 10 pins per session enforced in code, not via CHECK.** SQLite CHECK can't reference COUNT subqueries. `createPin` uses `withImmediateTransaction` so a count + insert sequence runs under the writer lock — two concurrent `createPin` calls from the slash command and the model-proposed tool path can't both pass a 9-pin check and land an 11th row. Surfaces as `PinCapExceededError` (structured class with `sessionId/currentCount/cap` fields) so UI can render a specific message instead of parsing a generic SQLite error string.
+- **Cap counts ALL pins including expired ones.** Matches spec literal "10 pins per session". Operator must remove explicitly — alternative ("silently allow creation after expiry") would hide resource pressure and surprise the user when an expired pin briefly resurfaces. Test pins this behavior so a future refactor can't drift.
+- **CASCADE on `sessions(id)`, not SET NULL.** Pin without a session is meaningless (per-session by design, §12.4.1 forbids cross-session pins). Contrasts with `memory_events` (SET NULL, audit rows carry standalone value). AUDIT §1 declared this retention behavior; the migration matches.
+- **Validation layered: TS first, SQL CHECK as defense-in-depth.** Repo `validateInput` catches kind/created_by enum violations, empty text, > 500 chars, non-positive `expires_at` — and throws structured `InvalidPinError` with `field` hint. SQL CHECK rejects the same shapes for any future caller that bypasses the repo (import script, replay tool). Tests cover both paths.
+- **Duration parser is repo-local, not a shared util.** `parseDuration("30m"|"2h"|"1d") → ms` is the only place in the codebase that parses durations this way; promoting to a shared helper would invent shared surface area for one call site. Rejects compound forms (`1h30m`), fractional (`1.5h`), zero, negative, > 365d ceiling. Throws `InvalidDurationError extends InvalidPinError` so the slash/tool layers can surface a field-level error to the UI without re-implementing the check.
+- **`UNIT_MS` typed `as const` + literal union narrow** rather than `Record<string, number>` + non-null assertions. Biome rejects `!` non-null assertions; the narrow makes the code total at the type level instead of trusting a regex contract that compiles to a runtime cast.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/045-context-pins.ts` | Table + indices (id PK, session_id FK CASCADE, text CHECK length ≤ 500, kind/created_by CHECK enums, expires_at nullable, source_step_id nullable); two indices on session_id alone and (session_id, expires_at) for active-pin filtering |
+| `src/storage/repos/context-pins.ts` | Public surface: `createPin` / `getPin` / `listPinsBySession` / `getActivePinsBySession` / `countActivePinsBySession` / `removePin`; structured errors `PinCapExceededError` / `InvalidPinError` / `InvalidDurationError`; `parseDuration` helper; constants `PIN_CAP=10`, `PIN_TEXT_MAX_LENGTH=500`, `PIN_KINDS`, `PIN_CREATED_BY` |
+| `tests/storage/context-pins.test.ts` | 33 tests across 6 describe blocks: create+read, cap enforcement (per-session + freed-after-remove + includes-expired + error fields), active filtering (boundary inclusive/exclusive semantics), TS-level validation, DB CHECK defense-in-depth, CASCADE + removePin, parseDuration (units, trim, compound rejection, ceiling) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/index.ts` | Import + register `migration045ContextPins` |
+
+### Deferred (next slices)
+
+- **1.1.b** — `pin_context` tool with operator-confirmed modal (template: `tools/builtin/memory-write.ts`)
+- **1.1.c** — `/pin` slash command parser + dispatcher
+- **1.1.d** — populate `RecapIntermediate.pinnedContext[]` from `context_pins` in the recap projection so the already-wired `resume-context.ts:162` rendering picks it up
+
+Goal re-injection and post-compaction injection remain deferred per the Phase 0 plan — both wait on subsystems not yet implemented (goal stack in harness loop; compaction maturity past the "No pinned context (M3+)" TODO already in `src/harness/compaction.ts`).
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/storage/context-pins.test.ts` 33 pass / 0 fail
+- `bun test` 7321 pass / 10 skip / 0 fail (+33 from baseline 7288)
+
 ## [2026-05-14] spec(memory/context) — stitch RETRIEVAL/FEEDBACK_ADAPTATION/EVICTION into existing docs (Phase 0)
 
 **Done.** Three new spec docs landed in `docs/spec/` (`RETRIEVAL.md`, `FEEDBACK_ADAPTATION.md`, `EVICTION.md`) covering context selection pipeline, harness-side adaptation loops, and typed lifecycle/eviction governance. They referenced sections in `AUDIT.md`, `MEMORY.md`, `CONTEXT_TUNING.md`, and `AGENTIC_CLI.md` that didn't yet have the corresponding hooks, leaving the architecture as three islands.
