@@ -158,7 +158,11 @@ export interface ChainVerifyFailedEvent {
   ts: number;
   install_id: string;
   broken_at: number;
-  reason: 'prev_hash_mismatch' | 'this_hash_mismatch';
+  // Slice 163: `ts_monotonic_break` joined the existing chain
+  // failure reasons. Catches backward-dated forgeries that
+  // recompute hashes correctly but place a row before its
+  // predecessor in wall-clock order.
+  reason: 'prev_hash_mismatch' | 'this_hash_mismatch' | 'ts_monotonic_break';
   expected: string;
   actual: string;
   // Whether the operator opted to continue under the broken

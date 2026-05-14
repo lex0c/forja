@@ -3291,3 +3291,46 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
     expect(decision.reason).toContain('write-fs:');
   });
 });
+
+// Slice 163 (review — Batch A audit hardening). reloadPolicy now
+// refuses mutation when the engine is in `refusing` state. Pre-slice
+// the watcher fired policy-reloaded audit rows with `decision:'allow'`
+// while every actual check returned deny — forensic tools could
+// believe the engine operated under the new policy when it was
+// actually refusing.
+describe('engine.reloadPolicy — refusing state guard (slice 163)', () => {
+  test('reloadPolicy on a refusing engine returns ok:false (no swap)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+    });
+    // Force engine into refusing via the existing refuse() admin call.
+    eng.refuse('test: force refuse');
+    expect(eng.state()).toBe('refusing');
+    const result = eng.reloadPolicy(policy({ tools: { bash: { allow: ['*'] } } }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('refusing');
+      expect(result.reason).toContain('terminal');
+    }
+    // Policy did NOT swap — checking the old policy is still in effect.
+    // (mode() reports the pre-refuse mode; the original policy's allow
+    // ['ls *'] would have allowed `ls -la` but refusing-state denies
+    // all checks regardless. We're proving the SWAP didn't happen by
+    // re-reading the policy.)
+    expect(eng.policy().tools.bash?.allow).toEqual(['ls *']);
+  });
+
+  test('reloadPolicy on degraded engine still works (only refusing blocks)', () => {
+    // Degraded is a transient state where allows become confirms but
+    // operator can still tune policy. Only `refusing` (terminal) blocks
+    // reload.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+    });
+    eng.degrade('test: force degrade');
+    expect(eng.state()).toBe('degraded');
+    const result = eng.reloadPolicy(policy({ tools: { bash: { allow: ['*'] } } }));
+    expect(result.ok).toBe(true);
+    expect(eng.policy().tools.bash?.allow).toEqual(['*']);
+  });
+});

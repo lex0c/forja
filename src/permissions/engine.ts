@@ -1997,6 +1997,29 @@ export const createPermissionEngine = (
     // diagnostic. Single-threaded JS means in-flight check() calls
     // run to completion before this fires.
     reloadPolicy: (newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult => {
+      // Slice 163 (review — Batch A audit hardening). Refuse the
+      // reload when the engine is in `refusing` state. Pre-slice the
+      // policy-watcher would keep firing reloads on YAML edits even
+      // after the engine refused (sealing failure, chain break,
+      // mandatory-sandbox-unavailable, etc.). Each reload swapped
+      // policy/policyHash/mode/provenance and emitted a
+      // `policy-reloaded` audit row with `decision: 'allow'` — but
+      // every actual `check()` returned deny ("engine not ready").
+      // Forensic tools (`permission diff`, `permission replay`)
+      // would later believe the engine operated under the new
+      // policy when it was actually refusing.
+      //
+      // Refusing is terminal; the only path out is a fresh engine
+      // (CLI reset, --accept-broken-chain, etc.). While in this
+      // state, policy YAML is irrelevant. Returning ok:false here
+      // makes the watcher's next-tick log an explicit refusal.
+      if (stateController.get() === 'refusing') {
+        return {
+          ok: false,
+          reason:
+            'reloadPolicy: engine state is `refusing` (terminal); policy swap rejected. Restart the agent to recover.',
+        };
+      }
       if (newPolicy === null || typeof newPolicy !== 'object') {
         return { ok: false, reason: 'reloadPolicy: newPolicy must be a non-null object' };
       }

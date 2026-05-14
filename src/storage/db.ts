@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export type DB = Database;
@@ -17,7 +17,72 @@ export interface OpenDbOptions {
   // consumer; future read-only inspection tools (export, replay
   // against archived DB) can adopt the same shape.
   readonly?: boolean;
+  // Slice 163 (review — Batch A audit hardening): skip the
+  // SessionStart `PRAGMA integrity_check`. Per spec §15 + SEC §1.2
+  // the integrity check is the load-bearing defense against torn-
+  // page corruption / hostile FS write — production paths MUST run
+  // it. The option exists only as a test seam for fixtures that
+  // construct + mutate the DB schema mid-test (e.g., migration
+  // tests intentionally leaving the DB in an inconsistent state).
+  // Production callers MUST NOT pass this.
+  skipIntegrityCheck?: boolean;
 }
+
+// Slice 163 (review — Batch A audit hardening). Run `PRAGMA
+// integrity_check` against the just-opened DB. SQLite's full
+// btree + schema walk; ~ms for empty DBs, ~hundreds of ms for
+// large ones. Returns the list of rows (always one row per
+// problem; a clean DB returns `[{ integrity_check: 'ok' }]`).
+//
+// Why at SessionStart: per spec §15 + SEC §1.2, FS-level corruption
+// of `sessions.db` (cosmic ray, torn-page after kernel crash,
+// hostile FS write) is part of the threat model. `verifyChain`
+// runs ON the rows present and would happily report ok:true on a
+// chain whose middle was silently dropped by a torn-page event.
+// integrity_check catches that BEFORE the engine starts emitting.
+const runIntegrityCheck = (db: DB, path: string): void => {
+  const rows = db.query('PRAGMA integrity_check;').all() as Array<{ integrity_check: string }>;
+  const allOk = rows.length === 1 && rows[0]?.integrity_check === 'ok';
+  if (allOk) return;
+  // Format problems for the error message: integrity_check can
+  // return multiple rows when several issues are found. Cap to
+  // first 5 so the error doesn't explode on a thoroughly corrupted
+  // DB; operator gets enough signal to act.
+  const issues = rows.slice(0, 5).map((r) => r.integrity_check);
+  if (rows.length > 5) issues.push(`... and ${rows.length - 5} more`);
+  // Close the connection before throwing — leaving it open holds
+  // the file handle + WAL writer slot.
+  db.close();
+  throw new Error(
+    `storage: PRAGMA integrity_check failed for '${path}': ${issues.join('; ')}. DB is corrupted — restore from backup or rotate (agent permission rotate-chain). See SEC §1.2 / spec §15.`,
+  );
+};
+
+// Slice 163 (review — Batch A): lock down permissions on the
+// sessions.db file + its parent dir per SEC §8.3. Multi-user host
+// scenario: user A runs Forja; user B on the same machine can
+// otherwise read /home/userA/.local/share/forja/sessions.db
+// (default umask 0644) — the file contains tool_calls.output rows
+// (file content the agent read, possibly secrets) and
+// approvals_log rows (capabilities, args). Tight perms (0600 file,
+// 0700 dir) close that vector.
+//
+// Best-effort: chmodSync can fail on exotic FS (FAT/exFAT have
+// no Unix perms, some mounts are noexec/nosuid w/o chmod support).
+// Swallow on failure — operator sees the lax perms at their own
+// host's normal `ls -l`; not breaking the agent on a niche FS.
+const lockdownDbPerms = (path: string): void => {
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Best-effort. FS without Unix perms support (FAT/exFAT) ignores.
+  }
+  try {
+    chmodSync(dirname(path), 0o700);
+  } catch {
+    // Best-effort.
+  }
+};
 
 export const openDb = (path: string, options: OpenDbOptions = {}): DB => {
   if (options.readonly === true) {
@@ -25,6 +90,12 @@ export const openDb = (path: string, options: OpenDbOptions = {}): DB => {
     // missing the open throws — caller decides how to surface.
     const db = new Database(path, { readonly: true });
     db.exec('PRAGMA foreign_keys = ON;');
+    // Slice 163: integrity_check applies to read-only opens too
+    // — a doctor inspection of a corrupted DB should refuse
+    // instead of silently reporting "all chains ok".
+    if (options.skipIntegrityCheck !== true && path !== MEMORY_DB) {
+      runIntegrityCheck(db, path);
+    }
     return db;
   }
   if (path !== MEMORY_DB) {
@@ -56,6 +127,14 @@ export const openDb = (path: string, options: OpenDbOptions = {}): DB => {
     // mock; applying a real busy_timeout there would slow
     // those tests without buying anything.
     db.exec('PRAGMA busy_timeout = 5000;');
+    // Slice 163: integrity check + permission lockdown.
+    // Order: integrity first (cheapest opportunity to refuse on
+    // corruption), then chmod (the new file just got created by
+    // Bun.Database; chmod runs against the live inode).
+    if (options.skipIntegrityCheck !== true) {
+      runIntegrityCheck(db, path);
+    }
+    lockdownDbPerms(path);
   }
   return db;
 };

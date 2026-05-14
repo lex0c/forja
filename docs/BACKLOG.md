@@ -2,6 +2,83 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(permission-engine/storage) — slice 163: Batch A audit chain hardening
+
+**Done.** First P1 batch from the 5-axis code review. Four independent audit/storage hardening fixes co-located by subsystem:
+
+### 1. reloadPolicy refuses mutation when state=refusing
+
+Concurrency review P1 #5. Pre-slice the policy-watcher kept firing reloads on YAML edits AFTER the engine refused (sealing failure, chain break, mandatory-sandbox-unavailable). Each reload swapped policy/policyHash/mode/provenance and emitted a `policy-reloaded` audit row with `decision: 'allow'` — but every `check()` returned deny ("engine not ready"). Forensic tools (`permission diff`, `permission replay`) would later believe the engine operated under the new policy when it was actually refusing.
+
+Fix: `engine.ts:reloadPolicy` checks `stateController.get() === 'refusing'` BEFORE touching policy state. Returns `ok:false` with an explicit "engine refusing (terminal); restart to recover" message. `degraded` state still allows reloads (transient, operator may want to tune the policy mid-degraded). Only `refusing` (terminal) blocks.
+
+### 2. Audit chain ts monotonicity check
+
+Sec-in-depth review P1 #3. Pre-slice `validateTs` (audit.ts:348) only checked the FUTURE side of the time skew window. An attacker with DB write could insert a row with `ts = previous_row.ts - 86400000` (1 day in the past); `verifyChain` accepted it because the hash chain stayed intact. Sealing doesn't help (per-decision-count keyed on hash, not ts). Effect: hostile row appears BEFORE legitimate ones, sorting-by-ts queries see it "first", forensic narrative inverted.
+
+Fix in two layers:
+
+- **Emit-time guard (audit.ts inside the IMMEDIATE transaction):** new check after fetching `last` row. If `ts < last.ts - AUDIT_TS_PAST_SKEW_MS` (1h window — same forgiveness as the future side for NTP smear / suspend-resume jumps), throw "forgery suspected". Race-free because the check runs inside the writer-lock transaction.
+- **Verify-time guard (verifyChain):** new `ts_monotonic_break` reason in `VerifyResult`. Walks rows tracking `lastTs`; flags any row whose ts is more than skew window before its predecessor. Catches tampering that bypassed the emit-time gate (direct DB write by attacker who recomputes hashes).
+
+Telemetry `ChainVerifyFailedEvent.reason` widened to include `'ts_monotonic_break'`. Fuzz harness updated to accept the new shape.
+
+`buildHashPayload` exported (pure deterministic function, no security cost) so tamper-test fixtures can construct valid-hash + back-dated rows.
+
+### 3. PRAGMA integrity_check at SessionStart
+
+Threat-model review P1 #2. Per spec §15 + SEC §1.2, FS-level corruption of `sessions.db` (cosmic ray, torn-page after kernel crash, hostile FS write) is in the threat model. Pre-slice `openDb` ran several PRAGMAs (foreign_keys, journal_mode, synchronous, busy_timeout) but never `integrity_check`. A corrupted DB that lost rows to a torn page would still parse as valid SQLite; `verifyChain` walked only the surviving rows and reported "ok:true".
+
+Fix: new `runIntegrityCheck` helper in `storage/db.ts`. Runs `PRAGMA integrity_check` against the just-opened DB (~ms for empty DBs, ~hundreds of ms for large ones). Refuses + closes the connection + throws an error naming the path, the first 5 problems, and the recovery hint ("restore from backup or rotate"). Applies to BOTH read-write opens AND readonly opens (doctor inspection should refuse on corruption, not silently report "ok"). Skipped for `:memory:` DBs (single-connection, no corruption surface).
+
+Test seam: `OpenDbOptions.skipIntegrityCheck` for fixtures that intentionally leave the DB inconsistent mid-test. Production callers MUST NOT pass it.
+
+### 4. sessions.db chmod 0600 + parent dir 0700
+
+Threat-model review P1 #5 (SEC §8.3). Multi-user host scenario: user A runs Forja; user B on the same machine reads `/home/userA/.local/share/forja/sessions.db` directly (default umask 0644 leaves it world-readable). File contains `tool_calls.output` (file content the agent read, possibly secrets) and `approvals_log` (capabilities, args). Tight perms close the vector.
+
+Fix: `lockdownDbPerms` helper called after Bun.Database creates the file. `chmodSync(path, 0o600)` + `chmodSync(dirname(path), 0o700)`. Best-effort — swallows EPERM / EINVAL on exotic FS (FAT/exFAT without Unix perms support). Readonly opens do NOT re-chmod (a read path mutating FS state would be surprising; operator's chmod between sessions stays in effect).
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **reloadPolicy guard** | `src/permissions/engine.ts` | `reloadPolicy` returns `ok:false` when `stateController.get() === 'refusing'`. |
+| **ts past-skew constant** | `src/permissions/audit.ts` | New `AUDIT_TS_PAST_SKEW_MS = 60 * 60 * 1000` (mirror of future-skew). |
+| **emit-time past-ts guard** | `src/permissions/audit.ts` | Inside `withImmediateTransaction`, after fetching `last`: throw if `ts < last.ts - AUDIT_TS_PAST_SKEW_MS`. |
+| **verifyChain ts walk** | `src/permissions/audit.ts` | Track `lastTs` across rows; return `ts_monotonic_break` reason on violation. |
+| **VerifyResult shape** | `src/permissions/audit.ts` | `reason` union widened. |
+| **ChainVerifyFailedEvent** | `src/telemetry/index.ts` | Telemetry event reason widened to match. |
+| **fuzz harness** | `src/fuzz/targets/chain.ts` | Validator accepts `ts_monotonic_break`. |
+| **buildHashPayload export** | `src/permissions/audit.ts` | Promoted from private to exported (tamper-test enablement). |
+| **integrity_check** | `src/storage/db.ts` | New `runIntegrityCheck` helper, called by `openDb` (both read-write + readonly paths). `OpenDbOptions.skipIntegrityCheck` test seam. |
+| **chmod lockdown** | `src/storage/db.ts` | New `lockdownDbPerms` helper, called by `openDb` after DB creation (read-write path only). Skips readonly + memory. |
+
+### Tests added (+15)
+
+| File | Coverage |
+|---|---|
+| **engine.test.ts (+2)** | `reloadPolicy` on refusing engine returns `ok:false`; reloadPolicy on degraded engine still works (only refusing blocks). |
+| **audit.test.ts (+5)** | Past-skew emit refuses; emit accepts within window (NTP smear); past-skew is no-op for first row; verifyChain reports `ts_monotonic_break` on DB tamper that recomputes hashes; verifyChain stays ok under legit ts movement within window. |
+| **storage/db.test.ts (+8)** | Fresh DB passes integrity_check; reopening passes; in-memory skips; skipIntegrityCheck seam; new DB is 0600; parent dir is 0700; reopening re-tightens after operator chmod; readonly open doesn't re-chmod. |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7069 pass / 10 skip / 0 fail** (was 7054 → +15 net new tests; zero regression)
+
+### Bash-tools / 5-axis review status
+
+Batch A (audit chain hardening) closed. Remaining batches from task #268:
+- Batch B (slice 164) — perm engine hot path remainders (Approvals-log SELECT cache, 3-tx merge — protected_paths + analyzeCommand items already done in slice 161)
+- Batch C (slice 165) — sandbox observability (trust warnings, degraded passthrough emit, darwin bg-reaper)
+- Batch D (slice 166) — subagent/IPC concurrency (permission-bridge race, policy-watcher atomic-rename)
+- Batch E (slice 167) — threat surface (injection scanner, trust hash-aggregate, hook hash, find -delete)
+- Batch F (slice 168) — dependency pin lockstep (engines.bun, @types/bun, anthropic-sdk, openai, google-genai)
+
+---
+
 ## [2026-05-14] fix(sandbox/sanitize) — slice 162: env scrub allowlist parity macOS ↔ Linux
 
 **Done.** Security P0 from the 5-axis review (sec-in-depth axis). Pre-slice the env-scrub posture was asymmetric across platforms:

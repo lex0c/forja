@@ -136,7 +136,12 @@ export type VerifyResult =
   | {
       ok: false;
       brokenAt: number;
-      reason: 'prev_hash_mismatch' | 'this_hash_mismatch';
+      // Slice 163: `ts_monotonic_break` flags a row whose `ts` is
+      // more than AUDIT_TS_PAST_SKEW_MS earlier than the previous
+      // row's `ts` — a forged-back-date shape. Hash chain may still
+      // be intact (attacker rebuilds hashes), so this is a second
+      // independent check during verify.
+      reason: 'prev_hash_mismatch' | 'this_hash_mismatch' | 'ts_monotonic_break';
       expected: string;
       actual: string;
       current_rotation_id: number;
@@ -155,6 +160,22 @@ const NOOP_ROW: EmittedRow = { seq: 0, this_hash: '' };
 // one canonical value. 1h forgiving window — see validateTs
 // rationale inline for the past-vs-future asymmetry.
 export const AUDIT_TS_FUTURE_SKEW_MS = 60 * 60 * 1000;
+
+// Slice 163 (review — Batch A audit hardening). Symmetric past-side
+// skew window: a forged row whose `ts` lands BEFORE the previous
+// row's wall clock is also a forgery shape (drops a row "into the
+// past" of the audit timeline, breaking forensic ordering). Pre-
+// slice `validateTs` only checked the future side, so an attacker
+// with DB write could insert a row with `ts = previous_row.ts -
+// 86400000` and `verifyChain` accepted it because the hash chain
+// stayed intact. The seal didn't catch this either — sealing is
+// per-decision-count keyed on the hash chain, not on ts monotonic.
+//
+// Window matches the future side (1h) so legitimate NTP smear /
+// suspend-resume time jumps don't trip false positives, but a
+// crafted "back-date by 1 day" row is rejected at emit time AND
+// flagged by `verifyChain` post-hoc.
+export const AUDIT_TS_PAST_SKEW_MS = 60 * 60 * 1000;
 
 export const createNoopSink = (): AuditSink => ({
   emit: () => NOOP_ROW,
@@ -207,7 +228,13 @@ const stripUndefined = (value: unknown, seen: WeakSet<object> = new WeakSet()): 
 // `verifyChain` build the SAME object shape from the SAME source.
 const HASH_INPUT_COLUMNS = PERSISTED_COLUMNS.filter((c) => c !== 'this_hash');
 
-const buildHashPayload = (
+// Slice 163 (review — Batch A): exported so tamper-test fixtures can
+// construct rows with valid-but-back-dated hashes (the threat
+// `ts_monotonic_break` defends against). The function is pure +
+// deterministic; exposing it for tests carries no security cost — an
+// attacker who can already write the DB can compute hashes by hand or
+// import this same module.
+export const buildHashPayload = (
   row: Omit<ApprovalLogRow, 'seq' | 'this_hash'>,
 ): Record<string, unknown> => {
   const payload: Record<string, unknown> = {};
@@ -395,6 +422,21 @@ export const createSqliteSink = ({
       const last = getLastApprovalsLogByInstall(db, identity.install_id);
       const prev_hash = last === null ? genesisHash : last.this_hash;
 
+      // Slice 163 (review — Batch A): past-side ts monotonicity guard.
+      // The future-side check in `validateTs` (above, before the
+      // transaction) catches forward-dated forgeries; this catches
+      // backward-dated ones. AUDIT_TS_PAST_SKEW_MS gives an hour of
+      // tolerance for NTP smear / suspend-resume jumps so we don't
+      // false-positive on legitimate clock corrections. Beyond that
+      // window, the row's ts is treated as a forgery attempt —
+      // refuse the insert. The chain has now been read inside the
+      // IMMEDIATE writer lock, so the comparison is race-free.
+      if (last !== null && ts < last.ts - AUDIT_TS_PAST_SKEW_MS) {
+        throw new Error(
+          `audit: ts ${ts} is more than ${AUDIT_TS_PAST_SKEW_MS}ms before previous row's ts ${last.ts} (forgery suspected; see PERMISSION_ENGINE.md §15)`,
+        );
+      }
+
       // Slice 143 (API-3): the 7 load-bearing fields below
       // (capabilities, score, score_components, classifier_hash,
       // classifier_adjust, sandbox_profile, ttl_expires_at) are now
@@ -522,6 +564,13 @@ export const createSqliteSink = ({
         : computeRotatedGenesisHash(identity, tipMeta.rotation_id, tipMeta.rotated_at_ms);
     const rows = listApprovalsLogByInstall(db, identity.install_id);
     let expectedPrev = liveGenesisHash;
+    // Slice 163: ts monotonic floor for the current walk position.
+    // `lastTs` tracks the previous row's ts; the next row must not
+    // be more than AUDIT_TS_PAST_SKEW_MS earlier. Same semantics as
+    // the emit-time guard (validateTs + the past-ts check inside
+    // the IMMEDIATE transaction), reapplied post-hoc to catch DB-
+    // tamper that bypassed emit.
+    let lastTs: number | null = null;
     for (const row of rows) {
       if (row.prev_hash !== expectedPrev) {
         return {
@@ -546,6 +595,22 @@ export const createSqliteSink = ({
           quarantined: tipQuarantined,
         };
       }
+      // Slice 163 (review — Batch A): ts monotonic break detection.
+      // Hash chain can stay intact while ts is forged backward
+      // (attacker with DB write recomputes hashes). The verify path
+      // is the second-line check.
+      if (lastTs !== null && row.ts < lastTs - AUDIT_TS_PAST_SKEW_MS) {
+        return {
+          ok: false,
+          brokenAt: row.seq,
+          reason: 'ts_monotonic_break',
+          expected: `>= ${lastTs - AUDIT_TS_PAST_SKEW_MS}`,
+          actual: String(row.ts),
+          current_rotation_id: tipRotationId,
+          quarantined: tipQuarantined,
+        };
+      }
+      lastTs = row.ts;
       expectedPrev = row.this_hash;
     }
     return {

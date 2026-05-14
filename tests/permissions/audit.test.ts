@@ -5,12 +5,13 @@ import { join } from 'node:path';
 import {
   type AuditEmitInput,
   type AuditSink,
+  buildHashPayload,
   computeGenesisHash,
   createNoopSink,
   createSqliteSink,
   listChainBreakAcceptedRows,
 } from '../../src/permissions/audit.ts';
-import { sha256Hex } from '../../src/permissions/canonical.ts';
+import { canonicalize, sha256Hex } from '../../src/permissions/canonical.ts';
 import type { InstallIdentity } from '../../src/permissions/install_id.ts';
 import { type DB, MIGRATIONS, migrate, openDb, openMemoryDb } from '../../src/storage/index.ts';
 import {
@@ -441,6 +442,85 @@ describe('createSqliteSink — slice 129 R5 ts validation', () => {
     const { sink } = fresh();
     const nearFuture = Date.now() + 30 * 60 * 1000;
     expect(() => sink.emit(baseInput({ ts: nearFuture }))).not.toThrow();
+  });
+});
+
+// Slice 163 (review — Batch A): past-side ts monotonicity. The
+// future-side check existed pre-slice (see above); slice 163 added
+// symmetric backward-skew rejection AT EMIT TIME (caught inside the
+// IMMEDIATE transaction after fetching the chain head) AND at
+// VERIFY TIME (`verifyChain` reports `ts_monotonic_break`). Both
+// layers close the "attacker with DB write back-dates a row" path.
+describe('createSqliteSink — slice 163 past-skew ts monotonicity', () => {
+  test('refuses emit when ts is more than 1h before previous row', () => {
+    const { sink } = fresh();
+    // Use wall clock as the anchor so the future-skew check above
+    // doesn't trip on test fixture dates.
+    const baseTs = Date.now();
+    sink.emit(baseInput({ ts: baseTs }));
+    // Now try to emit at baseTs - 2h. Past skew window is 1h →
+    // refuse.
+    const farPast = baseTs - 2 * 60 * 60 * 1000;
+    expect(() => sink.emit(baseInput({ ts: farPast }))).toThrow(/forgery/);
+  });
+
+  test('accepts emit when ts is within the past-skew window (NTP smear / suspend-resume)', () => {
+    const { sink } = fresh();
+    const baseTs = Date.now();
+    sink.emit(baseInput({ ts: baseTs }));
+    // 30 min before the previous row — within the 1h window. Legit
+    // NTP smear / clock-back-adjust scenario.
+    const nearPast = baseTs - 30 * 60 * 1000;
+    expect(() => sink.emit(baseInput({ ts: nearPast }))).not.toThrow();
+  });
+
+  test('past-skew check is no-op for the first row (no predecessor)', () => {
+    const { sink } = fresh();
+    // First emit has no previous row → past-skew check is bypassed.
+    // Only the future-skew check fires (validateTs above).
+    const baseTs = Date.now() - 60_000;
+    expect(() => sink.emit(baseInput({ ts: baseTs }))).not.toThrow();
+  });
+
+  test('verifyChain reports ts_monotonic_break when DB tamper inserts a back-dated row', () => {
+    // The threat: attacker with DB write back-dates row #2's ts AND
+    // recomputes the hash chain. Hash chain stays valid (no
+    // prev_hash_mismatch / this_hash_mismatch), but ts is now before
+    // row #1's ts - skew window. The new check inside verifyChain
+    // catches this.
+    const { sink, db, identity } = fresh();
+    const baseTs = Date.now();
+    sink.emit(baseInput({ ts: baseTs }));
+    sink.emit(baseInput({ ts: baseTs + 1000 }));
+    // Read row #2 as the attacker would, then forge a back-dated
+    // version with a fresh hash so prev/this_hash checks pass.
+    const rows = listApprovalsLogByInstall(db, identity.install_id);
+    const row2 = rows[1];
+    if (row2 === undefined) throw new Error('expected 2 rows');
+    const backTs = baseTs - 2 * 60 * 60 * 1000;
+    const tamperedRow = { ...row2, ts: backTs };
+    const newHash = sha256Hex(row2.prev_hash + canonicalize(buildHashPayload(tamperedRow)));
+    db.exec(
+      `UPDATE approvals_log SET ts = ${backTs}, this_hash = '${newHash}' WHERE install_id = '${identity.install_id}' AND seq = 2`,
+    );
+    const verify = sink.verifyChain();
+    expect(verify.ok).toBe(false);
+    if (!verify.ok) {
+      expect(verify.reason).toBe('ts_monotonic_break');
+      expect(verify.brokenAt).toBe(2);
+    }
+  });
+
+  test('verifyChain stays ok when ts movements are within the skew window', () => {
+    const { sink } = fresh();
+    const baseTs = Date.now();
+    sink.emit(baseInput({ ts: baseTs }));
+    // 30 min earlier — within window, emit accepts.
+    sink.emit(baseInput({ ts: baseTs - 30 * 60 * 1000 }));
+    // Forward again.
+    sink.emit(baseInput({ ts: baseTs + 5000 }));
+    const verify = sink.verifyChain();
+    expect(verify.ok).toBe(true);
   });
 });
 

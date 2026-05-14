@@ -158,7 +158,9 @@ const isValidVerifyResult = (r: unknown): boolean => {
     typeof obj.brokenAt === 'number' &&
     typeof obj.current_rotation_id === 'number' &&
     typeof obj.quarantined === 'boolean' &&
-    (obj.reason === 'prev_hash_mismatch' || obj.reason === 'this_hash_mismatch') &&
+    (obj.reason === 'prev_hash_mismatch' ||
+      obj.reason === 'this_hash_mismatch' ||
+      obj.reason === 'ts_monotonic_break') &&
     typeof obj.expected === 'string' &&
     typeof obj.actual === 'string'
   );
