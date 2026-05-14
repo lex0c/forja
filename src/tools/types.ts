@@ -10,6 +10,7 @@ import type {
   ToolArgs,
 } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { ContextPinsStore, PinKind } from '../storage/repos/context-pins.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
@@ -301,6 +302,26 @@ export interface ToolContext {
   confirmMemoryUserScope?: (req: {
     name: string;
     body: string;
+  }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Pinned context store (CONTEXT_TUNING.md §12.4). Set by the
+  // harness when context_pins persistence is wired (default in
+  // production REPL; off in degenerate test contexts). The
+  // pin_context tool and `/pin` slash command consume this; tools
+  // surface a clean error when absent rather than dereferencing
+  // undefined. Persistent — backed by SQLite, not an in-memory
+  // map — so pins survive `/resume` per §12.4.4.
+  contextPinsStore?: ContextPinsStore;
+  // Modal confirm hook for the `pin_context` tool (§12.4.1 —
+  // "modelo pode propor pin (vai a awaiting_user para confirmação
+  // modal, idêntico a memory writes)"). Same shape as
+  // `confirmMemoryWrite`: REPL wires it through the modal manager,
+  // headless leaves it unset. Absent ⇒ the pin_context tool
+  // refuses with `pin.headless_mode` (matches the memory_write
+  // headless path).
+  confirmPinContext?: (req: {
+    text: string;
+    kind: PinKind;
+    expiresAt: number | null;
   }) => Promise<'yes' | 'no' | 'cancel'>;
   // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
   // §9.1). Required so any future tool that needs trust info gets

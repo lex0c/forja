@@ -11,6 +11,7 @@ import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
 import { monitorTool } from './monitor.ts';
+import { pinContextTool } from './pin-context.ts';
 import { readFileTool } from './read-file.ts';
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
@@ -48,6 +49,8 @@ export type {
 export { memoryWriteTool } from './memory-write.ts';
 export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { monitorTool } from './monitor.ts';
+export { pinContextTool } from './pin-context.ts';
+export type { PinContextInput, PinContextOutput } from './pin-context.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
@@ -94,6 +97,7 @@ export const BUILTIN_TOOLS = [
   writeFileTool,
   editFileTool,
   memoryWriteTool,
+  pinContextTool,
   bashTool,
   bashBackgroundTool,
   bashOutputTool,

@@ -338,4 +338,29 @@ export const removePin = (db: DB, id: string): boolean => {
   return result.changes > 0;
 };
 
+// Session-scoped store wrapping the db handle so consumers (tool,
+// slash command, recap projection) don't reach into raw db queries.
+// Mirrors the TodoStore / MemoryRegistry shape: harness owns
+// construction, threads via ToolContext, tools fail-clean when
+// absent. Distinct from TodoStore in that this one IS persistent
+// — backed by SQLite, not an in-memory map — because pins must
+// survive a `/resume` per §12.4.4.
+export interface ContextPinsStore {
+  createPin(input: CreatePinInput): ContextPin;
+  getPin(id: string): ContextPin | null;
+  listPinsBySession(sessionId: string): ContextPin[];
+  getActivePinsBySession(sessionId: string, now?: number): ContextPin[];
+  countActivePinsBySession(sessionId: string, now?: number): number;
+  removePin(id: string): boolean;
+}
+
+export const createContextPinsStore = (db: DB): ContextPinsStore => ({
+  createPin: (input) => createPin(db, input),
+  getPin: (id) => getPin(db, id),
+  listPinsBySession: (sessionId) => listPinsBySession(db, sessionId),
+  getActivePinsBySession: (sessionId, now) => getActivePinsBySession(db, sessionId, now),
+  countActivePinsBySession: (sessionId, now) => countActivePinsBySession(db, sessionId, now),
+  removePin: (id) => removePin(db, id),
+});
+
 export { PERSISTED_COLUMNS };

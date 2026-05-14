@@ -2,6 +2,59 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] feat(tools/pin-context) — operator-confirmed model surface for pinned context (Phase 1.1.b)
+
+**Done.** Second slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the model-facing tool — `pin_context(text, kind?, expires_in?)` — that opens a confirmation modal idêntico ao memory_write. The model never persists a pin without operator approval; this gate is what turns a model proposal into the persistent state 1.1.a's repo can carry.
+
+### Pipeline mirrors memory_write's discipline
+
+Each gate is independent so audit shows exactly where a proposal died:
+
+1. Plumbing checks — aborted? store wired?
+2. Schema/shape — text non-empty + ≤ 500 chars, kind in enum, expires_in parses (delegates to `parseDuration`).
+3. Injection scanner — re-uses `scanForInjection` from the memory subsystem. Pin text is short (≤ 500 chars) so false-positive cost is trivial; the upside is closing a vector where a model proposes `"ignore previous instructions"` and the operator habit-confirms. Audit trail records the block; the hint to the model intentionally omits the matched pattern (mirror of memory_write §7.3 reasoning — surfacing it would teach a future prompt how to bypass).
+4. Headless rejection — when `confirmPinContext` is unwired (CI, one-shot, subagent), refuse with `pin.headless_mode`. Same shape as memory_write §5.1.6.
+5. Modal confirm — operator decides. `yes` persists; `no` and `cancel` return distinct rejected reasons so the model can echo the right thing back.
+6. Persist via `store.createPin`. The cap of 10 (PIN_CAP) is enforced atomically inside the repo (1.1.a); surfaces here as `PinCapExceededError` → mapped to `pin.cap_exceeded` tool error with `details: { currentCount, cap, sessionId }` so the model can recommend `/pin --remove`.
+
+### Key implementation decisions
+
+- **`created_by` hard-wired to `'model_proposed_user_approved'` on this surface.** The `user` value belongs to `/pin` (1.1.c) where the operator types the text directly. Splitting the axis across the two surfaces lets recap/audit answer "did the model propose this, or did the operator pin it themselves?" without extra metadata.
+- **`sourceStepId` populated from `ctx.stepId`** so the recap projection (1.1.d) can answer "which step led to this pin?" without digging through the message timeline.
+- **`writes: true, escapesCwd: true, requiresOperatorConfirm: true, planSafe omitted`.** Pin persists to `sessions.db` (outside the worktree → escapesCwd), goes through a modal (→ requiresOperatorConfirm), and is the wrong phase during planning (→ planSafe omitted = default-block in plan mode).
+- **Rejected outcome returned as success-shaped, not ToolError.** Operator decline is a structured answer to a proposal, not a failure mode. Same convention as memory_write — the model sees the rejected outcome and can echo the rationale back.
+- **Headless = harness without `confirmPinContext` wired.** Subagent contexts inherit this naturally (no IPC modal pipe), same as memory_write. The subagent validator's `requiresOperatorConfirm` gate (declared in `ToolMetadata`) is what excludes the tool from subagent whitelists at config time.
+- **No hook chain (yet).** memory_write fires the blocking `MemoryWrite` hook event; pin_context could mirror that pattern but the use-case is thinner (operator already confirmed; policy-driven hook is overkill for a session-scoped marker). Deferred until a concrete need surfaces.
+- **No trust gate (§7.2.1 of MEMORY).** Pins are per-session by spec (§12.4.1) — cross-session pins violate the memory contract. An untrusted cwd doesn't change the pin's blast radius (it dies with the session anyway).
+
+### Wiring deferred to 1.1.c
+
+`ContextPinsStore` factory exists and `ToolContext.contextPinsStore` / `confirmPinContext` fields are declared, but the **harness wiring** (loop.ts instantiating the store, REPL wiring `confirmPinContext` to the modal manager) is deferred to 1.1.c so it lands alongside the `/pin` slash command — both consumers wired together. In the interim, production runs of `pin_context` return `pin.store_unavailable` cleanly; tests construct the store directly through `makeCtx` overrides.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/tools/builtin/pin-context.ts` | The tool: input schema, validation, injection scanner pass, headless gate, modal confirm, persist via store with cap-error mapping |
+| `tests/tools/pin-context.test.ts` | 18 tests across 7 describe blocks: happy path (3) + decline/cancel (2) + headless/unwired (3) + input validation (5) + injection scanner (2) + cap enforcement (1) + metadata (2) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/context-pins.ts` | Added `ContextPinsStore` interface + `createContextPinsStore` factory (wraps the db handle so tools/slash don't reach into raw queries) |
+| `src/tools/types.ts` | Added `contextPinsStore?: ContextPinsStore` and `confirmPinContext?: (req: { text, kind, expiresAt }) => Promise<'yes' \| 'no' \| 'cancel'>` to `ToolContext`; imported `PinKind` for the request shape |
+| `src/tools/builtin/index.ts` | Imported + exported `pinContextTool` (with input/output types); inserted in `BUILTIN_TOOLS` between `memoryWriteTool` and the bash group (write-tools section) |
+| `tests/tools/_helpers.ts` | Extended `makeCtx` with conditional spreads for `contextPinsStore` and `confirmPinContext` overrides, mirroring the existing memoryRegistry/confirmMemoryWrite pattern |
+| `tests/cli/bootstrap.test.ts` | Added `'pin_context'` to the alphabetical builtin-tool list assertion |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/tools/pin-context.test.ts` 18 pass / 0 fail
+- `bun test` 7339 pass / 10 skip / 0 fail (+18 from baseline 7321; +1 bootstrap-list assertion updated, same total count)
+
 ## [2026-05-14] feat(storage/context-pins) — schema + repo + validation (Phase 1.1.a)
 
 **Done.** First implementation slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the persistence contract — table, repo, validation, duration parser — without yet wiring it to a tool / slash / projection (those are 1.1.b–d). Pinned context is the primitive that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate; without persistence there's nothing for downstream consumers to read.

@@ -66,6 +66,12 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   ...(overrides.confirmMemoryUserScope !== undefined
     ? { confirmMemoryUserScope: overrides.confirmMemoryUserScope }
     : {}),
+  ...(overrides.contextPinsStore !== undefined
+    ? { contextPinsStore: overrides.contextPinsStore }
+    : {}),
+  ...(overrides.confirmPinContext !== undefined
+    ? { confirmPinContext: overrides.confirmPinContext }
+    : {}),
   ...(overrides.emitWarn !== undefined ? { emitWarn: overrides.emitWarn } : {}),
   ...(overrides.fireHook !== undefined ? { fireHook: overrides.fireHook } : {}),
   ...(overrides.sandboxProfile !== undefined ? { sandboxProfile: overrides.sandboxProfile } : {}),
