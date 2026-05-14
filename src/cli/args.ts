@@ -521,18 +521,29 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 // structured data call `agent doctor --json` / `agent sandbox
 // setup --json` directly).
 const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => {
-  // Slice 125 (R2 P1): accept `welcome` in either position —
-  // bare `agent welcome [...]` OR `agent [flags...] welcome
-  // [more-flags...]`. Pre-slice the parser required `welcome`
-  // as argv[0], so `agent --i-know-what-im-doing welcome` hit
-  // the top-level parser instead and was rejected with a
-  // "use `agent welcome --i-know-what-im-doing` instead"
-  // error — confusing because the operator DID type `welcome`.
-  // POSIX muscle memory expects flags can precede positionals.
-  const welcomeIdx = argv.findIndex((t) => t === 'welcome');
-  if (welcomeIdx === -1) return null;
-  // Collect everything around `welcome` as the welcome flag set.
-  const welcomeArgs = [...argv.slice(0, welcomeIdx), ...argv.slice(welcomeIdx + 1)];
+  // Welcome is detected ONLY at argv[0], matching every other
+  // subcommand in this parser (init / recap / sandbox / doctor /
+  // permission). An earlier cut scanned the entire argv via
+  // `findIndex(t => t === 'welcome')` to accommodate
+  // `agent --i-know-what-im-doing welcome` (welcome after a
+  // flag) — but that regression-broke any normal prompt
+  // containing the literal word `welcome`. `agent --json
+  // welcome` (operator's prompt is the word "welcome", wants
+  // JSON output) and `agent hello welcome world` (prompt is a
+  // sentence containing the word) both got mis-routed into the
+  // welcome subcommand, where the surrounding tokens become
+  // "unknown welcome flags" — a hard error on inputs that
+  // should just be prompts.
+  //
+  // The flag-then-welcome case the earlier cut was trying to
+  // accept is already covered by the top-level
+  // `--i-know-what-im-doing` rejection path: an operator who
+  // types `agent --i-know-what-im-doing welcome` hits the
+  // explicit error pointing at `agent welcome
+  // --i-know-what-im-doing` (the canonical form), so the UX is
+  // recoverable without sacrificing prompt parsing.
+  if (argv.length === 0 || argv[0] !== 'welcome') return null;
+  const welcomeArgs = argv.slice(1);
   let iKnow = false;
   for (let i = 0; i < welcomeArgs.length; i += 1) {
     const token = welcomeArgs[i];

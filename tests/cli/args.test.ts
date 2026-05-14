@@ -786,6 +786,56 @@ describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => 
   });
 });
 
+// Welcome subcommand detection is anchored to argv[0]. An earlier
+// cut scanned the entire argv for the literal word `welcome` to
+// accommodate `agent --i-know-what-im-doing welcome` (welcome
+// after a flag) — but that regression-broke prompts containing
+// the word `welcome` as plain text, mis-routing them into the
+// welcome subcommand and erroring on unknown flags.
+describe('welcome subcommand detection — argv[0] only (review fix)', () => {
+  test('agent --json welcome → prompt is "welcome" with --json (NOT welcome subcommand)', () => {
+    const r = parseArgs(['--json', 'welcome']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.json).toBe(true);
+    expect(r.args.prompt).toBe('welcome');
+  });
+
+  test('agent hello welcome world → prompt is "hello welcome world"', () => {
+    const r = parseArgs(['hello', 'welcome', 'world']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.prompt).toBe('hello welcome world');
+  });
+
+  test('agent "welcome to forja" → prompt contains welcome verbatim', () => {
+    // Shell-quoted single positional. argv[0] is the whole prompt,
+    // not the literal token `welcome`, so no subcommand match.
+    const r = parseArgs(['welcome to forja']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.prompt).toBe('welcome to forja');
+  });
+
+  test('agent welcome → IS the welcome subcommand', () => {
+    // Sanity check: the canonical form still works (argv[0] match).
+    const r = parseArgs(['welcome']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBe(true);
+  });
+
+  test('agent welcome --help → welcome subcommand with help flag', () => {
+    const r = parseArgs(['welcome', '--help']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.help).toBe(true);
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();

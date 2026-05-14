@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(cli/args) — anchor welcome subcommand detection to argv[0]
+
+**Done.** `parseWelcomeSubcommand` scanned the entire argv via `findIndex(t => t === 'welcome')`, intended to accept `agent --i-know-what-im-doing welcome` (welcome after a flag). That ergonomic relaxation regression-broke any normal prompt containing the literal word `welcome`:
+
+- `agent --json welcome` (prompt is the word "welcome", request JSON output) → welcomeIdx=1, treated as welcome subcommand, `--json` becomes "unknown welcome flag"
+- `agent hello welcome world` (prompt is a sentence containing welcome) → same trap, `hello` and `world` rejected
+
+Both are core CLI flows — operators typing literal English prompts shouldn't hit unknown-flag errors.
+
+Fix: anchor detection to argv[0], matching every other subcommand in this parser (init / recap / sandbox / doctor / permission). The flag-then-welcome case the earlier cut targeted is already covered by the `--i-know-what-im-doing` top-level rejection (slice 123 R9 P1): an operator typing `agent --i-know-what-im-doing welcome` hits the explicit error pointing at `agent welcome --i-know-what-im-doing`, so the UX is recoverable without breaking prompt parsing.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | `parseWelcomeSubcommand` checks `argv[0] === 'welcome'` instead of scanning the whole argv |
+| `tests/cli/args.test.ts` | +5 tests: `--json welcome` is a prompt not subcommand, multi-token prompt with "welcome", quoted prompt with "welcome", canonical `agent welcome` still works, `agent welcome --help` still works |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7268 pass / 10 skip / 0 fail (+5 from baseline 7263)
+
 ## [2026-05-14] fix(permissions/sealing) — preserve filesystem root in seal-dir path normalization (rfc3161 + s3-object-lock backends)
 
 **Done.** Same bug, two backends. Both `createRfc3161TsaSealer` and `createS3ObjectLockSealer` stripped trailing slashes from `opts.path` via `opts.path.replace(/\/+$/, '')`. The naive replace collapsed all-slashes inputs (`"/"`, `"//"`) to the empty string, then `join("", "seal.log")` (and `join("", "<seq>-<ts>.tsr")` in rfc3161) produced CWD-relative paths instead of root-relative. A deployment configuring `seal.path = "/"` would pass shape validation, then silently write seal artifacts under whatever directory the agent happened to be running from (or fail outright on `ensureDir("")` — depends on underlying mkdir behavior).
