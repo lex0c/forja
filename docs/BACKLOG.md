@@ -2,6 +2,75 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(permission-engine) — slice 158: sealing scheduler crash on 2nd consecutive seal failure
+
+**Done.** First P0 from the 5-axis code review (concurrency / state-machine axis). Pre-slice, a sustained seal failure (worm-file disk full, `chattr +a` dropped, EROFS remount, etc.) would terminate the REPL mid-tool-call on the 2nd consecutive failure. Root cause: the bootstrap's `onSealFailed` callback in `bootstrap-engine.ts:666-697` called `engine.degrade(...)` / `engine.refuse(...)` unconditionally, claiming idempotence via a docstring that read "Repeated failures re-issue the same transition — harmless". That claim was factually wrong against `state-machine.ts:97-101` which throws on invalid edges:
+
+- `degraded → degraded` is NOT in `VALID_TRANSITIONS` (degraded's allowed set is `['ready','refusing']`).
+- `refusing` is terminal — its allowed set is empty.
+
+So on the 2nd failure the transition threw inside the bootstrap callback. From the audit-tick path the throw was swallowed by `audit.ts:439-447`'s try-around-`scheduler.tick()`, but from the wall-clock timer path it propagated as `uncaughtException` → `cli/signal.ts:70-75` → `process.exit(1)`. Operator running with `intervalSeconds: 3600` (the default) saw a clean session for ~1h after the FIRST failure, then a hard process kill at the SECOND timer fire — with no diagnostic correlation in the log because the audit row was already persisted; the failure manifested as "agent vanished".
+
+### Fix: gate transition on current state + defense-in-depth wrapper
+
+Two changes, each load-bearing for a different failure mode:
+
+**Change 1 (`bootstrap-engine.ts:666-697`)** — the bootstrap's `onSealFailed` now reads `engine.state()` and only calls `engine.degrade(...)` when state is `'ready'`, only calls `engine.refuse(...)` when state isn't already `'refusing'`. Telemetry `sealing.failure` event still fires on EVERY failure (above the gate, unchanged) so operator observability is unaffected. Idempotent at the state-machine level, not at the engine-method level.
+
+**Change 2 (`sealing-scheduler.ts:121+`)** — new internal `safeOnSealFailed` wraps `opts.onSealFailed?.(reason)` in try/catch. All three call sites (timer body, `tick()`, `sealNow()`) route through it. This is defense-in-depth: even if a FUTURE caller wires an `onSealFailed` callback that throws for some other reason (custom telemetry, 3rd-party integration, test stub), the scheduler now contains the throw locally instead of propagating it up the event loop. Matches the same pattern `audit.ts` already used around `scheduler.tick()`.
+
+The bootstrap docstring is replaced with one that explains the actual contract (the state machine throws on invalid edges; the gate is the load-bearing piece; telemetry is the observability source of truth).
+
+### Why both changes (not just the gate)
+
+The bootstrap gate closes the documented bug. The scheduler wrapper closes the LATENT bug: anyone authoring a future seal-store integration that wires `onSealFailed` with a throwing callback would hit the same crash via a different code path. Wrapping at the scheduler boundary makes the no-throw contract a property of the scheduler itself, not a property the caller must remember to maintain. The combined cost is ~30 LOC; the alternative (just the gate) would leave the same shape of bug reachable from any new caller.
+
+### Tests added (+8)
+
+**`tests/permissions/sealing-scheduler.test.ts` (+4):**
+| Test | Coverage |
+|---|---|
+| **timer path: throwing onSealFailed does NOT crash the timer body** | Pre-slice this throw would have unwound `setTimer`'s callback → uncaughtException. Post-slice the throw is swallowed, timer reschedules. |
+| **tick path: throwing onSealFailed does NOT crash tick()** | Symmetry — audit.ts already shielded this path, but the scheduler now does too so callers can rely on the contract independent of which caller invokes tick. |
+| **sealNow path: throwing onSealFailed does NOT crash sealNow()** | Same shape; sealNow's structured result (`ok: false, reason`) is unaffected by the throw. |
+| **repeated consecutive failures: callback fires each time, scheduler stays alive** | Drives 3 timer cycles with a throwing callback. Asserts all 3 invocations fire (reasons captured), scheduler reschedules 3 times (total 4 timer slots = initial + 3 cycles). |
+
+**`tests/permissions/bootstrap-engine.test.ts` (+4):**
+| Test | Coverage |
+|---|---|
+| **on_failure=degrade — N consecutive failures only transition ONCE** | Exactly one `ready→degraded` transition emitted across 5 failing checks. Pre-slice each subsequent check threw out of audit.ts's swallowed try. |
+| **on_failure=degrade — sealing.failure telemetry still fires per failure** | Confirms the gate doesn't suppress observability; telemetry fires 3 times even though only the first one transitioned state. |
+| **on_failure=refuse — N consecutive failures only transition ONCE** | Same shape for the refuse path. Refusing→refusing was the OTHER invalid-edge throw. |
+| **timer-driven repeated failures: scheduler keeps running across many cycles** | The ORIGINAL P0 crash scenario reproduced. Pre-slice this test would have crashed inside `capturedTimers[i]?.cb()`. Post-slice 5 cycles run cleanly, scheduler reschedules each time, state stays in `degraded`. |
+
+### Files changed
+
+- Code: `src/permissions/bootstrap-engine.ts`, `src/permissions/sealing-scheduler.ts`
+- Tests: `tests/permissions/sealing-scheduler.test.ts`, `tests/permissions/bootstrap-engine.test.ts`
+- BACKLOG: this entry
+
+No spec amend — the spec already prescribes the documented behavior; the bug was the implementation diverging from it. The bootstrap comment is now factual.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **6995 pass / 10 skip / 0 fail** (was 6987 → +8 new tests; zero regression)
+
+### Defense layering
+
+After slice 158 the sustained seal-failure path is bounded by:
+1. **Bootstrap gate** — state-machine-aware; only transitions when the edge is valid. Source of truth for "what state should the engine be in after failure N".
+2. **Scheduler wrapper** — defense in depth; throws inside any future `onSealFailed` callback are contained locally instead of crashing the surrounding event loop.
+3. **Telemetry** — `sealing.failure` event fires on every failure (above both gates) so operator observability is unaffected by the idempotence.
+4. **`failure_events` row** — separately written (unchanged by this slice) so forensics see every failed seal attempt regardless of state transitions.
+
+### Bash-tools / 5-axis review status
+
+This closes finding #1 (Concurrency P0) from the 5-axis review round. Pending from the same review: slice 159 (SEC §8.4 sensitive-paths wire), slice 160 (bash args.cwd bypass), slice 161 (matchPath realpath storm), slice 162 (env scrub allowlist), slice 163+ P1 batches.
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 157: macOS /tmp shared sandbox+host (phase 2 — production callers wired)
 
 **Done.** One-hundred-fifty-seventh slice. Closes the wiring half of the macOS /tmp isolation work. Phase 1 (slice 156) landed the capability (`buildSbplProfile` aceita `tmpdir?`, `defaultSandboxTmpdir(sessionId)` helper). Phase 2 (this slice) wires the 3 production callers — broker spawn, bg manager, grep — to use it with per-CLI-run uniform granularity.

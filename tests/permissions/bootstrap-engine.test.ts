@@ -726,6 +726,196 @@ describe('bootstrapPermissionEngine — §7.3 sealing wire-up', () => {
     expect(mem.entries).toHaveLength(0);
     r.sealingScheduler?.close();
   });
+
+  // Slice 158 (review): pre-slice, the bootstrap's onSealFailed
+  // called engine.degrade() / engine.refuse() unconditionally. Each
+  // call invokes stateController.transition which THROWS on invalid
+  // edges (degraded→degraded is invalid; refusing→refusing is also
+  // invalid since refusing is terminal). So on the 2nd consecutive
+  // seal failure the throw propagated out of the bootstrap's
+  // onSealFailed. From the tick path audit.ts swallowed it, but from
+  // the timer path it surfaced as uncaughtException → process.exit(1).
+  // The fix: gate the transition on the current state so it's a true
+  // no-op once we've reached the target state.
+  describe('seal failure idempotence (slice 158)', () => {
+    test('on_failure=degrade — N consecutive failures only transition ONCE', async () => {
+      const mem = makeMemFactory();
+      mem.failNext('disk full');
+      const transitions: Array<{ from: string; to: string }> = [];
+      const r = await bootstrapPermissionEngine(
+        baseInput({
+          sessionPolicy: {
+            defaults: {},
+            tools: {},
+            seal: {
+              mode: 'worm-file',
+              path: '/seal.log',
+              interval_decisions: 1,
+              interval_seconds: 0,
+              on_failure: 'degrade',
+            },
+          },
+          sealStoreFactory: mem.factory,
+          ...noopTimerSeams(),
+          telemetry: {
+            emit: (evt) => {
+              if (evt.kind === 'state.transition') {
+                transitions.push({ from: evt.from, to: evt.to });
+              }
+            },
+          },
+        }),
+      );
+      // Tick 1: ready → degraded.
+      r.engine.check('bash', 'bash', { command: 'ls' });
+      expect(r.engine.state()).toBe('degraded');
+      // Tick 2-5: still in degraded; bootstrap's onSealFailed now
+      // skips engine.degrade because currentState !== 'ready'.
+      // Pre-slice each of these would have thrown out of audit.ts's
+      // tick-around-try (which swallows) but the timer path crashes.
+      expect(() => r.engine.check('bash', 'bash', { command: 'ls' })).not.toThrow();
+      expect(() => r.engine.check('bash', 'bash', { command: 'ls' })).not.toThrow();
+      expect(() => r.engine.check('bash', 'bash', { command: 'ls' })).not.toThrow();
+      expect(() => r.engine.check('bash', 'bash', { command: 'ls' })).not.toThrow();
+      expect(r.engine.state()).toBe('degraded');
+      // Exactly ONE ready→degraded transition recorded. The
+      // remaining 4 calls did NOT push another state.transition event
+      // (because the gate skipped the engine.degrade call entirely).
+      const degradedTransitions = transitions.filter((t) => t.to === 'degraded');
+      expect(degradedTransitions).toHaveLength(1);
+      r.sealingScheduler?.close();
+    });
+
+    test('on_failure=degrade — sealing.failure telemetry still fires per failure', async () => {
+      const mem = makeMemFactory();
+      mem.failNext('disk full');
+      const sealFailures: string[] = [];
+      const r = await bootstrapPermissionEngine(
+        baseInput({
+          sessionPolicy: {
+            defaults: {},
+            tools: {},
+            seal: {
+              mode: 'worm-file',
+              path: '/seal.log',
+              interval_decisions: 1,
+              interval_seconds: 0,
+              on_failure: 'degrade',
+            },
+          },
+          sealStoreFactory: mem.factory,
+          ...noopTimerSeams(),
+          telemetry: {
+            emit: (evt) => {
+              if (evt.kind === 'sealing.failure') {
+                sealFailures.push(evt.reason);
+              }
+            },
+          },
+        }),
+      );
+      r.engine.check('bash', 'bash', { command: 'ls' });
+      r.engine.check('bash', 'bash', { command: 'ls' });
+      r.engine.check('bash', 'bash', { command: 'ls' });
+      // Telemetry fires on EVERY failure (3 times) even though only
+      // the first one transitioned state. Operators see the full
+      // failure stream; state machine is idempotent.
+      expect(sealFailures).toEqual(['disk full', 'disk full', 'disk full']);
+      r.sealingScheduler?.close();
+    });
+
+    test('on_failure=refuse — N consecutive failures only transition ONCE (and engine refuses)', async () => {
+      const mem = makeMemFactory();
+      mem.failNext('EROFS');
+      const transitions: Array<{ from: string; to: string }> = [];
+      const r = await bootstrapPermissionEngine(
+        baseInput({
+          sessionPolicy: {
+            defaults: {},
+            tools: {},
+            seal: {
+              mode: 'worm-file',
+              path: '/seal.log',
+              interval_decisions: 1,
+              interval_seconds: 0,
+              on_failure: 'refuse',
+            },
+          },
+          sealStoreFactory: mem.factory,
+          ...noopTimerSeams(),
+          telemetry: {
+            emit: (evt) => {
+              if (evt.kind === 'state.transition') {
+                transitions.push({ from: evt.from, to: evt.to });
+              }
+            },
+          },
+        }),
+      );
+      r.engine.check('bash', 'bash', { command: 'ls' });
+      expect(r.engine.state()).toBe('refusing');
+      // Further checks while already refusing: pre-slice each invoke
+      // would have THROWN out of audit.ts's swallowed try because
+      // refusing→refusing is invalid. Now the bootstrap's gate
+      // short-circuits.
+      expect(() => r.engine.check('bash', 'bash', { command: 'ls' })).not.toThrow();
+      expect(() => r.engine.check('bash', 'bash', { command: 'ls' })).not.toThrow();
+      expect(r.engine.state()).toBe('refusing');
+      const refusingTransitions = transitions.filter((t) => t.to === 'refusing');
+      expect(refusingTransitions).toHaveLength(1);
+      r.sealingScheduler?.close();
+    });
+
+    test('timer-driven repeated failures: scheduler keeps running across many cycles', async () => {
+      // The original P0 crash scenario: timer fires hourly, each
+      // failure throws inside setTimer's callback → uncaughtException.
+      // Post-slice the bootstrap gate (here) + the scheduler's
+      // safeOnSealFailed wrapper together guarantee the timer body
+      // never throws. Drive 5 timer cycles and verify the scheduler
+      // is still alive (reschedules every cycle).
+      const mem = makeMemFactory();
+      mem.failNext('chattr +a dropped');
+      const capturedTimers: Array<{ cb: () => void; ms: number }> = [];
+      const r = await bootstrapPermissionEngine(
+        baseInput({
+          sessionPolicy: {
+            defaults: {},
+            tools: {},
+            seal: {
+              mode: 'worm-file',
+              path: '/seal.log',
+              interval_decisions: 0,
+              interval_seconds: 10,
+              on_failure: 'degrade',
+            },
+          },
+          sealStoreFactory: mem.factory,
+          sealSchedulerSetTimer: (cb, ms) => {
+            capturedTimers.push({ cb, ms });
+            return capturedTimers.length;
+          },
+          sealSchedulerClearTimer: () => {},
+        }),
+      );
+      // Need at least one audit row so the timer can find a chain
+      // tip to seal.
+      r.engine.check('bash', 'bash', { command: 'ls' });
+      // Initial schedule registered at scheduler creation.
+      expect(capturedTimers.length).toBeGreaterThanOrEqual(1);
+      // Fire 5 timer cycles. Each one tries to seal, fails, calls
+      // bootstrap's onSealFailed, calls engine.degrade only on the
+      // first (rest skipped). No throws.
+      for (let i = 0; i < 5; i++) {
+        const next = capturedTimers[capturedTimers.length - 1];
+        expect(() => next?.cb()).not.toThrow();
+      }
+      // Scheduler kept rescheduling — 5 firings + initial = at least
+      // 6 timers tracked.
+      expect(capturedTimers.length).toBeGreaterThanOrEqual(6);
+      expect(r.engine.state()).toBe('degraded');
+      r.sealingScheduler?.close();
+    });
+  });
 });
 
 describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () => {

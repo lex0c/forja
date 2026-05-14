@@ -805,3 +805,140 @@ describe('createSealingScheduler — multi-process seed (slice 128 R4 P0-Race-1)
     schedB.close();
   });
 });
+
+// Slice 158 (review): defense-in-depth wrapper around the caller-
+// supplied `onSealFailed` callback. Pre-slice, a throwing callback
+// would propagate through the timer body (setTimer's callback ran
+// it without try/catch) and surface as uncaughtException → process
+// exit. With `safeOnSealFailed` the callback throw is caught and
+// the scheduler keeps running. The tick path was already shielded
+// by audit.ts's try-around-tick, but symmetric coverage in the
+// scheduler itself makes the contract explicit.
+describe('createSealingScheduler — onSealFailed throwing (slice 158)', () => {
+  test('timer path: throwing onSealFailed does NOT crash the timer body', () => {
+    const { db, identity } = setupChain(1);
+    const mem = makeMemStore();
+    mem.failNext('disk full');
+    let callbackInvoked = 0;
+    const capturedTimers: Array<{ cb: () => void; ms: number }> = [];
+    createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 0,
+      intervalSeconds: 10,
+      onSealFailed: () => {
+        callbackInvoked += 1;
+        throw new Error('hostile callback');
+      },
+      setTimer: (cb, ms) => {
+        capturedTimers.push({ cb, ms });
+        return capturedTimers.length;
+      },
+      clearTimer: () => {},
+    });
+    // Pre-slice this would have thrown out of the timer callback;
+    // post-slice it returns cleanly and reschedules.
+    expect(() => capturedTimers[0]?.cb()).not.toThrow();
+    expect(callbackInvoked).toBe(1);
+    // Timer rescheduled despite the throw — the scheduler is still
+    // alive and will fire again next interval.
+    expect(capturedTimers).toHaveLength(2);
+  });
+
+  test('tick path: throwing onSealFailed does NOT crash tick()', () => {
+    const { db, identity } = setupChain(1);
+    const mem = makeMemStore();
+    mem.failNext('chattr +a dropped');
+    let callbackInvoked = 0;
+    const scheduler = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 1,
+      intervalSeconds: 0,
+      onSealFailed: () => {
+        callbackInvoked += 1;
+        throw new Error('hostile callback');
+      },
+      ...noopTimerSeams(),
+    });
+    expect(() => scheduler.tick()).not.toThrow();
+    expect(callbackInvoked).toBe(1);
+    scheduler.close();
+  });
+
+  test('sealNow path: throwing onSealFailed does NOT crash sealNow()', () => {
+    const { db, identity } = setupChain(1);
+    const mem = makeMemStore();
+    mem.failNext('EROFS');
+    let callbackInvoked = 0;
+    const scheduler = createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 0,
+      intervalSeconds: 0,
+      onSealFailed: () => {
+        callbackInvoked += 1;
+        throw new Error('hostile callback');
+      },
+      ...noopTimerSeams(),
+    });
+    // sealNow returns ok:false with the underlying reason — the
+    // throwing callback is best-effort observability and shouldn't
+    // alter the structured result.
+    let result: { ok: boolean; reason?: string };
+    expect(() => {
+      result = scheduler.sealNow();
+    }).not.toThrow();
+    // biome-ignore lint/style/noNonNullAssertion: assigned in the not-throw block above
+    expect(result!.ok).toBe(false);
+    // biome-ignore lint/style/noNonNullAssertion: assigned in the not-throw block above
+    expect(result!.reason).toBe('EROFS');
+    expect(callbackInvoked).toBe(1);
+    scheduler.close();
+  });
+
+  test('repeated consecutive failures: callback fires each time, scheduler stays alive', () => {
+    // The bootstrap's onSealFailed used to call engine.degrade()
+    // which throws on degraded→degraded. With slice 158's bootstrap
+    // gate (only transition from ready), this is now a no-op past
+    // the first failure; the scheduler must still invoke the
+    // callback for telemetry / forensics. This test simulates the
+    // pre-fix shape by raising on every call AND asserts the
+    // scheduler keeps cycling.
+    const { db, identity } = setupChain(1);
+    const mem = makeMemStore();
+    mem.failNext('disk full');
+    const reasons: string[] = [];
+    const capturedTimers: Array<{ cb: () => void; ms: number }> = [];
+    createSealingScheduler({
+      store: mem.store,
+      db,
+      installId: identity.install_id,
+      intervalDecisions: 0,
+      intervalSeconds: 10,
+      onSealFailed: (r) => {
+        reasons.push(r);
+        throw new Error('always fail');
+      },
+      setTimer: (cb, ms) => {
+        capturedTimers.push({ cb, ms });
+        return capturedTimers.length;
+      },
+      clearTimer: () => {},
+    });
+    // Tick #1 (timer fires, seal fails, callback throws, swallowed,
+    // timer reschedules).
+    expect(() => capturedTimers[0]?.cb()).not.toThrow();
+    // Tick #2 (timer #2 fires, same flow).
+    expect(() => capturedTimers[1]?.cb()).not.toThrow();
+    // Tick #3.
+    expect(() => capturedTimers[2]?.cb()).not.toThrow();
+    expect(reasons).toEqual(['disk full', 'disk full', 'disk full']);
+    // After 3 failures, the scheduler has rescheduled 3 times +
+    // the initial schedule = 4 timer slots.
+    expect(capturedTimers).toHaveLength(4);
+  });
+});

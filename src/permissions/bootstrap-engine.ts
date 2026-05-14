@@ -684,15 +684,46 @@ export const bootstrapPermissionEngine = async (
             // Best-effort.
           }
         }
-        // Both degrade() and refuse() are idempotent for
-        // already-in-state engines; refuse() supersedes degrade()
-        // (state machine prevents the reverse). Repeated failures
-        // re-issue the same transition — harmless but visible in
-        // the events log for forensics.
+        // Slice 158 (review): gate the state transition on the
+        // CURRENT state. The pre-slice comment claimed degrade()
+        // and refuse() were idempotent, but state-machine.ts:97-101
+        // throws on invalid edges — `degraded → degraded` is NOT in
+        // VALID_TRANSITIONS, and `refusing` is terminal with an
+        // empty allowed set. So on the 2nd consecutive seal failure
+        // (timer path: an hour after the first; tick path: another
+        // 100 audit emits after the first), the second `engine.degrade`
+        // would throw. From the tick path the throw was swallowed by
+        // audit.ts's try-around-scheduler.tick(); from the timer path
+        // it propagated as uncaughtException → signal.ts:70 →
+        // process.exit(1). A sustained worm-file outage (disk full,
+        // chattr +a dropped, EROFS) would kill the REPL mid-tool.
+        //
+        // Fix: read the current state and only attempt a transition
+        // when the edge is allowed. The state-machine module owns
+        // the edge table — we use isRejectingState as a proxy for
+        // "refusing or pre-ready phases" (where degrade is invalid
+        // anyway). When already in the target state, this is a
+        // no-op; telemetry already fired above so operators still
+        // see every failure event.
+        const currentState = engine.state();
         if (onFailure === 'refuse') {
-          engine.refuse(`seal_failed: ${reason}`);
+          // refusing is terminal — skip if already there. Other
+          // states (init/loading-policy/validating-chain/ready/
+          // degraded) can all transition to refusing per the
+          // VALID_TRANSITIONS table.
+          if (currentState !== 'refusing') {
+            engine.refuse(`seal_failed: ${reason}`);
+          }
         } else {
-          engine.degrade(`seal_failed: ${reason}`);
+          // degraded is reachable only from `ready` and
+          // `validating-chain` (per state-machine.ts:52-53). If
+          // we're already degraded OR refusing OR in a pre-ready
+          // phase that doesn't allow this edge, skip silently —
+          // the telemetry event above is the operator-visible
+          // record.
+          if (currentState === 'ready') {
+            engine.degrade(`seal_failed: ${reason}`);
+          }
         }
       },
       ...(input.sealSchedulerNow !== undefined ? { now: input.sealSchedulerNow } : {}),

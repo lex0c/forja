@@ -131,6 +131,33 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
     return { kind: 'failed', reason: result.reason };
   };
 
+  // Slice 158 (review): defense-in-depth wrapper around the caller-
+  // supplied onSealFailed callback. The bootstrap's onSealFailed
+  // gates engine.degrade/refuse on the current state so the
+  // documented "harmless re-issue" property actually holds, but a
+  // future caller might wire a callback that still throws (custom
+  // telemetry / 3rd-party integration / test stub). The timer path
+  // runs inside setTimer's callback where an uncaught throw
+  // propagates as uncaughtException → signal.ts → process.exit(1),
+  // killing the REPL mid-tool. The tick path runs inside audit.emit
+  // which already try/catches scheduler.tick(), but invoking the
+  // callback safely there too keeps the contract symmetric. sealNow
+  // returns the failure to its caller (CLI verb / SessionEnd) and
+  // doesn't need the wrapper to avoid a crash, but uses it for the
+  // same symmetry + so a buggy callback can't tear down session
+  // shutdown.
+  const safeOnSealFailed = (reason: string): void => {
+    if (opts.onSealFailed === undefined) return;
+    try {
+      opts.onSealFailed(reason);
+    } catch {
+      // Best-effort observability — callback throws cannot kill the
+      // scheduler or the surrounding event loop. The seal store
+      // itself has already returned the failure reason; that's the
+      // source of truth for operator forensics.
+    }
+  };
+
   const scheduleTimer = (): void => {
     if (closed) return;
     if (intervalSeconds <= 0) return;
@@ -138,7 +165,7 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
       timerHandle = null;
       const outcome = sealLatestInternal();
       if (outcome.kind === 'failed') {
-        opts.onSealFailed?.(outcome.reason);
+        safeOnSealFailed(outcome.reason);
       }
       // Time-driven seals reset the decision counter — the next
       // `intervalDecisions` window starts fresh, so a slow stream
@@ -163,7 +190,7 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
       if (decisionCounter < intervalDecisions) return;
       const outcome = sealLatestInternal();
       if (outcome.kind === 'failed') {
-        opts.onSealFailed?.(outcome.reason);
+        safeOnSealFailed(outcome.reason);
       }
       decisionCounter = 0;
     },
@@ -178,7 +205,7 @@ export const createSealingScheduler = (opts: CreateSealingSchedulerOptions): Sea
         return { ok: true, sealed: null };
       }
       // outcome.kind === 'failed'
-      opts.onSealFailed?.(outcome.reason);
+      safeOnSealFailed(outcome.reason);
       return { ok: false, reason: outcome.reason };
     },
     close: (): void => {
