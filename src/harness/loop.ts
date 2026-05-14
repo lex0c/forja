@@ -19,6 +19,13 @@ import {
   toolPlanHasWrites,
 } from '../critique/index.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
+import {
+  deriveParentCapabilities,
+  formatCapability,
+  intersectCapabilities,
+  parseCapability,
+} from '../permissions/capabilities.ts';
+import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -45,6 +52,7 @@ import {
   recordCritiqueRun,
   reopenSession,
 } from '../storage/index.ts';
+import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -522,12 +530,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // here too, so adding them to the set is a no-op cost.
   const pendingHookChains = new Set<Promise<unknown>>();
   const dispatchHooks = async (payload: HookEventPayload): Promise<HookChainResult | null> => {
+    // Slice 181 — disableAllHooks short-circuit. Skip the chain
+    // entirely when the kill switch is on, even with hooks
+    // configured. The dispatcher honors the flag too (defense in
+    // depth), but short-circuiting here avoids the wrapper
+    // Promise + cleanup churn. Returning null mirrors the
+    // "no hooks configured" path so call sites don't branch on
+    // the discriminator.
+    if (config.disableAllHooks === true) return null;
     if (config.hooks === undefined || config.hooks.length === 0) return null;
     const chain = (async (): Promise<HookChainResult | null> => {
       try {
         return await dispatchChain(config.hooks ?? [], payload, config.cwd, {
           db: config.db,
           sessionId: sessionId.length > 0 ? sessionId : null,
+          ...(config.disableAllHooks !== undefined
+            ? { disableAllHooks: config.disableAllHooks }
+            : {}),
         });
       } catch (err) {
         // Defense-in-depth: dispatchChain wraps each hook's
@@ -593,6 +612,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     if (detail !== undefined) result.detail = detail;
     if (reason === 'aborted' && abortCause !== undefined) {
       result.abortCause = abortCause;
+    }
+
+    // Slice 131 wire: when the session terminates in an
+    // interrupted/error state, emit a `session_aborted`
+    // outcome_signal for the last N approvals. Weak signal
+    // (weight 0.20) — sessions abort for many reasons not all
+    // "decision-was-wrong" (Ctrl+C, timeout, cost cap, provider
+    // crash). N=5 is a heuristic floor: the problem is more
+    // likely in the recent few approvals than the session's
+    // very first. Best-effort: signal emit failure stderrs but
+    // never blocks the result.
+    if (
+      config.outcomeSink !== undefined &&
+      sessionId.length > 0 &&
+      (exitToStatus[reason] === 'interrupted' || exitToStatus[reason] === 'error')
+    ) {
+      // Slice 131 fixup #5: bounded query (ORDER BY seq DESC
+      // LIMIT 5) so a long session (10k tool calls) doesn't
+      // materialize the full list on every abort. Per-emit
+      // try/catch so a transient SQLITE_BUSY on one signal
+      // doesn't drop the rest of the cohort.
+      const SESSION_ABORTED_TAIL_N = 5;
+      const recent = listApprovalsLogBySessionRecent(config.db, sessionId, SESSION_ABORTED_TAIL_N);
+      for (const a of recent) {
+        try {
+          config.outcomeSink.emit({
+            approval_seq: a.seq,
+            signal_kind: 'session_aborted',
+            payload: {
+              exit_reason: reason,
+              ...(abortCause !== undefined ? { abort_cause: abortCause } : {}),
+            },
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          process.stderr.write(
+            `forja outcome_signals: session_aborted emit failed for approval_seq=${a.seq} (${msg})\n`,
+          );
+        }
+      }
     }
     // Stop hooks (spec AGENTIC_CLI.md §10.1). Fired AFTER the
     // session row is marked complete and the result struct is
@@ -832,6 +891,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // finally to fire — matters when the loop is mid-provider-
           // request, where finally can be seconds away.
           abortSignal: signal,
+          // Slice 130 fixup #1: thread failure_events sink +
+          // boot-time sandbox tool so the `sandbox.mid_session_loss`
+          // probe in bg/manager actually fires in production.
+          // Pre-fixup the manager was constructed without either,
+          // so the entire probe path was dead code at runtime
+          // (tests wired the seams directly, masking the gap).
+          // Both fields are optional on CreateBgManagerOptions, so
+          // headless/SDK callers that don't supply them keep
+          // pre-slice-130 behavior.
+          ...(config.failureSink !== undefined ? { failureSink: config.failureSink } : {}),
+          ...(config.sandboxBootTool !== undefined
+            ? { sandboxBootTool: config.sandboxBootTool }
+            : {}),
+          // Slice 157 (phase 2): bg manager threads the per-CLI-run
+          // sandbox tmpdir into every bg spawn so long-running bg
+          // processes get the same scoped /tmp on darwin as
+          // foreground tools.
+          ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
           // Lifecycle observer: translate bg manager events into
           // HarnessEvents so the renderer can update its `bg N`
           // footer counter (spec UI.md §4.10.6) and audit captures
@@ -857,6 +934,57 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           },
         });
       }
+
+      // §13.6 degraded banner emitter (slice 92). One emitter per
+      // runAgent invocation. State changes outside the run (engine
+      // degraded/restored between sessions) don't carry the counter
+      // across — each run gets a fresh first-emission semantics for
+      // its own degraded-transition timeline. The emitter is cheap
+      // (single state read per tool call); invoking it
+      // unconditionally is simpler than gating on engine state at
+      // the call site.
+      const degradedBannerEmitter = createDegradedBannerEmitter({
+        getState: () => config.permissionEngine.state(),
+        // §13.6 reason plumbing (slice 93). Reads the root cause
+        // from the engine's state controller history; renderers
+        // surface it in the banner ("⚠ Sandbox no longer available
+        // (bwrap binary missing)"). Undefined → empty reason, banner
+        // falls back to the suffix-less form.
+        getReason: () => config.permissionEngine.getDegradedReason() ?? '',
+        onFire: (event) => {
+          // §13.6 harness observer (renderers, NDJSON, future
+          // UI adapters). Unchanged from slice 92.
+          safeEmit(config.onEvent, {
+            type: 'sandbox_degraded_active',
+            sessionId: event.sessionId,
+            reason: event.reason,
+            firstEmission: event.firstEmission,
+          });
+          // §18 telemetry emit (slice 111, R10 #48). Pre-slice
+          // SandboxDegradedActiveEvent was a declared type with
+          // a scrubbing handler (slice 92) but no emit site —
+          // operators with OTEL dashboards saw `sandbox.degraded
+          // _active_total` flat-line even when banners were
+          // firing. The defensive try/catch matches slice 70's
+          // sink contract (sinks MUST NOT throw; observability
+          // bugs MUST NOT break the harness loop).
+          if (config.telemetry !== undefined) {
+            try {
+              config.telemetry.emit({
+                kind: 'sandbox.degraded_active',
+                ts: Date.now(),
+                sessionId: event.sessionId,
+                reason: event.reason,
+                firstEmission: event.firstEmission,
+              });
+            } catch {
+              // Telemetry sink threw — log site is the harness;
+              // we can't surface it without risking the same
+              // broken sink consuming our error. Swallow.
+            }
+          }
+        },
+      });
 
       // Subagent dispatcher + handle store. Wired only when a
       // subagent registry is configured; both `task` (sync) and the
@@ -940,6 +1068,85 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 estimate,
                 projected,
                 cap: budget.maxCostUsd,
+              };
+            }
+          }
+          // Capability intersection gate (PERMISSION_ENGINE.md §10.1).
+          // When the model requested capabilities via `task`'s
+          // `capabilities` arg (→ `args.declaredCapabilities`), the
+          // spawn factory enforces declared ⊆ parent. Any declared
+          // capability not covered by the parent set refuses the
+          // spawn with `subagent_escalation`; the tool layer maps
+          // it onto `subagent.escalation`.
+          //
+          // Slice 25 closes the §10 wiring: when the caller didn't
+          // pass an explicit `parentCapabilities`, derive it from
+          // the parent's active policy via
+          // `deriveParentCapabilities`. The intersection now fires
+          // automatically whenever the model declares capabilities,
+          // matching the §10 spec wording ("subagent inherits the
+          // parent's effective set"). Tests still pass an explicit
+          // `parentCapabilities` when they want to pin the parent
+          // set verbatim — caller-supplied takes precedence over
+          // derivation.
+          // Slice 95: capture the `effective` array from the
+          // intersection result so we can seal it onto the child's
+          // audit row (§10.1 evaluation-side gate). Pre-slice this
+          // value was discarded — only `excess` mattered for the
+          // refuse path. Defaults to `undefined` (no envelope,
+          // root behavior) so callers that don't declare
+          // capabilities preserve their legacy semantics.
+          let effectiveForChild: string[] | undefined;
+          if (args.declaredCapabilities !== undefined) {
+            try {
+              const declared = args.declaredCapabilities.map(parseCapability);
+              // Slice 128 (R4 P0-Bypass-2): when the engine has a
+              // narrowed envelope (i.e., it's a CHILD engine
+              // spawning a grandchild), use the engine's actual
+              // effective set as the parent caps for the
+              // intersection. Pre-slice we derived from
+              // `engine.policy()` which is the INHERITED policy
+              // snapshot (parent's full set), not the child's
+              // narrowed envelope — grandchild intersection then
+              // succeeded against a wider set than the child
+              // itself was allowed, violating §10.3 "escape
+              // impossível" across depth-2.
+              //
+              // `engine.effectiveCapabilities()` returns null on
+              // a ROOT engine (no envelope applied at
+              // construction) → fall back to the legacy
+              // deriveParentCapabilities path. Caller-supplied
+              // `parentCapabilities` still wins (tests).
+              const envelopeOverride = config.permissionEngine.effectiveCapabilities();
+              const parentCaps =
+                args.parentCapabilities !== undefined
+                  ? args.parentCapabilities.map(parseCapability)
+                  : envelopeOverride !== null
+                    ? envelopeOverride
+                    : deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parentCaps, declared);
+              if (excess.length > 0) {
+                return {
+                  kind: 'subagent_escalation',
+                  requested: args.name,
+                  excess: excess.map(formatCapability),
+                };
+              }
+              // Effective is what survived ⊆ declared, in declared
+              // order. Format back to the wire form for persistence.
+              // `[]` (pure-LLM) survives as `[]`, distinct from
+              // `undefined` — the child engine treats the two
+              // differently (see EngineOptions.effectiveCapabilities).
+              effectiveForChild = effective.map(formatCapability);
+            } catch (e) {
+              // Malformed capability string slipped through the
+              // tool-layer validation (programmer error, not a
+              // model error). Refuse defensively rather than
+              // silently letting the spawn proceed.
+              return {
+                kind: 'subagent_escalation',
+                requested: args.name,
+                excess: [`<parse error: ${(e as Error).message}>`],
               };
             }
           }
@@ -1109,6 +1316,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             cwd: config.cwd,
             ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // §10.1 effective envelope (slice 95). When the model
+            // declared capabilities, we forward the intersection
+            // result so the child engine can gate every resolved
+            // capability at evaluation time. `undefined` ⇒ child
+            // runs without a bound (root semantics) for callers
+            // that didn't declare.
+            ...(effectiveForChild !== undefined
+              ? { effectiveCapabilities: effectiveForChild }
+              : {}),
             signal: combinedSignal,
             ...(config.softStopSignal !== undefined
               ? { softStopSignal: config.softStopSignal }
@@ -1226,7 +1442,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         subagentHandleStore = createSubagentHandleStore({
           cap: subagentCap,
           spawnFn: async (args, perHandleSignal, handleId) => impl(args, perHandleSignal, handleId),
-          persistTo: { db: config.db, parentSessionId: sessionId },
+          // Slice 130 fixup #1: thread failure_events sink so the
+          // catch path in handle-store (around the settle persist
+          // call) emits structured `storage.lock_contention` /
+          // `storage.persist_failed` rows. Field is optional —
+          // when caller doesn't wire failureSink, persistence
+          // failures still log to stderr (pre-slice-130 posture).
+          persistTo: {
+            db: config.db,
+            parentSessionId: sessionId,
+            ...(config.failureSink !== undefined ? { failureSink: config.failureSink } : {}),
+          },
           // Re-emit parallel_status whenever the queued or
           // running count shifts — keeps the TUI footer's
           // `subagents R+Q/cap` chip in sync without polling.
@@ -2222,6 +2448,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(bgManager !== undefined ? { bgManager } : {}),
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
+          // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-
+          // CLI-run sandbox tmpdir. Tools that wrap argv via
+          // `maybeWrapSandboxArgv` forward this so the SBPL profile
+          // scopes write access on darwin. Undefined on linux (already
+          // isolated by `bwrap --tmpfs /tmp`) or when bootstrap mkdir
+          // failed (graceful fallback to pre-slice-156 behavior).
+          ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
           subagentDepth: config.subagentDepth ?? 0,
           // Cost budget tracker (spec ORCHESTRATION.md §3.5).
           // Returns the cumulative spend (parent self-cost +
@@ -2335,6 +2568,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // memory_write fires MemoryWrite); chain failure is
           // null-returned so tools fail-open per spec line 1057.
           fireHook: dispatchHooks,
+          // Broker for exec-tagged tools (PERMISSION_ENGINE.md
+          // §13.7). When bootstrap wired one through HarnessConfig,
+          // the bash tool routes through `broker.execute`. Absent
+          // ⇒ bash returns `bash.spawn_failed` (fail-loud).
+          ...(config.broker !== undefined ? { broker: config.broker } : {}),
         });
 
         // Per-tu worker. Emits tool_invoking, dispatches through
@@ -2388,6 +2626,45 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
           });
+          // Slice 131 wire: when a tool execution fails AFTER
+          // permission allowed it (failed=true, denied!=true)
+          // AND we have an approval_seq from the decision, emit
+          // an outcome_signal kind=tool_error. Calibration sweeps
+          // use this as a weak proxy for "the allow decision led
+          // to a bad outcome". Best-effort: outcome-sink failure
+          // surfaces to stderr but never crashes the loop. Skip
+          // denied paths — denials are by construction the
+          // engine refusing the call; outcome of a deny is
+          // already encoded in the decision itself.
+          if (
+            config.outcomeSink !== undefined &&
+            inv.failed === true &&
+            inv.denied !== true &&
+            inv.decision?.approvalSeq !== undefined
+          ) {
+            try {
+              config.outcomeSink.emit({
+                approval_seq: inv.decision.approvalSeq,
+                signal_kind: 'tool_error',
+                payload: {
+                  tool_name: tu.name,
+                  duration_ms: inv.durationMs,
+                  ...(inv.errorMessage !== undefined ? { error_message: inv.errorMessage } : {}),
+                },
+              });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              process.stderr.write(
+                `forja outcome_signals: tool_error wire failed for approval_seq=${inv.decision.approvalSeq} (${msg})\n`,
+              );
+            }
+          }
+          // §13.6 degraded banner heartbeat (slice 92). Fires after
+          // every tool call; emitter is cheap + queries engine state
+          // internally. Emits a `sandbox_degraded_active` harness
+          // event on first-entry to degraded + every N calls
+          // thereafter (default 10).
+          degradedBannerEmitter.notifyToolCall(sessionId);
           return { toolResult: inv.toolResult, failed: inv.failed };
         };
 

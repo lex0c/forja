@@ -9,17 +9,23 @@
 // committing to a session, and CI / scripts get a deterministic
 // stdout to grep against.
 //
-// Plain text only for now. JSON output is a follow-up — same shape
-// pattern as --list-sessions: switch on `json` flag, emit one
-// NDJSON line per layer + a summary line.
+// Plain text by default. `--json` (slice 38) toggles NDJSON output:
+// one `{"kind":"layer",...}` event per loaded YAML file, then one
+// `{"kind":"merged",...}` event with the full resolved policy +
+// per-section provenance + lockConflicts. Same convention as
+// --list-sessions: each line is a self-contained JSON object,
+// `kind` discriminates. Consumers stream-parse via jq or similar.
 
 import {
   type Layer,
+  type LayerPolicy,
+  type LockConflict,
   type Policy,
   type SectionProvenance,
   formatBash,
   formatFetch,
   formatPath,
+  renderSandbox,
   resolvePolicy,
 } from '../permissions/index.ts';
 
@@ -33,6 +39,12 @@ export interface ExplainPermissionsOptions {
   userPath?: string | null;
   // Inject env for path discovery (mirrors resolvePolicy's seam).
   env?: NodeJS.ProcessEnv;
+  // NDJSON output mode. When true, the renderer skips the human
+  // text and emits one JSON line per layer + a merged-summary line.
+  // Lock conflicts move from stderr into the merged event so stdout
+  // stays a pure stream (project convention from CLAUDE.md hard
+  // rules: "stdout is pure, stderr is for logs").
+  json?: boolean;
   out: (s: string) => void;
   err: (s: string) => void;
 }
@@ -60,6 +72,10 @@ const renderSection = (
   lines.push(...body);
   return lines;
 };
+
+// §6.5 sandbox renderer lives in permissions/render.ts so both
+// `/perms` (in-REPL) and this headless surface share the exact same
+// formatting. Imported via the barrel.
 
 export const renderExplainPermissions = (
   policy: Policy,
@@ -151,6 +167,15 @@ export const renderExplainPermissions = (
     );
   }
 
+  // §6.5 sandbox section. Per-field attribution per slice 35: each
+  // line carries its own writer. The lock is rendered as a footer
+  // line (conceptually about the section, not a field value). When
+  // no layer wrote sandbox the block is omitted entirely — `/perms
+  // why sandbox` outputs nothing for chains that never opted in.
+  if (policy.sandbox !== undefined) {
+    lines.push(...renderSandbox(policy.sandbox, provenance.sandbox));
+  }
+
   // Footer hint: in strict mode without sections, EVERY gated
   // tool default-denies. Same actionable footer /perms emits.
   const sectionCount = Object.keys(t).length;
@@ -169,6 +194,42 @@ export const renderExplainPermissions = (
   }
 
   return lines;
+};
+
+// NDJSON output (slice 38). Two event shapes:
+//   - `{"kind":"layer","layer":"<name>","path":"<file>"}` — one per
+//     loaded YAML file, in discovery order (enterprise → user →
+//     project). Absent `path` field when the resolver knew the
+//     layer's existence without a concrete file (rare; tests only).
+//   - `{"kind":"merged","policy":<Policy>,"provenance":<SectionProvenance>,
+//      "lockConflicts":[<LockConflict>,...]}` — emitted once after
+//     the layer events. Carries the full effective shape; consumers
+//     don't need to re-resolve. `lockConflicts` is always an array
+//     (empty when none), so `jq '.lockConflicts[]'` is safe in
+//     either case.
+const writeJson = (
+  layers: readonly LayerPolicy[],
+  policy: Policy,
+  provenance: SectionProvenance,
+  lockConflicts: readonly LockConflict[],
+  out: (s: string) => void,
+): void => {
+  for (const l of layers) {
+    const entry: { kind: 'layer'; layer: Layer; path?: string } = {
+      kind: 'layer',
+      layer: l.layer,
+    };
+    if (l.path !== undefined) entry.path = l.path;
+    out(`${JSON.stringify(entry)}\n`);
+  }
+  out(
+    `${JSON.stringify({
+      kind: 'merged',
+      policy,
+      provenance,
+      lockConflicts,
+    })}\n`,
+  );
 };
 
 export const runExplainPermissionsCli = async (
@@ -190,6 +251,22 @@ export const runExplainPermissionsCli = async (
     return 1;
   }
 
+  if (options.json === true) {
+    // NDJSON output: stdout stays pure (events only), stderr stays
+    // silent on the happy path. Lock conflicts move INTO the merged
+    // event — consumers parse one stream, not two. Resolve-failure
+    // errors still land on stderr (handled above) since they're
+    // diagnostics, not data.
+    writeJson(
+      resolved.layers,
+      resolved.policy,
+      resolved.provenance,
+      resolved.lockConflicts,
+      options.out,
+    );
+    return 0;
+  }
+
   const lines = renderExplainPermissions(resolved.policy, resolved.provenance, resolved.layers);
   for (const line of lines) options.out(`${line}\n`);
 
@@ -198,7 +275,8 @@ export const runExplainPermissionsCli = async (
   // Operators auditing the policy benefit from seeing those
   // conflicts surfaced (especially in CI / scripted runs); we
   // route them to stderr to keep stdout grep-friendly for the
-  // policy itself.
+  // policy itself. JSON mode folds them into the merged event
+  // instead (see above).
   if (resolved.lockConflicts.length > 0) {
     options.err('\nlock conflicts (rejected lower-layer overrides):\n');
     for (const c of resolved.lockConflicts) {

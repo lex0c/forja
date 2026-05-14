@@ -1,3 +1,4 @@
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { createHookRun } from '../storage/repos/hook-runs.ts';
 import { classifyExitCode, matchesPayload } from './dispatcher-matching.ts';
@@ -101,6 +102,15 @@ export interface DispatcherDeps {
   // for the audit row's recorded timeout. Caller must respect
   // the operator's spec.timeoutMs as the upper bound.
   effectiveTimeoutMs?: number;
+  // Slice 181 — kill switch. When true, `dispatchChain` returns
+  // an empty chain immediately without evaluating matchers,
+  // spawning hooks, or emitting audit rows. Per CONTRACTS.md
+  // hook hierarchy, managed settings can pin this at the
+  // enterprise layer; user/project layers cannot un-set it.
+  // Resolution + locking lives in the config-load step
+  // (bootstrap/runtime); the dispatcher just reads the
+  // already-resolved value.
+  disableAllHooks?: boolean;
 }
 
 // Build the env dict passed to the hook subprocess. Strict
@@ -174,7 +184,9 @@ export const dispatchOne = async (
     if (deps.db === undefined) return;
     try {
       const matcherTool =
-        payload.event === 'PreToolUse' || payload.event === 'PostToolUse'
+        payload.event === 'PreToolUse' ||
+        payload.event === 'PostToolUse' ||
+        payload.event === 'PostToolUseFailure'
           ? payload.data.tool.name
           : null;
       createHookRun(deps.db, {
@@ -195,8 +207,17 @@ export const dispatchOne = async (
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Slice 178 (review — P2 defense in depth). The audit-drift
+      // stderr line is operator-visible AND captured by any
+      // process supervisor / log aggregator the operator runs
+      // (journald, container log drivers, etc). A db-side error
+      // can include the offending SQL statement, which can include
+      // bound-parameter values from the hook's stdout/stderr (a
+      // hook that printed a Bearer token would land in the error).
+      // Redact secrets in the message; the operator still gets
+      // the structural failure shape and the spec hint.
       process.stderr.write(
-        `hooks: AUDIT DRIFT: failed to record ${spec.event} run (${spec.sourcePath}#${hookIndex}): ${msg}\n`,
+        `hooks: AUDIT DRIFT: failed to record ${spec.event} run (${spec.sourcePath}#${hookIndex}): ${redactSecrets(msg)}\n`,
       );
     }
   };
@@ -360,12 +381,25 @@ export const dispatchChain = async (
   cwd: string,
   deps: DispatcherDeps,
 ): Promise<HookChainResult> => {
+  // Slice 181 — disableAllHooks short-circuit. When the operator
+  // (or managed settings) flipped the kill switch, the chain
+  // returns empty immediately. No audit rows, no spawns, no
+  // matcher evaluation. Caller still receives a well-shaped
+  // HookChainResult so downstream code paths don't need their
+  // own opt-out logic.
+  if (deps.disableAllHooks === true) {
+    return { blockedBy: null, runs: [], additionalContext: '' };
+  }
+
   const matching = hooks.filter((spec) => matchesPayload(spec, payload));
   const isBlocking = BLOCKING_EVENTS.has(payload.event);
   const now = deps.now ?? (() => Date.now());
   const chainStarted = now();
   const runs: { spec: HookSpec; result: HookRunResult }[] = [];
   let blockedBy: HookChainResult['blockedBy'] = null;
+  // Slice 181 — aggregation of JSON-output fields across the chain.
+  const contextParts: string[] = [];
+  let updatedInput: Record<string, unknown> | undefined;
 
   // Short-circuit when no shell is available (Windows host
   // without sh/bash AND without cmd.exe — exotic, but possible
@@ -379,7 +413,7 @@ export const dispatchChain = async (
     process.stderr.write(
       `hooks: ${matching.length} hook(s) for ${payload.event} skipped — ${shell.reason}\n`,
     );
-    return { blockedBy: null, runs };
+    return { blockedBy: null, runs, additionalContext: '' };
   }
 
   for (let i = 0; i < matching.length; i++) {
@@ -438,6 +472,23 @@ export const dispatchChain = async (
     });
     runs.push({ spec, result });
 
+    // Slice 181 — aggregate JSON output fields from allow results.
+    // additionalContext concatenates in execution order so the LLM
+    // sees the chain's enrichment in the order operator declared.
+    // updatedInput is last-wins (paralelo a "the last hook in the
+    // chain that emits updatedInput defines the final input"); an
+    // earlier hook's mutation is overridden by a later one. This
+    // matches the operator-mental-model "later hooks have higher
+    // precedence" because they declared their handler after.
+    if (result.kind === 'allow') {
+      if (result.additionalContext !== undefined && result.additionalContext.length > 0) {
+        contextParts.push(result.additionalContext);
+      }
+      if (result.updatedInput !== undefined) {
+        updatedInput = result.updatedInput;
+      }
+    }
+
     if (!isBlocking) continue;
 
     // Blockable event — first blocking decision wins.
@@ -469,5 +520,8 @@ export const dispatchChain = async (
     // allow / non-failClosed error — continue to next.
   }
 
-  return { blockedBy, runs };
+  const finalContext = contextParts.join('\n\n');
+  const result: HookChainResult = { blockedBy, runs, additionalContext: finalContext };
+  if (updatedInput !== undefined) result.updatedInput = updatedInput;
+  return result;
 };

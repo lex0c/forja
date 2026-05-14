@@ -2194,4 +2194,133 @@ describe('runAgent', () => {
       expect(req.thinking_budget).toBe(2048);
     });
   });
+
+  // Slice 111 — R10 #48: SandboxDegradedActiveEvent was declared
+  // and scrubbing handler existed (slice 92), but the harness
+  // loop only emitted to config.onEvent — the §18 telemetry pipe
+  // was unwired. Slice 111 adds `telemetry?: TelemetrySink` to
+  // HarnessConfig and threads it through the degraded-banner
+  // onFire callback.
+  describe('telemetry sink — sandbox.degraded_active emission (slice 111, R10 #48)', () => {
+    test('emits to telemetry sink when engine is degraded and a tool call fires', async () => {
+      // Setup: a degraded engine + a recording telemetry sink.
+      // The script triggers a tool call (echo); the harness's
+      // pre-call degradedBannerEmitter fires; onFire wires both
+      // config.onEvent and config.telemetry.emit.
+      const { createRecordingTelemetrySink } = await import('../../src/telemetry/index.ts');
+      const sink = createRecordingTelemetrySink();
+      const engine = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+        cwd: '/p',
+        initialState: 'degraded',
+      });
+
+      const handle = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: engine,
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        telemetry: sink,
+      });
+
+      // The recording sink received at least one degraded_active
+      // event. The banner emitter fires on the first tool call
+      // after entering degraded; subsequent calls fire every Nth
+      // (default 10). One tool call → one emission.
+      const degradedEvents = sink.events().filter((e) => e.kind === 'sandbox.degraded_active');
+      expect(degradedEvents.length).toBeGreaterThanOrEqual(1);
+      const first = degradedEvents[0];
+      if (first === undefined) return;
+      expect(first.firstEmission).toBe(true);
+      // sessionId is engine-generated UUID; just verify it's a
+      // non-empty string (no fixed value to assert).
+      expect(typeof first.sessionId).toBe('string');
+      expect((first.sessionId as string).length).toBeGreaterThan(0);
+    });
+
+    test('does NOT emit when telemetry sink is undefined (no-op default)', async () => {
+      // Pre-slice this was the EVERY case — telemetry was always
+      // unwired. Post-slice operators who don't pass a sink still
+      // see banner events via config.onEvent (the existing path)
+      // but no telemetry events fire. Defensive coverage: omitting
+      // telemetry must not throw or break the run.
+      const engine = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+        cwd: '/p',
+        initialState: 'degraded',
+      });
+      const events: { type: string }[] = [];
+      const handle = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: engine,
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        // No telemetry — verify no throw + banner still fires
+        // through onEvent path.
+        onEvent: (e) => events.push(e),
+      });
+      // The harness observer still received the banner.
+      const banners = events.filter((e) => e.type === 'sandbox_degraded_active');
+      expect(banners.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test('sink throw does NOT break the harness loop (defensive try/catch)', async () => {
+      // Slice 70's contract: sinks MUST NOT throw. But bugs happen.
+      // The harness wraps every emit in try/catch defensively so a
+      // broken telemetry sink can't crash the agent session.
+      let sinkCalls = 0;
+      const throwingSink = {
+        emit: () => {
+          sinkCalls++;
+          throw new Error('synthetic sink throw');
+        },
+      };
+      const engine = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+        cwd: '/p',
+        initialState: 'degraded',
+      });
+      const handle = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      // The run completes despite the throwing sink — no
+      // unhandled rejection, no crash.
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: engine,
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        telemetry: throwingSink,
+      });
+      expect(result.status).toBe('done');
+      expect(sinkCalls).toBeGreaterThanOrEqual(1);
+    });
+  });
 });

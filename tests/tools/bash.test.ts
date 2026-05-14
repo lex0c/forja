@@ -147,12 +147,47 @@ describe('bashTool', () => {
     expect(out.truncated).toBe(false);
   });
 
+  // Slice 117 (R7 P1): pre-slice the bash tool inferred truncation
+  // by regex-testing the trailing `\n[... truncated; N bytes omitted]`
+  // pattern. User output that happened to end in that exact string
+  // (e.g., an echo command emitting that literal text) was falsely
+  // reported as truncated. The handler now carries truthful
+  // `stdoutTruncated` / `stderrTruncated` flags on BrokerResponse;
+  // the tool reads them directly.
+  test('output that LITERALLY ends in the truncation marker is NOT misreported (slice 117)', async () => {
+    // The exact regex shape — pre-slice this would test true even
+    // though the output was complete.
+    const out = await bashTool.execute(
+      { command: "printf 'hello\\n[... truncated; 42 bytes omitted]'" },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.stdout).toBe('hello\n[... truncated; 42 bytes omitted]');
+    expect(out.truncated).toBe(false);
+  });
+
   test('relative cwd argument is resolved against ctx.cwd', async () => {
     // Create a subdir and verify pwd resolves there.
     Bun.spawnSync(['mkdir', '-p', join(dir, 'sub')]);
     const out = await bashTool.execute({ command: 'pwd', cwd: 'sub' }, makeCtx({ cwd: dir }));
     if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
     expect(out.stdout.trim().endsWith(`${dir}/sub`)).toBe(true);
+  });
+
+  // Slice 150 (review): type-check cwd before isAbsolute. Pre-slice
+  // a non-string cwd (e.g. cwd: 42) threw ERR_INVALID_ARG_TYPE
+  // inside the path resolution and the harness surfaced it as
+  // internalError; now it surfaces as tool.invalid_arg with a
+  // clean message the model can react to.
+  test('rejects non-string cwd', async () => {
+    const out = await bashTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: synthesizing bad model input
+      { command: 'pwd', cwd: 42 as any },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('cwd must be a string');
   });
 
   test('caller abort mid-exec returns tool.aborted (not exit_code 143)', async () => {

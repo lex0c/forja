@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type BgManager, createBgManager } from '../../src/bg/index.ts';
@@ -123,16 +123,38 @@ describe('bash_background tool', () => {
     expect(out.stdout.trim()).toBe(join(sessionCwd, 'sub'));
   });
 
-  test('absolute cwd is used as-is', async () => {
+  test('absolute cwd inside session subtree is used as-is', async () => {
+    // Slice 160 (review): the pre-slice test allowed ANY absolute
+    // path; that was the bypass attack closed by this slice. Updated
+    // to use an absolute path INSIDE the session subtree, which is
+    // the legitimate use case.
+    const sessionCwd = mkdtempSync(join(tmpdir(), 'forja-bg-cwd-'));
+    const innerDir = join(sessionCwd, 'inner');
+    mkdirSync(innerDir, { recursive: true });
+    tempRoots.push(sessionCwd);
+    const ctx = makeCtx({ sessionId, bgManager: mgr, cwd: sessionCwd });
+    const r = await bashBackgroundTool.execute({ command: 'pwd', cwd: innerDir }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    await waitForExit(r.process_id);
+    const out = await mgr.readOutput(r.process_id);
+    // Allow canonical form drift (e.g. /private/var/folders on darwin
+    // firmlinks) — compare against the realpath of innerDir.
+    const realInner = realpathSync(innerDir);
+    expect(out.stdout.trim()).toBe(realInner);
+  });
+
+  test('absolute cwd OUTSIDE session subtree refuses with tool.invalid_arg (slice 160)', async () => {
+    // The original threat closed by slice 160: model emits cwd
+    // pointing at a directory outside the session, broker honored
+    // it, exec ran outside the engine's capability attribution.
     const sessionCwd = mkdtempSync(join(tmpdir(), 'forja-bg-cwd-'));
     const otherDir = mkdtempSync(join(tmpdir(), 'forja-bg-other-'));
     tempRoots.push(sessionCwd, otherDir);
     const ctx = makeCtx({ sessionId, bgManager: mgr, cwd: sessionCwd });
     const r = await bashBackgroundTool.execute({ command: 'pwd', cwd: otherDir }, ctx);
-    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
-    await waitForExit(r.process_id);
-    const out = await mgr.readOutput(r.process_id);
-    expect(out.stdout.trim()).toBe(otherDir);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('outside session subtree');
   });
 
   // max_runtime_ms is documented in the schema as `minimum: 100`, but
@@ -175,6 +197,45 @@ describe('bash_background tool', () => {
     const r = await bashBackgroundTool.execute({ command: 'sleep 0.05', max_runtime_ms: 100 }, ctx);
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(typeof r.process_id).toBe('string');
+    await waitForExit(r.process_id);
+  });
+
+  // Slice 150 (review): type-check label and cwd. Pre-slice these
+  // arrived from the LLM unvalidated and reached the manager /
+  // storage layer with wrong types (label=42 landed in audit logs
+  // as a non-string; cwd=42 threw ERR_INVALID_ARG_TYPE inside
+  // isAbsolute and surfaced as `internalError` instead of a clean
+  // tool error).
+  test('rejects non-string label', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: synthesizing bad model input
+      { command: 'true', label: 42 as any },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('label must be a string');
+  });
+
+  test('rejects non-string cwd', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: synthesizing bad model input
+      { command: 'true', cwd: 42 as any },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('cwd must be a string');
+  });
+
+  test('accepts label as null-ish (undefined)', async () => {
+    // label is optional; omitting must not trip the type check.
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute({ command: 'true' }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.label).toBeNull();
     await waitForExit(r.process_id);
   });
 });

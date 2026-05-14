@@ -19,6 +19,7 @@
 // stay in their respective consumer modules — only the
 // per-section formatting and the column layout live here.
 
+import type { SandboxProvenance } from './hierarchy.ts';
 import type { BashPolicy, FetchPolicy, PathPolicy, Policy, PolicyToolsSection } from './types.ts';
 
 // Cap the per-rule list at this count; past it we collapse to
@@ -103,6 +104,44 @@ export const formatSections = (tools: PolicyToolsSection): string[] => {
   return out;
 };
 
+// Render the sandbox section. Used by both `renderPolicy` (in-REPL
+// `/perms`, no provenance available) and
+// `renderExplainPermissions` (headless `agent perms`, with
+// provenance from the layer resolver). When provenance is
+// undefined every field renders bare (`required: true`); when
+// provided the per-field writer becomes a `[from <layer> policy]`
+// hint.
+//
+// Lock renders as a footer line (`(locked by <layer> policy)`) — the
+// lock is conceptually about the section, not a field value. With no
+// provenance the locking layer attribution drops: just `(locked)`.
+//
+// Body indent is 6 spaces matching `formatRules` — same shape as
+// every other section so the operator's eye doesn't have to track
+// two different layouts.
+export const renderSandbox = (
+  sandbox: NonNullable<Policy['sandbox']>,
+  provenance: SandboxProvenance | undefined,
+): string[] => {
+  const lines: string[] = ['  sandbox:'];
+  if (sandbox.required !== undefined) {
+    const layer = provenance?.required;
+    const hint = layer !== undefined ? ` [from ${layer} policy]` : '';
+    lines.push(`      required: ${sandbox.required}${hint}`);
+  }
+  if (sandbox.hostAllowed !== undefined) {
+    const layer = provenance?.hostAllowed;
+    const hint = layer !== undefined ? ` [from ${layer} policy]` : '';
+    lines.push(`      host_allowed: ${sandbox.hostAllowed}${hint}`);
+  }
+  if (sandbox.locked === true) {
+    const layer = provenance?.locked;
+    const lockHint = layer !== undefined ? ` by ${layer} policy` : '';
+    lines.push(`      (locked${lockHint})`);
+  }
+  return lines;
+};
+
 // Render the full merged policy without layer attribution. This
 // is the format the `/perms` slash command emits in the REPL
 // scrollback. The pre-REPL `--explain-permissions` flag uses a
@@ -112,7 +151,12 @@ export const renderPolicy = (policy: Policy): string[] => {
   const mode = policy.defaults.mode ?? 'strict';
   const lines: string[] = [`policy: mode=${mode}`];
   const sectionLines = formatSections(policy.tools);
-  if (sectionLines.length === 0) {
+  // Render sandbox after tools.* — same order as `renderExplainPermissions`,
+  // and matches the YAML layout convention (`tools:` then `sandbox:`).
+  // Without provenance the renderer emits bare values; introspection
+  // with attribution lives at `/perms why sandbox` and `agent perms`.
+  const sandboxLines = policy.sandbox !== undefined ? renderSandbox(policy.sandbox, undefined) : [];
+  if (sectionLines.length === 0 && sandboxLines.length === 0) {
     lines.push('  (no tool sections defined)');
     if (mode === 'strict') {
       lines.push("  every gated tool will be denied. Create '.agent/permissions.yaml'");
@@ -120,8 +164,8 @@ export const renderPolicy = (policy: Policy): string[] => {
     }
     return lines;
   }
-  lines.push(...sectionLines);
-  if (mode === 'strict') {
+  lines.push(...sectionLines, ...sandboxLines);
+  if (mode === 'strict' && sectionLines.length > 0) {
     lines.push('  (unlisted tools default-deny in strict mode)');
   }
   return lines;

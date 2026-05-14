@@ -1,3 +1,4 @@
+import { parseCapability } from '../../permissions/capabilities.ts';
 import { MAX_SUBAGENT_DEPTH } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
@@ -18,6 +19,13 @@ export interface TaskAsyncInput {
   // this — no parent history is leaked. Same 32 KiB cap as
   // `task`.
   prompt: string;
+  // Capability list the child needs (PERMISSION_ENGINE.md §10.1).
+  // REQUIRED — slice 94 closed the pre-slice gap where `task_async`
+  // had ZERO §10 wiring (privilege escalation by omission).
+  // Engine intersects declared ∩ parent and refuses spawn if any
+  // declared capability is outside the parent's set. Pass [] for
+  // pure-LLM subagent.
+  capabilities: string[];
 }
 
 export interface TaskAsyncOutput {
@@ -57,8 +65,14 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         description:
           'Self-contained user prompt for the child. Include all context the subagent needs — it has no view of this conversation.',
       },
+      capabilities: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          "Capability list the child needs (PERMISSION_ENGINE.md §10.1). REQUIRED — engine intersects declared ∩ parent; spawn refused if any declared capability is outside the parent's set. Pass [] to run pure-LLM (no side-effect capabilities). Slice 94 closed the prior gap where task_async had ZERO §10 wiring.",
+      },
     },
-    required: ['subagent', 'prompt'],
+    required: ['subagent', 'prompt', 'capabilities'],
   },
   metadata: {
     category: 'misc',
@@ -129,6 +143,46 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         },
       );
     }
+
+    // PERMISSION_ENGINE.md §10.1: capabilities REQUIRED (slice 94).
+    // Pre-slice `task_async` had ZERO §10 wiring — async spawn was a
+    // complete bypass of subagent inheritance. The review identified
+    // this as the second leg of privilege-escalation-by-omission
+    // alongside `task`'s opt-in. Same validation as `task` here
+    // (intentional duplication; lifting to a shared helper deferred to
+    // keep slice 94 surgical).
+    if (args.capabilities === undefined) {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        "'capabilities' is required (PERMISSION_ENGINE.md §10.1)",
+        {
+          hint: "Declare the capabilities the child needs (e.g. ['read-fs:src/**', 'exec:shell']) or pass [] for a pure-LLM subagent with no side-effect capabilities.",
+        },
+      );
+    }
+    if (!Array.isArray(args.capabilities)) {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        "'capabilities' must be an array of capability strings",
+      );
+    }
+    for (const entry of args.capabilities) {
+      if (typeof entry !== 'string') {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          "'capabilities' entries must be capability strings (e.g. 'read-fs:src/**')",
+        );
+      }
+      try {
+        parseCapability(entry);
+      } catch (e) {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          `'capabilities' entry '${entry}' is not a valid capability: ${(e as Error).message}`,
+        );
+      }
+    }
+    const declaredCapabilities: string[] = args.capabilities;
     // Resolve subagent name BEFORE issuing a handle. The estimate
     // getter returns `null` when the name doesn't match any
     // registered definition; coalescing that to 0 (the previous
@@ -222,6 +276,14 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         {
           name: args.subagent,
           prompt: args.prompt,
+          // Slice 94 §10 wiring: declaredCapabilities now threads
+          // through the store down to spawnSubagentImpl, which
+          // runs intersectCapabilities against parent. If declared
+          // is not ⊆ parent, the subsequent task_await/await-side
+          // settles with subagent_escalation. The handle still gets
+          // issued here so the model has a token to await on —
+          // refusal surfaces at await time, NOT at handle time.
+          declaredCapabilities,
         },
         // Forward the estimate so the store can include it in
         // `getReservedChildCostUsd()` for the duration of the

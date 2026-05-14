@@ -27,19 +27,25 @@ describe('task tool', () => {
         return ranEnvelope();
       },
     });
-    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(false);
     if (isToolError(result)) return;
     expect(result.output).toBe('child output');
     expect(result.session_id).toBe('child-session');
     expect(result.status).toBe('done');
     expect(result.cost_usd).toBe(0.001);
-    expect(calls).toEqual([{ name: 'explore', prompt: 'go' }]);
+    expect(calls).toEqual([{ name: 'explore', prompt: 'go', declaredCapabilities: [] }]);
   });
 
   test('errors when no spawnSubagent is wired', async () => {
     const ctx = makeCtx();
-    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('subagent.unavailable');
@@ -53,7 +59,10 @@ describe('task tool', () => {
         available: ['explore'],
       }),
     });
-    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'review', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('subagent.unknown');
@@ -79,7 +88,10 @@ describe('task tool', () => {
           auditFailure: { code: 'snapshot_insert_failed', message: 'storage broken' },
         }),
     });
-    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('subagent.run_failed');
@@ -103,7 +115,10 @@ describe('task tool', () => {
           auditFailure: { code: 'snapshot_insert_failed', message: 'no such table: subagent_runs' },
         }),
     });
-    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(false);
     if (isToolError(result)) return;
     expect(result.audit_failure).toBeDefined();
@@ -120,7 +135,10 @@ describe('task tool', () => {
         maxDepth: 4,
       }),
     });
-    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'review', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('subagent.depth_exceeded');
@@ -149,7 +167,10 @@ describe('task tool', () => {
           detail: 'AnthropicError 401 invalid x-api-key',
         }),
     });
-    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'review', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('subagent.run_failed');
@@ -170,7 +191,10 @@ describe('task tool', () => {
       spawnSubagent: async () =>
         ranEnvelope({ status: 'error', reason: 'subprocess_crashed', output: '' }),
     });
-    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'review', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     // Plain trailing single-quote, no `:` suffix.
@@ -182,7 +206,10 @@ describe('task tool', () => {
       spawnSubagent: async () =>
         ranEnvelope({ status: 'exhausted', reason: 'maxSteps', output: 'partial' }),
     });
-    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('subagent.run_failed');
@@ -197,8 +224,8 @@ describe('task tool', () => {
   test('rejects empty / non-string args', async () => {
     const ctx = makeCtx({ spawnSubagent: async () => ranEnvelope() });
     const cases: Array<[unknown, RegExp]> = [
-      [{ subagent: '', prompt: 'x' }, /subagent.*non-empty/],
-      [{ subagent: 'explore', prompt: '' }, /prompt.*non-empty/],
+      [{ subagent: '', prompt: 'x', capabilities: [] }, /subagent.*non-empty/],
+      [{ subagent: 'explore', prompt: '', capabilities: [] }, /prompt.*non-empty/],
       [{ subagent: 42, prompt: 'x' }, /subagent.*non-empty/],
       [{ subagent: 'explore', prompt: null }, /prompt.*non-empty/],
     ];
@@ -214,7 +241,10 @@ describe('task tool', () => {
   test('rejects oversized prompts', async () => {
     const ctx = makeCtx({ spawnSubagent: async () => ranEnvelope() });
     const huge = 'a'.repeat(33 * 1024);
-    const result = await taskTool.execute({ subagent: 'explore', prompt: huge }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: huge, capabilities: [] },
+      ctx,
+    );
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('tool.invalid_arg');
@@ -232,7 +262,10 @@ describe('task tool', () => {
         return ranEnvelope();
       },
     });
-    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
     expect(called).toBe(false);
     expect(isToolError(result)).toBe(true);
     if (!isToolError(result)) return;
@@ -247,7 +280,11 @@ describe('task tool', () => {
     // spec §3.1) — the legacy `task` alias shares this
     // execute body.
     type Decision = {
-      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      decisionType:
+        | 'budget_exhausted'
+        | 'unknown_subagent'
+        | 'depth_exceeded'
+        | 'subagent_escalation';
       toolName: 'task' | 'task_sync' | 'task_async';
       requestedName: string;
       details: Record<string, unknown>;
@@ -263,7 +300,10 @@ describe('task tool', () => {
       }),
       recordGateDecision,
     });
-    const r1 = await taskTool.execute({ subagent: 'typo', prompt: 'p' }, ctxUnknown);
+    const r1 = await taskTool.execute(
+      { subagent: 'typo', prompt: 'p', capabilities: [] },
+      ctxUnknown,
+    );
     expect(isToolError(r1)).toBe(true);
 
     const ctxDepth = makeCtx({
@@ -275,7 +315,10 @@ describe('task tool', () => {
       }),
       recordGateDecision,
     });
-    const r2 = await taskTool.execute({ subagent: 'explore', prompt: 'p' }, ctxDepth);
+    const r2 = await taskTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctxDepth,
+    );
     expect(isToolError(r2)).toBe(true);
 
     const ctxBudget = makeCtx({
@@ -289,7 +332,10 @@ describe('task tool', () => {
       }),
       recordGateDecision,
     });
-    const r3 = await taskTool.execute({ subagent: 'explore', prompt: 'p' }, ctxBudget);
+    const r3 = await taskTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctxBudget,
+    );
     expect(isToolError(r3)).toBe(true);
 
     expect(recorded).toHaveLength(3);

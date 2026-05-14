@@ -1,3 +1,4 @@
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
 import {
@@ -400,8 +401,12 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Slice 178 (review — P2). Redact secrets in the audit-drift
+      // line — db error messages can include bound parameter values
+      // from the memory body (which is operator-authored free text
+      // and may contain accidental Bearer tokens / API keys).
       process.stderr.write(
-        `memory: AUDIT DRIFT: failed to record read event for ${listing.name} (${listing.scope}): ${msg}\n`,
+        `memory: AUDIT DRIFT: failed to record read event for ${listing.name} (${listing.scope}): ${redactSecrets(msg)}\n`,
       );
     }
   };
@@ -615,7 +620,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           process.stderr.write(
-            `memory: AUDIT DRIFT: failed to record ${result.kind === 'created' ? 'created' : 'refused'} event for ${opts.frontmatter.name} (${opts.scope}): ${msg}\n`,
+            `memory: AUDIT DRIFT: failed to record ${result.kind === 'created' ? 'created' : 'refused'} event for ${opts.frontmatter.name} (${opts.scope}): ${redactSecrets(msg)}\n`,
           );
         }
       }
@@ -666,7 +671,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         // recovery path; surfacing on stderr is the convention.
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(
-          `memory: AUDIT DRIFT: failed to record ${input.action} event for ${input.memoryName} (${input.scope}): ${msg}\n`,
+          `memory: AUDIT DRIFT: failed to record ${input.action} event for ${input.memoryName} (${input.scope}): ${redactSecrets(msg)}\n`,
         );
       }
     },

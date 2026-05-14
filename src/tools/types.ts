@@ -1,7 +1,14 @@
 import type { BgManager } from '../bg/index.ts';
+import type { Broker } from '../broker/index.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
-import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
+import type {
+  Decision,
+  PermissionsView,
+  PolicyCategory,
+  SandboxProfile,
+  ToolArgs,
+} from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
@@ -133,6 +140,24 @@ export interface ToolContext {
   sessionId: string;
   stepId: string;
   permissions: PermissionsView;
+  // §6.5 sandbox profile the engine planner chose for THIS call.
+  // Populated by `invoke-tool.ts` from `decision.sandboxProfile`
+  // when the engine was constructed with sandbox inputs. Tools
+  // that spawn child processes (currently `bash`) consume this to
+  // wrap argv via `buildBwrapArgv(...)`. Undefined when the planner
+  // didn't run (legacy / test path), when category is `misc`, or
+  // when the decision didn't reach the planner stage (state-reject,
+  // resolver-refuse).
+  sandboxProfile?: SandboxProfile;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
+  // tmpdir on macOS, undefined elsewhere. Tools that spawn child
+  // processes via `maybeWrapSandboxArgv` forward this into the
+  // `tmpdir` field so the SBPL profile scopes write access. Tools
+  // ALSO merge `TMPDIR=<this>` into the child's env so
+  // mktemp / NSTemporaryDirectory / Python tempfile honor the scope.
+  // Plumbed by the harness from `HarnessConfig.sandboxTmpdir`. See
+  // `PERMISSION_ENGINE.md §6.5` for the threat model.
+  sandboxTmpdir?: string;
   // Recursion depth of the CURRENT run inside a subagent chain.
   // 0 (or unset) = top-level user session. The harness threads
   // this from `HarnessConfig.subagentDepth` so tools that spawn
@@ -196,7 +221,11 @@ export interface ToolContext {
   // can write its decision in one line — keeps tool code lean
   // and hides the db/sessionId binding inside the harness.
   recordGateDecision?: (input: {
-    decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+    decisionType:
+      | 'budget_exhausted'
+      | 'unknown_subagent'
+      | 'depth_exceeded'
+      | 'subagent_escalation';
     toolName: 'task' | 'task_sync' | 'task_async';
     requestedName: string;
     details: Record<string, unknown>;
@@ -298,14 +327,46 @@ export interface ToolContext {
   // headless / one-shot ToolContexts without a wired-through
   // harness leave it unset; tools degrade to "no hook gate".
   fireHook?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
+  // Broker for exec-tagged tools (PERMISSION_ENGINE.md §13.7). Tools
+  // whose execution requires OS-level isolation (currently `bash`)
+  // dispatch through `broker.execute(request)` instead of calling
+  // `Bun.spawn` directly. The broker owns sandbox mounting + worker
+  // lifecycle (slices 78–81). REQUIRED for exec tools — bashTool
+  // returns `bash.spawn_failed` when this is absent. Optional on
+  // the type because read/glob/grep/edit/write don't need it.
+  // Tests inject a degenerate in-process broker via
+  // `tests/tools/_helpers.ts#makeCtx`; bootstrap (slice 82) wires a
+  // production broker for the live REPL.
+  broker?: Broker;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent
 // runner. Kept narrow on purpose — the tool already validates the
 // model-supplied args; this type is just the spawn-side contract.
+//
+// Capability inheritance (PERMISSION_ENGINE.md §10.1):
+//   - `declaredCapabilities` — capability strings the model
+//     requested for the child via the `capabilities` task arg.
+//     Tool layer parses + validates the strings; this field
+//     carries them through verbatim so the spawn factory's
+//     intersection guard sees the exact bytes the model sent.
+//   - `parentCapabilities` — capability strings the harness loop
+//     snapshots from the parent's active policy at spawn time.
+//     The factory intersects declared ∩ parent; any declared cap
+//     NOT covered by some parent cap is `excess` and the spawn
+//     is refused with `subagent_escalation`.
+//
+// Both fields are optional. Legacy callers (no capabilities
+// declared in the task() invocation, OR a harness that doesn't
+// yet wire parentCapabilities into the ctx) skip the §10 guard
+// — the spawn proceeds under the existing toolset gating. Slice 9
+// lands the primitive + opt-in plumbing; a later slice wires
+// parentCapabilities derivation from policy automatically.
 export interface SpawnSubagentArgs {
   name: string;
   prompt: string;
+  declaredCapabilities?: readonly string[];
+  parentCapabilities?: readonly string[];
 }
 
 // Result discriminated by `kind` so the calling tool can map an
@@ -343,6 +404,19 @@ export type SpawnSubagentResult =
       estimate: number;
       projected: number;
       cap: number;
+    }
+  | {
+      // PERMISSION_ENGINE.md §10.1: refused because the declared
+      // capability set is NOT a subset of the parent's. `excess`
+      // is the formatted-string form of every declared capability
+      // the spawn factory could not match against parentCapabilities.
+      // The tool layer maps this onto `subagent.escalation` with
+      // `excess` in `details` so the operator can see exactly which
+      // capability the model asked for that wasn't already
+      // exercisable by the parent.
+      kind: 'subagent_escalation';
+      requested: string;
+      excess: string[];
     }
   | {
       kind: 'ran';

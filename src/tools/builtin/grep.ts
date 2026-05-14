@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface GrepInput {
@@ -123,12 +124,35 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       cmd.push(target);
     }
 
+    // §6.5 sandbox runtime wire-up via the shared helper. ENOENT
+    // detection below stays scoped to ripgrep — bwrap missing is
+    // filtered out by `maybeWrapSandboxArgv`'s `Bun.which('bwrap')`
+    // gate, so the error path is unambiguous.
+    const spawnArgv = maybeWrapSandboxArgv({
+      ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
+      cwd: ctx.cwd,
+      innerArgv: cmd,
+      // Slice 157 (phase 2): per-CLI-run scoped tmpdir for darwin.
+      // No-op on linux (the bwrap path ignores tmpdir) and when
+      // bootstrap mkdir failed (sandboxTmpdir is undefined; falls
+      // back to pre-slice-156 blanket allow).
+      ...(ctx.sandboxTmpdir !== undefined ? { tmpdir: ctx.sandboxTmpdir } : {}),
+    });
+
     let proc: ReturnType<typeof Bun.spawn>;
     try {
-      proc = Bun.spawn(cmd, {
+      proc = Bun.spawn(spawnArgv, {
         stdout: 'pipe',
         stderr: 'pipe',
         cwd: ctx.cwd,
+        // Slice 157 (phase 2): inherit parent env + overlay TMPDIR
+        // so the SBPL-scoped tmpdir is what rg sees. Bun's default
+        // is to inherit process.env; passing env explicitly lets us
+        // layer TMPDIR without dropping the rest of the env (which
+        // rg's PATH lookup for sub-binaries depends on).
+        ...(ctx.sandboxTmpdir !== undefined
+          ? { env: { ...process.env, TMPDIR: ctx.sandboxTmpdir } }
+          : {}),
         // biome-ignore lint/suspicious/noExplicitAny: Bun's spawn typing for `signal` is too narrow
         ...({ signal: ctx.signal } as any),
       });

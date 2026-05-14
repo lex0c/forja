@@ -59,6 +59,7 @@ const fakeBlock = (reason: 'silent' | 'message', message: string | null): HookCh
     message,
   },
   runs: [],
+  additionalContext: '',
 });
 
 afterEach(() => {
@@ -151,7 +152,7 @@ describe('memory_write — MemoryWrite hook', () => {
       fireHook: async (payload) => {
         calls.push(payload);
         // Allow: chain ran, no block.
-        return { blockedBy: null, runs: [] };
+        return { blockedBy: null, runs: [], additionalContext: '' };
       },
     });
 

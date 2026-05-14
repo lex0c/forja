@@ -1,4 +1,10 @@
-export { MEMORY_DB, openDb, openMemoryDb, withTransaction } from './db.ts';
+export {
+  MEMORY_DB,
+  openDb,
+  openMemoryDb,
+  withImmediateTransaction,
+  withTransaction,
+} from './db.ts';
 export type { DB } from './db.ts';
 export { StorageJsonError } from './json-safe.ts';
 
@@ -58,6 +64,22 @@ export type {
   ApprovalDecision,
   RecordApprovalInput,
 } from './repos/approvals.ts';
+
+export {
+  appendApprovalsLog,
+  countApprovalsLog,
+  getApprovalsLogBySeq,
+  getLastApprovalsLogByInstall,
+  listApprovalsLogByInstall,
+  listApprovalsLogBySession,
+  PERSISTED_COLUMNS as APPROVALS_LOG_COLUMNS,
+} from './repos/approvals-log.ts';
+export type {
+  AppendApprovalsLogInput,
+  ApprovalLogConfidence,
+  ApprovalLogDecision,
+  ApprovalLogRow,
+} from './repos/approvals-log.ts';
 
 export {
   advanceBgProcessStderrCursor,

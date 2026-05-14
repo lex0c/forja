@@ -1,7 +1,10 @@
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
-import { scrubEnv } from '../sanitize/index.ts';
+import type { FailureEventSink } from '../failures/index.ts';
+import type { SandboxProfile } from '../permissions/index.ts';
+import { maybeWrapSandboxArgv } from '../permissions/index.ts';
+import { redactSecrets, scrubEnv } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
   type BgProcess,
@@ -9,7 +12,10 @@ import {
   advanceBgProcessStdoutCursor,
   finalizeBgProcess,
   getBgProcess,
+  incrementBgProcessStderrBytesDropped,
+  incrementBgProcessStdoutBytesDropped,
   insertBgProcess,
+  listBgProcessesBySession,
   markRunningAsKilled,
 } from '../storage/repos/bg-processes.ts';
 
@@ -34,6 +40,171 @@ const DEFAULT_KILL_GRACE_MS = 5000;
 // finish on the first SIGTERM and pay zero.
 const CLEANUP_KILL_GRACE_MS = 2000;
 
+// Slice 148 (BG1 — process-group isolation): kill the entire
+// process group rooted at the spawned bash, so grandchildren
+// (npm run dev → node → webpack, pytest --watch → many subprocs)
+// receive the signal too. `process.kill(-pid, signal)` is the POSIX
+// convention: a negative PID targets the process group whose leader
+// has that PID. Pairs with `detached: true` on Bun.spawn — without
+// the spawn-side setsid, `-pid` would either fail (no PG) or signal
+// the wrong group.
+//
+// Fallback to direct `proc.kill(signal)` on ANY PG signal failure:
+//   - ESRCH (no such process / group) is benign — the natural-exit
+//     path already reaped the child. Returning quietly avoids
+//     "kill failed" spam in logs.
+//   - EPERM is unusual but possible under restricted execution
+//     contexts; direct kill on the leader is the same blast radius
+//     as the pre-slice behavior, so falling back loses nothing.
+//   - Any other error: log a warning to stderr and fall back so the
+//     visible behavior matches pre-slice (kill the leader, accept
+//     orphan risk on this one process). Best-effort posture matches
+//     the rest of the bg manager.
+const killProcessGroup = (proc: ReturnType<typeof Bun.spawn>, signal: NodeJS.Signals): void => {
+  const pid = proc.pid;
+  if (pid === undefined || pid <= 0) {
+    // No usable PID — fall back to the proc handle's own kill.
+    proc.kill(signal);
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return; // group already gone — benign
+    // Last-ditch: signal the leader directly. Worst case the
+    // grandchildren stay alive (pre-slice behavior).
+    try {
+      proc.kill(signal);
+    } catch {
+      // also gone — give up silently. The DB-side finalize path
+      // marks status='killed' regardless of OS-level race.
+    }
+  }
+};
+
+// Slice 153 (review): drain a Bun.spawn pipe into a file with a
+// truncate-head cap. Owns the file descriptor for its whole
+// lifetime so a truncate from inside doesn't race with the
+// kernel writer (which is exactly the race that made
+// `Bun.file(path)` redirection unsafe to truncate — the spawn's
+// fd would keep writing at a stale position and the kernel would
+// sparse-pad the resulting hole with zeros). Drainer fully owns
+// the fd: the spawn writes into a pipe, this loop reads from the
+// pipe and writes to the file at offsets we control.
+//
+// On each chunk:
+//   - If currentSize + chunk.length <= cap: append chunk, advance.
+//   - Else: compute how much tail (existing bytes) we can keep,
+//     read that tail in memory, truncate the file to 0, rewrite
+//     the tail + new chunk. Call `onDropped(droppedBytes)` so the
+//     LiveHandle's bookkeeping advances and `readOutput` knows
+//     to skip dropped offsets when computing the file position
+//     for a given persisted cursor.
+//
+// One pathological case: a single chunk >= cap. We can't keep
+// any of the prior file content; we keep only the LAST `cap`
+// bytes of the chunk itself. The whole prior file + the chunk
+// prefix are dropped. Rare in practice (Bun.spawn returns
+// chunks of at most ~64 KB, and the default cap is 50 MB).
+const drainStream = async (
+  source: ReadableStream<Uint8Array>,
+  filePath: string,
+  cap: number,
+  onDropped: (bytes: number) => void,
+): Promise<void> => {
+  const { open } = await import('node:fs/promises');
+  const fd = await open(filePath, 'r+');
+  let currentSize = 0;
+  const reader = source.getReader();
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      if (chunk === undefined || chunk.length === 0) continue;
+
+      // Special-case: cap disabled (Number.POSITIVE_INFINITY) or
+      // chunk fits comfortably under the budget. Append at end.
+      if (cap === Number.POSITIVE_INFINITY || currentSize + chunk.length <= cap) {
+        await fd.write(chunk, 0, chunk.length, currentSize);
+        currentSize += chunk.length;
+        continue;
+      }
+
+      // Over-cap path: truncate-head. Decide how much existing
+      // tail we keep (could be 0 if the new chunk alone is >=
+      // cap), read it into memory, truncate, rewrite.
+      const headroomForOld = Math.max(0, cap - chunk.length);
+      let droppedFromOld = 0;
+      let keptOldBytes: Buffer | null = null;
+      if (headroomForOld > 0 && currentSize > headroomForOld) {
+        // Keep the LAST headroomForOld bytes of the existing file;
+        // drop the prefix.
+        droppedFromOld = currentSize - headroomForOld;
+        keptOldBytes = Buffer.alloc(headroomForOld);
+        await fd.read(keptOldBytes, 0, headroomForOld, droppedFromOld);
+      } else if (headroomForOld > 0 && currentSize > 0) {
+        // The whole existing file fits in the new headroom; keep
+        // it all.
+        keptOldBytes = Buffer.alloc(currentSize);
+        await fd.read(keptOldBytes, 0, currentSize, 0);
+      } else {
+        // headroomForOld == 0 → the new chunk alone exceeds cap.
+        // Drop the entire existing file.
+        droppedFromOld = currentSize;
+      }
+
+      // Determine which slice of the new chunk we keep. Almost
+      // always the whole thing, but if chunk.length > cap we keep
+      // only the last `cap` bytes.
+      const chunkKeepStart = Math.max(0, chunk.length - cap);
+      const chunkKept = chunkKeepStart === 0 ? chunk : chunk.subarray(chunkKeepStart);
+      const droppedFromChunk = chunkKeepStart;
+
+      // Apply the truncation + rewrite atomically from the file's
+      // perspective: the fd is the only writer.
+      await fd.truncate(0);
+      let writePos = 0;
+      if (keptOldBytes !== null) {
+        await fd.write(keptOldBytes, 0, keptOldBytes.length, writePos);
+        writePos += keptOldBytes.length;
+      }
+      await fd.write(chunkKept, 0, chunkKept.length, writePos);
+      currentSize = writePos + chunkKept.length;
+
+      onDropped(droppedFromOld + droppedFromChunk);
+    }
+  } finally {
+    await fd.close();
+  }
+};
+
+// Slice 153 (review): per-stream on-disk cap. Pre-slice the bg
+// manager wrote stdout/stderr directly into `Bun.file(path)` via
+// Bun.spawn's redirection — kernel-side append-only with no upper
+// bound. A multi-hour `npm run watch` with chatty warnings would
+// grow the log file indefinitely until the filesystem ran out.
+// The model-facing `maxBytes` cap on bash_output only bounded
+// what the LLM SAW, not what was on disk.
+//
+// Slice 153 switches the spawn to `stdout: 'pipe'` / `stderr:
+// 'pipe'` plus a drainer task per stream that owns the file fd
+// directly. When the on-disk file size would exceed
+// `DEFAULT_LOG_CAP_BYTES`, the drainer truncates the head and
+// rewrites the tail — preserving the most-recent bytes (which
+// matter most for the LLM's read-the-latest pattern) while
+// dropping the oldest. The drainer tracks how many bytes were
+// dropped per stream so `readOutput` can map an absolute "bytes
+// emitted since spawn" cursor onto the current file offset
+// (`file_offset = max(0, cursor - dropped)`).
+//
+// 50 MB per stream is the default — generous enough to capture
+// hours of typical dev-server output, tight enough to bound the
+// FS impact at ~100 MB per concurrent bg job (stdout + stderr).
+// `maxLogBytes` on SpawnInput overrides per call.
+const DEFAULT_LOG_CAP_BYTES = 50 * 1024 * 1024;
+
 export interface SpawnInput {
   command: string;
   label?: string;
@@ -46,6 +217,19 @@ export interface SpawnInput {
   // watchers / file-system monitors. Models can opt in when they
   // know a build / test run / one-shot job has a bounded duration.
   maxRuntimeMs?: number;
+  // §6.5 sandbox profile chosen by the engine for THIS spawn.
+  // Threaded through from `ToolContext.sandboxProfile` at the
+  // bash_background tool layer. When set + Linux + bwrap available
+  // AND profile ≠ `host`, the manager wraps the spawn argv via
+  // `maybeWrapSandboxArgv`. Undefined → status quo direct spawn.
+  sandboxProfile?: SandboxProfile;
+  // Slice 153 (review): per-stream cap in bytes. When the on-disk
+  // log file would grow past this, the drainer truncates the
+  // head and retains the tail. Default DEFAULT_LOG_CAP_BYTES.
+  // Set explicitly when the spawn is short-lived and the operator
+  // wants the full log retained (use 0 to disable the cap — file
+  // grows unbounded, same as pre-slice behavior).
+  maxLogBytes?: number;
 }
 
 export interface SpawnResult {
@@ -134,6 +318,15 @@ export interface BgManager {
 interface LiveHandle {
   proc: ReturnType<typeof Bun.spawn>;
   exitedSettled: Promise<void>;
+  // Slice 153 (review): promise that resolves when BOTH drainer
+  // tasks have finished reading their pipes (proc exit closes
+  // the pipes → drainers loop returns done). exitedSettled
+  // awaits this before emitting 'ended' so readOutput run AFTER
+  // the ended event sees a fully flushed file with the final
+  // bytes captured. The per-stream bytes-dropped count lives in
+  // the DB row (migration 043) so it survives process exit + the
+  // handle being deleted from `live`.
+  drainersSettled: Promise<void>;
 }
 
 // Lifecycle observation. Fires once per process for `started` (right
@@ -186,10 +379,52 @@ export interface CreateBgManagerOptions {
   // are caught and discarded so a buggy observer can't break the
   // process lifecycle (mirrors HarnessConfig.onEvent's contract).
   onEvent?: (event: BgManagerEvent) => void;
+  // failure_events sink (slice 130). When set + sandboxBootTool is
+  // also set, the manager probes sandbox-tool availability before
+  // each spawn and emits `sandbox.mid_session_loss` the first time
+  // the boot-time tool is no longer present (subsequent spawns in
+  // the same loss window suppress; cleared when the tool reappears).
+  // Without the sink + boot tool, the probe is skipped entirely
+  // and behavior matches pre-slice-130.
+  failureSink?: FailureEventSink;
+  // The sandbox tool that was available at boot. Used by the
+  // mid-session-loss probe — comparing CURRENT `which()` against
+  // this BOOT state is what distinguishes "always unavailable"
+  // (audited at bootstrap as sandbox.tool_unavailable) from
+  // "available then lost" (audited here as sandbox.mid_session_loss).
+  // Caller sources via `detectSandboxAvailability` at bootstrap.
+  sandboxBootTool?: 'bwrap' | 'sandbox-exec';
+  // Test seam for the mid-session-loss probe. Production uses
+  // `Bun.which`; tests pin a fake that flips the return value
+  // between calls to simulate boot-vs-spawn-time divergence.
+  sandboxWhich?: (name: string) => string | null;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
+  // tmpdir, plumbed from `HarnessConfig.sandboxTmpdir`. When set, the
+  // bg spawn passes it to `maybeWrapSandboxArgv.tmpdir` AND merges
+  // `TMPDIR=<this>` into the child's env so the sandboxed bg process
+  // confines temp writes to the scoped path on darwin. Undefined on
+  // linux (`bwrap --tmpfs /tmp` already isolates) or on darwin when
+  // bootstrap mkdir failed (graceful pre-slice-156 fallback).
+  sandboxTmpdir?: string;
 }
 
 const ensureDir = (dir: string): void => {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Slice 172 (review — information-leak P0): bg log dir contains
+  // up to 50 MB/stream of captured stdout/stderr from arbitrary
+  // bash commands — npm-install network secrets, curl Bearer tokens,
+  // env dumps that echo provider API keys. Default umask leaves the
+  // dir 0755 (other local users read) and files 0644. Slice 163
+  // tightened sessions.db perms but not `.agent/bg/`. Lock down
+  // here; the dir lives under `<cwd>/.agent/bg/` per spec §2.7
+  // (or per-subagent under `<cwd>/.agent/bg/subagents/<id>/`),
+  // both of which are operator-owned trees.
+  // Best-effort — exotic FS (FAT/exFAT) ignore chmod.
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // Best-effort lockdown.
+  }
 };
 
 const fileSize = (path: string): number => {
@@ -230,26 +465,106 @@ const readWindow = async (
   }
 };
 
+// Slice 129 (R5 P1 leak): the prior shape registered an `abort`
+// listener on every sleep but never removed it on the natural-
+// timeout path. A long-lived AbortSignal (e.g., the harness-
+// level abortSignal threaded through many kill cycles) would
+// accumulate one listener per sleep — leaking memory and
+// triggering Node's MaxListenersExceededWarning around the
+// 11th call. Fix: both `{ once: true }` (auto-detaches if abort
+// DOES fire) and an explicit `removeEventListener` on the
+// natural-resolve branch (so the listener detaches BEFORE the
+// signal might ever fire). Either path cleans up; doubling up
+// is defensive but free.
 const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error('aborted'));
       return;
     }
-    const timer = setTimeout(() => resolve(), ms);
-    signal?.addEventListener('abort', () => {
+    const onAbort = (): void => {
       clearTimeout(timer);
       reject(new Error('aborted'));
-    });
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 
+// Slice 130 (R5 Tier 3): probe state cache for sandbox-loss
+// detection. Held by reference inside the closure so duplicate
+// emits are suppressed within a single manager instance. The
+// cache flips back to `false` if the tool reappears, so a
+// transient outage produces one event; a permanent loss
+// produces one event regardless of how many spawns happen.
+interface SandboxLossCache {
+  emittedAt: number | null;
+}
+
+const probeSandboxLoss = (
+  bootTool: 'bwrap' | 'sandbox-exec' | undefined,
+  cache: SandboxLossCache,
+  failureSink: FailureEventSink | undefined,
+  sessionId: string,
+  plannedProfile: SandboxProfile | undefined,
+  which: (name: string) => string | null,
+): void => {
+  if (bootTool === undefined || failureSink === undefined) return;
+  if (plannedProfile === undefined || plannedProfile === 'host') return;
+  const stillAvailable = which(bootTool) !== null;
+  if (stillAvailable) {
+    // Tool came back (or never left) — clear the suppression so
+    // a future loss produces a fresh event.
+    cache.emittedAt = null;
+    return;
+  }
+  if (cache.emittedAt !== null) {
+    // Already emitted for this loss window; suppress.
+    return;
+  }
+  try {
+    failureSink.emit({
+      code: 'sandbox.mid_session_loss',
+      classe: 'sandbox',
+      recovery_action: 'degraded',
+      user_visible: true,
+      session_id: sessionId,
+      payload: {
+        tool: bootTool,
+        planned_profile: plannedProfile,
+        detected_at_site: 'bg_manager.spawn',
+      },
+    });
+    cache.emittedAt = Date.now();
+  } catch {
+    // Best-effort — never break spawn on failure_events error.
+  }
+};
+
 export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
-  const { db, sessionId, logDir, abortSignal, onEvent } = options;
+  const {
+    db,
+    sessionId,
+    logDir,
+    abortSignal,
+    onEvent,
+    failureSink,
+    sandboxBootTool,
+    sandboxWhich,
+    sandboxTmpdir,
+  } = options;
+  const whichFn = sandboxWhich ?? ((name: string) => Bun.which(name));
   // In-memory map of live handles, keyed by internal process id. The
   // DB is the source of truth for status across restarts; this map
   // is the in-flight reference we need to actually call .kill() on
   // a Bun subprocess.
   const live = new Map<string, LiveHandle>();
+  // Slice 130: sandbox-loss probe state. Persists across spawns of
+  // this manager so duplicate emits suppress until the tool
+  // reappears.
+  const sandboxLossCache: SandboxLossCache = { emittedAt: null };
 
   // Tracks ids whose termination was operator-initiated (kill() or
   // cleanup()), so the exitedSettled handler can emit `ended` with
@@ -287,23 +602,128 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // (future wait_for) from racing on file_exists.
     await Bun.write(stdoutPath, '');
     await Bun.write(stderrPath, '');
+    // Slice 172 (review — information-leak P0). Bg log files
+    // capture up to 50 MB/stream of unredacted stdout/stderr —
+    // npm-install dependencies' API keys, curl `-H "Authorization:
+    // Bearer <token>"` traces, dev-server logs that echo provider
+    // tokens. Default umask leaves them 0644 (any other local user
+    // on the host can read). Lock down to 0600. Best-effort
+    // mirrors the dir chmod above.
+    try {
+      chmodSync(stdoutPath, 0o600);
+      chmodSync(stderrPath, 0o600);
+    } catch {
+      // Best-effort.
+    }
 
     const cwd = input.cwd ?? process.cwd();
     const spawnedAt = Date.now();
 
+    // §6.5 sandbox runtime wire-up. Same four-condition gate as
+    // bash + grep, encapsulated in maybeWrapSandboxArgv. Long-
+    // running bg processes get the same isolation when the
+    // operator configured a sandbox and the planner chose a
+    // non-host profile.
+    //
+    // Slice 130 (R5 Tier 3): probe boot vs current sandbox-tool
+    // state BEFORE the wrap. If the tool was available at boot
+    // but isn't now, maybeWrapSandboxArgv silently degrades to
+    // passthrough — operator-invisible without this audit trail.
+    // Probe is no-op when failureSink or sandboxBootTool aren't
+    // wired (test / pre-slice-130 callers).
+    probeSandboxLoss(
+      sandboxBootTool,
+      sandboxLossCache,
+      failureSink,
+      sessionId,
+      input.sandboxProfile,
+      whichFn,
+    );
+    // Slice 173 — info-leak fix mirrors the broker bash handler.
+    // Pre-slice `['bash', '-c', input.command]` leaked the full
+    // command body (including any interpolated secrets) into
+    // `/proc/<pid>/cmdline`, readable by any local user via
+    // `ps aux`. Switching to `['bash', '-s']` and piping the
+    // script over stdin removes the body from argv entirely. Both
+    // bwrap (Linux) and sandbox-exec (macOS) forward stdin from
+    // their own stdin to the wrapped child by default, so the
+    // script reaches bash even when wrapped.
+    const cmd = maybeWrapSandboxArgv({
+      ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
+      cwd,
+      innerArgv: ['bash', '-s'],
+      // Slice 157 (phase 2): forward per-CLI-run sandbox tmpdir so
+      // the SBPL profile on darwin scopes write access. No-op on
+      // linux (the option is ignored by the bwrap path) and when
+      // bootstrap mkdir failed (sandboxTmpdir is undefined; the
+      // wrap degrades to pre-slice-156 blanket allow).
+      ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
+    });
+
+    // Slice 153 (review): switch to piped streams + drainer tasks.
+    // Bun.file(path) redirection is kernel-direct (fast, but the
+    // file fd belongs to the kernel and we can't truncate without
+    // racing). Piped streams give the manager full fd control.
+    // `maxLogBytes: 0` is documented on SpawnInput as the unbounded
+    // sentinel ("file grows unbounded, same as pre-cap behavior").
+    // Translate to Infinity here so the drainer's existing no-cap
+    // branch handles it — without this normalization the validator
+    // below saw `0 < 1024` and rejected the documented call shape.
+    const requestedCap = input.maxLogBytes ?? DEFAULT_LOG_CAP_BYTES;
+    const logCap = requestedCap === 0 ? Number.POSITIVE_INFINITY : requestedCap;
+    if (logCap !== Number.POSITIVE_INFINITY && (!Number.isFinite(logCap) || logCap < 1024)) {
+      throw new Error(
+        `bg spawn: maxLogBytes must be 0, Infinity, or >= 1024 (got ${String(requestedCap)})`,
+      );
+    }
+
     let proc: ReturnType<typeof Bun.spawn>;
     try {
       proc = Bun.spawn({
-        cmd: ['bash', '-c', input.command],
+        cmd,
         cwd,
         // env scrubbed at the boundary — same defense the synchronous
         // bash tool applies. Without this, a model can spawn a bg
         // process whose command echoes the harness's API keys to the
         // log file and exfiltrate via bash_output. Defense in depth;
         // sandbox (M3+) is the next layer.
-        env: scrubEnv(process.env),
-        stdout: Bun.file(stdoutPath),
-        stderr: Bun.file(stderrPath),
+        //
+        // Slice 157 (phase 2): overlay `TMPDIR=<sandboxTmpdir>` on
+        // darwin so mktemp / NSTemporaryDirectory in the sandboxed
+        // bash inherit the scoped path. The TMPDIR override sits on
+        // top of scrubEnv because scrubEnv only allowlists; TMPDIR
+        // isn't on the allowlist by default. Merged AFTER scrubEnv
+        // so an attacker injecting TMPDIR via env wouldn't get past
+        // scrub anyway.
+        env: {
+          ...scrubEnv(process.env),
+          ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
+        },
+        // Slice 173 — `bash -s` reads the script from stdin. We
+        // pipe `input.command` into the child and close stdin so
+        // bash sees EOF and processes the script. The body never
+        // appears in `/proc/<pid>/cmdline`.
+        stdin: 'pipe',
+        // Slice 153 (review): pipes instead of Bun.file(path). The
+        // manager drains each pipe into the corresponding log file
+        // via `drainStream`, owning the fd directly so it can apply
+        // the truncate-head cap without racing the kernel writer.
+        stdout: 'pipe',
+        stderr: 'pipe',
+        // Slice 148 (BG1 — process-group isolation): `detached: true`
+        // wraps the child in setsid() on Unix, placing it in a fresh
+        // process group whose group leader is the child itself. That
+        // matters because the typical bg shape is `bash -c "<cmd>"`
+        // where `<cmd>` spawns its own children (npm run dev → node →
+        // webpack; pytest --watch → many subprocs). Without setsid,
+        // those grandchildren share the parent shell's PG; a
+        // `proc.kill('SIGTERM')` to the wrapping bash signals ONLY
+        // bash, and the grandchildren get orphaned to PID 1 holding
+        // their ports / file locks until the next system reboot.
+        // With setsid, killing by PG (`process.kill(-pid, sig)` —
+        // see killProcessGroup below) cascades to every descendant,
+        // exactly what the bg manager's lifecycle needs.
+        detached: true,
       });
       // Unref the subprocess so it does NOT keep the parent event
       // loop alive. A bg process is by definition long-running
@@ -315,6 +735,23 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // exit handler subscribes via `proc.exited` which still
       // resolves on detached children — no reaping regression.
       proc.unref();
+
+      // Slice 173 — feed the bash script over stdin and close so
+      // the child sees EOF and runs the script. Best-effort: if
+      // the pipe broke before we could write (child crashed on
+      // exec), the child exits non-zero and `proc.exited`
+      // surfaces it through the normal lifecycle. We do NOT want
+      // a failed stdin write to mask a `proc spawn ok` row.
+      try {
+        const stdin = (
+          proc as unknown as { stdin: { write: (s: string) => unknown; end: () => unknown } }
+        ).stdin;
+        stdin.write(input.command);
+        stdin.end();
+      } catch {
+        // Best-effort. proc.exited still resolves with the child's
+        // actual exit code; finalize will record it.
+      }
     } catch (e) {
       // Spawn-time failure (typical: bash not on PATH — vanishingly
       // rare on this stack — or cwd doesn't exist). Record the
@@ -347,6 +784,67 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       stderrLogPath: stderrPath,
       spawnedAt,
     });
+
+    // Slice 153 (review): spawn the two drainer tasks. Each owns
+    // its file fd; truncate-head when the on-disk size would
+    // exceed `logCap`. `dropped` is mutated by reference and read
+    // by `readOutput` to map persisted absolute cursors onto the
+    // current file offset.
+    //
+    // Type-narrow proc.stdout / proc.stderr: Bun.spawn returns
+    // `number | ReadableStream | undefined` depending on the
+    // redirection mode. We just passed 'pipe' for both, so they
+    // MUST be ReadableStreams; the runtime guard is defense in
+    // depth against a future Bun version that returns a different
+    // shape for 'pipe'.
+    const stdoutStream = proc.stdout as unknown;
+    const stderrStream = proc.stderr as unknown;
+    if (!(stdoutStream instanceof ReadableStream) || !(stderrStream instanceof ReadableStream)) {
+      throw new Error(
+        `bg spawn: expected stdout/stderr to be piped ReadableStreams (got stdout=${typeof stdoutStream}, stderr=${typeof stderrStream})`,
+      );
+    }
+    // Slice 153 (review): drainer notifies on truncate-head via
+    // DB increment. Survives process exit + session restart;
+    // readOutput reads the persisted counter from the row.
+    const stdoutDrainer = drainStream(stdoutStream, stdoutPath, logCap, (n) => {
+      try {
+        incrementBgProcessStdoutBytesDropped(db, id, n);
+      } catch {
+        // DB may have closed mid-shutdown. Drainer's own counter
+        // is canonical for the live session via the row lookup
+        // in readOutput; a failed DB write loses the increment
+        // but doesn't corrupt anything else.
+      }
+    }).catch((e) => {
+      // Drainer crash is best-effort — surface as stderr (operator-
+      // visible) and let the process continue. The bash output the
+      // operator sees may stop advancing, but the process is alive
+      // and a future readOutput will still read whatever made it
+      // to disk before the drainer died.
+      // Slice 178 (review — P2). Redact secrets in the error
+      // message: a write/truncate failure on the log fd can include
+      // bound parameter values from internal Bun/Node error shapes
+      // that wrapped the on-disk content (rare but possible). The
+      // log file itself is already chmod 0600 (slice 172) so
+      // operator's stderr is the only fanout vector.
+      process.stderr.write(
+        `forja bg: stdout drainer failed for pid=${proc.pid} id=${id}: ${redactSecrets(e instanceof Error ? e.message : String(e))}\n`,
+      );
+    });
+    const stderrDrainer = drainStream(stderrStream, stderrPath, logCap, (n) => {
+      try {
+        incrementBgProcessStderrBytesDropped(db, id, n);
+      } catch {
+        // see stdout comment
+      }
+    }).catch((e) => {
+      // Slice 178: parallel redaction with the stdout drainer above.
+      process.stderr.write(
+        `forja bg: stderr drainer failed for pid=${proc.pid} id=${id}: ${redactSecrets(e instanceof Error ? e.message : String(e))}\n`,
+      );
+    });
+    const drainersSettled = Promise.all([stdoutDrainer, stderrDrainer]).then(() => undefined);
 
     // Optional runtime cap. Schedules a SIGTERM (with normal grace
     // → SIGKILL escalation) after maxRuntimeMs. Stored locally so
@@ -386,6 +884,22 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         // pointless task in the loop and keeps the timer
         // referenced for its full duration).
         if (runtimeTimer !== undefined) clearTimeout(runtimeTimer);
+        // Slice 153 (review): wait for the drainers to finish
+        // reading the pipes before we declare the process ended.
+        // Bun.spawn closes the pipes when the child exits;
+        // drainStream loops break on read.done. Awaiting here
+        // guarantees that any readOutput call AFTER the `ended`
+        // event sees the final bytes on disk. Skip the await if
+        // it takes more than ~2s — defensive against a pathological
+        // drainer (shouldn't happen with the design but a stuck
+        // disk write shouldn't block the manager's lifecycle).
+        try {
+          await Promise.race([drainersSettled, sleep(2000)]);
+        } catch {
+          // sleep abort or drainer reject — both are swallowed
+          // because the manager's lifecycle shouldn't depend on
+          // drainer success.
+        }
         try {
           const current = getBgProcess(db, id);
           // If status was already moved to 'killed' or 'failed',
@@ -429,7 +943,7 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       }
     })();
 
-    live.set(id, { proc, exitedSettled });
+    live.set(id, { proc, exitedSettled, drainersSettled });
     // Emit AFTER live.set so getStatus() called from within the
     // observer is consistent with the in-memory state.
     safeEmit({
@@ -475,20 +989,49 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // end < cursor cannot drag the cursor backward.
     const isExplicitStdoutSince = opts.sinceStdout !== undefined;
     const isExplicitStderrSince = opts.sinceStderr !== undefined;
-    const stdoutStart = opts.sinceStdout ?? row.stdoutCursorPosition;
-    const stderrStart = opts.sinceStderr ?? row.stderrCursorPosition;
+    // Slice 153 (review): cursors are ABSOLUTE bytes-since-spawn.
+    // Pre-slice they were file offsets, which broke under truncate-
+    // head: a cursor of 50MB before truncate pointed past the new
+    // file end after the drainer dropped 30MB of head. Now the
+    // file offset is derived by subtracting the persisted dropped
+    // count from the absolute cursor.
+    //   file_offset = max(0, cursor - dropped)
+    //   total_absolute = file_size + dropped
+    // Reads happen relative to the file's current state but the
+    // accounting is in absolute bytes-since-spawn space, so a
+    // since= value from a previous response remains valid after a
+    // truncate.
+    const stdoutDropped = row.stdoutBytesDropped;
+    const stderrDropped = row.stderrBytesDropped;
+    const stdoutAbsStart = opts.sinceStdout ?? row.stdoutCursorPosition;
+    const stderrAbsStart = opts.sinceStderr ?? row.stderrCursorPosition;
+    const stdoutFileStart = Math.max(0, stdoutAbsStart - stdoutDropped);
+    const stderrFileStart = Math.max(0, stderrAbsStart - stderrDropped);
     const maxBytes = opts.maxBytes ?? DEFAULT_OUTPUT_READ_LIMIT_BYTES;
 
-    const stdoutTotal = fileSize(row.stdoutLogPath);
-    const stderrTotal = fileSize(row.stderrLogPath);
+    const stdoutFileSize = fileSize(row.stdoutLogPath);
+    const stderrFileSize = fileSize(row.stderrLogPath);
+    // Total absolute = file size + dropped (bytes truncated from
+    // head). Pending = total - current cursor.
+    const stdoutTotalAbs = stdoutFileSize + stdoutDropped;
+    const stderrTotalAbs = stderrFileSize + stderrDropped;
 
     // Two cursors, two windows. Each stream advances independently
     // — without this, a noisy stdout would strand stderr writes
     // (see migration 006 for the failure trace). Spec §7.3 surface
     // (`bash_output(process_id, since?)`) was vague on multiple
     // streams; we extend it to dual since.
-    const stdoutWin = await readWindow(row.stdoutLogPath, stdoutStart, maxBytes);
-    const stderrWin = await readWindow(row.stderrLogPath, stderrStart, maxBytes);
+    const stdoutWin = await readWindow(row.stdoutLogPath, stdoutFileStart, maxBytes);
+    const stderrWin = await readWindow(row.stderrLogPath, stderrFileStart, maxBytes);
+
+    // Convert file-offset ends back to absolute for cursor advance
+    // + return value. dropped read here may be slightly newer than
+    // when we computed start — drainer truncate concurrent with
+    // read advances dropped, but readWindow's end is in the file
+    // coords of when the read happened. Adding the CURRENT dropped
+    // would over-count. Use the same dropped values captured above.
+    const stdoutAbsEnd = stdoutWin.end + stdoutDropped;
+    const stderrAbsEnd = stderrWin.end + stderrDropped;
 
     // Cursor advance for canonical reads (no explicit `since`).
     // The local `> row.X` check is intentionally absent: the row
@@ -501,110 +1044,183 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // layer via `WHERE <cursor_col> < ?`; out-of-order writes
     // from concurrent readers become no-ops there.
     if (!isExplicitStdoutSince) {
-      advanceBgProcessStdoutCursor(db, id, stdoutWin.end);
+      advanceBgProcessStdoutCursor(db, id, stdoutAbsEnd);
     }
     if (!isExplicitStderrSince) {
-      advanceBgProcessStderrCursor(db, id, stderrWin.end);
+      advanceBgProcessStderrCursor(db, id, stderrAbsEnd);
     }
 
     return {
       stdout: stdoutWin.text,
       stderr: stderrWin.text,
-      stdoutCursor: stdoutWin.end,
-      stderrCursor: stderrWin.end,
+      stdoutCursor: stdoutAbsEnd,
+      stderrCursor: stderrAbsEnd,
       status: row.status,
       exitCode: row.exitCode,
-      stdoutPending: Math.max(0, stdoutTotal - stdoutWin.end),
-      stderrPending: Math.max(0, stderrTotal - stderrWin.end),
+      stdoutPending: Math.max(0, stdoutTotalAbs - stdoutAbsEnd),
+      stderrPending: Math.max(0, stderrTotalAbs - stderrAbsEnd),
     };
   };
 
+  // Slice 151 (review): per-id dedup for concurrent kill() callers.
+  // Pre-slice two callers entering kill(id) simultaneously both saw
+  // status='running', both called handle.proc.kill('SIGTERM'), both
+  // awaited exitedSettled, both called finalizeBgProcess. The
+  // second escalation timer (after grace) could fire SIGKILL on an
+  // already-dead PID; on Linux the kernel filters and it's
+  // harmless, but with PID reuse it would signal an unrelated
+  // victim. Dedupe by caching the in-flight kill promise per id;
+  // concurrent callers AWAIT the same promise rather than racing
+  // their own signal+grace cycles.
+  const inFlightKills = new Map<string, Promise<KillResult>>();
+
   const kill = async (id: string, opts: KillInput = {}): Promise<KillResult> => {
-    const row = getBgProcess(db, id);
-    if (row === null) {
-      throw new Error(`bg process not found: ${id}`);
-    }
-    if (row.sessionId !== sessionId) {
-      throw new Error(`bg process not in this session: ${id}`);
-    }
+    // Concurrent caller: piggyback on the in-flight kill. Same
+    // result, no second SIGTERM/SIGKILL cycle, no PID-reuse race.
+    const inFlight = inFlightKills.get(id);
+    if (inFlight !== undefined) return inFlight;
 
-    // Idempotent on already-finished processes: report current
-    // state, no signals sent, no DB writes.
-    if (row.status !== 'running') {
-      return {
-        status: row.status,
-        exitCode: row.exitCode,
-        exitedAt: row.exitedAt,
-      };
-    }
-
-    const handle = live.get(id);
-    if (handle === undefined) {
-      // DB says running but no live handle — possible if a prior
-      // kill raced or the process exited between getBgProcess and
-      // here. Mark as killed in DB to converge state and return.
-      finalizeBgProcess(db, { id, status: 'killed' });
-      return { status: 'killed', exitCode: null, exitedAt: Date.now() };
-    }
-
-    const initialSignal = opts.signal ?? 'SIGTERM';
-    const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_KILL_GRACE_MS;
-
-    // Mark BEFORE sending the signal so the exitedSettled handler
-    // (which races us to the finish line) sees the marker and emits
-    // status='killed' instead of 'exited'. Cleared in exitedSettled's
-    // finally — no leak even if kill() throws between here and the
-    // signal taking effect.
-    killing.add(id);
-    handle.proc.kill(initialSignal);
-
-    if (initialSignal !== 'SIGKILL') {
-      // Wait up to gracePeriodMs for graceful exit. Promise.race so
-      // a fast-exiting process doesn't pay the full grace; an abort
-      // of the sleep on graceful exit avoids a leaked timer.
-      const ac = new AbortController();
-      try {
-        await Promise.race([
-          handle.exitedSettled.then(() => ac.abort()),
-          sleep(gracePeriodMs, ac.signal),
-        ]);
-      } catch {
-        // sleep aborted on graceful exit — that's the success path
+    const killPromise = (async (): Promise<KillResult> => {
+      const row = getBgProcess(db, id);
+      if (row === null) {
+        throw new Error(`bg process not found: ${id}`);
       }
-      // If still running after grace, escalate.
-      const stillRunning = getBgProcess(db, id)?.status === 'running';
-      if (stillRunning) {
+      if (row.sessionId !== sessionId) {
+        throw new Error(`bg process not in this session: ${id}`);
+      }
+
+      // Idempotent on already-finished processes: report current
+      // state, no signals sent, no DB writes.
+      if (row.status !== 'running') {
+        return {
+          status: row.status,
+          exitCode: row.exitCode,
+          exitedAt: row.exitedAt,
+        };
+      }
+
+      const handle = live.get(id);
+      if (handle === undefined) {
+        // DB says running but no live handle — possible if a prior
+        // kill raced or the process exited between getBgProcess and
+        // here. Slice 151: preserve the DB's existing exitCode +
+        // exitedAt if the natural-exit handler ran between the
+        // getBgProcess snapshot above (line 713) and this point.
+        // Pre-slice the DB write hard-coded null and clobbered any
+        // exit metadata the handler captured.
+        const existing = getBgProcess(db, id);
+        const preservedExitCode = existing?.exitCode ?? null;
+        const preservedExitedAt = existing?.exitedAt ?? Date.now();
+        finalizeBgProcess(db, {
+          id,
+          status: 'killed',
+          exitCode: preservedExitCode,
+          exitedAt: preservedExitedAt,
+        });
+        return { status: 'killed', exitCode: preservedExitCode, exitedAt: preservedExitedAt };
+      }
+
+      const initialSignal = opts.signal ?? 'SIGTERM';
+      const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_KILL_GRACE_MS;
+
+      // Mark BEFORE sending the signal so the exitedSettled handler
+      // (which races us to the finish line) sees the marker and emits
+      // status='killed' instead of 'exited'. Cleared in exitedSettled's
+      // finally — no leak even if kill() throws between here and the
+      // signal taking effect.
+      killing.add(id);
+      // Slice 148 (BG1): kill the whole process group so grandchildren
+      // are reaped along with the bash wrapper.
+      killProcessGroup(handle.proc, initialSignal);
+
+      if (initialSignal !== 'SIGKILL') {
+        // Wait up to gracePeriodMs for graceful exit. Promise.race so
+        // a fast-exiting process doesn't pay the full grace; an abort
+        // of the sleep on graceful exit avoids a leaked timer.
+        const ac = new AbortController();
         try {
-          handle.proc.kill('SIGKILL');
+          await Promise.race([
+            handle.exitedSettled.then(() => ac.abort()),
+            sleep(gracePeriodMs, ac.signal),
+          ]);
         } catch {
-          // process already gone — race between status check and
-          // kill is benign; the DB update below settles state
+          // sleep aborted on graceful exit — that's the success path
         }
+        // If still running after grace, escalate.
+        const stillRunning = getBgProcess(db, id)?.status === 'running';
+        if (stillRunning) {
+          // Slice 148 (BG1): SIGKILL the whole process group. ESRCH
+          // (race with natural exit) is handled inside the helper.
+          killProcessGroup(handle.proc, 'SIGKILL');
+          await handle.exitedSettled;
+        }
+      } else {
         await handle.exitedSettled;
       }
-    } else {
-      await handle.exitedSettled;
-    }
 
-    // Force-mark as killed even if the natural-exit handler beat us
-    // to 'exited' — operator-initiated termination is the correct
-    // status for the audit log regardless of signal timing.
-    const exitedAt = Date.now();
-    finalizeBgProcess(db, {
-      id,
-      status: 'killed',
-      exitCode: handle.proc.exitCode ?? null,
-      exitedAt,
-    });
+      // Force-mark as killed even if the natural-exit handler beat us
+      // to 'exited' — operator-initiated termination is the correct
+      // status for the audit log regardless of signal timing.
+      const exitedAt = Date.now();
+      finalizeBgProcess(db, {
+        id,
+        status: 'killed',
+        exitCode: handle.proc.exitCode ?? null,
+        exitedAt,
+      });
 
-    return {
-      status: 'killed',
-      exitCode: handle.proc.exitCode ?? null,
-      exitedAt,
+      return {
+        status: 'killed',
+        exitCode: handle.proc.exitCode ?? null,
+        exitedAt,
+      };
+    })();
+
+    // Register the in-flight promise + clear on settle. We use
+    // `then(cleanup, cleanup)` rather than `.finally(cleanup)`
+    // because `.finally` returns a NEW promise that mirrors the
+    // original rejection; without a catch on that derived promise,
+    // a kill that throws (e.g. `bg process not found`) surfaces as
+    // an unhandled rejection event. `then(handler, handler)`
+    // attaches the SAME cleanup to both resolve and reject paths
+    // without creating a derived chain that needs its own catch.
+    // The original killPromise is the only one returned to the
+    // caller — they handle its rejection (or not) on the surface
+    // they care about.
+    inFlightKills.set(id, killPromise);
+    const cleanup = (): void => {
+      // Only delete if this is still the registered promise — a
+      // future kill cycle for the same id should not be cleared
+      // by an old completion. (Same id can't have two in-flight
+      // kills at once by construction, but defense in depth.)
+      if (inFlightKills.get(id) === killPromise) {
+        inFlightKills.delete(id);
+      }
     };
+    killPromise.then(cleanup, cleanup);
+    return killPromise;
   };
 
   const cleanup = async (): Promise<{ killed: number }> => {
+    // Slice 151 (review): count distinct rows we transitioned, not
+    // the sum of `ids.length + flipped`. Pre-slice cleanup returned
+    // `ids.length + flipped`: for a typical scenario where 3 live
+    // handles all get killed cleanly, `kill()` for each marks
+    // status='killed' on its DB row, then `markRunningAsKilled`
+    // touches 0 rows → flipped=0 → total=3. Correct. But when a
+    // kill THREW between signal-sent and finalize (Promise.allSettled
+    // swallows the rejection), the row stayed 'running';
+    // `markRunningAsKilled` then flipped it, and `ids.length + flipped`
+    // double-counted: ids.length counted the killed-attempt, flipped
+    // counted the same row in its straggler-pass. Reported "6 killed"
+    // for 3 live processes.
+    //
+    // Fix: snapshot ALL session rows with status='running' BEFORE
+    // touching anything, then run kills + flip, then return the
+    // snapshot count. That's the definition that matches operator
+    // intent: "rows we transitioned out of running".
+    const runningBefore = listBgProcessesBySession(db, sessionId, { status: 'running' });
+    const runningBeforeCount = runningBefore.length;
     const ids = [...live.keys()];
     // Send SIGTERM to all in parallel, then wait for the grace cycle
     // collectively. Sequential kill would multiply wall-clock by N
@@ -616,8 +1232,8 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // Defensive: any DB row still 'running' after the kill round
     // gets flipped. Catches the case where a kill threw (process
     // disappeared, etc.) — DB shouldn't lie.
-    const flipped = markRunningAsKilled(db, sessionId);
-    return { killed: ids.length + flipped };
+    markRunningAsKilled(db, sessionId);
+    return { killed: runningBeforeCount };
   };
 
   const liveCount = (): number => live.size;

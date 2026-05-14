@@ -424,6 +424,44 @@ describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
     expect(tracker.max).toBe(1);
   });
 
+  // Slice 135 P1 conc-4: soft-stop signal already aborted when
+  // the harness begins a step. The mid-batch test (D173, below)
+  // covers signal aborting WHILE tools execute; the pre-step
+  // case is the lighter weight scenario the harness must short-
+  // circuit on — zero provider requests, no tool execution.
+  test('pre-step soft-stop bails before any provider call (slice 135 P1 conc-4)', async () => {
+    const softCtrl = new AbortController();
+    softCtrl.abort(); // soft-stop already aborted
+    const tracker = makeTracker();
+    const tool = parallelEcho('p_read', { delayMs: 30, tracker });
+    const handle = mockProvider([
+      {
+        tool_uses: [{ id: 'tu1', name: 'p_read', input: { msg: '1' } }],
+        stop_reason: 'tool_use',
+      },
+    ]);
+    const registry = createToolRegistry();
+    registry.register(tool);
+    const result = await runAgent({
+      provider: handle.provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(
+        { defaults: { mode: 'strict' as const }, tools: {} },
+        { cwd: '/p' },
+      ),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      softStopSignal: softCtrl.signal,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
+    // Pre-step bail: provider never invoked, tool never executed.
+    expect(handle.requests).toHaveLength(0);
+    expect(tracker.max).toBe(0);
+  });
+
   test('soft-stop fired mid-batch lets the batch complete; loop bails at next step (D173)', async () => {
     const softCtrl = new AbortController();
     const tracker = makeTracker();

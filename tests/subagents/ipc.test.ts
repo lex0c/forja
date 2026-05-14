@@ -685,3 +685,213 @@ describe('IPC processTransport — Node streams', () => {
     expect(got).toEqual(['literal-string']);
   });
 });
+
+// Slice 135 P0-9: subprocessTransport against a REAL Bun-spawned
+// child process. Previous tests cover the in-memory stream pair —
+// they prove the framer + emitter wiring works against
+// `ReadableStream` / `WritableStream` mocks. This block locks the
+// production behavior end-to-end through `Bun.spawn`:
+//   - the parent's `subprocessTransport` sees lines from a real
+//     child's stdout, in order;
+//   - when the child exits (i.e., the writer dies), the parent's
+//     onClose fires (EOF propagation);
+//   - when the parent calls close() while the child is still
+//     alive, the child's stdin sees EOF (the symmetric "parent
+//     death" path — the child's `processTransport.onClose` fires
+//     on its end, which here is observed via the child writing a
+//     marker before exiting cleanly).
+//
+// Failure mode this catches: a regression that breaks the FileSink
+// vs. WritableStream branch in subprocessTransport (e.g., an
+// upgrade to Bun changing the stdin shape) would silently fail
+// EOF propagation on real subprocesses while the in-memory
+// stream tests stay green. End-to-end real-spawn coverage is the
+// only honest assertion that the production path still works.
+describe('subprocessTransport — real Bun.spawn child (slice 135 P0-9)', () => {
+  const waitForClose = (t: IpcTransport, timeoutMs = 2_000): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('onClose timeout')), timeoutMs);
+      t.onClose(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
+  test('child exits → parent observes lines in order + onClose', async () => {
+    // Child: write three lines + flush + exit 0. Bun's `-e` runs
+    // the literal source; we keep it self-contained so the test
+    // doesn't depend on a fixture file on disk.
+    const child = Bun.spawn({
+      cmd: [
+        'bun',
+        '-e',
+        `process.stdout.write('one\\n');
+         process.stdout.write('two\\n');
+         process.stdout.write('three\\n');
+         // Drain stdin so the child doesn't EPIPE when the parent
+         // hasn't written yet — fine to read into the void.
+         setTimeout(() => process.exit(0), 10);`,
+      ],
+      stdin: 'pipe',
+      stdout: 'pipe',
+    });
+    const transport = subprocessTransport({
+      stdin: child.stdin,
+      stdout: child.stdout,
+    });
+    const got: string[] = [];
+    transport.onLine((l) => got.push(l));
+    await waitForClose(transport, 3_000);
+    expect(got).toEqual(['one', 'two', 'three']);
+    // exitCode is `number | null` — null means the child is still
+    // alive when we asked. Wait on the exit promise to settle to
+    // get the real code.
+    const code = await child.exited;
+    expect(code).toBe(0);
+  });
+
+  test('parent ends stdin → child sees EOF and exits cleanly', async () => {
+    // Child waits for EOF on stdin, then writes a marker and
+    // exits. If the parent correctly EOFs the child's stdin, the
+    // child reaches the marker write; if it doesn't, the child
+    // hangs until we time out.
+    //
+    // We end the child's stdin directly via the Bun.spawn handle
+    // rather than calling `transport.close()` — close() also
+    // cancels the parent's stdout reader, which would race against
+    // the child's "saw-eof" write and lose it. The production
+    // analogue of "parent death" is: the parent's process exits,
+    // the kernel closes its end of the pipes, the child sees EOF.
+    // The parent's read loop is already gone in that scenario, so
+    // we don't need it here either — but we DO need to keep the
+    // reader alive long enough to capture the child's confirmation
+    // marker before we declare success.
+    const child = Bun.spawn({
+      cmd: [
+        'bun',
+        '-e',
+        `let saw_eof = false;
+         process.stdin.on('end', () => {
+           saw_eof = true;
+           process.stdout.write('saw-eof\\n');
+           // Give stdout a tick to flush before exit.
+           setTimeout(() => process.exit(0), 10);
+         });
+         process.stdin.resume();
+         // Safety: if EOF never lands, exit 1 after 2s.
+         setTimeout(() => {
+           if (!saw_eof) {
+             process.stdout.write('timeout\\n');
+             process.exit(1);
+           }
+         }, 2000);`,
+      ],
+      stdin: 'pipe',
+      stdout: 'pipe',
+    });
+    const transport = subprocessTransport({
+      stdin: child.stdin,
+      stdout: child.stdout,
+    });
+    const got: string[] = [];
+    transport.onLine((l) => got.push(l));
+    // Yield once so the child's setTimeout-watchdog gets armed
+    // before we send EOF.
+    await new Promise((r) => setTimeout(r, 100));
+    // Send EOF on the child's stdin — directly via the spawn
+    // handle. This emulates "parent process exited" without
+    // tearing down our own read loop in the same call.
+    await child.stdin.end();
+    // Wait for the parent's read loop to see the child exit.
+    await waitForClose(transport, 3_000);
+    const code = await child.exited;
+    expect(code).toBe(0);
+    expect(got).toEqual(['saw-eof']);
+  });
+
+  test('parent writes a line → child reads it via processTransport (round-trip)', async () => {
+    // End-to-end: parent's write() goes through real pipes to the
+    // child's stdin. The child uses processTransport — the same
+    // path production children use — to read it. Echo back so the
+    // parent can verify the round-trip.
+    const child = Bun.spawn({
+      cmd: [
+        'bun',
+        '-e',
+        // We can't easily import processTransport in a -e literal
+        // (the source tree path would have to be threaded in), so
+        // emulate its byte-level contract: read until '\n', write
+        // the same line back, exit on the second '\n'.
+        `let buf = '';
+         let n = 0;
+         process.stdin.on('data', (chunk) => {
+           buf += chunk.toString('utf-8');
+           while (true) {
+             const i = buf.indexOf('\\n');
+             if (i < 0) break;
+             const line = buf.slice(0, i);
+             buf = buf.slice(i + 1);
+             process.stdout.write('echo:' + line + '\\n');
+             n += 1;
+             if (n >= 2) {
+               process.exit(0);
+             }
+           }
+         });`,
+      ],
+      stdin: 'pipe',
+      stdout: 'pipe',
+    });
+    const transport = subprocessTransport({
+      stdin: child.stdin,
+      stdout: child.stdout,
+    });
+    const got: string[] = [];
+    transport.onLine((l) => got.push(l));
+    transport.write('alpha\n');
+    transport.write('beta\n');
+    await waitForClose(transport, 3_000);
+    expect(got).toEqual(['echo:alpha', 'echo:beta']);
+    const code = await child.exited;
+    expect(code).toBe(0);
+  });
+
+  test('child killed via SIGKILL → parent sees EOF (broken-pipe path)', async () => {
+    // Child writes one line, blocks on stdin forever. Parent
+    // reads the line, then sends SIGKILL. The kernel tears the
+    // pipe down, the parent's read loop sees done=true, onClose
+    // fires.
+    const child = Bun.spawn({
+      cmd: [
+        'bun',
+        '-e',
+        `process.stdout.write('alive\\n');
+         process.stdin.resume();
+         // Never exits on its own.
+         setInterval(() => {}, 60_000);`,
+      ],
+      stdin: 'pipe',
+      stdout: 'pipe',
+    });
+    const transport = subprocessTransport({
+      stdin: child.stdin,
+      stdout: child.stdout,
+    });
+    const got: string[] = [];
+    transport.onLine((l) => got.push(l));
+    // Wait until the 'alive' marker arrives.
+    for (let i = 0; i < 50 && got.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(got).toEqual(['alive']);
+    // Now SIGKILL the child. Bun.spawn surfaces a `kill` method
+    // that proxies the kernel signal.
+    child.kill('SIGKILL');
+    await waitForClose(transport, 3_000);
+    // SIGKILL ⇒ child exited via signal; Bun reports the exitCode
+    // as null when the process died by signal (varies by platform
+    // — checking it's not 0 is the portable assertion).
+    const code = await child.exited;
+    expect(code).not.toBe(0);
+  });
+});

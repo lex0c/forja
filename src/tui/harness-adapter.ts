@@ -618,6 +618,30 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         });
         return out;
 
+      case 'sandbox_degraded_active': {
+        // §13.6 degraded banner (slice 92). Non-suppressible
+        // operator-facing warning. First emission uses a stronger
+        // "no longer available" headline; recurring nudges use
+        // "still" so operators see whether the issue has been
+        // freshly detected vs is ongoing.
+        const reasonSuffix = event.reason.length > 0 ? ` (${event.reason})` : '';
+        const headline = event.firstEmission
+          ? `⚠ Sandbox no longer available${reasonSuffix}`
+          : `⚠ Sandbox still unavailable${reasonSuffix}`;
+        out.push({ type: 'warn', ts, message: headline });
+        out.push({
+          type: 'warn',
+          ts,
+          message: '  All tool calls now require manual confirmation.',
+        });
+        out.push({
+          type: 'warn',
+          ts,
+          message: "  Run 'agent doctor' to investigate.",
+        });
+        return out;
+      }
+
       case 'subagent_start':
         // Pass-through into the existing UIEvent shape (defined in
         // events.ts). The harness producer carries `prompt` (the

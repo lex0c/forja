@@ -170,9 +170,21 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     const script: ScriptedStep[] = [
       {
         tool_uses: [
-          { id: 'tu1', name: 'task_async', input: { subagent: 'explore', prompt: 'find auth' } },
-          { id: 'tu2', name: 'task_async', input: { subagent: 'explore', prompt: 'find queue' } },
-          { id: 'tu3', name: 'task_async', input: { subagent: 'explore', prompt: 'find db' } },
+          {
+            id: 'tu1',
+            name: 'task_async',
+            input: { subagent: 'explore', prompt: 'find auth', capabilities: [] },
+          },
+          {
+            id: 'tu2',
+            name: 'task_async',
+            input: { subagent: 'explore', prompt: 'find queue', capabilities: [] },
+          },
+          {
+            id: 'tu3',
+            name: 'task_async',
+            input: { subagent: 'explore', prompt: 'find db', capabilities: [] },
+          },
         ],
         stop_reason: 'tool_use',
       },
@@ -299,7 +311,11 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     const script: ScriptedStep[] = [
       {
         tool_uses: [
-          { id: 'tu1', name: 'task_async', input: { subagent: 'explore', prompt: 'go' } },
+          {
+            id: 'tu1',
+            name: 'task_async',
+            input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+          },
         ],
         stop_reason: 'tool_use',
       },
@@ -438,7 +454,11 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     const script: ScriptedStep[] = [
       {
         tool_uses: [
-          { id: 'tu1', name: 'task_async', input: { subagent: 'explore', prompt: 'go' } },
+          {
+            id: 'tu1',
+            name: 'task_async',
+            input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+          },
         ],
         stop_reason: 'tool_use',
       },
@@ -632,7 +652,11 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     const script: ScriptedStep[] = [
       {
         tool_uses: [
-          { id: 'tu1', name: 'task_async', input: { subagent: 'explore', prompt: 'go' } },
+          {
+            id: 'tu1',
+            name: 'task_async',
+            input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+          },
         ],
         stop_reason: 'tool_use',
       },

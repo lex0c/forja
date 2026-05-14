@@ -32,6 +32,7 @@ export type HookEvent =
   | 'UserPromptSubmit'
   | 'PreToolUse'
   | 'PostToolUse'
+  | 'PostToolUseFailure'
   | 'PreCompact'
   | 'Notification'
   | 'PreCheckpoint'
@@ -105,6 +106,18 @@ export interface HookSpec {
   // the chain. With `sourcePath`, this is the canonical
   // identity pair for `hook_runs.hook_index` (migration 019).
   entryIndex: number;
+  // Slice 181 — per-handler filter using permission-rule syntax
+  // (`Bash(rm *)`, `Edit(*.ts)`). Optional. Only evaluated on
+  // tool events (PreToolUse / PostToolUse / PostToolUseFailure)
+  // — other events ignore it. When set, the hook spawns ONLY
+  // when the tool input matches the rule pattern in addition
+  // to the matcher. Reuses `permissions/matcher.ts` semantics:
+  // `Bash(rm *)` is matched against each subcommand after env-
+  // prefix strip; `Edit(<glob>)` against `args.file_path`. For
+  // patterns that can't be parsed against the current tool, the
+  // hook runs (fail-open, defensive — operator's intent was a
+  // filter, not a deny).
+  if?: string;
 }
 
 // Resolved config for a session — the full ordered list of hooks
@@ -114,6 +127,14 @@ export interface ResolvedHookConfig {
   // → user → project. Within a layer, declaration order is
   // preserved per spec §10 line 1042-1045.
   hooks: readonly HookSpec[];
+  // Slice 181 — global kill switch. True when ANY layer set
+  // `disable_all_hooks = true` at the top of its hooks.toml.
+  // Once true, the dispatcher short-circuits the entire chain
+  // (no spawn, no audit, no matcher evaluation). The flag is
+  // OR'd across layers: enterprise can pin it (lower layers
+  // can't un-set), and user/project can disable hooks locally
+  // for debug without enterprise. Spec AGENTIC_CLI.md §10.3.3.
+  disableAllHooks: boolean;
   // Diagnostics surfaced to the operator at boot — mirrors
   // `permissions/hierarchy.ts` LockConflict pattern. Examples:
   // user-layer locked-flag ignored, project-layer attempted to
@@ -154,6 +175,12 @@ export type HookEventPayload =
     }
   | { schema: 'v1'; event: 'PreToolUse'; sessionId: string; data: ToolUseData }
   | { schema: 'v1'; event: 'PostToolUse'; sessionId: string; data: PostToolUseData }
+  | {
+      schema: 'v1';
+      event: 'PostToolUseFailure';
+      sessionId: string;
+      data: PostToolUseFailureData;
+    }
   | { schema: 'v1'; event: 'PreCompact'; sessionId: string; data: PreCompactData }
   | { schema: 'v1'; event: 'Notification'; sessionId: string; data: NotificationData }
   | { schema: 'v1'; event: 'PreCheckpoint'; sessionId: string; data: PreCheckpointData }
@@ -173,6 +200,17 @@ export interface ToolUseData {
 }
 export interface PostToolUseData {
   tool: { name: string; input: Record<string, unknown>; output: unknown; failed: boolean };
+}
+// Slice 181 — paralelo a PostToolUseData mas dedicado a falhas.
+// Pre-slice o operator que queria reagir a uma falha de tool
+// precisava ler `PostToolUseData.tool.failed` em CADA handler.
+// PostToolUseFailure fica como evento dedicado: handlers escritos
+// pra ele só rodam quando a falha ocorre. Útil pra alerts + retry
+// logic + log forensic. O field `error` carrega a mensagem
+// estruturada (paralelo ao `failure_events.payload.error_message`).
+export interface PostToolUseFailureData {
+  tool: { name: string; input: Record<string, unknown>; error: string };
+  durationMs: number;
 }
 export interface PreCompactData {
   promptTokens: number;
@@ -203,7 +241,20 @@ export interface StopData {
 // decision table). Audit row in `hook_runs` is written by
 // dispatcher regardless of outcome.
 export type HookRunResult =
-  | { kind: 'allow'; stdoutTruncated: string; durationMs: number }
+  | {
+      kind: 'allow';
+      stdoutTruncated: string;
+      durationMs: number;
+      // Slice 181 — JSON output parsing. When the hook's stdout is
+      // valid JSON with these well-known fields, the dispatcher
+      // surfaces them here for the caller to act on. Plain-text
+      // stdout sets these to undefined and the caller treats the
+      // run as a normal allow. All fields are optional; a hook
+      // can emit any subset.
+      additionalContext?: string;
+      updatedInput?: Record<string, unknown>;
+      suppressOutput?: boolean;
+    }
   | { kind: 'block_silent'; durationMs: number }
   | { kind: 'block_message'; message: string; durationMs: number }
   | {
@@ -234,6 +285,20 @@ export interface HookChainResult {
   // All hook runs, in execution order. Dispatcher emits one
   // `hook_runs` audit row per entry.
   runs: ReadonlyArray<{ spec: HookSpec; result: HookRunResult }>;
+  // Slice 181 — aggregated `additionalContext` from every allow
+  // result in the chain that returned JSON output. Caller (harness)
+  // injects this into the LLM's next call. Multiple hooks emitting
+  // additionalContext concatenate in execution order with `\n\n`
+  // separators (paralelo a Claude Code's "Claude receives all of
+  // the values"). Empty when no hook contributed.
+  additionalContext: string;
+  // Slice 181 — last-wins updatedInput from the chain. Only the
+  // FINAL allow result with `updatedInput` set survives; earlier
+  // mutations are discarded. Caller (harness, PreToolUse path)
+  // uses this to replace `args` before tool execution. Undefined
+  // when no hook emitted updatedInput. Other events ignore this
+  // field (it's only meaningful pre-execution).
+  updatedInput?: Record<string, unknown>;
 }
 
 // Default per-event timeout when the spec doesn't override.

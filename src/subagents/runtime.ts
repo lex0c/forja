@@ -298,6 +298,28 @@ export interface RunSubagentInput {
   // legacy disk-re-resolve path (preserving pre-migration
   // behavior for fixtures that don't model the snapshot).
   hooksSnapshot?: readonly HookSpec[];
+  // PERMISSION_ENGINE.md §10.1 — effective capability envelope at
+  // spawn time (slice 95). The harness loop's spawn factory
+  // already computes the intersection `parent_caps ∩ declared_caps`
+  // to refuse on excess; slice 95 also forwards the SURVIVING
+  // `effective` set here so `runSubagent` can seal it into the
+  // child's audit row. The child engine reads the row and
+  // configures `EngineOptions.effectiveCapabilities`, gating
+  // every resolved cap against the declared envelope at
+  // evaluation time.
+  //
+  // Tri-state:
+  //   - `undefined` — caller didn't pass declared (programmatic
+  //     test fixture, or a legacy code path). Row's
+  //     `effective_capabilities` column stays NULL; child engine
+  //     runs WITHOUT a §10.1 bound. Same forensic story as
+  //     `hooksSnapshot=undefined` — "no snapshot taken".
+  //   - `[]` — pure-LLM child (declared = []). Sealed as `'[]'`
+  //     into the column; child denies any non-empty resolved
+  //     cap.
+  //   - `['cap', ...]` — narrowed envelope. Sealed verbatim;
+  //     child gates each resolved cap via cwd-aware coverage.
+  effectiveCapabilities?: readonly string[];
   // Permission proxy callback (spec docs/spec/IPC.md §7,
   // permission:ask / permission:answer slice). When the child's
   // engine returns a `confirm` verdict, the child bridge
@@ -568,6 +590,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // fields persist for forward-compat consumer slices.
       ...(definition.contextRecipe !== undefined
         ? { contextRecipe: definition.contextRecipe }
+        : {}),
+      // PERMISSION_ENGINE.md §10.1 effective envelope (migration
+      // 040, slice 95). Forwarded only when the caller explicitly
+      // computed it — `undefined` keeps the column NULL (root /
+      // legacy semantics). The harness's spawn factory passes
+      // the `effective` array from `intersectCapabilities`; the
+      // child engine reads the column at startup and gates
+      // every resolved capability against this envelope.
+      ...(input.effectiveCapabilities !== undefined
+        ? { effectiveCapabilities: input.effectiveCapabilities }
         : {}),
     });
   } catch (e) {

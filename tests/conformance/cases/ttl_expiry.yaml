@@ -1,0 +1,197 @@
+# Conformance: §8 grant TTL + expiry contracts (PERMISSION_ENGINE.md §8,
+# src/permissions/engine.ts grants integration).
+#
+# The engine path runs normally; the runner seeds a grants snapshot
+# via `setup.grants` + `setup.now`. The snapshot builder filters the
+# seed list at construction time (mirrors the SQL repo's
+# `WHERE expires_at > snapshot_ts AND revoked_at IS NULL` clause), so
+# the engine sees exactly the live grants for the case's `now` value.
+#
+# Coverage groups (counts per §16.2 minimum of 6):
+#   A. Active grant matches and authorizes  (1)
+#   B. Expired grant does NOT authorize     (1)
+#   C. Revoked grant does NOT authorize     (1)
+#   D. Deny rule wins over grant            (1)
+#   E. Grant overrides confirm rule         (1)
+#   F. Wrong-capability filter (write-fs)   (1)
+#
+# Together these pin: the §8 grant + policy precedence, the TTL/
+# revocation lifecycle, and the per-section capability-kind filter
+# slice 40 added so a read-only grant can't authorize destructive
+# writes.
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Active grant matches
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "ttl_expiry: active grant authorizes matching bash command"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash: {}
+    grants:
+      - id: "01JN0000000000000000000001"
+        scope_kind: "pattern"
+        scope_value: "git status*"
+        capability: "exec:shell"
+        expires_at: 9999999999999
+    now: 1000
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status -s"
+  expect:
+    kind: "allow"
+    source_layer: "session"
+    source_section: "grants"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Expired grant
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "ttl_expiry: expired grant is filtered from snapshot → default-deny in strict mode"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash: {}
+    grants:
+      # expires_at <= now → filtered out by the snapshot builder per
+      # spec §8 strict-`>` semantics. Engine sees an empty grants
+      # list, falls through to policy, and strict-mode default-deny
+      # fires.
+      - id: "01JN0000000000000000000002"
+        scope_kind: "pattern"
+        scope_value: "git status*"
+        capability: "exec:shell"
+        expires_at: 1000
+    now: 1000
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status -s"
+  expect:
+    kind: "deny"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — Revoked grant
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "ttl_expiry: revoked grant is filtered from snapshot → default-deny"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash: {}
+    grants:
+      # revoked_at set (any value) → filtered out unconditionally,
+      # regardless of expires_at. Engine never sees the grant.
+      - id: "01JN0000000000000000000003"
+        scope_kind: "pattern"
+        scope_value: "git status*"
+        capability: "exec:shell"
+        expires_at: 9999999999999
+        revoked_at: 500
+    now: 1000
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status -s"
+  expect:
+    kind: "deny"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group D — Deny rule wins over grant
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "ttl_expiry: deny rule wins over an active grant"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          deny: ["rm -rf *"]
+    grants:
+      # Grant covers ALL bash commands (`*`). Deny rule for `rm -rf *`
+      # must still fire — deny is non-overridable per spec §8 (slice
+      # 40 ordered the grant check AFTER deny for this reason).
+      - id: "01JN0000000000000000000004"
+        scope_kind: "pattern"
+        scope_value: "*"
+        capability: "exec:shell"
+        expires_at: 9999999999999
+    now: 1000
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+    reason_substring: "rm -rf *"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group E — Grant overrides confirm rule
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "ttl_expiry: grant overrides a would-be confirm (operator pre-approved)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          confirm: ["git push *"]
+    grants:
+      # The operator previously approved `git push *` for this
+      # session window. Without the grant the confirm rule would
+      # fire; with the grant the call short-circuits to allow.
+      - id: "01JN0000000000000000000005"
+        scope_kind: "pattern"
+        scope_value: "git push *"
+        capability: "exec:shell"
+        expires_at: 9999999999999
+    now: 1000
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "allow"
+    source_layer: "session"
+    source_section: "grants"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group F — Wrong-capability filter
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "ttl_expiry: read-fs grant does NOT authorize write_file (capability-kind filter)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        write_file: {}
+    grants:
+      # read-fs grant — `grantRelevantForSection` (slice 40) rejects
+      # it for write_file (write_file needs write-fs prefix). The
+      # path glob matches but the kind doesn't; the grant is dropped
+      # in the per-section filter and the call falls through to
+      # strict-mode deny.
+      - id: "01JN0000000000000000000006"
+        scope_kind: "pattern"
+        scope_value: "src/**"
+        capability: "read-fs:src/**"
+        expires_at: 9999999999999
+    now: 1000
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "src/foo.ts"
+  expect:
+    kind: "deny"

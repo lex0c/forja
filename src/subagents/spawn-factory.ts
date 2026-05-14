@@ -1,5 +1,6 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { scrubEnv } from '../sanitize/env.ts';
 import {
   IPC_PROTOCOL_VERSION,
   type IpcChannel,
@@ -252,7 +253,25 @@ export const drainStderrToLogFile = (
           }
           try {
             mkdirSync(logDir, { recursive: true });
-            const writer = Bun.file(join(logDir, 'stderr.log')).writer();
+            // Slice 172 (review — information-leak P1): subagent
+            // stderr can carry the same secret-shaped payloads as
+            // bg logs (panics with env dumps, stack traces from
+            // tools that echoed Bearer tokens). Lock down dir +
+            // file to operator-only. Best-effort across exotic FS.
+            try {
+              chmodSync(logDir, 0o700);
+            } catch {
+              // Best-effort.
+            }
+            const stderrPath = join(logDir, 'stderr.log');
+            const writer = Bun.file(stderrPath).writer();
+            try {
+              chmodSync(stderrPath, 0o600);
+            } catch {
+              // Best-effort. Bun.file().writer() lazy-creates the
+              // file on first write — chmod here may race the
+              // create. The dir 0700 is the load-bearing barrier.
+            }
             sink = {
               write: (chunk) => {
                 writer.write(chunk);
@@ -343,10 +362,17 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   //     attach to the channel. Spec §2.3 requires the parent
   //     to drain stdout continuously — the channel's pump loop
   //     does this from the moment subprocessTransport binds.
+  // Slice 128 (R4 P1): subagent spawn now applies scrubEnv (slice
+  // 105 already wired this for the broker spawn). Pre-slice the
+  // child inherited every operator secret (API keys, vault tokens,
+  // ssh-agent socket — the new R4 P1 additions). A child whose
+  // whitelist allowed bash could `env | grep -i token` and recover
+  // credentials the parent meant to strip. Symmetric coverage at
+  // the subagent boundary closes the gap.
   const proc = Bun.spawn({
     cmd,
     cwd: opts.cwd,
-    env: process.env,
+    env: scrubEnv(process.env),
     ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',
   });

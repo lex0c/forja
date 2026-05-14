@@ -41,6 +41,40 @@ export interface ParsedArgs {
   // Pre-TUI substitute for the spec's interactive `Type 'undo' to
   // confirm` prompt; headless friendly.
   yes: boolean;
+  // Resume boot under a known-broken audit chain
+  // (PERMISSION_ENGINE.md §7.2). Default false: a broken chain
+  // refuses the engine and exit code is 2. With this flag, a
+  // `chain-break-accepted` audit row is emitted before any new
+  // decisions — the override itself is audited and visible in the
+  // chain forever.
+  acceptBrokenChain?: boolean;
+  // Explicit operator opt-in for the `host` sandbox profile
+  // (PERMISSION_ENGINE.md §6.5). Without this flag the sandbox
+  // planner refuses to fall back to the `host` (passthrough)
+  // profile even when policy and capabilities would allow it.
+  // Pairs with the `host-passthrough` capability in the
+  // resolved set — BOTH are required before host is selectable.
+  sandboxHost?: boolean;
+  // §13.7 broker mode (slice 87). `in-process` (default) keeps
+  // the bash exec in main via the in-process broker — bit-for-bit
+  // equivalent to the pre-§13.7 path. `spawn` flips bootstrap to
+  // construct `createSpawnBroker` against `bun run
+  // src/broker/worker.ts`, moving exec into a separate worker
+  // subprocess per call. Closes spec line 928 ("CLI main não tem
+  // exec privilege"). Compiled-binary mode is not supported yet —
+  // bootstrap surfaces a clear error if the worker source isn't
+  // on disk.
+  brokerMode?: 'in-process' | 'spawn';
+  // §13.5 first-boot UX (slice 91). When set, the welcome /
+  // sandbox-setup flow creates `~/.config/forja/sandbox_skip`
+  // (if not already present) AND skips the re-prompt for this
+  // run. Subsequent sessions see the marker + skip the prompt
+  // entirely. The spec calls this the "silent skip" gate that's
+  // intentionally hard to engage: the long flag name signals
+  // intent unambiguously; no short form. Operator-facing UX
+  // ONLY — does NOT bypass any policy / permission / sandbox
+  // enforcement at runtime.
+  iKnowWhatImDoing?: boolean;
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
   // `agent --checkpoints restore <session> <latest-ckpt>` but
@@ -195,6 +229,90 @@ export interface ParsedArgs {
   // (recap_start / recap_intermediate / recap_render / recap_end);
   // without `--json`, headless output is the rendered string only.
   recap?: { args: string[] };
+  // `agent doctor [--json]` — §13 platform provisioning surface.
+  // Runs a series of health checks (platform info, sandbox tool
+  // availability, config + data dir writability, git binary
+  // presence) and renders a structured report. Exit 0 on all-pass,
+  // 1 if any check fails. Pairs with the global `--json` toggle to
+  // emit NDJSON one-line-per-check + a summary line, same shape
+  // convention as --list-sessions / --explain-permissions.
+  //
+  // First slice on §13 — foundation for future `agent sandbox
+  // setup` + broker/worker architecture.
+  doctor?: { json: boolean };
+  // `agent sandbox <verb> [args]` — §13 platform provisioning
+  // operator surface. Verb is the second token. Currently:
+  //   setup — print the recommended sandbox install command for
+  //           the detected platform / distribution.
+  sandbox?: { verb: 'setup'; json: boolean };
+  // `agent welcome` — §13.5 first-boot walkthrough. Composes doctor
+  // + sandbox setup + next-steps menu into a guided intro. Idempotent
+  // — running it later as a "checkup" is fine.
+  welcome?: true;
+  // `agent permission <verb> [positionals]` — operator surface for
+  // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
+  //   - 'verify'       — walk the audit hash chain for the current
+  //                      install_id; exit 0 (intact) / 1 (broken).
+  //   - 'rotate-chain' — archive the current `approvals_log` segment
+  //                      under a new rotation_id and start a fresh
+  //                      chain (§7.2). `--reason` is captured into the
+  //                      `chain_meta.reason` column for forensics.
+  // Future slices add 'replay', 'revoke', 'list', 'test'.
+  permission?: {
+    verb: string;
+    positionals: string[];
+    reason?: string;
+    // `agent permission replay <seq> --without-classifier` (§17 mode).
+    // Hint-only-impact analysis: split the row's deterministic score
+    // from the classifier adjust and report whether the classifier
+    // moved the decision across the §6.6 threshold.
+    withoutClassifier?: boolean;
+    // `agent permission replay <seq> --against-current-policy` (§17 mode).
+    // Re-executes the decision pipeline using the row's args (recovered
+    // via approval_call_links + tool_calls.input) against the ACTIVE
+    // policy. Reports the original decision vs the replayed one;
+    // diverging outcomes flag policy drift impact.
+    againstCurrentPolicy?: boolean;
+    // `agent permission replay <seq> --against-archived-policy` (§17
+    // mode, slice 96). The canonical reproducibility test: re-executes
+    // the pipeline using the row's args against the EXACT policy bytes
+    // that produced the row (looked up by `row.policy_hash` in the
+    // `policy_archive` table populated at engine bootstrap). When the
+    // archive hit is present, this is the "would replay reproduce
+    // bit-for-bit?" check the spec §17 calls for. Skipped when the
+    // archive doesn't contain the row's hash (pre-archive boot, or
+    // archive rotated out).
+    againstArchivedPolicy?: boolean;
+    // `agent permission inspect <rotation_id> --clear` (§7.2).
+    // Flips chain_meta.quarantined to 0 for the named rotation after
+    // the operator confirms the archived segment is benign. Without
+    // this flag, `inspect` is read-only — render chain_meta + the
+    // archived-row count for the rotation_id.
+    clearQuarantine?: boolean;
+    // `agent permission grants --all` (§8). Default lists only
+    // active (non-expired, non-revoked) grants. `--all` includes
+    // every row for forensic audit (expired + revoked).
+    allGrants?: boolean;
+    // `agent permission policy-rollback --write` (§12.4 slice 50).
+    // Without this flag, the verb is dry-run: prints the planned
+    // rollback summary without touching the target file. With it,
+    // canonical_json bytes are written to the target and an audit
+    // row is emitted per spec line 756.
+    rollbackWrite?: boolean;
+    // `agent permission policy-rollback --target <file>` override.
+    // Default `.agent/permissions.yaml` (project-local). Operators
+    // pointing at a user-level or enterprise YAML pass --target.
+    rollbackTarget?: string;
+    // `agent permission calibration-export --since-days <N>`
+    // (slice 138, §6.3.2 step 1). Time window in days; default
+    // 30. Must be > 0.
+    sinceDays?: number;
+    // `agent permission calibration-export --all-decisions`.
+    // Widens the decision filter to '*' (every approval_log row).
+    // Default keeps the spec's clean-label set
+    // (confirm-allowed + confirm-denied) per §6.3.2.1.
+    allDecisions?: boolean;
+  };
 }
 
 export interface ParseError {
@@ -396,11 +514,661 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
+// `agent welcome` — §13.5 first-boot walkthrough. Accepts --help
+// and --i-know-what-im-doing (slice 91, creates the
+// `~/.config/forja/sandbox_skip` marker + silences sandbox setup
+// in future sessions). Plain text only (operators wanting
+// structured data call `agent doctor --json` / `agent sandbox
+// setup --json` directly).
+const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => {
+  // Welcome is detected ONLY at argv[0], matching every other
+  // subcommand in this parser (init / recap / sandbox / doctor /
+  // permission). An earlier cut scanned the entire argv via
+  // `findIndex(t => t === 'welcome')` to accommodate
+  // `agent --i-know-what-im-doing welcome` (welcome after a
+  // flag) — but that regression-broke any normal prompt
+  // containing the literal word `welcome`. `agent --json
+  // welcome` (operator's prompt is the word "welcome", wants
+  // JSON output) and `agent hello welcome world` (prompt is a
+  // sentence containing the word) both got mis-routed into the
+  // welcome subcommand, where the surrounding tokens become
+  // "unknown welcome flags" — a hard error on inputs that
+  // should just be prompts.
+  //
+  // The flag-then-welcome case the earlier cut was trying to
+  // accept is already covered by the top-level
+  // `--i-know-what-im-doing` rejection path: an operator who
+  // types `agent --i-know-what-im-doing welcome` hits the
+  // explicit error pointing at `agent welcome
+  // --i-know-what-im-doing` (the canonical form), so the UX is
+  // recoverable without sacrificing prompt parsing.
+  if (argv.length === 0 || argv[0] !== 'welcome') return null;
+  const welcomeArgs = argv.slice(1);
+  let iKnow = false;
+  for (let i = 0; i < welcomeArgs.length; i += 1) {
+    const token = welcomeArgs[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--i-know-what-im-doing') {
+      iKnow = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent welcome: unknown flag '${token}' (only --help and --i-know-what-im-doing are accepted)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json: false,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      welcome: true,
+      ...(iKnow ? { iKnowWhatImDoing: true } : {}),
+    },
+  };
+};
+
+// `agent sandbox <verb> [--json]` — §13 platform provisioning
+// guided bootstrap. First verb: `setup` (slice 44). Future verbs
+// will cover sandbox profile testing + introspection.
+const KNOWN_SANDBOX_VERBS = ['setup'] as const;
+
+const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'sandbox') return null;
+  if (argv.length === 1) {
+    return {
+      ok: false,
+      message: `usage: agent sandbox <${KNOWN_SANDBOX_VERBS.join('|')}> [--json]`,
+    };
+  }
+  const verb = argv[1];
+  if (verb === undefined) {
+    return { ok: false, message: 'agent sandbox: missing verb' };
+  }
+  if (!KNOWN_SANDBOX_VERBS.includes(verb as (typeof KNOWN_SANDBOX_VERBS)[number])) {
+    return {
+      ok: false,
+      message: `agent sandbox: unknown verb '${verb}' (expected: ${KNOWN_SANDBOX_VERBS.join('|')})`,
+    };
+  }
+  let json = false;
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent sandbox ${verb}: unknown flag '${token}' (only --json and --help are accepted)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      sandbox: { verb: 'setup', json },
+    },
+  };
+};
+
+// `agent doctor [--json]` — §13 platform provisioning health
+// check. No positionals, no verb. Top-level subcommand mirroring
+// the `init` / `recap` / `permission` shape.
+const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'doctor') return null;
+  let json = false;
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent doctor: unknown flag '${token}' (only --json and --help are accepted)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      doctor: { json },
+    },
+  };
+};
+
+// `agent permission <verb> [positionals]` — operator surface for the
+// v2 permission engine (PERMISSION_ENGINE.md). Mirrors the recap /
+// init parsers: verb is the second token, everything after is
+// positional. `--json` is honored as a top-level toggle so headless
+// scripts can switch the verify output to NDJSON.
+//
+// Current verbs:
+//   verify        — walk the audit hash chain. Exit 0 = intact, 1 =
+//                   broken or bootstrap error.
+//   rotate-chain  — archive current chain under a new rotation_id and
+//                   start fresh (§7.2). `--reason "<text>"` captures
+//                   the motive into chain_meta.reason; required, no
+//                   default — operator action without a written reason
+//                   is audit-hostile and rejected at parse.
+//
+// Verbs:
+//   verify        — walk the audit hash chain.
+//   rotate-chain  — archive + start a fresh chain (§7.2).
+//   replay        — render every input the engine saw for a past
+//                   decision identified by its seq, flag policy
+//                   drift (§17). Default mode (slice 12),
+//                   --without-classifier (slice 14),
+//                   --against-current-policy (slice 16) all routed
+//                   here.
+//   diff          — cross-row comparison of two audit rows by seq.
+//                   Renders field-by-field diff + capabilities set
+//                   diff + score-components deltas (§17 cross-row).
+//   inspect       — operator surface for a rotation event (§7.2
+//                   quarantine clearance). Renders chain_meta +
+//                   archived row count; `--clear` flips the
+//                   quarantine flag after the operator confirms the
+//                   archived segment is benign.
+//   grants        — list §8 persisted grants. Active by default;
+//                   `--all` includes revoked + expired rows for
+//                   forensic audit.
+//   revoke        — revoke a grant by id (§8 line 621). Idempotent
+//                   per spec; `--reason <text>` optional but
+//                   recommended (audit forensics).
+//   policy-list   — enumerate the policy_archive (§12.4 read
+//                   surface). Each row is a UNIQUE policy hash the
+//                   engine ever booted with; pairs with future
+//                   `policy-rollback` for the write side.
+//   policy-rollback — revert to a previous archived policy (§12.4
+//                     write side). Dry-run by default; `--write`
+//                     commits the canonical JSON to the target file
+//                     and emits an audit event per spec line 756.
+//                     `--target <file>` overrides the default
+//                     `.agent/permissions.yaml`. Positional <hash>
+//                     identifies the archive entry.
+//
+// Future verbs (each lands in its own slice):
+//   list           — show approvals log entries
+//   test           — run conformance suite
+const KNOWN_PERMISSION_VERBS = [
+  'verify',
+  'rotate-chain',
+  'replay',
+  'diff',
+  'inspect',
+  'grants',
+  'revoke',
+  'policy-list',
+  'policy-rollback',
+  // §7.3 sealing CLI verbs (slice 58).
+  'seal-now',
+  'seal-verify',
+  // §6.3.2 step 1 calibration extractor (slice 138).
+  'calibration-export',
+] as const;
+
+const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'permission') return null;
+  if (argv.length === 1) {
+    return {
+      ok: false,
+      message: `usage: agent permission <${KNOWN_PERMISSION_VERBS.join('|')}> [--json] [--reason <text>]`,
+    };
+  }
+  const verb = argv[1];
+  if (verb === undefined) {
+    return { ok: false, message: 'agent permission: missing verb' };
+  }
+  if (!KNOWN_PERMISSION_VERBS.includes(verb as (typeof KNOWN_PERMISSION_VERBS)[number])) {
+    return {
+      ok: false,
+      message: `agent permission: unknown verb '${verb}' (expected: ${KNOWN_PERMISSION_VERBS.join('|')})`,
+    };
+  }
+  let json = false;
+  let reason: string | undefined;
+  let withoutClassifier = false;
+  let againstCurrentPolicy = false;
+  let againstArchivedPolicy = false;
+  let clearQuarantine = false;
+  let allGrants = false;
+  let rollbackWrite = false;
+  let rollbackTarget: string | undefined;
+  let sinceDays: number | undefined;
+  let allDecisions = false;
+  const positionals: string[] = [];
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    if (token === '--reason') {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return {
+          ok: false,
+          message: 'agent permission: --reason requires a non-empty text value',
+        };
+      }
+      reason = value;
+      i += 1;
+      continue;
+    }
+    if (token === '--without-classifier') {
+      withoutClassifier = true;
+      continue;
+    }
+    if (token === '--against-current-policy') {
+      againstCurrentPolicy = true;
+      continue;
+    }
+    if (token === '--against-archived-policy') {
+      againstArchivedPolicy = true;
+      continue;
+    }
+    if (token === '--clear') {
+      clearQuarantine = true;
+      continue;
+    }
+    if (token === '--all') {
+      allGrants = true;
+      continue;
+    }
+    if (token === '--write') {
+      rollbackWrite = true;
+      continue;
+    }
+    if (token === '--target') {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return {
+          ok: false,
+          message: 'agent permission policy-rollback: --target requires a file path',
+        };
+      }
+      rollbackTarget = value;
+      i += 1;
+      continue;
+    }
+    if (token === '--since-days') {
+      const value = argv[i + 1];
+      if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
+        return {
+          ok: false,
+          message: 'agent permission calibration-export: --since-days requires a positive integer',
+        };
+      }
+      sinceDays = Number.parseInt(value, 10);
+      i += 1;
+      continue;
+    }
+    if (token === '--all-decisions') {
+      allDecisions = true;
+      continue;
+    }
+    positionals.push(token);
+  }
+  if (allGrants && verb !== 'grants') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --all only applies to 'grants'`,
+    };
+  }
+  if ((rollbackWrite || rollbackTarget !== undefined) && verb !== 'policy-rollback') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --write / --target only apply to 'policy-rollback'`,
+    };
+  }
+  if (withoutClassifier && verb !== 'replay') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --without-classifier only applies to 'replay'`,
+    };
+  }
+  if (againstCurrentPolicy && verb !== 'replay') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --against-current-policy only applies to 'replay'`,
+    };
+  }
+  if (againstArchivedPolicy && verb !== 'replay') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --against-archived-policy only applies to 'replay'`,
+    };
+  }
+  if ((sinceDays !== undefined || allDecisions) && verb !== 'calibration-export') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --since-days / --all-decisions only apply to 'calibration-export'`,
+    };
+  }
+  if (clearQuarantine && verb !== 'inspect') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --clear only applies to 'inspect'`,
+    };
+  }
+  if (verb === 'rotate-chain') {
+    if (reason === undefined || reason.trim().length === 0) {
+      return {
+        ok: false,
+        message:
+          'agent permission rotate-chain: --reason <text> is required (forensic record of why the chain was rotated)',
+      };
+    }
+  }
+  if (verb === 'replay') {
+    // <seq> is a single positional. We reject zero/negative/non-numeric
+    // upstream — exact integer parsing keeps the runtime handler's
+    // contract tight (no NaN, no fractional ids).
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission replay: exactly one <seq> positional is required (e.g. `agent permission replay 42`)',
+      };
+    }
+    const raw = positionals[0] as string;
+    if (!/^\d+$/.test(raw)) {
+      return {
+        ok: false,
+        message: `agent permission replay: <seq> must be a positive integer (got '${raw}')`,
+      };
+    }
+    const seq = Number.parseInt(raw, 10);
+    if (seq <= 0 || !Number.isSafeInteger(seq)) {
+      return {
+        ok: false,
+        message: `agent permission replay: <seq> out of range (got ${raw})`,
+      };
+    }
+  }
+  if (verb === 'inspect') {
+    // Single <rotation_id> positional; same int validation as replay.
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission inspect: exactly one <rotation_id> positional is required (e.g. `agent permission inspect 1`)',
+      };
+    }
+    const raw = positionals[0] as string;
+    if (!/^\d+$/.test(raw)) {
+      return {
+        ok: false,
+        message: `agent permission inspect: <rotation_id> must be a positive integer (got '${raw}')`,
+      };
+    }
+    const rotationId = Number.parseInt(raw, 10);
+    if (rotationId <= 0 || !Number.isSafeInteger(rotationId)) {
+      return {
+        ok: false,
+        message: `agent permission inspect: <rotation_id> out of range (got ${raw})`,
+      };
+    }
+  }
+  if (verb === 'diff') {
+    // Two seqs required, same validation as the replay positional —
+    // tight contract on the runtime handler. Distinct seqs are NOT
+    // enforced at parse: comparing a row to itself is harmless (all
+    // fields show ✓ same) and operationally useful as a sanity check.
+    if (positionals.length !== 2) {
+      return {
+        ok: false,
+        message:
+          'agent permission diff: exactly two <seq> positionals are required (e.g. `agent permission diff 42 43`)',
+      };
+    }
+    for (const raw of positionals) {
+      if (!/^\d+$/.test(raw)) {
+        return {
+          ok: false,
+          message: `agent permission diff: <seq> must be a positive integer (got '${raw}')`,
+        };
+      }
+      const seq = Number.parseInt(raw, 10);
+      if (seq <= 0 || !Number.isSafeInteger(seq)) {
+        return {
+          ok: false,
+          message: `agent permission diff: <seq> out of range (got ${raw})`,
+        };
+      }
+    }
+  }
+  if (verb === 'grants') {
+    // No positionals; --all is the only verb-specific flag.
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission grants: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: 'agent permission grants: --reason only applies to revoke / rotate-chain',
+      };
+    }
+  }
+  if (verb === 'policy-list') {
+    // Read-only enumeration of policy_archive (§12.4 read side).
+    // No positionals, no verb-specific flags besides --json.
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission policy-list: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: 'agent permission policy-list: --reason only applies to revoke / rotate-chain',
+      };
+    }
+  }
+  if (verb === 'policy-rollback') {
+    // <hash> positional required; ULID-shape NOT validated here
+    // (policy_archive hashes are sha256, not ULID — the handler
+    // validates against the archive contents instead). --write
+    // commits, --target overrides default `.agent/permissions.yaml`.
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission policy-rollback: exactly one <hash> positional is required (e.g. `agent permission policy-rollback sha256:abc...`)',
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: 'agent permission policy-rollback: --reason only applies to revoke / rotate-chain',
+      };
+    }
+  }
+  if (verb === 'revoke') {
+    // Single <id> positional — ULID-shape validation in the handler
+    // (CLI knows the ULID alphabet only via isUlid; keeping the
+    // import out of args.ts avoids dragging permissions/ulid.ts
+    // through every parse). Empty / multi-positional rejected here.
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission revoke: exactly one <id> positional is required (e.g. `agent permission revoke 01JN...`)',
+      };
+    }
+  }
+  if (verb === 'seal-now' || verb === 'seal-verify') {
+    // Both §7.3 sealing verbs take no positionals and no verb-
+    // specific flags besides --json. Reason/target/etc are not
+    // applicable; reject up front so a stray flag doesn't pass
+    // silently and lead to confused operator follow-up.
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: --reason only applies to revoke / rotate-chain`,
+      };
+    }
+  }
+  if (verb === 'calibration-export') {
+    // §6.3.2 step 1 — no positionals, only --since-days /
+    // --all-decisions / --json / --limit (limit defaults).
+    if (positionals.length !== 0) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: no positionals expected (got ${positionals.length})`,
+      };
+    }
+    if (reason !== undefined) {
+      return {
+        ok: false,
+        message: `agent permission ${verb}: --reason only applies to revoke / rotate-chain`,
+      };
+    }
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      permission: {
+        verb,
+        positionals,
+        ...(reason !== undefined ? { reason } : {}),
+        ...(withoutClassifier ? { withoutClassifier: true } : {}),
+        ...(againstCurrentPolicy ? { againstCurrentPolicy: true } : {}),
+        ...(againstArchivedPolicy ? { againstArchivedPolicy: true } : {}),
+        ...(clearQuarantine ? { clearQuarantine: true } : {}),
+        ...(allGrants ? { allGrants: true } : {}),
+        ...(rollbackWrite ? { rollbackWrite: true } : {}),
+        ...(rollbackTarget !== undefined ? { rollbackTarget } : {}),
+        ...(sinceDays !== undefined ? { sinceDays } : {}),
+        ...(allDecisions ? { allDecisions: true } : {}),
+      },
+    },
+  };
+};
+
 export const parseArgs = (argv: readonly string[]): ParseResult => {
   const initParsed = parseInitSubcommand(argv);
   if (initParsed !== null) return initParsed;
   const recapParsed = parseRecapSubcommand(argv);
   if (recapParsed !== null) return recapParsed;
+  const doctorParsed = parseDoctorSubcommand(argv);
+  if (doctorParsed !== null) return doctorParsed;
+  const sandboxParsed = parseSandboxSubcommand(argv);
+  if (sandboxParsed !== null) return sandboxParsed;
+  const welcomeParsed = parseWelcomeSubcommand(argv);
+  if (welcomeParsed !== null) return welcomeParsed;
+  const permissionParsed = parsePermissionSubcommand(argv);
+  if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
     prompt: '',
     json: false,
@@ -466,6 +1234,46 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.yes = true;
         i += 1;
         break;
+      case '--accept-broken-chain':
+        args.acceptBrokenChain = true;
+        i += 1;
+        break;
+      case '--sandbox-host':
+        args.sandboxHost = true;
+        i += 1;
+        break;
+      case '--broker': {
+        const value = argv[i + 1];
+        if (value === undefined || value.startsWith('-')) {
+          return {
+            ok: false,
+            message: '--broker requires a mode (in-process|spawn)',
+          };
+        }
+        if (value !== 'in-process' && value !== 'spawn') {
+          return {
+            ok: false,
+            message: `--broker mode must be 'in-process' or 'spawn', got '${value}'`,
+          };
+        }
+        args.brokerMode = value;
+        i += 2;
+        break;
+      }
+      case '--i-know-what-im-doing':
+        // Slice 123 (R9 P1): pre-slice this case silently accepted
+        // the flag at the top level, but `args.iKnowWhatImDoing` is
+        // only ever read inside the `args.welcome === true` branch
+        // in `run.ts` — so `agent --i-know-what-im-doing` (without
+        // the `welcome` verb) parsed successfully and did nothing.
+        // Now it's rejected with a pointer to the correct invocation
+        // so operators don't silently no-op their unsafe-mode
+        // acknowledgment.
+        return {
+          ok: false,
+          message:
+            '--i-know-what-im-doing is only valid as a flag of `agent welcome`; use `agent welcome --i-know-what-im-doing`',
+        };
       case '--undo': {
         const value = argv[i + 1];
         if (value === undefined || value.startsWith('--')) {
@@ -863,7 +1671,7 @@ export const usage = (): string =>
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
     '  --memory <verb>        Inspect cross-session memory (verb: list [scope] | show <name> [scope])',
-    '  --explain-permissions  Print the resolved permission policy + per-section layer attribution and exit',
+    '  --explain-permissions  Print the resolved permission policy + per-section layer attribution and exit (pair with --json for NDJSON output)',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',
@@ -877,4 +1685,7 @@ export const usage = (): string =>
     '  agent --json "what changed in the last commit?" > events.ndjson',
     '  agent --list-sessions --json',
     '  agent --resume last "now refactor the parts you flagged"',
+    '  agent doctor             Health check: platform, sandbox tools, config + data dirs, git',
+    '  agent sandbox setup      Print the recommended sandbox install command for this platform',
+    '  agent welcome            First-boot walkthrough: composes doctor + sandbox setup + next steps',
   ].join('\n');

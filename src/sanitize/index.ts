@@ -5,3 +5,4 @@ export {
   stripAnsi,
 } from './ansi.ts';
 export { scrubEnv } from './env.ts';
+export { redactSecrets } from './secrets.ts';

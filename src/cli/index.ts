@@ -24,6 +24,23 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // §13.5 first-boot nudge (slice 46). Fires when install_id doesn't
+  // exist yet, EXCEPT on §13 verbs (welcome/doctor/sandbox) — the
+  // operator is already on the setup path and pointing them back to
+  // it would be noise. Goes to stderr so stdout stays pure for JSON
+  // consumers; one-shot per install (install_id gets created by the
+  // next normal bootstrap and the nudge stops firing).
+  const inSetupFlow =
+    args.welcome === true || args.doctor !== undefined || args.sandbox !== undefined;
+  if (!inSetupFlow) {
+    const { isFirstBoot } = await import('../permissions/install_id.ts');
+    if (isFirstBoot()) {
+      process.stderr.write(
+        'forja: first run detected — try `agent welcome` for a setup walkthrough.\n',
+      );
+    }
+  }
+
   // `agent init` — scaffold .agent/permissions.yaml. Pure
   // filesystem work, no provider/DB needed; same lazy-import
   // posture as the other handlers below so a broken provider
@@ -111,7 +128,24 @@ const main = async (): Promise<number> => {
     // `args.recap.args` and never expects a free-text prompt — the
     // empty-prompt check below would otherwise route it into the
     // REPL TTY gate or the `--json requires a prompt` rejection.
-    args.recap !== undefined;
+    args.recap !== undefined ||
+    // `agent doctor` (§13 slice 43) is the headless platform-health
+    // surface. No prompt, no provider, no REPL — same exemption as
+    // the other lifecycle modes above.
+    args.doctor !== undefined ||
+    // `agent sandbox setup` (§13 slice 44) — same lifecycle-mode
+    // exemption as doctor. Pure informational verb.
+    args.sandbox !== undefined ||
+    // `agent welcome` (§13.5 slice 45) — first-boot walkthrough.
+    // Composes doctor + sandbox setup; same lifecycle-mode shape.
+    args.welcome === true ||
+    // `agent permission <verb>` (PERMISSION_ENGINE.md operator
+    // surface) — every verb is DB-only and one-shot; no prompt,
+    // no provider, no REPL. Pre-fixup the empty-prompt branch
+    // hit before the run.ts dispatcher could route the verb, so
+    // `agent permission verify --json` produced "--json requires
+    // a prompt" instead of the chain integrity report.
+    args.permission !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

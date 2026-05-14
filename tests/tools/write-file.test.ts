@@ -53,4 +53,29 @@ describe('writeFileTool', () => {
     if (isToolError(out)) expect(out.error_code).toBe('tool.aborted');
     expect(existsSync(join(dir, 'x.txt'))).toBe(false);
   });
+
+  // Slice 129 (R5 P1 disk-fill): mirror read_file's 10 MiB cap on
+  // the write side. The cap is on encoded UTF-8 bytes, so even an
+  // input that's short in JS chars but big in UTF-8 (multi-byte
+  // codepoints) gets blocked.
+  test('refuses content above MAX_CONTENT_BYTES (10 MiB) and does NOT write the file', async () => {
+    // 10 MiB + 1 byte of ASCII → fails the cap by exactly one byte.
+    const oversized = 'a'.repeat(10 * 1024 * 1024 + 1);
+    const path = join(dir, 'too-big.txt');
+    const out = await writeFileTool.execute({ path, content: oversized }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('fs.write_failed');
+      expect(out.error_message).toMatch(/content too large/);
+    }
+    expect(existsSync(path)).toBe(false);
+  });
+
+  test('accepts exactly MAX_CONTENT_BYTES (boundary)', async () => {
+    const exactCap = 'a'.repeat(10 * 1024 * 1024);
+    const path = join(dir, 'cap.txt');
+    const out = await writeFileTool.execute({ path, content: exactCap }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(false);
+    if (!isToolError(out)) expect(out.bytes_written).toBe(10 * 1024 * 1024);
+  });
 });

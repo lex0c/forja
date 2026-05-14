@@ -503,7 +503,7 @@ You are the worker.`,
             yield {
               kind: 'tool_use_stop',
               id: 'tu1',
-              final_args: { subagent: 'worker', prompt: 'go' },
+              final_args: { subagent: 'worker', prompt: 'go', capabilities: [] },
             };
             yield { kind: 'stop', reason: 'tool_use' };
           } else {
@@ -1835,7 +1835,7 @@ You are the worker.`,
             yield {
               kind: 'tool_use_stop',
               id: 'tu1',
-              final_args: { subagent: 'nonexistent', prompt: 'go' },
+              final_args: { subagent: 'nonexistent', prompt: 'go', capabilities: [] },
             };
             yield { kind: 'stop', reason: 'tool_use' };
           } else {

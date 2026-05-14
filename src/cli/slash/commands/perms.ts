@@ -20,7 +20,7 @@
 // diverge from the on-disk format. Spec: AGENTIC_CLI §8.
 
 import type { Decision, PolicyCategory, ToolArgs } from '../../../permissions/index.ts';
-import { renderPolicy } from '../../../permissions/render.ts';
+import { renderPolicy, renderSandbox } from '../../../permissions/render.ts';
 import type { SlashCommand } from '../types.ts';
 
 // Re-export for tests + downstream consumers (a few tests still
@@ -128,6 +128,32 @@ const renderDryCheck = (decision: Decision): string[] => {
   return lines;
 };
 
+// `/perms why sandbox` — sandbox isn't a tool (no dry-check shape),
+// so this branch runs SEPARATELY from the per-tool `runWhy`. Renders
+// the merged sandbox section + per-field provenance from the engine.
+// Emits "(sandbox section not declared)" when no layer wrote it, so
+// the operator gets a definite answer instead of empty output.
+const runWhySandbox = (
+  ctx: Parameters<SlashCommand['exec']>[1],
+): ReturnType<SlashCommand['exec']> => {
+  const policy = ctx.baseConfig.permissionEngine.policy();
+  const provenance = ctx.baseConfig.permissionEngine.provenance();
+  if (policy.sandbox === undefined) {
+    return Promise.resolve({
+      kind: 'ok',
+      notes: [
+        '/perms why sandbox',
+        '  (sandbox section not declared by any policy layer)',
+        '  bootstrap defaults: required=false, host_allowed=false',
+      ],
+    });
+  }
+  return Promise.resolve({
+    kind: 'ok',
+    notes: ['/perms why sandbox', ...renderSandbox(policy.sandbox, provenance.sandbox)],
+  });
+};
+
 const runWhy = (
   args: readonly string[],
   ctx: Parameters<SlashCommand['exec']>[1],
@@ -146,6 +172,11 @@ const runWhy = (
       kind: 'error',
       message: '/perms why: missing tool name (e.g. /perms why bash npm test)',
     });
+  }
+  // §6.5 sandbox section introspection — not a tool, no dry-check.
+  // Hand off to the dedicated branch.
+  if (toolName === 'sandbox') {
+    return runWhySandbox(ctx);
   }
   const tool = ctx.baseConfig.toolRegistry.get(toolName);
   if (tool === null) {

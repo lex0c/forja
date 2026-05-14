@@ -1,0 +1,276 @@
+# Conformance: deterministic risk score weights (PERMISSION_ENGINE.md §6.3.1).
+#
+# `risk_score.yaml` pins THRESHOLD-shaped contracts ("score_gte 0.5 when these
+# features fire"). This file pins WEIGHT-EXACT contracts: identical inputs
+# produce a score that equals the sum of triggered RISK_SCORE_WEIGHTS, no
+# fuzz. Every case uses `score_gte: X AND score_lte: X` to assert equality.
+#
+# The §6.3 contract — score is a pure function of (capabilities, command,
+# confidence, engineState, recentErrors, isMcp, trustedHosts, cwd, home) —
+# is load-bearing for replay (slice 16): same engine version + same audit
+# inputs must reproduce the same score. A weight drift breaks reproducibility
+# silently unless something pins the values.
+#
+# Coverage groups (§16.2 minimum 10):
+#   A. Trusted-host egress baseline (no features)  (2)  github, npm registry
+#   B. Single-feature isolation                    (4)  untrusted_egress,
+#                                                       mcp_tool,
+#                                                       workspace_escape,
+#                                                       shell_complex
+#   C. Feature combinations sum exactly            (2)  cap+wildcard,
+#                                                       cap+blocklist+escape
+#   D. Clamp saturation at 1.0                     (1)
+#   E. Same features → same score (path agnostic)  (1)
+#
+# Weights pinned per §6.3.1 baseline-v2.0 (src/permissions/risk-score.ts):
+#   capability_risk    0.4    workspace_escape   0.15   untrusted_egress  0.25
+#   blocklist_command  0.3    wildcard_scope     0.2    shell_complex     0.2
+#   mcp_tool           0.1    confidence_medium  0.1    confidence_low    0.3
+#   recent_errors      0.15   engine_degraded    0.2
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Trusted-host egress baseline (no features fire)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "score determinism: bash curl github.com (trusted) → exact 0"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl https://github.com/x/y"
+  expect:
+    # DEFAULT_TRUSTED_HOSTS includes github.com → untrusted_egress does
+    # NOT fire. No other features apply. Score = 0 exactly.
+    kind: "allow"
+    score_gte: 0.0
+    score_lte: 0.0
+
+- name: "score determinism: bash curl registry.npmjs.org (trusted) → exact 0"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Pins the trust list includes the npm public registry — a regression
+      # that dropped npm from DEFAULT_TRUSTED_HOSTS would have curl-of-npm
+      # flag untrusted_egress and confirm-prompt every package install.
+      command: "curl https://registry.npmjs.org/express"
+  expect:
+    kind: "allow"
+    score_gte: 0.0
+    score_lte: 0.0
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Single-feature isolation (one feature, exact weight)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "score determinism: untrusted_egress alone → exact 0.25"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # evil.example.com is NOT in DEFAULT_TRUSTED_HOSTS → untrusted_egress
+      # fires (0.25). No dangerous capability (net-egress is not
+      # DANGEROUS_KINDS). No blocklist substring. No shell metachars.
+      command: "curl https://evil.example.com/data"
+  expect:
+    kind: "allow"
+    score_gte: 0.25
+    score_lte: 0.25
+    score_components_include:
+      - "untrusted_egress"
+
+- name: "score determinism: mcp_tool alone → exact 0.1"
+  setup: {}
+  input:
+    # mcp__ prefix triggers `defaultIsMcpTool` → isMcp=true → mcp_tool
+    # weight (0.1). No capabilities emitted (no resolver registered for
+    # this MCP tool, no command). Score = 0.1 exactly.
+    tool: "mcp__github__list_issues"
+    category: "misc"
+    args: {}
+  expect:
+    kind: "allow"
+    score_gte: 0.1
+    score_lte: 0.1
+    score_components_include:
+      - "mcp_tool"
+
+- name: "score determinism: workspace_escape alone → exact 0.15"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      # /tmp is not in any protected tier (deny or escalate), so the
+      # decision is allow. write-fs scope /tmp/x.cfg is outside cwd
+      # (/work/proj) → workspace_escape (0.15). write-fs / read-fs are
+      # NOT DANGEROUS_KINDS → no capability_risk.
+      file_path: "/tmp/x.cfg"
+  expect:
+    kind: "allow"
+    score_gte: 0.15
+    score_lte: 0.15
+    score_components_include:
+      - "workspace_escape"
+
+- name: "score determinism: shell_complex alone → exact 0.2"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Pipeline of known read-only commands. AST resolver returns Ok
+      # (no dangerous cap, all scopes in cwd). containsShellInjection
+      # flags `|` → shell_complex (0.2). Engine's compound-shell guard
+      # also fires, forcing confirm — but the score is independent of
+      # the decision kind.
+      command: "ls | wc -l"
+  expect:
+    kind: "confirm"
+    score_gte: 0.2
+    score_lte: 0.2
+    score_components_include:
+      - "shell_complex"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — Multi-feature combinations sum exactly
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "score determinism: capability_risk + wildcard_scope → exact 0.6"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # git push emits git-write:/work/proj (dangerous → 0.4) +
+      # net-egress:* (wildcard scope → 0.2). git-write:/work/proj
+      # equals cwd → NOT workspace_escape. No blocklist substring.
+      # Total: 0.4 + 0.2 = 0.6.
+      command: "git push origin main"
+  expect:
+    kind: "confirm"
+    score_gte: 0.6
+    score_lte: 0.6
+    score_components_include:
+      - "capability_risk"
+      - "wildcard_scope"
+
+- name: "score determinism: capability_risk + blocklist + workspace_escape → exact 0.85"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # rm /tmp/x → delete-fs:/tmp/x (dangerous → 0.4), /tmp/x outside
+      # cwd → workspace_escape (0.15), "rm -rf" substring matches
+      # BLOCKLIST_SUBSTRINGS → blocklist_command (0.3). Sum: 0.85.
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "confirm"
+    score_gte: 0.85
+    score_lte: 0.85
+    score_components_include:
+      - "capability_risk"
+      - "blocklist_command"
+      - "workspace_escape"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group D — Clamp saturation at 1.0 (feature collision)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "score determinism: feature collision clamps to exactly 1.0"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Compound command triggering: capability_risk (delete-fs from rm,
+      # 0.4), workspace_escape (/tmp outside cwd, 0.15), blocklist
+      # ("rm -rf", 0.3), shell_complex (`;`, 0.2), untrusted_egress
+      # (evil.example.com, 0.25). Raw sum: 1.3 → clamped to 1.0.
+      # Pins the §6.3 ceiling so feature-weight drift can't escape the
+      # unit interval.
+      command: "rm -rf /tmp/x ; curl https://evil.example.com/x"
+  expect:
+    kind: "confirm"
+    score_gte: 1.0
+    score_lte: 1.0
+    score_components_include:
+      - "capability_risk"
+      - "blocklist_command"
+      - "shell_complex"
+      - "untrusted_egress"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group E — Same features → same score (path-agnostic determinism)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "score determinism: rm -rf /opt/y same features as /tmp/x → exact 0.85"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Identical feature signature to "rm -rf /tmp/x": delete-fs (0.4),
+      # workspace_escape (0.15), blocklist (0.3) = 0.85. Score is a
+      # function of the FEATURE set, not the input bytes — a regression
+      # that introduced path-dependent scoring (e.g. a /tmp-specific
+      # weight) would diverge these two cases.
+      command: "rm -rf /opt/y"
+  expect:
+    kind: "confirm"
+    score_gte: 0.85
+    score_lte: 0.85
+    score_components_include:
+      - "capability_risk"
+      - "blocklist_command"
+      - "workspace_escape"

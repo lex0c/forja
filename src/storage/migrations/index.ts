@@ -31,6 +31,17 @@ import { migration030RecapRuns } from './030-recap-runs.ts';
 import { migration031CritiqueRuns } from './031-critique-runs.ts';
 import { migration032RecapCache } from './032-recap-cache.ts';
 import { migration033RecapRunsCost } from './033-recap-runs-cost.ts';
+import { migration034ApprovalsLog } from './034-approvals-log.ts';
+import { migration035ChainRotation } from './035-chain-rotation.ts';
+import { migration036SubagentGateEscalation } from './036-subagent-gate-escalation.ts';
+import { migration037PolicyArchive } from './037-policy-archive.ts';
+import { migration038ApprovalCallLinks } from './038-approval-call-links.ts';
+import { migration039Grants } from './039-grants.ts';
+import { migration040SubagentRunsEffectiveCapabilities } from './040-subagent-runs-effective-capabilities.ts';
+import { migration041FailureEvents } from './041-failure-events.ts';
+import { migration042OutcomeSignals } from './042-outcome-signals.ts';
+import { migration043BgBytesDropped } from './043-bg-bytes-dropped.ts';
+import { migration044HookRunsPostToolUseFailure } from './044-hook-runs-post-tool-use-failure.ts';
 
 export interface Migration {
   id: number;
@@ -72,4 +83,15 @@ export const MIGRATIONS: readonly Migration[] = [
   migration031CritiqueRuns,
   migration032RecapCache,
   migration033RecapRunsCost,
+  migration034ApprovalsLog,
+  migration035ChainRotation,
+  migration036SubagentGateEscalation,
+  migration037PolicyArchive,
+  migration038ApprovalCallLinks,
+  migration039Grants,
+  migration040SubagentRunsEffectiveCapabilities,
+  migration041FailureEvents,
+  migration042OutcomeSignals,
+  migration043BgBytesDropped,
+  migration044HookRunsPostToolUseFailure,
 ];

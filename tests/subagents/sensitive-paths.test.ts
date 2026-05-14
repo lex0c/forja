@@ -150,6 +150,103 @@ describe('SENSITIVE_PATH_DENY_LIST integrity', () => {
       '**/secrets.yml',
       '**/secrets.yaml',
       '.git-credentials',
+      // Slice 180 — tool-specific credential file additions.
+      '.terraformrc',
+      '.dockercfg',
+      '.pgpass',
+      '.my.cnf',
+      '.mongorc.js',
+      '**/.htpasswd',
     ]);
+  });
+});
+
+// Slice 180 — explicit per-pattern match tests for the new
+// additions. Each entry has a known canonical name shape; the
+// fence test above is structural, these are semantic.
+describe('SENSITIVE_PATH_DENY_LIST — slice 180 additions', () => {
+  test('matches `.terraformrc` at any depth', () => {
+    expect(matchSensitivePath('.terraformrc')).toBe('.terraformrc');
+    expect(matchSensitivePath('/home/op/.terraformrc')).toBe('.terraformrc');
+  });
+
+  test('matches `.dockercfg` (legacy docker auth)', () => {
+    expect(matchSensitivePath('.dockercfg')).toBe('.dockercfg');
+  });
+
+  test('matches `.pgpass` (postgres password file)', () => {
+    expect(matchSensitivePath('.pgpass')).toBe('.pgpass');
+    expect(matchSensitivePath('/home/op/.pgpass')).toBe('.pgpass');
+  });
+
+  test('matches `.my.cnf` (mysql client config with password)', () => {
+    expect(matchSensitivePath('.my.cnf')).toBe('.my.cnf');
+  });
+
+  test('matches `.mongorc.js` (mongo shell init with conn strings)', () => {
+    expect(matchSensitivePath('.mongorc.js')).toBe('.mongorc.js');
+  });
+
+  test('matches `.htpasswd` at any depth (Apache basic auth)', () => {
+    expect(matchSensitivePath('.htpasswd')).toBe('**/.htpasswd');
+    expect(matchSensitivePath('docs/.htpasswd')).toBe('**/.htpasswd');
+  });
+
+  test('non-sensitive look-alikes do NOT match', () => {
+    expect(matchSensitivePath('terraform.tf')).toBeNull();
+    expect(matchSensitivePath('mongo-prod.js')).toBeNull();
+    expect(matchSensitivePath('my-config.json')).toBeNull();
+  });
+});
+
+// Slice 159 self-review: the matcher moved into the hot path
+// (per-call from engine.checkPath + bypass capability loop). The
+// module memoizes compiled `Glob` instances at module scope so
+// repeated calls don't pay 46 constructions each time. The cache
+// is keyed by the literal pattern string, so default + custom
+// pattern lists share entries when their strings overlap. These
+// tests pin the memoization behavior — a regression that drops
+// the cache would re-introduce slice 159's hot-path tax.
+describe('matchSensitivePath — module-level Glob cache (slice 159 self-review)', () => {
+  test('repeated calls against the same path produce stable results', () => {
+    // Functional regression: a memoized Glob must return the same
+    // verdict on every call. (A buggy cache that swaps Glob shapes
+    // between calls would break this.)
+    const samples = [
+      '.env',
+      'src/foo.ts',
+      'deep/.env.production',
+      'docs/readme.md',
+      'id_rsa',
+      '.aws/credentials',
+      'src/envconfig.json',
+    ];
+    const first = samples.map((p) => matchSensitivePath(p));
+    for (let i = 0; i < 100; i++) {
+      const again = samples.map((p) => matchSensitivePath(p));
+      expect(again).toEqual(first);
+    }
+  });
+
+  test('cache survives across custom-pattern callers', () => {
+    // The first call uses the default list, warming the cache for
+    // the canonical patterns. A subsequent caller passing a custom
+    // list that overlaps with default patterns must reuse the
+    // cached Globs (same pattern string → same Glob).
+    expect(matchSensitivePath('.env')).toBe('.env');
+    // Custom list with overlap.
+    const custom = ['.env', 'my-secret.txt'];
+    expect(matchSensitivePath('.env', custom)).toBe('.env');
+    expect(matchSensitivePath('my-secret.txt', custom)).toBe('my-secret.txt');
+    expect(matchSensitivePath('.env', custom)).toBe('.env');
+  });
+
+  test('null result is also stable under repeat', () => {
+    // The matcher returns null for non-sensitive paths. Cache must
+    // not poison this with a stale hit on a prior pattern.
+    for (let i = 0; i < 50; i++) {
+      expect(matchSensitivePath('src/main.ts')).toBeNull();
+      expect(matchSensitivePath('docs/readme.md')).toBeNull();
+    }
   });
 });

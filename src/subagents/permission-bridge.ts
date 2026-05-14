@@ -210,6 +210,24 @@ export const createChildPermissionBridge = (
       const promise = new Promise<boolean>((resolve) => {
         pending.set(promptId, { resolve });
       });
+      // Slice 166 (review — Batch D subagent IPC concurrency).
+      // Re-check the terminal flags AFTER `pending.set` to close
+      // the check-then-act race window between the initial guard
+      // (line above the promptId allocation) and the entry
+      // registration. Concurrency review P1 trigger: the
+      // `channel.onClose` callback OR the `onAbort` listener
+      // could have fired between the initial check and the set
+      // (drain saw an empty Map → no-op), leaving our newly-
+      // registered entry orphaned with no future drain to resolve
+      // it. invoke-tool's `raceAgainstAbort` would eventually
+      // surface the abort, but the bridge had no clean path —
+      // promise hung. Re-check + cleanup makes the contract:
+      // "every confirmPermission returns within terminal state
+      // ticks, no orphaned promises".
+      if (disposed || closed || signal.aborted) {
+        pending.delete(promptId);
+        return false;
+      }
       try {
         channel.send(
           makePermissionAsk({

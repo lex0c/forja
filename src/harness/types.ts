@@ -1,16 +1,20 @@
+import type { Broker } from '../broker/index.ts';
 import type {
   ConfirmCritiqueRequest,
   CritiqueAnswer,
   CritiqueConfig,
   CritiqueStrategy,
 } from '../critique/index.ts';
+import type { FailureEventSink } from '../failures/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
+import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
+import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem } from '../todo/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
@@ -154,6 +158,23 @@ export type HarnessEvent =
       // from `enableCheckpoints=false` (no event emitted).
       type: 'checkpoints_unavailable';
       reason: string;
+    }
+  | {
+      // §13.6 degraded banner (slice 92). Emitted by the harness
+      // loop's `DegradedBannerEmitter` while the engine is in
+      // `degraded` state: once immediately on the FIRST tool call
+      // after the transition, then every N tool calls (default
+      // 10). Renderers display a non-suppressible banner with the
+      // reason + a hint to run `agent doctor`. Spec line 905-908.
+      //
+      // `firstEmission` lets renderers format the initial entry
+      // differently from recurring nudges ("⚠ Sandbox no longer
+      // available" first, then "⚠ Sandbox still unavailable"
+      // subsequently).
+      type: 'sandbox_degraded_active';
+      sessionId: string;
+      reason: string;
+      firstEmission: boolean;
     }
   | {
       // Background process started. Fires once per process right
@@ -871,6 +892,14 @@ export interface HarnessConfig {
   // into a no-op filter — no perf cost beyond an empty array
   // walk.
   hooks?: readonly HookSpec[];
+  // Slice 181 — global kill switch resolved at boot via
+  // `resolveHookConfig`. When true, the dispatcher short-circuits
+  // the chain (no spawn, no audit, no matcher evaluation) even
+  // when `hooks` is non-empty. Bootstrap reads this from the
+  // top-level `disable_all_hooks` key in any hooks.toml layer
+  // (OR'd across layers). Default false. Spec AGENTIC_CLI.md
+  // §10.3.3.
+  disableAllHooks?: boolean;
   // Test seam: subprocess spawn factory threaded through
   // `runSubagent` so the harness can exercise the full
   // `task` / `task_async` chain without forking a real Bun
@@ -907,6 +936,78 @@ export interface HarnessConfig {
   // this to `modalManager.askCritique`; one-shot mode leaves
   // it unset.
   confirmCritique?: (req: ConfirmCritiqueRequest) => Promise<CritiqueAnswer>;
+  // Broker for exec-tagged tools (PERMISSION_ENGINE.md §13.7). The
+  // bash family routes through `broker.execute(request)` instead of
+  // spawning directly from main. Bootstrap (`src/cli/bootstrap.ts`)
+  // constructs an in-process broker wired to the bash worker
+  // handler; future security-mode flips can swap in a spawn-based
+  // broker without touching the harness or tool code. Optional on
+  // the type so headless / SDK callers without exec needs don't
+  // have to construct one; bash surfaces `bash.spawn_failed` when
+  // absent.
+  broker?: Broker;
+  // §18 telemetry sink (slice 111, R10 #48). When wired, the
+  // harness emits structured events for cross-cutting signals
+  // that don't fit the audit row shape — currently `sandbox
+  // .degraded_active` (the §13.6 recurring banner heartbeat).
+  // Pre-slice the SandboxDegradedActiveEvent type was declared
+  // and a scrubbing handler existed (slice 92), but the harness
+  // loop only emitted to `config.onEvent` — the telemetry pipe
+  // was unwired and the metric stream documented in spec §18
+  // was unfireable.
+  //
+  // Production wiring binds an OTEL-bound sink via bootstrap;
+  // tests pass a recording sink to assert emission shape.
+  // Sinks MUST NOT throw — the harness wraps every call in
+  // try/catch defensively (slice 70 contract). When undefined,
+  // every telemetry event is dropped silently.
+  telemetry?: TelemetrySink;
+  // failure_events sink (slice 130). When wired, the harness threads
+  // this through `createBgManager` so `sandbox.mid_session_loss`
+  // probes hit a real sink + into `handle-store`'s `persistTo` so
+  // `storage.lock_contention`/`storage.persist_failed` rows land.
+  // Bootstrap also receives a sink directly so `sandbox.tool_unavailable`
+  // emits at boot. Without this field wired by the CLI / SDK caller,
+  // the slice-130 emit sites stay inert — every probe / catch path
+  // short-circuits on `failureSink === undefined`. Production CLI
+  // bootstrap (slice 130 fixup) constructs `createSqliteFailureSink({
+  // db })` and passes here. Tests can wire a noop sink to keep the
+  // suite hermetic.
+  failureSink?: FailureEventSink;
+  // The sandbox tool detected at boot (bwrap | sandbox-exec | null).
+  // Paired with `failureSink` to enable the bg manager's mid-session
+  // loss probe — comparing CURRENT `Bun.which(...)` against this
+  // BOOT state is what distinguishes "always unavailable" (audited
+  // at bootstrap as `sandbox.tool_unavailable`) from "available
+  // then lost" (audited from bg manager as `sandbox.mid_session_loss`).
+  // CLI bootstrap sources via `detectSandboxAvailability` and
+  // forwards here; tests pin a constant.
+  sandboxBootTool?: 'bwrap' | 'sandbox-exec';
+  // outcome_signals sink (slice 131). When wired, the harness
+  // emits a `tool_error` outcome_signal on every failed tool
+  // invocation that was authorized by the engine (failed=true,
+  // not denied). Spec §6.3.2 calibration: these signals link
+  // decisions to observed bad outcomes. Optional — without it,
+  // tool errors only land in `tool_calls.status='error'` and
+  // calibration scripts have to recover them via join. Production
+  // CLI bootstrap constructs `createSqliteOutcomeSink({ db })`
+  // and passes here.
+  outcomeSink?: OutcomeSink;
+  // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
+  // tmpdir that scoped-sandbox spawns redirect their TMPDIR into.
+  // CLI bootstrap calls `acquireSandboxTmpdir({ sessionId: <ULID> })`
+  // once, registers cleanup at process exit, and forwards the
+  // resolved path here. The harness then:
+  //   1. Builds it into every ToolContext so tools like `grep` /
+  //      `bash` pass it to `maybeWrapSandboxArgv.tmpdir`.
+  //   2. Forwards it into `createBgManager` so background spawns
+  //      apply the same scoping.
+  //
+  // `undefined` on linux (bwrap's `--tmpfs /tmp` already isolates)
+  // and on darwin when mkdir failed at bootstrap (graceful fallback
+  // to the pre-slice-156 blanket /tmp allow). Tools that read this
+  // and find undefined just omit the tmpdir option to maybeWrap.
+  sandboxTmpdir?: string;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

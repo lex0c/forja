@@ -13,6 +13,7 @@ export type HookRunsEvent =
   | 'UserPromptSubmit'
   | 'PreToolUse'
   | 'PostToolUse'
+  | 'PostToolUseFailure'
   | 'PreCompact'
   | 'Notification'
   | 'PreCheckpoint'

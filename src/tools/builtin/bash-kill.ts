@@ -53,9 +53,19 @@ export const bashKillTool: Tool<BashKillInput, BashKillOutput> = {
     category: 'misc',
     // Sends a signal — pessimistic write under plan mode.
     writes: true,
-    // Killing a bg process is itself a side effect that doesn't
-    // revert when a checkpoint restores: the process is gone and
-    // any half-finished work it had in flight stays half-finished.
+    // Slice 150 (review): the `escapesCwd` field is misnamed for
+    // this tool's case — bash_kill doesn't touch the filesystem,
+    // it sends a signal. But the field's DOCUMENTED meaning per
+    // tools/types.ts is broader: "side effects of this tool may
+    // escape ctx.cwd ... NOT reversed by a working-tree restore."
+    // Killing a bg process satisfies the second half: any
+    // half-finished work the process had in flight stays half-
+    // finished after a checkpoint restore. Setting the flag here
+    // is correct under the documented semantics, just confusing
+    // under the name. The harness's `loop.ts` comment acknowledges
+    // the field name is a future-rename target; bundling the
+    // rename with the broader cleanup is out of scope for this
+    // slice.
     escapesCwd: true,
     exec: true,
     // Same as bash_background: the runtime dispatches through

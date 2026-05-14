@@ -1,5 +1,5 @@
-import { isAbsolute, resolve } from 'node:path';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { resolveAndValidateBashCwd } from './_bash-cwd.ts';
 
 export interface BashBackgroundInput {
   command: string;
@@ -112,20 +112,34 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
         return toolError(ERROR_CODES.invalidArg, 'max_runtime_ms must be an integer >= 100 (ms)');
       }
     }
-    // Resolve cwd against the session: undefined → session cwd;
-    // absolute → as-is; relative → resolve from session cwd. Same
-    // pattern as the synchronous bash tool. Forwarding args.cwd
-    // verbatim (or omitting it) makes the manager fall back to
-    // process.cwd(), which silently runs commands in the wrong
-    // directory whenever the harness was launched with a different
-    // working dir than the session — e.g. evals (each case has its
-    // own tmp cwd) and worktree subagents (M3+).
-    const wd =
-      args.cwd === undefined
-        ? ctx.cwd
-        : isAbsolute(args.cwd)
-          ? args.cwd
-          : resolve(ctx.cwd, args.cwd);
+    // Slice 150 (review): type-check label and cwd. Pre-slice both
+    // were forwarded to the manager without a runtime type guard.
+    //   - `label` non-string (e.g. `label: 42` or `label: {x: 1}`)
+    //     reached the storage layer and landed in audit logs / UI
+    //     tray as a non-string, breaking downstream renders that
+    //     expect string|null. Spec §17.4 documents label as a
+    //     human-readable name.
+    //   - `cwd` non-string would throw ERR_INVALID_ARG_TYPE inside
+    //     `isAbsolute(args.cwd)`, surfaced as `internalError` from
+    //     the harness instead of a clean tool error. Same gap the
+    //     sync bash tool had pre-slice; fixed here in parallel.
+    if (args.label !== undefined && typeof args.label !== 'string') {
+      return toolError(ERROR_CODES.invalidArg, 'label must be a string');
+    }
+    if (args.cwd !== undefined && typeof args.cwd !== 'string') {
+      return toolError(ERROR_CODES.invalidArg, 'cwd must be a string');
+    }
+    // Slice 160 (review): same cwd-subtree refuse as the synchronous
+    // bash tool. Pre-slice forwarding args.cwd verbatim let a model
+    // emit `bash_background {command:"...", cwd:"/etc"}` and run a
+    // long-lived process outside the engine's capability attribution.
+    // The helper resolves + canonicalizes + refuses cwd outside the
+    // session subtree. See _bash-cwd.ts.
+    const cwdResult = resolveAndValidateBashCwd({ argsCwd: args.cwd, sessionCwd: ctx.cwd });
+    if (!cwdResult.ok) {
+      return toolError(ERROR_CODES.invalidArg, cwdResult.error);
+    }
+    const wd = cwdResult.cwd;
 
     try {
       const r = await ctx.bgManager.spawn({
@@ -133,6 +147,9 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
         cwd: wd,
         ...(args.label !== undefined ? { label: args.label } : {}),
         ...(args.max_runtime_ms !== undefined ? { maxRuntimeMs: args.max_runtime_ms } : {}),
+        // §6.5: pass the engine's chosen profile through so the bg
+        // manager's Bun.spawn wraps with bwrap when applicable.
+        ...(ctx.sandboxProfile !== undefined ? { sandboxProfile: ctx.sandboxProfile } : {}),
       });
       return {
         process_id: r.id,

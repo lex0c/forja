@@ -50,6 +50,7 @@ const VALID_EVENTS: ReadonlySet<string> = new Set<HookEvent>([
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'PostToolUseFailure',
   'PreCompact',
   'Notification',
   'PreCheckpoint',
@@ -218,6 +219,29 @@ const validateEntry = (
     }
   }
 
+  // Slice 181 — `if` per-handler filter. Optional string in
+  // permission-rule syntax (`Bash(rm *)`, `Edit(*.ts)`). Parser
+  // here only validates type/shape; semantic parse + match lives
+  // in `dispatcher-matching.ts:ifFilterMatches`. Malformed
+  // patterns there fail-OPEN at dispatch time — we don't pre-
+  // validate the inside-parens glob because the dispatcher's
+  // fail-open semantics already protect against typos.
+  let ifRule: string | undefined;
+  const rawIf = obj.if;
+  if (rawIf !== undefined) {
+    if (typeof rawIf !== 'string' || rawIf.length === 0) {
+      return {
+        warning: {
+          kind: 'invalid_entry',
+          layer,
+          sourcePath,
+          message: `hook entry #${index}: if must be a non-empty string when present`,
+        },
+      };
+    }
+    ifRule = rawIf;
+  }
+
   const spec: HookSpec = {
     layer,
     sourcePath,
@@ -228,6 +252,7 @@ const validateEntry = (
     failClosed,
     locked,
     entryIndex: index,
+    ...(ifRule !== undefined ? { if: ifRule } : {}),
   };
   // Both warnings are mutually exclusive in practice (timeout
   // vs lock), but if a future field grows a third warning we'd
@@ -244,15 +269,23 @@ const validateEntry = (
 const loadLayer = (
   path: string | null,
   layer: HookLayer,
-): { specs: HookSpec[]; warnings: HookConfigWarning[] } => {
-  if (path === null) return { specs: [], warnings: [] };
+): {
+  specs: HookSpec[];
+  warnings: HookConfigWarning[];
+  // Slice 181 — per-layer kill switch from top-level
+  // `disable_all_hooks = true`. `resolveHookConfig` ORs across
+  // layers so any layer can opt out locally; enterprise effectively
+  // pins (lower layers can't un-set an OR).
+  disableAllHooks: boolean;
+} => {
+  if (path === null) return { specs: [], warnings: [], disableAllHooks: false };
 
   let raw: string;
   try {
     raw = readFileSync(path, 'utf-8');
   } catch (err) {
     if (err !== null && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
-      return { specs: [], warnings: [] };
+      return { specs: [], warnings: [], disableAllHooks: false };
     }
     return {
       specs: [],
@@ -264,6 +297,7 @@ const loadLayer = (
           message: `cannot read hooks config: ${err instanceof Error ? err.message : String(err)}`,
         },
       ],
+      disableAllHooks: false,
     };
   }
 
@@ -281,6 +315,7 @@ const loadLayer = (
           message: `TOML parse failed: ${err instanceof Error ? err.message : String(err)}`,
         },
       ],
+      disableAllHooks: false,
     };
   }
 
@@ -295,31 +330,51 @@ const loadLayer = (
           message: 'TOML root must be a table',
         },
       ],
+      disableAllHooks: false,
     };
   }
 
-  const hooksField = (parsed as Record<string, unknown>).hooks;
+  const root = parsed as Record<string, unknown>;
+  const warnings: HookConfigWarning[] = [];
+
+  // Slice 181 — top-level kill switch. Non-boolean value drops
+  // the flag with a warning (operator wrote a typo or got the
+  // type wrong — we don't want a string `"true"` to silently
+  // count as falsy).
+  let disableAllHooks = false;
+  const rawDisable = root.disable_all_hooks;
+  if (rawDisable !== undefined) {
+    if (typeof rawDisable !== 'boolean') {
+      warnings.push({
+        kind: 'invalid_entry',
+        layer,
+        sourcePath: path,
+        message: `disable_all_hooks must be a boolean (got ${JSON.stringify(rawDisable)})`,
+      });
+    } else {
+      disableAllHooks = rawDisable;
+    }
+  }
+
+  const hooksField = root.hooks;
   if (hooksField === undefined) {
     // Empty layer — operator wrote a hooks.toml with no
-    // [[hooks]] yet. Treat as zero hooks, no warning.
-    return { specs: [], warnings: [] };
+    // [[hooks]] yet. Treat as zero hooks, no warning. (A bare
+    // file with only `disable_all_hooks = true` is also valid
+    // and lands here.)
+    return { specs: [], warnings, disableAllHooks };
   }
   if (!Array.isArray(hooksField)) {
-    return {
-      specs: [],
-      warnings: [
-        {
-          kind: 'invalid_entry',
-          layer,
-          sourcePath: path,
-          message: '`hooks` field must be an array of tables (use [[hooks]])',
-        },
-      ],
-    };
+    warnings.push({
+      kind: 'invalid_entry',
+      layer,
+      sourcePath: path,
+      message: '`hooks` field must be an array of tables (use [[hooks]])',
+    });
+    return { specs: [], warnings, disableAllHooks };
   }
 
   const specs: HookSpec[] = [];
-  const warnings: HookConfigWarning[] = [];
   for (let i = 0; i < hooksField.length; i++) {
     const result = validateEntry(hooksField[i], layer, path, i);
     if ('spec' in result) {
@@ -329,7 +384,7 @@ const loadLayer = (
       warnings.push(result.warning);
     }
   }
-  return { specs, warnings };
+  return { specs, warnings, disableAllHooks };
 };
 
 // Resolve all three layers into one ordered hook list. Order:
@@ -345,8 +400,19 @@ export const resolveHookConfig = (paths: HookConfigPaths): ResolvedHookConfig =>
   const project = loadLayer(paths.project, 'project');
   warnings.push(...project.warnings);
 
+  // Slice 181 — OR the per-layer kill switches. Any layer can
+  // opt into "no hooks at all"; once any one is true the chain
+  // short-circuits at dispatch. Enterprise gets de-facto locking
+  // for free (lower layers can only add more `true`, never
+  // un-set). Lower layers can disable hooks locally for debug
+  // when enterprise didn't pin — matches the "any layer can
+  // disable" mental model.
+  const disableAllHooks =
+    enterprise.disableAllHooks || user.disableAllHooks || project.disableAllHooks;
+
   return {
     hooks: [...enterprise.specs, ...user.specs, ...project.specs],
+    disableAllHooks,
     warnings,
   };
 };

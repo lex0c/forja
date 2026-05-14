@@ -248,7 +248,7 @@ export interface RunReplOptions {
   // provider/DB/registries. `bootstrapOverride` (a precomputed
   // result) takes precedence when set; this seam only fires when
   // the override is absent.
-  bootstrapFn?: (input: BootstrapInput) => BootstrapResult;
+  bootstrapFn?: (input: BootstrapInput) => Promise<BootstrapResult> | BootstrapResult;
   // Test seam: replace the harness entry. Defaults to `runAgent`.
   // Tests inject a fake that drives a scripted set of HarnessEvents
   // through `cfg.onEvent` and resolves a HarnessResult.
@@ -611,7 +611,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const bootstrapFn = options.bootstrapFn ?? bootstrap;
     bootstrapped =
       options.bootstrapOverride ??
-      bootstrapFn({
+      (await bootstrapFn({
         prompt: '',
         // Pin bootstrap's cwd to the same string we trust-checked
         // above. Without this they'd both default to process.cwd()
@@ -633,7 +633,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         ...(options.trustListPathOverride !== undefined
           ? { trustListPathOverride: options.trustListPathOverride }
           : {}),
-      } satisfies BootstrapInput);
+      } satisfies BootstrapInput));
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
     errSink(`forja: ${msg}\n`);
@@ -1401,6 +1401,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // production it'd just delay process exit by up to ESC_DRAIN_MS).
     cancelDrain();
     if (typeof stdin.pause === 'function') stdin.pause();
+    // §13.7 broker drain BEFORE storage close — same rationale as
+    // src/cli/run.ts. Awaits in-flight exec; closes idempotently.
+    if (baseConfig.broker !== undefined) {
+      await baseConfig.broker.close();
+    }
     db.close();
     resolveExit();
   };

@@ -1,0 +1,167 @@
+# Conformance: deterministic risk score (PERMISSION_ENGINE.md §6.3).
+# Each case asserts the score floor / ceiling + presence of feature
+# components. Together they pin the §6.3.1 weights against typical
+# tool-call shapes.
+
+- name: "read_file under cwd → score=0 baseline"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "src/index.ts"
+  expect:
+    kind: "allow"
+    score_lte: 0.0
+
+- name: "bash ls → score=0 baseline"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    score_lte: 0.0
+
+- name: "bash rm -rf → capability_risk + blocklist_command (§6.6 score-gate confirms)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    # Score 0.7+ (capability_risk 0.4 + blocklist_command 0.3). The
+    # slice-7 approval gate upgrades the matching allow rule to
+    # confirm because the score is above the 0.4 threshold.
+    kind: "confirm"
+    score_gte: 0.5
+    score_components_include:
+      - "capability_risk"
+      - "blocklist_command"
+
+- name: "bash git push → capability_risk + wildcard_scope (§6.6 score-gate confirms)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    # Score 0.4+ (capability_risk 0.4 from git-write; wildcard_scope
+    # adds on top). Approval gate forces confirm at the 0.4 boundary
+    # — git push is fundamentally a state-changing remote operation
+    # and the operator should see the modal once per session.
+    kind: "confirm"
+    score_gte: 0.4
+    score_components_include:
+      - "capability_risk"
+      - "wildcard_scope"
+
+- name: "bash curl github (trusted host) → no untrusted_egress"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl https://github.com/x/y"
+  expect:
+    kind: "allow"
+    score_lte: 0.0
+
+- name: "bash curl arbitrary host → untrusted_egress"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl https://evil.example.com/data"
+  expect:
+    kind: "allow"
+    score_gte: 0.2
+    score_components_include:
+      - "untrusted_egress"
+
+- name: "bash pipeline of known commands → shell_complex score component (slice 6)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "cat file | grep token"
+  expect:
+    # Slice-6 AST resolver accepts pipelines of known commands as
+    # Ok with aggregated capabilities. The engine's slice-1
+    # compound-shell guard fires on `|` and forces confirm
+    # downstream (defense in depth); risk-score still flags
+    # `shell_complex` because the `|` token carries composition risk.
+    kind: "confirm"
+    score_components_include:
+      - "shell_complex"
+
+- name: "MCP tool prefix triggers mcp_tool feature"
+  setup: {}
+  input:
+    tool: "mcp__github__create_issue"
+    category: "misc"
+    args: {}
+  expect:
+    kind: "allow"
+    score_components_include:
+      - "mcp_tool"
+
+- name: "write_file to /etc → workspace_escape feature"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "/etc/hosts"
+  expect:
+    # protected paths upgrade write under /etc to confirm
+    kind: "confirm"
+    score_components_include:
+      - "workspace_escape"

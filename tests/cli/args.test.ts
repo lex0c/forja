@@ -751,6 +751,91 @@ describe('--memory', () => {
   });
 });
 
+// Slice 123 (R9 P1): pre-slice `agent --i-know-what-im-doing`
+// (without the `welcome` verb) silently parsed `iKnowWhatImDoing:
+// true`, but the flag is only read inside the welcome branch in
+// run.ts — so the top-level form was a no-op that LOOKED like
+// it acknowledged unsafe-mode. Now the top-level parser rejects
+// with a pointer to the correct invocation.
+describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => {
+  test('agent --i-know-what-im-doing (no welcome) returns error pointing at `agent welcome`', () => {
+    const r = parseArgs(['--i-know-what-im-doing']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--i-know-what-im-doing');
+    expect(r.message).toContain('agent welcome');
+  });
+
+  test('agent welcome --i-know-what-im-doing still parses successfully', () => {
+    // The welcome subcommand parser is separate from the top-level
+    // parser and continues to accept the flag (slice 91 contract).
+    const r = parseArgs(['welcome', '--i-know-what-im-doing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBe(true);
+    expect(r.args.iKnowWhatImDoing).toBe(true);
+  });
+
+  test('agent --i-know-what-im-doing with other flags before still rejects', () => {
+    // Even when the flag appears alongside otherwise-valid flags,
+    // the top-level form is invalid.
+    const r = parseArgs(['--json', '--i-know-what-im-doing', 'hello']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('agent welcome');
+  });
+});
+
+// Welcome subcommand detection is anchored to argv[0]. An earlier
+// cut scanned the entire argv for the literal word `welcome` to
+// accommodate `agent --i-know-what-im-doing welcome` (welcome
+// after a flag) — but that regression-broke prompts containing
+// the word `welcome` as plain text, mis-routing them into the
+// welcome subcommand and erroring on unknown flags.
+describe('welcome subcommand detection — argv[0] only (review fix)', () => {
+  test('agent --json welcome → prompt is "welcome" with --json (NOT welcome subcommand)', () => {
+    const r = parseArgs(['--json', 'welcome']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.json).toBe(true);
+    expect(r.args.prompt).toBe('welcome');
+  });
+
+  test('agent hello welcome world → prompt is "hello welcome world"', () => {
+    const r = parseArgs(['hello', 'welcome', 'world']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.prompt).toBe('hello welcome world');
+  });
+
+  test('agent "welcome to forja" → prompt contains welcome verbatim', () => {
+    // Shell-quoted single positional. argv[0] is the whole prompt,
+    // not the literal token `welcome`, so no subcommand match.
+    const r = parseArgs(['welcome to forja']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.prompt).toBe('welcome to forja');
+  });
+
+  test('agent welcome → IS the welcome subcommand', () => {
+    // Sanity check: the canonical form still works (argv[0] match).
+    const r = parseArgs(['welcome']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.welcome).toBe(true);
+  });
+
+  test('agent welcome --help → welcome subcommand with help flag', () => {
+    const r = parseArgs(['welcome', '--help']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.help).toBe(true);
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();
@@ -933,5 +1018,64 @@ describe('parseArgs — recap subcommand', () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.message).toContain('--model requires a value');
+  });
+
+  test('--sandbox-host is a presence-only flag (slice 10 §6.5)', () => {
+    const r = parseArgs(['--sandbox-host']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.sandboxHost).toBe(true);
+  });
+
+  test('--sandbox-host absent leaves the field undefined (default off)', () => {
+    const r = parseArgs([]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.sandboxHost).toBeUndefined();
+  });
+});
+
+describe('--broker (§13.7 mode flag, slice 87)', () => {
+  test('--broker spawn sets brokerMode to "spawn"', () => {
+    const r = parseArgs(['--broker', 'spawn']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.brokerMode).toBe('spawn');
+  });
+
+  test('--broker in-process sets brokerMode to "in-process"', () => {
+    const r = parseArgs(['--broker', 'in-process']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.brokerMode).toBe('in-process');
+  });
+
+  test('--broker absent leaves brokerMode undefined (bootstrap defaults to in-process)', () => {
+    const r = parseArgs([]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.brokerMode).toBeUndefined();
+  });
+
+  test('--broker with no value is rejected', () => {
+    const r = parseArgs(['--broker']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--broker requires a mode');
+  });
+
+  test('--broker with a flag-shaped next token is rejected', () => {
+    const r = parseArgs(['--broker', '--yes']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--broker requires a mode');
+  });
+
+  test('--broker with an unknown mode is rejected with the offending value', () => {
+    const r = parseArgs(['--broker', 'magic']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain("'in-process' or 'spawn'");
+    expect(r.message).toContain('magic');
   });
 });

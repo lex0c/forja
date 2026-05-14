@@ -389,6 +389,350 @@ describe('bg manager: kill', () => {
   test('throws on unknown id', async () => {
     expect(mgr.kill('nope')).rejects.toThrow(/not found/);
   });
+
+  // Slice 135 P1 conc-5: kill() concurrent with readOutput().
+  // The readOutput path: getBgProcess snapshot → fileSize →
+  // readWindow → cursor advance. If kill() lands BETWEEN the
+  // snapshot and the cursor advance, the row is finalized to
+  // status='killed' while the read still completes. The cursor
+  // advance writes through a `WHERE cursor_position < ?` guard
+  // (DB-level monotonicity), so racing writes can't roll the
+  // cursor backwards. This pins:
+  //   - readOutput completes without throwing (no race against
+  //     finalize);
+  //   - the row ends as status='killed';
+  //   - cursor advances monotonically;
+  //   - subsequent readOutput on the killed row still returns
+  //     the captured output.
+  test('kill() racing readOutput() leaves cursor monotonic + status killed (slice 135 P1 conc-5)', async () => {
+    // Process that streams enough output for the read to span
+    // the kill — `yes` is a flooding command, capped at 1s so
+    // the test doesn't hang if kill misfires.
+    const r = await mgr.spawn({ command: "yes 'streaming-payload-line' | head -n 5000" });
+    // Race: fire readOutput + kill in parallel.
+    const [readResult, killResult] = await Promise.all([
+      mgr.readOutput(r.id, { maxBytes: 10_000 }),
+      mgr.kill(r.id, { signal: 'SIGKILL' }),
+    ]);
+    // Both must resolve without throwing — no race against the
+    // finalize transaction.
+    expect(killResult.status).toBe('killed');
+    expect(typeof readResult.stdout).toBe('string');
+    expect(readResult.stdoutCursor).toBeGreaterThanOrEqual(0);
+    // Row finalized as killed (kill won the race or the SIGKILL
+    // landed before the kernel flushed the natural exit path).
+    const row = getBgProcess(db, r.id);
+    expect(row?.status).toBe('killed');
+    expect(row?.stdoutCursorPosition).toBeGreaterThanOrEqual(readResult.stdoutCursor);
+    // Follow-up read on the killed row still works — no crash on
+    // the missing live handle.
+    const after = await mgr.readOutput(r.id);
+    expect(after.status).toBe('killed');
+    expect(after.stdoutCursor).toBeGreaterThanOrEqual(row?.stdoutCursorPosition ?? 0);
+  });
+
+  test('kill() does not invalidate stdout reads issued before AND after the kill', async () => {
+    // Sequential rather than racing: read BEFORE kill, kill, then
+    // read AFTER. The "after" read must still find the file (logs
+    // aren't deleted on kill) and advance the cursor correctly.
+    // Use an unbounded `yes` to guarantee the process is alive
+    // when kill lands (head -n N would race the kill against
+    // natural exit).
+    const r = await mgr.spawn({ command: "yes 'persist-after-kill'" });
+    // Let some output land before killing.
+    await new Promise((res) => setTimeout(res, 50));
+    const before = await mgr.readOutput(r.id, { maxBytes: 2_000 });
+    expect(before.stdout.length).toBeGreaterThan(0);
+    await mgr.kill(r.id, { signal: 'SIGKILL' });
+    // Post-kill read: cursor advances, status reports killed.
+    const after = await mgr.readOutput(r.id);
+    expect(after.status).toBe('killed');
+    expect(after.stdoutCursor).toBeGreaterThanOrEqual(before.stdoutCursor);
+  });
+
+  // Slice 148 (BG1 — process-group isolation). Pre-slice the bg
+  // manager spawned via `Bun.spawn` WITHOUT `detached: true`. The
+  // shape was `bash -c "<cmd>"` where `<cmd>` typically forks
+  // (npm run dev → node → webpack, pytest --watch → many subprocs).
+  // `proc.kill('SIGTERM')` signalled ONLY the wrapping bash; the
+  // grandchildren got orphaned to PID 1, holding ports + file
+  // locks until the next system reboot. Slice 148 adds setsid
+  // (`detached: true`) on spawn + group-kill (`process.kill(-pid)`)
+  // on kill, cascading the signal across every descendant.
+  test('spawn places the child in its own process group (BG1)', async () => {
+    // Spawn a process whose grandchild writes its own pid + pgid
+    // (process group) to a temp file. After the spawn we read the
+    // file and assert the child's PGID equals the child's own PID
+    // (setsid succeeded — the child IS the group leader, distinct
+    // from the harness's PGID).
+    const tmpFile = join(logDir, `pgid-${Date.now()}.txt`);
+    const r = await mgr.spawn({
+      command: `(echo "pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ')" > ${tmpFile}; sleep 5)`,
+    });
+    // Wait for the echo to land.
+    await new Promise((res) => setTimeout(res, 200));
+    const fs = await import('node:fs/promises');
+    const content = await fs.readFile(tmpFile, 'utf8');
+    // Parse pid=<n> pgid=<n>
+    const match = content.match(/pid=(\d+) pgid=(\d+)/);
+    expect(match).not.toBeNull();
+    if (match === null) throw new Error('output parse failed');
+    const childPid = Number(match[1]);
+    const childPgid = Number(match[2]);
+    // The grandchild's PGID equals the spawned shell's PID (the bash
+    // wrapper). `osPid` returned by spawn is the bash PID; PGID of
+    // the grandchild's process tree must match it. Pre-slice this
+    // would have been the HARNESS's PGID instead.
+    expect(childPgid).toBe(r.osPid);
+    // PGID also distinct from harness's own PGID — defense in depth.
+    expect(childPgid).not.toBe(process.pid);
+    expect(childPid).toBeGreaterThan(0);
+    // Cleanup the lingering sleep.
+    await mgr.kill(r.id, { signal: 'SIGKILL' });
+  });
+
+  // Slice 151 (review): per-id dedup for concurrent kill() callers.
+  // Pre-slice two callers entering kill(id) simultaneously both
+  // signalled SIGTERM, both started a grace timer, and both could
+  // race their own SIGKILL escalation onto a PID the kernel had
+  // already reaped + reused. Dedup via inFlightKills makes the
+  // second caller piggyback on the first kill's promise.
+  test('concurrent kill() calls dedupe via inFlightKills (slice 151)', async () => {
+    const r = await mgr.spawn({ command: 'sleep 30' });
+    // Fire 4 concurrent kills on the same id. Without dedup, each
+    // would issue its own SIGTERM + grace timer + SIGKILL cycle.
+    // With dedup, all four await the same in-flight promise.
+    const results = await Promise.all([
+      mgr.kill(r.id),
+      mgr.kill(r.id),
+      mgr.kill(r.id),
+      mgr.kill(r.id),
+    ]);
+    // All four return the same shape (status='killed').
+    for (const result of results) {
+      expect(result.status).toBe('killed');
+    }
+    // DB row is killed exactly once — no duplicate finalize.
+    const row = getBgProcess(db, r.id);
+    expect(row?.status).toBe('killed');
+  });
+
+  // Slice 151 (review): cleanup() returned ids.length + flipped,
+  // which double-counted when a kill threw between signal-send and
+  // finalize — the row stayed 'running', flipped picked it up, and
+  // the same row was counted twice (once in ids.length, once in
+  // flipped). 3 live processes reported "killed: 6". Fixed by
+  // snapshotting runningBefore count instead.
+  test('cleanup() returns a deduplicated count of rows transitioned (slice 151)', async () => {
+    // Spawn 3 long-running bg processes.
+    const r1 = await mgr.spawn({ command: 'sleep 30' });
+    const r2 = await mgr.spawn({ command: 'sleep 30' });
+    const r3 = await mgr.spawn({ command: 'sleep 30' });
+    // All three should be 'running' at this point.
+    expect(getBgProcess(db, r1.id)?.status).toBe('running');
+    expect(getBgProcess(db, r2.id)?.status).toBe('running');
+    expect(getBgProcess(db, r3.id)?.status).toBe('running');
+    // Cleanup should report exactly 3 killed (no double-count).
+    const result = await mgr.cleanup();
+    expect(result.killed).toBe(3);
+    // Verify all 3 rows are killed.
+    expect(getBgProcess(db, r1.id)?.status).toBe('killed');
+    expect(getBgProcess(db, r2.id)?.status).toBe('killed');
+    expect(getBgProcess(db, r3.id)?.status).toBe('killed');
+  });
+
+  // Slice 151 (review): early-handle-undef path in kill() preserves
+  // the DB's existing exitCode. Pre-slice it hard-coded null,
+  // clobbering any exit metadata the natural-exit handler had
+  // already captured for the same row.
+  test('kill() with no live handle preserves existing exitCode (slice 151)', async () => {
+    // Spawn a process that exits IMMEDIATELY with code 42. The
+    // exit handler runs and writes exitCode=42 to the DB. Then
+    // call kill() — DB shows 'exited', not 'running', so the
+    // idempotent branch returns the row as-is. To exercise the
+    // EARLY-undef path we need DB.status='running' BUT no live
+    // handle — that's the race-y case the early-undef branch is
+    // documented for. Simulate by directly mutating the DB row
+    // to 'running' after natural exit + clearing live handle.
+    const r = await mgr.spawn({ command: 'exit 42' });
+    await waitForExit(r.id);
+    // At this point DB has status='exited', exit_code=42.
+    expect(getBgProcess(db, r.id)?.status).toBe('exited');
+    expect(getBgProcess(db, r.id)?.exitCode).toBe(42);
+    // Force DB back to 'running' (synthetic stuck-row state) to
+    // exercise the early-handle-undef branch. The natural-exit
+    // path already cleared live handle.
+    db.query("UPDATE background_processes SET status = 'running' WHERE id = ?").run(r.id);
+    // Now kill: DB says 'running', live handle is gone. Old
+    // behavior: exitCode forced to null. New behavior: preserve
+    // exitCode=42 from the DB row.
+    const result = await mgr.kill(r.id);
+    expect(result.status).toBe('killed');
+    expect(result.exitCode).toBe(42);
+    // DB row also preserved.
+    expect(getBgProcess(db, r.id)?.exitCode).toBe(42);
+  });
+
+  // Slice 153 (review): per-stream on-disk cap with truncate-head.
+  // Pre-slice bg manager wrote stdout/stderr directly via
+  // Bun.spawn's Bun.file(path) redirection — no upper bound,
+  // FS exhaustion on multi-hour dev servers. New drainer owns
+  // the fd and truncates the head when file would exceed
+  // maxLogBytes, preserving the tail (most-relevant bytes for
+  // the LLM's read-the-latest pattern).
+  test('stdout cap truncates head when file would exceed maxLogBytes (slice 153)', async () => {
+    // Use a tight cap (16 KB) and a command that emits >2x that
+    // before exiting. Drainer must truncate.
+    const r = await mgr.spawn({
+      // Emit 32 KB of "X" — twice the cap. Drainer must truncate
+      // the head and retain ~16 KB of tail.
+      command: "yes 'X' | head -c 32768",
+      maxLogBytes: 16384,
+    });
+    await waitForExit(r.id);
+    // File on disk should be ≤ cap.
+    const { statSync } = await import('node:fs');
+    const fileSize = statSync(`${logDir}/${r.id}.stdout.log`).size;
+    expect(fileSize).toBeLessThanOrEqual(16384);
+    // Readback: the LLM sees a single window of the file. Since
+    // we already drained 32 KB and capped at 16 KB, ≥16 KB was
+    // dropped from the head.
+    const out = await mgr.readOutput(r.id, { sinceStdout: 0, maxBytes: 100_000 });
+    // The returned bytes are the TAIL of the original output.
+    // They're all 'X\n' alternations — every byte is 'X' or '\n'.
+    expect(out.stdout.length).toBeGreaterThan(0);
+    for (const ch of out.stdout) {
+      expect(['X', '\n']).toContain(ch);
+    }
+  });
+
+  test('stdout cap: cursor advances absolute over truncation (slice 153)', async () => {
+    // Test the absolute-cursor semantics: after truncation, a
+    // canonical read advances to the absolute end (file_offset +
+    // dropped). The pending count reflects the absolute total.
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 32768",
+      maxLogBytes: 16384,
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    // Cursor end is absolute — should be close to 32768 (the
+    // total bytes emitted), not the file size (~16 KB).
+    expect(out.stdoutCursor).toBeGreaterThan(16384);
+    // No pending because we just consumed everything to the
+    // absolute end. (After-exit, drainer.done, file static.)
+    expect(out.stdoutPending).toBe(0);
+  });
+
+  test('stdout cap: subsequent canonical read returns empty (slice 153)', async () => {
+    // After a canonical read consumes everything, the next read
+    // sees pending=0 and stdout=''. The absolute cursor + dropped
+    // mapping correctly identifies "all consumed".
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 32768",
+      maxLogBytes: 16384,
+    });
+    await waitForExit(r.id);
+    await mgr.readOutput(r.id); // canonical consume
+    const second = await mgr.readOutput(r.id);
+    expect(second.stdout).toBe('');
+    expect(second.stdoutPending).toBe(0);
+  });
+
+  test('stdout cap: under-cap output is not truncated (slice 153)', async () => {
+    // Regression: the truncate-head logic must NOT fire when the
+    // file size stays under cap. The drainer should behave like
+    // a plain append.
+    const r = await mgr.spawn({
+      command: "echo 'hello cap'",
+      maxLogBytes: 1024 * 1024, // 1 MB cap, tiny output
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdout.trim()).toBe('hello cap');
+    expect(out.stdoutCursor).toBeLessThan(1024 * 1024);
+  });
+
+  test('stdout cap: rejects sub-1KB non-zero maxLogBytes at spawn', async () => {
+    // A non-zero cap smaller than 1KB is almost certainly a
+    // programmer bug — too small to retain useful tail. Reject at
+    // the spawn boundary. `0` is handled separately as the
+    // documented unbounded sentinel (see next test).
+    await expect(
+      mgr.spawn({
+        command: 'true',
+        maxLogBytes: 100,
+      }),
+    ).rejects.toThrow(/maxLogBytes/);
+  });
+
+  test('stdout cap: Infinity disables cap (file grows unbounded)', async () => {
+    // Opt-out path for operator workflows that genuinely need
+    // the full log retained. Pass Number.POSITIVE_INFINITY.
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 4096",
+      maxLogBytes: Number.POSITIVE_INFINITY,
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdoutCursor).toBe(4096);
+    expect(out.stdoutPending).toBe(0);
+  });
+
+  test('stdout cap: `0` is the documented unbounded sentinel (review fix)', async () => {
+    // SpawnInput documents `maxLogBytes: 0` as the way to disable
+    // truncation and keep pre-cap behavior. The validator used to
+    // reject it as `0 < 1024`, breaking the documented contract for
+    // tooling callers. Now `0` is normalized to Infinity internally
+    // and the drainer's no-cap branch handles it.
+    const r = await mgr.spawn({
+      command: "yes 'X' | head -c 4096",
+      maxLogBytes: 0,
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdoutCursor).toBe(4096);
+    expect(out.stdoutPending).toBe(0);
+  });
+
+  test('kill cascades to grandchildren via process-group signal (BG1)', async () => {
+    // The motivating shape: bash spawns a subshell that runs sleep.
+    // Pre-slice `proc.kill('SIGTERM')` would signal bash only —
+    // sleep survives as an orphan. With group-kill, sleep also dies.
+    //
+    // Verification trick: the inner sleep writes its own PID to a
+    // file BEFORE sleeping. After mgr.kill() we use `kill -0 <pid>`
+    // to check whether sleep still lives (kill -0 = signal 0,
+    // "exists check"). If the grandchild was orphaned, kill -0 would
+    // succeed for several more seconds; with group-kill it fails
+    // immediately with ESRCH.
+    const tmpFile = join(logDir, `sleep-pid-${Date.now()}.txt`);
+    const r = await mgr.spawn({
+      command: `(sleep 30 & echo $! > ${tmpFile}; wait)`,
+    });
+    // Wait for the inner sleep to launch + write its PID.
+    await new Promise((res) => setTimeout(res, 200));
+    const fs = await import('node:fs/promises');
+    const pidContent = await fs.readFile(tmpFile, 'utf8');
+    const sleepPid = Number(pidContent.trim());
+    expect(sleepPid).toBeGreaterThan(0);
+    // Sanity: sleep is alive right now.
+    expect(() => process.kill(sleepPid, 0)).not.toThrow();
+    // Kill the bg via the manager.
+    await mgr.kill(r.id, { signal: 'SIGTERM', gracePeriodMs: 1000 });
+    // Give the OS a beat to process the group signal.
+    await new Promise((res) => setTimeout(res, 100));
+    // The grandchild MUST be gone (group-kill cascaded). Pre-slice
+    // it would still be alive, requiring its own SIGTERM.
+    let stillAlive = false;
+    try {
+      process.kill(sleepPid, 0);
+      stillAlive = true;
+    } catch {
+      // ESRCH expected — process is gone.
+    }
+    expect(stillAlive).toBe(false);
+  });
 });
 
 describe('bg manager: maxRuntimeMs', () => {

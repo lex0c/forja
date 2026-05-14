@@ -1,5 +1,6 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
 import { defaultDbPath, getSession, listSessions, migrate, openDb } from '../storage/index.ts';
+import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
 import { runCheckpointsCli } from './checkpoints.ts';
@@ -163,9 +164,221 @@ export const run = async (options: RunOptions): Promise<number> => {
       const { runExplainPermissionsCli } = await import('./explain-permissions.ts');
       return await runExplainPermissionsCli({
         cwd,
+        json: args.json,
         out: (s) => process.stdout.write(s),
         err: errSink,
       });
+    }
+
+    // `agent permission <verb>` — DB-only operator surface for the
+    // v2 permission engine. Both verbs are read-only / one-shot,
+    // never start a provider or session. They read the operator's
+    // session DB and the per-install install_id only.
+    if (args.permission !== undefined) {
+      if (args.permission.verb === 'verify') {
+        const { runPermissionVerify } = await import('./permission-verify.ts');
+        return await runPermissionVerify({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'rotate-chain') {
+        // --reason is enforced at parse time; the type-checker doesn't
+        // know that, so we assert non-null here. The chain-rotate
+        // handler also re-validates defensively.
+        const reason = args.permission.reason ?? '';
+        const { runChainRotate } = await import('./chain-rotate.ts');
+        return await runChainRotate({
+          reason,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'inspect') {
+        const rotationId = Number.parseInt(args.permission.positionals[0] ?? '0', 10);
+        const { runPermissionInspect } = await import('./permission-inspect.ts');
+        return await runPermissionInspect({
+          rotationId,
+          ...(args.permission.clearQuarantine === true ? { clear: true } : {}),
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'diff') {
+        // Both seqs validated at parse time. Defensive re-parse
+        // keeps the runtime handler's contract tight when a
+        // programmatic caller bypasses the CLI.
+        const seq1 = Number.parseInt(args.permission.positionals[0] ?? '0', 10);
+        const seq2 = Number.parseInt(args.permission.positionals[1] ?? '0', 10);
+        const { runPermissionDiff } = await import('./permission-diff.ts');
+        return await runPermissionDiff({
+          seq1,
+          seq2,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'replay') {
+        // <seq> positional + numeric range are enforced at parse time.
+        // The handler re-parses defensively in case a programmatic
+        // caller bypasses the CLI.
+        const seq = Number.parseInt(args.permission.positionals[0] ?? '0', 10);
+        const { runPermissionReplay } = await import('./permission-replay.ts');
+        return await runPermissionReplay({
+          seq,
+          json: args.json,
+          ...(args.permission.withoutClassifier === true ? { withoutClassifier: true } : {}),
+          ...(args.permission.againstCurrentPolicy === true ? { againstCurrentPolicy: true } : {}),
+          ...(args.permission.againstArchivedPolicy === true
+            ? { againstArchivedPolicy: true }
+            : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'grants') {
+        // §8 grants list (slice 41). Active by default; --all
+        // includes revoked + expired rows for forensic audit.
+        const { runPermissionGrants } = await import('./permission-grants.ts');
+        return await runPermissionGrants({
+          all: args.permission.allGrants === true,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'revoke') {
+        // §8 grant revoke (slice 41). Idempotent per spec line 621;
+        // <id> positional shape (ULID) re-validated in the handler.
+        const id = args.permission.positionals[0] ?? '';
+        const { runPermissionRevoke } = await import('./permission-revoke.ts');
+        return await runPermissionRevoke({
+          id,
+          json: args.json,
+          ...(args.permission.reason !== undefined ? { reason: args.permission.reason } : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'policy-list') {
+        // §12.4 policy archive enumeration (slice 49). Read-only;
+        // pairs with future `policy-rollback` for the write side.
+        const { runPermissionPolicyList } = await import('./permission-policy-list.ts');
+        return await runPermissionPolicyList({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'policy-rollback') {
+        // §12.4 policy rollback (slice 50). Dry-run by default;
+        // --write commits AND emits an audit event per spec line
+        // 756. Positional <hash> validated upstream (parser checks
+        // length); handler validates against archive contents.
+        const hash = args.permission.positionals[0] ?? '';
+        const { runPermissionPolicyRollback } = await import('./permission-policy-rollback.ts');
+        return await runPermissionPolicyRollback({
+          hash,
+          json: args.json,
+          ...(args.permission.rollbackWrite === true ? { write: true } : {}),
+          ...(args.permission.rollbackTarget !== undefined
+            ? { target: args.permission.rollbackTarget }
+            : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'seal-now') {
+        // §7.3 manual seal flush (slice 58). Reads active policy
+        // for `seal.mode`, builds the matching SealStore, appends
+        // one entry pointing at the latest chain row. Idempotent
+        // when chain hasn't moved since last seal — returns 0 with
+        // noop status. Operators use this before SIGTERM in
+        // scripts, in cron, or when one-shot batch jobs don't hit
+        // the scheduler's automatic intervals.
+        const { runPermissionSealNow } = await import('./permission-seal-now.ts');
+        return await runPermissionSealNow({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'seal-verify') {
+        // §7.3 seal-file integrity check (slice 58). Reads active
+        // policy for `seal.mode`, builds the matching SealStore in
+        // read-only mode, cross-references every seal entry against
+        // the live `approvals_log` chain. Exit 0 (intact) or 1
+        // (broken / not configured / fs error).
+        const { runPermissionSealVerify } = await import('./permission-seal-verify.ts');
+        return await runPermissionSealVerify({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'calibration-export') {
+        // §6.3.2 step 1 (slice 138). Reads approvals_log +
+        // outcome_signals for the current install over a configurable
+        // window (default 30d), produces coverage summary (text) or
+        // NDJSON triples (--json). Output consumed by offline
+        // calibration scripts; the in-process regression itself is a
+        // future slice.
+        const { runPermissionCalibrationExport } = await import('./permission-calibration.ts');
+        return await runPermissionCalibrationExport({
+          json: args.json,
+          ...(args.permission.sinceDays !== undefined
+            ? { sinceDays: args.permission.sinceDays }
+            : {}),
+          ...(args.permission.allDecisions === true ? { allDecisions: true } : {}),
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      // The arg parser already rejects unknown verbs; this branch
+      // catches the impossible-but-safe case of a verb the dispatch
+      // doesn't know how to route.
+      errSink(`forja permission: verb '${args.permission.verb}' has no handler\n`);
+      return 1;
     }
 
     // `agent recap [args]` headless surface (RECAP §9). Tries to
@@ -181,6 +394,47 @@ export const run = async (options: RunOptions): Promise<number> => {
     // NDJSON envelope (recap_start / recap_intermediate /
     // recap_render / recap_end); without it, the rendered text
     // streams to stdout verbatim.
+    // `agent doctor [--json]` — §13 platform provisioning health check.
+    // No provider, no DB, no harness — just probes the host and
+    // emits a structured report. Exit 0 on all-pass, 1 if any check
+    // fails.
+    if (args.doctor !== undefined) {
+      const { runDoctor } = await import('./doctor.ts');
+      return await runDoctor({
+        json: args.doctor.json,
+        out: (s) => process.stdout.write(s),
+        err: errSink,
+      });
+    }
+
+    // `agent sandbox <verb> [--json]` — §13 guided sandbox bootstrap.
+    // Slice 44: setup verb. Same lifecycle-mode shape as doctor.
+    if (args.sandbox !== undefined) {
+      if (args.sandbox.verb === 'setup') {
+        const { runSandboxSetup } = await import('./sandbox-setup.ts');
+        return await runSandboxSetup({
+          json: args.sandbox.json,
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      // Defensive: parser rejects unknown verbs, but route the
+      // impossible case to a clean error.
+      errSink(`forja sandbox: verb '${args.sandbox.verb}' has no handler\n`);
+      return 1;
+    }
+
+    // `agent welcome` — §13.5 first-boot walkthrough (slice 45).
+    // Composes doctor + sandbox setup. Same lifecycle-mode shape.
+    if (args.welcome === true) {
+      const { runWelcome } = await import('./welcome.ts');
+      return await runWelcome({
+        out: (s) => process.stdout.write(s),
+        err: errSink,
+        ...(args.iKnowWhatImDoing === true ? { iKnowWhatImDoing: true } : {}),
+      });
+    }
+
     if (args.recap !== undefined) {
       const { runRecapHeadless } = await import('./recap-headless.ts');
       let provider: import('../providers/types.ts').Provider;
@@ -199,7 +453,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           signal: options.signal ?? new AbortController().signal,
           ...(options.bootstrapOverride ?? {}),
         };
-        const result = bootstrap(bootstrapInput);
+        const result = await bootstrap(bootstrapInput);
         provider = result.config.provider;
         dbOverride = result.db;
         bootstrappedDbCloser = () => result.db.close();
@@ -375,6 +629,45 @@ export const run = async (options: RunOptions): Promise<number> => {
         return 1;
       }
       resumeFromSessionId = resolved.id;
+
+      // Slice 129 (R5 P0 crash): settle any subagent handles
+      // left in `running` from the previous (crashed) run of
+      // this session. Pre-slice `settleRunningSubagentHandles`
+      // was DEFINED but never called — a parent that crashed
+      // mid-`task_async` left `subagent_handles.status='running'`
+      // forever; `task_await(handle_id)` post-resume returned
+      // `unknown_handle` and the cached child output in
+      // `subagent_outputs` was unreachable.
+      //
+      // The payload describes the interruption shape so any
+      // operator-facing UI rendering the settled envelope sees
+      // a coherent "this session was interrupted" message.
+      try {
+        const db = openDb(dbPath);
+        try {
+          const settled = settleRunningSubagentHandles(db, resolved.id, {
+            status: 'interrupted',
+            reason: 'parent_session_resumed_after_crash',
+            interrupted_at_ms: Date.now(),
+          });
+          if (settled > 0) {
+            errSink(
+              `forja: --resume settled ${settled} subagent handle(s) left running from the previous (crashed) run.\n`,
+            );
+          }
+        } finally {
+          db.close();
+        }
+      } catch (e) {
+        // Non-fatal: resume can still proceed even if the
+        // settle pass fails. Surface the diagnostic so operator
+        // sees that some handles MIGHT still be stranded.
+        errSink(
+          `forja: --resume could not settle stale subagent handles: ${
+            e instanceof Error ? e.message : String(e)
+          }\n`,
+        );
+      }
     }
 
     const renderer = options.rendererOverride ?? pickRenderer(args);
@@ -393,11 +686,42 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
       ...(args.plan === true ? { plan: true } : {}),
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
+      ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
+      ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
+      ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db, lockConflicts, subagents, hookWarnings, critiqueWarnings } =
-      bootstrap(bootstrapInput);
+    const {
+      config,
+      db,
+      lockConflicts,
+      subagents,
+      hookWarnings,
+      critiqueWarnings,
+      permissionState,
+      permissionRefusingReason,
+      permissionChain,
+    } = await bootstrap(bootstrapInput);
+
+    // Permission engine refused to come up — typically a broken
+    // audit chain (PERMISSION_ENGINE.md §7.2). Surface the cause
+    // to stderr with the recovery flag, then exit 2 (boot-blocking
+    // configuration error). We close the DB explicitly so the WAL
+    // doesn't linger across the failed boot.
+    if (permissionState === 'refusing') {
+      const reason = permissionRefusingReason ?? 'unknown';
+      errSink(`forja: permission engine refused to start — ${reason}\n`);
+      if (!permissionChain.ok) {
+        errSink(`  chain broken at seq ${permissionChain.brokenAt} (${permissionChain.reason})\n`);
+        errSink('  to continue under the known break, re-run with --accept-broken-chain\n');
+        errSink(
+          '  (the override is itself audited — a `chain-break-accepted` row lands before any new decisions)\n',
+        );
+      }
+      db.close();
+      return 2;
+    }
 
     // Surface cross-scope subagent shadows. A user's
     // ~/.config/agent/agents/<name>.md silently being eclipsed by
@@ -468,6 +792,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       renderer.flush();
       return exitCodeFor(result);
     } finally {
+      // §13.7 broker drain BEFORE storage close. broker.close()
+      // awaits any in-flight exec call (slice 78's FIFO chain); if
+      // we closed the DB first, an orphaned handler that emits an
+      // audit row mid-drain would hit a closed sqlite handle. The
+      // close is idempotent + always-defined in production (bootstrap
+      // wires it); the conditional is for headless / SDK callers
+      // that may construct a HarnessConfig without a broker.
+      if (cfg.broker !== undefined) {
+        await cfg.broker.close();
+      }
       db.close();
     }
   } catch (e) {

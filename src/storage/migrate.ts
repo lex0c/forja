@@ -40,6 +40,23 @@ export const migrate = (db: DB, migrations: readonly Migration[] = MIGRATIONS): 
     .all() as MigrationRow[];
   const appliedById = new Map(appliedRows.map((r) => [r.id, r]));
 
+  // Slice 134 P0-6: forward-compat check. If `_migrations` carries a
+  // row whose id isn't in the current registry, this DB was last
+  // touched by a NEWER Forja binary — the older binary can't
+  // assume its schema knowledge covers the row shape that was
+  // created. Refuse loud rather than silently proceed and risk
+  // writing rows the future binary will mis-read. Forensic audit
+  // DBs are expected to outlive Forja versions; opening with the
+  // wrong binary should be impossible to do quietly.
+  const registeredIds = new Set(migrations.map((m) => m.id));
+  for (const row of appliedRows) {
+    if (!registeredIds.has(row.id)) {
+      throw new Error(
+        `migrate: DB has migration id=${row.id} (name=${row.name}) that this Forja binary does not know about. This DB was last written by a NEWER Forja; update the binary or open with a fresh DB.`,
+      );
+    }
+  }
+
   const applied: string[] = [];
   const skipped: string[] = [];
 

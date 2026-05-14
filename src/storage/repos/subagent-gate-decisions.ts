@@ -17,7 +17,14 @@ import type { DB } from '../db.ts';
 // is built so external tooling can SELECT directly or a
 // future `agent dump-decisions <session>` CLI can wrap it).
 
-export type GateDecisionType = 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+// PERMISSION_ENGINE.md §10.1 spawn refusal kinds. New entries require
+// a migration to widen the CHECK constraint (see migration 036 for
+// the `subagent_escalation` addition).
+export type GateDecisionType =
+  | 'budget_exhausted'
+  | 'unknown_subagent'
+  | 'depth_exceeded'
+  | 'subagent_escalation';
 
 export type GateDecisionTool = 'task' | 'task_sync' | 'task_async';
 

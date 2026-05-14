@@ -1,6 +1,7 @@
 import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
+import { matchSensitivePath } from '../permissions/sensitive-paths.ts';
 
 // Low-level git plumbing for the checkpoint subsystem.
 //
@@ -288,6 +289,35 @@ export const snapshot = async (input: SnapshotInput): Promise<SnapshotResult> =>
     // real index stays untouched because GIT_INDEX_FILE points
     // elsewhere.
     await runGit(['add', '-A', '.'], { cwd, env });
+    // Slice 172 (review — information-leak P1). `git add -A .`
+    // captures EVERY file in the working tree including untracked
+    // `.env`, `.aws/credentials`, `*.pem`, `id_rsa*` that the
+    // operator has in cwd. Without filtering, these flow into loose
+    // git objects under `.git/objects/` reachable via
+    // `refs/agent/checkpoints/<session>/`. The objects stay even if
+    // the ref is later deleted (until `git gc` fires; `git log
+    // --all` and `git fsck` find them; repo backups capture them).
+    //
+    // SEC §8.4 sensitive-paths patterns identify the canonical
+    // secret-shaped files. Walk the temp index, drop any matched
+    // entries via `update-index --force-remove --` before the
+    // write-tree. Paths kept in tree-only form for the audit
+    // checkpoint trail; operators who genuinely need to checkpoint
+    // a secret-bearing file move it OUT of the sensitive-name
+    // pattern (rare).
+    const lsRes = await runGit(['ls-files', '-z'], { cwd, env });
+    const indexed = lsRes.stdout.split('\0').filter((s) => s.length > 0);
+    const sensitiveEntries = indexed.filter((p) => matchSensitivePath(p) !== null);
+    if (sensitiveEntries.length > 0) {
+      // `update-index --force-remove --` takes paths as positionals.
+      // Batch in chunks of 512 to stay under argv limits on
+      // pathological repos.
+      const chunkSize = 512;
+      for (let i = 0; i < sensitiveEntries.length; i += chunkSize) {
+        const chunk = sensitiveEntries.slice(i, i + chunkSize);
+        await runGit(['update-index', '--force-remove', '--', ...chunk], { cwd, env });
+      }
+    }
     const treeRes = await runGit(['write-tree'], { cwd, env });
     const tree = treeRes.stdout.trim();
     if (tree.length === 0) {

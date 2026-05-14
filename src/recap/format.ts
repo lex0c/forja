@@ -12,6 +12,7 @@
 
 import { homedir } from 'node:os';
 import { stripAnsi } from '../sanitize/ansi.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { RecapIntermediate } from './types.ts';
 
 // Common options for every renderer that emits human-facing text
@@ -151,91 +152,12 @@ export const oneLine = (s: string): string =>
 // best-effort defense, not a substitute for not-pasting-secrets;
 // the spec acknowledges this as heuristic.
 //
-// Patterns ordered most-specific first so a JWT does not get
-// caught by the more permissive Bearer rule, etc.
-interface SecretPattern {
-  readonly name: string;
-  readonly pattern: RegExp;
-  // When true, the pattern's first capturing group is preserved
-  // (typically the env-var key) so the operator sees what was
-  // redacted. When false, the entire match is replaced.
-  readonly preserveKey: boolean;
-}
-
-const SECRET_PATTERNS: readonly SecretPattern[] = [
-  // Anthropic API keys: `sk-ant-...`. Length is open-ended in
-  // practice (40+ alphanumerics with `_-`).
-  { name: 'anthropic-key', pattern: /sk-ant-[A-Za-z0-9_-]{20,}/g, preserveKey: false },
-  // OpenAI keys: `sk-...`, `sk-proj-...`. Negative lookahead
-  // excludes Anthropic-shaped keys (handled above).
-  { name: 'openai-key', pattern: /sk-(?!ant-)[A-Za-z0-9_-]{20,}/g, preserveKey: false },
-  // AWS access key IDs.
-  { name: 'aws-access-key', pattern: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, preserveKey: false },
-  // GitHub fine-grained / PAT / OAuth / app tokens.
-  {
-    name: 'github-token',
-    pattern: /\b(?:ghp|ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}\b/g,
-    preserveKey: false,
-  },
-  // Google API keys: `AIza` prefix + 35 chars of `[A-Za-z0-9_-]`
-  // (per Google's published format). Length is fixed; bounding
-  // with `\b` on the right is critical because the trailing chars
-  // can include `-` and `_` which `\b` treats as word boundaries.
-  // SECURITY_GUIDELINE §6.1 lists this as a required pattern.
-  {
-    name: 'google-api-key',
-    pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
-    preserveKey: false,
-  },
-  // Slack tokens: bot (`xoxb-`), user (`xoxp-`), workspace
-  // (`xoxa-`/`xoxr-`), Slack-Internal (`xoxs-`). Body is hyphen-
-  // separated digit/alpha segments; the conservative shape
-  // `[A-Za-z0-9-]{20,}` catches every variant without
-  // over-matching neighboring text. SECURITY_GUIDELINE §6.1.
-  {
-    name: 'slack-token',
-    pattern: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g,
-    preserveKey: false,
-  },
-  // JWT shape: header.payload.signature, all base64url. Has to
-  // come BEFORE the bearer rule — a JWT after `Bearer` would
-  // otherwise get caught by the broader bearer pattern with a
-  // less informative label.
-  {
-    name: 'jwt',
-    pattern: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
-    preserveKey: false,
-  },
-  // `Bearer <token>` carrying anything that smells like a token.
-  {
-    name: 'bearer-token',
-    pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/g,
-    preserveKey: false,
-  },
-  // KEY=VALUE forms where the key name suggests a secret. Key
-  // is preserved so the operator knows what was redacted; value
-  // is replaced. Catches both `FOO_API_KEY=...` and inline
-  // `--api-key foo123`. Quoted values supported.
-  {
-    name: 'env-secret',
-    pattern:
-      /\b([A-Z][A-Z0-9_]*(?:API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH_KEY|PRIVATE_KEY))\s*=\s*['"]?([A-Za-z0-9_./+=:-]{8,})['"]?/g,
-    preserveKey: true,
-  },
-];
-
-export const redactSecrets = (text: string): string => {
-  if (text.length === 0) return text;
-  let result = text;
-  for (const { name, pattern, preserveKey } of SECRET_PATTERNS) {
-    if (preserveKey) {
-      result = result.replace(pattern, (_match, key) => `${key}=<redacted:${name}>`);
-    } else {
-      result = result.replace(pattern, `<redacted:${name}>`);
-    }
-  }
-  return result;
-};
+// Slice 177 (review — P1). The pattern table + `redactSecrets`
+// function moved to `src/sanitize/secrets.ts` so the permissions
+// engine can use the same redactor for operator-visible prompts
+// without a `permissions → recap` layering reversal. Re-export
+// here so existing recap consumers keep working unchanged.
+export { redactSecrets } from '../sanitize/secrets.ts';
 
 // Selective redaction over a `RecapIntermediate`. The JSON
 // renderer needs the same §6.2 privacy guarantee as the markdown

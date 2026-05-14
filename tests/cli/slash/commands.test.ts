@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
 import { budgetCommand } from '../../../src/cli/slash/commands/budget.ts';
 import { clearCommand } from '../../../src/cli/slash/commands/clear.ts';
 import { costCommand } from '../../../src/cli/slash/commands/cost.ts';
@@ -13,6 +13,7 @@ import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { initBashParser } from '../../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../../src/permissions/index.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { openMemoryDb } from '../../../src/storage/db.ts';
@@ -22,6 +23,15 @@ import { createToolRegistry } from '../../../src/tools/registry.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../src/tui/modal-manager.ts';
+
+// Bash resolver (slice 6) walks the tree-sitter-bash AST and requires
+// an async one-time init. Tests that exercise bash checks through
+// `/perms why` would otherwise hit `parser unavailable` Refuse when
+// this file runs in isolation. Idempotent across files via the module
+// singleton, so this is cheap even when other files have warmed it.
+beforeAll(async () => {
+  await initBashParser();
+});
 
 const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
   const bus = createBus();
@@ -1266,6 +1276,42 @@ describe('/perms', () => {
     expect(lines[0]).toBe('policy: mode=acceptEdits');
     expect(lines.some((l) => l.includes('default-deny in strict mode'))).toBe(false);
   });
+
+  test('renders sandbox section after tools.* (slice 37)', () => {
+    const lines = renderPolicy({
+      defaults: { mode: 'strict' },
+      tools: { bash: { allow: ['ls *'] } },
+      sandbox: { required: true, hostAllowed: false, locked: true },
+    });
+    const text = lines.join('\n');
+    // Sandbox header + each set field + locked footer. No layer hints
+    // because /perms (no args) doesn't carry provenance — bare values.
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true');
+    expect(text).toContain('host_allowed: false');
+    expect(text).toContain('(locked)');
+    // Pre-slice-37 /perms quietly omitted sandbox even when set.
+    // Regression guard for that gap.
+    expect(text.indexOf('bash:')).toBeLessThan(text.indexOf('sandbox:'));
+  });
+
+  test('sandbox-only policy (no tools sections) still renders sandbox', () => {
+    // Edge case: a policy that ONLY configures sandbox (typical for an
+    // enterprise lockdown that defers tool sections to lower layers).
+    // Pre-slice-37 the "no tool sections defined" notice fired and
+    // sandbox stayed invisible; now the section renders and the
+    // strict-mode footer drops (no tool sections to caveat).
+    const lines = renderPolicy({
+      defaults: { mode: 'strict' },
+      tools: {},
+      sandbox: { required: true, locked: true },
+    });
+    const text = lines.join('\n');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true');
+    expect(text).toContain('(locked)');
+    expect(text).not.toContain('no tool sections defined');
+  });
 });
 
 describe('/perms why', () => {
@@ -1327,18 +1373,23 @@ describe('/perms why', () => {
   });
 
   test('bash allow rule renders decision + rule + layer + section', async () => {
+    // `ls -la` lands as high-confidence + score 0; the slice-7
+    // approval gate doesn't fire, so the matched allow rule
+    // surfaces as decision: allow in the render. Using a medium-
+    // confidence command (e.g. `npm test`) would force confirm via
+    // §6.6 and shadow the layer/rule attribution we're testing.
     const ctx = buildCtx(
-      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['npm test*'] } } },
+      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls*'] } } },
       [{ name: 'bash', category: 'bash' }],
       { defaults: 'project', bash: 'project' },
     );
-    const result = await permsCommand.exec(['why', 'bash', 'npm', 'test', '--watch'], ctx);
+    const result = await permsCommand.exec(['why', 'bash', 'ls', '-la'], ctx);
     if (result.kind !== 'ok') throw new Error('expected ok');
     const text = (result.notes ?? []).join('\n');
     // Header echoes the input verbatim so scrollback is greppable.
-    expect(text).toContain('/perms why bash npm test --watch');
+    expect(text).toContain('/perms why bash ls -la');
     expect(text).toContain('decision: allow');
-    expect(text).toContain('rule:     npm test*');
+    expect(text).toContain('rule:     ls*');
     expect(text).toContain('layer:    project policy');
     expect(text).toContain('section:  bash');
   });
@@ -1349,7 +1400,11 @@ describe('/perms why', () => {
       [{ name: 'bash', category: 'bash' }],
       { defaults: 'project', bash: 'enterprise' },
     );
-    const result = await permsCommand.exec(['why', 'bash', 'rm', '-rf', '/'], ctx);
+    // Slice 147: use a cwd-relative target so the resolver doesn't
+    // refuse on RM_REFUSE_ROOTS BEFORE the policy stage runs.
+    // /perms why pins the POLICY attribution; the resolver-refuse
+    // path is exercised in the resolver suite.
+    const result = await permsCommand.exec(['why', 'bash', 'rm', '-rf', 'build/garbage'], ctx);
     if (result.kind !== 'ok') throw new Error('expected ok');
     const text = (result.notes ?? []).join('\n');
     expect(text).toContain('decision: deny');
@@ -1472,5 +1527,68 @@ describe('/perms why', () => {
     expect(result.kind).toBe('error');
     if (result.kind !== 'error') return;
     expect(result.message).toContain('unknown sub-command');
+  });
+
+  test('/perms why sandbox: section declared → renders state + per-field provenance (slice 37)', async () => {
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { required: true, hostAllowed: false, locked: true },
+      },
+      [],
+      {
+        defaults: 'enterprise',
+        sandbox: { required: 'enterprise', hostAllowed: 'user', locked: 'enterprise' },
+      },
+    );
+    const result = await permsCommand.exec(['why', 'sandbox'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    // Header echoes the input; renderSandbox produces the body.
+    expect(text).toContain('/perms why sandbox');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('required: true [from enterprise policy]');
+    expect(text).toContain('host_allowed: false [from user policy]');
+    expect(text).toContain('(locked by enterprise policy)');
+  });
+
+  test('/perms why sandbox: no section declared → renders "not declared" notice with defaults', async () => {
+    // Bootstrap defaults are required=false, host_allowed=false. The
+    // notice surfaces this so the operator knows the engine ISN'T
+    // running sandboxed without having to dig into the source. Same
+    // shape as the "no tool sections defined" footer in `/perms`.
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, []);
+    const result = await permsCommand.exec(['why', 'sandbox'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('/perms why sandbox');
+    expect(text).toContain('sandbox section not declared');
+    expect(text).toContain('bootstrap defaults');
+    expect(text).toContain('required=false');
+    expect(text).toContain('host_allowed=false');
+  });
+
+  test('/perms why sandbox: lock-only section renders just the lock footer (no field lines)', async () => {
+    // Lock-only-layer case from slice 34: no required / host_allowed
+    // set, just locked=true. /perms why sandbox should render the
+    // header + lock footer with attribution, NOT phantom "required:
+    // unset" lines.
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: {},
+        sandbox: { locked: true },
+      },
+      [],
+      { defaults: 'enterprise', sandbox: { locked: 'enterprise' } },
+    );
+    const result = await permsCommand.exec(['why', 'sandbox'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('sandbox:');
+    expect(text).toContain('(locked by enterprise policy)');
+    expect(text).not.toContain('required:');
+    expect(text).not.toContain('host_allowed:');
   });
 });

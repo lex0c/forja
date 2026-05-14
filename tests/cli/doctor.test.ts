@@ -1,0 +1,1158 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parseArgs } from '../../src/cli/args.ts';
+import { resetSharedDoctorCache } from '../../src/cli/doctor-cache.ts';
+import { runDoctor } from '../../src/cli/doctor.ts';
+import {
+  type SealEntry,
+  type SealStore,
+  createSqliteSink,
+  ensureInstallId,
+} from '../../src/permissions/index.ts';
+import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
+
+const captured = () => {
+  const lines: string[] = [];
+  return { write: (s: string) => lines.push(s), lines };
+};
+
+describe('parseArgs — agent doctor', () => {
+  test('doctor verb is recognized', () => {
+    const r = parseArgs(['doctor']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.doctor?.json).toBe(false);
+      expect(r.args.json).toBe(false);
+    }
+  });
+
+  test('--json flag is captured', () => {
+    const r = parseArgs(['doctor', '--json']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.doctor?.json).toBe(true);
+      expect(r.args.json).toBe(true);
+    }
+  });
+
+  test('--help short-circuits to help mode', () => {
+    const r = parseArgs(['doctor', '--help']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.help).toBe(true);
+      expect(r.args.doctor).toBeUndefined();
+    }
+  });
+
+  test('unknown flag rejected', () => {
+    const r = parseArgs(['doctor', '--foo']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('--foo');
+  });
+
+  test('positional after doctor is treated as unknown flag', () => {
+    // Doctor takes no positionals; the loop in the parser hits
+    // the unknown-flag branch on the first non-flag token.
+    const r = parseArgs(['doctor', 'extra']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('extra');
+  });
+});
+
+describe('runDoctor', () => {
+  let tmp: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-doctor-'));
+    // Point HOME at a writable temp dir so config_dir + data_dir
+    // checks pass deterministically on any runner.
+    env = { HOME: tmp, PATH: process.env.PATH };
+    // Slice 124: reset the shared doctor cache so cached entries
+    // from previous tests don't leak into this test's check
+    // results (e.g., a test that stubbed `aa-status` to fail
+    // would otherwise feed a cached "warn" into a later test that
+    // expected "ok" with a different stub).
+    resetSharedDoctorCache();
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('all checks pass → exit 0 + "all checks passed" footer', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      // Stub which() so the sandbox + git checks pass regardless of
+      // the runner's $PATH (CI hosts often lack bwrap).
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('platform');
+    expect(text).toContain('sandbox');
+    expect(text).toContain('config_dir');
+    expect(text).toContain('data_dir');
+    expect(text).toContain('git');
+    expect(text).toContain('summary: all checks passed');
+  });
+
+  // Slice 123 (R9 P1): pre-slice `dirWritable` short-circuited on
+  // `existsSync(dir)` and returned writable:true without probing.
+  // A dir at chmod 0500 (read+exec, no write) passed config_dir
+  // → 'ok' but every runtime fs op on the path failed. Now
+  // `accessSync(dir, W_OK)` is probed and the check fails loud.
+  test('config_dir on chmod 0500 → fail with EACCES-ish error', async () => {
+    const out = captured();
+    // The config_dir resolution: HOME/.config/agent (we control
+    // HOME via env). Pre-create the tree and chmod the LEAF to
+    // 0500 so accessSync(W_OK) fails.
+    const targetDir = join(tmp, '.config', 'agent');
+    mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+    chmodSync(targetDir, 0o500);
+    try {
+      await runDoctor({
+        json: true,
+        env,
+        which: (cmd) => `/usr/bin/${cmd}`,
+        exists: (p) => p.startsWith('/usr/bin/'),
+        readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+        runCmd: () => null,
+        engineVersion: '0.0.0',
+        out: out.write,
+      });
+      const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+      const configCheck = lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find((e) => e.kind === 'check' && e.name === 'config_dir');
+      expect(configCheck?.status).toBe('fail');
+      // The OS error text varies (EACCES vs permission denied) but
+      // both forms contain 'EACCES' or 'permission'.
+      const detail = configCheck?.detail as string | undefined;
+      expect(detail?.toLowerCase()).toMatch(/eacces|permission/);
+    } finally {
+      // chmod back so rmSync can clean up.
+      chmodSync(targetDir, 0o700);
+    }
+  });
+
+  test('sandbox available with trustLevel=path-resolved → warn with trust warnings (slice 165)', async () => {
+    // Pre-slice 165: doctor reported "sandbox: ok bwrap available"
+    // even when the resolver flagged the install as non-canonical.
+    // Post-slice: trustLevel != 'canonical' becomes a `warn` line
+    // with the resolver's trustWarnings rendered as remediation.
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      // bwrap missing at canonical /usr/bin/bwrap but present at
+      // /nix/store/.../bwrap (operator's Nix install).
+      which: (cmd) => (cmd === 'bwrap' ? '/nix/store/abc/bwrap' : `/usr/bin/${cmd}`),
+      exists: (p) => p !== '/usr/bin/bwrap' && p.startsWith('/usr/bin/'),
+      stat: () => ({ uid: 0, mode: 0o755 }),
+      out: out.write,
+      err: captured().write,
+    });
+    // Warnings → exit 0 (sandbox warning is recoverable).
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('sandbox');
+    expect(text).toContain('warn');
+    // The non-canonical path + trustLevel surface in the detail.
+    expect(text).toContain('/nix/store/abc/bwrap');
+    expect(text).toContain('path-resolved');
+    // Trust warning copy from the resolver bubbles into remediation.
+    expect(text).toContain('non-canonical');
+  });
+
+  test('missing sandbox tool → warn, exit 0 (sandbox absence is recoverable)', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      which: (cmd) => (cmd === 'bwrap' || cmd === 'sandbox-exec' ? null : `/usr/bin/${cmd}`),
+      exists: (p) =>
+        p !== '/usr/bin/bwrap' && p !== '/usr/bin/sandbox-exec' && p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0); // warnings don't fail the check
+    const text = out.lines.join('');
+    expect(text).toContain('sandbox');
+    expect(text).toContain('warn');
+    expect(text).toMatch(/warning\(s\)/);
+  });
+
+  test('missing git → warn, exit 0', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      which: (cmd) => (cmd === 'git' ? null : `/usr/bin/${cmd}`),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('git not found on $PATH');
+    expect(text).toContain('install git');
+  });
+
+  test('--json: NDJSON one event per check + info + summary line', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      // Slice 90 seams: stub the new probe sites so every check
+      // lands OK on a runner that may not have nft / SELinux /
+      // AppArmor / /proc/sys/user/max_user_namespaces.
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: (cmd, _args) => {
+        if (cmd === 'nft') return 'nftables v1.0.9 (Old Doc Yak)\n';
+        if (cmd === 'getenforce') return 'Enforcing\n';
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    // 11 checks (slice 90 added user_namespaces + net_filtering +
+    // mac_lsm) + 1 info (capability ceiling + engine version) +
+    // 1 summary.
+    expect(lines.length).toBe(13);
+    const events = lines.map((l) => JSON.parse(l));
+    expect(events[0].kind).toBe('check');
+    expect(events[0].name).toBe('platform');
+    // Info event sits between the last check and the summary.
+    const info = events[events.length - 2];
+    expect(info.kind).toBe('info');
+    expect(info.engine_version).toBe('0.0.0');
+    expect(Array.isArray(info.capability_ceiling)).toBe(true);
+    const summary = events[events.length - 1];
+    expect(summary.kind).toBe('summary');
+    expect(summary.ok).toBe(true);
+    expect(summary.counts).toEqual({ ok: 11, warn: 0, fail: 0 });
+  });
+
+  test('--json: failures bump summary.ok to false + exit 1', async () => {
+    // Force a failure by pointing HOME at a non-existent + non-
+    // writable parent. Real production checks would hit this when
+    // operators have HOME set to a path their user can't reach.
+    const noHome = { PATH: process.env.PATH };
+    const out = captured();
+    const code = await runDoctor({
+      json: true,
+      env: noHome,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1);
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const summary = JSON.parse(lines[lines.length - 1] as string);
+    expect(summary.kind).toBe('summary');
+    expect(summary.ok).toBe(false);
+    expect(summary.counts.fail).toBeGreaterThanOrEqual(1);
+  });
+
+  test('plain text: failures render the remediation hint', async () => {
+    const noHome = { PATH: process.env.PATH };
+    const out = captured();
+    await runDoctor({
+      env: noHome,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('→');
+    expect(text).toMatch(/failure\(s\)/);
+  });
+});
+
+describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
+  let tmp: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-doctor-seal-'));
+    env = { HOME: tmp, PATH: process.env.PATH };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const writeUserYaml = (sealSection: string | null): string => {
+    const path = join(tmp, 'user-permissions.yaml');
+    const content =
+      sealSection === null
+        ? 'defaults:\n  mode: strict\n'
+        : `defaults:\n  mode: strict\n${sealSection}\n`;
+    writeFileSync(path, content);
+    return path;
+  };
+
+  const makeStaticStore =
+    (entries: SealEntry[]): (() => SealStore) =>
+    () => ({
+      append: () => ({ ok: true }),
+      list: () => entries.slice(),
+      close: () => {},
+    });
+
+  test('no seal section → ok "not configured"', async () => {
+    const userPath = writeUserYaml(null);
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('not configured (optional per spec §7.3)');
+  });
+
+  test('mode=none → ok "not configured"', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: none');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('not configured');
+  });
+
+  test('mode=worm-file with empty seal file → warn "no entries yet"', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      sealStoreFactory: makeStaticStore([]),
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0); // warn doesn't fail
+    const text = out.lines.join('');
+    expect(text).toContain('configured but no entries yet');
+    expect(text).toContain('seal-now'); // remediation
+  });
+
+  test('mode=worm-file with N entries → ok with relative-time + count', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const entries: SealEntry[] = [
+      { seq: 1, ts: 1_000_000_000_000, hash: 'sha256:a' },
+      { seq: 50, ts: 1_000_000_300_000, hash: 'sha256:b' }, // 5 minutes after start
+      { seq: 100, ts: 1_000_000_600_000, hash: 'sha256:c' }, // 10 minutes after start
+    ];
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      sealStoreFactory: makeStaticStore(entries),
+      // Now = 4 hours after the last seal (4 * 3600 * 1000 ms).
+      now: () => 1_000_000_600_000 + 4 * 3600 * 1000,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('3 entries');
+    expect(text).toContain('last 4h ago');
+    expect(text).toContain('worm-file at /var/log/agent/seal.log');
+  });
+
+  test('mode=worm-file with single entry → singular "1 entry"', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      sealStoreFactory: makeStaticStore([{ seq: 1, ts: 1_000_000_000_000, hash: 'sha256:a' }]),
+      now: () => 1_000_000_000_000 + 30 * 1000, // 30s after
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('1 entry,');
+    expect(text).toContain('last 30s ago');
+  });
+
+  test('corrupted seal file (list throws) → fail with remediation', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const factory = (): SealStore => ({
+      append: () => ({ ok: true }),
+      list: () => {
+        throw new Error('malformed seal entry at line 3');
+      },
+      close: () => {},
+    });
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      sealStoreFactory: factory,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1); // fail exits non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('seal file corrupted');
+    expect(text).toContain('seal-verify'); // remediation hint
+  });
+
+  test('relative-time buckets: seconds / minutes / hours / days', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /tmp/s.log');
+    const cases: Array<{ deltaMs: number; expect: string }> = [
+      { deltaMs: 5 * 1000, expect: '5s ago' },
+      { deltaMs: 90 * 1000, expect: '1m ago' },
+      { deltaMs: 90 * 60 * 1000, expect: '1h ago' },
+      { deltaMs: 2 * 24 * 3600 * 1000, expect: '2d ago' },
+    ];
+    for (const c of cases) {
+      const out = captured();
+      const baseTs = 1_000_000_000_000;
+      await runDoctor({
+        env,
+        cwd: tmp,
+        enterprisePath: null,
+        userPath,
+        sealStoreFactory: makeStaticStore([{ seq: 1, ts: baseTs, hash: 'sha256:a' }]),
+        now: () => baseTs + c.deltaMs,
+        which: (cmd) => `/usr/bin/${cmd}`,
+        exists: (p) => p.startsWith('/usr/bin/'),
+        out: out.write,
+        err: captured().write,
+      });
+      expect(out.lines.join('')).toContain(`last ${c.expect}`);
+    }
+  });
+
+  test('--json: sealing check is included with structured fields', async () => {
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const out = captured();
+    await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      sealStoreFactory: makeStaticStore([{ seq: 7, ts: 1_000_000_000_000, hash: 'sha256:abc' }]),
+      now: () => 1_000_000_000_000 + 5 * 1000,
+      json: true,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const events = lines.map((l) => JSON.parse(l));
+    const sealing = events.find((e) => e.name === 'sealing');
+    expect(sealing).toBeDefined();
+    expect(sealing.status).toBe('ok');
+    expect(sealing.detail).toContain('1 entry');
+    expect(sealing.detail).toContain('last 5s ago');
+  });
+});
+
+describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
+  let tmp: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-doctor-policy-'));
+    env = { HOME: tmp, PATH: process.env.PATH };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('no layers present → ok "enterprise=none user=none project=none"', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null, // explicitly disabled (no file to look for)
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('enterprise=none user=none project=none');
+  });
+
+  test('user layer present → ok "user=ok"', async () => {
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: strict\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('user=ok');
+  });
+
+  test('project layer present → ok "project=ok"', async () => {
+    // Project layer is discovered relative to cwd. Build a project
+    // policy under .agent/permissions.yaml.
+    const projDir = join(tmp, 'proj');
+    const agentDir = join(projDir, '.agent');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'permissions.yaml'), 'defaults:\n  mode: strict\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: projDir,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('project=ok');
+  });
+
+  test('all three layers present → ok with every layer marked ok', async () => {
+    const enterprisePath = join(tmp, 'enterprise-permissions.yaml');
+    writeFileSync(enterprisePath, 'defaults:\n  mode: strict\n');
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: strict\n');
+    const projDir = join(tmp, 'proj');
+    mkdirSync(join(projDir, '.agent'), { recursive: true });
+    writeFileSync(join(projDir, '.agent', 'permissions.yaml'), 'defaults:\n  mode: strict\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: projDir,
+      enterprisePath,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('enterprise=ok user=ok project=ok');
+  });
+
+  test('malformed yaml → fail with parser error + remediation', async () => {
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: not_a_real_mode\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1); // fail exits non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('policy_load');
+    expect(text).toMatch(/defaults\.mode|not_a_real_mode/);
+    expect(text).toContain('check the YAML files');
+  });
+
+  test('lock conflict → warn with conflict summary + remediation', async () => {
+    // Enterprise locks defaults.mode=strict; user tries to set
+    // mode=acceptEdits. Hierarchy reports a lock conflict; the
+    // policy still loads (lower-layer change is dropped).
+    const enterprisePath = join(tmp, 'enterprise-permissions.yaml');
+    writeFileSync(enterprisePath, 'defaults:\n  mode: strict\n  locked: true\n');
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: acceptEdits\n');
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      enterprisePath,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0); // warn doesn't exit non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('enterprise=ok user=ok');
+    expect(text).toContain('lock conflict');
+    expect(text).toContain('locked by enterprise');
+    expect(text).toContain('attempted by user');
+    expect(text).toContain('review layer precedence');
+  });
+
+  test('--json: policy_load check is included with structured fields', async () => {
+    const userPath = join(tmp, 'user-permissions.yaml');
+    writeFileSync(userPath, 'defaults:\n  mode: strict\n');
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      cwd: tmp,
+      enterprisePath: null,
+      userPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const events = lines.map((l) => JSON.parse(l));
+    const policy = events.find((e) => e.name === 'policy_load');
+    expect(policy).toBeDefined();
+    expect(policy.status).toBe('ok');
+    expect(policy.detail).toBe('enterprise=none user=ok project=none');
+  });
+});
+
+describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
+  let tmp: string;
+  let dbPath: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-doctor-chain-'));
+    dbPath = join(tmp, 'state.sqlite');
+    env = { HOME: tmp, PATH: process.env.PATH };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // Seed the audit chain with `rowCount` clean rows under the
+  // ensureInstallId identity. Returns the install identity so
+  // tests can also tamper rows by primary-key seq if needed.
+  const seedChain = (rowCount: number) => {
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const identity = ensureInstallId({
+      env,
+      now: () => 1,
+      uuid: () => 'chain-uuid-aaaa-bbbb',
+    });
+    const sink = createSqliteSink({ db, identity });
+    for (let i = 0; i < rowCount; i++) {
+      sink.emit({
+        session_id: `s${i}`,
+        tool_name: 'bash',
+        args: { i },
+        decision: 'allow',
+        policy_hash: 'sha256:p',
+        reason_chain: [],
+        capabilities: [],
+        score: 0,
+        score_components: {},
+        classifier_hash: 'none',
+        classifier_adjust: null,
+        sandbox_profile: null,
+        ttl_expires_at: null,
+        ts: 100 + i,
+      });
+    }
+    db.close?.();
+    return identity;
+  };
+
+  test('no DB file → ok "no chain yet"', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath, // path that doesn't exist yet
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('no chain yet');
+  });
+
+  test('DB exists but empty chain → ok "no chain rows yet"', async () => {
+    seedChain(0);
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('no chain rows yet');
+  });
+
+  test('healthy chain → ok "intact (N rows)"', async () => {
+    seedChain(5);
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).toContain('intact (5 rows)');
+  });
+
+  test('single-row chain uses singular "row"', async () => {
+    seedChain(1);
+    const out = captured();
+    await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(out.lines.join('')).toContain('intact (1 row)');
+  });
+
+  test('broken chain → fail with broken seq + remediation', async () => {
+    seedChain(3);
+    // Tamper with seq=2 — flip decision so the stored this_hash no
+    // longer matches the recomputed payload.
+    const db = openDb(dbPath);
+    db.run('UPDATE approvals_log SET decision = ? WHERE seq = 2', ['deny']);
+    db.close?.();
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1); // fail exits non-zero
+    const text = out.lines.join('');
+    expect(text).toContain('hash_chain');
+    expect(text).toContain('BROKEN at seq 2');
+    expect(text).toContain('agent permission verify');
+    expect(text).toContain('agent permission rotate-chain');
+  });
+
+  test('install_id discovery failure → fail with remediation', async () => {
+    // No HOME / XDG / APPDATA → ensureInstallId throws.
+    const noHomeEnv = { PATH: process.env.PATH };
+    const out = captured();
+    const code = await runDoctor({
+      env: noHomeEnv,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1);
+    const text = out.lines.join('');
+    expect(text).toContain('hash_chain');
+    expect(text).toContain('install_id discovery failed');
+  });
+
+  test('--json: hash_chain check is included with structured fields', async () => {
+    seedChain(7);
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      cwd: tmp,
+      dbPath,
+      enterprisePath: null,
+      userPath: null,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      out: out.write,
+      err: captured().write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const events = lines.map((l) => JSON.parse(l));
+    const chain = events.find((e) => e.name === 'hash_chain');
+    expect(chain).toBeDefined();
+    expect(chain.status).toBe('ok');
+    expect(chain.detail).toBe('intact (7 rows)');
+  });
+});
+
+// ─── slice 90 §13.3 expansion ─────────────────────────────────────────────
+
+describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
+  const env = { PATH: process.env.PATH };
+
+  // Slice 124: each kernel-check test stubs runCmd/readFile/which
+  // differently; the shared doctor cache would otherwise feed the
+  // first test's results into all subsequent ones, since these
+  // checks (user_namespaces, net_filtering, mac_lsm, git) are
+  // exactly the non-critical set covered by the 60s cache.
+  beforeEach(() => {
+    resetSharedDoctorCache();
+  });
+
+  const seamsAllOk = {
+    readFile: (path: string): string | null =>
+      path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null,
+    runCmd: (cmd: string, _args: readonly string[]): string | null => {
+      if (cmd === 'nft') return 'nftables v1.0.9 (Old Doc Yak)\n';
+      if (cmd === 'getenforce') return 'Enforcing\n';
+      return null;
+    },
+  };
+
+  const extractCheck = (out: { lines: string[] }, name: string): Record<string, unknown> | null => {
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    for (const l of lines) {
+      const e = JSON.parse(l) as Record<string, unknown>;
+      if (e.kind === 'check' && e.name === name) return e;
+    }
+    return null;
+  };
+
+  test('user_namespaces: enabled (max > 0) → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toBe('enabled (max=15000)');
+  });
+
+  test('user_namespaces: disabled (max=0) → fail with remediation', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '0\n' : null),
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('fail');
+    expect(c?.detail).toContain('disabled (max_user_namespaces=0)');
+    expect(c?.remediation).toContain('sysctl');
+  });
+
+  test('user_namespaces: file missing → fail with kernel upgrade hint', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      readFile: () => null,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('fail');
+    expect(c?.detail).toContain('missing');
+    expect(c?.remediation).toContain('kernel');
+  });
+
+  test('user_namespaces: non-numeric content → warn', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? 'garbage\n' : null),
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('unexpected');
+  });
+
+  test('net_filtering: nft present + version → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'net_filtering');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('v1.0.9');
+    expect(c?.detail).toContain('/usr/bin/nft');
+  });
+
+  test('net_filtering: nft missing → warn with install hint', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => (cmd === 'nft' ? null : `/usr/bin/${cmd}`),
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'net_filtering');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('nft not found');
+    expect(c?.remediation).toContain('nftables');
+  });
+
+  test('net_filtering: nft present but version probe fails → warn', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => (cmd === 'getenforce' ? 'Enforcing\n' : null), // nft → null
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'net_filtering');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('version probe failed');
+  });
+
+  test('mac_lsm: SELinux Enforcing → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toBe('SELinux (Enforcing)');
+  });
+
+  test('mac_lsm: SELinux Permissive → warn', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0\n';
+        if (cmd === 'getenforce') return 'Permissive\n';
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('Permissive');
+    expect(c?.remediation).toContain('setenforce');
+  });
+
+  test('mac_lsm: AppArmor enabled (no SELinux) → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => {
+        if (cmd === 'getenforce') return null; // no SELinux
+        return `/usr/bin/${cmd}`;
+      },
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0\n';
+        if (cmd === 'aa-status') return ''; // enabled probe exits 0
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('AppArmor');
+  });
+
+  test('mac_lsm: neither SELinux nor AppArmor → ok with informational detail', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => {
+        if (cmd === 'getenforce' || cmd === 'aa-status') return null;
+        return `/usr/bin/${cmd}`;
+      },
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => (cmd === 'nft' ? 'nftables v1.0\n' : null),
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('no LSM detected');
+  });
+
+  // Slice 123 (R9 P1): pre-slice when aa-status was installed but
+  // the kernel module wasn't loaded, runCmd returned null and we
+  // emitted a "probe failed" warn — unhelpful because the probe
+  // didn't fail; the kernel just wasn't enforcing. Now the warn
+  // detail names the actual state + remediation walks the operator
+  // through the diagnostic.
+  test('mac_lsm: AppArmor binary present but kernel module disabled → warn with remediation', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => {
+        if (cmd === 'getenforce') return null; // no SELinux
+        return `/usr/bin/${cmd}`; // aa-status installed
+      },
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0\n';
+        if (cmd === 'aa-status') return null; // non-zero exit (kernel disabled)
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('AppArmor');
+    expect(c?.detail).toContain('kernel enforcement disabled');
+    expect(c?.remediation).toBeDefined();
+    expect(c?.remediation).toContain('aa-status');
+  });
+
+  test('capability_ceiling info line: Linux+bwrap+userNs → full set', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const info = lines
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((e) => e.kind === 'info');
+    expect(info?.engine_version).toBe('0.0.0');
+    // On Linux test runners; capability_ceiling reflects detected
+    // sandbox + userNs state. Since `which` returns paths for
+    // everything (including bwrap) and userNs seam returns ok,
+    // ceiling should be the full Linux set on Linux runners. On
+    // non-Linux test runners (e.g., macOS CI) the ceiling is
+    // different — assert the array exists + length > 0 instead of
+    // pinning specific contents.
+    expect(Array.isArray(info?.capability_ceiling)).toBe(true);
+    expect((info?.capability_ceiling as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  test('plain text footer: capability ceiling + engine version rendered', async () => {
+    const out = captured();
+    await runDoctor({
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      ...seamsAllOk,
+      engineVersion: '1.2.3',
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('capability ceiling:');
+    expect(text).toContain('engine version: 1.2.3');
+  });
+});

@@ -1365,3 +1365,539 @@ describe('dispatchChain — shell unavailable short-circuits', () => {
     expect(result.blockedBy).toBeNull();
   });
 });
+
+// Slice 135 P1 conc-2: hook chain with non-zero exit at the
+// MIDDLE position. Existing tests cover (a) first-hook block,
+// (b) two-hook non-failClosed continues, (c) chain-timeout skips
+// remainder. The 3-hook chain with a block at position 2 is the
+// missing shape — it pins both "first hook ran ok" AND "third
+// hook never ran because middle blocked" + audit count.
+describe('dispatchChain — mid-chain non-zero exit (slice 135 P1 conc-2)', () => {
+  const PRE_TOOL_USE_PAYLOAD: HookEventPayload = {
+    schema: 'v1',
+    event: 'PreToolUse',
+    sessionId: 'sess-mid',
+    data: { tool: { name: 'bash', input: {} } },
+  } as HookEventPayload;
+
+  test('middle hook block_silent: first runs, middle blocks, third never runs', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      // h1=0 (pass), h2=1 (block_silent on blocking event), h3 must NOT spawn.
+      const exitCode = call === 1 ? 0 : call === 2 ? 1 : null;
+      return makeFakeSpawn({ exitCode: exitCode ?? 0 })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }),
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    // Exactly TWO runs landed: h1 (success), h2 (block_silent).
+    // h3 is never invoked — the dispatcher breaks the loop the
+    // moment a blocking decision lands.
+    expect(result.runs).toHaveLength(2);
+    expect(result.runs[0]?.spec.command).toBe('h1');
+    expect(result.runs[0]?.result.kind).toBe('allow');
+    expect(result.runs[1]?.spec.command).toBe('h2');
+    expect(result.runs[1]?.result.kind).toBe('block_silent');
+    expect(result.blockedBy?.spec.command).toBe('h2');
+    expect(result.blockedBy?.reason).toBe('silent');
+    // Spawn was invoked exactly 2 times (h1, h2). h3 never reached.
+    expect(call).toBe(2);
+  });
+
+  test('middle hook block_message: third hook still skipped, message threaded back', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      // h1=0 (pass), h2=2 with stdout (block_message), h3 must NOT spawn.
+      const spec: FakeSpec =
+        call === 1
+          ? { exitCode: 0 }
+          : call === 2
+            ? { exitCode: 2, stdout: 'denied by mid-chain policy' }
+            : { exitCode: 0 };
+      return makeFakeSpawn(spec)(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }),
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(2);
+    expect(result.blockedBy?.reason).toBe('message');
+    expect(result.blockedBy?.message).toBe('denied by mid-chain policy');
+    expect(call).toBe(2);
+  });
+
+  test('middle hook failClosed error: third hook skipped, message NOT leaked', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      // h1=0, h2=5 (error, failClosed). h3 never runs.
+      const exitCode = call === 1 ? 0 : 5;
+      return makeFakeSpawn({ exitCode })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2', failClosed: true }),
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(2);
+    expect(result.blockedBy?.spec.command).toBe('h2');
+    // failClosed → block_silent shape (NOT block_message); reason
+    // text never reaches the model per types.ts:198.
+    expect(result.blockedBy?.reason).toBe('silent');
+    expect(result.blockedBy?.message).toBeNull();
+    expect(call).toBe(2);
+  });
+
+  test('middle hook non-failClosed error: third hook STILL runs (no block from non-failClosed error)', async () => {
+    // Inverse: non-failClosed error in the middle should NOT halt
+    // the chain. h3 must still be invoked.
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      const exitCode = call === 2 ? 5 : 0;
+      return makeFakeSpawn({ exitCode })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }), // failClosed=false (default)
+      makeSpec({ event: 'PreToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, PRE_TOOL_USE_PAYLOAD, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(3);
+    expect(result.blockedBy).toBeNull();
+    expect(call).toBe(3);
+  });
+
+  test('non-blocking event: middle hook non-zero does NOT halt (drained chain)', async () => {
+    // PostToolUse is non-blocking — even an exit 1 doesn't stop
+    // the chain. All three hooks run to completion. This is the
+    // observability contract: every matching hook gets a chance
+    // to fire so audit captures the full picture.
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      const exitCode = call === 2 ? 1 : 0;
+      return makeFakeSpawn({ exitCode })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PostToolUse', command: 'h1' }),
+      makeSpec({ event: 'PostToolUse', command: 'h2' }),
+      makeSpec({ event: 'PostToolUse', command: 'h3' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PostToolUse',
+      sessionId: 'sess-non-blocking',
+      data: {
+        tool: { name: 'bash', input: {}, output: 'ok', failed: false },
+      },
+    } as HookEventPayload;
+    const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(3);
+    expect(result.blockedBy).toBeNull();
+    expect(call).toBe(3);
+  });
+});
+
+// Slice 181 — JSON output parsing + additionalContext +
+// updatedInput + disableAllHooks + `if` per-handler + the new
+// PostToolUseFailure event.
+describe('dispatchOne — slice 181 JSON output parsing', () => {
+  test('exit 0 with JSON additionalContext surfaces on allow result', async () => {
+    const json = '{"additionalContext":"branch=main; tests=passing"}';
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: json });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.additionalContext).toBe('branch=main; tests=passing');
+  });
+
+  test('exit 0 with JSON updatedInput surfaces on allow result', async () => {
+    const json = '{"updatedInput":{"command":"npm test -- --quiet"}}';
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: json });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.updatedInput).toEqual({ command: 'npm test -- --quiet' });
+  });
+
+  test('exit 0 with plain (non-JSON) stdout leaves JSON fields undefined', async () => {
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: 'just text\n' });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.additionalContext).toBeUndefined();
+    expect(result.updatedInput).toBeUndefined();
+    expect(result.stdoutTruncated.trim()).toBe('just text');
+  });
+
+  test('malformed JSON falls back to plain stdout (no throw)', async () => {
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: '{not valid json' });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.additionalContext).toBeUndefined();
+  });
+
+  test('JSON with wrong field types is filtered out (defensive)', async () => {
+    // additionalContext=array (not string) and updatedInput=42 (not object).
+    const json = '{"additionalContext":["not","a","string"],"updatedInput":42}';
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: json });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.additionalContext).toBeUndefined();
+    expect(result.updatedInput).toBeUndefined();
+  });
+
+  test('JSON output > 4KB stdout cap becomes unparseable (additionalContext undefined)', async () => {
+    // The dispatcher truncates raw stdout at 4KB (HOOK_STDOUT_MAX_BYTES)
+    // BEFORE the JSON parser runs. A hook emitting > 4KB of JSON has
+    // its stdout cut mid-string → JSON unparseable → additionalContext
+    // falls back to undefined (the truncated stdout still goes to the
+    // audit row's `stdoutTruncated` for forensic visibility). Operators
+    // wanting larger context must split into multiple hooks.
+    const big = 'A'.repeat(5000);
+    const json = JSON.stringify({ additionalContext: big });
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: json });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.additionalContext).toBeUndefined();
+  });
+
+  test('JSON additionalContext fitting within 4KB is delivered verbatim', async () => {
+    // Below the cap (~3900 chars allowing for JSON overhead), the
+    // additionalContext is delivered intact. This is the working
+    // case — operator can rely on the value reaching the LLM.
+    const big = 'A'.repeat(3900);
+    const json = JSON.stringify({ additionalContext: big });
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: json });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('allow');
+    if (result.kind !== 'allow') return;
+    expect(result.additionalContext).toBe(big);
+  });
+
+  test('exit 2 with JSON in stdout is treated as block_message (not JSON parse)', async () => {
+    // Exit 2 means block-message; the dispatcher uses stdout as
+    // the reason VERBATIM. JSON parsing only fires on exit 0.
+    const json = '{"additionalContext":"hello"}';
+    const fake = makeFakeSpawn({ exitCode: 2, stdout: json });
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/repo', {
+      now: () => 1000,
+      spawn: fake,
+    });
+    expect(result.kind).toBe('block_message');
+    if (result.kind !== 'block_message') return;
+    expect(result.message).toBe(json);
+  });
+});
+
+describe('dispatchChain — slice 181 additionalContext + updatedInput aggregation', () => {
+  test('chain concatenates additionalContext from multiple allow hooks', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      const json =
+        call === 1
+          ? '{"additionalContext":"first"}'
+          : call === 2
+            ? '{"additionalContext":"second"}'
+            : '{}';
+      return makeFakeSpawn({ exitCode: 0, stdout: json })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PostToolUse', command: 'h1' }),
+      makeSpec({ event: 'PostToolUse', command: 'h2' }),
+      makeSpec({ event: 'PostToolUse', command: 'h3' }),
+    ];
+    const result = await dispatchChain(hooks, makePayload(), '/cwd', { spawn: fake });
+    expect(result.additionalContext).toBe('first\n\nsecond');
+  });
+
+  test('chain last-wins on updatedInput', async () => {
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call++;
+      const json =
+        call === 1
+          ? '{"updatedInput":{"command":"first"}}'
+          : '{"updatedInput":{"command":"second"}}';
+      return makeFakeSpawn({ exitCode: 0, stdout: json })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess-1',
+      data: { tool: { name: 'bash', input: { command: 'original' } } },
+    } as HookEventPayload;
+    const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(result.updatedInput).toEqual({ command: 'second' });
+  });
+
+  test('chain empty additionalContext when no hook emits one', async () => {
+    const fake: SpawnFn = makeFakeSpawn({ exitCode: 0, stdout: 'plain output' });
+    const hooks = [makeSpec({ event: 'PostToolUse', command: 'h1' })];
+    const result = await dispatchChain(hooks, makePayload(), '/cwd', { spawn: fake });
+    expect(result.additionalContext).toBe('');
+  });
+});
+
+describe('dispatchChain — slice 181 disableAllHooks short-circuit', () => {
+  test('disableAllHooks=true returns empty chain (no spawn)', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [makeSpec({ event: 'PostToolUse' }), makeSpec({ event: 'PostToolUse' })];
+    const result = await dispatchChain(hooks, makePayload(), '/cwd', {
+      spawn: fake,
+      disableAllHooks: true,
+    });
+    expect(spawned).toBe(0);
+    expect(result.runs).toEqual([]);
+    expect(result.blockedBy).toBeNull();
+    expect(result.additionalContext).toBe('');
+  });
+
+  test('disableAllHooks=false (default) runs hooks normally', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [makeSpec({ event: 'PostToolUse' })];
+    await dispatchChain(hooks, makePayload(), '/cwd', { spawn: fake });
+    expect(spawned).toBe(1);
+  });
+});
+
+describe('dispatchChain — slice 181 `if` per-handler filter', () => {
+  test('bash command matches `if: "Bash(rm *)"`', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [makeSpec({ event: 'PreToolUse', matcher: { tool: 'bash' }, if: 'Bash(rm *)' })];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess-1',
+      data: { tool: { name: 'bash', input: { command: 'rm -rf /tmp/junk' } } },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(1);
+  });
+
+  test('bash command NOT matching `if` skips the hook', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [makeSpec({ event: 'PreToolUse', matcher: { tool: 'bash' }, if: 'Bash(rm *)' })];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess-1',
+      data: { tool: { name: 'bash', input: { command: 'npm test' } } },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(0);
+  });
+
+  test('fs tool matches `if: "Edit(*.ts)"`', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', matcher: { tool: 'edit_file' }, if: 'Edit(*.ts)' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess-1',
+      data: { tool: { name: 'edit_file', input: { file_path: 'src/main.ts' } } },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(1);
+  });
+
+  test('fs tool NOT matching `if: "Edit(*.ts)"` (different ext) skips', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', matcher: { tool: 'edit_file' }, if: 'Edit(*.ts)' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess-1',
+      data: { tool: { name: 'edit_file', input: { file_path: 'docs/README.md' } } },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(0);
+  });
+
+  test('malformed `if` pattern fails open (hook still runs)', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', matcher: { tool: 'bash' }, if: 'malformed-no-parens' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess-1',
+      data: { tool: { name: 'bash', input: { command: 'ls' } } },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(1);
+  });
+
+  test('`if` set on non-tool event skips the hook (filter unsatisfiable)', async () => {
+    // SessionStart isn't tool-shaped — operator wrote an `if`
+    // that can never apply. Hook is skipped (vs fail-open) because
+    // intent was a filter; without tool data the filter is by
+    // construction unsatisfiable.
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [makeSpec({ event: 'SessionStart', if: 'Bash(rm *)' })];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'SessionStart',
+      sessionId: 'sess-1',
+      data: { cwd: '/work', model: 'sonnet', profile: 'default' },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(0);
+  });
+});
+
+describe('PostToolUseFailure event (slice 181)', () => {
+  test('hook spec with PostToolUseFailure event matches', async () => {
+    let spawned = 0;
+    const fake: SpawnFn = (...args) => {
+      spawned += 1;
+      return makeFakeSpawn({ exitCode: 0 })(...args);
+    };
+    const hooks = [makeSpec({ event: 'PostToolUseFailure' })];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PostToolUseFailure',
+      sessionId: 'sess-1',
+      data: {
+        tool: { name: 'bash', input: { command: 'npm test' }, error: 'exit 1' },
+        durationMs: 1234,
+      },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(spawned).toBe(1);
+  });
+
+  test('PostToolUseFailure is non-blocking (matches PostToolUse posture)', async () => {
+    // A hook on PostToolUseFailure returning exit 1 must NOT stop
+    // remaining hooks in the chain — failure-side hooks are
+    // observability, not gating.
+    let call = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      call += 1;
+      return makeFakeSpawn({ exitCode: call === 1 ? 1 : 0 })(cmd, opts);
+    };
+    const hooks = [
+      makeSpec({ event: 'PostToolUseFailure', command: 'h1' }),
+      makeSpec({ event: 'PostToolUseFailure', command: 'h2' }),
+    ];
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PostToolUseFailure',
+      sessionId: 'sess-1',
+      data: {
+        tool: { name: 'bash', input: {}, error: 'boom' },
+        durationMs: 1,
+      },
+    } as HookEventPayload;
+    const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
+    expect(result.runs).toHaveLength(2);
+    expect(result.blockedBy).toBeNull();
+  });
+
+  test('audit row records matchedTool for PostToolUseFailure (review fix)', async () => {
+    // Bug pre-review-fix: dispatcher.ts:emitAudit gated matcherTool
+    // on `PreToolUse || PostToolUse` only, missing
+    // PostToolUseFailure. A hook on PostToolUseFailure for bash
+    // would land in hook_runs with matched_tool=NULL, breaking
+    // `WHERE event='PostToolUseFailure' AND matched_tool='bash'`
+    // queries. Fix added PostToolUseFailure to the union; this
+    // test pins it.
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const fake = makeFakeSpawn({ exitCode: 0, stdout: '' });
+    const payload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PostToolUseFailure',
+      sessionId,
+      data: {
+        tool: { name: 'bash', input: { command: 'npm test' }, error: 'exit 1' },
+        durationMs: 1234,
+      },
+    } as HookEventPayload;
+    await dispatchOne(makeSpec({ event: 'PostToolUseFailure' }), 0, payload, '/p', {
+      db,
+      sessionId,
+      spawn: fake,
+    });
+    const rows = listHookRunsBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.event).toBe('PostToolUseFailure');
+    expect(rows[0]?.matchedTool).toBe('bash');
+  });
+});
