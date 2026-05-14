@@ -163,10 +163,64 @@ describe('parsePolicy — protected paths (§11)', () => {
     ).toThrow(/PERMISSION_ENGINE\.md §11/);
   });
 
-  test('skips check when context has no home/cwd (compat path)', () => {
+  test('absolute-tier roots enforced even without context (review fix)', () => {
+    // Pre-review-fix the entire validator early-returned when EITHER
+    // home or cwd was missing, silently letting `/etc/...` redefinitions
+    // sail through any non-bootstrap parse (hierarchy merge, policy-
+    // archive replay, /perms diff tooling). The tiered design keeps
+    // the absolute tiers (systemDeny + absoluteEscalate) enforced
+    // unconditionally — these are constants that don't depend on
+    // home/cwd, so any caller can validate them.
+    expect(() => parsePolicy({ tools: { write_file: { allow_paths: ['/etc/hosts'] } } })).toThrow(
+      /redefines a protected path/,
+    );
+    expect(() => parsePolicy({ tools: { write_file: { allow_paths: ['/proc/1/maps'] } } })).toThrow(
+      /redefines a protected path/,
+    );
     expect(() =>
-      parsePolicy({ tools: { write_file: { allow_paths: ['/etc/hosts'] } } }),
+      parsePolicy({ tools: { write_file: { allow_paths: ['/sys/kernel/debug'] } } }),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('tilde-tier roots are SKIPPED without context (home-dependent — caller-side compat)', () => {
+    // Tilde patterns need `home` to resolve; without it the validator
+    // can't check them. Operator running tooling cross-platform
+    // without supplying home gets partial coverage (absolute tier
+    // still enforced), not zero coverage like before.
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['~/.ssh/known_hosts'] } } }),
     ).not.toThrow();
+  });
+
+  test('cwd-tier roots are SKIPPED without context (cwd-dependent — caller-side compat)', () => {
+    // CWD-relative `.git`/`.agent`/`.claude` need `cwd` to resolve.
+    // Without it, an allow_paths pattern referencing an absolute
+    // path that HAPPENS to look like `<some-cwd>/.git/...` can't be
+    // distinguished from a regular allow — only checked when cwd
+    // is supplied. The absolute-tier roots above still apply.
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['/work/proj/.git/**'] } } }),
+    ).not.toThrow();
+  });
+
+  test('tilde-tier ENFORCED when only home is supplied (cwd absent)', () => {
+    // Partial context: bootstrap-equivalent tilde enforcement works
+    // even when cwd is missing.
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['~/.ssh/known_hosts'] } } },
+        { home: '/home/op' },
+      ),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('cwd-tier ENFORCED when only cwd is supplied (home absent)', () => {
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['/work/proj/.git/**'] } } },
+        { cwd: '/work/proj' },
+      ),
+    ).toThrow(/redefines a protected path/);
   });
 
   test('cwd-rooted protected dirs (.git, .agent, .claude) flagged', () => {

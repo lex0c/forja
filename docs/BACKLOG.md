@@ -2,6 +2,31 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(permissions/config) — enforce protected-path validation tiers regardless of context completeness
+
+**Done.** `enforceProtectedPathInvariants` early-returned when either `context.home` OR `context.cwd` was missing, silently disabling EVERY tier of protected-path enforcement. The original intent was operator ergonomics for tests ("don't force test construction of platform-specific paths"), but the early return went too far: non-bootstrap parse sites that legitimately omit context (hierarchy merge, policy-archive replay, `/perms` diff tooling, CI policy validators) accepted policies that bootstrap would then reject at startup. Operators got "valid" reports for policies redefining `/etc`, `/proc`, `/sys` etc. — paths whose protected status doesn't depend on home/cwd at all.
+
+Fix: tiered enforcement, gated by what context the caller supplied:
+
+- **systemDeny + absoluteEscalate** (`/proc`, `/sys`, `/boot`, `/dev`, `/run`, `/var/run`, `/etc`): constants — no home/cwd needed. **ALWAYS enforced.**
+- **tildeEscalate{Files,Dirs}** (`~/.ssh`, `~/.gnupg`, `~/.bashrc`, etc.): require `home`. Enforced **only when home is supplied**.
+- **cwdEscalateDirs** (`<cwd>/.git`, `<cwd>/.agent`, `<cwd>/.claude`): require `cwd`. Enforced **only when cwd is supplied**.
+
+Operator tooling that supplies neither still gets meaningful protection for the system-level redefinitions that are the highest-impact mistakes; tooling that supplies one of the two gets the corresponding extra tier without paying the cost of constructing the other.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/config.ts` | Replaced `allProtectedRoots` early-return with tiered build via `protectedTargets` — absolute tiers always enforced, tilde/cwd tiers gated by their context |
+| `tests/permissions/config.test.ts` | Reversed the old "skips check without context" test (which pinned the bug); +4 new tests: absolute-tier enforced without context (covers `/etc`, `/proc`, `/sys`), tilde-tier skipped without home, cwd-tier skipped without cwd, partial-context cases (home-only enforces tilde, cwd-only enforces cwd) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7279 pass / 10 skip / 0 fail (+4 from baseline 7275)
+
 ## [2026-05-14] fix(permissions/sandbox-availability) — gate canonical-path fast path behind executability check
 
 **Done.** `resolveSandboxBinary` returned `/usr/bin/<tool>` as `canonical` based on `exists()` alone — a `statSync` probe that only verifies the file is present. If the canonical path existed but wasn't executable for the current user (mode stripped, ACL deny, owner mismatch on `/usr/bin/bwrap`), the resolver still returned it as `canonical` and `available: true`. Every wrapped spawn then failed with `EACCES` at `execve(2)` time — even when a working binary lived elsewhere on PATH (Nix, Homebrew, custom build), because the canonical branch monopolized the answer and never consulted `which()`.

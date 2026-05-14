@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
-import { allProtectedRoots } from './protected_paths.ts';
+import { protectedTargets } from './protected_paths.ts';
 import type { Policy, PolicyMode, SealMode, SealOnFailure } from './types.ts';
 
 // Optional validation context for parsePolicy. When supplied, the
@@ -64,8 +64,45 @@ const enforceProtectedPathInvariants = (
   toolName: string,
   context: ParsePolicyContext,
 ): void => {
-  if (context.home === undefined || context.cwd === undefined) return;
-  const roots = allProtectedRoots(context.home, context.cwd);
+  // Tiered enforcement. The protected-roots list partitions into
+  // tiers by context-dependency:
+  //   - systemDeny + absoluteEscalate (`/proc`, `/sys`, `/etc`, …)
+  //     are constants — no home/cwd needed; ALWAYS enforced so
+  //     non-bootstrap callers (hierarchy merge, policy-archive
+  //     replay, /perms-style diff tooling) can't accept a policy
+  //     that bootstrap would reject.
+  //   - tildeEscalate{Files,Dirs} (`~/.ssh`, `~/.gnupg`, …) require
+  //     `home` to resolve. Enforced only when `home` is supplied.
+  //   - cwdEscalateDirs (`<cwd>/.git`, …) require `cwd`. Enforced
+  //     only when `cwd` is supplied.
+  //
+  // Pre-review-fix the validator early-returned when either `home`
+  // OR `cwd` was missing, silently disabling EVERY tier including
+  // the absolute ones. A policy file that redefined `/etc` (no
+  // context dependency) sailed through any non-bootstrap parse —
+  // operator tooling and CI checks reported "valid" for policies
+  // bootstrap would then reject at startup. The tiered design
+  // closes that gap while preserving the original "tests don't
+  // need to construct platform-specific paths" affordance for the
+  // tilde + cwd tiers.
+  //
+  // Empty-string fallbacks below are safe: when `home`/`cwd` is
+  // unset, the corresponding tier's roots are NOT added to the
+  // check list (the gated `if` blocks), so the garbage paths
+  // `protectedTargets('', '')` returns for those tiers never reach
+  // `isProtectedRedefinition`. The `home ?? ''` passed to
+  // `expandTilde` likewise can't cause false positives — a `~/x`
+  // pattern with empty home expands to `/x`, which doesn't match
+  // any system-deny or absolute-escalate root.
+  const t = protectedTargets(context.home ?? '', context.cwd ?? '');
+  const roots: string[] = [...t.systemDeny, ...t.absoluteEscalate];
+  if (context.home !== undefined) {
+    roots.push(...t.tildeEscalateFiles, ...t.tildeEscalateDirs);
+  }
+  if (context.cwd !== undefined) {
+    roots.push(...t.cwdEscalateDirs);
+  }
+  const home = context.home ?? '';
   // Only allow/confirm are restricted — deny_paths is always
   // allowed since operator reinforcing protection is welcome.
   for (const key of ['allow_paths', 'confirm_paths'] as const) {
@@ -73,7 +110,7 @@ const enforceProtectedPathInvariants = (
     if (!Array.isArray(list)) continue;
     for (const pattern of list) {
       if (typeof pattern !== 'string') continue;
-      if (isProtectedRedefinition(pattern, roots, context.home)) {
+      if (isProtectedRedefinition(pattern, roots, home)) {
         throw new Error(
           `policy: ${toolName}.${key} pattern '${pattern}' redefines a protected path; use deny_paths if you want to reinforce protection, or rephrase with a broader glob (PERMISSION_ENGINE.md §11)`,
         );
