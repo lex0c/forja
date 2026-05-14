@@ -71,6 +71,22 @@ export const CODE_VOCABULARY: ReadonlyMap<string, FailureClass> = new Map<string
   // present at spawn-time probe. The wrap silently degrades; this
   // event is the audit trail. Recovery = 'degraded'.
   ['sandbox.mid_session_loss', 'sandbox'],
+  // Slice 165 (review — Batch C sandbox observability).
+  // sandbox.path_resolved: detected at bootstrap, the sandbox tool
+  // was found via $PATH walk instead of the canonical /usr/bin/
+  // path. Recovery = 'degraded'. Pre-slice the resolver computed
+  // `trustLevel='path-resolved'` + `trustWarnings` but no consumer
+  // surfaced them — postmortems lost the "rodava com bwrap não-
+  // canonical em /opt/bin" signal. This code is emitted from
+  // bootstrap when `trustLevel !== 'canonical'`.
+  ['sandbox.path_resolved', 'sandbox'],
+  // Note: `sandbox.silent_passthrough` (when `maybeWrapSandboxArgv`
+  // returns innerArgv unchanged due to missing sandbox tool at
+  // spawn-time, despite the planner picking a non-host profile) is
+  // a known observability gap. The wire-up requires plumbing a
+  // failureSink reference into the per-spawn-site call chain (bg
+  // manager → grep → broker), which is bigger than the slice 165
+  // scope. Deferred to a future slice.
   // Storage subsystem (slice 130).
   // storage.lock_contention: SQLITE_BUSY (concurrent writer / WAL
   // checkpoint racing). Distinct from generic persist_failed so

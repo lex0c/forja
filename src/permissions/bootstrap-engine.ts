@@ -70,6 +70,25 @@ export interface BootstrapPermissionEngineInput {
     available: boolean;
     hostExplicitlyAllowed: boolean;
     required: boolean;
+    // Slice 165 (review — Batch C sandbox observability): forward
+    // the resolver's trust marker so bootstrap can emit a
+    // `sandbox.path_resolved` failure_event when the sandbox tool
+    // was resolved via $PATH (non-canonical install). Pre-slice the
+    // trust signal lived only on `detectSandboxAvailability`'s
+    // return; bootstrap saw only the `available` boolean and lost
+    // the asymmetric-trust dimension. Optional for backward compat
+    // with callers that don't pass the full SandboxAvailability
+    // shape (legacy tests).
+    trustLevel?: 'canonical' | 'path-resolved' | 'absent';
+    // Resolved binary path (when available). Surfaced into the
+    // failure_event payload so operators see "the agent wrapped
+    // with bwrap at /opt/bin/bwrap" in postmortems.
+    path?: string | null;
+    // Trust-check warnings (`not owned by root`, `world-writable`,
+    // `using non-canonical X at Y`). Forwarded verbatim into the
+    // payload so the operator's audit row carries the same strings
+    // doctor renders.
+    trustWarnings?: readonly string[];
   };
   // Test seams for policy discovery.
   enterprisePath?: string | null;
@@ -515,6 +534,41 @@ export const bootstrapPermissionEngine = async (
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
     ...(input.now !== undefined ? { now: input.now } : {}),
   });
+
+  // Slice 165 (review — Batch C): emit `sandbox.path_resolved`
+  // when the resolver flagged the install as non-canonical. Fires
+  // BEFORE the unavailable check below — non-canonical-but-present
+  // is a SEPARATE concern from absent. Postmortem trail: operators
+  // who later see "compromise traced to sandbox bypass" can query
+  // `failure_events WHERE code='sandbox.path_resolved'` and
+  // correlate against the install path on the affected host.
+  if (
+    sandbox?.available &&
+    sandbox.trustLevel !== undefined &&
+    sandbox.trustLevel !== 'canonical' &&
+    input.failureSink !== undefined
+  ) {
+    try {
+      input.failureSink.emit({
+        code: 'sandbox.path_resolved',
+        classe: 'sandbox',
+        recovery_action: 'degraded',
+        user_visible: true,
+        session_id: input.sessionId,
+        payload: {
+          platform: process.platform,
+          trust_level: sandbox.trustLevel,
+          path: sandbox.path ?? null,
+          warnings: sandbox.trustWarnings ?? [],
+        },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(
+        `forja bootstrap: sandbox.path_resolved emit failed (${msg}); trust warnings still in availability\n`,
+      );
+    }
+  }
 
   if (sandbox !== undefined && !sandbox.available) {
     // Slice 130 (R5 Tier 3 P0-1): structured failure_event so

@@ -422,6 +422,103 @@ describe('bootstrapPermissionEngine — §12.3 watchPolicy wire-up', () => {
     expect(watcherCalls).toBe(0);
   });
 
+  test('sandbox available but trustLevel=path-resolved → emits sandbox.path_resolved failure_event (slice 165)', async () => {
+    // The trust marker (slice 154) flagged a non-canonical sandbox
+    // install. Pre-slice 165 the warning was computed but dropped.
+    // Now bootstrap emits a structured failure_event so postmortems
+    // can correlate "rodava com bwrap não-canonical em /opt/bin" via
+    // `failure_events WHERE code='sandbox.path_resolved'`.
+    const emitted: Array<{ code: string; payload: Record<string, unknown> }> = [];
+    const failureSink = {
+      emit: (event: { code: string; payload?: Record<string, unknown> | null }) => {
+        emitted.push({ code: event.code, payload: event.payload ?? {} });
+        return { id: `mock-${emitted.length}`, this_chain_hash: '' };
+      },
+      verifyChain: () => ({ ok: true as const, rows: emitted.length }),
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        failureSink,
+        sandbox: {
+          available: true,
+          hostExplicitlyAllowed: false,
+          required: false,
+          trustLevel: 'path-resolved',
+          path: '/nix/store/abc/bwrap',
+          trustWarnings: ['using non-canonical bwrap at /nix/store/abc/bwrap'],
+        },
+      }),
+    );
+    expect(r.state).toBe('ready');
+    const pathResolvedEvents = emitted.filter((e) => e.code === 'sandbox.path_resolved');
+    expect(pathResolvedEvents).toHaveLength(1);
+    const evt = pathResolvedEvents[0];
+    expect(evt).toBeDefined();
+    if (evt !== undefined) {
+      expect(evt.payload.trust_level).toBe('path-resolved');
+      expect(evt.payload.path).toBe('/nix/store/abc/bwrap');
+      expect(evt.payload.warnings).toEqual(['using non-canonical bwrap at /nix/store/abc/bwrap']);
+    }
+  });
+
+  test('sandbox available with trustLevel=canonical → no path_resolved emit (slice 165)', async () => {
+    // Canonical install — no warning, no emit.
+    const emitted: Array<{ code: string }> = [];
+    const failureSink = {
+      emit: (event: { code: string }) => {
+        emitted.push({ code: event.code });
+        return { id: `mock-${emitted.length}`, this_chain_hash: '' };
+      },
+      verifyChain: () => ({ ok: true as const, rows: emitted.length }),
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        failureSink,
+        sandbox: {
+          available: true,
+          hostExplicitlyAllowed: false,
+          required: false,
+          trustLevel: 'canonical',
+          path: '/usr/bin/bwrap',
+          trustWarnings: [],
+        },
+      }),
+    );
+    expect(r.state).toBe('ready');
+    expect(emitted.filter((e) => e.code === 'sandbox.path_resolved')).toHaveLength(0);
+  });
+
+  test("sandbox unavailable still emits sandbox.tool_unavailable (slice 165 doesn't regress slice 130)", async () => {
+    // Both codes can co-exist in the same bootstrap. trustLevel
+    // is moot when available=false, so only the unavailable code
+    // fires. Pin to confirm slice 165 didn't accidentally suppress
+    // the slice 130 emit.
+    const emitted: Array<{ code: string }> = [];
+    const failureSink = {
+      emit: (event: { code: string }) => {
+        emitted.push({ code: event.code });
+        return { id: `mock-${emitted.length}`, this_chain_hash: '' };
+      },
+      verifyChain: () => ({ ok: true as const, rows: emitted.length }),
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        failureSink,
+        sandbox: {
+          available: false,
+          hostExplicitlyAllowed: false,
+          required: false,
+          trustLevel: 'absent',
+          path: null,
+          trustWarnings: [],
+        },
+      }),
+    );
+    expect(r.state).toBe('degraded'); // sandbox not required, available=false → degraded
+    expect(emitted.filter((e) => e.code === 'sandbox.tool_unavailable')).toHaveLength(1);
+    expect(emitted.filter((e) => e.code === 'sandbox.path_resolved')).toHaveLength(0);
+  });
+
   test('watchPolicy=true skipped when sandbox required+unavailable forces late refusing', async () => {
     // This is the SECOND refusing path — the late transition AFTER
     // archive but inside the same bootstrap body. The wire-up's

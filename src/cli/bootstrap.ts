@@ -386,6 +386,14 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       available: sandboxAvail.available,
       hostExplicitlyAllowed: input.sandboxHost === true || policySandbox?.hostAllowed === true,
       required: policySandbox?.required === true,
+      // Slice 165 (review — Batch C sandbox observability). Forward
+      // the trust marker so bootstrap can emit a
+      // `sandbox.path_resolved` failure_event when the install isn't
+      // canonical. Slice 154 populated these fields; pre-slice 165
+      // they were dropped at this boundary.
+      trustLevel: sandboxAvail.trustLevel,
+      path: sandboxAvail.path,
+      trustWarnings: sandboxAvail.trustWarnings,
     },
   });
   const permissionEngine = permResult.engine;

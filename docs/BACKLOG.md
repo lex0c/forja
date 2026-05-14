@@ -2,6 +2,71 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(sandbox/doctor) — slice 165: Batch C sandbox observability (partial)
+
+**Done.** First two items from Batch C (sandbox observability) of task #268. Pre-slice the resolver's `trustLevel` + `trustWarnings` (slice 154) were computed but never surfaced — operator running with `/tmp/evilbin/bwrap` (owner root, mode 0o755 — passes stat-check but isn't canonical) saw "sandbox: ok bwrap available" with zero indication that the install isn't `/usr/bin/bwrap`. Postmortems lost the "rodava com bwrap não-canonical em /opt/bin" signal that slice 154's spec explicitly called out.
+
+### 1. doctor.ts surfaces trustWarnings
+
+`src/cli/doctor.ts:sandboxCheck` now branches on `availability.trustLevel`:
+
+- `'canonical'` → status `'ok'`, detail includes the canonical path (`bwrap available (/usr/bin/bwrap)`).
+- `'path-resolved'` (non-canonical install, e.g. Nix/Homebrew/custom build) → status `'warn'`, detail includes the resolved path + trustLevel, remediation surfaces the resolver's `trustWarnings` array verbatim. Operator sees "Trust warnings: using non-canonical bwrap at /nix/store/abc/bwrap; ... Verify the binary is legitimate or install the canonical version per spec §6.5."
+
+Non-canonical installs are still operationally usable — the wrap fires, the sandbox is mounted — but the operator now has a doctor surface to read the warning from.
+
+### 2. Bootstrap emits `sandbox.path_resolved` failure_event
+
+New failure code `sandbox.path_resolved` registered in `src/failures/codes.ts` (class `sandbox`, recovery_action `degraded`). `src/permissions/bootstrap-engine.ts` emits it when:
+
+- `sandbox.available === true` (tool is present)
+- `sandbox.trustLevel !== undefined && sandbox.trustLevel !== 'canonical'` (non-canonical install)
+- `input.failureSink !== undefined` (sink wired)
+
+Emits BEFORE the existing `sandbox.tool_unavailable` branch (the two codes can co-occur in different shapes: path_resolved fires when present-but-non-canonical; tool_unavailable fires when absent). Payload carries platform, trust_level, path, and warnings array — operator can query `failure_events WHERE code='sandbox.path_resolved'` and correlate against the install path on the affected host post-mortem.
+
+`cli/bootstrap.ts` forwards `sandboxAvail.trustLevel`, `sandboxAvail.path`, and `sandboxAvail.trustWarnings` into the `bootstrapPermissionEngine` sandbox option (the field was widened to accept these — backward-compat for legacy test callers that pass the minimal shape).
+
+### Deferred from Batch C scope
+
+Two items from the original Batch C plan remain pending:
+
+- **`maybeWrapSandboxArgv` silent-passthrough emit** — when the spawn-site dispatch returns `innerArgv.slice()` because no sandbox tool resolved (degraded passthrough) despite a non-host profile, operator currently sees nothing. The fix would emit `sandbox.silent_passthrough`, but it needs `failureSink` plumbed through the per-spawn-site call chain (bg manager → grep → broker). Bigger than slice 165 scope; deferred to a future slice with the plumbing decision documented (codes.ts has a comment marking the gap).
+- **macOS bg-reaper darwin fallback via `ps -o comm=`** — `src/subagents/bg-reaper.ts:176` short-circuits on `platform !== 'linux'`, leaving darwin without identity-check reaping. Bg processes on macOS survive as orphans until OS reboot. Needs a `ps`-based identity check + careful platform-specific test harness. Deferred.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **doctor trust surface** | `src/cli/doctor.ts` | `sandboxCheck` branches on `availability.trustLevel`. Canonical → ok with path; path-resolved → warn with trustWarnings in remediation. |
+| **failure code** | `src/failures/codes.ts` | New `sandbox.path_resolved` entry in `CODE_VOCABULARY`. Deferred-note for `sandbox.silent_passthrough`. |
+| **bootstrap-engine sandbox shape** | `src/permissions/bootstrap-engine.ts` | `BootstrapPermissionEngineInput.sandbox` widened with optional `trustLevel` / `path` / `trustWarnings`. New emit block BEFORE the unavailable check; pre-slice the unavailable check was the only emit site. Uses optional-chaining for cleanness. |
+| **cli bootstrap forwards trust** | `src/cli/bootstrap.ts` | `bootstrapPermissionEngine({ sandbox: { ..., trustLevel, path, trustWarnings } })` — passes the slice-154 fields through the boundary they dropped at pre-slice. |
+
+### Tests added (+4)
+
+| File | Coverage |
+|---|---|
+| **doctor.test.ts (+1)** | Sandbox available with `trustLevel=path-resolved` → status `warn`, output contains the non-canonical path + `path-resolved` + `non-canonical` strings from the resolver's warnings. |
+| **bootstrap-engine.test.ts (+3)** | path-resolved → emits `sandbox.path_resolved` with full payload (trust_level, path, warnings); canonical → no emit; unavailable → still emits `sandbox.tool_unavailable` AND no `sandbox.path_resolved` (slice 130 regression check). |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7073 pass / 10 skip / 0 fail** (was 7069 → +4 net new; zero regression)
+
+### 5-axis review status
+
+Batch C partial (items 1+2 of 4) closed. Items 3 (silent_passthrough emit) and 4 (darwin bg-reaper fallback) deferred to future slices — both need cross-module plumbing beyond slice 165 scope. The original Batch B items (Approvals-log SELECT cache + 3-tx merge) are tracked as architectural-design-needed and skipped from the current run; the prev_hash cache can't safely eliminate the SELECT under multi-writer scenarios (parent + subagent sinks share install_id) without a stronger SQL invariant, and merging the 3 transactions across async boundaries would hold the writer lock through user-confirm waits.
+
+Remaining batches:
+- Batch D (slice 166) — subagent/IPC concurrency
+- Batch E (slice 167) — threat surface (injection scanner, trust hash-aggregate, hook hash, find -delete)
+- Batch F (slice 168) — dependency pin lockstep
+
+---
+
 ## [2026-05-14] fix(permission-engine/storage) — slice 163: Batch A audit chain hardening
 
 **Done.** First P1 batch from the 5-axis code review. Four independent audit/storage hardening fixes co-located by subsystem:

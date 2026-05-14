@@ -168,10 +168,37 @@ const sandboxCheck = (
   if (stat !== undefined) detectOpts.stat = stat;
   const availability = detectSandboxAvailability(detectOpts);
   if (availability.available) {
+    // Slice 165 (review — Batch C sandbox observability). The
+    // resolver populated `trustLevel` + `trustWarnings` in slice
+    // 154 specifically so doctor + telemetry could surface them
+    // to the operator. Pre-slice the warnings were computed and
+    // dropped — operator running with `/tmp/evilbin/bwrap` (owner
+    // root, mode 0o755 — passes the stat-check but isn't canonical)
+    // saw "sandbox: ok bwrap available" without any clue that the
+    // binary isn't `/usr/bin/bwrap`. Trust postmortem ("rodava com
+    // bwrap não-canonical em /opt/bin" — slice 154 spec phrasing)
+    // had no surface to read from.
+    //
+    // Post-slice doctor renders trust warnings as `warn` status (not
+    // `fail` — non-canonical sandbox still works, just deserves an
+    // operator-visible flag). Canonical installs continue to be
+    // pure `ok`.
+    if (availability.trustLevel === 'canonical') {
+      return {
+        name: 'sandbox',
+        status: 'ok',
+        detail: `${availability.tool ?? 'unknown'} available (${availability.path ?? 'canonical'})`,
+      };
+    }
+    // path-resolved (non-canonical) — surface the warnings.
     return {
       name: 'sandbox',
-      status: 'ok',
-      detail: `${availability.tool ?? 'unknown'} available`,
+      status: 'warn',
+      detail: `${availability.tool ?? 'unknown'} available at ${availability.path ?? '<unknown>'} (trustLevel=${availability.trustLevel})`,
+      remediation:
+        availability.trustWarnings.length > 0
+          ? `Trust warnings: ${availability.trustWarnings.join('; ')}. Verify the binary is legitimate or install the canonical version per spec §6.5.`
+          : 'Sandbox binary resolved via $PATH instead of canonical /usr/bin/. Verify the install source.',
     };
   }
   // Sandbox absence is `warn`, not `fail`: the engine still runs

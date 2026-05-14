@@ -142,6 +142,34 @@ describe('runDoctor', () => {
     }
   });
 
+  test('sandbox available with trustLevel=path-resolved → warn with trust warnings (slice 165)', async () => {
+    // Pre-slice 165: doctor reported "sandbox: ok bwrap available"
+    // even when the resolver flagged the install as non-canonical.
+    // Post-slice: trustLevel != 'canonical' becomes a `warn` line
+    // with the resolver's trustWarnings rendered as remediation.
+    const out = captured();
+    const code = await runDoctor({
+      env,
+      // bwrap missing at canonical /usr/bin/bwrap but present at
+      // /nix/store/.../bwrap (operator's Nix install).
+      which: (cmd) => (cmd === 'bwrap' ? '/nix/store/abc/bwrap' : `/usr/bin/${cmd}`),
+      exists: (p) => p !== '/usr/bin/bwrap' && p.startsWith('/usr/bin/'),
+      stat: () => ({ uid: 0, mode: 0o755 }),
+      out: out.write,
+      err: captured().write,
+    });
+    // Warnings → exit 0 (sandbox warning is recoverable).
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('sandbox');
+    expect(text).toContain('warn');
+    // The non-canonical path + trustLevel surface in the detail.
+    expect(text).toContain('/nix/store/abc/bwrap');
+    expect(text).toContain('path-resolved');
+    // Trust warning copy from the resolver bubbles into remediation.
+    expect(text).toContain('non-canonical');
+  });
+
   test('missing sandbox tool → warn, exit 0 (sandbox absence is recoverable)', async () => {
     const out = captured();
     const code = await runDoctor({
