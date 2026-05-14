@@ -36,6 +36,7 @@
 // undefined; tests pin specific scenarios deterministically.
 
 import { existsSync, watch as fsWatch } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import type { PermissionEngine } from './engine.ts';
 import type { LockConflict, ResolveOptions } from './hierarchy.ts';
 import { type ReloadPolicyResult, resolvePolicy } from './index.ts';
@@ -95,8 +96,39 @@ const formatLockConflicts = (conflicts: readonly LockConflict[]): string => {
     .join('; ');
 };
 
+// Slice 166 (review — Batch D subagent IPC concurrency, second item).
+// Watch the PARENT DIRECTORY + filter by basename instead of watching
+// the file inode directly. Pre-slice the watcher used
+// `fs.watch(path, cb)` — when an editor saves via atomic rename
+// (vim with `backupcopy=no`, IntelliJ "safe save", VS Code default),
+// the file's inode is replaced. The OS's inotify / FSEvents
+// subscription was attached to the OLD inode, which is now unlinked
+// — every subsequent save hits the new inode that nobody is watching.
+// Operator edits policy, expects the reload audit row, sees nothing,
+// doesn't know the engine is still enforcing stale rules.
+//
+// Dir-watch + basename filter survives rename: the dir's inode is
+// stable; rename + create + delete events all land on the dir
+// watcher; we filter to the ONE filename we care about. Standard
+// pattern, supported by both inotify (Linux) and FSEvents (macOS).
+//
+// Intermediate-state caveat: during a rename save the file briefly
+// doesn't exist (tmp → renamed-to-final). reloadNow's resolvePolicy
+// throws ENOENT on read → onReloadFailed fires with the diagnostic.
+// The debounce coalesces follow-up events; the final state (file
+// fully written) reloads cleanly. The brief failure is a known
+// noisy edge but not a security or correctness concern.
 const defaultWatcher = (path: string, cb: () => void): { close: () => void } => {
-  const w = fsWatch(path, cb);
+  const dir = dirname(path);
+  const base = basename(path);
+  const w = fsWatch(dir, (_event, filename) => {
+    // filename can be null (very rare; observed on some FUSE
+    // mounts when the underlying signal lacks an entry). Treat as
+    // "something happened in this dir we care about" — fire the
+    // callback. Debouncing dedupes if the next event names our
+    // file.
+    if (filename === null || filename === base) cb();
+  });
   return { close: () => w.close() };
 };
 

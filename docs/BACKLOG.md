@@ -2,6 +2,83 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(subagents/policy-watcher) — slice 166: Batch D subagent IPC concurrency
+
+**Done.** Both items from Batch D of the 5-axis review's P1 list.
+
+### 1. permission-bridge: re-check terminal flags AFTER pending.set
+
+Concurrency review P1 #3. Pre-slice `confirmPermission` (`src/subagents/permission-bridge.ts:194-237`) had a check-then-act race window between the initial guard (`if (disposed || closed || signal.aborted)`) and the `pending.set` entry registration:
+
+```
+(a) child reads signal.aborted === false (line 195)
+(b) IPC channel.onClose / abort listener fires; drainPendingAsDenied()
+    runs against an EMPTY pending — no-op
+(c) child registers pending.set(promptId, {resolve})  // orphan
+(d) channel.send() into a closed channel
+(e) promise never resolves; invoke-tool's raceAgainstAbort eventually
+    surfaces the abort, but the bridge advertises clean abort semantics
+    and silently bypassed them
+```
+
+In pure single-threaded JS the gap requires a microtask interleave between (a) and (c) — theoretical, but a future refactor adding an `await` or Bun-IPC dispatching as a microtask between sync statements would break the contract.
+
+**Fix:** post-set re-check of `disposed || closed || signal.aborted`. If any flag flipped during the registration window, delete the just-set pending entry and return `false` synchronously. Promise constructor's `resolve` callback never had to fire — the orphan is removed before any await sees it.
+
+Contract after slice 166: every `confirmPermission` returns within terminal-state ticks, no orphaned promises.
+
+### 2. policy-watcher: watch parent dir + filter by basename (survives atomic-rename saves)
+
+Concurrency review P1 #4. Pre-slice `defaultWatcher` (`src/permissions/policy-watcher.ts:98-101`) used `fs.watch(path, cb)` — attached to the file's inode. Editors that save via atomic rename (vim with `backupcopy=no`, IntelliJ "safe save", VS Code default) replace the inode; the OS's inotify / FSEvents subscription was attached to the OLD inode (now unlinked); every subsequent save hit the new inode that nobody was watching. Operator edited policy, expected the reload audit row, saw nothing, didn't know the engine was enforcing stale rules.
+
+**Fix:** watch the PARENT DIRECTORY and filter the dispatched events by basename:
+
+```ts
+const defaultWatcher = (path, cb) => {
+  const dir = dirname(path);
+  const base = basename(path);
+  const w = fsWatch(dir, (_event, filename) => {
+    if (filename === null || filename === base) cb();
+  });
+  return { close: () => w.close() };
+};
+```
+
+Dir-watch + basename filter survives rename: the dir's inode is stable; rename + create + delete events all land on the dir watcher; we filter to the ONE filename we care about. Standard pattern, supported by both inotify (Linux) and FSEvents (macOS). `filename === null` fallback covers rare FUSE-mount cases where the underlying signal lacks an entry — debouncing dedupes if the next event names our file anyway.
+
+Intermediate-state caveat: during a rename save the file briefly doesn't exist (tmp → renamed-to-final). reloadNow's `resolvePolicy` throws ENOENT on read → onReloadFailed fires with the diagnostic. The debounce coalesces follow-up events; the final state (file fully written) reloads cleanly. The brief failure is a known noisy edge but not a security or correctness concern.
+
+The file-creation-mid-session gap (operator never had the policy file at startup, creates it later) remains documented in the watcher header — closing it would require dropping the `exists(path)` gate, which is a larger scope change.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **permission-bridge re-check** | `src/subagents/permission-bridge.ts` | New `if (disposed \|\| closed \|\| signal.aborted)` block AFTER `pending.set`; `pending.delete(promptId); return false`. |
+| **policy-watcher dir-watch** | `src/permissions/policy-watcher.ts` | `defaultWatcher` switched from `fsWatch(path, cb)` to `fsWatch(dirname(path), (_event, filename) => { if (filename === null \|\| filename === base) cb(); })`. New `dirname`/`basename` imports from `node:path`. |
+
+### Tests added (+5)
+
+| File | Coverage |
+|---|---|
+| **permission-bridge.test.ts (+3)** | Signal aborted before confirmPermission returns → false; dispose during confirmPermission → entry drained + pendingCount=0; channel close during confirmPermission → entry drained + pendingCount=0. |
+| **policy-watcher.test.ts (+2)** | Atomic-rename save (write tmp + rename over) triggers the dir watcher; second save in same session also triggers (proves no inode orphan). Sibling-file event in same dir filtered out (no spurious reload). |
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors / 2 pre-existing warnings
+- `bun test` — **7078 pass / 10 skip / 0 fail** (was 7073 → +5 net new; zero regression)
+
+### 5-axis review status
+
+Batch D closed. Remaining batches from task #268:
+- Batch E (slice 167) — threat surface (injection scanner, trust hash-aggregate, hook hash, find -delete)
+- Batch F (slice 168) — dependency pin lockstep (engines.bun, @types/bun, anthropic-sdk, openai, google-genai)
+- Deferred (separate slices): silent_passthrough emit (Batch C tail), darwin bg-reaper (Batch C tail), Batch B architectural items.
+
+---
+
 ## [2026-05-14] fix(sandbox/doctor) — slice 165: Batch C sandbox observability (partial)
 
 **Done.** First two items from Batch C (sandbox observability) of task #268. Pre-slice the resolver's `trustLevel` + `trustWarnings` (slice 154) were computed but never surfaced — operator running with `/tmp/evilbin/bwrap` (owner root, mode 0o755 — passes stat-check but isn't canonical) saw "sandbox: ok bwrap available" with zero indication that the install isn't `/usr/bin/bwrap`. Postmortems lost the "rodava com bwrap não-canonical em /opt/bin" signal that slice 154's spec explicitly called out.

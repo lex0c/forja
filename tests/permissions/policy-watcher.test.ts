@@ -364,3 +364,108 @@ describe('watchAndReload', () => {
     expect(reloads[1]?.newHash).not.toBe(reloads[1]?.oldHash);
   });
 });
+
+// Slice 166 (review — Batch D, second item): the production
+// `defaultWatcher` watches the PARENT DIR + filters by basename so
+// atomic-rename saves keep the watcher alive across inode swaps.
+// Pre-slice `fs.watch(path, cb)` attached to the file's inode; vim
+// (backupcopy=no) / IntelliJ "safe save" / VS Code default all
+// replace the inode on save and the old watcher was orphaned.
+//
+// This test uses the REAL `fsWatch` to validate the integration
+// (Bun's fs.watch is the production path). The fake watcher tests
+// above remain the regression net for the watcher dispatch logic.
+describe('watchAndReload — atomic-rename save survives the watcher (slice 166)', () => {
+  test('replacing the policy file via rename triggers the dir watcher', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'forja-policy-watch-rename-'));
+    try {
+      const projectDir = join(tmp, 'proj');
+      const agentDir = join(projectDir, '.agent');
+      mkdirSync(agentDir, { recursive: true });
+      const policyPath = join(agentDir, 'permissions.yaml');
+      writeFileSync(policyPath, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v1"]\n');
+      const engine = createPermissionEngine(policy({}), { cwd: projectDir });
+      const reloads: Array<{ oldHash: string; newHash: string }> = [];
+      const failures: string[] = [];
+      // Production defaultWatcher (no `watcher` seam). Real fs.watch
+      // on the parent dir.
+      const watcher = watchAndReload({
+        engine,
+        resolveOptions: { cwd: projectDir, enterprisePath: null, userPath: null },
+        debounceMs: 50,
+        onReload: (r) => reloads.push({ oldHash: r.oldHash, newHash: r.newHash }),
+        onReloadFailed: (r) => failures.push(r),
+      });
+      try {
+        // Simulate atomic-rename save: write a sibling tmp file,
+        // then rename over the original. Inode of policyPath
+        // changes. Pre-slice the watcher would miss subsequent
+        // saves; post-slice the parent-dir watcher fires every
+        // event in the directory.
+        const tmpPath = join(agentDir, 'permissions.yaml.tmp');
+        const { renameSync } = await import('node:fs');
+        writeFileSync(tmpPath, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v2"]\n');
+        // Let the kernel's inotify deliver the IN_CREATE event for
+        // the tmp file before the rename happens. Without this
+        // pause Bun's fs.watch dispatcher races the rename and only
+        // surfaces the first event.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        renameSync(tmpPath, policyPath);
+        // Poll for the reload: inotify + Bun event-loop ticking +
+        // 50ms debounce can take a non-trivial wall-clock window.
+        // Bounded retry instead of a single sleep so the test
+        // doesn't fight transient scheduling jitter on CI.
+        for (let i = 0; i < 30 && reloads.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(reloads.length).toBeGreaterThanOrEqual(1);
+        // No reload-failed callbacks expected on a clean save.
+        expect(failures).toEqual([]);
+        const firstReloadCount = reloads.length;
+        // Second save proves the watcher didn't orphan post-rename.
+        writeFileSync(tmpPath, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v3"]\n');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        renameSync(tmpPath, policyPath);
+        for (let i = 0; i < 30 && reloads.length === firstReloadCount; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(reloads.length).toBeGreaterThan(firstReloadCount);
+      } finally {
+        watcher.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('events for unrelated siblings in the same dir are filtered out', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'forja-policy-watch-sibling-'));
+    try {
+      const projectDir = join(tmp, 'proj');
+      const agentDir = join(projectDir, '.agent');
+      mkdirSync(agentDir, { recursive: true });
+      const policyPath = join(agentDir, 'permissions.yaml');
+      writeFileSync(policyPath, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v1"]\n');
+      const engine = createPermissionEngine(policy({}), { cwd: projectDir });
+      const reloads: Array<{ oldHash: string; newHash: string }> = [];
+      const watcher = watchAndReload({
+        engine,
+        resolveOptions: { cwd: projectDir, enterprisePath: null, userPath: null },
+        debounceMs: 50,
+        onReload: (r) => reloads.push({ oldHash: r.oldHash, newHash: r.newHash }),
+      });
+      try {
+        // Touch a sibling file in the same dir. The watcher fires
+        // (dir-level event) but the basename filter drops it —
+        // no reload.
+        writeFileSync(join(agentDir, 'unrelated.txt'), 'noise');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(reloads.length).toBe(0);
+      } finally {
+        watcher.close();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
