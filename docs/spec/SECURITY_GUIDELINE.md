@@ -383,6 +383,13 @@ id_ecdsa*
 **/secrets.yml
 **/secrets.yaml
 .git-credentials
+# Slice 180 — tool-specific credential files
+.terraformrc              # Terraform CLI credentials blocks
+.dockercfg                # Legacy Docker auth (pre-config.json)
+.pgpass                   # Postgres password file (netrc-shaped)
+.my.cnf                   # MySQL client [client] password=
+.mongorc.js               # Mongo shell init com conn strings
+**/.htpasswd              # Apache basic-auth
 ```
 
 Match → tool retorna erro `path.deny_listed` com texto:

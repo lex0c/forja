@@ -150,7 +150,52 @@ describe('SENSITIVE_PATH_DENY_LIST integrity', () => {
       '**/secrets.yml',
       '**/secrets.yaml',
       '.git-credentials',
+      // Slice 180 — tool-specific credential file additions.
+      '.terraformrc',
+      '.dockercfg',
+      '.pgpass',
+      '.my.cnf',
+      '.mongorc.js',
+      '**/.htpasswd',
     ]);
+  });
+});
+
+// Slice 180 — explicit per-pattern match tests for the new
+// additions. Each entry has a known canonical name shape; the
+// fence test above is structural, these are semantic.
+describe('SENSITIVE_PATH_DENY_LIST — slice 180 additions', () => {
+  test('matches `.terraformrc` at any depth', () => {
+    expect(matchSensitivePath('.terraformrc')).toBe('.terraformrc');
+    expect(matchSensitivePath('/home/op/.terraformrc')).toBe('.terraformrc');
+  });
+
+  test('matches `.dockercfg` (legacy docker auth)', () => {
+    expect(matchSensitivePath('.dockercfg')).toBe('.dockercfg');
+  });
+
+  test('matches `.pgpass` (postgres password file)', () => {
+    expect(matchSensitivePath('.pgpass')).toBe('.pgpass');
+    expect(matchSensitivePath('/home/op/.pgpass')).toBe('.pgpass');
+  });
+
+  test('matches `.my.cnf` (mysql client config with password)', () => {
+    expect(matchSensitivePath('.my.cnf')).toBe('.my.cnf');
+  });
+
+  test('matches `.mongorc.js` (mongo shell init with conn strings)', () => {
+    expect(matchSensitivePath('.mongorc.js')).toBe('.mongorc.js');
+  });
+
+  test('matches `.htpasswd` at any depth (Apache basic auth)', () => {
+    expect(matchSensitivePath('.htpasswd')).toBe('**/.htpasswd');
+    expect(matchSensitivePath('docs/.htpasswd')).toBe('**/.htpasswd');
+  });
+
+  test('non-sensitive look-alikes do NOT match', () => {
+    expect(matchSensitivePath('terraform.tf')).toBeNull();
+    expect(matchSensitivePath('mongo-prod.js')).toBeNull();
+    expect(matchSensitivePath('my-config.json')).toBeNull();
   });
 });
 

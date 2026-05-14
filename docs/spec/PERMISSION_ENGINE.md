@@ -275,7 +275,14 @@ Resolver bash usa **AST parsing** (lib `tree-sitter-bash`), não regex. Pipeline
 | `cat`, `ls`, `head`, `tail`, `wc`, `grep`, `find` (sem `-exec`) | `read-fs(args)` |
 | `find` com `-exec` | `exec:arbitrary` + capabilities do comando exec |
 | `chmod`, `chown` | `write-fs(target)` + flag `permission-mutate` (escala score) |
-| `dd`, `mkfs`, `fdisk` | sempre `Refuse` em v2 (não há resolver seguro) |
+| `dd`, `mkfs.*`, `fdisk`, `parted`, `mkswap`, `shred` | sempre `Refuse` em v2 (não há resolver seguro) |
+| `sudo`, `doas`, `pkexec`, `su` | sempre `Refuse` (slice 180 — privilege boundary; operator usa `--sandbox-host` + policy explícita pra elevações legítimas) |
+| `chroot`, `unshare`, `nsenter`, `setpriv` | sempre `Refuse` (slice 180 — namespace/privilege manipulation) |
+| `useradd`/`userdel`/`usermod`/`groupadd`/`groupdel`/`groupmod`/`passwd`/`chpasswd`/`visudo` | sempre `Refuse` (slice 180 — user db mutation) |
+| `reboot`/`shutdown`/`halt`/`poweroff`/`kexec`/`init`/`telinit` | sempre `Refuse` (slice 180 — system halt + runlevel) |
+| `crontab`/`at`/`batch`/`systemd-run` | sempre `Refuse` (slice 180 — scheduled persistence fires outside audit chain) |
+| `insmod`/`rmmod`/`modprobe`/`depmod` | sempre `Refuse` (slice 180 — kernel-module injection) |
+| `wipefs`/`debugfs`/`tune2fs`/`xfs_admin`/`hdparm`/`badblocks` | sempre `Refuse` (slice 180 — destructive filesystem ops not covered by `dd`/`mkfs.*`) |
 
 Conservative fallback (cmd desconhecido):
 
@@ -941,21 +948,52 @@ Não há flag, prompt, ou config que permita subagent ter capability fora de `pa
 
 Capabilities `env-mutate` e `agent-mutate` **nunca** auto-allow, mesmo com static rule.
 
-Paths protegidos (write/delete sempre escala pra `confirm` no mínimo):
+Paths protegidos em três tiers. **Hardcoded na engine, não em policy file**. Policy não flexibiliza. Locked enterprise rule pode adicionar paths protegidos; nunca remover. Tentativa de remoção em policy load → `policy_invalid: protected_paths_redefined`.
+
+### 11.1 Tier `deny` — refuse direto em qualquer op
+
+Pseudofs do kernel + sockets runtime de daemons privilegiados. Read e write ambos negados (read de `/proc/<pid>/environ` é o shape canônico de credential-exfil; write de `/var/run/docker.sock` é game over).
 
 ```
-.git/                  (exceto via tools git_* específicos com policy)
-.agent/
-.claude/
-~/.bashrc, ~/.zshrc, ~/.profile, ~/.bash_profile
-~/.config/agent/, ~/.config/claude/
-/etc/                  (qualquer)
-/boot/, /sys/, /proc/  (deny direto, não confirm)
+/proc/, /sys/, /boot/, /dev/
+/run/, /var/run/      (docker.sock, postgresql.sock, dbus — slice 180)
 ```
 
-Hardcoded na engine, **não em policy file**. Policy não flexibiliza. Locked enterprise rule pode adicionar paths protegidos; nunca remover. Tentativa de remoção em policy load → `policy_invalid: protected_paths_redefined`.
+### 11.2 Tier `escalate` — write/delete escala pra confirm
 
-Detecção a `rm -rf /`, `rm -rf ~`, `rm -rf $HOME`: blocklist hardcoded em §5.2 + path resolver § 4.3 confirma resolução pra root/home.
+Reads passam (operador legitimamente lê `/etc/hosts`, `~/.bashrc`).
+
+```
+/etc/                              (qualquer)
+~/.bashrc, .zshrc, .zshenv, .zprofile, .profile, .bash_profile, .bash_aliases
+~/.config/fish/config.fish, ~/.tmux.conf, ~/.inputrc
+~/.netrc, ~/.npmrc, ~/.pypirc
+~/.gitconfig, ~/.git-credentials, ~/.boto
+~/.docker/config.json, ~/.cargo/credentials.toml
+~/.config/agent/, ~/.config/claude/, ~/.config/forja/
+~/.config/gcloud/, ~/.config/azure/, ~/.config/op/, ~/.config/sops/
+~/.ssh/, ~/.aws/, ~/.gnupg/, ~/.kube/
+~/.docker/, ~/.cargo/
+~/.terraform.d/, ~/.ansible/, ~/.rustup/
+~/.subversion/auth/
+~/.local/share/forja/                (audit DB; sandbox-write evade chain)
+.git/, .agent/, .claude/             (project-relative)
+```
+
+A lista de tilde-paths está **sincronizada com `HIDE_PATHS_DIRS` / `HIDE_PATHS_FILES`** (§9 sandbox-side credential masking). Pré-slice 180 as duas listas divergiram em ~10 entries, deixando dirs sandbox-mascarados mas engine-permitidos quando rodando em `degraded` (sandbox indisponível) ou `host` profile. Sincronização fechada via slice 180.
+
+### 11.3 Catastrophic deletion blocklist
+
+`rm`/`rmdir`/`find -delete` em system roots: hardcoded em §5.2 + path resolver §4.3 resolvem para root/home antes do match:
+
+```
+POSIX/Linux:  /, /etc, /usr, /usr/local, /var, /lib, /lib64, /bin, /sbin,
+              /boot, /root, /opt, /home, /dev, /proc, /sys,
+              /run, /var/run, /srv, /mnt, /media
+macOS:        /Users, /Applications, /Library, /System, /private
+```
+
+Match é exato (não prefix): `rm -rf /etc` refuse hard; `rm /etc/agent/old.conf` passa pelo classifier escalate. Trade-off: `rm /home/alice/junk.txt` passa (alice's home, legitimately rm-able); `rm -rf /home` refuse. Operator que quer remoção em system root usa `--sandbox-host` + policy explícita.
 
 ---
 

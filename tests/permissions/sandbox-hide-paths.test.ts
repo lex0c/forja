@@ -104,6 +104,27 @@ describe('sensitive-paths vs sandbox-hide-paths fence (slice 125)', () => {
       '**/credentials*.json': { kind: 'unmappable' },
       '**/secrets.yml': { kind: 'unmappable' },
       '**/secrets.yaml': { kind: 'unmappable' },
+      // Slice 180 additions — tool-specific credential files. Mapping:
+      //   `.terraformrc` lives at home root; would belong as a file
+      //       hide_path but `.terraform.d/` is already a HIDE_PATHS_DIR
+      //       (dir-level credential cache); mark unmappable since the
+      //       `.terraformrc` shape is name-only at home, not under
+      //       `.terraform.d`.
+      //   `.dockercfg` is legacy peer of `.docker/config.json`; the
+      //       new file should land in HIDE_PATHS_FILES at the slice 180
+      //       sandbox-side sync (future). For now, unmappable — the
+      //       sensitive-paths layer alone covers it.
+      //   `.pgpass`, `.my.cnf`, `.mongorc.js` — home-root files. Same
+      //       posture: sensitive-paths catches the engine layer; sandbox
+      //       overlay can land in a follow-up if telemetry shows real
+      //       operator usage.
+      //   `**/.htpasswd` — anywhere; unmappable to a specific mount.
+      '.terraformrc': { kind: 'unmappable' },
+      '.dockercfg': { kind: 'unmappable' },
+      '.pgpass': { kind: 'unmappable' },
+      '.my.cnf': { kind: 'unmappable' },
+      '.mongorc.js': { kind: 'unmappable' },
+      '**/.htpasswd': { kind: 'unmappable' },
     };
 
   test('every sensitive-paths entry has an explicit fence mapping (catches new patterns without coverage)', () => {

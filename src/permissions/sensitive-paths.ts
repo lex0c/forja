@@ -72,6 +72,27 @@ export const SENSITIVE_PATH_DENY_LIST: readonly string[] = [
   '**/secrets.yml',
   '**/secrets.yaml',
   '.git-credentials',
+  // Slice 180 (review — sensitive-path gap). Tool-specific
+  // credential files that share the shape of `.netrc` /
+  // `.aws/credentials` (well-known location, plain-text or
+  // base64'd credentials on disk):
+  //   `.terraformrc` — Terraform CLI config with `credentials`
+  //       blocks for Terraform Cloud / Enterprise.
+  //   `.dockercfg` — legacy Docker auth file (pre-`.docker/config.json`).
+  //   `.pgpass` — Postgres password file, netrc-shaped (`host:port:db:user:pass`).
+  //   `.my.cnf` — MySQL client config with `[client] password=` blocks.
+  //   `.mongorc.js` — MongoDB shell init; commonly carries
+  //       connection strings with password embedded.
+  //   `**/.htpasswd` — Apache basic-auth password file.
+  //   `**/Charles.cer` / `**/charles-proxy.pem` — proxy MITM certs
+  //       (not credentials, but reading them confirms an attacker
+  //       MITM is in place).
+  '.terraformrc',
+  '.dockercfg',
+  '.pgpass',
+  '.my.cnf',
+  '.mongorc.js',
+  '**/.htpasswd',
 ];
 
 // Match a relative path against the deny-list. Returns the

@@ -457,6 +457,62 @@ describe('bash resolver — refusals', () => {
       expect(r.capabilities).toEqual([]);
     }
   });
+
+  // Slice 180 — HARD_REFUSE_COMMANDS expansion. Six command families
+  // added. Spec rationale per protected_paths.ts and resolvers/bash.ts
+  // comments.
+  describe('slice 180 HARD_REFUSE additions', () => {
+    test.each([
+      // Privilege escalation
+      'sudo apt update',
+      'doas pkg upgrade',
+      'pkexec systemctl restart docker',
+      'su -l root',
+      // Namespace / privilege manipulation
+      'chroot /mnt /bin/bash',
+      'unshare --user --map-root-user',
+      'nsenter --target 1 --mount',
+      'setpriv --reuid 0 --regid 0 --init-groups',
+      // User-db mutation
+      'useradd -m attacker',
+      'userdel -r alice',
+      'usermod -aG sudo alice',
+      'groupadd evil',
+      'groupdel staff',
+      'groupmod -n new old',
+      'passwd alice',
+      'chpasswd',
+      'visudo',
+      // System halt + boot
+      'reboot',
+      'shutdown -h now',
+      'halt',
+      'poweroff',
+      'kexec -l /tmp/evil.bzImage',
+      'init 6',
+      'telinit 0',
+      // Scheduled persistence
+      'crontab -e',
+      'at now + 1 hour',
+      'batch',
+      'systemd-run --unit=evil ./payload',
+      // Kernel modules
+      'insmod evil.ko',
+      'rmmod nf_tables',
+      'modprobe usb_storage',
+      'depmod -a',
+      // Destructive fs
+      'wipefs -a /dev/sda',
+      'debugfs -w /dev/sda1',
+      'tune2fs -L EVIL /dev/sda1',
+      'xfs_admin -L EVIL /dev/sda1',
+      'hdparm --security-erase-enhanced PASS /dev/sda',
+      'badblocks -w /dev/sda1',
+    ])('refuses %s (slice 180)', (cmd) => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('refuse');
+    });
+  });
 });
 
 describe('bash resolver — adversarial shapes are Refused (slice 6: whitelist + Refuse)', () => {
@@ -646,6 +702,35 @@ describe('bash resolver — rm hardcoded blocklist (slice 147)', () => {
     // Either ok with delete-fs OR refuse-NOT-attributed-to-RM_REFUSE_ROOTS.
     if (r.kind === 'refuse') {
       expect(r.reason).not.toContain('system root');
+    }
+  });
+
+  // Slice 180 — macOS + runtime-socket roots. Pre-slice the list
+  // was Linux-only; `rm -rf /Users` on macOS walked past. Note:
+  // `/run` and `/var/run` are dual-covered — they're also in
+  // SYSTEM_DENY_ROOTS (protected_paths.ts) which fires from the
+  // per-arg classifier BEFORE reaching cmdRm's RM_REFUSE_ROOTS
+  // check. Refuse is correct; the source path is the classifier,
+  // not the rm blocklist. We assert refuse without pinning the
+  // reason text for those two entries.
+  test.each([
+    { root: '/run', source: 'classifier' },
+    { root: '/var/run', source: 'classifier' },
+    { root: '/srv', source: 'rm' },
+    { root: '/mnt', source: 'rm' },
+    { root: '/media', source: 'rm' },
+    { root: '/usr/local', source: 'rm' },
+    // macOS roots — none in SYSTEM_DENY; RM_REFUSE_ROOTS catches.
+    { root: '/Users', source: 'rm' },
+    { root: '/Applications', source: 'rm' },
+    { root: '/Library', source: 'rm' },
+    { root: '/System', source: 'rm' },
+    { root: '/private', source: 'rm' },
+  ])('rm -rf $root is Refused via $source (slice 180)', ({ root, source }) => {
+    const r = resolveCapabilities('bash', { command: `rm -rf ${root}` }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse' && source === 'rm') {
+      expect(r.reason).toContain('system root');
     }
   });
 });

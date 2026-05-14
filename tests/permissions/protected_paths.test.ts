@@ -156,7 +156,10 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
 describe('protectedTargets', () => {
   test('resolves tilde and cwd entries against supplied roots', () => {
     const t = protectedTargets(HOME, CWD);
-    expect(t.systemDeny).toEqual(['/proc', '/sys', '/boot', '/dev']);
+    // Slice 180: `/run` and `/var/run` added (runtime sockets —
+    // docker.sock / postgresql.sock / dbus). Order matches the
+    // declared array order in protected_paths.ts.
+    expect(t.systemDeny).toEqual(['/proc', '/sys', '/boot', '/dev', '/run', '/var/run']);
     expect(t.absoluteEscalate).toEqual(['/etc']);
     expect(t.tildeEscalateFiles).toContain('/home/op/.bashrc');
     expect(t.tildeEscalateFiles).toContain('/home/op/.zshrc');
@@ -280,6 +283,168 @@ describe('classifyProtectedPath — slice 97 additions (R2 P0/P1)', () => {
     expect(
       classifyProtectedPath({
         absPath: '/home/op/.npmrc',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+});
+
+// Slice 180 — protected-path expansions. Three categories:
+//   1. SYSTEM_DENY: `/run` + `/var/run` (runtime sockets like
+//      docker.sock / postgresql.sock / dbus).
+//   2. TILDE_ESCALATE_FILES: shell variants (`.zshenv`, `.zprofile`,
+//      `.bash_aliases`, `.config/fish/config.fish`, `.tmux.conf`,
+//      `.inputrc`) + sync with HIDE_PATHS_FILES (`.gitconfig`,
+//      `.docker/config.json`, `.cargo/credentials.toml`,
+//      `.git-credentials`, `.pypirc`, `.boto`).
+//   3. TILDE_ESCALATE_DIRS: sync with HIDE_PATHS_DIRS (10 dirs
+//      that were sandbox-masked but engine-allowed pre-slice).
+describe('classifyProtectedPath — slice 180 additions', () => {
+  test('/var/run write denies (docker.sock + similar privileged sockets)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/var/run/docker.sock',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('deny');
+  });
+
+  test('/run write denies (systemd-host postgresql/dbus sockets)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/run/postgresql/.s.PGSQL.5432',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('deny');
+  });
+
+  test('/var/run READ also denies (socket file metadata leak)', () => {
+    // Reads of socket files leak daemon state and presence.
+    // SYSTEM_DENY applies to both ops.
+    expect(
+      classifyProtectedPath({
+        absPath: '/var/run/docker.sock',
+        op: 'read',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('deny');
+  });
+
+  test('~/.zshenv escalates on write (sourced in EVERY zsh invocation)', () => {
+    // `.zshenv` loads in non-interactive `zsh -c "..."` too;
+    // RCE on any zsh subprocess after a poisoned write.
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.zshenv',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.gitconfig escalates on write (slice 180 — sync with HIDE_PATHS)', () => {
+    // Pre-slice .gitconfig was in HIDE_PATHS_FILES (sandbox-side)
+    // but NOT in TILDE_ESCALATE_FILES (engine-side). A write via
+    // fs tool in degraded/host profile bypassed both. Fixed.
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.gitconfig',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.docker/config.json escalates on write (registry auth + credsStore RCE)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.docker/config.json',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.cargo/credentials.toml escalates on write (crates.io token)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.cargo/credentials.toml',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.config/gcloud/* escalates on write (slice 180 — was HIDE_PATHS-only)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.config/gcloud/credentials.db',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.config/azure/* escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.config/azure/azureProfile.json',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.terraform.d/* escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.terraform.d/credentials.tfrc.json',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.rustup/* escalates on write (default-toolchain hijack vector)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.rustup/settings.toml',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.tmux.conf escalates on write (run-shell directive is RCE)', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.tmux.conf',
+        op: 'write',
+        home: HOME,
+        cwd: CWD,
+      }),
+    ).toBe('escalate');
+  });
+
+  test('~/.config/fish/config.fish escalates on write', () => {
+    expect(
+      classifyProtectedPath({
+        absPath: '/home/op/.config/fish/config.fish',
         op: 'write',
         home: HOME,
         cwd: CWD,

@@ -234,6 +234,75 @@ const HARD_REFUSE_COMMANDS: ReadonlySet<string> = new Set([
   // table.
   'command',
   'builtin',
+  // Slice 180 (review — HARD_REFUSE gap). Six families added; each
+  // shares the rationale of `eval` / `dd` / `mkfs.*`: there's no
+  // safe way the static resolver can shape these into a typed
+  // capability the engine can gate. Policy-via-allow is the wrong
+  // surface — operator who wants `sudo apt update` once should use
+  // `--sandbox-host` + an explicit policy rule, not a bash allow
+  // pattern that compounds with other model output.
+  //
+  // Privilege escalation: any of these grants the LLM the host
+  // user's full authority. CI runners with `NOPASSWD` configured
+  // turn `sudo rm -rf /var` into a one-prompt RCE.
+  'sudo',
+  'doas',
+  'pkexec',
+  'su',
+  // Namespace + privilege manipulation: `chroot` / `unshare` /
+  // `nsenter` change the wrapped process's context out from under
+  // the sandbox; `setpriv` flips capabilities directly.
+  'chroot',
+  'unshare',
+  'nsenter',
+  'setpriv',
+  // User database mutation: adds attacker-controlled accounts +
+  // groups. `visudo` rewrites the sudoers file.
+  'useradd',
+  'userdel',
+  'usermod',
+  'groupadd',
+  'groupdel',
+  'groupmod',
+  'passwd',
+  'chpasswd',
+  'visudo',
+  // System halt + boot transition: every one can terminate the
+  // host or load a new kernel image.
+  'reboot',
+  'shutdown',
+  'halt',
+  'poweroff',
+  'kexec',
+  // Init / runlevel — same threat shape.
+  'init',
+  'telinit',
+  // Scheduled persistence: `crontab` / `at` / `batch` plant
+  // commands that fire later, outside the current audit chain.
+  // `systemd-run` is the systemd equivalent.
+  'crontab',
+  'at',
+  'batch',
+  'systemd-run',
+  // Kernel module load/unload: `insmod` / `rmmod` / `modprobe` are
+  // direct kernel-code injection vectors. `depmod` rebuilds the
+  // module dependency map (less direct but enables module load).
+  'insmod',
+  'rmmod',
+  'modprobe',
+  'depmod',
+  // Destructive filesystem ops not covered by `dd` / `mkfs.*`:
+  //   `wipefs` strips filesystem signatures (negative of mkfs).
+  //   `debugfs` is direct ext2/3/4 manipulation.
+  //   `tune2fs` / `xfs_admin` mutate fs metadata (label, UUID, etc).
+  //   `hdparm -w` is destructive disk reformat.
+  //   `badblocks -w` does destructive write tests.
+  'wipefs',
+  'debugfs',
+  'tune2fs',
+  'xfs_admin',
+  'hdparm',
+  'badblocks',
 ]);
 
 const isHardRefuseCommand = (name: string): boolean => {
@@ -544,9 +613,11 @@ const cmdFind: CommandResolver = (positional, tokens, ctx) => {
 // breaks the host. The list intentionally OMITS `/tmp`, `/var/log`,
 // `/var/tmp` — those are legitimately rm-able under workflows.
 const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
+  // POSIX / Linux system roots
   '/',
   '/etc',
   '/usr',
+  '/usr/local', // Homebrew + Linux site-installs root
   '/var',
   '/lib',
   '/lib64',
@@ -559,6 +630,33 @@ const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
   '/dev',
   '/proc',
   '/sys',
+  // Slice 180: runtime + storage roots paralelos aos system dirs.
+  //   `/run` + `/var/run` — runtime sockets (docker.sock, etc).
+  //   `/srv` — server data root on systemd hosts.
+  //   `/mnt` + `/media` — mount points; rm here may unmount + erase
+  //     external storage (rare but catastrophic when it happens).
+  '/run',
+  '/var/run',
+  '/srv',
+  '/mnt',
+  '/media',
+  // Slice 180: macOS system roots. Pre-slice the list was
+  // Linux-only — `rm -rf /Users` on macOS (equivalent to `/home`)
+  // walked past. Apple's hierarchy:
+  //   `/Users` — equivalent to `/home`.
+  //   `/Applications` — system + user app bundles.
+  //   `/Library` — system libs + user prefs (mixed with `/Users/<u>/Library`).
+  //   `/System` — Apple-owned; modifications break the OS.
+  //   `/private` — real path of many system dirs (`/etc` → `/private/etc`,
+  //                `/tmp` → `/private/tmp`, `/var` → `/private/var`).
+  //                Listing `/private` ROOT — not specific subpaths — because
+  //                rm-rf at any prefix is the catastrophic shape; deeper
+  //                paths route through the regular escalate tier.
+  '/Users',
+  '/Applications',
+  '/Library',
+  '/System',
+  '/private',
 ]);
 
 const cmdRm: CommandResolver = (positional, _tokens, ctx) => {

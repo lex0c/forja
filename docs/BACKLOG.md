@@ -2,6 +2,88 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] sec(perm-engine) — slice 180: hardcoded list expansion (protected paths + commands + sensitive patterns)
+
+**Done.** Self-review of the four hardcoded defense lists in `docs/SECURITY.md` and the code identified 5 P1 gaps with known attack vectors, ~10 P2 defensive-completeness gaps, and one systemic inconsistency between `HIDE_PATHS` (sandbox-side, 15 dirs / 8 files) and `TILDE_ESCALATE` (engine-side, 6 dirs / 6 files). Single-slice batched commit closes all P1+P2.
+
+### Threat shape
+
+Three failure modes the slice closes:
+
+1. **HIDE_PATHS vs TILDE_ESCALATE divergence** — operator running in `degraded` (sandbox unavailable) or `host` profile lost the credential masking the sandbox normally provides. Engine policy was the ONLY remaining defense — and 10 dirs (`.config/gcloud`/`.config/azure`/`.config/op`/`.terraform.d`/etc.) sat in HIDE_PATHS but NOT in TILDE_ESCALATE, so `write_file('~/.config/gcloud/credentials.db')` in `mode: acceptEdits` passed silently. Same gap for 6 files (`.gitconfig`/`.docker/config.json`/`.cargo/credentials.toml`/etc.). Sync closed.
+
+2. **HARD_REFUSE_COMMANDS missing privilege boundary** — `sudo`, `doas`, `pkexec`, `su`, `chroot`, `unshare`, `nsenter`, `setpriv` fell through to default `cmdInterpreter` with confidence:low. In CI environments with `sudo NOPASSWD` configured (GitHub Actions, GitLab runners), `sudo rm -rf /var` was a one-prompt RCE. Added with rationale paralelo a `eval`/`dd`/`mkfs.*`: there's no safe static-resolver shape; operator wants elevation uses `--sandbox-host` + explicit policy, never a bash allow pattern.
+
+3. **macOS root paths missing from `RM_REFUSE_ROOTS`** — list was Linux-shape (`/etc`, `/usr`, `/bin`, etc.). `rm -rf /Users`, `rm -rf /Applications`, `rm -rf /System` on macOS walked past. Added.
+
+### Changes by surface
+
+**`src/permissions/protected_paths.ts`** (P1 + P2):
+
+| List | Pre-slice | Post-slice |
+|---|---|---|
+| `SYSTEM_DENY_ROOTS` | `/proc`, `/sys`, `/boot`, `/dev` (4) | + `/run`, `/var/run` — runtime sockets (docker.sock, postgresql.sock, dbus) → 6 |
+| `TILDE_ESCALATE_FILES` | 6 entries | + `.zshenv`, `.zprofile`, `.bash_aliases`, `.config/fish/config.fish`, `.tmux.conf`, `.inputrc`, `.gitconfig`, `.git-credentials`, `.docker/config.json`, `.cargo/credentials.toml`, `.pypirc`, `.boto` → 18 |
+| `TILDE_ESCALATE_DIRS` | 6 entries | + `.config/forja`, `.config/gcloud`, `.config/azure`, `.config/op`, `.config/sops`, `.docker`, `.cargo`, `.terraform.d`, `.ansible`, `.rustup`, `.subversion/auth`, `.local/share/forja` → 18 (sync com HIDE_PATHS_DIRS) |
+
+**`src/permissions/resolvers/bash.ts`** — `HARD_REFUSE_COMMANDS` (P1 + P2):
+
+| Family | Additions |
+|---|---|
+| Privilege escalation | `sudo`, `doas`, `pkexec`, `su` |
+| Namespace/privilege manipulation | `chroot`, `unshare`, `nsenter`, `setpriv` |
+| User-db mutation | `useradd`, `userdel`, `usermod`, `groupadd`, `groupdel`, `groupmod`, `passwd`, `chpasswd`, `visudo` |
+| System halt/boot transition | `reboot`, `shutdown`, `halt`, `poweroff`, `kexec`, `init`, `telinit` |
+| Scheduled persistence | `crontab`, `at`, `batch`, `systemd-run` |
+| Kernel modules | `insmod`, `rmmod`, `modprobe`, `depmod` |
+| Destructive filesystem | `wipefs`, `debugfs`, `tune2fs`, `xfs_admin`, `hdparm`, `badblocks` |
+
+**`src/permissions/resolvers/bash.ts`** — `RM_REFUSE_ROOTS` (P2 macOS):
+
+Added Linux runtime: `/run`, `/var/run`, `/srv`, `/mnt`, `/media`, `/usr/local`. Added macOS roots: `/Users`, `/Applications`, `/Library`, `/System`, `/private`.
+
+**`src/permissions/sensitive-paths.ts`** — `SENSITIVE_PATH_DENY_LIST` (P2):
+
+Added `.terraformrc`, `.dockercfg`, `.pgpass`, `.my.cnf`, `.mongorc.js`, `**/.htpasswd` — tool-specific credential files that share `.netrc`/`.aws/credentials` shape.
+
+### Spec PRs (PT-BR)
+
+- `docs/spec/PERMISSION_ENGINE.md §11` — restructured into three tiers (deny / escalate / catastrophic-deletion) with the new entries documented. Section now matches the code exactly (was lagging by ~12 entries pre-slice).
+- `docs/spec/PERMISSION_ENGINE.md §5.2` — HARD_REFUSE command table extended with 7 new family rows + rationale.
+- `docs/spec/SECURITY_GUIDELINE.md §8.4` — sensitive-path canonical patterns extended with the 6 new entries.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/protected_paths.ts` | SYSTEM_DENY +2, TILDE_ESCALATE_FILES +12, TILDE_ESCALATE_DIRS +12 |
+| `src/permissions/resolvers/bash.ts` | HARD_REFUSE_COMMANDS +30 entries, RM_REFUSE_ROOTS +11 entries (6 Linux + 5 macOS) |
+| `src/permissions/sensitive-paths.ts` | SENSITIVE_PATH_DENY_LIST +6 entries |
+| `docs/spec/PERMISSION_ENGINE.md` | §11 restructured into 3 subsections; §5.2 HARD_REFUSE table extended |
+| `docs/spec/SECURITY_GUIDELINE.md` | §8.4 patterns extended |
+| `tests/permissions/protected_paths.test.ts` | +13 new tests covering each tier addition |
+| `tests/permissions/resolvers.test.ts` | +38 test.each entries for HARD_REFUSE + RM_REFUSE additions |
+| `tests/subagents/sensitive-paths.test.ts` | +7 new tests + integrity-list update |
+| `tests/permissions/sandbox-hide-paths.test.ts` | Fence-mapping updated for 6 new SENSITIVE entries |
+
+### Backward-compat caveats
+
+These are user-visible behavior changes — operator policies that depended on the pre-slice gaps will see different decisions:
+
+- `bash.allow: ['sudo*']` patterns now NEVER match (resolver hard-refuses before policy). Operator workflow that legitimately needs sudo must use `--sandbox-host` + a session-allow grant, OR run the command outside Forja.
+- `write_file` to `~/.config/gcloud/credentials.db` in `mode: acceptEdits` now escalates to `confirm` (was silently allowed). Acknowledges the credential write.
+- `rm -rf /Users/old` on macOS now refuses (was silently allowed). Same shape as `/home` on Linux.
+
+These are intentional hardening, not regressions — every previous behavior was a documented defense gap.
+
+### Verification
+
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 0 warnings (pre-existing abortable.test warnings already fixed in commit 16c14d1).
+- `bun test` — **7217 pass / 10 skip / 0 fail** (+69 tests from pre-slice 7148).
+
+---
+
 ## [2026-05-14] sec(perm-engine) — slice 179: permission-bypass code review round
 
 **Done.** Second focused review of `feat/permission-engine`, axis: permission bypass. Three parallel agent scans (engine pipeline / resolver under-attribution / matcher + sandbox-plan) + my own engine pipeline + state-machine + hook + IPC pass. 8 fixable findings, all in the resolver flag-decoder surface + one engine-side defense-in-depth.

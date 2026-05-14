@@ -60,7 +60,17 @@ export interface ProtectedClassifyInput {
 // or `/dev/zero` are legitimate but rare; refusing them outright
 // pushes operators to explicitly invoke a non-LLM tool, which is
 // the safer default for kernel-managed pseudofs.
-const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev'];
+//
+// Slice 180 (review — protected-path gap): `/var/run` + `/run` added.
+// Both host SOCKETS to privileged daemons: `/var/run/docker.sock`
+// (root container access), `/run/postgresql/.s.PGSQL.5432` (DB
+// admin), `/run/dbus/system_bus_socket` (system reconfig via
+// PolicyKit / systemd). Write to those sockets is game over for
+// the host. Read of socket files exposes daemon state. POSIX
+// semantics: `/var/run` is symlinked to `/run` on modern Linux
+// systemd hosts; we list both for portability — older distros
+// (Alpine, some embedded) still have a real `/var/run`.
+const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev', '/run', '/var/run'];
 
 // Tilde-rooted files that escalate on write. Each entry is resolved
 // against the operator's `$HOME` at classification time. We list the
@@ -72,13 +82,56 @@ const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev'];
 // registry). Operator writes to these are legitimate during account
 // setup but rare during agent work; escalating on write defends
 // against silent credential injection by a hostile agent definition.
+//
+// Slice 180 (review — protected-path gap) additions:
+//   `.zshenv` — sourced in EVERY zsh invocation including
+//       non-interactive `zsh -c "..."` script form. Different from
+//       `.zshrc` (interactive-only); write here is RCE on every
+//       subsequent zsh subprocess. On macOS Catalina+ zsh is the
+//       default user shell, so this is the dominant attack path
+//       for "modify shell rc, gain RCE on next session". Paridade
+//       com `.bash_profile`.
+//   `.zprofile` — zsh login-shell init. Paralelo a `.bash_profile`.
+//   `.bash_aliases` — typically sourced by `.bashrc`; same RCE
+//       shape via aliases.
+//   `.config/fish/config.fish` — fish-shell init. XDG variant.
+//   `.tmux.conf` — `run-shell` directive lets tmux exec arbitrary
+//       commands at config-load time.
+//   `.inputrc` — readline keybind macros; bind a keystroke to a
+//       shell-injected sequence.
+//   `.gitconfig` — `core.sshCommand` / `core.pager` / `core.editor`
+//       / `credential.helper` / `[alias] *` are executable hooks
+//       that fire on standard git ops. Write is RCE on next
+//       `git pull`. ALREADY in HIDE_PATHS_FILES (sandbox-side);
+//       sync into the engine policy layer too so a tool running
+//       in `degraded` (sandbox unavailable) or `host` profile
+//       still escalates the write.
+//   `.docker/config.json` — Docker registry auth + `credsStore`
+//       (helper-binary indirection — write is RCE on next
+//       docker login / pull / push). HIDE_PATHS sync.
+//   `.cargo/credentials.toml` — crates.io API token. HIDE_PATHS sync.
+//   `.git-credentials` — git HTTP creds store. HIDE_PATHS sync.
+//   `.pypirc` — PyPI auth token. HIDE_PATHS sync.
+//   `.boto` — Legacy AWS Boto creds. HIDE_PATHS sync.
 const TILDE_ESCALATE_FILES: readonly string[] = [
   '.bashrc',
   '.zshrc',
+  '.zshenv',
+  '.zprofile',
   '.profile',
   '.bash_profile',
+  '.bash_aliases',
+  '.config/fish/config.fish',
+  '.tmux.conf',
+  '.inputrc',
   '.netrc',
   '.npmrc',
+  '.pypirc',
+  '.gitconfig',
+  '.git-credentials',
+  '.docker/config.json',
+  '.cargo/credentials.toml',
+  '.boto',
 ];
 
 // `.ssh`, `.aws`, `.gnupg`, `.kube` (slice 97, R2 P1 finding):
@@ -90,13 +143,36 @@ const TILDE_ESCALATE_FILES: readonly string[] = [
 // escalate. Adding these to the dir list (vs the file list) means
 // the classifier matches `.ssh/known_hosts` AND `.ssh/foo/bar`
 // alike via `startsWithSegment`.
+//
+// Slice 180 (review — sync with HIDE_PATHS_DIRS). Pre-slice the
+// engine's escalate-tier list lagged the sandbox-side HIDE_PATHS
+// list by 10 entries. Sandbox masks credentials inside the
+// wrapped process; engine policy was the ONLY defense when running
+// in `degraded` (sandbox unavailable) or `host` profile. The
+// asymmetry meant a write to `.config/gcloud/credentials.db` from
+// an fs tool in `mode: acceptEdits` + `host` profile would NOT
+// escalate to confirm — silent credential injection. Sync the
+// lists. Spec PR: SECURITY_GUIDELINE.md §8.4 + PERMISSION_ENGINE.md
+// §11 acknowledge the parallel.
 const TILDE_ESCALATE_DIRS: readonly string[] = [
   '.config/agent',
   '.config/claude',
+  '.config/forja',
+  '.config/gcloud',
+  '.config/azure',
+  '.config/op',
+  '.config/sops',
   '.ssh',
   '.aws',
   '.gnupg',
   '.kube',
+  '.docker',
+  '.cargo',
+  '.terraform.d',
+  '.ansible',
+  '.rustup',
+  '.subversion/auth',
+  '.local/share/forja',
 ];
 
 // Absolute roots that escalate on write regardless of cwd or home.
