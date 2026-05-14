@@ -68,6 +68,35 @@ export interface BuildSandboxExecArgvOptions {
   // macOS parity (SBPL deny rules on the literal cwd path would
   // be bypassed by the same symlink-to-hidden-dir trick).
   realpath?: (p: string) => string;
+  // Slice 156 (review — macOS /tmp shared sandbox+host): per-
+  // sandbox tmpdir subpath. When set, the SBPL `file-write*` allow
+  // for the tmp tree is restricted to this subpath rather than the
+  // host's `/tmp` blanket (plus the `/private/tmp` firmlink form).
+  //
+  // Pre-slice the SBPL profile granted `(allow file-write*
+  // (subpath "/tmp"))` and `(allow file-write* (subpath
+  // "/private/tmp"))` unconditionally — matching Linux's
+  // `--tmpfs /tmp` ergonomics but missing Linux's isolation. macOS
+  // `/tmp` is the host's `/tmp`, shared across every process the
+  // operator runs. Sandbox A writes `/tmp/secret`, operator's
+  // non-sandboxed app B reads it. Cross-tenancy leak.
+  //
+  // When `tmpdir` is set:
+  //   - Caller MUST pre-create the directory (mkdir + mode 0o700
+  //     recommended) and override the wrapped process's
+  //     `TMPDIR` env var to point at it. SBPL refuses the
+  //     /tmp blanket otherwise — tools fall back to the no-write
+  //     state.
+  //   - SBPL profile emits `(allow file-write* (subpath "<tmpdir>"))`
+  //     plus the `/private/<tmpdir-after-/tmp>` firmlink-equivalent
+  //     form when tmpdir starts with `/tmp/`. No blanket /tmp.
+  //
+  // When omitted (default): pre-slice behavior — full `/tmp` +
+  // `/private/tmp` allowed. Spec §6.5 documents this as a known
+  // divergence from Linux's per-sandbox isolation; the capability
+  // exists here for operator-driven workflows that pre-create a
+  // session-scoped tmpdir.
+  tmpdir?: string;
 }
 
 // SBPL string escaping. Apple's profile parser accepts double-quoted
@@ -110,6 +139,12 @@ export const buildSbplProfile = (
   profile: Exclude<SandboxProfile, 'host'>,
   cwd: string,
   home: string,
+  // Slice 156 (review — macOS /tmp shared): per-sandbox tmpdir
+  // subpath. When set, replaces the blanket `/tmp` + `/private/tmp`
+  // write allow with a subpath-scoped allow. See
+  // BuildSandboxExecArgvOptions.tmpdir docstring for the threat
+  // shape + caller-responsibility contract.
+  tmpdir?: string,
 ): string => {
   // Common header for every sandboxed profile.
   const header = [
@@ -166,9 +201,32 @@ export const buildSbplProfile = (
 
   // Filesystem writes — profile-specific. /tmp is always writable
   // (matches Linux's --tmpfs /tmp). Then cwd or home per profile.
+  //
+  // Slice 156 (review — macOS /tmp shared): when `tmpdir` is set,
+  // the SBPL allow is restricted to that subpath ONLY (plus the
+  // /private firmlink-equivalent form when tmpdir starts with
+  // /tmp/). No blanket /tmp + /private/tmp allow. When `tmpdir`
+  // is unset (default), pre-slice behavior — full /tmp tree
+  // allowed. The caller is responsible for pre-creating the
+  // directory and setting `TMPDIR=<tmpdir>` in the wrapped
+  // process's env so mktemp / NSTemporaryDirectory honor the
+  // restricted scope.
   const writeRules: string[] = [];
-  writeRules.push('(allow file-write* (subpath "/tmp"))');
-  writeRules.push('(allow file-write* (subpath "/private/tmp"))');
+  if (tmpdir !== undefined) {
+    const escTmpdir = escapeSbplLiteral(tmpdir);
+    writeRules.push(`(allow file-write* (subpath "${escTmpdir}"))`);
+    // macOS firmlinks /tmp ↔ /private/tmp; emit the /private form
+    // for tmpdirs under /tmp so operations that resolve through
+    // either prefix find the matching allow.
+    if (tmpdir.startsWith('/tmp/')) {
+      const privateForm = `/private${tmpdir}`;
+      const escPrivate = escapeSbplLiteral(privateForm);
+      writeRules.push(`(allow file-write* (subpath "${escPrivate}"))`);
+    }
+  } else {
+    writeRules.push('(allow file-write* (subpath "/tmp"))');
+    writeRules.push('(allow file-write* (subpath "/private/tmp"))');
+  }
   // macOS routes /tmp through /private/tmp via a firmlink; some
   // operations resolve one form, some the other. Allow both.
   //
@@ -364,7 +422,7 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
     }
   }
 
-  const profileString = buildSbplProfile(profile, cwd, home);
+  const profileString = buildSbplProfile(profile, cwd, home, options.tmpdir);
   // Slice 154 (review — PATH-shim resistance): use the resolved
   // absolute path when provided (production via maybeWrapSandboxArgv);
   // fall back to the bare binary name for direct-build test callers.

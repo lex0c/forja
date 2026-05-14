@@ -56,7 +56,7 @@ export type {
   SandboxAvailability,
   DetectSandboxAvailabilityOptions,
 } from './sandbox-availability.ts';
-export { detectSandboxAvailability } from './sandbox-availability.ts';
+export { defaultSandboxTmpdir, detectSandboxAvailability } from './sandbox-availability.ts';
 
 export type {
   SandboxProfile,

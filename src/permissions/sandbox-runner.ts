@@ -539,6 +539,25 @@ export interface MaybeWrapSandboxArgvOptions {
   // pass identity `(p) => p` to skip canonicalization OR a custom
   // mapping to exercise the symlink-to-hidden-dir Refuse path.
   realpath?: (p: string) => string;
+  // Slice 156 (review — macOS /tmp shared sandbox+host): per-
+  // sandbox tmpdir subpath. Only consumed on darwin (Linux's
+  // `--tmpfs /tmp` already provides per-sandbox isolation; on
+  // Linux this option is a no-op). When set, the macOS SBPL
+  // profile's `file-write*` allow on the tmp tree is restricted
+  // to this subpath rather than blanket `/tmp` + `/private/tmp`.
+  //
+  // Caller responsibility:
+  //   1. Pre-create the directory (mode 0o700 recommended).
+  //   2. Override `TMPDIR=<tmpdir>` in the wrapped process's
+  //      env so `mktemp` / `NSTemporaryDirectory` honor the
+  //      restricted scope.
+  //   3. Clean up post-spawn (or rely on /tmp reboot cleanup).
+  //
+  // This slice adds the capability; production callers (bg
+  // manager, broker bash handler, etc.) still default to the
+  // unrestricted /tmp allow. Operators / future slices wire
+  // session-scoped tmpdirs in.
+  tmpdir?: string;
 }
 
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
@@ -605,6 +624,10 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         sandboxExecPath: r.path,
       };
       if (realpath !== undefined) macOpts.realpath = realpath;
+      // Slice 156 (review — macOS /tmp shared): forward tmpdir to
+      // restrict SBPL write allow to that subpath. Linux ignores
+      // tmpdir entirely (--tmpfs /tmp already gives isolation).
+      if (options.tmpdir !== undefined) macOpts.tmpdir = options.tmpdir;
       return buildSandboxExecArgv(macOpts);
     }
   }

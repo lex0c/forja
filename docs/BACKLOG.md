@@ -2,6 +2,107 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-13] fix(sandbox) — slice 156: macOS /tmp shared sandbox+host (phase 1)
+
+**Done.** One-hundred-fifty-sixth slice. Closes the **last** of the 3 design-deferred items from the bash-tools review. Phase 1 of 2: capability + knob land, no production callers wired. Phase 2 (future slice) wires the bash broker / background process manager / code-generation pipeline to set `tmpdir` on every spawn.
+
+### Threat shape
+
+Linux runners derrubam `/tmp` via `--tmpfs /tmp` no `bwrap`, isolando o tmpdir por sandbox. macOS não tem equivalente direto — pré-slice o SBPL profile concedia:
+
+```
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+```
+
+blanket. O `/tmp` no macOS é o host's `/tmp`, shared across every process the operator runs. Concrete attack:
+
+1. Sandbox A (`agent bash`) escreve `/tmp/agent-leaked-token`.
+2. App B não-sandboxed (terminal do operator, browser, qualquer script) lê `/tmp/agent-leaked-token`.
+3. Cross-tenancy leak entre sandbox e host — exactly o cenário que `--tmpfs /tmp` previne no Linux.
+
+Combo equivalente também acontece on inverse: app não-sandboxed C escreve `/tmp/legit-data`, sandbox A lê. SBPL allow é symmetric writability não read-restricted.
+
+### Fix: per-sandbox TMPDIR option na SBPL profile builder
+
+`buildSbplProfile(profile, cwd, home, tmpdir?)` ganhou um quarto argument opcional. Quando setado:
+
+- Emite scoped allow apenas sobre `(allow file-write* (subpath "<tmpdir>"))` em vez do blanket `/tmp`.
+- Se o `tmpdir` cai sob `/tmp/`, também emite a forma `(allow file-write* (subpath "/private<tmpdir>"))` — firmlink macOS `/tmp ↔ /private/tmp` resolve a path por qualquer um dos dois prefixes; SBPL evaluation só vê o literal que matchou, então precisa cobrir ambos.
+- Demais prefixes (e.g. `/var/tmp/forja`) recebem só a forma literal (não há firmlink fora de `/tmp`).
+
+`buildSandboxExecArgv` recebeu `tmpdir?` em `BuildSandboxExecArgvOptions` e forwarda para `buildSbplProfile`. `maybeWrapSandboxArgv` ganhou `tmpdir?` em `MaybeWrapSandboxArgvOptions` — forwarda apenas no path darwin (Linux já tem `--tmpfs /tmp` per-sandbox e não precisa).
+
+Helper de convenção: `defaultSandboxTmpdir(sessionId) → /tmp/forja-sb-<sessionId>` — caller pode usar ou customizar.
+
+### Caller responsibility (phase 2, fora deste slice)
+
+Quando o caller ativa `tmpdir`:
+
+1. **Pre-spawn:** `mkdir(tmpdir, { recursive: true, mode: 0o700 })`.
+2. **Env propagation:** setar `TMPDIR=<tmpdir>` no env do `Bun.spawn(..., { env: ... })` para que `mktemp(1)`, `NSTemporaryDirectory()`, `$TMPDIR` em scripts honorem o scope.
+3. **Cleanup:** remover o diretório no shutdown da sessão. Sem cleanup, `/tmp/forja-sb-<sessionId>` acumula e expõe o residual cross-session.
+
+### Phase 1 scope
+
+- Capability + helper landam.
+- Production callers (background process manager, bash broker, code-generation pipeline) continuam invocando `buildSandboxExecArgv` / `maybeWrapSandboxArgv` sem `tmpdir` — comportamento pre-slice preservado (blanket allow).
+- Pre-existing tests permanecem verdes — backward-compat confirmed por test `default (tmpdir undefined): blanket /tmp + /private/tmp allow kept`.
+
+Phase 2 wira os callers explicitamente com o trade-off TMPDIR poisoning vs cross-tenancy.
+
+### Fixes
+
+| # | File | Change |
+|---|---|---|
+| **SBPL builder** | `src/permissions/sandbox-runner-macos.ts` | `buildSbplProfile` aceita `tmpdir?: string` 4º argument. Quando set, write rules emitem apenas o scoped subpath (+ `/private` form se sob `/tmp/`). Sem set, fallback ao blanket pre-slice. `BuildSandboxExecArgvOptions.tmpdir?` forwarda para o builder. |
+| **maybeWrap forwarding** | `src/permissions/sandbox-runner.ts` | `MaybeWrapSandboxArgvOptions.tmpdir?` forwardado para `buildSandboxExecArgv` no path darwin. Linux explicitamente ignora (`--tmpfs /tmp` já per-sandbox via bwrap). |
+| **helper de convenção** | `src/permissions/sandbox-availability.ts` | `defaultSandboxTmpdir(sessionId) → /tmp/forja-sb-<sessionId>`. Exportado via barrel `src/permissions/index.ts`. |
+| **spec** | `docs/spec/PERMISSION_ENGINE.md §6.5` | Documenta a threat shape (cross-tenancy `/tmp` leak), a capability (`tmpdir?` option + firmlink emission rule), caller responsibility de phase 2 (mkdir 0o700 + TMPDIR env + cleanup), escopo de phase 1 (apenas knob lands), residual risk (env vars não-`TMPDIR` que libs reescrevem). |
+
+### Tests added (+7)
+
+| Test | Coverage |
+|---|---|
+| **default (tmpdir undefined): blanket /tmp + /private/tmp allow kept** | Backward-compat regression. Pre-slice callers continuam vendo o blanket. |
+| **tmpdir set: SBPL allow restricted to subpath** | Blanket allow ausente; scoped allow presente. |
+| **tmpdir under /tmp: emits matching /private firmlink form** | `/tmp/forja-sb-abc` → também emite `/private/tmp/forja-sb-abc`. |
+| **tmpdir outside /tmp (/var/tmp/forja): no firmlink form emitted** | Confirma que a firmlink-emission só dispara pro prefix `/tmp/`. |
+| **tmpdir SBPL escaping: backslash + quotes escaped** | `escapeSbplLiteral` cobre o tmpdir literal — defense vs SBPL injection se tmpdir vier de fonte semi-trusted. |
+| **buildSandboxExecArgv forwards tmpdir to profile** | `argv[2]` (SBPL string) contém o scoped allow. |
+| **defaultSandboxTmpdir returns /tmp/forja-sb-<sessionId>** | Helper de convenção. |
+
+### Files changed
+
+- Code: `src/permissions/sandbox-runner-macos.ts`, `src/permissions/sandbox-runner.ts`, `src/permissions/sandbox-availability.ts`, `src/permissions/index.ts`
+- Tests: `tests/permissions/sandbox-runner-macos.test.ts`
+- Spec: `docs/spec/PERMISSION_ENGINE.md §6.5`
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun test tests/permissions/sandbox-runner-macos.test.ts` — 56 pass / 0 fail (was 49 pre-slice)
+
+### Defense layering
+
+Após slice 156 (phase 1) o cross-tenancy `/tmp` vector tem um **mitigation opt-in**:
+
+1. **Capability** — `buildSbplProfile` aceita `tmpdir?` que restringe write allow ao subpath.
+2. **Firmlink coverage** — `/tmp ↔ /private/tmp` ambos emitidos quando aplicável; SBPL evaluation cobre os dois prefixes que tools podem usar.
+3. **Convention name** — `defaultSandboxTmpdir(sessionId)` evita callers inventarem layouts incompatíveis.
+
+Phase 2 fecha o vector entirely ao wirar os production callers. Phase 1 mantém backward-compat e isola surface area do change.
+
+### Deferred items from bash-tools review (status)
+
+- ✅ **slice 154 — bwrap PATH-shim resistance** — done.
+- ✅ **slice 155 — cwd symlink canonicalization** — done.
+- ✅ **slice 156 — macOS /tmp shared sandbox+host (phase 1)** — done. Phase 2 (wire production callers) virá em slice futuro quando o background process manager / bash broker estiverem prontos pra absorber a coordination cost (mkdir + TMPDIR env + cleanup).
+
+**All 3 deferred items closed.** Bash-tools review round encerrada.
+
+---
+
 ## [2026-05-13] fix(sandbox) — slice 155: cwd symlink canonicalization
 
 **Done.** One-hundred-fifty-fifth slice. Closes the second of the 3 design-deferred items from the bash-tools review. The last one (macOS `/tmp` shared sandbox+host) still needs design discussion. Slice 155 was the most surgical of the three remaining — a single `realpath()` call at the right boundary plus failure-mode policy.

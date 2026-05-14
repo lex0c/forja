@@ -233,6 +233,28 @@ export const resolveSandboxBinary = (
   };
 };
 
+// Slice 156 (review — macOS /tmp shared sandbox+host): canonical
+// scheme for the per-sandbox tmpdir path. Used by callers that
+// pre-create a session-scoped tmpdir + pass it via
+// `MaybeWrapSandboxArgvOptions.tmpdir` to restrict the macOS SBPL
+// allow-rule. The path lives directly under `/tmp` (not under
+// `/private/var/folders/...`) because the SBPL filter's firmlink
+// resolution between `/tmp` and `/private/tmp` is the only path
+// where the slice 156 builder emits the matching `/private` form.
+//
+// `sessionId` is the harness's session UUID. Embedding it ties
+// the tmpdir to a single Forja session: two parallel `forja`
+// processes don't collide, and operator post-mortem can correlate
+// `ls /tmp/forja-sb-*` against `agent doctor` sessions.
+//
+// Caller responsibility: pre-create (mkdir + mode 0o700), set
+// `TMPDIR=<this-path>` in the wrapped process's env, optionally
+// clean up at session end. The path itself is pure / side-effect
+// free.
+export const defaultSandboxTmpdir = (sessionId: string): string => {
+  return `/tmp/forja-sb-${sessionId}`;
+};
+
 export const detectSandboxAvailability = (
   options: DetectSandboxAvailabilityOptions = {},
 ): SandboxAvailability => {

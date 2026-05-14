@@ -628,3 +628,78 @@ describe('buildSandboxExecArgv — symlink canonicalization (slice 155)', () => 
     ).toThrow(/does not exist/);
   });
 });
+
+// Slice 156 (review — macOS /tmp shared sandbox+host). Pre-slice
+// the SBPL allow blanketly granted file-write* on /tmp +
+// /private/tmp — the host's /tmp, shared across every process
+// the operator runs. Sandbox A writes /tmp/secret, operator's
+// non-sandboxed app B reads it. Cross-tenancy leak. New `tmpdir`
+// option restricts the allow to a caller-provided subpath.
+describe('buildSbplProfile — slice 156 per-sandbox tmpdir', () => {
+  test('default (tmpdir undefined): blanket /tmp + /private/tmp allow kept', () => {
+    // Backward-compat: no tmpdir → pre-slice behavior.
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/Users/op');
+    expect(profile).toContain('(allow file-write* (subpath "/tmp"))');
+    expect(profile).toContain('(allow file-write* (subpath "/private/tmp"))');
+  });
+
+  test('tmpdir set: SBPL allow restricted to subpath (no blanket /tmp)', () => {
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/Users/op', '/tmp/forja-sb-sess123');
+    // Scoped allow present.
+    expect(profile).toContain('(allow file-write* (subpath "/tmp/forja-sb-sess123"))');
+    // Blanket allow absent.
+    expect(profile).not.toContain('(allow file-write* (subpath "/tmp"))');
+    expect(profile).not.toContain('(allow file-write* (subpath "/private/tmp"))');
+  });
+
+  test('tmpdir under /tmp: emits matching /private firmlink form', () => {
+    // macOS firmlinks /tmp ↔ /private/tmp; tools resolve via either
+    // prefix. Emit both forms so the inner process's mktemp /
+    // NSTemporaryDirectory honor the scope regardless of which
+    // path SBPL evaluation sees.
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/Users/op', '/tmp/forja-sb-abc');
+    expect(profile).toContain('(allow file-write* (subpath "/tmp/forja-sb-abc"))');
+    expect(profile).toContain('(allow file-write* (subpath "/private/tmp/forja-sb-abc"))');
+  });
+
+  test('tmpdir outside /tmp (e.g. /var/tmp): no firmlink form emitted', () => {
+    // The firmlink trick is /tmp ↔ /private/tmp specific. Other
+    // tmpdir prefixes get only the literal allow.
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/Users/op', '/var/tmp/forja');
+    expect(profile).toContain('(allow file-write* (subpath "/var/tmp/forja"))');
+    // No /private/var/tmp emission (not a firmlink).
+    expect(profile).not.toContain('(allow file-write* (subpath "/private/var/tmp/forja"))');
+  });
+
+  test('tmpdir SBPL escaping: backslash + quotes in path escaped', () => {
+    // Defensive: a tmpdir with `"` or `\` would otherwise close
+    // the SBPL string literal and inject clauses. escapeSbplLiteral
+    // (already proven for cwd) covers the tmpdir path too.
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/Users/op', '/tmp/with"quote');
+    expect(profile).toContain('(allow file-write* (subpath "/tmp/with\\"quote"))');
+  });
+});
+
+describe('buildSandboxExecArgv — slice 156 tmpdir forwarded to profile', () => {
+  test('tmpdir option flows through to the SBPL profile string', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'cwd-rw',
+      cwd: '/work/proj',
+      home: '/Users/op',
+      innerArgv: ['bash', '-c', 'echo hi'],
+      realpath: (p) => p,
+      tmpdir: '/tmp/forja-sb-XYZ',
+    });
+    // argv[2] is the SBPL profile string.
+    expect(argv[2]).toContain('(allow file-write* (subpath "/tmp/forja-sb-XYZ"))');
+    expect(argv[2]).not.toContain('(allow file-write* (subpath "/tmp"))');
+  });
+});
+
+describe('defaultSandboxTmpdir', () => {
+  test('returns /tmp/forja-sb-<sessionId>', async () => {
+    const { defaultSandboxTmpdir } = await import('../../src/permissions/sandbox-availability.ts');
+    expect(defaultSandboxTmpdir('abc-123')).toBe('/tmp/forja-sb-abc-123');
+    expect(defaultSandboxTmpdir('SESSION_42')).toBe('/tmp/forja-sb-SESSION_42');
+  });
+});

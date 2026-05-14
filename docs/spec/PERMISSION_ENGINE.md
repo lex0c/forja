@@ -631,6 +631,14 @@ Sandbox indisponível (kernel sem unshare, bwrap binary missing) → state = `de
 
 Trust marker + warnings persistem no `SandboxAvailability` retornado por `detectSandboxAvailability()` → telemetry → audit. `agent doctor` e `agent sandbox setup` renderizam as warnings para que postmortems correlacionem "rodava com bwrap não-canonical em /opt/bin" com qualquer incident downstream.
 
+**macOS `/tmp` per-sandbox isolation (slice 156).** Linux derruba `/tmp` via `--tmpfs /tmp` no `bwrap`, isolando o tmpdir por sandbox. macOS não tem equivalente direto — pré-slice o SBPL profile concedia blanket `(allow file-write* (subpath "/tmp"))` + `(allow file-write* (subpath "/private/tmp"))`, deixando o host `/tmp` (e tudo que outros processos do operator escrevem lá) writable de dentro do sandbox.
+
+- **Threat shape:** sandbox A escreve `/tmp/secret`. App não-sandboxed B (terminal do operator, browser, qualquer coisa) lê `/tmp/secret`. Cross-tenancy leak entre sandbox e host — exactly what o `--tmpfs /tmp` no Linux previne.
+- **Capability:** `buildSbplProfile(profile, cwd, home, tmpdir?)` aceita um `tmpdir?: string` opcional. Quando setado, o profile emite scoped allow apenas sobre esse subpath em vez do blanket. Se o tmpdir cai sob `/tmp/`, o profile também emite a forma `/private<tmpdir>` (firmlink macOS `/tmp ↔ /private/tmp`). Demais prefixes (e.g. `/var/tmp/...`) recebem apenas a forma literal.
+- **Caller responsibility (phase 2, fora deste slice):** o caller que ativa `tmpdir` deve (1) `mkdir(tmpdir, { recursive: true, mode: 0o700 })` antes do `Bun.spawn(...)`; (2) propagar `TMPDIR=<tmpdir>` no env do inner process; (3) limpar o diretório no shutdown da sessão. O helper `defaultSandboxTmpdir(sessionId) → /tmp/forja-sb-<sessionId>` é a convention name; o caller pode customizar.
+- **Escopo phase 1 (este slice):** apenas a capability landa. Production callers (background process manager, bash broker, code generation pipeline) continuam invocando sem `tmpdir` — comportamento pre-slice preservado (blanket allow). Phase 2 wira os callers de fato, com o trade-off explícito de TMPDIR poisoning vs cross-tenancy.
+- **Residual risk documentado:** mesmo com tmpdir scoped, paths fora de `/tmp` referenciados por libraries de terceiros via env vars (`HOME`, `DARWIN_USER_TEMP_DIR`, etc) ainda podem fugir do scope. SBPL allow é defense in depth — operator que reuses `/tmp/forja-sb-XXX` paths entre sessões expõe o residual. Cleanup obrigatório.
+
 ### 6.6 Approval gate
 
 | Condição | Decisão |
