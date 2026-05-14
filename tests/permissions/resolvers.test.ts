@@ -1647,6 +1647,279 @@ describe('bash resolver — slice 174 flag-decoding batch (info-leak P0/P1)', ()
   });
 });
 
+// Slice 179 (review — permission-bypass round 2). Six more resolver
+// flag decoders covering write-target redirection (npm/pip/make) +
+// info-leak file reads (grep --include-from, rsync --files-from,
+// curl --trace/--netrc-file/--cacert).
+describe('bash resolver — slice 179 flag-decoding batch (permission-bypass P1/P2)', () => {
+  test('npm install --prefix <dir> emits write-fs at redirected path (P1)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'npm install --prefix /tmp/exfil-install foo' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/exfil-install');
+    }
+  });
+
+  test('npm pack --pack-destination <dir> emits write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'npm pack --pack-destination /tmp/loot mypkg' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/loot');
+    }
+  });
+
+  test('npm install -g emits write-fs:<npm-global-prefix> marker', () => {
+    const r = resolveCapabilities('bash', { command: 'npm install -g typescript' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:<npm-global-prefix>');
+    }
+  });
+
+  test('npm install (no redirect) still emits cwd/node_modules (no regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'npm install lodash' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/work/proj/node_modules');
+    }
+  });
+
+  test('pip install --target <dir> emits write-fs at redirected path (P1)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'pip install --target /tmp/exfil-pip requests' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/exfil-pip');
+    }
+  });
+
+  test('pip install -t <dir> short form emits write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'pip install -t /tmp/short-target flask' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/short-target');
+    }
+  });
+
+  test('pip install --user emits write-fs to ~/.local', () => {
+    const r = resolveCapabilities('bash', { command: 'pip install --user requests' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/home/op/.local');
+    }
+  });
+
+  test('pip install --prefix and --root both emit write-fs', () => {
+    const r1 = resolveCapabilities('bash', { command: 'pip install --prefix /opt/myapp foo' }, CTX);
+    expect(r1.kind).toBe('ok');
+    if (r1.kind === 'ok') {
+      expect(capStrings(r1.capabilities)).toContain('write-fs:/opt/myapp');
+    }
+    const r2 = resolveCapabilities('bash', { command: 'pip install --root /tmp/stage bar' }, CTX);
+    expect(r2.kind).toBe('ok');
+    if (r2.kind === 'ok') {
+      expect(capStrings(r2.capabilities)).toContain('write-fs:/tmp/stage');
+    }
+  });
+
+  test('make -C <dir> shifts read/write scope (P2)', () => {
+    const r = resolveCapabilities('bash', { command: 'make -C /etc/agent target' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/agent');
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/agent');
+      // Pre-slice was emitting read-fs:/work/proj — confirm we no
+      // longer mis-attribute to cwd when -C shifts the root.
+      expect(capStrings(r.capabilities)).not.toContain('read-fs:/work/proj');
+    }
+  });
+
+  test('make --directory=<dir> long form also shifts scope', () => {
+    const r = resolveCapabilities('bash', { command: 'make --directory=/etc/agent install' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/agent');
+    }
+  });
+
+  test('grep --include-from <pattern-file> emits read-fs (P1)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'grep --include-from /etc/shadow foo /work/proj' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/shadow');
+    }
+  });
+
+  test('grep --exclude-from <pattern-file> emits read-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'grep --exclude-from /etc/passwd foo /work/proj' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/passwd');
+    }
+  });
+
+  test('grep --include-from=<path> equals form emits read-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'grep --include-from=/home/op/.ssh/known_hosts foo /work/proj' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh/known_hosts');
+    }
+  });
+
+  test('rsync --files-from <file> emits read-fs (P1)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --files-from /etc/shadow /src/ /dst/' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/shadow');
+    }
+  });
+
+  test('rsync --exclude-from <file> emits read-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --exclude-from /tmp/list.txt /src/ /dst/' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/tmp/list.txt');
+    }
+  });
+
+  test('curl --trace <file> emits write-fs (P1)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl https://api.example.com --trace /tmp/exfil-trace.log' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/exfil-trace.log');
+    }
+  });
+
+  test('curl --trace-ascii <file> emits write-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl https://api.example.com --trace-ascii /tmp/trace.txt' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/trace.txt');
+    }
+  });
+
+  test('curl --netrc-file <file> emits read-fs (credential read)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl https://api.example.com --netrc-file /home/op/.aws/credentials' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.aws/credentials');
+    }
+  });
+
+  test('curl --cacert <file> emits read-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'curl https://api.example.com --cacert /etc/ssl/custom-ca.pem' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/ssl/custom-ca.pem');
+    }
+  });
+});
+
+// Slice 179 (review — permission-bypass P2). fetch_url dangerous
+// protocols are explicitly named-and-refused. The allowlist
+// already covered them with a generic "not supported" message;
+// the named refusal surfaces the security framing in the audit
+// row + operator's modal.
+describe('fetch_url — slice 179 dangerous protocol naming (permission-bypass P2)', () => {
+  test('data: URLs refused with a security-framed reason', () => {
+    const r = resolveCapabilities('fetch_url', { url: 'data:text/html,<h1>x</h1>' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('data:');
+      expect(r.reason).toContain('URL-smuggling');
+    }
+  });
+
+  test('javascript: URLs refused with code-injection framing', () => {
+    const r = resolveCapabilities('fetch_url', { url: 'javascript:alert(1)' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('javascript:');
+      expect(r.reason).toContain('code-injection');
+    }
+  });
+
+  test('file: URLs refused with fs-tool redirect hint', () => {
+    const r = resolveCapabilities('fetch_url', { url: 'file:///etc/shadow' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('file:');
+      expect(r.reason).toContain('fs.read');
+    }
+  });
+
+  test('gopher: / ftp: / dict: refused with SSRF framing', () => {
+    for (const scheme of ['gopher://localhost/', 'ftp://attacker.example/', 'dict://x/']) {
+      const r = resolveCapabilities('fetch_url', { url: scheme }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') {
+        expect(r.reason).toContain('SSRF gadget');
+      }
+    }
+  });
+
+  test('unknown non-http scheme falls back to generic allowlist refusal', () => {
+    // `chrome:` isn't in DANGEROUS_PROTOCOLS; should refuse via the
+    // generic allowlist with the pre-slice message shape.
+    const r = resolveCapabilities('fetch_url', { url: 'chrome://settings/' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('not supported');
+    }
+  });
+});
+
 // Slice 98 — defensive coverage for R2 #201. The redirect-shape
 // extractor already returns null (→ refuse upstream) on any
 // non-literal target, including `command_substitution`. These

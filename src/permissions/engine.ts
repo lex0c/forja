@@ -1745,7 +1745,28 @@ export const createPermissionEngine = (
       let bypassProtectedTier: ProtectedTier | null = null;
       let bypassProtectedTarget = '';
       for (const cap of resolvedCapabilities) {
-        if (cap.kind !== 'read-fs' && cap.kind !== 'write-fs' && cap.kind !== 'delete-fs') {
+        // Slice 179 (review — permission-bypass P2). `git-write`
+        // capability carries a fs-path scope (the target repo);
+        // pre-slice the loop only iterated the three direct fs
+        // kinds and a `git-write:<protected-path>` slipped past
+        // the bypass-mode §11 floor. Bypass mode skipping policy
+        // confirms is intentional; skipping the protected-path
+        // hardcoded floor is NOT — git-write to a path in §11's
+        // deny / escalate tier should refuse / confirm under
+        // bypass, same as a direct write-fs would.
+        //
+        // Treat git-write as the WRITE op for classifier purposes
+        // (a git push / commit / clone writes the repo's objects
+        // dir; reading is not the dangerous side). Other non-fs
+        // kinds (exec, net-egress, env-mutate, host-passthrough,
+        // etc.) stay out of this loop by design — they're not
+        // path-shaped and the §11 classifier is path-only.
+        if (
+          cap.kind !== 'read-fs' &&
+          cap.kind !== 'write-fs' &&
+          cap.kind !== 'delete-fs' &&
+          cap.kind !== 'git-write'
+        ) {
           continue;
         }
         if (cap.scope === null) continue;

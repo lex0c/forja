@@ -2,6 +2,62 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] sec(perm-engine) — slice 179: permission-bypass code review round
+
+**Done.** Second focused review of `feat/permission-engine`, axis: permission bypass. Three parallel agent scans (engine pipeline / resolver under-attribution / matcher + sandbox-plan) + my own engine pipeline + state-machine + hook + IPC pass. 8 fixable findings, all in the resolver flag-decoder surface + one engine-side defense-in-depth.
+
+### Threat shape
+
+Two dominant bypass patterns:
+
+1. **Write-target redirection.** Resolver emits a hardcoded write scope (`<cwd>/node_modules`, `<cwd>` for make) while the runtime tool accepts a flag that REDIRECTS the write elsewhere. Operator policy `deny: write-fs:/tmp/**` doesn't fire because the redirected write was never emitted as a capability.
+
+2. **Manifest / pattern-file reads.** Resolver emits read-fs only for the obvious positional inputs while the tool ALSO reads a file referenced by a flag (`grep --include-from`, `rsync --files-from`, `curl --netrc-file`, etc.). Operator policy `deny: read-fs:/etc/**` doesn't fire because the file read was invisible.
+
+### Findings fixed
+
+| # | Severity | Resolver | Flags decoded |
+|---|---|---|---|
+| 1 | P1 | `cmdNpmLike` | `--prefix` / `--pack-destination` / `-g`/`--global` / `--cache` / `--modules-folder` (write-target redirection) |
+| 2 | P1 | `cmdPip` | `--target` / `-t` / `--prefix` / `--root` / `--user` (→ `~/.local`) / `--cache-dir` / `-d`/`--download` |
+| 3 | P1 | `cmdGrep` | `--include-from` / `--exclude-from` / `--exclude-dir-from` (extends slice 174's `-f` loop) |
+| 4 | P1 | `cmdRsync` | `--files-from` / `--exclude-from` / `--include-from` manifest reads |
+| 5 | P1 | `cmdCurlWget` | `--trace` / `--trace-ascii` write + `--netrc-file` / `--cacert` read |
+| 6 | P2 | `cmdMake` | `-C <dir>` / `--directory=<dir>` shifts read/write scope away from `ctx.cwd` |
+| 7 | P2 | `engine.ts:1748` | Bypass-mode protected-path floor adds `git-write` to the kind whitelist (defense-in-depth: every current emission co-occurs with read-fs/delete-fs, but a future resolver emitting git-write alone would have slipped) |
+| 8 | P2 | `resolvers/fetch.ts` | Explicit security-framed refuse for `data:` / `javascript:` / `file:` / `ftp[s]:` / `gopher:` / `dict:` / `tftp:` / `ldap[s]:` schemes (already refused via allowlist; new reason text surfaces the SECURITY intent in audit + modal) |
+
+### Not fixed (deliberate)
+
+- **Sandbox `net-egress` scope ignored in profile selection** — `net-egress:localhost` selects `cwd-rw-net` which grants unrestricted egress. Real concern, but the fix is scope-aware sandbox profiles (new profile variant). Spec-level change, deferred.
+- **Session-allow suppresses score gate** when `decision.source.layer === 'session'`. Audited: this is operator-intended behavior. The session-allow promotion path (`derivePromotionTarget` in `cli/repl.ts`) stores the LITERAL command (escaped) when `matchedRule` is catch-all (`*`/`**`), and the operator-authored rule otherwise. Scope is operator-controlled; engine respects it correctly.
+- **Unsupported-platform passthrough** (Windows/BSD) — slice 47 documented; operator's modal shows the engine-chosen profile while the runtime is host-equivalent. UX fix (modal warning) needed, not engine.
+- **`reloadPolicy` mid-decision race** — synchronous JS makes this safe today; defensive snapshot would be over-engineering.
+
+### Verified safe (false positives from agent scans)
+
+- **Subagent envelope check** (`engine.ts:1501+`) — `effectiveCovers` returns ALL uncovered caps; engine denies if any. Solid.
+- **Pre-tool hook gate** (`harness/invoke-tool.ts:600`) — hook block returns `denied: true` before tool execution. Tool body unreachable. Solid.
+- **IPC permission spoofing** — child's `permission:ask` goes through parent's IPC; answer originates at parent's operator modal, not child stdin. Child cannot spoof. Solid.
+- **Bypass-mode non-fs caps** (exec / net-egress / env-mutate / etc.) — flagged by agent as P0, but these aren't path-shaped capabilities. "Protected" is a path-zone concept; bypass mode allowing exec is the defined contract.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/permissions/resolvers/bash.ts` | 5 resolvers extended with flag decoders + `cmdMake -C` scope shift (~150 lines added) |
+| `src/permissions/resolvers/fetch.ts` | `DANGEROUS_PROTOCOLS` Map + explicit refuse path (~30 lines) |
+| `src/permissions/engine.ts` | 4-line addition: `git-write` to bypass-mode protected-path kind whitelist + docstring |
+| `tests/permissions/resolvers.test.ts` | 24 new tests covering every new decode path + dangerous-protocol refusals |
+
+### Verification
+
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 2 pre-existing warnings in `tests/harness/abortable.test.ts` (unchanged from pre-slice).
+- `bun test` — **7148 pass / 10 skip / 0 fail** (+24 tests from pre-slice 7124).
+
+---
+
 ## [2026-05-14] sec(perm-engine) — slices 169-178: code review round on `feat/permission-engine` (wrong-info / command-bypass / sandbox-escape / info-leak)
 
 **Done.** Ten consecutive slices closing 35 findings from a four-axis code review of the branch. Test suite at **7121 pass / 10 skip / 0 fail**; lint clean modulo 2 pre-existing warnings in `tests/harness/abortable.test.ts` (unrelated to this work).

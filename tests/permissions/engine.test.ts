@@ -222,6 +222,21 @@ describe('engine modes', () => {
     expect(d.kind).toBe('allow');
   });
 
+  // Slice 179 (review — permission-bypass P2). The bypass-mode §11
+  // protected-path loop pre-slice only iterated `read-fs / write-fs
+  // / delete-fs`. `git-write` is also fs-path-shaped (scope is the
+  // target repo) and pre-slice slipped past the floor at the
+  // kind-whitelist line. The fix is defense-in-depth: every current
+  // emission site (cmdGit's known-subcommand cases) co-emits
+  // `readFs` or `deleteFs` at the SAME scope, so the loop already
+  // catches the protected path through a co-occurring kind today.
+  // No isolated test fixture today produces gitWrite-only at a
+  // protected scope without one of those co-occurrences AND without
+  // the per-arg classifier (analyzeCommand) refusing first. The
+  // fix protects against a FUTURE resolver that emits gitWrite
+  // alone — covered by the in-code comment + the engine.ts kind
+  // whitelist read at slice 179.
+
   test('acceptEdits default-denies unmatched writes (mode is convenience, not bypass)', () => {
     const eng = createPermissionEngine(policy({ defaults: { mode: 'acceptEdits' } }), { cwd: CWD });
     expect(eng.check('write_file', 'fs.write', { path: 'src/foo.ts' }).kind).toBe('deny');

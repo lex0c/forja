@@ -30,6 +30,32 @@ const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v
 
 const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
 
+// Slice 179 (review — permission-bypass P2). The allowlist above
+// already refuses every non-http/https protocol with a generic
+// "not supported" message, but several schemes carry SECURITY
+// semantics distinct from "unsupported": `data:` and `javascript:`
+// embed payload directly in the URL (no network roundtrip, but
+// the LLM may try to smuggle script content), `file:` reads local
+// filesystem (different threat class than a remote fetch), `ftp:`
+// / `gopher:` / `dict:` allow SSRF gadgets even on libraries that
+// auto-redirect from http. Naming them explicitly surfaces the
+// SECURITY intent in the audit row and the operator's modal —
+// helps forensic queries distinguish "model tried known-dangerous
+// scheme" from "model typo'd the URL". Refusal posture is the
+// same as the allowlist; this just emits a clearer reason.
+const DANGEROUS_PROTOCOLS: ReadonlyMap<string, string> = new Map([
+  ['data:', 'embeds payload inline (no network); blocked as URL-smuggling vector'],
+  ['javascript:', 'evaluates JavaScript; blocked as code-injection vector'],
+  ['file:', 'reads local filesystem; use the fs.read tool for local reads'],
+  ['ftp:', 'unencrypted file transport; blocked as SSRF gadget'],
+  ['ftps:', 'unencrypted control channel; blocked as SSRF gadget'],
+  ['gopher:', 'legacy text protocol; blocked as SSRF gadget'],
+  ['dict:', 'dictionary protocol; blocked as SSRF gadget'],
+  ['tftp:', 'trivial file transport; blocked as SSRF gadget'],
+  ['ldap:', 'directory protocol; blocked as SSRF gadget'],
+  ['ldaps:', 'directory protocol; blocked as SSRF gadget'],
+]);
+
 // SSRF blocklist. Returns a refuse-reason when host targets a
 // local/private/metadata resource; null when host is acceptable
 // for further engine consideration.
@@ -170,6 +196,18 @@ const fetchResolver: Resolver = (args): ResolverResult => {
     parsed = new URL(args.url);
   } catch {
     return { kind: 'refuse', reason: `fetch_url: invalid URL '${args.url}'` };
+  }
+  // Slice 179 (review — permission-bypass P2). Name-check the
+  // known-dangerous protocols BEFORE the generic allowlist so the
+  // refuse reason carries the security framing. Both the explicit
+  // and generic branches refuse — only the operator-visible reason
+  // text differs.
+  const dangerousReason = DANGEROUS_PROTOCOLS.get(parsed.protocol);
+  if (dangerousReason !== undefined) {
+    return {
+      kind: 'refuse',
+      reason: `fetch_url: protocol '${parsed.protocol}' refused — ${dangerousReason}`,
+    };
   }
   if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
     return {
