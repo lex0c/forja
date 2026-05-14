@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] fix(tools/_bash-cwd) — narrow cwd-escape check to real parent traversals
+
+**Done.** `resolveAndValidateBashCwd` rejected any `path.relative()` output starting with `..` via `rel.startsWith('..')`. That prefix match conflates two unrelated shapes:
+
+- **Real traversal**: `..` (exact) or `../<...>` — parent / sibling / outside. Must refuse.
+- **Legitimate descendant**: `..foo` — a directory whose name literally starts with two dots. `path.relative('/work/proj', '/work/proj/..foo')` returns `'..foo'` verbatim. **Must allow.**
+
+The naive `startsWith('..')` rejected both, breaking `bash` and `bash_background` calls into in-tree directories with `..`-prefixed names with an "outside session subtree" error.
+
+Fix: narrow the check to "the first segment of the relative path equals `..` exactly." Split on both POSIX `/` and Windows `\` so the predicate stays correct under either platform's `path.relative` output. The absolute-path arm (firmlink mismatch) is preserved unchanged.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/_bash-cwd.ts` | First-segment-equals-`..` check replaces the over-broad `startsWith('..')` prefix match |
+| `tests/tools/_bash-cwd.test.ts` | +5 tests: `..foo` relative descendant allowed, `..foo/bar` allowed, absolute `/work/proj/..foo` allowed, exact `..` still refused (regression guard), `../escape` still refused (regression guard) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7284 pass / 10 skip / 0 fail (+5 from baseline 7279)
+
 ## [2026-05-14] fix(permissions/config) — enforce protected-path validation tiers regardless of context completeness
 
 **Done.** `enforceProtectedPathInvariants` early-returned when either `context.home` OR `context.cwd` was missing, silently disabling EVERY tier of protected-path enforcement. The original intent was operator ergonomics for tests ("don't force test construction of platform-specific paths"), but the early return went too far: non-bootstrap parse sites that legitimately omit context (hierarchy merge, policy-archive replay, `/perms` diff tooling, CI policy validators) accepted policies that bootstrap would then reject at startup. Operators got "valid" reports for policies redefining `/etc`, `/proc`, `/sys` etc. — paths whose protected status doesn't depend on home/cwd at all.

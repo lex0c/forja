@@ -108,14 +108,26 @@ export const resolveAndValidateBashCwd = (opts: ResolveBashCwdOptions): ResolveB
   // Step 3: subtree check. `relative(canonicalSession, canonicalProposed)`:
   //   - `''` when equal (proposed === session) → OK.
   //   - a path like `subdir/...` when proposed is a descendant → OK.
-  //   - a `..`-prefixed string when proposed is an ancestor / sibling
-  //     / outside → REFUSE.
+  //   - a `..`-only or `..<sep>...` string when proposed is an
+  //     ancestor / sibling / outside → REFUSE.
   //   - an ABSOLUTE path when the two roots differ (e.g. one resolved
   //     to `/private/var/...` and the other to `/var/...` due to a
   //     darwin firmlink). Treat as outside.
+  //
+  // Naive `rel.startsWith('..')` over-rejects: `path.relative()`
+  // emits `..foo` verbatim for a legitimate descendant directory
+  // literally named `..foo` (`<session>/..foo`), and the prefix-
+  // string check would conflate that with a parent-traversal `..`
+  // segment. Falsely-flagged paths broke bash / bash_background
+  // calls into in-tree dirs whose names happened to start with two
+  // dots. Match a TRUE parent traversal: the first segment of the
+  // relative path equals `..` exactly. We split on both POSIX `/`
+  // and Windows `\` so the check stays correct under either
+  // platform's `path.relative` output.
   const rel = relative(canonicalSession, canonicalProposed);
   if (rel === '') return { ok: true, cwd: canonicalProposed };
-  if (rel.startsWith('..') || isAbsolute(rel)) {
+  const firstSegment = rel.split(/[\\/]/)[0];
+  if (firstSegment === '..' || isAbsolute(rel)) {
     return {
       ok: false,
       error: `args.cwd '${opts.argsCwd}' resolves to '${canonicalProposed}' which is outside session cwd '${canonicalSession}'; bash refuses cwd outside session subtree (use 'cd' inside the command to navigate within the session)`,

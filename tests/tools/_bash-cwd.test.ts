@@ -209,4 +209,58 @@ describe('resolveAndValidateBashCwd', () => {
     });
     expect(r.ok).toBe(false);
   });
+
+  // Review fix: `rel.startsWith('..')` over-rejected legitimate
+  // descendants whose names happen to start with two dots. The
+  // narrowed guard splits on path separators and checks that the
+  // FIRST SEGMENT equals `..` exactly — `..foo` is a different
+  // name, not a traversal.
+  test('descendant directory literally named `..foo` → allowed (review fix)', () => {
+    const r = resolveAndValidateBashCwd({
+      argsCwd: '..foo',
+      sessionCwd: '/work/proj',
+      realpath: (p) => p,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.cwd).toBe('/work/proj/..foo');
+  });
+
+  test('descendant directory named `..foo/bar` → allowed', () => {
+    const r = resolveAndValidateBashCwd({
+      argsCwd: '..foo/bar',
+      sessionCwd: '/work/proj',
+      realpath: (p) => p,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.cwd).toBe('/work/proj/..foo/bar');
+  });
+
+  test('absolute path to a `..foo`-named descendant → allowed', () => {
+    const r = resolveAndValidateBashCwd({
+      argsCwd: '/work/proj/..foo',
+      sessionCwd: '/work/proj',
+      realpath: (p) => p,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.cwd).toBe('/work/proj/..foo');
+  });
+
+  test('exact `..` traversal → still refused (regression guard)', () => {
+    // Resolves to /work, an ancestor of /work/proj — must refuse.
+    const r = resolveAndValidateBashCwd({
+      argsCwd: '..',
+      sessionCwd: '/work/proj',
+      realpath: (p) => p,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test('`../escape` traversal → still refused (regression guard)', () => {
+    const r = resolveAndValidateBashCwd({
+      argsCwd: '../escape',
+      sessionCwd: '/work/proj',
+      realpath: (p) => p,
+    });
+    expect(r.ok).toBe(false);
+  });
 });
