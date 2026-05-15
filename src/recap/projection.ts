@@ -1,6 +1,7 @@
 import type { DB } from '../storage/db.ts';
 import { listApprovalsByToolCall } from '../storage/repos/approvals.ts';
 import { listCheckpointsBySession } from '../storage/repos/checkpoints.ts';
+import { getActivePinsBySession } from '../storage/repos/context-pins.ts';
 import { listMemoryEventsBySession } from '../storage/repos/memory-events.ts';
 import { type Message, listMessagesBySession } from '../storage/repos/messages.ts';
 import {
@@ -19,6 +20,7 @@ import {
   type RecapFileWrite,
   type RecapIntermediate,
   type RecapMemoryProposed,
+  type RecapPinnedContext,
   type RecapSubagentSpawn,
   type RecapTestRun,
   type RecapTimelineEvent,
@@ -386,6 +388,34 @@ const extractExitCode = (tc: ToolCall): number => {
   // -1 marks "no exit code observed" without colliding with valid
   // POSIX exit codes (0..255). Renderer can decide how to display.
   return -1;
+};
+
+// Active pins across every session in scope (CONTEXT_TUNING.md §12.4).
+// `bundles` is already chronologically sorted (oldest first); pins
+// within a session come back from getActivePinsBySession in
+// created_at ASC order, so the concatenated list reads as natural
+// pin timeline across sessions.
+//
+// Auto-rehydrate's primary consumer of `pinnedContext` operates on
+// `session_current` scope (one session), so day/range callers also
+// getting a sensible cross-session list is a free side-effect.
+//
+// `now` parameterizes expiry filtering — getActivePinsBySession
+// excludes pins where `expires_at <= now`. Defaults to Date.now()
+// in the caller; tests inject a fixed timestamp.
+const collectPinnedContext = (
+  db: DB,
+  bundles: ReadonlyArray<{ session: Session }>,
+  now: number,
+): RecapPinnedContext[] => {
+  const out: RecapPinnedContext[] = [];
+  for (const b of bundles) {
+    const pins = getActivePinsBySession(db, b.session.id, now);
+    for (const pin of pins) {
+      out.push({ kind: pin.kind, text: pin.text, createdBy: pin.createdBy });
+    }
+  }
+  return out;
 };
 
 export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapIntermediate => {
@@ -782,7 +812,7 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
     goal,
     goalStack: [],
     decisions,
-    pinnedContext: [],
+    pinnedContext: collectPinnedContext(db, bundles, now),
     actions: {
       filesRead,
       // Drain the path-keyed Map. Map iteration preserves

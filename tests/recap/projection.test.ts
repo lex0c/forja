@@ -5,6 +5,7 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { recordApproval } from '../../src/storage/repos/approvals.ts';
 import { insertCheckpoint } from '../../src/storage/repos/checkpoints.ts';
+import { createPin } from '../../src/storage/repos/context-pins.ts';
 import { createMemoryEvent } from '../../src/storage/repos/memory-events.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { type Session, completeSession, createSession } from '../../src/storage/repos/sessions.ts';
@@ -1412,6 +1413,108 @@ describe('projectRecap', () => {
       // looking at logs ($what) can pivot directly to it.
       void what;
     }
+  });
+
+  // ── pinnedContext (Phase 1.1.d) ──────────────────────────────────
+  //
+  // Projection reads active pins (CONTEXT_TUNING.md §12.4) from
+  // every session in scope and maps to RecapPinnedContext shape.
+  // Auto-rehydrate consumes the result in [resume_context].
+
+  test('pinnedContext is empty when session has no pins', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'hi');
+    const r = projectRecap(db, { scope: { kind: 'session_current', sessionId: s.id } });
+    expect(r.pinnedContext).toEqual([]);
+  });
+
+  test('pinnedContext populates with active pins from the session', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'hi');
+    createPin(db, {
+      sessionId: s.id,
+      text: 'API pública não muda',
+      kind: 'constraint',
+      createdBy: 'user',
+      createdAt: 1_200,
+    });
+    createPin(db, {
+      sessionId: s.id,
+      text: 'rodar pnpm fmt',
+      kind: 'workflow',
+      createdBy: 'model_proposed_user_approved',
+      createdAt: 1_300,
+    });
+    const r = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id },
+      now: 2_000,
+    });
+    // Shape is (kind, text, createdBy) only — no id, sessionId,
+    // expiresAt etc. The renderer (resume-context.ts) doesn't need
+    // those, and exposing them would couple the recap surface to
+    // the storage schema.
+    expect(r.pinnedContext).toEqual([
+      { kind: 'constraint', text: 'API pública não muda', createdBy: 'user' },
+      { kind: 'workflow', text: 'rodar pnpm fmt', createdBy: 'model_proposed_user_approved' },
+    ]);
+  });
+
+  test('pinnedContext filters expired pins using options.now', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'hi');
+    createPin(db, {
+      sessionId: s.id,
+      text: 'live forever',
+      kind: 'constraint',
+      createdBy: 'user',
+      createdAt: 1_200,
+    });
+    createPin(db, {
+      sessionId: s.id,
+      text: 'gone',
+      kind: 'reminder',
+      createdBy: 'user',
+      createdAt: 1_200,
+      expiresAt: 1_500,
+    });
+    const r = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id },
+      now: 2_000,
+    });
+    expect(r.pinnedContext).toEqual([
+      { kind: 'constraint', text: 'live forever', createdBy: 'user' },
+    ]);
+  });
+
+  test('pinnedContext aggregates across sessions in chronological order', () => {
+    // Two sessions started apart; range scope picks both up. Pins
+    // come back in (session start ASC, pin created_at ASC) order
+    // so the recap reads as a natural timeline.
+    const earlier = seedSession('/proj', 1_000);
+    const later = seedSession('/proj', 5_000);
+    addUserTurn(earlier.id, 'a', 1_100);
+    addUserTurn(later.id, 'b', 5_100);
+    completeSession(db, earlier.id, 'done', 0, true);
+    completeSession(db, later.id, 'done', 0, true);
+    createPin(db, {
+      sessionId: later.id,
+      text: 'second-session pin',
+      kind: 'reminder',
+      createdBy: 'user',
+      createdAt: 5_200,
+    });
+    createPin(db, {
+      sessionId: earlier.id,
+      text: 'first-session pin',
+      kind: 'constraint',
+      createdBy: 'user',
+      createdAt: 1_200,
+    });
+    const r = projectRecap(db, {
+      scope: { kind: 'range', cwd: '/proj', start: 0, end: 10_000 },
+      now: 10_000,
+    });
+    expect(r.pinnedContext.map((p) => p.text)).toEqual(['first-session pin', 'second-session pin']);
   });
 
   test('day scope accepts valid leap-year and month-end dates', () => {

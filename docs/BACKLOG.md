@@ -2,6 +2,66 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] feat(recap/pinned-context) — populate from context_pins on resume (Phase 1.1.d)
+
+**Done.** Final slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Closes the loop end-to-end: pins persisted in 1.1.a, surfaced by 1.1.b (model tool) and 1.1.c (operator slash), now show up in `[resume_context]` on `/resume` per §12.4.3.
+
+### What was missing before
+
+The renderer and event surface were already wired:
+- `RecapIntermediate.pinnedContext: RecapPinnedContext[]` field (src/recap/types.ts:69 — `{kind, text, createdBy}`)
+- `resume-context.ts:162` renders pins as `Pinned context (always-include):` block
+- `HarnessEvent.resume_rehydrated` has a `pinCount` field
+
+Only the projection itself was hardcoded to `pinnedContext: []`. This slice replaces that with a real read from the `context_pins` table.
+
+### Implementation
+
+Single helper `collectPinnedContext(db, bundles, now)` reads `getActivePinsBySession` (1.1.a) for every session in scope and maps each pin to the `RecapPinnedContext` shape. `bundles` is already sorted by `session.startedAt` ASC (the projection does this earlier for timeline consistency); within a session, pins return in `created_at ASC` (the repo's natural ordering). The concatenated list reads as a natural pin timeline across sessions.
+
+### Key decisions
+
+- **Shape collapse to `(kind, text, createdBy)` only.** The recap surface drops `id`, `sessionId`, `expiresAt`, `sourceStepId` — the renderer doesn't need them, and exposing them would couple the recap envelope to the storage schema. Auto-rehydrate just re-injects the literal pin text; downstream consumers (JSON forensics) can join back to `context_pins` via the session id already in the recap if they need the wider shape.
+- **`options.now` parameterizes expiry filtering.** Projection already defaults `now` to `Date.now()`; the new helper forwards it to `getActivePinsBySession`. Tests inject fixed timestamps to pin the expiry boundary without flakiness.
+- **Cross-session aggregation comes for free.** Auto-rehydrate's primary consumer is `session_current` scope (one session resumed), so the multi-session branch matters most for `day`/`range` recap renderings — which now show pins from every covered session in chronological order. No code path needed special-casing; the loop over `bundles` is the same regardless of scope.
+- **The renderer's truncation protection stays load-bearing.** `resume-context.ts` already guarantees pins are never truncated when `decisions[]` / `todos[]` exceed the budget (CONTEXT_TUNING §12.4.4); this slice just feeds it real data.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/recap/projection.ts` | Imports `getActivePinsBySession` and `RecapPinnedContext`; adds `collectPinnedContext` helper above `projectRecap`; replaces `pinnedContext: []` with `pinnedContext: collectPinnedContext(db, bundles, now)` |
+| `tests/recap/projection.test.ts` | +4 tests in the existing `projectRecap` describe block: empty session, populates with active pins, filters expired pins via `options.now`, aggregates across sessions in chronological order |
+
+### Fase 1.1 — closing summary
+
+Four commits ship the pinned context primitive end-to-end. Each commit was independently validated (typecheck + lint + full suite) and the working tree was clean after every step:
+
+| Slice | Commit | Net |
+|---|---|---|
+| 1.1.a — storage layer (schema, repo, validation) | `4497f0d` | +786 |
+| 1.1.b — `pin_context` tool (operator-confirmed model surface) | `5da7cdb` | +624 |
+| 1.1.c — `/pin` slash + harness/REPL wiring | `a7b77f4` | +735 / −3 |
+| 1.1.d — recap projection populates `pinnedContext[]` | (this commit) | +159 / −2 |
+
+What pinned context now does in production:
+- Operator pins via `/pin "<text>"` (sync, no modal). Tool surface `pin_context` exists but defers persistence until a `confirmPinContext` modal callback is wired in the REPL — that lands in a separate UI slice when other modal additions warrant the surface.
+- Pins persist to `context_pins` (cascade with sessions, 90d retention per AUDIT §1).
+- Cap of 10 per session enforced atomically inside the repo.
+- On `/resume`, auto-rehydrate's `[resume_context]` block re-injects every active pin literally, never truncated. The `resume_rehydrated` event reports `pinCount` so the renderer can show "🔄 Resumed from <status> — N decisions, M pins, K todos rehydrated".
+
+What's still deferred (per the Phase 0 plan):
+- **Goal re-injection** (CONTEXT_TUNING §10). Subsystem ahead of the current harness; pins ride the same channel when it lands.
+- **Post-compaction re-injection.** `src/harness/compaction.ts` still has the "No pinned context (M3+)" TODO. Pins are not currently re-injected after compaction in-session — they survive `/resume` (audit-rehydrate path), not mid-session compaction.
+- **`confirmPinContext` modal-manager wiring.** New `ModalManager.askPinContext` + bus event + renderer. Waiting on a UI slice with batched modal additions; the tool path returns `pin.headless_mode` cleanly in the interim.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/recap/projection.test.ts` 52 pass / 0 fail
+- `bun test` 7370 pass / 10 skip / 0 fail (+4 from 1.1.c baseline 7366)
+
 ## [2026-05-14] feat(cli/pin) — /pin slash command + harness/REPL wiring (Phase 1.1.c)
 
 **Done.** Third slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the operator-facing surface (`/pin <text>` / `/pin --list` / `/pin --remove <id>`) plus the harness/REPL wiring that brings 1.1.a's persistence and 1.1.b's tool surface into production paths. Direct user action — `/pin` writes WITHOUT a confirmation modal because the operator typed the text themselves. The model-proposed equivalent (`pin_context` tool, 1.1.b) is still the only path that uses the modal.
