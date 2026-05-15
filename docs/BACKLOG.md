@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(feedback,memory,storage) — Phase 3.7 review batch (14 findings closed)
+
+**Done.** Closes the comprehensive code-review punch list for the `feat/memory` branch (32 commits across multiple phases). Findings span Critical (1), High (3), Medium (7), Low (3) severity; all closed in five tightly-scoped slices on the same branch.
+
+### 3.7a — Security: outcomes evidence scrub + unknown-tool FK guard
+
+C1: `outcomes.evidence_json` lands operator-typed payloads (error messages, tool input fragments) which could carry secrets or PII. Mirrored the eviction-events two-pass scrub (telemetry redactor + secret-pattern redactor) onto `createOutcome`. Recursive walk handles arrays + nested objects + cycle guard via WeakSet. Malformed JSON falls through to a `_scrubbed_invalid_json` marker so the row still persists for forensic anchoring.
+
+M7: `invokeTool` returns `toolCallId=''` when the tool is unknown (no `tool_calls` row was created). The emitter's INSERT then tripped the FK constraint and the catch stderr-logged per dispatch — operator saw "forja outcomes: emit failed" noise on every unknown-tool attempt. Early-return guard on empty toolCallId silences this.
+
+### 3.7b — Multi-scope outcome emission
+
+H1: `emitToolCallOutcome` hardcoded `scope_kind='session'` — repo/user/language policies never accumulated evidence. Fix: emitter accepts `scopeChain?: BuiltScopeChain` and resolves to `scope_kind='repo'` (scopeId=chain.repo) when detected; falls back to session when chain absent or `repo='unknown'`. Loop.ts wires the chain via `buildScopeChain({ sessionId, repoCwd: config.cwd })`. Per-repo policies now accumulate evidence for the loop frio.
+
+### 3.7c — Concurrency hardening (TOCTOU + bash parser quotes)
+
+H2: `gcPurgeExpiredTombstones` sweep computed the candidate set, then walked each row through recency-check + `transitionMemoryState`. A concurrent `/memory restore` interleaved between the recency check and the transition would let the sweep purge a tombstone that had just been resurrected (audit drift). Fix: each per-row sequence runs inside `BEGIN IMMEDIATE` / `COMMIT` with `try/finally ROLLBACK` so the recency check + transition are atomic against a concurrent restore writer.
+
+H3: `bash-parser`'s env-prefix regex `[A-Za-z_][A-Za-z0-9_]*=\S+\s+` greedily consumed through quoted values with spaces — `FOO="a b" grep` matched `FOO="a ` and left `b" grep` in rest, producing a wrong binary detection (`b`). Split into name+value captures and bail when value contains `["'`\\]`. Five new tests cover double-quoted / single-quoted / no-space-but-quoted / escaped-space / backtick env values.
+
+### 3.7d — Loop frio refinements + same-state evidence validation
+
+`findSuperiorContradiction` recency window (90d): a long-dormant `active` policy at a more-specific scope with zero outcome flow at its own `(signature, scope, scope_id)` for 90+ days loses contradiction veto over divergent proposals at less-specific scopes. Policy stays active and dispatchable; what decays is its AUTHORITY TO CONTRADICT. Spec §7.2 preserved — we don't decay the policy itself, only the right to block re-learning when the world has clearly moved on. EXISTS subquery joins outcomes; no schema changes. Three tests (fresh-superior-blocks / stale-superior-doesn't-block / 30d-inside-window-still-blocks).
+
+Same-state evidence marker gate: `eviction_events` repo previously skipped shape validation entirely for non-applied outcomes (`trigger_fired_no_action`, `blocked_by_protection`, `blocked_by_hook`). Now requires a STRUCTURAL marker without enforcing the full motivo shape:
+
+- `blocked_by_protection` / `blocked_by_hook`: `blocked_by` column non-empty (names the specific guard).
+- `trigger_fired_no_action`: evidence has either `trigger_source: string` OR `_operator_driven: true`.
+
+`transitionMemoryState`'s same-state path auto-injects `trigger_source = input.trigger` into the evidence so existing callers don't need to thread the marker explicitly. Caller-supplied `trigger_source` (rare override) still wins via spread order. Five new tests cover marker present / marker absent / `_operator_driven` bypass / blocked_by_protection without column / blocked_by_hook with column.
+
+### 3.7e — Polish + doc + missing branch tests
+
+L2: hoist the prepared `Statement` outside the 5-iteration loop in `resolveActivePolicy`. bun:sqlite caches by SQL string internally so savings are marginal; the hoist is primarily a clarity signal that the statement is parametric across the chain.
+
+L1 + M5: inline doc for CI clamping in `bayesian.ts` (why `Math.max(0, ...) / Math.min(1, ...)` over Wilson-style) + structured doc for the `ACTORS` enum in `eviction-events.ts` (each role's meaning + the `actor='user'` protection-gate bypass contract).
+
+L3: branch coverage for `kind: 'no_observations'` (loop-frio with 12 all-partial outcomes pass the accumulation gate but produce zero success/failure data → posterior null) and `kind: 'io_error'` (transitions same-state path with a closed db).
+
+### Test impact
+
+Suite went from 7793 → 7795 pass (10 skip, 0 fail) — added scrub/guard/scope-chain/parser-quotes/recency/marker/branch tests; updated fixtures in eviction-events / memory-lifecycle / loop-frio for the new marker contract and recency window. typecheck + biome lint clean. `.gitignore` now ignores `.claude/`.
+
 ## [2026-05-15] fix(feedback) — Phase 3.6 gap-closing batch (7 follow-ups from Phase 3 review)
 
 **Done.** Closes 7 follow-up gaps declared across Phase 3 — high-relevance items that affect code already in production. Bundled in one slice because the changes are tightly coupled (audit table feeds operator forensics for the rewrites just landed; scope enrichment unblocks user/language policies; contradiction check + transactional bracket + ordering + self-alias filter are all loop frio surface refinements).
