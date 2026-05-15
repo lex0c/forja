@@ -348,6 +348,52 @@ describe('gcExpiredMemories', () => {
     expect(evidence.expires).toBe('2025-01-01');
   });
 
+  test('expires user_explicit memory created < 72h ago (cooldown bypass for expired_at)', async () => {
+    // Regression: gcExpiredMemories drives active → quarantined →
+    // evicted with motivo='low_roi' and trigger='expired_at'. Before
+    // the cooldown bypass for expired_at, a user_explicit memory
+    // created less than 72h before its `expires` date stayed active
+    // (gate refused) and gc kept logging failures on every boot.
+    // The operator's explicit expiry IS the second consent — must
+    // fire even inside the cooldown window.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { createMemoryEvent } = await import('../../src/storage/repos/memory-events.ts');
+    writeIndex(roots.projectLocal, '- [Fresh](fresh-but-expired.md) — h\n');
+    writeBody(roots.projectLocal, 'fresh-but-expired', {
+      source: 'user_explicit',
+      expires: '2026-05-01', // 3 days before sweep date below
+    });
+    // Land a `created` audit row 1h before today — well inside the
+    // 72h cooldown. The cooldown gate would block low_roi by default.
+    const todayMs = Date.UTC(2026, 4, 4); // 2026-05-04
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'fresh-but-expired',
+      source: 'user_explicit',
+      sessionId,
+      createdAt: todayMs - 60 * 60 * 1000, // 1h ago
+    });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    const result = await gcExpiredMemories(db, reg, roots, {
+      today: new Date(todayMs),
+      auditSessionId: sessionId,
+      auditCwd: '/p',
+    });
+    expect(result.removed).toHaveLength(1);
+    expect(result.removed[0]?.name).toBe('fresh-but-expired');
+    expect(result.failures).toEqual([]);
+
+    // Memory actually moved through the state machine.
+    expect(existsSync(join(roots.projectLocal, 'fresh-but-expired.md'))).toBe(false);
+    const { getLastEvictionForObject } = await import('../../src/storage/repos/eviction-events.ts');
+    const last = getLastEvictionForObject(db, 'memory', 'fresh-but-expired', 'project_local');
+    expect(last?.toState).toBe('evicted');
+    expect(last?.outcome).toBe('applied');
+  });
+
   test('refreshes registry snapshot so list() reflects post-gc state', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

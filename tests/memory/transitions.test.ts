@@ -856,6 +856,49 @@ describe('transitionMemoryState: protection gates', () => {
     expect(r.kind).toBe('applied');
   });
 
+  test('trigger=expired_at bypasses cooldown even inside the 72h window', async () => {
+    // Regression: gcExpiredMemories drives active → quarantined
+    // with motivo='low_roi' + trigger='expired_at'. When the
+    // memory was created < 72h ago AND its operator-set `expires`
+    // already lapsed, the cooldown gate previously blocked the
+    // expiration — leaving the memory active until the cooldown
+    // ran out. The expiry date is the operator's second consent:
+    // when the calendar date arrives, the gate must yield.
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh-but-expired');
+
+    // Created 1h ago — well inside the 72h cooldown.
+    const oneHourMs = 60 * 60 * 1000;
+    const createdAt = 1_000_000 - oneHourMs;
+    const registry = baseRegistry();
+    createMemoryEvent(db, {
+      scope: 'user',
+      action: 'created',
+      memoryName: 'fresh-but-expired',
+      source: 'user_explicit',
+      sessionId,
+      createdAt,
+    });
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh-but-expired',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'expired_at', // canonical expiry trigger
+      actor: 'startup_probe',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    expect(r.kind).toBe('applied');
+  });
+
   test('actor=user bypasses cooldown (operator override)', async () => {
     const roots = makeRoots();
     seedActiveMemory(roots.user, 'fresh');

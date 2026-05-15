@@ -442,6 +442,17 @@ const mapToMemoryAction = (
 //   - motivos `user_purge` and `security` bypass quarantine TTL
 //     (a security-driven eviction can't wait for the dwell
 //     window to expire).
+//   - `trigger: 'expired_at'` bypasses cooldown. Premise: the
+//     operator authored both the memory AND its `expires` date —
+//     when the calendar date arrives, expiry is the second
+//     explicit consent, not a sample-size-insufficient automated
+//     decision. The cooldown protects against `low_roi` firing
+//     too early on fresh memories; an explicit expiry that
+//     happens to fall inside the 72h window was deliberately set
+//     short by the operator and must still fire. `motivo` stays
+//     `low_roi` because the state machine doesn't admit `expired`
+//     on active→quarantined (closest-fit per lifecycle.ts §357
+//     comment); the trigger field carries the real semantics.
 
 const USER_EXPLICIT_COOLDOWN_MS = 72 * 60 * 60 * 1000;
 const QUARANTINE_MIN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -469,12 +480,17 @@ const checkProtectionGates = (
     toState === 'quarantined' || toState === 'evicted' || toState === 'purged';
   if (!targetsEvictionShape) return { blocked: false };
 
-  // Cooldown bypass: security + user_purge motivos can't wait.
+  // Cooldown bypass: security + user_purge motivos can't wait;
+  // expired_at trigger represents the operator's explicit calendar
+  // consent and must fire even inside the 72h window (see
+  // checkProtectionGates header).
   const motivoCanWaitCooldown = input.motivo !== 'security' && input.motivo !== 'user_purge';
+  const triggerCanWaitCooldown = input.trigger !== 'expired_at';
 
   // Gate 1: user_explicit cooldown
   if (
     motivoCanWaitCooldown &&
+    triggerCanWaitCooldown &&
     currentFile.frontmatter.source === 'user_explicit' &&
     (input.motivo === 'low_roi' || input.motivo === 'irrelevant') &&
     (toState === 'quarantined' || toState === 'evicted' || toState === 'purged')
