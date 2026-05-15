@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(harness,feedback) — loop quente outcome emitter (Phase 3.2)
+
+**Done.** Wires the FEEDBACK_ADAPTATION loop quente (§3.1) into the harness tool-dispatch path. Every finished tool call now produces an `outcomes` row capturing `(action_signature, tier, result)` keyed to the operator's session. No behavior change yet — pure data capture. The loop frio aggregator (3.4) will read these rows.
+
+The emitter coexists with the existing `outcome_signals` write at the same dispatch site (loop.ts:2642-2664, signal_kind='tool_error'). Per AUDIT.md §1.1.1's no-dual-write contract, the two emissions record different audit dimensions: `outcome_signals` feeds the permission engine's calibration (PERMISSION_ENGINE §6.3.2); `outcomes` feeds the adaptation engine.
+
+### Design decisions
+
+- **Generic `flag:<tool_name>:default:default` action_signature.** A baseline that captures "this tool was used; did it succeed?" Future slices refine: a bash command parser will emit `alias:<bin>:<bin>` for known L1 aliases (grep, rg, find); per-tool flag detectors will emit `flag:bash:cwd_arg:preferred` style L2 signatures. The generic shape captures every dispatch without requiring per-tool integration up front; downstream aggregators that want to focus on specific levels filter via `levelOf`.
+
+- **Tier 1 only for now.** §2.1's tier ordering says "tier 1 disponível ⇒ usa tier 1". Every tool dispatch produces a deterministic outcome from the status (done/error) — that's tier 1 by definition. Tier 3 (humano explícito via permission denial) and Tier 2 (estrutural via diff stats) require cross-table joins or downstream detectors that don't ship in this slice; deferred to 3.3.
+
+- **Denied calls skipped.** Per the coexistence contract: when the permission engine denies a call before execution, the decision IS the signal — there's no body outcome to record. The emitter checks `denied === true` and returns false without writing. The permission outcome lives in `outcome_signals` already; double-writing would violate the no-dual-write rule.
+
+- **`scope_kind: 'session'` for every row.** The scope resolver (3.3) will compute the active scope per dispatch (session → repo → user → language → global). For now, every outcome lands at session granularity — coarsest aggregation, but unambiguous. When 3.3 ships, this becomes `scope_kind = resolveScope(...)`.
+
+- **Best-effort emission.** A failure to INSERT the outcome stderr-logs and returns false. The loop continues. Adaptation data loss is preferable to crashing the operator's session — same defensive pattern the existing `outcome_signals` emission uses.
+
+- **`evidence_json` carries `tool_name`, `duration_ms`, `failed?`, `error_message?`.** Minimum shape that supports forensic queries ("which bash invocations failed in this scope?") without bloating storage. The per-tier evidence schema (analogous to EVICTION §6.1) is a future surface; for now the shape is permissive.
+
+- **New `src/feedback/` directory.** Distinct from `src/outcomes/` which owns the PERMISSION_ENGINE outcome_signals subsystem. The two subsystems share the broad concept ("outcome") but live in different audit dimensions; keeping them in separate directories avoids file-grep confusion.
+
+### Files added/modified
+
+| File | Change |
+|---|---|
+| `src/feedback/outcome-emitter.ts` (new) | `emitToolCallOutcome(db, input)` — best-effort INSERT; skips denied paths; tier 1 + generic signature. |
+| `src/harness/loop.ts` | Wire emitter right after the outcome_signals tool_error block in the per-tool dispatch closure. Same dispatch site, distinct emission. |
+| `tests/feedback/outcome-emitter.test.ts` (new) | 5 tests: success → tier 1 success row; failure → tier 1 failure with error_message; denied → skip; action_signature reflects tool name; FK violation → stderr log + return false. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7606 pass / 10 skip / 0 fail (+5 from the slice)
+
+### Deferred / follow-ups declared
+
+- **Bash command parser for L1 aliases**: emit `alias:<bin>:<bin>` for known L1 aliases (grep, rg, find, awk) when bash command parses cleanly. Out of scope here.
+- **Tier 3 link via approvals_log**: when a permission decision later flips a tool's policy, the operator-approved/refused signal becomes the tier-3 outcome. Requires the loop frio to join outcomes + approvals_log; deferred.
+- **scope_kind=repo via repo-hash detector**: needs `repoRoot` threaded through dispatch + hashed identifier. Lands in 3.3 alongside the scope resolver.
+- **3.3 — `policies` table + scope resolver**: next slice.
+
 ## [2026-05-15] feat(storage) — outcomes table + action_signature schema (Phase 3.1 — opens FEEDBACK_ADAPTATION)
 
 **Done.** Foundation for the FEEDBACK_ADAPTATION subsystem. Ships the canonical `outcomes` table (FEEDBACK_ADAPTATION §3.1 + AUDIT.md §1) and the `action_signature` parser/serializer for the four levels declared in §4.2 (L1 alias, L2 flag, L3 recipe, L4 strategy). Pure infrastructure — no producers, no consumers. The loop quente detector (3.2) starts writing rows; the loop frio aggregator (3.4) starts reading.

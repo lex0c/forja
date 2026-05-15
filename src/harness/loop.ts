@@ -18,6 +18,7 @@ import {
   shouldCritique,
   toolPlanHasWrites,
 } from '../critique/index.ts';
+import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import {
   deriveParentCapabilities,
@@ -2662,6 +2663,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               );
             }
           }
+          // FEEDBACK_ADAPTATION §3.1 loop quente write — emit a
+          // `outcomes` row capturing the (action_signature, tier,
+          // result) tuple for the dispatch. Coexists with the
+          // outcome_signals emission above per AUDIT.md §1.1.1:
+          // the two tables record different audit dimensions and
+          // never dual-write the same fact. The signal_kind=
+          // 'tool_error' block above feeds the permission engine's
+          // calibration; THIS row feeds the loop frio adaptation
+          // engine (3.4). Best-effort — failures stderr but don't
+          // crash. Denied calls are skipped inside the emitter (no
+          // body ran, no action_signature outcome to record).
+          emitToolCallOutcome(config.db, {
+            sessionId,
+            toolCallId: inv.toolCallId,
+            toolName: tu.name,
+            failed: inv.failed,
+            ...(inv.denied === true ? { denied: true } : {}),
+            durationMs: inv.durationMs,
+            ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
+          });
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state
           // internally. Emits a `sandbox_degraded_active` harness
