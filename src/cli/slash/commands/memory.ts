@@ -835,7 +835,40 @@ const deleteViaTransition = async (
     purgeAt: ctx.now() + MEMORY_TOMBSTONE_RETENTION_MS,
   });
   if (r2.kind !== 'applied') {
-    return mapTransitionFailure('/memory delete (quarantined→evicted)', r2);
+    // Compensate step 1. Step 1 already moved the memory to
+    // `quarantined`; without rollback, a step-2 failure (e.g., the
+    // Eviction hook blocking only the to_state='evicted' step)
+    // leaves the operator with a "delete failed" message AND a
+    // quarantined memory — a partial state change that doesn't
+    // match the command's surface. Roll back to `active` so the
+    // command's reported failure matches the on-disk state.
+    //
+    // The rollback skips fireHook deliberately: the same Eviction
+    // chain just refused step 2; firing it again on the inverse
+    // transition would either block (leaving the memory stuck in
+    // quarantined) or run policy that wasn't authored to gate
+    // resurrections. A distinct trigger (`delete_rollback`)
+    // distinguishes the row in forensic queries.
+    //
+    // When the rollback itself fails (rare — `quarantined → active`
+    // is permissive in the state machine), we surface BOTH the
+    // original error and the orphaned state so the operator can
+    // recover via `/memory restore`.
+    const { fireHook: _omit, ...rollbackInput } = transitionInput;
+    const rollback = await transitionMemoryState({
+      ...rollbackInput,
+      toState: 'active',
+      trigger: 'delete_rollback',
+    });
+    registry.reload();
+    const base = mapTransitionFailure('/memory delete (quarantined→evicted)', r2);
+    if (rollback.kind !== 'applied' && base.kind === 'error') {
+      return {
+        kind: 'error',
+        message: `${base.message}; rollback to 'active' also failed (memory remains in 'quarantined' — recover via /memory restore)`,
+      };
+    }
+    return base;
   }
 
   registry.reload();

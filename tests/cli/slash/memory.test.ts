@@ -5,7 +5,7 @@
 // against returned notes / db state.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { memoryCommand } from '../../../src/cli/slash/commands/memory.ts';
@@ -1210,6 +1210,78 @@ describe('/memory delete + restore — Eviction hook chain', () => {
     if (r.kind !== 'ok') return;
     expect(r.notes?.[0]).toContain('deleted project_local/mem');
     expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+  });
+
+  test('hook blocking only the evicted step rolls back to active (no orphan quarantined state)', async () => {
+    // Regression: /memory delete runs two transitions
+    // (active→quarantined, then quarantined→evicted). A hook that
+    // allows step 1 but blocks step 2 previously left the memory in
+    // `quarantined` while reporting "delete failed" — partial state
+    // change the operator didn't authorize. Now step 2 failure
+    // compensates with a rollback to `active`.
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots } = fixture;
+
+    // Selective hook: allows active→quarantined, blocks
+    // quarantined→evicted. Also lets the rollback (quarantined→
+    // active) through because slash-delete deliberately omits
+    // fireHook on the rollback transition.
+    ctx.dispatchHooks = async (payload) => {
+      const data = (payload as { data?: { toState?: string } }).data;
+      if (data?.toState === 'evicted') {
+        return {
+          blockedBy: {
+            spec: {
+              layer: 'enterprise' as const,
+              sourcePath: '/etc/agent/hooks.toml',
+              event: 'Eviction' as const,
+              matcher: {},
+              entryIndex: 0,
+              command: 'block-evict.sh',
+              timeoutMs: 5000,
+              failClosed: false,
+              locked: false,
+            },
+            reason: 'message' as const,
+            message: 'compliance: cannot evict (only quarantine allowed)',
+          },
+          runs: [],
+          additionalContext: '',
+        };
+      }
+      return { blockedBy: null, runs: [], additionalContext: '' };
+    };
+
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['delete', 'mem'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain('blocked by Eviction hook');
+    }
+
+    // Body still on disk in the scope root — not in tombstones.
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    expect(existsSync(join(roots.projectLocal, '.tombstones'))).toBe(false);
+
+    // Frontmatter `state` field should be back to `active` (or
+    // absent, which equals active per spec §3.1.1) — NOT `quarantined`.
+    const body = readFileSync(join(roots.projectLocal, 'mem.md'), 'utf-8');
+    expect(body).not.toMatch(/^state:\s*quarantined/m);
+
+    // Eviction trail: step 1 applied (active→quarantined), step 2
+    // blocked by hook, step 3 applied (rollback quarantined→active,
+    // with a distinct trigger so forensic queries can identify it).
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const actions = events.map((e) => e.action);
+    expect(actions).toContain('quarantined');
+    expect(actions).toContain('refused'); // step 2 hook block
+    expect(actions).toContain('restored'); // rollback to active
   });
 });
 
