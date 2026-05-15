@@ -180,13 +180,12 @@ const formatActivePin = (
   const sid = shortId(pin.id);
   let expiresNote = '';
   if (pin.expiresAt !== null) {
+    // handleList calls getActivePinsBySession with the same `now`
+    // that lands here, so remainingMs is guaranteed > 0 — no
+    // "expired" branch needed (a row at exactly expires_at == now
+    // was already filtered out by the strict `> now` predicate).
     const remainingMs = pin.expiresAt - now;
-    if (remainingMs <= 0) {
-      // Defensive: getActivePinsBySession should have filtered, but
-      // a clock skew between repo query and render is harmless to
-      // surface as "expired" rather than fake an active row.
-      expiresNote = ' (expired)';
-    } else if (remainingMs < 60_000) {
+    if (remainingMs < 60_000) {
       expiresNote = ' (expires in <1m)';
     } else if (remainingMs < 3_600_000) {
       expiresNote = ` (expires in ${Math.floor(remainingMs / 60_000)}m)`;

@@ -59,11 +59,15 @@
 //   table scan would dominate large audit DBs even with low pin
 //   counts per session.
 //
-// - (session_id, expires_at). Composite for getActivePins —
-//   filter session, then expires_at predicate. expires_at NULLs
-//   sort first in SQLite (ASC) which is fine; the predicate is
-//   `expires_at IS NULL OR expires_at > ?` and SQLite uses the
-//   index for the session_id filter regardless.
+// - (session_id, expires_at). Composite — primary value is as a
+//   covering index for the countActivePinsBySession query
+//   (SELECT COUNT(*) ... WHERE session_id = ? AND
+//   (expires_at IS NULL OR expires_at > ?)), which is the hot
+//   path on /pin --list summaries and on the cap pre-check
+//   inside createPin. getActivePinsBySession itself selects all
+//   columns and therefore uses idx_context_pins_session (the
+//   simple index) plus a row read for the expires_at predicate;
+//   the composite earns its keep on the count path only.
 //
 // Cap of 10 (§12.4.2) is NOT a CHECK constraint — SQLite CHECK
 // can't reference COUNT subqueries. Enforced in createPin via

@@ -2,6 +2,63 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] chore(pin) — medium/low cleanup pack (post-review C)
+
+**Done.** Bundles the four medium/low code-review findings into one commit so the working tree closes the post-review cycle cleanly. None of these are correctness fixes; they're contract-tightening + test-gap closures that make future reviewers (and the BACKLOG audit trail) faster.
+
+### 1. Render `[kind]` and `(model)` suffix in `[resume_context]` pinned-context block
+
+The renderer was discarding `kind` and `createdBy` entirely (line was `  - ${p.text}`). The review flagged this as making `RecapPinnedContext.createdBy` a dead field at the literal point of consumption — which weakened the case for keeping it in the recap intermediate.
+
+New format:
+- Operator-direct pin: `  - [constraint] API pública não muda`
+- Model-proposed (approved) pin: `  - [workflow] rodar pnpm fmt (model)`
+
+The `[kind]` tag matches the `/pin --list` vocabulary so an operator who pinned it recognizes the line immediately. The `(model)` suffix appears only for `createdBy === 'model_proposed_user_approved'` to keep operator-direct pins (the common case) quiet in the resume block.
+
+### 2. Correct misleading index comment in migration 045
+
+Original comment claimed `idx_context_pins_session_active` covers `getActivePinsBySession`'s NULL-sort behavior — but `EXPLAIN QUERY PLAN` shows the hot read uses the simple `idx_context_pins_session` index (the composite isn't covering because the SELECT pulls every column). The composite's real value is on `countActivePinsBySession`, which IS covered. Rewrote the comment to declare both indices' actual roles so a future maintainer reading the migration doesn't waste time deciding "which one is the hot read?"
+
+### 3. Drop dead `<= 0` branch in `/pin --list` rendering
+
+`formatActivePin` had a defensive `if (remainingMs <= 0) expiresNote = ' (expired)'` branch. The branch is unreachable: `handleList` calls `getActivePinsBySession(store, sessionId, t)` and `formatActivePin(p, t)` with the SAME `t`, so a pin where `expires_at == t` was already filtered out by the strict `> now` predicate. Dropped the branch; replaced the "clock skew" comment with the actual invariant (same `now`).
+
+### 4. Test gaps closed in `tests/storage/context-pins.test.ts`
+
+- `createPin` with an explicit `id` (the replay/import path documented but never exercised by tests).
+- `createPin` with a duplicate `id` — pins the current contract that the repo does NOT wrap the SQLite PRIMARY KEY violation in a structured error. If a future replay-tool slice needs structured errors, the test will surface the regression instead of silently changing replay semantics.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/recap/resume-context.ts` | New `[kind] text (model)?` rendering in the Pinned context block; comment explains the suffix rule |
+| `src/storage/migrations/045-context-pins.ts` | Index comment rewritten to declare the actual role of each index (simple = full-row reads; composite = counts) |
+| `src/cli/slash/commands/pin.ts` | `formatActivePin`: drop the unreachable `<= 0` branch; comment notes the same-`now` invariant |
+| `tests/recap/resume-context.test.ts` | Update the existing 2 pin tests to the new format; +1 new test pinning the `(model)` suffix discriminator |
+| `tests/storage/context-pins.test.ts` | +2 tests for `createPin` `id` override path and duplicate-id throw |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7382 pass / 10 skip / 0 fail (+3 from post-review B baseline 7379: +1 resume-context, +2 storage)
+
+### Post-review closing summary
+
+Three commits address the code review on Phase 1.1:
+
+| Severity | Finding | Commit |
+|---|---|---|
+| High #1 | `pin_context` tool ships dead in production | `c84cecc` |
+| High #2 | `/pin` slash lacked the secret scanner | `710cd29` |
+| Medium #3,4 + Low #6,7,11 | rendering / comments / dead branch / test gaps | (this commit) |
+
+Findings deliberately NOT addressed:
+- **Medium #5** (`ContextPinsStore` location) — the review itself recommended "leave as-is; revisit if 1.1.e adds eviction logic". Trade-off accepted.
+- **Low #8** (off wording on `--remove --kind`), **#9** (`unknown` cast in `valuesForInsert`), **#10** (`sourceStepId` always-string in tool path) — cosmetic nitpicks where the engineering cost outweighs the readability gain.
+
 ## [2026-05-14] sec(cli/pin) — secret-only scan on /pin slash (post-review B)
 
 **Done.** Code-review finding High #2: the `/pin` slash skipped `scanForInjection` entirely, leaving a real gap — a copy-paste from a log line containing `sk-ant-...` or `AKIA...` would land literal in `context_pins.text` and re-inject on every goal/resume per spec §12.4.4. Memory's equivalent surface (`/memory promote shared`) already runs `scanForPromotion`; the pin slash was asymmetric.

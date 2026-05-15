@@ -87,6 +87,24 @@ describe('context_pins repo: create + read', () => {
     expect(pin.createdBy).toBe('model_proposed_user_approved');
     expect(pin.sourceStepId).toBe('step-42');
   });
+
+  test('createPin accepts an explicit id (replay/import path)', () => {
+    // Documented for future replay tooling. Round-trips verbatim so
+    // the caller's deterministic id survives.
+    const pin = createPin(db, validInput({ id: 'fixed-id-abc', text: 'replayed' }));
+    expect(pin.id).toBe('fixed-id-abc');
+    expect(getPin(db, 'fixed-id-abc')?.text).toBe('replayed');
+  });
+
+  test('duplicate explicit id throws (PRIMARY KEY)', () => {
+    // The repo does NOT wrap the SQLite primary-key violation in a
+    // structured error. Anyone building a replay tool needs to
+    // handle this case explicitly. Test pins the current contract
+    // so a future structured-error refactor surfaces here, not as
+    // a silent replay regression.
+    createPin(db, validInput({ id: 'dup', text: 'first' }));
+    expect(() => createPin(db, validInput({ id: 'dup', text: 'second' }))).toThrow();
+  });
 });
 
 describe('context_pins repo: cap enforcement', () => {

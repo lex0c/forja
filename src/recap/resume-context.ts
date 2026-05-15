@@ -159,7 +159,17 @@ export const buildResumeContext = (input: BuildResumeContextInput): ResumeContex
     sections.push(
       ...buildSection(
         'Pinned context:',
-        intermediate.pinnedContext.map((p) => `  - ${p.text}`),
+        intermediate.pinnedContext.map((p) => {
+          // `[kind]` is informational — same vocabulary the
+          // /pin --list view uses, so the operator who pinned
+          // it recognizes it immediately. `(model)` suffix
+          // appears ONLY when the pin came through the
+          // pin_context tool path (and was operator-approved
+          // via the modal); operator-direct pins via /pin omit
+          // the suffix to avoid visual noise on the common case.
+          const suffix = p.createdBy === 'model_proposed_user_approved' ? ' (model)' : '';
+          return `  - [${p.kind}] ${p.text}${suffix}`;
+        }),
         '  - (none)',
       ),
     );
