@@ -2,6 +2,50 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(memory) — GC sweep evicted → purged (Phase 2.3)
+
+**Done.** Materializes the retention window EVICTION §7.1 declares. Phase 2.2 routed `gcExpiredMemories` through the state machine, producing `evicted` rows with `purgeAt = now + 30d`. Phase 1.3.c1 already wired the `evicted → purged` transition into `transitionMemoryState`. The piece missing: a sweep that reads `listEvictedDueForPurge` and calls the transition for each due tombstone. Without it, tombstones accumulated forever — every memory ever evicted lived on disk until the operator manually nuked `.tombstones/`.
+
+This slice ships `gcPurgeExpiredTombstones(db, registry, roots, opts)` and wires it into bootstrap right after `gcExpiredMemories`. Same boot now both expires fresh `expires:` memories AND purges tombstones whose 30d window ran out. Forensic queries (`getLastEvictionForObject`, eviction metrics, `eviction.purge_irreversible_count`) finally have non-trivial purge data.
+
+### Design decisions
+
+- **N+1 recency check via `getLastEvictionForObject`.** `listEvictedDueForPurge` returns ALL rows with `to_state='evicted' AND purge_at <= now` — including stale rows for objects that were restored after the eviction. Without a recency check, the sweep would attempt to purge based on an eviction event that's no longer authoritative. For each candidate, the sweep queries the latest eviction event for `(substrate, objectId)` and skips if the candidate row isn't latest. Tracked separately in `result.skipped` (expected control flow, no stderr) versus `result.failures` (operator surfacing).
+
+- **Substrate filter is inline.** The query is substrate-agnostic; this sweep filters to `substrate === 'memory'`. Future policy/candidate/slot_item substrates will run their own sweeps over the same query with their own filters. A single cross-substrate sweep would have a circular-import problem (each owner's transitionMemoryState equivalent isn't a generic API).
+
+- **`motivo: 'expired'` IS legal on `evicted → purged`** (per EVICTION §4.1 — admits `expired, user_purge, security`). Different from the `gcExpiredMemories` path which had to use `low_roi` as a closest-fit. This sweep is the one place where `expired` lands as motivo in production.
+
+- **`evidence_json` carries the original eviction row id + purge_at.** Operators investigating purges (forensic audit, eviction.purge_irreversible_count anomalies) can trace back from the purge row to the eviction that triggered the retention window. Without the link, a `purged` row by itself doesn't say "why did this disappear?".
+
+- **`MemoryScope` enum validation on `objectScope`.** The eviction_events `object_scope` column is free TEXT (the spec EVICTION §10.1 calls for it — different substrates use different scope vocabularies). For memory, only `user | project_shared | project_local` are valid; the sweep validates before calling transitionMemoryState. A row with `object_scope = 'global'` from a future substrate that piped through the wrong substrate value would land in `failures`, not crash.
+
+- **Bootstrap call site lives AFTER `gcExpiredMemories`.** Ordering rationale: a memory whose `expires:` field hits today gets evicted by gcExpiredMemories (new tombstone, purge_at = today + 30d, not due). On a future boot 31+ days later, gcExpiredMemories finds no new expirations (the memory is already gone), but the purge sweep finds the now-overdue tombstone and finalizes it. Two-phase scheme matches the spec lifecycle.
+
+- **Sweep failure surfacing.** `stderr.write` line per failure, mirroring the pre-existing `gcExpiredMemories` failure path in bootstrap. The audit trail (eviction_events) records the failed transition internally via `audit_drift` or `io_error`; stderr surfaces the live signal.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/lifecycle.ts` | New `gcPurgeExpiredTombstones` async helper + `GcPurgeOptions`, `PurgedTombstone`, `GcPurgeResult` types. `MEMORY_SCOPES` const + `isMemoryScope` validator. Lazy import of `eviction-events.ts` repo to avoid circular-import friction. |
+| `src/memory/index.ts` | Barrel re-exports the new function + types. |
+| `src/cli/bootstrap.ts` | After `gcExpiredMemories`, call `gcPurgeExpiredTombstones` with `auditCwd`. Each `result.failures[]` lands a stderr line. |
+| `tests/memory/lifecycle.test.ts` | 4 new tests covering the sweep: purges tombstones past the window; leaves tombstones inside the window alone; skips rows whose object has a newer eviction event (restore-then-re-evict); non-memory substrate candidates are filtered out before scope validation. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7526 pass / 10 skip / 0 fail (+4 from the slice)
+- `bun test tests/memory/lifecycle.test.ts` 30 pass
+
+### Deferred / follow-ups declared
+
+- **Per-substrate retention.** Today the sweep runs only for memory; policy substrate (EVICTION §7.1: 14d retention) and the future invalidated → evicted window (7d) need their own sweeps when they ship.
+- **REPL re-sweep timer.** Today the sweep runs at boot only. A long-lived REPL (multi-day session) won't see new tombstones materialize purged until restart. A periodic timer (24h) could close this — out of scope here.
+- **2.4 — Evidence gate per-motivo schema validation** (next slice — closes the §6.1 contract).
+
 ## [2026-05-15] fix(memory) — route gcExpiredMemories through transitionMemoryState (Phase 2.2)
 
 **Done.** Closes the silent-GC violation of EVICTION §0.9. Pre-1.3, `gcExpiredMemories` (the boot-time sweep that materializes the `expires:` frontmatter field) deleted memories via `removeMemory` and emitted a single `memory_events action='expired'` row — zero `eviction_events` rows, so downstream forensic queries (`getLastEvictionForObject`, GC sweep, trigger-thrashing detector) were blind to expirations. With the state machine landed in Phase 1.2 and `transitionMemoryState` shipping in 1.3, the GC path now flows through the canonical 2-step transition (active→quarantined→evicted) like `/memory delete` does — the eviction trail is uniform across operator-driven and time-driven deletions.

@@ -99,6 +99,7 @@ export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer
 export {
   findExpiredMemories,
   gcExpiredMemories,
+  gcPurgeExpiredTombstones,
   moveMemory,
   removeMemory,
 } from './lifecycle.ts';
@@ -107,8 +108,11 @@ export type {
   GcExpiredAuditOverride,
   GcExpiredOptions,
   GcExpiredResult,
+  GcPurgeOptions,
+  GcPurgeResult,
   MoveMemoryInput,
   MoveMemoryResult,
+  PurgedTombstone,
   RemoveMemoryInput,
   RemoveMemoryResult,
 } from './lifecycle.ts';

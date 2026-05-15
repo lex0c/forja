@@ -488,6 +488,154 @@ const gcFailureReason = (
   }
 };
 
+// ─── purge sweep (evicted → purged) ──────────────────────────────────
+//
+// The consumer side of the retention window EVICTION §7.1 declares.
+// `gcExpiredMemories` (boot-time, this module) and `/memory delete`
+// (slash) both PRODUCE evicted rows with `purge_at = now + 30d`.
+// Without a sweep that materializes `evicted → purged` when the
+// window expires, those tombstones accumulate without bound — every
+// memory ever evicted lives on disk forever.
+//
+// Sweep contract:
+//   1. Read `listEvictedDueForPurge(db, now)` — rows with
+//      `to_state='evicted' AND purge_at <= now`.
+//   2. For each row of substrate='memory': verify via
+//      getLastEvictionForObject that this is STILL the latest event
+//      for the object. If a later row exists (the memory was
+//      restored, then maybe re-evicted), skip — the older row's
+//      purge_at is no longer load-bearing because the disk state
+//      has moved on.
+//   3. Resolve scope from objectScope (validated against the
+//      MemoryScope enum); call transitionMemoryState with
+//      toState='purged', motivo='expired', trigger='expired_at',
+//      actor='startup_probe'.
+//   4. Transition removes the tombstone file (transitions.ts) +
+//      lands the eviction_events purged row + memory_events
+//      action='purged' row.
+//
+// N+1 lookup (getLastEvictionForObject per candidate) is acceptable
+// because boot-time sweeps process at most dozens of tombstones —
+// the additional cost is dwarfed by the eviction_events INSERT itself.
+
+const MEMORY_SCOPES = new Set<MemoryScope>(['user', 'project_shared', 'project_local']);
+
+const isMemoryScope = (value: string): value is MemoryScope =>
+  MEMORY_SCOPES.has(value as MemoryScope);
+
+export interface GcPurgeOptions {
+  // Probe time for the retention check. Defaults to Date.now(). Tests
+  // pass fixed values for determinism.
+  now?: () => number;
+  // Audit attribution forwarded to the eviction_events +
+  // memory_events rows.
+  auditSessionId?: string;
+  auditCwd?: string;
+}
+
+export interface PurgedTombstone {
+  scope: MemoryScope;
+  name: string;
+  // The eviction_events row id that drove the purge — useful for
+  // forensic audit ("which retention window expired?").
+  evictionEventId: string;
+}
+
+export interface GcPurgeResult {
+  purged: PurgedTombstone[];
+  failures: { evictionEventId: string; reason: string }[];
+  // Candidate rows that were skipped because a newer eviction
+  // event exists for the same object (memory was restored after
+  // the original eviction). Tracked separately from failures so
+  // the boot caller can stay silent on skip (expected control
+  // flow) but stderr-log failures.
+  skipped: { evictionEventId: string; reason: string }[];
+}
+
+export const gcPurgeExpiredTombstones = async (
+  db: DB,
+  registry: MemoryRegistry,
+  roots: ScopeRoots,
+  opts: GcPurgeOptions = {},
+): Promise<GcPurgeResult> => {
+  // Lazy imports to avoid circular dependency with the storage
+  // layer (lifecycle.ts is loaded by writer.ts which is loaded by
+  // the storage layer's repos for some test fixtures).
+  const { getLastEvictionForObject, listEvictedDueForPurge } = await import(
+    '../storage/repos/eviction-events.ts'
+  );
+  const nowMs = opts.now?.() ?? Date.now();
+  const candidates = listEvictedDueForPurge(db, nowMs);
+  const purged: PurgedTombstone[] = [];
+  const failures: { evictionEventId: string; reason: string }[] = [];
+  const skipped: { evictionEventId: string; reason: string }[] = [];
+
+  for (const row of candidates) {
+    // Filter to memory substrate — other substrates (policy,
+    // candidate, slot_item) will run their own sweeps when they
+    // ship. The query returns all evicted rows; per-substrate
+    // owner decides what to do with them.
+    if (row.substrate !== 'memory') continue;
+
+    // Verify recency: a subsequent restore-then-re-evict cycle
+    // would have produced a newer eviction event. The OLDER row's
+    // purge_at is no longer load-bearing — the disk state moved
+    // on. Skip silently.
+    const latest = getLastEvictionForObject(db, row.substrate, row.objectId);
+    if (latest === null || latest.id !== row.id) {
+      skipped.push({
+        evictionEventId: row.id,
+        reason: 'newer eviction event exists for object (restored or re-evicted since)',
+      });
+      continue;
+    }
+
+    if (!isMemoryScope(row.objectScope)) {
+      failures.push({
+        evictionEventId: row.id,
+        reason: `invalid memory scope '${row.objectScope}' on eviction_events row`,
+      });
+      continue;
+    }
+    const scope = row.objectScope;
+
+    const result = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope,
+      name: row.objectId,
+      toState: 'purged',
+      motivo: 'expired',
+      trigger: 'expired_at',
+      actor: 'startup_probe',
+      evidence: {
+        purged_after_retention_window: true,
+        original_eviction_id: row.id,
+        original_purge_at: row.purgeAt,
+      },
+      ...(opts.auditSessionId !== undefined ? { sessionId: opts.auditSessionId } : {}),
+      ...(opts.auditCwd !== undefined ? { cwd: opts.auditCwd } : {}),
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+    });
+
+    if (result.kind === 'applied') {
+      purged.push({ scope, name: row.objectId, evictionEventId: row.id });
+    } else {
+      failures.push({
+        evictionEventId: row.id,
+        reason: gcFailureReason(result, 'evicted→purged'),
+      });
+    }
+  }
+
+  // Snapshot reload — purged memories aren't indexed (already
+  // cleared on eviction) but a future caller might rely on
+  // registry-side state matching disk.
+  if (purged.length > 0) registry.reload();
+  return { purged, failures, skipped };
+};
+
 // ─── moveMemory (promote / demote primitive) ─────────────────────────
 //
 // Spec MEMORY.md §5.4 (promote local → shared) and §5.5 (demote

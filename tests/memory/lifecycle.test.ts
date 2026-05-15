@@ -441,6 +441,199 @@ describe('gcExpiredMemories', () => {
   });
 });
 
+describe('gcPurgeExpiredTombstones', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('purges tombstones whose retention window expired', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Old](old.md) — h\n');
+    writeBody(roots.projectLocal, 'old', { expires: '2024-01-01' });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    // Expire it (boot 1, 2024-06-01).
+    const expireDay = new Date(Date.UTC(2024, 5, 1));
+    await gcExpiredMemories(db, reg, roots, { today: expireDay });
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(1);
+
+    // Sweep at a probe time PAST the retention window (30d + slack).
+    // gcExpiredMemories used the day's getTime() + per-mem ticks
+    // as recorded_at, so purge_at = recorded_at + 30d. Probe 35d
+    // later guarantees we're past.
+    const sweepNow = expireDay.getTime() + 35 * 24 * 60 * 60 * 1000;
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+    const result = await gcPurgeExpiredTombstones(db, reg, roots, {
+      now: () => sweepNow,
+      auditSessionId: sessionId,
+      auditCwd: '/p',
+    });
+    expect(result.purged).toHaveLength(1);
+    expect(result.purged[0]?.scope).toBe('project_local');
+    expect(result.purged[0]?.name).toBe('old');
+    expect(result.failures).toEqual([]);
+
+    // Tombstone file is gone.
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(0);
+
+    // Audit: eviction_events purged row with motivo='expired'.
+    const { getLastEvictionForObject } = await import('../../src/storage/repos/eviction-events.ts');
+    const last = getLastEvictionForObject(db, 'memory', 'old');
+    expect(last?.toState).toBe('purged');
+    expect(last?.motivo).toBe('expired');
+    expect(last?.trigger).toBe('expired_at');
+    expect(last?.actor).toBe('startup_probe');
+
+    // memory_events: purged action landed.
+    const events = listMemoryEventsByName(db, 'old');
+    expect(events.map((e) => e.action)).toContain('purged');
+  });
+
+  test('leaves tombstones inside retention window alone', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Old](old.md) — h\n');
+    writeBody(roots.projectLocal, 'old', { expires: '2024-01-01' });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    const expireDay = new Date(Date.UTC(2024, 5, 1));
+    await gcExpiredMemories(db, reg, roots, { today: expireDay });
+
+    // Sweep INSIDE the window (1 day after eviction).
+    const sweepNow = expireDay.getTime() + 24 * 60 * 60 * 1000;
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+    const result = await gcPurgeExpiredTombstones(db, reg, roots, {
+      now: () => sweepNow,
+    });
+    expect(result.purged).toEqual([]);
+
+    // Tombstone still on disk.
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(1);
+  });
+
+  test('skips rows whose object has a newer eviction event (restored then re-evicted)', async () => {
+    // First eviction (boot 1, 2024-06-01) → eviction_events row
+    // A, purge_at = boot1 + 30d. Restore at t > boot1 + audit
+    // row B (evicted→active). Re-eviction (boot 2, 2024-08-01)
+    // → rows C+D, purge_at = boot2 + 30d.
+    //
+    // Sweep probe at boot1 + 35d (past row A's window but
+    // before row D's). Row A becomes a candidate of
+    // listEvictedDueForPurge, but the latest event is row D.
+    // Sweep must skip row A.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { expires: '2024-01-01' });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    // First boot — expire and evict.
+    const boot1 = new Date(Date.UTC(2024, 5, 1));
+    await gcExpiredMemories(db, reg, roots, { today: boot1 });
+
+    // Restore via transitionMemoryState (mirrors /memory restore).
+    // Use a counter > boot1.ms so the restore audit row is
+    // monotonically newer than the eviction.
+    let restoreCounter = boot1.getTime() + 1_000_000;
+    const { transitionMemoryState } = await import('../../src/memory/transitions.ts');
+    const r1 = await transitionMemoryState({
+      db,
+      registry: reg,
+      roots,
+      scope: 'project_local',
+      name: 'mem',
+      toState: 'active',
+      motivo: 'irrelevant',
+      trigger: 'manual',
+      actor: 'user',
+      now: () => ++restoreCounter,
+    });
+    expect(r1.kind).toBe('applied');
+
+    // Second boot — the memory is back at the scope root post-
+    // restore. Re-write its body (the restore landed it there)
+    // and re-expire so a fresh eviction lands. We need to also
+    // reload the registry because restore modified the index.
+    reg.reload();
+    // Re-evict by simulating an `expires:` value still in the past.
+    const boot2 = new Date(Date.UTC(2024, 7, 1));
+    await gcExpiredMemories(db, reg, roots, { today: boot2 });
+
+    // Sweep at boot1 + 35d (past row A's purge_at; before row D's).
+    const sweepNow = boot1.getTime() + 35 * 24 * 60 * 60 * 1000;
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+    const result = await gcPurgeExpiredTombstones(db, reg, roots, { now: () => sweepNow });
+
+    // Nothing purged — row A is stale, row D's purge_at hasn't
+    // hit yet (boot2 + 30d > boot1 + 35d).
+    expect(result.purged).toEqual([]);
+    expect(result.skipped.length).toBeGreaterThanOrEqual(1);
+    expect(result.skipped[0]?.reason).toContain('newer eviction event');
+
+    // The current tombstone (from the re-evict) is still on disk.
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(1);
+  });
+
+  test('non-memory substrate candidates are ignored', async () => {
+    // Insert a policy-substrate evicted row directly so the
+    // sweep query returns it; verify it's filtered out without
+    // hitting the memory-scope validator.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    const { appendEvictionEvent } = await import('../../src/storage/repos/eviction-events.ts');
+    // First quarantine → evicted (state machine requires the
+    // sequence). substrate='policy' is in the enum even though
+    // the policy subsystem isn't implemented; the sweep MUST NOT
+    // try to act on it.
+    appendEvictionEvent(db, {
+      substrate: 'policy',
+      objectId: 'rule-x',
+      objectScope: 'repo',
+      fromState: 'active',
+      toState: 'quarantined',
+      trigger: 'failure_burst',
+      motivo: 'conflict',
+      evidenceJson: '{}',
+      outcome: 'applied',
+      actor: 'loop_cold',
+      recordedAt: 1000,
+    });
+    appendEvictionEvent(db, {
+      substrate: 'policy',
+      objectId: 'rule-x',
+      objectScope: 'repo',
+      fromState: 'quarantined',
+      toState: 'evicted',
+      trigger: 'failure_burst',
+      motivo: 'low_roi',
+      evidenceJson: '{}',
+      outcome: 'applied',
+      actor: 'loop_cold',
+      recordedAt: 2000,
+      purgeAt: 1, // way in the past
+    });
+
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+    const result = await gcPurgeExpiredTombstones(db, reg, roots, {
+      now: () => 10_000_000_000,
+    });
+    expect(result.purged).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(result.skipped).toEqual([]); // filtered before the recency check
+  });
+});
+
 describe('moveMemory — primitive (promote / demote)', () => {
   test('promote: project_local → project_shared, source removed, target written', () => {
     const repo = makeTmp();

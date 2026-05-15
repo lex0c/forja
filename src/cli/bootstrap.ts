@@ -21,6 +21,7 @@ import {
   createMemoryRegistry,
   evaluateBootTriggers,
   gcExpiredMemories,
+  gcPurgeExpiredTombstones,
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
@@ -543,6 +544,21 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     for (const failure of gcResult.failures) {
       process.stderr.write(
         `forja: memory gc: failed to expire ${failure.memory.scope}/${failure.memory.name} (expires ${failure.memory.expires}): ${failure.reason}\n`,
+      );
+    }
+    // Purge sweep — materializes evicted → purged for tombstones
+    // whose retention window expired (EVICTION §7.1). Runs after
+    // gcExpiredMemories so this same boot can purge an entry that
+    // was just expired in a prior boot whose retention has now
+    // run out, AND so any concurrent boot-time evictions land
+    // their `evicted` row before this sweep iterates. Failures
+    // surface to stderr like expiration failures.
+    const purgeResult = await gcPurgeExpiredTombstones(db, memoryRegistry, memoryRoots, {
+      auditCwd: cwd,
+    });
+    for (const failure of purgeResult.failures) {
+      process.stderr.write(
+        `forja: memory gc: failed to purge eviction_event ${failure.evictionEventId}: ${failure.reason}\n`,
       );
     }
     // Boot-time trigger context (spec §4.3). evaluateBootTriggers
