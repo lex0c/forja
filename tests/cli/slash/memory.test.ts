@@ -926,21 +926,22 @@ describe('/memory restore', () => {
     const repo = makeTmp();
     const fixture = makeCtx(repo);
     const { ctx, roots, registry } = fixture;
+    // ctx.now is threaded through transitionMemoryState → moveToTombstone,
+    // so a counter gives deterministic tombstone filenames
+    // (<name>.<ts>.md) without relying on wall-clock granularity.
+    let nowCounter = 1_000;
+    ctx.now = () => ++nowCounter;
 
-    // First eviction.
+    // First eviction (tombstone ts ≥ 1001).
     await deleteThenSetup(fixture, roots.projectLocal, 'mem', 'first version');
 
-    // Re-create the memory at the scope root + re-evict so two
-    // tombstones exist with different ts.
+    // Re-create the memory + re-evict (tombstone ts ≥ 1003 because
+    // the counter advanced through both transitions of the first
+    // delete). Two distinct tombstones now coexist for 'mem'.
     writeBody(roots.projectLocal, 'mem', {}, 'second version');
     writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
     registry.reload();
     stubMemoryAction(ctx, 'yes');
-    // Sleep 5ms to guarantee distinct unix_ms tombstone filenames
-    // (Date.now() is ms-precision; back-to-back evictions in the
-    // same ms would collide). A tighter fix would inject `now()`
-    // into the slash flow; tolerable here.
-    await new Promise((res) => setTimeout(res, 5));
     await memoryCommand.exec(['delete', 'mem'], ctx);
 
     // Restore: should pick the latest (which carried 'second version').
@@ -950,6 +951,137 @@ describe('/memory restore', () => {
     const { readFileSync } = await import('node:fs');
     const restoredBody = readFileSync(join(roots.projectLocal, 'mem.md'), 'utf-8');
     expect(restoredBody).toContain('second version');
+  });
+
+  test('cross-scope tombstones with same name refuse without --scope', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots } = fixture;
+
+    // Evict mem in both local AND user.
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', {}, 'local body');
+    writeIndex(roots.user, '- [Mem](mem.md) — h\n');
+    writeBody(roots.user, 'mem', { type: 'user' }, 'user body');
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', 'mem', 'local'], ctx);
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', 'mem', 'user'], ctx);
+
+    // Restore without scope: ambiguous → refused.
+    const ambiguous = await memoryCommand.exec(['restore', 'mem'], ctx);
+    expect(ambiguous.kind).toBe('error');
+    if (ambiguous.kind === 'error') {
+      expect(ambiguous.message).toContain('multiple scopes');
+      expect(ambiguous.message).toContain('local');
+      expect(ambiguous.message).toContain('user');
+    }
+
+    // Explicit scope succeeds and pins the right body.
+    stubMemoryAction(ctx, 'yes');
+    const explicitUser = await memoryCommand.exec(['restore', 'mem', 'user'], ctx);
+    expect(explicitUser.kind).toBe('ok');
+    const { readFileSync } = await import('node:fs');
+    const restored = readFileSync(join(roots.user, 'mem.md'), 'utf-8');
+    expect(restored).toContain('user body');
+  });
+
+  test('idempotent restore: body already at scope root preserves operator edits', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots } = fixture;
+    await deleteThenSetup(fixture, roots.projectLocal, 'mem', 'tombstone body');
+
+    // Simulate a partial restore: write a body at scope root (with
+    // operator edits) while the tombstone still exists. The
+    // transition should NOT overwrite the body with the tombstone
+    // — operator edits win.
+    const { writeFileSync } = await import('node:fs');
+    const bodyPath = join(roots.projectLocal, 'mem.md');
+    writeFileSync(
+      bodyPath,
+      `---
+name: mem
+description: hook for mem
+type: feedback
+source: user_explicit
+state: evicted
+---
+
+operator edits on top of partial restore
+`,
+    );
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['restore', 'mem'], ctx);
+    expect(r.kind).toBe('ok');
+    const { readFileSync } = await import('node:fs');
+    const finalBody = readFileSync(bodyPath, 'utf-8');
+    // Operator's edit preserved; tombstone content NOT overwritten.
+    expect(finalBody).toContain('operator edits on top of partial restore');
+    expect(finalBody).not.toContain('tombstone body');
+    // State field stripped on finalize.
+    expect(finalBody).not.toContain('state: evicted');
+  });
+});
+
+// ── audit_drift surface + retention purge_at ─────────────────────────
+
+describe('/memory delete — retention + audit_drift', () => {
+  test('purge_at is set on the evicted eviction_events row (30d window)', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots } = fixture;
+    let nowCounter = 1_000_000;
+    ctx.now = () => ++nowCounter;
+
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['delete', 'mem'], ctx);
+    expect(r.kind).toBe('ok');
+
+    const { getLastEvictionForObject } = await import(
+      '../../../src/storage/repos/eviction-events.ts'
+    );
+    const last = getLastEvictionForObject(db, 'memory', 'mem');
+    expect(last).not.toBeNull();
+    expect(last?.toState).toBe('evicted');
+    expect(last?.purgeAt).not.toBeNull();
+    // 30 days in ms — verify the window matches the spec retention.
+    const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+    const recordedAt = last?.recordedAt ?? 0;
+    const purgeAt = last?.purgeAt ?? 0;
+    // Window is computed as ctx.now() + retention at call time, so
+    // purgeAt may differ slightly from recordedAt depending on
+    // counter advancement; allow a few-ms tolerance.
+    expect(purgeAt - recordedAt).toBeGreaterThanOrEqual(THIRTY_DAYS_MS - 10);
+    expect(purgeAt - recordedAt).toBeLessThanOrEqual(THIRTY_DAYS_MS + 10);
+  });
+
+  test('listEvictableInWindow surfaces the freshly-evicted row', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots } = fixture;
+    let nowCounter = 1_000_000;
+    ctx.now = () => ++nowCounter;
+
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', 'mem'], ctx);
+
+    const { listEvictableInWindow } = await import('../../../src/storage/repos/eviction-events.ts');
+    // Query as if no time has passed — purge_at is way in the future.
+    const inWindow = listEvictableInWindow(db, nowCounter);
+    expect(inWindow.length).toBe(1);
+    expect(inWindow[0]?.objectId).toBe('mem');
   });
 });
 

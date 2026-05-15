@@ -27,7 +27,6 @@ import {
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
-  type MemoryState,
   type TombstoneEntry,
   findLatestTombstone,
   moveMemory,
@@ -481,10 +480,8 @@ const handleDelete = async (
     // preview and proceed; remove path doesn't care about content.
     // Source unknown when the body can't parse — fall back to
     // 'imported' for the audit row (most neutral provenance
-    // marker). State is unknown for the same reason; we treat
-    // malformed as a non-active path so the legacy removeMemory
-    // primitive handles it (no transitionMemoryState attempts on
-    // unreadable files).
+    // marker). Force the legacy route — transitionMemoryState
+    // can't read state from a body it can't parse.
     return await confirmAndDelete(
       ctx,
       registry,
@@ -492,14 +489,14 @@ const handleDelete = async (
       name,
       [`(body parse failed: ${peek.error})`],
       'imported',
-      'invalidated',
+      'legacy',
     );
   }
   if (peek.kind === 'missing') {
     // Index entry exists, body file is gone. Confirm anyway —
     // operator's intent is to clean up the dangling entry. Source
-    // unrecoverable; same 'imported' fallback as malformed.
-    // Tombstone path doesn't apply — body is already gone.
+    // unrecoverable; same 'imported' fallback as malformed. Force
+    // the legacy route — tombstone semantics need a body to move.
     return await confirmAndDelete(
       ctx,
       registry,
@@ -507,14 +504,17 @@ const handleDelete = async (
       name,
       ['(body file missing — only the index entry will be cleared)'],
       'imported',
-      'invalidated',
+      'legacy',
     );
   }
 
   // Happy path: real source from frontmatter so audit groups with
   // the memory's history (created/refused/etc rows carry the
-  // same provenance). State defaults to 'active' per spec §3.1.1
-  // when frontmatter omits the field.
+  // same provenance). State machine routing only fires for the
+  // `active` state; quarantined/invalidated/evicted use legacy
+  // removeMemory because tombstone semantics don't add value when
+  // the entry is already off the active path.
+  const state = peek.file.frontmatter.state ?? 'active';
   return await confirmAndDelete(
     ctx,
     registry,
@@ -522,9 +522,19 @@ const handleDelete = async (
     name,
     peek.file.body.split('\n'),
     peek.file.frontmatter.source,
-    peek.file.frontmatter.state ?? 'active',
+    state === 'active' ? 'state-machine' : 'legacy',
   );
 };
+
+// Routing choice for /memory delete. Drives whether the slash
+// goes through transitionMemoryState (tombstone + audit pair +
+// restorable via /memory restore) or falls through to the legacy
+// removeMemory primitive (other states + corrupted / missing
+// files where tombstone semantics don't apply). Explicit param so
+// the caller declares intent — earlier shape used `currentState:
+// MemoryState` as a routing flag with fake values, which a
+// future refactor reading the field would mis-branch on.
+type DeleteRoute = 'state-machine' | 'legacy';
 
 const confirmAndDelete = async (
   ctx: SlashContext,
@@ -533,13 +543,7 @@ const confirmAndDelete = async (
   name: string,
   preview: string[],
   source: string,
-  // Current frontmatter state, defaulting to `active` per spec
-  // §3.1.1 absence-equals-active rule. Drives whether we route
-  // through transitionMemoryState (active path → tombstone, audit
-  // pair, restorable via /memory restore) or fall through to the
-  // legacy removeMemory primitive (other states + corrupted /
-  // missing files).
-  currentState: MemoryState,
+  route: DeleteRoute,
 ): Promise<SlashResult> => {
   const answer = await ctx.modalManager.askMemoryAction({
     action: 'delete',
@@ -562,7 +566,7 @@ const confirmAndDelete = async (
   // one caller).
   const roots = registry.roots;
 
-  // Active-state path: route through transitionMemoryState so the
+  // State-machine route: through transitionMemoryState so the
   // body moves to .tombstones/ (operator can /memory restore it
   // within the retention window) and the eviction_events +
   // memory_events audit pair lands. State machine forbids
@@ -574,7 +578,7 @@ const confirmAndDelete = async (
   // machine-legal label. Follow-up: spec EVICTION §4.1 may grow
   // an explicit `user_purge` motivo on active→evicted to clean
   // this attribution.
-  if (currentState === 'active') {
+  if (route === 'state-machine') {
     return await deleteViaTransition(ctx, registry, roots, scope, name);
   }
 
@@ -630,6 +634,12 @@ const confirmAndDelete = async (
   return { kind: 'ok', notes: [`deleted ${scope}/${name}`] };
 };
 
+// Memory tombstone retention per EVICTION §7.1 — operator can
+// /memory restore a deleted entry within this window before the
+// GC sweep materializes evicted→purged. Set in ms so we can pass
+// it directly as `purgeAt = now + MEMORY_TOMBSTONE_RETENTION_MS`.
+const MEMORY_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 // Two-step transition for the active-state delete path. Returns
 // a SlashResult mirroring the legacy code's shape — error on the
 // first sub-transition failure (we never partially evict).
@@ -641,6 +651,12 @@ const deleteViaTransition = async (
   name: string,
 ): Promise<SlashResult> => {
   const sessionId = ctx.currentSessionId();
+  // Wall-clock source: thread ctx.now through to transitionMemoryState
+  // so the two back-to-back evictions get monotonically increasing
+  // recorded_at values (deterministic test fixtures; production
+  // path is still Date.now-shaped). Without this, two transitions
+  // in the same ms tiebreak by rowid (M3) — deterministic but
+  // less semantically meaningful than `quarantined < evicted`.
   const transitionInput = {
     db: ctx.db,
     registry,
@@ -652,6 +668,7 @@ const deleteViaTransition = async (
     actor: 'user' as const,
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
+    now: ctx.now,
   };
 
   // 1) active → quarantined.
@@ -660,8 +677,16 @@ const deleteViaTransition = async (
     return mapTransitionFailure('/memory delete (active→quarantined)', r1);
   }
 
-  // 2) quarantined → evicted.
-  const r2 = await transitionMemoryState({ ...transitionInput, toState: 'evicted' });
+  // 2) quarantined → evicted. purge_at materializes the retention
+  // window: GC sweep (future slice) will move evicted→purged
+  // when recorded_at + retention <= now. Without this, the
+  // eviction lands with purge_at=NULL and `listEvictedDueForPurge`
+  // never sees it — tombstones would accumulate without bound.
+  const r2 = await transitionMemoryState({
+    ...transitionInput,
+    toState: 'evicted',
+    purgeAt: ctx.now() + MEMORY_TOMBSTONE_RETENTION_MS,
+  });
   if (r2.kind !== 'applied') {
     return mapTransitionFailure('/memory delete (quarantined→evicted)', r2);
   }
@@ -681,7 +706,7 @@ const deleteViaTransition = async (
 
 const mapTransitionFailure = (
   prefix: string,
-  result: { kind: string; reason?: string | null },
+  result: { kind: string; reason?: string | null; tombstonePath?: string },
 ): SlashResult => {
   if (result.kind === 'unknown') {
     return { kind: 'error', message: `${prefix}: memory not found` };
@@ -691,6 +716,19 @@ const mapTransitionFailure = (
   }
   if (result.kind === 'blocked_by_hook') {
     return { kind: 'error', message: `${prefix}: blocked by Eviction hook` };
+  }
+  if (result.kind === 'audit_drift') {
+    // The disk transition completed but the audit trail is
+    // missing. Surface both facts so the operator understands the
+    // file did move (and may be restorable from .tombstones/)
+    // even though the eviction trail is incomplete. Avoid the
+    // misleading "delete failed" copy that io_error would render.
+    const tombstoneHint =
+      result.tombstonePath !== undefined ? ` (body at ${result.tombstonePath})` : '';
+    return {
+      kind: 'error',
+      message: `${prefix}: audit drift — disk transition completed but eviction_events insert failed${tombstoneHint}: ${result.reason ?? 'unknown'}`,
+    };
   }
   if (result.kind === 'io_error') {
     return { kind: 'error', message: `${prefix}: ${result.reason ?? 'i/o error'}` };
@@ -725,21 +763,33 @@ const attribution = (ctx: SlashContext): { auditSessionId?: string } => {
 // would need a spec PR. Trade-off accepted in this slice.
 
 // Search every scope for the latest tombstone matching `name`.
-// Returns the first match in scope precedence order
-// (project_local → project_shared → user — same as the resolution
-// order in §2.4). Returns null when no tombstone exists in any
-// scope.
-const findTombstoneInAnyScope = (
-  registry: MemoryRegistry,
-  name: string,
-): { scope: MemoryScope; tombstone: TombstoneEntry } | null => {
+// Returns the result discriminated three ways: `found` when
+// exactly one scope holds a tombstone, `none` when no scope does,
+// and `ambiguous` when two or more scopes hold tombstones for the
+// same name — operator MUST specify `--scope` in that case. Earlier
+// shape silently picked the first scope in precedence order; for
+// an evicted name that exists in multiple scopes with distinct
+// content, that meant `/memory restore <name>` resurrected the
+// wrong scope's body without any operator notice.
+type FindTombstoneResult =
+  | { kind: 'found'; scope: MemoryScope; tombstone: TombstoneEntry }
+  | { kind: 'none' }
+  | { kind: 'ambiguous'; scopes: MemoryScope[] };
+
+const findTombstoneInAnyScope = (registry: MemoryRegistry, name: string): FindTombstoneResult => {
   const roots = registry.roots;
   const scopes: MemoryScope[] = ['project_local', 'project_shared', 'user'];
+  const hits: { scope: MemoryScope; tombstone: TombstoneEntry }[] = [];
   for (const scope of scopes) {
     const t = findLatestTombstone(roots, scope, name);
-    if (t !== null) return { scope, tombstone: t };
+    if (t !== null) hits.push({ scope, tombstone: t });
   }
-  return null;
+  if (hits.length === 0) return { kind: 'none' };
+  if (hits.length === 1) {
+    const only = hits[0] as { scope: MemoryScope; tombstone: TombstoneEntry };
+    return { kind: 'found', scope: only.scope, tombstone: only.tombstone };
+  }
+  return { kind: 'ambiguous', scopes: hits.map((h) => h.scope) };
 };
 
 const handleRestore = async (
@@ -759,10 +809,12 @@ const handleRestore = async (
   const name = args[0] as string;
   const scopeArg = args[1];
 
-  // Resolve target scope. If supplied, validate + restrict to it.
-  // Otherwise, search every scope and pick the first with a
-  // tombstone.
-  let target: { scope: MemoryScope; tombstone: TombstoneEntry } | null;
+  // Resolve target scope. With scope arg, lookup is pinned. Without
+  // a scope arg, walk every scope and require an unambiguous hit
+  // — two scopes with tombstones for the same name MUST be
+  // disambiguated by the operator (silently picking precedence
+  // order would restore the wrong body when scopes diverge).
+  let target: { scope: MemoryScope; tombstone: TombstoneEntry };
   if (scopeArg !== undefined) {
     if (!VALID_SINGLE_SCOPES.has(scopeArg)) {
       return {
@@ -775,17 +827,33 @@ const handleRestore = async (
       return { kind: 'error', message: `/memory restore: invalid scope '${scopeArg}'` };
     }
     const tomb = findLatestTombstone(registry.roots, scope, name);
-    target = tomb !== null ? { scope, tombstone: tomb } : null;
+    if (tomb === null) {
+      return {
+        kind: 'error',
+        message: `/memory restore: no tombstone found for '${name}' in scope ${scopeArg}`,
+      };
+    }
+    target = { scope, tombstone: tomb };
   } else {
-    target = findTombstoneInAnyScope(registry, name);
-  }
-
-  if (target === null) {
-    const scopeQual = scopeArg !== undefined ? ` in scope ${scopeArg}` : '';
-    return {
-      kind: 'error',
-      message: `/memory restore: no tombstone found for '${name}'${scopeQual}`,
-    };
+    const lookup = findTombstoneInAnyScope(registry, name);
+    if (lookup.kind === 'none') {
+      return {
+        kind: 'error',
+        message: `/memory restore: no tombstone found for '${name}'`,
+      };
+    }
+    if (lookup.kind === 'ambiguous') {
+      // Translate internal scope names back to operator vocabulary
+      // for the error message (project_local → local, etc.).
+      const opScopes = lookup.scopes
+        .map((s) => (s === 'user' ? 'user' : s === 'project_local' ? 'local' : 'shared'))
+        .join(', ');
+      return {
+        kind: 'error',
+        message: `/memory restore: '${name}' has tombstones in multiple scopes (${opScopes}); specify scope explicitly (e.g. /memory restore ${name} ${(lookup.scopes[0] as MemoryScope) === 'user' ? 'user' : (lookup.scopes[0] as MemoryScope) === 'project_local' ? 'local' : 'shared'})`,
+      };
+    }
+    target = { scope: lookup.scope, tombstone: lookup.tombstone };
   }
 
   // Build preview from the tombstone body. Reading the tombstone
@@ -835,6 +903,7 @@ const handleRestore = async (
     actor: 'user',
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
+    now: ctx.now,
   });
 
   if (result.kind !== 'applied') {

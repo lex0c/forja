@@ -44,11 +44,34 @@ beforeEach(() => {
 // ── isLegalTransition (pure validator) ─────────────────────────────
 
 describe('isLegalTransition: state machine', () => {
-  test('same-state pseudo-transition always allowed', () => {
+  test('same-state pseudo-transition requires motivo legal for some transition out of `from`', () => {
     // trigger_fired_no_action / blocked_by_* outcomes use
-    // from === to. Any motivo combination must pass.
-    for (const motivo of ['irrelevant', 'conflict', 'security'] as const) {
+    // from === to. Motivo MUST still be valid for some real
+    // transition out of `from`, otherwise a row records a
+    // semantically impossible (substrate, trigger) combo.
+    // Motivos that ARE valid out of 'active': shift, conflict,
+    // low_roi, security, user_purge.
+    for (const motivo of ['conflict', 'low_roi', 'security', 'user_purge', 'shift'] as const) {
       const r = isLegalTransition('active', 'active', motivo);
+      expect(r.ok).toBe(true);
+    }
+    // Motivos NOT valid out of 'active' get refused.
+    for (const motivo of ['irrelevant', 'expired', 'quota'] as const) {
+      const r = isLegalTransition('active', 'active', motivo);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toContain('same-state');
+        expect(r.reason).toContain('active');
+      }
+    }
+  });
+
+  test('same-state with "any"-motivo branch admits every motivo', () => {
+    // 'proposed' has 'active': 'any', so same-state 'proposed →
+    // proposed' should accept any motivo via the early-return
+    // path in the validator's same-state branch.
+    for (const motivo of ['irrelevant', 'quota', 'expired'] as const) {
+      const r = isLegalTransition('proposed', 'proposed', motivo);
       expect(r.ok).toBe(true);
     }
   });

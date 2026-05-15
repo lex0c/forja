@@ -147,15 +147,31 @@ export type LegalCheck = LegalCheckOk | LegalCheckFail;
 // depth — a caller that bypasses this helper still can't INSERT
 // an illegal row.
 //
-// Returns `{ ok: true }` for the same-state pseudo-transitions
-// used by `trigger_fired_no_action` / `blocked_by_*` outcomes.
-// Callers that record those should pass `from === to`.
+// Same-state pseudo-transitions (from === to) represent
+// `trigger_fired_no_action` / `blocked_by_*` outcomes — the
+// trigger fired with a real motivo but the state didn't move.
+// Motivo MUST still be valid for some real transition out of
+// `from`, otherwise forensic queries land semantic garbage
+// (e.g., a `from=active to=active motivo=expired` row implies
+// an expired-trigger that the active state machine doesn't
+// admit). Without this guard, callers could record motivo
+// /trigger combinations the substrate never actually supports.
 export const isLegalTransition = (
   from: EvictionState,
   to: EvictionState,
   motivo: EvictionMotivo,
 ): LegalCheck => {
-  if (from === to) return { ok: true };
+  if (from === to) {
+    const transitionsOut = LEGAL_TRANSITIONS[from];
+    for (const allowed of Object.values(transitionsOut)) {
+      if (allowed === 'any') return { ok: true };
+      if (allowed?.includes(motivo)) return { ok: true };
+    }
+    return {
+      ok: false,
+      reason: `illegal motivo '${motivo}' for same-state ${from} (no real transition out of ${from} admits this motivo)`,
+    };
+  }
   const allowed = LEGAL_TRANSITIONS[from][to];
   if (allowed === undefined) {
     return { ok: false, reason: `illegal transition: ${from} → ${to}` };
@@ -445,9 +461,16 @@ export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): Ev
 
 // Last eviction event for a (substrate, object_id) — answers "what
 // is the current state, and why did it land there?" without
-// scanning the full history. Ordering by recorded_at DESC, id DESC
-// gives a deterministic tiebreak when two events share the same
-// millisecond timestamp. Backed by idx_evict_obj.
+// scanning the full history. Ordering by recorded_at DESC, then
+// rowid DESC as a monotonic tiebreaker when two events share the
+// same millisecond timestamp. SQLite assigns rowid monotonically
+// per INSERT for rowid tables (this table uses TEXT PRIMARY KEY,
+// so it has the hidden rowid); since eviction_events is
+// append-only (no DELETEs from the repo surface; retention sweep
+// is a future slice), rowid reuse can't happen and the ordering
+// is deterministic. Earlier versions used `id DESC` (UUID v4)
+// which produced random tiebreaks and surfaced as test flakes.
+// Backed by idx_evict_obj.
 export const getLastEvictionForObject = (
   db: DB,
   substrate: EvictionSubstrate,
@@ -457,7 +480,7 @@ export const getLastEvictionForObject = (
     .query<EvictionEventRow, [EvictionSubstrate, string]>(
       `${SELECT_ALL}
         WHERE substrate = ? AND object_id = ?
-        ORDER BY recorded_at DESC, id DESC
+        ORDER BY recorded_at DESC, rowid DESC
         LIMIT 1`,
     )
     .get(substrate, objectId);
@@ -467,14 +490,14 @@ export const getLastEvictionForObject = (
 // All currently-evicted rows whose retention window hasn't yet
 // expired ("what could still be restored?"). Backed by
 // idx_evict_purge (partial index on purge_at IS NOT NULL).
-// Default ordering by recorded_at DESC, id DESC so UI surfaces
-// see most-recent first.
+// Default ordering by recorded_at DESC, rowid DESC (monotonic
+// tiebreaker — same rationale as getLastEvictionForObject).
 export const listEvictableInWindow = (db: DB, nowMs: number): EvictionEvent[] => {
   const rows = db
     .query<EvictionEventRow, [number]>(
       `${SELECT_ALL}
         WHERE to_state = 'evicted' AND purge_at IS NOT NULL AND purge_at > ?
-        ORDER BY recorded_at DESC, id DESC`,
+        ORDER BY recorded_at DESC, rowid DESC`,
     )
     .all(nowMs);
   return rows.map(fromRow);
@@ -482,13 +505,14 @@ export const listEvictableInWindow = (db: DB, nowMs: number): EvictionEvent[] =>
 
 // Rows whose retention window has expired — input to the GC sweep
 // that materializes the `evicted → purged` transition. Ordered
-// oldest-first so the sweep can batch a fixed prefix.
+// oldest-first so the sweep can batch a fixed prefix; rowid is
+// the monotonic tiebreaker when purge_at ties.
 export const listEvictedDueForPurge = (db: DB, nowMs: number): EvictionEvent[] => {
   const rows = db
     .query<EvictionEventRow, [number]>(
       `${SELECT_ALL}
         WHERE to_state = 'evicted' AND purge_at IS NOT NULL AND purge_at <= ?
-        ORDER BY purge_at ASC, id ASC`,
+        ORDER BY purge_at ASC, rowid ASC`,
     )
     .all(nowMs);
   return rows.map(fromRow);

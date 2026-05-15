@@ -21,7 +21,14 @@
 // (verify-before-act in 1.3.c2, /memory delete in 1.3.c3, restore
 // slash in 1.3.d) lands in subsequent slices.
 
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { DB } from '../storage/db.ts';
@@ -106,6 +113,21 @@ export type TransitionMemoryStateResult =
     }
   | { kind: 'illegal_transition'; fromState: MemoryState; toState: MemoryState; reason: string }
   | { kind: 'unknown' }
+  // The on-disk transition completed (file/index mutated) but the
+  // eviction_events INSERT failed afterward. Distinct from
+  // io_error so callers can render the right copy — the body has
+  // already moved, and surfacing "delete failed" would mislead.
+  // tombstonePath is set when the transition materialized one
+  // (active→evicted) so the caller can point at the partial
+  // state for manual reconciliation.
+  | {
+      kind: 'audit_drift';
+      fromState: MemoryState;
+      toState: MemoryState;
+      reason: string;
+      tombstonePath?: string;
+      tombstoneTs?: number;
+    }
   | { kind: 'io_error'; reason: string };
 
 // ─── helpers ─────────────────────────────────────────────────────────
@@ -116,8 +138,14 @@ const isEnoent = (err: unknown): boolean =>
   typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === 'ENOENT';
 
 // Atomic file write — mirror of lifecycle.ts/writer.ts shape.
+// crypto.randomUUID() for tmp suffix (uniform with
+// appendEvictionEvent + memory_events id generation; the older
+// process.pid + Math.random() shape collides if two processes
+// share pid % 2^16 and produce the same Math.random() slice,
+// which is theoretical but Math.random() seeded the same on
+// process clone is real on some platforms).
 const atomicWrite = (path: string, content: string): void => {
-  const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const tmp = `${path}.tmp-${crypto.randomUUID()}`;
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(tmp, content);
   renameSync(tmp, path);
@@ -193,16 +221,18 @@ interface ApplyResult {
 
 // Apply the file/index mutation for a (from, to) tuple. Throws on
 // I/O errors so transitionMemoryState's outer try/catch maps them
-// to `kind: 'io_error'`.
+// to `kind: 'io_error'`. `cachedTombstone` is the result of the
+// findLatestTombstone scan the caller already performed (in stage
+// 1) — passed through so we don't re-scan `.tombstones/` from the
+// purged/active branches.
 const applyTransition = (
   input: TransitionMemoryStateInput,
   current: MemoryFile,
   fromState: MemoryState,
   toState: MemoryState,
+  cachedTombstone: ReturnType<typeof findLatestTombstone>,
 ): ApplyResult => {
   const { roots, scope, name } = input;
-  // Common case: most transitions just update the frontmatter
-  // state field. Move/restore/purge paths override below.
   switch (toState) {
     case 'evicted': {
       // Write frontmatter with state=evicted (so the tombstone
@@ -217,10 +247,10 @@ const applyTransition = (
     }
     case 'purged': {
       if (fromState === 'evicted') {
-        // Body is in .tombstones/. Find + remove.
-        const tomb = findLatestTombstone(roots, scope, name);
-        if (tomb !== null) {
-          removeFromTombstones(roots, scope, name, tomb.ts);
+        // Body is in .tombstones/. Caller-cached tombstone is
+        // authoritative — same scan that derived fromState.
+        if (cachedTombstone !== null) {
+          removeFromTombstones(roots, scope, name, cachedTombstone.ts);
         }
         // Index already cleared on active→evicted. No-op here.
         return {};
@@ -239,34 +269,63 @@ const applyTransition = (
     case 'active': {
       if (fromState === 'evicted') {
         // Restore: copy tombstone content back to body path,
-        // drop the state field (or set state=active explicitly
-        // depending on the tombstone's frontmatter), remove
-        // tombstone, re-insert index entry.
-        const tomb = findLatestTombstone(roots, scope, name);
-        if (tomb === null) {
+        // remove tombstone, re-insert index entry.
+        //
+        // Idempotency on retry: if the scope-root body file
+        // ALREADY exists, a prior restore attempt landed the body
+        // but failed before tombstone removal / index upsert.
+        // Re-reading the tombstone now would overwrite operator
+        // edits made between the partial restore and this retry
+        // — instead, treat the existing body as authoritative,
+        // skip the body write, finalize the index entry, and
+        // clean up the stale tombstone. The transition still
+        // reaches the canonical end state (body at scope root,
+        // tombstone gone, index entry present, state=active).
+        if (cachedTombstone === null) {
           throw new Error(`no tombstone to restore for ${scope}/${name}`);
         }
-        const raw = readFileSync(tomb.path, 'utf-8');
-        const tombFile = parseMemoryFile(raw);
-        const newFm = { ...tombFile.frontmatter };
+        const bodyPath = memoryFilePath(roots, scope, name);
+        const bodyAlreadyExists = existsSync(bodyPath);
+        let restoredFile: MemoryFile;
+        if (bodyAlreadyExists) {
+          // Re-read scope-root body — operator edits since the
+          // partial restore are authoritative. Frontmatter `state`
+          // (which would be 'evicted' if untouched from the prior
+          // attempt) gets normalized below.
+          restoredFile = parseMemoryFile(readFileSync(bodyPath, 'utf-8'));
+        } else {
+          const raw = readFileSync(cachedTombstone.path, 'utf-8');
+          restoredFile = parseMemoryFile(raw);
+        }
+        // Strip `state` field on the restored frontmatter. Per
+        // the spec convention (absence === active), the canonical
+        // restored shape has no state field. Edge case: a
+        // future caller that bypasses transitionMemoryState
+        // could land a tombstone with non-'evicted' state in the
+        // frontmatter; we still normalize to "absent" here
+        // because the canonical restored shape is unambiguous.
+        // An operator who wants an explicit `state: active`
+        // marker can hand-edit after restore.
+        const newFm = { ...restoredFile.frontmatter };
         delete newFm.state;
-        const restored: MemoryFile = { frontmatter: newFm, body: tombFile.body };
-        atomicWrite(memoryFilePath(roots, scope, name), serializeMemoryFile(restored));
-        upsertEntry(roots, scope, restored);
-        removeFromTombstones(roots, scope, name, tomb.ts);
+        const finalFile: MemoryFile = { frontmatter: newFm, body: restoredFile.body };
+        atomicWrite(bodyPath, serializeMemoryFile(finalFile));
+        upsertEntry(roots, scope, finalFile);
+        removeFromTombstones(roots, scope, name, cachedTombstone.ts);
         return {};
       }
-      // From proposed or quarantined: update frontmatter,
-      // ensure index entry present (proposed wasn't indexed;
-      // quarantined was — upsert is idempotent).
-      writeFrontmatterState(roots, scope, name, current, 'active');
-      // Build a temp file shape without the `state` field for
-      // upsertEntry's index logic. The state field on the index
-      // entry doesn't change — upsert reads description/href/hook
-      // only.
+      // From proposed or quarantined: strip the state field on
+      // disk (canonical active shape has no state — absence
+      // equals active per MEMORY §3.1.1) and ensure index entry
+      // present (proposed wasn't indexed; quarantined was —
+      // upsert is idempotent). Symmetric with the evicted→active
+      // branch above; an explicit `state: active` left on the
+      // file after restore would be redundant noise.
       const fmActive = { ...current.frontmatter };
       delete fmActive.state;
-      upsertEntry(roots, scope, { frontmatter: fmActive, body: current.body });
+      const restoredQuar: MemoryFile = { frontmatter: fmActive, body: current.body };
+      atomicWrite(memoryFilePath(roots, scope, name), serializeMemoryFile(restoredQuar));
+      upsertEntry(roots, scope, restoredQuar);
       return {};
     }
     case 'quarantined': {
@@ -296,9 +355,6 @@ const applyTransition = (
       throw new Error(`proposed is admission-only; transition from ${fromState} not supported`);
     }
   }
-  // The switch is exhaustive over MemoryState; if a new state
-  // ever lands without adding a case, control would fall through
-  // and TS would warn at the function level (no return).
 };
 
 // Map (fromState, toState) → MemoryEventAction. Returns null for
@@ -507,7 +563,7 @@ export const transitionMemoryState = async (
   // is in an unknown state would be worse than no row).
   let applyResult: ApplyResult;
   try {
-    applyResult = applyTransition(input, currentFile, fromState, toState);
+    applyResult = applyTransition(input, currentFile, fromState, toState, tomb);
   } catch (err) {
     return {
       kind: 'io_error',
@@ -538,13 +594,20 @@ export const transitionMemoryState = async (
     });
     evictionEventId = ev.id;
   } catch (err) {
-    // The file/index already moved. eviction_events write failed
-    // — surface but acknowledge the on-disk transition completed.
-    // Treat as io_error so caller can audit the drift separately
-    // (eventual reconciliation slice will replay from disk shape).
+    // The file/index already moved. eviction_events INSERT failed
+    // afterwards — distinct surface from io_error so callers can
+    // render the right copy ("file moved, audit trail missing —
+    // manual reconciliation needed") instead of misleading the
+    // operator with "delete failed."
     return {
-      kind: 'io_error',
+      kind: 'audit_drift',
+      fromState,
+      toState,
       reason: `eviction_events write failed after file mutation: ${err instanceof Error ? err.message : String(err)}`,
+      ...(applyResult.tombstonePath !== undefined
+        ? { tombstonePath: applyResult.tombstonePath }
+        : {}),
+      ...(applyResult.tombstoneTs !== undefined ? { tombstoneTs: applyResult.tombstoneTs } : {}),
     };
   }
 

@@ -164,6 +164,23 @@ describe('moveToTombstone', () => {
     const roots = makeRoots();
     expect(() => moveToTombstone(roots, 'user', 'never-existed', { now: () => 100 })).toThrow();
   });
+
+  test('collision: same-ts eviction bumps ts +1 to avoid overwrite', () => {
+    const roots = makeRoots();
+    // First eviction lands at ts=100.
+    seedMemory(roots.user, 'mem', 'first');
+    const r1 = moveToTombstone(roots, 'user', 'mem', { now: () => 100 });
+    expect(r1.ts).toBe(100);
+
+    // Second eviction at the SAME ms — the collision check must
+    // bump ts so the older tombstone survives.
+    seedMemory(roots.user, 'mem', 'second');
+    const r2 = moveToTombstone(roots, 'user', 'mem', { now: () => 100 });
+    expect(r2.ts).toBe(101);
+    expect(existsSync(r1.tombstonePath)).toBe(true);
+    expect(existsSync(r2.tombstonePath)).toBe(true);
+    expect(r1.tombstonePath).not.toBe(r2.tombstonePath);
+  });
 });
 
 // ── findLatestTombstone ────────────────────────────────────────────

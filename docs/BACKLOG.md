@@ -2,6 +2,79 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(memory) — post-1.3 review batch: retention, atomicity, audit drift, ambiguity
+
+**Done.** Addresses every finding from the post-1.3 multi-agent review across the five Phase 1.3 commits. Twelve corrections in one slice because they're tightly coupled (state-machine validator change cascades into same-state semantics; routing-flag cleanup reshapes the slash callers; retention enforcement requires both `purgeAt` propagation and the `now()` threading). Splitting would create churn without smaller blast radius.
+
+### Critical fixes
+
+- **C1 — purge_at is now set on operator deletes (30d retention).** `deleteViaTransition` computes `purgeAt = ctx.now() + 30 * 24h` and threads it to the `quarantined → evicted` transition. Without this, every evicted row landed with `purge_at=NULL` and `listEvictedDueForPurge` filtered them out — the future GC sweep would have seen nothing and tombstones would accumulate without bound past spec EVICTION §7.1's 30-day window. Constant `MEMORY_TOMBSTONE_RETENTION_MS` lives in the slash module; future per-substrate / per-scope retention can override.
+
+- **C2 — cross-scope tombstone restore now refuses on ambiguity.** `findTombstoneInAnyScope` returns a discriminated `found | none | ambiguous` result; `/memory restore <name>` (without `--scope`) errors when two scopes hold tombstones for the same name, naming the scopes and the disambiguation syntax. Earlier shape silently picked precedence order — restoring `local/X` when the operator may have meant `shared/X` would have overwritten the wrong scope's body without any visible audit attribution.
+
+- **C3 — restore is idempotent against partial-failure retry.** The `evicted → active` branch now checks `existsSync(scopeRootBody)` BEFORE reading the tombstone. If the body already exists (prior restore landed step 1 but crashed before tombstone removal), the operator-edited body is treated as authoritative — tombstone content is NOT overwritten on retry. The frontmatter `state` field is still stripped on finalize so the canonical "no state field" shape lands. Eliminates the "second restore silently overwrites operator edits" data-loss surface.
+
+### High-severity fixes
+
+- **H1 — restore strips `state` field consistently across both source branches.** `quarantined → active` previously called `writeFrontmatterState(target='active')` which wrote an explicit `state: active` to the file (the `else` branch of writeFrontmatterState fires when source had any explicit state). Now both restore paths (`evicted → active` and `quarantined → active`) strip the field on finalize, matching the spec convention "absence === active" symmetrically.
+
+- **H2 — same-state pseudo-transitions validate motivo.** `isLegalTransition(from, from, motivo)` previously returned `ok` for any motivo. Now it requires the motivo to be admitted by at least one real transition out of `from`. Forensic queries can no longer record `from=active to=active motivo=expired` (no transition out of active admits `expired`), which would have implied a substrate trigger that doesn't exist. Defense-in-depth at validator level; the DB CHECK still gates the column enum.
+
+- **H3 — audit_drift discriminant on TransitionMemoryStateResult.** The `eviction_events` INSERT failing AFTER `applyTransition` succeeded now returns `kind: 'audit_drift'` with the `tombstonePath` reference, NOT `kind: 'io_error'`. The slash's `mapTransitionFailure` renders a distinct copy ("disk transition completed but eviction_events insert failed (body at …)"), so an operator no longer sees "delete failed" when the file actually moved. Reconciliation slice (declared follow-up) will replay these drifted rows from disk shape.
+
+- **H4 — `confirmAndDelete` routing flag is explicit.** The earlier shape used `currentState: MemoryState` as a routing flag, passing fake values (`'invalidated'` for malformed/missing entries) purely to force the legacy branch. New shape: `route: 'state-machine' | 'legacy'`. The two malformed/missing call sites now pass `'legacy'` explicitly; the happy path computes the route from `peek.file.frontmatter.state ?? 'active'`. A future refactor reading the field will no longer mis-branch on the fake state.
+
+- **H5 — `ctx.now()` threads through to transitionMemoryState.** Both `deleteViaTransition` (2 calls) and `handleRestore` now pass `now: ctx.now` to `transitionMemoryState`. The `multiple tombstones same name` test was using `setTimeout(5)` as a workaround for `Date.now()` ms granularity; now uses a `nowCounter` and is fully deterministic. Production paths still receive `Date.now`-shaped values from the REPL's default ctx.
+
+- **H6 — new test coverage.** Seven new tests covering the surfaces that previously had none:
+  - `cross-scope tombstones with same name refuse without --scope` (C2 happy + sad path)
+  - `idempotent restore: body already at scope root preserves operator edits` (C3)
+  - `purge_at is set on the evicted eviction_events row (30d window)` (C1)
+  - `listEvictableInWindow surfaces the freshly-evicted row` (C1 GC observability)
+  - `blocked_by_hook on evicted → active: tombstone stays put, refused audit` (restore-path hook block)
+  - `quarantined → active: strips state field, keeps index entry, emits restored audit` (H1 + the missing restore-from-quarantine path)
+  - `moveToTombstone: collision: same-ts eviction bumps ts +1 to avoid overwrite` (M2)
+  - Same-state motivo validation tests in `eviction-events.test.ts` (H2)
+
+### Medium-severity fixes
+
+- **M1 — `findLatestTombstone` cached at the entry of `transitionMemoryState`.** The earlier shape called it twice (once in stage 1 to detect `fromState='evicted'`, again in stage 4 for the restore/purge file mutation). `applyTransition` now takes the result as a `cachedTombstone` parameter — single readdir per transition. Race window between the two calls (concurrent eviction in `.tombstones/`) closed.
+
+- **M2 — `moveToTombstone` bumps `ts +1` on collision.** Two evictions in the same millisecond previously collided on `<name>.<unix_ms>.md` and POSIX `renameSync` silently overwrote the older tombstone. New shape: `while (existsSync(dest)) ts += 1`. Bounded loop — terminates in 0–2 iterations under realistic load.
+
+- **M3 — `rowid` is the monotonic tiebreaker on `getLastEvictionForObject` and `listEvictableInWindow` / `listEvictedDueForPurge`.** Earlier queries used `ORDER BY recorded_at DESC, id DESC` where `id` is a random UUID v4 — same-ms rows returned in non-deterministic order. SQLite's hidden `rowid` is monotonic on INSERT for this rowid table (TEXT PRIMARY KEY, append-only, no DELETEs); ordering by it gives deterministic insertion order tiebreaks without a migration. Documented in the query comments.
+
+- **M4 — `atomicWrite` uses `crypto.randomUUID()` for tmp suffix.** Uniform with `appendEvictionEvent` + `memory_events.id` generation. The earlier `process.pid + Math.random()` shape was theoretical (pid wrap + Math.random seed collision on fork) but unnecessary divergence.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/eviction-events.ts` | H2 — `isLegalTransition` same-state branch validates motivo against admitted set of transitions out of `from`. M3 — query tiebreaker switched to `rowid`. |
+| `src/memory/tombstones.ts` | M2 — `moveToTombstone` collision-check loop. |
+| `src/memory/transitions.ts` | C3 — restore idempotency via `existsSync(bodyPath)` check. H1 — `quarantined → active` strips state field. H3 — `audit_drift` result kind. M1 — `cachedTombstone` threaded through `applyTransition`. M4 — `crypto.randomUUID()` in atomicWrite. |
+| `src/cli/slash/commands/memory.ts` | C1 — `purgeAt` 30d window in `deleteViaTransition`. C2 — `findTombstoneInAnyScope` returns discriminated `found \| none \| ambiguous`; restore refuses on ambiguity. H4 — `confirmAndDelete` takes `route: 'state-machine' \| 'legacy'`. H5 — `ctx.now` threaded to `transitionMemoryState`. H3 — `mapTransitionFailure` renders audit_drift. Unused `MemoryState` import dropped. |
+| `tests/storage/eviction-events.test.ts` | H2 — same-state motivo validation tests (admitted + refused + 'any'-motivo). |
+| `tests/memory/tombstones.test.ts` | M2 — collision-check test. |
+| `tests/memory/transitions.test.ts` | New: blocked_by_hook on restore path; quarantined → active strips state field. |
+| `tests/cli/slash/memory.test.ts` | New: cross-scope ambiguity refuse; idempotent restore preserves operator edits; purgeAt 30d window; listEvictableInWindow surfaces row. Updated: `multiple tombstones same name` no longer uses `setTimeout`. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7519 pass / 10 skip / 0 fail (+7 from the slice's new tests; prior was 7512)
+- `bun test tests/memory/transitions.test.ts` 13 pass (+2 new)
+- `bun test tests/cli/slash/memory.test.ts` 71 pass (+5 new)
+- `bun test tests/memory/tombstones.test.ts` 31 pass (+1 new)
+- `bun test tests/storage/eviction-events.test.ts` 44 pass (+1 new)
+
+### Follow-ups declared (not addressed here)
+
+- **Atomicity beyond restore idempotency.** The `active → evicted` direction still has partial-failure surfaces (frontmatter written + rename succeeded + index removal failed). Full reconciliation needs a journal/transaction log slice — out of scope here. Restore-side idempotency (C3) covers the operator-visible recovery path; the evicted-side surfaces produce orphaned state that needs the journal to recover.
+- **Spec MEMORY §6.5.5 vs EVICTION §4.1.** Still declared: spec PR to align "restore goes to `active`" with the state machine.
+- **Spec EVICTION §4.1 — admit `motivo='user_purge'` on `active → evicted`.** Would drop the 2-step intermediate that `/memory delete` runs through. Audit consumers filtering by `motivo='low_roi'` would stop catching operator-initiated deletes.
+
 ## [2026-05-15] feat(cli/memory) — /memory restore slash + re-admission (Phase 1.3.d)
 
 **Done.** Operator-facing inverse of `/memory delete`. `/memory restore <name> [scope]` looks up the latest tombstone for `name`, shows a modal preview with the captured body, and on confirmation transitions the memory from `evicted → active` — body copies back to the scope root, frontmatter strips `state: 'evicted'`, tombstone is consumed, and the paired audit (`eviction_events` `evicted→active` + `memory_events action='restored'`) lands.

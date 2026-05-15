@@ -507,6 +507,140 @@ describe('transitionMemoryState: Eviction hook blocks', () => {
   });
 });
 
+// ── hook blocks the restore path (evicted → active) ─────────────────
+
+describe('transitionMemoryState: Eviction hook blocks restore', () => {
+  test('blocked_by_hook on evicted → active: tombstone stays put, refused audit', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'x');
+    const registry = baseRegistry();
+
+    // Step 1: evict it through the 2-step canonical path so the
+    // tombstone exists.
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'x',
+      toState: 'quarantined',
+      motivo: 'conflict',
+      trigger: 'verify_failed',
+      actor: 'loop_cold',
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000,
+    });
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'x',
+      toState: 'evicted',
+      motivo: 'low_roi',
+      trigger: 'user_purge',
+      actor: 'user',
+      sessionId,
+      cwd: workdir,
+      now: () => 2_000,
+    });
+    const tomb = findLatestTombstone(roots, 'user', 'x');
+    expect(tomb).not.toBeNull();
+
+    // Step 2: try to restore with a hook that blocks the transition.
+    const fireHook = async (payload: HookEventPayload): Promise<HookChainResult | null> => {
+      expect(payload.event).toBe('Eviction');
+      const data = payload.data as { fromState?: string; toState?: string };
+      expect(data.fromState).toBe('evicted');
+      expect(data.toState).toBe('active');
+      return {
+        blockedBy: {
+          spec: {
+            layer: 'enterprise',
+            sourcePath: '/etc/agent/hooks.toml',
+            event: 'Eviction',
+            matcher: {},
+            entryIndex: 0,
+            command: 'audit.sh',
+            timeoutMs: 5000,
+            failClosed: false,
+            locked: false,
+          },
+          reason: 'message',
+          message: 'restore disallowed',
+        },
+        runs: [],
+        additionalContext: '',
+      };
+    };
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'x',
+      toState: 'active',
+      motivo: 'irrelevant',
+      trigger: 'manual',
+      actor: 'user',
+      sessionId,
+      cwd: workdir,
+      fireHook,
+      now: () => 3_000,
+    });
+    expect(r.kind).toBe('blocked_by_hook');
+
+    // Tombstone still present; no scope-root body materialized.
+    expect(findLatestTombstone(roots, 'user', 'x')).not.toBeNull();
+    expect(existsSync(memoryFilePath(roots, 'user', 'x'))).toBe(false);
+
+    // memory_events refused row landed.
+    const refused = listMemoryEventsByName(db, 'x').find((e) => e.action === 'refused');
+    expect(refused).toBeDefined();
+    expect((refused as MemoryEvent | undefined)?.details?.stage).toBe('eviction_hook');
+  });
+});
+
+// ── quarantined → active is a restore-without-tombstone path ────────
+
+describe('transitionMemoryState: quarantined → active', () => {
+  test('strips state field, keeps index entry, emits restored audit', async () => {
+    const roots = makeRoots();
+    // Seed the memory already in 'quarantined' state.
+    seedActiveMemory(roots.user, 'x', 'body', 'quarantined');
+    const registry = baseRegistry();
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'x',
+      toState: 'active',
+      // `quarantined → active` admits any motivo per EVICTION §4.1.
+      motivo: 'irrelevant',
+      trigger: 'manual',
+      actor: 'user',
+      sessionId,
+      cwd: workdir,
+    });
+    expect(r.kind).toBe('applied');
+    if (r.kind !== 'applied') return;
+    expect(r.fromState).toBe('quarantined');
+    expect(r.toState).toBe('active');
+
+    // Frontmatter `state` stripped (absence === active).
+    const file = parseMemoryFile(readFileSync(memoryFilePath(roots, 'user', 'x'), 'utf-8'));
+    expect(file.frontmatter.state).toBeUndefined();
+
+    // memory_events 'restored' action landed.
+    const restored = listMemoryEventsByName(db, 'x').find((e) => e.action === 'restored');
+    expect(restored).toBeDefined();
+  });
+});
+
 // ── evidence_json redaction round-trips (delegated to repo) ─────────
 
 describe('transitionMemoryState: evidence_json is scrubbed by repo', () => {

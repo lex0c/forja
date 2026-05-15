@@ -61,6 +61,16 @@ export interface MoveToTombstoneResult {
 //     function throws ENOENT through if it doesn't, surfacing
 //     the bug rather than silently no-op'ing)
 //
+// Filename collision handling: tombstones are
+// `<name>.<unix_ms>.md`. Two evictions of the same name within
+// the same ms (rare, but possible after a fast restore-then-
+// evict cycle) would collide on the destination filename, and
+// POSIX renameSync silently overwrites the destination — the
+// older tombstone would be lost. To prevent silent overwrite,
+// we bump `ts` by 1ms until we find a free filename. Bounded
+// because the loop walks integer ms forward — in practice it
+// terminates in 0-2 iterations.
+//
 // `now()` is injectable for deterministic test fixtures.
 export const moveToTombstone = (
   roots: ScopeRoots,
@@ -69,9 +79,13 @@ export const moveToTombstone = (
   options: MoveToTombstoneOptions = {},
 ): MoveToTombstoneResult => {
   const now = options.now ?? Date.now;
-  const ts = now();
+  let ts = now();
   const source = memoryFilePath(roots, scope, name);
-  const dest = tombstonePath(roots, scope, name, ts);
+  let dest = tombstonePath(roots, scope, name, ts);
+  while (existsSync(dest)) {
+    ts += 1;
+    dest = tombstonePath(roots, scope, name, ts);
+  }
   mkdirSync(dirname(dest), { recursive: true });
   renameSync(source, dest);
   return { tombstonePath: dest, ts };
