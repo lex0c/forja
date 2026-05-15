@@ -2682,6 +2682,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             durationMs: inv.durationMs,
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
+            // Pass tool input so the emitter can derive L1 alias
+            // signatures from bash commands (3.5a). Other tools
+            // ignore the input; only `bash` carries a `command`
+            // field the parser inspects.
+            toolInput: tu.input,
           });
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state

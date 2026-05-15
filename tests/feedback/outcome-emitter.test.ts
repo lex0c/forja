@@ -108,6 +108,81 @@ describe('emitToolCallOutcome', () => {
     expect(rows[0]?.actionSignature).toBe('flag:read_file:default:default');
   });
 
+  test('bash with known L1 alias binary emits BOTH flag + alias signatures', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 42,
+      toolInput: { command: 'grep -r foo src/' },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(2);
+    const sigs = rows.map((r) => r.actionSignature).sort();
+    expect(sigs).toEqual(['alias:grep:ripgrep', 'flag:bash:default:default']);
+  });
+
+  test('bash with unknown binary emits only the generic flag signature', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'ls -la' },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.actionSignature).toBe('flag:bash:default:default');
+  });
+
+  test('bash with cd prefix still detects the L1 alias', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'cd /tmp && grep foo' },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows.map((r) => r.actionSignature).sort()).toContain('alias:grep:ripgrep');
+  });
+
+  test('non-bash tool with toolInput does not emit L1 alias', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'read_file',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'grep -r foo' }, // even with bash-shaped input, the tool isn't bash
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.actionSignature).toBe('flag:read_file:default:default');
+  });
+
+  test('bash with failure surfaces failure on both flag + alias rows', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: true,
+      durationMs: 5,
+      errorMessage: 'exit 2',
+      toolInput: { command: 'grep -X foo' },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(2);
+    for (const r of rows) {
+      expect(r.result).toBe('failure');
+      const evidence = JSON.parse(r.evidenceJson ?? '{}') as Record<string, unknown>;
+      expect(evidence.error_message).toBe('exit 2');
+    }
+  });
+
   test('best-effort: failure to emit logs to stderr without throwing', () => {
     // Pass a bogus tool_call_id — FK constraint refuses, emitter
     // logs to stderr and returns false. Capture stderr to assert

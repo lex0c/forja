@@ -45,6 +45,8 @@
 
 import type { DB } from '../storage/db.ts';
 import { createOutcome } from '../storage/repos/outcomes.ts';
+import { lookupBashAlias } from './bash-aliases.ts';
+import { extractLeadingBinary } from './bash-parser.ts';
 
 export interface EmitOutcomeInput {
   // The session that initiated the tool call.
@@ -66,12 +68,44 @@ export interface EmitOutcomeInput {
   // Human-readable error message when failed === true and !denied.
   // Surfaced in evidence_json for forensic queries.
   errorMessage?: string;
+  // Raw tool input — used by L1 alias detection for bash tool
+  // calls. When `toolName === 'bash'` and the input carries a
+  // `command` string whose leading binary matches a known alias
+  // (bash-aliases.ts), the emitter writes an ADDITIONAL outcome
+  // row with signature `alias:<from>:<to>` so the loop frio can
+  // accumulate tier-1 evidence for the adaptation. Optional —
+  // callers that don't carry the input fall back to the generic
+  // `flag:bash:default:default` outcome only.
+  toolInput?: unknown;
 }
 
-// Best-effort emit. Returns true when a row was written, false when
-// the call was skipped (denied path; permission outcomes are in
-// outcome_signals). Errors during INSERT surface on stderr and
-// return false — the caller continues unaffected.
+// Extract a known L1 alias signature from a bash tool input when
+// applicable. Returns null when the tool isn't bash, the input
+// shape doesn't carry a string `command`, or the leading binary
+// isn't in the known-aliases table.
+const deriveL1AliasSignature = (toolName: string, toolInput: unknown): string | null => {
+  if (toolName !== 'bash') return null;
+  if (toolInput === null || typeof toolInput !== 'object') return null;
+  const cmd = (toolInput as Record<string, unknown>).command;
+  if (typeof cmd !== 'string' || cmd.length === 0) return null;
+  const binary = extractLeadingBinary(cmd);
+  if (binary === null) return null;
+  const alias = lookupBashAlias(binary);
+  if (alias === null) return null;
+  return `alias:${alias.from}:${alias.to}`;
+};
+
+// Best-effort emit. Returns true when at least one row was written,
+// false when the call was skipped (denied path; permission outcomes
+// are in outcome_signals). Errors during INSERT surface on stderr
+// and don't crash — the caller continues unaffected.
+//
+// Multi-row emit: for bash invocations of known L1-alias binaries
+// (grep, find, awk, sed, etc.), the emitter writes an additional
+// outcome row with signature `alias:<from>:<to>` so the loop frio
+// can accumulate L1 evidence. The generic `flag:bash:default:default`
+// row still lands too — coexistence is intentional, the two
+// signatures track different adaptation surfaces.
 export const emitToolCallOutcome = (db: DB, input: EmitOutcomeInput): boolean => {
   // Skip denied paths — they belong in outcome_signals per the
   // coexistence contract (AUDIT.md §1.1.1). The decision IS the
@@ -79,36 +113,46 @@ export const emitToolCallOutcome = (db: DB, input: EmitOutcomeInput): boolean =>
   // the body never ran.
   if (input.denied === true) return false;
 
-  const actionSignature = `flag:${input.toolName}:default:default`;
   const result = input.failed ? 'failure' : 'success';
-  const evidence: Record<string, unknown> = {
+  const baseEvidence: Record<string, unknown> = {
     tool_name: input.toolName,
     duration_ms: input.durationMs,
   };
   if (input.failed) {
-    evidence.failed = true;
+    baseEvidence.failed = true;
     if (input.errorMessage !== undefined) {
-      evidence.error_message = input.errorMessage;
+      baseEvidence.error_message = input.errorMessage;
     }
   }
 
-  try {
-    createOutcome(db, {
-      sessionId: input.sessionId,
-      toolCallId: input.toolCallId,
-      actionSignature,
-      tier: 1,
-      result,
-      evidenceJson: JSON.stringify(evidence),
-      scopeKind: 'session',
-      scopeId: input.sessionId,
-    });
-    return true;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(
-      `forja outcomes: emit failed for tool_call=${input.toolCallId} (${msg})\n`,
-    );
-    return false;
+  // Signatures to emit. Generic flag signature always; L1 alias
+  // signature when the bash command matches the table. Two rows
+  // share the same evidence shape — they're indexed by different
+  // action_signatures for adaptation tracking purposes.
+  const signatures: string[] = [`flag:${input.toolName}:default:default`];
+  const l1 = deriveL1AliasSignature(input.toolName, input.toolInput);
+  if (l1 !== null) signatures.push(l1);
+
+  let wroteAny = false;
+  for (const actionSignature of signatures) {
+    try {
+      createOutcome(db, {
+        sessionId: input.sessionId,
+        toolCallId: input.toolCallId,
+        actionSignature,
+        tier: 1,
+        result,
+        evidenceJson: JSON.stringify(baseEvidence),
+        scopeKind: 'session',
+        scopeId: input.sessionId,
+      });
+      wroteAny = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `forja outcomes: emit failed for tool_call=${input.toolCallId} signature=${actionSignature} (${msg})\n`,
+      );
+    }
   }
+  return wroteAny;
 };

@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(feedback) — bash parser emits L1 alias outcomes (Phase 3.5a)
+
+**Done.** The producer side of L1 alias adaptation. Without it, the loop frio's L1 proposer has nothing to aggregate — the existing outcome emitter writes only `flag:<tool_name>:default:default` for every dispatch. This slice adds a minimum-viable bash command parser + a curated known-aliases table, so when the model invokes `bash {command: "grep foo"}` the emitter ALSO writes an `alias:grep:ripgrep` outcome alongside the generic `flag:bash:default:default` row.
+
+The loop frio (3.4) can now propose L1 policies once enough alias outcomes accumulate per (scope, signature). 3.5b will wire dispatch consultation so promoted policies actually rewrite tool calls.
+
+### Design decisions
+
+- **Curated known-aliases table, not learned.** The adaptation direction (`grep → ripgrep`, `find → fd`) is Forja-opinionated. Inferring "which alternative to propose" from outcome data alone needs an alias-discovery subsystem that's out of scope here. Today's table covers grep/find/cat/awk/sed; the first two have real alternatives (rg, fd), the last three are self-aliases (no broadly-recommended swap, but we still capture per-binary tally for future telemetry). Future slice loads from TOML for operator-curated additions.
+
+- **Minimum-viable parser, conservative on shell magic.** Handles plain commands, env prefixes (`FOO=1 grep`), `cd && command` walks, parens-wrapped subshells, leading whitespace, and absolute / relative path binaries (`/usr/bin/grep`, `./grep`). Bails on quotes, pipes/redirections that appear BEFORE the binary, backticks, function calls, control structures. Conservative rationale: false positives pollute the loop frio's outcome stream and produce wrong adaptation proposals; false negatives just leave a stat unrecorded.
+
+- **L1 outcome emitted ALONGSIDE the generic flag outcome.** Two rows per bash dispatch when the leading binary matches the table. Same evidence shape, same success/failure derivation, different action_signatures. The flag signature continues to feed per-tool reliability tracking; the alias signature feeds adaptation. Coexistence is intentional — they index different surfaces.
+
+- **Self-aliases (sed → sed, awk → awk) included.** Captures per-binary tally without proposing change. Loop frio's L1 proposer WOULD construct `actionJson = {target: 'sed'}` for these — operator sees a "promote alias:sed:sed → use sed" no-op proposal, which they wouldn't promote. Future slice can filter self-aliases out of the proposer surface; today the duplicate-guard + operator review covers it.
+
+- **Conservative on the binary alphabet for path-stripping.** `/usr/bin/grep` → `grep`. But the post-strip name can't START with `.` (rules out `.config` as a "binary" if a degenerate path made it through). Empty / `.` / `./` / `/` tokens return null.
+
+### Files added/modified
+
+| File | Purpose |
+|---|---|
+| `src/feedback/bash-aliases.ts` (new) | Curated `KNOWN_BASH_ALIASES` table + `lookupBashAlias` O(1) helper. |
+| `src/feedback/bash-parser.ts` (new) | `extractLeadingBinary(command)` — handles env prefixes, cd walks, parens, path stripping. |
+| `src/feedback/outcome-emitter.ts` | New optional `toolInput` field. Multi-row emit: generic `flag:bash:default:default` PLUS `alias:<from>:<to>` when applicable. Best-effort per-row (one failure doesn't block the other). |
+| `src/harness/loop.ts` | Pass `toolInput: tu.input` to the emitter at the bash dispatch site. |
+| `tests/feedback/bash-parser.test.ts` (new) | 24 tests covering plain commands, env prefixes, cd walks, paths, real-world shapes (git/npm/bun/find), and null bail cases. |
+| `tests/feedback/outcome-emitter.test.ts` | 5 new tests: bash + known alias → 2 rows; bash + unknown → 1 row; cd-prefixed alias detection; non-bash + bash-shaped input → no L1; failure surfaces on both rows. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7708 pass / 10 skip / 0 fail (+29 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.5b — L1 alias dispatch** (next + final slice for L1 closure): tool-dispatch consults `resolveActivePolicy`; if an active L1 alias policy matches, rewrite the tool call before invocation.
+- **TOML-loaded aliases**: operator-curated table; spec §5.2 example uses YAML for priors, same shape for aliases. Future slice.
+- **Self-alias filter on proposer**: skip `from === to` signatures so operators don't see no-op proposals.
+- **Cross-tool comparison signals**: when both `grep` and `rg` have outcomes in the same scope, compute a "ripgrep would have been faster N% of the time" signal that informs the loop frio's adoption decision beyond pure grep success rate.
+- **Per-command-flag detection** (L2): bash commands with specific flag combinations (`grep -E` vs `grep -P`) might prefer different alternatives. Out of scope here.
+
 ## [2026-05-15] feat(feedback,cli) — loop frio L1 pipeline + /agent policy slash (Phase 3.4)
 
 **Done.** Complete L1 adaptation pipeline for FEEDBACK_ADAPTATION: priors → Bayesian aggregator → accumulation trigger → L1 alias proposer → orchestrator → operator slash. The loop closes for `alias:<from>:<to>` action_signatures. Outcomes from 3.2 feed the aggregator; proposed policies populate the table from 3.3; operators inspect via `/agent policy list` and promote via `/agent policy promote`. NO behavior change yet — dispatch-time rewriting is 3.5.
