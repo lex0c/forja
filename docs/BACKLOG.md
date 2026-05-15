@@ -2,6 +2,59 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(storage,feedback) — policies table + scope resolver (Phase 3.3)
+
+**Done.** Schema + state machine + scope-aware lookup for adaptation policies. The loop frio (3.4) writes proposed/active rows; the tool dispatcher (3.5) reads via the resolver at decision time. No callers wire either yet — pure infrastructure.
+
+Policies are the COMMIT-LIKE artifact of the adaptation pipeline. Each row says: "for action_signature X in scope Y, do Z instead of the default". The loop frio aggregates outcomes, fits a Beta posterior, and emits proposals (`state='proposed'`). Operators promote via `/agent policy promote` (`state='active'`). Distribution shift detector (§7.3, future) moves active rows to `shadow` or `quarantined`.
+
+### Design decisions
+
+- **5-state machine**: `proposed | active | shadow | quarantined | invalidated`. Per AGENTIC_CLI §11 + FEEDBACK_ADAPTATION §7.1. `invalidated` is terminal — re-promotion starts fresh per spec §4.2 "begins from `proposed` novo, com nova evidence". Bypasses the same-state pseudo-transition pattern that eviction_events uses; policy state changes are commit-like, not probe events.
+
+- **`isLegalPolicyTransition` + `IllegalPolicyTransitionError`** mirror the eviction state machine shape — `transitionPolicy(db, id, toState)` validates via the helper and throws on refusal. Same defense-in-depth pattern.
+
+- **`transitionPolicy` UPDATES rather than INSERTs.** Trade-off vs eviction_events (which append-only INSERTs per transition): policies are commit-like artifacts; the chain of WHO promoted/invalidated them lives in `audit_timeline` (future), not in repeated policy rows. `parent_id` captures DERIVATION (e.g., a repo policy promoted from a session policy), not state transitions.
+
+- **`action_json` is opaque TEXT at the repo layer.** Per-level shapes (L1 `{target}`, L2 `{flag, value}`, L3 `{recipe_id}`, L4 `{strategy_id}`) are emitter contracts; the repo just stores. Future slice can add per-level validation analogous to eviction evidence schemas if needed.
+
+- **`ci_low` + `ci_high` + `n` for Bayesian state.** Populated by the loop frio aggregator (3.4) — 95% credibility interval bounds from the Beta posterior + sample size. NULL for cold-start defaults + manually-curated policies. Promotion gate (§5.3) reads these.
+
+- **Scope resolver walks 5 levels in order**: `session → repo → user → language → global`. Each level queries independently; cross-level JOIN is forbidden per §6.1 ("Policy é declarada em um único escopo. Não há 'policy global com override per-repo'"). Most-recent-wins within a level (operator-edited policies override loop-frio-proposed ones at the same scope).
+
+- **`ScopeChain` shape carries 4 values + implicit global.** Caller (harness) computes `session` (current session id), `repo` (hash of repo root), `user` (stable user id), `language` (primary language id from workspace detector). Global is literal `'global'` per spec §6 — shipped defaults. The 4-value chain avoids threading 5 args through every consumer.
+
+- **`desiredStates` defaults to `['active']`.** Callers wanting shadow-mode policies (logged-but-not-applied per §7.3 distribution shift) pass `['active', 'shadow']`. The future distribution shift detector emits this expanded read when scope is unstable.
+
+- **Indices per spec read paths**: `(action_signature, scope_kind, scope_id, state)` for resolver hot path; `(state, recorded_at)` for `/agent policy list --pending` style queries; `(parent_id)` for history walks.
+
+- **Coexistence with `policy_archive`** (PERMISSION_ENGINE §6.2) declared in code. The two tables share the noun "policy" but record different audit dimensions: `policy_archive` is permission-policy YAML snapshots; `policies` is adaptation policies (action_signature → action). No dual-write.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/050-policies.ts` | Migration: `policies` table + 3 indices. |
+| `src/storage/migrations/index.ts` | Register migration 050. |
+| `src/storage/repos/policies.ts` | State machine helper + `createPolicy` + `transitionPolicy` + read queries (`getPolicy`, `listPoliciesByActionSignature`, `listPoliciesByState`, `listPolicyHistory`, `countPolicies`). |
+| `src/feedback/scope-resolver.ts` | `resolveActivePolicy(db, actionSignature, chain, desiredStates?)` walks the scope chain returning the first match. |
+| `tests/storage/policies.test.ts` | 17 tests: state machine (legal/illegal transitions, terminal invalidated, same-state refused); create + CHECK violations; transitionPolicy success/failure paths; list helpers; parent-chain history. |
+| `tests/feedback/scope-resolver.test.ts` | 8 tests: none on empty; most-specific wins; fall-through session→repo→user→language→global; ignores non-active states; desiredStates override (shadow); most-recent-wins within a level; signature mismatch returns none. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings (after biome auto-fix on the new SQL row-shape cast)
+- `bun test` 7633 pass / 10 skip / 0 fail (+27 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.4 — Loop frio MVP** (next slice): accumulation trigger + Bayesian aggregator + L1 alias proposer + promotion gate + `/agent policy list` + `/agent policy promote` slash.
+- **3.5 — L1 alias dispatch**: first manifestação — tool dispatch consults resolver.
+- **`audit_timeline`** for policy_changed events: deferred until the audit timeline subsystem lands. For now, `policies.motivo` + `recorded_at` are the forensic record.
+- **Distribution shift detector** (§7.3): triggers `active → shadow` transitions. Out of scope until fingerprint computation ships.
+- **Per-level `action_json` validation**: analogous to EVICTION §6.1 evidence gates. Future slice.
+
 ## [2026-05-15] feat(harness,feedback) — loop quente outcome emitter (Phase 3.2)
 
 **Done.** Wires the FEEDBACK_ADAPTATION loop quente (§3.1) into the harness tool-dispatch path. Every finished tool call now produces an `outcomes` row capturing `(action_signature, tier, result)` keyed to the operator's session. No behavior change yet — pure data capture. The loop frio aggregator (3.4) will read these rows.
