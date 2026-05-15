@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] chore(tools/pin-context) — omit from BUILTIN_TOOLS while modal wiring is pending (post-review A)
+
+**Done.** Code-review finding High #1: the `pin_context` tool was registered in `BUILTIN_TOOLS` despite `confirmPinContext` not being wired through the REPL — every model invocation would return `pin.headless_mode`, wasting a turn on a proposal that always errors. Filter the tool out of the default registry until the modal-manager wiring lands (deferred UI slice noted in 1.1.b/c).
+
+The export stays so the tool's own test suite (`tests/tools/pin-context.test.ts`) still exercises the contract end-to-end and the harness can re-add to `BUILTIN_TOOLS` in a one-line patch when `ModalManager.askPinContext` + bus event + renderer arrive. Comment in `src/tools/builtin/index.ts` documents the omission rationale and the un-omit recipe.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/index.ts` | Drop the value-import of `pinContextTool` (re-export stays). Remove from `BUILTIN_TOOLS` array. Add comment block explaining the omission and the re-add recipe. |
+| `tests/cli/bootstrap.test.ts` | Drop `'pin_context'` from the alphabetical builtin-tool list assertion. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7370 pass / 10 skip / 0 fail (unchanged — `pin-context.test.ts` exercises the export directly so the suite is untouched)
+
 ## [2026-05-14] feat(recap/pinned-context) — populate from context_pins on resume (Phase 1.1.d)
 
 **Done.** Final slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Closes the loop end-to-end: pins persisted in 1.1.a, surfaced by 1.1.b (model tool) and 1.1.c (operator slash), now show up in `[resume_context]` on `/resume` per §12.4.3.

@@ -89,7 +89,6 @@ describe('bootstrap', () => {
         'memory_search',
         'memory_write',
         'monitor',
-        'pin_context',
         'read_file',
         'task',
         'task_async',
