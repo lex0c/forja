@@ -2,6 +2,67 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] feat(storage/eviction-events) — schema + state machine + transition API (Phase 1.2.a)
+
+**Done.** First slice of the eviction skeleton (`EVICTION.md`). Lands the canonical `eviction_events` table (announced in Phase 0 AUDIT §1 as audit row 24), the typed state machine for the four substrates (memory / policy / candidate / slot_item) with 7 states and 8 motivos, the transition API (`appendEvictionEvent` validates before INSERT), and the three canonical queries from EVICTION §10.2 (`getLastEvictionForObject`, `listEvictableInWindow`, `detectTriggerThrashing`).
+
+This slice ships the **contract**, not the consumers. Memory entries, policies, retrieval candidates, and slot items will adopt it incrementally — 1.3 wires memory, future slices wire the rest.
+
+### Schema decisions (deviations from spec §10.1)
+
+The spec uses INTEGER PRIMARY KEY; this migration uses TEXT (UUID v4) to match the Forja convention (`memory_events`, `failure_events`, `outcome_signals`). `parent_id` follows suit. `session_id` is nullable with `FK ON DELETE SET NULL` (memory_events pattern) so a session purge preserves forensics — eviction events can fire outside any session (startup probe, GC, hook-driven security purge), and a session purge MUST NOT cascade-delete its audit history.
+
+CHECK constraints close five enums (`substrate`, `from_state`/`to_state`, `motivo`, `outcome`, `actor`); `trigger` stays free TEXT because the 12-element vocabulary will grow as substrates ship (compaction adds `token_pressure`/`turn_threshold` per §9.3; future detectors add more). Writer-layer const set keeps the value space tight without an ALTER per addition.
+
+`blocked_by_hook` is the 1.2.b wiring outcome — added to the CHECK list up front so the hook landing doesn't need a follow-up ALTER.
+
+### State machine
+
+`LEGAL_TRANSITIONS` is a `Record<from, Record<to, motivo[] | 'any'>>` map encoding EVICTION §4.1's table verbatim. Same-state transitions (from === to) are always allowed at the type level — they encode `trigger_fired_no_action` / `blocked_by_*` outcomes where the trigger fired but state didn't change. The validator handles that branch before consulting the table.
+
+`'any'` motivo marks unrestricted pairs (admission gate `proposed → active`, restore `evicted → active`, etc.). The `* → purged` row from §4.1 is encoded explicitly per from-state instead of a wildcard so a future state addition has to be considered (no silent inheritance into purged).
+
+`purged` is terminal: no outgoing transitions. Forensic data (eviction_events metadata) is what survives.
+
+### Transition API
+
+`appendEvictionEvent(db, input)` runs `isLegalTransition` first (throws `IllegalTransitionError` with structured fields), then INSERTs. Defense-in-depth: a future caller bypassing the helper still can't INSERT a typo state thanks to the CHECK constraints. Same TS + DB layering 1.1.a's `context_pins` uses.
+
+`purgeAt` is silently coerced to `null` when `toState !== 'evicted'` (caller-bug guard documented in the comment: callers may forward state from a prior row that had it set).
+
+### Three canonical queries
+
+- `getLastEvictionForObject(substrate, objectId)` — current state + why it landed there, backed by `idx_evict_obj`.
+- `listEvictableInWindow(nowMs)` — restorable evicted rows (purge_at > now), backed by partial index `idx_evict_purge`.
+- `listEvictedDueForPurge(nowMs)` — GC sweep input (purge_at <= now), same index. Pair with the previous: a row sits in one or the other based on `now`.
+- `detectTriggerThrashing(sinceMs, minCount)` — diagnostic surface for misconfigured thresholds / flapping signals (GROUP BY substrate/object_id/trigger HAVING count >= minCount).
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/046-eviction-events.ts` | Table + CHECK on the 5 closed enums + 3 indices (object, state, partial purge) |
+| `src/storage/repos/eviction-events.ts` | Public surface: 5 enum constants, `LEGAL_TRANSITIONS` map, `isLegalTransition` pure validator, `IllegalTransitionError` class, `appendEvictionEvent`, 5 canonical queries |
+| `tests/storage/eviction-events.test.ts` | 36 tests across 7 describe blocks: isLegalTransition (10), appendEvictionEvent insert + defaults (8), DB-level CHECK defense-in-depth (5), FK semantics (2), getLastEvictionForObject (3), listEvictableInWindow + listEvictedDueForPurge (3), detectTriggerThrashing (4) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/index.ts` | Import + register `migration046EvictionEvents` |
+
+### Deferred (1.2.b + later slices)
+
+- **1.2.b** — `Eviction` hook event integration. EVICTION §10.3 specifies a blocking hook chain with matchers on `substrate`/`motivo`/`from_state`/`to_state`/`actor`. Lands separately so the table + state machine can be reviewed without the hook plumbing in the same diff.
+- **Owner integration** — memory entries don't yet emit eviction events (1.3 wires the lifecycle); policies / retrieval / context-tuning compaction wire when their subsystems land. The contract is callable today; nothing is calling it.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/storage/eviction-events.test.ts` 36 pass / 0 fail
+- `bun test` 7418 pass / 10 skip / 0 fail (+36 from post-review C baseline 7382)
+
 ## [2026-05-14] chore(pin) — medium/low cleanup pack (post-review C)
 
 **Done.** Bundles the four medium/low code-review findings into one commit so the working tree closes the post-review cycle cleanly. None of these are correctness fixes; they're contract-tightening + test-gap closures that make future reviewers (and the BACKLOG audit trail) faster.

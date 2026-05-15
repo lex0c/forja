@@ -1,0 +1,445 @@
+// eviction_events repo — typed lifecycle transitions per
+// EVICTION.md §3-§5, §10.1. Schema in migration 046-eviction-
+// events.ts.
+//
+// Public surface:
+//
+//   isLegalTransition(from, to, motivo) → { ok } | { ok: false, reason }
+//   appendEvictionEvent(db, input)        → EvictionEvent
+//   getLastEvictionForObject(db, ...)     → EvictionEvent | null
+//   listEvictableInWindow(db, nowMs)      → EvictionEvent[]
+//   detectTriggerThrashing(db, sinceMs)   → ThrashingRow[]
+//
+// Plus constants for the closed enums (SUBSTRATES / STATES /
+// MOTIVOS / OUTCOMES / ACTORS) and a structured
+// IllegalTransitionError class.
+//
+// Distinct from other audit repos in this tree:
+//
+//   - failure_events (041) chains rows per-session via SHA-256 of
+//     the prior `this_chain_hash`. Eviction events do NOT chain.
+//     EVICTION.md does not call for tamper-evidence; each
+//     substrate owner is the trust anchor (memory owns its
+//     frontmatter / file presence; policy owns its row). Adding
+//     a chain later is an ALTER, not a redesign.
+//
+//   - outcome_signals (042) is derived-audit: every row's
+//     correctness derives from a referenced approvals_log/failure_
+//     events row. Eviction is primary-audit: rows record the
+//     transition itself, not a derivation of one. Same shape
+//     pattern (PERSISTED_COLUMNS / valuesForInsert / SELECT_ALL)
+//     but no derived-audit caveats.
+
+import type { SQLQueryBindings } from 'bun:sqlite';
+import type { DB } from '../db.ts';
+
+// ─── enums + types ───────────────────────────────────────────────────
+
+export const SUBSTRATES = ['memory', 'policy', 'candidate', 'slot_item'] as const;
+export type EvictionSubstrate = (typeof SUBSTRATES)[number];
+
+export const STATES = [
+  'proposed',
+  'active',
+  'shadow',
+  'quarantined',
+  'invalidated',
+  'evicted',
+  'purged',
+] as const;
+export type EvictionState = (typeof STATES)[number];
+
+export const MOTIVOS = [
+  'irrelevant',
+  'conflict',
+  'shift',
+  'low_roi',
+  'quota',
+  'expired',
+  'user_purge',
+  'security',
+] as const;
+export type EvictionMotivo = (typeof MOTIVOS)[number];
+
+export const OUTCOMES = [
+  'applied',
+  'blocked_by_protection',
+  'blocked_by_hook',
+  'trigger_fired_no_action',
+] as const;
+export type EvictionOutcome = (typeof OUTCOMES)[number];
+
+export const ACTORS = ['loop_cold', 'compaction', 'user', 'hook', 'startup_probe'] as const;
+export type EvictionActor = (typeof ACTORS)[number];
+
+// ─── state machine ───────────────────────────────────────────────────
+
+// Transitions table per EVICTION §4.1. Map: from-state → to-state →
+// allowed motivos. `'any'` means the from→to pair has no motivo
+// restriction (admission gate, restore from evicted, etc.). An
+// absent key means the transition is illegal.
+//
+// Same-state transitions (from === to) are ALWAYS allowed at the
+// type level — they represent `trigger_fired_no_action` /
+// `blocked_by_*` outcomes where the trigger fired but the state
+// didn't actually change. The validator handles that branch
+// before consulting this table.
+//
+// `* → purged` from §4.1 last row applies to {active, shadow,
+// quarantined, invalidated, evicted} all gated on `user_purge` or
+// `security`. Encoded explicitly per from-state instead of a
+// wildcard so a future state addition has to be considered
+// (no silent inheritance into purged).
+const LEGAL_TRANSITIONS: Record<
+  EvictionState,
+  Partial<Record<EvictionState, EvictionMotivo[] | 'any'>>
+> = {
+  proposed: {
+    active: 'any',
+    evicted: ['irrelevant', 'low_roi'],
+    purged: ['user_purge', 'security'],
+  },
+  active: {
+    shadow: ['shift'],
+    quarantined: ['conflict', 'low_roi'],
+    invalidated: ['shift', 'security'],
+    purged: ['user_purge', 'security'],
+  },
+  shadow: {
+    active: 'any',
+    quarantined: ['conflict'],
+    purged: ['user_purge', 'security'],
+  },
+  quarantined: {
+    active: 'any',
+    evicted: ['low_roi', 'conflict'],
+    invalidated: ['shift'],
+    purged: ['user_purge', 'security'],
+  },
+  invalidated: {
+    evicted: ['shift'],
+    purged: ['user_purge', 'security'],
+  },
+  evicted: {
+    active: 'any',
+    purged: ['expired', 'user_purge', 'security'],
+  },
+  // `purged` is terminal. No outgoing transitions; forensic data
+  // (eviction_events metadata) is what survives.
+  purged: {},
+};
+
+export interface LegalCheckOk {
+  ok: true;
+}
+export interface LegalCheckFail {
+  ok: false;
+  reason: string;
+}
+export type LegalCheck = LegalCheckOk | LegalCheckFail;
+
+// Validate a (from, to, motivo) tuple against the state machine.
+// Pure: no DB access, no side effects. Callers use it before
+// appendEvictionEvent to surface structured errors; the
+// repo-side append will re-run the same check as defense-in-
+// depth — a caller that bypasses this helper still can't INSERT
+// an illegal row.
+//
+// Returns `{ ok: true }` for the same-state pseudo-transitions
+// used by `trigger_fired_no_action` / `blocked_by_*` outcomes.
+// Callers that record those should pass `from === to`.
+export const isLegalTransition = (
+  from: EvictionState,
+  to: EvictionState,
+  motivo: EvictionMotivo,
+): LegalCheck => {
+  if (from === to) return { ok: true };
+  const allowed = LEGAL_TRANSITIONS[from][to];
+  if (allowed === undefined) {
+    return { ok: false, reason: `illegal transition: ${from} → ${to}` };
+  }
+  if (allowed === 'any') return { ok: true };
+  if (!allowed.includes(motivo)) {
+    return {
+      ok: false,
+      reason: `illegal motivo '${motivo}' for ${from} → ${to} (expected one of: ${allowed.join(', ')})`,
+    };
+  }
+  return { ok: true };
+};
+
+// Thrown by appendEvictionEvent when isLegalTransition rejected.
+// Callers that want to surface "state machine refused" distinctly
+// from "DB CHECK violated" pattern-match on this class.
+export class IllegalTransitionError extends Error {
+  readonly from: EvictionState;
+  readonly to: EvictionState;
+  readonly motivo: EvictionMotivo;
+  constructor(from: EvictionState, to: EvictionState, motivo: EvictionMotivo, reason: string) {
+    super(`eviction_events: ${reason}`);
+    this.name = 'IllegalTransitionError';
+    this.from = from;
+    this.to = to;
+    this.motivo = motivo;
+  }
+}
+
+// ─── row + input shapes ──────────────────────────────────────────────
+
+export interface EvictionEvent {
+  id: string;
+  parentId: string | null;
+  substrate: EvictionSubstrate;
+  objectId: string;
+  objectScope: string;
+  fromState: EvictionState;
+  toState: EvictionState;
+  trigger: string;
+  motivo: EvictionMotivo;
+  evidenceJson: string;
+  outcome: EvictionOutcome;
+  blockedBy: string | null;
+  actor: EvictionActor;
+  sessionId: string | null;
+  dependentsJson: string | null;
+  recordedAt: number;
+  purgeAt: number | null;
+}
+
+interface EvictionEventRow {
+  id: string;
+  parent_id: string | null;
+  substrate: EvictionSubstrate;
+  object_id: string;
+  object_scope: string;
+  from_state: EvictionState;
+  to_state: EvictionState;
+  trigger: string;
+  motivo: EvictionMotivo;
+  evidence_json: string;
+  outcome: EvictionOutcome;
+  blocked_by: string | null;
+  actor: EvictionActor;
+  session_id: string | null;
+  dependents_json: string | null;
+  recorded_at: number;
+  purge_at: number | null;
+}
+
+const PERSISTED_COLUMNS = [
+  'id',
+  'parent_id',
+  'substrate',
+  'object_id',
+  'object_scope',
+  'from_state',
+  'to_state',
+  'trigger',
+  'motivo',
+  'evidence_json',
+  'outcome',
+  'blocked_by',
+  'actor',
+  'session_id',
+  'dependents_json',
+  'recorded_at',
+  'purge_at',
+] as const;
+
+const PLACEHOLDERS = PERSISTED_COLUMNS.map(() => '?').join(', ');
+const COLUMN_LIST = PERSISTED_COLUMNS.join(', ');
+const INSERT_SQL = `INSERT INTO eviction_events (${COLUMN_LIST}) VALUES (${PLACEHOLDERS})`;
+
+const SELECT_ALL = `SELECT id, parent_id, substrate, object_id, object_scope,
+       from_state, to_state, trigger, motivo, evidence_json,
+       outcome, blocked_by, actor, session_id, dependents_json,
+       recorded_at, purge_at
+  FROM eviction_events`;
+
+const fromRow = (row: EvictionEventRow): EvictionEvent => ({
+  id: row.id,
+  parentId: row.parent_id,
+  substrate: row.substrate,
+  objectId: row.object_id,
+  objectScope: row.object_scope,
+  fromState: row.from_state,
+  toState: row.to_state,
+  trigger: row.trigger,
+  motivo: row.motivo,
+  evidenceJson: row.evidence_json,
+  outcome: row.outcome,
+  blockedBy: row.blocked_by,
+  actor: row.actor,
+  sessionId: row.session_id,
+  dependentsJson: row.dependents_json,
+  recordedAt: row.recorded_at,
+  purgeAt: row.purge_at,
+});
+
+const valuesForInsert = (row: EvictionEventRow): SQLQueryBindings[] =>
+  PERSISTED_COLUMNS.map((col) => {
+    const v = (row as unknown as Record<string, unknown>)[col];
+    return (v ?? null) as SQLQueryBindings;
+  });
+
+export interface AppendEvictionEventInput {
+  substrate: EvictionSubstrate;
+  objectId: string;
+  objectScope: string;
+  fromState: EvictionState;
+  toState: EvictionState;
+  trigger: string;
+  motivo: EvictionMotivo;
+  // Already-serialized JSON payload tailored to the motivo per
+  // §6.1. Repo doesn't parse — it just persists.
+  evidenceJson: string;
+  outcome: EvictionOutcome;
+  actor: EvictionActor;
+  // Optional: deterministic id (replay/import). Defaults to UUID.
+  id?: string;
+  parentId?: string | null;
+  blockedBy?: string | null;
+  sessionId?: string | null;
+  dependentsJson?: string | null;
+  recordedAt?: number;
+  // When `toState === 'evicted'`, the timestamp the retention
+  // window ends and the row should transition to `purged`.
+  // Callers compute per-substrate retention defaults (memory
+  // 30d / 7d invalidated, policy 14d) per EVICTION §7.1.
+  purgeAt?: number | null;
+}
+
+// Validate the (from, to, motivo) tuple and INSERT. Throws
+// IllegalTransitionError if the state machine refuses; otherwise
+// returns the persisted row.
+//
+// purge_at sanity (defense-in-depth): when `toState !== 'evicted'`
+// any non-null `purgeAt` is treated as a caller bug — the column
+// only carries meaning for the eviction-retention case. We
+// silently coerce to null rather than throw (callers may forward
+// state from a prior row that had purge_at set), but the comment
+// is the policy: don't rely on the coercion as a feature.
+export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): EvictionEvent => {
+  const check = isLegalTransition(input.fromState, input.toState, input.motivo);
+  if (!check.ok) {
+    throw new IllegalTransitionError(input.fromState, input.toState, input.motivo, check.reason);
+  }
+  const id = input.id ?? crypto.randomUUID();
+  const recordedAt = input.recordedAt ?? Date.now();
+  const purgeAt = input.toState === 'evicted' ? (input.purgeAt ?? null) : null;
+  const row: EvictionEventRow = {
+    id,
+    parent_id: input.parentId ?? null,
+    substrate: input.substrate,
+    object_id: input.objectId,
+    object_scope: input.objectScope,
+    from_state: input.fromState,
+    to_state: input.toState,
+    trigger: input.trigger,
+    motivo: input.motivo,
+    evidence_json: input.evidenceJson,
+    outcome: input.outcome,
+    blocked_by: input.blockedBy ?? null,
+    actor: input.actor,
+    session_id: input.sessionId ?? null,
+    dependents_json: input.dependentsJson ?? null,
+    recorded_at: recordedAt,
+    purge_at: purgeAt,
+  };
+  db.query(INSERT_SQL).run(...valuesForInsert(row));
+  return fromRow(row);
+};
+
+// ─── queries (per §10.2) ─────────────────────────────────────────────
+
+// Last eviction event for a (substrate, object_id) — answers "what
+// is the current state, and why did it land there?" without
+// scanning the full history. Ordering by recorded_at DESC, id DESC
+// gives a deterministic tiebreak when two events share the same
+// millisecond timestamp. Backed by idx_evict_obj.
+export const getLastEvictionForObject = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objectId: string,
+): EvictionEvent | null => {
+  const row = db
+    .query<EvictionEventRow, [EvictionSubstrate, string]>(
+      `${SELECT_ALL}
+        WHERE substrate = ? AND object_id = ?
+        ORDER BY recorded_at DESC, id DESC
+        LIMIT 1`,
+    )
+    .get(substrate, objectId);
+  return row !== null ? fromRow(row) : null;
+};
+
+// All currently-evicted rows whose retention window hasn't yet
+// expired ("what could still be restored?"). Backed by
+// idx_evict_purge (partial index on purge_at IS NOT NULL).
+// Default ordering by recorded_at DESC, id DESC so UI surfaces
+// see most-recent first.
+export const listEvictableInWindow = (db: DB, nowMs: number): EvictionEvent[] => {
+  const rows = db
+    .query<EvictionEventRow, [number]>(
+      `${SELECT_ALL}
+        WHERE to_state = 'evicted' AND purge_at IS NOT NULL AND purge_at > ?
+        ORDER BY recorded_at DESC, id DESC`,
+    )
+    .all(nowMs);
+  return rows.map(fromRow);
+};
+
+// Rows whose retention window has expired — input to the GC sweep
+// that materializes the `evicted → purged` transition. Ordered
+// oldest-first so the sweep can batch a fixed prefix.
+export const listEvictedDueForPurge = (db: DB, nowMs: number): EvictionEvent[] => {
+  const rows = db
+    .query<EvictionEventRow, [number]>(
+      `${SELECT_ALL}
+        WHERE to_state = 'evicted' AND purge_at IS NOT NULL AND purge_at <= ?
+        ORDER BY purge_at ASC, id ASC`,
+    )
+    .all(nowMs);
+  return rows.map(fromRow);
+};
+
+export interface TriggerThrashingRow {
+  substrate: EvictionSubstrate;
+  objectId: string;
+  trigger: string;
+  count: number;
+}
+
+// "Trigger fired N times without action" — diagnostic surface for
+// EVICTION §10.2. A trigger that keeps firing but never advances
+// past the evidence gate is usually a sign of a misconfigured
+// threshold or a flapping signal. `minCount` defaults to 5
+// (spec query example).
+export const detectTriggerThrashing = (
+  db: DB,
+  sinceMs: number,
+  minCount = 5,
+): TriggerThrashingRow[] => {
+  return db
+    .query<TriggerThrashingRow, [number, number]>(
+      `SELECT substrate, object_id AS objectId, trigger, COUNT(*) AS count
+         FROM eviction_events
+        WHERE outcome = 'trigger_fired_no_action' AND recorded_at > ?
+        GROUP BY substrate, object_id, trigger
+        HAVING count >= ?
+        ORDER BY count DESC, substrate ASC, object_id ASC`,
+    )
+    .all(sinceMs, minCount);
+};
+
+// Count of eviction events. Cheap O(1) when used for tests /
+// health checks; not indexed but the table size is bounded by
+// retention (365d in AUDIT.md §1.2).
+export const countEvictionEvents = (db: DB): number => {
+  const row = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM eviction_events').get() as {
+    n: number;
+  };
+  return row.n;
+};
+
+export { LEGAL_TRANSITIONS, PERSISTED_COLUMNS };
