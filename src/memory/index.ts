@@ -34,14 +34,30 @@ export {
   ScopeError,
   indexFilePath,
   memoryFilePath,
+  parseTombstoneFilename,
   projectScopeRoots,
   resolveRepoRoot,
   resolveScopeRoots,
   rootForScope,
   scopeOfPath,
+  tombstonePath,
+  tombstonesDir,
   userScopeRoot,
 } from './paths.ts';
 export type { ScopeRoots } from './paths.ts';
+
+export {
+  findLatestTombstone,
+  listExpiredTombstones,
+  listTombstones,
+  moveToTombstone,
+  removeFromTombstones,
+} from './tombstones.ts';
+export type {
+  MoveToTombstoneOptions,
+  MoveToTombstoneResult,
+  TombstoneEntry,
+} from './tombstones.ts';
 
 export { DEFAULT_AGENT_GITIGNORE, ensureAgentGitignore } from './gitignore.ts';
 export type { EnsureAgentGitignoreResult } from './gitignore.ts';

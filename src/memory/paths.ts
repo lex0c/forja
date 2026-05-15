@@ -184,6 +184,81 @@ export const memoryFilePath = (roots: ScopeRoots, scope: MemoryScope, name: stri
 export const indexFilePath = (roots: ScopeRoots, scope: MemoryScope): string =>
   join(rootForScope(roots, scope), 'MEMORY.md');
 
+// `.tombstones/` directory inside a scope. Per MEMORY.md §6.5.3,
+// every eviction moves the body file here (preserving the
+// original frontmatter with `state: evicted`) so restore is a
+// cheap rename and the retention window has a single GC root.
+//
+// User scope: `~/.config/agent/memory/.tombstones/` — fully out
+// of any tree the operator might commit.
+// Project shared: `./.agent/memory/shared/.tombstones/` —
+// versioned in git (per §6.5.4) so eviction history is
+// observable cross-team; restore-via-git works past the
+// retention window.
+// Project local: `./.agent/memory/local/.tombstones/` —
+// gitignored by inheritance from the project default
+// `.gitignore` entry `memory/local/` (a prefix match catches
+// `memory/local/.tombstones/`). See MEMORY.md §2.5 for the
+// default gitignore layout.
+export const tombstonesDir = (roots: ScopeRoots, scope: MemoryScope): string =>
+  join(rootForScope(roots, scope), '.tombstones');
+
+// Tombstone file path for a (name, timestamp) pair. The filename
+// shape is `<name>.<unix_ms>.md` — repeats of the same name in a
+// single session (rare, but possible after a restore-then-evict
+// cycle) get distinct files because `Date.now()` advances. Even
+// when two evictions land in the same millisecond (test fixtures
+// with `now` injection), the operator can disambiguate via
+// `eviction_events.recorded_at` because each tombstone carries
+// the timestamp in its filename.
+//
+// The name is re-validated as a frontmatter `name` to keep this
+// path on the same sandbox surface as the main body file. ts is
+// not validated beyond the type system — a caller that passes
+// non-finite or negative timestamps gets a path with the
+// stringified bad value (and parseTombstoneFilename rejects on
+// the way back). We don't preempt that here because the only
+// production caller computes ts from Date.now()/options.
+export const tombstonePath = (
+  roots: ScopeRoots,
+  scope: MemoryScope,
+  name: string,
+  ts: number,
+): string => {
+  validateName(name);
+  const resolvedRoot = resolve(tombstonesDir(roots, scope));
+  const candidate = resolve(join(resolvedRoot, `${name}.${ts}.md`));
+  if (!isUnderRoot(candidate, resolvedRoot)) {
+    throw new ScopeError(
+      `tombstone path escapes scope root: name=${JSON.stringify(name)} scope=${scope} ts=${ts}`,
+    );
+  }
+  return candidate;
+};
+
+// Parse a tombstone filename back into (name, ts). Returns null
+// for anything that doesn't match the canonical shape — that
+// includes plain memory files (no embedded ts), index files
+// (`MEMORY.md`), and operator-dropped junk. Listing code uses
+// the null return as a filter on `readdir` output.
+//
+// Regex shape: `^<name>.<digits>.md$` with the standard
+// validateName character class. ts is unsigned integer (no sign,
+// no decimal, no exponent) — Date.now() values are positive
+// integers up to ~year 287,000 in ms, so the 1..n digit window
+// covers any realistic timestamp without overflow risk.
+const TOMBSTONE_RE = /^([a-z0-9][a-z0-9_-]*)\.(\d+)\.md$/;
+export const parseTombstoneFilename = (filename: string): { name: string; ts: number } | null => {
+  const m = TOMBSTONE_RE.exec(filename);
+  if (m === null) return null;
+  const name = m[1];
+  const tsStr = m[2];
+  if (name === undefined || tsStr === undefined) return null;
+  const ts = Number.parseInt(tsStr, 10);
+  if (!Number.isFinite(ts) || ts < 0) return null;
+  return { name, ts };
+};
+
 // Inverse mapping: given an absolute path, identify which scope
 // (if any) owns it. Used by the audit + UI layers to render a
 // memory's scope without re-deriving from name. Returns null

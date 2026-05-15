@@ -2,6 +2,55 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(memory) — .tombstones/ paths + lifecycle helpers (Phase 1.3.b)
+
+**Done.** Second slice of memory lifecycle. Adds the `.tombstones/` storage layer per `MEMORY.md` §6.5: a per-scope sub-directory under the scope root that holds evicted body files renamed `<name>.<unix_ms>.md`. Path helpers in `paths.ts`; I/O helpers (move, list, find latest, list expired, remove) in a new `tombstones.ts`. No consumer yet — eviction transition that calls `moveToTombstone` is 1.3.c.
+
+### Design decisions
+
+- **Filename `<name>.<unix_ms>.md`** preserves the ability to evict the same name multiple times across a session (after a restore-then-evict cycle). `Date.now()` typically advances per call; the tombstone path embeds the timestamp so two evictions in the same ms generate distinct paths only if the caller injects different `now()` values (tests do; production calls Date.now once per eviction so the boundary is moot). Each tombstone carries its ts in the filename so an operator/audit query can disambiguate without consulting `eviction_events`.
+
+- **`parseTombstoneFilename` is the inverse — strict regex.** Returns `null` for anything that doesn't match `^[a-z0-9][a-z0-9_-]*\.\d+\.md$`. Listing code uses the null return as a filter so operator-dropped junk (READMEs, plain `.md` files, `.txt`) in `.tombstones/` doesn't trip queries.
+
+- **`tombstonePath` re-validates the name** through the same `validateName` the main `memoryFilePath` uses. Defense-in-depth: a future regression in the name validator (or a caller bypassing the repo via cast) still can't escape the sandbox root. The `ScopeError` thrown matches the main memory path's contract — callers handling sandbox errors don't need a new branch.
+
+- **Per-scope isolation** (validated by test): tombstones in `user` don't appear under `project_shared` listings. Each scope's `.tombstones/` is independent — eviction never crosses scope boundaries.
+
+- **Sync I/O** matches the rest of `src/memory/` (writer, lifecycle). Tombstone churn is low (one rename per eviction, one readdir per restore/GC) so async would add complexity without payoff.
+
+- **`listExpiredTombstones` boundary is strict (`>`).** Age `===` retention does NOT trip the expiry filter — the operator can still restore exactly at the limit. Mirrors the strict-comparison gate the future GC sweep will apply.
+
+- **`removeFromTombstones` is idempotent** (returns `false` for missing files). The GC sweep may re-run after partial failures; making it idempotent keeps the contract simple.
+
+- **`moveToTombstone` propagates ENOENT** when the source body file doesn't exist. This surfaces caller bugs (trying to evict a memory that was already evicted) instead of silently no-op'ing.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/memory/tombstones.ts` | I/O helpers: `moveToTombstone`, `listTombstones`, `findLatestTombstone`, `listExpiredTombstones`, `removeFromTombstones` + `TombstoneEntry`, `MoveToTombstoneOptions`, `MoveToTombstoneResult` types |
+| `tests/memory/tombstones.test.ts` | 32 tests across 7 describe blocks: tombstonesDir (3), tombstonePath (3), parseTombstoneFilename (7), moveToTombstone (4), findLatestTombstone (4), listTombstones (4), listExpiredTombstones (3), removeFromTombstones (3), sandbox edge (1) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/paths.ts` | Add `tombstonesDir`, `tombstonePath` (sandbox-validated), `parseTombstoneFilename` |
+| `src/memory/index.ts` | Re-export the new path helpers + the tombstones barrel |
+
+### Deferred to subsequent slices
+
+- **1.3.c** — `transitionMemoryState` that calls `moveToTombstone` as part of `active → evicted` flow, plus `eviction_events` + `memory_events` emission and `Eviction` hook firing.
+- **1.3.d** — `/memory restore <name>` that reads `findLatestTombstone` and copies the body back into the scope root as `proposed`.
+- **GC sweep** — `agent gc` would call `listExpiredTombstones` per scope and `removeFromTombstones` for each expired entry. Lives outside the memory subsystem (cross-cutting concern); the helpers are ready when the sweep lands.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/tombstones.test.ts` 32 pass / 0 fail
+- `bun test` 7492 pass / 10 skip / 0 fail (+32 from 1.3.a baseline 7460)
+
 ## [2026-05-15] feat(memory) — frontmatter `state` field (Phase 1.3.a)
 
 **Done.** First slice of memory lifecycle integration (`MEMORY.md` §3.1.1). Adds the optional `state` field to the frontmatter and the canonical `MemoryState` type — the 6-state subset of EVICTION §3 (omitting `shadow`, which overlaps with the existing `trust: untrusted` semantics per the Phase 0 stitching decision). Pure persistence layer; no consumer wires the field yet.
