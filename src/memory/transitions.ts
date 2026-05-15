@@ -38,6 +38,7 @@ import {
   appendEvictionEvent,
   getLastQuarantineEvent,
   isLegalTransition,
+  preflightValidateEvidence,
 } from '../storage/repos/eviction-events.ts';
 import { getEarliestMemoryCreatedAt } from '../storage/repos/memory-events.ts';
 import { detectMemoryDependents } from './dependents.ts';
@@ -128,6 +129,18 @@ export type TransitionMemoryStateResult =
       reason: string | null;
     }
   | { kind: 'illegal_transition'; fromState: MemoryState; toState: MemoryState; reason: string }
+  // Evidence shape failed pre-flight schema validation (§6.1).
+  // The transition was refused BEFORE any disk mutation — no
+  // file moved, no audit row written. Distinct from
+  // `illegal_transition` (state machine refused the from/to/motivo
+  // tuple) because the failure is in the operator-provided
+  // payload, not the requested transition.
+  | {
+      kind: 'invalid_evidence';
+      fromState: MemoryState;
+      toState: MemoryState;
+      reason: string;
+    }
   | { kind: 'unknown' }
   // The on-disk transition completed (file/index mutated) but the
   // eviction_events INSERT failed afterward. Distinct from
@@ -447,6 +460,15 @@ const checkProtectionGates = (
   // `/memory restore` are the operator's explicit override.
   if (input.actor === 'user') return { blocked: false };
 
+  // Short-circuit: neither gate fires unless the transition targets
+  // a state where eviction-side protection makes sense. `active →
+  // shadow`, `quarantined → active` (restore), `evicted → active`
+  // (restore), `proposed → active` (admission) etc. don't carry
+  // cooldown / TTL semantics — the gates are eviction-shaped.
+  const targetsEvictionShape =
+    toState === 'quarantined' || toState === 'evicted' || toState === 'purged';
+  if (!targetsEvictionShape) return { blocked: false };
+
   // Cooldown bypass: security + user_purge motivos can't wait.
   const motivoCanWaitCooldown = input.motivo !== 'security' && input.motivo !== 'user_purge';
 
@@ -550,6 +572,31 @@ export const transitionMemoryState = async (
     return { kind: 'illegal_transition', fromState, toState, reason: check.reason };
   }
 
+  // 2b. Pre-flight evidence schema validation (§6.1). Refuse
+  // malformed evidence BEFORE applyTransition so a caller bug
+  // doesn't produce file/index mutations that the audit row
+  // would never witness (the in-repo validation in
+  // appendEvictionEvent runs at stage 5, AFTER applyTransition,
+  // which would surface a real audit_drift). Same outcome=applied
+  // gate the repo applies — non-applied paths (blocked_by_hook,
+  // protection blocks, same-state pseudo) record an attempted
+  // gate not real evidence, so they skip pre-flight too.
+  // Same-state (trigger_fired_no_action) lands as outcome !=
+  // 'applied' downstream; skip pre-flight here so the early
+  // return for same-state doesn't trip evidence checks.
+  if (fromState !== toState) {
+    const evidenceJsonForPreflight = JSON.stringify(input.evidence ?? {});
+    const evCheck = preflightValidateEvidence(input.motivo, evidenceJsonForPreflight);
+    if (!evCheck.ok) {
+      return {
+        kind: 'invalid_evidence',
+        fromState,
+        toState,
+        reason: evCheck.reason ?? 'evidence validation failed',
+      };
+    }
+  }
+
   // Same-state pseudo-transition: nothing to apply, nothing to
   // audit as 'applied'. Caller hit this by mistake; we surface a
   // no-op 'applied' row so the trail records the trigger fire
@@ -558,12 +605,11 @@ export const transitionMemoryState = async (
   //
   // recordedAt is derived from input.now() when supplied so two
   // back-to-back transitions in the same test fixture (with
-  // different `now()` values) land deterministically ordered.
-  // In production where input.now is unset, appendEvictionEvent
-  // falls back to Date.now(); same-ms collisions then tie-break
-  // by id (random UUID v4), which is a latent bug for "most
-  // recent" queries — follow-up: add a seq column for monotonic
-  // tiebreaker.
+  // different `now()` values) land deterministically ordered. In
+  // production where input.now is unset, appendEvictionEvent
+  // falls back to Date.now(); same-ms collisions tie-break by
+  // SQLite rowid DESC (monotonic on INSERT for this append-only
+  // table) per the query layer.
   const recordedAt = input.now !== undefined ? input.now() : undefined;
   if (fromState === toState) {
     const evidenceJson = JSON.stringify(input.evidence ?? {});

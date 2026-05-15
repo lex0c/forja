@@ -1,6 +1,7 @@
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
+import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../storage/repos/eviction-events.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
   IndexError,
@@ -421,7 +422,7 @@ export const gcExpiredMemories = async (
     // attribution. The `expires` field preserves the operator-set
     // lifetime for "what was the original expires?" audit
     // queries.
-    const evidence = { _operator_driven: true, expires: mem.expires };
+    const evidence = { [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true, expires: mem.expires };
     // Per-memory now counter so two back-to-back expirations get
     // monotonically distinct recorded_at + tombstone ts values.
     // Without this, all expired rows in one boot would collide
@@ -569,7 +570,7 @@ export const gcPurgeExpiredTombstones = async (
   // Lazy imports to avoid circular dependency with the storage
   // layer (lifecycle.ts is loaded by writer.ts which is loaded by
   // the storage layer's repos for some test fixtures).
-  const { getLastEvictionForObject, listEvictedDueForPurge } = await import(
+  const { getLastAppliedEvictionForObject, listEvictedDueForPurge } = await import(
     '../storage/repos/eviction-events.ts'
   );
   const nowMs = opts.now?.() ?? Date.now();
@@ -586,14 +587,19 @@ export const gcPurgeExpiredTombstones = async (
     if (row.substrate !== 'memory') continue;
 
     // Verify recency: a subsequent restore-then-re-evict cycle
-    // would have produced a newer eviction event. The OLDER row's
-    // purge_at is no longer load-bearing — the disk state moved
-    // on. Skip silently.
-    const latest = getLastEvictionForObject(db, row.substrate, row.objectId);
+    // would have produced a newer applied eviction event. Use the
+    // APPLIED filter — `trigger_fired_no_action` or `blocked_by_*`
+    // rows recorded between the eviction and now don't represent
+    // state changes, so they shouldn't mask the purge candidate.
+    // Earlier shape used getLastEvictionForObject which returns
+    // any outcome; a cold-loop probe trigger on an evicted memory
+    // would skip the purge forever, growing tombstone storage
+    // unbounded.
+    const latest = getLastAppliedEvictionForObject(db, row.substrate, row.objectId);
     if (latest === null || latest.id !== row.id) {
       skipped.push({
         evictionEventId: row.id,
-        reason: 'newer eviction event exists for object (restored or re-evicted since)',
+        reason: 'newer applied eviction event exists for object (restored or re-evicted since)',
       });
       continue;
     }

@@ -521,6 +521,7 @@ describe('transitionMemoryState: Eviction hook blocks', () => {
       motivo: 'conflict',
       trigger: 'verify_failed',
       actor: 'loop_cold',
+      evidence: validEvidence('conflict'),
       sessionId,
       cwd: workdir,
       fireHook,
@@ -626,6 +627,7 @@ describe('transitionMemoryState: Eviction hook blocks restore', () => {
       motivo: 'irrelevant',
       trigger: 'manual',
       actor: 'user',
+      evidence: validEvidence('irrelevant'),
       sessionId,
       cwd: workdir,
       fireHook,
@@ -751,6 +753,38 @@ describe('transitionMemoryState: protection gates', () => {
     expect(refused).toBeDefined();
     expect(refused?.details?.stage).toBe('eviction_protection');
     expect(refused?.details?.protection).toBe('user_explicit_cooldown');
+  });
+
+  test('user_explicit cooldown SKIPS when no `created` audit row exists (legacy fallback)', async () => {
+    // Legacy registry pickup: memory file on disk with
+    // source: user_explicit but no memory_events `created` row
+    // (pre-audit-chain era). The cooldown gate must NOT block —
+    // age can't be computed, so the operator override path is
+    // the only way to delete; gating on absent evidence would
+    // permanently block low_roi/irrelevant evictions for those
+    // memories.
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'legacy');
+    // Note: no createMemoryEvent(db, ...) call — no `created` row.
+    const registry = baseRegistry();
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'legacy',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    expect(r.kind).toBe('applied');
   });
 
   test('user_explicit cooldown does NOT block after 72h', async () => {
@@ -945,6 +979,98 @@ describe('transitionMemoryState: protection gates', () => {
       sessionId,
       cwd: workdir,
       now: () => 2_000,
+    });
+
+    expect(r.kind).toBe('applied');
+  });
+});
+
+// ── pre-flight evidence validation (§6.1) ───────────────────────────
+
+describe('transitionMemoryState: invalid_evidence pre-flight', () => {
+  test('refuses with kind=invalid_evidence BEFORE any disk mutation', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+    const registry = baseRegistry();
+
+    // motivo=low_roi requires {tokens_consumed, load_bearing_count,
+    // ratio}; passing empty evidence triggers pre-flight refusal.
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: {},
+      sessionId,
+      cwd: workdir,
+    });
+
+    expect(r.kind).toBe('invalid_evidence');
+    if (r.kind !== 'invalid_evidence') return;
+    expect(r.reason).toContain('low_roi');
+    expect(r.fromState).toBe('active');
+    expect(r.toState).toBe('quarantined');
+
+    // CRITICAL: file/index unchanged. Earlier shape (validation
+    // inside appendEvictionEvent at stage 5) would have moved the
+    // body to .tombstones/ before catching the failure — producing
+    // a real audit_drift. Pre-flight refuses before applyTransition.
+    const file = parseMemoryFile(readFileSync(memoryFilePath(roots, 'user', 'fresh'), 'utf-8'));
+    expect(file.frontmatter.state).toBeUndefined();
+
+    // NO eviction_events row landed — the pre-flight short-
+    // circuits before any DB write.
+    expect(getLastEvictionForObject(db, 'memory', 'fresh')).toBeNull();
+  });
+
+  test('accepts well-formed evidence', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+    const registry = baseRegistry();
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: { tokens_consumed: 100, load_bearing_count: 0, ratio: 0 },
+      sessionId,
+      cwd: workdir,
+    });
+
+    expect(r.kind).toBe('applied');
+  });
+
+  test('operator-driven marker bypasses pre-flight', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+    const registry = baseRegistry();
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'user_purge',
+      actor: 'user',
+      // Closest-fit motivo + operator marker — same shape /memory
+      // delete uses for the operator path.
+      evidence: { _operator_driven: true, source: 'slash_delete' },
+      sessionId,
+      cwd: workdir,
     });
 
     expect(r.kind).toBe('applied');

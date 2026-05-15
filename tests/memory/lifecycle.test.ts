@@ -580,11 +580,59 @@ describe('gcPurgeExpiredTombstones', () => {
     // hit yet (boot2 + 30d > boot1 + 35d).
     expect(result.purged).toEqual([]);
     expect(result.skipped.length).toBeGreaterThanOrEqual(1);
-    expect(result.skipped[0]?.reason).toContain('newer eviction event');
+    expect(result.skipped[0]?.reason).toContain('newer applied eviction event');
 
     // The current tombstone (from the re-evict) is still on disk.
     const { readdirSync } = await import('node:fs');
     expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(1);
+  });
+
+  test('trigger_fired_no_action between eviction and sweep does NOT mask the purge candidate', async () => {
+    // Real scenario: a cold-loop detector probes an already-evicted
+    // memory and emits trigger_fired_no_action (same-state pseudo
+    // on `evicted → evicted`). Earlier sweep used
+    // getLastEvictionForObject which returned the probe row;
+    // probe.id !== candidate.id → sweep skipped forever, tombstone
+    // never purged. Now the sweep uses getLastAppliedEviction* and
+    // ignores non-applied rows.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { expires: '2024-01-01' });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    const expireDay = new Date(Date.UTC(2024, 5, 1));
+    await gcExpiredMemories(db, reg, roots, { today: expireDay });
+
+    // Inject a probe row that recorded a trigger fire without a
+    // state change. Outcome='trigger_fired_no_action'; from==to.
+    const { appendEvictionEvent } = await import('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'mem',
+      objectScope: 'project_local',
+      fromState: 'evicted',
+      toState: 'evicted',
+      trigger: 'roi_below_threshold',
+      motivo: 'low_roi',
+      evidenceJson: JSON.stringify({ tokens_consumed: 0, load_bearing_count: 0, ratio: 0 }),
+      outcome: 'trigger_fired_no_action',
+      actor: 'loop_cold',
+      recordedAt: expireDay.getTime() + 10 * 24 * 60 * 60 * 1000,
+    });
+
+    // Sweep past the retention window — sweep MUST purge despite
+    // the probe row being more recent than the eviction.
+    const sweepNow = expireDay.getTime() + 35 * 24 * 60 * 60 * 1000;
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+    const result = await gcPurgeExpiredTombstones(db, reg, roots, { now: () => sweepNow });
+    expect(result.purged).toHaveLength(1);
+    expect(result.purged[0]?.name).toBe('mem');
+    expect(result.skipped).toEqual([]);
+
+    // Tombstone gone.
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(0);
   });
 
   test('non-memory substrate candidates are ignored', async () => {

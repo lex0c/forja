@@ -400,6 +400,48 @@ const validateEvidenceShape = (motivo: EvictionMotivo, evidence: unknown): Evide
 export const OPERATOR_DRIVEN_EVIDENCE_MARKER = OPERATOR_DRIVEN_MARKER;
 export { EVIDENCE_SCHEMAS };
 
+// Pre-flight evidence validation for callers that want to refuse
+// invalid input BEFORE side-effects (disk writes, hook fires).
+// Mirror of the in-repo check appendEvictionEvent runs at INSERT
+// time. Pure: no DB, no throw. Returns { ok: true } when the
+// evidence shape satisfies §6.1 schema for `motivo`, or
+// { ok: false, reason } with a structured failure message.
+//
+// Use case: `transitionMemoryState` calls this BEFORE
+// `applyTransition` so a malformed evidence payload doesn't
+// produce file/index mutations that the audit row would never
+// witness. Repo-side validation stays as defense-in-depth (a
+// caller that bypasses this helper still can't INSERT an invalid
+// row).
+export interface PreflightEvidenceResult {
+  ok: boolean;
+  reason: string | null;
+}
+
+export const preflightValidateEvidence = (
+  motivo: EvictionMotivo,
+  evidenceJson: string,
+): PreflightEvidenceResult => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(evidenceJson);
+  } catch {
+    // Malformed JSON is the scrub layer's concern — let it through
+    // so the audit row can land with a `_scrubbed_invalid_json`
+    // marker. Same exemption appendEvictionEvent applies.
+    return { ok: true, reason: null };
+  }
+  const v = validateEvidenceShape(motivo, parsed);
+  if (v.ok) return { ok: true, reason: null };
+  const sets = v.failures
+    .map((f) => `set #${f.setIndex} (missing/invalid: ${f.missingOrInvalid.join(', ')})`)
+    .join('; ');
+  return {
+    ok: false,
+    reason: `evidence shape doesn't satisfy schema for motivo '${motivo}': ${sets}`,
+  };
+};
+
 // ─── evidence_json sanitizer ─────────────────────────────────────────
 
 // Cycle guard sentinel — symmetric with failures/scrub.ts.
@@ -697,6 +739,37 @@ export const getLastEvictionForObject = (
     .query<EvictionEventRow, [EvictionSubstrate, string]>(
       `${SELECT_ALL}
         WHERE substrate = ? AND object_id = ?
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT 1`,
+    )
+    .get(substrate, objectId);
+  return row !== null ? fromRow(row) : null;
+};
+
+// Last APPLIED eviction event for a (substrate, object_id) —
+// answers "what state did this actually land in?", filtering out
+// `trigger_fired_no_action` / `blocked_by_hook` / `blocked_by_
+// protection` rows that recorded an attempted gate without a real
+// state change. Distinct from getLastEvictionForObject which
+// returns the latest row regardless of outcome.
+//
+// Use this when the caller cares about the object's CURRENT
+// effective state (e.g., the GC sweep deciding whether a purge
+// candidate is still authoritative): the most-recent applied row
+// IS the current state. A row with outcome='trigger_fired_no_
+// action' between the purge candidate and now does NOT mean the
+// object moved on — it means a probe trigger fired but evidence
+// didn't pass. Using getLastEvictionForObject's bare "latest"
+// would mask the purge candidate and storage grows unbounded.
+export const getLastAppliedEvictionForObject = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objectId: string,
+): EvictionEvent | null => {
+  const row = db
+    .query<EvictionEventRow, [EvictionSubstrate, string]>(
+      `${SELECT_ALL}
+        WHERE substrate = ? AND object_id = ? AND outcome = 'applied'
         ORDER BY recorded_at DESC, rowid DESC
         LIMIT 1`,
     )

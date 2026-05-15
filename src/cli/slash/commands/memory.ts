@@ -42,6 +42,7 @@ import {
   listRecentMemoryEvents,
 } from '../../../storage/index.ts';
 import type { MemoryEvent } from '../../../storage/index.ts';
+import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
@@ -274,17 +275,37 @@ const formatAuditRow = (e: MemoryEvent): string => {
   const session = e.sessionId !== null ? e.sessionId.slice(0, 8) : '--------';
   let detail = '';
   if (e.details !== null) {
-    // Render the most operator-relevant fields per action. `stage`
-    // and `reason` show up on `refused` rows; `expires` on `created`
-    // / `expired`; `path` on `created`. Keep the line scannable —
-    // pick a single most-useful detail per row, no full JSON dump.
+    // Render the most operator-relevant fields per action. Keep the
+    // line scannable — pick a single most-useful detail per row, no
+    // full JSON dump.
+    //
+    // `refused` rows: stage (eviction_protection / eviction_hook /
+    // lifecycle_gc / promote_scanner / ...) + reason.
+    // `evicted` / `quarantined` / `restored` / `purged` (post-1.3
+    // state-machine path): motivo + trigger from the paired
+    // eviction_events row.
+    // `expired`: kept for backwards compat — pre-1.3 boot GC emitted
+    // this action with `expires:`. Phase 2.2 routed boot GC through
+    // the state machine so production no longer emits it, but
+    // legacy rows in the DB still render.
     const stage = typeof e.details.stage === 'string' ? e.details.stage : null;
     const reason = typeof e.details.reason === 'string' ? e.details.reason : null;
     const expires = typeof e.details.expires === 'string' ? e.details.expires : null;
+    const motivo = typeof e.details.motivo === 'string' ? e.details.motivo : null;
+    const trigger = typeof e.details.trigger === 'string' ? e.details.trigger : null;
     if (e.action === 'refused' && stage !== null) {
       detail = ` [${stage}${reason !== null ? `: ${reason}` : ''}]`;
     } else if (e.action === 'expired' && expires !== null) {
       detail = ` [expires ${expires}]`;
+    } else if (
+      (e.action === 'evicted' ||
+        e.action === 'quarantined' ||
+        e.action === 'restored' ||
+        e.action === 'purged' ||
+        e.action === 'invalidated') &&
+      motivo !== null
+    ) {
+      detail = trigger !== null ? ` [${motivo}/${trigger}]` : ` [${motivo}]`;
     }
   }
   return `  ${ts} · ${e.action.padEnd(8)} · ${e.scope}/${e.memoryName} · ${e.source} · ${session}${detail}`;
@@ -790,7 +811,7 @@ const deleteViaTransition = async (
     // exclude these rows by predicate. Spec amendment to admit
     // `user_purge` on active→quarantined / quarantined→evicted
     // would obviate the marker.
-    evidence: { _operator_driven: true, source: 'slash_delete' as const },
+    evidence: { [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true, source: 'slash_delete' },
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
     now: ctx.now,
@@ -844,6 +865,12 @@ const mapTransitionFailure = (
   }
   if (result.kind === 'illegal_transition') {
     return { kind: 'error', message: `${prefix}: ${result.reason ?? 'illegal state transition'}` };
+  }
+  if (result.kind === 'invalid_evidence') {
+    return {
+      kind: 'error',
+      message: `${prefix}: ${result.reason ?? 'evidence shape invalid for motivo'}`,
+    };
   }
   if (result.kind === 'blocked_by_protection') {
     // Operator-initiated paths (`/memory delete`, `/memory
@@ -1051,7 +1078,7 @@ const handleRestore = async (
     // irrelevant evidence exclude restore rows. The
     // `_operator_driven: true` marker bypasses the schema's
     // required-fields check at the repo level.
-    evidence: { _operator_driven: true, source: 'slash_restore' as const },
+    evidence: { [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true, source: 'slash_restore' },
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
     now: ctx.now,

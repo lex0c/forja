@@ -521,25 +521,30 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const repoRoot = resolveRepoRoot(cwd);
     const memoryRoots = resolveScopeRoots(repoRoot);
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
-    // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-removes
-    // memories whose `expires:` field is on or before today. Each
-    // removal emits a `memory_events` row with `action: 'expired'`
-    // so the operator can audit "what disappeared and when". We
-    // run this BEFORE assembling the eager prompt section so the
-    // model never sees stale entries that vanish mid-session. The
-    // session id isn't known yet (the harness loop creates it
+    // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-evicts
+    // memories whose `expires:` field is on or before today through
+    // the canonical state machine — Phase 2.2 routed this path
+    // through transitionMemoryState, so each expiry lands TWO
+    // memory_events rows (action='quarantined' then action='evicted')
+    // plus the paired eviction_events trail with motivo='low_roi'
+    // (closest-fit per the spec follow-up) and trigger='expired_at'.
+    // The body moves into `.tombstones/`; operators can `/memory
+    // restore` an unintended expiry within the retention window.
+    // We run this BEFORE assembling the eager prompt section so
+    // the model never sees stale entries that vanish mid-session.
+    // The session id isn't known yet (the harness loop creates it
     // later), so the audit rows here land with sessionId NULL —
     // the lifecycle GC is conceptually a session-bootstrap event,
     // not a per-session-conversation one. cwd is forwarded so
     // `/memory audit` can group GC events by working directory.
     //
-    // Failures (sandbox / io / unknown) get a `refused` audit row
-    // with stage='lifecycle_gc' AND a stderr line so the operator
-    // sees them in two places: the persistent audit table (for
-    // forensic review) and the live stderr stream (for "something
-    // unusual happened on this boot"). A bootstrap-blocking
-    // failure would be wrong — one bad memory shouldn't gate the
-    // session — but silently dropping the failure is worse.
+    // Failures surface in `gcResult.failures` with a translated
+    // reason string (transitionMemoryState's discriminated outcomes
+    // → operator-facing message), plus a stderr line per failure
+    // so the operator sees them live without consulting the audit
+    // table. A bootstrap-blocking failure would be wrong — one
+    // bad memory shouldn't gate the session — but silently
+    // dropping the failure is worse.
     const gcResult = await gcExpiredMemories(db, memoryRegistry, memoryRoots, { auditCwd: cwd });
     for (const failure of gcResult.failures) {
       process.stderr.write(

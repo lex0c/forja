@@ -186,12 +186,16 @@ export const listRecentMemoryEvents = (db: DB, limit = 50): MemoryEvent[] => {
 // the first 72h after creation.
 //
 // Falls back to NULL when the memory pre-dates the audit table
-// (legacy registry pickups) — caller treats null as "age unknown"
-// and grants the benefit of the doubt to the protection gate
-// (refuses eviction). Counterargument exists for both directions;
-// we pick conservative (over-protect) because the audit trail is
-// supposed to be complete from creation, so a missing `created`
-// row signals a data gap worth investigating.
+// (legacy registry pickups created before MEMORY §3.1.1's
+// `created` event landed in the schema). The protection gate
+// treats null as "age unknown" and SKIPS the cooldown — under-
+// protect rather than over-protect. Rationale: a legacy memory
+// with no `created` row would otherwise be permanently blocked
+// from eviction by any cooldown-protected motivo, since age
+// never elapses. The operator override (`actor: 'user'` via
+// `/memory delete`) still works for those rows, and any newly-
+// created memory (post-1.3) lands a `created` row alongside the
+// write so the gate fires correctly.
 export const getEarliestMemoryCreatedAt = (
   db: DB,
   scope: string,

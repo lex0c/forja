@@ -2,6 +2,54 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(memory,storage) — post-Phase-2 review batch (C1+C2+H1+H2+M3+M4+M5)
+
+**Done.** Six corrections from the post-Phase-2 multi-agent review. Bundled in one slice because the changes are tightly coupled (C1 introduces a new result discriminant; M5 tests the new discriminant; H1+H2 are alignment fixes; M3+M4 are polish).
+
+### Critical fixes
+
+- **C2 — GC purge sweep recency check filters by `outcome='applied'`** (`src/storage/repos/eviction-events.ts` + `src/memory/lifecycle.ts`). Earlier shape used `getLastEvictionForObject` which returns the latest row regardless of outcome. A cold-loop detector probing an evicted memory and emitting `trigger_fired_no_action` (same-state pseudo-transition with outcome != 'applied') would produce a later row than the eviction; the sweep's `latest.id !== row.id` check would skip the purge candidate forever and storage would grow unbounded. New helper `getLastAppliedEvictionForObject` filters to `outcome = 'applied'` — only real state changes mask purge candidates. Test added: trigger_fired_no_action between eviction and sweep does NOT mask the candidate.
+
+- **C1 — Pre-flight evidence validation refuses BEFORE applyTransition** (`src/memory/transitions.ts` + `src/storage/repos/eviction-events.ts`). Earlier shape validated evidence shape INSIDE `appendEvictionEvent`, which runs at stage 5 — AFTER `applyTransition` already moved the body to `.tombstones/` and dropped the index entry. A caller passing malformed evidence with outcome='applied' produced a real `audit_drift` (disk moved, no audit row). New `preflightValidateEvidence` helper runs at stage 2b in `transitionMemoryState` (after isLegalTransition, before applyTransition). Failures land as `kind: 'invalid_evidence'` — distinct from `illegal_transition` (state machine refused the from/to/motivo tuple) because the refusal is in the operator-provided payload. Repo-side validation stays as defense-in-depth. Slash `mapTransitionFailure` handles the new kind with operator-facing copy. M5 (test coverage) ships in the same slice — three tests cover the discriminant: refusal preserves disk state and emits no eviction_events row; well-formed evidence proceeds; operator-driven marker bypasses pre-flight.
+
+### High fixes
+
+- **H1 — Cooldown null fallback docstring aligned with code** (`src/storage/repos/memory-events.ts:182-194`). Earlier docstring claimed "over-protect" but code skipped the gate on null (under-protect). Updated the docstring to document the actual behavior + rationale: legacy registry pickups (pre-1.3, no `created` audit row) would otherwise be permanently un-evictable since age never elapses; operator override via `actor: 'user'` still works for those rows; newly-created memories land `created` rows alongside the write. Test added covering the legacy-fallback path.
+
+- **H2 — Stale audit shape references cleaned up** (`src/cli/bootstrap.ts:524-541` + `src/cli/slash/commands/memory.ts:276-300`). Bootstrap comment updated to describe the new 2-step state-machine path (quarantined + evicted memory_events rows instead of single 'expired'). `/memory audit` renderer extended with a new branch covering `evicted`/`quarantined`/`restored`/`purged`/`invalidated` actions (renders `[motivo/trigger]` detail); legacy `expired` branch preserved for old DB rows.
+
+### Medium fixes
+
+- **M3 — `checkProtectionGates` short-circuits when toState is not eviction-shaped.** Early return when `toState` is not `quarantined`/`evicted`/`purged` — restore (`evicted → active`, `quarantined → active`), admission (`proposed → active`), and shadow transitions skip gate evaluation entirely. Cosmetic but tightens the contract: gate code expresses its scope explicitly instead of relying on inner predicates short-circuiting.
+
+- **M4 — Hardcoded `'_operator_driven'` string replaced with `OPERATOR_DRIVEN_EVIDENCE_MARKER` constant.** Both call sites (`gcExpiredMemories` in lifecycle.ts; `deleteViaTransition` + `handleRestore` in slash) now import the constant and use computed-key syntax `{ [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true, ... }`. Single rename point if the marker shape evolves.
+
+- **M5 — Pre-flight evidence validation tests.** Shipped alongside C1 (see above).
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/eviction-events.ts` | New `getLastAppliedEvictionForObject` query (C2). New `preflightValidateEvidence` helper + `PreflightEvidenceResult` type (C1). |
+| `src/memory/lifecycle.ts` | GC sweep uses `getLastAppliedEvictionForObject` (C2). Evidence uses `OPERATOR_DRIVEN_EVIDENCE_MARKER` constant (M4). |
+| `src/memory/transitions.ts` | New stage 2b: pre-flight evidence validation (C1). New `invalid_evidence` result discriminant. `checkProtectionGates` early-returns when toState isn't eviction-shaped (M3). Stale tiebreaker comment removed. |
+| `src/cli/slash/commands/memory.ts` | `mapTransitionFailure` covers `invalid_evidence` (C1). Slash audit renderer covers state-machine actions (H2). Evidence uses constant (M4). |
+| `src/cli/bootstrap.ts` | Comment updated to reflect post-2.2 audit shape (H2). |
+| `src/storage/repos/memory-events.ts` | Docstring aligned with code behavior for null fallback (H1). |
+| `tests/memory/transitions.test.ts` | 3 invalid_evidence tests (C1+M5). 1 legacy-fallback cooldown test (H1). Hook block tests updated to pass valid evidence so pre-flight doesn't short-circuit them. |
+| `tests/memory/lifecycle.test.ts` | 1 test covering probe-trigger-doesn't-mask-purge (C2). Reason-string assertion updated. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7570 pass / 10 skip / 0 fail (+5 from the batch)
+
+### Notes
+
+- Comment about M1 from the review (quarantineStats self-join double-pair risk on theoretical same-state quarantine entries) deemed schema-prevented and not worth a SQL defense.
+- Comment about M2 (non-active /memory delete legacy path operator copy) is a UX nit; deliberate behavior, deferred.
+
 ## [2026-05-15] feat(storage,cli) — eviction metrics aggregator + /memory metrics slash (Phase 2.7 — closes Phase 2)
 
 **Done.** Final slice of Phase 2 — closes the EVICTION substrate=memory loop end-to-end. EVICTION §11 declares 10 metrics; this slice ships the 7 the memory substrate alone can produce. The other 3 (`cascade.dependents_orphaned`, `roi.bottom_decile_residency`, `decay.misfire`) need missing subsystems (loop frio re-evaluation; Memory ROI tracking; the decay subsystem). All metrics are read-only aggregators over `eviction_events`; no new producers — just SQL over the rows Phases 1.2–2.6 produced.
