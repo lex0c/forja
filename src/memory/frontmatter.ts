@@ -1,10 +1,12 @@
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
-import type {
-  MemoryFile,
-  MemoryFrontmatter,
-  MemorySource,
-  MemoryTrust,
-  MemoryType,
+import {
+  MEMORY_STATES,
+  type MemoryFile,
+  type MemoryFrontmatter,
+  type MemorySource,
+  type MemoryState,
+  type MemoryTrust,
+  type MemoryType,
 } from './types.ts';
 
 // Frontmatter parser/writer for memory .md files.
@@ -34,6 +36,7 @@ export class FrontmatterError extends Error {
 const VALID_TYPES = new Set<MemoryType>(['user', 'feedback', 'project', 'reference']);
 const VALID_SOURCES = new Set<MemorySource>(['user_explicit', 'inferred', 'imported']);
 const VALID_TRUSTS = new Set<MemoryTrust>(['trusted', 'untrusted']);
+const VALID_STATES = new Set<MemoryState>(MEMORY_STATES);
 
 // Memory `name` is the canonical id within a scope. Kebab-case
 // per spec line 220 ("kebab-case, único no scope"). We allow
@@ -150,6 +153,15 @@ const validateTrust = (trust: string): MemoryTrust => {
   return trust as MemoryTrust;
 };
 
+const validateState = (state: string): MemoryState => {
+  if (!VALID_STATES.has(state as MemoryState)) {
+    throw new FrontmatterError(
+      `frontmatter.state: must be one of ${[...VALID_STATES].join(', ')} (got ${JSON.stringify(state)})`,
+    );
+  }
+  return state as MemoryState;
+};
+
 const validateExpires = (expires: string): void => {
   if (!EXPIRES_RE.test(expires)) {
     throw new FrontmatterError(
@@ -205,11 +217,25 @@ export const validateFrontmatter = (raw: unknown): MemoryFrontmatter => {
     fm.triggers = triggers;
   }
 
+  const state = optionalString(obj, 'state');
+  if (state !== undefined) {
+    fm.state = validateState(state);
+  }
+
   // Reject unknown fields. Future-proofing: a future spec
   // revision might add `tags`, `priority`, etc. — the operator
   // running an older binary against newer files should see a
   // loud error instead of silent data loss on round-trip.
-  const known = new Set(['name', 'description', 'type', 'source', 'expires', 'trust', 'triggers']);
+  const known = new Set([
+    'name',
+    'description',
+    'type',
+    'source',
+    'expires',
+    'trust',
+    'triggers',
+    'state',
+  ]);
   for (const key of Object.keys(obj)) {
     if (!known.has(key)) {
       throw new FrontmatterError(`frontmatter: unknown field ${JSON.stringify(key)}`);
@@ -288,6 +314,7 @@ export const serializeMemoryFile = (file: MemoryFile): string => {
   if (file.frontmatter.expires !== undefined) ordered.expires = file.frontmatter.expires;
   if (file.frontmatter.trust !== undefined) ordered.trust = file.frontmatter.trust;
   if (file.frontmatter.triggers !== undefined) ordered.triggers = file.frontmatter.triggers;
+  if (file.frontmatter.state !== undefined) ordered.state = file.frontmatter.state;
 
   // `stringifyYaml` emits a trailing newline already. We force
   // single-line strings (lineWidth: 0 effectively disables

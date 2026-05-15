@@ -1,11 +1,13 @@
 // Memory subsystem barrel.
 
+export { MEMORY_STATES } from './types.ts';
 export type {
   IndexEntry,
   MemoryFile,
   MemoryFrontmatter,
   MemoryScope,
   MemorySource,
+  MemoryState,
   MemoryTrust,
   MemoryType,
 } from './types.ts';

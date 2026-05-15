@@ -28,6 +28,23 @@ export type MemoryTrust = 'trusted' | 'untrusted';
 // `MemoryType`, not a scope — it can live in any of the three.
 export type MemoryScope = 'user' | 'project_shared' | 'project_local';
 
+// Lifecycle states per spec §3.1.1 — declared subset of EVICTION
+// §3's 7-state vocabulary. Memory omits `shadow`: the trust
+// field already encodes "loaded but not vinculante" semantics
+// for the memory case (see §6.5 rationale and Phase 0 stitching).
+// Absence of the field in frontmatter equates to `active`; the
+// parser/writer round-trip preserves the field exactly as it
+// appears (no canonicalization to `active` on read).
+export const MEMORY_STATES = [
+  'proposed',
+  'active',
+  'quarantined',
+  'invalidated',
+  'evicted',
+  'purged',
+] as const;
+export type MemoryState = (typeof MEMORY_STATES)[number];
+
 // Parsed frontmatter block. All optional fields preserve their
 // absence on round-trip — `trust` omitted on input means `trust`
 // omitted on output, NOT a serialized `trust: trusted`. The
@@ -46,6 +63,13 @@ export interface MemoryFrontmatter {
   // Optional auto-injection tags (spec §4.3). 5.1 just preserves
   // these on round-trip; the eager-injection logic lives in 5.2.
   triggers?: string[];
+  // Optional lifecycle state per spec §3.1.1. Absence equates to
+  // `active`; the parser/writer preserve absence on round-trip
+  // (a memory written without `state` doesn't get a serialized
+  // `state: active`). Transitions are managed via the eviction
+  // contract (EVICTION.md §4); this field is the persisted
+  // snapshot the next session reads.
+  state?: MemoryState;
 }
 
 // A single memory file: frontmatter + raw markdown body. The

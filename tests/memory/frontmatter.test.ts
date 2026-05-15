@@ -275,3 +275,85 @@ describe('serializer guards', () => {
     expect(() => serializeMemoryFile(file)).toThrow(FrontmatterError);
   });
 });
+
+describe('memory frontmatter state field (spec §3.1.1)', () => {
+  test.each(['proposed', 'active', 'quarantined', 'invalidated', 'evicted', 'purged'])(
+    'parses state=%s round-trip',
+    (state) => {
+      const raw = `---
+name: x
+description: y
+type: feedback
+source: user_explicit
+state: ${state}
+---
+`;
+      const file = parseMemoryFile(raw);
+      expect(file.frontmatter.state).toBe(state as Exclude<typeof state, never>);
+    },
+  );
+
+  test('absence of state preserves undefined (no default coerce on read)', () => {
+    const raw = `---
+name: x
+description: y
+type: feedback
+source: user_explicit
+---
+`;
+    const file = parseMemoryFile(raw);
+    expect(file.frontmatter.state).toBeUndefined();
+  });
+
+  test('rejects unknown state value', () => {
+    const raw = `---
+name: x
+description: y
+type: feedback
+source: user_explicit
+state: banana
+---
+`;
+    expect(() => parseMemoryFile(raw)).toThrow(FrontmatterError);
+    expect(() => parseMemoryFile(raw)).toThrow(/state/);
+  });
+
+  test('serializer emits state last in canonical order (after triggers)', () => {
+    const file: MemoryFile = {
+      frontmatter: minimal({ state: 'quarantined', triggers: ['t1'] }),
+      body: '',
+    };
+    const out = serializeMemoryFile(file);
+    // Triggers comes before state — confirms canonical ordering
+    // (name, description, type, source, expires, trust, triggers, state).
+    const triggersIdx = out.indexOf('triggers:');
+    const stateIdx = out.indexOf('state:');
+    expect(triggersIdx).toBeGreaterThan(-1);
+    expect(stateIdx).toBeGreaterThan(triggersIdx);
+  });
+
+  test('serializer omits state line when frontmatter.state is undefined', () => {
+    const file: MemoryFile = { frontmatter: minimal(), body: '' };
+    const out = serializeMemoryFile(file);
+    expect(out).not.toContain('state:');
+  });
+
+  test('round-trip parse -> serialize -> parse preserves state', () => {
+    const original = `---
+name: x
+description: y
+type: feedback
+source: user_explicit
+trust: untrusted
+state: invalidated
+---
+
+body line
+`;
+    const parsed = parseMemoryFile(original);
+    const reserialized = serializeMemoryFile(parsed);
+    const reparsed = parseMemoryFile(reserialized);
+    expect(reparsed.frontmatter.state).toBe('invalidated');
+    expect(reparsed.frontmatter.trust).toBe('untrusted');
+  });
+});

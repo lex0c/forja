@@ -2,6 +2,44 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(memory) — frontmatter `state` field (Phase 1.3.a)
+
+**Done.** First slice of memory lifecycle integration (`MEMORY.md` §3.1.1). Adds the optional `state` field to the frontmatter and the canonical `MemoryState` type — the 6-state subset of EVICTION §3 (omitting `shadow`, which overlaps with the existing `trust: untrusted` semantics per the Phase 0 stitching decision). Pure persistence layer; no consumer wires the field yet.
+
+### Why this slice ships alone
+
+Frontmatter is the smallest atomic step toward the lifecycle: changing it without integrating eviction transitions yet (1.3.c) means the field round-trips cleanly today, and future slices add semantics without touching the parser/writer. Same discipline 1.1.a used for `context_pins` (storage layer alone before tool/slash/recap).
+
+### Design decisions
+
+- **Subset declared as `MEMORY_STATES` const** (`proposed`, `active`, `quarantined`, `invalidated`, `evicted`, `purged`). Exported from `src/memory/types.ts` + re-exported from the barrel. The exact six-element list lives in one place; future slices (1.3.b–d, and any external owner integration) read from the const rather than duplicating the union literal.
+- **Absence preserves on round-trip** — a memory written without `state` doesn't get a serialized `state: active`. Same convention as the existing `trust` field. Operator-edited files with the field omitted stay omitted; the read-side default (`active` per spec §3.1.1) is decided at consumption time, not at persistence.
+- **Canonical serialization order: state appears LAST** — after `name`, `description`, `type`, `source`, `expires`, `trust`, `triggers`. The order keeps the most-recently-added optional field at the bottom of the YAML so older operator-eye scans of frontmatter don't get visually disrupted.
+- **Unknown-field rejection updated** — the existing parser rejects unknown fields as a defense against silent data loss on round-trip. `state` is added to the `known` set; future fields will require the same explicit addition.
+- **Validator is structural, not transitional.** This slice validates that `state` is one of the six values; it does NOT validate transitions (that's the eviction state machine from 1.2.a, called by future owners via `isLegalTransition`). Same separation of concerns as `MemorySource` validation (parser rejects unknown values; doesn't enforce promotion rules).
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/types.ts` | Add `MEMORY_STATES` const + `MemoryState` type; add `state?: MemoryState` to `MemoryFrontmatter` |
+| `src/memory/frontmatter.ts` | Import + use `MEMORY_STATES`/`MemoryState`; add `VALID_STATES` + `validateState`; wire into `validateFrontmatter` (parse + reject unknown); wire into `serializeMemoryFile` (last position in canonical order); update `known` set so the unknown-field rejection includes `state` |
+| `src/memory/index.ts` | Re-export `MEMORY_STATES` const + `MemoryState` type from barrel |
+| `tests/memory/frontmatter.test.ts` | +11 tests in new `state field` describe: parses each of 6 states (test.each), absence preserves undefined, rejects unknown value, serializer canonical order (state after triggers), serializer omits when absent, round-trip parse→serialize→parse preserves the field |
+
+### Deferred to subsequent slices
+
+- **1.3.b** — `.tombstones/` storage paths + lifecycle helpers (moveToTombstone, findLatestTombstone, retention sweep).
+- **1.3.c** — `transitionMemoryState` helper: validates via EVICTION's state machine, fires `Eviction` hook, persists `eviction_events` + `memory_events`, updates frontmatter `state`. Wires verify-before-act → `active→quarantined`; `/memory delete` → `active→evicted`. First real consumer of the 1.2 contract.
+- **1.3.d** — `/memory restore <name>` + re-admission gate (`evicted→proposed`).
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/frontmatter.test.ts` 48 pass / 0 fail
+- `bun test` 7460 pass / 10 skip / 0 fail (+11 from post-1.2 baseline 7449)
+
 ## [2026-05-15] fix(eviction) — post-1.2 review pack (C1+C2+H1+H2+H3+M2+M3+M4+L3)
 
 **Done.** Single pack endereçando o review da Fase 1.2. Dois críticos (audit drift + leak), três highs (tool-matcher silenciado + table scan + test gaps), e cinco medium/low (throw em vez de coerce, cross-event matcher test, type reuse, comment cleanup, timestamp boundary test).
