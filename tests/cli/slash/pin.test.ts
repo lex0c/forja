@@ -201,6 +201,92 @@ describe('/pin --remove', () => {
     if (r.kind !== 'error') return;
     expect(r.message).toContain('needs an id');
   });
+
+  test('removes by the 8-char shortId shown in /pin --list', async () => {
+    // Regression: list rendered shortId(8) but remove required the
+    // full 36-char UUID — operators following the on-screen hint
+    // couldn't remove pins. Now shortId resolves via prefix lookup.
+    const pin = store.createPin({
+      sessionId,
+      text: 'doomed',
+      kind: 'constraint',
+      createdBy: 'user',
+    });
+    const shortId = pin.id.slice(0, 8);
+    const r = await pinCommand.exec(['--remove', shortId], buildCtx());
+    if (r.kind !== 'ok') throw new Error(`expected ok, got ${r.kind}`);
+    expect(r.notes?.[0]).toContain('removed pin');
+    expect(r.notes?.[0]).toContain(shortId);
+    expect(store.listPinsBySession(sessionId)).toHaveLength(0);
+  });
+
+  test('removes by an arbitrary unique prefix (length >= 4)', async () => {
+    const pin = store.createPin({
+      sessionId,
+      text: 'unique',
+      kind: 'constraint',
+      createdBy: 'user',
+    });
+    const prefix = pin.id.slice(0, 6);
+    const r = await pinCommand.exec(['--remove', prefix], buildCtx());
+    if (r.kind !== 'ok') throw new Error(`expected ok, got ${r.kind}`);
+    expect(store.listPinsBySession(sessionId)).toHaveLength(0);
+  });
+
+  test('refuses prefixes shorter than 4 chars', async () => {
+    store.createPin({
+      sessionId,
+      text: 'foo',
+      kind: 'constraint',
+      createdBy: 'user',
+    });
+    const r = await pinCommand.exec(['--remove', 'ab'], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('at least 4');
+    // Pin still there — we never executed the delete.
+    expect(store.listPinsBySession(sessionId)).toHaveLength(1);
+  });
+
+  test('refuses ambiguous prefixes — lists matches and lengthens hint', async () => {
+    // Insert two pins with synthesized ids sharing a prefix so the
+    // ambiguity branch is exercised deterministically. Default UUID
+    // generation is too random to guarantee a collision in tests.
+    const aId = 'aaaaaaaa-bbbb-bbbb-bbbb-111111111111';
+    const bId = 'aaaaaaaa-bbbb-bbbb-bbbb-222222222222';
+    db.query(
+      `INSERT INTO context_pins (id, session_id, text, kind, created_by, source_step_id, expires_at, created_at)
+       VALUES (?, ?, ?, 'constraint', 'user', NULL, NULL, ?)`,
+    ).run(aId, sessionId, 'one', 1000);
+    db.query(
+      `INSERT INTO context_pins (id, session_id, text, kind, created_by, source_step_id, expires_at, created_at)
+       VALUES (?, ?, ?, 'constraint', 'user', NULL, NULL, ?)`,
+    ).run(bId, sessionId, 'two', 1100);
+    const r = await pinCommand.exec(['--remove', 'aaaaaaaa'], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('ambiguous');
+    expect(r.message).toContain('matches 2 pins');
+    expect(r.message).toContain('lengthen the prefix');
+    // Both pins still there — no destructive action on ambiguity.
+    expect(store.listPinsBySession(sessionId)).toHaveLength(2);
+  });
+
+  test('prefix lookup is scoped to the active session', async () => {
+    // A pin in a DIFFERENT session should not satisfy the prefix
+    // match — operator can only remove pins they can see in their
+    // current /pin --list.
+    const otherSessionId = createSession(db, { model: 'test/m', cwd: '/p' }).id;
+    const otherPinId = 'cccccccc-1111-2222-3333-444444444444';
+    db.query(
+      `INSERT INTO context_pins (id, session_id, text, kind, created_by, source_step_id, expires_at, created_at)
+       VALUES (?, ?, 'cross-session', 'constraint', 'user', NULL, NULL, ?)`,
+    ).run(otherPinId, otherSessionId, 1000);
+    const r = await pinCommand.exec(['--remove', 'cccccccc'], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('no pin with id');
+  });
 });
 
 describe('/pin: validation + mutual exclusivity', () => {

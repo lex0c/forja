@@ -208,15 +208,68 @@ const handleList = (store: ContextPinsStore, sessionId: string, now: () => numbe
   return { kind: 'ok', notes: [header, ...pins.map((p) => formatActivePin(p, t))] };
 };
 
-const handleRemove = (store: ContextPinsStore, removeId: string): SlashResult => {
-  const ok = store.removePin(removeId);
+// Minimum prefix length operators can supply. Shorter inputs would
+// collide too often (a 1-char hex prefix matches ~1/16 of UUIDs) so
+// they're refused with a usability hint. /pin --list shows 8 chars,
+// which sits well above any reasonable collision threshold for the
+// `PIN_CAP=10` per-session limit.
+const MIN_REMOVE_ID_PREFIX = 4;
+
+const handleRemove = (
+  store: ContextPinsStore,
+  sessionId: string,
+  removeId: string,
+  now: number,
+): SlashResult => {
+  // Fast path: caller passed the full UUID — exact match avoids the
+  // prefix scan + ambiguity check. Same semantics as before this
+  // helper learned prefix resolution.
+  if (removeId.length === 36 && store.getPin(removeId) !== null) {
+    const ok = store.removePin(removeId);
+    if (!ok) {
+      // Race: pin was removed between getPin and removePin. Treat
+      // as not-found from the operator's POV.
+      return {
+        kind: 'error',
+        message: `/pin: no pin with id '${removeId}' (try /pin --list)`,
+      };
+    }
+    return { kind: 'ok', notes: [`removed pin ${shortId(removeId)}`] };
+  }
+
+  // Prefix path: resolve operator-typed shortId (or any unique prefix)
+  // against the session's active pins. Mirrors git's abbreviated SHA
+  // ergonomics — short enough to type, refuses on ambiguity instead
+  // of silently picking one.
+  if (removeId.length < MIN_REMOVE_ID_PREFIX) {
+    return {
+      kind: 'error',
+      message: `/pin: id prefix must be at least ${MIN_REMOVE_ID_PREFIX} chars (got '${removeId}')`,
+    };
+  }
+  const matches = store.findActivePinsByIdPrefix(sessionId, removeId, now);
+  if (matches.length === 0) {
+    return {
+      kind: 'error',
+      message: `/pin: no pin with id '${removeId}' (try /pin --list)`,
+    };
+  }
+  if (matches.length > 1) {
+    const sids = matches.map((p) => shortId(p.id)).join(', ');
+    return {
+      kind: 'error',
+      message: `/pin: prefix '${removeId}' is ambiguous — matches ${matches.length} pins (${sids}); lengthen the prefix`,
+    };
+  }
+  const target = matches[0] as (typeof matches)[0];
+  const ok = store.removePin(target.id);
   if (!ok) {
     return {
       kind: 'error',
       message: `/pin: no pin with id '${removeId}' (try /pin --list)`,
     };
   }
-  return { kind: 'ok', notes: [`removed pin ${shortId(removeId)}`] };
+  return { kind: 'ok', notes: [`removed pin ${shortId(target.id)}`] };
 };
 
 const handleCreate = (
@@ -337,7 +390,7 @@ export const pinCommand: SlashCommand = {
       if (id === undefined) {
         return { kind: 'error', message: '/pin: --remove needs an id (internal)' };
       }
-      return handleRemove(store, id);
+      return handleRemove(store, sessionId, id, ctx.now());
     }
     return handleCreate(store, sessionId, parsed, ctx.now());
   },

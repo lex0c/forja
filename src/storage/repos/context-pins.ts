@@ -338,6 +338,42 @@ export const removePin = (db: DB, id: string): boolean => {
   return result.changes > 0;
 };
 
+// Resolve a pin id prefix to its full row(s) within a session's active
+// pins. Used by `/pin --remove <id>`: the list output shows an 8-char
+// shortId for readability, but DELETE requires an exact match. Rather
+// than dump 36-char UUIDs at the operator, we accept any unique prefix
+// (git-style abbreviated SHA) and refuse on ambiguity.
+//
+// Scope is the session — pin ids are globally unique (UUID v4) so
+// session-scoping isn't required for correctness, but it keeps the
+// prefix index narrow (the operator's pins, not every pin in the DB)
+// and matches the operator's mental model ("pins I can see").
+//
+// Returns an array so the caller can disambiguate: 0 matches → not
+// found; 1 match → safe to delete by full id; ≥2 → ambiguous, the
+// operator must lengthen the prefix.
+export const findActivePinsByIdPrefix = (
+  db: DB,
+  sessionId: string,
+  prefix: string,
+  now: number = Date.now(),
+): ContextPin[] => {
+  // Escape SQL LIKE wildcards in operator-typed input. UUIDs only
+  // contain hex + dashes so this is belt-and-braces, but a future
+  // id scheme might include `%` / `_`.
+  const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+  const rows = db
+    .query<ContextPinRow, [string, number, string]>(
+      `${SELECT_ALL}
+        WHERE session_id = ?
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND id LIKE ? ESCAPE '\\'
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all(sessionId, now, `${escaped}%`);
+  return rows.map(fromRow);
+};
+
 // Session-scoped store wrapping the db handle so consumers (tool,
 // slash command, recap projection) don't reach into raw db queries.
 // Mirrors the TodoStore / MemoryRegistry shape: harness owns
@@ -351,6 +387,7 @@ export interface ContextPinsStore {
   listPinsBySession(sessionId: string): ContextPin[];
   getActivePinsBySession(sessionId: string, now?: number): ContextPin[];
   countActivePinsBySession(sessionId: string, now?: number): number;
+  findActivePinsByIdPrefix(sessionId: string, prefix: string, now?: number): ContextPin[];
   removePin(id: string): boolean;
 }
 
@@ -360,6 +397,8 @@ export const createContextPinsStore = (db: DB): ContextPinsStore => ({
   listPinsBySession: (sessionId) => listPinsBySession(db, sessionId),
   getActivePinsBySession: (sessionId, now) => getActivePinsBySession(db, sessionId, now),
   countActivePinsBySession: (sessionId, now) => countActivePinsBySession(db, sessionId, now),
+  findActivePinsByIdPrefix: (sessionId, prefix, now) =>
+    findActivePinsByIdPrefix(db, sessionId, prefix, now),
   removePin: (id) => removePin(db, id),
 });
 
