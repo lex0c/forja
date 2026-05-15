@@ -42,6 +42,7 @@ import {
   listRecentMemoryEvents,
 } from '../../../storage/index.ts';
 import type { MemoryEvent } from '../../../storage/index.ts';
+import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 // ─── scope arg helpers ───────────────────────────────────────────────
@@ -424,6 +425,113 @@ const handleSummary = (registry: MemoryRegistry): SlashResult => {
       'subcommands: list · show · audit · delete · promote shared · demote local',
     ],
   };
+};
+
+// ─── /memory metrics ─────────────────────────────────────────────────
+//
+// Spec EVICTION §11 metrics surface. Read-only aggregator over the
+// eviction_events table, scoped to substrate='memory'. Operators
+// invoke `/memory metrics [--days N]` to see what the eviction
+// pipeline did over the window — distribution by motivo, restore
+// rate, purge-bypass count, quarantine dwell + escape, protection
+// + hook blocks.
+
+const DEFAULT_METRICS_WINDOW_DAYS = 30;
+
+const formatPercent = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`;
+
+const formatMsAsDays = (ms: number): string => {
+  const days = ms / (24 * 60 * 60 * 1000);
+  return `${days.toFixed(1)}d`;
+};
+
+const parseMetricsArgs = (args: string[]): { windowMs: number } | { error: string } => {
+  let days = DEFAULT_METRICS_WINDOW_DAYS;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--days') {
+      const next = args[i + 1];
+      if (next === undefined || !/^\d+$/.test(next)) {
+        return {
+          error: `/memory metrics: --days needs a positive integer (got ${next ?? 'nothing'})`,
+        };
+      }
+      days = Number.parseInt(next, 10);
+      if (!Number.isFinite(days) || days <= 0) {
+        return { error: `/memory metrics: invalid days '${next}'` };
+      }
+      i += 2;
+      continue;
+    }
+    return {
+      error: `/memory metrics: unknown flag '${a}' (try --days N)`,
+    };
+  }
+  return { windowMs: days * 24 * 60 * 60 * 1000 };
+};
+
+const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
+  const parsed = parseMetricsArgs(args);
+  if ('error' in parsed) return { kind: 'error', message: parsed.error };
+  const nowMs = ctx.now();
+  const snap = evictionMetricsSnapshot(ctx.db, nowMs, parsed.windowMs);
+  const lines: string[] = [`eviction metrics (memory, last ${formatMsAsDays(snap.windowMs)}):`];
+
+  // rate_by_motivo
+  if (snap.rateByMotivo.length === 0) {
+    lines.push('  rate_by_motivo: no applied evictions in window');
+  } else {
+    lines.push('  rate_by_motivo:');
+    for (const r of snap.rateByMotivo) {
+      lines.push(`    ${r.motivo.padEnd(11)} ${r.count}`);
+    }
+  }
+
+  // restore_rate
+  const rr = snap.restoreRate;
+  lines.push(
+    `  restore_rate: ${rr.restoredCount}/${rr.evictedCount} = ${formatPercent(rr.ratio)} (threshold > 20% ⇒ gate too aggressive)`,
+  );
+
+  // purge_irreversible_count
+  if (snap.purgeIrreversible.totalCount === 0) {
+    lines.push('  purge_irreversible_count: 0 (good)');
+  } else {
+    const lines2 = snap.purgeIrreversible.breakdown.map((b) => `${b.motivo}=${b.count}`).join(', ');
+    lines.push(`  purge_irreversible_count: ${snap.purgeIrreversible.totalCount} (${lines2})`);
+  }
+
+  // quarantine.dwell_time + escape_rate
+  const q = snap.quarantine;
+  if (q.exitedCount === 0) {
+    lines.push('  quarantine: no exits in window');
+  } else {
+    const dwell = q.avgDwellMs !== null ? formatMsAsDays(q.avgDwellMs) : 'n/a';
+    lines.push(
+      `  quarantine: avg_dwell=${dwell} · escape_rate=${formatPercent(q.escapeRate)} (n=${q.exitedCount})`,
+    );
+  }
+
+  // protection.cooldown_blocks
+  if (snap.protectionBlocks.totalCount === 0) {
+    lines.push('  protection_blocks: 0');
+  } else {
+    const detail = snap.protectionBlocks.byProtection
+      .map((p) => `${p.protection}=${p.count}`)
+      .join(', ');
+    lines.push(`  protection_blocks: ${snap.protectionBlocks.totalCount} (${detail})`);
+  }
+
+  // hook.eviction_blocks
+  if (snap.hookBlocks.totalCount === 0) {
+    lines.push('  hook_blocks: 0');
+  } else {
+    const detail = snap.hookBlocks.byHook.map((h) => `${h.blockedBy}=${h.count}`).join(', ');
+    lines.push(`  hook_blocks: ${snap.hookBlocks.totalCount} (${detail})`);
+  }
+
+  return { kind: 'ok', notes: lines };
 };
 
 // ─── /memory delete ──────────────────────────────────────────────────
@@ -1252,6 +1360,8 @@ export const memoryCommand: SlashCommand = {
         return handleShow(registry, ctx, args.slice(1));
       case 'audit':
         return handleAudit(ctx, args.slice(1));
+      case 'metrics':
+        return handleMetrics(ctx, args.slice(1));
       case 'delete':
         return handleDelete(registry, ctx, args.slice(1));
       case 'restore':
@@ -1263,7 +1373,7 @@ export const memoryCommand: SlashCommand = {
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, delete, restore, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, metrics, delete, restore, promote, demote)`,
         };
     }
   },

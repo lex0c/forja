@@ -2,6 +2,85 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(storage,cli) — eviction metrics aggregator + /memory metrics slash (Phase 2.7 — closes Phase 2)
+
+**Done.** Final slice of Phase 2 — closes the EVICTION substrate=memory loop end-to-end. EVICTION §11 declares 10 metrics; this slice ships the 7 the memory substrate alone can produce. The other 3 (`cascade.dependents_orphaned`, `roi.bottom_decile_residency`, `decay.misfire`) need missing subsystems (loop frio re-evaluation; Memory ROI tracking; the decay subsystem). All metrics are read-only aggregators over `eviction_events`; no new producers — just SQL over the rows Phases 1.2–2.6 produced.
+
+**Shipped metrics:**
+
+1. **`eviction.rate_by_motivo`** — distribution by motivo over window
+2. **`eviction.restore_rate`** — % of evictions that came back via restore
+3. **`eviction.purge_irreversible_count`** — `*→purged` rows that bypassed `evicted` (the §4.1 skip-evicted path; should only fire with `user_purge`/`security`)
+4. **`quarantine.dwell_time`** — avg ms in quarantine before exit (excludes same-chain pairs)
+5. **`quarantine.escape_rate`** — % of quarantined that came back to active
+6. **`protection.cooldown_blocks`** — `blocked_by_protection` count, broken down by protection
+7. **`hook.eviction_blocks`** — `blocked_by_hook` count, broken down by hook spec ref
+
+**Deferred:**
+- `cascade.dependents_orphaned` — needs loop frio re-evaluation events
+- `roi.bottom_decile_residency` — needs Memory ROI tracking + citation tracking
+- `decay.misfire` — needs decay subsystem (EVICTION §8)
+
+### Design decisions
+
+- **Same-chain filter in `quarantineStats`.** The dwell SQL excludes pairs where the exit event shares `(actor, trigger)` with the quarantine event — same rule as the protection gate. Without this, `gcExpiredMemories`'s `active→quarantined→evicted` pipeline (same actor/trigger on both steps, only 1ms apart) would dominate the avg dwell with near-zero values, masking real quarantine periods. Filtering matches the operational meaning of the metric: how long does quarantine REALLY hold things in review?
+
+- **Earliest exit, not most-recent.** When a memory was quarantined then restored then re-quarantined within the window, the dwell is from the FIRST quarantine to the FIRST exit (correlated subquery on `MIN(recorded_at)`). The re-quarantine starts a new dwell period; counting it alongside the first would double-count.
+
+- **`evictionMetricsSnapshot` is the single-call surface.** `/memory metrics` calls one function and gets all 7 metrics for the same (nowMs, windowMs). Lets the slash output reflect a consistent window across every line — without the wrapper, callers could drift on the lookback definition between metrics.
+
+- **Per-metric breakdown structures.** `MotivoCount`, `RestoreRate`, `PurgeIrreversible`, `QuarantineStats`, `ProtectionBlocks`, `HookBlocks` are exported as distinct interface shapes. Future dashboard consumers (recap, web UI) read the structured snapshot; the slash output uses string formatting for the terminal.
+
+- **`/memory metrics --days N` operator-facing surface.** Default window is 30d (matches MEMORY's tombstone retention; a metric over the same window that produces it is intuitive). Operators can narrow (e.g., `--days 7` for weekly review, `--days 1` for alert-shape monitoring).
+
+- **Window filter is on `recorded_at`, not on object lifetime.** A memory evicted 5 days ago shows up in a `--days 7` window even if it was created years earlier. The metric measures recent activity, not recent objects.
+
+- **Substrate filter is hardcoded to `'memory'`.** Other substrates (policy, candidate, slot_item) will own their own metric modules when they ship. A single cross-substrate metric query would mix retention windows (memory 30d / policy 14d / etc.) and produce noisy outputs.
+
+- **Snapshot reuses each individual function** rather than denormalizing the SQL. Slightly more queries (7 vs 1 monster join), but each metric is independently testable + reusable from a future dashboard or recap caller. Performance is acceptable at the scale eviction_events grows to (365d retention with thousands of objects = O(1M) rows worst case; 7 indexed queries are sub-millisecond).
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/repos/eviction-metrics.ts` | 7 aggregator functions + `evictionMetricsSnapshot` combined surface. Each function takes `(db, nowMs, windowMs)` so callers control the lookback uniformly. |
+| `src/cli/slash/commands/memory.ts` | `handleMetrics` + `/memory metrics` dispatch case. `--days N` flag (default 30). Output formatted as scrollback lines, one metric per line. |
+| `tests/storage/eviction-metrics.test.ts` | 11 tests covering each function — windowing, motivo grouping, same-chain dwell exclusion, ratio math, breakdown structures, combined snapshot. |
+| `tests/cli/slash/memory.test.ts` | 4 slash-side tests: happy path output mentions every metric line; `--days N` customizes window; rejects non-positive `--days`; rejects unknown flags. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7565 pass / 10 skip / 0 fail (+15 from the slice)
+- `bun test tests/storage/eviction-metrics.test.ts` 11 pass
+
+### Phase 2 closure — what shipped, what's deferred
+
+**Phase 2 (EVICTION memory-substrate completion) — 7 slices closed:**
+
+| Slice | What | Status |
+|---|---|---|
+| 2.1 | Wire Eviction hook into /memory delete + /memory restore | ✅ |
+| 2.2 | Route gcExpiredMemories through transitionMemoryState | ✅ |
+| 2.3 | GC sweep evicted → purged | ✅ |
+| 2.4 | Evidence gate per-motivo schema validation | ✅ |
+| 2.5 | Protection gates (user_explicit cooldown + quarantine min TTL) | ✅ |
+| 2.6 | Cascading detector (memory × memory) | ✅ |
+| 2.7 | Metrics aggregator + /memory metrics slash | ✅ |
+
+**EVICTION.md compliance for the memory substrate:** every section that DOESN'T depend on missing subsystems (policy, candidate, slot_item; context engine for pinned items; FEEDBACK_ADAPTATION for re-promotion gate; CODE_INDEX for symbol cascade) is implemented. The remaining gaps are structurally blocked on other subsystem implementation, not on EVICTION-side work.
+
+**Aggregate verification across Phase 2:** typecheck clean, lint 0 errors, full suite 7565 pass / 10 skip / 0 fail.
+
+### Deferred follow-ups across Phase 2
+
+- **Substrate fan-out**: policy, candidate, slot_item substrates need their own transition pipelines + GC sweeps + protection gates + metrics. Each waits on its owner subsystem to land.
+- **Decay subsystem (§8)** — half-life weighting for retrieval / context (not eviction). Zero implementation today.
+- **Automated triggers (§5.1)** — 11 of 12 triggers fire only manually. Loop frio + verify-before-act + distribution shift detector would close this.
+- **Spec amendments** declared throughout: admit `user_purge` / `expired` motivos on `active → quarantined` / `quarantined → evicted` (eliminates `_operator_driven` marker workaround); align MEMORY §6.5.5 with EVICTION §4.1 (restore goes to `active`, not `proposed`).
+- **Reconciliation slice** — recover from `audit_drift` outcomes by replaying disk state. Mentioned in Phase 1.3 review; out of scope through Phase 2.
+
 ## [2026-05-15] feat(memory) — cascading detector (memory × memory) (Phase 2.6)
 
 **Done.** EVICTION §6.4 declares cascade detection: when an object is evicted, OTHER objects that reference it may become stale. The spec is explicit that EVICTION does NOT auto-cascade — instead the dependents are RECORDED in `eviction_events.dependents_json` so the future loop frio (re-evaluation slice, not yet built) can process them with fresh evidence. This slice owns the memory × memory detector — the column has been on the schema since Phase 1.2; this is the first producer.

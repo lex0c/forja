@@ -1054,6 +1054,57 @@ const stubBlockingDispatcher =
     additionalContext: '',
   });
 
+describe('/memory metrics', () => {
+  test('outputs every metric line including rate_by_motivo + restore_rate', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots } = fixture;
+    let nowCounter = 10_000_000_000;
+    ctx.now = () => ++nowCounter;
+
+    // Produce some real eviction events to populate the snapshot.
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    fixture.registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', 'mem'], ctx);
+
+    const r = await memoryCommand.exec(['metrics'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('eviction metrics (memory, last 30.0d)');
+    expect(text).toContain('rate_by_motivo');
+    expect(text).toContain('low_roi');
+    expect(text).toContain('restore_rate');
+    expect(text).toContain('quarantine');
+  });
+
+  test('--days N customizes window', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['metrics', '--days', '7'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('last 7.0d');
+  });
+
+  test('rejects --days with non-positive integer', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['metrics', '--days', 'abc'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('positive integer');
+  });
+
+  test('rejects unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['metrics', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+});
+
 describe('/memory delete + restore — Eviction hook chain', () => {
   test('blocking hook on /memory delete: body stays put, no tombstone, refused audit', async () => {
     const repo = makeTmp();
