@@ -155,7 +155,7 @@ export interface MemoryUserScopeAskArgs {
 // just queues the modal. `action` is forwarded to the event for
 // audit / telemetry.
 export interface MemoryActionAskArgs {
-  action: 'delete' | 'promote' | 'demote';
+  action: 'delete' | 'promote' | 'demote' | 'restore';
   title: string;
   subject: string;
   preview: string[];

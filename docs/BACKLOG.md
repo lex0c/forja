@@ -2,6 +2,45 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(cli/memory) — /memory restore slash + re-admission (Phase 1.3.d)
+
+**Done.** Operator-facing inverse of `/memory delete`. `/memory restore <name> [scope]` looks up the latest tombstone for `name`, shows a modal preview with the captured body, and on confirmation transitions the memory from `evicted → active` — body copies back to the scope root, frontmatter strips `state: 'evicted'`, tombstone is consumed, and the paired audit (`eviction_events` `evicted→active` + `memory_events action='restored'`) lands.
+
+This closes Phase 1.3 of the memory/context evolution: the lifecycle (`active → quarantined → evicted → active`) is now end-to-end exercisable from the slash surface, and any eviction (operator-driven via `/memory delete`, or future automated triggers) is reversible until the retention window of `.tombstones/` expires.
+
+### Design decisions
+
+- **Restore target is `active` (state-machine canonical).** Spec MEMORY §6.5.5 names `proposed` as the restore target, but the canonical state machine in EVICTION §4.1 (1.2.a `LEGAL_TRANSITIONS`) only admits `evicted → active`. Routing through `proposed` would require an additional re-admission gate that doesn't exist yet — and the operator's *intent* on `/memory restore` is "I want this entry back the way it was", not "I want a fresh review". Treating restore as direct re-activation matches that intent. Follow-up declared: spec MEMORY §6.5.5 should be amended to read `active` so the docs stop contradicting the state machine. The slash code carries a comment pointing at this inconsistency.
+
+- **Modal preview shows the captured body.** Restoration is rare and operator-confirmed; showing the body content (first ~20 lines) lets the operator verify "yes, this is the entry I meant" before committing to re-admission. Mirrors the preview pattern `/memory delete` already uses.
+
+- **Cross-scope tombstone lookup by default.** With no scope arg, `findTombstoneInAnyScope` walks `project_local → project_shared → user` and restores whichever scope holds the latest matching tombstone. Operators usually remember the *name* they evicted, not which scope held it. Explicit scope arg (`/memory restore mem local`) narrows the lookup — if the tombstone isn't in that scope, error rather than fall back, so the operator's mental model stays consistent.
+
+- **Modal `'restore'` action joins the existing union.** `MemoryActionAskArgs.action` / `MemoryActionAskEvent.action` grow a `'restore'` variant alongside `'delete' | 'promote'`. UI rendering on the TUI side can branch on the action label to show appropriate copy ("Restore from tombstone?" vs. "Delete this memory?"). Modal API stays uniform across lifecycle actions.
+
+- **Latest-wins on same-name tombstones.** Two evictions of the same name produce two tombstones (`<name>.<unix_ms_1>.md`, `<name>.<unix_ms_2>.md`). `findLatestTombstone` picks the highest `ts` — restore takes the most recent version. Operators rarely care about earlier evicted versions; if they do, they can grep `.tombstones/` directly. No multi-version selector slash.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/commands/memory.ts` | `restore` subcommand: arg parse → scope resolve → `findLatestTombstone` (per-scope or cross-scope) → modal confirm with body preview → `transitionMemoryState({ toState: 'active', motivo: 'irrelevant', trigger: 'manual', actor: 'user' })`. `findTombstoneInAnyScope` helper. Import order normalized for Biome. |
+| `src/tui/events.ts` | `MemoryActionAskEvent.action` extended with `'restore'`. |
+| `src/tui/modal-manager.ts` | `MemoryActionAskArgs.action` extended with `'restore'`. |
+| `tests/cli/slash/memory.test.ts` | 7 tests: confirm yes (body restored, tombstone consumed, restored audit), preview content, confirm no, missing name, no tombstone, strict scope pinning, invalid scope arg, latest-wins on duplicates. |
+
+### Deferred / follow-ups declared
+
+- **Spec MEMORY §6.5.5** — change restore target from `proposed` to `active` to match the state machine. Spec PR, not code.
+- **Re-admission gate** — if the project later wants restored memories to land in `proposed` (with explicit operator promotion), introduce a `restored_via: 'gate' | 'direct'` distinction. Out of scope here.
+- **Cross-scope restore disambiguation** — currently silent: first scope with a matching tombstone wins. A future slice could surface "found in scope X, also exists in Y — confirm scope" if operator confusion materializes.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/cli/slash/memory.test.ts` 66 pass / 0 fail (was 58 pre-slice; +7 new + 1 implicit from preview path)
+
 ## [2026-05-15] feat(cli/memory) — /memory delete uses transitionMemoryState (Phase 1.3.c3)
 
 **Done.** First production caller of `transitionMemoryState` (1.3.c1). When the operator runs `/memory delete <name>` on an `active` memory, the slash now routes through the state machine instead of calling the legacy `removeMemory` primitive — the body moves into `.tombstones/` (restorable later via `/memory restore`, 1.3.d), and the audit pair (`eviction_events` + `memory_events`) lands. Memories in other states (malformed body, missing file) keep the legacy code path because tombstone semantics don't apply.

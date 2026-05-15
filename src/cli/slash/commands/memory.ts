@@ -21,13 +21,17 @@
 // the dispatcher's `notes` channel; mutation subcommands (Tier 2)
 // add modal-confirm + audit-row emission paths.
 
+import { readFileSync } from 'node:fs';
 import {
   type MemoryFile,
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
   type MemoryState,
+  type TombstoneEntry,
+  findLatestTombstone,
   moveMemory,
+  parseMemoryFile,
   removeMemory,
   scanForInjection,
   scanForPromotion,
@@ -702,6 +706,148 @@ const attribution = (ctx: SlashContext): { auditSessionId?: string } => {
   return sid !== null ? { auditSessionId: sid } : {};
 };
 
+// ─── /memory restore ─────────────────────────────────────────────────
+//
+// Spec MEMORY.md §6.5.5: bring an evicted memory back into active
+// rotation by reading the latest tombstone and transitioning
+// `evicted → active`. Operator confirms via the same memory-action
+// modal /memory delete uses (action='restore').
+//
+// Spec literally calls for `state: proposed` (re-admission gate)
+// rather than `active`. We take the state-machine canonical path
+// (EVICTION §4.1: `evicted → active` is the only restore
+// transition listed) because: (a) the operator typed `/memory
+// restore` — a re-admission modal would be redundant; (b)
+// LEGAL_TRANSITIONS doesn't admit `evicted → proposed`; and
+// (c) `proposed` would force a parallel admission gate
+// subsystem that doesn't exist today. Spec MEMORY §6.5.5 vs
+// EVICTION §4.1 is a documented spec inconsistency; reconciling
+// would need a spec PR. Trade-off accepted in this slice.
+
+// Search every scope for the latest tombstone matching `name`.
+// Returns the first match in scope precedence order
+// (project_local → project_shared → user — same as the resolution
+// order in §2.4). Returns null when no tombstone exists in any
+// scope.
+const findTombstoneInAnyScope = (
+  registry: MemoryRegistry,
+  name: string,
+): { scope: MemoryScope; tombstone: TombstoneEntry } | null => {
+  const roots = registry.roots;
+  const scopes: MemoryScope[] = ['project_local', 'project_shared', 'user'];
+  for (const scope of scopes) {
+    const t = findLatestTombstone(roots, scope, name);
+    if (t !== null) return { scope, tombstone: t };
+  }
+  return null;
+};
+
+const handleRestore = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  if (args.length === 0) {
+    return { kind: 'error', message: '/memory restore: missing name argument' };
+  }
+  if (args.length > 2) {
+    return {
+      kind: 'error',
+      message: `/memory restore: too many args (got ${args.length}, expected name [scope])`,
+    };
+  }
+  const name = args[0] as string;
+  const scopeArg = args[1];
+
+  // Resolve target scope. If supplied, validate + restrict to it.
+  // Otherwise, search every scope and pick the first with a
+  // tombstone.
+  let target: { scope: MemoryScope; tombstone: TombstoneEntry } | null;
+  if (scopeArg !== undefined) {
+    if (!VALID_SINGLE_SCOPES.has(scopeArg)) {
+      return {
+        kind: 'error',
+        message: `/memory restore: invalid scope '${scopeArg}' (expected: user, local, shared)`,
+      };
+    }
+    const scope = memoryScopeFromSingleArg(scopeArg);
+    if (scope === null) {
+      return { kind: 'error', message: `/memory restore: invalid scope '${scopeArg}'` };
+    }
+    const tomb = findLatestTombstone(registry.roots, scope, name);
+    target = tomb !== null ? { scope, tombstone: tomb } : null;
+  } else {
+    target = findTombstoneInAnyScope(registry, name);
+  }
+
+  if (target === null) {
+    const scopeQual = scopeArg !== undefined ? ` in scope ${scopeArg}` : '';
+    return {
+      kind: 'error',
+      message: `/memory restore: no tombstone found for '${name}'${scopeQual}`,
+    };
+  }
+
+  // Build preview from the tombstone body. Reading the tombstone
+  // here is a probe — no audit row emitted; transitionMemoryState
+  // re-reads on the apply path and emits the canonical 'restored'
+  // memory_events row.
+  let preview: string[];
+  try {
+    const raw = readFileSync(target.tombstone.path, 'utf-8');
+    const file = parseMemoryFile(raw);
+    preview = file.body.split('\n');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      kind: 'error',
+      message: `/memory restore: failed to read tombstone (${msg})`,
+    };
+  }
+
+  const answer = await ctx.modalManager.askMemoryAction({
+    action: 'restore',
+    title: 'Restore memory',
+    subject: `${target.scope}/${name}`,
+    preview,
+    question: 'Restore this memory from .tombstones/ back to active?',
+  });
+  if (answer !== 'yes') {
+    return {
+      kind: 'ok',
+      notes: [`/memory restore cancelled (operator answered ${answer})`],
+    };
+  }
+
+  const sessionId = ctx.currentSessionId();
+  const result = await transitionMemoryState({
+    db: ctx.db,
+    registry,
+    roots: registry.roots,
+    scope: target.scope,
+    name,
+    toState: 'active',
+    // `evicted → active` admits any motivo per EVICTION §4.1.
+    // 'irrelevant' is the most neutral label — the original
+    // eviction reason no longer applies (the operator decided).
+    motivo: 'irrelevant',
+    trigger: 'manual',
+    actor: 'user',
+    ...(sessionId !== null ? { sessionId } : {}),
+    cwd: ctx.baseConfig.cwd,
+  });
+
+  if (result.kind !== 'applied') {
+    return mapTransitionFailure('/memory restore', result);
+  }
+
+  registry.reload();
+  return {
+    kind: 'ok',
+    notes: [`restored ${target.scope}/${name} (from tombstone ts=${target.tombstone.ts})`],
+  };
+};
+
 // ─── /memory promote shared ──────────────────────────────────────────
 //
 // Spec MEMORY.md §5.4: project_local → project_shared with an
@@ -991,6 +1137,8 @@ export const memoryCommand: SlashCommand = {
         return handleAudit(ctx, args.slice(1));
       case 'delete':
         return handleDelete(registry, ctx, args.slice(1));
+      case 'restore':
+        return handleRestore(registry, ctx, args.slice(1));
       case 'promote':
         return handlePromote(registry, ctx, args.slice(1));
       case 'demote':
@@ -998,7 +1146,7 @@ export const memoryCommand: SlashCommand = {
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, delete, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, delete, restore, promote, demote)`,
         };
     }
   },

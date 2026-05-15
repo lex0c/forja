@@ -793,6 +793,166 @@ describe('/memory delete', () => {
   });
 });
 
+describe('/memory restore', () => {
+  // Helper — runs `/memory delete` first so a tombstone exists,
+  // then exercises restore. The two-step lifecycle mirrors real
+  // operator flow.
+  const deleteThenSetup = async (
+    fixture: ReturnType<typeof makeCtx>,
+    scopeDir: string,
+    name: string,
+    body = 'restored body content',
+  ) => {
+    const { ctx, registry } = fixture;
+    writeIndex(scopeDir, `- [${name}](${name}.md) — h\n`);
+    writeBody(scopeDir, name, {}, body);
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', name], ctx);
+  };
+
+  test('confirm yes: copies tombstone back to scope root, audits restored', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots, sessionId } = fixture;
+    await deleteThenSetup(fixture, roots.projectLocal, 'mem');
+
+    // Sanity: tombstone exists, scope-root body is gone.
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+    const tombDir = join(roots.projectLocal, '.tombstones');
+    expect(existsSync(tombDir)).toBe(true);
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['restore', 'mem'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('restored project_local/mem');
+
+    // Body file back; tombstone consumed.
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    const { readdirSync } = await import('node:fs');
+    const remaining = readdirSync(tombDir);
+    expect(remaining).toHaveLength(0);
+
+    // Audit: memory_events 'restored' row lands.
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const restored = events.find((e) => e.action === 'restored');
+    expect(restored).toBeDefined();
+    expect(restored?.scope).toBe('project_local');
+    expect(restored?.sessionId).toBe(sessionId);
+  });
+
+  test('preview shows tombstone body content', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots } = fixture;
+    await deleteThenSetup(fixture, roots.projectLocal, 'mem', 'preserved\nlines\nhere');
+
+    const capture = { calls: [] as { action: string; subject: string; preview: string[] }[] };
+    stubMemoryAction(ctx, 'no', capture);
+    await memoryCommand.exec(['restore', 'mem'], ctx);
+    expect(capture.calls).toHaveLength(1);
+    expect(capture.calls[0]?.action).toBe('restore');
+    expect(capture.calls[0]?.subject).toBe('project_local/mem');
+    const previewText = capture.calls[0]?.preview.join('\n') ?? '';
+    expect(previewText).toContain('preserved');
+    expect(previewText).toContain('lines');
+  });
+
+  test('confirm no: leaves tombstone in place, no restore audit row', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots } = fixture;
+    await deleteThenSetup(fixture, roots.projectLocal, 'mem');
+
+    stubMemoryAction(ctx, 'no');
+    const r = await memoryCommand.exec(['restore', 'mem'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('cancelled');
+
+    // Body still in tombstone (not yet restored).
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones'))).toHaveLength(1);
+
+    // No 'restored' audit row.
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    expect(events.find((e) => e.action === 'restored')).toBeUndefined();
+  });
+
+  test('missing name errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['restore'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing name');
+  });
+
+  test('no tombstone errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['restore', 'never-evicted'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('no tombstone');
+  });
+
+  test('strict scope arg pins lookup', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots } = fixture;
+    await deleteThenSetup(fixture, roots.user, 'mem');
+
+    // Strict to local: should miss (tombstone is in user).
+    const miss = await memoryCommand.exec(['restore', 'mem', 'local'], ctx);
+    expect(miss.kind).toBe('error');
+    if (miss.kind === 'error') expect(miss.message).toContain('no tombstone');
+
+    // Strict to user: hit.
+    stubMemoryAction(ctx, 'yes');
+    const hit = await memoryCommand.exec(['restore', 'mem', 'user'], ctx);
+    expect(hit.kind).toBe('ok');
+  });
+
+  test('invalid scope arg errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['restore', 'mem', 'bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('invalid scope');
+  });
+
+  test('multiple tombstones same name: latest is restored', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots, registry } = fixture;
+
+    // First eviction.
+    await deleteThenSetup(fixture, roots.projectLocal, 'mem', 'first version');
+
+    // Re-create the memory at the scope root + re-evict so two
+    // tombstones exist with different ts.
+    writeBody(roots.projectLocal, 'mem', {}, 'second version');
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    // Sleep 5ms to guarantee distinct unix_ms tombstone filenames
+    // (Date.now() is ms-precision; back-to-back evictions in the
+    // same ms would collide). A tighter fix would inject `now()`
+    // into the slash flow; tolerable here.
+    await new Promise((res) => setTimeout(res, 5));
+    await memoryCommand.exec(['delete', 'mem'], ctx);
+
+    // Restore: should pick the latest (which carried 'second version').
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['restore', 'mem'], ctx);
+    expect(r.kind).toBe('ok');
+    const { readFileSync } = await import('node:fs');
+    const restoredBody = readFileSync(join(roots.projectLocal, 'mem.md'), 'utf-8');
+    expect(restoredBody).toContain('second version');
+  });
+});
+
 describe('/memory promote shared', () => {
   test('confirm yes: moves local → shared, audits promoted', async () => {
     const repo = makeTmp();
