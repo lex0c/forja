@@ -23,6 +23,8 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
+import { dispatchChain } from '../hooks/dispatcher.ts';
+import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import { escapeGlobMetacharacters } from '../permissions/index.ts';
 import type { PolicySource, PolicyToolsSection } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
@@ -1540,6 +1542,33 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // single source of truth.
   const contextPinsStore = createContextPinsStore(db);
 
+  // Hook dispatcher for slash commands (EVICTION.md §10.3). Mirrors
+  // the harness loop's wrapper at loop.ts:dispatchHooks but uses the
+  // operator's current REPL state (session id, hooks loaded at
+  // bootstrap). When no hooks are configured or the kill-switch is
+  // on, returns null so the slash caller skips the hook gate
+  // (same path as the empty-chain short-circuit). Errors inside
+  // the chain are caught + stderred so a buggy hook can't crash
+  // the slash command surface — defense in depth mirrors the
+  // harness's pattern.
+  const slashDispatchHooks = async (payload: HookEventPayload): Promise<HookChainResult | null> => {
+    if (baseConfig.disableAllHooks === true) return null;
+    if (baseConfig.hooks === undefined || baseConfig.hooks.length === 0) return null;
+    try {
+      return await dispatchChain(baseConfig.hooks, payload, baseConfig.cwd, {
+        db,
+        sessionId: lastSessionId !== null && lastSessionId.length > 0 ? lastSessionId : null,
+        ...(baseConfig.disableAllHooks !== undefined
+          ? { disableAllHooks: baseConfig.disableAllHooks }
+          : {}),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`hooks: slash chain dispatch failed for ${payload.event}: ${msg}\n`);
+      return null;
+    }
+  };
+
   const slashCtx: SlashContext = {
     baseConfig,
     db,
@@ -1549,6 +1578,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     now,
     requestShutdown,
     contextPinsStore,
+    dispatchHooks: slashDispatchHooks,
     // Closure over the REPL's busy state — fresh read per call so
     // a slash command queued before a turn starts but executed
     // after observes the post-startTurn state. The same predicate

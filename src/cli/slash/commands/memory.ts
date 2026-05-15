@@ -657,6 +657,14 @@ const deleteViaTransition = async (
   // path is still Date.now-shaped). Without this, two transitions
   // in the same ms tiebreak by rowid (M3) — deterministic but
   // less semantically meaningful than `quarantined < evicted`.
+  //
+  // fireHook is threaded when the REPL wired a dispatcher. Eviction
+  // hook can refuse the transition (security policy, compliance);
+  // the resulting `blocked_by_hook` audit lands without disk
+  // change. Slash commands run outside a session (no session id
+  // until first turn) → the helper itself skips hook fire when
+  // sessionId is null; we pass dispatchHooks regardless and let
+  // transitionMemoryState gate it.
   const transitionInput = {
     db: ctx.db,
     registry,
@@ -669,6 +677,7 @@ const deleteViaTransition = async (
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
     now: ctx.now,
+    ...(ctx.dispatchHooks !== undefined ? { fireHook: ctx.dispatchHooks } : {}),
   };
 
   // 1) active → quarantined.
@@ -904,6 +913,11 @@ const handleRestore = async (
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
     now: ctx.now,
+    // Eviction hook chain gates restore the same way it gates
+    // delete — a security policy that allows eviction but
+    // refuses restore (e.g. quarantine-mandatory) needs the hook
+    // to see the `evicted → active` payload.
+    ...(ctx.dispatchHooks !== undefined ? { fireHook: ctx.dispatchHooks } : {}),
   });
 
   if (result.kind !== 'applied') {

@@ -12,6 +12,7 @@
 // `bus.emit` calls across every command.
 
 import type { HarnessConfig } from '../../harness/index.ts';
+import type { HookChainResult, HookEventPayload } from '../../hooks/types.ts';
 import type { ModelRegistry } from '../../providers/registry.ts';
 import type { DB } from '../../storage/index.ts';
 import type { ContextPinsStore } from '../../storage/repos/context-pins.ts';
@@ -157,6 +158,16 @@ export interface SlashContext {
   // through there); the SlashContext copy is what /pin uses
   // because slash commands don't run inside a ToolContext.
   contextPinsStore?: ContextPinsStore;
+  // Hook dispatcher (AGENTIC_CLI.md §10.3 + EVICTION.md §10.3).
+  // Wraps `dispatchChain` against the REPL-resolved hooks. Slash
+  // commands that emit hook events (today: /memory delete + /memory
+  // restore via the Eviction event) thread this into the
+  // transitionMemoryState `fireHook` field. Absent in headless /
+  // test contexts that don't load hooks.toml; transitions then
+  // skip the hook gate entirely (same path as the harness loop's
+  // empty-chain short-circuit). Null return mirrors that path so
+  // call sites don't branch on the discriminator.
+  dispatchHooks?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

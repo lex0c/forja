@@ -1029,6 +1029,139 @@ operator edits on top of partial restore
 
 // ── audit_drift surface + retention purge_at ─────────────────────────
 
+// Stub for the Eviction hook chain. Returns a blocking decision
+// shaped like a real dispatcher result so transitionMemoryState
+// routes through the blocked_by_hook branch.
+const stubBlockingDispatcher =
+  (message = 'security policy refused') =>
+  async () => ({
+    blockedBy: {
+      spec: {
+        layer: 'enterprise' as const,
+        sourcePath: '/etc/agent/hooks.toml',
+        event: 'Eviction' as const,
+        matcher: {},
+        entryIndex: 0,
+        command: 'audit.sh',
+        timeoutMs: 5000,
+        failClosed: false,
+        locked: false,
+      },
+      reason: 'message' as const,
+      message,
+    },
+    runs: [],
+    additionalContext: '',
+  });
+
+describe('/memory delete + restore — Eviction hook chain', () => {
+  test('blocking hook on /memory delete: body stays put, no tombstone, refused audit', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots } = fixture;
+    ctx.dispatchHooks = stubBlockingDispatcher('compliance: cannot delete user memories');
+
+    writeIndex(roots.user, '- [Mem](mem.md) — h\n');
+    writeBody(roots.user, 'mem', { type: 'user' });
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['delete', 'mem', 'user'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain('blocked by Eviction hook');
+    }
+
+    // Body unchanged — hook refused at active → quarantined step.
+    expect(existsSync(join(roots.user, 'mem.md'))).toBe(true);
+    expect(existsSync(join(roots.user, '.tombstones'))).toBe(false);
+
+    // Audit: eviction_events row with outcome=blocked_by_hook.
+    const { getLastEvictionForObject } = await import(
+      '../../../src/storage/repos/eviction-events.ts'
+    );
+    const last = getLastEvictionForObject(db, 'memory', 'mem');
+    expect(last?.outcome).toBe('blocked_by_hook');
+    expect(last?.blockedBy).toContain('/etc/agent/hooks.toml');
+
+    // memory_events: refused row landed.
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const refused = events.find((e) => e.action === 'refused');
+    expect(refused).toBeDefined();
+    expect(refused?.details?.stage).toBe('eviction_hook');
+  });
+
+  test('blocking hook on /memory restore: tombstone stays, body absent, refused audit', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, db, roots } = fixture;
+    // Hook off during delete (so the eviction lands), then on for restore.
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', 'mem'], ctx);
+
+    // Tombstone landed; body is gone.
+    const tombDir = join(roots.projectLocal, '.tombstones');
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(tombDir).length).toBe(1);
+
+    // Now wire a blocking hook and try to restore.
+    ctx.dispatchHooks = stubBlockingDispatcher(
+      'compliance: restore disallowed for evicted memories',
+    );
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['restore', 'mem'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain('blocked by Eviction hook');
+    }
+
+    // Tombstone unchanged; body still absent.
+    expect(readdirSync(tombDir).length).toBe(1);
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+
+    // Audit: a NEW blocked_by_hook row landed for the restore attempt.
+    const { getLastEvictionForObject } = await import(
+      '../../../src/storage/repos/eviction-events.ts'
+    );
+    const last = getLastEvictionForObject(db, 'memory', 'mem');
+    expect(last?.outcome).toBe('blocked_by_hook');
+    expect(last?.fromState).toBe('evicted');
+    expect(last?.toState).toBe('evicted'); // refused — toState collapses to fromState
+
+    // memory_events: refused row for restore attempt.
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const refused = events.filter((e) => e.action === 'refused');
+    // Only the restore attempt's refused row (delete had no hook).
+    expect(refused.length).toBeGreaterThanOrEqual(1);
+    expect(refused[refused.length - 1]?.details?.proposed_to_state).toBe('active');
+  });
+
+  test('non-blocking hook on /memory delete: proceeds normally with chain audit', async () => {
+    const repo = makeTmp();
+    const fixture = makeCtx(repo);
+    const { ctx, roots } = fixture;
+    // Non-blocking: chain returns null blockedBy.
+    ctx.dispatchHooks = async () => ({ blockedBy: null, runs: [], additionalContext: '' });
+
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    fixture.registry.reload();
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['delete', 'mem'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(r.notes?.[0]).toContain('deleted project_local/mem');
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+  });
+});
+
 describe('/memory delete — retention + audit_drift', () => {
   test('purge_at is set on the evicted eviction_events row (30d window)', async () => {
     const repo = makeTmp();

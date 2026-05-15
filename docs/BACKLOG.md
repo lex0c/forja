@@ -2,6 +2,44 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(cli) — wire Eviction hook into /memory delete + /memory restore (Phase 2.1)
+
+**Done.** First slice of the "complete EVICTION" sequence. The Eviction hook chain has been a defined surface since Phase 1.2 (schema, matcher, payload type, dispatcher), but neither `/memory delete` nor `/memory restore` actually fired it — `transitionMemoryState` accepts `fireHook?` and the slash callers had it unset, so a security policy that needed to gate operator-driven evictions was inert. This slice plumbs the dispatcher from REPL → SlashContext → both slash flows.
+
+The plumbing mirrors the harness loop's `dispatchHooks` wrapper at `src/harness/loop.ts:532` — same hooks list (`baseConfig.hooks`), same kill-switch short-circuit, same session-id-null safety. The slash-side wrapper has an additional concern: it can fire before a turn has started (`lastSessionId === null`), so the sessionId guard is conjunctive (`!== null && length > 0`).
+
+### Design decisions
+
+- **Hook fires at both `active → quarantined` AND `quarantined → evicted` steps of `/memory delete`.** The 2-step canonical path goes through `transitionMemoryState` twice; each call evaluates the hook with its own payload (different `fromState`/`toState`). A hook that wants to allow quarantine but refuse final eviction can match on `to_state=evicted`. A hook that wants to refuse any operator-driven delete blocks the first transition and the second never fires.
+
+- **Refused row's `toState` collapses to `fromState`.** When a hook blocks an `evicted → active` restore, the eviction_events row records `fromState=evicted, toState=evicted` — the proposed transition's target is captured separately in `memory_events.details.proposed_to_state`. This is the same shape Phase 1.3.c1 settled for blocked-by-hook outcomes: the row reflects what HAPPENED on disk (no state change), not what was attempted.
+
+- **Wrapper catches dispatcher exceptions and stderr-logs.** Same defensive pattern the harness loop uses — a buggy hook (or a bug in the dispatcher itself) shouldn't crash the slash command surface. Failure modes are still observable via the stderr line; the slash result reads as "no hook configured" because returning null falls through transitionMemoryState's empty path.
+
+- **`disableAllHooks` short-circuits at the wrapper, not at the dispatcher.** Same defense-in-depth: the dispatcher honors the flag too (it's load-bearing for slice 181's kill switch), but short-circuiting at the wrapper avoids the wrapper-promise + cleanup churn. The slash caller never sees a half-spawned dispatcher in the disabled path.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/types.ts` | Added optional `dispatchHooks?: (payload) => Promise<HookChainResult \| null>` to `SlashContext`. Hook + chain result imports. |
+| `src/cli/repl.ts` | Built `slashDispatchHooks` wrapper using the REPL's `baseConfig.hooks`, db, and `lastSessionId`. Threaded into `SlashContext`. Tightened the `lastSessionId.length > 0` guard for null-safety (it's typed `string \| null`). |
+| `src/cli/slash/commands/memory.ts` | `deleteViaTransition` + `handleRestore` thread `fireHook: ctx.dispatchHooks` when defined. Each call lands as-is — transitionMemoryState already gates on `sessionId != null` internally. |
+| `tests/cli/slash/memory.test.ts` | 3 new tests: hook block on `/memory delete` keeps body and emits refused audit; hook block on `/memory restore` keeps tombstone in place; non-blocking hook on delete proceeds normally. Stub `stubBlockingDispatcher(message)` helper. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7522 pass / 10 skip / 0 fail (+3 from the slice)
+- `bun test tests/cli/slash/memory.test.ts` 73 pass
+
+### Deferred / follow-ups declared
+
+- **Subagent runtime + REPL `slashDispatchHooks` sharing.** Today the REPL has one wrapper and the harness loop has another, both calling `dispatchChain` against `baseConfig.hooks`. A future slice could lift the wrapper out (shared helper) — out of scope here because the two callers' contexts differ enough (harness has `sessionId` per-turn, REPL has `lastSessionId` from closure).
+- **2.2 — Route `gcExpiredMemories` through transitionMemoryState** (next slice — kills the silent-GC violation of EVICTION §0.9).
+- **2.3 — GC sweep `evicted → purged`** (next slice — materializes the retention window the slice landed via `purgeAt` 30d).
+
 ## [2026-05-15] fix(memory) — post-1.3 review batch: retention, atomicity, audit drift, ambiguity
 
 **Done.** Addresses every finding from the post-1.3 multi-agent review across the five Phase 1.3 commits. Twelve corrections in one slice because they're tightly coupled (state-machine validator change cascades into same-state semantics; routing-flag cleanup reshapes the slash callers; retention enforcement requires both `purgeAt` propagation and the `now()` threading). Splitting would create churn without smaller blast radius.
