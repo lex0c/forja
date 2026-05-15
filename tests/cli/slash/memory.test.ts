@@ -1131,7 +1131,7 @@ describe('/memory delete + restore — Eviction hook chain', () => {
     const { getLastEvictionForObject } = await import(
       '../../../src/storage/repos/eviction-events.ts'
     );
-    const last = getLastEvictionForObject(db, 'memory', 'mem');
+    const last = getLastEvictionForObject(db, 'memory', 'mem', 'user');
     expect(last?.outcome).toBe('blocked_by_hook');
     expect(last?.blockedBy).toContain('/etc/agent/hooks.toml');
 
@@ -1179,7 +1179,7 @@ describe('/memory delete + restore — Eviction hook chain', () => {
     const { getLastEvictionForObject } = await import(
       '../../../src/storage/repos/eviction-events.ts'
     );
-    const last = getLastEvictionForObject(db, 'memory', 'mem');
+    const last = getLastEvictionForObject(db, 'memory', 'mem', 'project_local');
     expect(last?.outcome).toBe('blocked_by_hook');
     expect(last?.fromState).toBe('evicted');
     expect(last?.toState).toBe('evicted'); // refused — toState collapses to fromState
@@ -1232,7 +1232,7 @@ describe('/memory delete — retention + audit_drift', () => {
     const { getLastEvictionForObject } = await import(
       '../../../src/storage/repos/eviction-events.ts'
     );
-    const last = getLastEvictionForObject(db, 'memory', 'mem');
+    const last = getLastEvictionForObject(db, 'memory', 'mem', 'project_local');
     expect(last).not.toBeNull();
     expect(last?.toState).toBe('evicted');
     expect(last?.purgeAt).not.toBeNull();

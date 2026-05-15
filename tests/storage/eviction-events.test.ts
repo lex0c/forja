@@ -8,7 +8,9 @@ import {
   appendEvictionEvent,
   countEvictionEvents,
   detectTriggerThrashing,
+  getLastAppliedEvictionForObject,
   getLastEvictionForObject,
+  getLastQuarantineEvent,
   isLegalTransition,
   listEvictableInWindow,
   listEvictedDueForPurge,
@@ -245,7 +247,9 @@ describe('appendEvictionEvent: insert + defaults', () => {
   test('explicit id round-trips (replay path)', () => {
     const e = appendEvictionEvent(db, validInput({ id: 'fixed-eviction-id' }));
     expect(e.id).toBe('fixed-eviction-id');
-    expect(getLastEvictionForObject(db, 'memory', 'test-memory-1')?.id).toBe('fixed-eviction-id');
+    expect(getLastEvictionForObject(db, 'memory', 'test-memory-1', 'project_local')?.id).toBe(
+      'fixed-eviction-id',
+    );
   });
 
   test('throws IllegalTransitionError for illegal state move', () => {
@@ -380,7 +384,7 @@ describe('eviction_events: FK semantics', () => {
   test('session purge preserves audit row with session_id NULL', () => {
     const e = appendEvictionEvent(db, validInput());
     db.query('DELETE FROM sessions WHERE id = ?').run(sessionId);
-    const after = getLastEvictionForObject(db, e.substrate, e.objectId);
+    const after = getLastEvictionForObject(db, e.substrate, e.objectId, e.objectScope);
     expect(after).not.toBeNull();
     expect(after?.sessionId).toBeNull();
   });
@@ -394,7 +398,7 @@ describe('eviction_events: FK semantics', () => {
 // ── queries ────────────────────────────────────────────────────────
 
 describe('getLastEvictionForObject', () => {
-  test('returns the most-recent event for (substrate, objectId)', () => {
+  test('returns the most-recent event for (substrate, objectId, objectScope)', () => {
     appendEvictionEvent(db, validInput({ recordedAt: 100 }));
     appendEvictionEvent(
       db,
@@ -405,22 +409,196 @@ describe('getLastEvictionForObject', () => {
         recordedAt: 200,
       }),
     );
-    const last = getLastEvictionForObject(db, 'memory', 'test-memory-1');
+    const last = getLastEvictionForObject(db, 'memory', 'test-memory-1', 'project_local');
     expect(last?.toState).toBe('quarantined');
     expect(last?.recordedAt).toBe(200);
   });
 
   test('returns null for unknown object', () => {
-    expect(getLastEvictionForObject(db, 'memory', 'never-existed')).toBeNull();
+    expect(getLastEvictionForObject(db, 'memory', 'never-existed', 'project_local')).toBeNull();
   });
 
   test('scopes to the requested substrate', () => {
     appendEvictionEvent(db, validInput({ substrate: 'memory' }));
     appendEvictionEvent(db, validInput({ substrate: 'policy', objectId: 'test-memory-1' }));
-    const m = getLastEvictionForObject(db, 'memory', 'test-memory-1');
-    const p = getLastEvictionForObject(db, 'policy', 'test-memory-1');
+    const m = getLastEvictionForObject(db, 'memory', 'test-memory-1', 'project_local');
+    const p = getLastEvictionForObject(db, 'policy', 'test-memory-1', 'project_local');
     expect(m?.substrate).toBe('memory');
     expect(p?.substrate).toBe('policy');
+  });
+
+  test('isolates by objectScope — same memory name in different scopes is independent', () => {
+    // Defense in depth: even though no production caller relies on
+    // getLastEvictionForObject for lifecycle decisions today, the
+    // signature now requires scope so future call sites can't
+    // accidentally inherit the old bug.
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'rule-x',
+        objectScope: 'project_local',
+        recordedAt: 100,
+      }),
+    );
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'rule-x',
+        objectScope: 'user',
+        recordedAt: 500,
+      }),
+    );
+    const projLocal = getLastEvictionForObject(db, 'memory', 'rule-x', 'project_local');
+    expect(projLocal?.recordedAt).toBe(100);
+    expect(projLocal?.objectScope).toBe('project_local');
+    const userScope = getLastEvictionForObject(db, 'memory', 'rule-x', 'user');
+    expect(userScope?.recordedAt).toBe(500);
+    expect(userScope?.objectScope).toBe('user');
+  });
+});
+
+describe('getLastAppliedEvictionForObject', () => {
+  test('returns the most-recent applied event for (substrate, objectId, objectScope)', () => {
+    appendEvictionEvent(db, validInput({ recordedAt: 100 })); // applied
+    appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'active',
+        toState: 'active', // same-state probe
+        motivo: 'low_roi',
+        outcome: 'trigger_fired_no_action',
+        evidenceJson: JSON.stringify({ trigger_source: 'roi_probe' }),
+        recordedAt: 200,
+      }),
+    );
+    const last = getLastAppliedEvictionForObject(db, 'memory', 'test-memory-1', 'project_local');
+    expect(last?.outcome).toBe('applied');
+    expect(last?.recordedAt).toBe(100);
+  });
+
+  test('returns null when no applied event exists in the scope', () => {
+    expect(getLastAppliedEvictionForObject(db, 'memory', 'never-existed', 'user')).toBeNull();
+  });
+
+  test('isolates by objectScope — same memory name in different scopes is independent', () => {
+    // Same object_id 'user-role' exists in user-scope and project_local
+    // as TWO independent memories. Without scope filtering, the lookup
+    // would return whichever event landed latest globally and the GC
+    // sweep would think the project_local tombstone is stale.
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'user-role',
+        objectScope: 'project_local',
+        recordedAt: 100,
+      }),
+    );
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'user-role',
+        objectScope: 'user',
+        recordedAt: 500, // newer applied event in the OTHER scope
+      }),
+    );
+    const projLocal = getLastAppliedEvictionForObject(db, 'memory', 'user-role', 'project_local');
+    expect(projLocal?.recordedAt).toBe(100);
+    expect(projLocal?.objectScope).toBe('project_local');
+    const userScope = getLastAppliedEvictionForObject(db, 'memory', 'user-role', 'user');
+    expect(userScope?.recordedAt).toBe(500);
+    expect(userScope?.objectScope).toBe('user');
+  });
+
+  test('scopes to the requested substrate', () => {
+    appendEvictionEvent(db, validInput({ substrate: 'memory' }));
+    appendEvictionEvent(db, validInput({ substrate: 'policy', objectId: 'test-memory-1' }));
+    const m = getLastAppliedEvictionForObject(db, 'memory', 'test-memory-1', 'project_local');
+    const p = getLastAppliedEvictionForObject(db, 'policy', 'test-memory-1', 'project_local');
+    expect(m?.substrate).toBe('memory');
+    expect(p?.substrate).toBe('policy');
+  });
+});
+
+describe('getLastQuarantineEvent', () => {
+  test('returns the most-recent applied quarantine transition', () => {
+    appendEvictionEvent(db, validInput({ recordedAt: 100 })); // active (admission)
+    appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'active',
+        toState: 'quarantined',
+        motivo: 'conflict',
+        recordedAt: 200,
+      }),
+    );
+    appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'active',
+        toState: 'active', // probe — not a quarantine
+        motivo: 'conflict',
+        outcome: 'trigger_fired_no_action',
+        evidenceJson: JSON.stringify({ trigger_source: 'verify_probe' }),
+        recordedAt: 300,
+      }),
+    );
+    const q = getLastQuarantineEvent(db, 'memory', 'test-memory-1', 'project_local');
+    expect(q?.toState).toBe('quarantined');
+    expect(q?.recordedAt).toBe(200);
+  });
+
+  test('returns null when no applied quarantine exists in the scope', () => {
+    appendEvictionEvent(db, validInput()); // applied to active, not quarantined
+    expect(getLastQuarantineEvent(db, 'memory', 'test-memory-1', 'project_local')).toBeNull();
+  });
+
+  test('isolates by objectScope — quarantine in another scope does NOT leak', () => {
+    // user-scope quarantine of 'auth-rule' should not gate a
+    // project_local 'auth-rule' transition. Without scope filtering,
+    // the TTL gate in transitionMemoryState would read the wrong
+    // quarantine timestamp and block a legitimate eviction.
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'auth-rule',
+        objectScope: 'user',
+        fromState: 'active',
+        toState: 'quarantined',
+        motivo: 'conflict',
+        recordedAt: 200,
+      }),
+    );
+    const projLocal = getLastQuarantineEvent(db, 'memory', 'auth-rule', 'project_local');
+    expect(projLocal).toBeNull();
+    const userScope = getLastQuarantineEvent(db, 'memory', 'auth-rule', 'user');
+    expect(userScope?.recordedAt).toBe(200);
+  });
+
+  test('ignores blocked_by_protection and trigger_fired_no_action rows', () => {
+    // Strictness check: only `applied` rows start a dwell period.
+    appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'active',
+        toState: 'quarantined',
+        motivo: 'conflict',
+        outcome: 'blocked_by_protection',
+        blockedBy: 'user_explicit_cooldown',
+        recordedAt: 100,
+      }),
+    );
+    appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'active',
+        toState: 'active',
+        motivo: 'conflict',
+        outcome: 'trigger_fired_no_action',
+        evidenceJson: JSON.stringify({ trigger_source: 'verify_probe' }),
+        recordedAt: 200,
+      }),
+    );
+    expect(getLastQuarantineEvent(db, 'memory', 'test-memory-1', 'project_local')).toBeNull();
   });
 });
 

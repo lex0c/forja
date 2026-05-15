@@ -798,19 +798,27 @@ export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): Ev
 // is deterministic. Earlier versions used `id DESC` (UUID v4)
 // which produced random tiebreaks and surfaced as test flakes.
 // Backed by idx_evict_obj.
+//
+// `objectScope` is REQUIRED — object_ids are not globally unique
+// across scopes (memory names repeat between user / project_local /
+// project_shared; policy ids repeat between session / repo / etc.).
+// Filtering by scope ensures the lookup answers "what was the last
+// event for THIS specific object" instead of "what was the last
+// event for any object with this name in any scope".
 export const getLastEvictionForObject = (
   db: DB,
   substrate: EvictionSubstrate,
   objectId: string,
+  objectScope: string,
 ): EvictionEvent | null => {
   const row = db
-    .query<EvictionEventRow, [EvictionSubstrate, string]>(
+    .query<EvictionEventRow, [EvictionSubstrate, string, string]>(
       `${SELECT_ALL}
-        WHERE substrate = ? AND object_id = ?
+        WHERE substrate = ? AND object_id = ? AND object_scope = ?
         ORDER BY recorded_at DESC, rowid DESC
         LIMIT 1`,
     )
-    .get(substrate, objectId);
+    .get(substrate, objectId, objectScope);
   return row !== null ? fromRow(row) : null;
 };
 
@@ -829,19 +837,26 @@ export const getLastEvictionForObject = (
 // object moved on — it means a probe trigger fired but evidence
 // didn't pass. Using getLastEvictionForObject's bare "latest"
 // would mask the purge candidate and storage grows unbounded.
+// `objectScope` is REQUIRED — memory names can repeat across
+// scopes (`user_role` in user-scope AND in project_local-scope are
+// independent objects). Without scope-filtering, a newer applied
+// event for the same name in a different scope would shadow the
+// purge candidate's scope and skip retention indefinitely.
 export const getLastAppliedEvictionForObject = (
   db: DB,
   substrate: EvictionSubstrate,
   objectId: string,
+  objectScope: string,
 ): EvictionEvent | null => {
   const row = db
-    .query<EvictionEventRow, [EvictionSubstrate, string]>(
+    .query<EvictionEventRow, [EvictionSubstrate, string, string]>(
       `${SELECT_ALL}
-        WHERE substrate = ? AND object_id = ? AND outcome = 'applied'
+        WHERE substrate = ? AND object_id = ? AND object_scope = ?
+          AND outcome = 'applied'
         ORDER BY recorded_at DESC, rowid DESC
         LIMIT 1`,
     )
-    .get(substrate, objectId);
+    .get(substrate, objectId, objectScope);
   return row !== null ? fromRow(row) : null;
 };
 
@@ -927,20 +942,26 @@ export const detectTriggerThrashing = (
 // `trigger_fired_no_action` or `blocked_by_*` — those don't
 // represent actual state changes, so they're not the start of a
 // dwell period.
+// `objectScope` is REQUIRED — memory names can repeat across
+// scopes. Without scope-filtering, the quarantine TTL gate in
+// transitionMemoryState would read a quarantine timestamp from a
+// different scope sharing the same name, incorrectly blocking a
+// valid transition (or incorrectly classifying it as same-chain).
 export const getLastQuarantineEvent = (
   db: DB,
   substrate: EvictionSubstrate,
   objectId: string,
+  objectScope: string,
 ): EvictionEvent | null => {
   const row = db
-    .query<EvictionEventRow, [EvictionSubstrate, string]>(
+    .query<EvictionEventRow, [EvictionSubstrate, string, string]>(
       `${SELECT_ALL}
-        WHERE substrate = ? AND object_id = ?
+        WHERE substrate = ? AND object_id = ? AND object_scope = ?
           AND to_state = 'quarantined' AND outcome = 'applied'
         ORDER BY recorded_at DESC, rowid DESC
         LIMIT 1`,
     )
-    .get(substrate, objectId);
+    .get(substrate, objectId, objectScope);
   return row !== null ? fromRow(row) : null;
 };
 

@@ -621,7 +621,12 @@ export const gcPurgeExpiredTombstones = async (
       // re-evict cycle would have produced a newer applied
       // eviction event. APPLIED filter excludes
       // `trigger_fired_no_action` / `blocked_by_*` probe rows.
-      const latest = getLastAppliedEvictionForObject(db, row.substrate, row.objectId);
+      const latest = getLastAppliedEvictionForObject(
+        db,
+        row.substrate,
+        row.objectId,
+        row.objectScope,
+      );
       if (latest === null || latest.id !== row.id) {
         skipped.push({
           evictionEventId: row.id,

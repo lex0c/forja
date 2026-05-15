@@ -338,7 +338,7 @@ describe('gcExpiredMemories', () => {
     // eviction_events: 2 rows, last is evicted with purge_at set
     // for the 30d retention window.
     const { getLastEvictionForObject } = await import('../../src/storage/repos/eviction-events.ts');
-    const last = getLastEvictionForObject(db, 'memory', 'old');
+    const last = getLastEvictionForObject(db, 'memory', 'old', 'project_local');
     expect(last?.toState).toBe('evicted');
     expect(last?.trigger).toBe('expired_at');
     expect(last?.actor).toBe('startup_probe');
@@ -485,7 +485,7 @@ describe('gcPurgeExpiredTombstones', () => {
 
     // Audit: eviction_events purged row with motivo='expired'.
     const { getLastEvictionForObject } = await import('../../src/storage/repos/eviction-events.ts');
-    const last = getLastEvictionForObject(db, 'memory', 'old');
+    const last = getLastEvictionForObject(db, 'memory', 'old', 'project_local');
     expect(last?.toState).toBe('purged');
     expect(last?.motivo).toBe('expired');
     expect(last?.trigger).toBe('expired_at');

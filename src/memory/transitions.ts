@@ -496,7 +496,7 @@ const checkProtectionGates = (
   // Gate 2: quarantine min TTL
   const motivoCanWaitTtl = input.motivo !== 'security' && input.motivo !== 'user_purge';
   if (fromState === 'quarantined' && toState === 'evicted' && motivoCanWaitTtl) {
-    const quarantineEv = getLastQuarantineEvent(db, 'memory', input.name);
+    const quarantineEv = getLastQuarantineEvent(db, 'memory', input.name, input.scope);
     if (quarantineEv !== null) {
       // Same-chain bypass: when the quarantine event was emitted
       // by the SAME (actor, trigger) tuple as the current

@@ -144,7 +144,7 @@ describe('transitionMemoryState: active → quarantined', () => {
     expect(idx).toContain('commit-style');
 
     // Audit pair lands.
-    const evictionEv = getLastEvictionForObject(db, 'memory', 'commit-style');
+    const evictionEv = getLastEvictionForObject(db, 'memory', 'commit-style', 'user');
     expect(evictionEv?.toState).toBe('quarantined');
     expect(evictionEv?.outcome).toBe('applied');
     expect(evictionEv?.motivo).toBe('conflict');
@@ -233,7 +233,7 @@ describe('transitionMemoryState: quarantined → evicted', () => {
     expect(idx).not.toContain('commit-style.md');
 
     // Audit.
-    const evictionEv = getLastEvictionForObject(db, 'memory', 'commit-style');
+    const evictionEv = getLastEvictionForObject(db, 'memory', 'commit-style', 'user');
     expect(evictionEv?.toState).toBe('evicted');
 
     const evictedMemEv = listMemoryEventsByName(db, 'commit-style').find(
@@ -361,7 +361,7 @@ describe('transitionMemoryState: evicted → purged', () => {
     expect(findLatestTombstone(roots, 'user', 'commit-style')).toBeNull();
 
     // eviction_events row for purge lands.
-    const last = getLastEvictionForObject(db, 'memory', 'commit-style');
+    const last = getLastEvictionForObject(db, 'memory', 'commit-style', 'user');
     expect(last?.toState).toBe('purged');
 
     // memory_events row for purge lands.
@@ -470,7 +470,7 @@ describe('transitionMemoryState: same-state pseudo-transition', () => {
     expect(r.toState).toBe('quarantined');
 
     // The eviction_events row is recorded as trigger_fired_no_action.
-    const last = getLastEvictionForObject(db, 'memory', 'x');
+    const last = getLastEvictionForObject(db, 'memory', 'x', 'user');
     expect(last?.outcome).toBe('trigger_fired_no_action');
 
     // No memory_events lifecycle row (same-state doesn't have a
@@ -569,7 +569,7 @@ describe('transitionMemoryState: Eviction hook blocks', () => {
     expect(file.frontmatter.state).toBeUndefined(); // still default-active
 
     // Audit: eviction_events with outcome=blocked_by_hook.
-    const last = getLastEvictionForObject(db, 'memory', 'x');
+    const last = getLastEvictionForObject(db, 'memory', 'x', 'user');
     expect(last?.outcome).toBe('blocked_by_hook');
     expect(last?.blockedBy).toContain('/etc/agent/hooks.toml');
 
@@ -777,7 +777,7 @@ describe('transitionMemoryState: protection gates', () => {
     expect(file.frontmatter.state).toBeUndefined();
 
     // Audit: eviction_events row with outcome=blocked_by_protection.
-    const last = getLastEvictionForObject(db, 'memory', 'fresh');
+    const last = getLastEvictionForObject(db, 'memory', 'fresh', 'user');
     expect(last?.outcome).toBe('blocked_by_protection');
     expect(last?.blockedBy).toBe('user_explicit_cooldown');
 
@@ -1058,7 +1058,7 @@ describe('transitionMemoryState: invalid_evidence pre-flight', () => {
 
     // NO eviction_events row landed — the pre-flight short-
     // circuits before any DB write.
-    expect(getLastEvictionForObject(db, 'memory', 'fresh')).toBeNull();
+    expect(getLastEvictionForObject(db, 'memory', 'fresh', 'user')).toBeNull();
   });
 
   test('accepts well-formed evidence', async () => {
@@ -1167,7 +1167,7 @@ describe('transitionMemoryState: dependents_json on *→evicted', () => {
 
     // The latest eviction event for 'target' has dependents_json
     // listing the dependent memory.
-    const last = getLastEvictionForObject(db, 'memory', 'target');
+    const last = getLastEvictionForObject(db, 'memory', 'target', 'user');
     expect(last?.toState).toBe('evicted');
     expect(last?.dependentsJson).not.toBeNull();
     const dependents = JSON.parse(last?.dependentsJson ?? '[]') as {
@@ -1216,7 +1216,7 @@ describe('transitionMemoryState: dependents_json on *→evicted', () => {
       now: () => 2_000,
     });
 
-    const last = getLastEvictionForObject(db, 'memory', 'standalone');
+    const last = getLastEvictionForObject(db, 'memory', 'standalone', 'user');
     expect(last?.dependentsJson).toBeNull();
   });
 });
@@ -1247,7 +1247,7 @@ describe('transitionMemoryState: evidence_json is scrubbed by repo', () => {
       cwd: workdir,
     });
 
-    const last = getLastEvictionForObject(db, 'memory', 'x');
+    const last = getLastEvictionForObject(db, 'memory', 'x', 'user');
     expect(last?.evidenceJson).not.toContain('sk-ant-aaaaaaaaaaaaaaaaaaaa');
   });
 });
