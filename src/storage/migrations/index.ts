@@ -46,6 +46,7 @@ import { migration045ContextPins } from './045-context-pins.ts';
 import { migration046EvictionEvents } from './046-eviction-events.ts';
 import { migration047EvictionHookRuns } from './047-eviction-hook-runs.ts';
 import { migration048MemoryEventsLifecycleActions } from './048-memory-events-lifecycle-actions.ts';
+import { migration049Outcomes } from './049-outcomes.ts';
 
 export interface Migration {
   id: number;
@@ -102,4 +103,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration046EvictionEvents,
   migration047EvictionHookRuns,
   migration048MemoryEventsLifecycleActions,
+  migration049Outcomes,
 ];

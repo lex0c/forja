@@ -2,6 +2,56 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(storage) — outcomes table + action_signature schema (Phase 3.1 — opens FEEDBACK_ADAPTATION)
+
+**Done.** Foundation for the FEEDBACK_ADAPTATION subsystem. Ships the canonical `outcomes` table (FEEDBACK_ADAPTATION §3.1 + AUDIT.md §1) and the `action_signature` parser/serializer for the four levels declared in §4.2 (L1 alias, L2 flag, L3 recipe, L4 strategy). Pure infrastructure — no producers, no consumers. The loop quente detector (3.2) starts writing rows; the loop frio aggregator (3.4) starts reading.
+
+This is the LARGEST greenfield subsystem in the project today (the post-Phase-1 gap analysis reported "Zero subsections of FEEDBACK_ADAPTATION.md are implemented as a feedback-adaptation subsystem"). Phase 3 closes that by building the layers incrementally — schema first, then capture, then policies, then aggregator, then first behavior manifestation.
+
+### Design decisions
+
+- **`id` is TEXT PRIMARY KEY (UUID), not INTEGER as spec §3.1 declares.** Every other audit-shaped repo in this project (memory_events, eviction_events, outcome_signals) uses TEXT UUIDs — globally-unique IDs survive cross-install DB copies and test fixture swaps. Conformance with project pattern overrides the spec letter (an anglicization-class adaptation).
+
+- **`tool_call_id` is TEXT, not INTEGER.** Same rationale — `tool_calls.id` is already TEXT (001-initial.ts), so the FK type must match.
+
+- **`session_id` CASCADE, not SET NULL.** Distinct from memory_events / eviction_events which use SET NULL because their forensic intent outlives sessions. Outcomes are per-session operational signals that feed loop frio, which re-aggregates from survivors — purging with the session is the right choice.
+
+- **`evidence_json` nullable, no validation at the repo layer.** The per-tier evidence shape is the emitter's responsibility. Future slices may add a per-tier schema validator analogous to `eviction_events` §6.1 evidence gates, but the current contract is permissive — Tier 1 might carry exit code + stderr, Tier 3 might carry approval seq + actor, etc. AUDIT.md §1 marks the column medium-sensitivity with required redaction; the emitter scrubs before passing.
+
+- **`action_signature` parser is strict on field alphabet.** Lowercase + digits + hyphen + underscore matches memory name validation — keeps the signature hashable, JOIN-safe, and immune to per-emitter quirks. Colons are reserved as the level/field separator. `serializeActionSignature` throws `InvalidActionSignatureError` on bad input (emitter bug, caller-side); `parseActionSignature` returns `null` for foreign vocabularies (the storage layer accepts any string; downstream consumers treat null as "opaque / skip").
+
+- **`levelOf` is the cheap prefix-only check** for query layers that want to filter L1/L2 without full parse. Does NOT validate field content — that's the parser's job. Loop frio uses `levelOf` to gate "adapt L1/L2 only by default" (§4.1).
+
+- **Indices per §3.1**: `(action_signature, scope_kind, scope_id)` for the loop frio aggregator's primary read; `(session_id, recorded_at)` for session-scoped cross-cuts; `(recorded_at)` for time-windowed sweeps.
+
+- **Repo shape mirrors memory_events / eviction_events**: PERSISTED_COLUMNS + valuesForInsert + SELECT_ALL + fromRow. Same idiom across audit-shaped repos keeps reading them predictable.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/049-outcomes.ts` | Migration: `outcomes` table + 3 indices per §3.1. |
+| `src/storage/migrations/index.ts` | Register migration 049. |
+| `src/storage/repos/action-signature.ts` | Parser + serializer + `levelOf` helper + `InvalidActionSignatureError`. |
+| `src/storage/repos/outcomes.ts` | `createOutcome` + `listOutcomesByActionSignature` + `countOutcomesByActionSignature` (accumulation trigger gate) + `listOutcomesBySession` + `getLatestOutcomeForSignature` + `countOutcomes` (health check). |
+| `tests/storage/action-signature.test.ts` | 14 tests: serialize all 4 levels; parse round-trip; reject uppercase/empty/colons; null for unknown prefix / wrong field count / invalid chars; levelOf prefix detection. |
+| `tests/storage/outcomes.test.ts` | 17 tests: create + CHECK violations (tier/result/scope_kind); CASCADE on session purge; listByActionSignature with scope + sinceMs + limit; count with sinceMs; listBySession ordering; getLatest. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7601 pass / 10 skip / 0 fail (+31 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.2 — Outcome detector** (loop quente write): post-tool-dispatch hook in harness/loop.ts emits outcomes for tier-1 signals available now (exit code, tool_error, outcome_signals). Tiers 2-3 wait for diff-stat detectors + approvals integration.
+- **3.3 — `policies` table + scope resolver**: parallel to outcomes but for the proposed/active adaptation policies.
+- **3.4 — Loop frio MVP**: accumulation trigger + Beta posterior + L1 alias proposer.
+- **3.5 — L1 alias dispatch** (first manifestação): closes the loop end-to-end.
+- **Per-tier evidence validation**: like EVICTION §6.1, future slice can add schema validation per (tier, result) tuple. Out of scope here.
+- **Recap surface for adaptation activity**: when loop frio lands, surface `policy_changed` events in `/recap`.
+
 ## [2026-05-15] fix(memory,storage) — post-Phase-2 review batch (C1+C2+H1+H2+M3+M4+M5)
 
 **Done.** Six corrections from the post-Phase-2 multi-agent review. Bundled in one slice because the changes are tightly coupled (C1 introduces a new result discriminant; M5 tests the new discriminant; H1+H2 are alignment fixes; M3+M4 are polish).
