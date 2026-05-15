@@ -14,6 +14,7 @@
 import type { HarnessConfig } from '../../harness/index.ts';
 import type { ModelRegistry } from '../../providers/registry.ts';
 import type { DB } from '../../storage/index.ts';
+import type { ContextPinsStore } from '../../storage/repos/context-pins.ts';
 import type { RunSubagentResult } from '../../subagents/index.ts';
 import type { Bus } from '../../tui/bus.ts';
 import type { ModalManager } from '../../tui/modal-manager.ts';
@@ -147,6 +148,15 @@ export interface SlashContext {
   // surface a clear "dispatch unavailable" error rather than
   // crashing or silently no-opping.
   runPlaybook?: PlaybookDispatcher;
+  // Pinned context store (CONTEXT_TUNING.md §12.4). Wrap of the
+  // db handle so /pin doesn't reach into raw context_pins queries.
+  // REPL constructs once at boot via createContextPinsStore(db);
+  // tests inject a degenerate one. Absent ⇒ /pin surfaces
+  // "store unavailable" cleanly. Same shape as the
+  // contextPinsStore field on ToolContext (pin_context tool reads
+  // through there); the SlashContext copy is what /pin uses
+  // because slash commands don't run inside a ToolContext.
+  contextPinsStore?: ContextPinsStore;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

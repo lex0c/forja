@@ -2,6 +2,67 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] feat(cli/pin) — /pin slash command + harness/REPL wiring (Phase 1.1.c)
+
+**Done.** Third slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the operator-facing surface (`/pin <text>` / `/pin --list` / `/pin --remove <id>`) plus the harness/REPL wiring that brings 1.1.a's persistence and 1.1.b's tool surface into production paths. Direct user action — `/pin` writes WITHOUT a confirmation modal because the operator typed the text themselves. The model-proposed equivalent (`pin_context` tool, 1.1.b) is still the only path that uses the modal.
+
+### Split contract: who originates
+
+`created_by` is the discriminator. The two surfaces share the underlying `context_pins` table:
+
+| Surface | `created_by` value | `sourceStepId` |
+|---|---|---|
+| `/pin` (operator typed) | `'user'` | `null` |
+| `pin_context` tool (model proposed → modal confirmed) | `'model_proposed_user_approved'` | `ctx.stepId` |
+
+Recap (1.1.d) reads both shapes and can answer "did the operator pin this, or did the model propose it via approval?" without extra metadata.
+
+### Subcommand behavior
+
+- **`/pin <text...> [--kind X] [--expires-in DUR]`**: creates a pin. All non-flag positional tokens join with `' '` to recover multi-word text (the shared slash parser doesn't support quoted args, same convention as `/memory show <name>`). Flag order flexible — `--kind` and `--expires-in` can appear before, between, or after text tokens. Success line: `pinned <short-id> [<kind>] (N/10 active): <text>`.
+- **`/pin --list`**: active pins for the current session. Header `pins (N/10):`; per-line shows short id, kind, text, and a humanized "expires in Xm/h/d" when applicable. Expired pins are filtered (matches `getActivePinsBySession` semantics from 1.1.a) so the operator sees what's actually re-injected.
+- **`/pin --remove <id>`**: drops the pin. Idempotent shape — unknown id returns a clear `no pin with id '<id>'` error rather than silently no-op.
+- **`/pin --help` / `/pin`** (no args): prints usage block.
+
+### Key implementation decisions
+
+- **Mode flags are mutually exclusive AND incompatible with create flags.** `/pin --list extra` errors out as "positional text not allowed with --list" rather than silently ignoring `extra`. Catches typos that would otherwise behave surprisingly. `--kind` paired with a mode flag is also rejected — operator probably meant `--remove`.
+- **No-session gate.** Pins are session-scoped (`session_id NOT NULL` in the migration); `/pin` errors with "no active session yet — submit a prompt first" rather than letting the FK constraint surface as an opaque SQLite error. Same gate `/memory show` uses, with a clearer hint pointing at the resolution.
+- **Cap reporting cites the cap directly.** Error message is `cap reached (10/10); remove one first via /pin --remove <id>` — turns the failure into an actionable next step instead of a bare "cap exceeded".
+- **Default `--help` when no args.** `/pin` without arguments returns usage notes (success-shaped) rather than an error. Operators discovering the command get the contract; explicit create mode with empty text still errors ("missing text") so a programmer typo doesn't disguise itself as help.
+- **One `ContextPinsStore` instance for the REPL lifetime.** Constructed once at REPL boot from `db`, threaded into both the `SlashContext` (so `/pin` reads/writes) and each turn's `HarnessConfig.contextPinsStore` (so the `pin_context` tool reads/writes through `ToolContext`). Both surfaces share the table — single source of truth.
+- **Modal-manager wiring for `confirmPinContext` deferred.** The tool's `pin.headless_mode` path still fires in production because no `confirmPinContext` callback is wired in the REPL yet — that needs new event types in the bus + modal renderer (memory-write-shaped surface). Lands in a separate UI slice; `/pin` works fully without it because the slash command is direct-user.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/commands/pin.ts` | The slash command: parsing (mode + flags + positional text), create/list/remove handlers, expiry rendering, cap-aware error messages |
+| `tests/cli/slash/pin.test.ts` | 27 tests across 6 describe blocks: create happy path (6) + --list (4) + --remove (3) + validation/mutual-exclusivity (10) + cap/unwired (3) + headless variants |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/index.ts` | Imports `pinCommand` and inserts it in `builtinsWithoutHelp` between `memoryCommand` and `hooksCommand` |
+| `src/cli/slash/types.ts` | Adds `contextPinsStore?: ContextPinsStore` to `SlashContext` (so `/pin` can dispatch without reaching into raw queries) |
+| `src/harness/types.ts` | Adds `contextPinsStore?: ContextPinsStore` to `HarnessConfig`; imports the type next to `MemoryRegistry` |
+| `src/harness/loop.ts` | Threads `config.contextPinsStore` into the `ToolContext` conditional-spread block, mirroring `memoryRegistry` |
+| `src/cli/repl.ts` | Imports `createContextPinsStore`, instantiates one store from `db` at REPL boot, passes the same instance into `slashCtx` AND each `startTurn`'s `HarnessConfig` so both surfaces share the table |
+| `tests/cli/slash/dispatch.test.ts` | Updates the builtin-list snapshot: 15 → 16, inserts `'pin'` between `'memory'` and `'hooks'`; corresponding help-output line count 18 → 19 |
+
+### Deferred
+
+- **`confirmPinContext` callback in REPL (modal manager wiring).** Requires `askPinContext` on `ModalManager`, new `pin:ask` event in the bus, and renderer support. Tool surface (1.1.b) already declares `pin.headless_mode` for the unwired case; production runs return that cleanly. Lands in a UI slice when other modal additions warrant the surface.
+- **1.1.d — recap projection populating `pinnedContext[]`.** Schema and renderer already exist (`src/recap/types.ts:69`, `src/recap/resume-context.ts:162`); only the projection needs to read `context_pins` for the session.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/cli/slash/pin.test.ts` 27 pass / 0 fail
+- `bun test` 7366 pass / 10 skip / 0 fail (+27 from 1.1.b baseline 7339, +2 dispatch snapshot updates restored)
+
 ## [2026-05-14] feat(tools/pin-context) — operator-confirmed model surface for pinned context (Phase 1.1.b)
 
 **Done.** Second slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the model-facing tool — `pin_context(text, kind?, expires_in?)` — that opens a confirmation modal idêntico ao memory_write. The model never persists a pin without operator approval; this gate is what turns a model proposal into the persistent state 1.1.a's repo can carry.

@@ -12,6 +12,7 @@ import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
+import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
@@ -816,6 +817,15 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // Pinned context store (CONTEXT_TUNING.md §12.4). When set, the
+  // harness threads it through ToolContext so the pin_context tool
+  // can dispatch. Absent ⇒ pin_context surfaces `pin.store_
+  // unavailable` cleanly. Same shape as memoryRegistry above: the
+  // REPL constructs once at boot via createContextPinsStore(db)
+  // and hands it through. The /pin slash command consumes the
+  // SAME store instance via SlashContext.contextPinsStore — both
+  // surfaces share the underlying table.
+  contextPinsStore?: ContextPinsStore;
   // Async hook the harness calls when the permission engine returns
   // a `confirm` decision. Caller resolves true to allow the call
   // (recorded as confirm_yes) or false to deny (confirm_no). When

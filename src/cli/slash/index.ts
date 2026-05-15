@@ -16,6 +16,7 @@ import { hooksCommand } from './commands/hooks.ts';
 import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
+import { pinCommand } from './commands/pin.ts';
 import { planCommand } from './commands/plan.ts';
 import { buildPlaybookSlashCommands } from './commands/playbook.ts';
 import { quitCommand } from './commands/quit.ts';
@@ -62,6 +63,7 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     permsCommand,
     historyCommand,
     memoryCommand,
+    pinCommand,
     hooksCommand,
   ];
   const playbookCommands =

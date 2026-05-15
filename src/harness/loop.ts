@@ -2544,6 +2544,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.confirmMemoryUserScope !== undefined
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
             : {}),
+          ...(config.contextPinsStore !== undefined
+            ? { contextPinsStore: config.contextPinsStore }
+            : {}),
           // Trust state — required on ToolContext, optional on
           // HarnessConfig. Default-false at the harness layer is
           // the fail-closed answer when bootstrap (or a test

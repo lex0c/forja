@@ -35,6 +35,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
+import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { listCritiqueRunsBySession } from '../storage/repos/critique-runs.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { runSubagent } from '../subagents/index.ts';
@@ -1317,6 +1318,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       confirmMemoryWrite,
       confirmMemoryUserScope,
       confirmCritique,
+      contextPinsStore,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;
@@ -1530,6 +1532,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // equivalent (the registry is just a Map of model entries).
   const modelRegistry = createDefaultRegistry();
 
+  // Pinned context store (CONTEXT_TUNING.md §12.4). One instance for
+  // the REPL's lifetime; threaded into both the SlashContext (so
+  // /pin reads/writes) and each turn's HarnessConfig (so the
+  // pin_context tool reads/writes through ToolContext). Both
+  // surfaces share the same store — the underlying table is the
+  // single source of truth.
+  const contextPinsStore = createContextPinsStore(db);
+
   const slashCtx: SlashContext = {
     baseConfig,
     db,
@@ -1538,6 +1548,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cumulative,
     now,
     requestShutdown,
+    contextPinsStore,
     // Closure over the REPL's busy state — fresh read per call so
     // a slash command queued before a turn starts but executed
     // after observes the post-startTurn state. The same predicate
