@@ -1,5 +1,6 @@
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { DB } from '../storage/db.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
   IndexError,
@@ -13,6 +14,7 @@ import { readMemoryByName } from './loader.ts';
 import { ScopeError, indexFilePath, memoryFilePath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
+import { transitionMemoryState } from './transitions.ts';
 import type { MemoryFile, MemoryScope } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
@@ -339,12 +341,36 @@ export interface GcExpiredResult {
   failures: { memory: ExpiredMemory; reason: string }[];
 }
 
-// Find all expired memories in the registry and remove them. Emits
-// a `memory_events` row with `action: 'expired'` per removal so
-// `/memory audit` can show the GC trail. Auto-refreshes the
-// registry's in-memory snapshot once at the end (single
-// reload, not per-removal — saves N filesystem index re-reads in
-// the common case).
+// Find all expired memories in the registry and route each through
+// the canonical state machine (EVICTION §4.1). Per spec §0.9 — no
+// silent GC: every transition lands an `eviction_events` row pair
+// (active→quarantined, quarantined→evicted) plus the matching
+// `memory_events` audit. The legacy `removeMemory`-shaped path
+// (single `expired` row + unlink) was the pre-1.3 surface; it
+// shipped before the state machine existed, leaked through the
+// audit trail, and produced no `eviction_events` rows so the
+// downstream queries (`getLastEvictionForObject`, GC sweep,
+// trigger-thrashing detector) couldn't see expirations.
+//
+// State-machine attribution:
+//   - motivo:  'low_roi'    (state machine doesn't admit 'expired'
+//                            on active→...→evicted; same trade-off
+//                            /memory delete made for user_purge.
+//                            Trigger field carries the real
+//                            semantics; spec PR to admit 'expired'
+//                            on these transitions is declared as
+//                            follow-up.)
+//   - trigger: 'expired_at' (canonical §5.1 trigger)
+//   - actor:   'startup_probe' (bootstrap-time GC)
+//   - purgeAt: now + 30d (memory retention per §7.1; 2.3 will
+//                         materialize the evicted→purged sweep)
+//   - evidence: { expires } — operator-set date preserved for
+//                             forensic queries
+//
+// Async because transitionMemoryState is async (hook fire is
+// async, even though bootstrap doesn't pass a dispatcher today).
+// The caller (`bootstrap`) is already async, so threading awaits
+// is free.
 //
 // `auditSessionId` / `auditCwd` forward to the audit rows; the
 // caller (bootstrap) is the right place to thread these from the
@@ -354,72 +380,112 @@ export interface GcExpiredAuditOverride {
   auditCwd?: string;
 }
 
-export const gcExpiredMemories = (
+// Memory tombstone retention per EVICTION §7.1. Same constant the
+// /memory delete slash uses; duplicated locally to keep this
+// module free of slash-layer dependencies. 30d in ms.
+const MEMORY_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+export const gcExpiredMemories = async (
+  db: DB,
   registry: MemoryRegistry,
   roots: ScopeRoots,
   opts: GcExpiredOptions & GcExpiredAuditOverride = {},
-): GcExpiredResult => {
-  const expired = findExpiredMemories(registry, opts.today ?? new Date());
+): Promise<GcExpiredResult> => {
+  const today = opts.today ?? new Date();
+  const expired = findExpiredMemories(registry, today);
   const removed: ExpiredMemory[] = [];
   const failures: { memory: ExpiredMemory; reason: string }[] = [];
 
+  // Wall-clock anchor for the eviction_events recorded_at field.
+  // Using `today.getTime()` keeps tests deterministic (they
+  // already pass a fixed `opts.today`); production with no
+  // override falls back to `new Date().getTime()`.
+  const nowMs = today.getTime();
+  const baseTransitionInput = {
+    db,
+    registry,
+    roots,
+    motivo: 'low_roi' as const,
+    trigger: 'expired_at',
+    actor: 'startup_probe' as const,
+    ...(opts.auditSessionId !== undefined ? { sessionId: opts.auditSessionId } : {}),
+    ...(opts.auditCwd !== undefined ? { cwd: opts.auditCwd } : {}),
+  };
+
   for (const mem of expired) {
-    const result = removeMemory({ roots, scope: mem.scope, name: mem.name });
-    if (result.kind === 'removed') {
-      removed.push(mem);
-      registry.recordEvent({
-        action: 'expired',
-        scope: mem.scope,
-        memoryName: mem.name,
-        // Source from the frontmatter — `inferred` (likely the
-        // +90d default) vs `user_explicit` (operator-set date)
-        // is the most useful discriminator for /memory audit
-        // pattern detection.
-        source: mem.source as 'user_explicit' | 'inferred' | 'imported',
-        details: {
-          expires: mem.expires,
-          bodyPath: result.bodyPath,
-        },
-        ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
-        ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-      });
-    } else {
-      const reason =
-        result.kind === 'sandbox_violation'
-          ? result.reason
-          : result.kind === 'unknown'
-            ? `body and index entry both absent at ${result.bodyPath}`
-            : result.reason;
-      failures.push({ memory: mem, reason });
-      // Audit the failure too (spec §5.3 audit log). `refused`
-      // with stage='lifecycle_gc' lets `/memory audit` show
-      // "tried to expire but couldn't" alongside the successful
-      // `expired` rows. Without this, a failure leaves no trace
-      // — the operator only notices via the absence of an
-      // `expired` row when they expected one. The stage tag
-      // distinguishes from tool-layer `refused` rows which
-      // carry stage='tool_gate' / 'scanner' / 'modal' / etc.
-      registry.recordEvent({
-        action: 'refused',
-        scope: mem.scope,
-        memoryName: mem.name,
-        source: mem.source as 'user_explicit' | 'inferred' | 'imported',
-        details: {
-          stage: 'lifecycle_gc',
-          kind: result.kind,
-          reason,
-          expires: mem.expires,
-        },
-        ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
-        ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-      });
+    const evidence = { expires: mem.expires };
+    // Per-memory now counter so two back-to-back expirations get
+    // monotonically distinct recorded_at + tombstone ts values.
+    // Without this, all expired rows in one boot would collide
+    // on Date.now()-ms granularity in fast loops.
+    let perMemNow = nowMs;
+    const tickNow = () => ++perMemNow;
+
+    // 1) active → quarantined
+    const r1 = await transitionMemoryState({
+      ...baseTransitionInput,
+      scope: mem.scope,
+      name: mem.name,
+      toState: 'quarantined',
+      evidence,
+      now: tickNow,
+    });
+    if (r1.kind !== 'applied') {
+      failures.push({ memory: mem, reason: gcFailureReason(r1, 'active→quarantined') });
+      continue;
     }
+
+    // 2) quarantined → evicted (with purgeAt for the retention window)
+    const r2 = await transitionMemoryState({
+      ...baseTransitionInput,
+      scope: mem.scope,
+      name: mem.name,
+      toState: 'evicted',
+      evidence,
+      purgeAt: perMemNow + MEMORY_TOMBSTONE_RETENTION_MS,
+      now: tickNow,
+    });
+    if (r2.kind !== 'applied') {
+      failures.push({ memory: mem, reason: gcFailureReason(r2, 'quarantined→evicted') });
+      // Audit-only attribution: at this point the memory IS in
+      // quarantined state (step 1 applied) but the eviction trail
+      // is half-baked. transitionMemoryState already lands a
+      // refused/audit_drift/io_error row for r2; we surface the
+      // failure to the caller (stderr) so the operator knows.
+      continue;
+    }
+
+    removed.push(mem);
   }
 
   // Single snapshot reload after the batch — registry's in-memory
   // listings now match disk.
   if (removed.length > 0) registry.reload();
   return { removed, failures };
+};
+
+// Translate a non-applied TransitionMemoryStateResult into an
+// operator-facing reason string. Mirrors mapTransitionFailure in
+// the slash layer but lives here as a private helper because the
+// audit chain at this layer is failure-soft (no slash result).
+const gcFailureReason = (
+  result: Awaited<ReturnType<typeof transitionMemoryState>>,
+  step: string,
+): string => {
+  switch (result.kind) {
+    case 'unknown':
+      return `${step}: memory not found at transition time`;
+    case 'illegal_transition':
+      return `${step}: ${result.reason}`;
+    case 'blocked_by_hook':
+      return `${step}: blocked by Eviction hook (${result.blockedBy})`;
+    case 'audit_drift':
+      return `${step}: audit drift — disk transition completed but audit row failed: ${result.reason}`;
+    case 'io_error':
+      return `${step}: ${result.reason}`;
+    default:
+      return `${step}: unexpected outcome '${(result as { kind: string }).kind}'`;
+  }
 };
 
 // ─── moveMemory (promote / demote primitive) ─────────────────────────

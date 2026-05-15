@@ -295,14 +295,14 @@ describe('gcExpiredMemories', () => {
     sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
   });
 
-  test('removes each expired memory and emits expired audit row', () => {
+  test('routes expired memories through transitionMemoryState: tombstone + audit pair', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Old](old.md) — h\n- [Fresh](fresh.md) — h\n');
     writeBody(roots.projectLocal, 'old', { expires: '2025-01-01' });
     writeBody(roots.projectLocal, 'fresh', { expires: '2030-01-01' });
     const reg = createMemoryRegistry({ roots, db, sessionId });
-    const result = gcExpiredMemories(reg, roots, {
+    const result = await gcExpiredMemories(db, reg, roots, {
       today: new Date(Date.UTC(2026, 4, 4)),
       auditSessionId: sessionId,
       auditCwd: '/p',
@@ -311,42 +311,69 @@ describe('gcExpiredMemories', () => {
     expect(result.removed[0]?.name).toBe('old');
     expect(result.failures).toEqual([]);
 
+    // Scope-root body moved into .tombstones/ (not deleted — the
+    // state machine preserves the body for the retention window).
     expect(existsSync(join(roots.projectLocal, 'old.md'))).toBe(false);
     expect(existsSync(join(roots.projectLocal, 'fresh.md'))).toBe(true);
+    const { readdirSync } = await import('node:fs');
+    const tombstones = readdirSync(join(roots.projectLocal, '.tombstones'));
+    expect(tombstones.length).toBe(1);
+    expect(tombstones[0]).toMatch(/^old\.\d+\.md$/);
 
+    // memory_events: 2-step transition produces quarantined + evicted
+    // actions (NOT a single 'expired'). The 'expired' label was the
+    // pre-state-machine surface; the canonical path lands the
+    // structural lifecycle vocabulary.
     const events = listMemoryEventsByName(db, 'old');
-    expect(events).toHaveLength(1);
-    expect(events[0]?.action).toBe('expired');
-    expect(events[0]?.scope).toBe('project_local');
-    expect(events[0]?.sessionId).toBe(sessionId);
-    expect(events[0]?.cwd).toBe('/p');
-    expect(events[0]?.details?.expires).toBe('2025-01-01');
+    const actions = events.map((e) => e.action);
+    expect(actions).toContain('quarantined');
+    expect(actions).toContain('evicted');
+    expect(actions).not.toContain('expired');
+    for (const e of events) {
+      expect(e.scope).toBe('project_local');
+      expect(e.sessionId).toBe(sessionId);
+      expect(e.cwd).toBe('/p');
+    }
+
+    // eviction_events: 2 rows, last is evicted with purge_at set
+    // for the 30d retention window.
+    const { getLastEvictionForObject } = await import('../../src/storage/repos/eviction-events.ts');
+    const last = getLastEvictionForObject(db, 'memory', 'old');
+    expect(last?.toState).toBe('evicted');
+    expect(last?.trigger).toBe('expired_at');
+    expect(last?.actor).toBe('startup_probe');
+    expect(last?.purgeAt).not.toBeNull();
+    // Evidence carries the operator-set expires date.
+    const evidence = JSON.parse(last?.evidenceJson ?? '{}') as { expires?: string };
+    expect(evidence.expires).toBe('2025-01-01');
   });
 
-  test('refreshes registry snapshot so list() reflects post-gc state', () => {
+  test('refreshes registry snapshot so list() reflects post-gc state', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Old](old.md) — h\n');
     writeBody(roots.projectLocal, 'old', { expires: '2024-01-01' });
     const reg = createMemoryRegistry({ roots, db, sessionId });
     expect(reg.list()).toHaveLength(1);
-    gcExpiredMemories(reg, roots, { today: new Date(Date.UTC(2026, 4, 4)) });
+    await gcExpiredMemories(db, reg, roots, { today: new Date(Date.UTC(2026, 4, 4)) });
     expect(reg.list()).toHaveLength(0);
   });
 
-  test('no expired memories: no work, no audit rows', () => {
+  test('no expired memories: no work, no audit rows', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Fresh](fresh.md) — h\n');
     writeBody(roots.projectLocal, 'fresh', { expires: '2030-01-01' });
     const reg = createMemoryRegistry({ roots, db, sessionId });
-    const result = gcExpiredMemories(reg, roots, { today: new Date(Date.UTC(2026, 4, 4)) });
+    const result = await gcExpiredMemories(db, reg, roots, {
+      today: new Date(Date.UTC(2026, 4, 4)),
+    });
     expect(result.removed).toEqual([]);
     expect(result.failures).toEqual([]);
     expect(listMemoryEventsByName(db, 'fresh')).toEqual([]);
   });
 
-  test('forwards source field from frontmatter to audit row', () => {
+  test('forwards source field from frontmatter to audit row', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Old](old.md) — h\n');
@@ -355,22 +382,22 @@ describe('gcExpiredMemories', () => {
       source: 'user_explicit',
     });
     const reg = createMemoryRegistry({ roots, db, sessionId });
-    gcExpiredMemories(reg, roots, { today: new Date(Date.UTC(2026, 4, 4)) });
+    await gcExpiredMemories(db, reg, roots, { today: new Date(Date.UTC(2026, 4, 4)) });
     const events = listMemoryEventsByName(db, 'old');
-    expect(events[0]?.source).toBe('user_explicit');
+    // The evicted row carries the source from the frontmatter.
+    const evicted = events.find((e) => e.action === 'evicted');
+    expect(evicted?.source).toBe('user_explicit');
   });
 
-  test('audits `refused` row with stage=lifecycle_gc on remove failure', () => {
-    // Engineer a real failure: write the expired body + index,
-    // then chmod the scope root read-execute (no write). The
-    // index rewrite hits EACCES, removeMemory returns io_error,
-    // gcExpiredMemories should emit the audit row.
+  test('io_error during transition: failure surfaced, no removed', async () => {
+    // Engineer a real failure: chmod the scope root read-execute
+    // (no write). transitionMemoryState's atomicWrite for the
+    // state=quarantined frontmatter hits EACCES, the first step
+    // returns io_error, gcExpiredMemories records the failure.
     //
-    // POSIX-only. Bun tests run on Linux/macOS in practice; we
-    // restore the mode in finally so afterEach can clean the
-    // tmpdir. Skipped silently when running as root (chmod
-    // doesn't restrict root, removeMemory would succeed).
-    if (process.getuid?.() === 0) return; // can't trigger EACCES as root
+    // POSIX-only. Skipped silently when running as root (chmod
+    // doesn't restrict root, the transition would succeed).
+    if (process.getuid?.() === 0) return;
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Old](old.md) — h\n');
@@ -378,7 +405,7 @@ describe('gcExpiredMemories', () => {
     chmodSync(roots.projectLocal, 0o500);
     try {
       const reg = createMemoryRegistry({ roots, db, sessionId });
-      const result = gcExpiredMemories(reg, roots, {
+      const result = await gcExpiredMemories(db, reg, roots, {
         today: new Date(Date.UTC(2026, 4, 4)),
         auditSessionId: sessionId,
         auditCwd: '/p',
@@ -386,22 +413,14 @@ describe('gcExpiredMemories', () => {
       expect(result.removed).toEqual([]);
       expect(result.failures).toHaveLength(1);
       expect(result.failures[0]?.memory.name).toBe('old');
-
-      const events = listMemoryEventsByName(db, 'old');
-      expect(events).toHaveLength(1);
-      expect(events[0]?.action).toBe('refused');
-      expect(events[0]?.details?.stage).toBe('lifecycle_gc');
-      expect(events[0]?.details?.expires).toBe('2024-01-01');
-      // The kind is `io_error` — failure came from the disk
-      // write, not from a sandbox check.
-      expect(events[0]?.details?.kind).toBe('io_error');
+      // Reason mentions the step that failed.
+      expect(result.failures[0]?.reason).toContain('active→quarantined');
     } finally {
-      // Restore so afterEach's rmSync can clean the tree.
       chmodSync(roots.projectLocal, 0o700);
     }
   });
 
-  test('handles multiple expired across different scopes', () => {
+  test('handles multiple expired across different scopes', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.user, '- [U](u-mem.md) — h\n');
@@ -409,12 +428,16 @@ describe('gcExpiredMemories', () => {
     writeBody(roots.user, 'u-mem', { expires: '2024-01-01', type: 'user' });
     writeBody(roots.projectLocal, 'l-mem', { expires: '2024-01-01' });
     const reg = createMemoryRegistry({ roots, db, sessionId });
-    const result = gcExpiredMemories(reg, roots, {
+    const result = await gcExpiredMemories(db, reg, roots, {
       today: new Date(Date.UTC(2026, 4, 4)),
     });
     expect(result.removed).toHaveLength(2);
+    // Scope-root bodies moved into per-scope .tombstones/.
     expect(existsSync(join(roots.user, 'u-mem.md'))).toBe(false);
     expect(existsSync(join(roots.projectLocal, 'l-mem.md'))).toBe(false);
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.user, '.tombstones')).length).toBe(1);
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(1);
   });
 });
 

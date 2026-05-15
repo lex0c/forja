@@ -539,7 +539,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // unusual happened on this boot"). A bootstrap-blocking
     // failure would be wrong — one bad memory shouldn't gate the
     // session — but silently dropping the failure is worse.
-    const gcResult = gcExpiredMemories(memoryRegistry, memoryRoots, { auditCwd: cwd });
+    const gcResult = await gcExpiredMemories(db, memoryRegistry, memoryRoots, { auditCwd: cwd });
     for (const failure of gcResult.failures) {
       process.stderr.write(
         `forja: memory gc: failed to expire ${failure.memory.scope}/${failure.memory.name} (expires ${failure.memory.expires}): ${failure.reason}\n`,

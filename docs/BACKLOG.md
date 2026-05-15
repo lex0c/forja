@@ -2,6 +2,48 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(memory) — route gcExpiredMemories through transitionMemoryState (Phase 2.2)
+
+**Done.** Closes the silent-GC violation of EVICTION §0.9. Pre-1.3, `gcExpiredMemories` (the boot-time sweep that materializes the `expires:` frontmatter field) deleted memories via `removeMemory` and emitted a single `memory_events action='expired'` row — zero `eviction_events` rows, so downstream forensic queries (`getLastEvictionForObject`, GC sweep, trigger-thrashing detector) were blind to expirations. With the state machine landed in Phase 1.2 and `transitionMemoryState` shipping in 1.3, the GC path now flows through the canonical 2-step transition (active→quarantined→evicted) like `/memory delete` does — the eviction trail is uniform across operator-driven and time-driven deletions.
+
+### Design decisions
+
+- **2-step transition with motivo `low_roi` + trigger `expired_at`.** Same trade-off `/memory delete` made for `user_purge`: spec EVICTION §4.1 `LEGAL_TRANSITIONS` only admits `expired` motivo on `evicted → purged`, so the `active → quarantined → evicted` path uses the closest state-machine-legal label (`low_roi`). The TRIGGER field carries the real semantics (`expired_at`), so audit consumers filter by trigger when distinguishing "operator delete" from "expiry GC". Follow-up declared: spec EVICTION §4.1 may grow `expired` motivo on the active→quarantined and quarantined→evicted transitions to clean this attribution.
+
+- **Body moves to `.tombstones/`, NOT deleted.** Same mechanism `/memory delete` uses — `transitionMemoryState({toState:'evicted'})` renames the body file rather than unlinking. Operators can `/memory restore <name>` an expired memory within the 30d retention window. Earlier shape (`removeMemory`) wiped the body permanently — an `expires:` typo (e.g. `2024-01-01` instead of `2027-01-01`) was unrecoverable.
+
+- **`purgeAt = now + 30d` on the evicted row.** Matches MEMORY tombstone retention from EVICTION §7.1. The future GC sweep (2.3 — next slice) materializes `evicted → purged` once `purgeAt <= now`. Without this, GC'd memories would tombstone forever like the pre-fix `/memory delete` did.
+
+- **`actor: 'startup_probe'`** — canonical bootstrap-time origin per EVICTION §5.1.
+
+- **Per-memory `now` counter** keeps monotonic recorded_at + tombstone ts values across the per-memory 2-step pipeline. Without this, two back-to-back expirations on Date.now()-ms granularity could collide on `recorded_at` and tombstone filename (the M2 collision check would bump tombstone ts but recorded_at tiebreaker would still depend on rowid M3).
+
+- **Async signature.** `transitionMemoryState` is async (hook fire is async). `gcExpiredMemories` becomes async too. The single caller (`bootstrap`) is already async, so awaiting is free.
+
+- **Breaking change to the audit shape.** The `memory_events action='expired'` row is no longer emitted by the boot GC — replaced by the canonical 2-step (`quarantined` + `evicted`). The 'expired' action label stays in the `MemoryEventAction` enum for future callers (e.g. a manual `/memory expire` slash, or an operator's audit replay tool), but the production GC stops emitting it. Existing tests updated accordingly.
+
+- **Failure path simplifies.** Earlier shape audited a `refused` row with `stage='lifecycle_gc'` on `removeMemory` failure. New path: `transitionMemoryState` already emits the appropriate audit (`blocked_by_hook` lands a refused memory_events row; `io_error` and `audit_drift` are surfaced to the caller). The local helper `gcFailureReason` translates the result kind into an operator-facing reason string for the `result.failures` field, matching the bootstrap caller's contract.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/lifecycle.ts` | `gcExpiredMemories` becomes async, takes `db: DB` as first param. Replaces `removeMemory` with two sequential `transitionMemoryState` calls (active→quarantined, quarantined→evicted) per expired memory. Local `gcFailureReason` helper translates non-applied results. `MEMORY_TOMBSTONE_RETENTION_MS = 30d` constant. |
+| `src/cli/bootstrap.ts` | Single call site updated: `await gcExpiredMemories(db, memoryRegistry, memoryRoots, { auditCwd: cwd })`. |
+| `tests/memory/lifecycle.test.ts` | 6 tests rewritten to expect tombstone-based behavior: body moves to `.tombstones/`, audit pair (quarantined + evicted), eviction_events.last row has trigger='expired_at' + actor='startup_probe' + purgeAt set, evidence preserves the operator's `expires:` date. Failure test asserts `result.failures[0].reason` contains the step name ('active→quarantined') instead of probing memory_events. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7522 pass / 10 skip / 0 fail (unchanged total — 6 tests rewritten, no net add)
+- `bun test tests/memory/lifecycle.test.ts` 26 pass
+
+### Deferred / follow-ups declared
+
+- **2.3 — GC sweep `evicted → purged`** (next slice — the producer of expired tombstones now ships, so the consumer can land).
+- **Spec EVICTION §4.1** — admit `expired` motivo on `active → quarantined` and `quarantined → evicted`. Audit consumers filtering by motivo would then catch expiries; today they need to filter by `trigger='expired_at'`.
+
 ## [2026-05-15] feat(cli) — wire Eviction hook into /memory delete + /memory restore (Phase 2.1)
 
 **Done.** First slice of the "complete EVICTION" sequence. The Eviction hook chain has been a defined surface since Phase 1.2 (schema, matcher, payload type, dispatcher), but neither `/memory delete` nor `/memory restore` actually fired it — `transitionMemoryState` accepts `fireHook?` and the slash callers had it unset, so a security policy that needed to gate operator-driven evictions was inert. This slice plumbs the dispatcher from REPL → SlashContext → both slash flows.
