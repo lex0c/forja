@@ -10,9 +10,17 @@ Forja progress diary. Entries in reverse chronological order (newest on top).
 - **Insertion via a model-facing `retrieve_context` tool**, not auto-fire on step start. Aligns with spec §1.2 ("retrieval is tool, not driver") and lets eval measure per-call value.
 - Slices declared up front (4.1 foundation; 4.2 memory view; 4.3 session view; 4.4 workspace view; 4.5 expansion; 4.6 ranking; 4.7 compression; 4.8 trace; 4.9 integration). v1 ships no embedding, no usage signal, no cross-view auto-edges (per spec §12.1).
 
-### 4.1 — Foundation (this entry)
+### 4.1 — Foundation
 
-Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet — these are stubs returning empty results. Establishes the public shape so 4.2+ slot into the skeleton without churn.
+Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet — these are stubs returning empty results. Establishes the public shape so 4.2+ slot into the skeleton without churn. M1 (selective scrub at the repo layer — reason fields redacted, slot content kept raw) and M2 (single `context_slot_json` column) fixed in the same commit per code review.
+
+### 4.2 — Memory view + BM25 utility
+
+`src/retrieval/bm25.ts` ships a hand-rolled BM25 (~80 lines, no deps). Tokenizer is lowercase + non-alphanumeric split — lexical-first per spec §0 principle 2. Constants k1=1.5, b=0.75 (textbook defaults). Deterministic tiebreaker on equal scores (id ASC) so trace replays are stable.
+
+`src/retrieval/views/memory.ts` implements `ViewSearch` for the memory view. Field weighting: title × 3, description × 2, body × 1 (body opt-in via `loadBodies` because each is a disk read). Uses dedup-by-name listings so local-over-shared overrides surface as one candidate, not two. Node id format `memory:<scope>/<name>` mirrors the cross-store disambiguation pattern. Reason strings get scrubbed at the repo trace layer (slice 4.1 selective scrub).
+
+What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
 
 ## [2026-05-15] fix(feedback,memory,storage) — Phase 3.7 review batch (14 findings closed)
 

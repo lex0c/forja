@@ -31,3 +31,9 @@ export type {
 
 export { runRetrieval } from './pipeline.ts';
 export type { PipelineDeps, ViewSearch } from './pipeline.ts';
+
+export { createBM25Index, tokenize } from './bm25.ts';
+export type { BM25Document, BM25Hit, BM25Index } from './bm25.ts';
+
+export { createMemoryView } from './views/memory.ts';
+export type { MemoryViewDeps } from './views/memory.ts';
