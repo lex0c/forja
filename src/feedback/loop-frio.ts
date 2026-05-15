@@ -114,6 +114,18 @@ export type SignatureResult =
       scopeId: string;
     }
   | {
+      // L1 alias where from === to (e.g., alias:sed:sed). The
+      // resulting policy would be a no-op rewrite. The bash-aliases
+      // table carries self-aliases for telemetry purposes (per-bin
+      // tally without an adaptation pair); operator-visible
+      // proposals would just clutter `/agent policy list`. Filter
+      // at the proposer.
+      kind: 'self_alias_no_op';
+      actionSignature: string;
+      scopeKind: ScopeKind;
+      scopeId: string;
+    }
+  | {
       kind: 'no_observations';
       actionSignature: string;
       scopeKind: ScopeKind;
@@ -159,10 +171,19 @@ const findExistingPolicy = (
 // somehow landed in outcomes (uppercase, embedded spaces, etc.)
 // falls through to the level_not_implemented / malformed branch
 // instead of stamping a broken `target` into a policy row.
-const buildL1AliasAction = (actionSignature: string): string | null => {
+//
+// Returns a discriminated result so the caller can distinguish
+// "malformed signature" from "self-alias (no-op proposal)" cleanly.
+type BuildAliasResult =
+  | { kind: 'ok'; actionJson: string }
+  | { kind: 'malformed' }
+  | { kind: 'self_alias' };
+
+const buildL1AliasAction = (actionSignature: string): BuildAliasResult => {
   const parsed = parseActionSignature(actionSignature);
-  if (parsed === null || parsed.level !== 'L1') return null;
-  return JSON.stringify({ target: parsed.to });
+  if (parsed === null || parsed.level !== 'L1') return { kind: 'malformed' };
+  if (parsed.from === parsed.to) return { kind: 'self_alias' };
+  return { kind: 'ok', actionJson: JSON.stringify({ target: parsed.to }) };
 };
 
 // Build the structured `motivo` for the proposed policy — operator
@@ -170,6 +191,67 @@ const buildL1AliasAction = (actionSignature: string): string | null => {
 // landed.
 const buildProposalMotivo = (stats: PosteriorStats): string =>
   `loop_frio:accumulation:ci_low=${stats.ciLow.toFixed(3)},n=${stats.n}`;
+
+// Scope precedence per spec §6.1 — most-specific first. The resolver
+// walks this order at dispatch time; the contradiction check below
+// uses it to determine which scopes are "more specific" than the
+// proposal's scope.
+const SCOPE_PRECEDENCE: ScopeKind[] = ['session', 'repo', 'user', 'language', 'global'];
+
+interface SuperiorContradiction {
+  superiorScope: ScopeKind;
+  superiorPolicyId: string;
+}
+
+// §5.3 gate condition 4: "Não contradiz policy ativa em tier
+// superior." Tier superior = more-specific scope per the resolver
+// precedence. The check: for a proposal at (scope_kind, signature,
+// action_json), is there an active policy at any MORE-SPECIFIC
+// scope_kind with the SAME signature but a DIFFERENT action_json?
+//
+// If yes, the proposal can never apply at dispatch (the higher
+// scope always wins resolution) AND the operator would see two
+// policies disagreeing in `/agent policy list`. Refuse via gate.
+//
+// Important: SAME action_json at higher tier does NOT trip this
+// check — the proposal is redundant (subsumed), not contradicting.
+// Operator might want a backup policy at broader scope; the
+// resolver harmlessly never reaches it.
+//
+// Cheap: one indexed query (idx_policies_action_scope_state). No
+// scope_id filter — we don't have the operator's chain at loop
+// frio time; ANY session-scope row with a different action_json
+// for this signature counts as superior contradiction (even if
+// it's another operator's session).
+const findSuperiorContradiction = (
+  db: DB,
+  signature: string,
+  proposedScope: ScopeKind,
+  proposedActionJson: string,
+): SuperiorContradiction | null => {
+  const proposedIndex = SCOPE_PRECEDENCE.indexOf(proposedScope);
+  // session-scope proposals have no more-specific tier; return null.
+  if (proposedIndex <= 0) return null;
+  const moreSpecific = SCOPE_PRECEDENCE.slice(0, proposedIndex);
+  const placeholders = moreSpecific.map(() => '?').join(', ');
+  const row = db
+    .query(
+      `SELECT id, scope_kind
+         FROM policies
+        WHERE action_signature = ?
+          AND state = 'active'
+          AND scope_kind IN (${placeholders})
+          AND action_json != ?
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT 1`,
+    )
+    .get(signature, ...moreSpecific, proposedActionJson) as {
+    id: string;
+    scope_kind: ScopeKind;
+  } | null;
+  if (row === null) return null;
+  return { superiorScope: row.scope_kind, superiorPolicyId: row.id };
+};
 
 export const runLoopFrio = (input: LoopFrioInput): LoopFrioResult => {
   const { db } = input;
@@ -200,102 +282,147 @@ export const runLoopFrio = (input: LoopFrioInput): LoopFrioResult => {
       continue;
     }
 
-    // Duplicate guard: don't re-propose when a non-terminal policy
-    // already exists at this scope. Operator promotes/invalidates
-    // existing entries explicitly.
-    const existing = findExistingPolicy(db, t.actionSignature, t.scopeKind, t.scopeId);
-    if (existing !== null) {
-      rejected.push({
-        kind: 'duplicate_proposed',
-        actionSignature: t.actionSignature,
-        scopeKind: t.scopeKind,
-        scopeId: t.scopeId,
-        existingPolicyId: existing.id,
-      });
-      continue;
+    // Transactional bracket per-tuple (3.6e). The duplicate guard
+    // + insert sequence is atomic — two concurrent runLoopFrio
+    // invocations can't both see "no existing policy" and both
+    // insert. BEGIN IMMEDIATE acquires SQLite's RESERVED lock so
+    // a second writer blocks until the first commits; when it
+    // proceeds, the duplicate guard SEES the just-inserted row
+    // and skips. Reads outside the transaction (outcome listing,
+    // contradiction check) are still racy but their staleness
+    // doesn't produce wrong DB state — only wrong tally.
+    db.exec('BEGIN IMMEDIATE');
+    let committed = false;
+    try {
+      const result = processTriggeredTuple(db, t, distributionStable, nowMs);
+      if (result.kind === 'proposed') {
+        proposed.push(result);
+      } else {
+        rejected.push(result);
+      }
+      db.exec('COMMIT');
+      committed = true;
+    } finally {
+      if (!committed) db.exec('ROLLBACK');
     }
-
-    // Load every outcome for this (signature, scope) — the
-    // aggregator wants the full history, not just the window. The
-    // accumulation trigger uses the window to DECIDE WHEN to run;
-    // the posterior uses ALL evidence the substrate has.
-    const outcomes = listOutcomesByActionSignature(db, t.actionSignature, t.scopeKind, t.scopeId);
-    const results: OutcomeResult[] = outcomes.map((o) => o.result);
-    const prior = getPriorForSignature(t.actionSignature);
-    const stats = posteriorFromOutcomes(prior, results);
-    if (stats === null) {
-      rejected.push({
-        kind: 'no_observations',
-        actionSignature: t.actionSignature,
-        scopeKind: t.scopeKind,
-        scopeId: t.scopeId,
-      });
-      continue;
-    }
-
-    // §5.3 gate has 4 AND conditions. Three of them (ci_low, n,
-    // distribution_stable) are computed here. The 4th —
-    // "noContradictionWithSuperior" — needs a cross-scope check
-    // ("is there an active policy with the SAME action_signature
-    // but DIFFERENT action_json at a more-specific scope that
-    // would always win the resolver?"). Implementation requires
-    // the operator's full scope chain to walk; loop frio runs
-    // OFFLINE (no current session/repo/user context per analysis).
-    // Deferred to 3.5+ when dispatch consultation lands the chain.
-    // Today we pass through (caller-declared no contradiction);
-    // promotion can still be reverted via /agent policy invalidate.
-    if (!passesPromotionGate({ ciLow: stats.ciLow, n: stats.n, distributionStable })) {
-      const reasons: string[] = [];
-      if (stats.ciLow <= 0.7) reasons.push(`ci_low=${stats.ciLow.toFixed(3)} <= 0.7`);
-      if (stats.n < 10) reasons.push(`n=${stats.n} < 10`);
-      if (!distributionStable) reasons.push('scope unstable (§7.3)');
-      rejected.push({
-        kind: 'gate_refused',
-        actionSignature: t.actionSignature,
-        scopeKind: t.scopeKind,
-        scopeId: t.scopeId,
-        stats,
-        reason: reasons.join('; '),
-      });
-      continue;
-    }
-
-    const actionJson = buildL1AliasAction(t.actionSignature);
-    if (actionJson === null) {
-      // levelOf approved the prefix; parseActionSignature refused
-      // the field content (alphabet violation). Surface as a
-      // distinct discriminator so callers can spot emitter bugs.
-      rejected.push({
-        kind: 'malformed_signature',
-        actionSignature: t.actionSignature,
-        scopeKind: t.scopeKind,
-        scopeId: t.scopeId,
-      });
-      continue;
-    }
-
-    const policy = createPolicy(db, {
-      scopeKind: t.scopeKind,
-      scopeId: t.scopeId,
-      actionSignature: t.actionSignature,
-      actionJson,
-      state: 'proposed',
-      ciLow: stats.ciLow,
-      ciHigh: stats.ciHigh,
-      n: stats.n,
-      motivo: buildProposalMotivo(stats),
-      recordedAt: nowMs,
-    });
-
-    proposed.push({
-      kind: 'proposed',
-      actionSignature: t.actionSignature,
-      scopeKind: t.scopeKind,
-      scopeId: t.scopeId,
-      policy,
-      stats,
-    });
   }
 
   return { proposed, rejected, considered: triggered.length };
+};
+
+// Per-tuple logic extracted from the runLoopFrio loop so the
+// transactional bracket can wrap it cleanly. Returns the result
+// the runner should push to either proposed or rejected.
+const processTriggeredTuple = (
+  db: DB,
+  t: { actionSignature: string; scopeKind: ScopeKind; scopeId: string },
+  distributionStable: boolean,
+  nowMs: number,
+): SignatureResult => {
+  // Duplicate guard: don't re-propose when a non-terminal policy
+  // already exists at this scope. Operator promotes/invalidates
+  // existing entries explicitly. Inside the transaction so a
+  // concurrent writer's just-committed row is visible here.
+  const existing = findExistingPolicy(db, t.actionSignature, t.scopeKind, t.scopeId);
+  if (existing !== null) {
+    return {
+      kind: 'duplicate_proposed',
+      actionSignature: t.actionSignature,
+      scopeKind: t.scopeKind,
+      scopeId: t.scopeId,
+      existingPolicyId: existing.id,
+    };
+  }
+
+  // Load every outcome for this (signature, scope) — the
+  // aggregator wants the full history, not just the window. The
+  // accumulation trigger uses the window to DECIDE WHEN to run;
+  // the posterior uses ALL evidence the substrate has.
+  const outcomes = listOutcomesByActionSignature(db, t.actionSignature, t.scopeKind, t.scopeId);
+  const results: OutcomeResult[] = outcomes.map((o) => o.result);
+  const prior = getPriorForSignature(t.actionSignature);
+  const stats = posteriorFromOutcomes(prior, results);
+  if (stats === null) {
+    return {
+      kind: 'no_observations',
+      actionSignature: t.actionSignature,
+      scopeKind: t.scopeKind,
+      scopeId: t.scopeId,
+    };
+  }
+
+  // Build the action_json early so the contradiction check has
+  // it. Per §5.3 the contradiction is between (signature,
+  // action_json) pairs across scopes.
+  const aliasResult = buildL1AliasAction(t.actionSignature);
+  if (aliasResult.kind === 'malformed') {
+    return {
+      kind: 'malformed_signature',
+      actionSignature: t.actionSignature,
+      scopeKind: t.scopeKind,
+      scopeId: t.scopeId,
+    };
+  }
+  if (aliasResult.kind === 'self_alias') {
+    return {
+      kind: 'self_alias_no_op',
+      actionSignature: t.actionSignature,
+      scopeKind: t.scopeKind,
+      scopeId: t.scopeId,
+    };
+  }
+  const actionJson = aliasResult.actionJson;
+
+  // §5.3 gate: 4 AND conditions (ci_low > 0.7, n >= 10,
+  // distribution_stable, noContradictionWithSuperior).
+  const contradiction = findSuperiorContradiction(db, t.actionSignature, t.scopeKind, actionJson);
+  const noContradiction = contradiction === null;
+  if (
+    !passesPromotionGate({
+      ciLow: stats.ciLow,
+      n: stats.n,
+      distributionStable,
+      noContradictionWithSuperior: noContradiction,
+    })
+  ) {
+    const reasons: string[] = [];
+    if (stats.ciLow <= 0.7) reasons.push(`ci_low=${stats.ciLow.toFixed(3)} <= 0.7`);
+    if (stats.n < 10) reasons.push(`n=${stats.n} < 10`);
+    if (!distributionStable) reasons.push('scope unstable (§7.3)');
+    if (contradiction !== null) {
+      reasons.push(
+        `contradicts active superior policy ${contradiction.superiorPolicyId} at scope ${contradiction.superiorScope}`,
+      );
+    }
+    return {
+      kind: 'gate_refused',
+      actionSignature: t.actionSignature,
+      scopeKind: t.scopeKind,
+      scopeId: t.scopeId,
+      stats,
+      reason: reasons.join('; '),
+    };
+  }
+
+  const policy = createPolicy(db, {
+    scopeKind: t.scopeKind,
+    scopeId: t.scopeId,
+    actionSignature: t.actionSignature,
+    actionJson,
+    state: 'proposed',
+    ciLow: stats.ciLow,
+    ciHigh: stats.ciHigh,
+    n: stats.n,
+    motivo: buildProposalMotivo(stats),
+    recordedAt: nowMs,
+  });
+
+  return {
+    kind: 'proposed',
+    actionSignature: t.actionSignature,
+    scopeKind: t.scopeKind,
+    scopeId: t.scopeId,
+    policy,
+    stats,
+  };
 };

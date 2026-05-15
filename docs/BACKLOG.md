@@ -2,6 +2,61 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(feedback) — Phase 3.6 gap-closing batch (7 follow-ups from Phase 3 review)
+
+**Done.** Closes 7 follow-up gaps declared across Phase 3 — high-relevance items that affect code already in production. Bundled in one slice because the changes are tightly coupled (audit table feeds operator forensics for the rewrites just landed; scope enrichment unblocks user/language policies; contradiction check + transactional bracket + ordering + self-alias filter are all loop frio surface refinements).
+
+### 3.6a — dispatch_rewrites audit table
+
+Phase 3.5b shipped the rewrite behavior but the only audit trail was a stderr line — non-queryable, lost on log rotation. New `dispatch_rewrites` table (migration 051) captures: `tool_call_id`, `session_id` (both FK CASCADE), `policy_id` (no FK; survives policy invalidation), `action_signature`, `original_command`, `rewritten_command`, `matched_scope`, `recorded_at`. Three indices for the common forensic queries. Loop.ts INSERTs on every successful rewrite; failure stderr-logs but lets the rewrite proceed (behavior change still happens, only the forensic surface degrades). 10 tests cover CRUD + CASCADE semantics + policy_id-no-FK.
+
+### 3.6b — Scope chain enrichment
+
+Phase 3.5b hardcoded `user: 'global'`, `language: 'unknown'`, and used `config.cwd` literal (no normalization). Three small fixes:
+
+- `normalizeRepoScope`: `path.resolve` + strip trailing slash. Symlinks NOT resolved (operator might use intentional symlinks; calling `realpath` would surprise them).
+- `detectUserScope`: `os.userInfo().username` → `process.env.USER` fallback → `host:<hostname>` last resort → `'unknown'`.
+- `detectLanguageScope`: probe repo root for marker files (package.json → typescript; pyproject.toml/setup.py → python; Cargo.toml → rust; go.mod → go; pom.xml/build.gradle → java; build.gradle.kts → kotlin; Gemfile → ruby; composer.json → php; else `'unknown'`). Order encodes operator-bias for polyglot repos.
+
+`buildScopeChain` convenience wraps all three. Loop.ts now calls this instead of the inline hardcoded chain. 23 tests.
+
+### 3.6c — `noContradictionWithSuperior` real check
+
+Phase 3.4 deferred this — the loop frio passed `true` by default. Now implemented as a SQL query: for a proposed policy at (scope_kind, signature, action_json), walk MORE-SPECIFIC scopes (per resolver precedence: session > repo > user > language > global) and check whether any has `state='active'` with the SAME signature but DIFFERENT action_json. If yes, the proposal would never apply at dispatch (the higher scope always wins); refuse via `gate_refused` with a specific reason. Same `action_json` at higher tier is REDUNDANT (subsumed), not contradicting — allowed. 4 tests cover the contradicting + redundant + session-no-superior + proposed-doesn't-trip paths.
+
+### 3.6d — Outcome emitter post-rewrite resonance
+
+After dispatch rewrites `grep foo → ripgrep foo`, the outcome emitter previously derived L1 from the rewritten command — `ripgrep` isn't in `KNOWN_BASH_ALIASES`, so NO L1 row landed. The policy's signature went dark immediately after promotion; loop frio couldn't measure post-promotion effectiveness. Fix: `EmitOutcomeInput.appliedL1Signature?: string` lets the caller pin the signature; loop.ts threads `rewrite.appliedSignature` when the rewrite manifested. 2 tests cover the override path.
+
+### 3.6e — Transactional bracket on `runLoopFrio`
+
+Two concurrent `runLoopFrio` invocations could both see "no existing policy" and both INSERT duplicate `proposed` rows for the same `(action_signature, scope)`. Refactored per-tuple work into `processTriggeredTuple` and wrapped each iteration in `BEGIN IMMEDIATE` / `COMMIT` (or `ROLLBACK` on throw). SQLite's RESERVED lock blocks concurrent writers; when the second one proceeds, the duplicate guard SEES the just-inserted row and skips. All 18 existing tests still pass (refactor preserves single-threaded semantics).
+
+### 3.6f — Stable ordering in `resolvePolicyId` ambiguity
+
+When operator passes a short-prefix that matches multiple policies, the error message enumerates the first 5 matches. The order reflected state-group iteration + per-state recorded_at — non-reproducible across runs. Fix: sort matches by `id` before slicing. One-line change.
+
+### 3.6g — Self-alias filter on proposer
+
+Loop frio proposer produced no-op proposals for self-alias signatures (`alias:sed:sed`, etc. — present in the curated table for telemetry). Operator saw useless `/agent policy list` entries. New `kind: 'self_alias_no_op'` SignatureResult variant filters at the proposer (after `parseActionSignature`, before `createPolicy`). 1 test.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings (after biome auto-fix)
+- `bun test` 7774 pass / 10 skip / 0 fail (+40 from the batch)
+
+### Deferred (declared throughout Phase 3, not closed in this batch)
+
+- TOML-loaded priors + aliases (operator override config files)
+- Persisted "última análise" timestamp per signature (today the duplicate guard handles re-runs)
+- Distribution shift detector (§7.3)
+- L2/L3/L4 proposers
+- Trigger-driven invocation (session-end auto loop frio)
+- Cross-scope auto-promotion (per §6.2 explicitly NOT auto)
+- Spec amendments (MEMORY §6.5.5, EVICTION §4.1 to admit user_purge/expired motivos)
+- `/agent rewrites list` slash to surface dispatch_rewrites via operator UI
+
 ## [2026-05-15] feat(feedback,harness) — L1 alias dispatch rewrite (Phase 3.5b — closes FEEDBACK_ADAPTATION L1 loop)
 
 **Done.** First behavior-changing slice of FEEDBACK_ADAPTATION. The L1 adaptation loop closes end-to-end: bash dispatches produce alias outcomes (3.5a) → loop frio aggregates + proposes policies (3.4) → operator promotes via `/agent policy promote` → THIS SLICE consults the resolver at dispatch time and rewrites the bash command before the permission engine + tool exec see it.

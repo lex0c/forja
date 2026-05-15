@@ -164,6 +164,45 @@ describe('emitToolCallOutcome', () => {
     expect(rows[0]?.actionSignature).toBe('flag:read_file:default:default');
   });
 
+  test('appliedL1Signature override emits the forced signature instead of bash-parser derivation', () => {
+    // Post-rewrite case: tool_input.command is `ripgrep foo`
+    // (rewritten from `grep foo`). The bash parser would derive
+    // nothing (ripgrep isn't in KNOWN_BASH_ALIASES), but the caller
+    // (harness) passes the original policy signature so the
+    // accumulator keeps tracking effectiveness.
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'ripgrep foo' },
+      appliedL1Signature: 'alias:grep:ripgrep',
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(2);
+    const sigs = rows.map((r) => r.actionSignature).sort();
+    expect(sigs).toEqual(['alias:grep:ripgrep', 'flag:bash:default:default']);
+  });
+
+  test('appliedL1Signature override wins over bash-parser when both apply', () => {
+    // The override takes precedence. A bash command that the
+    // parser WOULD have detected as alias:grep:ripgrep, but the
+    // caller passed alias:find:fd: the override wins.
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'grep foo' },
+      appliedL1Signature: 'alias:find:fd',
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    const sigs = rows.map((r) => r.actionSignature).sort();
+    expect(sigs).toEqual(['alias:find:fd', 'flag:bash:default:default']);
+  });
+
   test('bash with failure surfaces failure on both flag + alias rows', () => {
     emitToolCallOutcome(db, {
       sessionId,

@@ -77,6 +77,18 @@ export interface EmitOutcomeInput {
   // callers that don't carry the input fall back to the generic
   // `flag:bash:default:default` outcome only.
   toolInput?: unknown;
+  // Explicit L1 signature override. When a dispatch rewrite
+  // (3.5b) fired, the toolInput.command is the REWRITTEN command
+  // (e.g., 'ripgrep foo'), not the original 'grep foo'. The L1
+  // signature we want to record is the policy's — the ORIGINAL
+  // alias that drove the rewrite — so the loop frio's posterior
+  // for `alias:grep:ripgrep` keeps accumulating evidence after
+  // promotion. Without this override, the post-rewrite bash
+  // parser would see 'ripgrep' (not in KNOWN_BASH_ALIASES) and
+  // emit NO L1 outcome — the policy's effectiveness signal would
+  // go dark the moment it became active. Callers (loop.ts) pass
+  // the signature from `maybeRewriteBashCommand.appliedSignature`.
+  appliedL1Signature?: string;
 }
 
 // Extract a known L1 alias signature from a bash tool input when
@@ -126,12 +138,17 @@ export const emitToolCallOutcome = (db: DB, input: EmitOutcomeInput): boolean =>
   }
 
   // Signatures to emit. Generic flag signature always; L1 alias
-  // signature when the bash command matches the table. Two rows
-  // share the same evidence shape — they're indexed by different
-  // action_signatures for adaptation tracking purposes.
+  // signature when the bash command matches the table OR when the
+  // caller forces it (post-rewrite: the policy's signature must
+  // keep accumulating evidence even though the rewritten command
+  // wouldn't derive it).
   const signatures: string[] = [`flag:${input.toolName}:default:default`];
-  const l1 = deriveL1AliasSignature(input.toolName, input.toolInput);
-  if (l1 !== null) signatures.push(l1);
+  if (input.appliedL1Signature !== undefined) {
+    signatures.push(input.appliedL1Signature);
+  } else {
+    const l1 = deriveL1AliasSignature(input.toolName, input.toolInput);
+    if (l1 !== null) signatures.push(l1);
+  }
 
   let wroteAny = false;
   for (const actionSignature of signatures) {

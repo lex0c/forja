@@ -255,7 +255,14 @@ const resolvePolicyId = (ctx: SlashContext, idOrPrefix: string): ResolvedId => {
   for (const state of POLICY_STATES_OPERATOR) {
     all.push(...listPoliciesByState(ctx.db, state));
   }
-  const matches = all.filter((p) => p.id.startsWith(idOrPrefix));
+  // Sort matches by id so the ambiguity error message is stable
+  // across runs — without sorting, the order reflects state-group
+  // iteration + per-state recorded_at, which can flip between
+  // sessions. Operators relying on the listed prefix to disambiguate
+  // got non-reproducible enumerations.
+  const matches = all
+    .filter((p) => p.id.startsWith(idOrPrefix))
+    .sort((a, b) => a.id.localeCompare(b.id));
   if (matches.length === 0) {
     return { kind: 'error', message: `/agent policy: no policy matches prefix '${idOrPrefix}'` };
   }

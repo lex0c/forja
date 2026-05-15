@@ -20,6 +20,7 @@ import {
 } from '../critique/index.ts';
 import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
 import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
+import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import {
   deriveParentCapabilities,
@@ -55,6 +56,7 @@ import {
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
+import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -2606,18 +2608,55 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // audit table linking the policy id to the original
           // command — operator forensic queries need it. For now
           // operators trace via /agent policy history <id>.
+          // Tracks the L1 signature that drove a successful rewrite
+          // (null when no rewrite happened). Threaded into the
+          // outcome emitter so the policy's signature keeps
+          // accumulating evidence after promotion — without this,
+          // the post-rewrite command's bash-parser pass would
+          // either pick the rewritten binary (not in alias table)
+          // or nothing, and the policy's effectiveness signal
+          // would go dark immediately after promotion.
+          let appliedL1Signature: string | null = null;
           if (tu.name === 'bash' && typeof tu.input.command === 'string') {
-            const rewrite = maybeRewriteBashCommand(config.db, tu.input.command, {
-              session: sessionId,
-              repo: config.cwd,
-              user: 'global', // 3.5b minimum scope; richer detection lands later
-              language: 'unknown',
-            });
-            if (rewrite.rewritten) {
+            const originalCommand = tu.input.command;
+            const rewrite = maybeRewriteBashCommand(
+              config.db,
+              originalCommand,
+              buildScopeChain({ sessionId, repoCwd: config.cwd }),
+            );
+            if (
+              rewrite.rewritten &&
+              rewrite.appliedPolicyId !== null &&
+              rewrite.appliedSignature !== null &&
+              rewrite.matchedScope !== null
+            ) {
+              appliedL1Signature = rewrite.appliedSignature;
               tu.input = { ...tu.input, command: rewrite.command };
-              process.stderr.write(
-                `forja adaptation: rewrote bash command via policy ${rewrite.appliedPolicyId} (${rewrite.appliedSignature}, scope=${rewrite.matchedScope})\n`,
-              );
+              // Persist the structured audit row. Best-effort —
+              // failure (FK violation, IO) stderr-logs and lets the
+              // rewrite proceed. The behavior change still
+              // happens; only the forensic surface degrades.
+              try {
+                createDispatchRewrite(config.db, {
+                  toolCallId: tu.id,
+                  sessionId,
+                  policyId: rewrite.appliedPolicyId,
+                  actionSignature: rewrite.appliedSignature,
+                  originalCommand,
+                  rewrittenCommand: rewrite.command,
+                  matchedScope: rewrite.matchedScope as
+                    | 'global'
+                    | 'language'
+                    | 'repo'
+                    | 'user'
+                    | 'session',
+                });
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                process.stderr.write(
+                  `forja adaptation: dispatch_rewrites insert failed for tool_call=${tu.id} (${msg})\n`,
+                );
+              }
             }
           }
           safeEmit(config.onEvent, {
@@ -2719,6 +2758,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // ignore the input; only `bash` carries a `command`
             // field the parser inspects.
             toolInput: tu.input,
+            // When a dispatch rewrite manifested, pin the L1
+            // signature to the policy's — the post-rewrite
+            // command's leading binary (rg) isn't in the alias
+            // table, so without this override the emitter would
+            // skip the L1 row entirely and the policy would lose
+            // its evidence stream immediately after promotion
+            // (3.6d).
+            ...(appliedL1Signature !== null ? { appliedL1Signature } : {}),
           });
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state

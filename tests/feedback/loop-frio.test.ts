@@ -207,6 +207,19 @@ describe('runLoopFrio', () => {
     expect(refused.reason).toContain('ci_low');
   });
 
+  test('self-alias signature is filtered as kind=self_alias_no_op', () => {
+    // The bash-aliases table carries self-aliases (cat/awk/sed)
+    // for per-binary telemetry; outcomes accumulate, but the
+    // proposer should NOT produce a no-op rewrite policy.
+    // Without this filter, operator would see useless proposals
+    // like "promote alias:sed:sed → use sed" in /agent policy list.
+    seedOutcomes('alias:sed:sed', Array(12).fill('success' as OutcomeResult));
+    const r = runLoopFrio({ db, sinceMs: 0 });
+    expect(r.proposed).toHaveLength(0);
+    expect(r.rejected).toHaveLength(1);
+    expect(r.rejected[0]?.kind).toBe('self_alias_no_op');
+  });
+
   test('malformed L1 signature surfaces as kind=malformed_signature', () => {
     // levelOf('alias:UPPER:lower') returns 'L1' (prefix-only check),
     // but parseActionSignature refuses uppercase fields. The proposer
@@ -234,6 +247,87 @@ describe('runLoopFrio', () => {
     const refused = r.rejected[0];
     if (refused === undefined) throw new Error('expected rejected');
     expect(refused.kind).toBe('malformed_signature');
+  });
+
+  test('refuses when active superior policy has different action_json (contradiction)', () => {
+    // Proposing at global scope while session/repo/user/language
+    // has an active policy with the SAME signature but DIFFERENT
+    // action_json. The dispatch would never honor global (resolver
+    // walks specific → general; first hit wins). Refusing prevents
+    // the operator from seeing a doomed-to-shadow proposal.
+    createPolicy(db, {
+      scopeKind: 'user',
+      scopeId: 'some-user',
+      actionSignature: 'alias:grep:ripgrep',
+      actionJson: JSON.stringify({ target: 'rg-other' }),
+      state: 'active',
+    });
+    seedOutcomes(
+      'alias:grep:ripgrep',
+      Array(12).fill('success' as OutcomeResult),
+      'global',
+      'global',
+    );
+    const r = runLoopFrio({ db, sinceMs: 0 });
+    expect(r.proposed).toHaveLength(0);
+    const refused = r.rejected[0];
+    if (refused === undefined || refused.kind !== 'gate_refused') {
+      throw new Error('expected gate_refused');
+    }
+    expect(refused.reason).toContain('contradicts active superior');
+  });
+
+  test('does NOT refuse when superior policy has SAME action_json (redundant, not contradiction)', () => {
+    // Session-scope active with target: 'ripgrep'. Global proposal
+    // would have target: 'ripgrep' too. Spec §5.3 reads
+    // "contradiction" strictly — same action_json at higher tier
+    // means the lower-tier proposal is redundant (subsumed), not
+    // contradicting. Allow.
+    createPolicy(db, {
+      scopeKind: 'session',
+      scopeId: 'some-session',
+      actionSignature: 'alias:grep:ripgrep',
+      actionJson: JSON.stringify({ target: 'ripgrep' }),
+      state: 'active',
+    });
+    seedOutcomes(
+      'alias:grep:ripgrep',
+      Array(12).fill('success' as OutcomeResult),
+      'global',
+      'global',
+    );
+    const r = runLoopFrio({ db, sinceMs: 0 });
+    expect(r.proposed).toHaveLength(1);
+  });
+
+  test('session-scope proposal has no superior (no contradiction check applies)', () => {
+    // session is highest precedence; no scope is more specific.
+    // The contradiction check should pass trivially. Verifies the
+    // SCOPE_PRECEDENCE.indexOf branch.
+    seedOutcomes('alias:grep:ripgrep', Array(12).fill('success' as OutcomeResult));
+    const r = runLoopFrio({ db, sinceMs: 0 });
+    expect(r.proposed).toHaveLength(1);
+  });
+
+  test('proposed superior does NOT trip contradiction (only active matters)', () => {
+    // The contradiction check filters on state='active'. A merely
+    // proposed (not yet promoted) policy at a more-specific scope
+    // doesn't block a different-action proposal at a broader scope.
+    createPolicy(db, {
+      scopeKind: 'session',
+      scopeId: 'some-session',
+      actionSignature: 'alias:grep:ripgrep',
+      actionJson: JSON.stringify({ target: 'rg-other' }),
+      state: 'proposed',
+    });
+    seedOutcomes(
+      'alias:grep:ripgrep',
+      Array(12).fill('success' as OutcomeResult),
+      'global',
+      'global',
+    );
+    const r = runLoopFrio({ db, sinceMs: 0 });
+    expect(r.proposed).toHaveLength(1);
   });
 
   test('motivo on the proposed policy includes ci_low and n', () => {
