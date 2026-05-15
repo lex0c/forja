@@ -2630,6 +2630,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // or nothing, and the policy's effectiveness signal
           // would go dark immediately after promotion.
           let appliedL1Signature: string | null = null;
+          // Pending rewrite audit deferred until after invokeTool
+          // creates the tool_calls row. `tu.id` is the provider's
+          // tool_use id; `tool_calls.id` is a separate UUID that
+          // invokeTool generates inside the same call. Persisting
+          // here with tu.id would always hit the FK on
+          // dispatch_rewrites.tool_call_id → tool_calls.id and
+          // fall into the catch path — the behavior change happened
+          // but the structured audit row never landed.
+          let pendingRewriteAudit: {
+            policyId: string;
+            actionSignature: string;
+            originalCommand: string;
+            rewrittenCommand: string;
+            matchedScope: 'global' | 'language' | 'repo' | 'user' | 'session';
+          } | null = null;
           if (tu.name === 'bash' && typeof tu.input.command === 'string') {
             const originalCommand = tu.input.command;
             const rewrite = maybeRewriteBashCommand(
@@ -2645,31 +2660,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ) {
               appliedL1Signature = rewrite.appliedSignature;
               tu.input = { ...tu.input, command: rewrite.command };
-              // Persist the structured audit row. Best-effort —
-              // failure (FK violation, IO) stderr-logs and lets the
-              // rewrite proceed. The behavior change still
-              // happens; only the forensic surface degrades.
-              try {
-                createDispatchRewrite(config.db, {
-                  toolCallId: tu.id,
-                  sessionId,
-                  policyId: rewrite.appliedPolicyId,
-                  actionSignature: rewrite.appliedSignature,
-                  originalCommand,
-                  rewrittenCommand: rewrite.command,
-                  matchedScope: rewrite.matchedScope as
-                    | 'global'
-                    | 'language'
-                    | 'repo'
-                    | 'user'
-                    | 'session',
-                });
-              } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                process.stderr.write(
-                  `forja adaptation: dispatch_rewrites insert failed for tool_call=${tu.id} (${msg})\n`,
-                );
-              }
+              pendingRewriteAudit = {
+                policyId: rewrite.appliedPolicyId,
+                actionSignature: rewrite.appliedSignature,
+                originalCommand,
+                rewrittenCommand: rewrite.command,
+                matchedScope: rewrite.matchedScope as
+                  | 'global'
+                  | 'language'
+                  | 'repo'
+                  | 'user'
+                  | 'session',
+              };
             }
           }
           safeEmit(config.onEvent, {
@@ -2714,6 +2716,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
           });
+          // Persist the dispatch-rewrite audit row now that invokeTool
+          // created the tool_calls row that the FK points at. Skipped
+          // when invokeTool returned an empty toolCallId (unknown
+          // tool — no tool_call row to anchor against). Best-effort:
+          // FK / IO failure stderr-logs and lets the rewrite proceed;
+          // the behavior change already happened on tu.input mutation
+          // upstream, only the forensic surface degrades.
+          if (pendingRewriteAudit !== null && inv.toolCallId !== '') {
+            try {
+              createDispatchRewrite(config.db, {
+                toolCallId: inv.toolCallId,
+                sessionId,
+                policyId: pendingRewriteAudit.policyId,
+                actionSignature: pendingRewriteAudit.actionSignature,
+                originalCommand: pendingRewriteAudit.originalCommand,
+                rewrittenCommand: pendingRewriteAudit.rewrittenCommand,
+                matchedScope: pendingRewriteAudit.matchedScope,
+              });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              process.stderr.write(
+                `forja adaptation: dispatch_rewrites insert failed for tool_call=${inv.toolCallId} (${msg})\n`,
+              );
+            }
+          }
           // Slice 131 wire: when a tool execution fails AFTER
           // permission allowed it (failed=true, denied!=true)
           // AND we have an approval_seq from the decision, emit
