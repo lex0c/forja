@@ -26,10 +26,12 @@ import {
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
+  type MemoryState,
   moveMemory,
   removeMemory,
   scanForInjection,
   scanForPromotion,
+  transitionMemoryState,
 } from '../../../memory/index.ts';
 import {
   listMemoryEventsByName,
@@ -475,7 +477,10 @@ const handleDelete = async (
     // preview and proceed; remove path doesn't care about content.
     // Source unknown when the body can't parse — fall back to
     // 'imported' for the audit row (most neutral provenance
-    // marker).
+    // marker). State is unknown for the same reason; we treat
+    // malformed as a non-active path so the legacy removeMemory
+    // primitive handles it (no transitionMemoryState attempts on
+    // unreadable files).
     return await confirmAndDelete(
       ctx,
       registry,
@@ -483,12 +488,14 @@ const handleDelete = async (
       name,
       [`(body parse failed: ${peek.error})`],
       'imported',
+      'invalidated',
     );
   }
   if (peek.kind === 'missing') {
     // Index entry exists, body file is gone. Confirm anyway —
     // operator's intent is to clean up the dangling entry. Source
     // unrecoverable; same 'imported' fallback as malformed.
+    // Tombstone path doesn't apply — body is already gone.
     return await confirmAndDelete(
       ctx,
       registry,
@@ -496,12 +503,14 @@ const handleDelete = async (
       name,
       ['(body file missing — only the index entry will be cleared)'],
       'imported',
+      'invalidated',
     );
   }
 
   // Happy path: real source from frontmatter so audit groups with
   // the memory's history (created/refused/etc rows carry the
-  // same provenance).
+  // same provenance). State defaults to 'active' per spec §3.1.1
+  // when frontmatter omits the field.
   return await confirmAndDelete(
     ctx,
     registry,
@@ -509,6 +518,7 @@ const handleDelete = async (
     name,
     peek.file.body.split('\n'),
     peek.file.frontmatter.source,
+    peek.file.frontmatter.state ?? 'active',
   );
 };
 
@@ -519,6 +529,13 @@ const confirmAndDelete = async (
   name: string,
   preview: string[],
   source: string,
+  // Current frontmatter state, defaulting to `active` per spec
+  // §3.1.1 absence-equals-active rule. Drives whether we route
+  // through transitionMemoryState (active path → tombstone, audit
+  // pair, restorable via /memory restore) or fall through to the
+  // legacy removeMemory primitive (other states + corrupted /
+  // missing files).
+  currentState: MemoryState,
 ): Promise<SlashResult> => {
   const answer = await ctx.modalManager.askMemoryAction({
     action: 'delete',
@@ -540,6 +557,29 @@ const confirmAndDelete = async (
   // SlashContext (every other slash command would gain a field for
   // one caller).
   const roots = registry.roots;
+
+  // Active-state path: route through transitionMemoryState so the
+  // body moves to .tombstones/ (operator can /memory restore it
+  // within the retention window) and the eviction_events +
+  // memory_events audit pair lands. State machine forbids
+  // active→evicted direct (EVICTION §4.1 lists active→quarantined
+  // and quarantined→evicted as the only paths into evicted from
+  // an active source). We do a 2-step transition with motivo
+  // `low_roi` and trigger `user_purge` — the trigger correctly
+  // attributes the source while the motivo is the closest state-
+  // machine-legal label. Follow-up: spec EVICTION §4.1 may grow
+  // an explicit `user_purge` motivo on active→evicted to clean
+  // this attribution.
+  if (currentState === 'active') {
+    return await deleteViaTransition(ctx, registry, roots, scope, name);
+  }
+
+  // Other states / dangling entries: keep the legacy removeMemory
+  // primitive. tombstone path doesn't apply (the file is already
+  // absent / malformed; index-only cleanup is what the operator
+  // wants). Future slice can route quarantined/invalidated/evicted
+  // through transitionMemoryState too — out of scope here because
+  // the volume is tiny and the legacy path is well-tested.
   const result = removeMemory({ roots, scope, name });
   if (result.kind === 'sandbox_violation') {
     registry.recordEvent({
@@ -584,6 +624,74 @@ const confirmAndDelete = async (
   });
   registry.reload();
   return { kind: 'ok', notes: [`deleted ${scope}/${name}`] };
+};
+
+// Two-step transition for the active-state delete path. Returns
+// a SlashResult mirroring the legacy code's shape — error on the
+// first sub-transition failure (we never partially evict).
+const deleteViaTransition = async (
+  ctx: SlashContext,
+  registry: MemoryRegistry,
+  roots: MemoryRegistry['roots'],
+  scope: MemoryScope,
+  name: string,
+): Promise<SlashResult> => {
+  const sessionId = ctx.currentSessionId();
+  const transitionInput = {
+    db: ctx.db,
+    registry,
+    roots,
+    scope,
+    name,
+    motivo: 'low_roi' as const,
+    trigger: 'user_purge',
+    actor: 'user' as const,
+    ...(sessionId !== null ? { sessionId } : {}),
+    cwd: ctx.baseConfig.cwd,
+  };
+
+  // 1) active → quarantined.
+  const r1 = await transitionMemoryState({ ...transitionInput, toState: 'quarantined' });
+  if (r1.kind !== 'applied') {
+    return mapTransitionFailure('/memory delete (active→quarantined)', r1);
+  }
+
+  // 2) quarantined → evicted.
+  const r2 = await transitionMemoryState({ ...transitionInput, toState: 'evicted' });
+  if (r2.kind !== 'applied') {
+    return mapTransitionFailure('/memory delete (quarantined→evicted)', r2);
+  }
+
+  registry.reload();
+  // Lead with "deleted" so the operator-facing copy stays
+  // recognizable across the lifecycle refactor; the parenthetical
+  // explains the actual mechanism (tombstone instead of unlink)
+  // so the operator knows /memory restore is now available.
+  return {
+    kind: 'ok',
+    notes: [
+      `deleted ${scope}/${name} (moved to .tombstones/; restorable via /memory restore until retention window expires)`,
+    ],
+  };
+};
+
+const mapTransitionFailure = (
+  prefix: string,
+  result: { kind: string; reason?: string | null },
+): SlashResult => {
+  if (result.kind === 'unknown') {
+    return { kind: 'error', message: `${prefix}: memory not found` };
+  }
+  if (result.kind === 'illegal_transition') {
+    return { kind: 'error', message: `${prefix}: ${result.reason ?? 'illegal state transition'}` };
+  }
+  if (result.kind === 'blocked_by_hook') {
+    return { kind: 'error', message: `${prefix}: blocked by Eviction hook` };
+  }
+  if (result.kind === 'io_error') {
+    return { kind: 'error', message: `${prefix}: ${result.reason ?? 'i/o error'}` };
+  }
+  return { kind: 'error', message: `${prefix}: unexpected outcome '${result.kind}'` };
 };
 
 // Audit-attribution spread helper. SlashContext exposes

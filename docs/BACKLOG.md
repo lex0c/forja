@@ -2,6 +2,47 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(cli/memory) — /memory delete uses transitionMemoryState (Phase 1.3.c3)
+
+**Done.** First production caller of `transitionMemoryState` (1.3.c1). When the operator runs `/memory delete <name>` on an `active` memory, the slash now routes through the state machine instead of calling the legacy `removeMemory` primitive — the body moves into `.tombstones/` (restorable later via `/memory restore`, 1.3.d), and the audit pair (`eviction_events` + `memory_events`) lands. Memories in other states (malformed body, missing file) keep the legacy code path because tombstone semantics don't apply.
+
+Also fixes a latent flake surfaced during the stability check: `transitionMemoryState` now propagates the optional `input.now()` to the `recordedAt` field of every `eviction_events` row it writes (previously only the tombstone filename ts was overridable). Without this, two back-to-back transitions in a test fixture (or in production within the same ms) could collide on `recorded_at`, and the `id DESC` tiebreaker in `getLastEvictionForObject` is non-deterministic (UUID v4 is random). The transitions.test.ts `evicted → purged` test flaked ~1/4 runs before the fix; deterministic after.
+
+### Design decisions
+
+- **Two-step transition for the active path.** The state machine forbids `active → evicted` direct (1.2.a `LEGAL_TRANSITIONS` from spec EVICTION §4.1 — only `active → quarantined → evicted` is canonical). `/memory delete` does both transitions in sequence with `motivo: 'low_roi'` + `trigger: 'user_purge'`. The motivo is the closest state-machine-legal label for operator-driven deletion; the trigger correctly attributes the source. Audit row pair shows the 2-step flow — operator-visible via `/memory audit`. Follow-up declared in this entry: spec EVICTION §4.1 may eventually grow an explicit `user_purge` motivo on `active → evicted` so the 2-step intermediate disappears, but that's a spec PR; current code lives within the canonical state machine.
+
+- **Non-active states keep the legacy removeMemory path.** Three reasons: (1) volume is tiny — operators rarely `/memory delete` malformed entries; (2) the legacy path is well-tested; (3) tombstone semantics don't apply to corrupted/missing files (no body to move). Future slice can route `quarantined`/`invalidated`/`evicted` deletions through `transitionMemoryState` too if a need surfaces.
+
+- **Operator-facing message keeps the verb "deleted".** Lead with "deleted ${scope}/${name}" so the copy stays recognizable across the refactor; the parenthetical "(moved to .tombstones/; restorable via /memory restore until retention window expires)" explains the new mechanism without making the operator parse state-machine vocabulary.
+
+- **`mapTransitionFailure` helper centralizes the result-discriminant → SlashResult mapping.** Each `transitionMemoryState` failure mode (`unknown`, `illegal_transition`, `blocked_by_hook`, `io_error`) gets a specific error message; the prefix (`/memory delete (active→quarantined)`) attributes the failing sub-step.
+
+- **`recordedAt` propagation in `transitionMemoryState`.** When `input.now()` is set, the helper passes the same value to every `appendEvictionEvent` call (applied-row, blocked-by-hook row, trigger-fired-no-action row). Without an override, falls back to `Date.now()` inside the repo. Documented in code as a follow-up: a `seq INTEGER AUTOINCREMENT` column on `eviction_events` would give a deterministic tiebreaker without requiring callers to manage timestamps; out of scope for this slice.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/commands/memory.ts` | `confirmAndDelete` now takes `currentState`; routes through `deleteViaTransition` (new helper) when `currentState === 'active'`; falls through to legacy `removeMemory` otherwise. Each `handleDelete` caller passes the frontmatter state (default `active`, falls to `invalidated` for malformed/missing entries). New `mapTransitionFailure` helper centralizes SlashResult mapping. Imports `MemoryState` and `transitionMemoryState`. |
+| `src/memory/transitions.ts` | Derives `recordedAt` from `input.now()` (when supplied) and forwards to every `appendEvictionEvent` call site (applied, blocked_by_hook, trigger_fired_no_action). |
+| `tests/cli/slash/memory.test.ts` | Updates 2 existing `/memory delete` tests for the new tombstone-based behavior: asserts body moves to `.tombstones/`, asserts `evicted` + `quarantined` actions in memory_events (not `deleted`), asserts notes mention "deleted ... .tombstones". |
+| `tests/memory/transitions.test.ts` | Adds `now: () => 2_000` to the second transition in the `evicted → purged` test for deterministic ordering. |
+
+### Deferred / follow-ups declared
+
+- **1.3.d** — `/memory restore <name>` slash + re-admission gate (the operator-facing inverse of this slice).
+- **Spec EVICTION §4.1 PR** — extend `active → evicted` to admit `motivo: 'user_purge'`, dropping the 2-step intermediate. Operator audit would then show one event per delete instead of two.
+- **`eviction_events.seq` column** — monotonic tiebreaker for `getLastEvictionForObject`. Would close the latent flake without requiring callers to thread `now()` through every call. Needs a migration; out of scope here.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/transitions.test.ts` 11 pass / 0 fail across 3 stability runs (was flaky ~1/4 pre-fix)
+- `bun test tests/cli/slash/memory.test.ts` 58 pass / 0 fail
+- `bun test` 7503 pass / 10 skip / 0 fail (unchanged total — 2 tests rewritten, no net add)
+
 ## [2026-05-15] feat(memory) — transitionMemoryState helper (Phase 1.3.c1)
 
 **Done.** Memory's owner of the eviction contract from Phase 1.2. One async function (`transitionMemoryState`) orchestrates a lifecycle transition end-to-end across the file, the index, the `eviction_events` table, and the `memory_events` table — emitted as a paired audit so forensic queries can answer "what changed and why" from either surface. No caller wires it yet — verify-before-act (1.3.c2) and `/memory delete` (1.3.c3) follow.

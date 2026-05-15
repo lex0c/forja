@@ -293,6 +293,11 @@ describe('transitionMemoryState: evicted → purged', () => {
       motivo: 'low_roi',
       trigger: 'roi_below_threshold',
       actor: 'loop_cold',
+      // Distinct timestamps for the two transitions so
+      // getLastEvictionForObject's ORDER BY recorded_at DESC has
+      // an unambiguous winner. Without this, both rows can land
+      // at the same millisecond on a fast CI box and the id-DESC
+      // tiebreaker (random UUID) yields non-deterministic order.
       now: () => 1_000,
       sessionId,
       cwd: workdir,
@@ -308,6 +313,7 @@ describe('transitionMemoryState: evicted → purged', () => {
       motivo: 'expired',
       trigger: 'expired_at',
       actor: 'startup_probe',
+      now: () => 2_000,
       sessionId,
       cwd: workdir,
     });

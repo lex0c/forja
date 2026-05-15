@@ -666,7 +666,7 @@ const stubMemoryAction = (
 };
 
 describe('/memory delete', () => {
-  test('confirm yes: removes file + index entry, audits deleted', async () => {
+  test('confirm yes: moves body to .tombstones/, removes index, audits evicted', async () => {
     const repo = makeTmp();
     const { ctx, db, registry, roots, sessionId } = makeCtx(repo);
     writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
@@ -676,13 +676,28 @@ describe('/memory delete', () => {
     const r = await memoryCommand.exec(['delete', 'mem'], ctx);
     if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
     expect(r.notes?.[0]).toContain('deleted project_local/mem');
+    expect(r.notes?.[0]).toContain('.tombstones');
+    // Body moved off the scope root.
     expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+    // Body landed in .tombstones/.
+    const tombstoneDir = join(roots.projectLocal, '.tombstones');
+    expect(existsSync(tombstoneDir)).toBe(true);
+    const { readdirSync } = await import('node:fs');
+    const tombstones = readdirSync(tombstoneDir);
+    expect(tombstones.length).toBe(1);
+    expect(tombstones[0]).toMatch(/^mem\.\d+\.md$/);
+    // Audit pair: state machine emits the 2-step transition as
+    // 'quarantined' then 'evicted'. The legacy `deleted` action
+    // no longer fires from /memory delete; future audit consumers
+    // pivot on `evicted` for operator-driven removals.
     const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
     const events = listMemoryEventsByName(db, 'mem');
-    const deleted = events.find((e) => e.action === 'deleted');
-    expect(deleted).toBeDefined();
-    expect(deleted?.scope).toBe('project_local');
-    expect(deleted?.sessionId).toBe(sessionId);
+    const evictedEv = events.find((e) => e.action === 'evicted');
+    expect(evictedEv).toBeDefined();
+    expect(evictedEv?.scope).toBe('project_local');
+    expect(evictedEv?.sessionId).toBe(sessionId);
+    const quarantinedEv = events.find((e) => e.action === 'quarantined');
+    expect(quarantinedEv).toBeDefined();
   });
 
   test('confirm no: leaves file in place, no audit row', async () => {
@@ -735,7 +750,7 @@ describe('/memory delete', () => {
     expect(existsSync(join(roots.user, 'mem.md'))).toBe(false);
   });
 
-  test('confirm yes against project_shared: removes shared file + index entry', async () => {
+  test('confirm yes against project_shared: moves shared body to .tombstones/, audits evicted', async () => {
     const repo = makeTmp();
     const { ctx, db, registry, roots } = makeCtx(repo);
     writeIndex(roots.projectShared, '- [Team](team.md) — h\n');
@@ -746,15 +761,18 @@ describe('/memory delete', () => {
     if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
     expect(r.notes?.[0]).toContain('deleted project_shared/team');
     expect(existsSync(join(roots.projectShared, 'team.md'))).toBe(false);
+    // Body lands in .tombstones/ (shared tombstones are versioned
+    // per MEMORY §2.2 — restore via git checkout works past the
+    // retention window).
+    const tombDir = join(roots.projectShared, '.tombstones');
+    expect(existsSync(tombDir)).toBe(true);
     const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
     const events = listMemoryEventsByName(db, 'team');
-    const deleted = events.find((e) => e.action === 'deleted');
-    expect(deleted?.scope).toBe('project_shared');
-    // Real source from frontmatter (not 'imported' fallback)
-    // because peek succeeded — frontmatter source happens to be
-    // 'imported' for this fixture, so the test asserts the path
-    // not the value.
-    expect(deleted?.source).toBe('imported');
+    const evictedEv = events.find((e) => e.action === 'evicted');
+    expect(evictedEv?.scope).toBe('project_shared');
+    // Source forwarded verbatim from the file's frontmatter
+    // through both transition rows.
+    expect(evictedEv?.source).toBe('imported');
   });
 
   test('preview includes body content for operator review', async () => {

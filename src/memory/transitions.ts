@@ -382,6 +382,16 @@ export const transitionMemoryState = async (
   // no-op 'applied' row so the trail records the trigger fire
   // without claiming work happened. Distinct from real applied
   // outcomes via fromState === toState in the audit row.
+  //
+  // recordedAt is derived from input.now() when supplied so two
+  // back-to-back transitions in the same test fixture (with
+  // different `now()` values) land deterministically ordered.
+  // In production where input.now is unset, appendEvictionEvent
+  // falls back to Date.now(); same-ms collisions then tie-break
+  // by id (random UUID v4), which is a latent bug for "most
+  // recent" queries — follow-up: add a seq column for monotonic
+  // tiebreaker.
+  const recordedAt = input.now !== undefined ? input.now() : undefined;
   if (fromState === toState) {
     const evidenceJson = JSON.stringify(input.evidence ?? {});
     try {
@@ -397,6 +407,7 @@ export const transitionMemoryState = async (
         outcome: 'trigger_fired_no_action',
         actor: input.actor,
         sessionId: input.sessionId ?? null,
+        ...(recordedAt !== undefined ? { recordedAt } : {}),
       });
       return {
         kind: 'applied',
@@ -452,6 +463,7 @@ export const transitionMemoryState = async (
           blockedBy: blockedByStr,
           actor: input.actor,
           sessionId: input.sessionId ?? null,
+          ...(recordedAt !== undefined ? { recordedAt } : {}),
         });
         evId = ev.id;
       } catch (err) {
@@ -521,6 +533,7 @@ export const transitionMemoryState = async (
       outcome: 'applied',
       actor: input.actor,
       sessionId: input.sessionId ?? null,
+      ...(recordedAt !== undefined ? { recordedAt } : {}),
       ...(toState === 'evicted' ? { purgeAt: input.purgeAt ?? null } : {}),
     });
     evictionEventId = ev.id;
