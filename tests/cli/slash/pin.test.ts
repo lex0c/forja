@@ -279,6 +279,47 @@ describe('/pin: validation + mutual exclusivity', () => {
   });
 });
 
+describe('/pin: secret scanner', () => {
+  test('refuses text that matches a credential pattern', async () => {
+    const r = await pinCommand.exec(['tok', 'AKIAIOSFODNN7EXAMPLE'], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('credential pattern');
+    expect(store.listPinsBySession(sessionId)).toHaveLength(0);
+  });
+
+  test('refuses an Anthropic key shape', async () => {
+    const r = await pinCommand.exec(
+      ['log', 'line', 'with', 'sk-ant-aaaaaaaaaaaaaaaaaaaa'],
+      buildCtx(),
+    );
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('credential pattern');
+  });
+
+  test('error message does NOT echo the matched credential', async () => {
+    const cred = 'AKIAIOSFODNN7EXAMPLE';
+    const r = await pinCommand.exec(['tok', cred], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).not.toContain(cred);
+  });
+
+  test('does NOT reject injection phrases (operator typed them)', async () => {
+    // The whole point of using scanForSecrets vs scanForInjection
+    // on the slash surface: a /pin like "ignore previous
+    // instructions" can be a legitimate operator note about a
+    // model failure mode. The tool path (pin_context) still runs
+    // the full scanForInjection per CONTEXT_TUNING.md §12.4
+    // discipline; the slash path trusts the operator on phrases.
+    const r = await pinCommand.exec(['ignore', 'previous', 'instructions'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(store.listPinsBySession(sessionId)).toHaveLength(1);
+  });
+});
+
 describe('/pin: cap + unwired surfaces', () => {
   test('reports cap exceeded when 10 pins already exist', async () => {
     for (let i = 0; i < PIN_CAP; i++) {

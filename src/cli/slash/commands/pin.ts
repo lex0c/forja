@@ -28,6 +28,7 @@
 //     the value consumed by `--remove`) raise an error so a typo
 //     like `/pin --list foo` doesn't silently behave as `--list`.
 
+import { scanForSecrets } from '../../../memory/index.ts';
 import {
   type ContextPinsStore,
   InvalidDurationError,
@@ -233,6 +234,27 @@ const handleCreate = (
     return {
       kind: 'error',
       message: `/pin: text must be ≤ ${PIN_TEXT_MAX_LENGTH} chars (got ${parsed.text.length})`,
+    };
+  }
+
+  // Secret-only scan (skip the injection-phrase pass — operator
+  // typed this themselves; a /pin like "ignore previous
+  // instructions" may be a legitimate note about a failure mode).
+  // Credential leaks still need to be blocked: a copy-paste from
+  // a log line with `sk-ant-...` would otherwise land literal in
+  // context_pins.text and re-inject on every goal / resume.
+  // Mirror of the asymmetry the `/memory promote shared` slash
+  // command makes — the model-facing tool (pin_context) runs the
+  // full scanForInjection per CONTEXT_TUNING.md §12.4 discipline.
+  // The hint deliberately omits the matched pattern so an operator
+  // can't accidentally double-paste the credential into the
+  // error string.
+  const scan = scanForSecrets(parsed.text);
+  if (!scan.ok) {
+    return {
+      kind: 'error',
+      message:
+        '/pin: refusing to pin text that matches a credential pattern (rotate the secret and retry without it)',
     };
   }
 

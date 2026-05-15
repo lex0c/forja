@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] sec(cli/pin) — secret-only scan on /pin slash (post-review B)
+
+**Done.** Code-review finding High #2: the `/pin` slash skipped `scanForInjection` entirely, leaving a real gap — a copy-paste from a log line containing `sk-ant-...` or `AKIA...` would land literal in `context_pins.text` and re-inject on every goal/resume per spec §12.4.4. Memory's equivalent surface (`/memory promote shared`) already runs `scanForPromotion`; the pin slash was asymmetric.
+
+### Design choice: secret-only, not full injection
+
+The tool path (`pin_context`) runs the full `scanForInjection` per spec §12.4 discipline (model-proposed content gets the strict treatment). The slash path is operator-typed — blocking injection phrases there would be friction (a `/pin "ignore previous instructions"` may be a legitimate operator note about a failure mode the model just hit), but credential leaks have no defensible "operator meant it" reading.
+
+New `scanForSecrets` in `src/memory/scanner.ts` is a strict subset of `scanForInjection` — same `SECRET_PATTERNS` regex set, same `'secret pattern matched'` reason class, skips the `INJECTION_PHRASES` loop. The error message in `/pin` deliberately omits the matched credential ("rotate the secret and retry without it") so the operator doesn't double-paste it into the error trace.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/scanner.ts` | Add `scanForSecrets(text): ScanResult` — exports the secret-pattern check without the injection-phrase pass; reuses the existing `SECRET_PATTERNS` array and `ScanResult` shape |
+| `src/memory/index.ts` | Re-export `scanForSecrets` next to `scanForInjection` / `scanForPromotion` |
+| `src/cli/slash/commands/pin.ts` | Import `scanForSecrets`; call it in `handleCreate` before `store.createPin`; refuse with a hint that intentionally omits the matched pattern; comment explains the asymmetry vs the tool path |
+| `tests/memory/scanner.test.ts` | +5 tests: clean text passes, secret patterns match, reason vocabulary, injection phrases are NOT rejected (the load-bearing distinction), bare prefix without tail passes |
+| `tests/cli/slash/pin.test.ts` | +4 tests: credential rejection (AKIA + sk-ant- shapes), error message does NOT echo the credential, injection phrases ARE accepted on the slash path |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/scanner.test.ts tests/cli/slash/pin.test.ts` 56 pass / 0 fail
+- `bun test` 7379 pass / 10 skip / 0 fail (+9 from post-review A baseline 7370)
+
 ## [2026-05-14] chore(tools/pin-context) — omit from BUILTIN_TOOLS while modal wiring is pending (post-review A)
 
 **Done.** Code-review finding High #1: the `pin_context` tool was registered in `BUILTIN_TOOLS` despite `confirmPinContext` not being wired through the REPL — every model invocation would return `pin.headless_mode`, wasting a turn on a proposal that always errors. Filter the tool out of the default registry until the modal-manager wiring lands (deferred UI slice noted in 1.1.b/c).

@@ -88,6 +88,25 @@ export const scanForInjection = (text: string): ScanResult => {
   return { ok: true };
 };
 
+// Secret-only scan (skips the injection-phrase pass). Used on
+// operator-direct surfaces where the operator typed the text
+// themselves — injection-phrase blocking would be friction (a
+// `/pin "ignore previous instructions"` might be a legitimate
+// note about a model failure mode), but credential leaks
+// (copy-paste of a log line with `sk-ant-...`) still need to be
+// caught at the boundary before the secret lands in persistent
+// storage and gets re-injected literally on every goal/resume.
+// The reason class matches `scanForInjection`'s `secret pattern
+// matched` so audit rows from both surfaces share vocabulary.
+export const scanForSecrets = (text: string): ScanResult => {
+  for (const pat of SECRET_PATTERNS) {
+    if (pat.test(text)) {
+      return { ok: false, reason: 'secret pattern matched' };
+    }
+  }
+  return { ok: true };
+};
+
 // Hard cap on body line count for promotion (spec §5.4 line 384
 // "Content fica < 200 lines"). The cap value names the maximum
 // ALLOWED line count: 200 lines passes, 201 fails. Compare

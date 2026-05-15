@@ -96,5 +96,10 @@ export {
 } from './triggers.ts';
 export type { BootContext, BootTrigger } from './triggers.ts';
 
-export { SHARED_BODY_LINE_CAP, scanForInjection, scanForPromotion } from './scanner.ts';
+export {
+  SHARED_BODY_LINE_CAP,
+  scanForInjection,
+  scanForPromotion,
+  scanForSecrets,
+} from './scanner.ts';
 export type { ScanResult } from './scanner.ts';
