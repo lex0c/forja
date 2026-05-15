@@ -26,12 +26,28 @@ const getIfGlob = (pattern: string): Glob => {
 // Shared by `matchesPayload` and the public `filterMatchingHooks`
 // — keeping the rule in one place prevents drift between the
 // two call sites.
+// Events that carry a tool name in their payload. Tool matcher
+// only narrows for these; on non-tool-shaped events (Eviction,
+// MemoryWrite, etc.) the field is a no-op rather than a deny.
+const TOOL_SHAPED_EVENTS: ReadonlySet<HookEvent> = new Set([
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+]);
+
 const specMatches = (spec: HookSpec, event: HookEvent, toolName: string | null): boolean => {
   if (spec.event !== event) return false;
   const toolMatcher = spec.matcher.tool;
   if (toolMatcher === undefined) return true;
-  // Tool matcher only meaningful when a tool name is in scope.
-  // Non-tool events pass `null` and never match.
+  // Tool matcher is a no-op on non-tool-shaped events. Without
+  // this branch, an Eviction-event spec that ALSO sets
+  // `matcher.tool = "..."` (operator misconfiguration: tool
+  // matcher is meaningless on a non-tool payload) would suppress
+  // the hook silently. Preserving the original "tool matcher
+  // requires toolName when the event IS tool-shaped" gate
+  // (returns false if the caller forgot to supply one) keeps
+  // the existing dispatcher contract for PreToolUse etc.
+  if (!TOOL_SHAPED_EVENTS.has(event)) return true;
   if (toolName === null) return false;
   if (toolMatcher.endsWith('*')) {
     return toolName.startsWith(toolMatcher.slice(0, -1));

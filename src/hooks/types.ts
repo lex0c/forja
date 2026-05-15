@@ -1,3 +1,10 @@
+import type {
+  EvictionActor,
+  EvictionMotivo,
+  EvictionState,
+  EvictionSubstrate,
+} from '../storage/repos/eviction-events.ts';
+
 // Type vocabulary for the hooks subsystem (spec AGENTIC_CLI.md
 // §10 + CONTRACTS.md §3 / §10).
 //
@@ -256,35 +263,18 @@ export interface MemoryWriteData {
 // records `outcome: 'blocked_by_hook'` with `blocked_by` set to
 // the spec source (`<layer>:<sourcePath>#<entryIndex>`).
 //
-// The discriminator-shaped fields (`substrate`, `motivo`,
-// `fromState`, `toState`, `actor`) duplicate matcher vocabulary —
-// the dispatcher needs them on the payload to evaluate the
-// matcher; the audit row in `eviction_events` carries the
-// same values once the transition lands.
+// Types are imported from the eviction_events repo so adding a
+// new state/motivo/etc. there flows automatically into the hook
+// payload shape — no parallel literal unions to keep in sync.
 export interface EvictionEventData {
-  substrate: 'memory' | 'policy' | 'candidate' | 'slot_item';
+  substrate: EvictionSubstrate;
   objectId: string;
   objectScope: string;
-  fromState:
-    | 'proposed'
-    | 'active'
-    | 'shadow'
-    | 'quarantined'
-    | 'invalidated'
-    | 'evicted'
-    | 'purged';
-  toState: 'proposed' | 'active' | 'shadow' | 'quarantined' | 'invalidated' | 'evicted' | 'purged';
+  fromState: EvictionState;
+  toState: EvictionState;
   trigger: string;
-  motivo:
-    | 'irrelevant'
-    | 'conflict'
-    | 'shift'
-    | 'low_roi'
-    | 'quota'
-    | 'expired'
-    | 'user_purge'
-    | 'security';
-  actor: 'loop_cold' | 'compaction' | 'user' | 'hook' | 'startup_probe';
+  motivo: EvictionMotivo;
+  actor: EvictionActor;
   // The same JSON the row will persist in `evidence_json`. Hook
   // commands can inspect it via stdin (the dispatcher passes the
   // full payload as-is) — useful for security-policy hooks that

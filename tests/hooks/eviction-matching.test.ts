@@ -15,6 +15,9 @@ import {
   type HookMatcher,
   type HookSpec,
 } from '../../src/hooks/index.ts';
+import { openMemoryDb } from '../../src/storage/db.ts';
+import { migrate } from '../../src/storage/migrate.ts';
+import { createSession } from '../../src/storage/repos/sessions.ts';
 
 const makeEvictionPayload = (overrides: Partial<EvictionEventData> = {}): HookEventPayload => ({
   schema: 'v1',
@@ -49,6 +52,38 @@ const makeSpec = (matcher: HookMatcher = {}): HookSpec => ({
 describe('Eviction event: BLOCKING_EVENTS membership', () => {
   test('Eviction is registered as a blocking event', () => {
     expect(BLOCKING_EVENTS.has('Eviction')).toBe(true);
+  });
+});
+
+describe('Eviction event: hook_runs schema accepts the event', () => {
+  // Post-1.2 review C1 regression: migration 047 rebuilt
+  // hook_runs.event CHECK to include 'Eviction'. Without this,
+  // every audit write from a fired Eviction hook would hit the
+  // CHECK constraint and the dispatcher would log "AUDIT DRIFT"
+  // to stderr. The test inserts directly through bun:sqlite —
+  // exercising the schema, not the dispatcher — so a future
+  // migration regression that re-tightens the CHECK trips this
+  // first.
+  test('raw INSERT with event=Eviction succeeds against the migrated schema', () => {
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    expect(() =>
+      db
+        .query(
+          `INSERT INTO hook_runs (
+            id, session_id, event, layer, source_path, hook_index,
+            command, expanded, exit_code, outcome, duration_ms,
+            stdout, stderr, matched_tool, created_at
+          ) VALUES (?, ?, 'Eviction', 'project', '/x/hooks.toml', 0,
+                    'echo', 'echo', 0, 'allow', 5, NULL, NULL, NULL, ?)`,
+        )
+        .run('row-1', sessionId, Date.now()),
+    ).not.toThrow();
+    const rows = db
+      .query<{ event: string }, [string]>('SELECT event FROM hook_runs WHERE id = ?')
+      .all('row-1');
+    expect(rows[0]?.event).toBe('Eviction');
   });
 });
 
@@ -156,5 +191,39 @@ describe('Eviction matcher: event isolation', () => {
   test('a tool-event hook (different event) does not match Eviction', () => {
     const toolSpec: HookSpec = { ...makeSpec(), event: 'PreToolUse', matcher: { tool: 'bash' } };
     expect(matchesPayload(toolSpec, makeEvictionPayload())).toBe(false);
+  });
+
+  test('tool matcher on an Eviction spec is silently ignored (operator misconfig)', () => {
+    // Post-1.2 review H1: previously, a `tool` matcher set on an
+    // Eviction-event spec would suppress the hook (specMatches
+    // returned false because toolName=null). That made operator
+    // typos invisible. Fix: tool matcher is a no-op on non-tool
+    // payloads; the rest of the matcher chain (substrate, etc.)
+    // still narrows.
+    const spec = makeSpec({ tool: 'bash', substrate: 'memory' });
+    expect(matchesPayload(spec, makeEvictionPayload({ substrate: 'memory' }))).toBe(true);
+    expect(matchesPayload(spec, makeEvictionPayload({ substrate: 'policy' }))).toBe(false);
+  });
+
+  test('Eviction matcher fields on a tool-event spec are silently ignored', () => {
+    // Post-1.2 review M3: an operator who sets eviction matcher
+    // fields on a PostToolUse spec (cross-event nonsense) should
+    // see the hook still run for tool events — the eviction
+    // matcher is a no-op on non-Eviction payloads. Mirrors the
+    // tool-matcher-on-eviction-event behavior above.
+    const toolSpec: HookSpec = {
+      ...makeSpec(),
+      event: 'PostToolUse',
+      matcher: { substrate: 'memory', motivo: 'security' },
+    };
+    const toolPayload: HookEventPayload = {
+      schema: 'v1',
+      event: 'PostToolUse',
+      sessionId: 'sess-1',
+      data: {
+        tool: { name: 'write_file', input: { path: '/x' }, output: 'ok', failed: false },
+      },
+    };
+    expect(matchesPayload(toolSpec, toolPayload)).toBe(true);
   });
 });

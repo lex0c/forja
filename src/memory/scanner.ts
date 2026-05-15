@@ -107,6 +107,25 @@ export const scanForSecrets = (text: string): ScanResult => {
   return { ok: true };
 };
 
+// Replace credential-shaped substrings with `<REDACTED:secret>`.
+// Used on audit-write paths where the surface must persist
+// (the row is the forensic record) but the credential cannot
+// (365d retention). Distinct from `scanForSecrets`, which
+// rejects the input outright — redaction is "the message is
+// worth keeping, the secret in it isn't". Uses the same
+// SECRET_PATTERNS set so detection vocabulary stays consistent
+// across the codebase.
+//
+// Idempotent: calling twice yields the same string (the
+// placeholder doesn't match any pattern).
+export const redactSecrets = (text: string): string => {
+  let out = text;
+  for (const pat of SECRET_PATTERNS) {
+    out = out.replace(new RegExp(pat.source, `${pat.flags}g`), '<REDACTED:secret>');
+  }
+  return out;
+};
+
 // Hard cap on body line count for promotion (spec §5.4 line 384
 // "Content fica < 200 lines"). The cap value names the maximum
 // ALLOWED line count: 200 lines passes, 201 fails. Compare

@@ -98,6 +98,7 @@ export type { BootContext, BootTrigger } from './triggers.ts';
 
 export {
   SHARED_BODY_LINE_CAP,
+  redactSecrets,
   scanForInjection,
   scanForPromotion,
   scanForSecrets,

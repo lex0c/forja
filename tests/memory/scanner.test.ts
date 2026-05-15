@@ -9,6 +9,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   SHARED_BODY_LINE_CAP,
+  redactSecrets,
   scanForInjection,
   scanForPromotion,
   scanForSecrets,
@@ -90,6 +91,29 @@ describe('scanForSecrets — secret-only subset', () => {
 
   test('does NOT match a bare AKIA prefix without the 16-char tail', () => {
     expect(scanForSecrets('credentials prefixed AKIA are AWS').ok).toBe(true);
+  });
+});
+
+describe('redactSecrets — substitute matched credentials', () => {
+  test('replaces a single AWS key with the canonical placeholder', () => {
+    const out = redactSecrets('cred AKIAIOSFODNN7EXAMPLE here');
+    expect(out).toBe('cred <REDACTED:secret> here');
+  });
+
+  test('replaces every match (global flag, multiple occurrences)', () => {
+    const out = redactSecrets('one AKIAIOSFODNN7EXAMPLE two AKIAIOSFODNN7EXAMPLE');
+    expect(out).toBe('one <REDACTED:secret> two <REDACTED:secret>');
+  });
+
+  test('idempotent — re-running produces the same string', () => {
+    const once = redactSecrets('sk-ant-aaaaaaaaaaaaaaaaaaaa here');
+    const twice = redactSecrets(once);
+    expect(twice).toBe(once);
+  });
+
+  test('leaves clean text untouched', () => {
+    const out = redactSecrets('Lorem ipsum dolor sit amet');
+    expect(out).toBe('Lorem ipsum dolor sit amet');
   });
 });
 

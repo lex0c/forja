@@ -4,6 +4,7 @@ import { migrate } from '../../src/storage/migrate.ts';
 import {
   type AppendEvictionEventInput,
   IllegalTransitionError,
+  InvalidEvictionInputError,
   appendEvictionEvent,
   countEvictionEvents,
   detectTriggerThrashing,
@@ -156,12 +157,49 @@ describe('appendEvictionEvent: insert + defaults', () => {
     expect(e.purgeAt).toBe(purgeAt);
   });
 
-  test('silently nulls purgeAt when toState !== evicted (caller-bug guard)', () => {
-    // Documented coercion: caller forwards purgeAt from a prior
-    // row but toState is now 'active'; we null it out to keep the
-    // column meaning consistent.
-    const e = appendEvictionEvent(db, validInput({ purgeAt: 999_999 }));
+  test('throws InvalidEvictionInputError when purgeAt set on non-evicted toState', () => {
+    // The column only carries meaning for to_state=evicted; a
+    // non-null purgeAt anywhere else is a caller-shape bug, so
+    // we surface it loud rather than silently coerce (post-1.2
+    // review fix M2 — silent coerce was hiding writer bugs that
+    // tests would still pass).
+    expect(() => appendEvictionEvent(db, validInput({ purgeAt: 999_999 }))).toThrow(
+      InvalidEvictionInputError,
+    );
+  });
+
+  test('purgeAt: null is allowed for any toState (default shape)', () => {
+    const e = appendEvictionEvent(db, validInput({ purgeAt: null }));
     expect(e.purgeAt).toBeNull();
+  });
+
+  test('round-trips parent_id (audit-chain reference)', () => {
+    const root = appendEvictionEvent(db, validInput({ id: 'root-event' }));
+    const child = appendEvictionEvent(
+      db,
+      validInput({
+        id: 'child-event',
+        fromState: 'active',
+        toState: 'quarantined',
+        motivo: 'conflict',
+        parentId: root.id,
+      }),
+    );
+    expect(child.parentId).toBe('root-event');
+  });
+
+  test('round-trips dependents_json (cascade-detection field)', () => {
+    const deps = JSON.stringify(['mem-other-1', 'mem-other-2']);
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'active',
+        toState: 'quarantined',
+        motivo: 'conflict',
+        dependentsJson: deps,
+      }),
+    );
+    expect(e.dependentsJson).toBe(deps);
   });
 
   test('explicit id round-trips (replay path)', () => {
@@ -389,6 +427,77 @@ describe('listEvictableInWindow / listEvictedDueForPurge', () => {
     expect(listEvictableInWindow(db, now)).toHaveLength(0);
     expect(listEvictedDueForPurge(db, now)).toHaveLength(0);
   });
+
+  test('purge_at === now boundary lands in due-for-purge (predicate is <=)', () => {
+    // The listEvictedDueForPurge predicate is `purge_at <= ?`
+    // so a row whose retention window ends exactly at the
+    // probe instant should be eligible for GC. Pinning the
+    // boundary stops a future refactor that flips to strict <
+    // from silently leaving rows in evictable forever.
+    const now = 1_000_000;
+    appendEvictionEvent(
+      db,
+      validInput({
+        fromState: 'quarantined',
+        toState: 'evicted',
+        motivo: 'low_roi',
+        purgeAt: now,
+      }),
+    );
+    expect(listEvictableInWindow(db, now)).toHaveLength(0);
+    expect(listEvictedDueForPurge(db, now)).toHaveLength(1);
+  });
+});
+
+describe('appendEvictionEvent: evidence_json redaction (AUDIT.md §1 sensitivity=medium)', () => {
+  test('scrubs secret patterns inside the evidence payload', () => {
+    // Caller forwards an evidence payload that happens to carry a
+    // credential-shaped string (the trigger source dumped a log
+    // line). Repo must apply telemetry-grade redaction before
+    // INSERT so the row doesn't keep the secret for 365d.
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        evidenceJson: JSON.stringify({
+          detail: 'log: sk-ant-aaaaaaaaaaaaaaaaaaaa expired',
+        }),
+      }),
+    );
+    expect(e.evidenceJson).not.toContain('sk-ant-aaaaaaaaaaaaaaaaaaaa');
+  });
+
+  test('scrubs strings nested in arrays + sub-objects', () => {
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        evidenceJson: JSON.stringify({
+          paths: ['/home/operator/secrets/key.pem'],
+          inner: { ref: '/Users/operator/.aws/credentials' },
+        }),
+      }),
+    );
+    // Paths with /home/<user>/ or /Users/<user>/ are operator-PII
+    // per the telemetry scrub vocabulary; both should be
+    // collapsed. We don't assert the exact replacement shape
+    // because the canonical scrub rules live in
+    // telemetry/scrubbing.ts; we assert only that the original
+    // value did not survive.
+    expect(e.evidenceJson).not.toContain('/home/operator');
+    expect(e.evidenceJson).not.toContain('/Users/operator');
+  });
+
+  test('malformed JSON is preserved as scrubbed marker', () => {
+    // A future writer might pass raw text by mistake. The repo
+    // shouldn't reject (the transition is still legitimate); it
+    // should replace the payload with a marker so the audit row
+    // still persists and the un-parseable content is recorded.
+    const e = appendEvictionEvent(
+      db,
+      validInput({ evidenceJson: 'not-actually-json sk-ant-secretsecretsecretsecret' }),
+    );
+    expect(e.evidenceJson).toContain('_scrubbed_invalid_json');
+    expect(e.evidenceJson).not.toContain('sk-ant-secretsecretsecretsecret');
+  });
 });
 
 describe('detectTriggerThrashing', () => {
@@ -414,6 +523,11 @@ describe('detectTriggerThrashing', () => {
   });
 
   test('respects minCount threshold', () => {
+    // Fixtures use recordedAt > 0 because the sinceMs filter is
+    // strict (`recorded_at > ?`): with sinceMs=0, a row at
+    // recordedAt=0 would be excluded. Bumping by *100 keeps the
+    // test obvious-at-a-glance instead of relying on the implicit
+    // boundary semantics.
     for (let i = 1; i <= 3; i++) {
       appendEvictionEvent(
         db,
@@ -427,8 +541,6 @@ describe('detectTriggerThrashing', () => {
         }),
       );
     }
-    // sinceMs filter is strict (>), so use 0 as lower bound and
-    // recordedAt > 0 in the fixtures.
     expect(detectTriggerThrashing(db, 0, 5)).toHaveLength(0);
     expect(detectTriggerThrashing(db, 0, 3)).toHaveLength(1);
   });

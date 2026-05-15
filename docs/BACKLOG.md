@@ -2,6 +2,71 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(eviction) — post-1.2 review pack (C1+C2+H1+H2+H3+M2+M3+M4+L3)
+
+**Done.** Single pack endereçando o review da Fase 1.2. Dois críticos (audit drift + leak), três highs (tool-matcher silenciado + table scan + test gaps), e cinco medium/low (throw em vez de coerce, cross-event matcher test, type reuse, comment cleanup, timestamp boundary test).
+
+### Critical fixes
+
+**C1 — migration 047 expande `hook_runs.event` CHECK incluindo `'Eviction'`.** Eu havia errado no BACKLOG 1.2.b: a coluna *é* enum-constrained no SQL, não só no TS. Sem essa migration, `fireHook({event:'Eviction'})` causaria `CHECK constraint failed` em todo INSERT e o dispatcher escreveria "AUDIT DRIFT" no stderr — zero audit rows persistidos. Migration 047 faz table rebuild (mesmo pattern de 044 PostToolUseFailure) + recreate dos 2 indices. Test regression: raw INSERT de `event='Eviction'` agora passa.
+
+**C2 — `evidence_json` agora passa por scrub antes do INSERT.** AUDIT.md §1 declara `eviction_events.evidence_json` como medium-sensitivity com redaction obrigatória. O repo escrevia verbatim. Agora:
+- `scrubEvidenceJson(raw)` parse → walk recursivo via `scrubStringsRecursive` → re-serialize. Malformed JSON cai em `{ _scrubbed_invalid_json: "..." }` (scrubed) preservando o sinal de payload não-parseável.
+- Cada string passa por dupla camada: `scrubFreeformText` (paths/hosts/URLs/IPs/SSH refs do telemetry/scrubbing) E `redactSecrets` (credenciais AWS/GitHub/Anthropic/OpenAI/Slack/JWT do memory/scanner).
+- `redactSecrets` é nova: subset substitutivo do `scanForSecrets` (que rejeita). Idempotente (`<REDACTED:secret>` não casa nenhum pattern), global flag aplica em todas as ocorrências por string.
+- Cycle guard via `WeakSet` simétrico com `scrubFailurePayload` (back-references não estouram a pilha).
+
+### High fixes
+
+**H1 — `specMatches` ignora `tool` matcher em events não-tool-shaped.** Antes, um Eviction spec com `matcher = { tool = "...", substrate = "memory" }` (operator misconfig) era silenciado: o dispatcher via `toolName=null` e retornava false. Agora a regra é "tool matcher só narra em events tool-shaped" (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`); para outros eventos é no-op preservando a chain. Para tool-shaped events sem `toolName` (caller bug) o comportamento original sobrevive (retorna false).
+
+**H2 — partial index `idx_evict_thrash` cobre `detectTriggerThrashing`.** EXPLAIN antes mostrava `SCAN eviction_events USING INDEX idx_evict_obj` + `USE TEMP B-TREE FOR GROUP BY`. Índice partial `(substrate, object_id, trigger, recorded_at) WHERE outcome='trigger_fired_no_action'` cobre a query exatamente — partial WHERE mantém o índice pequeno (só rows thrash entram).
+
+**H3 — round-trip tests para `parent_id` e `dependents_json`.** Antes só assertava null no default; nenhum teste exercitava não-null. Cobertos agora: parent linking (audit chain) e cascade detection list.
+
+### Medium / Low fixes
+
+**M2 — `purgeAt` THROW quando `toState !== 'evicted'`.** Antes coerção silenciosa pra null; test que pinava o comportamento removido + nova classe `InvalidEvictionInputError` (estrutural, distinta de `IllegalTransitionError` que cobre apenas state-machine refusal).
+
+**M3 — test cross-event matcher fields ignored.** Hook PostToolUse com `matcher = { substrate: 'memory' }` (operator nonsense) ainda roda — eviction matcher é no-op em payloads não-Eviction. Simétrico com H1.
+
+**M4 — `EvictionEventData` importa types de `eviction-events.ts`.** Eliminado o duplo literal-union em `hooks/types.ts`; adicionar um estado/motivo novo no repo agora flui automaticamente.
+
+**L3 — comment explicando `sinceMs=0` boundary em `detectTriggerThrashing` test.** Fragile coupling entre fixture timestamps e operator agora documentada.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/047-eviction-hook-runs.ts` | (C1) Rebuild `hook_runs` adding `'Eviction'` to event CHECK + (H2) partial `idx_evict_thrash` |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/index.ts` | Register migration 047 |
+| `src/storage/repos/eviction-events.ts` | (C2) `scrubEvidenceJson` + `scrubStringsRecursive` + `scrubString` helpers; (M2) throw `InvalidEvictionInputError` instead of silent coerce; (M2) new error class export |
+| `src/memory/scanner.ts` | (C2) New `redactSecrets` (substitutive subset of `scanForSecrets`) |
+| `src/memory/index.ts` | Re-export `redactSecrets` |
+| `src/hooks/dispatcher-matching.ts` | (H1) Tool matcher is no-op on non-tool-shaped events; new `TOOL_SHAPED_EVENTS` const |
+| `src/hooks/types.ts` | (M4) Import EvictionState/Substrate/Motivo/Actor from eviction-events.ts; `EvictionEventData` uses them instead of duplicate literals |
+| `tests/storage/eviction-events.test.ts` | (M2) Replace coerce-test with throw-test + null-allowed test; (H3) parent_id + dependents_json round-trips; (L4) purge_at===now boundary; (C2) 3 redaction tests; (L3) comment on sinceMs semantics |
+| `tests/hooks/eviction-matching.test.ts` | (C1) hook_runs raw INSERT regression test; (H1) tool matcher on Eviction silently ignored test; (M3) eviction matcher fields on tool event silently ignored test |
+| `tests/memory/scanner.test.ts` | 4 tests for redactSecrets (single, multiple, idempotent, no-op on clean) |
+
+### Findings deliberately NOT addressed
+
+- **M1 (trigger CHECK enum)** — risk accepted as writer-layer const + tests pinning trigger names. Adding CHECK would force an ALTER on every new trigger landing; trade-off declined for now. Documented in this entry.
+- **L1 (migration comment claims redaction will rot)** — moot: the claim is now factual.
+- **L2 (slice numbers in pre-existing hooks comments)** — outside this slice's scope (slice 181 comments live in code I didn't write).
+- **Low boundary test #1 (purge_at===now)** — addressed inline as the "L4" boundary test.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7449 pass / 10 skip / 0 fail (+14 from 1.2.b baseline 7435: +4 redactSecrets + +3 eviction-matching + +7 eviction-events redaction/round-trip/throw/boundary)
+
 ## [2026-05-14] feat(hooks/eviction) — Eviction event + matcher (Phase 1.2.b)
 
 **Done.** Second slice of the eviction skeleton (`EVICTION.md` §10.3). Lands the `Eviction` hook event in the dispatcher pipeline with five new matcher fields (`substrate` / `motivo` / `fromState` / `toState` / `actor`), `EvictionEventData` payload shape, blocking semantics, and TOML config parsing — including snake_case → camelCase conversion that mirrors the existing `tool` matcher's discipline.

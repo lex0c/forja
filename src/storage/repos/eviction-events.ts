@@ -31,6 +31,8 @@
 //     but no derived-audit caveats.
 
 import type { SQLQueryBindings } from 'bun:sqlite';
+import { redactSecrets } from '../../memory/index.ts';
+import { scrubFreeformText } from '../../telemetry/scrubbing.ts';
 import type { DB } from '../db.ts';
 
 // ─── enums + types ───────────────────────────────────────────────────
@@ -184,6 +186,85 @@ export class IllegalTransitionError extends Error {
   }
 }
 
+// Thrown by appendEvictionEvent when the input shape violates a
+// non-state-machine invariant (e.g. purgeAt supplied for a
+// to_state that isn't 'evicted'). Distinct class from
+// IllegalTransitionError so UI/audit consumers can disambiguate
+// "state machine refused" from "caller passed an incoherent
+// shape".
+export class InvalidEvictionInputError extends Error {
+  readonly field: string;
+  constructor(field: string, reason: string) {
+    super(`eviction_events: invalid ${field}: ${reason}`);
+    this.name = 'InvalidEvictionInputError';
+    this.field = field;
+  }
+}
+
+// ─── evidence_json sanitizer ─────────────────────────────────────────
+
+// Cycle guard sentinel — symmetric with failures/scrub.ts.
+const CYCLE_SENTINEL = '__forja_cycle__';
+
+// Two-pass scrub on a single string: telemetry redactor
+// (paths/hosts/IPs/URLs/SSH refs) AND secret-pattern redactor
+// (credential shapes from memory/scanner.ts). Order doesn't
+// matter — neither pass produces output that the other matches —
+// but both are needed because they cover disjoint vocabularies.
+const scrubString = (s: string): string => redactSecrets(scrubFreeformText(s));
+
+// Walk the object tree applying scrubString to every string
+// value. Keys are vocabulary (operator doesn't control them — see
+// EVICTION §6.1's per-motivo evidence schema), so they pass
+// through untouched. Same shape as scrubFailurePayload in
+// src/failures/scrub.ts; lifted into a per-repo helper here
+// because adding a full sink wrapper for one repo would be
+// premature surface.
+const scrubStringsRecursive = (value: unknown, seen: WeakSet<object>): unknown => {
+  if (typeof value === 'string') return scrubString(value);
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value as object)) return CYCLE_SENTINEL;
+  seen.add(value as object);
+  if (Array.isArray(value)) {
+    return value.map((v) => scrubStringsRecursive(v, seen));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = scrubStringsRecursive(v, seen);
+  }
+  return out;
+};
+
+// AUDIT.md §1 declares eviction_events.evidence_json as
+// medium-sensitivity with required redaction. Owners (memory,
+// policy, etc.) pass operator-bearing strings — paths, identifier
+// fragments, hostnames in shift fingerprints, occasionally token
+// fragments in security-purge evidence. Without scrub, those
+// land verbatim and live 365d.
+//
+// We parse the JSON, walk every string value through the
+// telemetry-grade redactor (scrubFreeformText), and re-serialize.
+// Malformed JSON is treated as opaque text and replaced with a
+// marker object so the row still persists (forensics needs the
+// transition recorded; the un-parseable payload is the warning).
+//
+// No size cap here — EVICTION §6.1 declares small per-motivo
+// schemas (tokens/load_bearing_count/ratio for low_roi;
+// fingerprint hashes for shift). A future writer that violates
+// the schema by dumping unbounded text gets a "bug at the
+// source" outcome; the audit row itself isn't the place to
+// truncate.
+const scrubEvidenceJson = (raw: string): string => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return JSON.stringify({ _scrubbed_invalid_json: scrubString(raw) });
+  }
+  const scrubbed = scrubStringsRecursive(parsed, new WeakSet());
+  return JSON.stringify(scrubbed);
+};
+
 // ─── row + input shapes ──────────────────────────────────────────────
 
 export interface EvictionEvent {
@@ -310,23 +391,33 @@ export interface AppendEvictionEventInput {
 }
 
 // Validate the (from, to, motivo) tuple and INSERT. Throws
-// IllegalTransitionError if the state machine refuses; otherwise
-// returns the persisted row.
+// IllegalTransitionError if the state machine refuses; throws
+// InvalidEvictionInputError if `purgeAt` is supplied for a
+// `toState` that isn't 'evicted' (the column only carries
+// meaning in that case — a non-null value elsewhere is a
+// caller-shape bug, surfaced loud).
 //
-// purge_at sanity (defense-in-depth): when `toState !== 'evicted'`
-// any non-null `purgeAt` is treated as a caller bug — the column
-// only carries meaning for the eviction-retention case. We
-// silently coerce to null rather than throw (callers may forward
-// state from a prior row that had purge_at set), but the comment
-// is the policy: don't rely on the coercion as a feature.
+// evidence_json passes through `scrubEvidenceJson` before INSERT
+// per AUDIT.md §1 sensitivity = medium + redact. Walks every
+// string in the parsed JSON and applies the canonical
+// telemetry redactor (paths, hosts, tokens, SSH/URL shapes).
+// Malformed JSON gets replaced with a marker object so the row
+// still persists.
 export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): EvictionEvent => {
   const check = isLegalTransition(input.fromState, input.toState, input.motivo);
   if (!check.ok) {
     throw new IllegalTransitionError(input.fromState, input.toState, input.motivo, check.reason);
   }
+  if (input.toState !== 'evicted' && input.purgeAt !== undefined && input.purgeAt !== null) {
+    throw new InvalidEvictionInputError(
+      'purgeAt',
+      `only valid when toState === 'evicted' (got toState='${input.toState}')`,
+    );
+  }
   const id = input.id ?? crypto.randomUUID();
   const recordedAt = input.recordedAt ?? Date.now();
   const purgeAt = input.toState === 'evicted' ? (input.purgeAt ?? null) : null;
+  const scrubbedEvidence = scrubEvidenceJson(input.evidenceJson);
   const row: EvictionEventRow = {
     id,
     parent_id: input.parentId ?? null,
@@ -337,7 +428,7 @@ export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): Ev
     to_state: input.toState,
     trigger: input.trigger,
     motivo: input.motivo,
-    evidence_json: input.evidenceJson,
+    evidence_json: scrubbedEvidence,
     outcome: input.outcome,
     blocked_by: input.blockedBy ?? null,
     actor: input.actor,
