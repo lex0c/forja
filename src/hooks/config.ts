@@ -55,6 +55,7 @@ const VALID_EVENTS: ReadonlySet<string> = new Set<HookEvent>([
   'Notification',
   'PreCheckpoint',
   'MemoryWrite',
+  'Eviction',
   'Stop',
 ]);
 
@@ -104,9 +105,12 @@ const validateEntry = (
   }
 
   // matcher is optional. When present, must be an object
-  // (inline table). Today we only honor `tool: string`; other
-  // fields are forward-compat noise.
-  let matcher: HookMatcher = {};
+  // (inline table). Fields parsed: `tool` (string, with `*`
+  // wildcard semantics on tool-shaped events) + the five
+  // Eviction matcher fields (substrate / motivo / from_state /
+  // to_state / actor, exact-string match per EVICTION.md §10.3).
+  // Unknown fields are forward-compat noise.
+  const matcher: HookMatcher = {};
   const rawMatcher = obj.matcher;
   if (rawMatcher !== undefined) {
     if (rawMatcher === null || typeof rawMatcher !== 'object' || Array.isArray(rawMatcher)) {
@@ -131,7 +135,35 @@ const validateEntry = (
           },
         };
       }
-      matcher = { tool: matcherObj.tool };
+      matcher.tool = matcherObj.tool;
+    }
+    // Eviction-event matcher fields (EVICTION.md §10.3). TOML
+    // uses snake_case (`from_state`, `to_state`); HookMatcher
+    // exposes camelCase. Per-field validation mirrors the tool
+    // matcher: non-empty string or warning. Unknown matcher
+    // fields are intentionally ignored (forward-compat per the
+    // type comment).
+    const stringMatcherFields: Array<{ toml: string; ts: keyof HookMatcher }> = [
+      { toml: 'substrate', ts: 'substrate' },
+      { toml: 'motivo', ts: 'motivo' },
+      { toml: 'from_state', ts: 'fromState' },
+      { toml: 'to_state', ts: 'toState' },
+      { toml: 'actor', ts: 'actor' },
+    ];
+    for (const { toml, ts } of stringMatcherFields) {
+      const raw = matcherObj[toml];
+      if (raw === undefined) continue;
+      if (typeof raw !== 'string' || raw.length === 0) {
+        return {
+          warning: {
+            kind: 'invalid_entry',
+            layer,
+            sourcePath,
+            message: `hook entry #${index}: matcher.${toml} must be a non-empty string when present`,
+          },
+        };
+      }
+      matcher[ts] = raw;
     }
   }
 

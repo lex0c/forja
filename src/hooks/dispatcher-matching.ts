@@ -39,6 +39,36 @@ const specMatches = (spec: HookSpec, event: HookEvent, toolName: string | null):
   return toolName === toolMatcher;
 };
 
+// Eviction-event matcher per EVICTION.md §10.3. Each field is an
+// EXACT string match against the corresponding payload key. A
+// hook is admitted only when EVERY supplied field matches —
+// matcher fields conjunct, not disjunct.
+//
+// Same semantics as the tool matcher: supplying no field passes
+// any payload (the matcher is fully open); supplying one or more
+// narrows the conjunctive intersection. Wildcards are NOT
+// honored here (motivo/state/actor are closed enums in the
+// repo's CHECK constraints — a `*` matcher would be undefined
+// against an enum).
+const evictionMatcherMatches = (
+  spec: HookSpec,
+  data: {
+    substrate: string;
+    motivo: string;
+    fromState: string;
+    toState: string;
+    actor: string;
+  },
+): boolean => {
+  const m = spec.matcher;
+  if (m.substrate !== undefined && m.substrate !== data.substrate) return false;
+  if (m.motivo !== undefined && m.motivo !== data.motivo) return false;
+  if (m.fromState !== undefined && m.fromState !== data.fromState) return false;
+  if (m.toState !== undefined && m.toState !== data.toState) return false;
+  if (m.actor !== undefined && m.actor !== data.actor) return false;
+  return true;
+};
+
 // Extract the tool name from a payload, if it's a tool-shaped
 // event. Centralizes the discriminant check so callers don't
 // repeat `event === 'PreToolUse' || ...`.
@@ -153,6 +183,7 @@ const ifFilterMatches = (spec: HookSpec, payload: HookEventPayload): boolean => 
 
 export const matchesPayload = (spec: HookSpec, payload: HookEventPayload): boolean => {
   if (!specMatches(spec, payload.event, toolNameFromPayload(payload))) return false;
+  if (payload.event === 'Eviction' && !evictionMatcherMatches(spec, payload.data)) return false;
   return ifFilterMatches(spec, payload);
 };
 

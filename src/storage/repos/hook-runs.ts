@@ -18,6 +18,7 @@ export type HookRunsEvent =
   | 'Notification'
   | 'PreCheckpoint'
   | 'MemoryWrite'
+  | 'Eviction'
   | 'Stop';
 
 export type HookRunsLayer = 'enterprise' | 'user' | 'project';

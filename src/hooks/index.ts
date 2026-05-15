@@ -9,6 +9,7 @@ export {
   MIN_HOOK_TIMEOUT_MS,
 } from './types.ts';
 export type {
+  EvictionEventData,
   HookChainResult,
   HookConfigWarning,
   HookEvent,

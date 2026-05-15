@@ -2,6 +2,85 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-14] feat(hooks/eviction) — Eviction event + matcher (Phase 1.2.b)
+
+**Done.** Second slice of the eviction skeleton (`EVICTION.md` §10.3). Lands the `Eviction` hook event in the dispatcher pipeline with five new matcher fields (`substrate` / `motivo` / `fromState` / `toState` / `actor`), `EvictionEventData` payload shape, blocking semantics, and TOML config parsing — including snake_case → camelCase conversion that mirrors the existing `tool` matcher's discipline.
+
+This slice ships the **hook contract**, not its callers. Owners (memory, policy, retrieval, compaction) will call `fireHook({ event: 'Eviction', ... })` before `appendEvictionEvent` once their lifecycle integration lands. A hook that returns exit 1 refuses the proposed transition; the owner records `outcome: 'blocked_by_hook'` with `blocked_by` carrying the spec source. The `blocked_by_hook` value was already in the migration 046 CHECK enum (added in 1.2.a foresight) so this slice required no schema change.
+
+### Design decisions
+
+- **Eviction is in `BLOCKING_EVENTS`.** Same exit-code semantics as `MemoryWrite` / `PreToolUse` / `PreCompact`: exit 0 = allow, exit 1 = block silent, exit 2 = block with stdout-as-reason, `failClosed: true` makes timeouts/errors block too. Owner inspects `HookChainResult.blockedBy` to discriminate.
+- **Five new matcher fields share the `HookMatcher` interface, not a per-event variant.** Keeps a single config parser path and a single dispatcher API. The matcher is conjunctive — every supplied field must match the corresponding `payload.data` field for the hook to run. Empty matcher means "any Eviction payload" (mirrors the `tool` matcher's behavior).
+- **TOML uses snake_case (`from_state`, `to_state`); TS exposes camelCase (`fromState`, `toState`).** Mapping happens in the config parser, identical to how every other Forja TS/TOML boundary works. Operators write what reads naturally in TOML; the rest of the codebase stays consistent with the EvictionEvent shape from 1.2.a.
+- **No wildcards on the new matcher fields.** Substrate/motivo/state/actor are closed enums in migration 046's CHECK constraints; a `*` matcher would be undefined against an enum. Only `tool` keeps glob semantics because tool names are a free namespace (canonical + MCP `mcp:<server>:<tool>` form).
+- **`hook_runs.event` type was bumped in lockstep.** `src/storage/repos/hook-runs.ts` carries a parallel `HookRunsEvent` union — adding `'Eviction'` there at the same time closes the typecheck loop. A future ALTER on the underlying table isn't needed (the column is `TEXT`, not enum-constrained at SQL level).
+
+### Owner integration (deferred)
+
+The contract is fully callable today but unused — owners that propose eviction transitions will fire the hook and inspect the result in their own slices. Memory lifecycle (Phase 1.3) is the first concrete owner; retrieval/policy/compaction wire when their subsystems land. Pattern:
+
+```ts
+const chain = await ctx.fireHook?.({
+  schema: 'v1',
+  event: 'Eviction',
+  sessionId,
+  data: { substrate, objectId, fromState, toState, motivo, actor, ... },
+});
+if (chain?.blockedBy !== null) {
+  appendEvictionEvent(db, { ..., outcome: 'blocked_by_hook', blockedBy: `${layer}:${path}#${idx}` });
+  return /* refuse */;
+}
+appendEvictionEvent(db, { ..., outcome: 'applied' });
+```
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/hooks/types.ts` | Add `'Eviction'` to `HookEvent` union + `BLOCKING_EVENTS`; expand `HookMatcher` with 5 new optional fields; add `EvictionEventData` interface + variant in `HookEventPayload` |
+| `src/hooks/config.ts` | Add `'Eviction'` to `VALID_EVENTS`; expand matcher parser to read `substrate`/`motivo`/`from_state`/`to_state`/`actor` from TOML and map to camelCase; change `let matcher` to `const matcher` (assigning fields, not reassigning) |
+| `src/hooks/dispatcher-matching.ts` | Add `evictionMatcherMatches` (conjunctive per-field exact-string check); call it from `matchesPayload` when `event === 'Eviction'` |
+| `src/hooks/index.ts` | Re-export `EvictionEventData` |
+| `src/storage/repos/hook-runs.ts` | Add `'Eviction'` to `HookRunsEvent` union so audit-write paths typecheck |
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `tests/hooks/eviction-matching.test.ts` | 12 tests on `matchesPayload`: BLOCKING_EVENTS membership, empty matcher passes, per-field admit/reject (×5 fields), conjunction (×2 + a full 5-field shape), event isolation (eviction matcher doesn't leak to tool events; tool matcher doesn't match eviction payload) |
+
+### Files modified (tests)
+
+| File | Change |
+|---|---|
+| `tests/hooks/config.test.ts` | +5 tests: Eviction event accepted; all 5 matcher fields parse (snake_case → camelCase); empty string rejected; non-string rejected; unknown field ignored (forward-compat) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/hooks/` 170 pass / 0 fail
+- `bun test` 7435 pass / 10 skip / 0 fail (+17 from 1.2.a baseline 7418: +12 matching + +5 config)
+
+### Phase 1.2 — closing summary
+
+Two commits ship the eviction skeleton end-to-end of contract:
+
+| Slice | Commit | What |
+|---|---|---|
+| 1.2.a — storage + state machine | `618c3de` | Table, validator, transition API, queries |
+| 1.2.b — hook event + matcher | (this commit) | `Eviction` event in the dispatcher, 5 new matcher fields, TOML config + matching contract |
+
+What's now possible:
+- Any owner can `fireHook({ event: 'Eviction', ... })` and inspect `HookChainResult.blockedBy` before persisting.
+- Operators can declare TOML rules like `event = "Eviction", matcher = { motivo = "security", to_state = "purged" }` and the dispatcher routes only matching transitions to that hook.
+- `appendEvictionEvent` validates the state-machine transition and persists with the right `outcome` based on the hook chain's verdict.
+
+What's not yet wired (intentional):
+- No owner is calling `fireHook` for Eviction yet. Memory lifecycle (Phase 1.3) is the first concrete consumer.
+- No dispatcher integration test runs an actual `Eviction` hook subprocess end-to-end — the matching contract is covered, the spawn path inherits from `MemoryWrite`'s coverage (same blocking-event class). A full e2e test pairs naturally with the first owner slice.
+
 ## [2026-05-14] feat(storage/eviction-events) — schema + state machine + transition API (Phase 1.2.a)
 
 **Done.** First slice of the eviction skeleton (`EVICTION.md`). Lands the canonical `eviction_events` table (announced in Phase 0 AUDIT §1 as audit row 24), the typed state machine for the four substrates (memory / policy / candidate / slot_item) with 7 states and 8 motivos, the transition API (`appendEvictionEvent` validates before INSERT), and the three canonical queries from EVICTION §10.2 (`getLastEvictionForObject`, `listEvictableInWindow`, `detectTriggerThrashing`).
