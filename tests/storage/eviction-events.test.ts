@@ -925,7 +925,58 @@ describe('detectTriggerThrashing', () => {
     const thrashing = detectTriggerThrashing(db, 0);
     expect(thrashing).toHaveLength(1);
     expect(thrashing[0]?.trigger).toBe('roi_below_threshold');
+    expect(thrashing[0]?.objectScope).toBe('project_local');
     expect(thrashing[0]?.count).toBe(5);
+  });
+
+  test('isolates by objectScope — same name in different scopes is NOT merged', () => {
+    // Regression: the aggregation grouped by (substrate, object_id,
+    // trigger) only. Two scoped objects sharing a name (`foo` in
+    // user and `foo` in project_local) had their probe counts
+    // merged into a single bucket — false-positive thrashing hits
+    // and distorted counts. Now object_scope joins the group key.
+    for (let i = 0; i < 3; i++) {
+      appendEvictionEvent(
+        db,
+        validInput({
+          objectId: 'foo',
+          objectScope: 'user',
+          fromState: 'active',
+          toState: 'active',
+          outcome: 'trigger_fired_no_action',
+          trigger: 'roi_below_threshold',
+          motivo: 'low_roi',
+          evidenceJson: probeEvidence,
+          recordedAt: 1_000 + i,
+        }),
+      );
+    }
+    for (let i = 0; i < 4; i++) {
+      appendEvictionEvent(
+        db,
+        validInput({
+          objectId: 'foo',
+          objectScope: 'project_local',
+          fromState: 'active',
+          toState: 'active',
+          outcome: 'trigger_fired_no_action',
+          trigger: 'roi_below_threshold',
+          motivo: 'low_roi',
+          evidenceJson: probeEvidence,
+          recordedAt: 2_000 + i,
+        }),
+      );
+    }
+    // minCount=5 must NOT merge into a single bucket of 7. Each
+    // scope reports its own count — both below 5 — so no thrashing.
+    expect(detectTriggerThrashing(db, 0, 5)).toHaveLength(0);
+
+    // Lowering minCount surfaces both rows independently.
+    const rows = detectTriggerThrashing(db, 0, 3);
+    expect(rows).toHaveLength(2);
+    const byScope = new Map(rows.map((r) => [r.objectScope, r.count]));
+    expect(byScope.get('project_local')).toBe(4);
+    expect(byScope.get('user')).toBe(3);
   });
 
   test('respects minCount threshold', () => {

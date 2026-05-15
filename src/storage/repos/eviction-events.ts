@@ -894,6 +894,13 @@ export const listEvictedDueForPurge = (db: DB, nowMs: number): EvictionEvent[] =
 export interface TriggerThrashingRow {
   substrate: EvictionSubstrate;
   objectId: string;
+  // The scoped object's scope (memory: user / project_local /
+  // project_shared; policies: session / repo / user / language /
+  // global). REQUIRED on the grouping key — object_id is not
+  // globally unique across scopes, so a same-name object in two
+  // scopes would have its trigger counts merged, producing false
+  // thrashing hits and distorted diagnostics.
+  objectScope: string;
   trigger: string;
   count: number;
 }
@@ -903,6 +910,11 @@ export interface TriggerThrashingRow {
 // past the evidence gate is usually a sign of a misconfigured
 // threshold or a flapping signal. `minCount` defaults to 5
 // (spec query example).
+//
+// Aggregation key includes `object_scope` so each scoped object is
+// evaluated independently — `(memory, foo, user, low_roi_probe)`
+// and `(memory, foo, project_local, low_roi_probe)` are two
+// thrashing surfaces, not one merged bucket.
 export const detectTriggerThrashing = (
   db: DB,
   sinceMs: number,
@@ -910,12 +922,13 @@ export const detectTriggerThrashing = (
 ): TriggerThrashingRow[] => {
   return db
     .query<TriggerThrashingRow, [number, number]>(
-      `SELECT substrate, object_id AS objectId, trigger, COUNT(*) AS count
+      `SELECT substrate, object_id AS objectId, object_scope AS objectScope,
+              trigger, COUNT(*) AS count
          FROM eviction_events
         WHERE outcome = 'trigger_fired_no_action' AND recorded_at > ?
-        GROUP BY substrate, object_id, trigger
+        GROUP BY substrate, object_id, object_scope, trigger
         HAVING count >= ?
-        ORDER BY count DESC, substrate ASC, object_id ASC`,
+        ORDER BY count DESC, substrate ASC, object_id ASC, object_scope ASC`,
     )
     .all(sinceMs, minCount);
 };
