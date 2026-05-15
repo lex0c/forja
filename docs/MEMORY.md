@@ -525,13 +525,34 @@ Cross-table linkage via `memory_events.details.eviction_event_id` for transition
 
 ## 12. What's not implemented yet
 
-The spec describes a model-facing tool surface (`memory_read`, `memory_write`, `memory_search`, `memory_list`) that isn't wired into the model's vocabulary yet — the registry layer carries the implementations, but the dispatcher doesn't expose them as tools the model can call. Today the operator surface is the slash commands; the model interacts with memory via the eager-loaded index in the system prompt.
+Spec items called out so contributors don't infer them as bugs. Bucketed by category.
 
-Other deferred items from the spec, called out so contributors don't infer them as bugs:
+### 12.1 Slash command gaps
 
-- `/memory edit` (open `$EDITOR`) — operators edit files directly today.
-- `/memory save` (operator-driven save based on session context) — `/memory promote` covers the common path.
-- `/memory expire <name> <date>` — operators edit the frontmatter directly.
-- Distribution-shift-driven invalidation of `reference` memories (e.g., the Linear project pointed to was archived) — manual review for now.
+- **`/memory edit <name>`** — operators edit files directly with their own editor today. Spec `§6.3` describes a flow that shells out to `$EDITOR`.
+- **`/memory save`** — operator-driven save based on session context. `/memory promote` covers promoting an inferred local to shared; spec `§6.3` describes a separate "propose a memory from what just happened in this session" verb.
+- **`/memory expire <name> <date>`** — set or update the `expires` field. Operators edit frontmatter directly for now.
+- **`/memory promote user <name>`** — promotion from project to user scope (with double confirmation per spec `§6.3`). The slash command's switch handles `promote shared` and `demote local` only.
+
+### 12.2 Headless surface
+
+- **`--allow-memory-write=local` opt-in flag** (`§5.6`). Today `memory_write` rejects in headless mode unconditionally (`src/tools/builtin/memory-write.ts:284`); no flag widens the gate for CI flows.
+
+### 12.3 Trust boundary
+
+- **Hash-based re-trust on `shared/` changes** (`§7.2` mitigation 8). The spec calls for the trust prompt to re-fire when the operator pulls a commit that changes anything under `.agent/memory/shared/`. No content hash check exists today — operators can pull and immediately exec without re-confirming the new shared body.
+
+### 12.4 Adaptation cross-cut
+
+- **Loop-frio-driven `low_roi` quarantine of stale memories** (`§6.2` + `FEEDBACK_ADAPTATION.md §3.2`). The eviction substrate accepts `motivo: 'low_roi'` and the adaptation pipeline exists, but no detector currently emits memory ROI signals for the loop frio to aggregate. Manual `/memory delete` is the operator path today.
+- **Distribution-shift-driven invalidation of `reference` memories** (`§6.5.6`, e.g., the Linear project pointed to was archived). Manual review for now — no probe runs at boot to dereference external refs.
+
+### 12.5 What IS shipped (corrects an earlier draft of this section)
+
+These were listed as deferred in a prior draft but are wired today:
+
+- The four **model-facing tools** — `memory_read`, `memory_write`, `memory_search`, `memory_list` — are registered in `src/tools/builtin/index.ts` and exposed to the model via the harness tool registry.
+- **`MemoryWrite` hook fire** — `memory_write` dispatches the chain via `ctx.fireHook` at `src/tools/builtin/memory-write.ts:417`, before persisting. Blocking hook lands a `refused` audit row and aborts the write.
+- **Trigger-based eager-load** — `bootstrap.ts:580` and `subagent-child.ts:874` call `evaluateBootTriggers(repoRoot)`; `memory-prompt.ts` consumes the resulting `BootContext` via `shouldEagerLoadByTriggers` to surface conditionally-loaded memories on session boot.
 
 `docs/BACKLOG.md` carries the current milestone status; the FEEDBACK_ADAPTATION cross-cut (`docs/spec/FEEDBACK_ADAPTATION.md`) describes how loop-frio adaptation will eventually drive automatic `low_roi` quarantine / eviction proposals for stale memories.
