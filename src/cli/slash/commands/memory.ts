@@ -724,13 +724,31 @@ const deleteViaTransition = async (
 
 const mapTransitionFailure = (
   prefix: string,
-  result: { kind: string; reason?: string | null; tombstonePath?: string },
+  result: {
+    kind: string;
+    reason?: string | null;
+    tombstonePath?: string;
+    protection?: string;
+  },
 ): SlashResult => {
   if (result.kind === 'unknown') {
     return { kind: 'error', message: `${prefix}: memory not found` };
   }
   if (result.kind === 'illegal_transition') {
     return { kind: 'error', message: `${prefix}: ${result.reason ?? 'illegal state transition'}` };
+  }
+  if (result.kind === 'blocked_by_protection') {
+    // Operator-initiated paths (`/memory delete`, `/memory
+    // restore`) set actor='user' which already bypasses
+    // protection gates in transitionMemoryState. Reaching this
+    // branch means the slash flow forgot the bypass OR a future
+    // caller produced a protection-blocked outcome that needs
+    // operator-facing copy. Surface the protection name + reason
+    // so the operator understands what's blocking.
+    return {
+      kind: 'error',
+      message: `${prefix}: blocked by protection '${result.protection ?? 'unknown'}': ${result.reason ?? 'unknown'}`,
+    };
   }
   if (result.kind === 'blocked_by_hook') {
     return { kind: 'error', message: `${prefix}: blocked by Eviction hook` };

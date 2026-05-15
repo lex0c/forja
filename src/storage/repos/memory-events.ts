@@ -178,6 +178,37 @@ export const listRecentMemoryEvents = (db: DB, limit = 50): MemoryEvent[] => {
   return rows.map(fromRow);
 };
 
+// Earliest `created` event timestamp for a memory in a scope,
+// or null when no `created` row exists. Used by the user_explicit
+// cooldown protection gate (EVICTION §6.2) to determine when a
+// manually-created memory was first observed by the audit chain
+// — so the gate can refuse `low_roi` / `irrelevant` evictions in
+// the first 72h after creation.
+//
+// Falls back to NULL when the memory pre-dates the audit table
+// (legacy registry pickups) — caller treats null as "age unknown"
+// and grants the benefit of the doubt to the protection gate
+// (refuses eviction). Counterargument exists for both directions;
+// we pick conservative (over-protect) because the audit trail is
+// supposed to be complete from creation, so a missing `created`
+// row signals a data gap worth investigating.
+export const getEarliestMemoryCreatedAt = (
+  db: DB,
+  scope: string,
+  memoryName: string,
+): number | null => {
+  const row = db
+    .query<{ created_at: number }, [string, string]>(
+      `SELECT created_at
+         FROM memory_events
+        WHERE scope = ? AND memory_name = ? AND action = 'created'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    )
+    .get(scope, memoryName);
+  return row !== null ? row.created_at : null;
+};
+
 // History of one memory across its full lifetime. Ordered most-
 // recent first (matching the composite index direction) so the
 // caller can `LIMIT N` to get the latest activity.

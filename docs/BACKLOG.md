@@ -2,6 +2,65 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(memory) — protection gates: user_explicit cooldown + quarantine min TTL (Phase 2.5)
+
+**Done.** Two of the four protection gates EVICTION §6.2 declares — the two that don't require missing subsystems. `transitionMemoryState` now consults `checkProtectionGates` between state-machine validation and hook fire; blocked transitions produce a `blocked_by_protection` eviction_events row + a paired `memory_events` refused row with `stage='eviction_protection'` and the protection name. A new result discriminant `kind: 'blocked_by_protection'` surfaces the protection + reason to callers.
+
+### Implemented gates
+
+1. **`user_explicit` cooldown** (§6.2 line 240). Memory with `source: user_explicit` created within the last 72h can't be evicted via `low_roi` or `irrelevant` motivos by automated actors (loop_cold, compaction, startup_probe, hook). Premise: operator just authored it; sample size is insufficient for automated ROI/usage gates. Memory creation timestamp comes from the earliest `memory_events` row with `action='created'` for the (scope, name) pair.
+
+2. **Quarantine min TTL** (§6.2 line 242). `quarantined → evicted` is blocked unless the memory has been in quarantine for > 7d. Premise: the future re-promotion gate (1.3.c2 verify-before-act, when it ships) needs dwell time to gather evidence; a faster eviction bypasses the gate.
+
+### Bypass rules
+
+- **`actor: 'user'` ALWAYS bypasses both gates.** Operator-typed `/memory delete` or `/memory restore` is an explicit override.
+- **Motivos `user_purge` and `security` bypass cooldown.** Spec §6.2 explicitly lists `low_roi` / `irrelevant` as the cooldown-protected motivos; security-purge is a deliberate operator/hook action that can't wait.
+- **Motivos `user_purge` and `security` bypass quarantine TTL.** A security-driven eviction can't wait for the dwell window to expire.
+- **Same-chain bypass for quarantine TTL.** When the quarantine event was emitted by the same `(actor, trigger)` tuple as the current eviction attempt, the two transitions are one decision and TTL doesn't apply. Example: `gcExpiredMemories`'s `active→quarantined→evicted` runs both steps with `actor='startup_probe'` + `trigger='expired_at'`; the TTL gate protects against DIFFERENT automated processes fast-evicting quarantined memories, not decomposed pipelines from the same source.
+
+### Deferred gates (declared in spec §6.2, can't ship until subsystems land)
+
+- **Pinned items** — needs context engine slot pinning (CONTEXT_TUNING §12.4 producer; no consumer today).
+- **Active session-scope policy** — needs FEEDBACK_ADAPTATION subsystem (zero implementation as of this entry).
+
+### Design decisions
+
+- **Gate fires AFTER state-machine validation but BEFORE hook fire.** State machine refuses illegal transitions (typo motivo, wrong from/to pair) at the structural layer. Protection is the next gate — structural transitions that violate operator-side invariants (cooldown, TTL). Hook is the policy layer on top. This order means a hook can override protection (operator-deployed hook that allows fast-evict in a debug context) — but the audit trail records both the protection check AND the hook decision.
+
+- **`blocked_by_protection` outcome lands its own eviction_events row.** The row carries `to_state = fromState` (no state change), `outcome = 'blocked_by_protection'`, `blocked_by = '<protection_name>'`. Matches the existing `blocked_by_hook` shape so forensic queries pivot uniformly.
+
+- **`memory_events` refused row with `stage='eviction_protection'`** — distinct from `stage='eviction_hook'` (1.2.b hook block) and `stage='lifecycle_gc'` (legacy `removeMemory` failure). Operators investigating "why did this delete fail?" can filter by stage to find the protection that blocked.
+
+- **Audit-friendly reason strings.** Both gate reasons include the gauge value ("created 24h ago; 72h cooldown not yet elapsed", "quarantined 2d ago by loop_cold/verify_failed; 7d min TTL not yet elapsed"). Operators can read the row directly and understand what would un-block it without consulting docs.
+
+- **`getEarliestMemoryCreatedAt(db, scope, name)` returns null on missing row.** A memory pre-dating the audit table (legacy registry pickups) has no `created` event. The gate skips when null — generous fallback. Counterargument: over-protect (refuse without evidence). We picked under-protect because the legacy-registry case is a one-time data gap; refusing forever would block real operations.
+
+- **`getLastQuarantineEvent` returns the full row, not just the timestamp.** Same-chain detection needs `actor` + `trigger`. The earlier shape (`getLastQuarantineAt` returning just `recordedAt`) was insufficient — replaced before the slice landed.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/memory-events.ts` | New `getEarliestMemoryCreatedAt(db, scope, name)` query — fetches the earliest `created` row for the (scope, name) pair. |
+| `src/storage/repos/eviction-events.ts` | New `getLastQuarantineEvent(db, substrate, objectId)` query — most-recent applied `to_state='quarantined'` row, returning the full event for actor/trigger comparison. |
+| `src/memory/transitions.ts` | New `checkProtectionGates` helper (between stage 2 validation and stage 3 hook fire). New `blocked_by_protection` result discriminant. `USER_EXPLICIT_COOLDOWN_MS = 72h` + `QUARANTINE_MIN_TTL_MS = 7d` constants. Bypass rules: `actor=user`, `motivo=user_purge`, `motivo=security`, same-chain `(actor, trigger)` for TTL. |
+| `src/cli/slash/commands/memory.ts` | `mapTransitionFailure` handles the new `blocked_by_protection` kind — operator copy includes protection name + reason. |
+| `tests/memory/transitions.test.ts` | 6 new tests: cooldown blocks within 72h; cooldown bypassed after 72h; actor=user bypasses cooldown; security motivo bypasses cooldown; quarantine TTL blocks different-chain eviction; quarantine TTL bypassed for same-chain (boot GC pipeline). Uses `createMemoryEvent` directly to inject `created` rows with controlled `createdAt`. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7539 pass / 10 skip / 0 fail (+6 from the slice)
+- `bun test tests/memory/transitions.test.ts` 19 pass
+
+### Deferred / follow-ups declared
+
+- **Configurable thresholds.** Today `USER_EXPLICIT_COOLDOWN_MS` and `QUARANTINE_MIN_TTL_MS` are constants. Operator override via env / TOML config would be ergonomic for power users (e.g. shorter cooldown in a fast-iteration debug repo). Spec lists "default 7d" / "72h" — the defaults are right; configurability is polish.
+- **Pinned items + session-scope policy gates** — depend on missing subsystems (declared throughout).
+- **2.6 — Cascading detector** (next slice: detect dependents of an evicted memory and populate `eviction_events.dependents_json`).
+
 ## [2026-05-15] feat(storage) — evidence_json schema validation per motivo (Phase 2.4)
 
 **Done.** Closes the §6.1 evidence contract — `appendEvictionEvent` now validates the per-motivo evidence shape declared in EVICTION.md. Each motivo has a canonical evidence schema (e.g. `low_roi`: `{tokens_consumed, load_bearing_count, ratio}`; `shift`: `{shift_score}`; `irrelevant`: `{usage_count, sample_size}`); rows with missing or wrong-type fields are refused at INSERT time via `InvalidEvictionInputError`. Forensic queries that consume `evidence_json->>'$.<field>'` can now rely on the field being present + correctly-typed.

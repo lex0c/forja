@@ -19,7 +19,11 @@ import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { getLastEvictionForObject } from '../../src/storage/repos/eviction-events.ts';
-import { type MemoryEvent, listMemoryEventsByName } from '../../src/storage/repos/memory-events.ts';
+import {
+  type MemoryEvent,
+  createMemoryEvent,
+  listMemoryEventsByName,
+} from '../../src/storage/repos/memory-events.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
 let workdir: string;
@@ -676,6 +680,274 @@ describe('transitionMemoryState: quarantined → active', () => {
     // memory_events 'restored' action landed.
     const restored = listMemoryEventsByName(db, 'x').find((e) => e.action === 'restored');
     expect(restored).toBeDefined();
+  });
+});
+
+// ── protection gates (EVICTION §6.2) ────────────────────────────────
+
+describe('transitionMemoryState: protection gates', () => {
+  test('user_explicit cooldown blocks low_roi within 72h of creation', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+
+    // Patch the frontmatter to say source=user_explicit.
+    const path = memoryFilePath(roots, 'user', 'fresh');
+    const raw = readFileSync(path, 'utf-8').replace(
+      'source: user_explicit',
+      'source: user_explicit',
+    ); // already user_explicit
+    writeFileSync(path, raw);
+
+    // Land a `created` audit row 1h ago — well within the 72h
+    // cooldown window. Without this row, getEarliestMemoryCreatedAt
+    // returns null and the gate doesn't fire.
+    const oneHourMs = 60 * 60 * 1000;
+    const createdAt = 1_000_000 - oneHourMs;
+    const registry = baseRegistry();
+    // Use createMemoryEvent directly — registry.recordEvent doesn't
+    // forward createdAt, defaulting to Date.now() which would race
+    // the test's `now: () => 1_000_000` and never trigger the gate.
+    createMemoryEvent(db, {
+      scope: 'user',
+      action: 'created',
+      memoryName: 'fresh',
+      source: 'user_explicit',
+      sessionId,
+      createdAt,
+    });
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    expect(r.kind).toBe('blocked_by_protection');
+    if (r.kind !== 'blocked_by_protection') return;
+    expect(r.protection).toBe('user_explicit_cooldown');
+    expect(r.reason).toContain('72h cooldown');
+
+    // File state didn't change.
+    const file = parseMemoryFile(readFileSync(path, 'utf-8'));
+    expect(file.frontmatter.state).toBeUndefined();
+
+    // Audit: eviction_events row with outcome=blocked_by_protection.
+    const last = getLastEvictionForObject(db, 'memory', 'fresh');
+    expect(last?.outcome).toBe('blocked_by_protection');
+    expect(last?.blockedBy).toBe('user_explicit_cooldown');
+
+    // memory_events refused row with stage=eviction_protection.
+    const refused = listMemoryEventsByName(db, 'fresh').find((e) => e.action === 'refused');
+    expect(refused).toBeDefined();
+    expect(refused?.details?.stage).toBe('eviction_protection');
+    expect(refused?.details?.protection).toBe('user_explicit_cooldown');
+  });
+
+  test('user_explicit cooldown does NOT block after 72h', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'aged');
+
+    // Created 100h ago — past the cooldown window.
+    const hundredHoursMs = 100 * 60 * 60 * 1000;
+    const createdAt = 1_000_000 - hundredHoursMs;
+    const registry = baseRegistry();
+    createMemoryEvent(db, {
+      scope: 'user',
+      action: 'created',
+      memoryName: 'aged',
+      source: 'user_explicit',
+      sessionId,
+      createdAt,
+    });
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'aged',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    expect(r.kind).toBe('applied');
+  });
+
+  test('actor=user bypasses cooldown (operator override)', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+
+    const createdAt = 1_000_000 - 60 * 60 * 1000; // 1h ago
+    const registry = baseRegistry();
+    // Use createMemoryEvent directly — registry.recordEvent doesn't
+    // forward createdAt, defaulting to Date.now() which would race
+    // the test's `now: () => 1_000_000` and never trigger the gate.
+    createMemoryEvent(db, {
+      scope: 'user',
+      action: 'created',
+      memoryName: 'fresh',
+      source: 'user_explicit',
+      sessionId,
+      createdAt,
+    });
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'user_purge',
+      actor: 'user',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    expect(r.kind).toBe('applied');
+  });
+
+  test('security motivo bypasses cooldown', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+
+    const createdAt = 1_000_000 - 60 * 60 * 1000; // 1h ago
+    const registry = baseRegistry();
+    // Use createMemoryEvent directly — registry.recordEvent doesn't
+    // forward createdAt, defaulting to Date.now() which would race
+    // the test's `now: () => 1_000_000` and never trigger the gate.
+    createMemoryEvent(db, {
+      scope: 'user',
+      action: 'created',
+      memoryName: 'fresh',
+      source: 'user_explicit',
+      sessionId,
+      createdAt,
+    });
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'invalidated',
+      motivo: 'security',
+      trigger: 'security_purge',
+      actor: 'hook',
+      evidence: validEvidence('security'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    expect(r.kind).toBe('applied');
+  });
+
+  test('quarantine min TTL blocks evict from a different actor/trigger chain', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+    const registry = baseRegistry();
+
+    // First quarantine via loop_cold / verify_failed.
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'conflict',
+      trigger: 'verify_failed',
+      actor: 'loop_cold',
+      evidence: validEvidence('conflict'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000,
+    });
+
+    // Different actor (compaction) tries to evict 1h later —
+    // different chain, TTL applies.
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'evicted',
+      motivo: 'low_roi',
+      trigger: 'token_pressure',
+      actor: 'compaction',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000_000 + 60 * 60 * 1000, // 1h later
+    });
+
+    expect(r.kind).toBe('blocked_by_protection');
+    if (r.kind !== 'blocked_by_protection') return;
+    expect(r.protection).toBe('quarantine_min_ttl');
+    expect(r.reason).toContain('7d min TTL');
+  });
+
+  test('quarantine min TTL bypassed for same-chain (boot GC pipeline)', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'fresh');
+    const registry = baseRegistry();
+
+    // Boot GC: quarantine + evict by same actor + trigger.
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'expired_at',
+      actor: 'startup_probe',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000,
+    });
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'fresh',
+      toState: 'evicted',
+      motivo: 'low_roi',
+      trigger: 'expired_at',
+      actor: 'startup_probe',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 2_000,
+    });
+
+    expect(r.kind).toBe('applied');
   });
 });
 

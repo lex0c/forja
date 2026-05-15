@@ -767,6 +767,42 @@ export const detectTriggerThrashing = (
 // Count of eviction events. Cheap O(1) when used for tests /
 // health checks; not indexed but the table size is bounded by
 // retention (365d in AUDIT.md §1.2).
+// Most-recent eviction event whose to_state is `quarantined` for
+// (substrate, objectId), or null when the object has never been
+// quarantined. Used by the quarantine min TTL protection gate
+// (EVICTION §6.2) — refuses `quarantined → evicted` until the
+// dwell time exceeds the configured minimum (default 7d).
+//
+// Returns the full event so the gate can compare `actor` and
+// `trigger` against the current transition's values: when they
+// match, the current eviction is the same decision chain as the
+// quarantine (e.g., boot GC's active→quarantined→evicted runs
+// both with actor='startup_probe' trigger='expired_at'), and the
+// TTL is bypassed. When they differ, the protection applies —
+// preventing a different automated process from fast-evicting
+// memories someone else just quarantined.
+//
+// Strictness rationale: only `applied` rows count, not
+// `trigger_fired_no_action` or `blocked_by_*` — those don't
+// represent actual state changes, so they're not the start of a
+// dwell period.
+export const getLastQuarantineEvent = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objectId: string,
+): EvictionEvent | null => {
+  const row = db
+    .query<EvictionEventRow, [EvictionSubstrate, string]>(
+      `${SELECT_ALL}
+        WHERE substrate = ? AND object_id = ?
+          AND to_state = 'quarantined' AND outcome = 'applied'
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT 1`,
+    )
+    .get(substrate, objectId);
+  return row !== null ? fromRow(row) : null;
+};
+
 export const countEvictionEvents = (db: DB): number => {
   const row = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM eviction_events').get() as {
     n: number;

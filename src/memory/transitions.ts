@@ -36,8 +36,10 @@ import {
   type EvictionActor,
   type EvictionMotivo,
   appendEvictionEvent,
+  getLastQuarantineEvent,
   isLegalTransition,
 } from '../storage/repos/eviction-events.ts';
+import { getEarliestMemoryCreatedAt } from '../storage/repos/memory-events.ts';
 import { parseMemoryFile, serializeMemoryFile } from './frontmatter.ts';
 import {
   type ParsedIndex,
@@ -102,6 +104,19 @@ export type TransitionMemoryStateResult =
       // quarantined/invalidated/proposed → evicted).
       tombstonePath?: string;
       tombstoneTs?: number;
+    }
+  | {
+      kind: 'blocked_by_protection';
+      fromState: MemoryState;
+      toState: MemoryState;
+      evictionEventId: string;
+      // Canonical protection name — `'user_explicit_cooldown'`,
+      // `'quarantine_min_ttl'`, or future protection slot. Forensic
+      // queries pivot on this string.
+      protection: string;
+      // Operator-facing description with the gauge value (e.g.
+      // "created 24h ago; 72h cooldown not yet elapsed").
+      reason: string;
     }
   | {
       kind: 'blocked_by_hook';
@@ -387,6 +402,107 @@ const mapToMemoryAction = (
   return null;
 };
 
+// ─── protection gates (EVICTION §6.2) ────────────────────────────────
+//
+// Implemented gates (memory-applicable):
+//   - user_explicit cooldown: memory with `source: user_explicit`
+//     created < 72h ago can't be evicted via `low_roi` or
+//     `irrelevant` motivos. Premise: operator just authored it,
+//     sample size is insufficient.
+//   - quarantine min TTL: `quarantined → evicted` blocked until
+//     the memory has been quarantined > 7d. Premise: re-promotion
+//     gate (1.3.c2 once verify-before-act ships) needs dwell time
+//     to gather evidence; a faster eviction bypasses the gate.
+//
+// Deferred (spec §6.2, depends on missing subsystems):
+//   - Pinned items (context engine slot pinning)
+//   - Active session-scope policy (adaptation subsystem)
+//
+// Bypass rules:
+//   - `actor: 'user'` ALWAYS bypasses both gates. Operator typed
+//     `/memory delete` or `/memory restore`; they're overriding
+//     the automated protection.
+//   - motivos `user_purge` and `security` bypass cooldown (the
+//     spec lists `low_roi` / `irrelevant` explicitly; security
+//     purge is a deliberate operator/hook action).
+//   - motivos `user_purge` and `security` bypass quarantine TTL
+//     (a security-driven eviction can't wait for the dwell
+//     window to expire).
+
+const USER_EXPLICIT_COOLDOWN_MS = 72 * 60 * 60 * 1000;
+const QUARANTINE_MIN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+type ProtectionCheck = { blocked: false } | { blocked: true; protection: string; reason: string };
+
+const checkProtectionGates = (
+  db: DB,
+  input: TransitionMemoryStateInput,
+  currentFile: MemoryFile,
+  fromState: MemoryState,
+  toState: MemoryState,
+  nowMs: number,
+): ProtectionCheck => {
+  // Operator-driven actor always bypasses — `/memory delete` and
+  // `/memory restore` are the operator's explicit override.
+  if (input.actor === 'user') return { blocked: false };
+
+  // Cooldown bypass: security + user_purge motivos can't wait.
+  const motivoCanWaitCooldown = input.motivo !== 'security' && input.motivo !== 'user_purge';
+
+  // Gate 1: user_explicit cooldown
+  if (
+    motivoCanWaitCooldown &&
+    currentFile.frontmatter.source === 'user_explicit' &&
+    (input.motivo === 'low_roi' || input.motivo === 'irrelevant') &&
+    (toState === 'quarantined' || toState === 'evicted' || toState === 'purged')
+  ) {
+    const createdAt = getEarliestMemoryCreatedAt(db, input.scope, input.name);
+    if (createdAt !== null) {
+      const ageMs = nowMs - createdAt;
+      if (ageMs < USER_EXPLICIT_COOLDOWN_MS) {
+        const hoursElapsed = Math.floor(ageMs / 3_600_000);
+        return {
+          blocked: true,
+          protection: 'user_explicit_cooldown',
+          reason: `user_explicit memory created ${hoursElapsed}h ago; 72h cooldown not yet elapsed (eviction by '${input.motivo}' blocked)`,
+        };
+      }
+    }
+  }
+
+  // Gate 2: quarantine min TTL
+  const motivoCanWaitTtl = input.motivo !== 'security' && input.motivo !== 'user_purge';
+  if (fromState === 'quarantined' && toState === 'evicted' && motivoCanWaitTtl) {
+    const quarantineEv = getLastQuarantineEvent(db, 'memory', input.name);
+    if (quarantineEv !== null) {
+      // Same-chain bypass: when the quarantine event was emitted
+      // by the SAME (actor, trigger) tuple as the current
+      // transition attempt, the two transitions are one decision
+      // (e.g., gcExpiredMemories's active→quarantined→evicted is
+      // a single boot-time GC decision with
+      // actor='startup_probe' + trigger='expired_at'). The TTL
+      // protects against DIFFERENT automated processes
+      // fast-evicting memories someone else just quarantined —
+      // not against decomposed pipelines from the same source.
+      const sameChain =
+        quarantineEv.actor === input.actor && quarantineEv.trigger === input.trigger;
+      if (!sameChain) {
+        const dwellMs = nowMs - quarantineEv.recordedAt;
+        if (dwellMs < QUARANTINE_MIN_TTL_MS) {
+          const daysElapsed = Math.floor(dwellMs / 86_400_000);
+          return {
+            blocked: true,
+            protection: 'quarantine_min_ttl',
+            reason: `quarantined ${daysElapsed}d ago by ${quarantineEv.actor}/${quarantineEv.trigger}; 7d min TTL not yet elapsed (eviction by '${input.motivo}' blocked)`,
+          };
+        }
+      }
+    }
+  }
+
+  return { blocked: false };
+};
+
 // ─── public API ──────────────────────────────────────────────────────
 
 export const transitionMemoryState = async (
@@ -479,10 +595,78 @@ export const transitionMemoryState = async (
     }
   }
 
-  // 3. Fire Eviction hook when wired. Skipped when fireHook is
+  // 3a. Protection gates (EVICTION §6.2). Run BEFORE hook fire so a
+  // protection refusal lands before any hook side-effect. Hook
+  // gating layers on top of protection — protection is structural
+  // (cooldown / TTL math), hook is policy-driven. Bypass rules
+  // declared in checkProtectionGates' header: actor=user always
+  // bypasses; motivos user_purge / security bypass too.
+  const evidenceJson = JSON.stringify(input.evidence ?? {});
+  const nowMsForGates = input.now !== undefined ? input.now() : Date.now();
+  const protectionCheck = checkProtectionGates(
+    input.db,
+    input,
+    currentFile,
+    fromState,
+    toState,
+    nowMsForGates,
+  );
+  if (protectionCheck.blocked) {
+    let evId: string;
+    try {
+      const ev = appendEvictionEvent(input.db, {
+        substrate: 'memory',
+        objectId: input.name,
+        objectScope: input.scope,
+        fromState,
+        toState: fromState, // refused — state didn't change
+        trigger: input.trigger,
+        motivo: input.motivo,
+        evidenceJson,
+        outcome: 'blocked_by_protection',
+        blockedBy: protectionCheck.protection,
+        actor: input.actor,
+        sessionId: input.sessionId ?? null,
+        ...(recordedAt !== undefined ? { recordedAt } : {}),
+      });
+      evId = ev.id;
+    } catch (err) {
+      return {
+        kind: 'io_error',
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
+    input.registry.recordEvent({
+      action: 'refused',
+      scope: input.scope,
+      memoryName: input.name,
+      source: currentFile.frontmatter.source,
+      details: {
+        stage: 'eviction_protection',
+        proposed_to_state: toState,
+        motivo: input.motivo,
+        trigger: input.trigger,
+        protection: protectionCheck.protection,
+        reason: protectionCheck.reason,
+      },
+      ...(input.sessionId !== undefined && input.sessionId !== null
+        ? { auditSessionId: input.sessionId }
+        : {}),
+      ...(input.cwd !== undefined && input.cwd !== null ? { auditCwd: input.cwd } : {}),
+    });
+    return {
+      kind: 'blocked_by_protection',
+      fromState,
+      toState,
+      evictionEventId: evId,
+      protection: protectionCheck.protection,
+      reason: protectionCheck.reason,
+    };
+  }
+
+  // 3b. Fire Eviction hook when wired. Skipped when fireHook is
   // unset (headless / tests without hook plumbing) — same pattern
   // memory_write uses for confirmMemoryWrite.
-  const evidenceJson = JSON.stringify(input.evidence ?? {});
   if (input.fireHook !== undefined && input.sessionId !== undefined && input.sessionId !== null) {
     const sessionIdForHook = input.sessionId;
     const chain = await input.fireHook({
