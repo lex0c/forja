@@ -40,6 +40,7 @@ import {
   isLegalTransition,
 } from '../storage/repos/eviction-events.ts';
 import { getEarliestMemoryCreatedAt } from '../storage/repos/memory-events.ts';
+import { detectMemoryDependents } from './dependents.ts';
 import { parseMemoryFile, serializeMemoryFile } from './frontmatter.ts';
 import {
   type ParsedIndex,
@@ -741,7 +742,25 @@ export const transitionMemoryState = async (
     }
   }
 
-  // 4. Apply transition (file + index). Failures here surface as
+  // 4a. Detect dependents BEFORE applyTransition. The cascading
+  // detector (EVICTION §6.4) walks every memory in the registry
+  // looking for `[[evictedName]]` or `[link](evictedName.md)`
+  // references. Detection must precede the file mutation because
+  // the registry's in-memory snapshot is what we walk — running
+  // after the eviction would still work (the function skips the
+  // evicted memory itself) but the registry state is consistent
+  // with the audit trail this way. Only fires for *→evicted
+  // transitions; restore / quarantine / invalidated transitions
+  // don't carry cascade semantics per §6.4.
+  let dependentsJson: string | null = null;
+  if (toState === 'evicted') {
+    const dependents = detectMemoryDependents(input.registry, input.scope, input.name);
+    if (dependents.length > 0) {
+      dependentsJson = JSON.stringify(dependents);
+    }
+  }
+
+  // 4b. Apply transition (file + index). Failures here surface as
   // io_error; the audit row is NOT written because the disk state
   // is in-flight (writing a row that says "applied" while the file
   // is in an unknown state would be worse than no row).
@@ -773,6 +792,7 @@ export const transitionMemoryState = async (
       outcome: 'applied',
       actor: input.actor,
       sessionId: input.sessionId ?? null,
+      dependentsJson,
       ...(recordedAt !== undefined ? { recordedAt } : {}),
       ...(toState === 'evicted' ? { purgeAt: input.purgeAt ?? null } : {}),
     });

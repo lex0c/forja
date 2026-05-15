@@ -2,6 +2,61 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(memory) — cascading detector (memory × memory) (Phase 2.6)
+
+**Done.** EVICTION §6.4 declares cascade detection: when an object is evicted, OTHER objects that reference it may become stale. The spec is explicit that EVICTION does NOT auto-cascade — instead the dependents are RECORDED in `eviction_events.dependents_json` so the future loop frio (re-evaluation slice, not yet built) can process them with fresh evidence. This slice owns the memory × memory detector — the column has been on the schema since Phase 1.2; this is the first producer.
+
+### What's detected (in scope)
+
+- **`[[memory-name]]` wiki-style references** in another memory's body. Operator-authored syntax for cross-memory linking.
+- **`[link text](memory-name.md)` markdown links** to a memory file by bare name. Excludes fully-qualified paths (`./mem.md`, `/abs/mem.md`, `http://...`) — those don't unambiguously target a sibling memory.
+
+### What's deferred (declared spec dependents, depend on missing subsystems)
+
+- **Policy P → memory M** (no FEEDBACK_ADAPTATION substrate)
+- **Memory M → CODE_INDEX symbol S** (no code index)
+- **Slot item I → memory M** (no context engine)
+
+### Design decisions
+
+- **Cross-scope detection.** A `user`-scope memory referencing `[[project_local_name]]` IS detected because matching is by name. Operators who scope-shadow a name intentionally accept that the dependent reference might resolve to either version; the detector flags both, the future loop frio decides.
+
+- **Self-reference skipped.** A memory whose body references its own name (`mem` body contains `[[mem]]`) is NOT listed as a dependent of itself. Matches operator expectations — a self-cycle isn't a cross-memory dependency.
+
+- **Dedupe per (scope, name).** A body that references the target via BOTH `[[mem]]` and `[link](mem.md)` produces ONE entry in the dependents list. The `refKind` carries the precedence (wiki > md_link, alphabetical, deterministic) — the forensic surface is "this memory referenced the evicted one", not "via which mechanism".
+
+- **Detection runs BEFORE applyTransition for `*→evicted` paths.** The registry's in-memory snapshot is what we walk; running detection AFTER would still work (the function explicitly skips the evicted memory) but ordering before keeps the registry view consistent with the audit row's claim. `dependentsJson` is `null` when no dependents found (NOT empty array) — distinguishing "checked, none found" from "didn't check" requires a separate field; spec doesn't ask for it.
+
+- **Only fires for `*→evicted` transitions.** Restore (`evicted → active`), quarantine (`active → quarantined`), invalidated (`active → invalidated`), and purge (`evicted → purged`) don't carry cascade semantics per §6.4. The spec language is explicit: "Eviction de objeto X pode ter dependentes" — the transition INTO terminal-ish states is when cascade matters.
+
+- **Bare-name matcher constraints.** The regexes capture lowercase alphanumeric + hyphen + underscore tokens (matching memory name validation in `frontmatter.ts`). Mixed-case `[[Mem]]` doesn't match `mem` — operators using non-canonical case in references must adopt the canonical form for cascade detection to fire. This is structurally consistent with memory name validation (names are forced to lowercase).
+
+- **No `dependents.test.ts` integration with the slash flow.** Tests cover the detector unit and one transitionMemoryState integration test (dependents land in eviction_events when ref exists; null when no refs). Slash-side tests would just exercise the same code path through more layers — moved to a follow-up.
+
+### Files added/modified
+
+| File | Change |
+|---|---|
+| `src/memory/dependents.ts` | New module. `detectMemoryDependents(registry, evictedScope, evictedName)` walks registry, looks for wiki + md_link refs to the target, returns `{scope, name, refKind}[]` deduped per object. |
+| `src/memory/index.ts` | Barrel re-export of `detectMemoryDependents` + `MemoryDependent` type. |
+| `src/memory/transitions.ts` | New stage 4a: detect dependents before applyTransition when `toState === 'evicted'`. `dependentsJson` passed through to `appendEvictionEvent`. |
+| `tests/memory/dependents.test.ts` | 9 new tests: wiki ref detection, md_link ref detection, self-reference skipped, no dependents → empty, cross-scope detection, dedupe wiki+md_link, multiple distinct dependents, ignore unrelated wiki refs, ignore fully-qualified md links. |
+| `tests/memory/transitions.test.ts` | 2 new integration tests: dependents_json populates on `*→evicted` when refs exist; dependents_json is null when no refs. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7550 pass / 10 skip / 0 fail (+11 from the slice)
+- `bun test tests/memory/dependents.test.ts` 9 pass
+
+### Deferred / follow-ups declared
+
+- **Slash `/memory dependents <name>`** — operator surface to inspect "what memories reference this one?" without evicting first. Would consume `detectMemoryDependents` directly. Out of scope here.
+- **Cascade pass in loop frio** — when the loop frio adaptation engine ships (FEEDBACK_ADAPTATION), the consumer side reads `eviction_events.dependents_json` and re-evaluates each dependent against the new (post-eviction) world state.
+- **Policy / code-index / slot-item detectors** — when those substrates land.
+- **2.7 — Metrics aggregator** (next + final slice of Phase 2: read-only aggregators over eviction_events for /memory metrics + recap).
+
 ## [2026-05-15] feat(memory) — protection gates: user_explicit cooldown + quarantine min TTL (Phase 2.5)
 
 **Done.** Two of the four protection gates EVICTION §6.2 declares — the two that don't require missing subsystems. `transitionMemoryState` now consults `checkProtectionGates` between state-machine validation and hook fire; blocked transitions produce a `blocked_by_protection` eviction_events row + a paired `memory_events` refused row with `stage='eviction_protection'` and the protection name. A new result discriminant `kind: 'blocked_by_protection'` surfaces the protection + reason to callers.

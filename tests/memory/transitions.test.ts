@@ -951,6 +951,117 @@ describe('transitionMemoryState: protection gates', () => {
   });
 });
 
+// ── cascading detector (EVICTION §6.4) ──────────────────────────────
+
+describe('transitionMemoryState: dependents_json on *→evicted', () => {
+  test('records dependents in eviction_events when other memories reference the evicted one', async () => {
+    const roots = makeRoots();
+    // Two memories: 'target' (will be evicted) and 'dependent'
+    // (body references [[target]]).
+    seedActiveMemory(roots.user, 'target', 'body of target');
+    mkdirSync(join(roots.user), { recursive: true });
+    writeFileSync(
+      join(roots.user, 'dependent.md'),
+      '---\nname: dependent\ndescription: hook\ntype: feedback\nsource: inferred\n---\n\nuse [[target]] here\n',
+    );
+    // Re-write index so registry picks both up.
+    writeFileSync(
+      indexFilePath(roots, 'user'),
+      '# Memory index\n\n- [Target](target.md) - hook\n- [Dep](dependent.md) - hook\n',
+    );
+    const registry = baseRegistry();
+
+    // Evict target via the canonical 2-step path. Same
+    // (actor, trigger) on both steps so the quarantine min TTL
+    // gate's same-chain bypass kicks in.
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'target',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000,
+    });
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'target',
+      toState: 'evicted',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 2_000,
+    });
+    expect(r.kind).toBe('applied');
+
+    // The latest eviction event for 'target' has dependents_json
+    // listing the dependent memory.
+    const last = getLastEvictionForObject(db, 'memory', 'target');
+    expect(last?.toState).toBe('evicted');
+    expect(last?.dependentsJson).not.toBeNull();
+    const dependents = JSON.parse(last?.dependentsJson ?? '[]') as {
+      scope: string;
+      name: string;
+      refKind: string;
+    }[];
+    expect(dependents).toHaveLength(1);
+    expect(dependents[0]?.name).toBe('dependent');
+    expect(dependents[0]?.refKind).toBe('wiki');
+  });
+
+  test('dependents_json is null when no dependents reference the evicted memory', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'standalone');
+    const registry = baseRegistry();
+
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'standalone',
+      toState: 'quarantined',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 1_000,
+    });
+    await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'standalone',
+      toState: 'evicted',
+      motivo: 'low_roi',
+      trigger: 'roi_below_threshold',
+      actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
+      sessionId,
+      cwd: workdir,
+      now: () => 2_000,
+    });
+
+    const last = getLastEvictionForObject(db, 'memory', 'standalone');
+    expect(last?.dependentsJson).toBeNull();
+  });
+});
+
 // ── evidence_json redaction round-trips (delegated to repo) ─────────
 
 describe('transitionMemoryState: evidence_json is scrubbed by repo', () => {

@@ -96,6 +96,8 @@ export type {
 export { writeMemory } from './writer.ts';
 export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';
 
+export { detectMemoryDependents } from './dependents.ts';
+export type { MemoryDependent } from './dependents.ts';
 export {
   findExpiredMemories,
   gcExpiredMemories,
