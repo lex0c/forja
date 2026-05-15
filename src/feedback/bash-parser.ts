@@ -30,59 +30,154 @@
 // surfaces less promote-able L1 signatures, but no wrong
 // proposals.
 
+// Find the leading binary token in `command`, returning both the
+// resolved bare name AND the start/end offsets INTO THE ORIGINAL
+// string. Single scanner used by both `extractLeadingBinary`
+// (returns bare name only) and `rewriteCommandBinary` (uses
+// offsets to splice). Centralizing the prefix walk here prevents
+// the two consumers from drifting on edge cases — paren-with-
+// whitespace, multi-env, env-before-cd — that broke a previous
+// duplicate-walk implementation.
+//
+// Returns null when the shape is too exotic to parse safely:
+//   - empty / whitespace-only
+//   - quoted segments (single, double, backtick) in the prefix
+//   - pipes / redirections before the binary
+//   - degenerate path tokens (just `.`, `./`, `/`)
+//
+// Bail conditions are conservative: false positives would let the
+// rewrite splice into a wrong position and produce a non-equivalent
+// command. False negatives just skip the rewrite + outcome emission;
+// no harm done.
+interface BinaryLocation {
+  // Bare binary name (path-stripped).
+  binary: string;
+  // Index in the ORIGINAL command string where the binary token
+  // starts. The path prefix is INCLUDED in this offset; rewrite
+  // splices from here through `end`.
+  start: number;
+  // Exclusive end offset of the binary token (with path prefix).
+  end: number;
+}
+
+const findLeadingBinary = (command: string): BinaryLocation | null => {
+  // Optional outer parens. We REFUSE to handle parens — a previous
+  // implementation tried to track interior offsets and produced
+  // garbage on `( cd /tmp && grep foo )` with internal whitespace.
+  // Parens-wrapped commands are rare in practice; bailing is
+  // conservative + correct.
+  const trimmedFull = command.trimStart();
+  if (trimmedFull.startsWith('(')) return null;
+
+  // Track absolute offset into original command as we advance.
+  let offset = command.length - trimmedFull.length;
+  let rest = trimmedFull;
+
+  // Walk prefix shapes: `cd ... && / ;` AND env-var assignments.
+  // Both can appear in either order; loop until neither matches.
+  // Each iteration must consume at least one character or we
+  // break to avoid infinite-loop on a malformed prefix.
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    // cd prefix
+    if (rest.startsWith('cd ')) {
+      const breakIdx = findSeparator(rest);
+      if (breakIdx === null) return null;
+      // Consume `cd ... `, the separator (`&&` is 2 chars or `;`
+      // is 1 char), and any trailing whitespace.
+      const sepMatch = rest.slice(breakIdx).match(/^(&&|;)\s*/);
+      if (sepMatch === null) return null;
+      const consumed = breakIdx + sepMatch[0].length;
+      offset += consumed;
+      rest = rest.slice(consumed);
+      progressed = true;
+      continue;
+    }
+    // env-var prefix `WORD=value `
+    const envMatch = rest.match(/^([A-Za-z_][A-Za-z0-9_]*=\S+)\s+/);
+    if (envMatch !== null) {
+      offset += envMatch[0].length;
+      rest = rest.slice(envMatch[0].length);
+      progressed = true;
+      continue;
+    }
+    // Leading whitespace from a previous consumption left over.
+    if (rest.length !== rest.trimStart().length) {
+      const ws = rest.length - rest.trimStart().length;
+      offset += ws;
+      rest = rest.trimStart();
+      progressed = true;
+    }
+  }
+
+  if (rest.length === 0) return null;
+
+  // The leading token is the binary path. Same alphabet
+  // extractLeadingBinary previously used.
+  const m = rest.match(/^([A-Za-z_./][A-Za-z0-9_+./-]*)/);
+  if (m === null) return null;
+  const token = m[1] as string;
+  if (token.length === 0 || token === '.' || token === './' || token === '/') return null;
+
+  // Strip absolute / relative path prefix for the bare-name return,
+  // but keep `start`/`end` covering the FULL path token so rewrite
+  // replaces the whole `/usr/bin/grep` with the new bare binary.
+  const slashIdx = token.lastIndexOf('/');
+  const binary = slashIdx >= 0 ? token.slice(slashIdx + 1) : token;
+  if (binary.length === 0 || binary.startsWith('.')) return null;
+
+  return { binary, start: offset, end: offset + token.length };
+};
+
 // Single-line bash command parser. Returns the leading binary
 // after stepping past env-var prefixes and `cd` setup, or null
 // when the shape is too exotic.
 export const extractLeadingBinary = (command: string): string | null => {
-  // Strip leading whitespace + optional surrounding parens (one
-  // level — `(cd /tmp && grep foo)` is common; we don't recurse).
-  let cmd = command.trim();
-  if (cmd.startsWith('(') && cmd.endsWith(')')) {
-    cmd = cmd.slice(1, -1).trim();
-  }
-  if (cmd.length === 0) return null;
+  const loc = findLeadingBinary(command);
+  return loc === null ? null : loc.binary;
+};
 
-  // Walk over `cd ...` prefixes followed by `&&` or `;`. Repeat
-  // (rare but possible: `cd /a && cd /b && grep foo`).
-  while (true) {
-    const trimmed = cmd.trimStart();
-    if (!trimmed.startsWith('cd ')) break;
-    // Find the next `&&` or `;` outside of quotes. Conservative:
-    // bail when we hit a quote so we don't have to handle escapes.
-    const breakIdx = findSeparator(trimmed);
-    if (breakIdx === null) return null;
-    cmd = trimmed.slice(breakIdx).replace(/^(&&|;)\s*/, '');
-  }
+// Validate a candidate binary name for splice. Refuses anything
+// that would let an attacker-controlled `target` field corrupt
+// the rewritten command — shell metacharacters, paths, whitespace,
+// quotes, control chars. Spec §9.1 says rewrite happens BEFORE the
+// permission engine; without this validator a malicious
+// `action_json: {target: '; rm -rf /'}` (poisoned shared DB,
+// future TOML import) would bypass the entire allow-list.
+//
+// Allowed alphabet: ASCII letter or underscore at the start, then
+// letters/digits/underscore/`+`/`.`/`-`. NO `/` (no paths — the
+// new binary's PATH resolution wins). NO whitespace, NO shell
+// metas (`;`, `&`, `|`, `<`, `>`, `$`, backtick, quotes, newline).
+const BARE_BINARY_RE = /^[A-Za-z_][A-Za-z0-9_+.-]*$/;
 
-  // Strip leading `VAR=value VAR2=value2` env prefixes. Stop on
-  // the first token that doesn't match the `WORD=...` shape.
-  while (true) {
-    cmd = cmd.trimStart();
-    const m = cmd.match(/^([A-Za-z_][A-Za-z0-9_]*=\S+)\s+/);
-    if (m === null) break;
-    cmd = cmd.slice(m[0].length);
-  }
+export const isValidBinaryReplacement = (s: string): boolean => BARE_BINARY_RE.test(s);
 
-  // The leading token is the binary path. Accept letters, digits,
-  // `_`, `+`, `.`, `/`, `-`. Leading `.` and `/` are accepted so
-  // `./grep` and `/usr/bin/grep` resolve correctly to bare name.
-  // Stops at first whitespace / shell metacharacter.
-  const m = cmd.trimStart().match(/^([A-Za-z_./][A-Za-z0-9_+./-]*)/);
-  if (m === null) return null;
-  const token = m[1] as string;
-
-  // Refuse degenerate tokens.
-  if (token.length === 0 || token === '.' || token === './' || token === '/') return null;
-
-  // Strip absolute / relative path prefix — `/usr/bin/grep` or
-  // `./grep` resolves to `grep` for alias purposes. The operator's
-  // intent is the binary's role, not its install location.
-  const slashIdx = token.lastIndexOf('/');
-  const binary = slashIdx >= 0 ? token.slice(slashIdx + 1) : token;
-  // After stripping the path the bare-name still has to be non-
-  // empty and not start with a dot (`.config` etc. aren't binaries).
-  if (binary.length === 0 || binary.startsWith('.')) return null;
-  return binary;
+// Rewrite the leading binary token in `command` to `newBinary`,
+// preserving env prefixes, cd walks, leading whitespace, and the
+// rest of the argument vector. Returns null when the parser
+// can't locate the binary (same bail conditions as
+// extractLeadingBinary) OR when `newBinary` fails the
+// `isValidBinaryReplacement` check. Path-prefixed binaries
+// (`/usr/bin/grep`) are replaced as bare names — the rewrite
+// adopts the new binary's PATH resolution rather than copying
+// the old path prefix (which would resolve to a different
+// binary entirely under a different installed location).
+//
+// Used by 3.5b dispatch rewriting: when the resolver returns an
+// active L1 alias policy, the tool input's `command` is mutated
+// before invokeTool fires. Examples:
+//
+//   'grep -r foo'                → 'ripgrep -r foo'
+//   'FOO=1 grep -r foo'          → 'FOO=1 ripgrep -r foo'
+//   'cd /tmp && grep foo'        → 'cd /tmp && ripgrep foo'
+//   '/usr/bin/grep -r foo'       → 'ripgrep -r foo'
+export const rewriteCommandBinary = (command: string, newBinary: string): string | null => {
+  if (!isValidBinaryReplacement(newBinary)) return null;
+  const loc = findLeadingBinary(command);
+  if (loc === null) return null;
+  return `${command.slice(0, loc.start)}${newBinary}${command.slice(loc.end)}`;
 };
 
 // Find the index where a shell statement separator (`&&` or `;`)

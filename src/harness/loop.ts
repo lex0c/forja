@@ -18,6 +18,7 @@ import {
   shouldCritique,
   toolPlanHasWrites,
 } from '../critique/index.ts';
+import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
 import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import {
@@ -2588,6 +2589,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const invokeOne = async (
           tu: CollectedToolUse,
         ): Promise<{ toolResult: ProviderToolResultBlock; failed: boolean }> => {
+          // FEEDBACK_ADAPTATION §9.1 dispatch rewrite. When the
+          // model issues a bash command whose leading binary has an
+          // active L1 alias policy in the operator's scope chain,
+          // rewrite before the permission engine + tool dispatch
+          // see the call. CRITICAL: the engine sees the REWRITTEN
+          // command, so target validation (bare-binary name only,
+          // no shell metas) lives inside maybeRewriteBashCommand
+          // — a poisoned action_json with shell injection would
+          // otherwise bypass the allow-list.
+          //
+          // Audit gap (declared follow-up): the pre-rewrite command
+          // is NOT structurally persisted today. tool_calls.input
+          // captures the rewritten value; stderr below captures the
+          // rewrite event. A future slice adds a dispatch_rewrites
+          // audit table linking the policy id to the original
+          // command — operator forensic queries need it. For now
+          // operators trace via /agent policy history <id>.
+          if (tu.name === 'bash' && typeof tu.input.command === 'string') {
+            const rewrite = maybeRewriteBashCommand(config.db, tu.input.command, {
+              session: sessionId,
+              repo: config.cwd,
+              user: 'global', // 3.5b minimum scope; richer detection lands later
+              language: 'unknown',
+            });
+            if (rewrite.rewritten) {
+              tu.input = { ...tu.input, command: rewrite.command };
+              process.stderr.write(
+                `forja adaptation: rewrote bash command via policy ${rewrite.appliedPolicyId} (${rewrite.appliedSignature}, scope=${rewrite.matchedScope})\n`,
+              );
+            }
+          }
           safeEmit(config.onEvent, {
             type: 'tool_invoking',
             toolUseId: tu.id,

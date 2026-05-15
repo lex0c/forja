@@ -54,8 +54,15 @@ describe('extractLeadingBinary — cd prefixes', () => {
     expect(extractLeadingBinary('cd /a && cd /b && grep foo')).toBe('grep');
   });
 
-  test('parens around cd && command', () => {
-    expect(extractLeadingBinary('(cd /tmp && grep foo)')).toBe('grep');
+  test('parens around cd && command — bail (cannot safely track offsets)', () => {
+    // The previous implementation tried to handle parens-wrapped
+    // commands but produced garbage when interior whitespace was
+    // present. Refactor consolidated extract + rewrite onto a
+    // single scanner; parens-wrapped commands now bail uniformly.
+    // Operators using `(cd /tmp && grep foo)` syntax get no L1
+    // alias outcome OR rewrite — falls through to the generic
+    // flag:bash:default:default outcome only.
+    expect(extractLeadingBinary('(cd /tmp && grep foo)')).toBeNull();
   });
 
   test('cd path with spaces (skipped to next separator)', () => {

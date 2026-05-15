@@ -2,6 +2,102 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(feedback,harness) — L1 alias dispatch rewrite (Phase 3.5b — closes FEEDBACK_ADAPTATION L1 loop)
+
+**Done.** First behavior-changing slice of FEEDBACK_ADAPTATION. The L1 adaptation loop closes end-to-end: bash dispatches produce alias outcomes (3.5a) → loop frio aggregates + proposes policies (3.4) → operator promotes via `/agent policy promote` → THIS SLICE consults the resolver at dispatch time and rewrites the bash command before the permission engine + tool exec see it.
+
+Adaptation now manifests in behavior. The spec §0.6 anti-pattern ("adapt on N=1") stays structurally prevented by the loop frio's `n >= 10` gate; the rewrite trusts that gate.
+
+### Pipeline shape (Phase 3 L1 closure)
+
+```
+bash dispatch                   (model issues `grep foo src/`)
+  │
+  ▼
+maybeRewriteBashCommand         (3.5b — THIS SLICE)
+  ├─ extract leading binary     (3.5a parser)
+  ├─ lookup alias table         (3.5a)
+  ├─ resolveActivePolicy        (3.3 scope chain walk)
+  └─ rewriteCommandBinary       (3.5a parser, splice)
+  │
+  ▼
+permission engine + invokeTool  (sees REWRITTEN command)
+  │
+  ▼
+finishToolCall + outcome emit   (3.2 + 3.5a — alias signature lands)
+  │
+  ▼
+loop frio (3.4 aggregator)      operator review → /agent policy invalidate if degraded
+```
+
+### Design decisions
+
+- **Rewrite happens BEFORE permission engine.** The engine sees the effective command. Audit rows reflect what actually ran. Trade-off: an operator who scans permission logs sees `ripgrep -r foo` not `grep -r foo` — distinct from the model's INTENT. The pre-rewrite command is preserved on stderr via `forja adaptation: rewrote bash command via policy <id> (<signature>, scope=<level>)`; future slice can fold this into a structured audit_timeline event.
+
+- **`target` validated as a bare binary name** (`^[A-Za-z_][A-Za-z0-9_+.-]*$`). Critical because the permission engine sees the REWRITTEN command — without this validator, a poisoned `action_json: {target: '; rm -rf /'}` (hostile DB import, future TOML collaborator, drift on a shared install) would splice shell metacharacters into the command and bypass the entire allow-list. `isValidBinaryReplacement` refuses paths (`/usr/bin/rg`), whitespace (`rg foo`), shell metas (`;`, `&`, `|`, `<`, `>`, `$`, backtick, quotes, newline). Validator failure emits a stderr signal so operators notice tamper attempts on first occurrence.
+
+- **`rewriteCommandBinary` and `extractLeadingBinary` share a single internal scanner.** Earlier shape duplicated the prefix walk between extract + rewrite, with subtle offset-tracking bugs (`( cd /tmp && grep foo )` interior whitespace, `FOO=1 cd /tmp && grep` env-before-cd). Refactored to a single `findLeadingBinary` returning `{binary, start, end}`; both callers consume the same result. Drift-proof.
+
+- **Parens-wrapped commands now bail uniformly.** Previously the parser tried to handle `(cd /tmp && grep foo)` but produced corrupted output on interior whitespace. The bug was security-relevant — the corrupted output could bypass the engine. The refactor refuses parens; operators using subshell wrappers get the generic `flag:bash:default:default` outcome and no rewrite. Pragmatic trade-off vs the prior unsafe attempt at parens handling.
+
+- **Self-alias short-circuit moved up.** When the known-aliases table entry has `from === to` (cat/awk/sed in the curated set), the resolver query is skipped entirely — 3 of 5 entries gain a per-call DB roundtrip avoidance.
+
+- **Scope chain built from harness state.** `session: sessionId`, `repo: config.cwd` (literal path for now — hashing deferred), `user: 'global'` (no per-user differentiation yet), `language: 'unknown'` (no fingerprint detector yet). Minimum-viable; richer scope detection lands in a later slice without changing the resolver contract.
+
+- **Self-alias guard.** If `target === alias.from` (e.g., promoted `alias:sed:sed`), the rewrite is skipped — no string splice for a no-op. Loop frio's proposer may emit self-aliases for tally purposes; this guard ensures they don't pollute dispatch behavior even when accidentally promoted.
+
+- **Defensive parsing of `action_json`.** Missing field, malformed JSON, non-string target — all skip the rewrite silently. The policy row stays valid (the table accepts opaque TEXT per the 3.3 contract); the rewrite is just a no-op in those edge cases.
+
+- **Returns un-rewritten on parser bail.** When `extractLeadingBinary` returns null (quoted commands, pipes, exotic shapes), the rewrite is skipped. Conservative — false positives would silently mutate commands the operator typed exactly as intended.
+
+### Files added/modified
+
+| File | Change |
+|---|---|
+| `src/feedback/bash-parser.ts` | New `rewriteCommandBinary(command, newBinary)` — splices the leading-binary token preserving everything else. |
+| `src/feedback/dispatch-rewrite.ts` (new) | `maybeRewriteBashCommand(db, command, chain)` — resolver consultation + alias lookup + splice + structured result for audit. |
+| `src/harness/loop.ts` | Wire `maybeRewriteBashCommand` BEFORE `invokeTool` in the per-tool dispatch closure. When rewritten, mutates `tu.input.command` and stderr-logs the rewrite for operator visibility. |
+| `tests/feedback/dispatch-rewrite.test.ts` (new) | 26 tests covering: `rewriteCommandBinary` (env, cd, paths, multi-cd, multi-env, args-with-same-name, parens-bail, security-target-refused) + `maybeRewriteBashCommand` (active policy applies; proposed doesn't; missing policy; unknown binary; self-alias guard; global vs more-specific scope; malformed action_json; missing target field; unparseable command; SECURITY: target with shell metas refused — 9 probe targets; SECURITY: target with path prefix refused). |
+| `tests/feedback/bash-parser.test.ts` | Updated parens-around-cd test: now expects null (bail) rather than parsing the interior — matches the refactored security-tightening contract. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7734 pass / 10 skip / 0 fail (+26 from the slice, including post-review security probes)
+
+### Phase 3 closure — what shipped, what's deferred
+
+**Phase 3 (FEEDBACK_ADAPTATION L1 closure) — 6 slices:**
+
+| Slice | What | Status |
+|---|---|---|
+| 3.1 | outcomes table + action_signature schema | ✅ |
+| 3.2 | Loop quente outcome emitter wired into harness | ✅ |
+| 3.3 | policies table + scope resolver | ✅ |
+| 3.4 | Loop frio L1 pipeline + /agent policy slash | ✅ |
+| 3.5a | Bash parser emits L1 alias outcomes | ✅ |
+| 3.5b | L1 alias dispatch rewrite (first manifestação) | ✅ |
+
+**End-to-end L1 loop is live.** Operator can: see `flag:<tool>:default:default` + `alias:<bin>:<bin>` outcomes accumulate; fire `/agent policy run` to invoke loop frio; review proposals via `/agent policy list proposed`; promote with `/agent policy promote`; observe dispatch rewriting via stderr; invalidate degraded policies via `/agent policy invalidate`.
+
+**Deferred to future slices (declared throughout Phase 3):**
+
+- **Scope detection enrichment**: repo-hash, per-user id, language detection.
+- **TOML-loaded priors + aliases** (operator override).
+- **Per-signature "última análise" timestamp** persistence (today the duplicate guard handles re-runs).
+- **Distribution shift detector** (§7.3).
+- **L2/L3/L4 proposers** (per-tool flag detector; recipe template matcher; classifier-driven strategy detector).
+- **Trigger-driven invocation** (session-end auto loop frio, instead of operator-fired `/agent policy run`).
+- **Cross-scope auto-promotion** (per §6.2 explicitly NOT auto).
+- **`noContradictionWithSuperior` real check** (deferred from 3.4).
+- **Audit timeline `policy_changed` events** + structured rewrite audit (today stderr).
+- **Self-alias filter on proposer surface**.
+- **Cross-tool comparison signals** (grep success rate vs rg success rate when both have outcomes).
+- **Transactional bracket on `runLoopFrio`** (race guard for concurrent runs).
+
+**Aggregate verification across Phase 3:** typecheck clean, lint 0 errors, full suite 7728 pass / 10 skip / 0 fail.
+
 ## [2026-05-15] feat(feedback) — bash parser emits L1 alias outcomes (Phase 3.5a)
 
 **Done.** The producer side of L1 alias adaptation. Without it, the loop frio's L1 proposer has nothing to aggregate — the existing outcome emitter writes only `flag:<tool_name>:default:default` for every dispatch. This slice adds a minimum-viable bash command parser + a curated known-aliases table, so when the model invokes `bash {command: "grep foo"}` the emitter ALSO writes an `alias:grep:ripgrep` outcome alongside the generic `flag:bash:default:default` row.
