@@ -222,6 +222,88 @@ describe('emitToolCallOutcome', () => {
     }
   });
 
+  test('scopeChain with detected repo: row lands at scope_kind=repo', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'ls' },
+      scopeChain: {
+        session: sessionId,
+        repo: '/my/repo',
+        user: 'alice',
+        language: 'typescript',
+      },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.scopeKind).toBe('repo');
+    expect(rows[0]?.scopeId).toBe('/my/repo');
+  });
+
+  test('scopeChain with repo=unknown falls back to session', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'ls' },
+      scopeChain: {
+        session: sessionId,
+        repo: 'unknown',
+        user: 'alice',
+        language: 'unknown',
+      },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.scopeKind).toBe('session');
+    expect(rows[0]?.scopeId).toBe(sessionId);
+  });
+
+  test('no scopeChain: still emits at scope_kind=session (back-compat)', () => {
+    emitToolCallOutcome(db, {
+      sessionId,
+      toolCallId,
+      toolName: 'bash',
+      failed: false,
+      durationMs: 5,
+      toolInput: { command: 'ls' },
+    });
+    const rows = listOutcomesBySession(db, sessionId);
+    expect(rows[0]?.scopeKind).toBe('session');
+  });
+
+  test('empty toolCallId is silently skipped (unknown-tool FK guard)', () => {
+    // invokeTool returns toolCallId='' when the tool is unknown
+    // (no tool_call row was created). Before this guard, the FK
+    // constraint refused the INSERT and the catch stderr-logged
+    // per dispatch. Now: early-return false, no DB query, no
+    // stderr noise.
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const captured: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      captured.push(typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const wrote = emitToolCallOutcome(db, {
+        sessionId,
+        toolCallId: '',
+        toolName: 'unknown-tool',
+        failed: true,
+        durationMs: 1,
+      });
+      expect(wrote).toBe(false);
+      expect(captured.join('')).toBe('');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+  });
+
   test('best-effort: failure to emit logs to stderr without throwing', () => {
     // Pass a bogus tool_call_id — FK constraint refuses, emitter
     // logs to stderr and returns false. Capture stderr to assert

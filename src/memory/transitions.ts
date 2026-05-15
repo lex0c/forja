@@ -612,7 +612,19 @@ export const transitionMemoryState = async (
   // table) per the query layer.
   const recordedAt = input.now !== undefined ? input.now() : undefined;
   if (fromState === toState) {
-    const evidenceJson = JSON.stringify(input.evidence ?? {});
+    // Inject the trigger name as `trigger_source` marker so the
+    // repo-side non-applied marker gate (eviction-events §6.1)
+    // accepts the row. Forensic queries can match on
+    // `evidence_json->>'$.trigger_source'` without joining the
+    // `trigger` column. Caller-supplied `trigger_source` (rare —
+    // explicit override) wins.
+    const baseEvidence =
+      input.evidence !== undefined && input.evidence !== null ? input.evidence : {};
+    const withMarker =
+      typeof baseEvidence === 'object' && !Array.isArray(baseEvidence)
+        ? { trigger_source: input.trigger, ...(baseEvidence as Record<string, unknown>) }
+        : baseEvidence;
+    const evidenceJson = JSON.stringify(withMarker);
     try {
       const ev = appendEvictionEvent(input.db, {
         substrate: 'memory',

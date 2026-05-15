@@ -44,9 +44,11 @@
 // the signal, and lives in approvals_log.
 
 import type { DB } from '../storage/db.ts';
+import type { ScopeKind } from '../storage/repos/outcomes.ts';
 import { createOutcome } from '../storage/repos/outcomes.ts';
 import { lookupBashAlias } from './bash-aliases.ts';
 import { extractLeadingBinary } from './bash-parser.ts';
+import type { BuiltScopeChain } from './scope-detect.ts';
 
 export interface EmitOutcomeInput {
   // The session that initiated the tool call.
@@ -89,6 +91,16 @@ export interface EmitOutcomeInput {
   // go dark the moment it became active. Callers (loop.ts) pass
   // the signature from `maybeRewriteBashCommand.appliedSignature`.
   appliedL1Signature?: string;
+  // Operator's scope chain at dispatch time. When supplied AND
+  // `chain.repo` is detected (not 'unknown'), outcomes land at
+  // scope_kind='repo' so the loop frio can aggregate evidence for
+  // repo-scoped policies (spec §6.1: "outcome de bash em repo X
+  // alimenta policy per-repo X"). Without it (or with
+  // repo='unknown'), the row falls back to scope_kind='session'
+  // — session-scope adaptation still works but repo/user/
+  // language policies would never accumulate evidence. Callers
+  // build the chain via buildScopeChain (3.6b).
+  scopeChain?: BuiltScopeChain;
 }
 
 // Extract a known L1 alias signature from a bash tool input when
@@ -125,6 +137,14 @@ export const emitToolCallOutcome = (db: DB, input: EmitOutcomeInput): boolean =>
   // the body never ran.
   if (input.denied === true) return false;
 
+  // Unknown-tool guard: when invokeTool fails on an unknown tool,
+  // it returns toolCallId='' (no tool_call row was created). FK
+  // constraint on outcomes.tool_call_id would refuse the INSERT
+  // and the catch below stderr-logs noise per dispatch. Skip
+  // emission for those — no real action_signature outcome to
+  // record when the tool body never ran.
+  if (input.toolCallId === '') return false;
+
   const result = input.failed ? 'failure' : 'success';
   const baseEvidence: Record<string, unknown> = {
     tool_name: input.toolName,
@@ -150,6 +170,21 @@ export const emitToolCallOutcome = (db: DB, input: EmitOutcomeInput): boolean =>
     if (l1 !== null) signatures.push(l1);
   }
 
+  // Resolve emission scope. Spec §6.1: outcomes land at the scope
+  // where the policy would fire. Per-repo adaptation is the
+  // canonical default; session fallback keeps things flowing when
+  // repo detection fails (operator running from tmp dir without
+  // language markers).
+  let scopeKind: ScopeKind;
+  let scopeId: string;
+  if (input.scopeChain !== undefined && input.scopeChain.repo !== 'unknown') {
+    scopeKind = 'repo';
+    scopeId = input.scopeChain.repo;
+  } else {
+    scopeKind = 'session';
+    scopeId = input.sessionId;
+  }
+
   let wroteAny = false;
   for (const actionSignature of signatures) {
     try {
@@ -160,8 +195,8 @@ export const emitToolCallOutcome = (db: DB, input: EmitOutcomeInput): boolean =>
         tier: 1,
         result,
         evidenceJson: JSON.stringify(baseEvidence),
-        scopeKind: 'session',
-        scopeId: input.sessionId,
+        scopeKind,
+        scopeId,
       });
       wroteAny = true;
     } catch (err) {

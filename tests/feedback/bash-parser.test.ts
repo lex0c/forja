@@ -39,6 +39,34 @@ describe('extractLeadingBinary — env prefixes', () => {
     // second is also env-shape, consume; stop at first non-env.
     expect(extractLeadingBinary('NODE_OPTIONS=--max-old-space=4096 node script.js')).toBe('node');
   });
+
+  test('double-quoted env value with internal space (bail)', () => {
+    // The greedy `\S+` in the env regex would match only `"a` and
+    // leave `b" grep` in rest, producing a wrong binary detection.
+    // Refuse: quotes mean shell-level word splitting we don't model.
+    expect(extractLeadingBinary('FOO="a b" grep foo')).toBeNull();
+  });
+
+  test('single-quoted env value with internal space (bail)', () => {
+    expect(extractLeadingBinary("FOO='a b' grep foo")).toBeNull();
+  });
+
+  test('double-quoted env value without spaces (bail — still quoted)', () => {
+    // Even without internal space, quotes signal shell parsing we
+    // don't emulate (expansion suppression). Conservatively bail.
+    expect(extractLeadingBinary('FOO="abc" grep foo')).toBeNull();
+  });
+
+  test('escaped space inside env value (bail)', () => {
+    // `FOO=a\ b grep` — backslash-escaped space is shell syntax we
+    // don't track. The greedy `\S+` would consume only `a\` and the
+    // remainder would cause a wrong binary detection.
+    expect(extractLeadingBinary('FOO=a\\ b grep foo')).toBeNull();
+  });
+
+  test('backtick inside env value (bail)', () => {
+    expect(extractLeadingBinary('FOO=`x` grep foo')).toBeNull();
+  });
 });
 
 describe('extractLeadingBinary — cd prefixes', () => {

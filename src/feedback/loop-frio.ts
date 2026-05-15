@@ -203,49 +203,85 @@ interface SuperiorContradiction {
   superiorPolicyId: string;
 }
 
+// Authority window for superior-scope contradictions. A policy that
+// is `active` but hasn't been exercised by a fresh outcome inside
+// this window is treated as "stale active" — still on the books,
+// but no longer authoritative enough to block divergent proposals
+// at less-specific scopes.
+//
+// Why a window at all (spec §7.2 forbids L1-L2 decay): we don't
+// decay the POLICY itself — it stays active and dispatch still
+// rewrites under it. What decays is its AUTHORITY TO CONTRADICT a
+// proposal at a less-specific scope when the world has clearly
+// moved on (no outcomes referencing the policy's
+// (signature, scope, scope_id) tuple for 90+ days). Without this,
+// a long-dormant repo policy from a stale codebase blocks the
+// user-scope from re-learning the right answer forever.
+//
+// 90 days is generous: even seasonal projects produce some
+// outcome flow within 3 months when active; absence over that
+// window is a strong signal the policy is shelfware.
+const SUPERIOR_RECENCY_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+
 // §5.3 gate condition 4: "Não contradiz policy ativa em tier
 // superior." Tier superior = more-specific scope per the resolver
 // precedence. The check: for a proposal at (scope_kind, signature,
 // action_json), is there an active policy at any MORE-SPECIFIC
-// scope_kind with the SAME signature but a DIFFERENT action_json?
+// scope_kind with the SAME signature but a DIFFERENT action_json
+// AND with at least one outcome inside the recency window?
 //
 // If yes, the proposal can never apply at dispatch (the higher
 // scope always wins resolution) AND the operator would see two
 // policies disagreeing in `/agent policy list`. Refuse via gate.
+//
+// Recency gate (see SUPERIOR_RECENCY_WINDOW_MS comment): a policy
+// active for 90+ days with zero outcome flow loses contradiction
+// authority. The policy is preserved (still `active`, still
+// dispatchable) — only its veto over proposals at less-specific
+// scopes is dropped.
 //
 // Important: SAME action_json at higher tier does NOT trip this
 // check — the proposal is redundant (subsumed), not contradicting.
 // Operator might want a backup policy at broader scope; the
 // resolver harmlessly never reaches it.
 //
-// Cheap: one indexed query (idx_policies_action_scope_state). No
-// scope_id filter — we don't have the operator's chain at loop
-// frio time; ANY session-scope row with a different action_json
-// for this signature counts as superior contradiction (even if
-// it's another operator's session).
+// Cheap: one indexed query (idx_policies_action_scope_state) +
+// EXISTS subquery on idx_outcomes_action_scope_recorded. No
+// scope_id filter on policies — ANY active policy at the
+// more-specific scope_kind with a different action_json counts.
 const findSuperiorContradiction = (
   db: DB,
   signature: string,
   proposedScope: ScopeKind,
   proposedActionJson: string,
+  nowMs: number,
 ): SuperiorContradiction | null => {
   const proposedIndex = SCOPE_PRECEDENCE.indexOf(proposedScope);
   // session-scope proposals have no more-specific tier; return null.
   if (proposedIndex <= 0) return null;
   const moreSpecific = SCOPE_PRECEDENCE.slice(0, proposedIndex);
   const placeholders = moreSpecific.map(() => '?').join(', ');
+  const cutoffMs = nowMs - SUPERIOR_RECENCY_WINDOW_MS;
   const row = db
     .query(
-      `SELECT id, scope_kind
-         FROM policies
-        WHERE action_signature = ?
-          AND state = 'active'
-          AND scope_kind IN (${placeholders})
-          AND action_json != ?
-        ORDER BY recorded_at DESC, rowid DESC
+      `SELECT p.id AS id, p.scope_kind AS scope_kind
+         FROM policies p
+        WHERE p.action_signature = ?
+          AND p.state = 'active'
+          AND p.scope_kind IN (${placeholders})
+          AND p.action_json != ?
+          AND EXISTS (
+            SELECT 1 FROM outcomes o
+             WHERE o.action_signature = p.action_signature
+               AND o.scope_kind = p.scope_kind
+               AND o.scope_id = p.scope_id
+               AND o.recorded_at > ?
+            LIMIT 1
+          )
+        ORDER BY p.recorded_at DESC, p.rowid DESC
         LIMIT 1`,
     )
-    .get(signature, ...moreSpecific, proposedActionJson) as {
+    .get(signature, ...moreSpecific, proposedActionJson, cutoffMs) as {
     id: string;
     scope_kind: ScopeKind;
   } | null;
@@ -375,7 +411,13 @@ const processTriggeredTuple = (
 
   // §5.3 gate: 4 AND conditions (ci_low > 0.7, n >= 10,
   // distribution_stable, noContradictionWithSuperior).
-  const contradiction = findSuperiorContradiction(db, t.actionSignature, t.scopeKind, actionJson);
+  const contradiction = findSuperiorContradiction(
+    db,
+    t.actionSignature,
+    t.scopeKind,
+    actionJson,
+    nowMs,
+  );
   const noContradiction = contradiction === null;
   if (
     !passesPromotionGate({

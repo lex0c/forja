@@ -615,7 +615,12 @@ describe('gcPurgeExpiredTombstones', () => {
       toState: 'evicted',
       trigger: 'roi_below_threshold',
       motivo: 'low_roi',
-      evidenceJson: JSON.stringify({ tokens_consumed: 0, load_bearing_count: 0, ratio: 0 }),
+      evidenceJson: JSON.stringify({
+        trigger_source: 'roi_below_threshold',
+        tokens_consumed: 0,
+        load_bearing_count: 0,
+        ratio: 0,
+      }),
       outcome: 'trigger_fired_no_action',
       actor: 'loop_cold',
       recordedAt: expireDay.getTime() + 10 * 24 * 60 * 60 * 1000,

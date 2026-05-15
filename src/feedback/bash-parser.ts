@@ -95,8 +95,17 @@ const findLeadingBinary = (command: string): BinaryLocation | null => {
       continue;
     }
     // env-var prefix `WORD=value `
-    const envMatch = rest.match(/^([A-Za-z_][A-Za-z0-9_]*=\S+)\s+/);
+    // The value capture is split off so we can refuse quoted / escaped
+    // values. With a greedy `\S+`, `FOO="a b" grep` matches only `"a`
+    // and leaves `b" grep` in rest — the next round would then read
+    // `b` as the binary. Quotes signal shell-level parsing (expansion,
+    // word-splitting suppression) we don't emulate; bail to fall back
+    // to the generic flag:bash signature instead of emitting a wrong
+    // alias outcome.
+    const envMatch = rest.match(/^([A-Za-z_][A-Za-z0-9_]*)=(\S+)\s+/);
     if (envMatch !== null) {
+      const value = envMatch[2] as string;
+      if (/["'`\\]/.test(value)) return null;
       offset += envMatch[0].length;
       rest = rest.slice(envMatch[0].length);
       progressed = true;

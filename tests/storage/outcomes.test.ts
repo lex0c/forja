@@ -43,6 +43,72 @@ afterEach(() => {
   db.close();
 });
 
+describe('createOutcome — evidence scrub (AUDIT.md §1 medium sensitivity)', () => {
+  test('scrubs secret patterns inside evidence_json', () => {
+    const o = createOutcome(db, {
+      sessionId,
+      toolCallId,
+      actionSignature: 'flag:bash:default:default',
+      tier: 1,
+      result: 'failure',
+      evidenceJson: JSON.stringify({
+        tool_name: 'bash',
+        error_message: 'log: sk-ant-aaaaaaaaaaaaaaaaaaaa expired',
+      }),
+      scopeKind: 'session',
+      scopeId: sessionId,
+    });
+    expect(o.evidenceJson).not.toBeNull();
+    expect(o.evidenceJson).not.toContain('sk-ant-aaaaaaaaaaaaaaaaaaaa');
+  });
+
+  test('scrubs paths inside nested arrays + objects', () => {
+    const o = createOutcome(db, {
+      sessionId,
+      toolCallId,
+      actionSignature: 'flag:bash:default:default',
+      tier: 1,
+      result: 'failure',
+      evidenceJson: JSON.stringify({
+        paths: ['/home/operator/secrets/key.pem'],
+        inner: { ref: '/Users/operator/.aws/credentials' },
+      }),
+      scopeKind: 'session',
+      scopeId: sessionId,
+    });
+    expect(o.evidenceJson).not.toContain('/home/operator');
+    expect(o.evidenceJson).not.toContain('/Users/operator');
+  });
+
+  test('malformed JSON preserved as scrubbed marker', () => {
+    const o = createOutcome(db, {
+      sessionId,
+      toolCallId,
+      actionSignature: 'flag:bash:default:default',
+      tier: 1,
+      result: 'failure',
+      evidenceJson: 'not-actually-json sk-ant-secretsecretsecretsecret',
+      scopeKind: 'session',
+      scopeId: sessionId,
+    });
+    expect(o.evidenceJson).toContain('_scrubbed_invalid_json');
+    expect(o.evidenceJson).not.toContain('sk-ant-secretsecretsecretsecret');
+  });
+
+  test('null evidenceJson stays null (no scrub op)', () => {
+    const o = createOutcome(db, {
+      sessionId,
+      toolCallId,
+      actionSignature: 'flag:bash:default:default',
+      tier: 1,
+      result: 'success',
+      scopeKind: 'session',
+      scopeId: sessionId,
+    });
+    expect(o.evidenceJson).toBeNull();
+  });
+});
+
 describe('createOutcome', () => {
   test('lands a row with default id + recorded_at', () => {
     const o = createOutcome(db, {

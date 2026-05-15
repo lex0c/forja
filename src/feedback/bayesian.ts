@@ -75,6 +75,15 @@ export const posteriorFromCounts = (
   const mean = a / (a + b);
   const variance = (a * b) / ((a + b) ** 2 * (a + b + 1));
   const stdev = Math.sqrt(variance);
+  // CI clamping to [0, 1]: the normal approximation can produce
+  // bounds outside the valid probability range when n is small
+  // (e.g., 1 success / 0 failures with a Beta(2,1) prior yields
+  // mean=0.75 stdev=0.18 → ci_high ≈ 1.10). The promotion gate
+  // §5.3 only cares about ci_low > 0.7; an un-clamped ci_high
+  // displayed to the operator would be misleading. Math.max/min
+  // is the cheapest correct fix — the alternative (Wilson-style
+  // interval) would be more accurate but adds complexity §5.3
+  // doesn't require.
   const ciLow = Math.max(0, mean - Z_95 * stdev);
   const ciHigh = Math.min(1, mean + Z_95 * stdev);
   return { mean, ciLow, ciHigh, n };

@@ -86,9 +86,16 @@ export const resolveActivePolicy = (
               AND state IN (${stateList})
             ORDER BY recorded_at DESC, rowid DESC
             LIMIT 1`;
+  // Hoist the prepared statement outside the loop. Each call to
+  // resolveActivePolicy fires up to 5 scope queries; reusing the
+  // same `Statement` instance avoids re-resolving the same SQL
+  // 5x within a single resolver call. bun:sqlite caches by SQL
+  // string internally so the savings are marginal — the hoist is
+  // primarily a clarity signal that the statement is parametric.
+  const stmt = db.query(sql);
 
   for (const level of levels) {
-    const row = db.query(sql).get(actionSignature, level.kind, level.id, ...desiredStates) as {
+    const row = stmt.get(actionSignature, level.kind, level.id, ...desiredStates) as {
       id: string;
       parent_id: string | null;
       scope_kind: ScopeKind;

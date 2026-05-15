@@ -262,13 +262,101 @@ describe('runLoopFrio', () => {
       actionJson: JSON.stringify({ target: 'rg-other' }),
       state: 'active',
     });
+    // Recency: the superior policy needs at least one outcome in
+    // its own (scope_kind, scope_id) within the 90d window to
+    // carry contradiction authority. Pin `now` and the outcome
+    // recordedAt so they sit inside the same window.
+    const dayMs = 24 * 60 * 60 * 1000;
+    const nowMs = 200 * dayMs;
+    createOutcome(db, {
+      sessionId,
+      toolCallId: seedToolCall(sessionId),
+      actionSignature: 'alias:grep:ripgrep',
+      tier: 1,
+      result: 'success',
+      scopeKind: 'user',
+      scopeId: 'some-user',
+      recordedAt: nowMs - 10 * dayMs,
+    });
     seedOutcomes(
       'alias:grep:ripgrep',
       Array(12).fill('success' as OutcomeResult),
       'global',
       'global',
     );
-    const r = runLoopFrio({ db, sinceMs: 0 });
+    const r = runLoopFrio({ db, sinceMs: 0, now: () => nowMs });
+    expect(r.proposed).toHaveLength(0);
+    const refused = r.rejected[0];
+    if (refused === undefined || refused.kind !== 'gate_refused') {
+      throw new Error('expected gate_refused');
+    }
+    expect(refused.reason).toContain('contradicts active superior');
+  });
+
+  test('stale superior policy (no recent outcomes in 90d window) does NOT block proposal', () => {
+    // Policy was promoted long ago and the world moved on — zero
+    // outcomes referencing its (action_signature, scope_kind,
+    // scope_id) tuple for 90+ days. Spec §7.2 forbids L1-L2 policy
+    // decay, but a policy that no longer attracts outcome flow has
+    // lost contradiction authority over divergent proposals at
+    // less-specific scopes. Policy stays `active` and dispatchable;
+    // its veto over new proposals at broader scopes is dropped.
+    createPolicy(db, {
+      scopeKind: 'user',
+      scopeId: 'some-user',
+      actionSignature: 'alias:grep:ripgrep',
+      actionJson: JSON.stringify({ target: 'rg-other' }),
+      state: 'active',
+    });
+    // Outcome flow for the broader (global) proposal is fresh, but
+    // there's ZERO flow at (alias:grep:ripgrep, user, some-user) —
+    // the superior policy is stale. Use a `now` clock that puts the
+    // global outcomes well past the 90d cutoff from `nowMs`.
+    // recordedAt for global is 1000+i (~1000ms). nowMs=200d in ms.
+    const dayMs = 24 * 60 * 60 * 1000;
+    seedOutcomes(
+      'alias:grep:ripgrep',
+      Array(12).fill('success' as OutcomeResult),
+      'global',
+      'global',
+    );
+    const r = runLoopFrio({ db, sinceMs: 0, now: () => 200 * dayMs });
+    expect(r.proposed).toHaveLength(1);
+    expect(r.proposed[0]?.scopeKind).toBe('global');
+  });
+
+  test('superior policy with outcomes JUST INSIDE the 90d window still blocks', () => {
+    // Same setup as the stale test, but a single recent outcome at
+    // the superior's (scope_kind, scope_id) brings authority back.
+    // Verifies the recency cutoff is a boundary, not a coarse heuristic.
+    createPolicy(db, {
+      scopeKind: 'user',
+      scopeId: 'some-user',
+      actionSignature: 'alias:grep:ripgrep',
+      actionJson: JSON.stringify({ target: 'rg-other' }),
+      state: 'active',
+    });
+    const dayMs = 24 * 60 * 60 * 1000;
+    const nowMs = 200 * dayMs;
+    // One outcome at user/some-user recorded 30d ago — well inside
+    // the 90d window. Recency check finds it; contradiction fires.
+    createOutcome(db, {
+      sessionId,
+      toolCallId: seedToolCall(sessionId),
+      actionSignature: 'alias:grep:ripgrep',
+      tier: 1,
+      result: 'success',
+      scopeKind: 'user',
+      scopeId: 'some-user',
+      recordedAt: nowMs - 30 * dayMs,
+    });
+    seedOutcomes(
+      'alias:grep:ripgrep',
+      Array(12).fill('success' as OutcomeResult),
+      'global',
+      'global',
+    );
+    const r = runLoopFrio({ db, sinceMs: 0, now: () => nowMs });
     expect(r.proposed).toHaveLength(0);
     const refused = r.rejected[0];
     if (refused === undefined || refused.kind !== 'gate_refused') {
@@ -298,6 +386,30 @@ describe('runLoopFrio', () => {
     );
     const r = runLoopFrio({ db, sinceMs: 0 });
     expect(r.proposed).toHaveLength(1);
+  });
+
+  test('no_observations when all outcomes are partial/ambiguous (no success/failure data)', () => {
+    // Trigger threshold counts ALL outcome results; the Bayesian
+    // tally only counts success/failure. 12 `partial` rows pass the
+    // accumulation gate (count >= 10) but produce 0 success and 0
+    // failure — posterior returns null → `no_observations`.
+    for (let i = 0; i < 12; i++) {
+      createOutcome(db, {
+        sessionId,
+        toolCallId: seedToolCall(sessionId),
+        actionSignature: 'alias:grep:ripgrep',
+        tier: 2,
+        result: 'partial',
+        scopeKind: 'session',
+        scopeId: sessionId,
+        recordedAt: 1000 + i,
+      });
+    }
+    const r = runLoopFrio({ db, sinceMs: 0 });
+    expect(r.proposed).toHaveLength(0);
+    const rejected = r.rejected[0];
+    if (rejected === undefined) throw new Error('expected one rejected result');
+    expect(rejected.kind).toBe('no_observations');
   });
 
   test('session-scope proposal has no superior (no contradiction check applies)', () => {

@@ -71,6 +71,21 @@ export const OUTCOMES = [
 ] as const;
 export type EvictionOutcome = (typeof OUTCOMES)[number];
 
+// Who emitted the eviction event. Forensic queries filter on this
+// column to answer "did the operator drive this, or did the system
+// auto-evict?" The protection-gate bypass (memory/protections.ts)
+// uses `actor === 'user'` as the authorization signal — user-driven
+// transitions skip cooldown/TTL guards because the operator's
+// command IS the consent. New actors require auditing every caller
+// of `checkProtectionGates` before adding (silent inheritance of
+// the user bypass into a non-user actor would defeat the gate).
+//
+// Roster:
+//   - loop_cold:      adaptation pipeline (loop frio §3.2)
+//   - compaction:     context-engine slot reclaiming
+//   - user:           operator command — protection-gate bypass
+//   - hook:           hook fire that produced a refusal row
+//   - startup_probe:  boot-time consistency sweep
 export const ACTORS = ['loop_cold', 'compaction', 'user', 'hook', 'startup_probe'] as const;
 export type EvictionActor = (typeof ACTORS)[number];
 
@@ -685,6 +700,59 @@ export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): Ev
         throw new InvalidEvictionInputError(
           'evidence_json',
           `evidence shape doesn't satisfy schema for motivo '${input.motivo}': ${sets}`,
+        );
+      }
+    }
+  }
+  // Non-applied outcome markers. Same-state pseudo-transitions and
+  // refusals don't run the §6.1 shape validator (their evidence is
+  // owner-specific bookkeeping, not motivo-canonical), but they MUST
+  // carry SOME structural marker so forensic queries can distinguish
+  // a real probe / hook block from a caller that forgot to set
+  // anything. Without a marker, audit rows land empty `{}` payloads
+  // with `blocked_by IS NULL` and no upstream cause is recoverable.
+  //
+  // Markers per outcome:
+  //   - blocked_by_protection / blocked_by_hook → `blockedBy` column
+  //     non-empty (names the specific guard).
+  //   - trigger_fired_no_action → evidence has either `trigger_source`
+  //     (string) OR `_operator_driven: true`. The first marks "real
+  //     trigger fire without threshold passing"; the second marks an
+  //     operator-driven path that doesn't have a canonical trigger
+  //     source (e.g., a probe scheduled by `/memory metrics`).
+  if (input.outcome === 'blocked_by_protection' || input.outcome === 'blocked_by_hook') {
+    if (input.blockedBy === undefined || input.blockedBy === null || input.blockedBy === '') {
+      throw new InvalidEvictionInputError(
+        'blocked_by',
+        `outcome '${input.outcome}' requires a non-empty blocked_by marker`,
+      );
+    }
+  } else if (input.outcome === 'trigger_fired_no_action') {
+    let parsedMarker: unknown;
+    let markerJsonOk = true;
+    try {
+      parsedMarker = JSON.parse(input.evidenceJson);
+    } catch {
+      markerJsonOk = false;
+    }
+    // Malformed JSON falls through to scrubEvidenceJson which writes
+    // a `_scrubbed_invalid_json` marker — that itself acts as a
+    // forensic anchor, so we don't refuse here. Same exemption the
+    // shape validator above applies.
+    if (markerJsonOk) {
+      const isObject =
+        parsedMarker !== null && typeof parsedMarker === 'object' && !Array.isArray(parsedMarker);
+      const hasMarker = (() => {
+        if (!isObject) return false;
+        const obj = parsedMarker as Record<string, unknown>;
+        if (obj[OPERATOR_DRIVEN_MARKER] === true) return true;
+        const ts = obj.trigger_source;
+        return typeof ts === 'string' && ts.length > 0;
+      })();
+      if (!hasMarker) {
+        throw new InvalidEvictionInputError(
+          'evidence_json',
+          `outcome 'trigger_fired_no_action' requires evidence with either 'trigger_source' (string) or '${OPERATOR_DRIVEN_MARKER}: true' marker`,
         );
       }
     }

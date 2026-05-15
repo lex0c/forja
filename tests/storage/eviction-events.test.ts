@@ -292,6 +292,7 @@ describe('appendEvictionEvent: insert + defaults', () => {
         outcome: 'trigger_fired_no_action',
         motivo: 'low_roi',
         trigger: 'roi_below_threshold',
+        evidenceJson: JSON.stringify({ trigger_source: 'roi_probe' }),
       }),
     );
     expect(e.outcome).toBe('trigger_fired_no_action');
@@ -638,10 +639,12 @@ describe('appendEvictionEvent: evidence_json schema validation (EVICTION §6.1)'
     }
   });
 
-  test('validation skipped for non-applied outcomes', () => {
+  test('shape validation skipped for non-applied outcomes (but marker still required)', () => {
     // blocked_by_hook / blocked_by_protection / trigger_fired_no_action
     // record an attempted gate, not the substrate's evidence —
-    // structural fields don't apply.
+    // motivo-canonical structural fields don't apply. They MUST
+    // carry a structural marker (`trigger_source` or
+    // `_operator_driven`) so forensics can identify the source.
     const e = appendEvictionEvent(
       db,
       validInput({
@@ -649,14 +652,82 @@ describe('appendEvictionEvent: evidence_json schema validation (EVICTION §6.1)'
         fromState: 'active',
         toState: 'active', // same-state pseudo
         outcome: 'trigger_fired_no_action',
-        evidenceJson: '{}',
+        evidenceJson: JSON.stringify({ trigger_source: 'roi_probe' }),
       }),
     );
     expect(e.outcome).toBe('trigger_fired_no_action');
   });
+
+  test('trigger_fired_no_action without marker is refused', () => {
+    // The marker gate refuses an empty evidence payload — without
+    // `trigger_source` or `_operator_driven`, the audit row would
+    // land semantic garbage.
+    expect(() =>
+      appendEvictionEvent(
+        db,
+        validInput({
+          motivo: 'low_roi',
+          fromState: 'active',
+          toState: 'active',
+          outcome: 'trigger_fired_no_action',
+          evidenceJson: '{}',
+        }),
+      ),
+    ).toThrow(/trigger_source.*_operator_driven/);
+  });
+
+  test('trigger_fired_no_action with _operator_driven marker passes', () => {
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        motivo: 'low_roi',
+        fromState: 'active',
+        toState: 'active',
+        outcome: 'trigger_fired_no_action',
+        evidenceJson: JSON.stringify({ _operator_driven: true }),
+      }),
+    );
+    expect(e.outcome).toBe('trigger_fired_no_action');
+  });
+
+  test('blocked_by_protection without blocked_by column is refused', () => {
+    expect(() =>
+      appendEvictionEvent(
+        db,
+        validInput({
+          motivo: 'low_roi',
+          fromState: 'active',
+          toState: 'active',
+          outcome: 'blocked_by_protection',
+          evidenceJson: '{}',
+          // blockedBy: deliberately omitted
+        }),
+      ),
+    ).toThrow(/blocked_by/);
+  });
+
+  test('blocked_by_hook with non-empty blocked_by column passes', () => {
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        motivo: 'low_roi',
+        fromState: 'active',
+        toState: 'active',
+        outcome: 'blocked_by_hook',
+        evidenceJson: '{}',
+        blockedBy: 'project:hooks/foo.yaml#0',
+      }),
+    );
+    expect(e.outcome).toBe('blocked_by_hook');
+    expect(e.blockedBy).toBe('project:hooks/foo.yaml#0');
+  });
 });
 
 describe('detectTriggerThrashing', () => {
+  // Shared evidence payload — non-applied marker gate requires
+  // `trigger_source` for trigger_fired_no_action rows.
+  const probeEvidence = JSON.stringify({ trigger_source: 'roi_probe' });
+
   test('returns rows where outcome=trigger_fired_no_action repeats', () => {
     const now = 1_000_000;
     for (let i = 0; i < 5; i++) {
@@ -668,6 +739,7 @@ describe('detectTriggerThrashing', () => {
           outcome: 'trigger_fired_no_action',
           trigger: 'roi_below_threshold',
           motivo: 'low_roi',
+          evidenceJson: probeEvidence,
           recordedAt: now + i,
         }),
       );
@@ -693,6 +765,7 @@ describe('detectTriggerThrashing', () => {
           outcome: 'trigger_fired_no_action',
           trigger: 'roi_below_threshold',
           motivo: 'low_roi',
+          evidenceJson: probeEvidence,
           recordedAt: i * 100,
         }),
       );
@@ -716,6 +789,7 @@ describe('detectTriggerThrashing', () => {
           outcome: 'trigger_fired_no_action',
           trigger: 'roi_below_threshold',
           motivo: 'low_roi',
+          evidenceJson: probeEvidence,
           recordedAt: i * 100,
         }),
       );

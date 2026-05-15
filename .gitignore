@@ -26,3 +26,4 @@ dist/
 # Bun
 .bun/
 .agent/
+.claude/

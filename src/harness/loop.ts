@@ -2766,6 +2766,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // its evidence stream immediately after promotion
             // (3.6d).
             ...(appliedL1Signature !== null ? { appliedL1Signature } : {}),
+            // Pass the scope chain so outcomes land at scope=repo
+            // (when detected). Without this, every outcome lands
+            // at scope=session and repo/user/language-scoped
+            // policies never accumulate evidence (3.7b — fixes
+            // H1 from the branch review).
+            scopeChain: buildScopeChain({ sessionId, repoCwd: config.cwd }),
           });
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state

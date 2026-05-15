@@ -586,24 +586,6 @@ export const gcPurgeExpiredTombstones = async (
     // owner decides what to do with them.
     if (row.substrate !== 'memory') continue;
 
-    // Verify recency: a subsequent restore-then-re-evict cycle
-    // would have produced a newer applied eviction event. Use the
-    // APPLIED filter — `trigger_fired_no_action` or `blocked_by_*`
-    // rows recorded between the eviction and now don't represent
-    // state changes, so they shouldn't mask the purge candidate.
-    // Earlier shape used getLastEvictionForObject which returns
-    // any outcome; a cold-loop probe trigger on an evicted memory
-    // would skip the purge forever, growing tombstone storage
-    // unbounded.
-    const latest = getLastAppliedEvictionForObject(db, row.substrate, row.objectId);
-    if (latest === null || latest.id !== row.id) {
-      skipped.push({
-        evictionEventId: row.id,
-        reason: 'newer applied eviction event exists for object (restored or re-evicted since)',
-      });
-      continue;
-    }
-
     if (!isMemoryScope(row.objectScope)) {
       failures.push({
         evictionEventId: row.id,
@@ -613,41 +595,83 @@ export const gcPurgeExpiredTombstones = async (
     }
     const scope = row.objectScope;
 
-    const result = await transitionMemoryState({
-      db,
-      registry,
-      roots,
-      scope,
-      name: row.objectId,
-      toState: 'purged',
-      motivo: 'expired',
-      trigger: 'expired_at',
-      actor: 'startup_probe',
-      // Schema §6.1 expired requires `expires: string`. The purge
-      // sweep operates on the row's purgeAt as the effective
-      // expiry boundary (eviction lifetime = recorded_at + 30d);
-      // we synthesize the ISO date from purgeAt so the audit
-      // chain stays operationally meaningful. Forensic anchors
-      // (original_eviction_id, original_purge_at) make the
-      // tracing back to the eviction trivial.
-      evidence: {
-        expires: new Date(row.purgeAt ?? row.recordedAt).toISOString(),
-        purged_after_retention_window: true,
-        original_eviction_id: row.id,
-        original_purge_at: row.purgeAt,
-      },
-      ...(opts.auditSessionId !== undefined ? { sessionId: opts.auditSessionId } : {}),
-      ...(opts.auditCwd !== undefined ? { cwd: opts.auditCwd } : {}),
-      ...(opts.now !== undefined ? { now: opts.now } : {}),
-    });
+    // TOCTOU guard (3.7c). Wrap recency check + transition in a
+    // per-row immediate transaction. SQLite's RESERVED lock
+    // blocks a concurrent `/memory restore` (or another sweep)
+    // from mutating the eviction trail between our `latest.id !==
+    // row.id` check and `transitionMemoryState`'s reads.
+    // Without this, a restore interleave could land an
+    // "evicted → purged" audit row while the on-disk state was
+    // just restored to active — producing audit drift the
+    // operator would only spot via forensic queries.
+    //
+    // Note: transitionMemoryState is async (hook fire). Awaiting
+    // INSIDE the transaction is unusual but acceptable here
+    // because:
+    //   - The GC sweep doesn't fire the Eviction hook (no
+    //     fireHook in input); the await yields nothing.
+    //   - SQLite holds the RESERVED lock across the await; no
+    //     other writer can proceed.
+    //   - Aborting mid-await is rare (sweep runs at boot, not on
+    //     operator input); finally-ROLLBACK handles it.
+    db.exec('BEGIN IMMEDIATE');
+    let committed = false;
+    try {
+      // Verify recency under the lock: a subsequent restore-then-
+      // re-evict cycle would have produced a newer applied
+      // eviction event. APPLIED filter excludes
+      // `trigger_fired_no_action` / `blocked_by_*` probe rows.
+      const latest = getLastAppliedEvictionForObject(db, row.substrate, row.objectId);
+      if (latest === null || latest.id !== row.id) {
+        skipped.push({
+          evictionEventId: row.id,
+          reason: 'newer applied eviction event exists for object (restored or re-evicted since)',
+        });
+        db.exec('COMMIT');
+        committed = true;
+        continue;
+      }
 
-    if (result.kind === 'applied') {
-      purged.push({ scope, name: row.objectId, evictionEventId: row.id });
-    } else {
-      failures.push({
-        evictionEventId: row.id,
-        reason: gcFailureReason(result, 'evicted→purged'),
+      const result = await transitionMemoryState({
+        db,
+        registry,
+        roots,
+        scope,
+        name: row.objectId,
+        toState: 'purged',
+        motivo: 'expired',
+        trigger: 'expired_at',
+        actor: 'startup_probe',
+        // Schema §6.1 expired requires `expires: string`. The purge
+        // sweep operates on the row's purgeAt as the effective
+        // expiry boundary (eviction lifetime = recorded_at + 30d);
+        // we synthesize the ISO date from purgeAt so the audit
+        // chain stays operationally meaningful. Forensic anchors
+        // (original_eviction_id, original_purge_at) make the
+        // tracing back to the eviction trivial.
+        evidence: {
+          expires: new Date(row.purgeAt ?? row.recordedAt).toISOString(),
+          purged_after_retention_window: true,
+          original_eviction_id: row.id,
+          original_purge_at: row.purgeAt,
+        },
+        ...(opts.auditSessionId !== undefined ? { sessionId: opts.auditSessionId } : {}),
+        ...(opts.auditCwd !== undefined ? { cwd: opts.auditCwd } : {}),
+        ...(opts.now !== undefined ? { now: opts.now } : {}),
       });
+
+      if (result.kind === 'applied') {
+        purged.push({ scope, name: row.objectId, evictionEventId: row.id });
+      } else {
+        failures.push({
+          evictionEventId: row.id,
+          reason: gcFailureReason(result, 'evicted→purged'),
+        });
+      }
+      db.exec('COMMIT');
+      committed = true;
+    } finally {
+      if (!committed) db.exec('ROLLBACK');
     }
   }
 

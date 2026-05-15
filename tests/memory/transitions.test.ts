@@ -478,6 +478,39 @@ describe('transitionMemoryState: same-state pseudo-transition', () => {
     const memActions = listMemoryEventsByName(db, 'x').map((e) => e.action);
     expect(memActions).not.toContain('quarantined');
   });
+
+  test('io_error surfaces when appendEvictionEvent throws (same-state path)', async () => {
+    // Force the same-state append to throw by closing the db before
+    // the call. transitionMemoryState should catch the throw and
+    // surface kind=io_error so callers can render the right copy
+    // without crashing the harness loop.
+    const roots = makeRoots();
+    seedActiveMemory(roots.user, 'x', 'body', 'quarantined');
+    const registry = baseRegistry();
+
+    db.close();
+
+    const r = await transitionMemoryState({
+      db,
+      registry,
+      roots,
+      scope: 'user',
+      name: 'x',
+      toState: 'quarantined',
+      motivo: 'conflict',
+      trigger: 'verify_failed',
+      actor: 'loop_cold',
+      sessionId,
+      cwd: workdir,
+    });
+    expect(r.kind).toBe('io_error');
+    if (r.kind !== 'io_error') return;
+    expect(r.reason.length).toBeGreaterThan(0);
+
+    // Re-open so afterEach's cleanup doesn't trip on a closed handle.
+    db = openMemoryDb();
+    migrate(db);
+  });
 });
 
 // ── hook blocks the transition ──────────────────────────────────────

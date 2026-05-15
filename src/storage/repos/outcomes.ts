@@ -20,7 +20,56 @@
 // predictable.
 
 import type { SQLQueryBindings } from 'bun:sqlite';
+import { redactSecrets } from '../../memory/index.ts';
+import { scrubFreeformText } from '../../telemetry/scrubbing.ts';
 import type { DB } from '../db.ts';
+
+// ─── evidence_json scrub (AUDIT.md §1 medium sensitivity) ────────────
+//
+// outcomes.evidence_json carries tool errors, exit codes, duration,
+// occasionally tool stderr fragments. AUDIT.md §1 declares the column
+// medium-sensitivity with required redaction — operator paths,
+// hostnames, accidentally-leaked tokens in tracebacks need to be
+// scrubbed before persistence (90d retention default).
+//
+// Two-pass scrub mirrors eviction_events.ts (same sensitivity tier):
+//   - scrubFreeformText: paths, hosts, IPs, URLs, SSH refs
+//   - redactSecrets: credential-shaped patterns
+//
+// Order doesn't matter — disjoint vocabularies — but both are needed
+// because they cover different threat surfaces.
+
+const CYCLE_SENTINEL = '__forja_cycle__';
+
+const scrubString = (s: string): string => redactSecrets(scrubFreeformText(s));
+
+const scrubStringsRecursive = (value: unknown, seen: WeakSet<object>): unknown => {
+  if (typeof value === 'string') return scrubString(value);
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value as object)) return CYCLE_SENTINEL;
+  seen.add(value as object);
+  if (Array.isArray(value)) {
+    return value.map((v) => scrubStringsRecursive(v, seen));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = scrubStringsRecursive(v, seen);
+  }
+  return out;
+};
+
+const scrubEvidenceJson = (raw: string | null): string | null => {
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Malformed JSON: replace with a marker carrying the scrubbed
+    // raw text. Same shape as eviction-events' fallback.
+    return JSON.stringify({ _scrubbed_invalid_json: scrubString(raw) });
+  }
+  return JSON.stringify(scrubStringsRecursive(parsed, new WeakSet()));
+};
 
 // ─── enums + types ───────────────────────────────────────────────────
 
@@ -123,6 +172,9 @@ export interface CreateOutcomeInput {
 export const createOutcome = (db: DB, input: CreateOutcomeInput): Outcome => {
   const id = input.id ?? crypto.randomUUID();
   const recordedAt = input.recordedAt ?? Date.now();
+  // Scrub before persist (AUDIT.md §1 medium sensitivity). All
+  // writers benefit — caller doesn't have to remember to scrub.
+  const scrubbedEvidence = scrubEvidenceJson(input.evidenceJson ?? null);
   const row: OutcomeRow = {
     id,
     session_id: input.sessionId,
@@ -130,7 +182,7 @@ export const createOutcome = (db: DB, input: CreateOutcomeInput): Outcome => {
     action_signature: input.actionSignature,
     tier: input.tier,
     result: input.result,
-    evidence_json: input.evidenceJson ?? null,
+    evidence_json: scrubbedEvidence,
     scope_kind: input.scopeKind,
     scope_id: input.scopeId,
     recorded_at: recordedAt,
