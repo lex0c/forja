@@ -2,6 +2,50 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(storage) — evidence_json schema validation per motivo (Phase 2.4)
+
+**Done.** Closes the §6.1 evidence contract — `appendEvictionEvent` now validates the per-motivo evidence shape declared in EVICTION.md. Each motivo has a canonical evidence schema (e.g. `low_roi`: `{tokens_consumed, load_bearing_count, ratio}`; `shift`: `{shift_score}`; `irrelevant`: `{usage_count, sample_size}`); rows with missing or wrong-type fields are refused at INSERT time via `InvalidEvictionInputError`. Forensic queries that consume `evidence_json->>'$.<field>'` can now rely on the field being present + correctly-typed.
+
+### Design decisions
+
+- **Structural validation, not threshold validation.** The repo verifies SHAPE (required fields present, types correct) — NOT the upstream threshold gates (§6.1: `usage_rate=0 over N=20` for irrelevant; `shift_score>0.3` for shift; ROI threshold for low_roi). Threshold checks are the upstream owner's responsibility — the detector that observed `usage_count === 0 over N=20 queries` constructs the evidence AFTER passing its own gate. The repo trusts that contract; its job is to ensure the structure is correct so forensic queries don't have to defend against missing-field surprises.
+
+- **`oneOf` semantics for `conflict`.** Spec §6.1 admits two shapes — pair-detected `{winner_id, loser_id, conflict_kind}` OR failure-burst `{failures}`. The validator's `oneOf` array lets either pass; both shapes coexist as `conflict` evidence depending on the upstream detector (conflict resolver vs failure aggregator).
+
+- **`_operator_driven: true` marker bypasses required-field checks.** Operator paths (`/memory delete`, `/memory restore`, `gcExpiredMemories`) use closest-fit motivos that don't represent the real semantics — `/memory delete` uses `low_roi` because the state machine doesn't admit `user_purge` on `active → quarantined` (declared spec follow-up). The marker tells the validator "this is a closest-fit; the real evidence is the operator command, recorded in the trigger field instead". Forensic consumers filtering for "real" ROI-driven evictions exclude these rows via `evidence_json->>'$._operator_driven' IS NULL`. Without the marker, operator paths would have to fake degenerate ROI values (`tokens_consumed: 0, load_bearing_count: 0, ratio: 0`), which would pollute genuine ROI analytics.
+
+- **Validation runs only when outcome === 'applied'.** Outcomes that don't represent a real transition (`blocked_by_hook`, `blocked_by_protection`, `trigger_fired_no_action`) record the attempted gate, not the substrate's evidence. The evidence on those rows is owner-specific bookkeeping (the hook spec ref, the protection name, the trigger source) — would fail structural checks for the proposed motivo. Skipping validation on non-applied outcomes preserves their existing shape contracts.
+
+- **Malformed JSON bypasses validation, falls through to scrub.** When `JSON.parse(evidenceJson)` fails, the validator skips and `scrubEvidenceJson` replaces the payload with a `_scrubbed_invalid_json` marker so the row still persists. The validator's job is shape conformance per §6.1, not JSON parse correctness — those are separate concerns. A future writer that passes raw text by mistake gets the audit row + the warning marker; no INSERT failure.
+
+- **Per-motivo schemas exported as `EVIDENCE_SCHEMAS` constant.** Downstream consumers (the future loop frio adaptation engine, dashboards) can read the schemas to know which fields to expect. Single source of truth — adding a new motivo requires updating the schema map alongside the enum.
+
+- **`OPERATOR_DRIVEN_EVIDENCE_MARKER` exported as named constant.** Callers in `/memory delete`, `/memory restore`, `gcExpiredMemories` import + use this string instead of stringly-coding `'_operator_driven'`. Single rename point if the marker's shape evolves.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/eviction-events.ts` | New `EVIDENCE_SCHEMAS` map (per-motivo `oneOf` required-field sets). New `validateEvidenceShape` validator. `appendEvictionEvent` calls validator when outcome === 'applied' and JSON parses. New `OPERATOR_DRIVEN_EVIDENCE_MARKER` export. |
+| `src/cli/slash/commands/memory.ts` | `deleteViaTransition` + `handleRestore` pass `evidence: { _operator_driven: true, source }` so the closest-fit motivos pass validation. |
+| `src/memory/lifecycle.ts` | `gcExpiredMemories` passes `evidence: { _operator_driven: true, expires }` for the boot GC. `gcPurgeExpiredTombstones` passes structurally-valid `expired` evidence (`{expires: ISO}` derived from purgeAt + forensic anchors). |
+| `tests/storage/eviction-events.test.ts` | New `validInput()` defaults to a per-motivo `MIN_EVIDENCE_FOR_MOTIVO` so existing tests pass without per-test ceremony. 7 new tests covering: refusal on missing fields (low_roi, shift); accept both conflict shapes; operator-driven marker bypass; refuse non-object root; skip validation for non-applied outcomes. 3 redaction tests updated to use `motivo: 'user_purge'` (any-shape) so they isolate the scrub concern. |
+| `tests/memory/transitions.test.ts` | New `validEvidence(motivo)` helper. All `transitionMemoryState` call sites that produce `applied` outcomes thread proper evidence (low_roi, conflict, irrelevant, expired shapes). |
+| `tests/memory/lifecycle.test.ts` | Test `gcPurgeExpiredTombstones > skips rows with newer eviction event` uses operator-driven marker on the test's manual restore call. Test `non-memory substrate candidates are ignored` passes valid conflict + low_roi shapes on the policy-substrate fixture inserts. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7533 pass / 10 skip / 0 fail (+7 from the slice's new validator tests)
+- `bun test tests/storage/eviction-events.test.ts` 51 pass
+
+### Deferred / follow-ups declared
+
+- **Spec EVICTION §4.1 amendment** — admit `user_purge` motivo on `active → quarantined`/`quarantined → evicted`; admit `expired` motivo on the same transitions. Would obviate the `_operator_driven` marker for `/memory delete` and `gcExpiredMemories`. Spec PR, not code.
+- **Threshold gating in the validator** — today the validator checks SHAPE only. A future slice could add THRESHOLD checks (e.g. `low_roi` requires `sample_size >= 30`); when threshold isn't met, the row outcome becomes `trigger_fired_no_action` instead of `applied`, per §6.1's "evidência abaixo do gate ⇒ trigger_fired_no_action". Requires the upstream detectors to provide `sample_size` consistently — out of scope here because no automated detectors exist yet.
+- **2.5 — Protection gates** (next slice — user_explicit cooldown 72h + quarantine min TTL).
+
 ## [2026-05-15] feat(memory) — GC sweep evicted → purged (Phase 2.3)
 
 **Done.** Materializes the retention window EVICTION §7.1 declares. Phase 2.2 routed `gcExpiredMemories` through the state machine, producing `evicted` rows with `purgeAt = now + 30d`. Phase 1.3.c1 already wired the `evicted → purged` transition into `transitionMemoryState`. The piece missing: a sweep that reads `listEvictedDueForPurge` and calls the transition for each due tombstone. Without it, tombstones accumulated forever — every memory ever evicted lived on disk until the operator manually nuked `.tombstones/`.

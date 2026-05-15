@@ -60,6 +60,36 @@ const baseRegistry = () =>
     cwd: workdir,
   });
 
+// Minimum evidence shape per motivo so transitionMemoryState calls
+// pass §6.1 schema validation. Tests that exercise the evidence
+// validator directly override `evidence` explicitly. Outcomes that
+// don't represent a real transition (blocked_by_hook, same-state
+// trigger_fired_no_action) skip validation in the repo, so this
+// helper is only load-bearing for `applied` outcomes — but
+// including it everywhere keeps the test calls uniform.
+const validEvidence = (motivo: string): Record<string, unknown> => {
+  switch (motivo) {
+    case 'conflict':
+      return { failures: 3 };
+    case 'low_roi':
+      return { tokens_consumed: 0, load_bearing_count: 0, ratio: 0 };
+    case 'irrelevant':
+      return { usage_count: 0, sample_size: 20 };
+    case 'shift':
+      return { shift_score: 0.5 };
+    case 'expired':
+      return { expires: '2024-01-01' };
+    case 'quota':
+      return { slot_budget: 100, item_cost: 200 };
+    case 'user_purge':
+      return {};
+    case 'security':
+      return { trigger_source: 'hook' };
+    default:
+      return {};
+  }
+};
+
 beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'forja-mem-trans-'));
   db = openMemoryDb();
@@ -89,7 +119,7 @@ describe('transitionMemoryState: active → quarantined', () => {
       motivo: 'conflict',
       trigger: 'verify_failed',
       actor: 'loop_cold',
-      evidence: { reason: 'fs mismatch' },
+      evidence: { ...validEvidence('conflict'), reason: 'fs mismatch' },
       sessionId,
       cwd: workdir,
     });
@@ -174,6 +204,7 @@ describe('transitionMemoryState: quarantined → evicted', () => {
       motivo: 'low_roi',
       trigger: 'roi_below_threshold',
       actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
       now: () => 5_000,
       sessionId,
       cwd: workdir,
@@ -227,6 +258,7 @@ describe('transitionMemoryState: evicted → active (restore from tombstone)', (
       motivo: 'low_roi',
       trigger: 'roi_below_threshold',
       actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
       now: () => 1_000,
       sessionId,
       cwd: workdir,
@@ -244,6 +276,7 @@ describe('transitionMemoryState: evicted → active (restore from tombstone)', (
       motivo: 'irrelevant',
       trigger: 'manual',
       actor: 'user',
+      evidence: validEvidence('irrelevant'),
       sessionId,
       cwd: workdir,
     });
@@ -293,6 +326,7 @@ describe('transitionMemoryState: evicted → purged', () => {
       motivo: 'low_roi',
       trigger: 'roi_below_threshold',
       actor: 'loop_cold',
+      evidence: validEvidence('low_roi'),
       // Distinct timestamps for the two transitions so
       // getLastEvictionForObject's ORDER BY recorded_at DESC has
       // an unambiguous winner. Without this, both rows can land
@@ -313,6 +347,7 @@ describe('transitionMemoryState: evicted → purged', () => {
       motivo: 'expired',
       trigger: 'expired_at',
       actor: 'startup_probe',
+      evidence: validEvidence('expired'),
       now: () => 2_000,
       sessionId,
       cwd: workdir,
@@ -527,6 +562,7 @@ describe('transitionMemoryState: Eviction hook blocks restore', () => {
       motivo: 'conflict',
       trigger: 'verify_failed',
       actor: 'loop_cold',
+      evidence: validEvidence('conflict'),
       sessionId,
       cwd: workdir,
       now: () => 1_000,
@@ -541,6 +577,7 @@ describe('transitionMemoryState: Eviction hook blocks restore', () => {
       motivo: 'low_roi',
       trigger: 'user_purge',
       actor: 'user',
+      evidence: validEvidence('low_roi'),
       sessionId,
       cwd: workdir,
       now: () => 2_000,
@@ -623,6 +660,7 @@ describe('transitionMemoryState: quarantined → active', () => {
       motivo: 'irrelevant',
       trigger: 'manual',
       actor: 'user',
+      evidence: validEvidence('irrelevant'),
       sessionId,
       cwd: workdir,
     });
@@ -659,7 +697,10 @@ describe('transitionMemoryState: evidence_json is scrubbed by repo', () => {
       motivo: 'conflict',
       trigger: 'verify_failed',
       actor: 'loop_cold',
-      evidence: { detail: 'log shipped sk-ant-aaaaaaaaaaaaaaaaaaaa via webhook' },
+      evidence: {
+        ...validEvidence('conflict'),
+        detail: 'log shipped sk-ant-aaaaaaaaaaaaaaaaaaaa via webhook',
+      },
       sessionId,
       cwd: workdir,
     });

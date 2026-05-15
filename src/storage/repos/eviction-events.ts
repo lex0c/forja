@@ -217,6 +217,189 @@ export class InvalidEvictionInputError extends Error {
   }
 }
 
+// ─── evidence_json schema validation (EVICTION §6.1) ────────────────
+//
+// Each motivo declares an evidence shape; the repo validates the
+// caller's payload against the shape at INSERT time. Owners (memory
+// triggers, policy detectors, slot compaction) construct the
+// evidence upstream and call appendEvictionEvent with the full
+// payload — the repo's job is to ensure the SHAPE is correct so
+// forensic queries (`SELECT evidence_json->>'$.shift_score' FROM
+// eviction_events`) don't have to defend against missing-field
+// surprises.
+//
+// What this gate is NOT: the THRESHOLD gate (§6.1's "evidence
+// abaixo do gate ⇒ trigger_fired_no_action"). Threshold checks are
+// the upstream owner's job — the detector that observed
+// `usage_count === 0 over N=20 queries` constructs the evidence
+// AFTER passing its own gate. The repo trusts that contract.
+//
+// What this gate IS: structural validation. Required fields
+// present, types correct. A trigger detector that forgot to pass
+// `tokens_consumed` for a low_roi eviction is a bug at the source;
+// the audit row should never land with that shape because forensic
+// queries would mis-fire silently.
+//
+// Operator-driven paths (`/memory delete`, `/memory restore`, boot
+// GC) use closest-fit motivos that don't really represent the
+// trigger semantics — they're documented spec deviations. They
+// pass a structurally-valid evidence payload with a
+// `_operator_driven: true` marker so consumers filtering for
+// "real" trigger evidence can exclude them. Spec amendment to
+// admit `user_purge`/`expired` motivos on these transitions
+// would obviate the marker. Until then, the marker is the bridge.
+
+// Required fields per motivo, per §6.1. Each entry lists the field
+// names + the value-shape predicate. A `_operator_driven: true`
+// marker bypasses ALL required-field checks (operator paths don't
+// have measurable triggers — the operator's command IS the
+// evidence). This is structural validation; spec §6.1 threshold
+// numbers (N=20 for irrelevant, N=30 for low_roi) are the
+// upstream owner's responsibility.
+type FieldPredicate = (value: unknown) => boolean;
+
+const isNumber: FieldPredicate = (v) => typeof v === 'number' && Number.isFinite(v);
+const isString: FieldPredicate = (v) => typeof v === 'string' && v.length > 0;
+const isAnyShape: FieldPredicate = () => true;
+
+interface EvidenceSchema {
+  // One or more "required fields" sets. Validation passes if AT
+  // LEAST ONE set is satisfied. `conflict` uses this — either the
+  // `{winner_id, loser_id, conflict_kind}` shape (detected
+  // conflict) OR the `{failures}` shape (failure burst).
+  oneOf: { required: Record<string, FieldPredicate> }[];
+}
+
+// Per EVICTION §6.1 evidence schemas. Each motivo declares the
+// minimum shape its upstream trigger must produce. Empty `oneOf`
+// (e.g. `quota` — see below) means caller can pass any shape,
+// useful when the trigger evidence is owner-specific and the
+// repo doesn't have a meaningful invariant to check.
+const EVIDENCE_SCHEMAS: Record<EvictionMotivo, EvidenceSchema> = {
+  irrelevant: {
+    // usage_count over N consultas, both numeric. Upstream gate is
+    // usage_rate === 0 with N >= 20 (§6.1).
+    oneOf: [{ required: { usage_count: isNumber, sample_size: isNumber } }],
+  },
+  conflict: {
+    // Either a detected pair-conflict OR a failure-burst.
+    oneOf: [
+      {
+        required: {
+          winner_id: isString,
+          loser_id: isString,
+          conflict_kind: isString,
+        },
+      },
+      { required: { failures: isNumber } },
+    ],
+  },
+  shift: {
+    // Binary shift score above threshold (§6.1 — shift_score > 0.3
+    // is the upstream owner's gate; we just require the field).
+    oneOf: [{ required: { shift_score: isNumber } }],
+  },
+  low_roi: {
+    // Tokens × load-bearing × ratio. Upstream gate is ROI <
+    // threshold with N >= 30 (§6.1 + §6.5).
+    oneOf: [
+      {
+        required: {
+          tokens_consumed: isNumber,
+          load_bearing_count: isNumber,
+          ratio: isNumber,
+        },
+      },
+    ],
+  },
+  quota: {
+    // Budget vs cost. Upstream gate is item_cost > slot_budget.
+    oneOf: [{ required: { slot_budget: isNumber, item_cost: isNumber } }],
+  },
+  expired: {
+    // `expires < now()` per §6.1. The frontmatter value is the
+    // evidence — repo preserves the operator-set date so audit
+    // forensics can answer "what was the original lifetime?".
+    oneOf: [{ required: { expires: isString } }],
+  },
+  user_purge: {
+    // N=1 operator command. Spec doesn't declare a structured
+    // shape — the eviction IS the evidence. Accept any payload
+    // (including empty `{}`) by listing a no-op required set.
+    oneOf: [{ required: {} }],
+  },
+  security: {
+    // Hook block OR pattern match. trigger_source field
+    // distinguishes the two sources downstream.
+    oneOf: [{ required: { trigger_source: isString } }],
+  },
+};
+
+// Special marker that bypasses required-field checks. Used by
+// operator-driven paths that emit closest-fit motivos (`/memory
+// delete` uses low_roi; gcExpiredMemories uses low_roi). The
+// marker tells the validator "this is a closest-fit; the real
+// evidence is the operator command, recorded in the trigger
+// field instead". Spec amendment to admit user_purge/expired on
+// the right transitions would obviate this.
+const OPERATOR_DRIVEN_MARKER = '_operator_driven';
+
+interface EvidenceValidation {
+  ok: boolean;
+  // When !ok, the list of which oneOf-set failed and why. Empty
+  // when ok or when caller used the operator marker bypass.
+  failures: { setIndex: number; missingOrInvalid: string[] }[];
+}
+
+// Validate evidence shape per motivo schema. Returns { ok: true }
+// when at least one `oneOf` required set is satisfied (or when
+// the operator marker is set). Returns { ok: false } with
+// per-set failure detail so the thrown error message can be
+// specific.
+const validateEvidenceShape = (motivo: EvictionMotivo, evidence: unknown): EvidenceValidation => {
+  // Operator-driven bypass — the closest-fit motivo doesn't have
+  // its canonical evidence to validate against.
+  if (
+    evidence !== null &&
+    typeof evidence === 'object' &&
+    (evidence as Record<string, unknown>)[OPERATOR_DRIVEN_MARKER] === true
+  ) {
+    return { ok: true, failures: [] };
+  }
+  const schema = EVIDENCE_SCHEMAS[motivo];
+  // Non-object evidence (string, number, null, array) fails
+  // structurally — the JSON must be an object.
+  if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    return {
+      ok: false,
+      failures: schema.oneOf.map((_set, i) => ({
+        setIndex: i,
+        missingOrInvalid: ['<root>: evidence must be a JSON object'],
+      })),
+    };
+  }
+  const obj = evidence as Record<string, unknown>;
+  const setFailures: { setIndex: number; missingOrInvalid: string[] }[] = [];
+  for (let i = 0; i < schema.oneOf.length; i++) {
+    const set = schema.oneOf[i];
+    if (set === undefined) continue;
+    const missing: string[] = [];
+    for (const [field, predicate] of Object.entries(set.required)) {
+      if (predicate === isAnyShape) continue;
+      if (!Object.hasOwn(obj, field) || !predicate(obj[field])) {
+        missing.push(field);
+      }
+    }
+    if (missing.length === 0) return { ok: true, failures: [] };
+    setFailures.push({ setIndex: i, missingOrInvalid: missing });
+  }
+  return { ok: false, failures: setFailures };
+};
+
+// Re-export marker for callers that pass closest-fit motivos.
+export const OPERATOR_DRIVEN_EVIDENCE_MARKER = OPERATOR_DRIVEN_MARKER;
+export { EVIDENCE_SCHEMAS };
+
 // ─── evidence_json sanitizer ─────────────────────────────────────────
 
 // Cycle guard sentinel — symmetric with failures/scrub.ts.
@@ -429,6 +612,40 @@ export const appendEvictionEvent = (db: DB, input: AppendEvictionEventInput): Ev
       'purgeAt',
       `only valid when toState === 'evicted' (got toState='${input.toState}')`,
     );
+  }
+  // Evidence schema validation (§6.1). Outcomes that don't represent
+  // a real transition (`blocked_by_hook`, `blocked_by_protection`,
+  // `trigger_fired_no_action`) are exempt — those rows record the
+  // attempted gate, not the substrate's evidence. The evidence on
+  // those rows is owner-specific bookkeeping (the hook spec ref,
+  // the protection name, the trigger source), which would fail
+  // structural checks for the proposed motivo.
+  //
+  // Malformed JSON skips the validator and falls through to
+  // scrubEvidenceJson, which replaces the payload with a
+  // `_scrubbed_invalid_json` marker so the row still persists.
+  // The validator's job is shape conformance per §6.1, not JSON
+  // parse correctness — those are separate concerns.
+  if (input.outcome === 'applied') {
+    let parsedEvidence: unknown;
+    let jsonOk = true;
+    try {
+      parsedEvidence = JSON.parse(input.evidenceJson);
+    } catch {
+      jsonOk = false;
+    }
+    if (jsonOk) {
+      const validation = validateEvidenceShape(input.motivo, parsedEvidence);
+      if (!validation.ok) {
+        const sets = validation.failures
+          .map((f) => `set #${f.setIndex} (missing/invalid: ${f.missingOrInvalid.join(', ')})`)
+          .join('; ');
+        throw new InvalidEvictionInputError(
+          'evidence_json',
+          `evidence shape doesn't satisfy schema for motivo '${input.motivo}': ${sets}`,
+        );
+      }
+    }
   }
   const id = input.id ?? crypto.randomUUID();
   const recordedAt = input.recordedAt ?? Date.now();

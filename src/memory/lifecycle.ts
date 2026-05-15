@@ -413,7 +413,15 @@ export const gcExpiredMemories = async (
   };
 
   for (const mem of expired) {
-    const evidence = { expires: mem.expires };
+    // Closest-fit motivo `low_roi` (spec doesn't admit `expired`
+    // on active→quarantined / quarantined→evicted; declared
+    // follow-up). The `_operator_driven: true` marker bypasses
+    // the ROI-shape schema check at the repo level; forensic
+    // queries filter on `trigger='expired_at'` for real
+    // attribution. The `expires` field preserves the operator-set
+    // lifetime for "what was the original expires?" audit
+    // queries.
+    const evidence = { _operator_driven: true, expires: mem.expires };
     // Per-memory now counter so two back-to-back expirations get
     // monotonically distinct recorded_at + tombstone ts values.
     // Without this, all expired rows in one boot would collide
@@ -609,7 +617,15 @@ export const gcPurgeExpiredTombstones = async (
       motivo: 'expired',
       trigger: 'expired_at',
       actor: 'startup_probe',
+      // Schema §6.1 expired requires `expires: string`. The purge
+      // sweep operates on the row's purgeAt as the effective
+      // expiry boundary (eviction lifetime = recorded_at + 30d);
+      // we synthesize the ISO date from purgeAt so the audit
+      // chain stays operationally meaningful. Forensic anchors
+      // (original_eviction_id, original_purge_at) make the
+      // tracing back to the eviction trivial.
       evidence: {
+        expires: new Date(row.purgeAt ?? row.recordedAt).toISOString(),
         purged_after_retention_window: true,
         original_eviction_id: row.id,
         original_purge_at: row.purgeAt,

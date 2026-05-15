@@ -674,6 +674,15 @@ const deleteViaTransition = async (
     motivo: 'low_roi' as const,
     trigger: 'user_purge',
     actor: 'user' as const,
+    // Closest-fit motivo `low_roi` doesn't represent the real
+    // semantics (operator command, not ROI). The
+    // `_operator_driven: true` marker tells the evidence
+    // validator to bypass the canonical low_roi shape check —
+    // forensic consumers filtering for "real" ROI evidence
+    // exclude these rows by predicate. Spec amendment to admit
+    // `user_purge` on active→quarantined / quarantined→evicted
+    // would obviate the marker.
+    evidence: { _operator_driven: true, source: 'slash_delete' as const },
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
     now: ctx.now,
@@ -910,6 +919,13 @@ const handleRestore = async (
     motivo: 'irrelevant',
     trigger: 'manual',
     actor: 'user',
+    // `evicted → active` admits any motivo; closest-fit
+    // `irrelevant` carries operator-driven marker so forensic
+    // queries filtering for real "usage_rate=0 over N=20"
+    // irrelevant evidence exclude restore rows. The
+    // `_operator_driven: true` marker bypasses the schema's
+    // required-fields check at the repo level.
+    evidence: { _operator_driven: true, source: 'slash_restore' as const },
     ...(sessionId !== null ? { sessionId } : {}),
     cwd: ctx.baseConfig.cwd,
     now: ctx.now,

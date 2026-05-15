@@ -554,6 +554,10 @@ describe('gcPurgeExpiredTombstones', () => {
       motivo: 'irrelevant',
       trigger: 'manual',
       actor: 'user',
+      // Closest-fit motivo (restore is not really irrelevant —
+      // see /memory restore comment). Operator-driven marker
+      // skips §6.1 shape check.
+      evidence: { _operator_driven: true, source: 'test_restore' },
       now: () => ++restoreCounter,
     });
     expect(r1.kind).toBe('applied');
@@ -604,7 +608,7 @@ describe('gcPurgeExpiredTombstones', () => {
       toState: 'quarantined',
       trigger: 'failure_burst',
       motivo: 'conflict',
-      evidenceJson: '{}',
+      evidenceJson: JSON.stringify({ failures: 3 }),
       outcome: 'applied',
       actor: 'loop_cold',
       recordedAt: 1000,
@@ -617,7 +621,7 @@ describe('gcPurgeExpiredTombstones', () => {
       toState: 'evicted',
       trigger: 'failure_burst',
       motivo: 'low_roi',
-      evidenceJson: '{}',
+      evidenceJson: JSON.stringify({ tokens_consumed: 0, load_bearing_count: 0, ratio: 0 }),
       outcome: 'applied',
       actor: 'loop_cold',
       recordedAt: 2000,

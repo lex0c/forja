@@ -18,22 +18,39 @@ import { createSession } from '../../src/storage/repos/sessions.ts';
 let db: DB;
 let sessionId: string;
 
+// Minimum evidence shape per motivo so validInput() produces rows
+// that satisfy the §6.1 schema validation. Tests that need to
+// exercise the validator directly override evidenceJson explicitly.
+const MIN_EVIDENCE_FOR_MOTIVO: Record<string, string> = {
+  irrelevant: JSON.stringify({ usage_count: 0, sample_size: 20 }),
+  conflict: JSON.stringify({ failures: 3 }),
+  shift: JSON.stringify({ shift_score: 0.5 }),
+  low_roi: JSON.stringify({ tokens_consumed: 100, load_bearing_count: 0, ratio: 0 }),
+  quota: JSON.stringify({ slot_budget: 100, item_cost: 200 }),
+  expired: JSON.stringify({ expires: '2024-01-01' }),
+  user_purge: JSON.stringify({}),
+  security: JSON.stringify({ trigger_source: 'hook' }),
+};
+
 const validInput = (
   overrides: Partial<AppendEvictionEventInput> = {},
-): AppendEvictionEventInput => ({
-  substrate: 'memory',
-  objectId: 'test-memory-1',
-  objectScope: 'project_local',
-  fromState: 'proposed',
-  toState: 'active',
-  trigger: 'admission_gate',
-  motivo: 'irrelevant',
-  evidenceJson: '{}',
-  outcome: 'applied',
-  actor: 'user',
-  sessionId,
-  ...overrides,
-});
+): AppendEvictionEventInput => {
+  const motivo = overrides.motivo ?? 'irrelevant';
+  return {
+    substrate: 'memory',
+    objectId: 'test-memory-1',
+    objectScope: 'project_local',
+    fromState: 'proposed',
+    toState: 'active',
+    trigger: 'admission_gate',
+    motivo,
+    evidenceJson: MIN_EVIDENCE_FOR_MOTIVO[motivo] ?? '{}',
+    outcome: 'applied',
+    actor: 'user',
+    sessionId,
+    ...overrides,
+  };
+};
 
 beforeEach(() => {
   db = openMemoryDb();
@@ -478,9 +495,12 @@ describe('appendEvictionEvent: evidence_json redaction (AUDIT.md §1 sensitivity
     // credential-shaped string (the trigger source dumped a log
     // line). Repo must apply telemetry-grade redaction before
     // INSERT so the row doesn't keep the secret for 365d.
+    // Use motivo='user_purge' (admits any shape) so the test
+    // focuses on redaction, not §6.1 schema validation.
     const e = appendEvictionEvent(
       db,
       validInput({
+        motivo: 'user_purge',
         evidenceJson: JSON.stringify({
           detail: 'log: sk-ant-aaaaaaaaaaaaaaaaaaaa expired',
         }),
@@ -493,6 +513,7 @@ describe('appendEvictionEvent: evidence_json redaction (AUDIT.md §1 sensitivity
     const e = appendEvictionEvent(
       db,
       validInput({
+        motivo: 'user_purge',
         evidenceJson: JSON.stringify({
           paths: ['/home/operator/secrets/key.pem'],
           inner: { ref: '/Users/operator/.aws/credentials' },
@@ -514,12 +535,124 @@ describe('appendEvictionEvent: evidence_json redaction (AUDIT.md §1 sensitivity
     // shouldn't reject (the transition is still legitimate); it
     // should replace the payload with a marker so the audit row
     // still persists and the un-parseable content is recorded.
+    // The validator skips schema validation when JSON.parse
+    // fails — malformed payload is the scrub layer's concern.
     const e = appendEvictionEvent(
       db,
-      validInput({ evidenceJson: 'not-actually-json sk-ant-secretsecretsecretsecret' }),
+      validInput({
+        motivo: 'user_purge',
+        evidenceJson: 'not-actually-json sk-ant-secretsecretsecretsecret',
+      }),
     );
     expect(e.evidenceJson).toContain('_scrubbed_invalid_json');
     expect(e.evidenceJson).not.toContain('sk-ant-secretsecretsecretsecret');
+  });
+});
+
+describe('appendEvictionEvent: evidence_json schema validation (EVICTION §6.1)', () => {
+  test('rejects evidence missing required fields for low_roi', () => {
+    expect(() =>
+      appendEvictionEvent(
+        db,
+        validInput({
+          motivo: 'low_roi',
+          fromState: 'quarantined',
+          toState: 'evicted',
+          evidenceJson: '{}',
+        }),
+      ),
+    ).toThrow(/evidence shape doesn't satisfy schema for motivo 'low_roi'/);
+  });
+
+  test('rejects evidence with wrong field types for shift', () => {
+    expect(() =>
+      appendEvictionEvent(
+        db,
+        validInput({
+          motivo: 'shift',
+          fromState: 'active',
+          toState: 'invalidated',
+          evidenceJson: JSON.stringify({ shift_score: 'not-a-number' }),
+        }),
+      ),
+    ).toThrow(/evidence shape doesn't satisfy schema for motivo 'shift'/);
+  });
+
+  test('accepts conflict with the failure-burst shape', () => {
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        motivo: 'conflict',
+        fromState: 'active',
+        toState: 'quarantined',
+        evidenceJson: JSON.stringify({ failures: 3 }),
+      }),
+    );
+    expect(e.motivo).toBe('conflict');
+  });
+
+  test('accepts conflict with the pair-detected shape', () => {
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        motivo: 'conflict',
+        fromState: 'active',
+        toState: 'quarantined',
+        evidenceJson: JSON.stringify({
+          winner_id: 'mem-1',
+          loser_id: 'mem-2',
+          conflict_kind: 'contradiction',
+        }),
+      }),
+    );
+    expect(e.motivo).toBe('conflict');
+  });
+
+  test('operator-driven marker bypasses required-field check', () => {
+    // /memory delete + gcExpiredMemories use closest-fit motivos
+    // with this marker — the operator command IS the evidence;
+    // the structural fields would be degenerate noise.
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        motivo: 'low_roi',
+        fromState: 'quarantined',
+        toState: 'evicted',
+        evidenceJson: JSON.stringify({ _operator_driven: true, source: 'slash_delete' }),
+      }),
+    );
+    expect(e.motivo).toBe('low_roi');
+  });
+
+  test('non-object evidence (string, number, null, array) refused', () => {
+    for (const bad of ['"string-value"', '42', 'null', '[1, 2]']) {
+      expect(() =>
+        appendEvictionEvent(
+          db,
+          validInput({
+            motivo: 'irrelevant',
+            evidenceJson: bad,
+          }),
+        ),
+      ).toThrow(/evidence shape doesn't satisfy/);
+    }
+  });
+
+  test('validation skipped for non-applied outcomes', () => {
+    // blocked_by_hook / blocked_by_protection / trigger_fired_no_action
+    // record an attempted gate, not the substrate's evidence —
+    // structural fields don't apply.
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        motivo: 'low_roi',
+        fromState: 'active',
+        toState: 'active', // same-state pseudo
+        outcome: 'trigger_fired_no_action',
+        evidenceJson: '{}',
+      }),
+    );
+    expect(e.outcome).toBe('trigger_fired_no_action');
   });
 });
 
