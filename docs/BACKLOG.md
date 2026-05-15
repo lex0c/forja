@@ -2,6 +2,73 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(feedback,cli) — loop frio L1 pipeline + /agent policy slash (Phase 3.4)
+
+**Done.** Complete L1 adaptation pipeline for FEEDBACK_ADAPTATION: priors → Bayesian aggregator → accumulation trigger → L1 alias proposer → orchestrator → operator slash. The loop closes for `alias:<from>:<to>` action_signatures. Outcomes from 3.2 feed the aggregator; proposed policies populate the table from 3.3; operators inspect via `/agent policy list` and promote via `/agent policy promote`. NO behavior change yet — dispatch-time rewriting is 3.5.
+
+### Pipeline shape
+
+```
+findAccumulatedSignatures(N≥10)    →  triggered (action_signature, scope) tuples
+  for each L1 tuple:
+    listOutcomesByActionSignature  →  full history (not just window)
+    posteriorFromOutcomes(prior)   →  {mean, ci_low, ci_high, n}
+    passesPromotionGate            →  ci_low > 0.7 AND n >= 10 AND stable
+    findExistingPolicy             →  skip when non-terminal policy exists
+    createPolicy(state='proposed') →  ready for operator review
+```
+
+### Design decisions
+
+- **Priors per level per §5.2**: L1 `Beta(2,1)` optimistic (simple aliases usually work), L2 `Beta(1,1)` uniform, L3 `Beta(1,1)` uniform, L4 `Beta(1,2)` pessimistic (strategies fail more than they appear to — protects against premature enthusiasm from a noisy classifier). Foreign-vocabulary signatures fall through to the uniform default. Future slice loads from TOML config; this slice uses hardcoded defaults so the canonical priors ship in code without an external file dependency.
+
+- **Normal approximation on the Beta posterior** for the 95% CI. Mathematically defensible when n ≥ 10 (the promotion gate threshold). Alternatives — Wilson score interval, exact incomplete-beta-inverse — were considered. Normal approx is the simplest math + smallest code; exact Beta quantile would be ~50× the code without measurable accuracy gain at the gate boundary. Documented in code as a swap-in point.
+
+- **`partial` and `ambiguous` outcomes EXCLUDED from the binomial.** Spec §5 frames the posterior as `P(success | this action_signature in this scope)`; ambiguous outcomes contaminate that signal. They feed a different surface (per-tier evidence schema, future slice). Today they're tallied but ignored for the posterior.
+
+- **Promotion gate: `ci_low > 0.7 AND n >= 10 AND distribution_stable AND no_contradiction_with_superior`** per §5.3. `noContradictionWithSuperior` defaults to true (caller verifies); `distribution_stable` defaults to true until §7.3 detector ships. Gate refusal lands as `kind: 'gate_refused'` with explicit reason string.
+
+- **Accumulation trigger is window-based** (`sinceMs` parameter). Per-signature "última análise" timestamp persistence would prevent re-processing the same outcomes; out of scope here because the loop frio is idempotent (existing `proposed` policy short-circuits re-proposal via the duplicate guard).
+
+- **L1 alias proposer only.** L2 flag adaptation needs per-tool flag detectors that don't ship today (bash parser, etc.). L3 recipe and L4 strategy need their own evidence pipelines + classifier infrastructure. Per spec §4.1, "Adaptação só age em L1-L2 por default. L3 requer N alto e validação humana. L4 requer opt-in explícito." Shipping L1 first is the canonical entry point.
+
+- **Duplicate guard checks for non-terminal states** (proposed/active/shadow/quarantined). Terminal `invalidated` policies do NOT block re-proposal per spec §4.2 ("re-promoção começa de `proposed` novo, com nova evidence"). Tests pin this.
+
+- **`/agent policy run` is operator-triggered.** No scheduler in this slice — operators fire the loop frio manually via the slash. Future slice can add a per-session trigger or background timer; the runner contract is stable.
+
+- **Short-id prefix matching in `/agent policy promote/invalidate/history`.** Same UX pattern as `git`. The 8-char abbreviation from `list` output is enough for unique resolution in practice; the resolver refuses on ambiguity with an explanation. Full UUID also works.
+
+### Files added/modified
+
+| File | Purpose |
+|---|---|
+| `src/feedback/priors.ts` (new) | Per-level Beta priors + `getPriorForSignature` lookup. |
+| `src/feedback/bayesian.ts` (new) | `tallyOutcomes`, `posteriorFromCounts`, `posteriorFromOutcomes`, `passesPromotionGate` + `Z_95` constant. |
+| `src/feedback/accumulation.ts` (new) | `findAccumulatedSignatures` — SQL GROUP BY signature+scope with `HAVING count >= N`. Default minN=10. |
+| `src/feedback/loop-frio.ts` (new) | `runLoopFrio` orchestrator + `SignatureResult` discriminated union (`proposed | gate_refused | duplicate_proposed | level_not_implemented | no_observations`). |
+| `src/cli/slash/commands/agent-policy.ts` (new) | `/agent policy` slash with 6 subcommands: summary, list, promote, invalidate, history, run. |
+| `src/cli/slash/index.ts` | Register `agentPolicyCommand` in `createBuiltinRegistry`. |
+| `tests/feedback/bayesian.test.ts` (new) | 17 tests covering tallying, posterior math (CI bounds clamped, tight-vs-loose-CI), gate (4 refusal reasons), priors lookup. |
+| `tests/feedback/loop-frio.test.ts` (new) | 9 tests: proposed when gate passes; refused when ci_low too low / n < 10 / unstable; skip non-L1; duplicate guard (non-terminal blocks, terminal doesn't); cross-scope independence; scope filter; motivo content. |
+| `tests/cli/slash/agent-policy.test.ts` (new) | 16 tests: summary, list (grouped + filtered), promote (full id + short prefix + illegal + ambiguous + missing), invalidate, history, run, error paths. |
+| `tests/cli/slash/dispatch.test.ts` | Builtin count bumped 16 → 17. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings (after biome auto-fix)
+- `bun test` 7675 pass / 10 skip / 0 fail (+42 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.5 — L1 alias dispatch** (next + final slice for L1 closure): tool-dispatch consults `resolveActivePolicy`; if an active L1 alias policy matches, rewrite the tool call before invocation. Loop closes end-to-end.
+- **TOML-loaded priors**: spec §5.2 YAML example would let operators override per `action_signature` pattern. Future slice.
+- **Persisted "última análise" timestamp**: per-signature watermark so the accumulation trigger only counts NEW outcomes since the last loop frio run. Today the runner is idempotent via duplicate guard, so this is optimization not correctness.
+- **Distribution shift detector** (§7.3): when scope unstable, all proposals are refused. Today `distributionStable` defaults to true.
+- **L2/L3/L4 proposers**: per-tool flag detector for L2; recipe template matcher for L3; classifier-driven strategy detector for L4 (gated, opt-in).
+- **Trigger-driven invocation**: today operators fire the loop frio manually via `/agent policy run`. Future slice can add session-end automatic invocation or per-N-outcomes timer.
+- **Cross-scope promotion** (e.g., 9/10 in repo X → user-scope promotion): per §6.2 explicitly NOT auto.
+
 ## [2026-05-15] feat(storage,feedback) — policies table + scope resolver (Phase 3.3)
 
 **Done.** Schema + state machine + scope-aware lookup for adaptation policies. The loop frio (3.4) writes proposed/active rows; the tool dispatcher (3.5) reads via the resolver at decision time. No callers wire either yet — pure infrastructure.
