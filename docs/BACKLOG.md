@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(retrieval) — Phase 4 kickoff (RETRIEVAL.md v1)
+
+**In progress.** New branch `feat/retrieval` starts implementing `docs/spec/RETRIEVAL.md` v1 — the pipeline `query → candidates → expansion → ranking → compression → context slot`. Decisions agreed up front:
+
+- **Workspace view via filesystem + ripgrep**, not CODE_INDEX. The auto-memory entry "não vamos implementar code index" stays in force; workspace falls back to ripgrep + filename match. Loses caller/reference structural edges; covers symbol find / grep / file outline.
+- **Insertion via a model-facing `retrieve_context` tool**, not auto-fire on step start. Aligns with spec §1.2 ("retrieval is tool, not driver") and lets eval measure per-call value.
+- Slices declared up front (4.1 foundation; 4.2 memory view; 4.3 session view; 4.4 workspace view; 4.5 expansion; 4.6 ranking; 4.7 compression; 4.8 trace; 4.9 integration). v1 ships no embedding, no usage signal, no cross-view auto-edges (per spec §12.1).
+
+### 4.1 — Foundation (this entry)
+
+Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet — these are stubs returning empty results. Establishes the public shape so 4.2+ slot into the skeleton without churn.
+
 ## [2026-05-15] fix(feedback,memory,storage) — Phase 3.7 review batch (14 findings closed)
 
 **Done.** Closes the comprehensive code-review punch list for the `feat/memory` branch (32 commits across multiple phases). Findings span Critical (1), High (3), Medium (7), Low (3) severity; all closed in five tightly-scoped slices on the same branch.

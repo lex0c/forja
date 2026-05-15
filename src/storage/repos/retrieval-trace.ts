@@ -1,0 +1,250 @@
+// retrieval_trace repo (RETRIEVAL.md §10.1).
+//
+// One row per `runRetrieval` call. The pipeline writes ONE INSERT
+// at the end (not per-stage updates) — partial writes would let an
+// observer read a half-completed trace and draw wrong conclusions.
+// When a stage throws, the caller decides whether to persist a
+// partial row (filling in nulls for the stages that didn't run);
+// the spec-correct default is "no partial trace, an error surfaces
+// via the exception".
+//
+// Scrub policy at the repo layer (asymmetric by field, by design):
+//
+//   SCRUBBED (paths / hosts / IPs / SSH refs redacted at INSERT):
+//     - query_text
+//     - candidate `reason` strings across all three stages
+//       (raw / expanded / ranked) and the `reason` in skipped slot
+//       entries — these are operator/view free-form text and can
+//       leak a path the operator typed or a filename a view picked
+//       up. Same pattern outcomes.evidence_json applies for the
+//       same reason.
+//
+//   LEFT RAW (substrate; scrubbing would defeat the pipeline):
+//     - ContextSlotEntry.content — the body the retrieval is
+//       meant to surface. The model needs the real content to
+//       reason; an eval replay needs the real content to re-rank.
+//       Secret redaction at the prompt boundary
+//       (`telemetry/scrubbing` in the model I/O path) handles
+//       what doesn't leave the machine; the trace stores the
+//       substrate as-is.
+//
+// Trace rows live as long as their session (FK CASCADE). Per-trace
+// retention beyond that is operator policy — we don't auto-prune.
+
+import type {
+  Candidate,
+  ContextSlot,
+  ExpandedCandidate,
+  PipelineTimings,
+  RankedCandidate,
+  RetrievalQueryType,
+  RetrievalTraceRow,
+  RetrievalWorkflow,
+} from '../../retrieval/types.ts';
+import { scrubFreeformText } from '../../telemetry/scrubbing.ts';
+import type { DB } from '../db.ts';
+
+export interface CreateRetrievalTraceInput {
+  // Optional; defaults to crypto.randomUUID(). Caller pins when
+  // replaying / importing.
+  id?: string;
+  sessionId: string;
+  queryText: string;
+  workflow: RetrievalWorkflow;
+  queryType: RetrievalQueryType;
+  budgetTokens: number;
+  candidatesRaw: Candidate[];
+  candidatesExpanded: ExpandedCandidate[];
+  candidatesRanked: RankedCandidate[];
+  contextSlot: ContextSlot;
+  timings: PipelineTimings;
+  // Optional epoch ms; defaults to Date.now().
+  createdAt?: number;
+}
+
+interface RetrievalTraceDbRow {
+  id: string;
+  session_id: string;
+  query_text: string;
+  workflow: RetrievalWorkflow;
+  query_type: RetrievalQueryType;
+  budget_tokens: number;
+  candidates_raw_json: string | null;
+  candidates_expanded_json: string | null;
+  candidates_ranked_json: string | null;
+  context_slot_json: string | null;
+  timings_json: string | null;
+  created_at: number;
+}
+
+const fromRow = (row: RetrievalTraceDbRow): RetrievalTraceRow => {
+  const parse = <T>(json: string | null, fallback: T): T => {
+    if (json === null) return fallback;
+    try {
+      return JSON.parse(json) as T;
+    } catch {
+      // The repo writes JSON we control; a corrupted row implies
+      // direct DB mutation. Fall back so a corrupted slice still
+      // returns a structurally-valid object.
+      return fallback;
+    }
+  };
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    queryText: row.query_text,
+    workflow: row.workflow,
+    queryType: row.query_type,
+    budgetTokens: row.budget_tokens,
+    candidatesRaw: parse<Candidate[]>(row.candidates_raw_json, []),
+    candidatesExpanded: parse<ExpandedCandidate[]>(row.candidates_expanded_json, []),
+    candidatesRanked: parse<RankedCandidate[]>(row.candidates_ranked_json, []),
+    contextSlot: parse<ContextSlot>(row.context_slot_json, { included: [], skipped: [] }),
+    timings: parse<PipelineTimings>(row.timings_json, {
+      searchMs: 0,
+      expandMs: 0,
+      rankMs: 0,
+      compressMs: 0,
+    }),
+    createdAt: row.created_at,
+  };
+};
+
+// Selective scrub. Operator/view-emitted free-form strings (the
+// `reason` carried through every candidate stage and the `reason`
+// in skipped entries) can leak paths the operator typed into a
+// query or filenames the view picked up. We scrub those.
+//
+// `ContextSlotEntry.content` is the OPPOSITE policy — it carries
+// the substrate the retrieval is meant to surface (file body,
+// memory body). Scrubbing here would defeat the pipeline's purpose
+// (the compressed payload would lose its meaning). The scrub
+// layer at the prompt boundary (telemetry/scrubbing in the model
+// I/O path) handles secret redaction before tokens leave the
+// machine; the trace stores the substrate as-is so eval replay
+// can re-rank against the real content.
+const scrubReason = (reason: string): string => scrubFreeformText(reason);
+
+const scrubCandidates = (cands: readonly Candidate[]): Candidate[] =>
+  cands.map((c) => ({ ...c, reason: scrubReason(c.reason) }));
+
+const scrubExpanded = (cands: readonly ExpandedCandidate[]): ExpandedCandidate[] =>
+  cands.map((c) => ({ ...c, reason: scrubReason(c.reason) }));
+
+const scrubRanked = (cands: readonly RankedCandidate[]): RankedCandidate[] =>
+  cands.map((c) => ({ ...c, reason: scrubReason(c.reason) }));
+
+const scrubContextSlot = (slot: ContextSlot): ContextSlot => ({
+  included: slot.included.map((e) => ({ ...e })), // content kept raw (see header)
+  skipped: slot.skipped.map((s) => ({ ...s, reason: scrubReason(s.reason) })),
+});
+
+const INSERT_SQL = `
+  INSERT INTO retrieval_trace (
+    id, session_id, query_text, workflow, query_type, budget_tokens,
+    candidates_raw_json, candidates_expanded_json, candidates_ranked_json,
+    context_slot_json, timings_json, created_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
+export const createRetrievalTrace = (
+  db: DB,
+  input: CreateRetrievalTraceInput,
+): RetrievalTraceRow => {
+  const id = input.id ?? crypto.randomUUID();
+  const createdAt = input.createdAt ?? Date.now();
+  // Scrub query text + all view-emitted reason strings. See
+  // scrubReason header for the policy on what's scrubbed vs left
+  // raw.
+  const queryText = scrubFreeformText(input.queryText);
+  const candidatesRaw = scrubCandidates(input.candidatesRaw);
+  const candidatesExpanded = scrubExpanded(input.candidatesExpanded);
+  const candidatesRanked = scrubRanked(input.candidatesRanked);
+  const contextSlot = scrubContextSlot(input.contextSlot);
+  db.query(INSERT_SQL).run(
+    id,
+    input.sessionId,
+    queryText,
+    input.workflow,
+    input.queryType,
+    input.budgetTokens,
+    JSON.stringify(candidatesRaw),
+    JSON.stringify(candidatesExpanded),
+    JSON.stringify(candidatesRanked),
+    JSON.stringify(contextSlot),
+    JSON.stringify(input.timings),
+    createdAt,
+  );
+  return {
+    id,
+    sessionId: input.sessionId,
+    queryText,
+    workflow: input.workflow,
+    queryType: input.queryType,
+    budgetTokens: input.budgetTokens,
+    candidatesRaw,
+    candidatesExpanded,
+    candidatesRanked,
+    contextSlot,
+    timings: input.timings,
+    createdAt,
+  };
+};
+
+const SELECT_ALL = `
+  SELECT id, session_id, query_text, workflow, query_type, budget_tokens,
+         candidates_raw_json, candidates_expanded_json, candidates_ranked_json,
+         context_slot_json, timings_json, created_at
+    FROM retrieval_trace
+`;
+
+export const getRetrievalTrace = (db: DB, id: string): RetrievalTraceRow | null => {
+  const row = db.query(`${SELECT_ALL} WHERE id = ?`).get(id) as RetrievalTraceDbRow | null;
+  return row !== null ? fromRow(row) : null;
+};
+
+// Latest N traces in a session, newest first. Backed by
+// idx_retrieval_trace_session_created. Default limit 20 mirrors
+// /memory audit + /agent policy list pagination defaults.
+export const listRetrievalTracesBySession = (
+  db: DB,
+  sessionId: string,
+  limit = 20,
+): RetrievalTraceRow[] => {
+  const rows = db
+    .query<RetrievalTraceDbRow, [string, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?`,
+    )
+    .all(sessionId, limit);
+  return rows.map(fromRow);
+};
+
+// Latest N traces for a specific workflow across sessions, newest
+// first. Useful for per-workflow eval / metric queries. Backed by
+// idx_retrieval_trace_workflow + table scan within the matching
+// rows.
+export const listRetrievalTracesByWorkflow = (
+  db: DB,
+  workflow: RetrievalWorkflow,
+  limit = 50,
+): RetrievalTraceRow[] => {
+  const rows = db
+    .query<RetrievalTraceDbRow, [RetrievalWorkflow, number]>(
+      `${SELECT_ALL}
+        WHERE workflow = ?
+        ORDER BY created_at DESC
+        LIMIT ?`,
+    )
+    .all(workflow, limit);
+  return rows.map(fromRow);
+};
+
+export const countRetrievalTraces = (db: DB): number => {
+  const row = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM retrieval_trace').get() as {
+    n: number;
+  };
+  return row.n;
+};
