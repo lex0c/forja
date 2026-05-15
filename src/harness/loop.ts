@@ -22,6 +22,7 @@ import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
 import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
+import { resolveRepoRoot } from '../memory/paths.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -224,6 +225,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let steps = 0;
   let consecutiveErrors = 0;
   let sessionId = '';
+  // Repo root for scope-chain resolution. `config.cwd` is the
+  // invocation directory; an operator starting the CLI from a
+  // subdirectory of a repo would otherwise see policy / outcome
+  // scope_ids fragment per-subdirectory, so a `repo`-scoped policy
+  // promoted from one folder wouldn't apply when dispatching from
+  // another. `resolveRepoRoot` runs `git rev-parse --show-toplevel`
+  // once per run (cheap — config.cwd is stable across the session
+  // by the resume cwd-mismatch check) and falls back to config.cwd
+  // outside a git checkout. Language detection benefits too:
+  // markers (package.json, Cargo.toml, etc.) live at the repo root,
+  // not in arbitrary subdirectories.
+  const repoRoot = resolveRepoRoot(config.cwd);
   let lastMessageId = '';
   // Session-scoped bg manager. Created lazily after createSession
   // so the manager can record the right session_id on every spawn.
@@ -2622,7 +2635,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             const rewrite = maybeRewriteBashCommand(
               config.db,
               originalCommand,
-              buildScopeChain({ sessionId, repoCwd: config.cwd }),
+              buildScopeChain({ sessionId, repoCwd: repoRoot }),
             );
             if (
               rewrite.rewritten &&
@@ -2771,7 +2784,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // at scope=session and repo/user/language-scoped
             // policies never accumulate evidence (3.7b — fixes
             // H1 from the branch review).
-            scopeChain: buildScopeChain({ sessionId, repoCwd: config.cwd }),
+            scopeChain: buildScopeChain({ sessionId, repoCwd: repoRoot }),
           });
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state
