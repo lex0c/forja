@@ -272,6 +272,29 @@ describe('/pin --remove', () => {
     expect(store.listPinsBySession(sessionId)).toHaveLength(2);
   });
 
+  test('full-UUID --remove rejects cross-session pins (session-scoped contract)', async () => {
+    // Regression: the 36-char fast path skipped session checks and
+    // deleted by global id only. An operator with a foreign pin's
+    // UUID (from logs / tooling) could mutate another session's
+    // state. The fast path now requires pin.sessionId === sessionId
+    // and emits the same not-found copy on mismatch so the existence
+    // of the foreign pin doesn't leak.
+    const foreignSessionId = createSession(db, { model: 'test/m', cwd: '/p' }).id;
+    const foreignPin = store.createPin({
+      sessionId: foreignSessionId,
+      text: 'foreign',
+      kind: 'constraint',
+      createdBy: 'user',
+    });
+    expect(foreignPin.id.length).toBe(36);
+    const r = await pinCommand.exec(['--remove', foreignPin.id], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('no pin with id');
+    // Foreign pin still on disk — we never executed the delete.
+    expect(store.getPin(foreignPin.id)).not.toBeNull();
+  });
+
   test('prefix lookup is scoped to the active session', async () => {
     // A pin in a DIFFERENT session should not satisfy the prefix
     // match — operator can only remove pins they can see in their

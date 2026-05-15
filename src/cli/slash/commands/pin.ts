@@ -222,19 +222,39 @@ const handleRemove = (
   now: number,
 ): SlashResult => {
   // Fast path: caller passed the full UUID — exact match avoids the
-  // prefix scan + ambiguity check. Same semantics as before this
-  // helper learned prefix resolution.
-  if (removeId.length === 36 && store.getPin(removeId) !== null) {
-    const ok = store.removePin(removeId);
-    if (!ok) {
-      // Race: pin was removed between getPin and removePin. Treat
-      // as not-found from the operator's POV.
+  // prefix scan + ambiguity check. Session-scoped: a pin whose UUID
+  // is known (from logs, tooling, audit dumps) but belongs to a
+  // different session must NOT be deletable through this command —
+  // /pin's contract is "you can only mutate pins you can see in
+  // /pin --list", and --list filters to the current session. A
+  // foreign-session id collapses into the same not-found copy the
+  // prefix path emits.
+  if (removeId.length === 36) {
+    const pin = store.getPin(removeId);
+    if (pin !== null && pin.sessionId === sessionId) {
+      const ok = store.removePin(removeId);
+      if (!ok) {
+        // Race: pin was removed between getPin and removePin. Treat
+        // as not-found from the operator's POV.
+        return {
+          kind: 'error',
+          message: `/pin: no pin with id '${removeId}' (try /pin --list)`,
+        };
+      }
+      return { kind: 'ok', notes: [`removed pin ${shortId(removeId)}`] };
+    }
+    if (pin !== null) {
+      // Pin exists globally but belongs to another session. Surface
+      // the same not-found message instead of leaking the existence
+      // of the other session's pin.
       return {
         kind: 'error',
         message: `/pin: no pin with id '${removeId}' (try /pin --list)`,
       };
     }
-    return { kind: 'ok', notes: [`removed pin ${shortId(removeId)}`] };
+    // Fall through: 36 chars but not a known id. The prefix path
+    // below will produce the not-found error — keeping a single
+    // exit point for the operator-facing copy.
   }
 
   // Prefix path: resolve operator-typed shortId (or any unique prefix)
