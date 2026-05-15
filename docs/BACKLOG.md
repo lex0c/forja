@@ -22,6 +22,18 @@ Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet
 
 What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
 
+### 4.3 — Session view
+
+`src/retrieval/views/session.ts` projects the implicit session graph (RETRIEVAL §15.1 calls these "structures that ARE edges") onto a BM25 corpus. Three sources contribute one candidate per row:
+
+- **Messages** (`messages.content`) — Anthropic-shaped content blocks get text extracted; plain strings flow through unchanged. Role weighting: user × 3 (operator goal carries identifying signal), assistant × 1, tool × 1.
+- **Tool calls** (`tool_calls.tool_name` + `input`) — joined via `message_id → messages.session_id`. Tool name × 3 (more identifying than the JSON-stringified input). Output is intentionally NOT in the corpus — unbounded sizes (megabytes of stdout) would dominate without producing useful signal; slice 4.7 resolves outputs at `full` level for selected candidates only.
+- **Failure events** (`failure_events.code` + `classe` + `recovery_action` + `payload_json`) — code/classe/recovery × 3, payload × 1.
+
+Node ids: `session:message:<id>`, `session:tool_call:<id>`, `session:failure:<id>` — scoped so the trace makes the substrate visible.
+
+Temporal decay (§4.3 half-life 1h) is INTENTIONALLY NOT applied at bootstrap. The "recência boost" from spec §3.2 manifests in the ranking signal_temporal weight (slice 4.6) which is heaviest for the debug workflow. The trace records undecayed BM25 scores so eval replay can re-rank against truth without unwinding the decay.
+
 ## [2026-05-15] fix(feedback,memory,storage) — Phase 3.7 review batch (14 findings closed)
 
 **Done.** Closes the comprehensive code-review punch list for the `feat/memory` branch (32 commits across multiple phases). Findings span Critical (1), High (3), Medium (7), Low (3) severity; all closed in five tightly-scoped slices on the same branch.

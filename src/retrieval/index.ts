@@ -37,3 +37,6 @@ export type { BM25Document, BM25Hit, BM25Index } from './bm25.ts';
 
 export { createMemoryView } from './views/memory.ts';
 export type { MemoryViewDeps } from './views/memory.ts';
+
+export { createSessionView } from './views/session.ts';
+export type { SessionViewDeps } from './views/session.ts';
