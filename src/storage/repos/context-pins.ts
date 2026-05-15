@@ -200,6 +200,10 @@ export interface CreatePinInput {
   expiresAt?: number | null;
   // Optional step_id for model-proposed pins; NULL for /pin slash.
   sourceStepId?: string | null;
+  // Optional wall-clock anchor for the cap check (expired pins
+  // don't count toward the cap). Defaults to Date.now() in
+  // production; tests pin a value to make expiry deterministic.
+  now?: number;
 }
 
 const validateInput = (input: CreatePinInput): void => {
@@ -252,19 +256,24 @@ export const createPin = (db: DB, input: CreatePinInput): ContextPin => {
     source_step_id: sourceStepId,
   };
   return withImmediateTransaction(db, () => {
-    // Cap check counts ALL pins for the session, not just non-
-    // expired ones. §12.4.2 says "10 pins per session" without
-    // qualifier — operator removing expired ones explicitly is
-    // intentional friction (the alternative, silently allowing
-    // creation after expiry, hides resource pressure). The TTL
-    // window in the spec is short (default end-of-session) so
-    // this only matters in very long sessions with high pin churn,
-    // a degenerate case where the cap should bite harder anyway.
+    // Cap check counts ONLY active (non-expired) pins, matching
+    // what /pin --list shows and what prefix removal operates on.
+    // Counting expired rows here produced a dead-end: 10
+    // short-lived pins that lapsed would still block new creates,
+    // but the operator couldn't list or remove the expired rows to
+    // free the slot. §12.4.2's "10 pins per session" is the active
+    // surface budget; expired rows linger as history but don't
+    // occupy capacity. Use the same `now` anchor downstream
+    // surfaces use so expired-but-not-yet-gc'd rows fall off the
+    // count atomically with the active-list view.
+    const nowMs = input.now ?? Date.now();
     const { count } = db
-      .query<{ count: number }, [string]>(
-        'SELECT COUNT(*) AS count FROM context_pins WHERE session_id = ?',
+      .query<{ count: number }, [string, number]>(
+        `SELECT COUNT(*) AS count FROM context_pins
+          WHERE session_id = ?
+            AND (expires_at IS NULL OR expires_at > ?)`,
       )
-      .get(input.sessionId) ?? { count: 0 };
+      .get(input.sessionId, nowMs) ?? { count: 0 };
     if (count >= PIN_CAP) {
       throw new PinCapExceededError(input.sessionId, count);
     }

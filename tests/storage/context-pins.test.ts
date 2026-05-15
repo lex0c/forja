@@ -136,14 +136,43 @@ describe('context_pins repo: cap enforcement', () => {
     expect(() => createPin(db, validInput({ text: 'now fits' }))).not.toThrow();
   });
 
-  test('cap counts ALL pins including expired ones (matches spec)', () => {
-    // Spec §12.4.2 says "10 pins per session" without an
-    // "active-only" qualifier — operator must remove explicitly.
-    const past = Date.now() - 60_000;
+  test('cap counts only ACTIVE pins — expired rows do not occupy capacity', () => {
+    // Regression: counting expired pins toward the cap produced a
+    // dead-end for operators who created 10 short-lived pins. After
+    // expiry, /pin --list showed nothing (it filters to active) but
+    // createPin still refused — and there were no listable IDs to
+    // remove. The cap is now the ACTIVE surface budget; expired
+    // rows linger as history but free their slot.
+    const now = 1_000_000;
+    const past = now - 60_000;
     for (let i = 0; i < PIN_CAP; i++) {
       createPin(db, validInput({ text: `expired ${i}`, expiresAt: past }));
     }
-    expect(() => createPin(db, validInput({ text: 'still no room' }))).toThrow(PinCapExceededError);
+    // The 10 rows are still on disk but every one of them is past
+    // expiry — a new create at `now` finds zero active pins.
+    expect(() => createPin(db, validInput({ text: 'fresh room', now }))).not.toThrow();
+  });
+
+  test('cap counts a mix of active + expired by the active subset only', () => {
+    const now = 2_000_000;
+    const past = now - 60_000;
+    const future = now + 60_000;
+    // Six active (expires in the future) + four expired = 10 rows
+    // total but only 6 occupying the cap.
+    for (let i = 0; i < 6; i++) {
+      createPin(db, validInput({ text: `live ${i}`, expiresAt: future }));
+    }
+    for (let i = 0; i < 4; i++) {
+      createPin(db, validInput({ text: `dead ${i}`, expiresAt: past }));
+    }
+    // Four more actives still fit (6 + 4 = 10).
+    for (let i = 0; i < 4; i++) {
+      createPin(db, validInput({ text: `additional ${i}`, expiresAt: future, now }));
+    }
+    // 11th active is refused.
+    expect(() => createPin(db, validInput({ text: 'overflow', expiresAt: future, now }))).toThrow(
+      PinCapExceededError,
+    );
   });
 
   test('PinCapExceededError carries diagnostic fields', () => {

@@ -350,6 +350,10 @@ const handleCreate = (
       createdBy: 'user',
       ...(expiresAt !== null ? { expiresAt } : {}),
       createdAt: nowMs,
+      // Anchor the cap check at the same wall-clock the
+      // expiry math above used so the "expired pins don't
+      // count" semantics behave consistently in a single call.
+      now: nowMs,
     });
     const remaining = store.countActivePinsBySession(sessionId, nowMs);
     return {
