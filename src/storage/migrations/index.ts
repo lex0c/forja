@@ -45,6 +45,7 @@ import { migration044HookRunsPostToolUseFailure } from './044-hook-runs-post-too
 import { migration045ContextPins } from './045-context-pins.ts';
 import { migration046EvictionEvents } from './046-eviction-events.ts';
 import { migration047EvictionHookRuns } from './047-eviction-hook-runs.ts';
+import { migration048MemoryEventsLifecycleActions } from './048-memory-events-lifecycle-actions.ts';
 
 export interface Migration {
   id: number;
@@ -100,4 +101,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration045ContextPins,
   migration046EvictionEvents,
   migration047EvictionHookRuns,
+  migration048MemoryEventsLifecycleActions,
 ];

@@ -20,7 +20,15 @@ export type MemoryEventAction =
   | 'refused'
   | 'promoted'
   | 'demoted'
-  | 'expired';
+  | 'expired'
+  // Phase 0 stitching (MEMORY.md §5.3 + EVICTION.md §3) added
+  // five lifecycle actions. Migration 048 expanded the CHECK
+  // constraint to admit them; this union mirrors the schema.
+  | 'quarantined'
+  | 'invalidated'
+  | 'evicted'
+  | 'restored'
+  | 'purged';
 export type MemoryEventSource = 'user_explicit' | 'inferred' | 'imported';
 
 export interface MemoryEvent {

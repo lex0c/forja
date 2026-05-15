@@ -59,6 +59,12 @@ export type {
   TombstoneEntry,
 } from './tombstones.ts';
 
+export { transitionMemoryState } from './transitions.ts';
+export type {
+  TransitionMemoryStateInput,
+  TransitionMemoryStateResult,
+} from './transitions.ts';
+
 export { DEFAULT_AGENT_GITIGNORE, ensureAgentGitignore } from './gitignore.ts';
 export type { EnsureAgentGitignoreResult } from './gitignore.ts';
 

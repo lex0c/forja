@@ -2,6 +2,64 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] feat(memory) — transitionMemoryState helper (Phase 1.3.c1)
+
+**Done.** Memory's owner of the eviction contract from Phase 1.2. One async function (`transitionMemoryState`) orchestrates a lifecycle transition end-to-end across the file, the index, the `eviction_events` table, and the `memory_events` table — emitted as a paired audit so forensic queries can answer "what changed and why" from either surface. No caller wires it yet — verify-before-act (1.3.c2) and `/memory delete` (1.3.c3) follow.
+
+Also includes migration 048 (memory_events.action CHECK enum expanded), which the Phase 0 stitching declared in the spec vocabulary but never landed at SQL level. Same rebuild pattern migrations 044/047 use (SQLite doesn't ALTER CHECK).
+
+### Pipeline (5 stages, each independently failing)
+
+1. **Read current state.** Body file via `readMemoryByName`; if missing, fall back to `.tombstones/` (the lifecycle target). `fromState` is derived from the frontmatter `state` field (default `active`) or the tombstone (`evicted`).
+2. **Validate transition.** `isLegalTransition(from, to, motivo)` from the 1.2.a state machine. Refusal returns `kind: 'illegal_transition'` with structured reason.
+3. **Fire Eviction hook if wired.** Payload uses the `EvictionEventData` shape (1.2.b). Blocking hook produces `outcome: 'blocked_by_hook'` audit row + `memory_events action='refused'` row; no file/index change.
+4. **Apply transition.** Per (from, to) tuple — `active→quarantined` mutates frontmatter, `*→evicted` mutates frontmatter then renames into `.tombstones/` + removes index entry, `evicted→active` (restore) reads tombstone, copies back, removes tombstone, re-inserts index, `evicted→purged` removes tombstone, etc. File mutations are atomic via temp+rename mirroring `lifecycle.ts`.
+5. **Persist audit pair.** `eviction_events` with `outcome: 'applied'` (or `trigger_fired_no_action` for same-state pseudo-transitions); `memory_events` with the matching lifecycle action (`quarantined`, `evicted`, `invalidated`, `restored`, `purged`, `created`, `refused`).
+
+### Design decisions
+
+- **Helper is async** because the hook fire is async. Other code paths in `src/memory/` stay sync; only this new surface is async. Pattern matches `memory_write` tool.
+- **State machine is the source of truth.** Transitions not in `LEGAL_TRANSITIONS` (from 1.2.a) are refused — even when spec MEMORY §6.5 might suggest a direct path (e.g. `active → evicted` for `/memory delete`). Callers do 2-step transitions through `quarantined`. The state machine wins; spec EVICTION.md §4.1 is canonical.
+- **Same-state transitions record `trigger_fired_no_action`.** A trigger that fires but doesn't advance state (verify-before-act called on an already-quarantined memory) lands as a no-action audit row so trigger thrashing is observable downstream (1.2.a's `detectTriggerThrashing` query).
+- **File state precedes audit write.** If the audit INSERT fails after a successful file/index mutation, the helper returns `kind: 'io_error'` — surfacing drift without rolling back disk state (which would itself be racy). Future reconciliation slice replays from disk shape.
+- **Tombstone frontmatter has `state: 'evicted'`.** Eviction writes the frontmatter first, then renames body→tombstone, so the tombstone file accurately reflects the state it represents. Restore reads the tombstone, strips the state field (default `active`), writes body back, removes tombstone.
+- **Hook payload skipped when `fireHook` unwired.** Same pattern memory_write uses for `confirmMemoryWrite` — headless / test contexts don't need to construct a no-op hook callback.
+- **`evidence_json` redaction is delegated.** `appendEvictionEvent` (the 1.2.a repo, post-1.2 review) runs the scrub on the way in; this layer just JSON-serializes the input `evidence` Record.
+
+### Migration 048
+
+`memory_events.action` CHECK pre-Phase-0 only admitted the 9 original actions (`proposed`, `created`, `edited`, `deleted`, `read`, `refused`, `promoted`, `demoted`, `expired`). Phase 0 added five lifecycle actions to the spec (`quarantined`, `invalidated`, `evicted`, `restored`, `purged`) but never expanded the SQL CHECK — same gap C1 of the post-1.2 review fixed for `hook_runs.event = 'Eviction'`. Without 048, every `transitionMemoryState` would fail-and-stderr through `registry.recordEvent`'s catch-and-log, dropping audit silently. The TS union (`MemoryEventAction` in `src/storage/repos/memory-events.ts`) is updated in lockstep.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/memory/transitions.ts` | Public surface: `transitionMemoryState` async helper + `TransitionMemoryStateInput` / `TransitionMemoryStateResult` types |
+| `src/storage/migrations/048-memory-events-lifecycle-actions.ts` | Rebuild `memory_events` with the expanded `action` CHECK enum |
+| `tests/memory/transitions.test.ts` | 11 tests: active→quarantined, active→evicted illegal, quarantined→evicted, evicted→active restore, evicted→purged, illegal motivo, unknown memory, same-state pseudo, hook blocks, evidence redaction |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/index.ts` | Barrel re-export of `transitionMemoryState` + types |
+| `src/storage/repos/memory-events.ts` | Add 5 lifecycle values to `MemoryEventAction` union |
+| `src/storage/migrations/index.ts` | Register migration 048 |
+
+### Deferred
+
+- **1.3.c2** — Wire verify-before-act detector → `active → quarantined` (motivo=shift, trigger=verify_failed).
+- **1.3.c3** — Wire `/memory delete` slash → 2-step `active → quarantined → evicted`. Note: state machine rejects direct `active → evicted`. Spec EVICTION §4.1 may eventually warrant a `user_purge` motivo on the direct path (follow-up; would require spec PR).
+- **1.3.d** — `/memory restore <name>` slash + re-admission flow.
+- **GC sweep** — `agent gc` calls `listExpiredTombstones` + transition `evicted → purged` per scope retention window.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/transitions.test.ts` 11 pass / 0 fail
+- `bun test` 7503 pass / 10 skip / 0 fail (+11 from 1.3.b baseline 7492)
+
 ## [2026-05-15] feat(memory) — .tombstones/ paths + lifecycle helpers (Phase 1.3.b)
 
 **Done.** Second slice of memory lifecycle. Adds the `.tombstones/` storage layer per `MEMORY.md` §6.5: a per-scope sub-directory under the scope root that holds evicted body files renamed `<name>.<unix_ms>.md`. Path helpers in `paths.ts`; I/O helpers (move, list, find latest, list expired, remove) in a new `tombstones.ts`. No consumer yet — eviction transition that calls `moveToTombstone` is 1.3.c.
