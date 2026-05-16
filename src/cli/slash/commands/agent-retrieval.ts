@@ -1,0 +1,418 @@
+// /agent retrieval — operator-facing inspection of the retrieval
+// pipeline (RETRIEVAL.md §10.1 + §10.2).
+//
+// Subcommands:
+//   /agent retrieval                       summary (counts + latest)
+//   /agent retrieval audit [--limit N]     tail of retrieval_trace
+//   /agent retrieval replay <queryId>      full per-stage dump
+//   /agent retrieval metrics [--days N]    aggregated §10.2 surface
+//   /agent retrieval workflows             WORKFLOW_WEIGHTS table
+//
+// Reads from `retrieval_trace` populated by every `runRetrieval`
+// call (slice 4.1). Forensic-only — no slash subcommand mutates
+// pipeline state. Replay short-ids work like /agent policy: an
+// 8-char prefix is enough when unambiguous.
+
+import { WORKFLOW_WEIGHTS } from '../../../retrieval/ranking.ts';
+import type { RetrievalTraceRow, RetrievalWorkflow } from '../../../retrieval/types.ts';
+import {
+  getRetrievalTrace,
+  listRetrievalTracesBySession,
+} from '../../../storage/repos/retrieval-trace.ts';
+import type { SlashContext, SlashResult } from '../types.ts';
+
+// ─── helpers ──────────────────────────────────────────────────────────
+
+const DEFAULT_AUDIT_LIMIT = 10;
+const DEFAULT_METRICS_DAYS = 30;
+const MAX_AUDIT_LIMIT = 100;
+const MAX_METRICS_DAYS = 365;
+
+const formatDurationMs = (ms: number): string => {
+  if (ms < 1) return '<1ms';
+  if (ms < 1000) return `${ms.toFixed(0)}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+};
+
+const formatPercent = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`;
+
+const formatTraceSummaryLine = (row: RetrievalTraceRow, nowMs: number): string => {
+  const idShort = row.id.slice(0, 8);
+  const ageMs = nowMs - row.createdAt;
+  const ageStr =
+    ageMs < 60_000
+      ? `${Math.floor(ageMs / 1000)}s ago`
+      : ageMs < 3_600_000
+        ? `${Math.floor(ageMs / 60_000)}m ago`
+        : `${Math.floor(ageMs / 3_600_000)}h ago`;
+  const queryPreview = row.queryText.length > 50 ? `${row.queryText.slice(0, 47)}…` : row.queryText;
+  const included = row.contextSlot.included.length;
+  const skipped = row.contextSlot.skipped.length;
+  const totalMs =
+    row.timings.searchMs + row.timings.expandMs + row.timings.rankMs + row.timings.compressMs;
+  return `  ${idShort} · ${row.workflow.padEnd(16)} · ${ageStr.padEnd(8)} · included=${included} skipped=${skipped} · ${formatDurationMs(totalMs)} · "${queryPreview}"`;
+};
+
+// Resolve a (potentially short-id) prefix to a single trace row.
+// Mirrors the /agent policy resolvePolicyId pattern: full-uuid hit
+// shortcut, then prefix scan over the session's traces, refuse on
+// ambiguity.
+const resolveTraceId = (
+  ctx: SlashContext,
+  prefix: string,
+): { kind: 'ok'; row: RetrievalTraceRow } | { kind: 'error'; message: string } => {
+  if (prefix.length === 0) {
+    return { kind: 'error', message: '/agent retrieval replay: missing query id' };
+  }
+  // Full UUID fast path.
+  if (prefix.length === 36) {
+    const row = getRetrievalTrace(ctx.db, prefix);
+    if (row === null) {
+      return {
+        kind: 'error',
+        message: `/agent retrieval replay: trace ${prefix} not found`,
+      };
+    }
+    return { kind: 'ok', row };
+  }
+  // Prefix scan — cap at MAX_AUDIT_LIMIT rows; deep history needs
+  // the full id.
+  const sessionId = ctx.currentSessionId();
+  if (sessionId === null) {
+    return {
+      kind: 'error',
+      message: '/agent retrieval replay: no active session — pass the full 36-char id',
+    };
+  }
+  const traces = listRetrievalTracesBySession(ctx.db, sessionId, MAX_AUDIT_LIMIT);
+  const matches = traces.filter((t) => t.id.startsWith(prefix));
+  if (matches.length === 0) {
+    return {
+      kind: 'error',
+      message: `/agent retrieval replay: no trace id matches prefix '${prefix}'`,
+    };
+  }
+  if (matches.length > 1) {
+    const ids = matches
+      .slice(0, 5)
+      .map((m) => m.id.slice(0, 8))
+      .join(', ');
+    return {
+      kind: 'error',
+      message: `/agent retrieval replay: prefix '${prefix}' is ambiguous — matches ${matches.length} traces (${ids}…); lengthen the prefix`,
+    };
+  }
+  return { kind: 'ok', row: matches[0] as RetrievalTraceRow };
+};
+
+// ─── /agent retrieval (summary) ───────────────────────────────────────
+
+const handleSummary = (ctx: SlashContext): SlashResult => {
+  const sessionId = ctx.currentSessionId();
+  if (sessionId === null) {
+    return {
+      kind: 'ok',
+      notes: [
+        'retrieval trace empty (no active session)',
+        'subcommands: audit · replay · metrics · workflows',
+      ],
+    };
+  }
+  const traces = listRetrievalTracesBySession(ctx.db, sessionId, MAX_AUDIT_LIMIT);
+  if (traces.length === 0) {
+    return {
+      kind: 'ok',
+      notes: [
+        'no retrieval traces in this session yet',
+        'subcommands: audit · replay · metrics · workflows',
+      ],
+    };
+  }
+  const byWorkflow = new Map<string, number>();
+  for (const t of traces) {
+    byWorkflow.set(t.workflow, (byWorkflow.get(t.workflow) ?? 0) + 1);
+  }
+  const wfSummary = [...byWorkflow.entries()].map(([wf, n]) => `${wf}=${n}`).join(' ');
+  return {
+    kind: 'ok',
+    notes: [
+      `retrieval traces in this session: ${traces.length} (last ${MAX_AUDIT_LIMIT})`,
+      `  by workflow: ${wfSummary}`,
+      'subcommands: audit · replay · metrics · workflows',
+    ],
+  };
+};
+
+// ─── /agent retrieval audit ────────────────────────────────────────────
+
+const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
+  let limit = DEFAULT_AUDIT_LIMIT;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--limit') {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        return { kind: 'error', message: '/agent retrieval audit: --limit needs a value' };
+      }
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_AUDIT_LIMIT) {
+        return {
+          kind: 'error',
+          message: `/agent retrieval audit: --limit must be an integer in [1, ${MAX_AUDIT_LIMIT}] (got ${JSON.stringify(raw)})`,
+        };
+      }
+      limit = parsed;
+      i += 1;
+      continue;
+    }
+    return {
+      kind: 'error',
+      message: `/agent retrieval audit: unknown flag '${args[i]}' (try --limit N)`,
+    };
+  }
+  const sessionId = ctx.currentSessionId();
+  if (sessionId === null) {
+    return {
+      kind: 'error',
+      message: '/agent retrieval audit: no active session — start a turn first',
+    };
+  }
+  const traces = listRetrievalTracesBySession(ctx.db, sessionId, limit);
+  if (traces.length === 0) {
+    return { kind: 'ok', notes: ['no retrieval traces in this session yet'] };
+  }
+  const nowMs = ctx.now();
+  return {
+    kind: 'ok',
+    notes: [
+      `retrieval traces — last ${traces.length} (newest first):`,
+      ...traces.map((t) => formatTraceSummaryLine(t, nowMs)),
+      '  use /agent retrieval replay <id> for the full per-stage dump',
+    ],
+  };
+};
+
+// ─── /agent retrieval replay ───────────────────────────────────────────
+
+const handleReplay = (ctx: SlashContext, args: string[]): SlashResult => {
+  if (args.length === 0) {
+    return {
+      kind: 'error',
+      message: '/agent retrieval replay: missing query id (use /agent retrieval audit to find one)',
+    };
+  }
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/agent retrieval replay: too many args (got ${args.length}, expected 1 id)`,
+    };
+  }
+  const resolved = resolveTraceId(ctx, args[0] as string);
+  if (resolved.kind === 'error') return resolved;
+  const t = resolved.row;
+  const totalMs = t.timings.searchMs + t.timings.expandMs + t.timings.rankMs + t.timings.compressMs;
+  const lines: string[] = [
+    `trace ${t.id}`,
+    `  workflow=${t.workflow}  query_type=${t.queryType}  budget=${t.budgetTokens}t`,
+    `  query: "${t.queryText}"`,
+    '',
+    `timings: total=${formatDurationMs(totalMs)}  (search=${formatDurationMs(t.timings.searchMs)}  expand=${formatDurationMs(t.timings.expandMs)}  rank=${formatDurationMs(t.timings.rankMs)}  compress=${formatDurationMs(t.timings.compressMs)})`,
+    '',
+    `candidates_raw (${t.candidatesRaw.length}):`,
+  ];
+  for (const c of t.candidatesRaw.slice(0, 20)) {
+    lines.push(
+      `  ${c.view}/${c.nodeId.slice(0, 40)} · score=${c.bootstrapScore.toFixed(3)} · ${c.reason}`,
+    );
+  }
+  if (t.candidatesRaw.length > 20) {
+    lines.push(`  … (${t.candidatesRaw.length - 20} more raw candidates omitted)`);
+  }
+  lines.push('', `candidates_ranked (${t.candidatesRanked.length}):`);
+  for (const r of t.candidatesRanked.slice(0, 20)) {
+    const sig = r.signals;
+    lines.push(
+      `  ${r.view}/${r.nodeId.slice(0, 40)} · final=${r.finalScore.toFixed(3)} · str=${sig.structural.toFixed(2)} lex=${sig.lexical.toFixed(2)} sem=${sig.semantic.toFixed(2)} tmp=${sig.temporal.toFixed(2)} use=${sig.usage.toFixed(2)} goal=${sig.goalAlignment.toFixed(2)}`,
+    );
+  }
+  if (t.candidatesRanked.length > 20) {
+    lines.push(`  … (${t.candidatesRanked.length - 20} more ranked candidates omitted)`);
+  }
+  lines.push('', `context_slot included (${t.contextSlot.included.length}):`);
+  for (const e of t.contextSlot.included) {
+    lines.push(`  ${e.view}/${e.nodeId.slice(0, 40)} · level=${e.level} · cost=${e.costTokens}t`);
+  }
+  if (t.contextSlot.skipped.length > 0) {
+    lines.push('', `skipped (${t.contextSlot.skipped.length}):`);
+    for (const s of t.contextSlot.skipped) {
+      const wouldCost = s.wouldCostTokens === null ? 'n/a' : `${s.wouldCostTokens}t`;
+      lines.push(`  ${s.view}/${s.nodeId.slice(0, 40)} · would_cost=${wouldCost} · ${s.reason}`);
+    }
+  }
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /agent retrieval metrics ─────────────────────────────────────────
+
+const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
+  let days = DEFAULT_METRICS_DAYS;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--days') {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        return { kind: 'error', message: '/agent retrieval metrics: --days needs a value' };
+      }
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_METRICS_DAYS) {
+        return {
+          kind: 'error',
+          message: `/agent retrieval metrics: --days must be an integer in [1, ${MAX_METRICS_DAYS}] (got ${JSON.stringify(raw)})`,
+        };
+      }
+      days = parsed;
+      i += 1;
+      continue;
+    }
+    return {
+      kind: 'error',
+      message: `/agent retrieval metrics: unknown flag '${args[i]}' (try --days N)`,
+    };
+  }
+  const sessionId = ctx.currentSessionId();
+  if (sessionId === null) {
+    return {
+      kind: 'error',
+      message: '/agent retrieval metrics: no active session — start a turn first',
+    };
+  }
+  // List ALL traces in the session (capped); filter by time
+  // window in-memory. Per-session is what the operator wants 99%
+  // of the time; cross-session metrics need a different surface.
+  // Use `ctx.now` (not Date.now) so test fixtures with pinned
+  // clocks behave deterministically — same pattern /memory
+  // metrics uses.
+  const cutoffMs = ctx.now() - days * 24 * 60 * 60 * 1000;
+  const traces = listRetrievalTracesBySession(ctx.db, sessionId, MAX_AUDIT_LIMIT).filter(
+    (t) => t.createdAt >= cutoffMs,
+  );
+  if (traces.length === 0) {
+    return {
+      kind: 'ok',
+      notes: [`no retrieval traces in the last ${days}d for this session`],
+    };
+  }
+
+  // §10.2 metrics surface:
+  //   - budget utilization (mean across calls)
+  //   - eviction rate (% ranked candidates that got skipped)
+  //   - diversity (entropy of view distribution in slots)
+  //   - latency p50 / p95 per stage
+  const utilizations: number[] = [];
+  let totalRanked = 0;
+  let totalSkipped = 0;
+  const viewCounts = new Map<string, number>();
+  const searchMs: number[] = [];
+  const expandMs: number[] = [];
+  const rankMs: number[] = [];
+  const compressMs: number[] = [];
+  for (const t of traces) {
+    const used = t.contextSlot.included.reduce((sum, e) => sum + e.costTokens, 0);
+    utilizations.push(t.budgetTokens > 0 ? used / t.budgetTokens : 0);
+    totalRanked += t.candidatesRanked.length;
+    totalSkipped += t.contextSlot.skipped.length;
+    for (const e of t.contextSlot.included) {
+      viewCounts.set(e.view, (viewCounts.get(e.view) ?? 0) + 1);
+    }
+    searchMs.push(t.timings.searchMs);
+    expandMs.push(t.timings.expandMs);
+    rankMs.push(t.timings.rankMs);
+    compressMs.push(t.timings.compressMs);
+  }
+  const mean = (arr: number[]): number =>
+    arr.length === 0 ? 0 : arr.reduce((s, n) => s + n, 0) / arr.length;
+  const percentile = (arr: number[], p: number): number => {
+    if (arr.length === 0) return 0;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+    return sorted[idx] ?? 0;
+  };
+  // Shannon entropy of view distribution. Higher = more diverse;
+  // 0 = single view monopolizes. Normalized to [0, 1] by log(N)
+  // where N is the number of views present (max possible entropy
+  // for that view count).
+  const totalInclusions = [...viewCounts.values()].reduce((s, n) => s + n, 0);
+  let entropy = 0;
+  for (const count of viewCounts.values()) {
+    if (count === 0) continue;
+    const p = count / totalInclusions;
+    entropy -= p * Math.log2(p);
+  }
+  const maxEntropy = viewCounts.size > 1 ? Math.log2(viewCounts.size) : 1;
+  const diversityNorm = maxEntropy > 0 ? entropy / maxEntropy : 0;
+  const evictionRate = totalRanked === 0 ? 0 : totalSkipped / totalRanked;
+
+  const lines: string[] = [
+    `retrieval metrics — last ${days.toFixed(1)}d (${traces.length} traces)`,
+    '',
+    `budget_utilization_mean: ${formatPercent(mean(utilizations))}`,
+    `eviction_rate: ${formatPercent(evictionRate)} (${totalSkipped}/${totalRanked} ranked → skipped)`,
+    `diversity (view-entropy, normalized): ${diversityNorm.toFixed(3)}`,
+    '',
+    'latency by stage (p50 / p95):',
+    `  search:   p50=${formatDurationMs(percentile(searchMs, 0.5))}  p95=${formatDurationMs(percentile(searchMs, 0.95))}`,
+    `  expand:   p50=${formatDurationMs(percentile(expandMs, 0.5))}  p95=${formatDurationMs(percentile(expandMs, 0.95))}`,
+    `  rank:     p50=${formatDurationMs(percentile(rankMs, 0.5))}  p95=${formatDurationMs(percentile(rankMs, 0.95))}`,
+    `  compress: p50=${formatDurationMs(percentile(compressMs, 0.5))}  p95=${formatDurationMs(percentile(compressMs, 0.95))}`,
+  ];
+  if (viewCounts.size > 0) {
+    lines.push('', 'view distribution (slot inclusions):');
+    for (const [v, n] of viewCounts.entries()) {
+      lines.push(`  ${v}: ${n} (${formatPercent(n / totalInclusions)})`);
+    }
+  }
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /agent retrieval workflows ────────────────────────────────────────
+
+const handleWorkflows = (): SlashResult => {
+  const lines: string[] = [
+    'workflow weights (RETRIEVAL §5.2 — drives ranking signal fusion):',
+    '  workflow         · structural · lexical · semantic · temporal · usage · goal',
+  ];
+  const workflows = Object.keys(WORKFLOW_WEIGHTS) as RetrievalWorkflow[];
+  for (const wf of workflows) {
+    const w = WORKFLOW_WEIGHTS[wf];
+    lines.push(
+      `  ${wf.padEnd(16)} · ${w.structural.toFixed(2).padStart(10)} · ${w.lexical.toFixed(2).padStart(7)} · ${w.semantic.toFixed(2).padStart(8)} · ${w.temporal.toFixed(2).padStart(8)} · ${w.usage.toFixed(2).padStart(5)} · ${w.goalAlignment.toFixed(2).padStart(4)}`,
+    );
+  }
+  lines.push(
+    '',
+    'each row sums to 1.0 (module-load guard refuses any drift).',
+    'v1 ships: structural by path-length; lexical via BM25; temporal exp-decay by view',
+    '          (session 1h, memory 30d, workspace none). semantic/usage/goal=0 in v1.',
+  );
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── router ────────────────────────────────────────────────────────────
+
+export const handleRetrievalSub = (ctx: SlashContext, args: string[]): SlashResult => {
+  const sub = args[0];
+  if (sub === undefined) return handleSummary(ctx);
+  switch (sub) {
+    case 'audit':
+      return handleAudit(ctx, args.slice(1));
+    case 'replay':
+      return handleReplay(ctx, args.slice(1));
+    case 'metrics':
+      return handleMetrics(ctx, args.slice(1));
+    case 'workflows':
+      return handleWorkflows();
+    default:
+      return {
+        kind: 'error',
+        message: `/agent retrieval: unknown subcommand '${sub}' (try: audit, replay, metrics, workflows)`,
+      };
+  }
+};

@@ -22,6 +22,24 @@ Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet
 
 What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
 
+### 4.8 — Trace surfaces (`/agent retrieval`)
+
+Operator-facing forensic for the retrieval pipeline (spec §10). No pipeline mutation — pure reads off `retrieval_trace`. Closes the v1 surface: 4.9 wired the tool the model calls; 4.8 wires the slash command the operator inspects.
+
+`src/cli/slash/commands/agent-retrieval.ts` exports `handleRetrievalSub(ctx, args)`, routed from the existing `/agent` command (now accepts both `policy` and `retrieval` subnamespaces).
+
+Subcommands:
+
+- `/agent retrieval` — summary (trace count in current session, distribution by workflow).
+- `/agent retrieval audit [--limit N]` — newest-first list. Default limit 10, cap 100. Each line: short id · workflow · age · included/skipped counts · total latency · query preview.
+- `/agent retrieval replay <id>` — full per-stage dump for one trace. Accepts the 8-char short id (resolved against the session's traces; ambiguity refused with the colliding shortIds). Renders: query metadata, timings per stage, raw candidates with reason + bootstrap, ranked candidates with signal breakdown (`str=… lex=… sem=… tmp=… use=… goal=…`), included slot entries with level + cost, skipped trail with `would_cost` + reason.
+- `/agent retrieval metrics [--days N]` — aggregates §10.2: `budget_utilization_mean`, `eviction_rate` (skipped/ranked ratio), `diversity` (Shannon entropy of view distribution, normalized to [0,1]), latency `p50/p95` per stage, view distribution (slot inclusions per view). Default window 30d, cap 365d. Uses `ctx.now` so test fixtures with pinned clocks behave deterministically (same pattern `/memory metrics` uses).
+- `/agent retrieval workflows` — prints the `WORKFLOW_WEIGHTS` table with each workflow's six-signal split. Doubles as a debugging surface — the operator sees exactly why `debug` weights temporal heavily vs `refactor` weighting structural.
+
+`/agent` root description updated to reflect both subnamespaces; the previous "only 'policy' is implemented" copy is gone.
+
+Tests: 19 new in `tests/cli/slash/agent-retrieval.test.ts` covering router rejection of unknown subnamespace + subcommand, summary (empty / populated with workflow counts), audit (empty / newest-first ordering / --limit cap / invalid --limit / unknown flag), replay (missing id / full dump shape / short-id prefix resolution / skipped rendering / unknown id), metrics (empty window / aggregates surface / --days window / invalid --days), workflows (table coverage + column headers).
+
 ### 4.9 — Integration (retrieve_context tool)
 
 Pipeline finally encosta no operador. The subsystem is now reachable from the model's tool surface — every other slice (4.1 through 4.7) was internal plumbing leading here.
