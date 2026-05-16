@@ -44,8 +44,16 @@ import type {
 // Async because workspace will need filesystem IO (ripgrep). The
 // pipeline awaits them in parallel (Promise.all) — view A blocking
 // on file IO must not stall view B's DB query.
+//
+// `signal` is forwarded from the runner so views that can honor
+// cancellation (subprocess-backed views like workspace ripgrep, or
+// any future view with long-running IO) cancel in-flight work
+// instead of leaving zombies behind. v1 views (memory, session) are
+// synchronous over in-memory / SQLite state — they ignore `signal`
+// today; the pipeline still does a coarse `aborted` check between
+// stages so a flipped signal stops the chain at the next boundary.
 export interface ViewSearch {
-  search(query: RetrievalQuery): Promise<Candidate[]>;
+  search(query: RetrievalQuery, signal?: AbortSignal): Promise<Candidate[]>;
 }
 
 export interface PipelineDeps {
@@ -77,6 +85,15 @@ export interface PipelineDeps {
   // "when did this happen" (epoch) and `monoNow` answers "how
   // long did this stage take" (relative).
   monoNow?: () => number;
+  // Optional abort signal. When set and aborted, the pipeline
+  // throws between stages instead of running them — bounded
+  // cancellation. View-level cancellation is best-effort per the
+  // `ViewSearch.search` contract (only IO-backed views actually
+  // honor it today). A persist failure after compression doesn't
+  // re-check the signal — the work is already done, the row goes
+  // in regardless so the trace stays consistent with what the
+  // caller saw.
+  signal?: AbortSignal;
 }
 
 const defaultExpand = (candidates: Candidate[]): ExpandedCandidate[] =>
@@ -128,6 +145,17 @@ const defaultCompress = (ranked: RankedCandidate[], query: RetrievalQuery): Cont
 
 const defaultMonoNow = (): number => performance.now();
 
+// Throw early when the caller already gave up. Each stage boundary
+// is a yield point — if the signal flipped during the previous
+// stage we stop the chain here rather than running another stage
+// whose result will be discarded. The error message names the next
+// stage so the operator/test can tell at which boundary we bailed.
+const checkAborted = (signal: AbortSignal | undefined, nextStage: string): void => {
+  if (signal?.aborted) {
+    throw new Error(`retrieval aborted before ${nextStage}`);
+  }
+};
+
 // Run the retrieval pipeline against the configured views and
 // persist the trace. Returns the context slot the caller hands to
 // CONTEXT_TUNING + the intermediate stages so callers can render
@@ -161,16 +189,20 @@ export const runRetrieval = async (
           })
       : defaultCompress);
 
+  checkAborted(deps.signal, 'search');
+
   // Stage 1: search per view in parallel. A view's `search`
   // throwing collapses that view's contribution to [] — degradation
   // is preferred over a hard fail since other views may still
-  // produce a useful slot.
+  // produce a useful slot. `signal` is forwarded so IO-backed views
+  // (workspace ripgrep when 4.4 lands) can abort their subprocesses
+  // mid-flight; sync views ignore it.
   const searchStart = monoNow();
   const viewEntries = Object.entries(deps.views) as [RetrievalView, ViewSearch][];
   const candidatesByView = await Promise.all(
     viewEntries.map(async ([view, impl]) => {
       try {
-        return await impl.search(query);
+        return await impl.search(query, deps.signal);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(
@@ -183,15 +215,21 @@ export const runRetrieval = async (
   const candidatesRaw: Candidate[] = candidatesByView.flat();
   const searchMs = Math.max(0, monoNow() - searchStart);
 
+  checkAborted(deps.signal, 'expand');
+
   // Stage 2: expansion.
   const expandStart = monoNow();
   const candidatesExpanded = expand(candidatesRaw, query);
   const expandMs = Math.max(0, monoNow() - expandStart);
 
+  checkAborted(deps.signal, 'rank');
+
   // Stage 3: ranking.
   const rankStart = monoNow();
   const candidatesRanked = rank(candidatesExpanded, query);
   const rankMs = Math.max(0, monoNow() - rankStart);
+
+  checkAborted(deps.signal, 'compress');
 
   // Stage 4: compression.
   const compressStart = monoNow();

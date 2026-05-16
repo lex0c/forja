@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(retrieval) — plumb AbortSignal through pipeline + guard estimateTokens NaN/Infinity (review H1+H4)
+
+Closed two high findings from the `feat/retrieval` review.
+
+**H1** — `runner.ts:80-127` checked abort at entry/exit but `runRetrieval()` never received the signal. v1 views are synchronous, but workspace (4.4) will spawn ripgrep; without the signal reaching the pipeline, in-flight subprocesses won't cancel when the operator presses Ctrl+C. Added optional `signal?: AbortSignal` to `PipelineDeps`; `ViewSearch.search` now takes an optional second arg so views can propagate cancellation into their own IO. Sync views (memory + session) accept the parameter and ignore it — comment in each view documents why. Pipeline does a coarse `checkAborted` between every stage (search → expand → rank → compress) and throws `retrieval aborted before <stage>` so the operator/test can pinpoint the boundary. Runner now forwards `signal` to the pipeline.
+
+**H4** — `compression.ts compressGreedy` trusted whatever cost the per-view resolver returned. Slice 4.9 will wire provider-specific token counters via the `estimateTokens` hook; a buggy counter returning `NaN` / `Infinity` / negative would corrupt the greedy comparison (`NaN <= remaining` is `false`, silently skipping the level; placed `Infinity` underflows `remaining`). Added a guard: invalid `costTokens` treated identically to a `null` resolution (fall through to the next level) plus a stderr log naming the candidate / level / bad value. Validation lives in `compressGreedy` (not in resolvers) so every resolver — including future ones — is protected uniformly.
+
+Tests: 4 new in `tests/retrieval/pipeline.test.ts` covering pre-abort short-circuit, abort flipped between stages, signal forwarded to each view's search call, and the no-signal happy path. 2 new in `tests/retrieval/compression.test.ts` covering fall-through when some levels return invalid costs and full skip when all levels are invalid.
+
 ## [2026-05-15] fix(cli/slash/agent-retrieval) — compute metrics over the full requested window
 
 `/agent retrieval metrics [--days N]` was loading `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then filtering the result in-memory by `t.createdAt >= cutoffMs`. Once a session held more than 100 traces in the requested window, SQL handed back the freshest 100 (sorted by `created_at DESC`) and every row passed the post-filter — so utilization, eviction rate, diversity, and latency were silently computed from a truncated end-of-period sample. The header line printed "last 30.0d (100 traces)" with no signal that older traces in the window had been excluded.

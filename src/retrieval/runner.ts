@@ -108,6 +108,7 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
         sessionId: deps.sessionId,
         views: viewsForCall,
         compressionResolver: resolver,
+        ...(signal !== undefined ? { signal } : {}),
       },
       {
         text: input.query,
@@ -117,11 +118,13 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
       },
     );
 
-    // Late abort check. v1 view searches are synchronous enough
-    // that this fires only when the signal flipped DURING the
-    // pipeline's await — operator pressing Ctrl+C mid-call. We
-    // surface as throw so the tool's catch returns
-    // `retrieval.internal_error` with a recognizable message.
+    // Late abort check. The pipeline now does per-stage abort
+    // checks internally (and throws `retrieval aborted before
+    // <stage>` if the signal flipped), so this catches only the
+    // rare case where the signal flipped AFTER compress completed
+    // but BEFORE we got back here — e.g., during persist. Surface
+    // as throw so the tool's catch returns `retrieval.internal_error`
+    // with a recognizable message.
     if (signal?.aborted) {
       throw new Error('retrieval aborted mid-flight');
     }

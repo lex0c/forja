@@ -355,6 +355,22 @@ export const compressGreedy = (input: CompressGreedyInput): ContextSlot => {
     for (const level of TRY_LEVELS) {
       const resolved = input.resolver.resolve(c, level);
       if (resolved === null) continue;
+      // Guard against malformed cost output. `estimateTokens` is
+      // an injectable hook (slice 4.9 wires provider-specific
+      // token counters here); a buggy override returning NaN /
+      // Infinity / negative would otherwise corrupt the greedy
+      // comparison silently — `NaN <= remaining` is `false`, so
+      // the candidate would skip THIS level and try the next one
+      // without surfacing the breakage, and a placed Infinity
+      // would underflow `remaining`. Treat the level as
+      // not-resolvable (same as `null`) and fall through; the
+      // skipped trail will reflect the cheapest valid level.
+      if (!Number.isFinite(resolved.costTokens) || resolved.costTokens < 0) {
+        process.stderr.write(
+          `forja retrieval: resolver returned invalid costTokens ${resolved.costTokens} for ${c.view}/${c.nodeId} @ ${level}; treating as unresolvable\n`,
+        );
+        continue;
+      }
       if (resolved.costTokens <= remaining) {
         included.push({
           nodeId: c.nodeId,

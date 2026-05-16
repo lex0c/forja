@@ -259,3 +259,105 @@ describe('runRetrieval — skeleton', () => {
     expect(r.contextSlot.included[0]?.content).toBe('custom-content');
   });
 });
+
+describe('runRetrieval — abort signal', () => {
+  test('pre-aborted signal throws before stage 1 runs (no view searched)', async () => {
+    let searchCalls = 0;
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          async search() {
+            searchCalls++;
+            return [candidateOf('m:1')];
+          },
+        },
+      },
+      signal: ctrl.signal,
+    };
+    await expect(runRetrieval(deps, baseQuery)).rejects.toThrow(/aborted before search/);
+    expect(searchCalls).toBe(0);
+  });
+
+  test('signal flipped between search and expand aborts at the next boundary', async () => {
+    let expandRan = false;
+    const ctrl = new AbortController();
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          async search() {
+            // Simulate a view that triggers an abort while still
+            // returning successfully — the next stage boundary
+            // must catch it.
+            ctrl.abort();
+            return [candidateOf('m:1')];
+          },
+        },
+      },
+      expand: (cands) => {
+        expandRan = true;
+        return cands.map((c) => ({
+          nodeId: c.nodeId,
+          view: c.view,
+          bootstrapScore: c.bootstrapScore,
+          reason: c.reason,
+          path: [c.nodeId],
+          runningScore: c.bootstrapScore,
+        }));
+      },
+      signal: ctrl.signal,
+    };
+    await expect(runRetrieval(deps, baseQuery)).rejects.toThrow(/aborted before expand/);
+    expect(expandRan).toBe(false);
+  });
+
+  test('signal is forwarded to each view search call', async () => {
+    const seenSignals: (AbortSignal | undefined)[] = [];
+    const ctrl = new AbortController();
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          async search(_q, signal) {
+            seenSignals.push(signal);
+            return [];
+          },
+        },
+        session: {
+          async search(_q, signal) {
+            seenSignals.push(signal);
+            return [];
+          },
+        },
+      },
+      signal: ctrl.signal,
+    };
+    await runRetrieval(deps, baseQuery);
+    expect(seenSignals).toHaveLength(2);
+    expect(seenSignals[0]).toBe(ctrl.signal);
+    expect(seenSignals[1]).toBe(ctrl.signal);
+  });
+
+  test('no signal supplied → pipeline runs normally (signal field is optional)', async () => {
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          async search() {
+            return [candidateOf('m:1')];
+          },
+        },
+      },
+      // signal omitted on purpose
+    };
+    const r = await runRetrieval(deps, baseQuery);
+    expect(r.candidatesRaw).toHaveLength(1);
+  });
+});

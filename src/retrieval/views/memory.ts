@@ -54,7 +54,13 @@ export interface MemoryViewDeps {
 }
 
 export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
-  async search(query: RetrievalQuery): Promise<Candidate[]> {
+  // `_signal` is accepted to honor the ViewSearch contract but
+  // intentionally ignored — this view is fully synchronous over
+  // in-memory registry state, so there's nothing to cancel. The
+  // pipeline's between-stage `checkAborted` is the real bail-out
+  // path for sync views. IO-backed views (workspace, 4.4) will
+  // actually plumb the signal into their subprocesses.
+  async search(query: RetrievalQuery, _signal?: AbortSignal): Promise<Candidate[]> {
     const queryTokens = tokenize(query.text);
     if (queryTokens.length === 0) return [];
 

@@ -144,7 +144,11 @@ export interface SessionViewDeps {
 }
 
 export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
-  async search(query: RetrievalQuery): Promise<Candidate[]> {
+  // `_signal` accepted per the ViewSearch contract but ignored —
+  // this view is synchronous over SQLite reads against the active
+  // session; there's no subprocess or long IO to cancel. The
+  // pipeline's between-stage `checkAborted` covers bail-out.
+  async search(query: RetrievalQuery, _signal?: AbortSignal): Promise<Candidate[]> {
     if (tokenize(query.text).length === 0) return [];
     const limit = deps.limit ?? DEFAULT_LIMIT;
 

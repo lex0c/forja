@@ -469,6 +469,56 @@ describe('compressGreedy — budget allocation', () => {
     expect(slot.included).toEqual([]);
     expect(slot.skipped).toHaveLength(1);
   });
+
+  test('rejects costTokens=NaN / Infinity / negative — treats level as unresolvable, falls through', () => {
+    // H4: slice 4.9 will inject provider-specific token counters
+    // via the estimateTokens hook. A buggy counter returning
+    // NaN/Infinity/-1 must not corrupt the greedy comparison —
+    // NaN <= remaining is false (silent skip), placed Infinity
+    // would underflow `remaining`, negative would deflate budget.
+    // The compress loop must treat the level as not-resolvable
+    // (same shape as null) and fall through to the next.
+    const badAtFull = {
+      resolve(candidate: RankedCandidate, level: string) {
+        if (level === 'full') return { content: 'x', costTokens: Number.NaN };
+        if (level === 'outline') return { content: 'x', costTokens: Number.POSITIVE_INFINITY };
+        if (level === 'summary') return { content: 'x', costTokens: -5 };
+        // Only ref returns a valid cost — that's where this
+        // candidate must land.
+        return { content: candidate.nodeId, costTokens: 1 };
+      },
+    };
+    const ranked: RankedCandidate[] = [makeRanked({ nodeId: 'a' })];
+    const slot = compressGreedy({
+      ranked,
+      query: { ...baseQuery, budgetTokens: 10 },
+      resolver: badAtFull,
+    });
+    expect(slot.included).toHaveLength(1);
+    expect(slot.included[0]?.level).toBe('ref');
+    expect(slot.included[0]?.costTokens).toBe(1);
+    expect(slot.skipped).toEqual([]);
+  });
+
+  test('all-levels invalid → candidate skipped (no malformed cost reaches the slot)', () => {
+    const allBad = {
+      resolve(_c: RankedCandidate, _l: string) {
+        return { content: 'x', costTokens: Number.NaN };
+      },
+    };
+    const ranked: RankedCandidate[] = [makeRanked({ nodeId: 'a' })];
+    const slot = compressGreedy({
+      ranked,
+      query: { ...baseQuery, budgetTokens: 1000 },
+      resolver: allBad,
+    });
+    expect(slot.included).toEqual([]);
+    expect(slot.skipped).toHaveLength(1);
+    // No level produced a valid cost, so cheapestUnfit stays null —
+    // skipped trail reports 'no resolver produced content' (or
+    // equivalent), and wouldCostTokens is null.
+    expect(slot.skipped[0]?.wouldCostTokens).toBeNull();
+  });
 });
 
 describe('compressGreedy — end-to-end with createCompressionResolver', () => {
