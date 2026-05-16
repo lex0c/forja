@@ -25,6 +25,9 @@ export type {
   RetrievalTraceRow,
   RetrievalView,
   RetrievalWorkflow,
+  RetrieveContextInput,
+  RetrieveContextOutput,
+  RetrieveFn,
   ScoreBreakdown,
   SkippedCandidate,
 } from './types.ts';
@@ -51,3 +54,6 @@ export type {
   CompressionResolverDeps,
   ResolvedContent,
 } from './compression.ts';
+
+export { buildRetrievalRunner } from './runner.ts';
+export type { BuildRetrievalRunnerDeps } from './runner.ts';

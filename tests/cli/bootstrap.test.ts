@@ -90,6 +90,7 @@ describe('bootstrap', () => {
         'memory_write',
         'monitor',
         'read_file',
+        'retrieve_context',
         'task',
         'task_async',
         'task_await',

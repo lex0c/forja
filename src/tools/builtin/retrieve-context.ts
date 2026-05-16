@@ -1,0 +1,217 @@
+// retrieve_context — model-facing tool for the retrieval
+// subsystem (RETRIEVAL.md §15.4 + §1.2 "retrieval is tool, not
+// driver").
+//
+// The tool is intentionally thin: it forwards the input to the
+// runner the harness built (`ctx.retrieveContext`) and shapes the
+// result for the model. All pipeline plumbing — views, ranking,
+// compression, trace persistence — happens inside the runner.
+//
+// Read-only and plan-safe (the trace insert is the only DB write
+// and it's append-only audit, not state mutation the operator
+// would scope under "writes"). Parallel-safe — multiple retrieval
+// calls in one turn don't interfere; each lands its own trace row.
+
+import {
+  RETRIEVAL_QUERY_TYPES,
+  RETRIEVAL_VIEWS,
+  RETRIEVAL_WORKFLOWS,
+  type RetrievalQueryType,
+  type RetrievalView,
+  type RetrievalWorkflow,
+  type RetrieveContextInput,
+  type RetrieveContextOutput,
+} from '../../retrieval/index.ts';
+import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+
+const VALID_WORKFLOWS: ReadonlySet<string> = new Set(RETRIEVAL_WORKFLOWS);
+const VALID_QUERY_TYPES: ReadonlySet<string> = new Set(RETRIEVAL_QUERY_TYPES);
+const VALID_VIEWS: ReadonlySet<string> = new Set(RETRIEVAL_VIEWS);
+
+const MIN_BUDGET_TOKENS = 1;
+const MAX_BUDGET_TOKENS = 100_000;
+
+// Per-call cap on the input.views allow-list size. The valid set
+// is fixed at 3, so anything larger is a malformed arg — refuse
+// instead of silently truncating.
+const MAX_VIEWS = 3;
+
+export interface ValidatedArgs {
+  query: string;
+  workflow?: RetrievalWorkflow;
+  queryType?: RetrievalQueryType;
+  budgetTokens?: number;
+  views?: RetrievalView[];
+  loadBodies?: boolean;
+}
+
+const validate = (raw: unknown): ValidatedArgs | { error: string } => {
+  if (raw === null || typeof raw !== 'object') {
+    return { error: 'arguments must be an object' };
+  }
+  const args = raw as Record<string, unknown>;
+
+  if (typeof args.query !== 'string' || args.query.trim().length === 0) {
+    return { error: 'query must be a non-empty string' };
+  }
+
+  const out: ValidatedArgs = { query: args.query };
+
+  if (args.workflow !== undefined) {
+    if (typeof args.workflow !== 'string' || !VALID_WORKFLOWS.has(args.workflow)) {
+      return {
+        error: `workflow must be one of: ${[...VALID_WORKFLOWS].join(', ')} (got ${JSON.stringify(args.workflow)})`,
+      };
+    }
+    out.workflow = args.workflow as RetrievalWorkflow;
+  }
+
+  if (args.queryType !== undefined) {
+    if (typeof args.queryType !== 'string' || !VALID_QUERY_TYPES.has(args.queryType)) {
+      return {
+        error: `queryType must be one of: ${[...VALID_QUERY_TYPES].join(', ')} (got ${JSON.stringify(args.queryType)})`,
+      };
+    }
+    out.queryType = args.queryType as RetrievalQueryType;
+  }
+
+  if (args.budgetTokens !== undefined) {
+    if (
+      typeof args.budgetTokens !== 'number' ||
+      !Number.isFinite(args.budgetTokens) ||
+      !Number.isInteger(args.budgetTokens) ||
+      args.budgetTokens < MIN_BUDGET_TOKENS ||
+      args.budgetTokens > MAX_BUDGET_TOKENS
+    ) {
+      return {
+        error: `budgetTokens must be an integer in [${MIN_BUDGET_TOKENS}, ${MAX_BUDGET_TOKENS}] (got ${JSON.stringify(args.budgetTokens)})`,
+      };
+    }
+    out.budgetTokens = args.budgetTokens;
+  }
+
+  if (args.views !== undefined) {
+    if (!Array.isArray(args.views)) {
+      return { error: 'views must be an array of view names' };
+    }
+    if (args.views.length === 0) {
+      return { error: 'views array must not be empty (omit the field to use every wired view)' };
+    }
+    if (args.views.length > MAX_VIEWS) {
+      return { error: `views array length capped at ${MAX_VIEWS}` };
+    }
+    const validated: RetrievalView[] = [];
+    for (const v of args.views) {
+      if (typeof v !== 'string' || !VALID_VIEWS.has(v)) {
+        return {
+          error: `views entries must be one of: ${[...VALID_VIEWS].join(', ')} (got ${JSON.stringify(v)})`,
+        };
+      }
+      // De-dupe on the fly so a request with duplicate names
+      // doesn't trick the harness into double-wiring a view.
+      if (!validated.includes(v as RetrievalView)) {
+        validated.push(v as RetrievalView);
+      }
+    }
+    out.views = validated;
+  }
+
+  if (args.loadBodies !== undefined) {
+    if (typeof args.loadBodies !== 'boolean') {
+      return { error: 'loadBodies must be a boolean when provided' };
+    }
+    out.loadBodies = args.loadBodies;
+  }
+
+  return out;
+};
+
+export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutput> = {
+  name: 'retrieve_context',
+  description:
+    'Retrieve relevant context from memory + session for the active query. Returns a ranked, budget-constrained context slot with per-candidate level (full / outline / summary / ref) + a skipped trail explaining what did not fit. Read-only and parallel-safe. Pin `workflow` (review / refactor / explain / debug / precedent_lookup) to shape ranking weights; pass `views: ["memory"]` to scope; set `loadBodies: true` for deep coverage at I/O cost.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        description: 'Free-text query. Path leaks are scrubbed from the trace at persist time.',
+      },
+      workflow: {
+        type: 'string',
+        enum: [...RETRIEVAL_WORKFLOWS],
+        description:
+          'Drives ranking weights (§5.2): review/refactor lean structural, debug leans temporal, precedent_lookup leans lexical + semantic. Default: default (balanced).',
+      },
+      queryType: {
+        type: 'string',
+        enum: [...RETRIEVAL_QUERY_TYPES],
+        description: 'Query shape — symbol / semantic / causal / precedent / navigational.',
+      },
+      budgetTokens: {
+        type: 'integer',
+        minimum: MIN_BUDGET_TOKENS,
+        maximum: MAX_BUDGET_TOKENS,
+        description:
+          'Token budget the compression layer respects. Default per-call: 1000. Cap: 100000.',
+      },
+      views: {
+        type: 'array',
+        items: { type: 'string', enum: [...RETRIEVAL_VIEWS] },
+        description:
+          'Optional. Subset of wired views to query. Omit to query every wired view (default behavior).',
+      },
+      loadBodies: {
+        type: 'boolean',
+        description:
+          'When true, memory view loads body content (deep BM25 coverage). Default false (titles + descriptions only — faster, less I/O).',
+      },
+    },
+    required: ['query'],
+  },
+  metadata: {
+    category: 'misc',
+    writes: false,
+    idempotent: true,
+    planSafe: true,
+    parallel_safe: true,
+    display: 'raw',
+    cost: { latency_ms_typical: 30 },
+  },
+  async execute(args, ctx): Promise<ToolResult<RetrieveContextOutput>> {
+    if (ctx.signal.aborted) {
+      return toolError(ERROR_CODES.aborted, 'tool aborted before retrieval', {
+        retryable: true,
+      });
+    }
+    if (ctx.retrieveContext === undefined) {
+      return toolError(
+        'retrieval.unavailable',
+        'retrieve_context requires harness wiring (memoryRegistry + db) but neither is configured for this run',
+        {
+          hint: 'The harness needs HarnessConfig.memoryRegistry to construct the retrieval runner. Headless / SDK runs without memory wired surface this error.',
+        },
+      );
+    }
+
+    const validated = validate(args);
+    if ('error' in validated) {
+      return toolError(ERROR_CODES.invalidArg, validated.error);
+    }
+
+    try {
+      // Forward ctx.signal so a model-aborted call (or parent run
+      // shutdown) can cancel mid-flight. v1 view searches are
+      // synchronous SQLite/registry work so the signal mostly
+      // guards the await fence; 4.4 (workspace via ripgrep) is the
+      // case it actually saves.
+      const result = await ctx.retrieveContext(validated, ctx.signal);
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return toolError('retrieval.internal_error', `retrieval pipeline threw: ${msg}`, {
+        retryable: false,
+      });
+    }
+  },
+};

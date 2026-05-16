@@ -22,6 +22,22 @@ Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet
 
 What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
 
+### 4.9 — Integration (retrieve_context tool)
+
+Pipeline finally encosta no operador. The subsystem is now reachable from the model's tool surface — every other slice (4.1 through 4.7) was internal plumbing leading here.
+
+`src/retrieval/runner.ts` exports `buildRetrievalRunner({ db, sessionId, memoryRegistry, defaultBudgetTokens?, views? })` — produces a `RetrieveFn` the harness wires into `ToolContext.retrieveContext`. Builds session-scoped views (memory + session) once per session, plus a compression resolver bound to both substrates. Per-call: filters views per the input's allow-list, swaps in a body-loading memory view when `loadBodies: true`, translates the operator/model input shape into the canonical `RetrievalQuery`, and shapes the result with stats (`candidatesRaw`, `candidatesRanked`, `included`, `skipped`, `budgetUsedTokens`, `budgetRemainingTokens`).
+
+`src/tools/builtin/retrieve-context.ts` defines the model-facing tool. Thin by design — validates args (workflow / queryType / budgetTokens / views / loadBodies all checked against the canonical enums + range bounds; views de-duplicated; query must be a non-empty string), refuses with `retrieval.unavailable` when the harness didn't wire a runner, refuses with `tool.aborted` on a pre-call abort signal, and surfaces runner-thrown errors as `retrieval.internal_error` instead of propagating. Metadata: `category: 'misc'`, `writes: false`, `idempotent: true`, `planSafe: true`, `parallel_safe: true`. Cap: budget ∈ [1, 100000], views ≤ 3 entries.
+
+`src/harness/loop.ts` wires `retrieveContext` into `ToolContext` when `config.memoryRegistry` is present (db is always available — the harness can't run without it). Headless / SDK runs without memory get a clean `retrieval.unavailable` error per spec §15.7 degradation.
+
+`ToolContext.retrieveContext?: RetrieveFn` is the new optional field (same pattern as `memoryRegistry`, `confirmMemoryWrite`, etc.). Imports add `RetrieveFn` from `../retrieval/index.ts`.
+
+`BUILTIN_TOOLS` ordering puts `retrieve_context` next to the read-only memory tools — operator scanning `agent --list-tools` finds them clustered by purpose.
+
+Tests: 19 new in `tests/tools/retrieve-context.test.ts` covering tool validation (missing runner / non-string query / empty query / unknown workflow / unknown queryType / budget out of bounds / non-integer budget / invalid views entries / empty views / loadBodies type / duplicate de-dup / aborted signal / runner-thrown errors) plus 5 runner end-to-end (ranked + compressed output for real query, views filter restriction, loadBodies surfaces body-only matches, defaultBudgetTokens respected, retrieval_trace row persisted per call). Bootstrap test list updated to include `retrieve_context`.
+
 ### 4.7 — Compression
 
 Replaces the `ref-only` skeleton stub (slice 4.1) with the full §6 hierarchy + greedy budget allocator.

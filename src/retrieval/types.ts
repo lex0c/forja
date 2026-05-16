@@ -245,6 +245,70 @@ export interface RetrievalResult {
   timings: PipelineTimings;
 }
 
+// ─── tool-facing surface (slice 4.9) ──────────────────────────────────
+
+// What the model passes to the `retrieve_context` tool. Mirrors
+// the RetrievalQuery shape but with operator-facing defaults
+// (workflow / queryType / budgetTokens all optional).
+export interface RetrieveContextInput {
+  query: string;
+  // Workflow drives ranking weights + per-view budget split.
+  // Defaults to 'default' (lexical-leaning balanced posture).
+  workflow?: RetrievalWorkflow;
+  // Query shape; influences view priority. Defaults to 'semantic'.
+  queryType?: RetrievalQueryType;
+  // Token budget the compression layer respects. Defaults to a
+  // conservative value at the harness wireup site (slice 4.9
+  // picks 1000 — fits most prompts without dominating context).
+  budgetTokens?: number;
+  // Optional view subset filter — when omitted, every wired view
+  // contributes. Useful for queries the model knows are scoped
+  // (e.g., 'precedent' → memory only).
+  views?: RetrievalView[];
+  // When true, memory view loads body content (full BM25 corpus
+  // depth). Default false — body loading costs one disk read per
+  // memory; toggle on for deep coverage at the cost of latency.
+  loadBodies?: boolean;
+}
+
+// The tool's return shape. Echoes the context slot the operator
+// (or model) consumes plus a thin summary of the pipeline so the
+// model can decide whether to re-query.
+export interface RetrieveContextOutput {
+  // The materialized slot — included entries are what got into
+  // the context; skipped entries explain what didn't fit.
+  contextSlot: ContextSlot;
+  // Trace id (uuid). Operators forensic via `/agent retrieval
+  // replay <queryId>` (slice 4.8) — surfaced so the model can
+  // cite the trace in subsequent reasoning.
+  queryId: string;
+  // Counts per stage for the operator to gauge whether the
+  // query needed more / less budget. Mirrors §10 metrics surface.
+  stats: {
+    candidatesRaw: number;
+    candidatesRanked: number;
+    included: number;
+    skipped: number;
+    budgetUsedTokens: number;
+    budgetRemainingTokens: number;
+  };
+}
+
+// The harness-built runner the tool calls. Async because the
+// pipeline awaits view searches in parallel.
+//
+// `signal` is forwarded from the tool's `ctx.signal` so a model-
+// aborted call (or a parent run shutdown) can cancel an in-flight
+// retrieval. v1 view searches are synchronous SQLite/registry
+// work, so the signal mostly guards the await fence; slice 4.4
+// (workspace via ripgrep + Bun.spawn) is the case the signal
+// actually saves — an unresponsive subprocess would otherwise hold
+// the pipeline open until completion.
+export type RetrieveFn = (
+  input: RetrieveContextInput,
+  signal?: AbortSignal,
+) => Promise<RetrieveContextOutput>;
+
 // ─── trace persistence (§10.1) ────────────────────────────────────────
 
 export interface RetrievalTraceRow {
