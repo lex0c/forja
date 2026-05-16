@@ -40,3 +40,6 @@ export type { MemoryViewDeps } from './views/memory.ts';
 
 export { createSessionView } from './views/session.ts';
 export type { SessionViewDeps } from './views/session.ts';
+
+export { WORKFLOW_WEIGHTS, rankCandidates } from './ranking.ts';
+export type { RankCandidatesInput } from './ranking.ts';

@@ -224,6 +224,8 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
       // Compose the reason string per row kind. Operator-readable;
       // free of paths (those that come through messages/tool input
       // get scrubbed at the trace persist layer in slice 4.1).
+      // Each row carries its createdAt so the ranking temporal
+      // signal can decay against the session half-life (§4.3).
       const messageMatch = hit.id.startsWith('session:message:')
         ? messageById.get(hit.id.slice('session:message:'.length))
         : undefined;
@@ -233,6 +235,7 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
           view: VIEW,
           bootstrapScore: hit.score,
           reason: `BM25 match in ${messageMatch.role} message`,
+          createdAt: messageMatch.createdAt,
         };
       }
       const toolCallMatch = hit.id.startsWith('session:tool_call:')
@@ -244,6 +247,7 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
           view: VIEW,
           bootstrapScore: hit.score,
           reason: `BM25 match in tool_call(${toolCallMatch.tool_name})`,
+          createdAt: toolCallMatch.created_at,
         };
       }
       const failureMatch = hit.id.startsWith('session:failure:')
@@ -255,6 +259,7 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
           view: VIEW,
           bootstrapScore: hit.score,
           reason: `BM25 match in failure_event(${failureMatch.code})`,
+          createdAt: failureMatch.created_at,
         };
       }
       // Map miss would be a bug — fall through with a safe shape

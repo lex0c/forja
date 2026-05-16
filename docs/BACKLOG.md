@@ -22,6 +22,25 @@ Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet
 
 What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
 
+### 4.6 — Ranking (out of declared order)
+
+Slice 4.4 (workspace via ripgrep) and 4.5 (expansion) were deferred — workspace without CODE_INDEX collapses to a ripgrep wrapper that duplicates existing grep/glob tools and produces no structural edges; expansion without edges has nothing to traverse. The remaining v1 value sits in honest ranking + compression + integration, so the slice order shifts: 4.6 → 4.7 → 4.9, with 4.4/4.5 picked up when (or if) CODE_INDEX returns.
+
+`src/retrieval/ranking.ts` ships `rankCandidates({ candidates, query, now? })` implementing the spec §5.1 six-signal fusion with §5.2 workflow-specific weights. Module-load guard throws if any workflow's weights don't sum to 1.0 (within float epsilon) — a misspelled weight in the table can't drift scores silently.
+
+Signal calibration:
+
+- **structural**: `1 / pathLength` — placeholder until expansion ships; v1 paths are single-element so it lands at 1.0 across the board. The weight stays in the table so workflows can already declare their structural preference; the substrate flips on when expansion does.
+- **lexical**: BM25 score normalized by the batch max. Per-batch normalization keeps the signal bounded to [0, 1] even though BM25 itself is unbounded.
+- **semantic**: 0 (spec §0 principle 2 — embedding opt-in, not v1).
+- **temporal**: exponential decay against the view's half-life — session 1h, memory 30d, workspace ∞ (no decay). Candidates without `createdAt` get a neutral 1.0 (workspace by design; memory listings today because mtime isn't on the shape).
+- **usage**: 0 (citation history table not implemented).
+- **goalAlignment**: 0 (CONTEXT_TUNING §1.6 canonical goal form not implemented).
+
+`Candidate.createdAt` is now an optional field on the type. Session view populates it from `message.createdAt` / `tool_call.created_at` / `failure.created_at` so the decay math has substrate to chew on. Memory view leaves it undefined (registry doesn't expose mtime today).
+
+Pipeline default rank passes from the zero-filled stub (slice 4.1) to `rankCandidates` real. Custom rank callbacks still override via `deps.rank`. Sort is finalScore DESC with nodeId ASC tiebreak — same trace-stability discipline BM25 uses.
+
 ### 4.3 — Session view
 
 `src/retrieval/views/session.ts` projects the implicit session graph (RETRIEVAL §15.1 calls these "structures that ARE edges") onto a BM25 corpus. Three sources contribute one candidate per row:

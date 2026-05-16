@@ -24,6 +24,7 @@
 
 import type { DB } from '../storage/db.ts';
 import { createRetrievalTrace } from '../storage/repos/retrieval-trace.ts';
+import { rankCandidates } from './ranking.ts';
 import type {
   Candidate,
   ContextSlot,
@@ -79,24 +80,17 @@ const defaultExpand = (candidates: Candidate[]): ExpandedCandidate[] =>
     reason: c.reason,
     path: [c.nodeId],
     runningScore: c.bootstrapScore,
+    ...(c.createdAt !== undefined ? { createdAt: c.createdAt } : {}),
   }));
 
-const defaultRank = (expanded: ExpandedCandidate[]): RankedCandidate[] =>
-  expanded.map((e) => ({
-    nodeId: e.nodeId,
-    view: e.view,
-    reason: e.reason,
-    path: e.path,
-    finalScore: e.runningScore,
-    signals: {
-      structural: 0,
-      lexical: 0,
-      semantic: 0,
-      temporal: 0,
-      usage: 0,
-      goalAlignment: 0,
-    },
-  }));
+// Default rank delegates to the spec-implementing `rankCandidates`
+// (slice 4.6). The pipeline can still receive a custom rank via
+// `deps.rank` for tests or alternative ranking experiments.
+const defaultRank = (
+  expanded: ExpandedCandidate[],
+  query: RetrievalQuery,
+  now: () => number,
+): RankedCandidate[] => rankCandidates({ candidates: expanded, query, now });
 
 const defaultCompress = (ranked: RankedCandidate[], query: RetrievalQuery): ContextSlot => {
   const included: ContextSlot['included'] = [];
@@ -145,7 +139,7 @@ export const runRetrieval = async (
   const now = deps.now ?? (() => Date.now());
   const monoNow = deps.monoNow ?? defaultMonoNow;
   const expand = deps.expand ?? defaultExpand;
-  const rank = deps.rank ?? defaultRank;
+  const rank = deps.rank ?? ((expanded, query) => defaultRank(expanded, query, now));
   const compress = deps.compress ?? defaultCompress;
 
   // Stage 1: search per view in parallel. A view's `search`

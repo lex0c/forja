@@ -119,11 +119,20 @@ export interface RetrievalEdge {
 // Output of per-view `search`. The view annotates the raw match
 // with `bootstrapScore` (BM25 / recency / etc.) and a human
 // `reason` string so the trace at §10.1 is operator-readable.
+//
+// `createdAt` is OPTIONAL — views supply it when the node has an
+// event-shaped timestamp the temporal signal (§5.1) needs to
+// decay against. Session-view rows always carry it (each
+// message/tool_call/failure has `created_at`); memory-view
+// candidates skip it because `MemoryListing` doesn't expose mtime
+// today; workspace-view candidates skip it because FS state isn't
+// event-shaped (§4.3 "Workspace: sem decay").
 export interface Candidate {
   nodeId: string;
   view: RetrievalView;
   bootstrapScore: number;
   reason: string;
+  createdAt?: number;
 }
 
 // Output of expansion. The traversal walked from a seed candidate
@@ -137,6 +146,7 @@ export interface ExpandedCandidate {
   reason: string;
   path: string[]; // [seed, hop1, hop2, ...]
   runningScore: number;
+  createdAt?: number;
 }
 
 // Score breakdown per spec §5.3 — sum of weighted signals + the
