@@ -380,9 +380,21 @@ export const listGlobalProvenanceForMemory = (
   return rows.map(fromRow);
 };
 
-// Boot-time GC: drop rows older than `olderThanMs`. Default
-// retention in T1.7 = 90d, same as `eviction_events`. Returns
-// the row count for telemetry.
+// Retention window for the boot-time GC sweep (S1/T1.7). 90 days
+// mirrors `eviction_events` retention. Exposure rows are a
+// forensic substrate: useful for "what was visible when X
+// happened" queries, but value decays fast — a 6-month-old
+// exposure row is dead weight at provenance-query latency and
+// disk-cost (millions of rows accumulate across long-lived
+// installs). The TTL is conservative for now; future tuning may
+// expose it as an operator policy if real install data shows
+// 90d is too short.
+export const MEMORY_PROVENANCE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+// Boot-time GC: drop rows older than `olderThanMs`. Returns the
+// row count for telemetry. Cutoff is EXCLUSIVE — a row at exactly
+// `olderThanMs` is KEPT, so callers can treat the cutoff as the
+// inclusive lower-bound of the retention window.
 export const pruneMemoryProvenance = (db: DB, olderThanMs: number): number => {
   const result = db.query('DELETE FROM memory_provenance WHERE created_at < ?').run(olderThanMs);
   return Number(result.changes);

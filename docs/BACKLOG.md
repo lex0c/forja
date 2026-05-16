@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — boot-time provenance retention sweep (S1/T1.7)
+
+90-day retention for `memory_provenance` rows. Exposure rows are a forensic substrate: useful within the first few weeks for "what was visible when X happened" queries, but value decays fast and the table grows monotonically (every tool call that exposes a memory adds a row). Without a sweep, millions of rows accumulate across long-lived installs — slows operator queries, bloats disk, and eventually requires manual SQL pruning.
+
+The sweep mirrors the existing memory-lifecycle GC pattern in bootstrap:
+
+- `MEMORY_PROVENANCE_RETENTION_MS` exported from `memory-provenance.ts` (90 days). Constant lives next to the prune query so a future tuning PR has one place to change.
+- Bootstrap fires `pruneMemoryProvenance(db, Date.now() - RETENTION_MS)` right after the existing `gcExpiredMemories` + `gcPurgeExpiredTombstones` sweeps. Same try/catch posture: a sweep failure logs to stderr but MUST NOT abort boot. Worst case: the failed sweep retries next boot — provenance is observability, not correctness.
+- The cutoff is EXCLUSIVE (`created_at < olderThanMs`) — a row at exactly the cutoff is KEPT. Callers can treat the value as the inclusive lower-bound of the retention window. The boundary case is pinned in `memory-provenance.test.ts` from T1.2.
+
+The 90d default is conservative for now; if real install data shows it's too short (operators wanting to forensic-trace beyond a quarter), the constant becomes a candidate for the operator-policy surface. Until then, hard-coding keeps the boot path simple.
+
+Test: one integration test in `bootstrap.test.ts` seeds two provenance rows directly into the DB before calling `bootstrap()` — one well past retention (cutoff − 1 day past the window) and one inside (1s old). After boot, the old row is gone and the fresh row survives. Verifies wiring + cutoff direction end-to-end.
+
 ## [2026-05-16] feat(memory) — /memory provenance operator surface (S1/T1.6)
 
 First operator-facing read of the provenance trail. The `/memory provenance` subcommand reads `memory_provenance` rows and answers three forensic questions, picked via mutually-exclusive modes:

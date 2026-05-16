@@ -998,4 +998,62 @@ Body.`,
       db.close();
     });
   });
+
+  describe('memory_provenance retention sweep at boot (S1/T1.7)', () => {
+    test('prunes rows older than the retention window; keeps recent rows', async () => {
+      // Seed the DB BEFORE bootstrap so the row pre-exists when
+      // the boot sweep runs. Bootstrap re-opens the same dbPath,
+      // runs migrations (idempotent), then fires the sweep.
+      const {
+        MEMORY_PROVENANCE_RETENTION_MS: RETENTION_MS,
+        recordProvenance,
+        listGlobalProvenanceByName,
+      } = await import('../../src/storage/repos/memory-provenance.ts');
+      const { openDb, migrate } = await import('../../src/storage/index.ts');
+      const { createSession } = await import('../../src/storage/repos/sessions.ts');
+
+      const seedDb = openDb(dbPath);
+      migrate(seedDb);
+      const seedSession = createSession(seedDb, { model: 'm', cwd: workdir });
+      const nowMs = Date.now();
+      // Row 1: well past retention — must be swept.
+      recordProvenance(seedDb, {
+        sessionId: seedSession.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'old',
+        surface: 'eager',
+        createdAt: nowMs - RETENTION_MS - 24 * 60 * 60 * 1000,
+      });
+      // Row 2: inside retention window — must survive.
+      recordProvenance(seedDb, {
+        sessionId: seedSession.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'fresh',
+        surface: 'eager',
+        createdAt: nowMs - 1000,
+      });
+      seedDb.close();
+
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+      });
+      // Bootstrap doesn't surface the swept count; the assertion
+      // is on the post-sweep state of the table.
+      const oldRows = listGlobalProvenanceByName(db, 'old');
+      const freshRows = listGlobalProvenanceByName(db, 'fresh');
+      expect(oldRows).toEqual([]);
+      expect(freshRows).toHaveLength(1);
+      // Smoke-check the config built normally (sweep didn't poison
+      // anything downstream).
+      expect(config.memoryRegistry).toBeDefined();
+      db.close();
+    });
+  });
 });

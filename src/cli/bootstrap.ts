@@ -40,6 +40,10 @@ import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { scrubEnv } from '../sanitize/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import {
+  MEMORY_PROVENANCE_RETENTION_MS,
+  pruneMemoryProvenance,
+} from '../storage/repos/memory-provenance.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
@@ -569,6 +573,20 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     for (const failure of purgeResult.failures) {
       process.stderr.write(
         `forja: memory gc: failed to purge eviction_event ${failure.evictionEventId}: ${failure.reason}\n`,
+      );
+    }
+    // Provenance sweep (MEMORY.md §11.2, S1/T1.7). Drops
+    // exposure rows older than the retention window. Best-
+    // effort: a DB failure here MUST NOT abort boot — provenance
+    // is observability, not correctness, and a one-off failed
+    // sweep just delays cleanup by one boot. Stderr surfaces the
+    // cause for the operator without gating the session.
+    try {
+      pruneMemoryProvenance(db, Date.now() - MEMORY_PROVENANCE_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `forja: memory_provenance sweep failed at boot (${msg}); rows will be re-attempted on next boot\n`,
       );
     }
     // Boot-time trigger context (spec §4.3). evaluateBootTriggers
