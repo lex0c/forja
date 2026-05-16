@@ -325,6 +325,44 @@ describe('createRetrievalTrace', () => {
   });
 });
 
+describe('listRetrievalTracesBySession — ordering', () => {
+  test('equal created_at ties resolve deterministically by id DESC (H5 regression)', () => {
+    // Regression: prior ORDER BY was `created_at DESC` only.
+    // Concurrent inserts (eval harness) or two traces landing in
+    // the same millisecond came back in undefined order, so
+    // pagination and short-id resolution flaked. Tiebreaker is
+    // `id DESC` so the order is stable across calls.
+    const ids = [
+      '00000000-0000-0000-0000-000000000001',
+      '00000000-0000-0000-0000-000000000002',
+      '00000000-0000-0000-0000-000000000003',
+    ];
+    for (const id of ids) {
+      createRetrievalTrace(db, {
+        id,
+        sessionId,
+        queryText: `q-${id.slice(-1)}`,
+        workflow: 'default',
+        queryType: 'semantic',
+        budgetTokens: 100,
+        candidatesRaw: [],
+        candidatesExpanded: [],
+        candidatesRanked: [],
+        contextSlot: { included: [], skipped: [] },
+        timings: sampleTimings(),
+        createdAt: 5_000, // identical for every row — forces tiebreaker
+      });
+    }
+    const rowsA = listRetrievalTracesBySession(db, sessionId);
+    const rowsB = listRetrievalTracesBySession(db, sessionId);
+    expect(rowsA.map((r) => r.id)).toEqual(rowsB.map((r) => r.id));
+    // id DESC means the lexically-largest UUID comes first.
+    expect(rowsA[0]?.id).toBe(ids[2]);
+    expect(rowsA[1]?.id).toBe(ids[1]);
+    expect(rowsA[2]?.id).toBe(ids[0]);
+  });
+});
+
 describe('listRetrievalTracesBySession', () => {
   test('returns traces newest first, capped by limit', () => {
     for (let i = 0; i < 5; i++) {
@@ -459,12 +497,19 @@ describe('listRetrievalTracesSinceMs', () => {
 });
 
 describe('listRetrievalTracesByWorkflow', () => {
-  test('filters by workflow', () => {
+  const seed = (
+    overrides: Partial<{
+      sessionId: string;
+      workflow: 'review' | 'debug' | 'default';
+      queryText: string;
+      queryType: 'semantic' | 'causal';
+    }> = {},
+  ): void => {
     createRetrievalTrace(db, {
-      sessionId,
-      queryText: 'review-q',
-      workflow: 'review',
-      queryType: 'semantic',
+      sessionId: overrides.sessionId ?? sessionId,
+      queryText: overrides.queryText ?? 'q',
+      workflow: overrides.workflow ?? 'review',
+      queryType: overrides.queryType ?? 'semantic',
       budgetTokens: 100,
       candidatesRaw: [],
       candidatesExpanded: [],
@@ -472,20 +517,27 @@ describe('listRetrievalTracesByWorkflow', () => {
       contextSlot: { included: [], skipped: [] },
       timings: sampleTimings(),
     });
-    createRetrievalTrace(db, {
-      sessionId,
-      queryText: 'debug-q',
-      workflow: 'debug',
-      queryType: 'causal',
-      budgetTokens: 100,
-      candidatesRaw: [],
-      candidatesExpanded: [],
-      candidatesRanked: [],
-      contextSlot: { included: [], skipped: [] },
-      timings: sampleTimings(),
-    });
-    const reviews = listRetrievalTracesByWorkflow(db, 'review');
+  };
+
+  test('filters by workflow within the active session', () => {
+    seed({ workflow: 'review', queryText: 'review-q' });
+    seed({ workflow: 'debug', queryText: 'debug-q', queryType: 'causal' });
+    const reviews = listRetrievalTracesByWorkflow(db, sessionId, 'review');
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.queryText).toBe('review-q');
+  });
+
+  test('does NOT leak rows from other sessions (H6 regression)', () => {
+    // Regression: prior signature was `(db, workflow, limit)` and
+    // queried `WHERE workflow = ?` across every session in the DB.
+    // An operator inspecting "review traces in this session" would
+    // see other sessions' review traces too. Now `sessionId` is
+    // required and the query is scoped.
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    seed({ workflow: 'review', queryText: 'mine' });
+    seed({ sessionId: other, workflow: 'review', queryText: 'theirs' });
+    const reviews = listRetrievalTracesByWorkflow(db, sessionId, 'review');
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.queryText).toBe('mine');
   });
 });

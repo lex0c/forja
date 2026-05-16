@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(storage/retrieval-trace) — deterministic ordering + session-scoped workflow lookup (review H5+H6)
+
+Two findings on the trace repo.
+
+**H5** — every list query in `src/storage/repos/retrieval-trace.ts` sorted by `created_at DESC` only. Two traces landing in the same millisecond (concurrent inserts under eval harness load, or just clock granularity) came back in undefined order, flaking pagination and short-id resolution. Added `, id DESC` as the secondary key to `listRetrievalTracesBySession`, `listRetrievalTracesSinceMs`, and `listRetrievalTracesByWorkflow`. Matches the pattern in `failure-events.ts:93`.
+
+**H6** — `listRetrievalTracesByWorkflow(db, workflow, limit)` filtered only by `workflow = ?`, spanning every session in the DB. A caller assuming session-scope (operator running "show me review-workflow traces in this session") would leak traces from other sessions on the same DB — multi-tenant or shared-machine setups especially. The function had no production callers (only the test), so signature became `(db, sessionId, workflow, limit)` with `sessionId` required. A future cross-session aggregation surface would need a different function whose name and signature acknowledge the scope.
+
+Tests: 1 new tiebreaker test in `listRetrievalTracesBySession` (three rows pinned to the same `created_at`, verifies stable `id DESC` order and replay-stability). 1 new cross-session leak test in `listRetrievalTracesByWorkflow` (seeds 2 sessions, asserts only the active session's row comes back). Existing tests adapted to the new `sessionId` parameter.
+
 ## [2026-05-16] fix(tools+telemetry) — cap retrieve_context query length + strip terminal-attack control chars in scrub (review H2+H3)
 
 Closed two `feat/retrieval` review findings, both at the input/output boundary.

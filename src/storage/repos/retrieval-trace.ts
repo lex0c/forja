@@ -206,6 +206,12 @@ export const getRetrievalTrace = (db: DB, id: string): RetrievalTraceRow | null 
 // Latest N traces in a session, newest first. Backed by
 // idx_retrieval_trace_session_created. Default limit 20 mirrors
 // /memory audit + /agent policy list pagination defaults.
+//
+// Secondary sort by `id DESC` guards against equal-ms timestamps
+// (concurrent inserts under eval harness load, or two traces
+// landing in the same millisecond). Without the tiebreaker the
+// pagination / short-id resolution flakes between calls. Matches
+// the pattern in `failure-events.ts:93`.
 export const listRetrievalTracesBySession = (
   db: DB,
   sessionId: string,
@@ -215,7 +221,7 @@ export const listRetrievalTracesBySession = (
     .query<RetrievalTraceDbRow, [string, number]>(
       `${SELECT_ALL}
         WHERE session_id = ?
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ?`,
     )
     .all(sessionId, limit);
@@ -253,11 +259,14 @@ export const listRetrievalTracesSinceMs = (
   // window" (capReached=false) from "hardCap rows AND more behind
   // them" (capReached=true). One extra row at the SQL layer is
   // cheaper than a separate COUNT query.
+  // Secondary sort by `id DESC` mirrors `listRetrievalTracesBySession`
+  // — deterministic order under equal-ms timestamps so eval replays
+  // and metric aggregates over the window are stable across calls.
   const rows = db
     .query<RetrievalTraceDbRow, [string, number, number]>(
       `${SELECT_ALL}
         WHERE session_id = ? AND created_at >= ?
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ?`,
     )
     .all(sessionId, cutoffMs, hardCap + 1);
@@ -266,23 +275,34 @@ export const listRetrievalTracesSinceMs = (
   return { rows: kept.map(fromRow), capReached, hardCap };
 };
 
-// Latest N traces for a specific workflow across sessions, newest
-// first. Useful for per-workflow eval / metric queries. Backed by
-// idx_retrieval_trace_workflow + table scan within the matching
-// rows.
+// Latest N traces for a specific workflow within a single session,
+// newest first. Useful for per-workflow drilldowns from a session's
+// `/agent retrieval audit`. `sessionId` is required — the previous
+// signature filtered only by `workflow = ?` and spanned every
+// session in the DB, which leaks cross-session traces to any
+// caller that assumed session-scope (operator inspecting "debug
+// workflow traces" would see traces from other operators' sessions
+// on the same DB). A cross-session aggregation surface would need
+// a different function with explicit acknowledgement that the
+// caller wants every session.
+//
+// Backed by idx_retrieval_trace_session_created + workflow filter
+// at SQL level. Secondary sort `id DESC` for the same deterministic
+// ordering as the other list helpers.
 export const listRetrievalTracesByWorkflow = (
   db: DB,
+  sessionId: string,
   workflow: RetrievalWorkflow,
   limit = 50,
 ): RetrievalTraceRow[] => {
   const rows = db
-    .query<RetrievalTraceDbRow, [RetrievalWorkflow, number]>(
+    .query<RetrievalTraceDbRow, [string, RetrievalWorkflow, number]>(
       `${SELECT_ALL}
-        WHERE workflow = ?
-        ORDER BY created_at DESC
+        WHERE session_id = ? AND workflow = ?
+        ORDER BY created_at DESC, id DESC
         LIMIT ?`,
     )
-    .all(workflow, limit);
+    .all(sessionId, workflow, limit);
   return rows.map(fromRow);
 };
 
