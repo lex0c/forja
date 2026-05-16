@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — provenance docs + end-to-end integration test (S1/T1.8)
+
+Closes Slice 1 of `feat/memory-lifecycle-detectors`. Two artifacts:
+
+`docs/MEMORY.md §11.2` — operator-facing canonical doc for the exposure trail. Documents what the schema claims and (more importantly) what it does NOT claim: not causation, not "use", not replay completeness. Three surfaces (`eager` / `memory_read` / `retrieve_context`) tabulated with their `tool_call_id` + `retrieval_query_id` + `position_in_corpus` invariants. The repo-layer guards (`surface` / `memoryScope` enums, retrieval-grouping invariant, per-surface `tool_call_id` nullability) and the privacy-by-default query convention are documented so a future contributor can read the schema header in `migrations/054-memory-provenance.ts` plus this section and reproduce the contract without spelunking the repo. The `/memory provenance` operator surface (three modes), the 90d retention sweep, and the AUDIT DRIFT failure posture all get short sections. The cross-table reconciliation matrix at the end tells operators which of the three audit tables (`memory_events`, `retrieval_trace`, `memory_provenance`) to query for which question. §11 intro corrected from "two tables" to "three"; §14.5 "What IS shipped" gains a Slice 1 closure entry.
+
+`tests/memory/provenance-trail.test.ts` — cross-cut integration test exercising all three emitters against a real memory/registry/db substrate within one session, asserting `memory_provenance` carries the complete picture. Seven tests pin the contract end-to-end:
+
+- All three surfaces land for the same memory; per-surface `tool_call_id` / `retrieval_query_id` invariants hold simultaneously.
+- Content hash is stable across `memory_read` and `retrieve_context` for an unchanged file (catches future canonical-form divergence between the two paths).
+- Eager dedupe — one row per `(session, memory)` is the emit-site convention; schema doesn't enforce it but the inventory layer's contract is the line of defense.
+- `retrieve_context` exposures group by `retrieval_query_id` with position-ordered listing (monotone non-decreasing).
+- Session scoping regression — by-name and by-(scope,name) refuse cross-session reads silently; only the explicit `listGlobal*` helpers see across.
+- Retention sweep uses the shipped `MEMORY_PROVENANCE_RETENTION_MS` constant directly, verifying the boundary direction end-to-end against the same value the bootstrap path uses.
+- Operator-by-tool-call query surfaces per-call surfaces only — eager rows (which have `toolCallId=NULL` by construction) MUST NOT leak into "what did THIS tool_call expose?" forensic queries.
+
+The unit tests across T1.1-T1.7 already pin each emitter and helper in isolation; this file is the cross-cut. If a future refactor breaks the schema/repo/registry/runner contract in a way each unit test happens to miss but the operator forensic surface would notice, that gap surfaces here.
+
+Slice 1 acceptance per `docs/TODO.md`: every memory exposed to the model leaves a `memory_provenance` row carrying enough state (content_hash, state_at_exposure, retrieval grouping, position) to support honest replay later; operator queries by memory, by tool call, by retrieval batch — all session-scoped by default. ✓
+
 ## [2026-05-16] feat(memory) — boot-time provenance retention sweep (S1/T1.7)
 
 90-day retention for `memory_provenance` rows. Exposure rows are a forensic substrate: useful within the first few weeks for "what was visible when X happened" queries, but value decays fast and the table grows monotonically (every tool call that exposes a memory adds a row). Without a sweep, millions of rows accumulate across long-lived installs — slows operator queries, bloats disk, and eventually requires manual SQL pruning.
