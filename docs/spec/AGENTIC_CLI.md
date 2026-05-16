@@ -83,6 +83,99 @@ Spec arquitetural sem esses docs é descrição de uma implementação. **Com** 
 
 ---
 
+## 1.1 Invariantes operacionais
+
+Corolários operacionais dos princípios §1, escritos como regras verificáveis. Cada invariante existe porque um foot-gun recorrente em sistemas similares justifica documentá-lo explicitamente. Próximas slices devem citar o invariante violado quando propuserem exceção.
+
+### 1.1.1 Verifier hierarchy doctrine
+
+**Regra:** *Use o mecanismo mais barato que resolve o problema. Saltar níveis é foot-gun por default.*
+
+Pilha de verificação por custo (latência típica, custo USD por chamada):
+
+| Mecanismo | Latência | $ / chamada | Domínio |
+|---|---|---|---|
+| `stat` / `existsSync` | ~0.001 ms | $0 | Exact lookup (path-existence, file-shape) |
+| `grep` / regex | ~10 ms | $0 | Pattern search em texto conhecido |
+| SQLite indexed query | ~1 ms | $0 | Structured lookup em audit / state |
+| Embedding similarity | ~50 ms | ~$0.0001 | Semantic clustering, near-dup detection |
+| LLM call (Haiku-class) | ~1000 ms | ~$0.001 | Semantic judgment, paraphrase, single-doc reasoning |
+| LLM call (Sonnet-class) | ~2000 ms | ~$0.005 | Complex multi-step reasoning, multi-source synthesis |
+| LLM subagent (multi-tool) | ~30000 ms | ~$0.05 | Exploratory analysis, governance proposal generation |
+
+**Aplicação:**
+
+- Slice nova que precisa de verificação DEVE escolher o nível mais baixo que cobre o caso documentado e **justificar por que não usou o anterior**.
+- "LLM cobre tudo" é arquitetura cara + lenta + não-determinística sem ganho. Usar LLM em path-existence é gasto desnecessário de ~5-6 ordens de grandeza.
+- "Heurística sempre" é frágil em domínios semânticos. Quando o caso documentado envolve paráfrase, equivalência conceitual ou síntese — LLM é apropriado.
+- Hybrid stack: heurística pega o cheap path, retorna `unknown` no resto; LLM como fallback opt-in sobre o `unknown` set. Custo escala com complexidade real, não com volume.
+
+**Pull-in signal para overrider:** dados empíricos mostrando que o nível inferior tem false-negative rate intolerável para o caso de uso. Sem dados, ficar no nível barato.
+
+### 1.1.2 No-daemon discipline
+
+**Regra:** *Forja é per-CLI-invocation. Não há processo de longa duração entre sessões. Cross-session work acontece em boot sweeps, não em background.*
+
+**Aplicação:**
+
+- Sweeps de retenção (eviction tombstone purge, provenance prune, governance proposal expire) rodam **at boot**, com janela documentada (90d / 30d) — não em timer/cron interno.
+- Detectores e governance que precisam de "monitoramento contínuo" devem ser reformulados como "verificação at boot" ou "verificação at step boundary" dentro da sessão.
+- Subagents existem e correm async, mas dentro do escopo de **uma sessão** (`task_async` handle store é drenado no outer finally do `runAgent`).
+- Cron / scheduled work cross-session é responsabilidade do operator (cron + `agent` invocation), não do binário.
+
+**Por que:** processo background introduz classe inteira de bugs (zombie processes, db lock contention, signal handling em ambientes restritivos, recovery após crash) que a infra atual não modela. Inverter essa decisão requer projetar lifecycle de processo separado, IPC entre instâncias, lock files, etc. — escopo de subsistema novo.
+
+**Pull-in signal:** caso de uso documentado que **não pode** ser modelado como boot sweep ou step-boundary. Hoje nenhum existe.
+
+### 1.1.3 Append-only everywhere
+
+**Regra:** *Substrato de audit nunca muta retroativamente. Tudo que parece mutação é INSERT de nova row + ponteiro pro estado anterior.*
+
+**Aplicação:**
+
+- `memory_events`, `eviction_events`, `memory_provenance`, `memory_governance_proposals`: tabelas append-only. UPDATE permitido apenas em campos de status discriminantes (e.g., `governance_proposals.status: pending → applied/rejected/expired`), nunca rewrite de payload.
+- Mutações lógicas (state transition, memory rewrite) viram audit-row + paired transition-row. O histórico do conteúdo vive em commit history do filesystem + tombstones; o histórico do estado vive em eviction_events parent-chain.
+- Sweeps de retenção são a **única** operação DELETE permitida nesses substratos, com janela explícita documentada em constante exportada.
+- Migration que adicionar campo NOVO em audit table é OK; migration que reescreve rows existentes (backfill que não seja idempotente sobre `created_at`) **requer justificativa documentada**.
+
+**Por que:** replay forense + audit reconciliation + detector quality measurement dependem de imutabilidade. Uma rewrite silenciosa quebra a premissa que faz audit valer mais que log.
+
+### 1.1.4 Confidence ≠ authority
+
+**Regra:** *Scores de confidence guiam ranking e decay — nunca authorization. Authorization vem de: (a) operator explicit approval, (b) deterministic state-machine validation, (c) heuristic com zero false-positive shape.*
+
+**Aplicação:**
+
+- `memory_governance_proposals.confidence` é input para ordenação na UI e para gate de "auto-archive abaixo de threshold". **Nunca** input para "auto-apply acima de threshold".
+- Truth confidence em frontmatter (proposta em S12) impacta retrieval ranking, **não** auto-mutation.
+- "Auto-apply at confidence > 0.95" é refused by design — confidence é estimativa probabilística do modelo sobre si mesmo, não autorização para alterar estado persistente.
+- Apply path SEMPRE requer evento de authorization explícito (operator approval row, state machine `applied` outcome).
+
+**Por que:** confiar em confidence para auto-aplicar cria caminho de **recursive epistemic corruption**: memória ruim → LLM gera proposal high-confidence → auto-apply → estado degrada → futura geração de proposals piora. Separar confidence de authority quebra o loop.
+
+**Pull-in signal:** apenas se um detector tiver false-positive rate empiricamente medido em **zero** em corpus suficientemente grande — e mesmo assim, com kill-switch operacional.
+
+### 1.1.5 Injection surface ledger
+
+**Regra:** *Toda superfície onde bytes de memory body podem entrar em janela de modelo é listada explicitamente. Adicionar nova superfície requer: (a) entrada nesta lista, (b) revisão do trust filter, (c) `scanForInjection` pre-check.*
+
+**Superfícies hoje:**
+
+1. **Eager system prompt** (boot). Filtered: `frontmatter.trust === 'untrusted'` exclui o body do prompt. Index entry (name + description) ainda surface.
+2. **`memory_read` tool response** (per-call). Full body returned ao modelo via tool result. Trust marker propagated em `out.trust`; renderer surface "[memory: untrusted]" warn no terminal.
+3. **`retrieve_context` slot** (per-call). Full body em `level='full'`, comprimido em `outline/summary/ref`. Inclusão é gateada pelo compression resolver; não tem trust filter dedicado hoje (gap conhecido — `MEMORY.md §14.3`).
+4. **Governance subagent input** (planejado em S11). Bodies passam por `scanForInjection` pre-check; system prompt enquadra input como adversarial; output JSON-schema-validated.
+
+**Aplicação:**
+
+- PR que adicionar nova superfície (ex.: novo tool que retorna memory body, novo subagent que lê memory) DEVE adicionar entrada nesta lista. PR review check.
+- Trust filter (`frontmatter.trust === 'untrusted'` rejection) é o gate canônico — futuras superfícies devem usar a mesma helper, não reimplementar.
+- `scanForInjection` é o pre-check canônico para LLM-consumer surfaces — futuras superfícies LLM devem chamar antes de emitir bytes no prompt.
+
+**Por que:** memory bodies são operator-edited e alguns são imported (FEEDBACK_ADAPTATION cross-cut). Tratá-los como input não-adversarial em qualquer superfície reabre o vetor que o trust filter existe para fechar. Sem ledger central, próximo developer adiciona a 5ª superfície sem perceber que está bypassando uma camada de defesa.
+
+---
+
 ## 2. Terminal-first (o que isso significa, na prática)
 
 A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal portada pra terminal. Aqui não.

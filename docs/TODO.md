@@ -28,28 +28,17 @@ Land the manual paths before the auto-detectors so the pipeline is end-to-end te
 
 **Acceptance:** operator runs `/memory quarantine foo --motivo conflict --evidence "duplicates bar"`, sees foo in `/memory list` with quarantine flag, inspects the row in `/memory audit`. Pipeline tested end-to-end.
 
-## Slice 1 — Memory **exposure** infrastructure
+## Slice 1 — Memory **exposure** infrastructure · ✅ DONE
 
 Tracks which memory(s) **were visible to the model** at the moment of each tool call. **Not causation** — the model may ignore an exposed memory entirely. Exposure trace is foundational for the failure-correlation surfaces in Slices 2 (`verify_failed` runs against exposed memories) and 3 (`user_override_repeated` counts overrides per exposed memory).
 
-The schema accommodates spec/operator review surfaced design decisions:
+Closed in 9 commits (`719ff0a..dab5d73` on `feat/memory-lifecycle-detectors`). Three emitters (memory_read/eager/retrieve_context), one operator surface (`/memory provenance`), 90d retention sweep, full §11.2 docs. Post-review hardening pass landed bugs/guards/idempotency. See `docs/BACKLOG.md` for the slice closure summary.
 
-- **Content hash + state-at-exposure**: provenance points to a mutable substrate; without freezing content + state at the exposure moment, replay loses fidelity.
-- **Retrieval grouping**: `retrieve_context` returns N memories in one call. Group them by `retrieval_query_id` so blame analysis can ask "the retrieval at time T exposed X" instead of N separate rows.
-- **Per-call vs per-session emit**: `memory_read` and `retrieve_context` emit per-tool-call. **Eager-load emits once per (session, memory)** at boot — N tool_calls in the session don't generate N rows for the same eager memory, just the one "exposed via eager from session start" claim.
+## Slice 2 — `verify_failed` detector (heuristic) · ✅ DONE
 
-| Task | Description |
-|---|---|
-| **T1.1** | Migration `054-memory-provenance.sql` — table `memory_provenance(id PK, session_id FK CASCADE NOT NULL, tool_call_id FK CASCADE NULL, memory_scope TEXT, memory_name TEXT, surface ENUM('eager','memory_read','retrieve_context'), retrieval_query_id TEXT NULL FK retrieval_trace, position_in_corpus INTEGER NULL, memory_content_hash TEXT NULL, memory_state_at_exposure TEXT NULL, created_at INTEGER)`. Indices on `(session_id, created_at DESC, id DESC)`, `(memory_scope, memory_name, created_at DESC)`, `(tool_call_id)` (partial WHERE NOT NULL), `(retrieval_query_id)` (partial WHERE NOT NULL). `tool_call_id` nullable because eager-load happens before any tool call; eager rows have a null tool_call. |
-| **T1.2** | Repo `src/storage/repos/memory-provenance.ts` — `recordProvenance(input)`, `listProvenanceForToolCall(db, sessionId, toolCallId)`, `listProvenanceForMemory(db, sessionId, scope, name, limit)`, `listExposuresInRetrieval(db, retrievalQueryId)`, `countExposuresInWindow(db, sessionId, scope, name, windowMs)`. **Every helper requires sessionId** — privacy: never accidentally span sessions (same fix shape as commit `55ba11a`'s `listRetrievalTracesByWorkflow`). |
-| **T1.3** | Emit at `memory_read` tool — when the model reads a memory, persist exposure linked to the active tool_call. `surface='memory_read'`, content_hash = sha256 of `frontmatter + body`, state_at_exposure = `frontmatter.state ?? 'active'`. |
-| **T1.4** | Emit at eager-load — system-prompt-injected memories tracked **once per (session, memory)** at the eager-load moment, with `tool_call_id=NULL`. Subsequent tool calls in the same session reference the single eager row via `session_id` match. content_hash + state captured at boot. |
-| **T1.5** | Emit at `retrieve_context` — every `contextSlot.included` entry produces a provenance row with `surface='retrieve_context'`, `retrieval_query_id = result.queryId`, `position_in_corpus = index in slot.included`, content_hash + state captured at slot-build time. `tool_call_id` set to the tool_call that **issued** the `retrieve_context` request (NOT the next tool_call — that would be unverifiable speculation about which call "used" the slot). |
-| **T1.6** | Operator surfaces — `/memory provenance <name>` lists exposure history in current session (or `--all`); `/memory provenance --tool <tool_call_id>` lists what was exposed during a specific tool call; `retrieve_context` group view via `--retrieval <query_id>`. |
-| **T1.7** | TTL + storage budget — 90d default retention (mirror `eviction_events`). Boot-time GC sweep prunes rows older than TTL. Add `pruneMemoryProvenance(db, olderThanMs)` to the existing GC harness. |
-| **T1.8** | Tests + `docs/MEMORY.md §11.2` update — schema + audit shape doc. Tests cover: per-surface emit, eager dedupe (single row per session×memory), retrieval grouping, content_hash stability, session scoping (cross-session leak refused), prune sweep removes only old rows. |
+Auto-quarantines factual memories whose path claims contradict current FS state. Conservative heuristic: extracts paths under known prefixes (`src/ tests/ docs/ evals/ examples/ scripts/`), checks `existsSync`. Returns `unknown` (silent, forensic-only stderr) when no extractable claim — high bar against false-positives. LLM-judge fallback over `unknown` set is planned as Slice 11 (Phase 2).
 
-**Acceptance:** every memory **exposed** to the model leaves a `memory_provenance` row. The row carries enough state (content_hash, state_at_exposure, retrieval grouping, position) to support honest replay later. Operator queries by memory, by tool call, by retrieval batch — all session-scoped by default.
+Closed on the same branch. `motivo: 'conflict'` + `evidence: { failures: 1, ... }` to satisfy state machine constraint; `trigger: 'verify_failed'` carries detector identity. See BACKLOG entry for design notes on the semantic stretch.
 
 **What the schema does NOT claim:**
 - Causation. A row says "this memory was visible when this tool call fired"; not "this memory caused this tool call". Comment in the schema header documents this distinction.
@@ -136,6 +125,66 @@ Walk back the H1+H6 hard-filter (commit `949fadf`) to spec'd behavior: quarantin
 | **T7.3** | E2E smoke — single test: write 2 contradicting memories → second triggers `conflict_detected` → loser quarantined → operator `/memory restore` → memory back to active. |
 | **T7.4** | `docs/BACKLOG.md` comprehensive entry summarizing slice closure. |
 
+---
+
+# Phase 2 — LLM-judge governance (proposed branch: `feat/memory-governance-llm`)
+
+Heuristic family (Slices 0-7) covers the operations where ground truth is unambiguous (path-existence, override-counts, hash divergence). Phase 2 adds the LLM-judge layer for operations where heuristics can't reach: **semantic drift, paraphrase contradiction, consolidation candidate detection**.
+
+Design constraints carried forward from the heuristic-vs-LLM analysis:
+
+- **Propose-not-mutate.** LLM subagent NEVER writes/mutates memory directly. It emits structured proposals; a deterministic validator + operator approval flow drives the actual state transition.
+- **Heuristic-first, LLM-fallback.** Slice 2 heuristic stays as-is; LLM only runs over the `unknown` subset where the heuristic couldn't conclude. ~30% of memories produce heuristic verdicts; the remaining ~70% are LLM's domain.
+- **Injection-aware by construction.** Memory bodies are operator-edited and some are marked `trust: untrusted`. Every body that enters the subagent's window passes through `scanForInjection` first; system prompt explicitly frames input as adversarial; output is JSON-schema-validated (not free text) so prose injections can't shape the response.
+- **Confidence decay.** Pending proposals expire after 30 days. A stale proposal that didn't get reviewed loses authority — automation that auto-applied based on month-old confidence would be drift, not governance.
+- **Multi-source evidence.** Proposals carry not just LLM verdict but: provenance lineage, retrieval stats, outcome correlation. Never trust embedding/body content as sole evidence.
+
+## Slice 8 — Memory governance proposal substrate
+
+Foundational table + repo + approval flow. No LLM yet — this is the deterministic spine the subagent (Slice 11) lands its findings on.
+
+| Task | Description |
+|---|---|
+| **T8.1** | Migration `055-memory-governance-proposals.sql` — `memory_governance_proposals(id PK, session_id FK NULLABLE, kind ENUM('quarantine','restore','demote','merge','consolidate','expire'), source_memory_keys JSON, target_payload JSON NULLABLE, confidence NUMERIC, evidence JSON, status ENUM('pending','applied','rejected','expired'), proposed_by TEXT, created_at INTEGER, decided_at INTEGER NULLABLE, decided_by TEXT NULLABLE)`. `proposed_by` field carries `subagent:<name>` or `operator:<id>` so audit distinguishes auto vs manual proposals. `source_memory_keys` is an array of `{scope, name}` so multi-memory operations (merge, consolidate) carry their inputs. |
+| **T8.2** | Repo `src/storage/repos/memory-governance.ts` — `recordProposal(input)`, `listPendingProposals(db, limit?)`, `listProposalsForMemory(db, scope, name)`, `decideProposal(db, id, decision, decidedBy)`, `expirePendingProposals(db, olderThanMs)`. Session-scoped where applicable (mirroring Slice 1 privacy default); cross-session aggregate via explicitly-named `listGlobalProposals*`. **Proposal fingerprint:** column `proposal_fingerprint TEXT NOT NULL` = SHA-256 of `JSON.stringify({kind, sorted(source_memory_keys), evidence_essence_hash})`. UNIQUE partial index `WHERE status = 'pending'` so two subagent runs can't enqueue the same proposal twice. Collision on INSERT → no-op silent (does NOT bump `created_at`; the existing pending row keeps its identity). Applied/rejected/expired keep multiple historical rows — useful for detector quality measurement. |
+| **T8.3** | Apply path — `applyProposal(db, registry, id, decidedBy)` validates schema → loads memory → delegates to existing `transitionMemoryState`. Pre-flight refuses if: memory has changed state since proposal, evidence schema invalid, confidence below configured threshold. Failures emit `decision: 'rejected'` with reason instead of attempting the transition. |
+| **T8.4** | TTL sweep — `pendingExpiredCutoffMs = 30d` default. Boot-time prune wraps `expirePendingProposals(db, now - 30d)`. Same posture as `pruneMemoryProvenance` (best-effort, AUDIT DRIFT on failure). Constant exported as `GOVERNANCE_PROPOSAL_TTL_MS`. |
+| **T8.5** | Slash `/memory governance list [--status pending\|applied\|rejected\|expired]`, `/memory governance show <id>`, `/memory governance approve <id>`, `/memory governance reject <id> [--reason "..."]`. Approval triggers T8.3 apply path. Confirmation modal for `approve` when kind affects ≥3 memories. |
+| **T8.5b** | Slash `/memory governance audit <id>` — lineage view: proposal → approval decision → resulting `eviction_events` row(s) → subsequent exposure history of the affected memories. Reads on-demand from existing tables (`memory_governance_proposals` + `memory_events` + `eviction_events` + `memory_provenance`) — no materialized lineage table. JOIN-style query in the slash handler. Enables operator-level detector-quality forensics ("of last 10 verify_failed proposals, how many got reversed?"). Materialized lineage table is deferred until query latency proves it necessary. |
+| **T8.6** | Tests covering each `kind` x each `status` transition, TTL boundary (29d kept / 30d swept), confidence threshold gate, schema validation refusal, cross-session aggregate vs session-scoped privacy. |
+| **T8.7** | `docs/MEMORY.md §11.3` — governance proposals doc. Schema, lifecycle, slash surfaces, what proposals do NOT do (mutate state without approval). |
+
+**Acceptance:** operator runs `/memory governance list` and sees pending proposals. `approve <id>` applies via `transitionMemoryState`; row status flips to `applied`, decided_at + decided_by set. Pending proposals expire silently after 30d. No memory state mutates without explicit approval.
+
+## Slice 11 — Semantic verify_failed (LLM-judge fallback over heuristic `unknown`)
+
+The first LLM-judge consumer of S8's substrate. Routes the `unknown` verdict from Slice 2's heuristic verifier to a sandboxed subagent that does semantic verification with FS tools.
+
+**Why "fallback" and not "primary":** ~30% of factual memories have extractable path claims that the cheap heuristic handles in microseconds for $0. The remaining ~70% are prose-only or semantic — and there LLM is the right tool. Routing only the `unknown` subset means LLM cost is bounded to where it adds value.
+
+| Task | Description |
+|---|---|
+| **T11.1** | Subagent definition `src/subagents/builtin/verify-semantic.md` (or `.agent/subagents/`, TBD per project convention) — system prompt frames input as adversarial, requires JSON output, enumerates allowed tools (read_file, grep, memory_read — read-only set). Output schema: `{verdict: "passed"|"contradicted"|"inconclusive", confidence: 0.0-1.0, claim_extracted: string, ground_truth_observed: string, evidence_paths: string[]}`. |
+| **T11.2** | Injection pre-check — `scanForInjection(memory.body)` runs BEFORE the body enters the subagent's input. Flagged bodies skip semantic verification entirely; emit `verify_skipped` stderr line. The trust filter's intent (untrusted bodies out of model windows) extends to governance subagent windows. |
+| **T11.3** | Scheduler dispatch — extend `createVerifyScheduler` so when the project heuristic returns `unknown`, the scheduler enqueues a SECONDARY task that dispatches the semantic subagent. Gated on `config.memorySemanticVerify === true` (opt-in flag in `HarnessConfig`, default false) so operators consciously enable LLM cost. **Pre-dispatch dedup guard:** before enqueueing, check `listProposalsForMemory(scope, name)` with `status='pending'` AND `kind='quarantine'`. If a pending proposal already exists for this memory, skip dispatch — avoids paying LLM cost to generate a proposal that would collide with the existing pending row anyway (T8.2's fingerprint UNIQUE index would refuse the INSERT). |
+| **T11.4** | Subagent runner integration — uses existing `task_async` infrastructure: subagent spawn carries its own sandbox profile (no fs.write, no bash, no network beyond tool whitelist), depth gate, cost budget. Reuses `subagent_runs` audit table for prompt_hash + model_id + structured_output capture. |
+| **T11.5** | Structured output validator — JSON schema on the subagent's return. Malformed output → discard, log `verify_semantic_malformed` stderr. The validator is the same shape as the runtime's existing `outputSchema` enforcement for `task` results. |
+| **T11.6** | Emit as `memory_governance_proposals` (S8) — kind=quarantine, source_memory_keys=[{scope, name}], confidence=`output.confidence`, evidence=`{verdict, claim_extracted, ground_truth_observed, evidence_paths, subagent_run_id, prompt_hash}`. proposed_by=`subagent:verify-semantic`. |
+| **T11.7** | Confidence threshold gate — proposals with `confidence < 0.7` auto-archived (status=rejected, decided_by=`system:low_confidence`). Above threshold lands as pending for operator review. Constant `SEMANTIC_VERIFY_MIN_CONFIDENCE` exported and tunable. |
+| **T11.8** | Operator opt-in surface — bootstrap CLI flag `--memory-verify-llm` OR policy `[memory.verify].llm = true`. Default off. Surfaced in `/memory governance status` (new subcommand) showing whether LLM-judge is active for this session. |
+| **T11.9** | Per-session cost + dispatch caps — `MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION` (default 10) + `MEMORY_VERIFY_SEMANTIC_MAX_COST_USD` (default 0.50). Scheduler refuses dispatch beyond cap; logs `memory: verify_semantic_budget_exhausted` stderr line so operator sees the throttle. Constants exported and tunable via policy. Without caps, opt-in operator can see surprise bills when memory corpus grows. |
+| **T11.10** | `last_semantic_verify_at` dedup — `memory_verify_attempts(id, scope, name, content_hash, verdict, confidence, model_id, prompt_hash, attempted_at)` table. Scheduler skips re-dispatch when `(content_hash unchanged AND attempted_at > now - 7d AND verdict ∈ {passed, inconclusive})`. Cross-session memo so an opt-in operator doesn't pay LLM cost every boot for memories the subagent just judged unchanged. Contradicted verdicts always re-dispatch (high-stakes; want re-confirmation). |
+| **T11.11** | Tests + acceptance — fixture: project memory `"we use JWT for auth"` in tmpdir whose code shows OAuth-only patterns. Heuristic returns `unknown` (no path claim) → semantic dispatched → subagent reads files → returns `contradicted` with `confidence: 0.85` → proposal lands in `pending` → operator approves → memory quarantined with paired `memory_events` + `eviction_events` rows. Additional pin: cost cap fires when synthetic budget of $0.01 is set + 11 dispatches attempted (11th refused). Additional pin: dedup table skips re-dispatch when content_hash unchanged + same-day attempt exists. |
+
+**Acceptance:** with opt-in enabled, a semantic-only contradicted memory generates a pending proposal within one turn of being exposed. Operator approves via slash; memory transitions to `quarantined` with full audit trail (eviction_events + governance_proposal + subagent_runs all cross-linkable by ids). With opt-in disabled, no LLM call fires and no proposal lands (default-zero-cost preserved).
+
+**What S11 does NOT do (deferred):**
+- Consolidation (N similar memories → 1) — that's Slice 10 (not in scope here; subagent infrastructure of S11 is the building block but the consolidation prompt + flow is its own slice).
+- Conflict detection between memories (pairwise) — Slice 4's heuristic family; LLM-judge upgrade is a future slice if heuristic proves too brittle.
+- Drift detection across time (memory written 90 days ago, codebase migrated) — would need cross-session subagent that doesn't exist today. Future infrastructure.
+
+---
+
 ## Out of scope (deliberate)
 
 - **`distribution_shift` / `source_removed` detectors** — listed in EVICTION §5.1 but tied to startup probes for external sources. Tracked separately as "reference dereference probe".
@@ -145,21 +194,30 @@ Walk back the H1+H6 hard-filter (commit `949fadf`) to spec'd behavior: quarantin
 ## Dependency graph
 
 ```
-S0 (escape hatch)  →  independent
-S1 (provenance)    →  blocks S2, S3
-S6 (penalty)       →  independent
-S4 (conflict)      →  independent
-S5 (trust_revoked) →  independent
-S2 (verify_failed) →  depends on S1
-S3 (override)      →  depends on S1
-S7 (docs+smoke)    →  last (after S0..S6)
+Phase 1 — heuristic detector family
+  S0 (escape hatch)   →  ✅ done
+  S1 (provenance)     →  ✅ done, blocks S2/S3
+  S2 (verify_failed)  →  ✅ done (heuristic; semantic fallback in S11)
+  S6 (penalty)        →  independent
+  S4 (conflict)       →  independent
+  S5 (trust_revoked)  →  independent
+  S3 (override)       →  depends on S1
+  S7 (docs+smoke)     →  last (after S0..S6)
+
+Phase 2 — LLM-judge governance (new branch)
+  S8  (proposal substrate)        →  foundational, blocks S10/S11
+  S11 (semantic verify fallback)  →  depends on S8 + S2 (existing heuristic)
+  S10 (consolidation subagent)    →  depends on S8, deferred
+  S12 (confidence separation)     →  independent, deferred
 ```
 
-Recommended order: **S0 → S1 → S6 → S4 → S5 → S2 + S3 → S7**.
+Recommended order: **S0 ✅ → S1 ✅ → S2 ✅ → S6 → S4 → S5 → S3 → S7 → S8 → S11**.
+
+Phase 2 ideally lands on a separate branch (`feat/memory-governance-llm`) since the LLM-judge family introduces a different risk surface (injection, cost, non-determinism) and merging Phase 1 first keeps the heuristic baseline shippable independently.
 
 ## Tracking
 
-Each task lands as one or more commits on `feat/memory-lifecycle-detectors`. Each slice closes with a `chore(memory): slice N done` entry in `docs/BACKLOG.md` summarizing the slice's commits. Final consolidation at S7.
+Each task lands as one or more commits on the active branch. Each slice closes with a `feat(memory): slice N done` entry in `docs/BACKLOG.md` summarizing the slice's commits. Phase 1 final consolidation at S7; Phase 2 begins on a new branch after that lands.
 
 ---
 
