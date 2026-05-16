@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(memory) — S2 heuristic rolled back; LLM-judge becomes the only prose-judgment path
+
+Policy decision applied: **"todo o lifecycle de memória um llm-judge decide; sem heurísticas locais sobre texto"**. The S2 verify_failed heuristic (regex path extraction + `existsSync`) shipped initially and was removed for the same reason S4's textual conflict heuristic was: regex over prose cannot reliably distinguish factual assertion from historical/cautionary mention. The deterministic part (`existsSync`) is fine; the heuristic part (extracting "this memory ASSERTS path X exists" from prose) isn't. Without the extraction, the FS check has nothing to verify.
+
+Deleted:
+
+- `src/memory/verify/` (4 files: factuality classifier, project verifier, scheduler, MemoryVerifier interface types) — ~250 lines of implementation.
+- `tests/memory/verify/` (3 files: factuality, project-verifier, scheduler) — ~600 lines of tests.
+- Wire-up in `src/harness/loop.ts` (scheduler creation, poll, drain) — ~50 lines.
+
+Preserved as substrate-only:
+
+- The `verify_failed` trigger name + `/memory audit --trigger verify_failed` filter (from S0/T0.3). The audit surface is generic across triggers; it will render `verify_failed` rows when S11's LLM-judge emits them.
+- The `memory_provenance` exposure trail (S1) — foundational for S11's "what should I verify?" pool.
+
+Doc updates:
+
+- `docs/TODO.md`: cleaned up duplicate S2 entry; S2 marked `🔁 rolled back`; S11 reframed from "fallback over heuristic unknown" to "PRIMARY LLM-judge path"; S3 framing made explicit about the boundary (deterministic counter + threshold, LLM-judge proposal when threshold trips, propose-not-mutate via S8); dependency graph + recommended order updated.
+- `docs/MEMORY.md §14.5`: detector family entry updated to reflect substrate-only Phase 1 + LLM-judge Phase 2.
+
+Architectural commitment now documented across BACKLOG + TODO: **zero text-heuristic for memory lifecycle decisions in this codebase**. Deterministic substrate stays (state machine, audit, frontmatter, hashing, expiry, scope precedence, file existence). Numerical ranking dials stay (QUARANTINED_PENALTY=0.3, BM25 weights, retrieval caps). Threshold counters (S3 override count, S5 hash divergence) stay deterministic but trigger LLM-judge proposals via S8 when they trip — no auto-mutation. The boundary is sharp: anything that judges PROSE about memory content goes to LLM; anything that counts or compares structured values stays local.
+
+
+
 ## [2026-05-16] feat(memory) — verify_failed detector (S2)
 
 Auto-quarantines factual memories whose path claims contradict the active repo. Bolts onto Slice 1's `memory_provenance` substrate: the scheduler scans the trail at each step boundary, enqueues verification for each unique (session, scope, name), and runs verifiers fire-and-forget. A `contradicted` verdict drives `transitionMemoryState` with `motivo=conflict + trigger=verify_failed + actor=loop_cold`.
@@ -29,6 +53,30 @@ Scheduling architecture:
 - **Non-fatal failures everywhere.** Verifier throws, peek not-present, state machine refusal — all stderr-log and continue. Verification is observability, not correctness.
 
 Tests: 28 new across `factuality.test.ts` (4 — pure classifier), `project-verifier.test.ts` (13 — extractor + verify), `scheduler.test.ts` (11 — passed/contradicted/unknown verdicts, type gating, idempotency, drain timeout, failure isolation). Acceptance from TODO.md is met for path-mention claims; export-pattern verification is deferred with rationale.
+
+## [2026-05-16] feat(memory) — Slice 4: conflict audit substrate (detector deferred to Phase 2)
+
+Ships ONLY the audit substrate for conflict-detected eviction events. The textual heuristic detector built during initial S4 implementation was deliberately rolled back: empirical analysis showed it would cover <5% of real conflicts in operator-authored memory bodies (narrow vocab pattern matches require literal token collision on identical verb-object pairs — extremely rare in prose) while introducing false-positive paths on common English words (`bash`, `commit`, `test`, `push`, `merge`).
+
+The decision: **no local text heuristic. The conflict detector is LLM-judge only.** Phase 2 / S11-aligned slice will deliver the actual decision pipeline, emitting governance proposals through S8's substrate. V1 ships only what's substrate-agnostic and forward-compatible with the LLM-judge path:
+
+- **`listEvictionEventsByTrigger(db, trigger, limit)`** — generic repo helper in `eviction-events.ts`. Backs any future detector slash surface that filters by trigger (S5/T5.4 `/memory trust status`, future `/memory overrides` if Slice 3 lands).
+- **`/memory conflicts` slash command** — reads audit rows where `trigger='conflict_detected'` and renders `<ts> · <kind> · winner=<scope/name> loser=<scope/name> token="<shared>"`. Cross-session forensic surface. Agnostic of what emits the trigger (heuristic or LLM-judge both work). `--limit N` (default 50). 4 tests pin: empty-state hint, row rendering, --limit cap, unknown-flag rejection.
+
+Deleted from initial S4 attempt:
+
+- `src/memory/conflict/` (4 files: detector, types, resolver, scheduler) — heuristic-coupled and not forward-compatible with the LLM-judge propose-not-mutate path. Auto-mutating state from a heuristic verdict violates §1.1.4 (confidence ≠ authority) more sharply than verify_failed did.
+- `tests/memory/conflict/` (3 files) — exercised the heuristic specifically.
+- Wire-up in `src/harness/loop.ts` for the conflict scheduler.
+
+Decisions carried forward to the future Phase 2 slice (recorded in TODO.md):
+
+- Resolver ordering per `EVICTION.md §6.3`: provenance tier (`user_explicit > inferred > imported`) → recency → scope specificity → body length tiebreak → deterministic tiebreak.
+- Evidence schema: `{ winner_id, loser_id, conflict_kind, shared_concept?, confidence?, resolver_reason }` satisfies `conflict` motivo's `winner_id/loser_id/conflict_kind` triple directly (no semantic stretch like S2's `failures: 1`). Field name `shared_concept` (not the rolled-back heuristic's `shared_token`) is canonical — the slash + S13 producer agree on the LLM-judge vocabulary up front.
+- Actor `loop_cold`, trigger `conflict_detected` for state-machine + audit.
+- Propose-not-mutate: LLM emits `memory_governance_proposals` (S8), operator approves → `transitionMemoryState`. No direct state mutation from LLM verdict.
+
+Honest acceptance reframing: S4 V1 ships **audit substrate ready to receive a detector**, not a detector itself. The TODO acceptance criterion "writing a contradicting memory triggers detection" moves to Phase 2 alongside S8 + S11.
 
 ## [2026-05-16] feat(memory) — Slice 6: quarantine penalty + visual flag (EVICTION §9.7)
 

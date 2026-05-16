@@ -49,6 +49,7 @@ import {
   DETECTOR_TRIGGERS,
   OPERATOR_DRIVEN_EVIDENCE_MARKER,
   OPERATOR_DRIVEN_TRIGGER,
+  listEvictionEventsByTrigger,
 } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import {
@@ -851,6 +852,93 @@ const handleProvenance = (ctx: SlashContext, args: string[]): SlashResult => {
 
   const lines = [`${header} (${rows.length}):`];
   for (const r of rows) lines.push(formatProvenanceRow(r));
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory conflicts (S4/T4.4) ─────────────────────────────────────
+
+// Surface conflict_detected pairs forensically. Reads eviction_events
+// filtered to `trigger = 'conflict_detected'` and outcome = 'applied'.
+// Cross-session by design — operator wants to see the full history of
+// detected conflicts, not just the current session. `--limit N`
+// (default 50) caps the rendered batch.
+
+interface ConflictsFlags {
+  limit: number;
+}
+
+const parseConflictsFlags = (args: string[]): ConflictsFlags | { error: string } => {
+  let limit = 50;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--limit') {
+      const next = args[i + 1];
+      if (next === undefined || !/^\d+$/.test(next)) {
+        return {
+          error: `/memory conflicts: --limit needs a positive integer (got ${next ?? 'nothing'})`,
+        };
+      }
+      limit = Number.parseInt(next, 10);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        return { error: `/memory conflicts: invalid limit '${next}'` };
+      }
+      i += 2;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return { error: `/memory conflicts: unknown flag '${a}' (try --limit)` };
+    }
+    return { error: `/memory conflicts: unexpected positional '${a}'` };
+  }
+  return { limit };
+};
+
+const handleConflicts = (ctx: SlashContext, args: string[]): SlashResult => {
+  const flags = parseConflictsFlags(args);
+  if ('error' in flags) return { kind: 'error', message: flags.error };
+
+  const events = listEvictionEventsByTrigger(ctx.db, 'conflict_detected', flags.limit);
+  if (events.length === 0) {
+    return {
+      kind: 'ok',
+      notes: [
+        'no conflict_detected events recorded (heuristic returns silence by default — narrow bar)',
+      ],
+    };
+  }
+
+  const lines = [`conflict_detected events (${events.length}, most recent first):`];
+  for (const e of events) {
+    // Parse evidence to extract winner/loser/kind for inline display.
+    // Evidence JSON shape (S13 LLM-judge plan, TODO Phase 2):
+    //   { winner_id, loser_id, conflict_kind, shared_concept?,
+    //     confidence?, resolver_reason?, ... }
+    // `shared_concept` is the canonical name (was `shared_token` in
+    // the rolled-back S4 heuristic — kept the field renamed forward
+    // so when S13 lands, slash + producer agree). `confidence` is
+    // LLM-judge specific; absent for non-LLM-emitted rows.
+    let winner = '?';
+    let loser = '?';
+    let kind = '?';
+    let sharedConcept: string | null = null;
+    let confidence: number | null = null;
+    try {
+      const evidence = JSON.parse(e.evidenceJson) as Record<string, unknown>;
+      if (typeof evidence.winner_id === 'string') winner = evidence.winner_id;
+      if (typeof evidence.loser_id === 'string') loser = evidence.loser_id;
+      if (typeof evidence.conflict_kind === 'string') kind = evidence.conflict_kind;
+      if (typeof evidence.shared_concept === 'string') sharedConcept = evidence.shared_concept;
+      if (typeof evidence.confidence === 'number') confidence = evidence.confidence;
+    } catch {
+      // Malformed evidence JSON — fall back to placeholders. Audit
+      // row itself is intact; just couldn't decode the payload.
+    }
+    const ts = formatAuditTimestamp(e.recordedAt);
+    const conceptDetail = sharedConcept !== null ? ` concept="${sharedConcept}"` : '';
+    const confDetail = confidence !== null ? ` conf=${confidence.toFixed(2)}` : '';
+    lines.push(`  ${ts} · ${kind} · winner=${winner} loser=${loser}${conceptDetail}${confDetail}`);
+  }
   return { kind: 'ok', notes: lines };
 };
 
@@ -2086,6 +2174,8 @@ export const memoryCommand: SlashCommand = {
         return handleAudit(ctx, args.slice(1));
       case 'provenance':
         return handleProvenance(ctx, args.slice(1));
+      case 'conflicts':
+        return handleConflicts(ctx, args.slice(1));
       case 'metrics':
         return handleMetrics(ctx, args.slice(1));
       case 'delete':
@@ -2101,7 +2191,7 @@ export const memoryCommand: SlashCommand = {
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, metrics, delete, quarantine, restore, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote)`,
         };
     }
   },

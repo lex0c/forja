@@ -899,6 +899,31 @@ export const getLastAppliedEvictionForObject = (
 // idx_evict_purge (partial index on purge_at IS NOT NULL).
 // Default ordering by recorded_at DESC, rowid DESC (monotonic
 // tiebreaker — same rationale as getLastEvictionForObject).
+// List recent eviction events by trigger source. Used by the
+// `/memory conflicts` slash (S4/T4.4) to surface
+// `conflict_detected` pairs forensically. Returns applied
+// outcomes only (the pair operator wants to see is the
+// quarantine that DID happen, not refused attempts).
+//
+// Cross-session by design: conflict history is operator-relevant
+// forensic data, not session-scoped state. Bounded by `limit`
+// (default 50 matches the slice convention from S0).
+export const listEvictionEventsByTrigger = (
+  db: DB,
+  trigger: string,
+  limit = 50,
+): EvictionEvent[] => {
+  const rows = db
+    .query<EvictionEventRow, [string, number]>(
+      `${SELECT_ALL}
+        WHERE trigger = ? AND outcome = 'applied'
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT ?`,
+    )
+    .all(trigger, limit);
+  return rows.map(fromRow);
+};
+
 export const listEvictableInWindow = (db: DB, nowMs: number): EvictionEvent[] => {
   const rows = db
     .query<EvictionEventRow, [number]>(

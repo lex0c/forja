@@ -2507,3 +2507,94 @@ describe('/memory provenance (S1/T1.6)', () => {
     expect(r.notes).toHaveLength(4);
   });
 });
+
+describe('/memory conflicts (S4/T4.4)', () => {
+  test('empty state returns silent-bar hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['conflicts'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect((r.notes ?? []).join('\n')).toContain('no conflict_detected events recorded');
+  });
+
+  test('lists conflict_detected rows with winner/loser/kind/token', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const { appendEvictionEvent } = await import('../../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'b',
+      objectScope: 'user',
+      fromState: 'active',
+      toState: 'quarantined',
+      trigger: 'conflict_detected',
+      motivo: 'conflict',
+      evidenceJson: JSON.stringify({
+        winner_id: 'user/a',
+        loser_id: 'user/b',
+        conflict_kind: 'antonym_assertion',
+        shared_concept: 'tabs',
+        confidence: 0.85,
+        resolver_reason: 'provenance tier',
+        failures: 1,
+      }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'loop_cold',
+      sessionId,
+    });
+
+    const r = await memoryCommand.exec(['conflicts'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('conflict_detected events (1');
+    expect(text).toContain('antonym_assertion');
+    expect(text).toContain('winner=user/a');
+    expect(text).toContain('loser=user/b');
+    expect(text).toContain('concept="tabs"');
+    expect(text).toContain('conf=0.85');
+  });
+
+  test('--limit caps the rendered batch', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const { appendEvictionEvent } = await import('../../../src/storage/repos/eviction-events.ts');
+    for (let i = 0; i < 5; i++) {
+      appendEvictionEvent(db, {
+        substrate: 'memory',
+        objectId: `loser-${i}`,
+        objectScope: 'user',
+        fromState: 'active',
+        toState: 'quarantined',
+        trigger: 'conflict_detected',
+        motivo: 'conflict',
+        evidenceJson: JSON.stringify({
+          winner_id: `user/winner-${i}`,
+          loser_id: `user/loser-${i}`,
+          conflict_kind: 'antonym_assertion',
+          failures: 1,
+        }),
+        outcome: 'applied',
+        blockedBy: null,
+        actor: 'loop_cold',
+        sessionId,
+      });
+    }
+    const r = await memoryCommand.exec(['conflicts', '--limit', '2'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    // Header line + 2 rows = 3 notes.
+    expect(r.notes).toHaveLength(3);
+  });
+
+  test('rejects unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['conflicts', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+});

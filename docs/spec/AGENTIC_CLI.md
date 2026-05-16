@@ -112,6 +112,8 @@ Pilha de verificação por custo (latência típica, custo USD por chamada):
 
 **Pull-in signal para overrider:** dados empíricos mostrando que o nível inferior tem false-negative rate intolerável para o caso de uso. Sem dados, ficar no nível barato.
 
+**Excepção subsistema-específica documentada — memory:** o memory subsystem do Forja optou deliberadamente por **zero text-heuristic** para decisões de lifecycle (S2 verify_failed e S4 conflict_detected ambas tentaram extratores regex sobre prose e foram revertidas — análise empírica mostrou que distinguir "memória afirma X" de "memória menciona X em contexto histórico" requer compreensão semântica que regex não entrega). A doutrina geral acima continua válida (use o mais barato que resolve), mas no memory subsystem **a camada heurística é intencionalmente vazia** para essa classe de decisão: todo julgamento sobre prose vai para LLM-judge via S8 governance proposals (`MEMORY.md §11.3`). Substrato determinístico (state machine, audit, frontmatter, hashing, expiry, scope precedence, file existence checks) e dials numéricos (BM25 weights, quarantine penalty) ficam — não são "judgment over prose".
+
 ### 1.1.2 No-daemon discipline
 
 **Regra:** *Forja é per-CLI-invocation. Não há processo de longa duração entre sessões. Cross-session work acontece em boot sweeps, não em background.*
@@ -174,9 +176,21 @@ Pilha de verificação por custo (latência típica, custo USD por chamada):
 
 **Por que:** memory bodies são operator-edited e alguns são imported (FEEDBACK_ADAPTATION cross-cut). Tratá-los como input não-adversarial em qualquer superfície reabre o vetor que o trust filter existe para fechar. Sem ledger central, próximo developer adiciona a 5ª superfície sem perceber que está bypassando uma camada de defesa.
 
----
+### 1.1.6 Proposal staleness check
 
-## 2. Terminal-first (o que isso significa, na prática)
+**Regra:** *Toda governance proposal carrega snapshot do estado das memórias referenciadas no momento da criação. Apply path verifica os snapshots contra estado CURRENT antes da transição; mismatch = `rejected`, não `applied`.*
+
+**Aplicação:**
+
+- Qualquer proposal que cite uma ou mais memórias por `(scope, name)` (governance proposals, eviction proposals, consolidation proposals — toda família `memory_governance_proposals` da §11.3) DEVE persistir `source_memory_snapshots: { scope, name, content_hash }[]` no momento da criação.
+- O apply path computa `hashMemoryContent(serializeMemoryFile(current_file))` para cada memória citada e compara com o snapshot. Qualquer mismatch → status='rejected', `decided_by='system:stale_evidence'`, reason inclui qual memória drifou.
+- O check roda ANTES da verificação de state (memory has changed state since proposal) — drift de conteúdo é o sinal mais informativo para o operator ("a memória mudou desde que eu propus isso" é mais útil que "memória já não está active").
+- **Caso especial — memória citada não existe mais** (deletada entre proposal creation e approval): `readMemoryByName` retorna `missing`/`unknown` → rejection com `decided_by='system:memory_gone'`, distinto de `system:stale_evidence`. Os dois são UX semanticamente diferentes pro operator (memória "editada" vs memória "sumiu"); rejection reason carrega a distinção pra slash render.
+- **Caso especial — proposal sem source_memory_keys** (e.g., hipotético `kind='create'` propondo memória nova): `source_memory_snapshots` é array vazio; o check passa por vacuidade (nada pra comparar) e o apply path prossegue para validação de state + transição normal.
+
+**Por que:** propose-not-mutate (§1.1.4) tem latência entre criação e aprovação. Sem snapshot check, o operator aprova hoje uma proposal cuja evidência reflete o estado de N dias atrás — pior caso, autoriza mutação contra body completamente diferente do que a evidência da proposal cita. O snapshot fecha o gap: o invariante operacional é "approval ratifica evidência no contexto em que foi gerada; se contexto drifou, evidência expira".
+
+**Pull-in signal para overrider:** nenhum — esse é defesa estrutural barata (1 hash extra por proposal, 1 comparison no apply). Sem custo significativo, sem trade-off operacional.
 
 A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal portada pra terminal. Aqui não.
 
