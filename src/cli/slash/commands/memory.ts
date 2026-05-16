@@ -135,7 +135,63 @@ const filterByListScope = (
   }
 };
 
-const handleList = (registry: MemoryRegistry, args: string[]): SlashResult => {
+// `expires: YYYY-MM-DD` → `false` (no expiry / malformed) or `true`
+// (past `nowMs`, end-of-day UTC semantics — matches the same parse
+// in `src/memory/registry.ts`). Used to surface the `[EXPIRED]`
+// visual flag in /memory list output. Operators see the flag and
+// know the entry would already be excluded from retrieval (and
+// from any list call that passes `includeExpired: false`); the
+// default broad list shows the entry so the operator can decide.
+const isExpiredYyyyMmDd = (expires: string | undefined, nowMs: number): boolean => {
+  if (expires === undefined) return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expires);
+  if (m === null) return false;
+  const year = Number.parseInt(m[1] ?? '', 10);
+  const month = Number.parseInt(m[2] ?? '', 10);
+  const day = Number.parseInt(m[3] ?? '', 10);
+  const startOfDayMs = Date.UTC(year, month - 1, day, 0, 0, 0);
+  if (Number.isNaN(startOfDayMs)) return false;
+  const round = new Date(startOfDayMs);
+  if (
+    round.getUTCFullYear() !== year ||
+    round.getUTCMonth() !== month - 1 ||
+    round.getUTCDate() !== day
+  ) {
+    return false;
+  }
+  return nowMs >= startOfDayMs + 24 * 60 * 60 * 1000;
+};
+
+// Visual flag rendered as a prefix on the /memory list row.
+// Priorities (only one prefix renders, in this order):
+//   1. non-active state (`[QUARANTINED]` / `[INVALIDATED]` /
+//      `[PROPOSED]`) — operator sees lifecycle state at a glance
+//      per spec MEMORY.md §6.5.2 "continua no índice com flag
+//      visual". The spec format includes motivo + date
+//      (`[memory: quarantined — verify failed 2026-05-12]`); v1
+//      shows just the state because motivo / date live in
+//      eviction_events (JOIN-deferred to a follow-up).
+//   2. expired (active state + `expires` in the past) —
+//      operator notices entries that would be excluded by
+//      `includeExpired: false`.
+// Both signals together would mean a quarantined-AND-expired
+// entry; we prefer the state flag because it's the operator
+// action (manual or detector) rather than the calendar fact.
+const renderStateFlag = (
+  state: string,
+  expires: string | undefined,
+  nowMs: number,
+): string | null => {
+  if (state === 'quarantined') return '[QUARANTINED] ';
+  if (state === 'invalidated') return '[INVALIDATED] ';
+  if (state === 'proposed') return '[PROPOSED] ';
+  if (state === 'active' && isExpiredYyyyMmDd(expires, nowMs)) {
+    return `[EXPIRED ${expires}] `;
+  }
+  return null;
+};
+
+const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[]): SlashResult => {
   if (args.length > 1) {
     return {
       kind: 'error',
@@ -157,8 +213,34 @@ const handleList = (registry: MemoryRegistry, args: string[]): SlashResult => {
       ? `memories (${entries.length}, deduplicated by name):`
       : `memories in scope '${scope}' (${entries.length}):`;
   const lines = [header];
+
+  // For each listing, peek the body so we can render `state` and
+  // `expires`. `peek` is the canonical no-audit read — operator
+  // running /memory list isn't reading individual memories, just
+  // inspecting metadata, so no `read` event lands. File-missing /
+  // malformed cases get a marker so the operator sees the
+  // orphan / hand-edit (which the model-facing surfaces would
+  // hide via state filter).
+  const nowMs = ctx.now();
   for (const l of entries) {
-    lines.push(`  [${l.scope}] ${l.name} — ${l.entry.hook}`);
+    const peek = registry.peek(l.name, { scope: l.scope });
+    if (peek.kind === 'unknown' || peek.kind === 'missing') {
+      lines.push(`  [${l.scope}] [ORPHAN] ${l.name} — ${l.entry.hook}`);
+      continue;
+    }
+    if (peek.kind === 'malformed') {
+      lines.push(`  [${l.scope}] [MALFORMED] ${l.name} — ${l.entry.hook} (${peek.error})`);
+      continue;
+    }
+    const fm = peek.file.frontmatter;
+    const state = fm.state ?? 'active';
+    const flag = renderStateFlag(state, fm.expires, nowMs);
+    const expiresSuffix =
+      fm.expires !== undefined && !isExpiredYyyyMmDd(fm.expires, nowMs)
+        ? ` (expires ${fm.expires})`
+        : '';
+    const prefix = flag ?? '';
+    lines.push(`  [${l.scope}] ${prefix}${l.name} — ${l.entry.hook}${expiresSuffix}`);
   }
   return { kind: 'ok', notes: lines };
 };
@@ -1630,7 +1712,7 @@ export const memoryCommand: SlashCommand = {
     if (sub === undefined) return handleSummary(registry);
     switch (sub) {
       case 'list':
-        return handleList(registry, args.slice(1));
+        return handleList(registry, ctx, args.slice(1));
       case 'show':
         return handleShow(registry, ctx, args.slice(1));
       case 'audit':

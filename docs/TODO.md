@@ -22,7 +22,7 @@ Land the manual paths before the auto-detectors so the pipeline is end-to-end te
 | Task | Status | Description |
 |---|---|---|
 | **T0.1** | ✅ done | `/memory quarantine <name> --motivo <kind> --evidence "…"` slash command — invokes `transitionMemoryState` with the operator's motivo. Accepts every spec motivo (`conflict`, `shift`, `security`, `low_roi`, `irrelevant`). |
-| **T0.2** | pending | `/memory list` rendering — add `state` and `expires` columns; quarantined / expired entries get a visual flag per spec §6.5.2 (`[memory: quarantined — verify failed 2026-05-12]`). |
+| **T0.2** | ✅ done | `/memory list` rendering — `[QUARANTINED] / [INVALIDATED] / [PROPOSED] / [EXPIRED <date>]` prefix flags, `(expires <date>)` suffix for future-expiring active entries, `[ORPHAN] / [MALFORMED]` markers for unreadable rows. Spec §6.5.2 motivo+date format deferred (JOIN with eviction_events). |
 | **T0.3** | pending | `/memory audit` trigger-source filter — distinguish `operator_driven` vs `trigger_source: <detector_name>` (lays the path for slices 2-5). |
 | **T0.4** | pending | Tests + `docs/MEMORY.md` §6 update (new verb + columns documented). |
 

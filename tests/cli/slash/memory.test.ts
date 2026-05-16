@@ -45,7 +45,13 @@ const writeIndex = (dir: string, body: string): void => {
 const writeBody = (
   dir: string,
   name: string,
-  fmExtras: { type?: string; source?: string; trust?: string; expires?: string } = {},
+  fmExtras: {
+    type?: string;
+    source?: string;
+    trust?: string;
+    expires?: string;
+    state?: string;
+  } = {},
   body = `body of ${name}`,
 ): void => {
   mkdirSync(dir, { recursive: true });
@@ -57,6 +63,7 @@ const writeBody = (
   ];
   if (fmExtras.expires !== undefined) lines.push(`expires: ${fmExtras.expires}`);
   if (fmExtras.trust !== undefined) lines.push(`trust: ${fmExtras.trust}`);
+  if (fmExtras.state !== undefined) lines.push(`state: ${fmExtras.state}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\n${body}\n`);
 };
 
@@ -250,6 +257,105 @@ describe('/memory list', () => {
     const text = (r.notes ?? []).join('\n');
     expect(text).toContain('[project_local] l');
     expect(text).not.toContain('[project_shared]');
+  });
+
+  test('quarantined memory renders [QUARANTINED] flag (T0.2)', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Q](q.md) — quarantined-h\n');
+    writeBody(roots.projectLocal, 'q', { state: 'quarantined' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[project_local] [QUARANTINED] q');
+  });
+
+  test('invalidated / proposed memories render their flags', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.user, '- [Inv](inv.md) — invalidated\n- [Prop](prop.md) — proposed\n');
+    writeBody(roots.user, 'inv', { type: 'user', state: 'invalidated' });
+    writeBody(roots.user, 'prop', { type: 'user', state: 'proposed' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[INVALIDATED] inv');
+    expect(text).toContain('[PROPOSED] prop');
+  });
+
+  test('expired memory renders [EXPIRED <date>] flag', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Stale](stale.md) — old\n');
+    writeBody(roots.projectLocal, 'stale', { expires: '2024-01-01' });
+    registry.reload();
+    // Override ctx.now to a date AFTER 2024-01-01 so the expiry
+    // check fires. Default fixture clock is 1ms epoch — would
+    // never produce an expired result.
+    ctx.now = () => Date.UTC(2026, 0, 1);
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[EXPIRED 2024-01-01] stale');
+  });
+
+  test('active memory with future expires shows (expires <date>) suffix', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Fresh](fresh.md) — fresh-h\n');
+    writeBody(roots.projectLocal, 'fresh', { expires: '2099-12-31' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[project_local] fresh — fresh-h (expires 2099-12-31)');
+    // Active state means NO bracketed prefix flag.
+    expect(text).not.toContain('[QUARANTINED]');
+    expect(text).not.toContain('[EXPIRED');
+  });
+
+  test('orphan listing (index entry without body file) renders [ORPHAN]', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.user, '- [Phantom](phantom.md) — has-index-no-body\n');
+    // Deliberately no writeBody.
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[user] [ORPHAN] phantom');
+  });
+
+  test('malformed frontmatter renders [MALFORMED] with parse error', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.user, '- [Broken](broken.md) — bad-fm\n');
+    mkdirSync(roots.user, { recursive: true });
+    writeFileSync(join(roots.user, 'broken.md'), '---\nname: broken\n');
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[user] [MALFORMED] broken');
+  });
+
+  test('quarantine flag wins over expired suffix when both apply', async () => {
+    // A memory that's both quarantined AND past expires should
+    // render only the [QUARANTINED] flag — the operator action
+    // is more relevant than the calendar fact.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Both](both.md) — q+expired\n');
+    writeBody(roots.projectLocal, 'both', { state: 'quarantined', expires: '2024-01-01' });
+    registry.reload();
+    ctx.now = () => Date.UTC(2026, 0, 1);
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[QUARANTINED] both');
+    expect(text).not.toContain('[EXPIRED');
   });
 
   test('invalid scope arg errors with options list', async () => {
