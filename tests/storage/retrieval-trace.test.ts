@@ -16,6 +16,7 @@ import {
   getRetrievalTrace,
   listRetrievalTracesBySession,
   listRetrievalTracesByWorkflow,
+  listRetrievalTracesSinceMs,
 } from '../../src/storage/repos/retrieval-trace.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
@@ -377,6 +378,83 @@ describe('listRetrievalTracesBySession', () => {
     const rows = listRetrievalTracesBySession(db, sessionId);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.queryText).toBe('mine');
+  });
+});
+
+describe('listRetrievalTracesSinceMs', () => {
+  const seed = (createdAt: number, queryText = `q${createdAt}`): void => {
+    createRetrievalTrace(db, {
+      sessionId,
+      queryText,
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: sampleTimings(),
+      createdAt,
+    });
+  };
+
+  test('returns every row within the window newest-first, capReached=false when nothing was trimmed', () => {
+    seed(1000, 'before');
+    seed(2000, 'inside-old');
+    seed(3000, 'inside-new');
+    const res = listRetrievalTracesSinceMs(db, sessionId, 1500);
+    expect(res.rows.map((r) => r.queryText)).toEqual(['inside-new', 'inside-old']);
+    expect(res.capReached).toBe(false);
+    expect(res.hardCap).toBe(10_000);
+  });
+
+  test('honours session scoping (other sessions excluded)', () => {
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    seed(1000, 'mine');
+    createRetrievalTrace(db, {
+      sessionId: other,
+      queryText: 'theirs',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: sampleTimings(),
+      createdAt: 1000,
+    });
+    const res = listRetrievalTracesSinceMs(db, sessionId, 0);
+    expect(res.rows.map((r) => r.queryText)).toEqual(['mine']);
+  });
+
+  test('flags capReached=true when more rows exist than the hard cap (and surfaces only the freshest)', () => {
+    // Regression: prior `/agent retrieval metrics` path called
+    // `listRetrievalTracesBySession(db, sessionId, 100)` then
+    // filtered by date in memory, so a window holding >100 traces
+    // was silently truncated to the freshest 100 with no signal
+    // to the operator. The repo helper now surfaces the cap so
+    // the caller can render an explicit warning.
+    for (let i = 0; i < 6; i++) seed(1000 + i);
+    const res = listRetrievalTracesSinceMs(db, sessionId, 0, /* hardCap */ 3);
+    expect(res.rows).toHaveLength(3);
+    expect(res.capReached).toBe(true);
+    expect(res.hardCap).toBe(3);
+    // Freshest kept (1005, 1004, 1003 newest-first).
+    expect(res.rows.map((r) => r.queryText)).toEqual(['q1005', 'q1004', 'q1003']);
+  });
+
+  test('cap not reached when row count equals exactly hardCap', () => {
+    // Boundary: SQL fetches hardCap+1 to disambiguate "fits
+    // exactly" from "fits with leftovers". An exact match must
+    // report capReached=false so the caller doesn't print a
+    // misleading warning.
+    seed(1000);
+    seed(2000);
+    seed(3000);
+    const res = listRetrievalTracesSinceMs(db, sessionId, 0, /* hardCap */ 3);
+    expect(res.rows).toHaveLength(3);
+    expect(res.capReached).toBe(false);
   });
 });
 

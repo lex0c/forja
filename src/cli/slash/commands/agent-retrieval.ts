@@ -18,6 +18,7 @@ import type { RetrievalTraceRow, RetrievalWorkflow } from '../../../retrieval/ty
 import {
   getRetrievalTrace,
   listRetrievalTracesBySession,
+  listRetrievalTracesSinceMs,
 } from '../../../storage/repos/retrieval-trace.ts';
 import type { SlashContext, SlashResult } from '../types.ts';
 
@@ -284,16 +285,28 @@ const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
       message: '/agent retrieval metrics: no active session — start a turn first',
     };
   }
-  // List ALL traces in the session (capped); filter by time
-  // window in-memory. Per-session is what the operator wants 99%
-  // of the time; cross-session metrics need a different surface.
+  // Pull every trace within the requested window via SQL-side
+  // filtering. The previous implementation used
+  // `listRetrievalTracesBySession(..., MAX_AUDIT_LIMIT)` and
+  // filtered in memory — that silently truncated to the freshest
+  // 100 traces whenever a session had more than 100 hits in the
+  // window, biasing every aggregate toward the end of the period
+  // without telling the operator. `listRetrievalTracesSinceMs`
+  // still imposes a (much larger) hard cap as defense against
+  // pathological sessions; we surface that cap as an explicit
+  // warning line when it bites instead of pretending the truncated
+  // sample represents the full window. Per-session is what the
+  // operator wants 99% of the time; cross-session metrics need a
+  // different surface.
   // Use `ctx.now` (not Date.now) so test fixtures with pinned
   // clocks behave deterministically — same pattern /memory
   // metrics uses.
   const cutoffMs = ctx.now() - days * 24 * 60 * 60 * 1000;
-  const traces = listRetrievalTracesBySession(ctx.db, sessionId, MAX_AUDIT_LIMIT).filter(
-    (t) => t.createdAt >= cutoffMs,
-  );
+  const {
+    rows: traces,
+    capReached,
+    hardCap,
+  } = listRetrievalTracesSinceMs(ctx.db, sessionId, cutoffMs);
   if (traces.length === 0) {
     return {
       kind: 'ok',
@@ -352,6 +365,23 @@ const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
 
   const lines: string[] = [
     `retrieval metrics — last ${days.toFixed(1)}d (${traces.length} traces)`,
+  ];
+  if (capReached) {
+    // Honest cap disclosure. We hit the safety cap, so the window
+    // we actually aggregated over is narrower than `days` days —
+    // the OLDER end of the requested window is excluded. The
+    // operator needs to know this to interpret the numbers; we
+    // surface it as a `warning:` line and identify what the cap
+    // is so they can either narrow `--days` or treat the numbers
+    // as a freshest-N-traces sample.
+    const oldestKeptMs = traces[traces.length - 1]?.createdAt;
+    const effectiveDays =
+      oldestKeptMs !== undefined ? (ctx.now() - oldestKeptMs) / (24 * 60 * 60 * 1000) : days;
+    lines.push(
+      `  warning: sample capped at ${hardCap} traces (oldest kept ≈ ${effectiveDays.toFixed(1)}d ago); metrics reflect the freshest ${hardCap} only — older traces in the requested ${days}d window are excluded`,
+    );
+  }
+  lines.push(
     '',
     `budget_utilization_mean: ${formatPercent(mean(utilizations))}`,
     `eviction_rate: ${formatPercent(evictionRate)} (${totalSkipped}/${totalRanked} ranked → skipped)`,
@@ -362,7 +392,7 @@ const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
     `  expand:   p50=${formatDurationMs(percentile(expandMs, 0.5))}  p95=${formatDurationMs(percentile(expandMs, 0.95))}`,
     `  rank:     p50=${formatDurationMs(percentile(rankMs, 0.5))}  p95=${formatDurationMs(percentile(rankMs, 0.95))}`,
     `  compress: p50=${formatDurationMs(percentile(compressMs, 0.5))}  p95=${formatDurationMs(percentile(compressMs, 0.95))}`,
-  ];
+  );
   if (viewCounts.size > 0) {
     lines.push('', 'view distribution (slot inclusions):');
     for (const [v, n] of viewCounts.entries()) {

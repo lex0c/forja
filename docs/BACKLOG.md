@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(cli/slash/agent-retrieval) — compute metrics over the full requested window
+
+`/agent retrieval metrics [--days N]` was loading `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then filtering the result in-memory by `t.createdAt >= cutoffMs`. Once a session held more than 100 traces in the requested window, SQL handed back the freshest 100 (sorted by `created_at DESC`) and every row passed the post-filter — so utilization, eviction rate, diversity, and latency were silently computed from a truncated end-of-period sample. The header line printed "last 30.0d (100 traces)" with no signal that older traces in the window had been excluded.
+
+Fix in `src/storage/repos/retrieval-trace.ts`: new `listRetrievalTracesSinceMs(db, sessionId, cutoffMs, hardCap = 10_000)` filters by window SQL-side and returns `{ rows, capReached, hardCap }`. SQL fetches `hardCap + 1` to disambiguate "fits exactly" from "fits with leftovers" — one cheap extra row beats a separate `COUNT(*)`. The hard cap is defense against pathological sessions (eval harnesses logging tens of thousands of retrieval calls), not a marketing default — 10k is well above any realistic interactive session.
+
+`handleMetrics` consumes the new helper and surfaces `capReached` as an explicit `warning: sample capped at <N> traces (oldest kept ≈ Xd ago); metrics reflect the freshest N only — older traces in the requested Yd window are excluded` line under the header. When the cap doesn't bite (the overwhelming common case), the output is unchanged.
+
+Tests: 4 new in `tests/storage/retrieval-trace.test.ts` covering the helper directly — window scoping (excludes rows before cutoff), session scoping (other sessions excluded), `capReached=true` with surfaces-the-freshest semantics, and the boundary case where row-count equals `hardCap` exactly (must report `capReached=false`).
+
 ## [2026-05-15] fix(retrieval) — stop emitting synthetic `memory_events action=read` from retrieval-internal paths (compression + BM25 indexing)
 
 Two retrieval-internal paths were calling `registry.read` and minting `memory_events action=read` rows for content the model never actually saw. Both swapped to `registry.peek` (same scope precedence + discriminated outcome, no `auditRead` side effect). Policy now spelled out in both call sites: `memory_events action=read` stays reserved for explicit `memory_read` tool calls (model asking by name); retrieval-pipeline visibility lives in `retrieval_trace` (included nodeIds + skipped trail).

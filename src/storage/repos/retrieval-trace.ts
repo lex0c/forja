@@ -222,6 +222,50 @@ export const listRetrievalTracesBySession = (
   return rows.map(fromRow);
 };
 
+// Traces for a session whose created_at falls in [cutoffMs, ∞),
+// newest first. Used by `/agent retrieval metrics` to compute
+// aggregates honestly over the full requested window — the older
+// `listRetrievalTracesBySession(... limit=100)` + in-memory date
+// filter silently sampled the freshest 100 rows, biasing metrics
+// for any session whose window has >100 traces.
+//
+// A hard SQL cap still applies as defense against pathological
+// sessions (think eval harness logging 50k retrieval calls). The
+// caller learns whether the cap clipped the result via the
+// returned `capReached` flag and can render an explicit warning
+// instead of silently truncating.
+export interface RetrievalTracesSinceResult {
+  rows: RetrievalTraceRow[];
+  // True when SQL returned exactly `hardCap` rows AND there is at
+  // least one older trace in the window the caller asked for.
+  // The cap was therefore the binding constraint, not the window.
+  capReached: boolean;
+  hardCap: number;
+}
+
+export const listRetrievalTracesSinceMs = (
+  db: DB,
+  sessionId: string,
+  cutoffMs: number,
+  hardCap = 10_000,
+): RetrievalTracesSinceResult => {
+  // Fetch hardCap + 1 so we can tell "exactly hardCap rows in the
+  // window" (capReached=false) from "hardCap rows AND more behind
+  // them" (capReached=true). One extra row at the SQL layer is
+  // cheaper than a separate COUNT query.
+  const rows = db
+    .query<RetrievalTraceDbRow, [string, number, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ? AND created_at >= ?
+        ORDER BY created_at DESC
+        LIMIT ?`,
+    )
+    .all(sessionId, cutoffMs, hardCap + 1);
+  const capReached = rows.length > hardCap;
+  const kept = capReached ? rows.slice(0, hardCap) : rows;
+  return { rows: kept.map(fromRow), capReached, hardCap };
+};
+
 // Latest N traces for a specific workflow across sessions, newest
 // first. Useful for per-workflow eval / metric queries. Backed by
 // idx_retrieval_trace_workflow + table scan within the matching
