@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(cli/slash/agent-retrieval) — session-scope check on UUID fast-path (review H2)
+
+`resolveTraceId` in `/agent retrieval replay` previously checked the active session ONLY for prefix scans; the full-UUID fast path (`prefix.length === 36`) called `getRetrievalTrace(db, prefix)` directly and returned whatever the lookup found. `getRetrievalTrace` is a primary-key lookup by design (no session scoping). An operator with a UUID from any session — their own past session, a teammate's session on the same DB, a leaked log line — could replay that session's full trace, including the raw context_slot bodies.
+
+Fix: after `getRetrievalTrace` returns, compare `row.sessionId !== currentSessionId()` and refuse with the same not-found shape used for genuinely missing UUIDs. Same wording means the error doesn't double as an oracle for "this UUID exists but belongs to another session" — an operator probing cross-session can't distinguish the two failure modes.
+
+Test in `tests/cli/slash/agent-retrieval.test.ts`: seed a trace in a foreign session with a recognizable `queryText`, switch to the default session, call replay with the foreign UUID, assert the error path triggers AND that the foreign `queryText` doesn't leak through the message.
+
 ## [2026-05-16] fix(memory+retrieval) — lifecycle state + expires filter at the list boundary (review H1+H6)
 
 `registry.list()` previously returned every listing regardless of frontmatter `state` or `expires`. The retrieval memory view consumed `list({ deduplicateByName: true })` directly, so any memory the operator had quarantined / invalidated / proposed / evicted / purged — or a memory past its `expires` date between boot-time GC sweeps — surfaced to the model as a BM25 candidate and could end up in the context slot.

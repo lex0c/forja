@@ -114,10 +114,19 @@ const resolveTraceId = (
   if (prefix.length === 0) {
     return { kind: 'error', message: '/agent retrieval replay: missing query id' };
   }
-  // Full UUID fast path.
+  // Full UUID fast path. Even with the full UUID we must scope to
+  // the active session — `getRetrievalTrace` is session-agnostic
+  // by design (it's a primary-key lookup), so without this check
+  // an operator with a UUID from any session (their own past
+  // session, a teammate's, log leaks) would replay that session's
+  // trace. The error message intentionally mirrors the not-found
+  // shape so this isn't an oracle for "this UUID exists in another
+  // session" — operators inspecting traces stay scoped to what
+  // they're entitled to see.
   if (prefix.length === 36) {
+    const currentSessionId = ctx.currentSessionId();
     const row = getRetrievalTrace(ctx.db, prefix);
-    if (row === null) {
+    if (row === null || row.sessionId !== currentSessionId) {
       return {
         kind: 'error',
         message: `/agent retrieval replay: trace ${prefix} not found`,

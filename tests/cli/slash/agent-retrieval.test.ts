@@ -543,6 +543,39 @@ describe('/agent retrieval replay', () => {
     }
   });
 
+  test('UUID fast-path refuses traces from other sessions (H2 regression)', async () => {
+    // Regression: `getRetrievalTrace` is a session-agnostic
+    // primary-key lookup. Pre-H2, an operator passing a 36-char
+    // UUID from any session got the trace back. Now `resolveTraceId`
+    // checks `row.sessionId === currentSessionId()` and refuses
+    // cross-session reads with the same shape as not-found (no
+    // oracle for "this UUID belongs to another session").
+    const otherSession = createSession(db, { model: 'm', cwd: '/p2' }).id;
+    const foreignId = 'aaaabbbb-cccc-dddd-eeee-ffff00001111';
+    createRetrievalTrace(db, {
+      id: foreignId,
+      sessionId: otherSession,
+      queryText: 'leaked secret',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: sampleTimings(),
+    });
+    // Call replay with the foreign UUID while in the (default test)
+    // session.
+    const r = await agentPolicyCommand.exec(['retrieval', 'replay', foreignId], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain('not found');
+      // No leak of the foreign queryText through the error path.
+      expect(r.message).not.toContain('leaked secret');
+    }
+  });
+
   test('prefix scan reaches beyond MAX_AUDIT_LIMIT — older traces still resolve (H7 regression)', async () => {
     // Regression: prior `resolveTraceId` scanned only the freshest
     // MAX_AUDIT_LIMIT=100 traces. In a session with >100 traces, a
