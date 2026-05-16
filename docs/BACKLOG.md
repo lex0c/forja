@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(retrieval) — validate session node ids at projection (review M8)
+
+`src/retrieval/views/session.ts` was doing `hit.id.slice('session:message:'.length)` and trusting the result. A malformed id matching the prefix but truncated (e.g. `session:message:` with no UUID after) would silently slice to `""`, the Map miss would fall through to a generic "unknown session source" reason, and the BM25 invariant breach would go unnoticed.
+
+Extracted the parsers `parseMemoryNodeId` and `parseSessionNodeId` (originally inline in `compression.ts`) into a shared `src/retrieval/node-ids.ts` module so both call sites enforce the same invariants:
+
+- prefix correct (`memory:` / `session:`)
+- kind ∈ canonical enum (memory scope ∈ {`user`, `project_shared`, `project_local`}; session kind ∈ {`message`, `tool_call`, `failure`})
+- non-empty after-prefix segments
+
+Compression imports from the shared module; session view's projection now parses first and branches on `kind`. Malformed ids emit a stderr line ("BM25 emitted malformed node id … this is a view-internal bug") with a tagged fallback reason; valid-id-but-missing-row fall-through carries a kind-aware reason so the trace distinguishes the two failure shapes.
+
+Tests: 12 new in `tests/retrieval/node-ids.test.ts` exercising both parsers (canonical + every malformed shape: missing prefix, empty kind / scope, empty id / name, unknown enum value, case-sensitivity, colon-in-id preservation). 1 invariant test in `tests/retrieval/session-view.test.ts` documents the deletion-mid-flight stability case.
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — coverage closures + formatPercent clamp (review M5+M6+M7)
+
+Closes three coverage findings from the `feat/retrieval` review.
+
+**M5** — `formatPercent` computed `(ratio * 100).toFixed(1) + '%'` without checking the input range. Callers' invariants (`evictionRate = skipped / ranked`, `budgetUtilization = used / budget`) keep the ratio in `[0, 1]`, but a future regression upstream would render misleading `-50.0%` / `150.0%` instead of flagging the corruption. Added `Number.isFinite(ratio) && ratio >= 0 && ratio <= 1` guard rendering `?` otherwise. Exported for direct test coverage; mirrors the `formatDurationMs` posture from M2.
+
+**M6** — adequate coverage already exists: `describe('buildRetrievalRunner — end-to-end')` in `tests/tools/retrieve-context.test.ts` exercises the runner produced by `buildRetrievalRunner` against real corpora (6 tests covering ranked + compressed slot, views filter, loadBodies, default budget, pre-aborted signal, trace persistence). The bootstrap test asserts the tool is registered. The actual `ctx.retrieveContext = buildRetrievalRunner(...)` assignment in `src/harness/loop.ts:2566` is a single visible line — adding a separate integration test that wraps the entire harness loop just to re-assert that line was a poor risk/value trade. No code change.
+
+**M7** — the `capReached` warning render in `handleMetrics` had no slash-level test (the repo-level test from commit `49be554` covers `listRetrievalTracesSinceMs` itself, not the operator-visible warning string). Extracted the pure-render section as `buildMetricsLines({ traces, capReached, hardCap, days, nowMs })` — `handleMetrics` becomes a thin wrapper that pulls traces and delegates the rendering. The exported helper takes pre-computed inputs so a test can drive `capReached: true` with a 2-row fixture instead of seeding 10k+ rows. 3 new tests: warning surfaces with the right hardCap + "oldest kept ≈ Nd ago" computation, warning absent when `capReached=false`, canonical body intact regardless. `formatPercent` unit coverage adds 3 more tests (in-range, out-of-range, NaN/Infinity).
+
+## [2026-05-16] fix(retrieval+storage+cli) — honest error surfaces for corrupted JSON / negative timings / unknown views (review M1+M2+M3)
+
+Three small fixes that turn silent fallbacks into auditable ones.
+
+**M1** — `src/storage/repos/retrieval-trace.ts fromRow` swallowed `JSON.parse` failures and returned `[]` / empty shapes with zero indication that a row's JSON column was corrupt. Direct DB tampering, mid-write crashes, and migration anomalies all became invisible. The parse helper now takes the column name and logs to stderr (`forja retrieval_trace: row <id> <col> JSON parse failed (<msg>); returning empty fallback`) before falling back to the structural-valid shape. Read still completes; corruption is now traceable.
+
+**M2** — `formatDurationMs` in `src/cli/slash/commands/agent-retrieval.ts` accepted any `number` and would happily render `-123ms` from a corrupted `timings_json`. Added a `Number.isFinite(ms) && ms >= 0` guard that renders `?` for malformed values — the operator sees a flag-shaped output instead of a value that looks like a real (but impossible) timeline measurement. Exported the function for direct unit coverage.
+
+**M3** — `createCompressionResolver` returned `null` for any view it didn't recognize. A migration that adds a view without wiring the resolver would silently drop candidates; the operator would see "missing from slot" without learning the cause. Now logs once per unknown view (closure-scoped `warnedViews` Set deduplicates spam) and continues with `null` so the greedy loop tracks the skip honestly.
+
+Tests: 4 new across `tests/cli/slash/agent-retrieval.test.ts` (formatDurationMs unit suite covering negative / NaN / Infinity / boundary), `tests/retrieval/compression.test.ts` (unknown-view stderr capture + one-warning-per-view invariant), `tests/storage/retrieval-trace.test.ts` (corrupted JSON column logs `id` + column name and returns fallback).
+
 ## [2026-05-16] fix(cli/slash/agent-retrieval) — prefix scan reaches the full session history (review H7)
 
 `resolveTraceId` in `src/cli/slash/commands/agent-retrieval.ts` previously called `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then matched the prefix in memory. A session with more than 100 retrieval traces dropped any prefix whose match lived beyond the freshest 100 — the operator got "no trace id matches" indistinguishable from a genuinely wrong prefix, with no hint that the issue was scan depth.

@@ -78,14 +78,23 @@ interface RetrievalTraceDbRow {
 }
 
 const fromRow = (row: RetrievalTraceDbRow): RetrievalTraceRow => {
-  const parse = <T>(json: string | null, fallback: T): T => {
+  const parse = <T>(json: string | null, fallback: T, columnName: string): T => {
     if (json === null) return fallback;
     try {
       return JSON.parse(json) as T;
-    } catch {
+    } catch (err) {
       // The repo writes JSON we control; a corrupted row implies
-      // direct DB mutation. Fall back so a corrupted slice still
-      // returns a structurally-valid object.
+      // direct DB mutation, mid-write process kill, or
+      // mid-migration tampering — never a code path on our own
+      // write side. Fall back to a structurally-valid empty so the
+      // read still completes, but surface the corruption on stderr
+      // so the operator can notice and audit. Mirrors the same
+      // best-effort posture as the trace persist failure path
+      // (pipeline.ts).
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `forja retrieval_trace: row ${row.id} ${columnName} JSON parse failed (${msg}); returning empty fallback\n`,
+      );
       return fallback;
     }
   };
@@ -96,16 +105,32 @@ const fromRow = (row: RetrievalTraceDbRow): RetrievalTraceRow => {
     workflow: row.workflow,
     queryType: row.query_type,
     budgetTokens: row.budget_tokens,
-    candidatesRaw: parse<Candidate[]>(row.candidates_raw_json, []),
-    candidatesExpanded: parse<ExpandedCandidate[]>(row.candidates_expanded_json, []),
-    candidatesRanked: parse<RankedCandidate[]>(row.candidates_ranked_json, []),
-    contextSlot: parse<ContextSlot>(row.context_slot_json, { included: [], skipped: [] }),
-    timings: parse<PipelineTimings>(row.timings_json, {
-      searchMs: 0,
-      expandMs: 0,
-      rankMs: 0,
-      compressMs: 0,
-    }),
+    candidatesRaw: parse<Candidate[]>(row.candidates_raw_json, [], 'candidates_raw_json'),
+    candidatesExpanded: parse<ExpandedCandidate[]>(
+      row.candidates_expanded_json,
+      [],
+      'candidates_expanded_json',
+    ),
+    candidatesRanked: parse<RankedCandidate[]>(
+      row.candidates_ranked_json,
+      [],
+      'candidates_ranked_json',
+    ),
+    contextSlot: parse<ContextSlot>(
+      row.context_slot_json,
+      { included: [], skipped: [] },
+      'context_slot_json',
+    ),
+    timings: parse<PipelineTimings>(
+      row.timings_json,
+      {
+        searchMs: 0,
+        expandMs: 0,
+        rankMs: 0,
+        compressMs: 0,
+      },
+      'timings_json',
+    ),
     createdAt: row.created_at,
   };
 };

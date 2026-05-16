@@ -31,11 +31,12 @@
 // wires that from the active provider's `countTokens` when
 // available.
 
-import type { MemoryRegistry, MemoryScope } from '../memory/index.ts';
+import type { MemoryRegistry } from '../memory/index.ts';
 import type { DB } from '../storage/db.ts';
 import { getFailureEvent } from '../storage/repos/failure-events.ts';
 import { getMessage } from '../storage/repos/messages.ts';
 import { getToolCall } from '../storage/repos/tool-calls.ts';
+import { parseMemoryNodeId, parseSessionNodeId } from './node-ids.ts';
 import type {
   CompressionLevel,
   ContextSlot,
@@ -116,50 +117,10 @@ const messageText = (content: unknown): string => {
   return JSON.stringify(content);
 };
 
-// Parse a `memory:<scope>/<name>` node id. Returns null on
-// malformed input (defensive — view always emits the well-formed
-// shape, but a corrupt trace replay could feed garbage). The
-// scope is validated against the canonical MemoryScope enum here
-// so a corrupted nodeId with an unknown scope (`memory:made_up/x`)
-// is refused at parse time instead of bypassing the registry's
-// own validation later.
-const VALID_MEMORY_SCOPES: ReadonlySet<MemoryScope> = new Set([
-  'user',
-  'project_shared',
-  'project_local',
-]);
-
-const isMemoryScope = (s: string): s is MemoryScope => VALID_MEMORY_SCOPES.has(s as MemoryScope);
-
-const parseMemoryNodeId = (nodeId: string): { scope: MemoryScope; name: string } | null => {
-  const prefix = 'memory:';
-  if (!nodeId.startsWith(prefix)) return null;
-  const rest = nodeId.slice(prefix.length);
-  const slash = rest.lastIndexOf('/');
-  if (slash < 0) return null;
-  const scope = rest.slice(0, slash);
-  const name = rest.slice(slash + 1);
-  if (scope.length === 0 || name.length === 0) return null;
-  if (!isMemoryScope(scope)) return null;
-  return { scope, name };
-};
-
-// Parse a `session:<kind>:<id>` node id where kind ∈
-// { message, tool_call, failure }. Returns null on malformed.
-const parseSessionNodeId = (
-  nodeId: string,
-): { kind: 'message' | 'tool_call' | 'failure'; id: string } | null => {
-  const prefix = 'session:';
-  if (!nodeId.startsWith(prefix)) return null;
-  const rest = nodeId.slice(prefix.length);
-  const firstColon = rest.indexOf(':');
-  if (firstColon < 0) return null;
-  const kind = rest.slice(0, firstColon);
-  const id = rest.slice(firstColon + 1);
-  if (id.length === 0) return null;
-  if (kind !== 'message' && kind !== 'tool_call' && kind !== 'failure') return null;
-  return { kind, id };
-};
+// Node id parsers live in `./node-ids.ts` — shared with the
+// session view (M8 review fix) so view-side projection and
+// compression-side resolution use the same invariants
+// (scope/kind allowlist, empty-segment rejection).
 
 // Truncate to roughly N tokens by chars/4 heuristic. The token
 // count after truncation may overshoot slightly (estimator rounds
@@ -307,6 +268,14 @@ const VIEW_HAS_NO_RESOLVER = new Set<RetrievalView>(['workspace']);
 
 export const createCompressionResolver = (deps: CompressionResolverDeps): CompressionResolver => {
   const estimate = deps.estimateTokens ?? defaultEstimateTokens;
+  // Track which unknown views we've already warned about so a
+  // pipeline call producing many candidates of the same broken
+  // view doesn't spam stderr with a line per candidate × level.
+  // Closure-scoped: lives for the lifetime of the resolver
+  // (built once per session-runner) — a new bad view appearing
+  // mid-session still warns once. Limited to ~few entries even
+  // pathologically; no eviction needed.
+  const warnedViews = new Set<string>();
   return {
     resolve(candidate, level) {
       if (VIEW_HAS_NO_RESOLVER.has(candidate.view)) {
@@ -320,6 +289,18 @@ export const createCompressionResolver = (deps: CompressionResolverDeps): Compre
       }
       if (candidate.view === 'session') {
         return sessionResolver(deps.db, candidate, level, estimate);
+      }
+      // Unknown view — silently dropping these would let a
+      // migration that adds a new view (e.g. workspace, a future
+      // git-blame view) ship without its resolver and never
+      // surface the gap. Log once per view + continue with the
+      // skipped trail (don't throw — partial degradation is still
+      // a useful result per spec §15.7).
+      if (!warnedViews.has(candidate.view)) {
+        warnedViews.add(candidate.view);
+        process.stderr.write(
+          `forja retrieval: no compression resolver for view '${candidate.view}' (candidate ${candidate.nodeId}); skipping further candidates from this view\n`,
+        );
       }
       return null;
     },

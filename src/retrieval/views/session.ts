@@ -43,6 +43,7 @@ import {
 } from '../../storage/repos/failure-events.ts';
 import { type Message, listMessagesBySession } from '../../storage/repos/messages.ts';
 import { type BM25Document, createBM25Index, tokenize } from '../bm25.ts';
+import { parseSessionNodeId } from '../node-ids.ts';
 import type { ViewSearch } from '../pipeline.ts';
 import type { Candidate, RetrievalQuery, RetrievalView } from '../types.ts';
 
@@ -230,50 +231,74 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
       // get scrubbed at the trace persist layer in slice 4.1).
       // Each row carries its createdAt so the ranking temporal
       // signal can decay against the session half-life (§4.3).
-      const messageMatch = hit.id.startsWith('session:message:')
-        ? messageById.get(hit.id.slice('session:message:'.length))
-        : undefined;
-      if (messageMatch !== undefined) {
+      //
+      // The parser enforces the invariants:
+      //   - prefix is `session:`
+      //   - kind ∈ { message, tool_call, failure }
+      //   - id is non-empty after the second colon
+      // Without it, a malformed id matching `session:message:` with
+      // an empty UUID after would slice to `""`, the Map miss
+      // would fall through to the generic "unknown session source"
+      // reason, and the invariant breach would go unnoticed. The
+      // parser returns null for any of those shapes; we log so a
+      // BM25 invariant breach surfaces.
+      const parsed = parseSessionNodeId(hit.id);
+      if (parsed === null) {
+        process.stderr.write(
+          `forja retrieval session view: BM25 emitted malformed node id '${hit.id}'; dropping (this is a view-internal bug)\n`,
+        );
         return {
           nodeId: hit.id,
           view: VIEW,
           bootstrapScore: hit.score,
-          reason: `BM25 match in ${messageMatch.role} message`,
-          createdAt: messageMatch.createdAt,
+          reason: 'BM25 match in malformed session node id (dropped)',
         };
       }
-      const toolCallMatch = hit.id.startsWith('session:tool_call:')
-        ? toolCallById.get(hit.id.slice('session:tool_call:'.length))
-        : undefined;
-      if (toolCallMatch !== undefined) {
-        return {
-          nodeId: hit.id,
-          view: VIEW,
-          bootstrapScore: hit.score,
-          reason: `BM25 match in tool_call(${toolCallMatch.tool_name})`,
-          createdAt: toolCallMatch.created_at,
-        };
+      if (parsed.kind === 'message') {
+        const messageMatch = messageById.get(parsed.id);
+        if (messageMatch !== undefined) {
+          return {
+            nodeId: hit.id,
+            view: VIEW,
+            bootstrapScore: hit.score,
+            reason: `BM25 match in ${messageMatch.role} message`,
+            createdAt: messageMatch.createdAt,
+          };
+        }
+      } else if (parsed.kind === 'tool_call') {
+        const toolCallMatch = toolCallById.get(parsed.id);
+        if (toolCallMatch !== undefined) {
+          return {
+            nodeId: hit.id,
+            view: VIEW,
+            bootstrapScore: hit.score,
+            reason: `BM25 match in tool_call(${toolCallMatch.tool_name})`,
+            createdAt: toolCallMatch.created_at,
+          };
+        }
+      } else if (parsed.kind === 'failure') {
+        const failureMatch = failureById.get(parsed.id);
+        if (failureMatch !== undefined) {
+          return {
+            nodeId: hit.id,
+            view: VIEW,
+            bootstrapScore: hit.score,
+            reason: `BM25 match in failure_event(${failureMatch.code})`,
+            createdAt: failureMatch.created_at,
+          };
+        }
       }
-      const failureMatch = hit.id.startsWith('session:failure:')
-        ? failureById.get(hit.id.slice('session:failure:'.length))
-        : undefined;
-      if (failureMatch !== undefined) {
-        return {
-          nodeId: hit.id,
-          view: VIEW,
-          bootstrapScore: hit.score,
-          reason: `BM25 match in failure_event(${failureMatch.code})`,
-          createdAt: failureMatch.created_at,
-        };
-      }
-      // Map miss would be a bug — fall through with a safe shape
-      // rather than crash. The unknown-kind reason makes it
-      // distinguishable in the trace if it ever surfaces.
+      // Parsed shape was valid but the Map missed — would mean the
+      // BM25 corpus contains an id that no source table has. Fall
+      // through with a safe shape; the reason distinguishes this
+      // race-condition / corpus-drift case from the malformed-id
+      // case above so the trace still tells the operator what
+      // happened.
       return {
         nodeId: hit.id,
         view: VIEW,
         bootstrapScore: hit.score,
-        reason: 'BM25 match in unknown session source',
+        reason: `BM25 match in unknown session source (kind=${parsed.kind}, id missing in lookup map)`,
       };
     });
   },

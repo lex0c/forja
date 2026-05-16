@@ -325,6 +325,53 @@ describe('createRetrievalTrace', () => {
   });
 });
 
+describe('fromRow JSON corruption (M1)', () => {
+  test('corrupted JSON column logs to stderr and returns structurally-valid fallback', () => {
+    // Regression: prior code silently swallowed JSON.parse
+    // failures, returning `[]` / empty shapes. A corrupted column
+    // (direct DB mutation, mid-migration tampering) would
+    // disappear from operator view. Now stderr names the row id
+    // and the failed column.
+    const traceId = '11111111-1111-1111-1111-111111111111';
+    createRetrievalTrace(db, {
+      id: traceId,
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: sampleTimings(),
+    });
+    // Corrupt one JSON column via raw SQL.
+    db.query("UPDATE retrieval_trace SET candidates_raw_json = '{not valid json' WHERE id = ?").run(
+      traceId,
+    );
+
+    const writes: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      writes.push(typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    let row: ReturnType<typeof getRetrievalTrace> = null;
+    try {
+      row = getRetrievalTrace(db, traceId);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    expect(row).not.toBeNull();
+    expect(row?.candidatesRaw).toEqual([]); // fallback shape
+    // Stderr names the row id + the failing column so the
+    // operator can locate the corruption.
+    const matches = writes.filter((w) => w.includes(traceId) && w.includes('candidates_raw_json'));
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe('listRetrievalTracesBySession — ordering', () => {
   test('equal created_at ties resolve deterministically by id DESC (H5 regression)', () => {
     // Regression: prior ORDER BY was `created_at DESC` only.

@@ -500,6 +500,43 @@ describe('compressGreedy — budget allocation', () => {
     expect(slot.skipped).toEqual([]);
   });
 
+  test('unknown view emits a single warning per view and skips the candidate (M3)', () => {
+    // Migration that adds a new view without a resolver shouldn't
+    // silently drop candidates. createCompressionResolver logs once
+    // per unknown view (closure-scoped warnedViews set) and
+    // returns null so the greedy loop skips the candidate cleanly.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const resolver = createCompressionResolver({ registry, db });
+    // Capture stderr to assert exactly one warning lands.
+    const writes: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      writes.push(typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      // Cast through `unknown` since 'newview' is not in
+      // RetrievalView; the runtime path is what we're testing.
+      const c1 = makeRanked({
+        nodeId: 'newview:foo',
+        view: 'newview' as unknown as RankedCandidate['view'],
+      });
+      const c2 = makeRanked({
+        nodeId: 'newview:bar',
+        view: 'newview' as unknown as RankedCandidate['view'],
+      });
+      expect(resolver.resolve(c1, 'full')).toBeNull();
+      expect(resolver.resolve(c1, 'outline')).toBeNull();
+      expect(resolver.resolve(c2, 'full')).toBeNull();
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    const matches = writes.filter((w) => w.includes("no compression resolver for view 'newview'"));
+    expect(matches).toHaveLength(1);
+  });
+
   test('all-levels invalid → candidate skipped (no malformed cost reaches the slot)', () => {
     const allBad = {
       resolve(_c: RankedCandidate, _l: string) {

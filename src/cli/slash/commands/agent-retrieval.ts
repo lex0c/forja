@@ -38,13 +38,35 @@ const MAX_METRICS_DAYS = 365;
 // explicitly so the operator knows to pass the full UUID.
 const PREFIX_SCAN_HARD_CAP = 10_000;
 
-const formatDurationMs = (ms: number): string => {
+// Exported for unit testing edge cases (negative / NaN / Infinity).
+// Within this module it's still consumed as `formatDurationMs` —
+// no behavioral change.
+export const formatDurationMs = (ms: number): string => {
+  // Guard against negative / non-finite durations — timings come
+  // from `monoNow()` deltas (always ≥ 0 by construction) or from
+  // persisted `retrieval_trace.timings_json` (where a corrupted
+  // row could in principle land a negative number). Render `?`
+  // for malformed values rather than emitting `-123ms` to the
+  // operator's audit, which would look like a bug in their
+  // reading of the timeline instead of a flag that the data is
+  // suspect.
+  if (!Number.isFinite(ms) || ms < 0) return '?';
   if (ms < 1) return '<1ms';
   if (ms < 1000) return `${ms.toFixed(0)}ms`;
   return `${(ms / 1000).toFixed(2)}s`;
 };
 
-const formatPercent = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`;
+// Render a ratio (expected in [0, 1]) as a percentage. Out-of-range
+// values render as `?` rather than e.g. `-50.0%` / `150.0%`:
+// every caller's invariant should keep the ratio in [0, 1]
+// (`evictionRate = skipped / ranked`, `budgetUtilization = used /
+// budget`), so a value outside that range is a flag, not a number
+// to display. NaN / Infinity also render as `?`. Exported for
+// direct test coverage.
+export const formatPercent = (ratio: number): string => {
+  if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return '?';
+  return `${(ratio * 100).toFixed(1)}%`;
+};
 
 const formatTraceSummaryLine = (row: RetrievalTraceRow, nowMs: number): string => {
   const idShort = row.id.slice(0, 8);
@@ -343,6 +365,28 @@ const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
       notes: [`no retrieval traces in the last ${days}d for this session`],
     };
   }
+  return {
+    kind: 'ok',
+    notes: buildMetricsLines({ traces, capReached, hardCap, days, nowMs: ctx.now() }),
+  };
+};
+
+export interface BuildMetricsLinesInput {
+  traces: readonly RetrievalTraceRow[];
+  capReached: boolean;
+  hardCap: number;
+  days: number;
+  nowMs: number;
+}
+
+// Pure render of the §10.2 metrics surface. Extracted from
+// `handleMetrics` so the `capReached` warning path can be tested
+// directly with a synthetic trace fixture — exercising the slash
+// end-to-end would require seeding 10k+ rows. `nowMs` is passed
+// explicitly (not via callback) so the function is a pure projection
+// of its arguments.
+export const buildMetricsLines = (input: BuildMetricsLinesInput): string[] => {
+  const { traces, capReached, hardCap, days, nowMs } = input;
 
   // §10.2 metrics surface:
   //   - budget utilization (mean across calls)
@@ -406,7 +450,7 @@ const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
     // as a freshest-N-traces sample.
     const oldestKeptMs = traces[traces.length - 1]?.createdAt;
     const effectiveDays =
-      oldestKeptMs !== undefined ? (ctx.now() - oldestKeptMs) / (24 * 60 * 60 * 1000) : days;
+      oldestKeptMs !== undefined ? (nowMs - oldestKeptMs) / (24 * 60 * 60 * 1000) : days;
     lines.push(
       `  warning: sample capped at ${hardCap} traces (oldest kept ≈ ${effectiveDays.toFixed(1)}d ago); metrics reflect the freshest ${hardCap} only — older traces in the requested ${days}d window are excluded`,
     );
@@ -429,7 +473,7 @@ const handleMetrics = (ctx: SlashContext, args: string[]): SlashResult => {
       lines.push(`  ${v}: ${n} (${formatPercent(n / totalInclusions)})`);
     }
   }
-  return { kind: 'ok', notes: lines };
+  return lines;
 };
 
 // ─── /agent retrieval workflows ────────────────────────────────────────

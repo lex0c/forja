@@ -2,6 +2,11 @@
 
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { agentPolicyCommand } from '../../../src/cli/slash/commands/agent-policy.ts';
+import {
+  buildMetricsLines,
+  formatDurationMs,
+  formatPercent,
+} from '../../../src/cli/slash/commands/agent-retrieval.ts';
 import type { SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
@@ -12,6 +17,7 @@ import type {
   ExpandedCandidate,
   PipelineTimings,
   RankedCandidate,
+  RetrievalTraceRow,
 } from '../../../src/retrieval/types.ts';
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
@@ -135,6 +141,155 @@ beforeEach(() => {
   migrate(db);
   nowMs = 1_700_000_000_000;
   sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+});
+
+// ─── formatDurationMs unit tests ──────────────────────────────────────
+
+describe('formatDurationMs (M2)', () => {
+  test('renders the standard tiers', () => {
+    expect(formatDurationMs(0.5)).toBe('<1ms');
+    expect(formatDurationMs(42)).toBe('42ms');
+    expect(formatDurationMs(2_500)).toBe('2.50s');
+  });
+
+  test('returns `?` for negative timings (corrupted timings_json)', () => {
+    expect(formatDurationMs(-1)).toBe('?');
+    expect(formatDurationMs(-999_999)).toBe('?');
+  });
+
+  test('returns `?` for NaN / Infinity (defensive)', () => {
+    expect(formatDurationMs(Number.NaN)).toBe('?');
+    expect(formatDurationMs(Number.POSITIVE_INFINITY)).toBe('?');
+    expect(formatDurationMs(Number.NEGATIVE_INFINITY)).toBe('?');
+  });
+
+  test('exactly 0 still renders as <1ms (boundary)', () => {
+    expect(formatDurationMs(0)).toBe('<1ms');
+  });
+});
+
+describe('formatPercent (M5)', () => {
+  test('renders ratios in [0, 1] as percentages', () => {
+    expect(formatPercent(0)).toBe('0.0%');
+    expect(formatPercent(0.5)).toBe('50.0%');
+    expect(formatPercent(1)).toBe('100.0%');
+    expect(formatPercent(0.235)).toBe('23.5%');
+  });
+
+  test('returns `?` for out-of-range ratios (defensive)', () => {
+    // evictionRate / budgetUtilization should be ∈ [0, 1] by caller
+    // invariant. A value outside that range is a flag.
+    expect(formatPercent(-0.1)).toBe('?');
+    expect(formatPercent(1.5)).toBe('?');
+    expect(formatPercent(99)).toBe('?');
+  });
+
+  test('returns `?` for NaN / Infinity', () => {
+    expect(formatPercent(Number.NaN)).toBe('?');
+    expect(formatPercent(Number.POSITIVE_INFINITY)).toBe('?');
+    expect(formatPercent(Number.NEGATIVE_INFINITY)).toBe('?');
+  });
+});
+
+describe('buildMetricsLines — capReached path (M7)', () => {
+  const baseTrace = (overrides: Partial<RetrievalTraceRow> = {}): RetrievalTraceRow => ({
+    id: crypto.randomUUID(),
+    sessionId: 'sess',
+    queryText: 'q',
+    workflow: 'default',
+    queryType: 'semantic',
+    budgetTokens: 100,
+    candidatesRaw: [],
+    candidatesExpanded: [],
+    candidatesRanked: [],
+    contextSlot: { included: [], skipped: [] },
+    timings: { searchMs: 5, expandMs: 1, rankMs: 2, compressMs: 3 },
+    createdAt: 1_700_000_000_000,
+    ...overrides,
+  });
+
+  test('capReached=true surfaces a warning line naming the hardCap', () => {
+    // Exercises the slash-side render that the repo-level
+    // capReached test (commit 49be554 / 55ba11a) doesn't reach.
+    const nowMs = 1_700_000_000_000;
+    const dayMs = 24 * 60 * 60 * 1000;
+    // Two traces — oldest at nowMs - 5d so the warning quotes
+    // "≈ 5.0d ago" deterministically.
+    const lines = buildMetricsLines({
+      traces: [
+        baseTrace({ createdAt: nowMs - 1 * dayMs }),
+        baseTrace({ createdAt: nowMs - 5 * dayMs }),
+      ],
+      capReached: true,
+      hardCap: 10_000,
+      days: 30,
+      nowMs,
+    });
+    const text = lines.join('\n');
+    expect(text).toContain('warning: sample capped at 10000 traces');
+    expect(text).toContain('oldest kept ≈ 5.0d ago');
+    expect(text).toContain('older traces in the requested 30d window are excluded');
+  });
+
+  test('capReached=false does NOT emit a warning line', () => {
+    const lines = buildMetricsLines({
+      traces: [baseTrace()],
+      capReached: false,
+      hardCap: 10_000,
+      days: 30,
+      nowMs: 1_700_000_000_000,
+    });
+    expect(lines.join('\n')).not.toContain('warning: sample capped');
+  });
+
+  test('renders the canonical metrics header + body regardless of capReached', () => {
+    const lines = buildMetricsLines({
+      traces: [
+        baseTrace({
+          candidatesRanked: [
+            // Minimal RankedCandidate shape — fields beyond what
+            // the aggregator reads can stay default-ish.
+            {
+              nodeId: 'memory:user/x',
+              view: 'memory',
+              reason: 'r',
+              path: ['memory:user/x'],
+              finalScore: 0.5,
+              signals: {
+                structural: 0,
+                lexical: 0,
+                semantic: 0,
+                temporal: 0,
+                usage: 0,
+                goalAlignment: 0,
+              },
+            },
+          ],
+          contextSlot: {
+            included: [
+              {
+                nodeId: 'memory:user/x',
+                view: 'memory',
+                level: 'full',
+                content: 'x',
+                costTokens: 30,
+              },
+            ],
+            skipped: [],
+          },
+        }),
+      ],
+      capReached: false,
+      hardCap: 10_000,
+      days: 7,
+      nowMs: 1_700_000_000_000,
+    });
+    const text = lines.join('\n');
+    expect(text).toContain('retrieval metrics — last 7.0d (1 traces)');
+    expect(text).toContain('budget_utilization_mean');
+    expect(text).toContain('eviction_rate');
+    expect(text).toContain('view distribution');
+  });
 });
 
 // ─── router ────────────────────────────────────────────────────────────
