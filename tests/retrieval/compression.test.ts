@@ -179,6 +179,44 @@ describe('createCompressionResolver — memory view', () => {
     expect(resolver.resolve(makeRanked({ nodeId: 'memory:made_up_scope/auth' }), 'ref')).toBeNull();
   });
 
+  test('does not emit memory_events action=read for compression probes (fallback or place)', () => {
+    // Regression: prior implementation called `registry.read`
+    // inside the memory resolver. compressGreedy probes up to
+    // four levels per candidate, so even a single placed memory
+    // emitted 1–3 synthetic `read` audit rows, and a candidate
+    // skipped after probing every level emitted up to 3. The
+    // resolver now uses `registry.peek`, so the only audit that
+    // should ever land in `memory_events` for a retrieval pass
+    // is whatever non-read lifecycle event the registry emits
+    // (none, here — we're not creating / evicting anything).
+    //
+    // Scenario covers both outcomes in one pass:
+    //   - placed:  budget large enough that `full` fits.
+    //   - skipped: budget = 0 forces fallthrough to ref then skip.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Placed](placed.md) — h\n- [Skipped](skipped.md) — h\n');
+    writeBody(roots.user, 'placed', 'body for the candidate that lands at full level');
+    writeBody(roots.user, 'skipped', 'body for the candidate that gets skipped');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const resolver = createCompressionResolver({ registry, db });
+
+    const ranked: RankedCandidate[] = [
+      makeRanked({ nodeId: 'memory:user/placed', finalScore: 0.9 }),
+      makeRanked({ nodeId: 'memory:user/skipped', finalScore: 0.1 }),
+    ];
+    // First placement gets full; budget then forces skipped to
+    // try every level. Set budget tight enough that the second
+    // candidate can't fit at ref either.
+    compressGreedy({ ranked, query: { ...baseQuery, budgetTokens: 500 }, resolver });
+    compressGreedy({ ranked, query: { ...baseQuery, budgetTokens: 0 }, resolver });
+
+    const readRows = db
+      .prepare("SELECT COUNT(*) AS n FROM memory_events WHERE action = 'read'")
+      .get() as { n: number };
+    expect(readRows.n).toBe(0);
+  });
+
   test('estimateTokens override is respected for cost calculation', () => {
     // L4: slice 4.9 will wire provider-specific countTokens via
     // this override. Pin the contract now so a future refactor

@@ -88,12 +88,21 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
       for (let i = 0; i < TITLE_WEIGHT; i++) tokens.push(...nameTokens);
       for (let i = 0; i < DESCRIPTION_WEIGHT; i++) tokens.push(...descTokens);
       if (deps.loadBodies === true) {
-        // registry.read resolves the same scope precedence as the
-        // model would see — local > shared > user. `present` means
-        // body loaded; `missing` / `malformed` / `unknown` fall
-        // through as title+description only (the candidate is still
-        // ranked on its name + description signal).
-        const file = deps.registry.read(l.name);
+        // Use `registry.peek` (not `read`) — BM25 corpus
+        // construction reads EVERY listed memory body just to
+        // compute term frequencies for ranking. Only the top-K
+        // hits actually become candidates, and only the included
+        // slot entries ever reach the model. Emitting
+        // `memory_events action=read` per indexed memory would
+        // flood the audit log with rows for content the model
+        // never saw — same policy as compression fallback
+        // (§retrieval/compression.ts). `peek` mirrors `read`'s
+        // scope precedence (local > shared > user) but skips
+        // `auditRead`. `present` means body loaded; `missing` /
+        // `malformed` / `unknown` fall through as
+        // title+description only (the candidate is still ranked
+        // on its name + description signal).
+        const file = deps.registry.peek(l.name);
         if (file.kind === 'present') {
           const bodyTokens = tokenize(file.file.body);
           for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);

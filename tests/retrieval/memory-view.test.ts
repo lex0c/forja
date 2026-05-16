@@ -160,6 +160,34 @@ describe('createMemoryView', () => {
     expect(deepHits[0]?.nodeId).toBe('memory:user/notes');
   });
 
+  test('loadBodies=true does not emit memory_events action=read (BM25 corpus is internal)', async () => {
+    // Regression: prior implementation called `registry.read` for
+    // every listed memory when building the BM25 corpus, emitting
+    // one audit-read row per indexed memory regardless of whether
+    // it reached top-K. The view now uses `registry.peek` —
+    // retrieval-side visibility lives in `retrieval_trace`;
+    // `memory_events action=read` stays reserved for explicit
+    // `memory_read` tool calls. Scenario indexes 5 memories but
+    // produces zero hits (term not in any title/desc/body), so the
+    // ONLY way an audit-read row could land is the indexing path.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const lines: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      lines.push(`- [Note${i}](note${i}.md) — unrelated topic ${i}`);
+      writeBody(roots.user, `note${i}`, `body content for note ${i}`);
+    }
+    writeIndex(roots.user, `${lines.join('\n')}\n`);
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, loadBodies: true });
+    await view.search({ ...baseQuery, text: 'xyzzy' });
+
+    const readRows = db
+      .prepare("SELECT COUNT(*) AS n FROM memory_events WHERE action = 'read'")
+      .get() as { n: number };
+    expect(readRows.n).toBe(0);
+  });
+
   test('multi-scope: candidates carry the correct scope tag', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

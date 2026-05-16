@@ -2,6 +2,15 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-15] fix(retrieval) — stop emitting synthetic `memory_events action=read` from retrieval-internal paths (compression + BM25 indexing)
+
+Two retrieval-internal paths were calling `registry.read` and minting `memory_events action=read` rows for content the model never actually saw. Both swapped to `registry.peek` (same scope precedence + discriminated outcome, no `auditRead` side effect). Policy now spelled out in both call sites: `memory_events action=read` stays reserved for explicit `memory_read` tool calls (model asking by name); retrieval-pipeline visibility lives in `retrieval_trace` (included nodeIds + skipped trail).
+
+- `src/retrieval/compression.ts` `memoryResolver` — `compressGreedy` probes up to four levels per candidate (`full → outline → summary → ref`); a single ranked memory could fire 1–3 audit-read rows before placement, and a candidate skipped after probing every body level fired up to 3 reads for nothing the model saw.
+- `src/retrieval/views/memory.ts` BM25 corpus build (`loadBodies=true`) — read EVERY listed memory's body just to compute term frequencies for ranking; only top-K became candidates and only included slot entries reached the model. Worst case in the indexing path: one audit-read row per indexed memory per query.
+
+Regression tests in `tests/retrieval/compression.test.ts` and `tests/retrieval/memory-view.test.ts` each assert zero `memory_events action=read` rows after the respective retrieval pass. Compression test exercises both outcomes (placed + skipped) in one go; memory-view test indexes 5 memories with a query that hits none, isolating the indexing path as the only possible audit source.
+
 ## [2026-05-15] feat(retrieval) — Phase 4 kickoff (RETRIEVAL.md v1)
 
 **In progress.** New branch `feat/retrieval` starts implementing `docs/spec/RETRIEVAL.md` v1 — the pipeline `query → candidates → expansion → ranking → compression → context slot`. Decisions agreed up front:

@@ -186,9 +186,20 @@ const memoryResolver = (
   }
 
   // full / outline / summary all need the file body. Use
-  // registry.read with a `scope` pin so a same-name shadow in
-  // another scope doesn't redirect.
-  const result = registry.read(parsed.name, { scope: parsed.scope });
+  // `registry.peek` (not `read`) — compression is an internal
+  // pipeline step that may probe several levels per candidate
+  // before placement and may drop the candidate entirely if no
+  // level fits the remaining budget. Emitting `memory_events`
+  // `action=read` here would flood the audit log with synthetic
+  // reads that don't correspond to anything the model actually
+  // saw. The retrieval-side audit lives in `retrieval_trace`
+  // (included nodeIds + skipped trail), which is the right
+  // surface for "this memory was served via retrieve_context".
+  // `memory_events action=read` stays reserved for explicit
+  // `memory_read` tool calls — the model asking by name. `peek`
+  // gives the same scope-pinned lookup semantics, just without
+  // the audit side effect.
+  const result = registry.peek(parsed.name, { scope: parsed.scope });
   if (result.kind !== 'present') return null;
   const file = result.file;
 
