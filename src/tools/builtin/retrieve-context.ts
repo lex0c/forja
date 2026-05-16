@@ -222,7 +222,16 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
       // synchronous SQLite/registry work so the signal mostly
       // guards the await fence; 4.4 (workspace via ripgrep) is the
       // case it actually saves.
-      const result = await ctx.retrieveContext(validated, ctx.signal);
+      //
+      // Forward ctx.toolCallId so the runner can emit a
+      // memory_provenance row per `contextSlot.included` entry
+      // (MEMORY.md §11.2, S1/T1.5). Absent (test contexts that
+      // bypass the harness) ⇒ runner skips the emit cleanly.
+      const result = await ctx.retrieveContext(
+        validated,
+        ctx.signal,
+        ctx.toolCallId !== undefined ? { toolCallId: ctx.toolCallId } : undefined,
+      );
       return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

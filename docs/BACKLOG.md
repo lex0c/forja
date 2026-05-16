@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — retrieve_context provenance emitter (S1/T1.5)
+
+Third emitter on the provenance trail. Every `contextSlot.included` entry whose `view === 'memory'` now produces a `memory_provenance` row with `surface='retrieve_context'`, linking the exposure to BOTH the retrieval batch (via `retrieval_query_id` referencing `retrieval_trace.id`) AND the originating tool_call. `position_in_corpus` pins the slot rank — 0 = top hit — so operator forensics can ask "the memory was exposed but ranked 18th, maybe the model didn't attend to it".
+
+The wiring:
+
+- `RetrieveFn` signature gained an optional third `opts: { toolCallId? }` arg. The `retrieve_context` tool reads `ctx.toolCallId` (populated by `invoke-tool.ts` post-`createToolCall`) and forwards it; test contexts that bypass the harness pass undefined and the runner skips the emit cleanly (mirror of memory_read's posture).
+- Emit happens in `runner.ts`, AFTER `runRetrieval` returns and AFTER `createRetrievalTrace` succeeds — gated on `result.queryId.length > 0` so a persist-failed retrieval (queryId='') doesn't try to FK-link a non-existent trace row. The repo invariant requires non-null `retrievalQueryId` for `surface='retrieve_context'`, so skipping is the only correct path when the parent trace didn't persist.
+- The runner parses `entry.nodeId` (`memory:<scope>/<name>` per `views/memory.ts`) back into `(scope, name)` and `peek`s the memory file for the hash + state snapshot. Peek doesn't fire an audit `read` event (the registry's `peek` is the no-audit form by design) — the model already saw the bytes via the retrieval slot, the provenance row captures THAT exposure, not a second redundant `read` audit.
+- Per-entry `try`/`catch` isolates failures: malformed nodeId, missing memory file (operator deleted between rank and emit), FK violation — none abort the loop or the retrieval call. Audit drift hits stderr; the slot the model received already happened.
+- Session-view entries in `contextSlot.included` are filtered out: provenance is memory-specific. Session messages are already in `messages` table; conflating them into `memory_provenance` would invent a memory exposure that never happened.
+
+Tests: 5 new in `tests/tools/retrieve-context.test.ts`. Pin: one row per memory entry in `slot.included`, `position_in_corpus` matches index in the slot (verified by `listExposuresInRetrieval` which orders ASC), hash + state captured (state pinned to 'active' since the memory view filters non-active memories before they reach the slot — documented in the test comment), absent `toolCallId` ⇒ zero rows, session-view entries don't pollute `memory_provenance`.
+
 ## [2026-05-16] feat(memory) — eager-load provenance emitter (S1/T1.4)
 
 Second emitter on the provenance trail. Eager-loaded memories — the names + descriptions the model sees in the system prompt before any tool call fires — now produce one `memory_provenance` row per `(session, memory)` at session start. Surface is `eager` and `tool_call_id` is NULL by construction (the exposure precedes any tool call).

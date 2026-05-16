@@ -18,19 +18,39 @@
 // an explicit `views` set so future tests / fixtures can stub
 // individual views without rebuilding the whole runner.
 
-import type { MemoryRegistry } from '../memory/index.ts';
+import { type MemoryRegistry, serializeMemoryFile } from '../memory/index.ts';
 import type { DB } from '../storage/db.ts';
+import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { createCompressionResolver } from './compression.ts';
 import { runRetrieval } from './pipeline.ts';
 import type { ViewSearch } from './pipeline.ts';
 import type {
+  ContextSlotEntry,
   RetrievalView,
   RetrieveContextInput,
   RetrieveContextOutput,
   RetrieveFn,
+  RetrieveFnOpts,
 } from './types.ts';
 import { createMemoryView } from './views/memory.ts';
 import { createSessionView } from './views/session.ts';
+
+// `memory:<scope>/<name>` — produced by views/memory.ts. Parsed
+// here back into (scope, name) so the runner can peek the
+// underlying memory file for hash + state capture without
+// reaching into the view's encoding internals.
+const MEMORY_NODE_PREFIX = 'memory:';
+const parseMemoryNodeId = (
+  nodeId: string,
+): { scope: 'user' | 'project_shared' | 'project_local'; name: string } | null => {
+  if (!nodeId.startsWith(MEMORY_NODE_PREFIX)) return null;
+  const rest = nodeId.slice(MEMORY_NODE_PREFIX.length);
+  const slash = rest.indexOf('/');
+  if (slash <= 0 || slash === rest.length - 1) return null;
+  const scope = rest.slice(0, slash);
+  if (scope !== 'user' && scope !== 'project_shared' && scope !== 'project_local') return null;
+  return { scope, name: rest.slice(slash + 1) };
+};
 
 // Default per-call token budget when the caller omits `budgetTokens`.
 // 1000 is conservative — fits inside the system-prompt portion of
@@ -77,6 +97,7 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
   return async (
     input: RetrieveContextInput,
     signal?: AbortSignal,
+    opts?: RetrieveFnOpts,
   ): Promise<RetrieveContextOutput> => {
     // Early abort check. The pipeline doesn't have an internal
     // abort handler yet (slice 4.4 will plumb it through the
@@ -145,6 +166,27 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
       throw new Error('retrieval aborted mid-flight');
     }
 
+    // Provenance emit (MEMORY.md §11.2, S1/T1.5). Every memory-view
+    // entry in `contextSlot.included` becomes one
+    // memory_provenance row — surface='retrieve_context', linking
+    // the retrieval batch (via retrieval_query_id) AND the
+    // originating tool_call. Position pins the slot rank for
+    // operator forensics ("memory was exposed but ranked 18th").
+    //
+    // Skipped when:
+    //   - persist failed upstream (queryId === '') — FK to
+    //     retrieval_trace can't resolve and the repo invariant
+    //     requires a non-null retrieval_query_id;
+    //   - no toolCallId supplied (test contexts that bypass the
+    //     harness — degrades the same way memory_read does).
+    //
+    // Audit-drift posture: per-row try/catch; failures hit stderr
+    // but never abort the retrieval. The body load + ranking
+    // already happened; provenance is observability.
+    if (result.queryId.length > 0 && opts?.toolCallId !== undefined) {
+      emitRetrievalProvenance(deps, opts.toolCallId, result.queryId, result.contextSlot.included);
+    }
+
     const budgetUsed = result.contextSlot.included.reduce((sum, e) => sum + e.costTokens, 0);
     const budget = input.budgetTokens ?? defaultBudget;
 
@@ -162,4 +204,58 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
       },
     };
   };
+};
+
+// Walk `contextSlot.included`, filter memory-view entries, parse
+// scope/name from the node id, peek the memory body for hash +
+// state, and emit one provenance row per entry. `position` is the
+// index inside the slot (0 = top hit) — pinned for the
+// "exposed but ranked low" forensic query.
+//
+// Per-entry try/catch isolates failures: a malformed node id, a
+// missing memory file (operator deleted between rank and emit), a
+// DB FK violation — none should abort the loop or surface to the
+// caller. Audit drift hits stderr; the retrieval itself already
+// succeeded.
+const emitRetrievalProvenance = (
+  deps: BuildRetrievalRunnerDeps,
+  toolCallId: string,
+  queryId: string,
+  included: ContextSlotEntry[],
+): void => {
+  for (let i = 0; i < included.length; i++) {
+    const entry = included[i];
+    if (entry === undefined || entry.view !== 'memory') continue;
+    try {
+      const parsed = parseMemoryNodeId(entry.nodeId);
+      if (parsed === null) continue;
+      const peek = deps.memoryRegistry.peek(parsed.name, { scope: parsed.scope });
+      let contentHash: string | null = null;
+      let stateAtExposure = 'active';
+      if (peek.kind === 'present') {
+        try {
+          contentHash = hashMemoryContent(serializeMemoryFile(peek.file));
+        } catch {
+          contentHash = null; // best-effort, mirrors the schema's nullable column
+        }
+        stateAtExposure = peek.file.frontmatter.state ?? 'active';
+      }
+      recordProvenance(deps.db, {
+        sessionId: deps.sessionId,
+        toolCallId,
+        memoryScope: parsed.scope,
+        memoryName: parsed.name,
+        surface: 'retrieve_context',
+        retrievalQueryId: queryId,
+        positionInCorpus: i,
+        memoryContentHash: contentHash,
+        memoryStateAtExposure: stateAtExposure,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to record retrieve_context exposure for ${entry.nodeId}: ${msg}\n`,
+      );
+    }
+  }
 };
