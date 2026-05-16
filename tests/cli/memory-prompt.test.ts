@@ -32,7 +32,7 @@ const writeIndex = (dir: string, body: string): void => {
 const writeBody = (
   dir: string,
   name: string,
-  fmExtras: { trust?: string; type?: string; source?: string } = {},
+  fmExtras: { trust?: string; type?: string; source?: string; state?: string } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -42,6 +42,7 @@ const writeBody = (
     `source: ${fmExtras.source ?? 'user_explicit'}`,
   ];
   if (fmExtras.trust !== undefined) lines.push(`trust: ${fmExtras.trust}`);
+  if (fmExtras.state !== undefined) lines.push(`state: ${fmExtras.state}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
 };
 
@@ -283,6 +284,54 @@ describe('composeSystemPrompt', () => {
   test('appends memory after base with blank line separator', () => {
     const out = composeSystemPrompt('You are an agent.', '# Memory\n- entry');
     expect(out).toBe('You are an agent.\n\n# Memory\n- entry');
+  });
+});
+
+describe('assembleMemorySection — lifecycle state filter (spec MEMORY.md §6)', () => {
+  test('invalidated memory is excluded from the section', () => {
+    // S5 trust_revoked: every active shared memory becomes
+    // `invalidated` when operator revokes corpus trust. The boot
+    // probe persists that state to disk; THIS layer is what keeps
+    // it out of the system prompt for the rest of the session.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Live](live.md) — h\n- [Zombie](zombie.md) — h\n');
+    writeBody(roots.projectShared, 'live');
+    writeBody(roots.projectShared, 'zombie', { state: 'invalidated' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('live');
+    expect(result.text).not.toContain('zombie');
+  });
+
+  test('quarantined memory stays in the section with the [memory: quarantined] flag (S6)', () => {
+    // Lifecycle-state filter is targeted: ONLY `invalidated` is
+    // excluded. Quarantined memories remain visible with the flag
+    // per S6/T6.2 so the model sees the cautionary marker inline.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Q](q.md) — h\n');
+    writeBody(roots.projectShared, 'q', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('[memory: quarantined]');
+  });
+
+  test('active memory (default frontmatter state) is included unchanged', () => {
+    // Ensures the new filter is a no-op for the common case —
+    // memories without an explicit `state:` are treated as active
+    // by the registry/peek layer, and active memories ship.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Live](live.md) — h\n');
+    writeBody(roots.projectShared, 'live'); // no state marker
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('live');
+    expect(result.text).not.toContain('[memory:');
   });
 });
 

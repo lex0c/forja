@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — S5/T5.2+T5.3 trust_revoked detector wired end-to-end
+
+Builds on T5.1's substrate. The probe now fires inside `bootstrap`, the operator gets a modal-driven re-confirmation when the shared corpus drifted, and revocation bulk-invalidates the affected memories — taking effect in the SAME boot's system prompt rather than requiring a restart.
+
+Added:
+
+- `src/memory/trust-corpus-probe.ts` — boot orchestrator. State machine: `seeded` (no prior row → silent stamp), `unchanged` (no-op), `reconfirmed` (modal yes → re-stamp), `revoked` (modal no/cancel → clear row + bulk transition `active → invalidated` with motivo `security`, trigger `trust_revoked`), `verify_failed` (fs error). Already-quarantined shared memories are left alone since `quarantined → invalidated` admits only `shift` per EVICTION.md §4.1.
+- TUI plumbing for a new modal flavor `shared-trust:ask`. `SharedTrustAskEvent` carries the corpus inventory; the reducer renders a preview block with up to 8 file rows (`name — bytes`) + an explicit "and N more" suffix. Layout mirrors the `trust:ask` flavor with verbs adapted to "Yes, I trust the updated corpus" / "No, revoke trust"; conservative-default (D65) lands on revoke.
+- `BootstrapInput.askSharedTrust` callback and `BootstrapResult.sharedTrustProbe`. Bootstrap calls the probe between the memory GC sweeps and `assembleMemorySection` so the bulk-invalidate is reflected in this boot's prompt. Gated on `isCwdTrusted` — the probe is skipped (alongside undefined-callback) without preexisting cwd consent.
+- `src/cli/repl.ts` wires `modalManager.askSharedTrust` into bootstrap with a 5-minute timeout matching the cwd-trust modal, and pre-subscribes stdin before bootstrap so the modal can receive input even on the previously-trusted path. Renders summary lines on `reconfirmed` / `revoked` / `verify_failed` so the operator sees the action's effect echoed back.
+- `src/cli/memory-prompt.ts` filters `frontmatter.state === 'invalidated'` from the eager-load section. Quarantined memories continue rendering with the `[memory: quarantined]` flag (Slice 6 unchanged); only `invalidated` is excluded.
+- Tests: 8 probe state-machine + selectivity tests, 5 bootstrap integration tests (skip-when-no-callback, skip-when-cwd-untrusted, seed, revoke E2E, "invalidated memory excluded from THIS turn's prompt"), 3 memory-prompt lifecycle-filter tests.
+
+Known limitation (documented in `bootstrap.ts` block comment): a memory auto-evicted by `gcExpiredMemories` between sessions shifts the corpus hash and prompts a false-positive re-confirm next boot. Rare in practice — operator-curated shared/ memories almost never carry `expires:` frontmatter.
+
+Full suite (8210 tests across 349 files) green.
+
 ## [2026-05-16] feat(memory) — S5/T5.1 shared-corpus trust substrate (`trust_revoked` detector, phase 1)
 
 Substrate for the `trust_revoked` lifecycle detector. Deterministic-only — fits the zero-text-heuristic commitment because detection is pure hash diff (no prose judgment) and the operator modal is the authority for the revoke decision.

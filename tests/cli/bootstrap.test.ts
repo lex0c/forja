@@ -1056,4 +1056,210 @@ Body.`,
       db.close();
     });
   });
+
+  describe('shared-corpus trust probe (S5/T5.2)', () => {
+    // Verify the boot probe wires substrate + callback + bulk-
+    // invalidate end-to-end inside bootstrap. Per-unit assertions
+    // already live in tests/memory/trust-corpus-probe.test.ts; this
+    // suite covers the bootstrap-layer contract: gating on
+    // isCwdTrusted, plumbing the callback, exposing the result.
+
+    const seedFromMain = async (extra?: {
+      seed?: (db: import('../../src/storage/index.ts').DB) => void;
+    }) => {
+      const { openDb, migrate } = await import('../../src/storage/index.ts');
+      const seedDb = openDb(dbPath);
+      migrate(seedDb);
+      extra?.seed?.(seedDb);
+      seedDb.close();
+    };
+
+    test('skipped when no askSharedTrust callback is supplied', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(result.sharedTrustProbe).toBeUndefined();
+      result.db.close();
+    });
+
+    test('skipped when cwd is not trusted (probe requires cwd consent first)', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+
+      let callbackFired = false;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => {
+          callbackFired = true;
+          return 'yes';
+        },
+      });
+      expect(callbackFired).toBe(false);
+      expect(result.sharedTrustProbe).toBeUndefined();
+      result.db.close();
+    });
+
+    test('seeded on first visit: probe runs, no modal fires, hash persisted', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      let modalCalls = 0;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => {
+          modalCalls++;
+          return 'yes';
+        },
+      });
+      expect(modalCalls).toBe(0);
+      expect(result.sharedTrustProbe?.kind).toBe('seeded');
+      result.db.close();
+    });
+
+    test('revoked: corpus changed after seeding → modal fires, bulk-invalidate runs', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      // Pre-seed trust row with the CURRENT hash so the probe sees
+      // a baseline. Without this, the first bootstrap would seed
+      // silently and any drift test would be conflated with the
+      // initial-seed path.
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const baselineHash = computeSharedFingerprint(sharedDir);
+      expect(baselineHash).toBeString();
+      await seedFromMain({
+        seed: (db) => setSharedTrust(db, sharedDir, baselineHash as string, 1000),
+      });
+
+      // Modify the corpus AFTER the trust baseline.
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nTAMPERED\n',
+      );
+
+      let receivedPath: string | null = null;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async (args) => {
+          receivedPath = args.path;
+          return 'no';
+        },
+      });
+      expect(receivedPath as string | null).toBe(sharedDir);
+      expect(result.sharedTrustProbe?.kind).toBe('revoked');
+      if (result.sharedTrustProbe?.kind === 'revoked') {
+        expect(result.sharedTrustProbe.invalidated.map((q) => q.name)).toEqual(['a']);
+        expect(result.sharedTrustProbe.failed).toEqual([]);
+      }
+      // Trust row cleared so the NEXT boot re-prompts. We verify via
+      // the substrate helper rather than re-opening the DB so the
+      // assertion is hash-shape-independent.
+      const { getSharedTrust } = await import('../../src/memory/trust-corpus.ts');
+      expect(getSharedTrust(result.db, sharedDir)).toBeNull();
+      result.db.close();
+    });
+
+    test('revoked: invalidated memory is excluded from the system prompt this turn', async () => {
+      // End-to-end: probe runs BEFORE assembleMemorySection so the
+      // bulk-invalidate landing on disk is reflected in the prompt
+      // built this very boot. Without that ordering the operator
+      // would need to restart to get the memories out of the
+      // system prompt.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [Quokka](quokka.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'quokka.md'),
+        '---\nname: quokka\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const baselineHash = computeSharedFingerprint(sharedDir);
+      await seedFromMain({
+        seed: (db) => setSharedTrust(db, sharedDir, baselineHash as string, 1000),
+      });
+
+      writeFileSync(
+        join(sharedDir, 'quokka.md'),
+        '---\nname: quokka\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nTAMPERED\n',
+      );
+
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => 'no',
+      });
+      expect(result.sharedTrustProbe?.kind).toBe('revoked');
+      // The system prompt was assembled AFTER the bulk-invalidate
+      // landed on disk; the invalidated memory must not appear.
+      expect(result.config.systemPrompt ?? '').not.toContain('quokka');
+      result.db.close();
+    });
+  });
 });

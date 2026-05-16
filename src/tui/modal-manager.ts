@@ -111,6 +111,24 @@ export interface TrustAskArgs {
 
 export type TrustAnswer = 'yes' | 'no' | 'cancel';
 
+// Shared-corpus trust re-confirmation flavor (MEMORY.md §6.5.2
+// `trust_revoked` detector). Distinct from `TrustAskArgs` even though
+// the answer shape is identical — the producer wires very different
+// consequences to `no/cancel` (bulk-invalidate vs exit), so keeping
+// the type discriminant strict prevents a future refactor from
+// accidentally swapping them.
+export interface SharedTrustAskArgs {
+  // Absolute path of the shared-corpus root (`<repo>/.agent/memory/shared`).
+  path: string;
+  // Current corpus snapshot — name + byte length per file. Renderer
+  // wraps long lists with an explicit "(N more)" suffix; the
+  // producer should NOT pre-truncate so the audit event carries the
+  // full inventory.
+  corpusFiles: readonly { name: string; bytes: number }[];
+}
+
+export type SharedTrustAnswer = 'yes' | 'no' | 'cancel';
+
 // History-clear flavor (HISTORY.md §2.3 `/history clear` modal).
 // `yes` = clear only, `yes-disable` = clear + write the
 // `.agent/no-history` marker (permanent per-project opt-out), `no` =
@@ -185,6 +203,19 @@ export type CritiqueModalAnswer = 'ignore' | 'redo' | 'abort' | 'cancel';
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, I trust this folder', value: 'yes' },
   { key: '2', label: 'No, exit', value: 'no' },
+];
+
+// Shared-corpus re-confirm flavor. Verbs differ from `TRUST_OPTIONS`
+// on purpose: a re-prompt isn't a first-visit decision, and "No,
+// revoke" makes the consequence explicit (the shared corpus will be
+// invalidated; the operator does NOT exit the session). Conservative-
+// default (last position per D5/D65) is the revoke path — operator
+// hitting Enter without reading errs toward "I don't trust this
+// change", which is the safer outcome for a corpus the model would
+// otherwise eager-load every turn.
+const SHARED_TRUST_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, I trust the updated corpus', value: 'yes' },
+  { key: '2', label: 'No, revoke trust', value: 'no' },
 ];
 
 // History-clear flavor (HISTORY.md §2.3). Kept in sync with the
@@ -295,6 +326,17 @@ export interface ModalManager {
   // §9.1 calls for a 5-minute timeout that defaults to read-only —
   // we forward that via `opts.timeoutMs` so the producer decides.
   askTrust: (args: TrustAskArgs, opts?: ConfirmAskOptions) => Promise<TrustAnswer>;
+  // Shared-corpus trust re-confirmation flavor. Producer: REPL boot,
+  // after bootstrap, when `shared_corpus_trust` carries a row for the
+  // current scope-root AND its `last_confirmed_hash` differs from the
+  // freshly-computed fingerprint. Caller maps the answer: yes →
+  // re-stamp the trust row with the new hash and continue; no/cancel
+  // → clear the trust row, run the bulk-invalidate path (T5.3), and
+  // continue the REPL with shared/ memories in `invalidated` state.
+  askSharedTrust: (
+    args: SharedTrustAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<SharedTrustAnswer>;
   // History-clear flavor (HISTORY.md §2.3). Surfaces the entry count
   // and project root so the modal can render blast radius up front.
   askHistoryClear: (
@@ -696,6 +738,19 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           agentsMd: args.agentsMd === true,
         }),
         TRUST_OPTIONS,
+        opts?.timeoutMs,
+        opts?.signal,
+      ),
+    askSharedTrust: (args, opts) =>
+      enqueueConfirm<SharedTrustAnswer>(
+        (promptId) => ({
+          type: 'shared-trust:ask',
+          ts: now(),
+          promptId,
+          path: args.path,
+          corpusFiles: args.corpusFiles,
+        }),
+        SHARED_TRUST_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
       ),

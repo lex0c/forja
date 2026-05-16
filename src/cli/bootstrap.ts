@@ -22,9 +22,11 @@ import {
   evaluateBootTriggers,
   gcExpiredMemories,
   gcPurgeExpiredTombstones,
+  probeSharedTrust,
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
+import type { ProbeSharedTrustResult } from '../memory/index.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type LockConflict,
@@ -131,6 +133,23 @@ export interface BootstrapInput {
   // binary mode is currently unsupported — bootstrap throws a
   // clear error when the worker source isn't on disk.
   brokerMode?: 'in-process' | 'spawn';
+  // Shared-corpus trust modal callback (MEMORY.md §6.5.2
+  // `trust_revoked` detector, S5/T5.2). Fired by `probeSharedTrust`
+  // when the operator previously confirmed trust for this scope-
+  // root but the corpus' SHA-256 has since diverged. Caller (REPL
+  // boot) wraps `modalManager.askSharedTrust` in a thin adapter.
+  // When undefined, the probe is SKIPPED entirely — bootstrap
+  // doesn't seed, doesn't prompt, doesn't bulk-invalidate. Use
+  // case: tests / headless invocations that don't have a TUI and
+  // shouldn't be silently auto-accepting drifted corpora. Production
+  // REPL always passes the modal callback; an explicit
+  // `() => Promise.resolve('yes')` is the way to opt into "auto-
+  // accept" semantics with an audit trail (the probe records the
+  // reconfirmed transition with a real timestamp).
+  askSharedTrust?: (args: {
+    path: string;
+    corpusFiles: readonly { name: string; bytes: number }[];
+  }) => Promise<'yes' | 'no' | 'cancel'>;
 }
 
 export interface BootstrapResult {
@@ -180,6 +199,17 @@ export interface BootstrapResult {
   // to the active audit chain. The CLI surfaces this in
   // diagnostics so operators can correlate logs across machines.
   installIdentity: import('../permissions/index.ts').InstallIdentity;
+  // Outcome of the shared-corpus trust probe (S5/T5.2). Undefined
+  // when:
+  //   - `askSharedTrust` was not supplied (headless / tests), or
+  //   - the cwd was not trusted at boot (operator must first
+  //     confirm cwd trust before shared-trust kicks in), or
+  //   - bootstrap aborted before the memory subsystem finished
+  //     initializing (rare — try-block early throw).
+  // Present in the production REPL path. Callers render warnings on
+  // `revoked` and may surface a count on `reconfirmed` so the
+  // operator sees the trust action they just took echoed back.
+  sharedTrustProbe?: import('../memory/trust-corpus-probe.ts').ProbeSharedTrustResult;
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -425,6 +455,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // empty array survives the no-memory path without conditional
   // spread on the consumer side.
   let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
+  // Probe outcome (S5/T5.2). Lifted out of the try-block for the
+  // same reason as `eagerExposures` — present on BootstrapResult
+  // for the CLI driver to render warnings, absent on the early-
+  // throw path so callers can distinguish "probe skipped" from
+  // "probe ran and decided X".
+  let sharedTrustProbe: ProbeSharedTrustResult | undefined;
   try {
     // Resolve the effective system prompt. Layers stack here in
     // precedence order (most-specific to most-generic). Each
@@ -594,6 +630,37 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       process.stderr.write(
         `memory: AUDIT DRIFT: failed to record retention sweep at boot (will retry next boot): ${redactSecrets(msg)}\n`,
       );
+    }
+    // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2
+    // `trust_revoked` detector). Runs ONLY when the operator
+    // supplied a callback AND the cwd is trusted at boot — without
+    // cwd trust, the operator hasn't even consented to operate in
+    // this directory, so prompting them about its shared corpus is
+    // premature. Placement intent: AFTER the GC sweeps (an active
+    // shared memory just auto-evicted by `gcExpiredMemories` would
+    // shift the hash, prompting unnecessarily — accepted as a
+    // documented false-positive given how rarely operators set
+    // `expires:` on shared memories) and BEFORE
+    // `assembleMemorySection` so the bulk-invalidate path on revoke
+    // actually keeps the invalidated memories out of THIS session's
+    // system prompt (otherwise the operator would need to restart
+    // for the revocation to take effect).
+    if (input.askSharedTrust !== undefined && isCwdTrusted) {
+      sharedTrustProbe = await probeSharedTrust({
+        db,
+        registry: memoryRegistry,
+        roots: memoryRoots,
+        sharedRoot: memoryRoots.projectShared,
+        askSharedTrust: input.askSharedTrust,
+        sessionId: null,
+        cwd,
+        warn: (msg) => {
+          // Same shape used elsewhere in this try block (memory
+          // GC failures, provenance sweep failures). Operator
+          // greps stderr for any boot-time warning surface.
+          process.stderr.write(`forja: shared-corpus trust: ${msg}\n`);
+        },
+      });
     }
     // Boot-time trigger context (spec §4.3). evaluateBootTriggers
     // probes the REPO ROOT for well-known files (.git, .env,
@@ -797,6 +864,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       : {}),
     permissionChain: permResult.chain,
     installIdentity: permResult.identity,
+    ...(sharedTrustProbe !== undefined ? { sharedTrustProbe } : {}),
   };
 };
 

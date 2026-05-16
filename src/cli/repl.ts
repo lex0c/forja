@@ -612,6 +612,22 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   let bootstrapped: BootstrapResult;
   try {
     const bootstrapFn = options.bootstrapFn ?? bootstrap;
+    // The shared-corpus trust probe fires INSIDE bootstrap (S5/T5.2).
+    // For its modal to receive input, stdin must already be
+    // subscribed — the modal-manager pushes its focus handler on
+    // the focus stack synchronously, but without an active stdin
+    // 'data' listener, no keystrokes flow in. The cwd-trust flow
+    // subscribes lazily AFTER pushing its handler, but that path
+    // only runs when cwd wasn't already trusted; the
+    // already-trusted operator would hit bootstrap without stdin
+    // subscribed and the modal would block until timeout. Pre-
+    // subscribing here is idempotent (the cwd-trust path's call
+    // is a no-op afterward) and trades the Ctrl+C-during-slow-
+    // bootstrap-yields-SIGINT semantics for a working shared-trust
+    // prompt — the modal hands SIGINT-shaped events to the focus
+    // stack, where the editor's idle Ctrl+C handler still routes
+    // operator-cancel intent correctly.
+    subscribeStdin();
     bootstrapped =
       options.bootstrapOverride ??
       (await bootstrapFn({
@@ -636,6 +652,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         ...(options.trustListPathOverride !== undefined
           ? { trustListPathOverride: options.trustListPathOverride }
           : {}),
+        // Shared-corpus trust modal (S5/T5.2). Thin adapter around
+        // `modalManager.askSharedTrust` so bootstrap stays
+        // independent of the TUI layer types. Timeout matches the
+        // cwd-trust modal's 5-minute fail-closed window — both are
+        // operator-attention prompts that an unattended terminal
+        // shouldn't block forever.
+        askSharedTrust: (a) =>
+          modalManager.askSharedTrust(
+            { path: a.path, corpusFiles: a.corpusFiles },
+            { timeoutMs: 5 * 60 * 1000 },
+          ),
       } satisfies BootstrapInput));
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
@@ -684,6 +711,33 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // bad value at REPL boot.
   for (const w of critiqueWarnings) {
     errSink(`forja: critique config: ${w}\n`);
+  }
+  // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
+  // single summary line so operators see what the modal decision
+  // resulted in WITHOUT having to scroll through the modal preview
+  // again. `seeded` and `unchanged` are silent (the happy path
+  // shouldn't spam stderr at every boot); `reconfirmed` and
+  // `revoked` echo the trust action the operator just took;
+  // `verify_failed` surfaces the I/O error so the operator knows
+  // the shared corpus' state is unknown and may need cleanup.
+  if (bootstrapped.sharedTrustProbe !== undefined) {
+    const p = bootstrapped.sharedTrustProbe;
+    if (p.kind === 'reconfirmed') {
+      errSink('forja: shared memory corpus re-confirmed — new hash trusted.\n');
+    } else if (p.kind === 'revoked') {
+      const invCount = p.invalidated.length;
+      const failCount = p.failed.length;
+      const invFrag = `${invCount} shared memor${invCount === 1 ? 'y' : 'ies'} invalidated`;
+      const failFrag = failCount > 0 ? `; ${failCount} failed` : '';
+      errSink(`forja: shared memory trust revoked — ${invFrag}${failFrag}.\n`);
+      for (const f of p.failed) {
+        errSink(`forja:   could not invalidate ${f.name}: ${f.reason}\n`);
+      }
+    } else if (p.kind === 'verify_failed') {
+      errSink(
+        `forja: shared memory corpus could not be verified at ${p.sharedRoot} — trust state unknown.\n`,
+      );
+    }
   }
 
   const project = basename(baseConfig.cwd) || baseConfig.cwd;

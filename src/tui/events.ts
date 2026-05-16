@@ -319,6 +319,44 @@ export type TrustAskEvent = BaseEvent & {
   path: string;
   agentsMd: boolean;
 };
+
+// Shared-corpus trust re-confirmation (MEMORY.md §6.5.2 `trust_revoked`
+// detector, §7.2 rule 8). Fires AFTER bootstrap when the operator
+// previously confirmed trust for this scope-root but the corpus' SHA-256
+// fingerprint has since changed — typically because a `git pull` brought
+// in commits that modify `.agent/memory/shared/`. Distinct from
+// `trust:ask` (first-visit cwd trust) in both trigger and consequence:
+//
+//   - trust:ask resolves `yes` → cwd added to `trusted_dirs.json`.
+//     A `no/cancel` → operator hasn't entered the REPL at all yet, so
+//     we exit cleanly with no side-effects.
+//   - shared-trust:ask resolves `yes` → the new corpus hash is stamped
+//     into `shared_corpus_trust`. A `no/cancel` → operator stays in the
+//     REPL but the bulk-invalidate path runs against every state=active
+//     shared memory (T5.3), the trust row is cleared so the NEXT boot
+//     re-prompts, and `trust_revoked` is the eviction-event trigger.
+//
+// `path` is the absolute shared-corpus root (`<repo>/.agent/memory/shared`)
+// rather than the cwd — operator distinguishes "I trusted this cwd" from
+// "the shared/ within it just changed". `corpusFiles` is the current
+// inventory the operator would be re-confirming (name + byte length); no
+// prior snapshot is rendered because the substrate only stores ONE
+// aggregate hash. If/when per-file hashing lands as a follow-up, this
+// event grows a `changedFiles` field — additive, no breaking change to
+// the existing producer (the empty default keeps current consumers happy).
+export type SharedTrustAskEvent = BaseEvent & {
+  type: 'shared-trust:ask';
+  promptId: string;
+  path: string;
+  // Snapshot of the current corpus the operator is being asked to
+  // re-confirm. Each entry is one `.md` file at the corpus root —
+  // filename plus byte length so the operator can spot suspicious
+  // size growth ("foo.md is suddenly 50KB?") without the modal
+  // rendering raw bodies inline (would explode preview height for
+  // large corpora and re-expose the very content under review).
+  corpusFiles: readonly { name: string; bytes: number }[];
+};
+
 // `scope` mirrors `MemoryScope` from `src/memory/types.ts`. We re-declare
 // instead of importing so the TUI layer doesn't depend on memory's
 // internal types — but the values must stay in sync. If memory adds a
@@ -686,6 +724,7 @@ export type UIEvent =
   | ModalSelectEvent
   | ModalQueueDepthEvent
   | TrustAskEvent
+  | SharedTrustAskEvent
   | MemoryWriteAskEvent
   | MemoryUserScopeAskEvent
   | MemoryActionAskEvent

@@ -219,6 +219,7 @@ export interface ConfirmState {
   flavor:
     | 'permission'
     | 'trust'
+    | 'shared-trust'
     | 'memory-write'
     | 'memory-user-scope'
     | 'memory-action'
@@ -1517,6 +1518,80 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // default. Operator hitting Enter without reading
             // chooses "No, exit" — the safer outcome here.
             options,
+            selectedIndex: options.length - 1,
+            hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'shared-trust:ask': {
+      // Re-confirmation flavor for the `trust_revoked` detector
+      // (MEMORY.md §6.5.2, §7.2 rule 8). Triggered when the shared
+      // corpus' aggregate SHA-256 differs from the operator's last
+      // confirmation — most commonly after a `git pull` that touched
+      // `.agent/memory/shared/`. The two answer paths have very
+      // different consequences (yes → re-stamp, no → bulk-invalidate
+      // + clear trust row), so the prose makes both visible up front.
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, I trust the updated corpus', value: 'yes' },
+        { key: '2', label: 'No, revoke trust', value: 'no' },
+      ];
+      // Layout mirrors `trust:ask`: subject null, path on its own
+      // preview row, prose explains the situation + consequences,
+      // then a bounded inventory cap so a malicious corpus can't
+      // explode the modal height. The cap is deliberately small —
+      // operators with a large corpus should review the files
+      // outside the modal (e.g., `ls .agent/memory/shared/`); the
+      // modal's job is to flag THAT something changed and let the
+      // operator make a deliberate yes/no, not to be the audit UI.
+      const MAX_LIST = 8;
+      const visible = event.corpusFiles.slice(0, MAX_LIST);
+      const overflow = event.corpusFiles.length - visible.length;
+      const previewLines: PreviewLine[] = [
+        event.path,
+        '',
+        'The shared memory corpus changed since you last confirmed trust.',
+        'This commonly happens after a `git pull` that modifies, adds, or removes',
+        'files under `.agent/memory/shared/`. Review the current contents below:',
+        '',
+      ];
+      if (visible.length === 0) {
+        // The corpus exists from a hash-mismatch standpoint but the
+        // current listing is empty — every previously-trusted file
+        // was removed. Surface the absence explicitly; otherwise the
+        // operator sees blank space below "Review the current
+        // contents below" and may misread it as "no diff".
+        previewLines.push('(the corpus is currently empty)');
+      } else {
+        for (const f of visible) {
+          previewLines.push(`  ${f.name} — ${f.bytes} bytes`);
+        }
+        if (overflow > 0) {
+          previewLines.push(`  …and ${overflow} more file${overflow === 1 ? '' : 's'} not shown`);
+        }
+      }
+      previewLines.push('');
+      previewLines.push('If you trust this update: the new corpus hash will be stamped.');
+      previewLines.push('If you revoke: every active shared memory is invalidated and');
+      previewLines.push('the corpus will not load into context until you re-confirm.');
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'shared-trust',
+            title: 'Shared memory trust:',
+            subject: null,
+            preview: previewLines,
+            question: null,
+            options,
+            // D65: last option is the conservative default. Operator
+            // hitting Enter without reading chooses "No, revoke" —
+            // safer outcome for a corpus that just changed under
+            // their feet.
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
             queueDepth: 0,

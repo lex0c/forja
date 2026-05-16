@@ -216,6 +216,19 @@ export const assembleMemorySection = (
       continue;
     }
     if (peek.file.frontmatter.trust === 'untrusted') continue;
+    // State-based filter for non-retrievable lifecycle states
+    // (MEMORY.md §6): `invalidated` is "invariant broken" — kept on
+    // disk for audit but explicitly NOT eligible for retrieval or
+    // eager-load. Bulk-applied by the S5 `trust_revoked` detector
+    // (every active shared memory transitions to invalidated when
+    // operator revokes the shared corpus' trust). Without this
+    // skip, the system prompt would continue including those
+    // memories until the session restarted, defeating the
+    // revocation. `shadow` is similarly non-retrievable per spec
+    // but the shadow detector hasn't shipped — when it does, this
+    // is the call site to extend. `quarantined` deliberately stays
+    // eligible (visible with `[memory: quarantined]` flag per S6).
+    if (peek.file.frontmatter.state === 'invalidated') continue;
     if (!shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext)) continue;
     // Per-playbook memory filter (slice 9). When the playbook's
     // context_recipe.memory_filter is set, keep only entries

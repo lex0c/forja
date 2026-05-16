@@ -137,3 +137,19 @@ export {
   scanForSecrets,
 } from './scanner.ts';
 export type { ScanResult } from './scanner.ts';
+
+export {
+  clearSharedTrust,
+  computeSharedFingerprint,
+  getSharedTrust,
+  setSharedTrust,
+} from './trust-corpus.ts';
+export type { SharedTrustRow } from './trust-corpus.ts';
+
+export { probeSharedTrust } from './trust-corpus-probe.ts';
+export type {
+  ProbeCorpusFile,
+  ProbeSharedTrustInput,
+  ProbeSharedTrustResult,
+  SharedTrustProbeAnswer,
+} from './trust-corpus-probe.ts';
