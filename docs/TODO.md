@@ -223,6 +223,39 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 # DEFERRED — items intentionally left for later
 
+## Memory quarantine flag enrichment: motivo + date (MEMORY.md §6.5.2)
+
+**Status:** noted during Slice 0 (T0.2) and Slice 6 (T6.2) implementation. Same deferral shape on two surfaces.
+
+**What it is:** spec §6.5.2 formats the quarantine flag as `[memory: quarantined — <motivo> <YYYY-MM-DD>]` — e.g., `[memory: quarantined — conflict 2026-04-15]`. Both the `/memory list` slash command (T0.2) and the eager-load section in `cli/memory-prompt.ts` (T6.2) ship the minimal `[memory: quarantined]` flag today without the motivo + date enrichment.
+
+**Why deferred:** motivo + date live in `eviction_events`, NOT in the memory frontmatter. Enriching the flag requires a JOIN against `eviction_events` (specifically the latest applied `quarantined` event for that `(scope, name)` pair via `getLastQuarantineEvent`). Two call sites means two JOIN points; both should land together when the enrichment is wired so the format stays consistent across surfaces.
+
+**Where it would land:**
+
+- `src/cli/slash/commands/memory.ts` — `handleList` already peeks per-listing for state rendering (T0.2). Extend to call `getLastQuarantineEvent(db, 'memory', name, scope)` for each quarantined entry; format `[QUARANTINED motivo YYYY-MM-DD]`.
+- `src/cli/memory-prompt.ts` — `assembleMemorySection` already peeks for trust filter; extend to lookup the same quarantine event; format `[memory: quarantined — motivo YYYY-MM-DD]` per spec.
+
+**Pull-in signal:** operator request OR detector volume crosses threshold where "which memory is quarantined for which reason" becomes opaque from the bare flag. Estimate: ~10 quarantined memories per install. Below that, the bare flag + `/memory audit` lookup is enough.
+
+**Cost when pulled:** ~1 disk-cached SQL query per quarantined entry per render. For a session with N quarantined (likely < 5), negligible.
+
+## Memory trust filter on `retrieve_context` slot (MEMORY.md §14.3, AGENTIC_CLI §1.1.5)
+
+**Status:** acknowledged gap pre-S6; widened by S6 (quarantined memories now reach the slot, but no trust filter).
+
+**What it is:** the retrieval memory view (`src/retrieval/views/memory.ts`) filters by `states: ['active', 'quarantined']` + `includeExpired: false` but does NOT filter by `trust`. An operator-marked `trust: untrusted` memory reaches the retrieve_context slot unimpeded — eager-load filters it out (§7.2.2), but retrieval doesn't.
+
+**Why deferred:** the gap predates S6 (active untrusted memories already reached retrieval); S6 expanded it to include quarantined untrusted memories. Fixing it requires deciding the contract: hard-filter (mirror eager-load), include with marker, or operator-policy opt-in. Decision is design work, not just code work.
+
+**Where it would land:**
+
+- `src/retrieval/views/memory.ts:114-118` — add `trustFilter` option to the `registry.list()` call, OR a post-list filter on `listing.peek.frontmatter.trust`.
+- Decide: trust=untrusted hard-filtered? Surface with `[memory: untrusted]` reason marker? Operator opt-in via `policy.retrieval.allow_untrusted = false` default?
+- `tests/retrieval/memory-view.test.ts` — pin the chosen contract.
+
+**Pull-in signal:** any of: (a) detector quality measurement reveals untrusted bodies systematically degrading retrieval relevance; (b) security review flags the surface explicitly; (c) operator-reported incident where untrusted body content shaped a model decision.
+
 ## Monotonic seq tiebreaker on the remaining time-ordered tables
 
 **Status:** noted during the M3/Step 2.4 audit pass (2026-04-29).
