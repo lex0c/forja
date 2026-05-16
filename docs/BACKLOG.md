@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(cli/slash/agent-retrieval) — prefix scan reaches the full session history (review H7)
+
+`resolveTraceId` in `src/cli/slash/commands/agent-retrieval.ts` previously called `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then matched the prefix in memory. A session with more than 100 retrieval traces dropped any prefix whose match lived beyond the freshest 100 — the operator got "no trace id matches" indistinguishable from a genuinely wrong prefix, with no hint that the issue was scan depth.
+
+Fix: switch to `listRetrievalTracesSinceMs(ctx.db, sessionId, 0, PREFIX_SCAN_HARD_CAP=10_000)`. Same shape the metrics path uses (also 10k cap, also returns `capReached`). 10k is comfortably above any realistic interactive session and below pathological eval harness logs that would risk memory pressure. When `capReached` is true AND the prefix doesn't match in the returned 10k, the error message explicitly names the cap and points to the full-UUID escape hatch ("older traces may exist — pass the full 36-char id to look beyond") so the operator can distinguish "wrong prefix" from "right prefix, beyond the scan window".
+
+Tests: 1 new in `tests/cli/slash/agent-retrieval.test.ts` — seeds 150 filler traces (more than the old 100 cap) plus a target whose `created_at` is older than every filler, then resolves via the prefix; verifies the replay returns the target instead of "no match". Covers the original silent-miss exactly.
+
 ## [2026-05-16] fix(storage/retrieval-trace) — deterministic ordering + session-scoped workflow lookup (review H5+H6)
 
 Two findings on the trace repo.

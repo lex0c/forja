@@ -353,6 +353,51 @@ describe('/agent retrieval replay', () => {
       expect(r.message).toContain(idB.slice(0, 8));
     }
   });
+
+  test('prefix scan reaches beyond MAX_AUDIT_LIMIT — older traces still resolve (H7 regression)', async () => {
+    // Regression: prior `resolveTraceId` scanned only the freshest
+    // MAX_AUDIT_LIMIT=100 traces. In a session with >100 traces, a
+    // valid prefix for an older trace returned "no match" silently.
+    // The resolver now scans up to PREFIX_SCAN_HARD_CAP=10k so
+    // prefix resolution covers realistic session depths.
+    const targetId = 'beef0000-0000-0000-0000-000000000000';
+    // Seed 150 fresh traces (more than the old 100 cap) before the
+    // target so the target is "older" than the original window.
+    for (let i = 0; i < 150; i++) {
+      createRetrievalTrace(db, {
+        sessionId,
+        queryText: `filler ${i}`,
+        workflow: 'default',
+        queryType: 'semantic',
+        budgetTokens: 100,
+        candidatesRaw: [],
+        candidatesExpanded: [],
+        candidatesRanked: [],
+        contextSlot: { included: [], skipped: [] },
+        timings: sampleTimings(),
+        createdAt: nowMs - (200 - i),
+      });
+    }
+    createRetrievalTrace(db, {
+      id: targetId,
+      sessionId,
+      queryText: 'target',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: sampleTimings(),
+      createdAt: nowMs - 1000, // older than every filler
+    });
+    const r = await agentPolicyCommand.exec(['retrieval', 'replay', 'beef0000'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.notes?.join('\n')).toContain(targetId);
+    }
+  });
 });
 
 // ─── metrics ───────────────────────────────────────────────────────────

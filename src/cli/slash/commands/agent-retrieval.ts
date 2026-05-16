@@ -29,6 +29,15 @@ const DEFAULT_METRICS_DAYS = 30;
 const MAX_AUDIT_LIMIT = 100;
 const MAX_METRICS_DAYS = 365;
 
+// Hard cap on the row count `resolveTraceId` scans when matching a
+// short-id prefix. Set well above `MAX_AUDIT_LIMIT` so a session
+// with hundreds or low thousands of traces still resolves prefixes
+// correctly without flooding memory — 10k aligns with the metrics
+// helper's defensive cap (`listRetrievalTracesSinceMs`). If a
+// session somehow exceeds it, the resolver flags the situation
+// explicitly so the operator knows to pass the full UUID.
+const PREFIX_SCAN_HARD_CAP = 10_000;
+
 const formatDurationMs = (ms: number): string => {
   if (ms < 1) return '<1ms';
   if (ms < 1000) return `${ms.toFixed(0)}ms`;
@@ -76,8 +85,15 @@ const resolveTraceId = (
     }
     return { kind: 'ok', row };
   }
-  // Prefix scan — cap at MAX_AUDIT_LIMIT rows; deep history needs
-  // the full id.
+  // Prefix scan over the full session history (capped at
+  // PREFIX_SCAN_HARD_CAP). Previously this used MAX_AUDIT_LIMIT
+  // (100) — sessions with more than 100 traces would silently miss
+  // any prefix whose match lived beyond the freshest 100, leaving
+  // the operator with a misleading "no match" instead of a hint to
+  // pass the full UUID. `listRetrievalTracesSinceMs(..., cutoff=0)`
+  // scoops the whole history up to the cap and returns `capReached`
+  // so we can honestly tell the operator when their session is so
+  // large that even the larger cap doesn't reach the whole tail.
   const sessionId = ctx.currentSessionId();
   if (sessionId === null) {
     return {
@@ -85,9 +101,23 @@ const resolveTraceId = (
       message: '/agent retrieval replay: no active session — pass the full 36-char id',
     };
   }
-  const traces = listRetrievalTracesBySession(ctx.db, sessionId, MAX_AUDIT_LIMIT);
+  const {
+    rows: traces,
+    capReached,
+    hardCap,
+  } = listRetrievalTracesSinceMs(ctx.db, sessionId, 0, PREFIX_SCAN_HARD_CAP);
   const matches = traces.filter((t) => t.id.startsWith(prefix));
   if (matches.length === 0) {
+    if (capReached) {
+      // Session exceeds the prefix-scan cap; older traces may
+      // still match. Surface the cap explicitly so the operator
+      // doesn't conclude "wrong prefix" when the actual answer is
+      // "right prefix, beyond the scan window".
+      return {
+        kind: 'error',
+        message: `/agent retrieval replay: no trace id matches prefix '${prefix}' in the freshest ${hardCap} traces of this session; older traces may exist — pass the full 36-char id to look beyond`,
+      };
+    }
     return {
       kind: 'error',
       message: `/agent retrieval replay: no trace id matches prefix '${prefix}'`,
