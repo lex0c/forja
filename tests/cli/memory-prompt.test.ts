@@ -553,6 +553,76 @@ describe('assembleMemorySection — memory_filter (slice 9)', () => {
   });
 });
 
+describe('assembleMemorySection — quarantined visual flag (S6/T6.2)', () => {
+  // Quarantined memories ship in the eager-load section with a
+  // `[memory: quarantined]` marker between scope tag and
+  // description. Spec MEMORY.md §6.5.2; motivo + date enrichment
+  // is deferred (would require JOIN against eviction_events,
+  // matches T0.2's deferral on the slash side).
+  const writeBodyWithStateAlias = (dir: string, name: string, state: string | undefined): void => {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      `name: ${name}`,
+      `description: hook for ${name}`,
+      'type: feedback',
+      'source: user_explicit',
+    ];
+    if (state !== undefined) lines.push(`state: ${state}`);
+    writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
+  };
+
+  test('quarantined memory renders [memory: quarantined] flag inline', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Bad](bad.md) — questionable hook\n');
+    writeBodyWithStateAlias(roots.user, 'bad', 'quarantined');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // Regex pin (not toContain) so a future refactor that
+    // reordered to `[user] [memory: quarantined] bad — …` or
+    // `[user] bad — [memory: quarantined] …` would break this
+    // test. The spec order is `<scope> <name> [memory:
+    // quarantined] — <hook>`; we lock the line shape exactly.
+    expect(result.text).toMatch(/^- \[user\] bad \[memory: quarantined\] — questionable hook$/m);
+    expect(result.entryCount).toBe(1);
+  });
+
+  test('active memory does NOT carry the quarantined flag', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Good](good.md) — fine hook\n');
+    writeBodyWithStateAlias(roots.user, 'good', 'active');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] good — fine hook');
+    expect(result.text).not.toContain('[memory: quarantined]');
+  });
+
+  test('memory without explicit state (defaults to active) shows no flag', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Default](default.md) — no state set\n');
+    writeBodyWithStateAlias(roots.user, 'default', undefined);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] default — no state set');
+    expect(result.text).not.toContain('[memory: quarantined]');
+  });
+
+  test('mix of active + quarantined: only quarantined entries get the flag', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h1\n- [B](b.md) — h2\n');
+    writeBodyWithStateAlias(roots.user, 'a', 'active');
+    writeBodyWithStateAlias(roots.user, 'b', 'quarantined');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] a — h1');
+    expect(result.text).toContain('[user] b [memory: quarantined] — h2');
+    expect(result.text).not.toContain('[user] a [memory: quarantined]');
+  });
+});
+
 describe('assembleMemorySection — eagerLoaded inventory (S1/T1.4)', () => {
   // Helper specifically for these tests: write a body with a
   // specific state. Avoids leaking state-aware setup into every

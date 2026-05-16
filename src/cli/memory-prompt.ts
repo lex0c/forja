@@ -237,6 +237,16 @@ export const assembleMemorySection = (
   }
   // Dedupe by name on the eligible list. precedence order is
   // preserved (most-specific surviving scope wins).
+  //
+  // Visual flag for quarantined memories (S6/T6.2, MEMORY.md §6.5.2):
+  // a `[memory: quarantined]` marker appears between the scope tag
+  // and the description so the model sees the state inline. Motivo
+  // + date enrichment (`[memory: quarantined — conflict 2026-04-15]`
+  // per spec) is deferred — same shape as T0.2's `/memory list`
+  // deferral — and requires a JOIN against `eviction_events` that
+  // isn't worth the wire-up complexity until operators ask for it.
+  // The flag without motivo+date still delivers the load-bearing
+  // signal: "model, this memory is under review; be cautious".
   const seen = new Set<string>();
   const lines: string[] = [MEMORY_SECTION_HEADER, ''];
   const eagerLoaded: EagerExposure[] = [];
@@ -244,7 +254,9 @@ export const assembleMemorySection = (
   for (const { listing, file } of eligible) {
     if (seen.has(listing.name)) continue;
     seen.add(listing.name);
-    lines.push(`- [${listing.scope}] ${listing.name} — ${listing.entry.hook}`);
+    const state = file?.frontmatter.state;
+    const flag = state === 'quarantined' ? ' [memory: quarantined]' : '';
+    lines.push(`- [${listing.scope}] ${listing.name}${flag} — ${listing.entry.hook}`);
     included++;
     eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }

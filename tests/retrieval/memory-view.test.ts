@@ -283,13 +283,17 @@ describe('createMemoryView', () => {
     expect(cands).toEqual([]);
   });
 
-  test('quarantined memory does not surface as candidate (H1 regression)', async () => {
-    // The model must never see memories the operator quarantined.
-    // Pre-state-filter, `registry.list({ deduplicateByName: true })`
-    // returned every state — the view surfaced the candidate, BM25
-    // ranked it, and the body landed in the slot. Now the view
-    // passes `states: ['active']` so non-active states are excluded
-    // from the candidate pool.
+  test('quarantined memory surfaces with ranking penalty (S6/T6.1, EVICTION §9.7)', async () => {
+    // Walks back the H1 hard-filter: quarantined memories are now
+    // VISIBLE to retrieval with a ×0.3 penalty on bootstrap score.
+    // Spec EVICTION §9.7 + MEMORY.md §6.5.2 — penalty + visual flag
+    // is the spec'd behavior; hard-filtering was the safety
+    // shortcut. The model still sees the candidate but ranks it
+    // below an active sibling with comparable match quality.
+    //
+    // The `reason` string carries the `quarantined ×0.3` marker so
+    // retrieval_trace forensics can see why a candidate ranks
+    // where it does.
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.user, '- [Auth](auth.md) — auth conventions\n');
@@ -297,10 +301,77 @@ describe('createMemoryView', () => {
     const registry = createMemoryRegistry({ roots, db, sessionId });
     const view = createMemoryView({ registry });
     const cands = await view.search({ ...baseQuery, text: 'auth' });
-    expect(cands).toEqual([]);
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.nodeId).toBe('memory:user/auth');
+    expect(cands[0]?.reason).toContain('quarantined');
+    expect(cands[0]?.reason).toContain('×0.3');
   });
 
-  test('invalidated / proposed memories filtered out (H1)', async () => {
+  test('QUARANTINED_PENALTY constant value is exactly 0.3 (S6/T6.1 — pin)', async () => {
+    // Pinning the literal value (not just "quarantined < active").
+    // A silent change to 0.25 or 0.5 would still pass relative-
+    // ordering tests; the constant value is part of the behavioral
+    // contract documented in MEMORY.md §6.5.2 (~3.3× match needed
+    // for parity). Import + assert directly.
+    const { QUARANTINED_PENALTY } = await import('../../src/retrieval/views/memory.ts');
+    expect(QUARANTINED_PENALTY).toBe(0.3);
+  });
+
+  test('dedupe keeps quarantined local shadow when active shared sibling exists (S6 × H3)', async () => {
+    // Per the dedupe-after-filter ordering fix (commit 949fadf),
+    // state filter runs BEFORE dedupe-by-name. Pre-S6: `local:
+    // quarantined foo` was filtered out → dedupe saw only
+    // `shared: active foo` → shared surfaced. Post-S6: BOTH
+    // survive the state filter (quarantined now included), then
+    // dedupe-by-name picks local (most-specific scope wins).
+    //
+    // Net behavior: the model sees the quarantined local version,
+    // NOT the active shared sibling. This is spec'd (scope
+    // precedence trumps state preference) but a real semantic
+    // change from pre-S6 — pinned here so future refactors don't
+    // silently revert.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared auth hook\n');
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — local auth hook\n');
+    writeBody(roots.projectShared, 'foo', 'shared body content', { state: 'active' });
+    writeBody(roots.projectLocal, 'foo', 'local body content', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.nodeId).toBe('memory:project_local/foo');
+    expect(cands[0]?.reason).toContain('quarantined');
+  });
+
+  test('quarantined ranks below active sibling with comparable bootstrap (S6/T6.1)', async () => {
+    // Two memories with identical match shape; only state differs.
+    // Both surface; quarantined's bootstrapScore = active's × 0.3.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(
+      roots.user,
+      '- [Active](active.md) — auth\n- [Quarantined](quarantined.md) — auth\n',
+    );
+    writeBody(roots.user, 'active', 'auth body content', { state: 'active' });
+    writeBody(roots.user, 'quarantined', 'auth body content', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands).toHaveLength(2);
+    const active = cands.find((c) => c.nodeId === 'memory:user/active');
+    const quarantined = cands.find((c) => c.nodeId === 'memory:user/quarantined');
+    expect(active).toBeDefined();
+    expect(quarantined).toBeDefined();
+    if (active === undefined || quarantined === undefined) return;
+    // Same match quality means same raw BM25 score; quarantined's
+    // bootstrapScore is exactly active's × 0.3 (within float
+    // tolerance). Active ranks above quarantined as a result.
+    expect(quarantined.bootstrapScore).toBeCloseTo(active.bootstrapScore * 0.3, 5);
+    expect(active.bootstrapScore).toBeGreaterThan(quarantined.bootstrapScore);
+  });
+
+  test('invalidated / proposed memories still filtered out (only quarantined survives penalty)', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(

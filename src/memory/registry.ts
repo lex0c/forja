@@ -49,6 +49,15 @@ export interface MemoryListing {
   // and hook without loading the body. `entry.href` is NOT trusted
   // for path resolution — see SECURITY CONTRACT in `index-file.ts`.
   entry: IndexEntry;
+  // Frontmatter state at the moment list() was called. Populated
+  // ONLY when `list()` already peeked the body for filtering
+  // (i.e., `opts.states` or `opts.includeExpired === false` was
+  // set). Undefined otherwise — caller that didn't request state
+  // filtering shouldn't pay the per-listing peek cost just to read
+  // the state field. Consumers that need state must EITHER pass
+  // a `states` filter (cheap reuse of the existing peek) OR peek
+  // directly. Document on the call site which path was chosen.
+  state?: MemoryState;
 }
 
 export interface MemoryRegistry {
@@ -538,15 +547,34 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       const needFrontmatter = opts.states !== undefined || opts.includeExpired === false;
       if (needFrontmatter) {
         const nowMs = opts.nowMs ?? Date.now();
-        filtered = filtered.filter((l) => {
+        // map() + filter(null) instead of a plain filter so we
+        // can attach the read `state` to the surviving listing
+        // without a second peek downstream. Each listing's
+        // identity is preserved (same scope + name + entry); we
+        // just enrich with the state we read for filtering. The
+        // null-out form keeps the type narrow (no `MemoryListing
+        // | null` array intermediate).
+        //
+        // Race-window note: `listing.state` reflects state at
+        // list-time. If a downstream consumer re-peeks (e.g.,
+        // memory view's loadBodies path), the peek may observe a
+        // newer state (operator edited the file between list and
+        // body-load). The penalty multiplier downstream is tied
+        // to LIST-time state by design — a memory that's
+        // quarantined when retrieval starts ranks with the
+        // penalty for that retrieval, regardless of mid-flight
+        // edits. Cross-call consistency is the next list()
+        // call's responsibility.
+        const enriched: (MemoryListing | null)[] = filtered.map((l) => {
           const fileResult = readMemoryByName(roots, l.scope, l.name);
-          if (fileResult.kind !== 'present') return false;
+          if (fileResult.kind !== 'present') return null;
           const fm = fileResult.file.frontmatter;
           const state: MemoryState = fm.state ?? 'active';
-          if (opts.states !== undefined && !opts.states.includes(state)) return false;
-          if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return false;
-          return true;
+          if (opts.states !== undefined && !opts.states.includes(state)) return null;
+          if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return null;
+          return { ...l, state };
         });
+        filtered = enriched.filter((l): l is MemoryListing => l !== null);
       }
 
       if (opts.deduplicateByName === true) {

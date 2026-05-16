@@ -30,6 +30,28 @@ Scheduling architecture:
 
 Tests: 28 new across `factuality.test.ts` (4 — pure classifier), `project-verifier.test.ts` (13 — extractor + verify), `scheduler.test.ts` (11 — passed/contradicted/unknown verdicts, type gating, idempotency, drain timeout, failure isolation). Acceptance from TODO.md is met for path-mention claims; export-pattern verification is deferred with rationale.
 
+## [2026-05-16] feat(memory) — Slice 6: quarantine penalty + visual flag (EVICTION §9.7)
+
+Walks back the H1+H6 hard-filter on quarantined memories. Per spec EVICTION §9.7 + MEMORY.md §6.5.2, quarantined entries stay visible to model + operator with a ranking penalty + visual flag. Pre-S6 the retrieval memory view dropped quarantined entries entirely (state=active hard-filter); post-S6 they surface with `bootstrapScore × 0.3` and a `(quarantined ×0.3)` reason marker for forensics.
+
+The substrate change: `MemoryListing` gained an optional `state?: MemoryState` field, populated inline by `registry.list()` when the existing peek-for-filtering runs (i.e., when `opts.states` or `opts.includeExpired === false` triggers a frontmatter read). Memory view consumes the field without re-peeking. Other call sites that don't pass a filter get `state: undefined` — explicit opt-in path, no perf regression.
+
+Penalty rationale: 0.3 means a quarantined memory needs ~3.3× the raw match score to tie an active sibling. Suppresses in routine queries; lets overwhelming matches still surface. Quarantine flag is "questionable, not forbidden" — hard-filter would mimic deletion semantics and break operator forensics queries ("did the model see X when it produced Y?"). The constant is `export`ed so tests can pin the exact value — a silent change to 0.25 / 0.5 would shift behavior while passing relative-ordering tests.
+
+Eager-load visual flag: `cli/memory-prompt.ts` renders quarantined entries inline as `- [<scope>] <name> [memory: quarantined] — <hook>`. Motivo + date enrichment (`[memory: quarantined — conflict 2026-04-15]` per spec) is deferred — same shape as T0.2's `/memory list` deferral. The two deferrals are consolidated as one entry in TODO.md's DEFERRED section so the next contributor wires both surfaces together when JOIN-with-eviction-events lands.
+
+Injection surface widening note: AGENTIC_CLI §1.1.5 already documents that retrieve_context lacks a dedicated trust filter (MEMORY.md §14.3). Pre-S6 the state filter `['active']` indirectly excluded the quarantined-untrusted vector; post-S6 it doesn't. S6 doesn't violate the ledger (the gap is acknowledged), but it widens the set of model-facing bodies. Closing the gap is tracked as a separate DEFERRED entry pending a contract decision (hard-filter / marker / operator opt-in).
+
+Post-review fixes (round 2 of agents, 6 items applied):
+- F1: comment in memory view references §1.1.5 widening explicitly.
+- F2: constant `QUARANTINED_PENALTY` exported, pinned by test.
+- F3: motivo+date deferral consolidated as single DEFERRED entry.
+- F4: race-window note in registry.list comment (list-time state, downstream re-peeks may differ — by design).
+- F5: render-order test uses regex (not toContain) so a future reorder of `[scope] [flag] name` vs `[scope] name [flag]` breaks the pin.
+- F6: dedupe + quarantined local shadow + active shared sibling pinned (most-specific scope wins post-filter; semantic change vs pre-S6 explicitly tested).
+
+Tests: 5 new in memory-view.test.ts (single-quarantined surface, ranks-below-active, constant pin, dedupe-shadow interaction, plus retained `invalidated/proposed/evicted still filtered`); 4 new in memory-prompt.test.ts (flag inline, active no flag, default state no flag, mix); 1 rewritten (H1 regression → S6 spec'd behavior).
+
 ## [2026-05-16] fix(memory) — Slice 1 post-review hardening
 
 Round of code review delegated to three Explore agents (robustness, reliability, coverage). Four real bugs + three hardening gaps + handful of test pins surfaced. Applied:
