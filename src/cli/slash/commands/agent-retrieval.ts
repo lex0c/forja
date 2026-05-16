@@ -60,15 +60,30 @@ export const formatDurationMs = (ms: number): string => {
   return `${(ms / 1000).toFixed(2)}s`;
 };
 
-// Nearest-rank percentile. Empty array → 0 (matches the
-// metrics-line behavior). `p` is the percentile in [0, 1]. The
-// result is the smallest sorted value such that ≥ p fraction of
-// the array is ≤ it. Exported so the n=1 / p=0 / p=1 boundaries
+// Nearest-rank percentile (per Wikipedia / standard stats).
+//
+// For p ∈ [0, 1] and N samples: rank (1-based) = ⌈p · N⌉; index
+// (0-based) = rank − 1. The result is the smallest sorted value
+// such that ≥ p fraction of the array is ≤ it.
+//
+// PREVIOUS IMPLEMENTATION used `Math.floor(p * N)` which
+// systematically picked the NEXT higher element at common
+// boundaries — e.g., for N=20 / p=0.95, floor(19) = 19 returns
+// the max instead of index 18 (the actual 19th-rank value). The
+// inflated value made `/agent retrieval metrics` report p50/p95
+// stage latencies that overstated tail performance — a real
+// regression in the 95th percentile could be masked because the
+// previous "p95" was already pinned at the max sample.
+//
+// Empty array → 0 (matches the metrics-line "0 traces" behavior).
+// `Math.max(0, …)` guards p=0 / N=1 from producing -1 after the
+// ceil/-1 step. Exported so the boundary cases (n=1, p=0, p=1,
+// large arrays where the inflated-floor bug is most visible)
 // can be pinned by direct tests.
 export const percentileOf = (arr: readonly number[], p: number): number => {
   if (arr.length === 0) return 0;
   const sorted = [...arr].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+  const idx = Math.max(0, Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1));
   return sorted[idx] ?? 0;
 };
 

@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(cli/slash/agent-retrieval) — percentileOf used floor, not ceil/-1 (off-by-one inflated tail)
+
+`percentileOf` was documented as nearest-rank but computed `Math.floor(p * N)`, which at common boundaries returns the NEXT higher element. Worst case: N=20, p=0.95 — `floor(19) = 19` returned the MAX sample instead of index 18 (the actual 19th-rank value, per `⌈p · N⌉ − 1`). The inflated values made `/agent retrieval metrics` overstate p50/p95 stage latencies: a real tail regression was indistinguishable from the always-pinned-at-max output.
+
+Fix: `Math.max(0, Math.min(N - 1, Math.ceil(p * N) - 1))`. The `max(0, …)` guards p=0 / N=1 from producing a -1 index after the ceil/-1 step. Existing tests that asserted the floor-inflated values were corrected to match the standard nearest-rank semantics (p=0.5 over 10 samples is now 4, not 5). New regression test exercises N=20 with p=0.5 / 0.95 / 1.0 to pin the user-reported scenario.
+
+Source: comment block in the function now documents the formula explicitly so a future "simplification" doesn't reintroduce the floor variant.
+
 ## [2026-05-16] docs(memory) — reframe scanner as tripwire, not injection defense
 
 The `INJECTION_PHRASES` list in `src/memory/scanner.ts` (`"ignore previous instructions"`, `"you are now"`, etc.) is trivially burlable — any other language, paraphrase, or structural injection defeats it. The pre-existing code comment admitted it ("raise the cost of the obvious vector, not stop a human red team") but the module header, `docs/MEMORY.md §8.1`, and `docs/spec/MEMORY.md §7.3` framed the scanner as "injection defense", overpromising what it delivers.

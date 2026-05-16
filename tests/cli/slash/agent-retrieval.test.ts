@@ -203,17 +203,31 @@ describe('percentileOf (L2)', () => {
     expect(percentileOf([42], 1)).toBe(42);
   });
 
-  test('multi-element nearest-rank semantics', () => {
-    // 10 values 0..9. p50 → idx Math.floor(0.5 * 10) = 5 → 5.
-    expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0.5)).toBe(5);
-    // p95 → idx Math.floor(0.95 * 10) = 9 → 9.
+  test('multi-element nearest-rank semantics (post-fix: ceil/-1, not floor)', () => {
+    // 10 values 0..9. Nearest-rank: rank(1-based) = ⌈p·N⌉, index = rank − 1.
+    // p=0.5, N=10 → rank ⌈5⌉ = 5 → idx 4 → sorted[4] = 4.
+    expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0.5)).toBe(4);
+    // p=0.95, N=10 → rank ⌈9.5⌉ = 10 → idx 9 → sorted[9] = 9 (max).
     expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0.95)).toBe(9);
-    // p0 → idx 0 → 0.
+    // p=0, N=10 → rank ⌈0⌉ = 0, idx max(0, -1) = 0 → sorted[0] = 0.
     expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0)).toBe(0);
   });
 
+  test('p=0.95 with N=20 selects rank-19 (not max) — the original bug', () => {
+    // The user-reported regression: with N=20 / p=0.95, the
+    // previous `Math.floor(p * N)` returned index 19 (the max
+    // sample) instead of the actual 19th-rank value at index 18.
+    // The bug systematically inflated /agent retrieval metrics
+    // p95 — a real tail regression was indistinguishable from
+    // the always-pinned-at-max output.
+    const samples = Array.from({ length: 20 }, (_, i) => i); // 0..19
+    expect(percentileOf(samples, 0.95)).toBe(18); // rank 19, index 18
+    expect(percentileOf(samples, 0.5)).toBe(9); // rank 10, index 9
+    expect(percentileOf(samples, 1)).toBe(19); // rank 20, index 19 (max)
+  });
+
   test('p=1.0 caps at last element (not out-of-bounds)', () => {
-    // Math.floor(1.0 * 5) = 5, capped via Math.min(length - 1, …) = 4.
+    // Math.ceil(1.0 * 5) - 1 = 4 — index 4 of 5-element array = max.
     expect(percentileOf([10, 20, 30, 40, 50], 1)).toBe(50);
   });
 
