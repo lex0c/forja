@@ -51,6 +51,13 @@ import {
   OPERATOR_DRIVEN_TRIGGER,
 } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
+import {
+  type MemoryProvenanceRow,
+  listExposuresInRetrieval,
+  listGlobalProvenanceByName,
+  listProvenanceByName,
+  listProvenanceForToolCall,
+} from '../../../storage/repos/memory-provenance.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 // ─── scope arg helpers ───────────────────────────────────────────────
@@ -656,6 +663,194 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
     `recent memory events${scopeNote}${triggerNote} (${events.length}, most recent first):`,
   ];
   for (const e of events) lines.push(formatAuditRow(e));
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory provenance (S1/T1.6) ─────────────────────────────────────
+
+// Operator surface for the exposure trail (MEMORY.md §11.2). Three
+// query modes; mutual exclusion enforced at parse time:
+//
+//   /memory provenance <name>            session-scoped lookup
+//   /memory provenance <name> --all      cross-session forensic
+//   /memory provenance --tool <id>       what a tool_call exposed
+//   /memory provenance --retrieval <qid> group view of one retrieve_context
+//
+// `--limit N` (default 50) caps the rendered batch. The header
+// always says which mode was selected so the operator doesn't
+// confuse "no rows in this session" with "no rows anywhere".
+
+interface ProvenanceFlags {
+  mode: 'name' | 'tool' | 'retrieval';
+  name: string | null;
+  toolCallId: string | null;
+  retrievalQueryId: string | null;
+  allSessions: boolean;
+  limit: number;
+}
+
+const parseProvenanceFlags = (args: string[]): ProvenanceFlags | { error: string } => {
+  let name: string | null = null;
+  let toolCallId: string | null = null;
+  let retrievalQueryId: string | null = null;
+  let allSessions = false;
+  let limit = 50;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--limit') {
+      const next = args[i + 1];
+      if (next === undefined || !/^\d+$/.test(next)) {
+        return {
+          error: `/memory provenance: --limit needs a positive integer (got ${next ?? 'nothing'})`,
+        };
+      }
+      limit = Number.parseInt(next, 10);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        return { error: `/memory provenance: invalid limit '${next}'` };
+      }
+      i += 2;
+      continue;
+    }
+    if (a === '--tool') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/memory provenance: --tool needs a tool_call id' };
+      }
+      toolCallId = next;
+      i += 2;
+      continue;
+    }
+    if (a === '--retrieval') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/memory provenance: --retrieval needs a retrieval_query id' };
+      }
+      retrievalQueryId = next;
+      i += 2;
+      continue;
+    }
+    if (a === '--all') {
+      allSessions = true;
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return {
+        error: `/memory provenance: unknown flag '${a}' (try --tool, --retrieval, --all, --limit)`,
+      };
+    }
+    // Positional: memory name (only one allowed).
+    if (name !== null) {
+      return {
+        error: `/memory provenance: extra positional '${a}' — only one memory name allowed`,
+      };
+    }
+    name = a;
+    i += 1;
+  }
+  // Mutual exclusion between the three modes. `name` mode is the
+  // default when a positional is supplied; --tool / --retrieval
+  // explicitly select the other modes; mixing is a usage error
+  // (the underlying queries answer different questions).
+  const modes: ('name' | 'tool' | 'retrieval')[] = [];
+  if (name !== null) modes.push('name');
+  if (toolCallId !== null) modes.push('tool');
+  if (retrievalQueryId !== null) modes.push('retrieval');
+  if (modes.length === 0) {
+    return {
+      error: '/memory provenance: needs a memory name or --tool <id> or --retrieval <qid>',
+    };
+  }
+  if (modes.length > 1) {
+    return {
+      error: `/memory provenance: modes are mutually exclusive (picked ${modes.join(' + ')}) — pick one of: name, --tool, --retrieval`,
+    };
+  }
+  if (allSessions && modes[0] !== 'name') {
+    return {
+      error: '/memory provenance: --all only applies to the name lookup',
+    };
+  }
+  const mode = modes[0] as 'name' | 'tool' | 'retrieval';
+  return { mode, name, toolCallId, retrievalQueryId, allSessions, limit };
+};
+
+const formatProvenanceRow = (row: MemoryProvenanceRow): string => {
+  const ts = formatAuditTimestamp(row.createdAt);
+  const tc = row.toolCallId !== null ? row.toolCallId.slice(0, 8) : 'eager---';
+  // Show hash prefix when present — full 64-char hex hides actual
+  // identifying info we'd want at-a-glance; first 8 chars match
+  // the existing prefix convention for session/tool ids.
+  const hash = row.memoryContentHash !== null ? row.memoryContentHash.slice(0, 8) : '--------';
+  const state = row.memoryStateAtExposure ?? 'active';
+  // retrieval-only details: position + query id prefix when set.
+  let groupDetail = '';
+  if (row.surface === 'retrieve_context' && row.retrievalQueryId !== null) {
+    const qid = row.retrievalQueryId.slice(0, 8);
+    const pos = row.positionInCorpus !== null ? `#${row.positionInCorpus}` : '#?';
+    groupDetail = ` · retrieval=${qid} ${pos}`;
+  }
+  return `  ${ts} · ${row.surface.padEnd(16)} · ${row.memoryScope}/${row.memoryName} · tc=${tc} · state=${state} · hash=${hash}${groupDetail}`;
+};
+
+const handleProvenance = (ctx: SlashContext, args: string[]): SlashResult => {
+  const flags = parseProvenanceFlags(args);
+  if ('error' in flags) return { kind: 'error', message: flags.error };
+
+  const sessionId = ctx.currentSessionId();
+  let rows: MemoryProvenanceRow[];
+  let header: string;
+
+  if (flags.mode === 'name') {
+    const name = flags.name as string;
+    if (flags.allSessions) {
+      rows = listGlobalProvenanceByName(ctx.db, name, flags.limit);
+      header = `exposures for '${name}' (all sessions)`;
+    } else if (sessionId === null) {
+      // No current session yet — fall through to cross-session to
+      // avoid the confusing "0 rows in current session" header.
+      rows = listGlobalProvenanceByName(ctx.db, name, flags.limit);
+      header = `exposures for '${name}' (no current session — showing all)`;
+    } else {
+      rows = listProvenanceByName(ctx.db, sessionId, name, flags.limit);
+      header = `exposures for '${name}' (current session)`;
+    }
+  } else if (flags.mode === 'tool') {
+    if (sessionId === null) {
+      return {
+        kind: 'error',
+        message:
+          '/memory provenance --tool: needs an active session (tool_call ids are session-scoped)',
+      };
+    }
+    rows = listProvenanceForToolCall(ctx.db, sessionId, flags.toolCallId as string);
+    header = `exposures during tool_call ${(flags.toolCallId as string).slice(0, 8)}`;
+  } else {
+    // retrieval mode
+    if (sessionId === null) {
+      return {
+        kind: 'error',
+        message:
+          '/memory provenance --retrieval: needs an active session (retrieval_query ids are session-scoped)',
+      };
+    }
+    rows = listExposuresInRetrieval(ctx.db, sessionId, flags.retrievalQueryId as string);
+    header = `exposures from retrieval ${(flags.retrievalQueryId as string).slice(0, 8)} (position order)`;
+  }
+
+  if (rows.length === 0) {
+    if (flags.mode === 'name' && !flags.allSessions && sessionId !== null) {
+      return {
+        kind: 'ok',
+        notes: [`${header}: 0 rows`, '  (try --all for cross-session forensic)'],
+      };
+    }
+    return { kind: 'ok', notes: [`${header}: 0 rows`] };
+  }
+
+  const lines = [`${header} (${rows.length}):`];
+  for (const r of rows) lines.push(formatProvenanceRow(r));
   return { kind: 'ok', notes: lines };
 };
 
@@ -1871,7 +2066,7 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
 export const memoryCommand: SlashCommand = {
   name: 'memory',
   description:
-    'manage cross-session memories (list/show/audit/delete/quarantine/restore/promote/demote)',
+    'manage cross-session memories (list/show/audit/provenance/delete/quarantine/restore/promote/demote)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -1889,6 +2084,8 @@ export const memoryCommand: SlashCommand = {
         return handleShow(registry, ctx, args.slice(1));
       case 'audit':
         return handleAudit(ctx, args.slice(1));
+      case 'provenance':
+        return handleProvenance(ctx, args.slice(1));
       case 'metrics':
         return handleMetrics(ctx, args.slice(1));
       case 'delete':
@@ -1904,7 +2101,7 @@ export const memoryCommand: SlashCommand = {
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, metrics, delete, quarantine, restore, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, metrics, delete, quarantine, restore, promote, demote)`,
         };
     }
   },

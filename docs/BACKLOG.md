@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — /memory provenance operator surface (S1/T1.6)
+
+First operator-facing read of the provenance trail. The `/memory provenance` subcommand reads `memory_provenance` rows and answers three forensic questions, picked via mutually-exclusive modes:
+
+- `/memory provenance <name>` — every exposure of this memory in the current session (default). Cross-scope: matches `user/role` AND `project_local/role` when both share the name. `--all` opts out of the session scope for cross-session forensic queries.
+- `/memory provenance --tool <id>` — every memory exposed during one tool call. Session-scoped (tool_call ids are session-scoped; cross-session would surface unrelated calls under the same prefix).
+- `/memory provenance --retrieval <qid>` — grouped view of one `retrieve_context` call. Ordered by `position_in_corpus ASC` so the rendering reflects the slot's ranking (top hit first).
+
+Mutual exclusion enforced at parse time: mixing modes is a usage error (the underlying queries answer different questions). `--all` only applies to the name lookup — combining with `--tool` / `--retrieval` is refused with a hint. `--limit N` (default 50) caps the rendered batch across every mode.
+
+Two new repo helpers shipped to support the name-mode queries:
+
+- `listProvenanceByName(db, sessionId, name, limit)` — session-scoped, cross-scope. Mirrors `listMemoryEventsByName`'s shape (the operator doesn't always know the scope; the memory may have been deleted but provenance still lives in the table).
+- `listGlobalProvenanceByName(db, name, limit)` — cross-session, cross-scope. Explicitly named (matches the existing `listGlobalProvenanceForMemory` privacy-by-default convention) so a caller writing session-scoped queries can't accidentally reach for it.
+
+Output format is one compact row per exposure: `timestamp · surface · scope/name · tc-prefix · state · hash-prefix` plus `retrieval=<qid-prefix> #<pos>` when surface is `retrieve_context`. `tc=eager---` flags the eager-load rows (where `tool_call_id` is NULL by construction); hash truncated to 8 chars matches the existing session/tool prefix convention. Zero-result rows in name mode include a hint pointing at `--all` so the operator doesn't confuse "no rows in this session" with "no rows anywhere".
+
+Tests: 11 new in `tests/cli/slash/memory.test.ts` (validation + each mode + cross-session fall-through + position ordering + limit cap + no-session refusal for `--tool`); 4 new in `tests/storage/memory-provenance.test.ts` covering the two new helpers (cross-scope match, session-scoping, limit, cross-session aggregate). Pin: mutual exclusion errors, the position-order rendering for the retrieval mode, the `tc=eager---` shape for eager rows.
+
 ## [2026-05-16] feat(memory) — retrieve_context provenance emitter (S1/T1.5)
 
 Third emitter on the provenance trail. Every `contextSlot.included` entry whose `view === 'memory'` now produces a `memory_provenance` row with `surface='retrieve_context'`, linking the exposure to BOTH the retrieval batch (via `retrieval_query_id` referencing `retrieval_trace.id`) AND the originating tool_call. `position_in_corpus` pins the slot rank — 0 = top hit — so operator forensics can ask "the memory was exposed but ranked 18th, maybe the model didn't attend to it".

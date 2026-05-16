@@ -18,7 +18,9 @@ import {
   countExposuresInWindow,
   hashMemoryContent,
   listExposuresInRetrieval,
+  listGlobalProvenanceByName,
   listGlobalProvenanceForMemory,
+  listProvenanceByName,
   listProvenanceForMemory,
   listProvenanceForToolCall,
   pruneMemoryProvenance,
@@ -541,5 +543,86 @@ describe('FK CASCADE (session purge)', () => {
     db.query('DELETE FROM tool_calls WHERE id = ?').run(toolCallId);
     expect(listProvenanceForToolCall(db, sessionId, toolCallId)).toEqual([]);
     expect(listGlobalProvenanceForMemory(db, 'user', 'foo')).toEqual([]);
+  });
+});
+
+describe('listProvenanceByName (session-scoped by-name lookup, S1/T1.6)', () => {
+  test('matches the name across every scope it appears in (session-scoped)', () => {
+    // Operator surface (`/memory provenance <name>`) doesn't know
+    // which scope the memory lives in — by-name across scopes is
+    // the natural lookup shape. Mirrors `listMemoryEventsByName`.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'shared-name',
+      surface: 'eager',
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'project_local',
+      memoryName: 'shared-name',
+      surface: 'eager',
+      createdAt: 2000,
+    });
+    const rows = listProvenanceByName(db, sessionId, 'shared-name');
+    expect(rows).toHaveLength(2);
+    // DESC by created_at: newer (project_local) first.
+    expect(rows[0]?.memoryScope).toBe('project_local');
+    expect(rows[1]?.memoryScope).toBe('user');
+  });
+
+  test('does NOT leak rows from another session', () => {
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId: other,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+      createdAt: 1000,
+    });
+    expect(listProvenanceByName(db, sessionId, 'foo')).toEqual([]);
+  });
+
+  test('honors the limit', () => {
+    for (let i = 0; i < 5; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'foo',
+        surface: 'eager',
+        createdAt: 1000 + i,
+      });
+    }
+    expect(listProvenanceByName(db, sessionId, 'foo', 2)).toHaveLength(2);
+  });
+});
+
+describe('listGlobalProvenanceByName (cross-session by-name, S1/T1.6)', () => {
+  test('surfaces rows from every session', () => {
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId: other,
+      toolCallId: null,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      surface: 'eager',
+      createdAt: 2000,
+    });
+    const rows = listGlobalProvenanceByName(db, 'foo');
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.sessionId).sort()).toEqual([sessionId, other].sort());
   });
 });

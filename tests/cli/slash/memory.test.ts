@@ -18,7 +18,11 @@ import { createRegistry as createModelRegistry } from '../../../src/providers/re
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import { createMemoryEvent } from '../../../src/storage/repos/memory-events.ts';
+import { recordProvenance } from '../../../src/storage/repos/memory-provenance.ts';
+import { appendMessage } from '../../../src/storage/repos/messages.ts';
+import { createRetrievalTrace } from '../../../src/storage/repos/retrieval-trace.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
+import { createToolCall } from '../../../src/storage/repos/tool-calls.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../src/tui/modal-manager.ts';
@@ -2272,5 +2276,234 @@ describe('/memory unknown subcommand', () => {
     const r = await memoryCommand.exec(['nonsense'], ctx);
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain("unknown subcommand 'nonsense'");
+  });
+});
+
+describe('/memory provenance (S1/T1.6)', () => {
+  const seedToolCall = (db: DB, sessionId: string, name = 'memory_read'): string => {
+    const msgId = appendMessage(db, { sessionId, role: 'assistant', content: 'x' }).id;
+    return createToolCall(db, { messageId: msgId, toolName: name, input: {} }).id;
+  };
+
+  test('errors when no mode is selected', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('needs a memory name or --tool');
+  });
+
+  test('errors when modes are mixed', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', 'role', '--tool', 'tc-1'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('mutually exclusive');
+  });
+
+  test('errors when --all is combined with --tool', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', '--tool', 'tc-1', '--all'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--all only applies');
+  });
+
+  test('errors on unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+
+  test('name lookup returns session-scoped rows with surface labels', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId);
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'role',
+      surface: 'eager',
+      memoryContentHash: 'a'.repeat(64),
+      memoryStateAtExposure: 'active',
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'role',
+      surface: 'memory_read',
+      memoryContentHash: 'b'.repeat(64),
+      memoryStateAtExposure: 'active',
+      createdAt: 2000,
+    });
+    const r = await memoryCommand.exec(['provenance', 'role'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('current session');
+    expect(text).toContain('user/role');
+    expect(text).toContain('eager');
+    expect(text).toContain('memory_read');
+    expect(text).toContain(`tc=${tc.slice(0, 8)}`);
+  });
+
+  test('name lookup with no rows hints at --all', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', 'nope'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect((r.notes ?? []).join('\n')).toContain('--all');
+  });
+
+  test('--all surfaces rows from another session', async () => {
+    const repo = makeTmp();
+    const { ctx, db } = makeCtx(repo);
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId: other,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+      createdAt: 100,
+    });
+    // Session-scoped query returns nothing.
+    const scoped = await memoryCommand.exec(['provenance', 'foo'], ctx);
+    if (scoped.kind !== 'ok') throw new Error('expected ok');
+    expect((scoped.notes ?? []).join('\n')).toContain('0 rows');
+    // Cross-session surfaces it.
+    const all = await memoryCommand.exec(['provenance', 'foo', '--all'], ctx);
+    if (all.kind !== 'ok') throw new Error('expected ok');
+    const text = (all.notes ?? []).join('\n');
+    expect(text).toContain('all sessions');
+    expect(text).toContain('user/foo');
+  });
+
+  test('--tool surfaces exposures during that tool call only', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc1 = seedToolCall(db, sessionId);
+    const tc2 = seedToolCall(db, sessionId);
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc1,
+      memoryScope: 'user',
+      memoryName: 'a',
+      surface: 'memory_read',
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc2,
+      memoryScope: 'user',
+      memoryName: 'b',
+      surface: 'memory_read',
+      createdAt: 1100,
+    });
+    const r = await memoryCommand.exec(['provenance', '--tool', tc1], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('user/a');
+    expect(text).not.toContain('user/b');
+  });
+
+  test('--retrieval surfaces grouped exposures from one retrieve_context call', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId, 'retrieve_context');
+    const trace = createRetrievalTrace(db, {
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: { searchMs: 0, expandMs: 0, rankMs: 0, compressMs: 0 },
+    });
+    // Top hit at position 0, second at position 1.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'top',
+      surface: 'retrieve_context',
+      retrievalQueryId: trace.id,
+      positionInCorpus: 0,
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'second',
+      surface: 'retrieve_context',
+      retrievalQueryId: trace.id,
+      positionInCorpus: 1,
+      createdAt: 1001,
+    });
+    const r = await memoryCommand.exec(['provenance', '--retrieval', trace.id], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('position order');
+    // Top hit should appear before second hit (position 0 → first line).
+    const topIdx = text.indexOf('user/top');
+    const secondIdx = text.indexOf('user/second');
+    expect(topIdx).toBeGreaterThan(-1);
+    expect(secondIdx).toBeGreaterThan(topIdx);
+    expect(text).toContain('#0');
+    expect(text).toContain('#1');
+  });
+
+  test('--tool errors without an active session', async () => {
+    // makeCtx always seeds a session for the rest of the suite;
+    // construct a tweaked ctx that overrides currentSessionId() to
+    // null. Mirrors how a fresh REPL boot looks before the first
+    // turn — provenance --tool MUST refuse the query rather than
+    // fall through to the global aggregate (tool_call ids are
+    // session-scoped; cross-session lookup by tool_call_id would
+    // surface unrelated calls under the same prefix).
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    const ctxNoSession: SlashContext = {
+      ...bundle.ctx,
+      currentSessionId: () => null,
+    };
+    const r = await memoryCommand.exec(['provenance', '--tool', 'tc-x'], ctxNoSession);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('needs an active session');
+  });
+
+  test('--limit caps the rendered batch', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    for (let i = 0; i < 8; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'spammy',
+        surface: 'eager',
+        createdAt: 1000 + i,
+      });
+    }
+    const r = await memoryCommand.exec(['provenance', 'spammy', '--limit', '3'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    // Header line + 3 rows = 4 notes.
+    expect(r.notes).toHaveLength(4);
   });
 });

@@ -263,6 +263,29 @@ export const listProvenanceForMemory = (
   return rows.map(fromRow);
 };
 
+// Like `listProvenanceForMemory` but resolves across every scope
+// for a given name. Operator surfaces (`/memory provenance <name>`)
+// don't always know the scope — the memory may have been deleted,
+// or live in a scope the operator can't easily query. By-name
+// lookup matches the `/memory audit --name` shape and outlives
+// deletion of the memory file itself.
+export const listProvenanceByName = (
+  db: DB,
+  sessionId: string,
+  name: string,
+  limit = 50,
+): MemoryProvenanceRow[] => {
+  const rows = db
+    .query<MemoryProvenanceDbRow, [string, string, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ? AND memory_name = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(sessionId, name, limit);
+  return rows.map(fromRow);
+};
+
 // Every memory exposed by a single retrieve_context call. Ordered
 // by `position_in_corpus ASC` so the rendering reflects the slot's
 // ranking (0 first, etc.). `retrieval_query_id` is enough — we
@@ -313,6 +336,27 @@ export const countExposuresInWindow = (
     )
     .get(sessionId, scope, name, cutoffMs) as { n: number };
   return row.n;
+};
+
+// Cross-session, cross-scope aggregate by memory name. EXPLICITLY
+// named (mirrors `listGlobalProvenanceForMemory`) so a caller
+// writing session-scoped queries can't accidentally reach for it.
+// Used by `/memory provenance <name> --all` for forensic "every
+// time this memory was exposed, anywhere".
+export const listGlobalProvenanceByName = (
+  db: DB,
+  name: string,
+  limit = 50,
+): MemoryProvenanceRow[] => {
+  const rows = db
+    .query<MemoryProvenanceDbRow, [string, number]>(
+      `${SELECT_ALL}
+        WHERE memory_name = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(name, limit);
+  return rows.map(fromRow);
 };
 
 // Cross-session aggregate. EXPLICITLY named so a caller writing
