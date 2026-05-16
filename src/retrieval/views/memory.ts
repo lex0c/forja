@@ -117,12 +117,19 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
         // never saw — same policy as compression fallback
         // (§retrieval/compression.ts).
         //
-        // `peek` mirrors `read`'s scope precedence (local > shared
-        // > user) but skips `auditRead`. `present` means body
-        // loaded; `missing` / `malformed` / `unknown` fall through
-        // as title+description only (the candidate is still ranked
-        // on its name + description signal).
-        const file = deps.registry.peek(l.name);
+        // Scope-pinned via `{ scope: l.scope }`: the listing
+        // already carries the post-dedupe winning scope, and
+        // pinning makes the body load symmetric with the
+        // compression resolver (compression.ts memoryResolver).
+        // Without the pin, peek re-walks precedence and could
+        // land on a different scope's body if the registry's
+        // disk state changes between corpus build and body load
+        // — a race the listing-set is supposed to lock down.
+        // `present` means body loaded; `missing` / `malformed` /
+        // `unknown` fall through as title+description only (the
+        // candidate is still ranked on its name + description
+        // signal).
+        const file = deps.registry.peek(l.name, { scope: l.scope });
         if (file.kind === 'present') {
           const bodyTokens = tokenize(file.file.body);
           for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);

@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(retrieval/views/memory) — scope-pin peek in BM25 corpus build (review H3)
+
+`src/retrieval/views/memory.ts:111` called `deps.registry.peek(l.name)` without a `{ scope }` option. The iterated listing already carries the post-dedupe winning scope (`l.scope`); the lookup re-walked precedence. Today's behavior was usually correct via precedence, but inconsistent with the compression resolver (compression.ts:163, scope-pinned) and a registry-state change mid-call (scope migration, rename, eviction in another scope) could land the wrong body in the BM25 corpus.
+
+One-line fix: `deps.registry.peek(l.name, { scope: l.scope })`. Pins the body load to the same scope the listing represents.
+
+Test: seed `project_shared/auth` and `project_local/auth` with bodies containing distinctive tokens (`castle` vs `fortress`); query a token that only exists in the local body; verify the local candidate ranks (proving the corpus indexed the local body, not the shared one).
+
 ## [2026-05-16] fix(cli/slash/agent-retrieval) — session-scope check on UUID fast-path (review H2)
 
 `resolveTraceId` in `/agent retrieval replay` previously checked the active session ONLY for prefix scans; the full-UUID fast path (`prefix.length === 36`) called `getRetrievalTrace(db, prefix)` directly and returned whatever the lookup found. `getRetrievalTrace` is a primary-key lookup by design (no session scoping). An operator with a UUID from any session — their own past session, a teammate's session on the same DB, a leaked log line — could replay that session's full trace, including the raw context_slot bodies.

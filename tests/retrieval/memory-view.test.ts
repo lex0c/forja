@@ -316,6 +316,28 @@ describe('createMemoryView', () => {
     expect(cands.map((c) => c.nodeId)).toEqual(['memory:user/active']);
   });
 
+  test('loadBodies peek is scope-pinned (H3) — local body wins over shared with same name', async () => {
+    // Both scopes have a memory named `auth`. Local body contains
+    // the distinctive token "fortress"; shared has "castle". After
+    // dedupe-by-name (local > shared), the BM25 corpus must use
+    // the LOCAL body. Without scope-pinning, peek would re-walk
+    // precedence — today it happens to land on local too (same
+    // precedence), but the invariant pin prevents a future
+    // registry-state race from picking the wrong scope.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Auth](auth.md) — shared\n');
+    writeIndex(roots.projectLocal, '- [Auth](auth.md) — local\n');
+    writeBody(roots.projectShared, 'auth', 'auth body castle');
+    writeBody(roots.projectLocal, 'auth', 'auth body fortress');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, loadBodies: true });
+    // Query only matches the LOCAL body's distinctive token.
+    const cands = await view.search({ ...baseQuery, text: 'fortress' });
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.nodeId).toBe('memory:project_local/auth');
+  });
+
   test('expired memory does not surface as candidate (H6 regression)', async () => {
     // Boot-time GC is the canonical sweep; this guards the gap
     // between boots where stale memories would otherwise still land
