@@ -123,10 +123,17 @@ export const memoryReadTool: Tool<MemoryReadInput, MemoryReadOutput> = {
     // loop), so without this per-call attribution every read
     // would land in memory_events with session_id NULL — breaking
     // listMemoryEventsBySession queries for the active run.
+    //
+    // auditToolCallId enables the per-call provenance trail
+    // (MEMORY.md §11.2) — every successful read also emits a
+    // memory_provenance row linking the exposure to this tool
+    // call. Skipped (no provenance row) when ctx.toolCallId is
+    // absent — happens in test contexts that bypass the harness.
     const result = ctx.memoryRegistry.read(args.name, {
       ...(scopeCheck !== null ? { scope: scopeCheck } : {}),
       auditSessionId: ctx.sessionId,
       auditCwd: ctx.cwd,
+      ...(ctx.toolCallId !== undefined ? { auditToolCallId: ctx.toolCallId } : {}),
     });
 
     if (result.kind === 'unknown') {

@@ -155,6 +155,11 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
       limit: limit + 1,
       auditSessionId: ctx.sessionId,
       auditCwd: ctx.cwd,
+      // Body-match hits in the deep branch read the file, which
+      // is an EXPOSURE per MEMORY.md §11.2 — same accountability
+      // as a memory_read tool call. Forwarding ctx.toolCallId so
+      // the provenance row links back to the search call.
+      ...(ctx.toolCallId !== undefined ? { auditToolCallId: ctx.toolCallId } : {}),
     });
 
     const truncated = raw.length > limit;

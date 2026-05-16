@@ -1,7 +1,9 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
+import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { isExpired } from './expires.ts';
+import { serializeMemoryFile } from './frontmatter.ts';
 import {
   type MemoryFileResult,
   type ScopeIndexResult,
@@ -207,6 +209,15 @@ export interface ScopeOption {
 export interface AuditOverride {
   auditSessionId?: string;
   auditCwd?: string;
+  // Slice 1 — provenance. When set, every successful body load
+  // through `read()` (and `search(deep)`) ALSO emits a
+  // `memory_provenance` row with surface='memory_read', linking
+  // the exposure to the originating tool_call. Eager-load
+  // exposures (T1.4) and retrieve_context exposures (T1.5) emit
+  // through different paths with their own surface. Absent / null
+  // means "no provenance row" — the registry skips silently, which
+  // matches the registry's audit-best-effort posture.
+  auditToolCallId?: string;
 }
 
 export interface ReadOptions extends ScopeOption, AuditOverride {}
@@ -445,6 +456,59 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     }
   };
 
+  // Slice 1 / T1.3 — emit a `memory_provenance` row for the
+  // exposure. Same best-effort posture as `auditRead`: a DB
+  // failure here MUST NOT propagate (the body load already
+  // succeeded; the tool's contract to the model is satisfied).
+  // The exposure row is the lower bound — "these bytes WERE in
+  // the model's window" — and downstream detectors (S2/S3) layer
+  // correlation on top.
+  //
+  // Skipped when:
+  //   - no db is wired (headless / one-shot CLI sessions);
+  //   - no toolCallId is passed (caller is NOT a per-call surface;
+  //     eager-load and retrieve_context emit through their own
+  //     paths with the right surface in T1.4 / T1.5);
+  //   - no sessionId is resolvable (provenance is session-scoped
+  //     by design — see schema header).
+  //
+  // The hash is computed from the canonical serialization
+  // (`serializeMemoryFile`) — same producer the writer uses when
+  // it persists a memory, so a memory the system wrote round-trips
+  // through hash exactly. Operator-edited files with different
+  // whitespace will hash differently, which IS the signal: drift
+  // detection.
+  const auditExposure = (
+    listing: MemoryListing,
+    fileResult: MemoryFileResult,
+    override: AuditOverride = {},
+  ): void => {
+    if (db === undefined) return;
+    if (fileResult.kind !== 'present') return;
+    if (override.auditToolCallId === undefined) return;
+    const effectiveSessionId = override.auditSessionId ?? sessionId ?? null;
+    if (effectiveSessionId === null) return;
+    try {
+      const canonical = serializeMemoryFile(fileResult.file);
+      const hash = hashMemoryContent(canonical);
+      const stateAtExposure = fileResult.file.frontmatter.state ?? 'active';
+      recordProvenance(db, {
+        sessionId: effectiveSessionId,
+        toolCallId: override.auditToolCallId,
+        memoryScope: listing.scope,
+        memoryName: listing.name,
+        surface: 'memory_read',
+        memoryContentHash: hash,
+        memoryStateAtExposure: stateAtExposure,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to record exposure for ${listing.name} (${listing.scope}): ${redactSecrets(msg)}\n`,
+      );
+    }
+  };
+
   return {
     roots,
     list(opts: ListOptions = {}): MemoryListing[] {
@@ -506,10 +570,13 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       if (listing === null) return { kind: 'unknown' };
       const fileResult = readMemoryByName(roots, listing.scope, name);
       if (fileResult.kind === 'present') {
-        auditRead(listing, fileResult, {
+        const auditOverride: AuditOverride = {
           ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
           ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-        });
+          ...(opts.auditToolCallId !== undefined ? { auditToolCallId: opts.auditToolCallId } : {}),
+        };
+        auditRead(listing, fileResult, auditOverride);
+        auditExposure(listing, fileResult, auditOverride);
         return { kind: 'present', scope: listing.scope, file: fileResult.file };
       }
       if (fileResult.kind === 'missing') {
@@ -595,10 +662,15 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           // top-level reads get attributed to the active session
           // rather than NULL (the bootstrap-time constructor's
           // sessionId is undefined).
-          auditRead(listing, fileResult, {
+          const auditOverride: AuditOverride = {
             ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
             ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-          });
+            ...(opts.auditToolCallId !== undefined
+              ? { auditToolCallId: opts.auditToolCallId }
+              : {}),
+          };
+          auditRead(listing, fileResult, auditOverride);
+          auditExposure(listing, fileResult, auditOverride);
           hits.push({
             scope: listing.scope,
             name: listing.name,

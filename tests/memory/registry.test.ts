@@ -8,7 +8,10 @@ import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listMemoryEventsByName } from '../../src/storage/repos/memory-events.ts';
+import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
+import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
+import { createToolCall } from '../../src/storage/repos/tool-calls.ts';
 
 const tmpDirs: string[] = [];
 
@@ -944,5 +947,146 @@ describe('createMemoryRegistry — write', () => {
     });
     expect(result.kind).toBe('created');
     // No db handle to assert on — just exercise the no-throw path.
+  });
+});
+
+describe('createMemoryRegistry — provenance emission (S1/T1.3)', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  const seedToolCall = (): string => {
+    const msgId = appendMessage(db, { sessionId, role: 'assistant', content: 'x' }).id;
+    return createToolCall(db, { messageId: msgId, toolName: 'memory_read', input: {} }).id;
+  };
+
+  test('read with auditToolCallId emits a memory_read provenance row', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'Body of role.\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const toolCallId = seedToolCall();
+
+    const result = reg.read('role', { auditToolCallId: toolCallId });
+    expect(result.kind).toBe('present');
+
+    const rows = listProvenanceForMemory(db, sessionId, 'project_local', 'role');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.surface).toBe('memory_read');
+    expect(rows[0]?.toolCallId).toBe(toolCallId);
+    expect(rows[0]?.memoryScope).toBe('project_local');
+    expect(rows[0]?.memoryStateAtExposure).toBe('active');
+    expect(rows[0]?.memoryContentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(rows[0]?.retrievalQueryId).toBeNull();
+    expect(rows[0]?.positionInCorpus).toBeNull();
+  });
+
+  test('read WITHOUT auditToolCallId emits NO provenance row (other surfaces own their path)', () => {
+    // The eager-load (T1.4) and retrieve_context (T1.5) paths
+    // pass their own surface — the registry MUST stay silent
+    // here so it doesn't double-emit or claim memory_read for
+    // exposures that aren't tool-call-driven.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'b');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    reg.read('role');
+    expect(listProvenanceForMemory(db, sessionId, 'project_local', 'role')).toEqual([]);
+    // But memory_events DID fire — that path is independent.
+    expect(listMemoryEventsByName(db, 'role')).toHaveLength(1);
+  });
+
+  test('read on missing body emits neither audit nor provenance', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — role\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const toolCallId = seedToolCall();
+    const result = reg.read('role', { auditToolCallId: toolCallId });
+    expect(result.kind).toBe('missing');
+    expect(listProvenanceForMemory(db, sessionId, 'user', 'role')).toEqual([]);
+  });
+
+  test('hash is stable across reads of the same content', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'Body.\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const tc1 = seedToolCall();
+    const tc2 = seedToolCall();
+    reg.read('role', { auditToolCallId: tc1 });
+    reg.read('role', { auditToolCallId: tc2 });
+    const rows = listProvenanceForMemory(db, sessionId, 'project_local', 'role');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.memoryContentHash).toBe(rows[1]?.memoryContentHash);
+    expect(rows[0]?.toolCallId).not.toBe(rows[1]?.toolCallId);
+  });
+
+  test('quarantined frontmatter state survives in provenance snapshot', () => {
+    // Operator could transition the memory later; the row must
+    // pin the state AT EXPOSURE TIME, not the latest.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', `${fmUser('role')}state: quarantined\n`, 'b');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const toolCallId = seedToolCall();
+    reg.read('role', { auditToolCallId: toolCallId });
+    const rows = listProvenanceForMemory(db, sessionId, 'project_local', 'role');
+    expect(rows[0]?.memoryStateAtExposure).toBe('quarantined');
+  });
+
+  test('provenance failure (invalid toolCallId FK) does NOT break the read', () => {
+    // Audit-drift posture: the body load already succeeded; a
+    // failure recording the exposure is best-effort and MUST NOT
+    // surface as an exception to the caller.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'body\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    const original = process.stderr.write.bind(process.stderr);
+    const captured: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      const result = reg.read('role', { auditToolCallId: 'does-not-exist' });
+      expect(result.kind).toBe('present');
+      if (result.kind === 'present') {
+        expect(result.file.body).toBe('body\n');
+      }
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join('')).toMatch(/AUDIT DRIFT.*exposure/);
+    expect(listProvenanceForMemory(db, sessionId, 'project_local', 'role')).toEqual([]);
+  });
+
+  test('search-deep body match emits a memory_read provenance row', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — surface\n');
+    writeMemory(roots.user, 'a', fmUser('a'), 'body has zebra inside\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const toolCallId = seedToolCall();
+    const hits = reg.search('zebra', { deep: true, auditToolCallId: toolCallId });
+    expect(hits).toHaveLength(1);
+    const rows = listProvenanceForMemory(db, sessionId, 'user', 'a');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.surface).toBe('memory_read');
+    expect(rows[0]?.toolCallId).toBe(toolCallId);
   });
 });

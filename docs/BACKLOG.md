@@ -2,6 +2,31 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — exposure provenance: schema + repo + memory_read emitter (S1/T1.1-T1.3)
+
+Slice 1 of the memory lifecycle detectors plan. Records EXPOSURES — moments where a memory's bytes were visible to the model — for the `memory_read` and `memory_search --deep` paths. Foundational for Slice 2 (`verify_failed`) and Slice 3 (`user_override_repeated`) detectors which layer correlation analysis on top of this lower-bound trace.
+
+Schema (migration `054-memory-provenance`):
+- `memory_provenance` table with surface enum (`eager` / `memory_read` / `retrieve_context`), `memory_content_hash` (SHA-256 of canonical serialization), `memory_state_at_exposure` (frontmatter state snapshot), `retrieval_query_id` + `position_in_corpus` for grouping retrieve_context exposures.
+- FK CASCADE on `session_id` + `tool_call_id`; SET NULL on `retrieval_query_id` so retrieval-trace GC doesn't orphan provenance.
+- 4 indices including session-led composite `(session_id, memory_scope, memory_name, created_at DESC, id DESC)` for the canonical "history of memory X in this session" query, and partial indices on the FK columns.
+- Schema header documents what the table does NOT claim (causation, use, replay completeness) so future readers don't conflate exposure with attention.
+
+Repo (`memory-provenance.ts`):
+- `recordProvenance` enforces surface enum, memoryScope enum, retrieval-grouping invariant (`retrieve_context` requires both fields; other surfaces require neither), and toolCallId nullability per surface (eager=null, per-call=non-null).
+- Every list/count helper REQUIRES sessionId — same fix shape as commit `55ba11a`'s `listRetrievalTracesByWorkflow` (privacy-by-default). Cross-session aggregation only reachable via the explicitly-named `listGlobalProvenanceForMemory`.
+- `hashMemoryContent` documents the canonical input form (`${frontmatter}\n\n${body}`) and the throw-vs-swallow semantics so callers know to wrap in try/catch (the column is nullable precisely so hash glitches don't block exposure recording).
+- `pruneMemoryProvenance` GC sweep for the 90d TTL planned in T1.7.
+
+Wire-up:
+- `MemoryRegistry.read` and `search(deep)` emit `memory_provenance` rows alongside the existing `memory_events` audit row. New `auditExposure` helper next to `auditRead` mirrors the same best-effort posture: a DB failure does NOT propagate (body load already succeeded; tool contract honored). Stderr "AUDIT DRIFT" line on failure for operator visibility.
+- `ToolContext.toolCallId` optional, populated by `invoke-tool.ts` right after `createToolCall`. `memory_read` and `memory_search` forward it to the registry as `auditToolCallId`. Test contexts that bypass the harness simply emit no provenance row — degrades cleanly.
+- Hash computed from `serializeMemoryFile` (the canonical writer); a system-written memory round-trips through hash exactly. Operator hand-edits with different whitespace will hash differently — that drift IS the signal.
+
+T1.4 (eager-load), T1.5 (retrieve_context), T1.6 (slash surfaces), T1.7 (TTL+GC), T1.8 (docs+integration) still pending. The schema is forward-compatible with all three remaining emitter paths.
+
+Tests: 38 new (19 repo unit tests, 8 registry integration tests, 11 schema/invariant/cascade pins). Pin: surface-enum validation, scope-enum validation, retrieval-grouping invariant, toolCallId nullability, FK CASCADE for session + tool_calls, hash round-trip, state snapshot survival, cutoff boundaries (inclusive in `countExposuresInWindow`, exclusive in `pruneMemoryProvenance`), SHA-256 algorithm pinned to RFC 6234 empty-string canonical, search-deep emission parity, audit-drift resilience.
+
 ## [2026-05-16] fix(retrieval/runner) — preserve caller-supplied memory view when loadBodies is requested
 
 `buildRetrievalRunner` exposes a `views` slot on its deps (documented for tests / fixtures / alternative-scoring wireup). When `input.loadBodies === true`, the runner unconditionally replaced `viewsForCall.memory` with a fresh default `createMemoryView({ registry, loadBodies: true })` — discarding whatever custom view the caller had injected. A test asserting that its sentinel memory view ran, or a fixture stubbing memory behavior for a specific corpus, would silently get the default view's behavior instead. Same for any future custom wireup with alternative limits / scoring / filters.

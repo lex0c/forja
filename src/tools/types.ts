@@ -141,6 +141,16 @@ export interface ToolContext {
   cwd: string;
   sessionId: string;
   stepId: string;
+  // The active tool_call row's id, populated by the harness in
+  // `invoke-tool.ts` right after `createToolCall`. Tools that emit
+  // per-call audit rows (currently only memory_read / memory_search
+  // for the provenance trail in MEMORY.md §11.2) thread this into
+  // the registry so each exposure links back to its causal call.
+  // Optional because test contexts and legacy entrypoints
+  // construct ToolContext without going through the harness loop —
+  // those callers get no provenance row, which mirrors how
+  // bgManager / todoStore degrade cleanly when absent.
+  toolCallId?: string;
   permissions: PermissionsView;
   // §6.5 sandbox profile the engine planner chose for THIS call.
   // Populated by `invoke-tool.ts` from `decision.sandboxProfile`
