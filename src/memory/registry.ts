@@ -15,6 +15,7 @@ import type {
   MemoryFrontmatter,
   MemoryScope,
   MemorySource,
+  MemoryState,
 } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
@@ -154,6 +155,38 @@ export interface MemoryRegistry {
 export interface ListOptions {
   scope?: MemoryScope;
   deduplicateByName?: boolean;
+  // When set, restrict to listings whose current frontmatter `state`
+  // is in this allow-list (absence in frontmatter ≡ `active`).
+  // Default (undefined) returns every listing regardless of state —
+  // keeps existing callers (operator-facing `/memory list`, audit
+  // surfaces, count for boot banner) unchanged.
+  //
+  // Production consumers that hand candidates to the model
+  // (retrieval views, eager-injection, model-facing search) should
+  // pass `['active']` so quarantined / invalidated / proposed /
+  // evicted / purged memories never reach the model's view.
+  //
+  // Cost: filtering triggers one file read per surviving listing
+  // (to parse the current frontmatter from disk — the cached
+  // snapshot only carries IndexEntry from MEMORY.md, not the .md
+  // frontmatter). Tolerable for the dozens-of-memories scale the
+  // spec assumes; a future cache layer can promote `state` /
+  // `expires` into the snapshot if N grows large enough to matter.
+  states?: readonly MemoryState[];
+  // When `false`, exclude listings whose frontmatter `expires` is
+  // strictly before `nowMs`. Default (undefined) returns every
+  // listing regardless of expiration — boot-time GC remains the
+  // authoritative sweep; this flag is the at-pull defense for
+  // callers (notably retrieval) that should never surface a stale
+  // memory to the model between sweeps.
+  //
+  // Same per-listing file-read cost as `states`. Setting either
+  // option triggers the read; setting both shares it.
+  includeExpired?: boolean;
+  // `nowMs` reference for `includeExpired` evaluation. Default
+  // `Date.now()`. Tests pin a fixed value so the filter is
+  // deterministic against fixtures that hand-craft `expires`.
+  nowMs?: number;
 }
 
 export interface ScopeOption {
@@ -269,6 +302,37 @@ interface ScopeSnapshot {
   entries: IndexEntry[];
   diagnostic: ScopeIndexResult;
 }
+
+// Parse the spec-shaped `expires` value (`YYYY-MM-DD`) into an epoch
+// ms representing the END of that day (UTC). A memory with
+// `expires: 2026-05-15` is considered expired starting 2026-05-16
+// 00:00 UTC — matches the operator's intuition that "expires today"
+// means "valid through today" rather than "already expired at the
+// stroke of midnight". Returns null on malformed input so the
+// caller treats it as "no expiry set" and surfaces a stderr warning
+// elsewhere if needed (the validator already rejected this shape on
+// write; on read we're defensive against hand-edited files).
+const parseExpiresEndOfDayMs = (expires: string): number | null => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expires);
+  if (m === null) return null;
+  const year = Number.parseInt(m[1] ?? '', 10);
+  const month = Number.parseInt(m[2] ?? '', 10);
+  const day = Number.parseInt(m[3] ?? '', 10);
+  // `Date.UTC` is monthIdx-based; clamp by re-reading to detect
+  // overflow (e.g., 2026-02-31 becomes 2026-03-03 which we refuse).
+  const ms = Date.UTC(year, month - 1, day + 1, 0, 0, 0);
+  if (Number.isNaN(ms)) return null;
+  const round = new Date(ms);
+  if (round.getUTCFullYear() !== year || round.getUTCMonth() !== month - 1) return null;
+  return ms;
+};
+
+const isExpired = (expires: string | undefined, nowMs: number): boolean => {
+  if (expires === undefined) return false;
+  const cutoffMs = parseExpiresEndOfDayMs(expires);
+  if (cutoffMs === null) return false; // malformed → treat as non-expiring
+  return nowMs >= cutoffMs;
+};
 
 // Split body into lines for snippet extraction. We keep raw lines
 // (no trim) so column offsets in matches stay meaningful when the
@@ -427,7 +491,25 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           return true;
         });
       }
-      return filtered;
+      // State / expires filter — gated on the option so callers
+      // that don't care don't pay the per-listing file-read cost.
+      // The frontmatter lives in the .md file (NOT in the cached
+      // IndexEntry snapshot), so we read each surviving listing
+      // once. Missing / malformed files are excluded — they
+      // belong to /memory audit, not the model. See ListOptions
+      // for the rationale and the contract.
+      const needFrontmatter = opts.states !== undefined || opts.includeExpired === false;
+      if (!needFrontmatter) return filtered;
+      const nowMs = opts.nowMs ?? Date.now();
+      return filtered.filter((l) => {
+        const fileResult = readMemoryByName(roots, l.scope, l.name);
+        if (fileResult.kind !== 'present') return false;
+        const fm = fileResult.file.frontmatter;
+        const state: MemoryState = fm.state ?? 'active';
+        if (opts.states !== undefined && !opts.states.includes(state)) return false;
+        if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return false;
+        return true;
+      });
     },
 
     lookup(name, opts: ScopeOption = {}): MemoryListing | null {

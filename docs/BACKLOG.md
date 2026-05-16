@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(memory+retrieval) — lifecycle state + expires filter at the list boundary (review H1+H6)
+
+`registry.list()` previously returned every listing regardless of frontmatter `state` or `expires`. The retrieval memory view consumed `list({ deduplicateByName: true })` directly, so any memory the operator had quarantined / invalidated / proposed / evicted / purged — or a memory past its `expires` date between boot-time GC sweeps — surfaced to the model as a BM25 candidate and could end up in the context slot.
+
+Added two opt-in filters to `ListOptions`:
+
+- `states?: readonly MemoryState[]` — restrict to listings whose current frontmatter state is in the allow-list (`absent` ≡ `active`).
+- `includeExpired?: boolean` (default undefined ≡ no filter; pass `false` to exclude past-expiry).
+- `nowMs?: number` — injectable reference for `expires` evaluation; defaults to `Date.now()`.
+
+Cost: one file read per surviving listing when either filter fires (frontmatter lives in the .md, not in the cached index snapshot). Tolerable at the dozens-of-memories scale the spec assumes. A future cache layer can promote `state` / `expires` into the snapshot if N grows.
+
+`src/retrieval/views/memory.ts` now passes `states: ['active'], includeExpired: false` so the model-facing surface never sees a non-active or stale memory. Other callers (operator-facing `/memory list`, audit surfaces, boot-banner count, slash commands) keep their broad view — defaults unchanged.
+
+Helper: `parseExpiresEndOfDayMs` reads the spec-shaped `YYYY-MM-DD` string and returns the start of the *next* day UTC, so `expires: 2026-05-15` is valid through any time of 2026-05-15 and expired starting 2026-05-16 00:00 UTC (matches operator intuition: "expires today" = "valid through today"). Malformed dates (only reachable via hand-edited files; the writer's validator refuses them) are treated as non-expiring — but the same hand-edit makes the file `malformed` to the parser, which the state filter excludes anyway, so the model never sees it.
+
+Tests: 6 new in `tests/memory/registry.test.ts` covering states allow-list, orphaned listings (missing body files), past-expiry exclusion, the end-of-day boundary, combined filter composition, and the malformed-frontmatter defense-in-depth case. 3 new in `tests/retrieval/memory-view.test.ts` (quarantined / invalidated+proposed batch / expired) plus two existing tests (`loadBodies degrades silently when…`) flipped to assert that orphaned/malformed memories are now filtered out of the candidate pool — that's the safer policy, the model shouldn't be ranking memories the operator can't trust.
+
 ## [2026-05-16] chore(retrieval+cli) — L polish pass closing the feat/retrieval review
 
 Closes the remaining low-severity findings from the review with mostly cosmetic / defensive touches; no behavioral changes that an operator would notice except the days-label cleanup.

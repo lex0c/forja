@@ -30,7 +30,7 @@ const writeBody = (
   dir: string,
   name: string,
   body: string,
-  fm: { description?: string } = {},
+  fm: { description?: string; state?: string; expires?: string } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -39,6 +39,8 @@ const writeBody = (
     'type: feedback',
     'source: inferred',
   ];
+  if (fm.state !== undefined) lines.push(`state: ${fm.state}`);
+  if (fm.expires !== undefined) lines.push(`expires: ${fm.expires}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\n${body}\n`);
 };
 
@@ -245,13 +247,16 @@ describe('createMemoryView', () => {
     expect(cands).toEqual([]);
   });
 
-  test('loadBodies degrades silently when the body file is missing', async () => {
+  test('orphaned listing (body file missing) is filtered out of the candidate pool', async () => {
     // Registry index references a memory whose body file got
     // deleted out of band (operator removed the file but not the
     // index entry, or a partial purge left an orphaned listing).
-    // The view must NOT crash — it falls back to title +
-    // description ranking and the candidate still surfaces if its
-    // metadata matches the query.
+    // Pre-state-filter this surfaced a candidate using only the
+    // title + description; with the H1 state filter the view now
+    // demands a present, active, unexpired body. Missing body =>
+    // unknown state => excluded. The operator's `/memory audit`
+    // surface (broader `list()` defaults) still shows the orphan;
+    // the model does not.
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.user, '- [Auth](auth.md) — auth conventions\n');
@@ -259,16 +264,13 @@ describe('createMemoryView', () => {
     const registry = createMemoryRegistry({ roots, db, sessionId });
     const view = createMemoryView({ registry, loadBodies: true });
     const cands = await view.search({ ...baseQuery, text: 'auth' });
-    // Title + description still match 'auth'; absent body shouldn't
-    // bury the candidate, just deny it the body-weighted boost.
-    expect(cands).toHaveLength(1);
-    expect(cands[0]?.nodeId).toBe('memory:user/auth');
+    expect(cands).toEqual([]);
   });
 
-  test('loadBodies degrades silently when the body file is malformed', async () => {
-    // Frontmatter so broken `parseMemoryFile` rejects it. View
-    // falls through to title + description; same shape as the
-    // missing-body test above.
+  test('malformed body file is filtered out of the candidate pool', async () => {
+    // Frontmatter so broken `parseMemoryFile` rejects it. Same
+    // policy as the missing-body case: the model should never see
+    // a memory whose state can't be confirmed.
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.user, '- [Broken](broken.md) — auth notes\n');
@@ -278,7 +280,57 @@ describe('createMemoryView', () => {
     const registry = createMemoryRegistry({ roots, db, sessionId });
     const view = createMemoryView({ registry, loadBodies: true });
     const cands = await view.search({ ...baseQuery, text: 'auth' });
-    expect(cands).toHaveLength(1);
-    expect(cands[0]?.nodeId).toBe('memory:user/broken');
+    expect(cands).toEqual([]);
+  });
+
+  test('quarantined memory does not surface as candidate (H1 regression)', async () => {
+    // The model must never see memories the operator quarantined.
+    // Pre-state-filter, `registry.list({ deduplicateByName: true })`
+    // returned every state — the view surfaced the candidate, BM25
+    // ranked it, and the body landed in the slot. Now the view
+    // passes `states: ['active']` so non-active states are excluded
+    // from the candidate pool.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Auth](auth.md) — auth conventions\n');
+    writeBody(roots.user, 'auth', 'auth body content', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands).toEqual([]);
+  });
+
+  test('invalidated / proposed memories filtered out (H1)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(
+      roots.user,
+      '- [Inv](inv.md) — invalidated auth\n- [Prop](prop.md) — proposed auth\n- [Active](active.md) — active auth\n',
+    );
+    writeBody(roots.user, 'inv', 'body', { state: 'invalidated' });
+    writeBody(roots.user, 'prop', 'body', { state: 'proposed' });
+    writeBody(roots.user, 'active', 'body', { state: 'active' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands.map((c) => c.nodeId)).toEqual(['memory:user/active']);
+  });
+
+  test('expired memory does not surface as candidate (H6 regression)', async () => {
+    // Boot-time GC is the canonical sweep; this guards the gap
+    // between boots where stale memories would otherwise still land
+    // in the model's view.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(
+      roots.user,
+      '- [Stale](stale.md) — auth conventions stale\n- [Fresh](fresh.md) — auth conventions fresh\n',
+    );
+    writeBody(roots.user, 'stale', 'body', { expires: '2024-01-01' });
+    writeBody(roots.user, 'fresh', 'body', { expires: '2099-12-31' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands.map((c) => c.nodeId)).toEqual(['memory:user/fresh']);
   });
 });

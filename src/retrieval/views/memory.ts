@@ -70,7 +70,20 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // memory at decision time. Spec §2.4 says local > shared > user
     // for resolution; the retrieval surface should reflect what the
     // model would actually see.
-    const listings = deps.registry.list({ deduplicateByName: true });
+    //
+    // Hard-filter on `state=active` and unexpired: the model must
+    // never see memories the operator has quarantined / invalidated
+    // / evicted / purged or that have aged past their `expires`
+    // date. `registry.list({})` returns everything by default
+    // (operator-facing tooling needs broad visibility); retrieval is
+    // the model-facing surface and tightens. Each opt-in costs one
+    // file read per surviving listing — tolerable at the dozens-of-
+    // memories scale and the safety win is worth the I/O.
+    const listings = deps.registry.list({
+      deduplicateByName: true,
+      states: ['active'],
+      includeExpired: false,
+    });
     if (listings.length === 0) return [];
 
     // id → listing lookup. Used twice: once when emitting the BM25
@@ -102,11 +115,12 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
         // `memory_events action=read` per indexed memory would
         // flood the audit log with rows for content the model
         // never saw — same policy as compression fallback
-        // (§retrieval/compression.ts). `peek` mirrors `read`'s
-        // scope precedence (local > shared > user) but skips
-        // `auditRead`. `present` means body loaded; `missing` /
-        // `malformed` / `unknown` fall through as
-        // title+description only (the candidate is still ranked
+        // (§retrieval/compression.ts).
+        //
+        // `peek` mirrors `read`'s scope precedence (local > shared
+        // > user) but skips `auditRead`. `present` means body
+        // loaded; `missing` / `malformed` / `unknown` fall through
+        // as title+description only (the candidate is still ranked
         // on its name + description signal).
         const file = deps.registry.peek(l.name);
         if (file.kind === 'present') {
