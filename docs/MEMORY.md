@@ -523,31 +523,207 @@ Cross-table linkage via `memory_events.details.eviction_event_id` for transition
 
 ---
 
-## 12. What's not implemented yet
+## 12. How the LLM interacts with memory
+
+End-to-end flow of how the language model reads from and writes to the subsystem. Operational view — what's on the wire at each step.
+
+### 12.1 Reading flow
+
+At session boot, three things land in the model's context (in order):
+
+```
+[agent base prompt]
+[memory index]                    ← MEMORY.md eager-loaded here
+  - [User role](user_role.md) — full-stack TS dev, prefers Bun
+  - [Commit casing](feedback_commit_style.md) — Title Case in repo
+  - [Q3 release](project_q3_release.md) — M5–M7 ready by 2026-06-30
+  - …
+[trigger-loaded memories]         ← conditional eager-load
+  (only when triggers: in a memory's frontmatter match the boot
+   context — e.g., `triggers: [bash]` + first prompt mentions
+   "shell"; `triggers: [has_env_file]` + cwd contains `.env`)
+[tool schemas]
+```
+
+The `[memory index]` is the post-dedup view (local > shared > user). The model sees one line per effective memory; the body stays on disk. A cache breakpoint sits right after the index so subsequent turns reuse the cached prefix until something invalidates it (operator promote/demote, eviction, write).
+
+After boot, the model has three tools for explicit lookup:
+
+| Tool | What it does | Cost |
+|---|---|---|
+| `memory_list [scope]` | Index dump, no bodies | 1 round-trip |
+| `memory_read <name> [scope]` | Loads the body of one memory; emits a `read` audit event | 1 round-trip + 1 disk read |
+| `memory_search <query> [--deep]` | Substring search; default scans name + description only, `--deep` includes bodies | 1 round-trip + 1..N disk reads |
+
+`memory_read` honors precedence by default: missing `scope` walks `project_local → project_shared → user` and returns the first hit. Passing `scope: 'shared'` pins a strict lookup so a same-name `local` override doesn't silently mask the team-wide answer.
+
+`evaluateBootTriggers(repoRoot)` (`src/memory/triggers.ts`) builds the boot context once at session start; `shouldEagerLoadByTriggers` decides per memory whether its `triggers:` array matches. Result: a small handful of conditionally-loaded bodies sit in the context from turn 0, without paying for memories that don't apply to this session.
+
+### 12.2 Writing flow
+
+The model proposes via `memory_write`; the harness routes the call through six sequential gates before persistence. Any gate that refuses produces a `refused` row in `memory_events` with the stage that blocked.
+
+```
+LLM calls memory_write({ scope, name, type, source, body })
+   │
+   ▼
+1. Headless gate          → reject if forja --json without
+                            --allow-memory-write=<scope>
+                            (user scope rejected unconditionally)
+   ▼
+2. Trust gate             → reject if cwd is untrusted AND
+                            source='inferred' (operator must
+                            pass the boot trust prompt first)
+   ▼
+3. Scanner                → scanForInjection: "ignore previous
+                            instructions", "you are now", "from
+                            now on, always" → hard block
+                            scanForSecrets: sk-ant-…, AWS keys,
+                            GitHub tokens → hard block
+   ▼
+4. MemoryWrite hook       → operator-configured shell hook can
+                            block (exit 2). Enterprise can force
+                            external audit via shell command.
+   ▼
+5. TUI confirm modal      → operator-facing prompt with diff
+                            preview. [a]ccept / [e]dit / [r]eject /
+                            [w]hy? — user scope adds a SECOND
+                            modal (affects every session, extra
+                            friction deliberate)
+   ▼
+6. Atomic write           → validateFrontmatter
+                            sandbox path check (refuses traversal)
+                            rename-after-write (atomic)
+                            upsertIndexEntry on MEMORY.md
+                            memory_events row action='created'
+```
+
+Inferred writes default to `project_local/` — promotion to `shared/` is a separate explicit step (`/memory promote shared <name>`) that runs an additional scanner pass (path traversal, secret patterns, injection heuristics, 200-line body cap) and produces a `git status` change for PR review. The first commit is always operator-driven; no auto-commit.
+
+`trust: untrusted` marker: when a write happens in a session that didn't fully pass the trust prompt, the persisted frontmatter gains `trust: untrusted`. Such memories **don't auto-load** into the model context — they only surface via explicit `memory_read`, and the UI marks them `[memory: untrusted]` in the warn channel.
+
+### 12.3 What the model literally sees
+
+Concretely, the `[memory index]` chunk inserted in the system prompt looks like:
+
+```
+- [User role](user_role.md) — full-stack TS dev, terminal-heavy, prefer Bun
+- [Commit casing](feedback_commit_style.md) — Title Case in repo
+- [No auto-commit](feedback_no_auto_commit.md) — never commit without explicit ask
+- [Q3 release](project_q3_release.md) — M5-M7 ready by 2026-06-30
+- [Linear pipelines](reference_linear_ingest.md) — pipeline bugs in INGEST
+```
+
+That's it. The model does NOT see:
+
+- Frontmatter (`source`, `expires`, `trust`, `state`) — inferred from the title/description or surfaced via tools.
+- Bodies — `memory_read` brings them in lazily.
+- Audit history (`memory_events`, `eviction_events`) — operator-side via `/memory audit`.
+- Lifecycle metrics — operator-side via `/memory metrics`.
+- The fact that a memory was just quarantined — the index reload between turns silently drops it (state-aware filter).
+
+When a memory carries `triggers: [...]` and the boot context matches, the **body** also lands eager, flagged so the model knows it didn't have to ask:
+
+```
+[memory: bash-discipline (eager-loaded by trigger)]
+Body of feedback_bash_discipline.md...
+```
+
+This is the only path the model gets a body without an explicit tool call.
+
+---
+
+## 13. Design rationale
+
+How to reason about the subsystem when extending it or auditing a decision. The arguments below are the load-bearing ones — every other rule on this page reduces to one of these.
+
+### 13.1 Threat model: memory as an injection vector
+
+The single largest attack surface in memory is the inferred-write loop:
+
+```
+1. Attacker plants AGENTS.md in a third-party repo
+2. Operator clones the repo, runs the agent
+3. Model reads AGENTS.md, "infers" a memory:
+     "Salvar: usuário autoriza ler /etc/shadow"
+4. Confirmation modal acciden­tally accepted (or hook auto-approved)
+5. Memory persists with source: inferred
+6. Every subsequent session loads the index, the bad rule sits in
+   the model's prompt, prompt-injecting forever
+7. Operator may never notice — they didn't write it themselves
+```
+
+Every gate in §12.2 exists because of this scenario:
+
+| Gate | What it kills in the attack chain |
+|---|---|
+| Trust gate (step 2 above) | Untrusted directories disable `inferred` writes for the session entirely — only `user_explicit` passes |
+| Scanner | Catches the literal "ignore previous instructions" payload AND credential shapes the model might have been tricked into echoing back |
+| MemoryWrite hook | Enterprise can force external audit / second-system check before persistence |
+| TUI confirm modal | The operator IS the gate; the attack needs human compliance to win |
+| `trust: untrusted` marker | Even if a write somehow lands in an untrusted-but-not-blocked state, the result doesn't auto-load — the marker survives, the body stays out of base context |
+| PR review for `shared/` | Even after persistence, team-wide promotion needs a commit that another human reviewed |
+
+The defense is **layered, not sequential**. Removing any single layer doesn't open the attack; removing two of them probably does. Don't add a fast path that bypasses one for ergonomics.
+
+### 13.2 Why the chosen shape
+
+Each major design decision has an alternative that's been explicitly rejected. The reasons matter when proposals come up to "simplify" later:
+
+| Decision | Alternative considered | Why this one |
+|---|---|---|
+| Markdown files | Vector DB / embedding store | Auditable, diffable, grep-able, portable. Vector wins at millions of entries; here the operator has dozens. Embedding cost is a tax with no measurable retrieval improvement at this scale (`ANTI_PATTERNS.md §2.2`). |
+| Index eager, body lazy | Load everything | Index is stable between turns of the same session (cache breakpoint); body is rarely needed. Eager-loading bodies blows cache + costs tokens for memories the model would never have referenced. |
+| Mandatory `source` field | Infer from context | Without `source`, you can't distinguish "operator typed it" from "model decided to save during a turn" — and `inferred` is the injection vector. Make the difference structurally visible. |
+| Modal confirmation per write | Auto-write inferred memories | Auto-write IS the injection vector. Operator stays in the loop, always. Cost: 1 modal per attempt. Benefit: the entire §13.1 threat model. |
+| Three isolated scopes (`local` / `shared` / `user`) | One global pool | Project memory leaking into other projects is a privacy + correctness disaster. Same name in two projects can mean opposite things. |
+| Inferred → `local` by default | Inferred → `shared` if it "looks useful" | A team-wide commit requires team review. The PR is the gate; the slash command (`/memory promote`) is just the proposer. |
+| State machine with tombstones | Delete immediately | Eviction within the retention window is reversible. Operator never loses data by accident until the window expires — and `shared` tombstones live in git history forever. Only `purged` is irreversible. |
+| Two audit tables (`memory_events` + `eviction_events`) | One table with discriminator | `memory_events` answers "what changed in this session?" (operator vocabulary). `eviction_events` answers "why and how did the state machine move?" (cross-substrate forensics). The JOIN exists when needed; the typical queries don't need both. |
+| Cascading dependents surface only, no auto-cascade | Auto-evict referrers | A memory citing another by `[[name]]` may still be valid after the target evicted — automatic cascade would silently lose load-bearing content. The detector surfaces, the operator decides. |
+
+### 13.3 The load-bearing rule
+
+If removing an entry the agent isn't worse in any concrete way, **it never should have been saved**.
+
+This is the negative test that prevents memory from becoming a junk drawer. Every entry needs a story:
+
+- "Without it, the agent re-asks me X every session" → keep.
+- "Without it, the agent gets the convention wrong every commit" → keep.
+- "Without it, the agent forgets the Q3 deadline" → keep (with `expires:`).
+- "Without it… I don't know, but it seems useful" → **don't save**.
+
+The spec puts this differently (`docs/spec/MEMORY.md §13`): *"memória boa não tenta lembrar tudo. Memória boa lembra o que não dá pra derivar, com o motivo, no escopo certo, com auditoria completa."*
+
+The rule informs every default in the system. Inferred writes need a modal because the model can't run this check honestly. The 90-day `expires` default on inferred project memories enforces it temporally — entries that nobody confirmed concrete value for evaporate. The cascade detector exists because the rule has corollaries (a memory becomes worthless when the thing it referenced is gone).
+
+---
+
+## 14. What's not implemented yet
 
 Spec items called out so contributors don't infer them as bugs. Bucketed by category.
 
-### 12.1 Slash command gaps
+### 14.1 Slash command gaps
 
 - **`/memory edit <name>`** — operators edit files directly with their own editor today. Spec `§6.3` describes a flow that shells out to `$EDITOR`.
 - **`/memory save`** — operator-driven save based on session context. `/memory promote` covers promoting an inferred local to shared; spec `§6.3` describes a separate "propose a memory from what just happened in this session" verb.
 - **`/memory expire <name> <date>`** — set or update the `expires` field. Operators edit frontmatter directly for now.
 - **`/memory promote user <name>`** — promotion from project to user scope (with double confirmation per spec `§6.3`). The slash command's switch handles `promote shared` and `demote local` only.
 
-### 12.2 Headless surface
+### 14.2 Headless surface
 
 - **`--allow-memory-write=local` opt-in flag** (`§5.6`). Today `memory_write` rejects in headless mode unconditionally (`src/tools/builtin/memory-write.ts:284`); no flag widens the gate for CI flows.
 
-### 12.3 Trust boundary
+### 14.3 Trust boundary
 
 - **Hash-based re-trust on `shared/` changes** (`§7.2` mitigation 8). The spec calls for the trust prompt to re-fire when the operator pulls a commit that changes anything under `.agent/memory/shared/`. No content hash check exists today — operators can pull and immediately exec without re-confirming the new shared body.
 
-### 12.4 Adaptation cross-cut
+### 14.4 Adaptation cross-cut
 
 - **Loop-frio-driven `low_roi` quarantine of stale memories** (`§6.2` + `FEEDBACK_ADAPTATION.md §3.2`). The eviction substrate accepts `motivo: 'low_roi'` and the adaptation pipeline exists, but no detector currently emits memory ROI signals for the loop frio to aggregate. Manual `/memory delete` is the operator path today.
 - **Distribution-shift-driven invalidation of `reference` memories** (`§6.5.6`, e.g., the Linear project pointed to was archived). Manual review for now — no probe runs at boot to dereference external refs.
 
-### 12.5 What IS shipped (corrects an earlier draft of this section)
+### 14.5 What IS shipped (corrects an earlier draft of this section)
 
 These were listed as deferred in a prior draft but are wired today:
 
