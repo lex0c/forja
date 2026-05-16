@@ -226,6 +226,25 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
       return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Distinguish cancellation from a genuine pipeline failure.
+      // Pre-call aborts return early at the entry-point check above
+      // (`tool.aborted`, retryable). But if the signal flips AFTER
+      // execute() starts — during validation, during the await on
+      // the runner, or while a subprocess view is in-flight — the
+      // runner throws `retrieval aborted before <stage>` /
+      // `retrieval aborted mid-flight` and we land here. Mapping
+      // that to `retrieval.internal_error` (non-retryable) would
+      // misclassify normal cancellation as a hard failure and the
+      // caller would lose the standard `tool.aborted` semantic
+      // (retryable=true, same shape as every other tool's abort
+      // path). The signal state at catch time is the canonical
+      // witness — `ctx.signal.aborted` is true iff the cancellation
+      // request landed before we got here.
+      if (ctx.signal.aborted) {
+        return toolError(ERROR_CODES.aborted, `tool aborted during retrieval: ${msg}`, {
+          retryable: true,
+        });
+      }
       return toolError('retrieval.internal_error', `retrieval pipeline threw: ${msg}`, {
         retryable: false,
       });

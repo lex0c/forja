@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(tools/retrieve-context) — return tool.aborted (not retrieval.internal_error) for mid-flight cancellation
+
+The pre-call abort check at `execute()` entry correctly returns `tool.aborted` (retryable=true), but the catch block around `await ctx.retrieveContext(...)` mapped EVERY thrown error to `retrieval.internal_error` with `retryable: false`. When the signal flipped AFTER entry — during validation, during the await on the runner, or while a subprocess view was in-flight — the runner threw `retrieval aborted before <stage>` (pipeline check, commit `4935fef`) or `retrieval aborted mid-flight` (runner late check) and the catch misclassified it as a hard internal failure. Callers lost the standard `tool.aborted` semantic and could either retry forever (the standard retry-on-abort pattern doesn't fire because retryable=false) or surface the wrong failure reason to the operator.
+
+Fix: catch inspects `ctx.signal.aborted` and maps cancellation to `tool.aborted` (retryable=true) when true; genuine errors keep `retrieval.internal_error` (retryable=false) when the signal stayed un-aborted. The signal state at catch time is the canonical witness — `ctx.signal.aborted` is true iff a cancellation request landed before the catch executed.
+
+Two tests in `tests/tools/retrieve-context.test.ts`:
+- Mid-flight abort: runner aborts the controller and throws — assert `tool.aborted` with `retryable: true` and message containing "aborted during retrieval".
+- Counterpart: real failure (e.g., `disk full`) with un-aborted signal stays `retrieval.internal_error` with `retryable: false` — confirms the fix didn't over-classify hard failures as abortable.
+
 ## [2026-05-16] fix(memory/registry) — apply state/expiry filter before deduplicating by name
 
 `registry.list()` deduplicated by name BEFORE evaluating `states` / `includeExpired`. A higher-precedence shadow (e.g. `project_local/foo`) that was quarantined / invalidated / evicted / expired would win the precedence walk, then get dropped by the frontmatter filter — silently suppressing a lower-precedence ELIGIBLE sibling (`project_shared/foo` or `user/foo`) that should have surfaced. The retrieval memory view, which calls `list({ deduplicateByName: true, states: ['active'] })`, ended up with zero candidates for that name even when a valid active version existed in another scope.

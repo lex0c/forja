@@ -272,6 +272,62 @@ describe('retrieve_context — validation', () => {
     if ('is_error' in r)
       expect((r as { error_message: string }).error_message).toContain('pipeline boom');
   });
+
+  test('mid-flight abort surfaces as tool.aborted (retryable), not retrieval.internal_error', async () => {
+    // Regression: the catch block previously mapped every runner
+    // throw to `retrieval.internal_error` with retryable=false.
+    // When the signal flipped DURING the await (operator Ctrl+C
+    // mid-call, parent shutdown propagating, runner detecting the
+    // signal between stages and throwing `retrieval aborted
+    // before <stage>`), callers lost the standard tool.aborted
+    // semantic. The catch now inspects `ctx.signal.aborted` and
+    // maps cancellation to tool.aborted / retryable=true.
+    const controller = new AbortController();
+    const midFlightAbortRunner: RetrieveFn = async () => {
+      // Simulate the runner detecting the abort and throwing —
+      // matches the pipeline's `aborted before <stage>` message
+      // (commit `4935fef`) and the runner's `aborted mid-flight`.
+      controller.abort();
+      throw new Error('retrieval aborted before expand');
+    };
+    const r = await retrieveContextTool.execute(
+      { query: 'auth' },
+      makeCtx({
+        signal: controller.signal,
+        retrieveContext: midFlightAbortRunner,
+      }),
+    );
+    expect(r).toMatchObject({ is_error: true, error_code: 'tool.aborted' });
+    if ('is_error' in r) {
+      const err = r as { error_message: string; retryable?: boolean };
+      expect(err.retryable).toBe(true);
+      expect(err.error_message).toContain('aborted during retrieval');
+    }
+  });
+
+  test('non-abort throw with signal NOT aborted still maps to retrieval.internal_error', async () => {
+    // Counterpart to the regression above: if the runner throws
+    // for a genuine reason (DB error, bug) AND the signal stays
+    // un-aborted, we keep the `retrieval.internal_error`
+    // classification so retries don't fire on a hard failure.
+    const controller = new AbortController();
+    // Deliberately do NOT call controller.abort().
+    const realFailureRunner: RetrieveFn = async () => {
+      throw new Error('disk full');
+    };
+    const r = await retrieveContextTool.execute(
+      { query: 'auth' },
+      makeCtx({
+        signal: controller.signal,
+        retrieveContext: realFailureRunner,
+      }),
+    );
+    expect(r).toMatchObject({ is_error: true, error_code: 'retrieval.internal_error' });
+    if ('is_error' in r) {
+      const err = r as { retryable?: boolean };
+      expect(err.retryable).toBe(false);
+    }
+  });
 });
 
 // ─── runner end-to-end ───────────────────────────────────────────────
