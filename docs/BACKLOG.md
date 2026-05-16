@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] docs(memory+retrieval) — formalize audit split + retrieval_trace immutability policy (review H4+H5)
+
+H4 and H5 from the memory-flow code review are accepted as a policy decision rather than a code change. The split between `memory_events` (operator-driven, explicit memory operations) and `retrieval_trace.context_slot_json.included[]` (model-facing retrieval deliveries) is the established surface, and `retrieval_trace` bodies stay frozen after the originating memory is evicted/purged. The deliberate-not-accidental nature was implicit in the implementation; this entry promotes it to documented policy.
+
+Three doc updates land in the same commit:
+
+- `docs/MEMORY.md §11.1` — new subsection "Audit split with `retrieval_trace`" tabulating which surface answers which audit question. Calls out that `/memory audit` and `/agent retrieval audit` are complementary, not redundant: an operator asking "what did the model see of memory X" needs both surfaces. Documents why retrieval-internal paths (`peek` for BM25 corpus and compression fallback) are excluded from `memory_events`.
+- `docs/MEMORY.md §13.3` — new "Audit immutability on `retrieval_trace`" subsection (renumbered the original §13.3 load-bearing rule to §13.4). Three reasons listed: replay determinism, audit honesty, subsystem decoupling. Names the escape hatch (session purge via FK CASCADE) and a possible future targeted-purge command if a concrete use case appears.
+- `docs/spec/RETRIEVAL.md §10.4` — mirror of MEMORY §13.3 in PT-BR for the architect's spec, linked back to MEMORY.md §11.1 for the cross-table story.
+
+Two code comments add the same policy reference to the load-bearing sites:
+
+- `src/memory/lifecycle.ts` module header — documents that eviction / purge paths do NOT touch `retrieval_trace` and cites MEMORY.md §13.3.
+- `src/storage/migrations/053-retrieval-trace.ts` schema header — documents `context_slot_json.included[].content` as frozen-on-eviction and cites the policy in both spec docs.
+
+No code-behavior change. No new tests — the absence of a hook from `lifecycle` to `retrieval_trace` is the policy; the docs make it explicit. The `feat/retrieval` review's H4 (audit story gap) and H5 (eviction-doesn't-scrub-trace) are closed as deliberate trade-offs rather than open bugs.
+
 ## [2026-05-16] fix(retrieval/views/memory) — scope-pin peek in BM25 corpus build (review H3)
 
 `src/retrieval/views/memory.ts:111` called `deps.registry.peek(l.name)` without a `{ scope }` option. The iterated listing already carries the post-dedupe winning scope (`l.scope`); the lookup re-walked precedence. Today's behavior was usually correct via precedence, but inconsistent with the compression resolver (compression.ts:163, scope-pinned) and a registry-state change mid-call (scope migration, rename, eviction in another scope) could land the wrong body in the BM25 corpus.

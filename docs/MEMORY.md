@@ -521,6 +521,24 @@ The tables are intentionally separate because they answer different questions:
 
 Cross-table linkage via `memory_events.details.eviction_event_id` for transitions that emit both rows.
 
+### 11.1 Audit split with `retrieval_trace`
+
+A third table, `retrieval_trace` (migration 053), lives in the retrieval subsystem but its existence is visible to anyone auditing memory access. The split is deliberate:
+
+| Surface the operator inspects | Authoritative table |
+|---|---|
+| `memory_read` tool call (model asked by name) | `memory_events action=read` |
+| `memory_write` tool call | `memory_events action=created` / `updated` / `refused` |
+| State transition (quarantine / evict / restore / purge) | `memory_events` + `eviction_events` |
+| Memory body delivered via `retrieve_context` tool | `retrieval_trace.context_slot_json.included[]` |
+
+`retrieve_context` does NOT emit `memory_events action=read` rows for memories it surfaces. The audit-immutability policy on `retrieval_trace` (§13.3) carries the inclusion record forward as the canonical "model saw this body via retrieval" signal. `/memory audit` and `/agent retrieval audit` are the two complementary surfaces:
+
+- An operator asking "what did the model see of memory `user_role` in this session?" needs both tables: `memory_events` for explicit `memory_read` tool calls, `retrieval_trace.included` for retrieval-surfaced inclusions. A JOIN-style query would gate this; today the operator inspects each surface separately and reconciles.
+- Retrieval-internal paths (BM25 corpus build with `loadBodies=true`, compression fallback probing levels) use `registry.peek` so they don't emit `memory_events`. The model never sees the bodies they touch — those reads are pipeline-internal heuristics, not deliveries.
+
+This is the asymmetry that lets `/memory audit` stay focused on operator-driven actions without inflating with retrieval-internal noise, AT THE COST of needing two surfaces when the question is "what did the model receive."
+
 ---
 
 ## 12. How the LLM interacts with memory
@@ -682,7 +700,19 @@ Each major design decision has an alternative that's been explicitly rejected. T
 | Two audit tables (`memory_events` + `eviction_events`) | One table with discriminator | `memory_events` answers "what changed in this session?" (operator vocabulary). `eviction_events` answers "why and how did the state machine move?" (cross-substrate forensics). The JOIN exists when needed; the typical queries don't need both. |
 | Cascading dependents surface only, no auto-cascade | Auto-evict referrers | A memory citing another by `[[name]]` may still be valid after the target evicted — automatic cascade would silently lose load-bearing content. The detector surfaces, the operator decides. |
 
-### 13.3 The load-bearing rule
+### 13.3 Audit immutability on `retrieval_trace`
+
+When `retrieve_context` returns a `contextSlot.included` entry whose `nodeId` is `memory:<scope>/<name>`, the memory's raw body is inlined into `retrieval_trace.context_slot_json` and stays there for the life of the trace (until the parent session is purged, at which point the FK CASCADE cleans it). The body persists even if the memory itself is later evicted, purged, or scope-shrunk.
+
+This is **deliberate**, not accidental. Three reasons:
+
+1. **Replay determinism.** Eval re-ranking against historical traces needs the actual body the model saw at decision time. Scrubbing on eviction would silently mutate the historical record and break replay correctness.
+2. **Audit honesty.** "What was in the model's context at time T" should be a stable answer. A scrub-on-eviction policy means the answer changes depending on when the auditor asks, which is the opposite of what audit logs are for.
+3. **Subsystem decoupling.** Hooking the lifecycle path (`src/memory/lifecycle.ts`) into the retrieval trace table would couple two subsystems that today share only the DB schema. The coupling is reversible-by-implementation, but the immutability semantic is reversible-by-design — promote it to a property of the system rather than a knob.
+
+If an operator needs "this memory gone from everywhere, including past traces," the escape hatch is session purge (FK CASCADE drops every `retrieval_trace` row for that session). A future targeted "purge-traces-for `<memory>`" slash command would fit alongside `/agent retrieval` if a concrete use case appears — until then, the immutability default is the right trade.
+
+### 13.4 The load-bearing rule
 
 If removing an entry the agent isn't worse in any concrete way, **it never should have been saved**.
 

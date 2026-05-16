@@ -44,6 +44,18 @@
 //   query. Nullable so a pipeline that crashed mid-stage still
 //   produces a partial row that explains how far it got.
 //
+//   AUDIT IMMUTABILITY: `context_slot_json.included[N].content`
+//   carries the raw memory / session body inline. When the
+//   underlying memory is later evicted / purged / scope-shrunk,
+//   the inlined body STAYS in this column — the trace is a
+//   frozen snapshot of what the model saw at decision time, not
+//   a live mirror. Eval replay against historical traces needs
+//   the real content; scrubbing on eviction would silently
+//   mutate the historical record. See MEMORY.md §13.3 +
+//   RETRIEVAL.md §10 for the policy rationale. Cleanup at the
+//   trace level happens ONLY via session purge (FK CASCADE on
+//   `session_id`).
+//
 //   `context_slot_json` carries the FULL slot — both `included`
 //   and `skipped`. An earlier draft split skipped into a separate
 //   column to make per-skip rendering cheaper; the savings were

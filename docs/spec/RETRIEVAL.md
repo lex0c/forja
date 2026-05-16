@@ -357,6 +357,20 @@ Integra com `AUDIT.md` (decisão é auditável).
 
 Replay de queries históricas com ground truth (humano marcou "isto deveria estar no contexto"). Compara recall@K, precision@K, MRR. Pré-requisito para qualquer mudança de pesos em `§5.2`.
 
+### 10.4 Imutabilidade do trace
+
+O `context_slot_json.included[N].content` carrega o body bruto inline (memory body, message text, etc.). Quando o objeto referenciado é mais tarde despejado / purgado / muda de escopo no subsistema de origem (e.g., `/memory delete user_role`), **o body inlined permanece no trace** até o purge da sessão pai (FK CASCADE em `session_id`).
+
+É **deliberado**, não acidental:
+
+1. **Determinismo de replay.** Eval re-rank contra traces históricos precisa do body real que o modelo viu na hora da decisão. Scrub-on-eviction mutaria silenciosamente o registro histórico e quebraria a correção do replay.
+2. **Honestidade de auditoria.** "O que estava no contexto do modelo no tempo T" deve ser uma resposta estável. Uma política scrub-on-eviction faz a resposta mudar dependendo de quando o auditor pergunta — o oposto do que logs de auditoria existem para garantir.
+3. **Desacoplamento de subsistemas.** Plugar o lifecycle do subsistema de origem no `retrieval_trace` acoplaria dois subsistemas que hoje compartilham só o schema do DB. O acoplamento é reversível-por-implementação, mas o semântico de imutabilidade é reversível-por-design — sobe a propriedade pra sistema, não pra knob.
+
+Escape hatch para o operador que precisa "esse body fora de toda parte, traces inclusive": purge da sessão (FK CASCADE limpa todo `retrieval_trace` daquela sessão). Um futuro slash command `/agent retrieval purge-traces-for <objeto>` se encaixa em `§10.1` se houver caso de uso concreto — por enquanto, o default imutável é o trade certo.
+
+A política split entre `memory_events` (operações operator-visíveis explícitas) e `retrieval_trace.context_slot_json.included` (entrega via retrieval) é documentada em `docs/MEMORY.md §11.1`. As duas tabelas são complementares; um JOIN bate "o que o modelo recebeu" mas o auditor típico segue um surface por vez.
+
 ---
 
 ## 11. Anti-patterns (link com `ANTI_PATTERNS.md`)

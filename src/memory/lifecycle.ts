@@ -28,6 +28,17 @@ import { type WriteMemoryResult, writeMemory } from './writer.ts';
 //     atomic on POSIX. Discriminated-result return shape, no throws
 //     for caller-recoverable conditions.
 //
+// AUDIT IMMUTABILITY (MEMORY.md §13.3): eviction / purge paths in
+// this module do NOT touch `retrieval_trace`. A memory body that
+// landed in a past `contextSlot.included[]` entry stays inlined in
+// `context_slot_json` for the life of the parent session (cleaned
+// by FK CASCADE on session purge). Spec §10 in RETRIEVAL.md and
+// §13.3 in MEMORY.md document this as deliberate — replay
+// determinism, audit honesty, and subsystem decoupling all argue
+// for the trace being a frozen snapshot of what the model saw,
+// not a live mirror of current memory state. Operators needing
+// "this body gone from past traces too" use session purge.
+//
 //   - `findExpiredMemories(registry, today)` — scan the registry for
 //     memories whose `expires:` frontmatter field is on or before
 //     `today` (YYYY-MM-DD lex compare = chrono compare for ISO
