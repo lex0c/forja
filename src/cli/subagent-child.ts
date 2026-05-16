@@ -841,6 +841,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     const reflectionMode = audit.contextRecipe?.stepReflection;
     const promptWithReflection = composeWithReflectionBlock(promptWithSchema, reflectionMode);
     let resolvedSystemPrompt = composeWithParallelHint(promptWithReflection);
+    // Eager-load inventory captured at assembly so the harness
+    // can emit `memory_provenance` rows once the child's session
+    // is fully initialized (the loop fires after createSession;
+    // for preassigned-session subagents that's a verification
+    // step but the same emit-point). Empty array survives the
+    // "no memory" / "wantsMemory=false" branch without special
+    // casing on the consumer side.
+    let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
     if (opts.memoryCwd !== undefined && wantsMemory) {
       // Resolve repo root from the parent's cwd. Same fix as
       // bootstrap.ts: parent's invocation cwd may be a subdir
@@ -884,6 +892,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         ...(memoryFilter !== undefined ? { memoryFilter } : {}),
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
+      eagerExposures = memorySection.eagerLoaded;
     }
 
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Three paths,
@@ -1065,6 +1074,10 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // Conditional spread: omitted ⇒ registry stays undefined
       // ⇒ memory tools surface `registry_unavailable`.
       ...(memoryRegistry !== undefined ? { memoryRegistry } : {}),
+      // Eager-load provenance inventory (MEMORY.md §11.2). Always
+      // passed — empty array survives the no-memory branch and
+      // the loop's emit is a no-op then.
+      eagerExposures,
       // Hook chain resolved above. Always passed (even when
       // empty) — the harness's dispatch sites short-circuit on
       // empty arrays. Locked enterprise hooks reach the

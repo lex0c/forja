@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — eager-load provenance emitter (S1/T1.4)
+
+Second emitter on the provenance trail. Eager-loaded memories — the names + descriptions the model sees in the system prompt before any tool call fires — now produce one `memory_provenance` row per `(session, memory)` at session start. Surface is `eager` and `tool_call_id` is NULL by construction (the exposure precedes any tool call).
+
+The challenge: assembly happens at CLI boot (`bootstrap.ts`), but the session id doesn't exist until the harness loop calls `createSession`. The schema needs both — the session FK is non-nullable and FK CASCADE means the row must reference a real session row. Solution: capture an inventory at assembly time (`AssembleMemorySectionResult.eagerLoaded`), thread it through `HarnessConfig.eagerExposures`, emit in the loop right after `createSession`.
+
+The inventory is frozen at assembly, not at emit. An operator who rewrites a memory file between boot and session-start would otherwise drift the hash / state from "what landed in the prompt" to "what's on disk now", defeating the replay-fidelity contract. The hash is computed from `serializeMemoryFile` (the canonical writer), so memories the system wrote round-trip exactly; hand-edits with different whitespace hash differently, which IS the drift signal.
+
+Architectural decisions worth tracking:
+
+- `EagerExposure` lives in `src/memory/types.ts`, NOT `src/cli/memory-prompt.ts`, so `src/harness/types.ts` can carry it via `HarnessConfig.eagerExposures` without dragging a `cli/` dependency into the harness layer.
+- The emit is best-effort with `process.stderr.write` "AUDIT DRIFT" on failure — mirrors the registry's `auditRead` / `auditExposure` discipline (provenance is observability, not correctness; a DB throw must NOT abort session bring-up). Bad inventory rows (e.g., invalid scope passing through the inventory layer) get logged and skipped; following rows still emit.
+- Subagent boot uses the same plumbing: `subagent-child.ts` lifts the inventory out of the conditional `wantsMemory` block via `let eagerExposures: readonly EagerExposure[] = []`, then forwards it identically. Each subagent session emits its own eager-load trail under its own session id.
+- Dedupe by name applies to the inventory same way it applies to the rendered text — one row per name even when multiple scopes shadow it. Spec semantic is "once per (session, memory)"; the most-specific scope wins.
+
+Uncertainty path preserved: when `peek` returns missing / malformed, the index entry STILL ships in the eager section ("uncertainty → include" per existing module header). The corresponding inventory row has `memoryContentHash: null` and defaults `memoryStateAtExposure: 'active'`. The provenance row still emits — the operator-visible index line surfaced even when the body was unreadable, and the audit trail captures that.
+
+Tests: 10 new (6 in `memory-prompt.test.ts` covering inventory population for trusted / untrusted / dedupe / empty / uncertainty / hash determinism; 4 in `loop.test.ts` covering the emit happy path / empty array / absent field / audit-drift fault tolerance). Tests verify: surface='eager' + toolCallId=NULL invariant, hash + state round-trip through the emit, session-scoped via the new createSession's id, audit-drift posture continues to emit good rows after a bad one threw.
+
 ## [2026-05-16] feat(memory) — exposure provenance: schema + repo + memory_read emitter (S1/T1.1-T1.3)
 
 Slice 1 of the memory lifecycle detectors plan. Records EXPOSURES — moments where a memory's bytes were visible to the model — for the `memory_read` and `memory_search --deep` paths. Foundational for Slice 2 (`verify_failed`) and Slice 3 (`user_override_repeated`) detectors which layer correlation analysis on top of this lower-bound trace.

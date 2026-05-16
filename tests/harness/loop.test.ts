@@ -6,6 +6,7 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
 import { getSession, listSessions } from '../../src/storage/repos/sessions.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
@@ -2321,6 +2322,137 @@ describe('runAgent', () => {
       });
       expect(result.status).toBe('done');
       expect(sinkCalls).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('eager-load provenance (S1/T1.4)', () => {
+    test('emits one provenance row per eagerExposure after createSession', async () => {
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        eagerExposures: [
+          {
+            scope: 'user',
+            name: 'role',
+            memoryContentHash: 'a'.repeat(64),
+            memoryStateAtExposure: 'active',
+          },
+          {
+            scope: 'project_local',
+            name: 'commit-style',
+            memoryContentHash: 'b'.repeat(64),
+            memoryStateAtExposure: 'quarantined',
+          },
+        ],
+      });
+      expect(result.status).toBe('done');
+      const sessions = listSessions(db);
+      const sid = sessions[0]?.id;
+      expect(sid).toBeDefined();
+      if (sid === undefined) return;
+      const roleRows = listProvenanceForMemory(db, sid, 'user', 'role');
+      expect(roleRows).toHaveLength(1);
+      expect(roleRows[0]?.surface).toBe('eager');
+      expect(roleRows[0]?.toolCallId).toBeNull();
+      expect(roleRows[0]?.memoryContentHash).toBe('a'.repeat(64));
+      expect(roleRows[0]?.memoryStateAtExposure).toBe('active');
+      const commitRows = listProvenanceForMemory(db, sid, 'project_local', 'commit-style');
+      expect(commitRows).toHaveLength(1);
+      expect(commitRows[0]?.memoryStateAtExposure).toBe('quarantined');
+    });
+
+    test('empty eagerExposures array emits NO rows', async () => {
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        eagerExposures: [],
+      });
+      expect(result.status).toBe('done');
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      // No rows for any conceivable (scope, name) pair — sample-check
+      // a plausible one to guard against accidental fall-through.
+      expect(listProvenanceForMemory(db, sid, 'user', 'whatever')).toEqual([]);
+    });
+
+    test('omitted eagerExposures emits NO rows (default path)', async () => {
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+      });
+      expect(result.status).toBe('done');
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      expect(listProvenanceForMemory(db, sid, 'user', 'role')).toEqual([]);
+    });
+
+    test('invalid memoryScope on one exposure does NOT abort run (audit drift)', async () => {
+      // The repo guard throws for bogus scopes; the loop must
+      // swallow + log to stderr so a bad inventory row doesn't
+      // crash session bring-up. Following rows still emit.
+      const original = process.stderr.write.bind(process.stderr);
+      const captured: string[] = [];
+      process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+        captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+        return true;
+      }) as typeof process.stderr.write;
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      try {
+        const result = await runAgent({
+          provider: handle.provider,
+          toolRegistry: registry,
+          permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+          db,
+          cwd: '/p',
+          userPrompt: 'hi',
+          eagerExposures: [
+            {
+              scope: 'bogus' as never,
+              name: 'broken',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+            {
+              scope: 'user',
+              name: 'good',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+          ],
+        });
+        expect(result.status).toBe('done');
+      } finally {
+        process.stderr.write = original;
+      }
+      expect(captured.join('')).toMatch(/AUDIT DRIFT.*eager exposure.*broken/);
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      // The good entry's row landed even though the bad entry threw.
+      expect(listProvenanceForMemory(db, sid, 'user', 'good')).toHaveLength(1);
     });
   });
 });

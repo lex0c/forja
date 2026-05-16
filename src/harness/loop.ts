@@ -59,6 +59,7 @@ import {
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
+import { recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -885,6 +886,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             : {}),
         });
         sessionId = session.id;
+      }
+
+      // Eager-load provenance emit (MEMORY.md §11.2, S1/T1.4).
+      // The CLI bootstrap froze the inventory at system-prompt
+      // assembly time; this is the first moment a sessionId
+      // exists to link the exposures against. One row per
+      // (session, memory) with surface='eager' and
+      // tool_call_id=NULL — eager-load happens BEFORE any tool
+      // call exists, so the FK is intentionally absent.
+      //
+      // Best-effort: a DB failure here MUST NOT abort startup
+      // (provenance is observability, not correctness — same
+      // posture as registry.auditExposure). Failures land on
+      // stderr as AUDIT DRIFT.
+      if (config.eagerExposures !== undefined && config.eagerExposures.length > 0) {
+        for (const exposure of config.eagerExposures) {
+          try {
+            recordProvenance(config.db, {
+              sessionId,
+              toolCallId: null,
+              memoryScope: exposure.scope,
+              memoryName: exposure.name,
+              surface: 'eager',
+              memoryContentHash: exposure.memoryContentHash,
+              memoryStateAtExposure: exposure.memoryStateAtExposure,
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(
+              `memory: AUDIT DRIFT: failed to record eager exposure for ${exposure.name} (${exposure.scope}): ${msg}\n`,
+            );
+          }
+        }
       }
 
       // bg manager creation MUST happen here, after sessionId is

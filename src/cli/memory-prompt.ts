@@ -1,9 +1,14 @@
 import {
   type BootContext,
   EMPTY_BOOT_CONTEXT,
+  type EagerExposure,
+  type MemoryFile,
   type MemoryRegistry,
+  type MemoryScope,
+  serializeMemoryFile,
   shouldEagerLoadByTriggers,
 } from '../memory/index.ts';
+import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';
 
 // Eager memory index injection into the system prompt.
 //
@@ -158,6 +163,18 @@ export interface AssembleMemorySectionResult {
   // observability can use it to track "memory token cost"
   // ratios).
   entryCount: number;
+  // Inventory of memories that landed in the eager-load section,
+  // captured at assembly time. The harness loop consumes this
+  // right after `createSession` to emit one `memory_provenance`
+  // row per (session, memory) with surface='eager' (MEMORY.md
+  // §11.2). Hash + state-at-exposure are pinned here, not when
+  // the loop emits, because the operator may rewrite the file
+  // between assembly and session start — pinning at assembly
+  // matches the spec semantic: "the bytes that landed in the
+  // model's window at boot".
+  //
+  // Empty when no memories rendered (matches `entryCount: 0`).
+  eagerLoaded: readonly EagerExposure[];
 }
 
 export const assembleMemorySection = (
@@ -178,7 +195,7 @@ export const assembleMemorySection = (
   // more-specific scope is marked untrusted".
   const all = input.registry.list();
   if (all.length === 0) {
-    return { text: '', entryCount: 0 };
+    return { text: '', entryCount: 0, eagerLoaded: [] };
   }
   const bootContext = input.bootContext ?? EMPTY_BOOT_CONTEXT;
   // Combined per-memory filter: spec §7.2.2 trust + spec §4.3
@@ -186,11 +203,20 @@ export const assembleMemorySection = (
   // pieces of state (frontmatter.trust + frontmatter.triggers),
   // saving disk reads vs filtering in two passes. See module
   // header for failure-mode rationale (uncertain peek → include).
-  const eligible = all.filter((l) => {
+  //
+  // The peek's MemoryFile is carried alongside the listing so the
+  // dedupe/render loop can derive eager-exposure metadata without
+  // a second peek. `null` when peek returned anything other than
+  // `present` (matches the "uncertainty → include" branch).
+  const eligible: Array<{ listing: (typeof all)[number]; file: MemoryFile | null }> = [];
+  for (const l of all) {
     const peek = input.registry.peek(l.name, { scope: l.scope });
-    if (peek.kind !== 'present') return true; // uncertainty → include
-    if (peek.file.frontmatter.trust === 'untrusted') return false;
-    if (!shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext)) return false;
+    if (peek.kind !== 'present') {
+      eligible.push({ listing: l, file: null }); // uncertainty → include
+      continue;
+    }
+    if (peek.file.frontmatter.trust === 'untrusted') continue;
+    if (!shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext)) continue;
     // Per-playbook memory filter (slice 9). When the playbook's
     // context_recipe.memory_filter is set, keep only entries
     // whose `type` matches any filter value OR whose triggers
@@ -199,28 +225,61 @@ export const assembleMemorySection = (
       const ftype = peek.file.frontmatter.type;
       const fTriggers = peek.file.frontmatter.triggers ?? [];
       const matches = input.memoryFilter.some((f) => f === ftype || fTriggers.includes(f));
-      if (!matches) return false;
+      if (!matches) continue;
     }
-    return true;
-  });
+    eligible.push({ listing: l, file: peek.file });
+  }
   if (eligible.length === 0) {
     // Every memory was filtered out. Same empty-shape as a
     // registry that never had entries — bootstrap's length-zero
     // check passes through cleanly.
-    return { text: '', entryCount: 0 };
+    return { text: '', entryCount: 0, eagerLoaded: [] };
   }
   // Dedupe by name on the eligible list. precedence order is
   // preserved (most-specific surviving scope wins).
   const seen = new Set<string>();
   const lines: string[] = [MEMORY_SECTION_HEADER, ''];
+  const eagerLoaded: EagerExposure[] = [];
   let included = 0;
-  for (const l of eligible) {
-    if (seen.has(l.name)) continue;
-    seen.add(l.name);
-    lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);
+  for (const { listing, file } of eligible) {
+    if (seen.has(listing.name)) continue;
+    seen.add(listing.name);
+    lines.push(`- [${listing.scope}] ${listing.name} — ${listing.entry.hook}`);
     included++;
+    eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }
-  return { text: lines.join('\n'), entryCount: included };
+  return { text: lines.join('\n'), entryCount: included, eagerLoaded };
+};
+
+// Snapshot one eager-loaded entry. `file === null` happens for the
+// "uncertainty → include" path (peek returned missing / malformed):
+// the listing still ships in the index, but we have no body to
+// hash and no frontmatter.state to snapshot. Provenance row still
+// emits with NULL hash + 'active' default — the operator can
+// reconcile via the audit log seeing both the index entry and the
+// missing-body record.
+const toEagerExposure = (
+  scope: MemoryScope,
+  name: string,
+  file: MemoryFile | null,
+): EagerExposure => {
+  if (file === null) {
+    return { scope, name, memoryContentHash: null, memoryStateAtExposure: 'active' };
+  }
+  let memoryContentHash: string | null;
+  try {
+    memoryContentHash = hashMemoryContent(serializeMemoryFile(file));
+  } catch {
+    // Best-effort: a hash failure (e.g., FIPS-restricted host)
+    // must not block the eager render or the provenance emit.
+    memoryContentHash = null;
+  }
+  return {
+    scope,
+    name,
+    memoryContentHash,
+    memoryStateAtExposure: file.frontmatter.state ?? 'active',
+  };
 };
 
 // Compose the memory section onto an optional base prompt. The

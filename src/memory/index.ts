@@ -2,6 +2,7 @@
 
 export { MEMORY_STATES } from './types.ts';
 export type {
+  EagerExposure,
   IndexEntry,
   MemoryFile,
   MemoryFrontmatter,

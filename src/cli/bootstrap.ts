@@ -415,6 +415,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
+  // Eager-load inventory (MEMORY.md §11.2). Lifted out of the
+  // try-block so the post-try HarnessConfig builder can read it;
+  // empty array survives the no-memory path without conditional
+  // spread on the consumer side.
+  let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
   try {
     // Resolve the effective system prompt. Layers stack here in
     // precedence order (most-specific to most-generic). Each
@@ -611,6 +616,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       bootContext,
     });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
+    eagerExposures = memorySection.eagerLoaded;
 
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Resolved inside
     // the same try-block as memory so any throw — TOML parse
@@ -696,6 +702,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
     memoryRegistry,
+    // Eager-load provenance (MEMORY.md §11.2, S1/T1.4). Frozen
+    // here at assembly time; loop emits one provenance row per
+    // entry right after createSession. Empty array passes
+    // through cleanly when the registry produced no memories or
+    // every memory was filtered out (no harm in passing through).
+    eagerExposures,
     isCwdTrusted,
     // Hooks resolved at boot (spec AGENTIC_CLI.md §10). When the
     // list is empty (no config files exist) we still pass the

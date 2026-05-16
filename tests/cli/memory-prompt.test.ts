@@ -552,3 +552,111 @@ describe('assembleMemorySection — memory_filter (slice 9)', () => {
     expect(result.text).toBe('');
   });
 });
+
+describe('assembleMemorySection — eagerLoaded inventory (S1/T1.4)', () => {
+  // Helper specifically for these tests: write a body with a
+  // specific state. Avoids leaking state-aware setup into every
+  // suite above.
+  const writeBodyWithState = (
+    dir: string,
+    name: string,
+    state: string | undefined,
+    trust: string | undefined,
+  ): void => {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      `name: ${name}`,
+      `description: hook for ${name}`,
+      'type: feedback',
+      'source: user_explicit',
+    ];
+    if (state !== undefined) lines.push(`state: ${state}`);
+    if (trust !== undefined) lines.push(`trust: ${trust}`);
+    writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
+  };
+
+  test('every rendered entry appears in eagerLoaded with hash + state', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBodyWithState(roots.user, 'a', undefined, undefined); // defaults active
+    writeBodyWithState(roots.user, 'b', 'quarantined', undefined);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(2);
+    expect(result.eagerLoaded).toHaveLength(2);
+    const aEntry = result.eagerLoaded.find((e) => e.name === 'a');
+    expect(aEntry?.scope).toBe('user');
+    expect(aEntry?.memoryStateAtExposure).toBe('active');
+    expect(aEntry?.memoryContentHash).toMatch(/^[0-9a-f]{64}$/);
+    const bEntry = result.eagerLoaded.find((e) => e.name === 'b');
+    expect(bEntry?.memoryStateAtExposure).toBe('quarantined');
+  });
+
+  test('untrusted entries are excluded from eagerLoaded', () => {
+    // Same filter that drops the entry from `text` MUST drop it
+    // from `eagerLoaded` — keeping it would emit a provenance row
+    // for a memory the model never saw.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBodyWithState(roots.user, 'a', undefined, undefined);
+    writeBodyWithState(roots.user, 'b', undefined, 'untrusted');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.eagerLoaded.map((e) => e.name)).toEqual(['a']);
+  });
+
+  test('dedupe by name applies to eagerLoaded too (one row per name)', () => {
+    // Spec: "once per (session, memory)". Two scopes with the
+    // same name MUST produce only one eager row — the most-
+    // specific scope wins.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Same](same.md) — local\n');
+    writeIndex(roots.user, '- [Same](same.md) — user\n');
+    writeBodyWithState(roots.projectLocal, 'same', undefined, undefined);
+    writeBodyWithState(roots.user, 'same', undefined, undefined);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.eagerLoaded).toHaveLength(1);
+    expect(result.eagerLoaded[0]?.scope).toBe('project_local');
+  });
+
+  test('empty registry produces empty eagerLoaded', () => {
+    const repo = makeTmp();
+    const registry = createMemoryRegistry({ roots: makeRoots(repo) });
+    const result = assembleMemorySection({ registry });
+    expect(result.eagerLoaded).toEqual([]);
+  });
+
+  test('peek-uncertainty entry (missing body) still appears with null hash', () => {
+    // Index references a body that doesn't exist. The eager section
+    // includes it (uncertainty → include); the provenance row must
+    // emit too — with NULL hash and the default 'active' state —
+    // so the audit trail records that the operator-visible index
+    // line DID surface, even when the body was unreadable.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Ghost](ghost.md) — phantom\n');
+    // No body file written.
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.eagerLoaded).toHaveLength(1);
+    expect(result.eagerLoaded[0]?.name).toBe('ghost');
+    expect(result.eagerLoaded[0]?.memoryContentHash).toBeNull();
+    expect(result.eagerLoaded[0]?.memoryStateAtExposure).toBe('active');
+  });
+
+  test('hash is deterministic across two calls on unchanged file', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n');
+    writeBodyWithState(roots.user, 'a', undefined, undefined);
+    const registry = createMemoryRegistry({ roots });
+    const r1 = assembleMemorySection({ registry });
+    const r2 = assembleMemorySection({ registry });
+    expect(r1.eagerLoaded[0]?.memoryContentHash).toBe(r2.eagerLoaded[0]?.memoryContentHash);
+  });
+});
