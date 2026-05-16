@@ -28,21 +28,33 @@ Land the manual paths before the auto-detectors so the pipeline is end-to-end te
 
 **Acceptance:** operator runs `/memory quarantine foo --motivo conflict --evidence "duplicates bar"`, sees foo in `/memory list` with quarantine flag, inspects the row in `/memory audit`. Pipeline tested end-to-end.
 
-## Slice 1 — Memory provenance infrastructure
+## Slice 1 — Memory **exposure** infrastructure
 
-Tracks which memory(s) the agent consumed when emitting a tool call. Foundation for Slices 2 and 3.
+Tracks which memory(s) **were visible to the model** at the moment of each tool call. **Not causation** — the model may ignore an exposed memory entirely. Exposure trace is foundational for the failure-correlation surfaces in Slices 2 (`verify_failed` runs against exposed memories) and 3 (`user_override_repeated` counts overrides per exposed memory).
+
+The schema accommodates spec/operator review surfaced design decisions:
+
+- **Content hash + state-at-exposure**: provenance points to a mutable substrate; without freezing content + state at the exposure moment, replay loses fidelity.
+- **Retrieval grouping**: `retrieve_context` returns N memories in one call. Group them by `retrieval_query_id` so blame analysis can ask "the retrieval at time T exposed X" instead of N separate rows.
+- **Per-call vs per-session emit**: `memory_read` and `retrieve_context` emit per-tool-call. **Eager-load emits once per (session, memory)** at boot — N tool_calls in the session don't generate N rows for the same eager memory, just the one "exposed via eager from session start" claim.
 
 | Task | Description |
 |---|---|
-| **T1.1** | Migration `054-memory-provenance.sql` — table `memory_provenance(id, tool_call_id FK CASCADE, session_id FK CASCADE, memory_scope, memory_name, surface ENUM('eager','memory_read','retrieve_context'), created_at)`. Indexed on `(tool_call_id)` and `(memory_scope, memory_name, created_at DESC)`. |
-| **T1.2** | Repo `src/storage/repos/memory-provenance.ts` — `recordProvenance`, `listProvenanceForTool`, `listProvenanceForMemory`, `countOverridesInWindow` helpers. |
-| **T1.3** | Emit at `memory_read` tool — when the model reads a memory, persist the link to the active tool_call. |
-| **T1.4** | Emit at eager-load — system-prompt-injected memories tracked so subsequent tool calls in the same turn link to the eager set. |
-| **T1.5** | Emit at `retrieve_context` — every `contextSlot.included` entry produces a provenance row associated with the next tool_call the model issues. Needs a session-cursor pattern: the retrieval associates with the upcoming tool. |
-| **T1.6** | Operator surface — `/memory provenance <name>` (consuming tool calls in session) + `/memory audit --show-provenance` adds the column. |
-| **T1.7** | Tests + `docs/MEMORY.md` §11 update. |
+| **T1.1** | Migration `054-memory-provenance.sql` — table `memory_provenance(id PK, session_id FK CASCADE NOT NULL, tool_call_id FK CASCADE NULL, memory_scope TEXT, memory_name TEXT, surface ENUM('eager','memory_read','retrieve_context'), retrieval_query_id TEXT NULL FK retrieval_trace, position_in_corpus INTEGER NULL, memory_content_hash TEXT NULL, memory_state_at_exposure TEXT NULL, created_at INTEGER)`. Indices on `(session_id, created_at DESC, id DESC)`, `(memory_scope, memory_name, created_at DESC)`, `(tool_call_id)` (partial WHERE NOT NULL), `(retrieval_query_id)` (partial WHERE NOT NULL). `tool_call_id` nullable because eager-load happens before any tool call; eager rows have a null tool_call. |
+| **T1.2** | Repo `src/storage/repos/memory-provenance.ts` — `recordProvenance(input)`, `listProvenanceForToolCall(db, sessionId, toolCallId)`, `listProvenanceForMemory(db, sessionId, scope, name, limit)`, `listExposuresInRetrieval(db, retrievalQueryId)`, `countExposuresInWindow(db, sessionId, scope, name, windowMs)`. **Every helper requires sessionId** — privacy: never accidentally span sessions (same fix shape as commit `55ba11a`'s `listRetrievalTracesByWorkflow`). |
+| **T1.3** | Emit at `memory_read` tool — when the model reads a memory, persist exposure linked to the active tool_call. `surface='memory_read'`, content_hash = sha256 of `frontmatter + body`, state_at_exposure = `frontmatter.state ?? 'active'`. |
+| **T1.4** | Emit at eager-load — system-prompt-injected memories tracked **once per (session, memory)** at the eager-load moment, with `tool_call_id=NULL`. Subsequent tool calls in the same session reference the single eager row via `session_id` match. content_hash + state captured at boot. |
+| **T1.5** | Emit at `retrieve_context` — every `contextSlot.included` entry produces a provenance row with `surface='retrieve_context'`, `retrieval_query_id = result.queryId`, `position_in_corpus = index in slot.included`, content_hash + state captured at slot-build time. `tool_call_id` set to the tool_call that **issued** the `retrieve_context` request (NOT the next tool_call — that would be unverifiable speculation about which call "used" the slot). |
+| **T1.6** | Operator surfaces — `/memory provenance <name>` lists exposure history in current session (or `--all`); `/memory provenance --tool <tool_call_id>` lists what was exposed during a specific tool call; `retrieve_context` group view via `--retrieval <query_id>`. |
+| **T1.7** | TTL + storage budget — 90d default retention (mirror `eviction_events`). Boot-time GC sweep prunes rows older than TTL. Add `pruneMemoryProvenance(db, olderThanMs)` to the existing GC harness. |
+| **T1.8** | Tests + `docs/MEMORY.md §11.2` update — schema + audit shape doc. Tests cover: per-surface emit, eager dedupe (single row per session×memory), retrieval grouping, content_hash stability, session scoping (cross-session leak refused), prune sweep removes only old rows. |
 
-**Acceptance:** every memory the model reads (via any surface) leaves a `memory_provenance` row linked to the tool_call_id it inspired. Operator can trace memory → tool calls and back.
+**Acceptance:** every memory **exposed** to the model leaves a `memory_provenance` row. The row carries enough state (content_hash, state_at_exposure, retrieval grouping, position) to support honest replay later. Operator queries by memory, by tool call, by retrieval batch — all session-scoped by default.
+
+**What the schema does NOT claim:**
+- Causation. A row says "this memory was visible when this tool call fired"; not "this memory caused this tool call". Comment in the schema header documents this distinction.
+- Use. Model may ignore an exposed memory; provenance can't tell.
+- Replay completeness. The system prompt's full bytes, the tool registry version, the model id + temperature, the deterministic seed — none of these live here. Provenance is one dimension of cognitive observability, not all of it.
 
 ## Slice 2 — `verify_failed` detector
 
