@@ -312,19 +312,35 @@ interface ScopeSnapshot {
 // caller treats it as "no expiry set" and surfaces a stderr warning
 // elsewhere if needed (the validator already rejected this shape on
 // write; on read we're defensive against hand-edited files).
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
 const parseExpiresEndOfDayMs = (expires: string): number | null => {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expires);
   if (m === null) return null;
   const year = Number.parseInt(m[1] ?? '', 10);
   const month = Number.parseInt(m[2] ?? '', 10);
   const day = Number.parseInt(m[3] ?? '', 10);
-  // `Date.UTC` is monthIdx-based; clamp by re-reading to detect
-  // overflow (e.g., 2026-02-31 becomes 2026-03-03 which we refuse).
-  const ms = Date.UTC(year, month - 1, day + 1, 0, 0, 0);
-  if (Number.isNaN(ms)) return null;
-  const round = new Date(ms);
-  if (round.getUTCFullYear() !== year || round.getUTCMonth() !== month - 1) return null;
-  return ms;
+  // Two-step parse: VALIDATE the input date first (catches
+  // `2026-02-31` → JS rolls to 2026-03-03, which we refuse), then
+  // compute end-of-day as start-of-next-day via simple ms addition.
+  // The earlier `day + 1` form mixed the two steps and rejected
+  // every legitimate last-day-of-month (`2026-01-31` → start = Feb
+  // 1 → month mismatch → rejected as malformed), which made
+  // `isExpired` return false for those memories and quietly kept
+  // expired entries visible to `list({ includeExpired: false })`.
+  const startOfDayMs = Date.UTC(year, month - 1, day, 0, 0, 0);
+  if (Number.isNaN(startOfDayMs)) return null;
+  const round = new Date(startOfDayMs);
+  if (
+    round.getUTCFullYear() !== year ||
+    round.getUTCMonth() !== month - 1 ||
+    round.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  // Add exactly 24h. Crosses month / year boundaries correctly
+  // because epoch ms is independent of calendar structure.
+  return startOfDayMs + MS_PER_DAY;
 };
 
 const isExpired = (expires: string | undefined, nowMs: number): boolean => {

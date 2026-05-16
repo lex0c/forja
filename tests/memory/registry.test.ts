@@ -186,6 +186,82 @@ describe('createMemoryRegistry — list states + expires filter (H1+H6)', () => 
     expect(result.map((l) => `${l.scope}/${l.name}`)).toEqual(['project_local/a']);
   });
 
+  test('month-end expires dates are valid (regression: prior overflow guard rejected them)', () => {
+    // Prior implementation computed `Date.UTC(y, m-1, day+1)` and
+    // required `round.getUTCMonth() === m - 1`, which incorrectly
+    // rejected every legitimate last-day-of-month (`2026-01-31` →
+    // start-of-next-day is Feb 1 → month mismatch → null). With
+    // null returned, `isExpired` returned false and the memory
+    // stayed visible to `list({ includeExpired: false })` past its
+    // expiry. Today's two-step parse validates the date itself,
+    // then adds 24h.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Jan31](jan31.md) — jan\n- [Dec31](dec31.md) — dec\n');
+    writeMemory(roots.user, 'jan31', fmWithState('jan31', undefined, '2026-01-31'), 'body\n');
+    writeMemory(roots.user, 'dec31', fmWithState('dec31', undefined, '2026-12-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+
+    // 2026-01-31 14:00 UTC — both still valid (mid-day on Jan 31
+    // for jan31; far future for dec31).
+    const jan31Noon = Date.UTC(2026, 0, 31, 14, 0, 0);
+    expect(
+      reg
+        .list({ includeExpired: false, nowMs: jan31Noon })
+        .map((l) => l.name)
+        .sort(),
+    ).toEqual(['dec31', 'jan31']);
+
+    // 2026-02-01 00:00 UTC — Jan 31 just expired; Dec 31 unaffected.
+    // This is the case the previous overflow bug HID: jan31 should
+    // expire here, but with `parseExpiresEndOfDayMs` returning null
+    // (rejected as malformed) `isExpired` returned false and jan31
+    // stayed visible.
+    const feb1Midnight = Date.UTC(2026, 1, 1, 0, 0, 0);
+    expect(
+      reg
+        .list({ includeExpired: false, nowMs: feb1Midnight })
+        .map((l) => l.name)
+        .sort(),
+    ).toEqual(['dec31']);
+
+    // 2027-01-01 00:00 UTC — both expired. Year-rollover boundary.
+    const jan1_2027 = Date.UTC(2027, 0, 1, 0, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: jan1_2027 })).toEqual([]);
+  });
+
+  test('leap-day expires (2024-02-29) is valid and expires correctly the next day', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Leap](leap.md) — leap day\n');
+    writeMemory(roots.user, 'leap', fmWithState('leap', undefined, '2024-02-29'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    // 2024-02-29 23:00 UTC — still valid.
+    const lateLeapDay = Date.UTC(2024, 1, 29, 23, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: lateLeapDay })).toHaveLength(1);
+    // 2024-03-01 00:00 UTC — expired.
+    const march1 = Date.UTC(2024, 2, 1, 0, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: march1 })).toEqual([]);
+  });
+
+  test('numerically-invalid expires (e.g. 2026-02-31) treated as non-expiring (defensive)', () => {
+    // The frontmatter validator's EXPIRES_RE only checks the
+    // YYYY-MM-DD format, not whether the date is a real calendar
+    // day. A hand-edited `2026-02-31` survives parsing.
+    // `parseExpiresEndOfDayMs` now refuses such inputs (returns
+    // null), and `isExpired(undefined-like, …)` treats the result
+    // as "no expiry set" — the memory stays visible. Operator
+    // discovers the malformed date via `/memory audit`, NOT via
+    // surprise eviction.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Bad](bad.md) — bad date\n');
+    writeMemory(roots.user, 'bad', fmWithState('bad', undefined, '2026-02-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const nowMs = Date.UTC(2099, 0, 1); // far future — every real expiry would have passed
+    expect(reg.list({ states: ['active'], includeExpired: false, nowMs })).toHaveLength(1);
+  });
+
   test('malformed frontmatter (bad expires) excluded by state filter (defense in depth)', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

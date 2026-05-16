@@ -2,6 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(memory/registry) — parseExpiresEndOfDayMs rejected legitimate month-end expiries
+
+`parseExpiresEndOfDayMs` validated dates by computing `Date.UTC(year, month - 1, day + 1, …)` and requiring the resulting `getUTCMonth()` to still equal `month - 1`. That check intended to catch overflow inputs like `2026-02-31` (which JS rolls to 2026-03-03), but it ALSO rejected every legitimate last-day-of-month: `2026-01-31`'s "next day" naturally crosses into February, so the month check failed and the function returned null. With null returned, `isExpired` treated the memory as non-expiring and `list({ includeExpired: false })` quietly kept the entry visible past its expiry.
+
+Fix: two-step parse. Validate the date itself first (build `Date.UTC(year, month - 1, day, …)` WITHOUT incrementing) and verify all three fields round-trip — that's what catches `2026-02-31` honestly. Then compute end-of-day as `startOfDayMs + MS_PER_DAY`; ms addition crosses month / year boundaries correctly because epoch ms is independent of the calendar structure.
+
+Tests added in `tests/memory/registry.test.ts`:
+- `2026-01-31` + `2026-12-31` both stay valid mid-day on expiry, expire at next-day 00:00 UTC, and Dec 31 correctly rolls into the next year (Jan 1 2027 00:00 → expired).
+- `2024-02-29` (leap day) valid through the day, expires at Mar 1 00:00 UTC.
+- `2026-02-31` (numerically invalid) is treated as non-expiring (defensive — the frontmatter validator's regex only checks YYYY-MM-DD format; the date parser refusing here means the operator's `/memory audit` surface shows the bad entry rather than the model getting surprise eviction).
+
 ## [2026-05-16] fix(cli/slash/agent-retrieval) — percentileOf used floor, not ceil/-1 (off-by-one inflated tail)
 
 `percentileOf` was documented as nearest-rank but computed `Math.floor(p * N)`, which at common boundaries returns the NEXT higher element. Worst case: N=20, p=0.95 — `floor(19) = 19` returned the MAX sample instead of index 18 (the actual 19th-rank value, per `⌈p · N⌉ − 1`). The inflated values made `/agent retrieval metrics` overstate p50/p95 stage latencies: a real tail regression was indistinguishable from the always-pinned-at-max output.
