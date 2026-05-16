@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(memory) — Slice 1 post-review hardening
+
+Round of code review delegated to three Explore agents (robustness, reliability, coverage). Four real bugs + three hardening gaps + handful of test pins surfaced. Applied:
+
+**Real bugs:**
+- `positionInCorpus < 0` was accepted silently — off-by-one in the runner would land garbage forensics. Added repo guard: `surface='retrieve_context'` now requires `positionInCorpus >= 0`. Pinned with a negative-value throw test.
+- AUDIT DRIFT message format diverged between sites — bootstrap sweep was `forja: memory_provenance sweep failed at boot (...)` while every other site uses `memory: AUDIT DRIFT: failed to <action>...`. Unified to the latter so operators can grep one signal.
+- `redactSecrets` was missing on two of the new AUDIT DRIFT lines (`runner.ts` retrieve_context emit, `loop.ts` eager emit). SQLite errors can echo bound parameter values from operator-edited memory bodies — accidental tokens would surface unredacted on stderr. Added the call to both sites (and to the bootstrap sweep line) so the four memory emit sites and the boot sweep are now uniform.
+- Eager emit on session resume would duplicate rows. The harness loop's eager-emit block ran in BOTH the `createSession` branch and the `preassignedSessionId` branch; schema has no UNIQUE constraint, so each resume piled more `(session, memory, eager)` rows on top. New `hasEagerProvenance(db, sessionId)` probe gates the emit — returns true if any eager row exists for the session, so resume skips while subagent first boot (preassignedSessionId with no rows yet) still emits.
+
+**Hardening:**
+- `createdAt <= 0` was accepted silently — a broken-clock mock or miscomputed timestamp would corrupt `created_at >= cutoff` window queries 60 days later. Repo guard now refuses `<= 0`.
+- Empty-string `toolCallId` would coerce-pass `ctx.toolCallId !== undefined` in the three forwarding tools (`memory_read`, `memory_search`, `retrieve_context`), reach the registry, and FK-fail every INSERT silently as AUDIT DRIFT. No caller produces `''` today but the guard is cheap defense against future entrypoint bugs. Strengthened to `typeof string && length > 0`.
+
+**Tests added** (+9): negative `positionInCorpus`, `createdAt` zero + negative, `hasEagerProvenance` probe (4 cases — empty session, per-call-only, eager-present, session scoping), B4 idempotency end-to-end via `runAgent` (pre-existing eager row blocks resume re-emit), empty-string `toolCallId` doesn't emit provenance, multi-session `listGlobalProvenanceByName` cross-cut against 3 sessions.
+
+**Deferred** (low ROI):
+- Hash-failure fallback in `toEagerExposure` — defensive 4-line `catch { return null }` around `serializeMemoryFile`+`hashMemoryContent`. Hard to exercise without mocking; the runtime path is shaped so the catch never fires on well-formed inputs.
+- Per-entry isolation test in `emitRetrievalProvenance` — `parseMemoryNodeId` is private and the malformed-nodeId path returns null gracefully without throwing; the catch block protects against `recordProvenance` throws which the integration test already covers (via FK violation).
+
+**Post-cascade semantic of `retrieval_query_id`:** documented in the schema header and repo guard comment. The agent flagged it as "invariant violation post-cascade"; on closer look it's a design decision (INSERT-time strong invariant + graceful nullable post-cascade so retrieval-trace GC doesn't orphan exposure history). Updated comments to make the split explicit so a future contributor doesn't misread the `recordProvenance` guard as a runtime invariant.
+
+8164 pass / 0 fail · typecheck + lint clean.
+
 ## [2026-05-16] feat(memory) — provenance docs + end-to-end integration test (S1/T1.8)
 
 Closes Slice 1 of `feat/memory-lifecycle-detectors`. Two artifacts:

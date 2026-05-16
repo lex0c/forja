@@ -68,6 +68,22 @@
 //   grouping: "the retrieval at trace X exposed N memories" without
 //   reconstructing the relationship from the timing fields.
 //
+//   INSERT-time invariant (enforced by `recordProvenance`):
+//     surface='retrieve_context' ⇒ retrieval_query_id IS NOT NULL.
+//   Post-cascade state: when a retrieval_trace row is deleted, FK
+//   `ON DELETE SET NULL` may null this column on surviving
+//   provenance rows. The exposure still happened — the row stays
+//   in the table — but the grouping key is lost. Consumers handle
+//   the post-cascade state gracefully:
+//     - `listExposuresInRetrieval` filters by retrieval_query_id
+//       so post-cascade rows simply aren't returned by that path.
+//     - `listProvenanceForToolCall` / `listProvenanceByName` still
+//       return them; the slash command's renderer skips the
+//       retrieval grouping detail when the qid is null.
+//   This split (strong INSERT invariant, graceful post-cascade
+//   nullable) is deliberate so retrieval-trace GC can prune
+//   without orphaning the exposure history.
+//
 // - `position_in_corpus` (INTEGER NULL). For retrieve_context:
 //   index in `contextSlot.included` (0 = top hit). NULL elsewhere.
 //   Operator forensics value: "the memory was exposed but ranked

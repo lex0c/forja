@@ -274,4 +274,32 @@ describe('memory_read tool', () => {
     expect(result.trust).toBe('trusted');
     expect(result.triggers).toEqual(['git']);
   });
+
+  test('empty-string toolCallId does NOT emit provenance (post-review guard)', async () => {
+    // Defensive: today no caller produces '' but a future
+    // entrypoint that sets toolCallId = '' would otherwise
+    // coerce-pass `ctx.toolCallId !== undefined` and FK-fail
+    // every recordProvenance call silently. The forwarding
+    // guard in memory-read.ts is `typeof string && length > 0`.
+    const { listProvenanceForMemory } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — role\n');
+    writeMemory(
+      roots.user,
+      'role',
+      'name: role\ndescription: r\ntype: user\nsource: user_explicit\n',
+      'body\n',
+    );
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const ctx = makeCtx({ memoryRegistry: reg, sessionId, toolCallId: '' });
+    const result = await memoryReadTool.execute({ name: 'role' }, ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    // Read succeeds (memory_events.read still landed); but
+    // memory_provenance gets ZERO rows because the empty
+    // toolCallId was filtered before reaching the registry.
+    expect(listProvenanceForMemory(db, sessionId, 'user', 'role')).toEqual([]);
+  });
 });

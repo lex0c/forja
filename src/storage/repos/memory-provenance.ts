@@ -166,14 +166,32 @@ export const recordProvenance = (db: DB, input: RecordProvenanceInput): MemoryPr
   }
   const retrievalQueryId = input.retrievalQueryId ?? null;
   const positionInCorpus = input.positionInCorpus ?? null;
-  // Invariant: retrieval grouping fields go together. Either both
-  // set (retrieve_context exposure) or both null (eager /
-  // memory_read). A future caller that forgets one would silently
+  // INSERT-time invariant: retrieval grouping fields go together.
+  // Either both set (retrieve_context exposure) or both null (eager
+  // / memory_read). A future caller that forgets one would silently
   // produce un-groupable rows.
+  //
+  // Note on post-cascade state: the FK `retrieval_query_id ON
+  // DELETE SET NULL` (schema 054) may null this column AFTER a
+  // retrieval_trace deletion. That bypasses this guard by design —
+  // the row exists with surface='retrieve_context' and
+  // retrievalQueryId=null. Downstream consumers handle the state
+  // gracefully (see schema header for the full split). This guard
+  // is INSERT-side only.
   if (input.surface === 'retrieve_context') {
     if (retrievalQueryId === null || positionInCorpus === null) {
       throw new Error(
         'recordProvenance: surface=retrieve_context requires both retrievalQueryId and positionInCorpus',
+      );
+    }
+    // positionInCorpus is the index in `contextSlot.included`
+    // (0 = top hit). Negative values are caller bugs — schema
+    // accepts them (no CHECK), but forensic queries ("memory
+    // ranked Nth") would produce garbage. Guard at the repo
+    // layer so an off-by-one in the runner can't silently land.
+    if (positionInCorpus < 0) {
+      throw new Error(
+        `recordProvenance: surface=retrieve_context requires positionInCorpus >= 0 (got ${positionInCorpus})`,
       );
     }
   } else {
@@ -186,6 +204,15 @@ export const recordProvenance = (db: DB, input: RecordProvenanceInput): MemoryPr
 
   const id = input.id ?? crypto.randomUUID();
   const createdAt = input.createdAt ?? Date.now();
+  // Epoch ms is non-negative by contract. A caller passing 0 or
+  // negative is a bug (broken clock mock, miscomputed timestamp);
+  // the row would still INSERT but break `created_at >= cutoff`
+  // window queries downstream. Guard at the repo so the bug
+  // surfaces at the call site, not in `countExposuresInWindow`
+  // 60 days later.
+  if (createdAt <= 0) {
+    throw new Error(`recordProvenance: createdAt must be > 0 epoch ms (got ${createdAt})`);
+  }
   db.query(INSERT_SQL).run(
     id,
     input.sessionId,
@@ -378,6 +405,27 @@ export const listGlobalProvenanceForMemory = (
     )
     .all(scope, name, limit);
   return rows.map(fromRow);
+};
+
+// Idempotency probe for the harness loop's eager emit. Returns
+// true when ANY eager provenance row already exists for this
+// session — used to distinguish "first boot of session" (emit)
+// from "resume of existing session" (skip, rows already landed)
+// AND to keep subagent first boots working (preassignedSessionId
+// is set but no eager rows exist yet).
+//
+// Single indexed lookup against the session-led composite index;
+// the LIMIT 1 stops at the first match.
+export const hasEagerProvenance = (db: DB, sessionId: string): boolean => {
+  const row = db
+    .query<{ n: number }, [string]>(
+      `SELECT 1 AS n
+         FROM memory_provenance
+        WHERE session_id = ? AND surface = 'eager'
+        LIMIT 1`,
+    )
+    .get(sessionId);
+  return row !== null;
 };
 
 // Retention window for the boot-time GC sweep (S1/T1.7). 90 days

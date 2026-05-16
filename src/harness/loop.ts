@@ -44,6 +44,7 @@ import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import { buildRetrievalRunner } from '../retrieval/index.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import {
   type CritiqueRunCode,
   type SessionStatus,
@@ -59,7 +60,7 @@ import {
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
-import { recordProvenance } from '../storage/repos/memory-provenance.ts';
+import { hasEagerProvenance, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -896,11 +897,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // tool_call_id=NULL — eager-load happens BEFORE any tool
       // call exists, so the FK is intentionally absent.
       //
+      // Idempotency gate: skip emit when this session already has
+      // eager rows. Resume (preassignedSessionId reusing an
+      // existing session row) would otherwise re-emit the same
+      // (session, memory) pair every restart — schema has no
+      // UNIQUE constraint so duplicates pile up silently. Subagent
+      // first boots also use preassignedSessionId but have zero
+      // eager rows yet, so they still emit normally.
+      //
       // Best-effort: a DB failure here MUST NOT abort startup
       // (provenance is observability, not correctness — same
       // posture as registry.auditExposure). Failures land on
       // stderr as AUDIT DRIFT.
-      if (config.eagerExposures !== undefined && config.eagerExposures.length > 0) {
+      if (
+        config.eagerExposures !== undefined &&
+        config.eagerExposures.length > 0 &&
+        !hasEagerProvenance(config.db, sessionId)
+      ) {
         for (const exposure of config.eagerExposures) {
           try {
             recordProvenance(config.db, {
@@ -914,8 +927,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             });
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
+            // Redact — SQLite errors may echo bound parameter
+            // values (the inventory's hash + state). Mirrors
+            // registry.ts AUDIT DRIFT redaction pattern.
             process.stderr.write(
-              `memory: AUDIT DRIFT: failed to record eager exposure for ${exposure.name} (${exposure.scope}): ${msg}\n`,
+              `memory: AUDIT DRIFT: failed to record eager exposure for ${exposure.name} (${exposure.scope}): ${redactSecrets(msg)}\n`,
             );
           }
         }

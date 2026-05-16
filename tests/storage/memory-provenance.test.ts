@@ -16,6 +16,7 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   countExposuresInWindow,
+  hasEagerProvenance,
   hashMemoryContent,
   listExposuresInRetrieval,
   listGlobalProvenanceByName,
@@ -147,6 +148,44 @@ describe('recordProvenance', () => {
         surface: 'eager',
       }),
     ).toThrow(/invalid memoryScope/);
+  });
+
+  test('retrieve_context REFUSES negative positionInCorpus (post-review guard)', () => {
+    const toolCallId = seedToolCall('retrieve_context');
+    expect(() =>
+      recordProvenance(db, {
+        sessionId,
+        toolCallId,
+        memoryScope: 'user',
+        memoryName: 'foo',
+        surface: 'retrieve_context',
+        retrievalQueryId: 'qid-x',
+        positionInCorpus: -1,
+      }),
+    ).toThrow(/positionInCorpus >= 0/);
+  });
+
+  test('REFUSES createdAt <= 0 (broken-clock guard)', () => {
+    expect(() =>
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'foo',
+        surface: 'eager',
+        createdAt: 0,
+      }),
+    ).toThrow(/createdAt must be > 0/);
+    expect(() =>
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'foo',
+        surface: 'eager',
+        createdAt: -1,
+      }),
+    ).toThrow(/createdAt must be > 0/);
   });
 
   test('FK violation: non-null toolCallId that does not exist throws SQLiteError', () => {
@@ -599,6 +638,50 @@ describe('listProvenanceByName (session-scoped by-name lookup, S1/T1.6)', () => 
       });
     }
     expect(listProvenanceByName(db, sessionId, 'foo', 2)).toHaveLength(2);
+  });
+});
+
+describe('hasEagerProvenance (resume idempotency probe, S1 post-review)', () => {
+  test('returns false when the session has no eager rows', () => {
+    expect(hasEagerProvenance(db, sessionId)).toBe(false);
+  });
+
+  test('returns false when the session has ONLY per-call surface rows', () => {
+    // Per-call surfaces (memory_read / retrieve_context) MUST NOT
+    // gate the eager emit — they answer different questions.
+    const tc = seedToolCall('memory_read');
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'memory_read',
+    });
+    expect(hasEagerProvenance(db, sessionId)).toBe(false);
+  });
+
+  test('returns true after a single eager row lands', () => {
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+    });
+    expect(hasEagerProvenance(db, sessionId)).toBe(true);
+  });
+
+  test('is session-scoped: another session lit up does not bleed in', () => {
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId: other,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+    });
+    expect(hasEagerProvenance(db, sessionId)).toBe(false);
+    expect(hasEagerProvenance(db, other)).toBe(true);
   });
 });
 

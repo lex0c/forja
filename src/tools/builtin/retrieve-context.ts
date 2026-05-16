@@ -227,10 +227,15 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
       // memory_provenance row per `contextSlot.included` entry
       // (MEMORY.md §11.2, S1/T1.5). Absent (test contexts that
       // bypass the harness) ⇒ runner skips the emit cleanly.
+      // Stronger than `!== undefined`: empty string would
+      // coerce-pass to the runner and FK-fail every
+      // recordProvenance call silently. See memory-read.ts.
       const result = await ctx.retrieveContext(
         validated,
         ctx.signal,
-        ctx.toolCallId !== undefined ? { toolCallId: ctx.toolCallId } : undefined,
+        typeof ctx.toolCallId === 'string' && ctx.toolCallId.length > 0
+          ? { toolCallId: ctx.toolCallId }
+          : undefined,
       );
       return result;
     } catch (err) {

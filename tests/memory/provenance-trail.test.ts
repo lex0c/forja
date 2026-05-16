@@ -287,6 +287,54 @@ describe('provenance trail — three-surface end-to-end (S1/T1.8)', () => {
     expect(listProvenanceForMemory(db, sessionId, 'user', 'fresh')).toHaveLength(1);
   });
 
+  test('multi-session aggregate: 3 sessions each expose memory X, --all surfaces all 3', async () => {
+    // Cross-session forensic shape that `/memory provenance X
+    // --all` ultimately answers. The listGlobalProvenanceByName
+    // path is unit-pinned; this is the cross-cut against the
+    // schema's FK CASCADE + session_id index to verify that 3
+    // distinct sessions each contributing one row produces 3
+    // rows under the global lookup, ordered newest-first.
+    const { listGlobalProvenanceByName } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    // sessionId from beforeEach is session #1.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'cross-cut',
+      surface: 'eager',
+      createdAt: 1000,
+    });
+    const s2 = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId: s2,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'cross-cut',
+      surface: 'eager',
+      createdAt: 2000,
+    });
+    const s3 = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId: s3,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'cross-cut',
+      surface: 'eager',
+      createdAt: 3000,
+    });
+
+    const all = listGlobalProvenanceByName(db, 'cross-cut');
+    expect(all).toHaveLength(3);
+    // Newest first per the global helper's DESC ordering.
+    expect(all.map((r) => r.sessionId)).toEqual([s3, s2, sessionId]);
+    // None of the per-session helpers leak across.
+    expect(listProvenanceByName(db, sessionId, 'cross-cut')).toHaveLength(1);
+    expect(listProvenanceByName(db, s2, 'cross-cut')).toHaveLength(1);
+    expect(listProvenanceByName(db, s3, 'cross-cut')).toHaveLength(1);
+  });
+
   test('operator-by-tool-call query sees the per-call surfaces only (no eager)', async () => {
     // Eager rows have toolCallId=NULL by construction;
     // listProvenanceForToolCall MUST not surface them — the

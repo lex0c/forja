@@ -19,6 +19,7 @@
 // individual views without rebuilding the whole runner.
 
 import { type MemoryRegistry, serializeMemoryFile } from '../memory/index.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { createCompressionResolver } from './compression.ts';
@@ -253,8 +254,14 @@ const emitRetrievalProvenance = (
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Redact secrets — SQLite error messages can echo bound
+      // params (memory body bytes) on CHECK / FK violations.
+      // Operator-edited memory bodies may contain accidental
+      // Bearer tokens / API keys that we must not surface in
+      // the AUDIT DRIFT line. Mirrors registry.ts:auditRead /
+      // auditExposure posture.
       process.stderr.write(
-        `memory: AUDIT DRIFT: failed to record retrieve_context exposure for ${entry.nodeId}: ${msg}\n`,
+        `memory: AUDIT DRIFT: failed to record retrieve_context exposure for ${entry.nodeId}: ${redactSecrets(msg)}\n`,
       );
     }
   }

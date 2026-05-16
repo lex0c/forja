@@ -133,7 +133,13 @@ export const memoryReadTool: Tool<MemoryReadInput, MemoryReadOutput> = {
       ...(scopeCheck !== null ? { scope: scopeCheck } : {}),
       auditSessionId: ctx.sessionId,
       auditCwd: ctx.cwd,
-      ...(ctx.toolCallId !== undefined ? { auditToolCallId: ctx.toolCallId } : {}),
+      // Stronger than `!== undefined`: an empty string would
+      // coerce-pass the check, propagate to the registry, and
+      // FK-fail INSERT silently as AUDIT DRIFT. Today no caller
+      // produces '' but the guard is cheap defense.
+      ...(typeof ctx.toolCallId === 'string' && ctx.toolCallId.length > 0
+        ? { auditToolCallId: ctx.toolCallId }
+        : {}),
     });
 
     if (result.kind === 'unknown') {

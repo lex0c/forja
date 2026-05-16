@@ -7,7 +7,7 @@ import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
-import { getSession, listSessions } from '../../src/storage/repos/sessions.ts';
+import { createSession, getSession, listSessions } from '../../src/storage/repos/sessions.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
@@ -2405,6 +2405,55 @@ describe('runAgent', () => {
       const sid = listSessions(db)[0]?.id;
       if (sid === undefined) throw new Error('expected a session');
       expect(listProvenanceForMemory(db, sid, 'user', 'role')).toEqual([]);
+    });
+
+    test('eager emit is idempotent across resume: pre-existing eager rows skip the emit', async () => {
+      // Resume path (preassignedSessionId) reuses an existing session
+      // row. The eager-emit block in the loop would otherwise re-emit
+      // the same (session, memory, eager) rows every restart —
+      // schema has no UNIQUE constraint so duplicates pile up. The
+      // hasEagerProvenance probe gates this: if any eager rows exist
+      // for the session, skip emit.
+      const { recordProvenance } = await import('../../src/storage/repos/memory-provenance.ts');
+      // Pre-create a session and seed an eager row to simulate the
+      // "prior boot already emitted" state.
+      const session = createSession(db, { model: 'mock/m', cwd: '/p' });
+      recordProvenance(db, {
+        sessionId: session.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'role',
+        surface: 'eager',
+        memoryContentHash: 'pre-existing',
+        memoryStateAtExposure: 'active',
+      });
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        preassignedSessionId: session.id,
+        eagerExposures: [
+          {
+            scope: 'user',
+            name: 'role',
+            memoryContentHash: 'fresh-hash',
+            memoryStateAtExposure: 'active',
+          },
+        ],
+      });
+      expect(result.status).toBe('done');
+      const rows = listProvenanceForMemory(db, session.id, 'user', 'role');
+      // Exactly one row remains — the pre-existing one. The resume
+      // emit MUST have been skipped, so fresh-hash never landed.
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.memoryContentHash).toBe('pre-existing');
     });
 
     test('invalid memoryScope on one exposure does NOT abort run (audit drift)', async () => {

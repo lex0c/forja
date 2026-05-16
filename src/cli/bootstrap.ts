@@ -39,6 +39,7 @@ import {
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { scrubEnv } from '../sanitize/index.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import {
   MEMORY_PROVENANCE_RETENTION_MS,
@@ -585,8 +586,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       pruneMemoryProvenance(db, Date.now() - MEMORY_PROVENANCE_RETENTION_MS);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Match the AUDIT DRIFT shape every other memory site uses
+      // (registry.ts auditRead/auditExposure, loop.ts eager emit,
+      // runner.ts retrieve_context emit) so operators can grep
+      // 'memory: AUDIT DRIFT' for every drift signal. redactSecrets
+      // because SQLite errors may echo bound params.
       process.stderr.write(
-        `forja: memory_provenance sweep failed at boot (${msg}); rows will be re-attempted on next boot\n`,
+        `memory: AUDIT DRIFT: failed to record retention sweep at boot (will retry next boot): ${redactSecrets(msg)}\n`,
       );
     }
     // Boot-time trigger context (spec §4.3). evaluateBootTriggers

@@ -159,7 +159,11 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
       // is an EXPOSURE per MEMORY.md §11.2 — same accountability
       // as a memory_read tool call. Forwarding ctx.toolCallId so
       // the provenance row links back to the search call.
-      ...(ctx.toolCallId !== undefined ? { auditToolCallId: ctx.toolCallId } : {}),
+      // Stronger than `!== undefined`: empty string would
+      // coerce-pass and FK-fail silently. See memory-read.ts.
+      ...(typeof ctx.toolCallId === 'string' && ctx.toolCallId.length > 0
+        ? { auditToolCallId: ctx.toolCallId }
+        : {}),
     });
 
     const truncated = raw.length > limit;
