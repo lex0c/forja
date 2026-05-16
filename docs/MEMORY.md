@@ -227,11 +227,12 @@ The full operator surface ships via `/memory <subcommand>` (`src/cli/slash/comma
 | Command | What it does |
 |---|---|
 | `/memory` | One-line summary: total active memories per scope. |
-| `/memory list [scope]` | Index dump (no body) for `user` / `shared` / `local` / all. |
+| `/memory list [scope]` | Index dump (no body) for `user` / `shared` / `local` / all. Renders state + expires for each entry: `[QUARANTINED]` / `[INVALIDATED]` / `[PROPOSED]` / `[EXPIRED <date>]` prefix flags; `(expires <date>)` suffix on active entries with a future expiry; `[ORPHAN]` / `[MALFORMED]` markers for unreadable rows. |
 | `/memory show <name>` | Print the full body of a memory. |
-| `/memory audit` | Tail of `memory_events` for the current session. |
+| `/memory audit [--trigger <source>] [--name <n>] [--all] [--limit N]` | Tail of `memory_events`. `--trigger` accepts a literal value (e.g. `operator_driven`, `verify_failed`) or one of the semantic shortcuts: `operator` matches `operator_driven`; `detector` matches the 4 auto-detector triggers (`verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked`). |
 | `/memory metrics [--days N]` | Aggregated eviction pipeline metrics over the window — motivo distribution, restore rate, quarantine dwell, protection / hook block counts. Window default 30d. |
 | `/memory delete <name>` | Routes through `transitionMemoryState` (active → quarantined → evicted depending on current state). Asks for confirmation. |
+| `/memory quarantine <name> --motivo <kind> [--evidence "…"] [--scope <s>]` | Operator-driven `active → quarantined`. Motivo allow-list: `conflict`, `shift`, `security`, `low_roi`, `irrelevant`. Audit row lands with `trigger: operator_driven` so forensic queries can split manual transitions from the auto-detector triggers (`docs/TODO.md` Slices 2-5). |
 | `/memory restore <name>` | `evicted → proposed` from the latest tombstone. Operator passes the normal admission gate. |
 | `/memory promote shared <name>` | `local → shared`. Runs the extra promotion scanner (secrets + injection heuristics + 200-line body cap). Creates a `git status` change; does **not** auto-commit. |
 | `/memory demote local <name>` | `shared → local`. Inverse of promote. No extra scanner (going to less-trusted scope). |
@@ -785,5 +786,6 @@ These were listed as deferred in a prior draft but are wired today:
 - The four **model-facing tools** — `memory_read`, `memory_write`, `memory_search`, `memory_list` — are registered in `src/tools/builtin/index.ts` and exposed to the model via the harness tool registry.
 - **`MemoryWrite` hook fire** — `memory_write` dispatches the chain via `ctx.fireHook` at `src/tools/builtin/memory-write.ts:417`, before persisting. Blocking hook lands a `refused` audit row and aborts the write.
 - **Trigger-based eager-load** — `bootstrap.ts:580` and `subagent-child.ts:874` call `evaluateBootTriggers(repoRoot)`; `memory-prompt.ts` consumes the resulting `BootContext` via `shouldEagerLoadByTriggers` to surface conditionally-loaded memories on session boot.
+- **Operator-driven quarantine + audit forensics** (`feat/memory-lifecycle-detectors` Slice 0): `/memory quarantine` slash, state + expires + visual flag rendering on `/memory list`, and `/memory audit --trigger <source>` filter (literal match plus `operator` / `detector` shortcuts). The 4 auto-detectors named in `§6.5.2` (`verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked`) are still pending in Slices 2-5 of `docs/TODO.md §ACTIVE`; the operator surface is now production-ready to receive them.
 
 `docs/BACKLOG.md` carries the current milestone status; the FEEDBACK_ADAPTATION cross-cut (`docs/spec/FEEDBACK_ADAPTATION.md`) describes how loop-frio adaptation will eventually drive automatic `low_roi` quarantine / eviction proposals for stale memories.

@@ -406,12 +406,45 @@ interface AuditFlags {
   // cross-session because session-scoped on a NULL session
   // would return zero rows confusingly.
   allSessions: boolean;
+  // Optional trigger-source filter. Two forms accepted:
+  //   - `--trigger <literal>` — exact match on `details.trigger`
+  //     (e.g., `operator_driven`, `verify_failed`, `user_purge`).
+  //   - `--trigger operator` / `--trigger detector` — semantic
+  //     shortcuts: `operator` matches `operator_driven`;
+  //     `detector` matches every auto-detector trigger
+  //     (`verify_failed`, `user_override_repeated`,
+  //     `conflict_detected`, `trust_revoked`).
+  // Forensic operator separates manual transitions (their own
+  // `/memory quarantine` / `/memory delete`) from automatic
+  // detector firings — load-bearing once Slices 2-5 ship their
+  // auto-detectors.
+  triggerFilter: string | null;
 }
+
+// Canonical detector trigger names — see `docs/spec/MEMORY.md
+// §6.5.2`. Used by the `--trigger detector` semantic shortcut.
+// Keep in sync with the trigger strings emitted by the future
+// detector implementations (Slices 2-5); a new detector that
+// doesn't land here means the shortcut won't surface its rows.
+const DETECTOR_TRIGGERS: ReadonlySet<string> = new Set([
+  'verify_failed',
+  'user_override_repeated',
+  'conflict_detected',
+  'trust_revoked',
+]);
+
+const triggerMatches = (eventTrigger: string | null, filter: string): boolean => {
+  if (eventTrigger === null) return false;
+  if (filter === 'operator') return eventTrigger === 'operator_driven';
+  if (filter === 'detector') return DETECTOR_TRIGGERS.has(eventTrigger);
+  return eventTrigger === filter;
+};
 
 const parseAuditFlags = (args: string[]): AuditFlags | { error: string } => {
   let limit = 50;
   let name: string | null = null;
   let allSessions = false;
+  let triggerFilter: string | null = null;
   let i = 0;
   while (i < args.length) {
     const a = args[i] as string;
@@ -446,11 +479,23 @@ const parseAuditFlags = (args: string[]): AuditFlags | { error: string } => {
       i += 1;
       continue;
     }
+    if (a === '--trigger') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return {
+          error:
+            '/memory audit: --trigger needs a value (literal e.g. operator_driven, or shortcut: operator | detector)',
+        };
+      }
+      triggerFilter = next;
+      i += 2;
+      continue;
+    }
     return {
-      error: `/memory audit: unknown flag '${a}' (try --limit N, --name <name>, --all)`,
+      error: `/memory audit: unknown flag '${a}' (try --limit N, --name <name>, --all, --trigger <source>)`,
     };
   }
-  return { limit, name, allSessions };
+  return { limit, name, allSessions, triggerFilter };
 };
 
 const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
@@ -486,7 +531,28 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
     scopeNote = ' (current session)';
   }
 
+  // Trigger filter is applied AFTER load because trigger lives
+  // inside the JSONB `details` column — filtering at the repo
+  // would need a json_extract index we don't have. In-memory
+  // filter over the (already capped) batch is cheap.
+  let triggerNote = '';
+  if (flags.triggerFilter !== null) {
+    const before = events.length;
+    events = events.filter((e) => {
+      const trig =
+        e.details !== null && typeof e.details.trigger === 'string' ? e.details.trigger : null;
+      return triggerMatches(trig, flags.triggerFilter as string);
+    });
+    triggerNote = ` (trigger: ${flags.triggerFilter}, ${events.length}/${before} after filter)`;
+  }
+
   if (events.length === 0) {
+    if (flags.triggerFilter !== null) {
+      return {
+        kind: 'ok',
+        notes: [`no audit rows matching --trigger ${flags.triggerFilter}${scopeNote}`],
+      };
+    }
     if (flags.name !== null) {
       return { kind: 'ok', notes: [`no audit rows for '${flags.name}'`] };
     }
@@ -498,7 +564,9 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
     }
     return { kind: 'ok', notes: ['no memory audit rows yet'] };
   }
-  const lines = [`recent memory events${scopeNote} (${events.length}, most recent first):`];
+  const lines = [
+    `recent memory events${scopeNote}${triggerNote} (${events.length}, most recent first):`,
+  ];
   for (const e of events) lines.push(formatAuditRow(e));
   return { kind: 'ok', notes: lines };
 };

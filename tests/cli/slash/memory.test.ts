@@ -748,6 +748,138 @@ describe('/memory audit', () => {
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain("unknown flag '--bogus'");
   });
+
+  test('--trigger operator filters to operator_driven rows (T0.3)', async () => {
+    // Three rows: one operator-driven quarantine, one detector-driven
+    // (verify_failed), one unrelated (created). Operator filter
+    // surfaces only the first.
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'op-q',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 3000,
+      details: { motivo: 'conflict', trigger: 'operator_driven' },
+    });
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'det-q',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 2000,
+      details: { motivo: 'shift', trigger: 'verify_failed' },
+    });
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'plain',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 1000,
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'operator'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('trigger: operator');
+    expect(text).toContain('op-q');
+    expect(text).not.toContain('det-q');
+    expect(text).not.toContain('plain');
+  });
+
+  test('--trigger detector matches every spec auto-detector', async () => {
+    // Seed one row for each of the 4 detector triggers + one
+    // operator_driven to confirm the inverse.
+    const detectors = [
+      'verify_failed',
+      'user_override_repeated',
+      'conflict_detected',
+      'trust_revoked',
+    ];
+    let ts = 1000;
+    for (const trigger of detectors) {
+      createMemoryEvent(db, {
+        scope: 'project_local',
+        action: 'quarantined',
+        memoryName: `mem-${trigger}`,
+        source: 'inferred',
+        sessionId,
+        cwd: '/p',
+        createdAt: ts++,
+        details: { motivo: 'conflict', trigger },
+      });
+    }
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'mem-operator_driven',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: ts++,
+      details: { motivo: 'conflict', trigger: 'operator_driven' },
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'detector'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    for (const trigger of detectors) {
+      expect(text).toContain(`mem-${trigger}`);
+    }
+    expect(text).not.toContain('mem-operator_driven');
+  });
+
+  test('--trigger <literal> matches the literal trigger field', async () => {
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'vf',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 1000,
+      details: { motivo: 'shift', trigger: 'verify_failed' },
+    });
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'cd',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 2000,
+      details: { motivo: 'conflict', trigger: 'conflict_detected' },
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'verify_failed'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('vf');
+    expect(text).not.toContain('cd');
+  });
+
+  test('--trigger filter with zero matches yields a clear message', async () => {
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'plain',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 1000,
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'verify_failed'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('no audit rows matching --trigger verify_failed');
+  });
+
+  test('--trigger without a value errors', async () => {
+    const r = await memoryCommand.exec(['audit', '--trigger'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--trigger needs a value');
+  });
 });
 
 // Helper: stub modalManager.askMemoryAction to a fixed answer so

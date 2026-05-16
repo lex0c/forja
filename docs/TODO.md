@@ -23,8 +23,8 @@ Land the manual paths before the auto-detectors so the pipeline is end-to-end te
 |---|---|---|
 | **T0.1** | ✅ done | `/memory quarantine <name> --motivo <kind> --evidence "…"` slash command — invokes `transitionMemoryState` with the operator's motivo. Accepts every spec motivo (`conflict`, `shift`, `security`, `low_roi`, `irrelevant`). |
 | **T0.2** | ✅ done | `/memory list` rendering — `[QUARANTINED] / [INVALIDATED] / [PROPOSED] / [EXPIRED <date>]` prefix flags, `(expires <date>)` suffix for future-expiring active entries, `[ORPHAN] / [MALFORMED]` markers for unreadable rows. Spec §6.5.2 motivo+date format deferred (JOIN with eviction_events). |
-| **T0.3** | pending | `/memory audit` trigger-source filter — distinguish `operator_driven` vs `trigger_source: <detector_name>` (lays the path for slices 2-5). |
-| **T0.4** | pending | Tests + `docs/MEMORY.md` §6 update (new verb + columns documented). |
+| **T0.3** | ✅ done | `/memory audit --trigger <source>` filter — literal match on `details.trigger`, plus semantic shortcuts `operator` (matches `operator_driven`) and `detector` (matches the 4 spec detectors: `verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked`). Lays the forensic path for Slices 2-5. |
+| **T0.4** | ✅ done | Tests landed inline per task (T0.1: 9, T0.2: 7, T0.3: 5 = 21 new tests). `docs/MEMORY.md` §6 table updated with the 3 new surfaces (quarantine verb, list rendering, audit --trigger); §14.5 entry added under "What IS shipped" pointing to the Slice 0 closure. |
 
 **Acceptance:** operator runs `/memory quarantine foo --motivo conflict --evidence "duplicates bar"`, sees foo in `/memory list` with quarantine flag, inspects the row in `/memory audit`. Pipeline tested end-to-end.
 
