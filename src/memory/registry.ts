@@ -499,6 +499,38 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       if (opts.scope !== undefined) {
         filtered = filtered.filter((l) => l.scope === opts.scope);
       }
+
+      // State / expires filter — gated on the option so callers
+      // that don't care don't pay the per-listing file-read cost.
+      // The frontmatter lives in the .md file (NOT in the cached
+      // IndexEntry snapshot), so we read each surviving listing
+      // once. Missing / malformed files are excluded — they
+      // belong to /memory audit, not the model. See ListOptions
+      // for the rationale and the contract.
+      //
+      // ORDER MATTERS: this runs BEFORE the dedupe-by-name pass.
+      // If we deduplicated first, a higher-precedence shadow
+      // (e.g. `project_local/foo` that's quarantined / expired /
+      // missing) would WIN the precedence walk and then be
+      // dropped here — silently suppressing the lower-precedence
+      // ELIGIBLE sibling (`project_shared/foo` or `user/foo`)
+      // that should have surfaced for retrieval. Filtering first
+      // means precedence operates over the eligible set only,
+      // preserving the local > shared > user fallback semantic.
+      const needFrontmatter = opts.states !== undefined || opts.includeExpired === false;
+      if (needFrontmatter) {
+        const nowMs = opts.nowMs ?? Date.now();
+        filtered = filtered.filter((l) => {
+          const fileResult = readMemoryByName(roots, l.scope, l.name);
+          if (fileResult.kind !== 'present') return false;
+          const fm = fileResult.file.frontmatter;
+          const state: MemoryState = fm.state ?? 'active';
+          if (opts.states !== undefined && !opts.states.includes(state)) return false;
+          if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return false;
+          return true;
+        });
+      }
+
       if (opts.deduplicateByName === true) {
         const seen = new Set<string>();
         filtered = filtered.filter((l) => {
@@ -507,25 +539,8 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           return true;
         });
       }
-      // State / expires filter — gated on the option so callers
-      // that don't care don't pay the per-listing file-read cost.
-      // The frontmatter lives in the .md file (NOT in the cached
-      // IndexEntry snapshot), so we read each surviving listing
-      // once. Missing / malformed files are excluded — they
-      // belong to /memory audit, not the model. See ListOptions
-      // for the rationale and the contract.
-      const needFrontmatter = opts.states !== undefined || opts.includeExpired === false;
-      if (!needFrontmatter) return filtered;
-      const nowMs = opts.nowMs ?? Date.now();
-      return filtered.filter((l) => {
-        const fileResult = readMemoryByName(roots, l.scope, l.name);
-        if (fileResult.kind !== 'present') return false;
-        const fm = fileResult.file.frontmatter;
-        const state: MemoryState = fm.state ?? 'active';
-        if (opts.states !== undefined && !opts.states.includes(state)) return false;
-        if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return false;
-        return true;
-      });
+
+      return filtered;
     },
 
     lookup(name, opts: ScopeOption = {}): MemoryListing | null {

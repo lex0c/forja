@@ -2,6 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(memory/registry) — apply state/expiry filter before deduplicating by name
+
+`registry.list()` deduplicated by name BEFORE evaluating `states` / `includeExpired`. A higher-precedence shadow (e.g. `project_local/foo`) that was quarantined / invalidated / evicted / expired would win the precedence walk, then get dropped by the frontmatter filter — silently suppressing a lower-precedence ELIGIBLE sibling (`project_shared/foo` or `user/foo`) that should have surfaced. The retrieval memory view, which calls `list({ deduplicateByName: true, states: ['active'] })`, ended up with zero candidates for that name even when a valid active version existed in another scope.
+
+Fix: swap the order. State / expires filter runs FIRST, then dedupe-by-name operates over the eligible set only. Comment block above the filter now spells out the order invariant so a future refactor doesn't reintroduce the bug. The `scope` filter still runs at the head (scope mismatch is the cheapest filter and gates everything that follows).
+
+Three regression tests in `tests/memory/registry.test.ts`:
+- Local quarantined + shared active + user active → result is shared (precedence among eligible).
+- All shadows ineligible (local quarantined + shared evicted) → name absent from result.
+- Same precedence-aware filtering for `expires`: local stale + shared fresh → shared surfaces.
+
 ## [2026-05-16] fix(memory/registry) — parseExpiresEndOfDayMs rejected legitimate month-end expiries
 
 `parseExpiresEndOfDayMs` validated dates by computing `Date.UTC(year, month - 1, day + 1, …)` and requiring the resulting `getUTCMonth()` to still equal `month - 1`. That check intended to catch overflow inputs like `2026-02-31` (which JS rolls to 2026-03-03), but it ALSO rejected every legitimate last-day-of-month: `2026-01-31`'s "next day" naturally crosses into February, so the month check failed and the function returned null. With null returned, `isExpired` treated the memory as non-expiring and `list({ includeExpired: false })` quietly kept the entry visible past its expiry.

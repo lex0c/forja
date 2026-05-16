@@ -166,6 +166,63 @@ describe('createMemoryRegistry — list states + expires filter (H1+H6)', () => 
     expect(reg.list({ includeExpired: false, nowMs: nextDayMs })).toEqual([]);
   });
 
+  test('ineligible higher-precedence shadow does NOT suppress eligible lower-precedence (regression)', () => {
+    // Pre-fix: list() deduplicated by name BEFORE evaluating
+    // states/includeExpired. A local quarantined `foo` would win
+    // the precedence walk (local > shared > user) and then be
+    // dropped by the state filter, leaving zero candidates for
+    // `foo` even though shared/user had an active version that
+    // should have surfaced. Filter must run BEFORE dedupe so
+    // precedence operates over eligible memories only.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — local quarantined\n');
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared active\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user active\n');
+    writeMemory(roots.projectLocal, 'foo', fmWithState('foo', 'quarantined'), 'local body\n');
+    writeMemory(roots.projectShared, 'foo', fmWithState('foo', 'active'), 'shared body\n');
+    writeMemory(roots.user, 'foo', fmWithState('foo', 'active'), 'user body\n');
+    const reg = createMemoryRegistry({ roots });
+
+    // With state filter active: local is quarantined → excluded;
+    // among the remaining eligible {shared, user}, dedupe picks
+    // shared (higher precedence). User stays hidden — that's
+    // dedupe-by-name's purpose.
+    const result = reg.list({ deduplicateByName: true, states: ['active'] });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.scope).toBe('project_shared');
+    expect(result[0]?.name).toBe('foo');
+  });
+
+  test('all shadows ineligible → name absent from result (regression)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — local\n');
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeMemory(roots.projectLocal, 'foo', fmWithState('foo', 'quarantined'), 'body\n');
+    writeMemory(roots.projectShared, 'foo', fmWithState('foo', 'evicted'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const result = reg.list({ deduplicateByName: true, states: ['active'] });
+    expect(result).toEqual([]);
+  });
+
+  test('expired higher-precedence shadow does NOT suppress fresh lower-precedence', () => {
+    // Same precedence-aware filtering for the expires case: a
+    // local memory past its expires shouldn't hide a shared/user
+    // sibling that's still valid.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Bar](bar.md) — local stale\n');
+    writeIndex(roots.projectShared, '- [Bar](bar.md) — shared fresh\n');
+    writeMemory(roots.projectLocal, 'bar', fmWithState('bar', undefined, '2024-01-01'), 'body\n');
+    writeMemory(roots.projectShared, 'bar', fmWithState('bar', undefined, '2099-12-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const nowMs = Date.UTC(2026, 4, 16);
+    const result = reg.list({ deduplicateByName: true, includeExpired: false, nowMs });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.scope).toBe('project_shared');
+  });
+
   test('combined: states + expires + scope + dedupe filter compose', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
