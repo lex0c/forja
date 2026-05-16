@@ -266,6 +266,7 @@ export const runRetrieval = async (
 
   return {
     queryId,
+    traceMissing: queryId.length === 0,
     contextSlot,
     candidatesRaw,
     candidatesExpanded,

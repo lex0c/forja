@@ -10,7 +10,10 @@ import type { Candidate, PipelineDeps, RetrievalQuery } from '../../src/retrieva
 import { runRetrieval } from '../../src/retrieval/pipeline.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { listRetrievalTracesBySession } from '../../src/storage/repos/retrieval-trace.ts';
+import {
+  countRetrievalTraces,
+  listRetrievalTracesBySession,
+} from '../../src/storage/repos/retrieval-trace.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
 let db: DB;
@@ -314,6 +317,11 @@ describe('runRetrieval — abort signal', () => {
     };
     await expect(runRetrieval(deps, baseQuery)).rejects.toThrow(/aborted before expand/);
     expect(expandRan).toBe(false);
+    // M6 invariant: abort short-circuit MUST NOT persist a partial
+    // trace. Spec §10.1 mandates "one row end-of-pipeline"; without
+    // this assertion a future refactor that adds an early persist
+    // would slip through the abort tests silently.
+    expect(countRetrievalTraces(db)).toBe(0);
   });
 
   test('signal is forwarded to each view search call', async () => {
@@ -342,6 +350,49 @@ describe('runRetrieval — abort signal', () => {
     expect(seenSignals).toHaveLength(2);
     expect(seenSignals[0]).toBe(ctrl.signal);
     expect(seenSignals[1]).toBe(ctrl.signal);
+  });
+
+  test('traceMissing flag is true when persist fails (M4)', async () => {
+    // Force persist failure by closing the DB before the call —
+    // createRetrievalTrace throws, the pipeline catches and sets
+    // queryId='', and traceMissing reflects that the audit surface
+    // has a gap. The model still gets a populated contextSlot.
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          async search() {
+            return [candidateOf('m:1')];
+          },
+        },
+      },
+    };
+    db.close();
+    const result = await runRetrieval(deps, baseQuery);
+    expect(result.queryId).toBe('');
+    expect(result.traceMissing).toBe(true);
+    expect(result.candidatesRaw).toHaveLength(1);
+    // Reopen so afterEach teardown doesn't error.
+    db = openMemoryDb();
+    migrate(db);
+  });
+
+  test('traceMissing is false on the happy path', async () => {
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          async search() {
+            return [];
+          },
+        },
+      },
+    };
+    const result = await runRetrieval(deps, baseQuery);
+    expect(result.queryId).not.toBe('');
+    expect(result.traceMissing).toBe(false);
   });
 
   test('no signal supplied → pipeline runs normally (signal field is optional)', async () => {

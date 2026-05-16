@@ -142,6 +142,7 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
         skipped: result.contextSlot.skipped.length,
         budgetUsedTokens: budgetUsed,
         budgetRemainingTokens: Math.max(0, budget - budgetUsed),
+        traceMissing: result.traceMissing,
       },
     };
   };

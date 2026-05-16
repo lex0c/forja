@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] chore(retrieval+cli) — memory-flow review M round 2 (txn, traceMissing, scope verbose, polish)
+
+Closes the residual robustness findings from the memory-flow code review.
+
+**M1** — `src/retrieval/views/session.ts` did three sequential SQLite reads (messages, tool_calls, failure_events) without a transaction. A new row inserted between reads would leave the corpus with a tool_call whose parent message exists in the DB but not in `messageById`, surfacing a row through the projection's "unknown session source" fallback. Wrapped the three reads in `withTransaction` (DEFERRED — WAL readers don't block writers; the BEGIN's snapshot is stable through COMMIT for every read inside).
+
+**M3** — `src/retrieval/compression.ts createCompressionResolver`'s `warnedViews: Set<string>` is closure-scoped per resolver, which is built once per session-runner. Two concurrent `retrieve_context` calls share it. Behavior is intentional (dedupe stderr warnings across calls of the same session) but the coupling was implicit. Comment added documenting it so a future load-bearing use of the Set knows to revisit the scope decision.
+
+**M4** — Trace persist failure in `runRetrieval` sets `queryId = ''` and logs stderr, but callers had no structured signal that the audit surface had a gap. Added `traceMissing: boolean` to `RetrievalResult` and `RetrieveContextOutput.stats`; mirrors `queryId === ''` so the model / tool consumer can branch (`if (stats.traceMissing) { ... }`) without parsing the empty-string convention. 2 new tests in `tests/retrieval/pipeline.test.ts` covering the failure path (close DB before call) and the happy path.
+
+**M5** — `/agent retrieval replay <id>` previously emitted `memory/memory:project_local/auth · level=full · cost=42t` — the scope was inside the nodeId but visually buried. Added `--verbose-scope` flag that hoists scope into its own column (`memory[project_local]/auth · level=full · cost=42t`) and appends a footer noting the precedence order (`project_local > project_shared > user`). Flag is opt-in so the default output stays narrow. Two new tests pin the flag's render and unknown-flag rejection.
+
+**M6** — Abort signal mid-pipeline correctly throws (commit `4935fef`), but tests didn't assert that NO retrieval_trace row persists in that case. Spec §10.1 mandates "one row end-of-pipeline"; the assertion was missing the upper bound. Added `expect(countRetrievalTraces(db)).toBe(0)` after the existing abort-between-stages test.
+
+No behavior changes the operator would notice except the new `--verbose-scope` flag and the new `traceMissing` field. All previous tests still pass; 5 new tests land alongside.
+
 ## [2026-05-16] docs(memory+retrieval) — formalize audit split + retrieval_trace immutability policy (review H4+H5)
 
 H4 and H5 from the memory-flow code review are accepted as a policy decision rather than a code change. The split between `memory_events` (operator-driven, explicit memory operations) and `retrieval_trace.context_slot_json.included[]` (model-facing retrieval deliveries) is the established surface, and `retrieval_trace` bodies stay frozen after the originating memory is evicted/purged. The deliberate-not-accidental nature was implicit in the implementation; this entry promotes it to documented policy.

@@ -234,7 +234,19 @@ export interface PipelineTimings {
 }
 
 export interface RetrievalResult {
+  // Persisted trace id. Empty string when the trace persist
+  // step failed (see `traceMissing` below); `queryId.length > 0`
+  // is the canonical "trace is queryable" check.
   queryId: string;
+  // True when the trace persist step failed and `queryId` is
+  // empty. The pipeline still returned a populated `contextSlot`
+  // so the model can use the retrieval result; the trace just
+  // isn't available for `/agent retrieval audit` / `replay`.
+  // Operators relying on the trace for forensic auditing need
+  // this flag to know when the audit surface has a gap. The
+  // pipeline logs the underlying error to stderr; this flag is
+  // the structured equivalent the caller can branch on.
+  traceMissing: boolean;
   contextSlot: ContextSlot;
   // Read-back of the persisted trace stages so callers can render
   // breakdown without an extra DB hit. Mirrors retrieval_trace
@@ -280,7 +292,9 @@ export interface RetrieveContextOutput {
   contextSlot: ContextSlot;
   // Trace id (uuid). Operators forensic via `/agent retrieval
   // replay <queryId>` (slice 4.8) — surfaced so the model can
-  // cite the trace in subsequent reasoning.
+  // cite the trace in subsequent reasoning. Empty string when
+  // the persist step failed; `traceMissing` in `stats` carries
+  // the structured flag.
   queryId: string;
   // Counts per stage for the operator to gauge whether the
   // query needed more / less budget. Mirrors §10 metrics surface.
@@ -291,6 +305,11 @@ export interface RetrieveContextOutput {
     skipped: number;
     budgetUsedTokens: number;
     budgetRemainingTokens: number;
+    // True when `queryId` is empty because the persist step
+    // failed. Operator forensic via `/agent retrieval audit`
+    // will NOT find a row for this call — flag so the model can
+    // mention the gap in its reasoning if asked to cite.
+    traceMissing: boolean;
   };
 }
 

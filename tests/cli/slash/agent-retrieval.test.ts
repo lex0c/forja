@@ -543,6 +543,55 @@ describe('/agent retrieval replay', () => {
     }
   });
 
+  test('--verbose-scope annotates memory nodeIds with their scope (M5)', async () => {
+    // Seed a trace whose included slot has a memory entry. Without
+    // the flag, the nodeId renders as `memory/memory:project_local/foo`
+    // (raw); with `--verbose-scope`, the scope is hoisted to its
+    // own column: `memory[project_local]/foo`.
+    const traceId = '12345678-1111-2222-3333-444444444444';
+    createRetrievalTrace(db, {
+      id: traceId,
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: {
+        included: [
+          {
+            nodeId: 'memory:project_local/auth',
+            view: 'memory',
+            level: 'full',
+            content: 'body',
+            costTokens: 42,
+          },
+        ],
+        skipped: [],
+      },
+      timings: sampleTimings(),
+    });
+    const r = await agentPolicyCommand.exec(
+      ['retrieval', 'replay', traceId, '--verbose-scope'],
+      buildCtx(),
+    );
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('memory[project_local]/auth');
+    expect(text).toContain('scope precedence: project_local > project_shared > user');
+  });
+
+  test('replay rejects unknown flag (M5 parser)', async () => {
+    const r = await agentPolicyCommand.exec(
+      ['retrieval', 'replay', 'someid', '--made-up'],
+      buildCtx(),
+    );
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown flag '--made-up'");
+  });
+
   test('UUID fast-path refuses traces from other sessions (H2 regression)', async () => {
     // Regression: `getRetrievalTrace` is a session-agnostic
     // primary-key lookup. Pre-H2, an operator passing a 36-char

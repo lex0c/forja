@@ -79,6 +79,7 @@ describe('retrieve_context — validation', () => {
       skipped: 0,
       budgetUsedTokens: 0,
       budgetRemainingTokens: 0,
+      traceMissing: false,
     },
   });
 
@@ -204,6 +205,7 @@ describe('retrieve_context — validation', () => {
           skipped: 0,
           budgetUsedTokens: 0,
           budgetRemainingTokens: 0,
+          traceMissing: false,
         },
       };
     };

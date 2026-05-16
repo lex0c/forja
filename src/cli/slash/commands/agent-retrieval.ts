@@ -14,7 +14,11 @@
 // 8-char prefix is enough when unambiguous.
 
 import { WORKFLOW_WEIGHTS } from '../../../retrieval/ranking.ts';
-import type { RetrievalTraceRow, RetrievalWorkflow } from '../../../retrieval/types.ts';
+import type {
+  RetrievalTraceRow,
+  RetrievalView,
+  RetrievalWorkflow,
+} from '../../../retrieval/types.ts';
 import {
   getRetrievalTrace,
   listRetrievalTracesBySession,
@@ -274,19 +278,36 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
 // ─── /agent retrieval replay ───────────────────────────────────────────
 
 const handleReplay = (ctx: SlashContext, args: string[]): SlashResult => {
-  if (args.length === 0) {
+  // Parse flags (`--verbose-scope`) and the positional id. Two-step
+  // so the id can come before OR after the flag.
+  let verboseScope = false;
+  const positional: string[] = [];
+  for (const a of args) {
+    if (a === '--verbose-scope') {
+      verboseScope = true;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return {
+        kind: 'error',
+        message: `/agent retrieval replay: unknown flag '${a}' (try --verbose-scope)`,
+      };
+    }
+    positional.push(a);
+  }
+  if (positional.length === 0) {
     return {
       kind: 'error',
       message: '/agent retrieval replay: missing query id (use /agent retrieval audit to find one)',
     };
   }
-  if (args.length > 1) {
+  if (positional.length > 1) {
     return {
       kind: 'error',
-      message: `/agent retrieval replay: too many args (got ${args.length}, expected 1 id)`,
+      message: `/agent retrieval replay: too many args (got ${positional.length}, expected 1 id)`,
     };
   }
-  const resolved = resolveTraceId(ctx, args[0] as string);
+  const resolved = resolveTraceId(ctx, positional[0] as string);
   if (resolved.kind === 'error') return resolved;
   const t = resolved.row;
   const totalMs = t.timings.searchMs + t.timings.expandMs + t.timings.rankMs + t.timings.compressMs;
@@ -319,16 +340,53 @@ const handleReplay = (ctx: SlashContext, args: string[]): SlashResult => {
   }
   lines.push('', `context_slot included (${t.contextSlot.included.length}):`);
   for (const e of t.contextSlot.included) {
-    lines.push(`  ${e.view}/${e.nodeId.slice(0, 40)} · level=${e.level} · cost=${e.costTokens}t`);
+    const label = formatNodeIdForReplay(e.view, e.nodeId, verboseScope);
+    lines.push(`  ${label} · level=${e.level} · cost=${e.costTokens}t`);
   }
   if (t.contextSlot.skipped.length > 0) {
     lines.push('', `skipped (${t.contextSlot.skipped.length}):`);
     for (const s of t.contextSlot.skipped) {
       const wouldCost = s.wouldCostTokens === null ? 'n/a' : `${s.wouldCostTokens}t`;
-      lines.push(`  ${s.view}/${s.nodeId.slice(0, 40)} · would_cost=${wouldCost} · ${s.reason}`);
+      const label = formatNodeIdForReplay(s.view, s.nodeId, verboseScope);
+      lines.push(`  ${label} · would_cost=${wouldCost} · ${s.reason}`);
     }
   }
+  if (verboseScope) {
+    lines.push(
+      '',
+      'scope precedence: project_local > project_shared > user (lower scopes hidden by dedupe).',
+    );
+  }
   return { kind: 'ok', notes: lines };
+};
+
+// Render a candidate's `view/nodeId` for replay output, optionally
+// surfacing the memory scope so the operator can see WHICH scope
+// version landed (or skipped). nodeId for memory carries
+// `memory:<scope>/<name>` natively; in default mode we render it
+// raw (e.g., `memory/memory:project_local/auth`). With
+// `--verbose-scope` we hoist the scope to its own column:
+// `memory[project_local]/auth`. Other views pass through unchanged.
+const formatNodeIdForReplay = (
+  view: RetrievalView,
+  nodeId: string,
+  verboseScope: boolean,
+): string => {
+  if (!verboseScope || view !== 'memory') {
+    return `${view}/${nodeId.slice(0, 40)}`;
+  }
+  // `memory:<scope>/<name>` → `memory[<scope>]/<name>`.
+  const prefix = 'memory:';
+  if (!nodeId.startsWith(prefix)) {
+    return `${view}/${nodeId.slice(0, 40)}`;
+  }
+  const rest = nodeId.slice(prefix.length);
+  const slash = rest.indexOf('/');
+  if (slash < 0) return `${view}/${nodeId.slice(0, 40)}`;
+  const scope = rest.slice(0, slash);
+  const name = rest.slice(slash + 1);
+  const truncatedName = name.length > 30 ? `${name.slice(0, 27)}…` : name;
+  return `memory[${scope}]/${truncatedName}`;
 };
 
 // ─── /agent retrieval metrics ─────────────────────────────────────────

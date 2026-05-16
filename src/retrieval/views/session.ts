@@ -36,7 +36,7 @@
 // signal_temporal weight, which is heaviest for the debug
 // workflow (§5.2).
 
-import type { DB } from '../../storage/db.ts';
+import { type DB, withTransaction } from '../../storage/db.ts';
 import {
   type FailureEventRow,
   listFailureEventsBySession,
@@ -164,61 +164,73 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
     const toolCallById = new Map<string, ToolCallRow>();
     const failureById = new Map<string, FailureEventRow>();
 
-    // Messages.
-    const messages = listMessagesBySession(deps.db, deps.sessionId);
-    for (const msg of messages) {
-      messageById.set(msg.id, msg);
-      const text = messageText(msg.content);
-      const textTokens = tokenize(text);
-      const tokens: string[] = [];
-      const repeat =
-        msg.role === 'user'
-          ? USER_MESSAGE_WEIGHT
-          : msg.role === 'assistant'
-            ? ASSISTANT_MESSAGE_WEIGHT
-            : TOOL_MESSAGE_WEIGHT;
-      for (let i = 0; i < repeat; i++) tokens.push(...textTokens);
-      docs.push({ id: messageNodeId(msg.id), tokens });
-    }
+    // Wrap the three substrate reads in a single transaction so
+    // they see a consistent snapshot of the session. Without it,
+    // a new message inserted between read 1 (messages) and read 2
+    // (tool_calls) could leave the corpus with a toolcall whose
+    // parent message exists in the DB but not in `messageById`
+    // — the projection step then falls through to a generic
+    // "unknown session source" reason for a row that's genuinely
+    // valid. WAL mode + DEFERRED transaction is the right shape:
+    // readers don't block writers; the BEGIN's snapshot is stable
+    // through COMMIT for ALL reads inside it.
+    withTransaction(deps.db, () => {
+      // Messages.
+      const messages = listMessagesBySession(deps.db, deps.sessionId);
+      for (const msg of messages) {
+        messageById.set(msg.id, msg);
+        const text = messageText(msg.content);
+        const textTokens = tokenize(text);
+        const tokens: string[] = [];
+        const repeat =
+          msg.role === 'user'
+            ? USER_MESSAGE_WEIGHT
+            : msg.role === 'assistant'
+              ? ASSISTANT_MESSAGE_WEIGHT
+              : TOOL_MESSAGE_WEIGHT;
+        for (let i = 0; i < repeat; i++) tokens.push(...textTokens);
+        docs.push({ id: messageNodeId(msg.id), tokens });
+      }
 
-    // Tool calls.
-    const toolCalls = listToolCallsBySession(deps.db, deps.sessionId);
-    for (const tc of toolCalls) {
-      toolCallById.set(tc.id, tc);
-      const nameTokens = tokenize(tc.tool_name);
-      // input is raw JSON string from the DB. Tokenize directly —
-      // ASCII split surfaces the substantive words ("grep", "src",
-      // "auth", paths' segments) without us needing to JSON.parse
-      // every row.
-      //
-      // This deliberately also surfaces JSON keys (`command`,
-      // `path`, etc.) as tokens. They add noise (a query like
-      // `command` matches every bash row), but BM25 IDF dampens
-      // it — keys that appear in every doc carry near-zero
-      // contribution. The simpler tokenizer wins until eval shows
-      // measurable harm.
-      const inputTokens = tokenize(tc.input);
-      const tokens: string[] = [];
-      for (let i = 0; i < TOOL_NAME_WEIGHT; i++) tokens.push(...nameTokens);
-      for (let i = 0; i < TOOL_INPUT_WEIGHT; i++) tokens.push(...inputTokens);
-      docs.push({ id: toolCallNodeId(tc.id), tokens });
-    }
+      // Tool calls.
+      const toolCalls = listToolCallsBySession(deps.db, deps.sessionId);
+      for (const tc of toolCalls) {
+        toolCallById.set(tc.id, tc);
+        const nameTokens = tokenize(tc.tool_name);
+        // input is raw JSON string from the DB. Tokenize directly —
+        // ASCII split surfaces the substantive words ("grep", "src",
+        // "auth", paths' segments) without us needing to JSON.parse
+        // every row.
+        //
+        // This deliberately also surfaces JSON keys (`command`,
+        // `path`, etc.) as tokens. They add noise (a query like
+        // `command` matches every bash row), but BM25 IDF dampens
+        // it — keys that appear in every doc carry near-zero
+        // contribution. The simpler tokenizer wins until eval shows
+        // measurable harm.
+        const inputTokens = tokenize(tc.input);
+        const tokens: string[] = [];
+        for (let i = 0; i < TOOL_NAME_WEIGHT; i++) tokens.push(...nameTokens);
+        for (let i = 0; i < TOOL_INPUT_WEIGHT; i++) tokens.push(...inputTokens);
+        docs.push({ id: toolCallNodeId(tc.id), tokens });
+      }
 
-    // Failure events.
-    const failures = listFailureEventsBySession(deps.db, deps.sessionId);
-    for (const fe of failures) {
-      failureById.set(fe.id, fe);
-      const codeTokens = [
-        ...tokenize(fe.code),
-        ...tokenize(fe.classe),
-        ...tokenize(fe.recovery_action),
-      ];
-      const bodyTokens = fe.payload_json !== null ? tokenize(fe.payload_json) : ([] as string[]);
-      const tokens: string[] = [];
-      for (let i = 0; i < FAILURE_CODE_WEIGHT; i++) tokens.push(...codeTokens);
-      for (let i = 0; i < FAILURE_BODY_WEIGHT; i++) tokens.push(...bodyTokens);
-      docs.push({ id: failureNodeId(fe.id), tokens });
-    }
+      // Failure events.
+      const failures = listFailureEventsBySession(deps.db, deps.sessionId);
+      for (const fe of failures) {
+        failureById.set(fe.id, fe);
+        const codeTokens = [
+          ...tokenize(fe.code),
+          ...tokenize(fe.classe),
+          ...tokenize(fe.recovery_action),
+        ];
+        const bodyTokens = fe.payload_json !== null ? tokenize(fe.payload_json) : ([] as string[]);
+        const tokens: string[] = [];
+        for (let i = 0; i < FAILURE_CODE_WEIGHT; i++) tokens.push(...codeTokens);
+        for (let i = 0; i < FAILURE_BODY_WEIGHT; i++) tokens.push(...bodyTokens);
+        docs.push({ id: failureNodeId(fe.id), tokens });
+      }
+    });
 
     if (docs.length === 0) return [];
 

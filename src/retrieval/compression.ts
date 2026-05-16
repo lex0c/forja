@@ -275,6 +275,15 @@ export const createCompressionResolver = (deps: CompressionResolverDeps): Compre
   // (built once per session-runner) — a new bad view appearing
   // mid-session still warns once. Limited to ~few entries even
   // pathologically; no eviction needed.
+  //
+  // Concurrency note: `buildRetrievalRunner` constructs ONE
+  // resolver per session and reuses it across `retrieve_context`
+  // calls. Two concurrent calls therefore share this Set. The
+  // behavior is intentional (dedupe warnings ACROSS calls of the
+  // same session) but creates an implicit coupling — if a future
+  // use of `warnedViews` ever becomes load-bearing for behavior
+  // (not just for stderr noise), the per-call vs. per-resolver
+  // scope choice needs to be reconsidered.
   const warnedViews = new Set<string>();
   return {
     resolve(candidate, level) {
