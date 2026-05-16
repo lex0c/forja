@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(tools+telemetry) — cap retrieve_context query length + strip terminal-attack control chars in scrub (review H2+H3)
+
+Closed two `feat/retrieval` review findings, both at the input/output boundary.
+
+**H2** — `src/tools/builtin/retrieve-context.ts` validated `query.trim().length === 0` but not an upper bound. A 1GB query string would otherwise be accepted, tokenized by every view's BM25, persisted into `retrieval_trace.query_text`, and stored verbatim in audit logs — audit-storage DoS through a single tool call. Added `MAX_QUERY_LENGTH = 10_000` chars (well above any real natural-language query, hard refuses pathological inputs). Schema declares `maxLength` so providers that respect schema-side bounds can refuse client-side too.
+
+**H3** — `src/telemetry/scrubbing.ts scrubFreeformText` redacted paths/hosts but left C0/C1 control characters intact. A trace whose `query_text` or `reason` field carried `\x1b[2J` (clear screen), `\x1b[31m` (color), `\x07` (bell), or any other ANSI/OSC escape would manipulate the operator's terminal when surfaced via `/agent retrieval audit`, `/agent retrieval replay`, `/agent policy …`, or any other forensic surface interpolating scrubbed text into stdout. Same surface exists in `worker.crashed.stderr` and `state.transition.reason` — every consumer of `scrubFreeformText` benefits.
+
+Strip range: full C0 (0x00-0x1F) MINUS TAB / LF / CR, plus DEL (0x7F) and C1 (0x80-0x9F). TAB / LF / CR preserved because legitimate multi-line consumers (stack traces in `worker.crashed.stderr`, multi-paragraph reasons) need them, and plain whitespace isn't an attack vector. Stripping runs BEFORE path/host sweeps so an attacker can't smuggle a path past PATH_REGEX_POSIX via an ESC-prefixed token (`\x1b/home/x` — pre-strip the leading `\x1b` breaks the word boundary; post-strip the path emerges and gets redacted).
+
+Tests: 2 new in `tests/tools/retrieve-context.test.ts` (refuse at MAX+1, accept at exactly MAX); 5 new in `tests/telemetry/scrubbing.test.ts` (ANSI SGR strip, OSC/BEL/NUL/DEL strip, C1 strip, whitespace controls preserved, smuggle-via-ESC defended, ordinary text passthrough). Existing `worker.crashed.stderr` test for newline preservation still passes — exactly the case the whitespace-preserve carveout was designed for.
+
 ## [2026-05-15] fix(retrieval) — plumb AbortSignal through pipeline + guard estimateTokens NaN/Infinity (review H1+H4)
 
 Closed two high findings from the `feat/retrieval` review.

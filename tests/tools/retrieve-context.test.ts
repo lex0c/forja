@@ -106,6 +106,30 @@ describe('retrieve_context — validation', () => {
     expect(r).toMatchObject({ is_error: true, error_code: 'tool.invalid_arg' });
   });
 
+  test('rejects query exceeding MAX_QUERY_LENGTH (audit/DoS cap)', async () => {
+    // H2 review: an unbounded query would inflate retrieval_trace
+    // query_text, get tokenized by every view's BM25, and persist
+    // verbatim into audit storage. Cap is 10k chars — anything
+    // larger refused at tool boundary with `tool.invalid_arg`.
+    const huge = 'a'.repeat(10_001);
+    const r = await retrieveContextTool.execute(
+      { query: huge },
+      makeCtx({ retrieveContext: stubRetrieve }),
+    );
+    expect(r).toMatchObject({ is_error: true, error_code: 'tool.invalid_arg' });
+    if ('is_error' in r)
+      expect((r as { error_message: string }).error_message).toContain('query length capped');
+  });
+
+  test('accepts query at exactly MAX_QUERY_LENGTH (boundary)', async () => {
+    const exact = 'a'.repeat(10_000);
+    const r = await retrieveContextTool.execute(
+      { query: exact },
+      makeCtx({ retrieveContext: stubRetrieve }),
+    );
+    expect(r).not.toMatchObject({ is_error: true });
+  });
+
   test('rejects unknown workflow', async () => {
     const r = await retrieveContextTool.execute(
       { query: 'auth', workflow: 'whatever' } as never,

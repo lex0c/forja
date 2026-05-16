@@ -36,6 +36,17 @@ const MAX_BUDGET_TOKENS = 100_000;
 // instead of silently truncating.
 const MAX_VIEWS = 3;
 
+// Per-call cap on query text length. Operator/model queries are
+// short by design (a sentence or two of natural language, an
+// identifier, a path). 10k chars is a generous ceiling that still
+// refuses pathological inputs — a 1GB query string would otherwise
+// be tokenized, passed through every view's BM25 scoring, persisted
+// into `retrieval_trace.query_text`, and stored verbatim in audit
+// logs. Refuse at the tool boundary with `tool.invalid_arg` so the
+// model can resubmit a shorter query instead of corrupting downstream
+// storage.
+const MAX_QUERY_LENGTH = 10_000;
+
 export interface ValidatedArgs {
   query: string;
   workflow?: RetrievalWorkflow;
@@ -53,6 +64,11 @@ const validate = (raw: unknown): ValidatedArgs | { error: string } => {
 
   if (typeof args.query !== 'string' || args.query.trim().length === 0) {
     return { error: 'query must be a non-empty string' };
+  }
+  if (args.query.length > MAX_QUERY_LENGTH) {
+    return {
+      error: `query length capped at ${MAX_QUERY_LENGTH} chars (got ${args.query.length}); resubmit a shorter query`,
+    };
   }
 
   const out: ValidatedArgs = { query: args.query };
@@ -135,7 +151,8 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
     properties: {
       query: {
         type: 'string',
-        description: 'Free-text query. Path leaks are scrubbed from the trace at persist time.',
+        maxLength: MAX_QUERY_LENGTH,
+        description: `Free-text query (max ${MAX_QUERY_LENGTH} chars). Path leaks are scrubbed from the trace at persist time.`,
       },
       workflow: {
         type: 'string',
