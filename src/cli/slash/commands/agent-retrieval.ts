@@ -56,6 +56,18 @@ export const formatDurationMs = (ms: number): string => {
   return `${(ms / 1000).toFixed(2)}s`;
 };
 
+// Nearest-rank percentile. Empty array → 0 (matches the
+// metrics-line behavior). `p` is the percentile in [0, 1]. The
+// result is the smallest sorted value such that ≥ p fraction of
+// the array is ≤ it. Exported so the n=1 / p=0 / p=1 boundaries
+// can be pinned by direct tests.
+export const percentileOf = (arr: readonly number[], p: number): number => {
+  if (arr.length === 0) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+  return sorted[idx] ?? 0;
+};
+
 // Render a ratio (expected in [0, 1]) as a percentage. Out-of-range
 // values render as `?` rather than e.g. `-50.0%` / `150.0%`:
 // every caller's invariant should keep the ratio in [0, 1]
@@ -67,6 +79,12 @@ export const formatPercent = (ratio: number): string => {
   if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return '?';
   return `${(ratio * 100).toFixed(1)}%`;
 };
+
+// `WORKFLOW_PAD` covers every entry in the fixed RetrievalWorkflow
+// enum today (longest is `precedent_lookup` at 16). If a new
+// workflow longer than 16 chars lands in the spec, bump this so
+// the audit columns stay aligned.
+const WORKFLOW_PAD = 16;
 
 const formatTraceSummaryLine = (row: RetrievalTraceRow, nowMs: number): string => {
   const idShort = row.id.slice(0, 8);
@@ -82,7 +100,7 @@ const formatTraceSummaryLine = (row: RetrievalTraceRow, nowMs: number): string =
   const skipped = row.contextSlot.skipped.length;
   const totalMs =
     row.timings.searchMs + row.timings.expandMs + row.timings.rankMs + row.timings.compressMs;
-  return `  ${idShort} · ${row.workflow.padEnd(16)} · ${ageStr.padEnd(8)} · included=${included} skipped=${skipped} · ${formatDurationMs(totalMs)} · "${queryPreview}"`;
+  return `  ${idShort} · ${row.workflow.padEnd(WORKFLOW_PAD)} · ${ageStr.padEnd(8)} · included=${included} skipped=${skipped} · ${formatDurationMs(totalMs)} · "${queryPreview}"`;
 };
 
 // Resolve a (potentially short-id) prefix to a single trace row.
@@ -416,20 +434,17 @@ export const buildMetricsLines = (input: BuildMetricsLinesInput): string[] => {
   }
   const mean = (arr: number[]): number =>
     arr.length === 0 ? 0 : arr.reduce((s, n) => s + n, 0) / arr.length;
-  const percentile = (arr: number[], p: number): number => {
-    if (arr.length === 0) return 0;
-    const sorted = [...arr].sort((a, b) => a - b);
-    const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
-    return sorted[idx] ?? 0;
-  };
+  const percentile = percentileOf;
   // Shannon entropy of view distribution. Higher = more diverse;
   // 0 = single view monopolizes. Normalized to [0, 1] by log(N)
   // where N is the number of views present (max possible entropy
   // for that view count).
   const totalInclusions = [...viewCounts.values()].reduce((s, n) => s + n, 0);
   let entropy = 0;
+  // viewCounts is populated via `set(view, (get(view) ?? 0) + 1)`
+  // — every entry is therefore ≥ 1. No `count === 0` guard needed
+  // (previously present as defensive dead code, removed for clarity).
   for (const count of viewCounts.values()) {
-    if (count === 0) continue;
     const p = count / totalInclusions;
     entropy -= p * Math.log2(p);
   }
@@ -437,9 +452,13 @@ export const buildMetricsLines = (input: BuildMetricsLinesInput): string[] => {
   const diversityNorm = maxEntropy > 0 ? entropy / maxEntropy : 0;
   const evictionRate = totalRanked === 0 ? 0 : totalSkipped / totalRanked;
 
-  const lines: string[] = [
-    `retrieval metrics — last ${days.toFixed(1)}d (${traces.length} traces)`,
-  ];
+  // `days` is always an integer (parsed via Number.parseInt in
+  // handleMetrics). The previous render used `days.toFixed(1)`,
+  // which always emitted a trailing `.0` (e.g. `30.0d`) — useless
+  // visual noise for an integer field. Render plain. The
+  // `effectiveDays` value below stays decimal because it comes
+  // from a ms → days division and is genuinely non-integer.
+  const lines: string[] = [`retrieval metrics — last ${days}d (${traces.length} traces)`];
   if (capReached) {
     // Honest cap disclosure. We hit the safety cap, so the window
     // we actually aggregated over is narrower than `days` days —
@@ -487,7 +506,7 @@ const handleWorkflows = (): SlashResult => {
   for (const wf of workflows) {
     const w = WORKFLOW_WEIGHTS[wf];
     lines.push(
-      `  ${wf.padEnd(16)} · ${w.structural.toFixed(2).padStart(10)} · ${w.lexical.toFixed(2).padStart(7)} · ${w.semantic.toFixed(2).padStart(8)} · ${w.temporal.toFixed(2).padStart(8)} · ${w.usage.toFixed(2).padStart(5)} · ${w.goalAlignment.toFixed(2).padStart(4)}`,
+      `  ${wf.padEnd(WORKFLOW_PAD)} · ${w.structural.toFixed(2).padStart(10)} · ${w.lexical.toFixed(2).padStart(7)} · ${w.semantic.toFixed(2).padStart(8)} · ${w.temporal.toFixed(2).padStart(8)} · ${w.usage.toFixed(2).padStart(5)} · ${w.goalAlignment.toFixed(2).padStart(4)}`,
     );
   }
   lines.push(

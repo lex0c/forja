@@ -6,6 +6,7 @@ import {
   buildMetricsLines,
   formatDurationMs,
   formatPercent,
+  percentileOf,
 } from '../../../src/cli/slash/commands/agent-retrieval.ts';
 import type { SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
@@ -191,6 +192,39 @@ describe('formatPercent (M5)', () => {
   });
 });
 
+describe('percentileOf (L2)', () => {
+  test('empty array returns 0', () => {
+    expect(percentileOf([], 0.5)).toBe(0);
+  });
+
+  test('single element returns that element for any p', () => {
+    expect(percentileOf([42], 0)).toBe(42);
+    expect(percentileOf([42], 0.5)).toBe(42);
+    expect(percentileOf([42], 1)).toBe(42);
+  });
+
+  test('multi-element nearest-rank semantics', () => {
+    // 10 values 0..9. p50 → idx Math.floor(0.5 * 10) = 5 → 5.
+    expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0.5)).toBe(5);
+    // p95 → idx Math.floor(0.95 * 10) = 9 → 9.
+    expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0.95)).toBe(9);
+    // p0 → idx 0 → 0.
+    expect(percentileOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0)).toBe(0);
+  });
+
+  test('p=1.0 caps at last element (not out-of-bounds)', () => {
+    // Math.floor(1.0 * 5) = 5, capped via Math.min(length - 1, …) = 4.
+    expect(percentileOf([10, 20, 30, 40, 50], 1)).toBe(50);
+  });
+
+  test('sorts the input copy without mutating the caller (purity)', () => {
+    const arr = [3, 1, 4, 1, 5, 9, 2, 6];
+    const snap = [...arr];
+    percentileOf(arr, 0.5);
+    expect(arr).toEqual(snap);
+  });
+});
+
 describe('buildMetricsLines — capReached path (M7)', () => {
   const baseTrace = (overrides: Partial<RetrievalTraceRow> = {}): RetrievalTraceRow => ({
     id: crypto.randomUUID(),
@@ -285,7 +319,7 @@ describe('buildMetricsLines — capReached path (M7)', () => {
       nowMs: 1_700_000_000_000,
     });
     const text = lines.join('\n');
-    expect(text).toContain('retrieval metrics — last 7.0d (1 traces)');
+    expect(text).toContain('retrieval metrics — last 7d (1 traces)');
     expect(text).toContain('budget_utilization_mean');
     expect(text).toContain('eviction_rate');
     expect(text).toContain('view distribution');

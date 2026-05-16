@@ -94,6 +94,45 @@ beforeEach(() => {
   sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
 });
 
+describe('migration 053 idempotency (L6)', () => {
+  test('running migrate() on an already-migrated DB is a no-op', () => {
+    // migrate() runs in beforeEach so by the time this test
+    // starts, the DB is at the latest version. Running it again
+    // should not duplicate the table, drop existing data, or
+    // change the schema. The migration tracking table guards
+    // against re-application; this test pins that guarantee for
+    // the retrieval_trace migration specifically.
+    const traceId = '00000000-0000-0000-0000-000000000001';
+    createRetrievalTrace(db, {
+      id: traceId,
+      sessionId,
+      queryText: 'seed',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: sampleTimings(),
+    });
+    expect(countRetrievalTraces(db)).toBe(1);
+    // Re-run migrate — should be a no-op.
+    migrate(db);
+    expect(countRetrievalTraces(db)).toBe(1);
+    expect(getRetrievalTrace(db, traceId)?.queryText).toBe('seed');
+    // Schema still has the canonical indices.
+    const indices = db
+      .query<{ name: string }, []>(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='retrieval_trace'",
+      )
+      .all() as { name: string }[];
+    const indexNames = indices.map((i) => i.name).sort();
+    expect(indexNames).toContain('idx_retrieval_trace_session_created');
+    expect(indexNames).toContain('idx_retrieval_trace_workflow');
+  });
+});
+
 describe('createRetrievalTrace', () => {
   test('persists every stage and round-trips', () => {
     const trace = createRetrievalTrace(db, {

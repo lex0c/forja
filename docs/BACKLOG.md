@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] chore(retrieval+cli) — L polish pass closing the feat/retrieval review
+
+Closes the remaining low-severity findings from the review with mostly cosmetic / defensive touches; no behavioral changes that an operator would notice except the days-label cleanup.
+
+- **L1** — `src/retrieval/ranking.ts` temporal signal guard now explicitly checks `halfLife > 0` alongside `Number.isFinite(halfLife)`. Today every `HALF_LIFE_MS_BY_VIEW` entry is positive or `Infinity`, so the guard is dead code; the explicit check documents the invariant for future config additions.
+
+- **L2** — extracted `percentileOf` from `handleMetrics`/`buildMetricsLines` as an exported helper so n=1, p=0, p=1 boundaries and array-immutability can be pinned by direct unit tests (5 new tests in `tests/cli/slash/agent-retrieval.test.ts`).
+
+- **L3** — `padEnd(16)` literal (used for workflow column alignment in both the audit summary line and the workflows table) replaced by a named `WORKFLOW_PAD = 16` constant with a comment naming `precedent_lookup` (16 chars) as the longest current enum entry. Bumping the value is the explicit checklist when adding a longer workflow name.
+
+- **L4** — `days.toFixed(1)` in the metrics header (`last 30.0d`) replaced by plain `${days}` (`last 30d`). `--days` is parsed via `Number.parseInt`, so the trailing `.0` was a no-op visual that suggested non-integer support which doesn't exist. The `effectiveDays` value in the `capReached` warning stays decimal because it's a genuine ms → days division.
+
+- **L5** — `if (count === 0) continue` dead code removed from the Shannon entropy loop; `viewCounts` is populated via `set(view, (get(view) ?? 0) + 1)` so every entry is ≥ 1.
+
+- **L6** — explicit migration idempotency test in `tests/storage/retrieval-trace.test.ts` — re-runs `migrate()` after seeding a trace, asserts the row count is unchanged, the trace still round-trips, and both canonical indices are still present.
+
 ## [2026-05-16] fix(retrieval) — validate session node ids at projection (review M8)
 
 `src/retrieval/views/session.ts` was doing `hit.id.slice('session:message:'.length)` and trusting the result. A malformed id matching the prefix but truncated (e.g. `session:message:` with no UUID after) would silently slice to `""`, the Map miss would fall through to a generic "unknown session source" reason, and the BM25 invariant breach would go unnoticed.

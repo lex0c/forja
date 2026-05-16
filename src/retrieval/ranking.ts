@@ -168,9 +168,18 @@ export const rankCandidates = (input: RankCandidatesInput): RankedCandidate[] =>
     // older `now`) would otherwise produce signal > 1.0 from a
     // negative decay exponent, breaking the [0, 1] contract the
     // rest of the trace renders against.
+    // `halfLife > 0` is required to make the exponent well-defined.
+    // Today every entry in HALF_LIFE_MS_BY_VIEW is either Infinity
+    // (workspace — treat as timeless, no decay) or a positive
+    // finite number (session 1h, memory 30d). A hypothetical zero
+    // or negative value would yield `(now - createdAt) / 0` =
+    // ±Infinity → `0.5 ** Infinity = 0` (or NaN if the dividend
+    // is also zero), which the clamp below would absorb but
+    // silently. The explicit guard documents the invariant and
+    // protects against future config additions that violate it.
     const halfLife = HALF_LIFE_MS_BY_VIEW[c.view];
     const temporalRaw =
-      c.createdAt === undefined || !Number.isFinite(halfLife)
+      c.createdAt === undefined || !Number.isFinite(halfLife) || halfLife <= 0
         ? 1.0
         : 0.5 ** ((now - c.createdAt) / halfLife);
     const temporal = Math.min(1.0, Math.max(0.0, temporalRaw));
