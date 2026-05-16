@@ -15,6 +15,7 @@ import { monitorTool } from './monitor.ts';
 // imported here — see the BUILTIN_TOOLS comment for why it is
 // omitted from the default registry.
 import { readFileTool } from './read-file.ts';
+import { retrieveContextTool } from './retrieve-context.ts';
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
@@ -56,6 +57,7 @@ export type { PinContextInput, PinContextOutput } from './pin-context.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
+export { retrieveContextTool } from './retrieve-context.ts';
 export { taskTool, taskSyncTool } from './task.ts';
 export type { TaskInput, TaskOutput } from './task.ts';
 export { taskAsyncTool } from './task-async.ts';
@@ -97,6 +99,7 @@ export const BUILTIN_TOOLS = [
   memoryListTool,
   memoryReadTool,
   memorySearchTool,
+  retrieveContextTool,
   waitForTool,
   monitorTool,
   todoWriteTool,

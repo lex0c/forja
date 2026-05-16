@@ -10,6 +10,7 @@ import type {
   ToolArgs,
 } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { RetrieveFn } from '../retrieval/index.ts';
 import type { ContextPinsStore, PinKind } from '../storage/repos/context-pins.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
@@ -282,6 +283,13 @@ export interface ToolContext {
   // logged to memory_events at the registry layer; the tool just
   // dispatches.
   memoryRegistry?: MemoryRegistry;
+  // Retrieval subsystem runner (spec RETRIEVAL.md §15.4). Set by
+  // the harness when both memoryRegistry AND db are wired — the
+  // pipeline needs both for its view + compression-resolver
+  // dependencies. Absent in headless callers that didn't wire
+  // either. The `retrieve_context` tool surfaces a clean
+  // `retrieval.unavailable` error when this is undefined.
+  retrieveContext?: RetrieveFn;
   // Modal confirm hook for the `memory_write` tool (MEMORY.md §5.1).
   // Set by the harness when `HarnessConfig.confirmMemoryWrite` is
   // wired. Absent in headless / non-interactive runs — the

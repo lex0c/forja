@@ -1,31 +1,64 @@
-// Heuristic injection / secret scanner shared across memory write
-// surfaces (spec MEMORY.md §7.3). Two consumers today:
+// Memory write tripwire (spec MEMORY.md §7.3).
 //
-//   - `memory_write` tool (`src/tools/builtin/memory-write.ts`):
-//     scans body + description before showing the modal so the
-//     operator never gets a confirm prompt for content that
-//     would have been blocked anyway.
+// HONEST FRAMING. This module is two things, kept together because
+// they share the secret-pattern set:
 //
-//   - `/memory promote shared` slash command (spec §5.4): scans
-//     the source body again before moving local → shared, with
-//     a TIGHTER size cap (`SHARED_BODY_LINE_CAP`, 200 lines) the
-//     spec mandates because shared memories enter the team's
-//     committed context and benefit from less surface area.
+//   1. A `INJECTION_PHRASES` tripwire — a small list of obvious
+//      English jailbreak phrases ("ignore previous instructions",
+//      etc.). It catches script-kiddie copy-paste from public
+//      jailbreak tutorials. It does NOT catch:
+//        - the same intent in any other language ("ignore as
+//          instruções anteriores", "忽略之前的指令", …);
+//        - paraphrase ("the new rule is …", "your role going
+//          forward", "treat my prior message as void", …);
+//        - structural injection (yaml/code-block/role-play wrappers,
+//          markdown that mimics system instructions, …).
+//      An attacker with five minutes of effort defeats it. The
+//      list of legal phrases stays SHORT on purpose — extending it
+//      with more English phrases doesn't move the threat needle and
+//      inflates false-positive rate against legitimate memory
+//      bodies that quote model failure modes.
 //
-// Spec §7.3 names "injection phrases" + "secret patterns" as the
-// two filter classes. The bar is "raise the cost of the obvious
-// vector", not "stop a human red team" — keep the list short so
-// false positives stay rare.
+//      This tripwire's value is two-fold:
+//        (a) **Audit signal.** A match produces a `memory_events
+//            action=refused` row with `details.reason='injection
+//            phrase: …'`, so the operator sees that something
+//            obviously hostile tried to write. The model can't
+//            silently retry.
+//        (b) **Defense-in-depth.** Combined with the modal
+//            confirmation (operator approves every inferred
+//            write), the trust boundary (`untrusted` memories
+//            don't eager-load), `source` attribution (operator-
+//            typed vs model-decided), and scope isolation (local/
+//            shared/user), the tripwire is one of several layers
+//            that all need to fall for an injection to land. See
+//            `docs/MEMORY.md §8.1` for the full picture.
 //
-// Promote-specific extras (spec §5.4 "scanner adicional"):
-//   - Path traversal heuristic: bodies that *look like* they
-//     reference filesystem traversal (`../`, `/etc/`, etc.).
-//     Memory-write doesn't run this because regular memories
-//     legitimately discuss paths; promotion surfaces it because
-//     a shared memory shouldn't carry unvalidated path
-//     references that would mislead future readers.
-//   - Body line cap: hard-cap of 200 lines for shared bodies so
-//     the eager-load section stays scannable.
+//      It is NOT the defense. The defense is structural — the
+//      modal is the load-bearing gate. Frame this module
+//      accordingly when claims about "injection defense" come up.
+//
+//   2. `SECRET_PATTERNS` — credential-shape regexes (AWS keys,
+//      GitHub PATs, Anthropic/OpenAI/Slack tokens). UNLIKE phrase
+//      detection, these ARE shape-stable and language-agnostic;
+//      a key has the same prefix + entropy regardless of the
+//      surrounding prose. The secret pass is the more honest
+//      half of this scanner.
+//
+// Consumers (all gate writes / pins before the substrate persists):
+//
+//   - `memory_write` tool — runs the full scan on body + description
+//     before showing the modal so the operator doesn't get a
+//     confirm prompt for content that would be blocked anyway.
+//   - `/memory promote shared` slash command — scans before
+//     local → shared via the `scanForPromotion` superset (adds
+//     path-traversal heuristic + 200-line cap per spec §5.4).
+//   - `pin_context` tool / `/pin` slash — `scanForSecrets` only,
+//     skipping the phrase pass on operator-direct surfaces.
+//   - Harness tool-output gate — runs the full scan on every tool
+//     result before it reaches the model, catching credentials
+//     that landed in stdout. Phrase pass here is best-effort same
+//     story as memory writes.
 
 export interface ScanResult {
   ok: boolean;
@@ -37,11 +70,13 @@ export interface ScanResult {
   reason?: string;
 }
 
-// Spec §7.3:
-//   - "ignore previous instructions"
-//   - "you are now"
-//   - "from now on, always"
-//   - secret patterns (AWS keys, GitHub tokens, etc.)
+// English-only obvious-jailbreak phrases. See module header for the
+// honest framing: this catches script-kiddie copy-paste, not real
+// adversarial input. Spec §7.3 names these verbatim. Do NOT extend
+// the list with translations or paraphrases — false-positive rate
+// climbs against legitimate operator notes (a memory documenting
+// "the model failed when prompted with 'ignore previous instructions'"
+// is itself useful content) without moving the threat needle.
 const INJECTION_PHRASES: readonly string[] = [
   'ignore previous instructions',
   'ignore all previous',
@@ -69,10 +104,17 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /xox[baprs]-[A-Za-z0-9-]{10,}/,
 ];
 
-// Run the standard injection + secret scanner against a single
-// text field (body or description). Used by memory_write before
-// the modal opens AND by /memory promote shared as part of the
-// `scanForPromotion` superset.
+// Run the obvious-jailbreak tripwire + secret pattern check
+// against a single text field (body or description). Used by
+// memory_write before the modal opens AND by /memory promote
+// shared as part of the `scanForPromotion` superset.
+//
+// Naming note: the function is called `scanForInjection` for
+// backwards compatibility with callers across the codebase; the
+// MODULE header (above) reframes what "injection" means here —
+// English script-kiddie phrases, NOT semantic injection defense.
+// A future rename to `scanWriteTripwire` is in the backlog if/
+// when the call sites are touched for another reason.
 export const scanForInjection = (text: string): ScanResult => {
   const lower = text.toLowerCase();
   for (const phrase of INJECTION_PHRASES) {

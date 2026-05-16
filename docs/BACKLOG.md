@@ -2,6 +2,358 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(retrieval/runner) — preserve caller-supplied memory view when loadBodies is requested
+
+`buildRetrievalRunner` exposes a `views` slot on its deps (documented for tests / fixtures / alternative-scoring wireup). When `input.loadBodies === true`, the runner unconditionally replaced `viewsForCall.memory` with a fresh default `createMemoryView({ registry, loadBodies: true })` — discarding whatever custom view the caller had injected. A test asserting that its sentinel memory view ran, or a fixture stubbing memory behavior for a specific corpus, would silently get the default view's behavior instead. Same for any future custom wireup with alternative limits / scoring / filters.
+
+Fix: track `callerSuppliedViews = deps.views !== undefined` at runner build time. The `loadBodies` override now runs only when views were default-wired. Callers who supply their own views and want loadBodies-on can construct their custom view with `createMemoryView({ ..., loadBodies: true })` themselves — the API is already there, the runner just shouldn't substitute behind their back.
+
+Test in `tests/tools/retrieve-context.test.ts`: build a runner with a sentinel memory view that returns a recognizable candidate and counts calls; invoke with `loadBodies: true`; assert sentinel ran once AND the sentinel's candidate appears in `stats.candidatesRaw`. Pre-fix this test would have shown 0 sentinel calls (the default view replaced it) and a different candidate count.
+
+## [2026-05-16] fix(tools/retrieve-context) — return tool.aborted (not retrieval.internal_error) for mid-flight cancellation
+
+The pre-call abort check at `execute()` entry correctly returns `tool.aborted` (retryable=true), but the catch block around `await ctx.retrieveContext(...)` mapped EVERY thrown error to `retrieval.internal_error` with `retryable: false`. When the signal flipped AFTER entry — during validation, during the await on the runner, or while a subprocess view was in-flight — the runner threw `retrieval aborted before <stage>` (pipeline check, commit `4935fef`) or `retrieval aborted mid-flight` (runner late check) and the catch misclassified it as a hard internal failure. Callers lost the standard `tool.aborted` semantic and could either retry forever (the standard retry-on-abort pattern doesn't fire because retryable=false) or surface the wrong failure reason to the operator.
+
+Fix: catch inspects `ctx.signal.aborted` and maps cancellation to `tool.aborted` (retryable=true) when true; genuine errors keep `retrieval.internal_error` (retryable=false) when the signal stayed un-aborted. The signal state at catch time is the canonical witness — `ctx.signal.aborted` is true iff a cancellation request landed before the catch executed.
+
+Two tests in `tests/tools/retrieve-context.test.ts`:
+- Mid-flight abort: runner aborts the controller and throws — assert `tool.aborted` with `retryable: true` and message containing "aborted during retrieval".
+- Counterpart: real failure (e.g., `disk full`) with un-aborted signal stays `retrieval.internal_error` with `retryable: false` — confirms the fix didn't over-classify hard failures as abortable.
+
+## [2026-05-16] fix(memory/registry) — apply state/expiry filter before deduplicating by name
+
+`registry.list()` deduplicated by name BEFORE evaluating `states` / `includeExpired`. A higher-precedence shadow (e.g. `project_local/foo`) that was quarantined / invalidated / evicted / expired would win the precedence walk, then get dropped by the frontmatter filter — silently suppressing a lower-precedence ELIGIBLE sibling (`project_shared/foo` or `user/foo`) that should have surfaced. The retrieval memory view, which calls `list({ deduplicateByName: true, states: ['active'] })`, ended up with zero candidates for that name even when a valid active version existed in another scope.
+
+Fix: swap the order. State / expires filter runs FIRST, then dedupe-by-name operates over the eligible set only. Comment block above the filter now spells out the order invariant so a future refactor doesn't reintroduce the bug. The `scope` filter still runs at the head (scope mismatch is the cheapest filter and gates everything that follows).
+
+Three regression tests in `tests/memory/registry.test.ts`:
+- Local quarantined + shared active + user active → result is shared (precedence among eligible).
+- All shadows ineligible (local quarantined + shared evicted) → name absent from result.
+- Same precedence-aware filtering for `expires`: local stale + shared fresh → shared surfaces.
+
+## [2026-05-16] fix(memory/registry) — parseExpiresEndOfDayMs rejected legitimate month-end expiries
+
+`parseExpiresEndOfDayMs` validated dates by computing `Date.UTC(year, month - 1, day + 1, …)` and requiring the resulting `getUTCMonth()` to still equal `month - 1`. That check intended to catch overflow inputs like `2026-02-31` (which JS rolls to 2026-03-03), but it ALSO rejected every legitimate last-day-of-month: `2026-01-31`'s "next day" naturally crosses into February, so the month check failed and the function returned null. With null returned, `isExpired` treated the memory as non-expiring and `list({ includeExpired: false })` quietly kept the entry visible past its expiry.
+
+Fix: two-step parse. Validate the date itself first (build `Date.UTC(year, month - 1, day, …)` WITHOUT incrementing) and verify all three fields round-trip — that's what catches `2026-02-31` honestly. Then compute end-of-day as `startOfDayMs + MS_PER_DAY`; ms addition crosses month / year boundaries correctly because epoch ms is independent of the calendar structure.
+
+Tests added in `tests/memory/registry.test.ts`:
+- `2026-01-31` + `2026-12-31` both stay valid mid-day on expiry, expire at next-day 00:00 UTC, and Dec 31 correctly rolls into the next year (Jan 1 2027 00:00 → expired).
+- `2024-02-29` (leap day) valid through the day, expires at Mar 1 00:00 UTC.
+- `2026-02-31` (numerically invalid) is treated as non-expiring (defensive — the frontmatter validator's regex only checks YYYY-MM-DD format; the date parser refusing here means the operator's `/memory audit` surface shows the bad entry rather than the model getting surprise eviction).
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — percentileOf used floor, not ceil/-1 (off-by-one inflated tail)
+
+`percentileOf` was documented as nearest-rank but computed `Math.floor(p * N)`, which at common boundaries returns the NEXT higher element. Worst case: N=20, p=0.95 — `floor(19) = 19` returned the MAX sample instead of index 18 (the actual 19th-rank value, per `⌈p · N⌉ − 1`). The inflated values made `/agent retrieval metrics` overstate p50/p95 stage latencies: a real tail regression was indistinguishable from the always-pinned-at-max output.
+
+Fix: `Math.max(0, Math.min(N - 1, Math.ceil(p * N) - 1))`. The `max(0, …)` guards p=0 / N=1 from producing a -1 index after the ceil/-1 step. Existing tests that asserted the floor-inflated values were corrected to match the standard nearest-rank semantics (p=0.5 over 10 samples is now 4, not 5). New regression test exercises N=20 with p=0.5 / 0.95 / 1.0 to pin the user-reported scenario.
+
+Source: comment block in the function now documents the formula explicitly so a future "simplification" doesn't reintroduce the floor variant.
+
+## [2026-05-16] docs(memory) — reframe scanner as tripwire, not injection defense
+
+The `INJECTION_PHRASES` list in `src/memory/scanner.ts` (`"ignore previous instructions"`, `"you are now"`, etc.) is trivially burlable — any other language, paraphrase, or structural injection defeats it. The pre-existing code comment admitted it ("raise the cost of the obvious vector, not stop a human red team") but the module header, `docs/MEMORY.md §8.1`, and `docs/spec/MEMORY.md §7.3` framed the scanner as "injection defense", overpromising what it delivers.
+
+Reframe is doc/comment-only — no runtime behavior changes.
+
+**`src/memory/scanner.ts`** — module header expanded to spell out the honest split:
+- `scanForSecrets` + `redactSecrets` ARE the honest half (credential shapes are language-agnostic).
+- `scanForInjection` is a tripwire for English script-kiddie copy-paste; its value is the `refused` audit row + defense-in-depth alongside the modal, NOT a semantic injection blocker.
+- Comment above `INJECTION_PHRASES` documents why the list stays short on purpose (translations inflate false positives without moving the threat needle).
+- Comment above `scanForInjection` notes the symbol kept its name for backwards compatibility but the module header reframes what "injection" means.
+
+**`docs/MEMORY.md §8.1`** — rewritten as "Scanner — tripwire, not defense", explicitly listing what the tripwire CAN'T catch (other languages, paraphrase, structural). New §8.1.1 lists the load-bearing layers (modal, source attribution, trust boundary, scope isolation, eager-load filter, audit chain) so an operator reading the security story knows the scanner is layer 0, not the answer.
+
+**`docs/MEMORY.md §13.1` threat table** — Scanner row annotated as "tripwire only" with a pointer to §8.1.
+
+**`docs/spec/MEMORY.md §7.3`** — retitled "Tripwire de phrases óbvias + secret detection" (was "Detecção heurística de injection"). Body restructured into (a) tripwire-with-caveats and (b) honest secret detection. PT-BR preserved per spec convention.
+
+No symbol rename: `scanForInjection` has 8 call sites; the cost of renaming outweighs the clarity gain when the header already reframes. A future rename to `scanWriteTripwire` is noted in the function's comment if call sites are touched for another reason.
+
+No new tests — scanner runtime is unchanged; existing 29 tests still pass.
+
+## [2026-05-16] chore(retrieval+cli) — memory-flow review M round 2 (txn, traceMissing, scope verbose, polish)
+
+Closes the residual robustness findings from the memory-flow code review.
+
+**M1** — `src/retrieval/views/session.ts` did three sequential SQLite reads (messages, tool_calls, failure_events) without a transaction. A new row inserted between reads would leave the corpus with a tool_call whose parent message exists in the DB but not in `messageById`, surfacing a row through the projection's "unknown session source" fallback. Wrapped the three reads in `withTransaction` (DEFERRED — WAL readers don't block writers; the BEGIN's snapshot is stable through COMMIT for every read inside).
+
+**M3** — `src/retrieval/compression.ts createCompressionResolver`'s `warnedViews: Set<string>` is closure-scoped per resolver, which is built once per session-runner. Two concurrent `retrieve_context` calls share it. Behavior is intentional (dedupe stderr warnings across calls of the same session) but the coupling was implicit. Comment added documenting it so a future load-bearing use of the Set knows to revisit the scope decision.
+
+**M4** — Trace persist failure in `runRetrieval` sets `queryId = ''` and logs stderr, but callers had no structured signal that the audit surface had a gap. Added `traceMissing: boolean` to `RetrievalResult` and `RetrieveContextOutput.stats`; mirrors `queryId === ''` so the model / tool consumer can branch (`if (stats.traceMissing) { ... }`) without parsing the empty-string convention. 2 new tests in `tests/retrieval/pipeline.test.ts` covering the failure path (close DB before call) and the happy path.
+
+**M5** — `/agent retrieval replay <id>` previously emitted `memory/memory:project_local/auth · level=full · cost=42t` — the scope was inside the nodeId but visually buried. Added `--verbose-scope` flag that hoists scope into its own column (`memory[project_local]/auth · level=full · cost=42t`) and appends a footer noting the precedence order (`project_local > project_shared > user`). Flag is opt-in so the default output stays narrow. Two new tests pin the flag's render and unknown-flag rejection.
+
+**M6** — Abort signal mid-pipeline correctly throws (commit `4935fef`), but tests didn't assert that NO retrieval_trace row persists in that case. Spec §10.1 mandates "one row end-of-pipeline"; the assertion was missing the upper bound. Added `expect(countRetrievalTraces(db)).toBe(0)` after the existing abort-between-stages test.
+
+No behavior changes the operator would notice except the new `--verbose-scope` flag and the new `traceMissing` field. All previous tests still pass; 5 new tests land alongside.
+
+## [2026-05-16] docs(memory+retrieval) — formalize audit split + retrieval_trace immutability policy (review H4+H5)
+
+H4 and H5 from the memory-flow code review are accepted as a policy decision rather than a code change. The split between `memory_events` (operator-driven, explicit memory operations) and `retrieval_trace.context_slot_json.included[]` (model-facing retrieval deliveries) is the established surface, and `retrieval_trace` bodies stay frozen after the originating memory is evicted/purged. The deliberate-not-accidental nature was implicit in the implementation; this entry promotes it to documented policy.
+
+Three doc updates land in the same commit:
+
+- `docs/MEMORY.md §11.1` — new subsection "Audit split with `retrieval_trace`" tabulating which surface answers which audit question. Calls out that `/memory audit` and `/agent retrieval audit` are complementary, not redundant: an operator asking "what did the model see of memory X" needs both surfaces. Documents why retrieval-internal paths (`peek` for BM25 corpus and compression fallback) are excluded from `memory_events`.
+- `docs/MEMORY.md §13.3` — new "Audit immutability on `retrieval_trace`" subsection (renumbered the original §13.3 load-bearing rule to §13.4). Three reasons listed: replay determinism, audit honesty, subsystem decoupling. Names the escape hatch (session purge via FK CASCADE) and a possible future targeted-purge command if a concrete use case appears.
+- `docs/spec/RETRIEVAL.md §10.4` — mirror of MEMORY §13.3 in PT-BR for the architect's spec, linked back to MEMORY.md §11.1 for the cross-table story.
+
+Two code comments add the same policy reference to the load-bearing sites:
+
+- `src/memory/lifecycle.ts` module header — documents that eviction / purge paths do NOT touch `retrieval_trace` and cites MEMORY.md §13.3.
+- `src/storage/migrations/053-retrieval-trace.ts` schema header — documents `context_slot_json.included[].content` as frozen-on-eviction and cites the policy in both spec docs.
+
+No code-behavior change. No new tests — the absence of a hook from `lifecycle` to `retrieval_trace` is the policy; the docs make it explicit. The `feat/retrieval` review's H4 (audit story gap) and H5 (eviction-doesn't-scrub-trace) are closed as deliberate trade-offs rather than open bugs.
+
+## [2026-05-16] fix(retrieval/views/memory) — scope-pin peek in BM25 corpus build (review H3)
+
+`src/retrieval/views/memory.ts:111` called `deps.registry.peek(l.name)` without a `{ scope }` option. The iterated listing already carries the post-dedupe winning scope (`l.scope`); the lookup re-walked precedence. Today's behavior was usually correct via precedence, but inconsistent with the compression resolver (compression.ts:163, scope-pinned) and a registry-state change mid-call (scope migration, rename, eviction in another scope) could land the wrong body in the BM25 corpus.
+
+One-line fix: `deps.registry.peek(l.name, { scope: l.scope })`. Pins the body load to the same scope the listing represents.
+
+Test: seed `project_shared/auth` and `project_local/auth` with bodies containing distinctive tokens (`castle` vs `fortress`); query a token that only exists in the local body; verify the local candidate ranks (proving the corpus indexed the local body, not the shared one).
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — session-scope check on UUID fast-path (review H2)
+
+`resolveTraceId` in `/agent retrieval replay` previously checked the active session ONLY for prefix scans; the full-UUID fast path (`prefix.length === 36`) called `getRetrievalTrace(db, prefix)` directly and returned whatever the lookup found. `getRetrievalTrace` is a primary-key lookup by design (no session scoping). An operator with a UUID from any session — their own past session, a teammate's session on the same DB, a leaked log line — could replay that session's full trace, including the raw context_slot bodies.
+
+Fix: after `getRetrievalTrace` returns, compare `row.sessionId !== currentSessionId()` and refuse with the same not-found shape used for genuinely missing UUIDs. Same wording means the error doesn't double as an oracle for "this UUID exists but belongs to another session" — an operator probing cross-session can't distinguish the two failure modes.
+
+Test in `tests/cli/slash/agent-retrieval.test.ts`: seed a trace in a foreign session with a recognizable `queryText`, switch to the default session, call replay with the foreign UUID, assert the error path triggers AND that the foreign `queryText` doesn't leak through the message.
+
+## [2026-05-16] fix(memory+retrieval) — lifecycle state + expires filter at the list boundary (review H1+H6)
+
+`registry.list()` previously returned every listing regardless of frontmatter `state` or `expires`. The retrieval memory view consumed `list({ deduplicateByName: true })` directly, so any memory the operator had quarantined / invalidated / proposed / evicted / purged — or a memory past its `expires` date between boot-time GC sweeps — surfaced to the model as a BM25 candidate and could end up in the context slot.
+
+Added two opt-in filters to `ListOptions`:
+
+- `states?: readonly MemoryState[]` — restrict to listings whose current frontmatter state is in the allow-list (`absent` ≡ `active`).
+- `includeExpired?: boolean` (default undefined ≡ no filter; pass `false` to exclude past-expiry).
+- `nowMs?: number` — injectable reference for `expires` evaluation; defaults to `Date.now()`.
+
+Cost: one file read per surviving listing when either filter fires (frontmatter lives in the .md, not in the cached index snapshot). Tolerable at the dozens-of-memories scale the spec assumes. A future cache layer can promote `state` / `expires` into the snapshot if N grows.
+
+`src/retrieval/views/memory.ts` now passes `states: ['active'], includeExpired: false` so the model-facing surface never sees a non-active or stale memory. Other callers (operator-facing `/memory list`, audit surfaces, boot-banner count, slash commands) keep their broad view — defaults unchanged.
+
+Helper: `parseExpiresEndOfDayMs` reads the spec-shaped `YYYY-MM-DD` string and returns the start of the *next* day UTC, so `expires: 2026-05-15` is valid through any time of 2026-05-15 and expired starting 2026-05-16 00:00 UTC (matches operator intuition: "expires today" = "valid through today"). Malformed dates (only reachable via hand-edited files; the writer's validator refuses them) are treated as non-expiring — but the same hand-edit makes the file `malformed` to the parser, which the state filter excludes anyway, so the model never sees it.
+
+Tests: 6 new in `tests/memory/registry.test.ts` covering states allow-list, orphaned listings (missing body files), past-expiry exclusion, the end-of-day boundary, combined filter composition, and the malformed-frontmatter defense-in-depth case. 3 new in `tests/retrieval/memory-view.test.ts` (quarantined / invalidated+proposed batch / expired) plus two existing tests (`loadBodies degrades silently when…`) flipped to assert that orphaned/malformed memories are now filtered out of the candidate pool — that's the safer policy, the model shouldn't be ranking memories the operator can't trust.
+
+## [2026-05-16] chore(retrieval+cli) — L polish pass closing the feat/retrieval review
+
+Closes the remaining low-severity findings from the review with mostly cosmetic / defensive touches; no behavioral changes that an operator would notice except the days-label cleanup.
+
+- **L1** — `src/retrieval/ranking.ts` temporal signal guard now explicitly checks `halfLife > 0` alongside `Number.isFinite(halfLife)`. Today every `HALF_LIFE_MS_BY_VIEW` entry is positive or `Infinity`, so the guard is dead code; the explicit check documents the invariant for future config additions.
+
+- **L2** — extracted `percentileOf` from `handleMetrics`/`buildMetricsLines` as an exported helper so n=1, p=0, p=1 boundaries and array-immutability can be pinned by direct unit tests (5 new tests in `tests/cli/slash/agent-retrieval.test.ts`).
+
+- **L3** — `padEnd(16)` literal (used for workflow column alignment in both the audit summary line and the workflows table) replaced by a named `WORKFLOW_PAD = 16` constant with a comment naming `precedent_lookup` (16 chars) as the longest current enum entry. Bumping the value is the explicit checklist when adding a longer workflow name.
+
+- **L4** — `days.toFixed(1)` in the metrics header (`last 30.0d`) replaced by plain `${days}` (`last 30d`). `--days` is parsed via `Number.parseInt`, so the trailing `.0` was a no-op visual that suggested non-integer support which doesn't exist. The `effectiveDays` value in the `capReached` warning stays decimal because it's a genuine ms → days division.
+
+- **L5** — `if (count === 0) continue` dead code removed from the Shannon entropy loop; `viewCounts` is populated via `set(view, (get(view) ?? 0) + 1)` so every entry is ≥ 1.
+
+- **L6** — explicit migration idempotency test in `tests/storage/retrieval-trace.test.ts` — re-runs `migrate()` after seeding a trace, asserts the row count is unchanged, the trace still round-trips, and both canonical indices are still present.
+
+## [2026-05-16] fix(retrieval) — validate session node ids at projection (review M8)
+
+`src/retrieval/views/session.ts` was doing `hit.id.slice('session:message:'.length)` and trusting the result. A malformed id matching the prefix but truncated (e.g. `session:message:` with no UUID after) would silently slice to `""`, the Map miss would fall through to a generic "unknown session source" reason, and the BM25 invariant breach would go unnoticed.
+
+Extracted the parsers `parseMemoryNodeId` and `parseSessionNodeId` (originally inline in `compression.ts`) into a shared `src/retrieval/node-ids.ts` module so both call sites enforce the same invariants:
+
+- prefix correct (`memory:` / `session:`)
+- kind ∈ canonical enum (memory scope ∈ {`user`, `project_shared`, `project_local`}; session kind ∈ {`message`, `tool_call`, `failure`})
+- non-empty after-prefix segments
+
+Compression imports from the shared module; session view's projection now parses first and branches on `kind`. Malformed ids emit a stderr line ("BM25 emitted malformed node id … this is a view-internal bug") with a tagged fallback reason; valid-id-but-missing-row fall-through carries a kind-aware reason so the trace distinguishes the two failure shapes.
+
+Tests: 12 new in `tests/retrieval/node-ids.test.ts` exercising both parsers (canonical + every malformed shape: missing prefix, empty kind / scope, empty id / name, unknown enum value, case-sensitivity, colon-in-id preservation). 1 invariant test in `tests/retrieval/session-view.test.ts` documents the deletion-mid-flight stability case.
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — coverage closures + formatPercent clamp (review M5+M6+M7)
+
+Closes three coverage findings from the `feat/retrieval` review.
+
+**M5** — `formatPercent` computed `(ratio * 100).toFixed(1) + '%'` without checking the input range. Callers' invariants (`evictionRate = skipped / ranked`, `budgetUtilization = used / budget`) keep the ratio in `[0, 1]`, but a future regression upstream would render misleading `-50.0%` / `150.0%` instead of flagging the corruption. Added `Number.isFinite(ratio) && ratio >= 0 && ratio <= 1` guard rendering `?` otherwise. Exported for direct test coverage; mirrors the `formatDurationMs` posture from M2.
+
+**M6** — adequate coverage already exists: `describe('buildRetrievalRunner — end-to-end')` in `tests/tools/retrieve-context.test.ts` exercises the runner produced by `buildRetrievalRunner` against real corpora (6 tests covering ranked + compressed slot, views filter, loadBodies, default budget, pre-aborted signal, trace persistence). The bootstrap test asserts the tool is registered. The actual `ctx.retrieveContext = buildRetrievalRunner(...)` assignment in `src/harness/loop.ts:2566` is a single visible line — adding a separate integration test that wraps the entire harness loop just to re-assert that line was a poor risk/value trade. No code change.
+
+**M7** — the `capReached` warning render in `handleMetrics` had no slash-level test (the repo-level test from commit `49be554` covers `listRetrievalTracesSinceMs` itself, not the operator-visible warning string). Extracted the pure-render section as `buildMetricsLines({ traces, capReached, hardCap, days, nowMs })` — `handleMetrics` becomes a thin wrapper that pulls traces and delegates the rendering. The exported helper takes pre-computed inputs so a test can drive `capReached: true` with a 2-row fixture instead of seeding 10k+ rows. 3 new tests: warning surfaces with the right hardCap + "oldest kept ≈ Nd ago" computation, warning absent when `capReached=false`, canonical body intact regardless. `formatPercent` unit coverage adds 3 more tests (in-range, out-of-range, NaN/Infinity).
+
+## [2026-05-16] fix(retrieval+storage+cli) — honest error surfaces for corrupted JSON / negative timings / unknown views (review M1+M2+M3)
+
+Three small fixes that turn silent fallbacks into auditable ones.
+
+**M1** — `src/storage/repos/retrieval-trace.ts fromRow` swallowed `JSON.parse` failures and returned `[]` / empty shapes with zero indication that a row's JSON column was corrupt. Direct DB tampering, mid-write crashes, and migration anomalies all became invisible. The parse helper now takes the column name and logs to stderr (`forja retrieval_trace: row <id> <col> JSON parse failed (<msg>); returning empty fallback`) before falling back to the structural-valid shape. Read still completes; corruption is now traceable.
+
+**M2** — `formatDurationMs` in `src/cli/slash/commands/agent-retrieval.ts` accepted any `number` and would happily render `-123ms` from a corrupted `timings_json`. Added a `Number.isFinite(ms) && ms >= 0` guard that renders `?` for malformed values — the operator sees a flag-shaped output instead of a value that looks like a real (but impossible) timeline measurement. Exported the function for direct unit coverage.
+
+**M3** — `createCompressionResolver` returned `null` for any view it didn't recognize. A migration that adds a view without wiring the resolver would silently drop candidates; the operator would see "missing from slot" without learning the cause. Now logs once per unknown view (closure-scoped `warnedViews` Set deduplicates spam) and continues with `null` so the greedy loop tracks the skip honestly.
+
+Tests: 4 new across `tests/cli/slash/agent-retrieval.test.ts` (formatDurationMs unit suite covering negative / NaN / Infinity / boundary), `tests/retrieval/compression.test.ts` (unknown-view stderr capture + one-warning-per-view invariant), `tests/storage/retrieval-trace.test.ts` (corrupted JSON column logs `id` + column name and returns fallback).
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — prefix scan reaches the full session history (review H7)
+
+`resolveTraceId` in `src/cli/slash/commands/agent-retrieval.ts` previously called `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then matched the prefix in memory. A session with more than 100 retrieval traces dropped any prefix whose match lived beyond the freshest 100 — the operator got "no trace id matches" indistinguishable from a genuinely wrong prefix, with no hint that the issue was scan depth.
+
+Fix: switch to `listRetrievalTracesSinceMs(ctx.db, sessionId, 0, PREFIX_SCAN_HARD_CAP=10_000)`. Same shape the metrics path uses (also 10k cap, also returns `capReached`). 10k is comfortably above any realistic interactive session and below pathological eval harness logs that would risk memory pressure. When `capReached` is true AND the prefix doesn't match in the returned 10k, the error message explicitly names the cap and points to the full-UUID escape hatch ("older traces may exist — pass the full 36-char id to look beyond") so the operator can distinguish "wrong prefix" from "right prefix, beyond the scan window".
+
+Tests: 1 new in `tests/cli/slash/agent-retrieval.test.ts` — seeds 150 filler traces (more than the old 100 cap) plus a target whose `created_at` is older than every filler, then resolves via the prefix; verifies the replay returns the target instead of "no match". Covers the original silent-miss exactly.
+
+## [2026-05-16] fix(storage/retrieval-trace) — deterministic ordering + session-scoped workflow lookup (review H5+H6)
+
+Two findings on the trace repo.
+
+**H5** — every list query in `src/storage/repos/retrieval-trace.ts` sorted by `created_at DESC` only. Two traces landing in the same millisecond (concurrent inserts under eval harness load, or just clock granularity) came back in undefined order, flaking pagination and short-id resolution. Added `, id DESC` as the secondary key to `listRetrievalTracesBySession`, `listRetrievalTracesSinceMs`, and `listRetrievalTracesByWorkflow`. Matches the pattern in `failure-events.ts:93`.
+
+**H6** — `listRetrievalTracesByWorkflow(db, workflow, limit)` filtered only by `workflow = ?`, spanning every session in the DB. A caller assuming session-scope (operator running "show me review-workflow traces in this session") would leak traces from other sessions on the same DB — multi-tenant or shared-machine setups especially. The function had no production callers (only the test), so signature became `(db, sessionId, workflow, limit)` with `sessionId` required. A future cross-session aggregation surface would need a different function whose name and signature acknowledge the scope.
+
+Tests: 1 new tiebreaker test in `listRetrievalTracesBySession` (three rows pinned to the same `created_at`, verifies stable `id DESC` order and replay-stability). 1 new cross-session leak test in `listRetrievalTracesByWorkflow` (seeds 2 sessions, asserts only the active session's row comes back). Existing tests adapted to the new `sessionId` parameter.
+
+## [2026-05-16] fix(tools+telemetry) — cap retrieve_context query length + strip terminal-attack control chars in scrub (review H2+H3)
+
+Closed two `feat/retrieval` review findings, both at the input/output boundary.
+
+**H2** — `src/tools/builtin/retrieve-context.ts` validated `query.trim().length === 0` but not an upper bound. A 1GB query string would otherwise be accepted, tokenized by every view's BM25, persisted into `retrieval_trace.query_text`, and stored verbatim in audit logs — audit-storage DoS through a single tool call. Added `MAX_QUERY_LENGTH = 10_000` chars (well above any real natural-language query, hard refuses pathological inputs). Schema declares `maxLength` so providers that respect schema-side bounds can refuse client-side too.
+
+**H3** — `src/telemetry/scrubbing.ts scrubFreeformText` redacted paths/hosts but left C0/C1 control characters intact. A trace whose `query_text` or `reason` field carried `\x1b[2J` (clear screen), `\x1b[31m` (color), `\x07` (bell), or any other ANSI/OSC escape would manipulate the operator's terminal when surfaced via `/agent retrieval audit`, `/agent retrieval replay`, `/agent policy …`, or any other forensic surface interpolating scrubbed text into stdout. Same surface exists in `worker.crashed.stderr` and `state.transition.reason` — every consumer of `scrubFreeformText` benefits.
+
+Strip range: full C0 (0x00-0x1F) MINUS TAB / LF / CR, plus DEL (0x7F) and C1 (0x80-0x9F). TAB / LF / CR preserved because legitimate multi-line consumers (stack traces in `worker.crashed.stderr`, multi-paragraph reasons) need them, and plain whitespace isn't an attack vector. Stripping runs BEFORE path/host sweeps so an attacker can't smuggle a path past PATH_REGEX_POSIX via an ESC-prefixed token (`\x1b/home/x` — pre-strip the leading `\x1b` breaks the word boundary; post-strip the path emerges and gets redacted).
+
+Tests: 2 new in `tests/tools/retrieve-context.test.ts` (refuse at MAX+1, accept at exactly MAX); 5 new in `tests/telemetry/scrubbing.test.ts` (ANSI SGR strip, OSC/BEL/NUL/DEL strip, C1 strip, whitespace controls preserved, smuggle-via-ESC defended, ordinary text passthrough). Existing `worker.crashed.stderr` test for newline preservation still passes — exactly the case the whitespace-preserve carveout was designed for.
+
+## [2026-05-15] fix(retrieval) — plumb AbortSignal through pipeline + guard estimateTokens NaN/Infinity (review H1+H4)
+
+Closed two high findings from the `feat/retrieval` review.
+
+**H1** — `runner.ts:80-127` checked abort at entry/exit but `runRetrieval()` never received the signal. v1 views are synchronous, but workspace (4.4) will spawn ripgrep; without the signal reaching the pipeline, in-flight subprocesses won't cancel when the operator presses Ctrl+C. Added optional `signal?: AbortSignal` to `PipelineDeps`; `ViewSearch.search` now takes an optional second arg so views can propagate cancellation into their own IO. Sync views (memory + session) accept the parameter and ignore it — comment in each view documents why. Pipeline does a coarse `checkAborted` between every stage (search → expand → rank → compress) and throws `retrieval aborted before <stage>` so the operator/test can pinpoint the boundary. Runner now forwards `signal` to the pipeline.
+
+**H4** — `compression.ts compressGreedy` trusted whatever cost the per-view resolver returned. Slice 4.9 will wire provider-specific token counters via the `estimateTokens` hook; a buggy counter returning `NaN` / `Infinity` / negative would corrupt the greedy comparison (`NaN <= remaining` is `false`, silently skipping the level; placed `Infinity` underflows `remaining`). Added a guard: invalid `costTokens` treated identically to a `null` resolution (fall through to the next level) plus a stderr log naming the candidate / level / bad value. Validation lives in `compressGreedy` (not in resolvers) so every resolver — including future ones — is protected uniformly.
+
+Tests: 4 new in `tests/retrieval/pipeline.test.ts` covering pre-abort short-circuit, abort flipped between stages, signal forwarded to each view's search call, and the no-signal happy path. 2 new in `tests/retrieval/compression.test.ts` covering fall-through when some levels return invalid costs and full skip when all levels are invalid.
+
+## [2026-05-15] fix(cli/slash/agent-retrieval) — compute metrics over the full requested window
+
+`/agent retrieval metrics [--days N]` was loading `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then filtering the result in-memory by `t.createdAt >= cutoffMs`. Once a session held more than 100 traces in the requested window, SQL handed back the freshest 100 (sorted by `created_at DESC`) and every row passed the post-filter — so utilization, eviction rate, diversity, and latency were silently computed from a truncated end-of-period sample. The header line printed "last 30.0d (100 traces)" with no signal that older traces in the window had been excluded.
+
+Fix in `src/storage/repos/retrieval-trace.ts`: new `listRetrievalTracesSinceMs(db, sessionId, cutoffMs, hardCap = 10_000)` filters by window SQL-side and returns `{ rows, capReached, hardCap }`. SQL fetches `hardCap + 1` to disambiguate "fits exactly" from "fits with leftovers" — one cheap extra row beats a separate `COUNT(*)`. The hard cap is defense against pathological sessions (eval harnesses logging tens of thousands of retrieval calls), not a marketing default — 10k is well above any realistic interactive session.
+
+`handleMetrics` consumes the new helper and surfaces `capReached` as an explicit `warning: sample capped at <N> traces (oldest kept ≈ Xd ago); metrics reflect the freshest N only — older traces in the requested Yd window are excluded` line under the header. When the cap doesn't bite (the overwhelming common case), the output is unchanged.
+
+Tests: 4 new in `tests/storage/retrieval-trace.test.ts` covering the helper directly — window scoping (excludes rows before cutoff), session scoping (other sessions excluded), `capReached=true` with surfaces-the-freshest semantics, and the boundary case where row-count equals `hardCap` exactly (must report `capReached=false`).
+
+## [2026-05-15] fix(retrieval) — stop emitting synthetic `memory_events action=read` from retrieval-internal paths (compression + BM25 indexing)
+
+Two retrieval-internal paths were calling `registry.read` and minting `memory_events action=read` rows for content the model never actually saw. Both swapped to `registry.peek` (same scope precedence + discriminated outcome, no `auditRead` side effect). Policy now spelled out in both call sites: `memory_events action=read` stays reserved for explicit `memory_read` tool calls (model asking by name); retrieval-pipeline visibility lives in `retrieval_trace` (included nodeIds + skipped trail).
+
+- `src/retrieval/compression.ts` `memoryResolver` — `compressGreedy` probes up to four levels per candidate (`full → outline → summary → ref`); a single ranked memory could fire 1–3 audit-read rows before placement, and a candidate skipped after probing every body level fired up to 3 reads for nothing the model saw.
+- `src/retrieval/views/memory.ts` BM25 corpus build (`loadBodies=true`) — read EVERY listed memory's body just to compute term frequencies for ranking; only top-K became candidates and only included slot entries reached the model. Worst case in the indexing path: one audit-read row per indexed memory per query.
+
+Regression tests in `tests/retrieval/compression.test.ts` and `tests/retrieval/memory-view.test.ts` each assert zero `memory_events action=read` rows after the respective retrieval pass. Compression test exercises both outcomes (placed + skipped) in one go; memory-view test indexes 5 memories with a query that hits none, isolating the indexing path as the only possible audit source.
+
+## [2026-05-15] feat(retrieval) — Phase 4 kickoff (RETRIEVAL.md v1)
+
+**In progress.** New branch `feat/retrieval` starts implementing `docs/spec/RETRIEVAL.md` v1 — the pipeline `query → candidates → expansion → ranking → compression → context slot`. Decisions agreed up front:
+
+- **Workspace view via filesystem + ripgrep**, not CODE_INDEX. The auto-memory entry "não vamos implementar code index" stays in force; workspace falls back to ripgrep + filename match. Loses caller/reference structural edges; covers symbol find / grep / file outline.
+- **Insertion via a model-facing `retrieve_context` tool**, not auto-fire on step start. Aligns with spec §1.2 ("retrieval is tool, not driver") and lets eval measure per-call value.
+- Slices declared up front (4.1 foundation; 4.2 memory view; 4.3 session view; 4.4 workspace view; 4.5 expansion; 4.6 ranking; 4.7 compression; 4.8 trace; 4.9 integration). v1 ships no embedding, no usage signal, no cross-view auto-edges (per spec §12.1).
+
+### 4.1 — Foundation
+
+Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet — these are stubs returning empty results. Establishes the public shape so 4.2+ slot into the skeleton without churn. M1 (selective scrub at the repo layer — reason fields redacted, slot content kept raw) and M2 (single `context_slot_json` column) fixed in the same commit per code review.
+
+### 4.2 — Memory view + BM25 utility
+
+`src/retrieval/bm25.ts` ships a hand-rolled BM25 (~80 lines, no deps). Tokenizer is lowercase + non-alphanumeric split — lexical-first per spec §0 principle 2. Constants k1=1.5, b=0.75 (textbook defaults). Deterministic tiebreaker on equal scores (id ASC) so trace replays are stable.
+
+`src/retrieval/views/memory.ts` implements `ViewSearch` for the memory view. Field weighting: title × 3, description × 2, body × 1 (body opt-in via `loadBodies` because each is a disk read). Uses dedup-by-name listings so local-over-shared overrides surface as one candidate, not two. Node id format `memory:<scope>/<name>` mirrors the cross-store disambiguation pattern. Reason strings get scrubbed at the repo trace layer (slice 4.1 selective scrub).
+
+What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
+
+### 4.8 — Trace surfaces (`/agent retrieval`)
+
+Operator-facing forensic for the retrieval pipeline (spec §10). No pipeline mutation — pure reads off `retrieval_trace`. Closes the v1 surface: 4.9 wired the tool the model calls; 4.8 wires the slash command the operator inspects.
+
+`src/cli/slash/commands/agent-retrieval.ts` exports `handleRetrievalSub(ctx, args)`, routed from the existing `/agent` command (now accepts both `policy` and `retrieval` subnamespaces).
+
+Subcommands:
+
+- `/agent retrieval` — summary (trace count in current session, distribution by workflow).
+- `/agent retrieval audit [--limit N]` — newest-first list. Default limit 10, cap 100. Each line: short id · workflow · age · included/skipped counts · total latency · query preview.
+- `/agent retrieval replay <id>` — full per-stage dump for one trace. Accepts the 8-char short id (resolved against the session's traces; ambiguity refused with the colliding shortIds). Renders: query metadata, timings per stage, raw candidates with reason + bootstrap, ranked candidates with signal breakdown (`str=… lex=… sem=… tmp=… use=… goal=…`), included slot entries with level + cost, skipped trail with `would_cost` + reason.
+- `/agent retrieval metrics [--days N]` — aggregates §10.2: `budget_utilization_mean`, `eviction_rate` (skipped/ranked ratio), `diversity` (Shannon entropy of view distribution, normalized to [0,1]), latency `p50/p95` per stage, view distribution (slot inclusions per view). Default window 30d, cap 365d. Uses `ctx.now` so test fixtures with pinned clocks behave deterministically (same pattern `/memory metrics` uses).
+- `/agent retrieval workflows` — prints the `WORKFLOW_WEIGHTS` table with each workflow's six-signal split. Doubles as a debugging surface — the operator sees exactly why `debug` weights temporal heavily vs `refactor` weighting structural.
+
+`/agent` root description updated to reflect both subnamespaces; the previous "only 'policy' is implemented" copy is gone.
+
+Tests: 19 new in `tests/cli/slash/agent-retrieval.test.ts` covering router rejection of unknown subnamespace + subcommand, summary (empty / populated with workflow counts), audit (empty / newest-first ordering / --limit cap / invalid --limit / unknown flag), replay (missing id / full dump shape / short-id prefix resolution / skipped rendering / unknown id), metrics (empty window / aggregates surface / --days window / invalid --days), workflows (table coverage + column headers).
+
+### 4.9 — Integration (retrieve_context tool)
+
+Pipeline finally encosta no operador. The subsystem is now reachable from the model's tool surface — every other slice (4.1 through 4.7) was internal plumbing leading here.
+
+`src/retrieval/runner.ts` exports `buildRetrievalRunner({ db, sessionId, memoryRegistry, defaultBudgetTokens?, views? })` — produces a `RetrieveFn` the harness wires into `ToolContext.retrieveContext`. Builds session-scoped views (memory + session) once per session, plus a compression resolver bound to both substrates. Per-call: filters views per the input's allow-list, swaps in a body-loading memory view when `loadBodies: true`, translates the operator/model input shape into the canonical `RetrievalQuery`, and shapes the result with stats (`candidatesRaw`, `candidatesRanked`, `included`, `skipped`, `budgetUsedTokens`, `budgetRemainingTokens`).
+
+`src/tools/builtin/retrieve-context.ts` defines the model-facing tool. Thin by design — validates args (workflow / queryType / budgetTokens / views / loadBodies all checked against the canonical enums + range bounds; views de-duplicated; query must be a non-empty string), refuses with `retrieval.unavailable` when the harness didn't wire a runner, refuses with `tool.aborted` on a pre-call abort signal, and surfaces runner-thrown errors as `retrieval.internal_error` instead of propagating. Metadata: `category: 'misc'`, `writes: false`, `idempotent: true`, `planSafe: true`, `parallel_safe: true`. Cap: budget ∈ [1, 100000], views ≤ 3 entries.
+
+`src/harness/loop.ts` wires `retrieveContext` into `ToolContext` when `config.memoryRegistry` is present (db is always available — the harness can't run without it). Headless / SDK runs without memory get a clean `retrieval.unavailable` error per spec §15.7 degradation.
+
+`ToolContext.retrieveContext?: RetrieveFn` is the new optional field (same pattern as `memoryRegistry`, `confirmMemoryWrite`, etc.). Imports add `RetrieveFn` from `../retrieval/index.ts`.
+
+`BUILTIN_TOOLS` ordering puts `retrieve_context` next to the read-only memory tools — operator scanning `agent --list-tools` finds them clustered by purpose.
+
+Tests: 19 new in `tests/tools/retrieve-context.test.ts` covering tool validation (missing runner / non-string query / empty query / unknown workflow / unknown queryType / budget out of bounds / non-integer budget / invalid views entries / empty views / loadBodies type / duplicate de-dup / aborted signal / runner-thrown errors) plus 5 runner end-to-end (ranked + compressed output for real query, views filter restriction, loadBodies surfaces body-only matches, defaultBudgetTokens respected, retrieval_trace row persisted per call). Bootstrap test list updated to include `retrieve_context`.
+
+### 4.7 — Compression
+
+Replaces the `ref-only` skeleton stub (slice 4.1) with the full §6 hierarchy + greedy budget allocator.
+
+`src/retrieval/compression.ts` exports two layers:
+
+1. **`createCompressionResolver({ registry, db, estimateTokens? })`** — per-view content materializer. Given a `(candidate, level)` pair, returns `{ content, costTokens }` from the underlying substrate or `null` when the row no longer exists (deletion between rank and compress) / the view is deferred (workspace returns null at every level until 4.4).
+
+   - **memory view**: `full` = frontmatter header + full body; `outline` = name + description + first 5 body lines; `summary` = `frontmatter.description`; `ref` = `memory:<scope>/<name>` projection (no I/O — works even when the file is missing).
+   - **session view**: `message` / `tool_call` / `failure` each have all four levels. `full` for tool_call includes input + output (output is unbounded but greedy can demote to outline when needed); `failure_event` `full` carries the payload_json. New `getFailureEvent(db, id)` helper added to the repo (the existing surface only had list helpers).
+
+2. **`compressGreedy({ ranked, query, resolver })`** — implements spec §6.2 verbatim. For each ranked candidate tries `full → outline → summary → ref` until a level fits; tracks the cheapest-unfit cost for the skipped trail so the operator hint reads `"cheapest level (ref) costs 5t > remaining 2t"` instead of bare "skipped".
+
+Token cost: `Math.ceil(content.length / 4)` heuristic, with minimum 1 to keep empty-content slots structurally honest. Slice 4.9 (integration) wires provider-specific `countTokens` via the optional `estimateTokens` dep.
+
+Pipeline integration: `PipelineDeps` gains an optional `compressionResolver` field. When provided, the pipeline runs `compressGreedy` against it as the default compress stage. Explicit `deps.compress` still wins (for tests). When neither is set, the slice-4.1 ref-only stub remains as the fallback so skeleton-shape tests don't need substrate.
+
+Tests: 15 new in `tests/retrieval/compression.test.ts` covering per-view resolver shape (memory + session + workspace-null), cost-ordering invariant (`ref ≤ summary ≤ outline ≤ full`), missing-row fallback to null, malformed nodeId guards, greedy budget cases (top-K full / tail degrades / exact fit / zero budget / skipped trail with wouldCostTokens / resolver that always returns null), and an end-to-end with the real resolver against memory + session corpora.
+
+### 4.6 — Ranking (out of declared order)
+
+Slice 4.4 (workspace via ripgrep) and 4.5 (expansion) were deferred — workspace without CODE_INDEX collapses to a ripgrep wrapper that duplicates existing grep/glob tools and produces no structural edges; expansion without edges has nothing to traverse. The remaining v1 value sits in honest ranking + compression + integration, so the slice order shifts: 4.6 → 4.7 → 4.9, with 4.4/4.5 picked up when (or if) CODE_INDEX returns.
+
+`src/retrieval/ranking.ts` ships `rankCandidates({ candidates, query, now? })` implementing the spec §5.1 six-signal fusion with §5.2 workflow-specific weights. Module-load guard throws if any workflow's weights don't sum to 1.0 (within float epsilon) — a misspelled weight in the table can't drift scores silently.
+
+Signal calibration:
+
+- **structural**: `1 / pathLength` — placeholder until expansion ships; v1 paths are single-element so it lands at 1.0 across the board. The weight stays in the table so workflows can already declare their structural preference; the substrate flips on when expansion does.
+- **lexical**: BM25 score normalized by the batch max. Per-batch normalization keeps the signal bounded to [0, 1] even though BM25 itself is unbounded.
+- **semantic**: 0 (spec §0 principle 2 — embedding opt-in, not v1).
+- **temporal**: exponential decay against the view's half-life — session 1h, memory 30d, workspace ∞ (no decay). Candidates without `createdAt` get a neutral 1.0 (workspace by design; memory listings today because mtime isn't on the shape).
+- **usage**: 0 (citation history table not implemented).
+- **goalAlignment**: 0 (CONTEXT_TUNING §1.6 canonical goal form not implemented).
+
+`Candidate.createdAt` is now an optional field on the type. Session view populates it from `message.createdAt` / `tool_call.created_at` / `failure.created_at` so the decay math has substrate to chew on. Memory view leaves it undefined (registry doesn't expose mtime today).
+
+Pipeline default rank passes from the zero-filled stub (slice 4.1) to `rankCandidates` real. Custom rank callbacks still override via `deps.rank`. Sort is finalScore DESC with nodeId ASC tiebreak — same trace-stability discipline BM25 uses.
+
+### 4.3 — Session view
+
+`src/retrieval/views/session.ts` projects the implicit session graph (RETRIEVAL §15.1 calls these "structures that ARE edges") onto a BM25 corpus. Three sources contribute one candidate per row:
+
+- **Messages** (`messages.content`) — Anthropic-shaped content blocks get text extracted; plain strings flow through unchanged. Role weighting: user × 3 (operator goal carries identifying signal), assistant × 1, tool × 1.
+- **Tool calls** (`tool_calls.tool_name` + `input`) — joined via `message_id → messages.session_id`. Tool name × 3 (more identifying than the JSON-stringified input). Output is intentionally NOT in the corpus — unbounded sizes (megabytes of stdout) would dominate without producing useful signal; slice 4.7 resolves outputs at `full` level for selected candidates only.
+- **Failure events** (`failure_events.code` + `classe` + `recovery_action` + `payload_json`) — code/classe/recovery × 3, payload × 1.
+
+Node ids: `session:message:<id>`, `session:tool_call:<id>`, `session:failure:<id>` — scoped so the trace makes the substrate visible.
+
+Temporal decay (§4.3 half-life 1h) is INTENTIONALLY NOT applied at bootstrap. The "recência boost" from spec §3.2 manifests in the ranking signal_temporal weight (slice 4.6) which is heaviest for the debug workflow. The trace records undecayed BM25 scores so eval replay can re-rank against truth without unwinding the decay.
+
 ## [2026-05-15] fix(feedback,memory,storage) — Phase 3.7 review batch (14 findings closed)
 
 **Done.** Closes the comprehensive code-review punch list for the `feat/memory` branch (32 commits across multiple phases). Findings span Critical (1), High (3), Medium (7), Low (3) severity; all closed in five tightly-scoped slices on the same branch.

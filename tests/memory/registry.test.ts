@@ -92,6 +92,254 @@ describe('createMemoryRegistry — list', () => {
   });
 });
 
+describe('createMemoryRegistry — list states + expires filter (H1+H6)', () => {
+  const fmWithState = (name: string, state?: string, expires?: string): string => {
+    const lines = [
+      `name: ${name}`,
+      `description: hook for ${name}`,
+      'type: user',
+      'source: user_explicit',
+    ];
+    if (state !== undefined) lines.push(`state: ${state}`);
+    if (expires !== undefined) lines.push(`expires: ${expires}`);
+    return `${lines.join('\n')}\n`;
+  };
+
+  test('states filter excludes non-allowed states (default returns all)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — a\n- [B](b.md) — b\n- [C](c.md) — c\n');
+    writeMemory(roots.user, 'a', fmWithState('a', 'active'), 'body\n');
+    writeMemory(roots.user, 'b', fmWithState('b', 'quarantined'), 'body\n');
+    writeMemory(roots.user, 'c', fmWithState('c'), 'body\n'); // no state → active
+    const reg = createMemoryRegistry({ roots });
+    // Default: every state returned.
+    expect(reg.list()).toHaveLength(3);
+    // states=['active'] excludes b; c (no state → 'active') passes.
+    const active = reg.list({ states: ['active'] });
+    expect(active.map((l) => l.name).sort()).toEqual(['a', 'c']);
+    // Explicit broader allow-list passes all.
+    const allStates = reg.list({ states: ['active', 'quarantined'] });
+    expect(allStates).toHaveLength(3);
+  });
+
+  test('orphaned listing (missing body file) is excluded by states filter', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Phantom](phantom.md) — referenced but no body\n');
+    // Deliberately no writeMemory call.
+    const reg = createMemoryRegistry({ roots });
+    expect(reg.list()).toHaveLength(1); // default: index says it exists
+    expect(reg.list({ states: ['active'] })).toEqual([]); // state unknown → out
+  });
+
+  test('includeExpired=false excludes past-expiry memories', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Stale](stale.md) — old\n- [Fresh](fresh.md) — new\n');
+    writeMemory(roots.user, 'stale', fmWithState('stale', undefined, '2024-01-01'), 'body\n');
+    writeMemory(roots.user, 'fresh', fmWithState('fresh', undefined, '2099-12-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    // nowMs pinned to 2026-05-16 — stale is past, fresh is future.
+    const nowMs = Date.UTC(2026, 4, 16); // month is 0-indexed
+    const fresh = reg.list({ includeExpired: false, nowMs });
+    expect(fresh.map((l) => l.name)).toEqual(['fresh']);
+    // Default omits the filter, returns both.
+    expect(reg.list()).toHaveLength(2);
+  });
+
+  test('end-of-day semantics: expires=YYYY-MM-DD is valid through that day', () => {
+    // A memory with `expires: 2026-05-15` should be valid on
+    // 2026-05-15 (any time-of-day) and expired starting
+    // 2026-05-16 00:00 UTC. Mirrors operator intuition that
+    // "expires today" = "valid through today".
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Edge](edge.md) — boundary\n');
+    writeMemory(roots.user, 'edge', fmWithState('edge', undefined, '2026-05-15'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    // Mid-day on the expiry date — still valid.
+    const midDayMs = Date.UTC(2026, 4, 15, 12, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: midDayMs })).toHaveLength(1);
+    // 00:00 UTC the next day — expired.
+    const nextDayMs = Date.UTC(2026, 4, 16, 0, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: nextDayMs })).toEqual([]);
+  });
+
+  test('ineligible higher-precedence shadow does NOT suppress eligible lower-precedence (regression)', () => {
+    // Pre-fix: list() deduplicated by name BEFORE evaluating
+    // states/includeExpired. A local quarantined `foo` would win
+    // the precedence walk (local > shared > user) and then be
+    // dropped by the state filter, leaving zero candidates for
+    // `foo` even though shared/user had an active version that
+    // should have surfaced. Filter must run BEFORE dedupe so
+    // precedence operates over eligible memories only.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — local quarantined\n');
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared active\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user active\n');
+    writeMemory(roots.projectLocal, 'foo', fmWithState('foo', 'quarantined'), 'local body\n');
+    writeMemory(roots.projectShared, 'foo', fmWithState('foo', 'active'), 'shared body\n');
+    writeMemory(roots.user, 'foo', fmWithState('foo', 'active'), 'user body\n');
+    const reg = createMemoryRegistry({ roots });
+
+    // With state filter active: local is quarantined → excluded;
+    // among the remaining eligible {shared, user}, dedupe picks
+    // shared (higher precedence). User stays hidden — that's
+    // dedupe-by-name's purpose.
+    const result = reg.list({ deduplicateByName: true, states: ['active'] });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.scope).toBe('project_shared');
+    expect(result[0]?.name).toBe('foo');
+  });
+
+  test('all shadows ineligible → name absent from result (regression)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — local\n');
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeMemory(roots.projectLocal, 'foo', fmWithState('foo', 'quarantined'), 'body\n');
+    writeMemory(roots.projectShared, 'foo', fmWithState('foo', 'evicted'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const result = reg.list({ deduplicateByName: true, states: ['active'] });
+    expect(result).toEqual([]);
+  });
+
+  test('expired higher-precedence shadow does NOT suppress fresh lower-precedence', () => {
+    // Same precedence-aware filtering for the expires case: a
+    // local memory past its expires shouldn't hide a shared/user
+    // sibling that's still valid.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Bar](bar.md) — local stale\n');
+    writeIndex(roots.projectShared, '- [Bar](bar.md) — shared fresh\n');
+    writeMemory(roots.projectLocal, 'bar', fmWithState('bar', undefined, '2024-01-01'), 'body\n');
+    writeMemory(roots.projectShared, 'bar', fmWithState('bar', undefined, '2099-12-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const nowMs = Date.UTC(2026, 4, 16);
+    const result = reg.list({ deduplicateByName: true, includeExpired: false, nowMs });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.scope).toBe('project_shared');
+  });
+
+  test('combined: states + expires + scope + dedupe filter compose', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — local-active\n- [B](b.md) — local-stale\n');
+    writeIndex(roots.user, '- [A](a.md) — user-shadow\n');
+    writeMemory(roots.projectLocal, 'a', fmWithState('a', 'active'), 'body\n');
+    writeMemory(roots.projectLocal, 'b', fmWithState('b', 'active', '2024-01-01'), 'body\n');
+    writeMemory(roots.user, 'a', fmWithState('a', 'active'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const nowMs = Date.UTC(2026, 4, 16);
+    const result = reg.list({
+      deduplicateByName: true,
+      states: ['active'],
+      includeExpired: false,
+      nowMs,
+    });
+    // A: deduped to project_local. B: excluded (expired).
+    expect(result.map((l) => `${l.scope}/${l.name}`)).toEqual(['project_local/a']);
+  });
+
+  test('month-end expires dates are valid (regression: prior overflow guard rejected them)', () => {
+    // Prior implementation computed `Date.UTC(y, m-1, day+1)` and
+    // required `round.getUTCMonth() === m - 1`, which incorrectly
+    // rejected every legitimate last-day-of-month (`2026-01-31` →
+    // start-of-next-day is Feb 1 → month mismatch → null). With
+    // null returned, `isExpired` returned false and the memory
+    // stayed visible to `list({ includeExpired: false })` past its
+    // expiry. Today's two-step parse validates the date itself,
+    // then adds 24h.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Jan31](jan31.md) — jan\n- [Dec31](dec31.md) — dec\n');
+    writeMemory(roots.user, 'jan31', fmWithState('jan31', undefined, '2026-01-31'), 'body\n');
+    writeMemory(roots.user, 'dec31', fmWithState('dec31', undefined, '2026-12-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+
+    // 2026-01-31 14:00 UTC — both still valid (mid-day on Jan 31
+    // for jan31; far future for dec31).
+    const jan31Noon = Date.UTC(2026, 0, 31, 14, 0, 0);
+    expect(
+      reg
+        .list({ includeExpired: false, nowMs: jan31Noon })
+        .map((l) => l.name)
+        .sort(),
+    ).toEqual(['dec31', 'jan31']);
+
+    // 2026-02-01 00:00 UTC — Jan 31 just expired; Dec 31 unaffected.
+    // This is the case the previous overflow bug HID: jan31 should
+    // expire here, but with `parseExpiresEndOfDayMs` returning null
+    // (rejected as malformed) `isExpired` returned false and jan31
+    // stayed visible.
+    const feb1Midnight = Date.UTC(2026, 1, 1, 0, 0, 0);
+    expect(
+      reg
+        .list({ includeExpired: false, nowMs: feb1Midnight })
+        .map((l) => l.name)
+        .sort(),
+    ).toEqual(['dec31']);
+
+    // 2027-01-01 00:00 UTC — both expired. Year-rollover boundary.
+    const jan1_2027 = Date.UTC(2027, 0, 1, 0, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: jan1_2027 })).toEqual([]);
+  });
+
+  test('leap-day expires (2024-02-29) is valid and expires correctly the next day', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Leap](leap.md) — leap day\n');
+    writeMemory(roots.user, 'leap', fmWithState('leap', undefined, '2024-02-29'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    // 2024-02-29 23:00 UTC — still valid.
+    const lateLeapDay = Date.UTC(2024, 1, 29, 23, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: lateLeapDay })).toHaveLength(1);
+    // 2024-03-01 00:00 UTC — expired.
+    const march1 = Date.UTC(2024, 2, 1, 0, 0, 0);
+    expect(reg.list({ includeExpired: false, nowMs: march1 })).toEqual([]);
+  });
+
+  test('numerically-invalid expires (e.g. 2026-02-31) treated as non-expiring (defensive)', () => {
+    // The frontmatter validator's EXPIRES_RE only checks the
+    // YYYY-MM-DD format, not whether the date is a real calendar
+    // day. A hand-edited `2026-02-31` survives parsing.
+    // `parseExpiresEndOfDayMs` now refuses such inputs (returns
+    // null), and `isExpired(undefined-like, …)` treats the result
+    // as "no expiry set" — the memory stays visible. Operator
+    // discovers the malformed date via `/memory audit`, NOT via
+    // surprise eviction.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Bad](bad.md) — bad date\n');
+    writeMemory(roots.user, 'bad', fmWithState('bad', undefined, '2026-02-31'), 'body\n');
+    const reg = createMemoryRegistry({ roots });
+    const nowMs = Date.UTC(2099, 0, 1); // far future — every real expiry would have passed
+    expect(reg.list({ states: ['active'], includeExpired: false, nowMs })).toHaveLength(1);
+  });
+
+  test('malformed frontmatter (bad expires) excluded by state filter (defense in depth)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Wonky](wonky.md) — bad expires\n');
+    writeMemory(
+      roots.user,
+      'wonky',
+      'name: wonky\ndescription: hook\ntype: user\nsource: user_explicit\nexpires: not-a-date\n',
+      'body\n',
+    );
+    const reg = createMemoryRegistry({ roots });
+    // The validator at write time would refuse this; on read,
+    // `parseMemoryFile` returns `malformed`. The state filter
+    // sees `kind !== 'present'` and excludes. The operator's
+    // `/memory audit` surface (broader `list()` defaults) still
+    // shows the entry — that's where they fix the hand-edit.
+    expect(reg.list()).toHaveLength(1); // default list still surfaces it
+    expect(reg.list({ states: ['active'] })).toEqual([]); // model-facing path excludes
+  });
+});
+
 describe('createMemoryRegistry — lookup', () => {
   test('returns null for unknown name', () => {
     const repo = makeTmp();

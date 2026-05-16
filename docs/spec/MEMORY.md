@@ -596,15 +596,27 @@ command = "~/.config/agent/hooks/memory_audit.sh"
 
 10. **PR review é gate primário pra shared:** memória shared só entra no repo via commit; commit passa por code review do time. Defesa social, não automática — mas eficaz.
 
-### 7.3 Detecção heurística de injection
+### 7.3 Tripwire de phrases óbvias + secret detection
 
-Antes de propor write, scanner simples checa o body:
+Antes de propor write, scanner roda duas passes contra o body:
+
+**(a) Tripwire de phrases (limitado, não é defesa).** Lista pequena de phrases em **inglês** vindas de tutoriais públicos de jailbreak:
+
 - "ignore previous instructions"
 - "you are now"
 - "from now on, always"
-- secret patterns (chaves AWS, GitHub tokens, etc — não salvar nunca)
+- "disregard prior", "forget previous"
 
-Match: write **bloqueado**, não só warning. Vai pra `memory_events` como `refused` com motivo.
+Match: write **bloqueado**, audit row `refused` com motivo. **Não confundir com defesa contra prompt injection.** Trivialmente burlável por:
+- outro idioma ("ignore as instruções anteriores", "忽略之前的指令", …);
+- paráfrase ("the new rule is", "your role going forward", …);
+- injection estrutural (yaml/code-block/role-play wrappers).
+
+Lista fica **curta de propósito** — estender com traduções inflaciona false-positive contra memórias legítimas que citam falhas do modelo, sem mover a agulha de ameaça. Valor real do tripwire: (1) row de audit (`memory_events action=refused`) sinaliza tentativa óbvia; (2) defense-in-depth alongside o modal de §6, o trust boundary, e a atribuição de `source`. O modal É o gate carregando peso; o tripwire é layer 0.
+
+**(b) Secret patterns (honesto, agnostic-to-language).** Shape-stable regexes (chaves AWS `AKIA…`, GitHub PAT `ghp_…`, Anthropic `sk-ant-…`, OpenAI `sk-…40+`, Slack `xox[baprs]-…`). Match: write **bloqueado**. Credentials têm prefixo de alta entropia — não dependem de prosa em volta; false-positive rate é baixo.
+
+Ambas passes geram `memory_events action=refused` com `details.reason` distinguindo phrase vs secret pattern (operator distingue tentativa hostile vs vazamento acidental de credencial em prosa).
 
 ---
 

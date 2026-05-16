@@ -8,7 +8,11 @@ import {
   type TelemetryEvent,
   createRecordingTelemetrySink,
 } from '../../src/telemetry/index.ts';
-import { createScrubbingTelemetrySink, scrubEvent } from '../../src/telemetry/scrubbing.ts';
+import {
+  createScrubbingTelemetrySink,
+  scrubEvent,
+  scrubFreeformText,
+} from '../../src/telemetry/scrubbing.ts';
 
 const basePermissionEvent = (
   overrides: Partial<PermissionDecisionEvent> = {},
@@ -494,6 +498,58 @@ describe('scrubEvent — slice 99 R10 hardening', () => {
         firstEmission: true,
       }) as Extract<TelemetryEvent, { kind: 'sandbox.degraded_active' }>;
       expect(out.reason).toContain('localhost:8080');
+    });
+  });
+
+  describe('scrubFreeformText — C0/C1 control char stripping (H3 retrieval review)', () => {
+    test('strips ESC and ANSI SGR sequences (terminal cannot be manipulated)', () => {
+      // A reason carrying ANSI clear-screen + colors would otherwise
+      // execute when surfaced via /agent retrieval audit / replay.
+      // Stripping the leading ESC neutralizes the whole sequence —
+      // `[2J[31m` becomes literal text, not a control directive.
+      const malicious = 'before \x1b[2Jmiddle \x1b[31mred\x1b[0m after';
+      const cleaned = scrubFreeformText(malicious);
+      expect(cleaned).not.toContain('\x1b');
+      expect(cleaned).toBe('before [2Jmiddle [31mred[0m after');
+    });
+
+    test('strips OSC, BEL, NUL, DEL and other C0 controls', () => {
+      const malicious = 'a\x00b\x07c\x1b]0;title\x07d\x7fe';
+      const cleaned = scrubFreeformText(malicious);
+      expect(cleaned).toBe('ab' + 'c]0;titlede');
+      for (const code of [0x00, 0x07, 0x1b, 0x7f]) {
+        expect(cleaned).not.toContain(String.fromCharCode(code));
+      }
+    });
+
+    test('strips C1 controls (0x80-0x9F)', () => {
+      const malicious = `a${String.fromCharCode(0x9b)}[31mb${String.fromCharCode(0x80)}c`;
+      const cleaned = scrubFreeformText(malicious);
+      expect(cleaned).toBe('a[31mbc');
+    });
+
+    test('preserves TAB / LF / CR (legitimate in stack traces and multi-line stderr)', () => {
+      // `worker.crashed.stderr` legitimately carries stack traces
+      // with newlines; reasons may include tab-formatted lists.
+      // Whitespace controls aren't an attack vector for terminal
+      // manipulation, so we leave them alone.
+      const multiline = 'first line\nsecond line\twith\ttabs\rand cr';
+      expect(scrubFreeformText(multiline)).toBe(multiline);
+    });
+
+    test('control stripping runs BEFORE path/host regex (no smuggling)', () => {
+      // `\x1b/home/secrets` pre-strip would not match PATH_REGEX_POSIX
+      // (the `\x1b` breaks word boundary). After stripping, the path
+      // emerges and gets redacted. Verifies ordering.
+      const sneaky = 'load \x1b/home/op/secrets.env now';
+      const cleaned = scrubFreeformText(sneaky);
+      expect(cleaned).not.toContain('/home/op/secrets.env');
+      expect(cleaned).toContain('<path>');
+    });
+
+    test('ordinary text passes through unchanged (no controls, no path/host shapes)', () => {
+      const benign = 'BM25 match — score 0.42 sealed';
+      expect(scrubFreeformText(benign)).toBe(benign);
     });
   });
 

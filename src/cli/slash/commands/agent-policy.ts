@@ -27,6 +27,7 @@ import {
   transitionPolicy,
 } from '../../../storage/repos/policies.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
+import { handleRetrievalSub } from './agent-retrieval.ts';
 
 const POLICY_STATES_OPERATOR: PolicyState[] = [
   'proposed',
@@ -291,14 +292,22 @@ export { listPoliciesByActionSignature };
 
 export const agentPolicyCommand: SlashCommand = {
   name: 'agent',
-  description:
-    'manage adaptation policies (subcommands: policy list, promote, invalidate, history, run)',
+  description: 'manage adaptation policies + inspect retrieval (subnamespaces: policy, retrieval)',
   exec: async (args, ctx): Promise<SlashResult> => {
-    // /agent <sub> ... — only `policy` subnamespace ships in 3.4.
-    if (args.length === 0 || args[0] !== 'policy') {
+    const root = args[0];
+    if (root === undefined) {
       return {
         kind: 'error',
-        message: "/agent: only 'policy' subnamespace is implemented (try /agent policy)",
+        message: "/agent: subnamespace required (try 'policy' or 'retrieval')",
+      };
+    }
+    if (root === 'retrieval') {
+      return handleRetrievalSub(ctx, args.slice(1));
+    }
+    if (root !== 'policy') {
+      return {
+        kind: 'error',
+        message: `/agent: unknown subnamespace '${root}' (try: policy, retrieval)`,
       };
     }
     const tail = args.slice(1);

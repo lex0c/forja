@@ -43,6 +43,7 @@ import { estimatePromptTokens } from '../providers/tokens.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
+import { buildRetrievalRunner } from '../retrieval/index.ts';
 import {
   type CritiqueRunCode,
   type SessionStatus,
@@ -2555,6 +2556,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           },
           ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
+          // Retrieval subsystem runner (slice 4.9). Wired when the
+          // memory registry is configured — db is always available
+          // since harness can't run without it. retrieve_context
+          // tool surfaces 'retrieval.unavailable' when this is
+          // absent (headless / SDK runs without memory).
+          ...(config.memoryRegistry !== undefined
+            ? {
+                retrieveContext: buildRetrievalRunner({
+                  db: config.db,
+                  sessionId,
+                  memoryRegistry: config.memoryRegistry,
+                }),
+              }
+            : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }
             : {}),
