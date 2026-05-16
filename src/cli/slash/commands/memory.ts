@@ -42,6 +42,7 @@ import {
   listRecentMemoryEvents,
 } from '../../../storage/index.ts';
 import type { MemoryEvent } from '../../../storage/index.ts';
+import type { EvictionMotivo } from '../../../storage/repos/eviction-events.ts';
 import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
@@ -996,6 +997,219 @@ const findTombstoneInAnyScope = (registry: MemoryRegistry, name: string): FindTo
   return { kind: 'ambiguous', scopes: hits.map((h) => h.scope) };
 };
 
+// ─── /memory quarantine ───────────────────────────────────────────────
+//
+// Operator-driven `active → quarantined` transition. The 4 automatic
+// detectors spec'd in MEMORY.md §6.5.2 (`verify_failed`,
+// `user_override_repeated`, `conflict_detected`, `trust_revoked`)
+// are tracked in `docs/TODO.md` (Slice 0+). This slash command is
+// the manual escape hatch — operator can drive a quarantine when
+// they've spotted a problem the detectors don't yet catch. Same
+// `transitionMemoryState` substrate the detectors will use once
+// shipped; the trigger marker (`operator_driven`) distinguishes
+// manual from automatic in forensic queries.
+//
+// Args: `<name> --motivo <kind> [--evidence "..."] [--scope <s>]`.
+// Motivo MUST be one spec admits for active→quarantined per
+// EVICTION.md §4.1 + §5.1: conflict / shift / security / low_roi
+// / irrelevant. (`quota` / `expired` / `user_purge` are real
+// motivos but not applicable to active→quarantined as a manual
+// verb; they're terminal-side or cross-substrate.)
+
+const VALID_QUARANTINE_MOTIVOS: ReadonlySet<EvictionMotivo> = new Set([
+  'conflict',
+  'shift',
+  'security',
+  'low_roi',
+  'irrelevant',
+]);
+
+const isQuarantineMotivo = (s: string): s is EvictionMotivo =>
+  VALID_QUARANTINE_MOTIVOS.has(s as EvictionMotivo);
+
+const handleQuarantine = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  // Two-pass arg parse: positional `name` + flag pairs.
+  // `--motivo <kind>` is required; `--evidence "..."` and
+  // `--scope <s>` are optional. Unknown flags are refused so a
+  // typo doesn't silently take the default code path.
+  let name: string | undefined;
+  let motivoArg: string | undefined;
+  let evidenceText: string | undefined;
+  let scopeArg: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] as string;
+    if (a === '--motivo') {
+      motivoArg = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a === '--evidence') {
+      evidenceText = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a === '--scope') {
+      scopeArg = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return {
+        kind: 'error',
+        message: `/memory quarantine: unknown flag '${a}' (try --motivo, --evidence, --scope)`,
+      };
+    }
+    if (name === undefined) {
+      name = a;
+      continue;
+    }
+    return {
+      kind: 'error',
+      message: `/memory quarantine: too many positional args (got '${a}' after name '${name}')`,
+    };
+  }
+
+  if (name === undefined) {
+    return {
+      kind: 'error',
+      message:
+        '/memory quarantine: missing name (usage: /memory quarantine <name> --motivo <kind> [--evidence "..."] [--scope <s>])',
+    };
+  }
+  if (motivoArg === undefined) {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: --motivo is required (one of: ${[...VALID_QUARANTINE_MOTIVOS].join(', ')})`,
+    };
+  }
+  if (!isQuarantineMotivo(motivoArg)) {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: invalid motivo '${motivoArg}' (expected: ${[...VALID_QUARANTINE_MOTIVOS].join(', ')})`,
+    };
+  }
+  const motivo: EvictionMotivo = motivoArg;
+
+  let scope: MemoryScope | undefined;
+  if (scopeArg !== undefined) {
+    if (!VALID_SINGLE_SCOPES.has(scopeArg)) {
+      return {
+        kind: 'error',
+        message: `/memory quarantine: invalid scope '${scopeArg}' (expected: user, local, shared)`,
+      };
+    }
+    scope = memoryScopeFromSingleArg(scopeArg) ?? undefined;
+  }
+
+  // Locate the memory. peek (no audit) — this is a pre-action
+  // probe, not an operator-initiated read.
+  const peek = scope !== undefined ? registry.peek(name, { scope }) : registry.peek(name);
+  if (peek.kind === 'unknown') {
+    const scopeQual = scope !== undefined ? ` in scope ${scopeArg}` : '';
+    return {
+      kind: 'error',
+      message: `/memory quarantine: no memory named '${name}'${scopeQual}`,
+    };
+  }
+  if (peek.kind === 'missing') {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: '${name}' body file is missing — use /memory delete instead`,
+    };
+  }
+  if (peek.kind === 'malformed') {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: '${name}' frontmatter is malformed (${peek.error}) — fix the file or use /memory delete`,
+    };
+  }
+
+  const currentState = peek.file.frontmatter.state ?? 'active';
+  if (currentState !== 'active') {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: '${name}' is already in state '${currentState}' (only active memories can be quarantined via this command)`,
+    };
+  }
+
+  // Modal preview + confirm. Shows motivo, current state, and the
+  // operator's evidence note so they double-check before committing
+  // the transition.
+  const preview = [
+    `motivo:  ${motivo}`,
+    `state:   ${currentState} → quarantined`,
+    evidenceText !== undefined ? `evidence: ${evidenceText}` : '(no evidence note supplied)',
+    `scope:   ${peek.scope}`,
+  ];
+  const answer = await ctx.modalManager.askMemoryAction({
+    action: 'quarantine',
+    title: 'Quarantine memory',
+    subject: `${peek.scope}/${name}`,
+    preview,
+    question:
+      'Quarantine this memory? It stays on disk with a ranking penalty until restored or evicted.',
+  });
+  if (answer !== 'yes') {
+    return {
+      kind: 'ok',
+      notes: [`/memory quarantine cancelled (operator answered ${answer})`],
+    };
+  }
+
+  // Transition via the substrate. `trigger: 'operator_driven'` is
+  // the canonical attribution for slash-driven transitions —
+  // forensic queries filter on it to distinguish manual from
+  // detector-driven. The OPERATOR_DRIVEN_EVIDENCE_MARKER on the
+  // payload also bypasses the per-motivo evidence schema (the
+  // operator's note is unstructured by nature).
+  const sessionId = ctx.currentSessionId();
+  const evidencePayload: Record<string, unknown> = {
+    [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true,
+    source: 'slash_quarantine',
+  };
+  if (evidenceText !== undefined) {
+    evidencePayload.note = evidenceText;
+  }
+
+  const result = await transitionMemoryState({
+    db: ctx.db,
+    registry,
+    roots: registry.roots,
+    scope: peek.scope,
+    name,
+    toState: 'quarantined',
+    motivo,
+    trigger: 'operator_driven',
+    actor: 'user',
+    evidence: evidencePayload,
+    ...(sessionId !== null ? { sessionId } : {}),
+    cwd: ctx.baseConfig.cwd,
+    now: ctx.now,
+    ...(ctx.dispatchHooks !== undefined ? { fireHook: ctx.dispatchHooks } : {}),
+  });
+
+  if (result.kind !== 'applied') {
+    return mapTransitionFailure('/memory quarantine', result);
+  }
+
+  registry.reload();
+  return {
+    kind: 'ok',
+    notes: [
+      `quarantined ${peek.scope}/${name}`,
+      `  motivo: ${motivo}`,
+      '  trigger: operator_driven',
+      evidenceText !== undefined ? `  evidence: ${evidenceText}` : '',
+      'use /memory restore to bring it back; /memory delete to fully evict',
+    ].filter((l) => l.length > 0),
+  };
+};
+
 const handleRestore = async (
   registry: MemoryRegistry,
   ctx: SlashContext,
@@ -1402,7 +1616,8 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
 
 export const memoryCommand: SlashCommand = {
   name: 'memory',
-  description: 'manage cross-session memories (list/show/audit/delete/promote/demote)',
+  description:
+    'manage cross-session memories (list/show/audit/delete/quarantine/restore/promote/demote)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -1424,6 +1639,8 @@ export const memoryCommand: SlashCommand = {
         return handleMetrics(ctx, args.slice(1));
       case 'delete':
         return handleDelete(registry, ctx, args.slice(1));
+      case 'quarantine':
+        return handleQuarantine(registry, ctx, args.slice(1));
       case 'restore':
         return handleRestore(registry, ctx, args.slice(1));
       case 'promote':
@@ -1433,7 +1650,7 @@ export const memoryCommand: SlashCommand = {
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, metrics, delete, restore, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, metrics, delete, quarantine, restore, promote, demote)`,
         };
     }
   },

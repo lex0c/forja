@@ -793,6 +793,145 @@ describe('/memory delete', () => {
   });
 });
 
+describe('/memory quarantine', () => {
+  test('confirm yes: transitions active → quarantined, audit pair lands', async () => {
+    const repo = makeTmp();
+    const { ctx, db, registry, roots, sessionId } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--evidence', 'duplicates other.md'],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('quarantined project_local/mem');
+    expect(r.notes?.join('\n')).toContain('motivo: conflict');
+    expect(r.notes?.join('\n')).toContain('trigger: operator_driven');
+    expect(r.notes?.join('\n')).toContain('evidence: duplicates other.md');
+    // Body stays on disk (quarantine doesn't move to tombstones).
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    // Audit row landed with action=quarantined, scope+session attribution.
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const quarantinedEv = events.find((e) => e.action === 'quarantined');
+    expect(quarantinedEv).toBeDefined();
+    expect(quarantinedEv?.scope).toBe('project_local');
+    expect(quarantinedEv?.sessionId).toBe(sessionId);
+  });
+
+  test('confirm no: file untouched, no transition', async () => {
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'no');
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'shift'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('cancelled');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    expect(listMemoryEventsByName(db, 'mem')).toHaveLength(0);
+  });
+
+  test('missing name errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['quarantine'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing name');
+  });
+
+  test('missing --motivo errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['quarantine', 'mem'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--motivo is required');
+  });
+
+  test('invalid motivo errors with allowed list', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'made_up'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain("invalid motivo 'made_up'");
+      // The allowed list is enumerated so the operator can fix.
+      expect(r.message).toContain('conflict');
+      expect(r.message).toContain('shift');
+    }
+  });
+
+  test('unknown flag errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--bogus'],
+      ctx,
+    );
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown flag '--bogus'");
+  });
+
+  test('unknown name errors before opening modal', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const capture = { calls: [] as { action: string; subject: string; preview: string[] }[] };
+    stubMemoryAction(ctx, 'yes', capture);
+    const r = await memoryCommand.exec(['quarantine', 'ghost', '--motivo', 'conflict'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("no memory named 'ghost'");
+    expect(capture.calls).toHaveLength(0);
+  });
+
+  test('non-active memory refused (operator must use the correct command)', async () => {
+    // Pre-quarantine the memory first, then try to quarantine
+    // again. The state filter on this command refuses non-active
+    // sources to avoid double-transitions producing confusing
+    // audit pairs.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    // Write with state:quarantined frontmatter to simulate.
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'mem.md'),
+      '---\nname: mem\ndescription: h\ntype: feedback\nsource: inferred\nstate: quarantined\n---\n\nbody\n',
+    );
+    registry.reload();
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'conflict'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("already in state 'quarantined'");
+  });
+
+  test('preview includes motivo, current/next state, evidence note, scope', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectShared, 'mem');
+    registry.reload();
+    const capture = { calls: [] as { action: string; subject: string; preview: string[] }[] };
+    stubMemoryAction(ctx, 'yes', capture);
+    await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'security', '--evidence', 'leaked PAT pattern in body'],
+      ctx,
+    );
+    expect(capture.calls).toHaveLength(1);
+    const preview = capture.calls[0]?.preview.join('\n') ?? '';
+    expect(preview).toContain('motivo:  security');
+    expect(preview).toContain('state:   active → quarantined');
+    expect(preview).toContain('evidence: leaked PAT pattern in body');
+    expect(preview).toContain('scope:   project_shared');
+    expect(capture.calls[0]?.action).toBe('quarantine');
+  });
+});
+
 describe('/memory restore', () => {
   // Helper — runs `/memory delete` first so a tombstone exists,
   // then exercises restore. The two-step lifecycle mirrors real

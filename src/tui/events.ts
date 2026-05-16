@@ -364,7 +364,7 @@ export type MemoryActionAskEvent = BaseEvent & {
   // Discriminator for audit + telemetry. Reducer doesn't branch
   // on it; the slash command does to pick the right `action`
   // value when emitting the resulting `memory_events` row.
-  action: 'delete' | 'promote' | 'demote' | 'restore';
+  action: 'delete' | 'promote' | 'demote' | 'restore' | 'quarantine';
   title: string;
   subject: string;
   preview: string[];

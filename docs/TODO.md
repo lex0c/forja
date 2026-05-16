@@ -3,7 +3,155 @@
 Items intentionally left for later milestones, with the deferral
 rationale and a "pull-in" signal so we know when to revisit.
 
+The first section ("ACTIVE") is different — it tracks work in flight
+on a named branch with slices and tasks. When a slice closes, its
+artifacts move to `docs/BACKLOG.md` and the entry here is trimmed.
+
 ---
+
+# ACTIVE — `feat/memory-lifecycle-detectors`
+
+**Branch off `feat/retrieval`.** Goal: close the four automatic detectors spec'd in `docs/spec/MEMORY.md §6.5.2` and `docs/spec/EVICTION.md §5.1` — `verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked` — plus the upstream infrastructure they depend on. Production-ready: substrate + detectors + operator surfaces + audit + tests + docs.
+
+Order matters: Slice 1 (provenance) is foundational for Slices 2 and 3. Slice 6 (penalty + visual flag) is independent.
+
+## Slice 0 — Operator escape hatch + audit baselines
+
+Land the manual paths before the auto-detectors so the pipeline is end-to-end testable and operators have a way to drive transitions explicitly.
+
+| Task | Status | Description |
+|---|---|---|
+| **T0.1** | ✅ done | `/memory quarantine <name> --motivo <kind> --evidence "…"` slash command — invokes `transitionMemoryState` with the operator's motivo. Accepts every spec motivo (`conflict`, `shift`, `security`, `low_roi`, `irrelevant`). |
+| **T0.2** | pending | `/memory list` rendering — add `state` and `expires` columns; quarantined / expired entries get a visual flag per spec §6.5.2 (`[memory: quarantined — verify failed 2026-05-12]`). |
+| **T0.3** | pending | `/memory audit` trigger-source filter — distinguish `operator_driven` vs `trigger_source: <detector_name>` (lays the path for slices 2-5). |
+| **T0.4** | pending | Tests + `docs/MEMORY.md` §6 update (new verb + columns documented). |
+
+**Acceptance:** operator runs `/memory quarantine foo --motivo conflict --evidence "duplicates bar"`, sees foo in `/memory list` with quarantine flag, inspects the row in `/memory audit`. Pipeline tested end-to-end.
+
+## Slice 1 — Memory provenance infrastructure
+
+Tracks which memory(s) the agent consumed when emitting a tool call. Foundation for Slices 2 and 3.
+
+| Task | Description |
+|---|---|
+| **T1.1** | Migration `054-memory-provenance.sql` — table `memory_provenance(id, tool_call_id FK CASCADE, session_id FK CASCADE, memory_scope, memory_name, surface ENUM('eager','memory_read','retrieve_context'), created_at)`. Indexed on `(tool_call_id)` and `(memory_scope, memory_name, created_at DESC)`. |
+| **T1.2** | Repo `src/storage/repos/memory-provenance.ts` — `recordProvenance`, `listProvenanceForTool`, `listProvenanceForMemory`, `countOverridesInWindow` helpers. |
+| **T1.3** | Emit at `memory_read` tool — when the model reads a memory, persist the link to the active tool_call. |
+| **T1.4** | Emit at eager-load — system-prompt-injected memories tracked so subsequent tool calls in the same turn link to the eager set. |
+| **T1.5** | Emit at `retrieve_context` — every `contextSlot.included` entry produces a provenance row associated with the next tool_call the model issues. Needs a session-cursor pattern: the retrieval associates with the upcoming tool. |
+| **T1.6** | Operator surface — `/memory provenance <name>` (consuming tool calls in session) + `/memory audit --show-provenance` adds the column. |
+| **T1.7** | Tests + `docs/MEMORY.md` §11 update. |
+
+**Acceptance:** every memory the model reads (via any surface) leaves a `memory_provenance` row linked to the tool_call_id it inspired. Operator can trace memory → tool calls and back.
+
+## Slice 2 — `verify_failed` detector
+
+Auto-quarantines factual memories whose claim contradicts current FS / repo state.
+
+| Task | Description |
+|---|---|
+| **T2.1** | Memory factuality classifier — `type: project` / `reference` factual; `type: user` / `feedback` preference. Helper `isMemoryFactual(frontmatter)`. |
+| **T2.2** | Verifier interface — `interface MemoryVerifier { verify(memory, repoRoot, db): Promise<VerifyResult>; }`. Implementations: `ProjectVerifier` (grep / file-exists), `ReferenceVerifier` (stub in v1; external probe out of scope). |
+| **T2.3** | Project-type verifier — extracts simple `file:line`, `export X`, `function Y` claims from body and verifies via FS read. Heuristic, not parser; high bar to avoid false-positives. |
+| **T2.4** | Instrument agent loop — when a memory is loaded (eager OR `memory_read` OR `retrieve_context`), schedule a deferred verify call against active repoRoot. Async — doesn't block the turn. |
+| **T2.5** | Emit `verify_failed` — verifier returns `kind=contradicted` → `transitionMemoryState({ motivo: 'shift', triggerSource: 'verify_failed', evidence: { claim, found, expected } })`. |
+| **T2.6** | Tests + spec annotation explaining the heuristic bar (false-positive aware). |
+
+**Acceptance:** a `project` memory claiming `src/auth.ts exports validateToken` for a file that no longer exports it gets quarantined within one turn of being loaded. Vague claims don't trigger.
+
+## Slice 3 — `user_override_repeated` detector
+
+Auto-quarantines memories whose derived actions the user keeps rejecting.
+
+| Task | Description |
+|---|---|
+| **T3.1** | Override signal detection — three concrete signals: (a) modal `MemoryWrite` rejected on a memory; (b) `permission ask` denied for a tool whose provenance points to this memory; (c) `edit_file` reverted within N turns of write. Each emits a `memory_override_events` row. |
+| **T3.2** | Migration `055-memory-override-events.sql` — `(id, session_id FK, memory_scope, memory_name, signal ENUM, tool_call_id FK NULL, created_at)`. |
+| **T3.3** | Sliding window counter — `countOverridesInWindow(scope, name, windowMs)`. Spec threshold: 3 in 24h. |
+| **T3.4** | Threshold detector — runs on each new override event; when threshold crosses, emit `user_override_repeated` → quarantine `motivo=conflict`, evidence `{ override_count, override_signal_ids }`. |
+| **T3.5** | Tests covering each signal kind + threshold boundary (3 vs 2 hits). |
+
+**Acceptance:** user rejects 3 tool-call modals in 24h whose provenance traces to memory X → X auto-quarantined. Sub-3 leaves it alone.
+
+## Slice 4 — `conflict_detected` detector
+
+Auto-quarantines memories that contradict each other within the same scope.
+
+| Task | Description |
+|---|---|
+| **T4.1** | Pairwise comparator — runs after each successful memory write. Loads other memories in same scope, runs `detectConflict(a, b)`. Async-batched. |
+| **T4.2** | Textual contradiction heuristic — keyword-based: `always X` vs `never X`, `use X` vs `don't use X`, mutually exclusive enum claims. Returns `{ conflicting: true, conflict_kind } | false`. Conservative on false-positives. |
+| **T4.3** | Resolver per `EVICTION.md §6.3` — ranks `(a, b)` by (1) provenance tier (`user_explicit > inferred > imported`), (2) recency, (3) scope specificity, (4) evidence base size. Loser → quarantine; winner stays. |
+| **T4.4** | `/memory conflicts` slash command — lists pairs flagged (resolved and unresolved). |
+| **T4.5** | Emit `conflict_detected` with evidence `(loser_id, winner_id, conflict_kind)`. |
+| **T4.6** | Tests: clear contradictory pair → loser quarantined; same name in two scopes (precedence, NOT conflict); heuristic false-positive avoidance. |
+
+**Acceptance:** writing a `feedback` memory contradicting an existing one in same scope triggers detection within the write transaction; loser in `quarantined`; `/memory conflicts` shows the pair.
+
+## Slice 5 — `trust_revoked` detector
+
+Auto-quarantines `shared/` memories when operator revokes trust after a hash change.
+
+| Task | Description |
+|---|---|
+| **T5.1** | `shared/` content fingerprint — hash over canonical concat of `.agent/memory/shared/MEMORY.md` + every body file (sorted by name). Persisted in dedicated `trust_state` table or `sessions.shared_hash`. |
+| **T5.2** | Boot-time re-prompt — when stored hash diverges from current, fire trust modal with diff preview ("3 shared memories changed since last boot — re-confirm trust?"). |
+| **T5.3** | If operator revokes trust → emit `trust_revoked` for every `state=active` shared memory; transition all to `quarantined` with `motivo=security`. |
+| **T5.4** | Bonus: `/memory trust status` shows trust state + last hash + last re-confirm timestamp. |
+| **T5.5** | Tests: hash unchanged → no prompt; hash changed + confirm → no quarantine; hash changed + revoke → every shared memory quarantined. |
+
+**Acceptance:** operator `git pull`s a commit that adds 2 new shared memories; next session boot re-prompts; if declined, the new + existing shared memories enter `quarantined`.
+
+## Slice 6 — Quarantine penalty ranking + visual flag (EVICTION §9.7)
+
+Walk back the H1+H6 hard-filter (commit `949fadf`) to spec'd behavior: quarantined memories stay visible, with penalty + visual flag.
+
+| Task | Description |
+|---|---|
+| **T6.1** | Retrieval memory view — include `quarantined` in candidate pool with ranking penalty (multiply final score by 0.3). Update view's `registry.list({ states: ['active', 'quarantined'] })`. |
+| **T6.2** | Visual flag in eager-load — `cli/memory-prompt.ts` renders quarantined entries with `[memory: quarantined — <reason> <date>]` per spec §6.5.2. |
+| **T6.3** | `/memory list` shows the same flag (already partial in T0.2; verify integration). |
+| **T6.4** | Tests: quarantined memory appears in retrieval candidates but ranks below active sibling; visual flag renders in eager-load. |
+
+**Acceptance:** quarantined memories visible to operator and model with penalty + tag. Operator decides whether to restore or delete.
+
+## Slice 7 — Docs + E2E smoke
+
+| Task | Description |
+|---|---|
+| **T7.1** | `docs/MEMORY.md §14` update — remove shipped items. |
+| **T7.2** | `docs/spec/MEMORY.md` annotations if implementation revealed ambiguity (ask before editing per CLAUDE.md). |
+| **T7.3** | E2E smoke — single test: write 2 contradicting memories → second triggers `conflict_detected` → loser quarantined → operator `/memory restore` → memory back to active. |
+| **T7.4** | `docs/BACKLOG.md` comprehensive entry summarizing slice closure. |
+
+## Out of scope (deliberate)
+
+- **`distribution_shift` / `source_removed` detectors** — listed in EVICTION §5.1 but tied to startup probes for external sources. Tracked separately as "reference dereference probe".
+- **Compaction × quarantine cross-lifecycle** (EVICTION §9.7) — context-tuning subsystem's responsibility, not memory's.
+- **`roi_below_threshold` detector** — depends on loop frio aggregation (FEEDBACK_ADAPTATION §3.2); listed in `docs/MEMORY.md §14.4`.
+
+## Dependency graph
+
+```
+S0 (escape hatch)  →  independent
+S1 (provenance)    →  blocks S2, S3
+S6 (penalty)       →  independent
+S4 (conflict)      →  independent
+S5 (trust_revoked) →  independent
+S2 (verify_failed) →  depends on S1
+S3 (override)      →  depends on S1
+S7 (docs+smoke)    →  last (after S0..S6)
+```
+
+Recommended order: **S0 → S1 → S6 → S4 → S5 → S2 + S3 → S7**.
+
+## Tracking
+
+Each task lands as one or more commits on `feat/memory-lifecycle-detectors`. Each slice closes with a `chore(memory): slice N done` entry in `docs/BACKLOG.md` summarizing the slice's commits. Final consolidation at S7.
+
+---
+
+# DEFERRED — items intentionally left for later
 
 ## Monotonic seq tiebreaker on the remaining time-ordered tables
 

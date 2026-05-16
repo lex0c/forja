@@ -151,11 +151,11 @@ export interface MemoryUserScopeAskArgs {
 
 // Generic memory-action confirm (MEMORY.md §5.4 / §5.5 / §6.3).
 // Producers: `/memory delete`, `/memory promote shared`,
-// `/memory demote local`. Caller constructs the copy; manager
-// just queues the modal. `action` is forwarded to the event for
-// audit / telemetry.
+// `/memory demote local`, `/memory restore`, `/memory quarantine`.
+// Caller constructs the copy; manager just queues the modal.
+// `action` is forwarded to the event for audit / telemetry.
 export interface MemoryActionAskArgs {
-  action: 'delete' | 'promote' | 'demote' | 'restore';
+  action: 'delete' | 'promote' | 'demote' | 'restore' | 'quarantine';
   title: string;
   subject: string;
   preview: string[];
