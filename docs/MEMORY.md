@@ -411,18 +411,43 @@ The `.agent/.gitignore` is written **once**, on first contact. Subsequent runs p
 
 ## 8. Trust and injection
 
-The primary attack vector is a malicious `AGENTS.md` in a cloned third-party repo nudging the agent to write a poisoned `inferred` memory. The scanner module + trust boundary + protection gates form the layered defense.
+The primary attack vector is a malicious `AGENTS.md` in a cloned third-party repo nudging the agent to write a poisoned `inferred` memory. **No single mechanism is "the defense."** The system layers several weak-on-their-own filters so an attacker has to defeat ALL of them to land an injection. Removing one filter doesn't open the attack; removing two probably does. Spec MEMORY.md §13.1 calls this posture "layered, not sequential" — it's the only honest way to write security for an LLM-driven memory subsystem.
 
-### 8.1 Scanner
+### 8.1 Scanner — tripwire, not defense
 
-`src/memory/scanner.ts` exports four primitives:
+`src/memory/scanner.ts` exports four primitives. **Two of them are honest, two are tripwires.** Frame them accordingly.
 
-- **`scanForInjection(body)`** — heuristic match against patterns like "ignore previous instructions", "you are now", "from now on, always". Hard block (write refused; lands as `refused` in `memory_events`).
-- **`scanForSecrets(body)`** — credential shapes (AWS keys, GitHub tokens, generic `sk-...` patterns). Hard block.
-- **`redactSecrets(body)`** — applied at audit time so refused-write rows don't leak the secret they refused.
-- **`scanForPromotion(body)`** — superset of the above plus a 200-line body cap and path-traversal patterns. Only runs on `/memory promote shared`.
+**Honest (shape-stable, language-agnostic):**
 
-The scanner is shared with the eviction repo's evidence-scrub layer so the same redaction vocabulary applies to refused-write audit rows.
+- **`scanForSecrets(body)`** — credential-shape regexes (AWS `AKIA…`, GitHub `ghp_…` / `github_pat_…`, Anthropic `sk-ant-…`, OpenAI `sk-…40+`, Slack `xox[baprs]-…`). High-entropy prefixes mean false-positive rate is low; a credential matches the same way regardless of surrounding prose. Hard block.
+- **`redactSecrets(body)`** — same patterns as above, applied at audit time so refused-write rows don't carry the secret they refused. Idempotent.
+
+**Tripwires (limited reach, do NOT mistake for defense):**
+
+- **`scanForInjection(body)`** — small list of English jailbreak phrases (`"ignore previous instructions"`, `"you are now"`, `"from now on, always"`, …). Hard block on match. **Burlable by:**
+  - Any other language (`"ignore as instruções anteriores"`, `"忽略之前的指令"`, `"désormais, toujours"`, …).
+  - Paraphrase (`"the new rule is"`, `"treat my prior message as void"`, `"your role going forward"`, …).
+  - Structural injection (yaml/code-block/role-play wrappers, markdown mimicking system instructions, …).
+  - An attacker with five minutes of effort.
+
+  The list stays SHORT on purpose. Extending it with more English phrases doesn't move the threat needle; extending with translations climbs false-positive rate against legitimate operator notes (a memory documenting "the model failed when prompted with `ignore previous instructions`" is itself useful content).
+
+  **What the tripwire actually buys:** (a) an audit row (`memory_events action=refused` with `details.reason='injection phrase: …'`) so the operator sees that something obviously hostile tried; (b) defense-in-depth — one of several layers below.
+
+- **`scanForPromotion(body)`** — superset of `scanForInjection` plus a 200-line body cap and path-traversal patterns. Only runs on `/memory promote shared`. Same tripwire caveats apply to the injection-phrase piece; the line cap and path patterns are honest.
+
+### 8.1.1 The load-bearing layers
+
+A poisoned `inferred` memory write fails when ANY of these holds:
+
+1. **Modal confirmation** (the actual gate). Every `inferred` write opens a TUI modal showing the proposed body to the operator. No keyboard approval, no write. The scanner runs BEFORE the modal only to avoid wasting a modal on obvious junk — the modal itself is the load-bearing decision.
+2. **`source` attribution.** `inferred` (model decided to write) vs `user_explicit` (operator typed) is a structural distinction in the frontmatter. `inferred` writes face the modal; `user_explicit` skip it (you typed it, you meant it). Without this split there'd be no surface to gate.
+3. **Trust boundary** (§8.2). Untrusted directory ⇒ `inferred` writes disabled for the session. The poisoned `AGENTS.md` is in an untrusted repo by default; even if the model parses its hostile instruction, the write tool refuses.
+4. **Scope isolation.** Worst case the attack lands a `project_local` memory — confined to this repo. `shared` requires `/memory promote` + PR review; `user` requires explicit confirmation with extra warning.
+5. **Eager-load filter.** Memories with `trust: untrusted` (set when the write happened in an untrusted state) NEVER enter the system prompt automatically. They surface only via `memory_read` tool calls — explicit, audit-logged.
+6. **Audit chain.** `memory_events` is tombstone-chain-hashed (§5.3). Tampering is detectable.
+
+The scanner is layer 0 — it filters obvious noise so the layers above face less traffic. It is NOT the answer to "how does Forja resist prompt injection in memories." The answer is the modal + the trust + the scopes + the chain.
 
 ### 8.2 Trust boundary
 
@@ -676,7 +701,7 @@ Every gate in §12.2 exists because of this scenario:
 | Gate | What it kills in the attack chain |
 |---|---|
 | Trust gate (step 2 above) | Untrusted directories disable `inferred` writes for the session entirely — only `user_explicit` passes |
-| Scanner | Catches the literal "ignore previous instructions" payload AND credential shapes the model might have been tricked into echoing back |
+| Scanner | **Tripwire only.** Catches the English literal `"ignore previous instructions"` payload and credential shapes (genuinely useful — credentials are shape-stable). The English phrase list is trivially burlable by paraphrase or translation — see §8.1 for the honest framing. Value is the `refused` audit row + filtering obvious noise so the modal handles the real cases |
 | MemoryWrite hook | Enterprise can force external audit / second-system check before persistence |
 | TUI confirm modal | The operator IS the gate; the attack needs human compliance to win |
 | `trust: untrusted` marker | Even if a write somehow lands in an untrusted-but-not-blocked state, the result doesn't auto-load — the marker survives, the body stays out of base context |

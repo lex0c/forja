@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] docs(memory) — reframe scanner as tripwire, not injection defense
+
+The `INJECTION_PHRASES` list in `src/memory/scanner.ts` (`"ignore previous instructions"`, `"you are now"`, etc.) is trivially burlable — any other language, paraphrase, or structural injection defeats it. The pre-existing code comment admitted it ("raise the cost of the obvious vector, not stop a human red team") but the module header, `docs/MEMORY.md §8.1`, and `docs/spec/MEMORY.md §7.3` framed the scanner as "injection defense", overpromising what it delivers.
+
+Reframe is doc/comment-only — no runtime behavior changes.
+
+**`src/memory/scanner.ts`** — module header expanded to spell out the honest split:
+- `scanForSecrets` + `redactSecrets` ARE the honest half (credential shapes are language-agnostic).
+- `scanForInjection` is a tripwire for English script-kiddie copy-paste; its value is the `refused` audit row + defense-in-depth alongside the modal, NOT a semantic injection blocker.
+- Comment above `INJECTION_PHRASES` documents why the list stays short on purpose (translations inflate false positives without moving the threat needle).
+- Comment above `scanForInjection` notes the symbol kept its name for backwards compatibility but the module header reframes what "injection" means.
+
+**`docs/MEMORY.md §8.1`** — rewritten as "Scanner — tripwire, not defense", explicitly listing what the tripwire CAN'T catch (other languages, paraphrase, structural). New §8.1.1 lists the load-bearing layers (modal, source attribution, trust boundary, scope isolation, eager-load filter, audit chain) so an operator reading the security story knows the scanner is layer 0, not the answer.
+
+**`docs/MEMORY.md §13.1` threat table** — Scanner row annotated as "tripwire only" with a pointer to §8.1.
+
+**`docs/spec/MEMORY.md §7.3`** — retitled "Tripwire de phrases óbvias + secret detection" (was "Detecção heurística de injection"). Body restructured into (a) tripwire-with-caveats and (b) honest secret detection. PT-BR preserved per spec convention.
+
+No symbol rename: `scanForInjection` has 8 call sites; the cost of renaming outweighs the clarity gain when the header already reframes. A future rename to `scanWriteTripwire` is noted in the function's comment if call sites are touched for another reason.
+
+No new tests — scanner runtime is unchanged; existing 29 tests still pass.
+
 ## [2026-05-16] chore(retrieval+cli) — memory-flow review M round 2 (txn, traceMissing, scope verbose, polish)
 
 Closes the residual robustness findings from the memory-flow code review.
