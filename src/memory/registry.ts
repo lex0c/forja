@@ -1,6 +1,7 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
+import { isExpired } from './expires.ts';
 import {
   type MemoryFileResult,
   type ScopeIndexResult,
@@ -302,53 +303,6 @@ interface ScopeSnapshot {
   entries: IndexEntry[];
   diagnostic: ScopeIndexResult;
 }
-
-// Parse the spec-shaped `expires` value (`YYYY-MM-DD`) into an epoch
-// ms representing the END of that day (UTC). A memory with
-// `expires: 2026-05-15` is considered expired starting 2026-05-16
-// 00:00 UTC — matches the operator's intuition that "expires today"
-// means "valid through today" rather than "already expired at the
-// stroke of midnight". Returns null on malformed input so the
-// caller treats it as "no expiry set" and surfaces a stderr warning
-// elsewhere if needed (the validator already rejected this shape on
-// write; on read we're defensive against hand-edited files).
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-const parseExpiresEndOfDayMs = (expires: string): number | null => {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expires);
-  if (m === null) return null;
-  const year = Number.parseInt(m[1] ?? '', 10);
-  const month = Number.parseInt(m[2] ?? '', 10);
-  const day = Number.parseInt(m[3] ?? '', 10);
-  // Two-step parse: VALIDATE the input date first (catches
-  // `2026-02-31` → JS rolls to 2026-03-03, which we refuse), then
-  // compute end-of-day as start-of-next-day via simple ms addition.
-  // The earlier `day + 1` form mixed the two steps and rejected
-  // every legitimate last-day-of-month (`2026-01-31` → start = Feb
-  // 1 → month mismatch → rejected as malformed), which made
-  // `isExpired` return false for those memories and quietly kept
-  // expired entries visible to `list({ includeExpired: false })`.
-  const startOfDayMs = Date.UTC(year, month - 1, day, 0, 0, 0);
-  if (Number.isNaN(startOfDayMs)) return null;
-  const round = new Date(startOfDayMs);
-  if (
-    round.getUTCFullYear() !== year ||
-    round.getUTCMonth() !== month - 1 ||
-    round.getUTCDate() !== day
-  ) {
-    return null;
-  }
-  // Add exactly 24h. Crosses month / year boundaries correctly
-  // because epoch ms is independent of calendar structure.
-  return startOfDayMs + MS_PER_DAY;
-};
-
-const isExpired = (expires: string | undefined, nowMs: number): boolean => {
-  if (expires === undefined) return false;
-  const cutoffMs = parseExpiresEndOfDayMs(expires);
-  if (cutoffMs === null) return false; // malformed → treat as non-expiring
-  return nowMs >= cutoffMs;
-};
 
 // Split body into lines for snippet extraction. We keep raw lines
 // (no trim) so column offsets in matches stay meaningful when the

@@ -20,6 +20,8 @@ export {
   validateName,
 } from './frontmatter.ts';
 
+export { isExpired, parseExpiresEndOfDayMs } from './expires.ts';
+
 export {
   IndexError,
   INDEX_LINE_SOFT_MAX,

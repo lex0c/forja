@@ -29,6 +29,7 @@ import {
   type MemoryScope,
   type TombstoneEntry,
   findLatestTombstone,
+  isExpired,
   moveMemory,
   parseMemoryFile,
   removeMemory,
@@ -36,6 +37,7 @@ import {
   scanForPromotion,
   transitionMemoryState,
 } from '../../../memory/index.ts';
+import type { DB } from '../../../storage/db.ts';
 import {
   listMemoryEventsByName,
   listMemoryEventsBySession,
@@ -43,7 +45,11 @@ import {
 } from '../../../storage/index.ts';
 import type { MemoryEvent } from '../../../storage/index.ts';
 import type { EvictionMotivo } from '../../../storage/repos/eviction-events.ts';
-import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../../../storage/repos/eviction-events.ts';
+import {
+  DETECTOR_TRIGGERS,
+  OPERATOR_DRIVEN_EVIDENCE_MARKER,
+  OPERATOR_DRIVEN_TRIGGER,
+} from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
@@ -135,57 +141,108 @@ const filterByListScope = (
   }
 };
 
-// `expires: YYYY-MM-DD` → `false` (no expiry / malformed) or `true`
-// (past `nowMs`, end-of-day UTC semantics — matches the same parse
-// in `src/memory/registry.ts`). Used to surface the `[EXPIRED]`
-// visual flag in /memory list output. Operators see the flag and
-// know the entry would already be excluded from retrieval (and
-// from any list call that passes `includeExpired: false`); the
-// default broad list shows the entry so the operator can decide.
-const isExpiredYyyyMmDd = (expires: string | undefined, nowMs: number): boolean => {
-  if (expires === undefined) return false;
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expires);
-  if (m === null) return false;
-  const year = Number.parseInt(m[1] ?? '', 10);
-  const month = Number.parseInt(m[2] ?? '', 10);
-  const day = Number.parseInt(m[3] ?? '', 10);
-  const startOfDayMs = Date.UTC(year, month - 1, day, 0, 0, 0);
-  if (Number.isNaN(startOfDayMs)) return false;
-  const round = new Date(startOfDayMs);
-  if (
-    round.getUTCFullYear() !== year ||
-    round.getUTCMonth() !== month - 1 ||
-    round.getUTCDate() !== day
-  ) {
-    return false;
-  }
-  return nowMs >= startOfDayMs + 24 * 60 * 60 * 1000;
-};
+// `expires` parsing + cutoff predicate lives in `src/memory/expires.ts`
+// — single source of truth shared with the registry's `list()`
+// filter. Earlier shape had a duplicate implementation here; drift
+// risk was real (the recent two-step calendar fix had to be applied
+// in two places). Import the canonical helper.
 
 // Visual flag rendered as a prefix on the /memory list row.
 // Priorities (only one prefix renders, in this order):
-//   1. non-active state (`[QUARANTINED]` / `[INVALIDATED]` /
-//      `[PROPOSED]`) — operator sees lifecycle state at a glance
-//      per spec MEMORY.md §6.5.2 "continua no índice com flag
-//      visual". The spec format includes motivo + date
-//      (`[memory: quarantined — verify failed 2026-05-12]`); v1
-//      shows just the state because motivo / date live in
-//      eviction_events (JOIN-deferred to a follow-up).
+//   1. non-active state (`[QUARANTINED — motivo/trigger
+//      YYYY-MM-DD]` / `[INVALIDATED — …]` / `[PROPOSED]`) —
+//      operator sees lifecycle state, the reason it transitioned,
+//      and when, all at a glance per spec MEMORY.md §6.5.2.
+//      Motivo + trigger + date come from the most recent
+//      `memory_events` row whose action matches the current
+//      state (e.g., the last `quarantined` row for a memory
+//      currently in `quarantined` state). When no such row
+//      exists (legacy entries, hand-edited state without
+//      audit pair), the flag falls back to the bare state
+//      label so the operator still sees the non-active
+//      signal.
 //   2. expired (active state + `expires` in the past) —
 //      operator notices entries that would be excluded by
 //      `includeExpired: false`.
 // Both signals together would mean a quarantined-AND-expired
 // entry; we prefer the state flag because it's the operator
 // action (manual or detector) rather than the calendar fact.
+
+// Format a `memory_events.createdAt` ms epoch as `YYYY-MM-DD` (UTC).
+// Matches the spec format MEMORY.md §6.5.2 quotes (`[memory:
+// quarantined — verify failed 2026-05-12]`).
+const formatEventDateYyyyMmDd = (epochMs: number): string => {
+  const d = new Date(epochMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+// Look up the most recent `memory_events` row whose action matches
+// the candidate state and return its motivo + trigger + date for
+// the visual flag. Returns null when no matching row exists —
+// renderStateFlag falls back to the bare label. Cost: one DB read
+// per non-active listing in /memory list. At dozens-of-memories
+// scale this is single-digit reads per call.
+interface StateFlagDetail {
+  motivo: string | null;
+  trigger: string | null;
+  date: string;
+}
+
+const lookupStateDetail = (
+  db: DB,
+  scope: MemoryScope,
+  name: string,
+  state: string,
+): StateFlagDetail | null => {
+  // We don't have a `by-name-and-action` repo helper; the existing
+  // `listMemoryEventsByName(db, name, limit)` returns DESC by
+  // createdAt. A short scan from the top picks up the first row
+  // whose action matches the target state. Cap at 20 — operator-
+  // driven transitions are rare relative to read/created events,
+  // so the most-recent state transition is almost always within
+  // the top few rows.
+  const events = listMemoryEventsByName(db, name, 20);
+  for (const e of events) {
+    if (e.scope !== scope) continue;
+    if (e.action !== state) continue;
+    const motivo =
+      e.details !== null && typeof e.details.motivo === 'string' ? e.details.motivo : null;
+    const trigger =
+      e.details !== null && typeof e.details.trigger === 'string' ? e.details.trigger : null;
+    return { motivo, trigger, date: formatEventDateYyyyMmDd(e.createdAt) };
+  }
+  return null;
+};
+
 const renderStateFlag = (
   state: string,
   expires: string | undefined,
   nowMs: number,
+  detail: StateFlagDetail | null,
 ): string | null => {
-  if (state === 'quarantined') return '[QUARANTINED] ';
-  if (state === 'invalidated') return '[INVALIDATED] ';
-  if (state === 'proposed') return '[PROPOSED] ';
-  if (state === 'active' && isExpiredYyyyMmDd(expires, nowMs)) {
+  const flagLabel = (label: string): string => {
+    if (detail === null) return `[${label}] `;
+    // Format: [QUARANTINED — motivo/trigger 2026-05-12]
+    // When motivo or trigger is missing (legacy rows / partial
+    // details), drop that segment so the flag stays readable.
+    const segments: string[] = [];
+    if (detail.motivo !== null && detail.trigger !== null) {
+      segments.push(`${detail.motivo}/${detail.trigger}`);
+    } else if (detail.motivo !== null) {
+      segments.push(detail.motivo);
+    } else if (detail.trigger !== null) {
+      segments.push(detail.trigger);
+    }
+    segments.push(detail.date);
+    return `[${label} — ${segments.join(' ')}] `;
+  };
+  if (state === 'quarantined') return flagLabel('QUARANTINED');
+  if (state === 'invalidated') return flagLabel('INVALIDATED');
+  if (state === 'proposed') return flagLabel('PROPOSED');
+  if (state === 'active' && isExpired(expires, nowMs)) {
     return `[EXPIRED ${expires}] `;
   }
   return null;
@@ -218,9 +275,21 @@ const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[])
   // `expires`. `peek` is the canonical no-audit read — operator
   // running /memory list isn't reading individual memories, just
   // inspecting metadata, so no `read` event lands. File-missing /
-  // malformed cases get a marker so the operator sees the
-  // orphan / hand-edit (which the model-facing surfaces would
-  // hide via state filter).
+  // malformed cases get a marker (`[ORPHAN]` / `[MALFORMED]`) by
+  // intent: this is the operator-facing surface where hand-editing
+  // errors should be visible so the operator can fix them. The
+  // model-facing surfaces (retrieval memory view, eager-load,
+  // `memory_read` tool) filter these out via the state-filter path
+  // in `registry.list({ states: ['active'] })`. Operator surface
+  // ⇒ show; model surface ⇒ hide — two audiences with opposite
+  // needs for the same anomalous data.
+  //
+  // `nowMs = ctx.now()` flows into renderStateFlag's expiry check
+  // below. If a future change routes the list call through
+  // `registry.list({ includeExpired: false, nowMs })`, the
+  // explicit `nowMs` param is what propagates — the registry's
+  // default `Date.now()` would NOT observe `ctx.now` overrides
+  // from test fixtures. Keep the explicit threading honest.
   const nowMs = ctx.now();
   for (const l of entries) {
     const peek = registry.peek(l.name, { scope: l.scope });
@@ -234,11 +303,13 @@ const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[])
     }
     const fm = peek.file.frontmatter;
     const state = fm.state ?? 'active';
-    const flag = renderStateFlag(state, fm.expires, nowMs);
+    // Non-active states get a DB lookup for motivo+trigger+date —
+    // active entries skip the read because there's no flag to
+    // enrich. The lookup gates the cost behind the rare path.
+    const detail = state !== 'active' ? lookupStateDetail(ctx.db, l.scope, l.name, state) : null;
+    const flag = renderStateFlag(state, fm.expires, nowMs, detail);
     const expiresSuffix =
-      fm.expires !== undefined && !isExpiredYyyyMmDd(fm.expires, nowMs)
-        ? ` (expires ${fm.expires})`
-        : '';
+      fm.expires !== undefined && !isExpired(fm.expires, nowMs) ? ` (expires ${fm.expires})` : '';
     const prefix = flag ?? '';
     lines.push(`  [${l.scope}] ${prefix}${l.name} — ${l.entry.hook}${expiresSuffix}`);
   }
@@ -421,22 +492,17 @@ interface AuditFlags {
   triggerFilter: string | null;
 }
 
-// Canonical detector trigger names — see `docs/spec/MEMORY.md
-// §6.5.2`. Used by the `--trigger detector` semantic shortcut.
-// Keep in sync with the trigger strings emitted by the future
-// detector implementations (Slices 2-5); a new detector that
-// doesn't land here means the shortcut won't surface its rows.
-const DETECTOR_TRIGGERS: ReadonlySet<string> = new Set([
-  'verify_failed',
-  'user_override_repeated',
-  'conflict_detected',
-  'trust_revoked',
-]);
+// Set view over the canonical `DETECTOR_TRIGGERS` tuple for O(1)
+// lookup in `triggerMatches`. The tuple itself is the single
+// source of truth (`eviction-events.ts`); building the Set lazily
+// once at module load keeps the tuple → set asymmetry purely
+// internal to this consumer.
+const DETECTOR_TRIGGER_SET: ReadonlySet<string> = new Set(DETECTOR_TRIGGERS);
 
 const triggerMatches = (eventTrigger: string | null, filter: string): boolean => {
   if (eventTrigger === null) return false;
-  if (filter === 'operator') return eventTrigger === 'operator_driven';
-  if (filter === 'detector') return DETECTOR_TRIGGERS.has(eventTrigger);
+  if (filter === 'operator') return eventTrigger === OPERATOR_DRIVEN_TRIGGER;
+  if (filter === 'detector') return DETECTOR_TRIGGER_SET.has(eventTrigger);
   return eventTrigger === filter;
 };
 
@@ -487,6 +553,11 @@ const parseAuditFlags = (args: string[]): AuditFlags | { error: string } => {
             '/memory audit: --trigger needs a value (literal e.g. operator_driven, or shortcut: operator | detector)',
         };
       }
+      if (triggerFilter !== null) {
+        return {
+          error: `/memory audit: --trigger specified twice (got '${triggerFilter}' then '${next}'); use a single trigger value`,
+        };
+      }
       triggerFilter = next;
       i += 2;
       continue;
@@ -535,6 +606,15 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
   // inside the JSONB `details` column — filtering at the repo
   // would need a json_extract index we don't have. In-memory
   // filter over the (already capped) batch is cheap.
+  //
+  // Note on limit interaction: SQL applies --limit FIRST (most-
+  // recent N rows), then trigger filter narrows in memory. If
+  // the operator wants "every verify_failed in the session" and
+  // there are 100 events with 5 verify_failed scattered through,
+  // a default --limit 50 may not reach all 5. The header text
+  // shows "X/Y after filter" so the operator notices when the
+  // limit was the binding constraint; widening --limit picks up
+  // older matches.
   let triggerNote = '';
   if (flags.triggerFilter !== null) {
     const before = events.length;
@@ -543,14 +623,22 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
         e.details !== null && typeof e.details.trigger === 'string' ? e.details.trigger : null;
       return triggerMatches(trig, flags.triggerFilter as string);
     });
-    triggerNote = ` (trigger: ${flags.triggerFilter}, ${events.length}/${before} after filter)`;
+    triggerNote = ` (trigger: ${flags.triggerFilter}, ${events.length}/${before} after --limit, raise --limit to widen)`;
   }
 
   if (events.length === 0) {
     if (flags.triggerFilter !== null) {
+      // Two failure modes share this message: (a) no events at
+      // all in scope, (b) events exist but none match the trigger
+      // filter. Hint the operator at the second case so they can
+      // try the semantic shortcuts (`operator` / `detector`)
+      // before assuming the session is empty.
       return {
         kind: 'ok',
-        notes: [`no audit rows matching --trigger ${flags.triggerFilter}${scopeNote}`],
+        notes: [
+          `no audit rows matching --trigger ${flags.triggerFilter}${scopeNote}`,
+          '  (try --trigger operator for manual rows, --trigger detector for auto-detector rows)',
+        ],
       };
     }
     if (flags.name !== null) {
@@ -1166,13 +1254,22 @@ const findTombstoneInAnyScope = (registry: MemoryRegistry, name: string): FindTo
 // motivos but not applicable to active→quarantined as a manual
 // verb; they're terminal-side or cross-substrate.)
 
-const VALID_QUARANTINE_MOTIVOS: ReadonlySet<EvictionMotivo> = new Set([
-  'conflict',
-  'shift',
-  'security',
-  'low_roi',
-  'irrelevant',
-]);
+// Spec-admissible motivos for `active → quarantined` per
+// EVICTION.md §4.1 table. The state machine (LEGAL_TRANSITIONS in
+// eviction-events.ts:155) refuses any other motivo with
+// `illegal_transition`; refusing them at the slash boundary
+// surfaces a clearer operator error than leaking the state-machine
+// vocabulary.
+//
+// Note on spec conflict: MEMORY.md §6.5.2 lists `verify_failed →
+// motivo: shift` as a quarantine trigger, but EVICTION.md §4.1 only
+// admits `conflict` + `low_roi` for active→quarantined. The two
+// specs are inconsistent; the state machine is authoritative.
+// Slice 2 (`verify_failed` detector) will need a spec amendment OR
+// will emit `motivo: conflict` with a trigger that disambiguates
+// (the same trigger marker pattern this slash uses for operator
+// commands).
+const VALID_QUARANTINE_MOTIVOS: ReadonlySet<EvictionMotivo> = new Set(['conflict', 'low_roi']);
 
 const isQuarantineMotivo = (s: string): s is EvictionMotivo =>
   VALID_QUARANTINE_MOTIVOS.has(s as EvictionMotivo);
@@ -1199,6 +1296,13 @@ const handleQuarantine = async (
       continue;
     }
     if (a === '--evidence') {
+      // No hard length cap today. The note is JSON-encoded and
+      // scrub-redacted before landing in eviction_events.evidence_json
+      // (medium-sensitivity per AUDIT.md §1). Operator-friendly soft
+      // cap: keep notes under ~500 chars so /memory audit + audit
+      // dump remain scannable. Spec EVICTION §6.1 doesn't mandate a
+      // max; a future tightening can land here when a real abuse
+      // pattern shows up.
       evidenceText = args[i + 1];
       i += 1;
       continue;
@@ -1334,7 +1438,7 @@ const handleQuarantine = async (
     name,
     toState: 'quarantined',
     motivo,
-    trigger: 'operator_driven',
+    trigger: OPERATOR_DRIVEN_TRIGGER,
     actor: 'user',
     evidence: evidencePayload,
     ...(sessionId !== null ? { sessionId } : {}),
@@ -1353,7 +1457,7 @@ const handleQuarantine = async (
     notes: [
       `quarantined ${peek.scope}/${name}`,
       `  motivo: ${motivo}`,
-      '  trigger: operator_driven',
+      `  trigger: ${OPERATOR_DRIVEN_TRIGGER}`,
       evidenceText !== undefined ? `  evidence: ${evidenceText}` : '',
       'use /memory restore to bring it back; /memory delete to fully evict',
     ].filter((l) => l.length > 0),

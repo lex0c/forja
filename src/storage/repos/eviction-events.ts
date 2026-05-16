@@ -89,6 +89,40 @@ export type EvictionOutcome = (typeof OUTCOMES)[number];
 export const ACTORS = ['loop_cold', 'compaction', 'user', 'hook', 'startup_probe'] as const;
 export type EvictionActor = (typeof ACTORS)[number];
 
+// ─── canonical trigger names ─────────────────────────────────────────
+//
+// Trigger strings live in `eviction_events.trigger` (TEXT) and in
+// `memory_events.details.trigger` (JSONB). They distinguish operator
+// commands from auto-detector firings in forensic queries —
+// `/memory audit --trigger operator` matches `OPERATOR_DRIVEN_TRIGGER`;
+// `--trigger detector` matches every entry in `DETECTOR_TRIGGERS`.
+//
+// Single source of truth so the slash command's filter set, the slash
+// command's quarantine emit path, and the future Slices 2-5 detector
+// implementations all agree on the same strings. A new detector lands
+// here AND in its emit site; a typo in either fails forensics
+// silently (visible only when the operator runs `--trigger detector`
+// and notices the missing row).
+
+// String emitted by every manual transition driven from a slash
+// command (`/memory quarantine`, `/memory delete`). Distinguishes
+// operator action from detector firings (which use the names below).
+export const OPERATOR_DRIVEN_TRIGGER = 'operator_driven';
+
+// The 4 auto-detector triggers spec'd in MEMORY.md §6.5.2 +
+// EVICTION.md §5.1. Slices 2-5 of feat/memory-lifecycle-detectors
+// emit these; the `/memory audit --trigger detector` semantic
+// shortcut matches against this set. Adding a new memory-side
+// detector MUST extend this set (build does not fail otherwise —
+// the operator just won't see the new rows under the shortcut).
+export const DETECTOR_TRIGGERS = [
+  'verify_failed',
+  'user_override_repeated',
+  'conflict_detected',
+  'trust_revoked',
+] as const;
+export type DetectorTrigger = (typeof DETECTOR_TRIGGERS)[number];
+
 // ─── state machine ───────────────────────────────────────────────────
 
 // Transitions table per EVICTION §4.1. Map: from-state → to-state →

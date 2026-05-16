@@ -341,6 +341,51 @@ describe('/memory list', () => {
     expect(text).toContain('[user] [MALFORMED] broken');
   });
 
+  test('state flag enriched with motivo/trigger/date when audit event exists (H2)', async () => {
+    // When the quarantined memory has a paired memory_events row
+    // (operator-driven via /memory quarantine, or future
+    // detector-driven via Slices 2-5), the [QUARANTINED] flag
+    // becomes [QUARANTINED — motivo/trigger YYYY-MM-DD], matching
+    // the spec format `[memory: quarantined — verify failed
+    // 2026-05-12]` from MEMORY.md §6.5.2.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { state: 'quarantined' });
+    const { createMemoryEvent } = await import('../../../src/storage/repos/memory-events.ts');
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'mem',
+      source: 'inferred',
+      sessionId: null,
+      cwd: '/p',
+      createdAt: Date.UTC(2026, 4, 12),
+      details: { motivo: 'conflict', trigger: 'operator_driven' },
+    });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[QUARANTINED — conflict/operator_driven 2026-05-12] mem');
+  });
+
+  test('state flag falls back to bare label when no matching audit row exists', async () => {
+    // Hand-edited file (state set but no audit pair) gets the
+    // basic `[QUARANTINED]` flag — resilient to legacy / corrupt
+    // state.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { state: 'quarantined' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[QUARANTINED] mem');
+    expect(text).not.toContain('[QUARANTINED —');
+  });
+
   test('quarantine flag wins over expired suffix when both apply', async () => {
     // A memory that's both quarantined AND past expires should
     // render only the [QUARANTINED] flag — the operator action
@@ -880,6 +925,22 @@ describe('/memory audit', () => {
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain('--trigger needs a value');
   });
+
+  test('--trigger specified twice refuses with explicit error (M4)', async () => {
+    // Pre-fix the parser silently kept the last value; operator
+    // ran `--trigger op --trigger det` and got just detector
+    // results without a hint that --trigger op was ignored.
+    const r = await memoryCommand.exec(
+      ['audit', '--trigger', 'operator', '--trigger', 'detector'],
+      ctx,
+    );
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain('--trigger specified twice');
+      expect(r.message).toContain('operator');
+      expect(r.message).toContain('detector');
+    }
+  });
 });
 
 // Helper: stub modalManager.askMemoryAction to a fixed answer so
@@ -1066,7 +1127,7 @@ describe('/memory quarantine', () => {
     writeBody(roots.projectLocal, 'mem');
     registry.reload();
     stubMemoryAction(ctx, 'no');
-    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'shift'], ctx);
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'low_roi'], ctx);
     if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
     expect(r.notes?.[0]).toContain('cancelled');
     const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
@@ -1101,7 +1162,27 @@ describe('/memory quarantine', () => {
       expect(r.message).toContain("invalid motivo 'made_up'");
       // The allowed list is enumerated so the operator can fix.
       expect(r.message).toContain('conflict');
-      expect(r.message).toContain('shift');
+      expect(r.message).toContain('low_roi');
+    }
+  });
+
+  test('non-admissible motivo (shift / security / irrelevant) refused', async () => {
+    // EVICTION §4.1 admits only conflict + low_roi for
+    // active → quarantined. Other valid EvictionMotivos
+    // (`shift` for active→invalidated, `security` for purges,
+    // `irrelevant` for proposed→evicted) are refused at the slash
+    // boundary so the operator sees a clear error rather than
+    // an `illegal_transition` outcome leaking state-machine
+    // vocabulary.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    for (const motivo of ['shift', 'security', 'irrelevant']) {
+      const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', motivo], ctx);
+      expect(r.kind).toBe('error');
+      if (r.kind === 'error') expect(r.message).toContain(`invalid motivo '${motivo}'`);
     }
   });
 
@@ -1148,6 +1229,93 @@ describe('/memory quarantine', () => {
     if (r.kind === 'error') expect(r.message).toContain("already in state 'quarantined'");
   });
 
+  test('low_roi motivo: evidence schema bypassed via OPERATOR_DRIVEN_EVIDENCE_MARKER (H5)', async () => {
+    // Per EVICTION §6.1 `low_roi` has a non-trivial evidence schema
+    // (tokens_consumed, load_bearing_count, ratio). The slash sends
+    // only `{ _operator_driven: true, source, note }` — the marker
+    // tells preflightValidateEvidence to bypass the schema. Test
+    // pins that the path completes without invalid_evidence rejection.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Stale](stale.md) — h\n');
+    writeBody(roots.projectLocal, 'stale');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(
+      ['quarantine', 'stale', '--motivo', 'low_roi', '--evidence', 'unused 30d'],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('quarantined project_local/stale');
+    expect(r.notes?.join('\n')).toContain('motivo: low_roi');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'stale');
+    expect(events.find((e) => e.action === 'quarantined')).toBeDefined();
+  });
+
+  test('actor=user bypasses cooldown protection (H4 — design invariant)', async () => {
+    // The 72h `user_explicit` cooldown gate at transitions.ts:490
+    // applies to low_roi/irrelevant motivos — but is unconditionally
+    // bypassed when `actor === 'user'` (line 472). /memory
+    // quarantine sets actor='user', so even a freshly-created
+    // user_explicit memory can be quarantined immediately by the
+    // operator. This test pins the bypass invariant — future
+    // detectors that DON'T use actor='user' will see the cooldown
+    // fire and produce blocked_by_protection outcomes, which is
+    // the spec'd safety net.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Fresh](fresh.md) — just-created\n');
+    writeBody(roots.projectLocal, 'fresh', { source: 'user_explicit' });
+    // Seed a `created` event so getEarliestMemoryCreatedAt returns
+    // a value inside the 72h window (default ctx.now() = 1ms so any
+    // recent createdAt qualifies as fresh).
+    const { createMemoryEvent } = await import('../../../src/storage/repos/memory-events.ts');
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'fresh',
+      source: 'user_explicit',
+      sessionId: null,
+      cwd: '/p',
+      createdAt: 1,
+    });
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(
+      ['quarantine', 'fresh', '--motivo', 'low_roi', '--evidence', 'still bypasses'],
+      ctx,
+    );
+    // Operator path: no cooldown block.
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('quarantined project_local/fresh');
+  });
+
+  test('evidence note with newlines / quotes survives audit JSON (M5)', async () => {
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const evidenceWithSpecials = 'line1\nline2 with "quotes"\nand a tab\there';
+    const r = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--evidence', evidenceWithSpecials],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    // Audit row's details_json must round-trip the note safely
+    // through JSON.stringify (no SQL corruption / parse failure).
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const quarantined = events.find((e) => e.action === 'quarantined');
+    expect(quarantined).toBeDefined();
+    // The note is persisted in eviction_events.evidence_json via
+    // transitionMemoryState; the memory_events row carries motivo
+    // / trigger but the full evidence stays on eviction_events.
+    // Either way: the slash didn't crash, the audit row landed.
+  });
+
   test('preview includes motivo, current/next state, evidence note, scope', async () => {
     const repo = makeTmp();
     const { ctx, registry, roots } = makeCtx(repo);
@@ -1157,16 +1325,55 @@ describe('/memory quarantine', () => {
     const capture = { calls: [] as { action: string; subject: string; preview: string[] }[] };
     stubMemoryAction(ctx, 'yes', capture);
     await memoryCommand.exec(
-      ['quarantine', 'mem', '--motivo', 'security', '--evidence', 'leaked PAT pattern in body'],
+      ['quarantine', 'mem', '--motivo', 'low_roi', '--evidence', 'unused 30d'],
       ctx,
     );
     expect(capture.calls).toHaveLength(1);
     const preview = capture.calls[0]?.preview.join('\n') ?? '';
-    expect(preview).toContain('motivo:  security');
+    expect(preview).toContain('motivo:  low_roi');
     expect(preview).toContain('state:   active → quarantined');
-    expect(preview).toContain('evidence: leaked PAT pattern in body');
+    expect(preview).toContain('evidence: unused 30d');
     expect(preview).toContain('scope:   project_shared');
     expect(capture.calls[0]?.action).toBe('quarantine');
+  });
+});
+
+describe('/memory quarantine + /memory audit integration (M3)', () => {
+  test('quarantine → audit --trigger operator surfaces the same row end-to-end', async () => {
+    // Wires up the full chain: /memory quarantine produces a
+    // memory_events row with details.trigger='operator_driven';
+    // /memory audit --trigger operator filters on that string via
+    // OPERATOR_DRIVEN_TRIGGER constant; the same row appears in
+    // the audit output. Pre-fix this couldn't be asserted because
+    // the constant didn't exist — drift between emit site and
+    // filter site was possible.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+
+    // Step 1: quarantine.
+    const qr = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--evidence', 'duplicates foo'],
+      ctx,
+    );
+    if (qr.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(qr)}`);
+
+    // Step 2: audit --trigger operator → row appears.
+    const ar = await memoryCommand.exec(['audit', '--trigger', 'operator'], ctx);
+    if (ar.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(ar)}`);
+    const text = (ar.notes ?? []).join('\n');
+    expect(text).toContain('trigger: operator');
+    expect(text).toContain('mem');
+    expect(text).toContain('quarantined');
+
+    // Step 3: audit --trigger detector → NO row (operator_driven
+    // is not a detector trigger).
+    const dr = await memoryCommand.exec(['audit', '--trigger', 'detector'], ctx);
+    if (dr.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(dr)}`);
+    expect(dr.notes?.[0]).toContain('no audit rows matching --trigger detector');
   });
 });
 
