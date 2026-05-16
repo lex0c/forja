@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — S5/T5.4 `/memory trust status` slash inspector
+
+Read-only operator surface for the shared-corpus trust state, closing the gap between "the agent computed a hash and stored it somewhere" and "the operator can see what the agent believes about this corpus without restarting".
+
+Added:
+
+- `src/cli/slash/commands/memory.ts:handleTrust` — branches on `getSharedTrust` × `computeSharedFingerprint` to render one of four states: `never confirmed` (substrate seeded silently on next boot), `in sync` with timestamp + truncated hash, `DIVERGED` with both hash prefixes + a hint that the next boot will fire the modal, `VERIFY FAILED` when fs reads are blocked. Hash truncation (first 12 hex chars + `…`) keeps the output scannable; the operator who needs the full hash can query the DB directly. Inventory line reports the same file set the fingerprint hashes (including MEMORY.md).
+- Strict argument validation. Bare `/memory trust` errors with a subcommand hint; unknown subcommands are rejected; extra args after `status` are also refused so a future `/memory trust forget <path>` doesn't accidentally absorb operator typos.
+- 6 slash tests covering all four states + the three argument-validation paths.
+
+T5.5 (additional "hash unchanged + verify_failed integration" tests) is the only remaining S5 work; the slice is functionally complete.
+
 ## [2026-05-16] feat(memory) — S5/T5.2+T5.3 trust_revoked detector wired end-to-end
 
 Builds on T5.1's substrate. The probe now fires inside `bootstrap`, the operator gets a modal-driven re-confirmation when the shared corpus drifted, and revocation bulk-invalidates the affected memories — taking effect in the SAME boot's system prompt rather than requiring a restart.

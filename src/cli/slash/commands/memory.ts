@@ -21,14 +21,17 @@
 // the dispatcher's `notes` channel; mutation subcommands (Tier 2)
 // add modal-confirm + audit-row emission paths.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   type MemoryFile,
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
   type TombstoneEntry,
+  computeSharedFingerprint,
   findLatestTombstone,
+  getSharedTrust,
   isExpired,
   moveMemory,
   parseMemoryFile,
@@ -939,6 +942,120 @@ const handleConflicts = (ctx: SlashContext, args: string[]): SlashResult => {
     const confDetail = confidence !== null ? ` conf=${confidence.toFixed(2)}` : '';
     lines.push(`  ${ts} · ${kind} · winner=${winner} loser=${loser}${conceptDetail}${confDetail}`);
   }
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory trust status (S5/T5.4) ──────────────────────────────────
+//
+// Operator-facing inspector for the shared-corpus trust state. Read-
+// only: no transitions, no modal, no DB writes. Surfaces enough
+// information for the operator to answer "do I need to re-confirm
+// trust, and if so, against what?" without restarting the agent.
+//
+// Output sections:
+//   - `path` — absolute scope root (typically `<repo>/.agent/memory/
+//     shared`). Surfaced so the operator can `cat` files outside
+//     the slash interaction if they want deeper inspection.
+//   - `status` — one of: `in sync`, `DIVERGED`, `never confirmed`,
+//     `VERIFY FAILED`. Diverged is upper-case so the operator's eye
+//     catches the security-relevant state on a scroll-by; the other
+//     states aren't load-bearing enough to warrant the same visual
+//     weight.
+//   - hashes — last confirmed + current side-by-side on divergence,
+//     just the current hash otherwise. Truncated to first 12 hex
+//     chars in the line; the operator who needs the full hash can
+//     query the DB directly (intentionally not exposed via the
+//     slash to keep the output scannable).
+//   - inventory — file count + total bytes (NOT per-file enumeration;
+//     `/memory list --scope shared` is the right tool for that).
+//
+// Args: only `status` is supported as of T5.4. Future extensions
+// (`/memory trust clear`, `/memory trust forget <scope>`) land in
+// follow-up slices when operators ask for them.
+const handleTrust = (registry: MemoryRegistry, ctx: SlashContext, args: string[]): SlashResult => {
+  const sub = args[0];
+  if (sub === undefined) {
+    return {
+      kind: 'error',
+      message: '/memory trust: missing subcommand (try: status)',
+    };
+  }
+  if (sub !== 'status') {
+    return {
+      kind: 'error',
+      message: `/memory trust: unknown subcommand '${sub}' (try: status)`,
+    };
+  }
+  // Extra args beyond `status` are user error — refuse rather than
+  // silently ignoring, matching the spec's "explicit is better than
+  // implicit" stance for operator-facing surfaces.
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/memory trust status: unexpected extra args (${args.slice(1).join(' ')})`,
+    };
+  }
+
+  const sharedRoot = registry.roots.projectShared;
+  const stored = getSharedTrust(ctx.db, sharedRoot);
+  const currentHash = computeSharedFingerprint(sharedRoot);
+
+  const lines: string[] = ['shared corpus trust:', `  path: ${sharedRoot}`];
+
+  if (currentHash === null) {
+    // Substrate couldn't fingerprint — fs unreadable. Operator gets
+    // a clear signal that the agent doesn't know the corpus state;
+    // distinct from "no row yet" (recoverable on next confirm) or
+    // "diverged" (operator decision pending).
+    lines.push('  status: VERIFY FAILED — could not read corpus root');
+    return { kind: 'ok', notes: lines };
+  }
+
+  // Inventory line (file count + total bytes). Recomputed here
+  // rather than threaded through the substrate so the slash works
+  // even when bootstrap hasn't run the probe this session. Uses
+  // the same definition as `computeSharedFingerprint` (`.md` files
+  // at the corpus root, excluding `.tombstones/` and subdirs).
+  let fileCount = 0;
+  let totalBytes = 0;
+  try {
+    for (const name of readdirSync(sharedRoot)) {
+      if (!name.endsWith('.md')) continue;
+      try {
+        const st = statSync(join(sharedRoot, name));
+        if (st.isFile()) {
+          fileCount++;
+          totalBytes += st.size;
+        }
+      } catch {
+        // Transient — skip; the operator's status snapshot tolerates
+        // a missed entry, the source of truth is the fingerprint.
+      }
+    }
+  } catch {
+    // sharedRoot doesn't exist or unreadable — fileCount stays 0.
+    // currentHash already reflects this case (EMPTY_CORPUS_HASH for
+    // ENOENT, null for EACCES — null branched above).
+  }
+
+  if (stored === null) {
+    lines.push('  status: never confirmed (next boot will silently seed the current hash)');
+    lines.push(`  current hash: ${currentHash.slice(0, 12)}…`);
+  } else if (stored.lastConfirmedHash === currentHash) {
+    lines.push(
+      `  status: in sync · last confirmed ${formatAuditTimestamp(stored.lastConfirmedAtMs)}`,
+    );
+    lines.push(`  current hash: ${currentHash.slice(0, 12)}…`);
+  } else {
+    lines.push(
+      `  status: DIVERGED · last confirmed ${formatAuditTimestamp(stored.lastConfirmedAtMs)}`,
+    );
+    lines.push(`  last hash:    ${stored.lastConfirmedHash.slice(0, 12)}…`);
+    lines.push(`  current hash: ${currentHash.slice(0, 12)}…`);
+    lines.push('  (a re-confirm modal will fire on next boot if the divergence persists)');
+  }
+  lines.push(`  inventory: ${fileCount} file${fileCount === 1 ? '' : 's'}, ${totalBytes} bytes`);
+
   return { kind: 'ok', notes: lines };
 };
 
@@ -2154,7 +2271,7 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
 export const memoryCommand: SlashCommand = {
   name: 'memory',
   description:
-    'manage cross-session memories (list/show/audit/provenance/delete/quarantine/restore/promote/demote)',
+    'manage cross-session memories (list/show/audit/provenance/delete/quarantine/restore/promote/demote/trust)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -2188,10 +2305,12 @@ export const memoryCommand: SlashCommand = {
         return handlePromote(registry, ctx, args.slice(1));
       case 'demote':
         return handleDemote(registry, ctx, args.slice(1));
+      case 'trust':
+        return handleTrust(registry, ctx, args.slice(1));
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote, trust)`,
         };
     }
   },

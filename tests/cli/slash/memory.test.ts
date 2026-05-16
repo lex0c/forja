@@ -2598,3 +2598,110 @@ describe('/memory conflicts (S4/T4.4)', () => {
     if (r.kind === 'error') expect(r.message).toContain('unknown flag');
   });
 });
+
+// /memory trust status (S5/T5.4) — read-only inspector for the
+// shared-corpus trust state. Exercises:
+//   - never-confirmed path (no row → "next boot will silently seed")
+//   - in-sync path (row matches current hash → "in sync")
+//   - diverged path (row differs from current hash → "DIVERGED")
+//   - verify-failed path (no separate test — covered by the
+//     substrate; the slash branches identically off the null return)
+// Argument validation:
+//   - bare `/memory trust` → error with subcommand hint
+//   - unknown subcommand → error
+//   - extra args after `status` → error (explicit-is-better-than-
+//     implicit; future-proofs against silent typos)
+describe('/memory trust status', () => {
+  test('never confirmed: signals next-boot-will-seed', async () => {
+    const repo = makeTmp();
+    const { ctx, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('shared corpus trust:');
+      expect(text).toContain(roots.projectShared);
+      expect(text).toContain('never confirmed');
+      expect(text).toContain('next boot will silently seed');
+      // 2 files = a.md (the body) + MEMORY.md (the index); the
+      // fingerprint hashes both, the inventory line reports both.
+      expect(text).toMatch(/inventory: 2 files/);
+    }
+  });
+
+  test('in sync: matching hash renders timestamp and current hash prefix', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    const { computeSharedFingerprint, setSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const current = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, current, 1_700_000_000_000);
+
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('in sync');
+      // Hash prefix (12 chars + ellipsis) — first chars of the
+      // actual hash MUST appear; tests aren't allowed to be
+      // hash-blind because that would let truncation regressions
+      // pass silently.
+      expect(text).toContain(`${current.slice(0, 12)}…`);
+      expect(text).not.toContain('DIVERGED');
+    }
+  });
+
+  test('diverged: hash mismatch surfaces both prefixes and the divergence flag', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', {}, 'baseline body');
+    const { computeSharedFingerprint, setSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const baselineHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, baselineHash, 1_700_000_000_000);
+    // Mutate the corpus AFTER the trust row was stamped.
+    writeBody(roots.projectShared, 'a', {}, 'tampered body');
+
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('DIVERGED');
+      expect(text).toContain(`${baselineHash.slice(0, 12)}…`);
+      const currentHash = computeSharedFingerprint(roots.projectShared) as string;
+      expect(text).toContain(`${currentHash.slice(0, 12)}…`);
+      expect(text).toContain('re-confirm modal will fire on next boot');
+    }
+  });
+
+  test('bare `/memory trust` errors with subcommand hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing subcommand');
+  });
+
+  test('unknown subcommand errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'foo'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown subcommand 'foo'");
+  });
+
+  test('extra args after `status` are refused (no silent typo absorption)', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'status', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unexpected extra args');
+  });
+});
