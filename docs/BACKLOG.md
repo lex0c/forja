@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] fix(retrieval/runner) — preserve caller-supplied memory view when loadBodies is requested
+
+`buildRetrievalRunner` exposes a `views` slot on its deps (documented for tests / fixtures / alternative-scoring wireup). When `input.loadBodies === true`, the runner unconditionally replaced `viewsForCall.memory` with a fresh default `createMemoryView({ registry, loadBodies: true })` — discarding whatever custom view the caller had injected. A test asserting that its sentinel memory view ran, or a fixture stubbing memory behavior for a specific corpus, would silently get the default view's behavior instead. Same for any future custom wireup with alternative limits / scoring / filters.
+
+Fix: track `callerSuppliedViews = deps.views !== undefined` at runner build time. The `loadBodies` override now runs only when views were default-wired. Callers who supply their own views and want loadBodies-on can construct their custom view with `createMemoryView({ ..., loadBodies: true })` themselves — the API is already there, the runner just shouldn't substitute behind their back.
+
+Test in `tests/tools/retrieve-context.test.ts`: build a runner with a sentinel memory view that returns a recognizable candidate and counts calls; invoke with `loadBodies: true`; assert sentinel ran once AND the sentinel's candidate appears in `stats.candidatesRaw`. Pre-fix this test would have shown 0 sentinel calls (the default view replaced it) and a different candidate count.
+
 ## [2026-05-16] fix(tools/retrieve-context) — return tool.aborted (not retrieval.internal_error) for mid-flight cancellation
 
 The pre-call abort check at `execute()` entry correctly returns `tool.aborted` (retryable=true), but the catch block around `await ctx.retrieveContext(...)` mapped EVERY thrown error to `retrieval.internal_error` with `retryable: false`. When the signal flipped AFTER entry — during validation, during the await on the runner, or while a subprocess view was in-flight — the runner threw `retrieval aborted before <stage>` (pipeline check, commit `4935fef`) or `retrieval aborted mid-flight` (runner late check) and the catch misclassified it as a hard internal failure. Callers lost the standard `tool.aborted` semantic and could either retry forever (the standard retry-on-abort pattern doesn't fire because retryable=false) or surface the wrong failure reason to the operator.

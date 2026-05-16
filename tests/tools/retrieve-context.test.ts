@@ -389,6 +389,53 @@ describe('buildRetrievalRunner — end-to-end', () => {
     expect(deep.stats.candidatesRaw).toBeGreaterThan(0);
   });
 
+  test('caller-supplied views are NOT overridden when loadBodies=true (regression)', async () => {
+    // Regression: the loadBodies branch unconditionally replaced
+    // `viewsForCall.memory` with a fresh default view, discarding
+    // a caller-injected memory view (custom limits, stubs,
+    // alternative scoring). A test/fixture / custom-wireup
+    // expecting its view to run would silently query a different
+    // corpus. The override now skips when views were
+    // caller-supplied.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Real](real.md) — auth\n');
+    writeBody(roots.user, 'real', 'real body about auth');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    // Custom memory view that emits a sentinel candidate so we
+    // can prove it was called (and that the default view was NOT
+    // substituted in its place).
+    let sentinelCalls = 0;
+    const sentinelMemoryView = {
+      async search() {
+        sentinelCalls++;
+        return [
+          {
+            nodeId: 'memory:user/sentinel',
+            view: 'memory' as const,
+            bootstrapScore: 1.0,
+            reason: 'sentinel candidate (custom view)',
+          },
+        ];
+      },
+    };
+
+    const runner = buildRetrievalRunner({
+      db,
+      sessionId,
+      memoryRegistry: registry,
+      views: { memory: sentinelMemoryView },
+    });
+
+    // loadBodies=true would, pre-fix, have rebuilt the default
+    // memory view and dropped sentinelMemoryView. With the fix,
+    // sentinelMemoryView still runs and its candidate appears.
+    const result = await runner({ query: 'auth', loadBodies: true });
+    expect(sentinelCalls).toBe(1);
+    expect(result.stats.candidatesRaw).toBe(1);
+  });
+
   test('honors the default budget when budgetTokens is omitted', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

@@ -55,6 +55,12 @@ export interface BuildRetrievalRunnerDeps {
 
 export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn => {
   const defaultBudget = deps.defaultBudgetTokens ?? DEFAULT_BUDGET_TOKENS;
+  // Track whether the views were caller-supplied vs default-wired
+  // — the `loadBodies` swap below MUST NOT replace a caller-supplied
+  // memory view (custom limits, stubs, alternative scoring), which
+  // would silently query a different corpus than the test/fixture
+  // / custom-wireup asked for.
+  const callerSuppliedViews = deps.views !== undefined;
   // Session-scoped views built once per runner. memory + session
   // hold no internal state today (BM25 corpora are rebuilt per
   // search call), so reuse is safe and matches the ViewSearch
@@ -95,7 +101,17 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
     // built with body loading on. Cheap — the view is a single
     // object with closure deps; we're not rebuilding the BM25
     // corpus here, just the view's search function.
-    if (input.loadBodies === true && viewsForCall.memory !== undefined) {
+    //
+    // GUARDED BY `!callerSuppliedViews`: only the default-wired
+    // memory view gets replaced. A caller that injected its own
+    // `views.memory` (tests, fixtures, alternative-scoring wireup
+    // per BuildRetrievalRunnerDeps doc) keeps the view as
+    // supplied — overriding silently would mean the runner
+    // queried a different corpus / behavior than the caller
+    // requested. Callers that DO want loadBodies-on can construct
+    // their custom view with `loadBodies: true` themselves
+    // (createMemoryView accepts the flag) before passing it in.
+    if (input.loadBodies === true && viewsForCall.memory !== undefined && !callerSuppliedViews) {
       viewsForCall.memory = createMemoryView({
         registry: deps.memoryRegistry,
         loadBodies: true,
