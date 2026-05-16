@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — verify_failed detector (S2)
+
+Auto-quarantines factual memories whose path claims contradict the active repo. Bolts onto Slice 1's `memory_provenance` substrate: the scheduler scans the trail at each step boundary, enqueues verification for each unique (session, scope, name), and runs verifiers fire-and-forget. A `contradicted` verdict drives `transitionMemoryState` with `motivo=conflict + trigger=verify_failed + actor=loop_cold`.
+
+The slice deliberately ships a **narrow, high-bar heuristic**. False-positive auto-quarantines erode operator trust in every detector — so the verifier:
+
+- Extracts ONLY paths under known top-level prefixes (`src/ tests/ docs/ evals/ examples/ scripts/`).
+- Refuses paths with `..` traversal or `\` (Windows-style) — a malicious memory body can't make the verifier touch `/etc/passwd`.
+- Returns `unknown` (not `contradicted`) whenever the body has no extractable claim. Most memories ship without verifiable patterns; the long tail stays silent.
+- Logs `verify_unknown` to stderr for forensic visibility without state change.
+
+What v1 does NOT do, by design:
+
+- **Export resolution** — a claim like "src/foo.ts exports validateToken" gets the path checked but NOT the export. Pattern 2 (export+symbol grep) is a future extension if real corpora show it would catch drift the path-existence heuristic misses.
+- **Semantic equivalence** — "auth lives in the user-service" vs "src/auth/" is paraphrase, not literal. Out of scope until/unless an opt-in LLM-judge path lands.
+- **LLM-as-judge** — the verifier injection surface is real (memory bodies are operator-edited; some are marked `trust: untrusted`). Putting them in a judge model's window reopens exactly what the trust filter closes. Documented as a future opt-in flag (`memory.verify.llm = true`) with structured-output + scanForInjection pre-check; not built here.
+
+State machine motivo handling (semantic stretch): EVICTION.md §4.1 admits only `conflict + low_roi` for `active→quarantined`. MEMORY.md §6.5.2 lists verify_failed under motivo `shift`, but `shift` is admitted only for `active→shadow` / `active→invalidated`. Resolution: use `motivo: 'conflict'` (admitted) with `evidence: { failures: 1, claim, expected, observed, verifier_id }` — the `failures: number` branch of the `conflict` schema is satisfied; the auxiliary fields carry the actual forensic detail. The `trigger: 'verify_failed'` field carries detector identity for `/memory audit --trigger verify_failed`. Follow-up issue: amend EVICTION.md to admit `shift` for `active→quarantined`, OR introduce a dedicated `factual_drift` motivo.
+
+Scheduling architecture:
+
+- **Provenance-driven, not per-site enqueue.** The harness calls `pollAndEnqueue()` once per step boundary; the scheduler scans memory_provenance for unique (scope, name) and enqueues. This keeps the integration to ONE site in loop.ts instead of 6 (registry.auditExposure, retrieval runner, memory_read tool, memory_search tool, eager block, retrieve_context tool).
+- **Fire-and-forget.** The model's turn doesn't block on verifier work. `drain()` at the outer finally gives in-flight tasks a 2000ms grace window before shutdown — a hung verifier can't stall session close.
+- **Dedupe in memory.** Same (session, scope, name) verifies once per session; cross-session re-verification fires naturally on the next boot's poll.
+- **Non-fatal failures everywhere.** Verifier throws, peek not-present, state machine refusal — all stderr-log and continue. Verification is observability, not correctness.
+
+Tests: 28 new across `factuality.test.ts` (4 — pure classifier), `project-verifier.test.ts` (13 — extractor + verify), `scheduler.test.ts` (11 — passed/contradicted/unknown verdicts, type gating, idempotency, drain timeout, failure isolation). Acceptance from TODO.md is met for path-mention claims; export-pattern verification is deferred with rationale.
+
 ## [2026-05-16] fix(memory) — Slice 1 post-review hardening
 
 Round of code review delegated to three Explore agents (robustness, reliability, coverage). Four real bugs + three hardening gaps + handful of test pins surfaced. Applied:

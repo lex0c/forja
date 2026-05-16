@@ -23,6 +23,10 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
+import type { MemoryType } from '../memory/types.ts';
+import { createProjectVerifier } from '../memory/verify/project-verifier.ts';
+import { type VerifyScheduler, createVerifyScheduler } from '../memory/verify/scheduler.ts';
+import type { MemoryVerifier } from '../memory/verify/types.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -248,6 +252,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // closure so the outer-finally cleanup hook can find it whether
   // we exited normally or through guardedFinish.
   let bgManager: BgManager | undefined;
+  // Run-scoped verify scheduler (S2/T2.4). Created after the
+  // session id resolves AND a memory registry is wired. Stays
+  // undefined when memory subsystem isn't wired (headless / SDK
+  // contexts) or when no factual-type verifiers exist for the
+  // session. Polled per step boundary; drained in the outer
+  // finally before DB closes so in-flight verifies + their
+  // resulting eviction_events writes land cleanly.
+  let verifyScheduler: VerifyScheduler | undefined;
   // Run-scoped subagent handle store (spec ORCHESTRATION.md §3,
   // task_async family). Created after sessionId resolves —
   // identical lifecycle window as bgManager. Drained in the outer
@@ -934,6 +946,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               `memory: AUDIT DRIFT: failed to record eager exposure for ${exposure.name} (${exposure.scope}): ${redactSecrets(msg)}\n`,
             );
           }
+        }
+      }
+
+      // Verify scheduler (S2/T2.4). Composes one verifier per
+      // factual memory type and consumes the memory_provenance
+      // trail per step boundary. Created only when:
+      //   - a MemoryRegistry is wired (otherwise nothing to peek);
+      //   - the cwd resolves to a repo root (verifier needs an FS
+      //     anchor; non-repo cwds skip verification).
+      // Fire-and-forget — verify tasks run in the background while
+      // the model's next step is in-flight. Drained in the outer
+      // finally with a small timeout so a hung verifier doesn't
+      // block shutdown.
+      if (config.memoryRegistry !== undefined) {
+        try {
+          const repoRoot = resolveRepoRoot(config.cwd);
+          const verifiers: Map<MemoryType, MemoryVerifier> = new Map();
+          verifiers.set('project', createProjectVerifier());
+          // 'reference' verifier deferred — external-system probes
+          // out of scope for v1. Memories of type=reference simply
+          // skip verification at the scheduler dispatch layer.
+          verifyScheduler = createVerifyScheduler({
+            db: config.db,
+            sessionId,
+            registry: config.memoryRegistry,
+            repoRoot,
+            verifiers,
+          });
+          // Seed from eager rows + any provenance the resume path
+          // might already have. pollAndEnqueue dedupes against
+          // already-enqueued; safe to call freely.
+          verifyScheduler.pollAndEnqueue();
+        } catch (err) {
+          // Non-fatal: a missing repo root or any scheduler
+          // construction failure degrades to "no verification this
+          // session". The model's session continues normally.
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: verify scheduler unavailable for session (${redactSecrets(msg)})\n`,
+          );
         }
       }
 
@@ -1836,6 +1888,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ? await finish('maxWallClockMs')
             : await finish('aborted', undefined, 'hard');
         }
+        // Verify scheduler poll (S2/T2.4). At each step boundary,
+        // pick up new memory_provenance rows from the just-
+        // completed step's tool calls and enqueue verification.
+        // Idempotent — already-enqueued (scope, name) pairs are
+        // no-ops. Verify tasks run in the background; the model's
+        // next step doesn't wait for them.
+        verifyScheduler?.pollAndEnqueue();
         // Cooperative stop: spec UI.md §3 soft interrupt. The check
         // sits at the top of the loop so the just-completed step's
         // tool calls + their results are persisted before exiting.
@@ -3396,6 +3455,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         await checkpointsPurgeInFlight;
       } catch {
         // Already swallowed at construction; defensive.
+      }
+    }
+    // Drain the verify scheduler before subagent / bg drains.
+    // Verifier tasks may issue eviction_events writes through
+    // transitionMemoryState; those writes need an open DB. The
+    // scheduler's own drain has an internal timeout so a hung
+    // verifier can't block shutdown indefinitely.
+    if (verifyScheduler !== undefined) {
+      try {
+        await verifyScheduler.drain();
+      } catch {
+        // Defensive — scheduler's drain uses Promise.allSettled
+        // internally; this shouldn't fire. Catch keeps the
+        // cleanup chain resilient to future code paths.
       }
     }
     // Drain the subagent handle store before bgManager cleanup —
