@@ -147,6 +147,69 @@ describe('runRetrieval — skeleton', () => {
     expect(r.timings).toEqual({ searchMs: 10, expandMs: 10, rankMs: 10, compressMs: 10 });
   });
 
+  test('compressionResolver dep activates compressGreedy as default compress', async () => {
+    // Slice 4.7 wiring: when deps.compress is absent but
+    // deps.compressionResolver is set, the pipeline uses
+    // compressGreedy against the resolver instead of the
+    // ref-only skeleton stub.
+    let resolveCalls = 0;
+    const resolver = {
+      resolve: () => {
+        resolveCalls += 1;
+        return { content: 'resolved-content', costTokens: 10 };
+      },
+    };
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: {
+        memory: {
+          search: async () => [candidateOf('memory:user/foo')],
+        },
+      },
+      compressionResolver: resolver,
+    };
+    const r = await runRetrieval(deps, baseQuery);
+    expect(r.contextSlot.included).toHaveLength(1);
+    expect(r.contextSlot.included[0]?.content).toBe('resolved-content');
+    expect(r.contextSlot.included[0]?.costTokens).toBe(10);
+    // The default ref-only stub would have emitted level='ref'
+    // with costTokens=1; the resolver path takes over and
+    // produces level='full' (first level the greedy loop tries).
+    expect(r.contextSlot.included[0]?.level).toBe('full');
+    expect(resolveCalls).toBeGreaterThan(0);
+  });
+
+  test('explicit deps.compress wins over deps.compressionResolver', async () => {
+    // Override precedence: a test that wants total control
+    // passes deps.compress directly; the resolver is ignored.
+    const resolver = {
+      resolve: () => {
+        throw new Error('resolver should not be called when deps.compress is set');
+      },
+    };
+    const deps: PipelineDeps = {
+      db,
+      sessionId,
+      views: { memory: { search: async () => [candidateOf('memory:user/foo')] } },
+      compress: () => ({
+        included: [
+          {
+            nodeId: 'override',
+            view: 'memory',
+            level: 'summary',
+            content: 'override-content',
+            costTokens: 1,
+          },
+        ],
+        skipped: [],
+      }),
+      compressionResolver: resolver,
+    };
+    const r = await runRetrieval(deps, baseQuery);
+    expect(r.contextSlot.included[0]?.content).toBe('override-content');
+  });
+
   test('custom expand / rank / compress callbacks override stubs', async () => {
     const deps: PipelineDeps = {
       db,

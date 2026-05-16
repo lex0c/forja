@@ -43,3 +43,11 @@ export type { SessionViewDeps } from './views/session.ts';
 
 export { WORKFLOW_WEIGHTS, rankCandidates } from './ranking.ts';
 export type { RankCandidatesInput } from './ranking.ts';
+
+export { compressGreedy, createCompressionResolver } from './compression.ts';
+export type {
+  CompressGreedyInput,
+  CompressionResolver,
+  CompressionResolverDeps,
+  ResolvedContent,
+} from './compression.ts';

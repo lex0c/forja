@@ -24,6 +24,7 @@
 
 import type { DB } from '../storage/db.ts';
 import { createRetrievalTrace } from '../storage/repos/retrieval-trace.ts';
+import { type CompressionResolver, compressGreedy } from './compression.ts';
 import { rankCandidates } from './ranking.ts';
 import type {
   Candidate,
@@ -59,9 +60,15 @@ export interface PipelineDeps {
   // Ranking stage. Stub default copies bootstrapScore into
   // finalScore and zero-fills the signal breakdown.
   rank?: (expanded: ExpandedCandidate[], query: RetrievalQuery) => RankedCandidate[];
-  // Compression stage. Stub default emits one `ref` entry per
-  // ranked candidate with costTokens=1 and stops at the budget.
+  // Compression stage. When `compressionResolver` is provided
+  // (slice 4.7), the pipeline runs the greedy budget allocator
+  // over the four-level representation hierarchy
+  // (full/outline/summary/ref). When neither `compress` nor
+  // `compressionResolver` is provided, falls back to the
+  // ref-only stub (slice 4.1) — useful for skeleton-shape tests
+  // that don't need substrate resolution.
   compress?: (ranked: RankedCandidate[], query: RetrievalQuery) => ContextSlot;
+  compressionResolver?: CompressionResolver;
   // Wall-clock source. Defaults to Date.now(). Tests pin a value
   // so `created_at` is deterministic.
   now?: () => number;
@@ -140,7 +147,19 @@ export const runRetrieval = async (
   const monoNow = deps.monoNow ?? defaultMonoNow;
   const expand = deps.expand ?? defaultExpand;
   const rank = deps.rank ?? ((expanded, query) => defaultRank(expanded, query, now));
-  const compress = deps.compress ?? defaultCompress;
+  // Compression: explicit `compress` override wins; else if a
+  // resolver is configured, run greedy allocation against it; else
+  // fall back to the ref-only skeleton stub.
+  const compress =
+    deps.compress ??
+    (deps.compressionResolver !== undefined
+      ? (ranked: RankedCandidate[], query: RetrievalQuery) =>
+          compressGreedy({
+            ranked,
+            query,
+            resolver: deps.compressionResolver as CompressionResolver,
+          })
+      : defaultCompress);
 
   // Stage 1: search per view in parallel. A view's `search`
   // throwing collapses that view's contribution to [] — degradation

@@ -22,6 +22,25 @@ Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet
 
 What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
 
+### 4.7 — Compression
+
+Replaces the `ref-only` skeleton stub (slice 4.1) with the full §6 hierarchy + greedy budget allocator.
+
+`src/retrieval/compression.ts` exports two layers:
+
+1. **`createCompressionResolver({ registry, db, estimateTokens? })`** — per-view content materializer. Given a `(candidate, level)` pair, returns `{ content, costTokens }` from the underlying substrate or `null` when the row no longer exists (deletion between rank and compress) / the view is deferred (workspace returns null at every level until 4.4).
+
+   - **memory view**: `full` = frontmatter header + full body; `outline` = name + description + first 5 body lines; `summary` = `frontmatter.description`; `ref` = `memory:<scope>/<name>` projection (no I/O — works even when the file is missing).
+   - **session view**: `message` / `tool_call` / `failure` each have all four levels. `full` for tool_call includes input + output (output is unbounded but greedy can demote to outline when needed); `failure_event` `full` carries the payload_json. New `getFailureEvent(db, id)` helper added to the repo (the existing surface only had list helpers).
+
+2. **`compressGreedy({ ranked, query, resolver })`** — implements spec §6.2 verbatim. For each ranked candidate tries `full → outline → summary → ref` until a level fits; tracks the cheapest-unfit cost for the skipped trail so the operator hint reads `"cheapest level (ref) costs 5t > remaining 2t"` instead of bare "skipped".
+
+Token cost: `Math.ceil(content.length / 4)` heuristic, with minimum 1 to keep empty-content slots structurally honest. Slice 4.9 (integration) wires provider-specific `countTokens` via the optional `estimateTokens` dep.
+
+Pipeline integration: `PipelineDeps` gains an optional `compressionResolver` field. When provided, the pipeline runs `compressGreedy` against it as the default compress stage. Explicit `deps.compress` still wins (for tests). When neither is set, the slice-4.1 ref-only stub remains as the fallback so skeleton-shape tests don't need substrate.
+
+Tests: 15 new in `tests/retrieval/compression.test.ts` covering per-view resolver shape (memory + session + workspace-null), cost-ordering invariant (`ref ≤ summary ≤ outline ≤ full`), missing-row fallback to null, malformed nodeId guards, greedy budget cases (top-K full / tail degrades / exact fit / zero budget / skipped trail with wouldCostTokens / resolver that always returns null), and an end-to-end with the real resolver against memory + session corpora.
+
 ### 4.6 — Ranking (out of declared order)
 
 Slice 4.4 (workspace via ripgrep) and 4.5 (expansion) were deferred — workspace without CODE_INDEX collapses to a ripgrep wrapper that duplicates existing grep/glob tools and produces no structural edges; expansion without edges has nothing to traverse. The remaining v1 value sits in honest ranking + compression + integration, so the slice order shifts: 4.6 → 4.7 → 4.9, with 4.4/4.5 picked up when (or if) CODE_INDEX returns.
