@@ -89,13 +89,19 @@ What does NOT ship in S4 V1 (moved to Phase 2 / S13):
 
 ## Slice 5 — `trust_revoked` detector
 
-Auto-quarantines `shared/` memories when operator revokes trust after a hash change.
+Mass-quarantines `shared/` memories when operator revokes trust after a hash change.
+
+**Architectural rationale (boundary check against zero-heuristic commitment):** S5 fits within the architectural commitment because:
+- **Detection is deterministic** — SHA-256 hash diff over canonical concat of shared/MEMORY.md + bodies. No prose judgment; the hash either matches or doesn't.
+- **Judgment is operator authority** — the boot modal IS the explicit consent moment (§1.1.4: authorization vem de "operator explicit approval"). System surfaces the change; operator decides.
+- **Bulk transition is justified by the modal's consent** — modal shows the diff preview; operator's revoke choice IS consent for the bulk effect across all shared memories. Per-memory governance proposals would be UX-wrong here: the operator already reviewed and decided in one place. Splitting into N proposals to approve individually would force the same decision N times.
+- **Diff preview shows raw changes** — no summarization, no "looks malicious" classification. Operator reads the diff and forms their own judgment.
 
 | Task | Description |
 |---|---|
-| **T5.1** | `shared/` content fingerprint — hash over canonical concat of `.agent/memory/shared/MEMORY.md` + every body file (sorted by name). Persisted in dedicated `trust_state` table or `sessions.shared_hash`. |
+| **T5.1 ✅** | `shared/` content fingerprint — hash over canonical concat of `.agent/memory/shared/MEMORY.md` + every body file (sorted by name). Persisted in `shared_corpus_trust` (migration 055), keyed by absolute scope-root path. SHA-256 with `forja:shared-corpus:v1\n` domain separator and `filename\n<bytes-len>\n<bytes>\n` framing per file. `src/memory/trust-corpus.ts` exports `computeSharedFingerprint`, `getSharedTrust`, `setSharedTrust`, `clearSharedTrust`. 19 substrate tests. |
 | **T5.2** | Boot-time re-prompt — when stored hash diverges from current, fire trust modal with diff preview ("3 shared memories changed since last boot — re-confirm trust?"). |
-| **T5.3** | If operator revokes trust → emit `trust_revoked` for every `state=active` shared memory; transition all to `quarantined` with `motivo=security`. |
+| **T5.3** | If operator revokes trust → emit `trust_revoked` for every `state=active` shared memory; transition all to `quarantined` with `motivo=security`. The modal interaction IS the authorization — no governance proposal layer needed for the bulk transition. |
 | **T5.4** | Bonus: `/memory trust status` shows trust state + last hash + last re-confirm timestamp. |
 | **T5.5** | Tests: hash unchanged → no prompt; hash changed + confirm → no quarantine; hash changed + revoke → every shared memory quarantined. |
 

@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] feat(memory) — S5/T5.1 shared-corpus trust substrate (`trust_revoked` detector, phase 1)
+
+Substrate for the `trust_revoked` lifecycle detector. Deterministic-only — fits the zero-text-heuristic commitment because detection is pure hash diff (no prose judgment) and the operator modal is the authority for the revoke decision.
+
+Added:
+
+- `src/storage/migrations/055-shared-corpus-trust.ts` — `shared_corpus_trust(scope_root TEXT PK, last_confirmed_hash TEXT NOT NULL, last_confirmed_at INTEGER NOT NULL CHECK > 0)`. Absence-of-row is the canonical "never confirmed" state.
+- `src/memory/trust-corpus.ts` — `computeSharedFingerprint(sharedRoot)` returns a SHA-256 hex over the canonical concat of every `.md` file at the corpus root (lexicographic sort, length-prefixed framing, `forja:shared-corpus:v1` domain separator). Excludes `.tombstones/` and any subdirectory. Distinguishes "no corpus" (sentinel hash) from "empty corpus" (hashes the domain separator alone) from genuine read failure (returns `null` — caller fail-closes). Repo helpers: `getSharedTrust`, `setSharedTrust` (upsert), `clearSharedTrust`.
+- `tests/memory/trust-corpus.test.ts` — 19 tests covering canonicalization (order-independence, length-prefix anti-collision, present-vs-absent file disambiguation), corpus filter (non-`.md` junk, `.tombstones/`, subdirs, `mistake.md/` directories), and repo round-trip (upsert semantics, multi-scope isolation, CHECK constraint).
+
+T5.2 (boot modal flow) and T5.3 (bulk transition on revoke) are NOT in this slice. They depend on either extending `modal-manager.ts` with a `shared-trust:ask` type OR threading a diff-preview through `askTrust`. Substrate is forward-compatible with either approach.
+
+952 storage + memory tests still green.
+
 ## [2026-05-16] fix(memory) — S2 heuristic rolled back; LLM-judge becomes the only prose-judgment path
 
 Policy decision applied: **"todo o lifecycle de memória um llm-judge decide; sem heurísticas locais sobre texto"**. The S2 verify_failed heuristic (regex path extraction + `existsSync`) shipped initially and was removed for the same reason S4's textual conflict heuristic was: regex over prose cannot reliably distinguish factual assertion from historical/cautionary mention. The deterministic part (`existsSync`) is fine; the heuristic part (extracting "this memory ASSERTS path X exists" from prose) isn't. Without the extraction, the FS check has nothing to verify.
