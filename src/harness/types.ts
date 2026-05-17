@@ -7,7 +7,7 @@ import type {
 } from '../critique/index.ts';
 import type { FailureEventSink } from '../failures/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
-import type { MemoryRegistry } from '../memory/index.ts';
+import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
 import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
@@ -817,6 +817,31 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // S5 CRIT/H2 hardening. Scopes that must be excluded from
+  // retrieval (`retrieve_context` tool) for this session. Mirrors
+  // the eager-load exclusion the bootstrap applies to
+  // `assembleMemorySection` when the shared-corpus trust probe
+  // returned a non-confirmed outcome (verify_failed / deferred /
+  // revoked). Without this, the model could fetch project_shared
+  // bodies via retrieve_context even though the system prompt
+  // already excluded them — partial fail-closed. Absent / empty
+  // = no exclusion.
+  memoryExcludeScopes?: ReadonlyArray<import('../memory/index.ts').MemoryScope>;
+  // Inventory of memories that landed in the eager-load section
+  // of the system prompt (MEMORY.md §11.2 — provenance, surface
+  // 'eager'). Populated by the CLI bootstrap from
+  // assembleMemorySection. The harness loop emits one
+  // memory_provenance row per entry right after createSession —
+  // that's the first moment a sessionId exists to link against
+  // (eager loading happens BEFORE the session is created, so the
+  // record has to be deferred). Absent / empty ⇒ no eager
+  // exposures (headless tests, registries with no memories).
+  //
+  // The inventory pins hash + state-at-exposure at boot, NOT at
+  // emit time — the operator may rewrite a file between assembly
+  // and session start. The spec semantic is "the bytes the model
+  // saw at boot", which freezes at assembly.
+  eagerExposures?: readonly EagerExposure[];
   // Pinned context store (CONTEXT_TUNING.md §12.4). When set, the
   // harness threads it through ToolContext so the pin_context tool
   // can dispatch. Absent ⇒ pin_context surfaces `pin.store_

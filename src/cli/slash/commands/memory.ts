@@ -23,27 +23,48 @@
 
 import { readFileSync } from 'node:fs';
 import {
+  EMPTY_CORPUS_HASH,
   type MemoryFile,
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
   type TombstoneEntry,
+  clearSharedTrust,
+  computeSharedFingerprint,
   findLatestTombstone,
+  getSharedTrust,
+  isExpired,
+  listSharedCorpusFiles,
   moveMemory,
   parseMemoryFile,
   removeMemory,
   scanForInjection,
   scanForPromotion,
+  setSharedTrust,
   transitionMemoryState,
 } from '../../../memory/index.ts';
+import type { DB } from '../../../storage/db.ts';
 import {
   listMemoryEventsByName,
   listMemoryEventsBySession,
   listRecentMemoryEvents,
 } from '../../../storage/index.ts';
 import type { MemoryEvent } from '../../../storage/index.ts';
-import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../../../storage/repos/eviction-events.ts';
+import type { EvictionMotivo } from '../../../storage/repos/eviction-events.ts';
+import {
+  DETECTOR_TRIGGERS,
+  OPERATOR_DRIVEN_EVIDENCE_MARKER,
+  OPERATOR_DRIVEN_TRIGGER,
+  listEvictionEventsByTrigger,
+} from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
+import {
+  type MemoryProvenanceRow,
+  listExposuresInRetrieval,
+  listGlobalProvenanceByName,
+  listProvenanceByName,
+  listProvenanceForToolCall,
+} from '../../../storage/repos/memory-provenance.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 // ─── scope arg helpers ───────────────────────────────────────────────
@@ -134,7 +155,114 @@ const filterByListScope = (
   }
 };
 
-const handleList = (registry: MemoryRegistry, args: string[]): SlashResult => {
+// `expires` parsing + cutoff predicate lives in `src/memory/expires.ts`
+// — single source of truth shared with the registry's `list()`
+// filter. Earlier shape had a duplicate implementation here; drift
+// risk was real (the recent two-step calendar fix had to be applied
+// in two places). Import the canonical helper.
+
+// Visual flag rendered as a prefix on the /memory list row.
+// Priorities (only one prefix renders, in this order):
+//   1. non-active state (`[QUARANTINED — motivo/trigger
+//      YYYY-MM-DD]` / `[INVALIDATED — …]` / `[PROPOSED]`) —
+//      operator sees lifecycle state, the reason it transitioned,
+//      and when, all at a glance per spec MEMORY.md §6.5.2.
+//      Motivo + trigger + date come from the most recent
+//      `memory_events` row whose action matches the current
+//      state (e.g., the last `quarantined` row for a memory
+//      currently in `quarantined` state). When no such row
+//      exists (legacy entries, hand-edited state without
+//      audit pair), the flag falls back to the bare state
+//      label so the operator still sees the non-active
+//      signal.
+//   2. expired (active state + `expires` in the past) —
+//      operator notices entries that would be excluded by
+//      `includeExpired: false`.
+// Both signals together would mean a quarantined-AND-expired
+// entry; we prefer the state flag because it's the operator
+// action (manual or detector) rather than the calendar fact.
+
+// Format a `memory_events.createdAt` ms epoch as `YYYY-MM-DD` (UTC).
+// Matches the spec format MEMORY.md §6.5.2 quotes (`[memory:
+// quarantined — verify failed 2026-05-12]`).
+const formatEventDateYyyyMmDd = (epochMs: number): string => {
+  const d = new Date(epochMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+// Look up the most recent `memory_events` row whose action matches
+// the candidate state and return its motivo + trigger + date for
+// the visual flag. Returns null when no matching row exists —
+// renderStateFlag falls back to the bare label. Cost: one DB read
+// per non-active listing in /memory list. At dozens-of-memories
+// scale this is single-digit reads per call.
+interface StateFlagDetail {
+  motivo: string | null;
+  trigger: string | null;
+  date: string;
+}
+
+const lookupStateDetail = (
+  db: DB,
+  scope: MemoryScope,
+  name: string,
+  state: string,
+): StateFlagDetail | null => {
+  // We don't have a `by-name-and-action` repo helper; the existing
+  // `listMemoryEventsByName(db, name, limit)` returns DESC by
+  // createdAt. A short scan from the top picks up the first row
+  // whose action matches the target state. Cap at 20 — operator-
+  // driven transitions are rare relative to read/created events,
+  // so the most-recent state transition is almost always within
+  // the top few rows.
+  const events = listMemoryEventsByName(db, name, 20);
+  for (const e of events) {
+    if (e.scope !== scope) continue;
+    if (e.action !== state) continue;
+    const motivo =
+      e.details !== null && typeof e.details.motivo === 'string' ? e.details.motivo : null;
+    const trigger =
+      e.details !== null && typeof e.details.trigger === 'string' ? e.details.trigger : null;
+    return { motivo, trigger, date: formatEventDateYyyyMmDd(e.createdAt) };
+  }
+  return null;
+};
+
+const renderStateFlag = (
+  state: string,
+  expires: string | undefined,
+  nowMs: number,
+  detail: StateFlagDetail | null,
+): string | null => {
+  const flagLabel = (label: string): string => {
+    if (detail === null) return `[${label}] `;
+    // Format: [QUARANTINED — motivo/trigger 2026-05-12]
+    // When motivo or trigger is missing (legacy rows / partial
+    // details), drop that segment so the flag stays readable.
+    const segments: string[] = [];
+    if (detail.motivo !== null && detail.trigger !== null) {
+      segments.push(`${detail.motivo}/${detail.trigger}`);
+    } else if (detail.motivo !== null) {
+      segments.push(detail.motivo);
+    } else if (detail.trigger !== null) {
+      segments.push(detail.trigger);
+    }
+    segments.push(detail.date);
+    return `[${label} — ${segments.join(' ')}] `;
+  };
+  if (state === 'quarantined') return flagLabel('QUARANTINED');
+  if (state === 'invalidated') return flagLabel('INVALIDATED');
+  if (state === 'proposed') return flagLabel('PROPOSED');
+  if (state === 'active' && isExpired(expires, nowMs)) {
+    return `[EXPIRED ${expires}] `;
+  }
+  return null;
+};
+
+const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[]): SlashResult => {
   if (args.length > 1) {
     return {
       kind: 'error',
@@ -156,8 +284,48 @@ const handleList = (registry: MemoryRegistry, args: string[]): SlashResult => {
       ? `memories (${entries.length}, deduplicated by name):`
       : `memories in scope '${scope}' (${entries.length}):`;
   const lines = [header];
+
+  // For each listing, peek the body so we can render `state` and
+  // `expires`. `peek` is the canonical no-audit read — operator
+  // running /memory list isn't reading individual memories, just
+  // inspecting metadata, so no `read` event lands. File-missing /
+  // malformed cases get a marker (`[ORPHAN]` / `[MALFORMED]`) by
+  // intent: this is the operator-facing surface where hand-editing
+  // errors should be visible so the operator can fix them. The
+  // model-facing surfaces (retrieval memory view, eager-load,
+  // `memory_read` tool) filter these out via the state-filter path
+  // in `registry.list({ states: ['active'] })`. Operator surface
+  // ⇒ show; model surface ⇒ hide — two audiences with opposite
+  // needs for the same anomalous data.
+  //
+  // `nowMs = ctx.now()` flows into renderStateFlag's expiry check
+  // below. If a future change routes the list call through
+  // `registry.list({ includeExpired: false, nowMs })`, the
+  // explicit `nowMs` param is what propagates — the registry's
+  // default `Date.now()` would NOT observe `ctx.now` overrides
+  // from test fixtures. Keep the explicit threading honest.
+  const nowMs = ctx.now();
   for (const l of entries) {
-    lines.push(`  [${l.scope}] ${l.name} — ${l.entry.hook}`);
+    const peek = registry.peek(l.name, { scope: l.scope });
+    if (peek.kind === 'unknown' || peek.kind === 'missing') {
+      lines.push(`  [${l.scope}] [ORPHAN] ${l.name} — ${l.entry.hook}`);
+      continue;
+    }
+    if (peek.kind === 'malformed') {
+      lines.push(`  [${l.scope}] [MALFORMED] ${l.name} — ${l.entry.hook} (${peek.error})`);
+      continue;
+    }
+    const fm = peek.file.frontmatter;
+    const state = fm.state ?? 'active';
+    // Non-active states get a DB lookup for motivo+trigger+date —
+    // active entries skip the read because there's no flag to
+    // enrich. The lookup gates the cost behind the rare path.
+    const detail = state !== 'active' ? lookupStateDetail(ctx.db, l.scope, l.name, state) : null;
+    const flag = renderStateFlag(state, fm.expires, nowMs, detail);
+    const expiresSuffix =
+      fm.expires !== undefined && !isExpired(fm.expires, nowMs) ? ` (expires ${fm.expires})` : '';
+    const prefix = flag ?? '';
+    lines.push(`  [${l.scope}] ${prefix}${l.name} — ${l.entry.hook}${expiresSuffix}`);
   }
   return { kind: 'ok', notes: lines };
 };
@@ -323,12 +491,40 @@ interface AuditFlags {
   // cross-session because session-scoped on a NULL session
   // would return zero rows confusingly.
   allSessions: boolean;
+  // Optional trigger-source filter. Two forms accepted:
+  //   - `--trigger <literal>` — exact match on `details.trigger`
+  //     (e.g., `operator_driven`, `verify_failed`, `user_purge`).
+  //   - `--trigger operator` / `--trigger detector` — semantic
+  //     shortcuts: `operator` matches `operator_driven`;
+  //     `detector` matches every auto-detector trigger
+  //     (`verify_failed`, `user_override_repeated`,
+  //     `conflict_detected`, `trust_revoked`).
+  // Forensic operator separates manual transitions (their own
+  // `/memory quarantine` / `/memory delete`) from automatic
+  // detector firings — load-bearing once Slices 2-5 ship their
+  // auto-detectors.
+  triggerFilter: string | null;
 }
+
+// Set view over the canonical `DETECTOR_TRIGGERS` tuple for O(1)
+// lookup in `triggerMatches`. The tuple itself is the single
+// source of truth (`eviction-events.ts`); building the Set lazily
+// once at module load keeps the tuple → set asymmetry purely
+// internal to this consumer.
+const DETECTOR_TRIGGER_SET: ReadonlySet<string> = new Set(DETECTOR_TRIGGERS);
+
+const triggerMatches = (eventTrigger: string | null, filter: string): boolean => {
+  if (eventTrigger === null) return false;
+  if (filter === 'operator') return eventTrigger === OPERATOR_DRIVEN_TRIGGER;
+  if (filter === 'detector') return DETECTOR_TRIGGER_SET.has(eventTrigger);
+  return eventTrigger === filter;
+};
 
 const parseAuditFlags = (args: string[]): AuditFlags | { error: string } => {
   let limit = 50;
   let name: string | null = null;
   let allSessions = false;
+  let triggerFilter: string | null = null;
   let i = 0;
   while (i < args.length) {
     const a = args[i] as string;
@@ -363,11 +559,28 @@ const parseAuditFlags = (args: string[]): AuditFlags | { error: string } => {
       i += 1;
       continue;
     }
+    if (a === '--trigger') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return {
+          error:
+            '/memory audit: --trigger needs a value (literal e.g. operator_driven, or shortcut: operator | detector)',
+        };
+      }
+      if (triggerFilter !== null) {
+        return {
+          error: `/memory audit: --trigger specified twice (got '${triggerFilter}' then '${next}'); use a single trigger value`,
+        };
+      }
+      triggerFilter = next;
+      i += 2;
+      continue;
+    }
     return {
-      error: `/memory audit: unknown flag '${a}' (try --limit N, --name <name>, --all)`,
+      error: `/memory audit: unknown flag '${a}' (try --limit N, --name <name>, --all, --trigger <source>)`,
     };
   }
-  return { limit, name, allSessions };
+  return { limit, name, allSessions, triggerFilter };
 };
 
 const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
@@ -403,7 +616,45 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
     scopeNote = ' (current session)';
   }
 
+  // Trigger filter is applied AFTER load because trigger lives
+  // inside the JSONB `details` column — filtering at the repo
+  // would need a json_extract index we don't have. In-memory
+  // filter over the (already capped) batch is cheap.
+  //
+  // Note on limit interaction: SQL applies --limit FIRST (most-
+  // recent N rows), then trigger filter narrows in memory. If
+  // the operator wants "every verify_failed in the session" and
+  // there are 100 events with 5 verify_failed scattered through,
+  // a default --limit 50 may not reach all 5. The header text
+  // shows "X/Y after filter" so the operator notices when the
+  // limit was the binding constraint; widening --limit picks up
+  // older matches.
+  let triggerNote = '';
+  if (flags.triggerFilter !== null) {
+    const before = events.length;
+    events = events.filter((e) => {
+      const trig =
+        e.details !== null && typeof e.details.trigger === 'string' ? e.details.trigger : null;
+      return triggerMatches(trig, flags.triggerFilter as string);
+    });
+    triggerNote = ` (trigger: ${flags.triggerFilter}, ${events.length}/${before} after --limit, raise --limit to widen)`;
+  }
+
   if (events.length === 0) {
+    if (flags.triggerFilter !== null) {
+      // Two failure modes share this message: (a) no events at
+      // all in scope, (b) events exist but none match the trigger
+      // filter. Hint the operator at the second case so they can
+      // try the semantic shortcuts (`operator` / `detector`)
+      // before assuming the session is empty.
+      return {
+        kind: 'ok',
+        notes: [
+          `no audit rows matching --trigger ${flags.triggerFilter}${scopeNote}`,
+          '  (try --trigger operator for manual rows, --trigger detector for auto-detector rows)',
+        ],
+      };
+    }
     if (flags.name !== null) {
       return { kind: 'ok', notes: [`no audit rows for '${flags.name}'`] };
     }
@@ -415,8 +666,458 @@ const handleAudit = (ctx: SlashContext, args: string[]): SlashResult => {
     }
     return { kind: 'ok', notes: ['no memory audit rows yet'] };
   }
-  const lines = [`recent memory events${scopeNote} (${events.length}, most recent first):`];
+  const lines = [
+    `recent memory events${scopeNote}${triggerNote} (${events.length}, most recent first):`,
+  ];
   for (const e of events) lines.push(formatAuditRow(e));
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory provenance (S1/T1.6) ─────────────────────────────────────
+
+// Operator surface for the exposure trail (MEMORY.md §11.2). Three
+// query modes; mutual exclusion enforced at parse time:
+//
+//   /memory provenance <name>            session-scoped lookup
+//   /memory provenance <name> --all      cross-session forensic
+//   /memory provenance --tool <id>       what a tool_call exposed
+//   /memory provenance --retrieval <qid> group view of one retrieve_context
+//
+// `--limit N` (default 50) caps the rendered batch. The header
+// always says which mode was selected so the operator doesn't
+// confuse "no rows in this session" with "no rows anywhere".
+
+interface ProvenanceFlags {
+  mode: 'name' | 'tool' | 'retrieval';
+  name: string | null;
+  toolCallId: string | null;
+  retrievalQueryId: string | null;
+  allSessions: boolean;
+  limit: number;
+}
+
+const parseProvenanceFlags = (args: string[]): ProvenanceFlags | { error: string } => {
+  let name: string | null = null;
+  let toolCallId: string | null = null;
+  let retrievalQueryId: string | null = null;
+  let allSessions = false;
+  let limit = 50;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--limit') {
+      const next = args[i + 1];
+      if (next === undefined || !/^\d+$/.test(next)) {
+        return {
+          error: `/memory provenance: --limit needs a positive integer (got ${next ?? 'nothing'})`,
+        };
+      }
+      limit = Number.parseInt(next, 10);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        return { error: `/memory provenance: invalid limit '${next}'` };
+      }
+      i += 2;
+      continue;
+    }
+    if (a === '--tool') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/memory provenance: --tool needs a tool_call id' };
+      }
+      toolCallId = next;
+      i += 2;
+      continue;
+    }
+    if (a === '--retrieval') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/memory provenance: --retrieval needs a retrieval_query id' };
+      }
+      retrievalQueryId = next;
+      i += 2;
+      continue;
+    }
+    if (a === '--all') {
+      allSessions = true;
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return {
+        error: `/memory provenance: unknown flag '${a}' (try --tool, --retrieval, --all, --limit)`,
+      };
+    }
+    // Positional: memory name (only one allowed).
+    if (name !== null) {
+      return {
+        error: `/memory provenance: extra positional '${a}' — only one memory name allowed`,
+      };
+    }
+    name = a;
+    i += 1;
+  }
+  // Mutual exclusion between the three modes. `name` mode is the
+  // default when a positional is supplied; --tool / --retrieval
+  // explicitly select the other modes; mixing is a usage error
+  // (the underlying queries answer different questions).
+  const modes: ('name' | 'tool' | 'retrieval')[] = [];
+  if (name !== null) modes.push('name');
+  if (toolCallId !== null) modes.push('tool');
+  if (retrievalQueryId !== null) modes.push('retrieval');
+  if (modes.length === 0) {
+    return {
+      error: '/memory provenance: needs a memory name or --tool <id> or --retrieval <qid>',
+    };
+  }
+  if (modes.length > 1) {
+    return {
+      error: `/memory provenance: modes are mutually exclusive (picked ${modes.join(' + ')}) — pick one of: name, --tool, --retrieval`,
+    };
+  }
+  if (allSessions && modes[0] !== 'name') {
+    return {
+      error: '/memory provenance: --all only applies to the name lookup',
+    };
+  }
+  const mode = modes[0] as 'name' | 'tool' | 'retrieval';
+  return { mode, name, toolCallId, retrievalQueryId, allSessions, limit };
+};
+
+const formatProvenanceRow = (row: MemoryProvenanceRow): string => {
+  const ts = formatAuditTimestamp(row.createdAt);
+  const tc = row.toolCallId !== null ? row.toolCallId.slice(0, 8) : 'eager---';
+  // Show hash prefix when present — full 64-char hex hides actual
+  // identifying info we'd want at-a-glance; first 8 chars match
+  // the existing prefix convention for session/tool ids.
+  const hash = row.memoryContentHash !== null ? row.memoryContentHash.slice(0, 8) : '--------';
+  const state = row.memoryStateAtExposure ?? 'active';
+  // retrieval-only details: position + query id prefix when set.
+  let groupDetail = '';
+  if (row.surface === 'retrieve_context' && row.retrievalQueryId !== null) {
+    const qid = row.retrievalQueryId.slice(0, 8);
+    const pos = row.positionInCorpus !== null ? `#${row.positionInCorpus}` : '#?';
+    groupDetail = ` · retrieval=${qid} ${pos}`;
+  }
+  return `  ${ts} · ${row.surface.padEnd(16)} · ${row.memoryScope}/${row.memoryName} · tc=${tc} · state=${state} · hash=${hash}${groupDetail}`;
+};
+
+const handleProvenance = (ctx: SlashContext, args: string[]): SlashResult => {
+  const flags = parseProvenanceFlags(args);
+  if ('error' in flags) return { kind: 'error', message: flags.error };
+
+  const sessionId = ctx.currentSessionId();
+  let rows: MemoryProvenanceRow[];
+  let header: string;
+
+  if (flags.mode === 'name') {
+    const name = flags.name as string;
+    if (flags.allSessions) {
+      rows = listGlobalProvenanceByName(ctx.db, name, flags.limit);
+      header = `exposures for '${name}' (all sessions)`;
+    } else if (sessionId === null) {
+      // No current session yet — fall through to cross-session to
+      // avoid the confusing "0 rows in current session" header.
+      rows = listGlobalProvenanceByName(ctx.db, name, flags.limit);
+      header = `exposures for '${name}' (no current session — showing all)`;
+    } else {
+      rows = listProvenanceByName(ctx.db, sessionId, name, flags.limit);
+      header = `exposures for '${name}' (current session)`;
+    }
+  } else if (flags.mode === 'tool') {
+    if (sessionId === null) {
+      return {
+        kind: 'error',
+        message:
+          '/memory provenance --tool: needs an active session (tool_call ids are session-scoped)',
+      };
+    }
+    rows = listProvenanceForToolCall(ctx.db, sessionId, flags.toolCallId as string, flags.limit);
+    header = `exposures during tool_call ${(flags.toolCallId as string).slice(0, 8)}`;
+  } else {
+    // retrieval mode
+    if (sessionId === null) {
+      return {
+        kind: 'error',
+        message:
+          '/memory provenance --retrieval: needs an active session (retrieval_query ids are session-scoped)',
+      };
+    }
+    rows = listExposuresInRetrieval(
+      ctx.db,
+      sessionId,
+      flags.retrievalQueryId as string,
+      flags.limit,
+    );
+    header = `exposures from retrieval ${(flags.retrievalQueryId as string).slice(0, 8)} (position order)`;
+  }
+
+  if (rows.length === 0) {
+    if (flags.mode === 'name' && !flags.allSessions && sessionId !== null) {
+      return {
+        kind: 'ok',
+        notes: [`${header}: 0 rows`, '  (try --all for cross-session forensic)'],
+      };
+    }
+    return { kind: 'ok', notes: [`${header}: 0 rows`] };
+  }
+
+  const lines = [`${header} (${rows.length}):`];
+  for (const r of rows) lines.push(formatProvenanceRow(r));
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory conflicts (S4/T4.4) ─────────────────────────────────────
+
+// Surface conflict_detected pairs forensically. Reads eviction_events
+// filtered to `trigger = 'conflict_detected'` and outcome = 'applied'.
+// Cross-session by design — operator wants to see the full history of
+// detected conflicts, not just the current session. `--limit N`
+// (default 50) caps the rendered batch.
+
+interface ConflictsFlags {
+  limit: number;
+}
+
+const parseConflictsFlags = (args: string[]): ConflictsFlags | { error: string } => {
+  let limit = 50;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--limit') {
+      const next = args[i + 1];
+      if (next === undefined || !/^\d+$/.test(next)) {
+        return {
+          error: `/memory conflicts: --limit needs a positive integer (got ${next ?? 'nothing'})`,
+        };
+      }
+      limit = Number.parseInt(next, 10);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        return { error: `/memory conflicts: invalid limit '${next}'` };
+      }
+      i += 2;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return { error: `/memory conflicts: unknown flag '${a}' (try --limit)` };
+    }
+    return { error: `/memory conflicts: unexpected positional '${a}'` };
+  }
+  return { limit };
+};
+
+const handleConflicts = (ctx: SlashContext, args: string[]): SlashResult => {
+  const flags = parseConflictsFlags(args);
+  if ('error' in flags) return { kind: 'error', message: flags.error };
+
+  const events = listEvictionEventsByTrigger(ctx.db, 'conflict_detected', flags.limit);
+  if (events.length === 0) {
+    return {
+      kind: 'ok',
+      notes: [
+        'no conflict_detected events recorded (heuristic returns silence by default — narrow bar)',
+      ],
+    };
+  }
+
+  const lines = [`conflict_detected events (${events.length}, most recent first):`];
+  for (const e of events) {
+    // Parse evidence to extract winner/loser/kind for inline display.
+    // Evidence JSON shape (S13 LLM-judge plan, TODO Phase 2):
+    //   { winner_id, loser_id, conflict_kind, shared_concept?,
+    //     confidence?, resolver_reason?, ... }
+    // `shared_concept` is the canonical name (was `shared_token` in
+    // the rolled-back S4 heuristic — kept the field renamed forward
+    // so when S13 lands, slash + producer agree). `confidence` is
+    // LLM-judge specific; absent for non-LLM-emitted rows.
+    let winner = '?';
+    let loser = '?';
+    let kind = '?';
+    let sharedConcept: string | null = null;
+    let confidence: number | null = null;
+    try {
+      const evidence = JSON.parse(e.evidenceJson) as Record<string, unknown>;
+      if (typeof evidence.winner_id === 'string') winner = evidence.winner_id;
+      if (typeof evidence.loser_id === 'string') loser = evidence.loser_id;
+      if (typeof evidence.conflict_kind === 'string') kind = evidence.conflict_kind;
+      if (typeof evidence.shared_concept === 'string') sharedConcept = evidence.shared_concept;
+      if (typeof evidence.confidence === 'number') confidence = evidence.confidence;
+    } catch {
+      // Malformed evidence JSON — fall back to placeholders. Audit
+      // row itself is intact; just couldn't decode the payload.
+    }
+    const ts = formatAuditTimestamp(e.recordedAt);
+    const conceptDetail = sharedConcept !== null ? ` concept="${sharedConcept}"` : '';
+    const confDetail = confidence !== null ? ` conf=${confidence.toFixed(2)}` : '';
+    lines.push(`  ${ts} · ${kind} · winner=${winner} loser=${loser}${conceptDetail}${confDetail}`);
+  }
+  return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory trust status (S5/T5.4) ──────────────────────────────────
+//
+// Operator-facing inspector for the shared-corpus trust state. Read-
+// only: no transitions, no modal, no DB writes. Surfaces enough
+// information for the operator to answer "do I need to re-confirm
+// trust, and if so, against what?" without restarting the agent.
+//
+// Output sections:
+//   - `path` — absolute scope root (typically `<repo>/.agent/memory/
+//     shared`). Surfaced so the operator can `cat` files outside
+//     the slash interaction if they want deeper inspection.
+//   - `status` — one of: `in sync`, `DIVERGED`, `never confirmed`,
+//     `VERIFY FAILED`. Diverged is upper-case so the operator's eye
+//     catches the security-relevant state on a scroll-by; the other
+//     states aren't load-bearing enough to warrant the same visual
+//     weight.
+//   - hashes — last confirmed + current side-by-side on divergence,
+//     just the current hash otherwise. Truncated to first 12 hex
+//     chars in the line; the operator who needs the full hash can
+//     query the DB directly (intentionally not exposed via the
+//     slash to keep the output scannable).
+//   - inventory — file count + total bytes (NOT per-file enumeration;
+//     `/memory list --scope shared` is the right tool for that).
+//
+// Args: only `status` is supported as of T5.4. Future extensions
+// (`/memory trust clear`, `/memory trust forget <scope>`) land in
+// follow-up slices when operators ask for them.
+const handleTrust = (registry: MemoryRegistry, ctx: SlashContext, args: string[]): SlashResult => {
+  const sub = args[0];
+  if (sub === undefined) {
+    return {
+      kind: 'error',
+      message: '/memory trust: missing subcommand (try: status, accept, forget)',
+    };
+  }
+  if (sub !== 'status' && sub !== 'accept' && sub !== 'forget') {
+    return {
+      kind: 'error',
+      message: `/memory trust: unknown subcommand '${sub}' (try: status, accept, forget)`,
+    };
+  }
+  // Extra args beyond `status`/`accept`/`forget` are user error —
+  // refuse rather than silently ignoring, matching the spec's
+  // "explicit is better than implicit" stance for operator-facing
+  // surfaces.
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/memory trust ${sub}: unexpected extra args (${args.slice(1).join(' ')})`,
+    };
+  }
+
+  const sharedRootForAction = registry.roots.projectShared;
+
+  // `/memory trust accept` (S5 IMP/F6). Operator-explicit consent
+  // recorded as a slash command — equivalent to answering 'yes' in
+  // the modal but without re-prompting (operator already typed the
+  // command; THAT is the explicit consent moment). Use case: the
+  // operator cancelled the boot modal (Esc/timeout) → 'deferred'
+  // outcome → eager-load excluded the scope this session. They
+  // want to enable it without restarting; `/memory trust accept`
+  // stamps the current hash and tells them the scope will load
+  // from the NEXT session.
+  if (sub === 'accept') {
+    const currentHash = computeSharedFingerprint(sharedRootForAction);
+    if (currentHash === null) {
+      return {
+        kind: 'error',
+        message: `/memory trust accept: corpus unreadable at ${sharedRootForAction} — cannot record trust`,
+      };
+    }
+    setSharedTrust(ctx.db, sharedRootForAction, currentHash, ctx.now());
+    return {
+      kind: 'ok',
+      notes: [
+        `shared corpus trust recorded for ${sharedRootForAction}`,
+        `  hash: ${currentHash}`,
+        "  (scope will load from the NEXT session boot — this session's eager-load",
+        '   inventory was frozen at bootstrap and is not retroactively patched)',
+      ],
+    };
+  }
+
+  // `/memory trust forget` (S5 IMP/F6). Operator-explicit clear —
+  // removes the stored trust row WITHOUT touching memory state on
+  // disk. Use case: operator wants the next boot to re-prompt as
+  // first-visit (e.g., after they manually edited shared/ and
+  // want a fresh confirmation flow), but does NOT want to
+  // invalidate the existing memories (that's `/memory delete`).
+  if (sub === 'forget') {
+    clearSharedTrust(ctx.db, sharedRootForAction);
+    return {
+      kind: 'ok',
+      notes: [
+        `shared corpus trust cleared for ${sharedRootForAction}`,
+        '  (next boot will fire the first-visit modal; memory states on disk are unchanged)',
+      ],
+    };
+  }
+  // Falls through to status.
+
+  const sharedRoot = registry.roots.projectShared;
+  const stored = getSharedTrust(ctx.db, sharedRoot);
+  const currentHash = computeSharedFingerprint(sharedRoot);
+
+  const lines: string[] = ['shared corpus trust:', `  path: ${sharedRoot}`];
+
+  if (currentHash === null) {
+    // Substrate couldn't fingerprint — fs unreadable. Operator gets
+    // a clear signal that the agent doesn't know the corpus state;
+    // distinct from "no row yet" (recoverable on next confirm) or
+    // "diverged" (operator decision pending).
+    lines.push('  status: VERIFY FAILED — could not read corpus root');
+    return { kind: 'ok', notes: lines };
+  }
+
+  // Inventory line (file count + total bytes). Delegates to the
+  // single corpus-enumeration helper that the fingerprint and the
+  // modal preview also use — symlink rejection and `.tombstones/`
+  // exclusion stay aligned across surfaces by construction.
+  const listing = listSharedCorpusFiles(sharedRoot);
+  const inventory = listing.kind === 'present' ? listing.files : [];
+  const fileCount = inventory.length;
+  let totalBytes = 0;
+  for (const f of inventory) totalBytes += f.bytes;
+
+  // Hash display: full 64-char SHA-256, NOT truncated. A truncated
+  // 12-char prefix is only 48 bits — an attacker who can choose
+  // corpus content can brute-force a hash with the same prefix
+  // (birthday collision ≈ 2^24, seconds on a workstation) and trick
+  // an operator scanning the slash output into believing "barely
+  // diverged" when the substrate already determined DIVERGED on the
+  // full hash. The operator's terminal width handles the line; we
+  // don't optimize for scrollback compactness at the cost of
+  // forgeability.
+  if (stored === null) {
+    // Two distinct flavors of "no trust row" (S5 P0/F2 + CRIT/F1+V2
+    // post-hardening): an EMPTY corpus is safe to silent-seed next
+    // boot (nothing to consent to); a non-empty corpus will instead
+    // trigger a first-visit modal — that's typically the case after
+    // a recent revoke OR a fresh clone of a repo whose shared/ was
+    // never trusted on this machine.
+    if (currentHash === EMPTY_CORPUS_HASH) {
+      lines.push('  status: never confirmed · corpus is empty (next boot will silently seed)');
+    } else {
+      lines.push(
+        '  status: NOT TRUSTED · corpus has content but no trust row (next boot will fire the first-visit modal)',
+      );
+    }
+    lines.push(`  current hash: ${currentHash}`);
+  } else if (stored.lastConfirmedHash === currentHash) {
+    lines.push(
+      `  status: in sync · last confirmed ${formatAuditTimestamp(stored.lastConfirmedAtMs)}`,
+    );
+    lines.push(`  current hash: ${currentHash}`);
+  } else {
+    lines.push(
+      `  status: DIVERGED · last confirmed ${formatAuditTimestamp(stored.lastConfirmedAtMs)}`,
+    );
+    lines.push(`  last hash:    ${stored.lastConfirmedHash}`);
+    lines.push(`  current hash: ${currentHash}`);
+    lines.push('  (a re-confirm modal will fire on next boot if the divergence persists)');
+  }
+  lines.push(`  inventory: ${fileCount} file${fileCount === 1 ? '' : 's'}, ${totalBytes} bytes`);
+
   return { kind: 'ok', notes: lines };
 };
 
@@ -996,6 +1697,235 @@ const findTombstoneInAnyScope = (registry: MemoryRegistry, name: string): FindTo
   return { kind: 'ambiguous', scopes: hits.map((h) => h.scope) };
 };
 
+// ─── /memory quarantine ───────────────────────────────────────────────
+//
+// Operator-driven `active → quarantined` transition. The 4 automatic
+// detectors spec'd in MEMORY.md §6.5.2 (`verify_failed`,
+// `user_override_repeated`, `conflict_detected`, `trust_revoked`)
+// are tracked in `docs/TODO.md` (Slice 0+). This slash command is
+// the manual escape hatch — operator can drive a quarantine when
+// they've spotted a problem the detectors don't yet catch. Same
+// `transitionMemoryState` substrate the detectors will use once
+// shipped; the trigger marker (`operator_driven`) distinguishes
+// manual from automatic in forensic queries.
+//
+// Args: `<name> --motivo <kind> [--evidence "..."] [--scope <s>]`.
+// Motivo MUST be one spec admits for active→quarantined per
+// EVICTION.md §4.1 + §5.1: conflict / shift / security / low_roi
+// / irrelevant. (`quota` / `expired` / `user_purge` are real
+// motivos but not applicable to active→quarantined as a manual
+// verb; they're terminal-side or cross-substrate.)
+
+// Spec-admissible motivos for `active → quarantined` per
+// EVICTION.md §4.1 table. The state machine (LEGAL_TRANSITIONS in
+// eviction-events.ts:155) refuses any other motivo with
+// `illegal_transition`; refusing them at the slash boundary
+// surfaces a clearer operator error than leaking the state-machine
+// vocabulary.
+//
+// Note on spec conflict: MEMORY.md §6.5.2 lists `verify_failed →
+// motivo: shift` as a quarantine trigger, but EVICTION.md §4.1 only
+// admits `conflict` + `low_roi` for active→quarantined. The two
+// specs are inconsistent; the state machine is authoritative.
+// Slice 2 (`verify_failed` detector) will need a spec amendment OR
+// will emit `motivo: conflict` with a trigger that disambiguates
+// (the same trigger marker pattern this slash uses for operator
+// commands).
+const VALID_QUARANTINE_MOTIVOS: ReadonlySet<EvictionMotivo> = new Set(['conflict', 'low_roi']);
+
+const isQuarantineMotivo = (s: string): s is EvictionMotivo =>
+  VALID_QUARANTINE_MOTIVOS.has(s as EvictionMotivo);
+
+const handleQuarantine = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  // Two-pass arg parse: positional `name` + flag pairs.
+  // `--motivo <kind>` is required; `--evidence "..."` and
+  // `--scope <s>` are optional. Unknown flags are refused so a
+  // typo doesn't silently take the default code path.
+  let name: string | undefined;
+  let motivoArg: string | undefined;
+  let evidenceText: string | undefined;
+  let scopeArg: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] as string;
+    if (a === '--motivo') {
+      motivoArg = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a === '--evidence') {
+      // No hard length cap today. The note is JSON-encoded and
+      // scrub-redacted before landing in eviction_events.evidence_json
+      // (medium-sensitivity per AUDIT.md §1). Operator-friendly soft
+      // cap: keep notes under ~500 chars so /memory audit + audit
+      // dump remain scannable. Spec EVICTION §6.1 doesn't mandate a
+      // max; a future tightening can land here when a real abuse
+      // pattern shows up.
+      evidenceText = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a === '--scope') {
+      scopeArg = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return {
+        kind: 'error',
+        message: `/memory quarantine: unknown flag '${a}' (try --motivo, --evidence, --scope)`,
+      };
+    }
+    if (name === undefined) {
+      name = a;
+      continue;
+    }
+    return {
+      kind: 'error',
+      message: `/memory quarantine: too many positional args (got '${a}' after name '${name}')`,
+    };
+  }
+
+  if (name === undefined) {
+    return {
+      kind: 'error',
+      message:
+        '/memory quarantine: missing name (usage: /memory quarantine <name> --motivo <kind> [--evidence "..."] [--scope <s>])',
+    };
+  }
+  if (motivoArg === undefined) {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: --motivo is required (one of: ${[...VALID_QUARANTINE_MOTIVOS].join(', ')})`,
+    };
+  }
+  if (!isQuarantineMotivo(motivoArg)) {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: invalid motivo '${motivoArg}' (expected: ${[...VALID_QUARANTINE_MOTIVOS].join(', ')})`,
+    };
+  }
+  const motivo: EvictionMotivo = motivoArg;
+
+  let scope: MemoryScope | undefined;
+  if (scopeArg !== undefined) {
+    if (!VALID_SINGLE_SCOPES.has(scopeArg)) {
+      return {
+        kind: 'error',
+        message: `/memory quarantine: invalid scope '${scopeArg}' (expected: user, local, shared)`,
+      };
+    }
+    scope = memoryScopeFromSingleArg(scopeArg) ?? undefined;
+  }
+
+  // Locate the memory. peek (no audit) — this is a pre-action
+  // probe, not an operator-initiated read.
+  const peek = scope !== undefined ? registry.peek(name, { scope }) : registry.peek(name);
+  if (peek.kind === 'unknown') {
+    const scopeQual = scope !== undefined ? ` in scope ${scopeArg}` : '';
+    return {
+      kind: 'error',
+      message: `/memory quarantine: no memory named '${name}'${scopeQual}`,
+    };
+  }
+  if (peek.kind === 'missing') {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: '${name}' body file is missing — use /memory delete instead`,
+    };
+  }
+  if (peek.kind === 'malformed') {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: '${name}' frontmatter is malformed (${peek.error}) — fix the file or use /memory delete`,
+    };
+  }
+
+  const currentState = peek.file.frontmatter.state ?? 'active';
+  if (currentState !== 'active') {
+    return {
+      kind: 'error',
+      message: `/memory quarantine: '${name}' is already in state '${currentState}' (only active memories can be quarantined via this command)`,
+    };
+  }
+
+  // Modal preview + confirm. Shows motivo, current state, and the
+  // operator's evidence note so they double-check before committing
+  // the transition.
+  const preview = [
+    `motivo:  ${motivo}`,
+    `state:   ${currentState} → quarantined`,
+    evidenceText !== undefined ? `evidence: ${evidenceText}` : '(no evidence note supplied)',
+    `scope:   ${peek.scope}`,
+  ];
+  const answer = await ctx.modalManager.askMemoryAction({
+    action: 'quarantine',
+    title: 'Quarantine memory',
+    subject: `${peek.scope}/${name}`,
+    preview,
+    question:
+      'Quarantine this memory? It stays on disk with a ranking penalty until restored or evicted.',
+  });
+  if (answer !== 'yes') {
+    return {
+      kind: 'ok',
+      notes: [`/memory quarantine cancelled (operator answered ${answer})`],
+    };
+  }
+
+  // Transition via the substrate. `trigger: 'operator_driven'` is
+  // the canonical attribution for slash-driven transitions —
+  // forensic queries filter on it to distinguish manual from
+  // detector-driven. The OPERATOR_DRIVEN_EVIDENCE_MARKER on the
+  // payload also bypasses the per-motivo evidence schema (the
+  // operator's note is unstructured by nature).
+  const sessionId = ctx.currentSessionId();
+  const evidencePayload: Record<string, unknown> = {
+    [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true,
+    source: 'slash_quarantine',
+  };
+  if (evidenceText !== undefined) {
+    evidencePayload.note = evidenceText;
+  }
+
+  const result = await transitionMemoryState({
+    db: ctx.db,
+    registry,
+    roots: registry.roots,
+    scope: peek.scope,
+    name,
+    toState: 'quarantined',
+    motivo,
+    trigger: OPERATOR_DRIVEN_TRIGGER,
+    actor: 'user',
+    evidence: evidencePayload,
+    ...(sessionId !== null ? { sessionId } : {}),
+    cwd: ctx.baseConfig.cwd,
+    now: ctx.now,
+    ...(ctx.dispatchHooks !== undefined ? { fireHook: ctx.dispatchHooks } : {}),
+  });
+
+  if (result.kind !== 'applied') {
+    return mapTransitionFailure('/memory quarantine', result);
+  }
+
+  registry.reload();
+  return {
+    kind: 'ok',
+    notes: [
+      `quarantined ${peek.scope}/${name}`,
+      `  motivo: ${motivo}`,
+      `  trigger: ${OPERATOR_DRIVEN_TRIGGER}`,
+      evidenceText !== undefined ? `  evidence: ${evidenceText}` : '',
+      'use /memory restore to bring it back; /memory delete to fully evict',
+    ].filter((l) => l.length > 0),
+  };
+};
+
 const handleRestore = async (
   registry: MemoryRegistry,
   ctx: SlashContext,
@@ -1402,7 +2332,8 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
 
 export const memoryCommand: SlashCommand = {
   name: 'memory',
-  description: 'manage cross-session memories (list/show/audit/delete/promote/demote)',
+  description:
+    'manage cross-session memories (list/show/audit/provenance/delete/quarantine/restore/promote/demote/trust)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -1415,25 +2346,33 @@ export const memoryCommand: SlashCommand = {
     if (sub === undefined) return handleSummary(registry);
     switch (sub) {
       case 'list':
-        return handleList(registry, args.slice(1));
+        return handleList(registry, ctx, args.slice(1));
       case 'show':
         return handleShow(registry, ctx, args.slice(1));
       case 'audit':
         return handleAudit(ctx, args.slice(1));
+      case 'provenance':
+        return handleProvenance(ctx, args.slice(1));
+      case 'conflicts':
+        return handleConflicts(ctx, args.slice(1));
       case 'metrics':
         return handleMetrics(ctx, args.slice(1));
       case 'delete':
         return handleDelete(registry, ctx, args.slice(1));
+      case 'quarantine':
+        return handleQuarantine(registry, ctx, args.slice(1));
       case 'restore':
         return handleRestore(registry, ctx, args.slice(1));
       case 'promote':
         return handlePromote(registry, ctx, args.slice(1));
       case 'demote':
         return handleDemote(registry, ctx, args.slice(1));
+      case 'trust':
+        return handleTrust(registry, ctx, args.slice(1));
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, metrics, delete, restore, promote, demote)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote, trust)`,
         };
     }
   },

@@ -6,7 +6,8 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { getSession, listSessions } from '../../src/storage/repos/sessions.ts';
+import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
+import { createSession, getSession, listSessions } from '../../src/storage/repos/sessions.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
@@ -2321,6 +2322,439 @@ describe('runAgent', () => {
       });
       expect(result.status).toBe('done');
       expect(sinkCalls).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('eager-load provenance (S1/T1.4)', () => {
+    test('emits one provenance row per eagerExposure after createSession', async () => {
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        eagerExposures: [
+          {
+            scope: 'user',
+            name: 'role',
+            memoryContentHash: 'a'.repeat(64),
+            memoryStateAtExposure: 'active',
+          },
+          {
+            scope: 'project_local',
+            name: 'commit-style',
+            memoryContentHash: 'b'.repeat(64),
+            memoryStateAtExposure: 'quarantined',
+          },
+        ],
+      });
+      expect(result.status).toBe('done');
+      const sessions = listSessions(db);
+      const sid = sessions[0]?.id;
+      expect(sid).toBeDefined();
+      if (sid === undefined) return;
+      const roleRows = listProvenanceForMemory(db, sid, 'user', 'role');
+      expect(roleRows).toHaveLength(1);
+      expect(roleRows[0]?.surface).toBe('eager');
+      expect(roleRows[0]?.toolCallId).toBeNull();
+      expect(roleRows[0]?.memoryContentHash).toBe('a'.repeat(64));
+      expect(roleRows[0]?.memoryStateAtExposure).toBe('active');
+      const commitRows = listProvenanceForMemory(db, sid, 'project_local', 'commit-style');
+      expect(commitRows).toHaveLength(1);
+      expect(commitRows[0]?.memoryStateAtExposure).toBe('quarantined');
+    });
+
+    test('empty eagerExposures array emits NO rows', async () => {
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        eagerExposures: [],
+      });
+      expect(result.status).toBe('done');
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      // No rows for any conceivable (scope, name) pair — sample-check
+      // a plausible one to guard against accidental fall-through.
+      expect(listProvenanceForMemory(db, sid, 'user', 'whatever')).toEqual([]);
+    });
+
+    test('omitted eagerExposures emits NO rows (default path)', async () => {
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+      });
+      expect(result.status).toBe('done');
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      expect(listProvenanceForMemory(db, sid, 'user', 'role')).toEqual([]);
+    });
+
+    test('eager emit is per-key idempotent across resume: pre-existing (scope, name) skips, no duplicate', async () => {
+      // Resume path (preassignedSessionId) reuses an existing session
+      // row. The eager-emit block in the loop would otherwise re-emit
+      // the same (session, memory, eager) rows every restart —
+      // schema has no UNIQUE constraint so duplicates pile up. The
+      // getEagerProvenanceKeys lookup gates per-key: an exposure
+      // whose (scope, name) is already present is skipped; missing
+      // ones backfill (see the partial-write test below).
+      const { recordProvenance } = await import('../../src/storage/repos/memory-provenance.ts');
+      // Pre-create a session and seed an eager row to simulate the
+      // "prior boot already emitted" state.
+      const session = createSession(db, { model: 'mock/m', cwd: '/p' });
+      recordProvenance(db, {
+        sessionId: session.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'role',
+        surface: 'eager',
+        memoryContentHash: 'pre-existing',
+        memoryStateAtExposure: 'active',
+      });
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        preassignedSessionId: session.id,
+        eagerExposures: [
+          {
+            scope: 'user',
+            name: 'role',
+            memoryContentHash: 'fresh-hash',
+            memoryStateAtExposure: 'active',
+          },
+        ],
+      });
+      expect(result.status).toBe('done');
+      const rows = listProvenanceForMemory(db, session.id, 'user', 'role');
+      // Exactly one row remains — the pre-existing one. The resume
+      // emit MUST have skipped this (scope, name), so fresh-hash
+      // never landed.
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.memoryContentHash).toBe('pre-existing');
+    });
+
+    test('eager emit resumes partial writes: missing inventory rows backfill on the next run', async () => {
+      // Review regression. Pre-fix the loop asked "does ANY eager row
+      // exist for this session?" If yes, skip the entire emit. So a
+      // previous boot that landed ONE exposure before hitting a
+      // transient SQLITE_BUSY trapped the session: the next resume
+      // saw the single row, declared "already done", and the missing
+      // inventory entries stayed missing forever — even after the DB
+      // recovered. Provenance accuracy this feature exists to add
+      // gets silently broken.
+      //
+      // Post-fix the loop reads the SET of recorded (scope, name)
+      // keys and emits only the missing ones, so a partial first
+      // write recovers on the next resume.
+      const { recordProvenance } = await import('../../src/storage/repos/memory-provenance.ts');
+      const session = createSession(db, { model: 'mock/m', cwd: '/p' });
+      // Simulate the partial-write state: `user/role` landed, but
+      // `user/style` did NOT. The next resume's inventory still
+      // contains both.
+      recordProvenance(db, {
+        sessionId: session.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'role',
+        surface: 'eager',
+        memoryContentHash: 'role-hash',
+        memoryStateAtExposure: 'active',
+      });
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        preassignedSessionId: session.id,
+        eagerExposures: [
+          {
+            scope: 'user',
+            name: 'role',
+            memoryContentHash: 'role-hash',
+            memoryStateAtExposure: 'active',
+          },
+          {
+            scope: 'user',
+            name: 'style',
+            memoryContentHash: 'style-hash',
+            memoryStateAtExposure: 'active',
+          },
+        ],
+      });
+      expect(result.status).toBe('done');
+
+      // role: still one row (pre-existing); resume MUST NOT have
+      // duplicated it.
+      const roleRows = listProvenanceForMemory(db, session.id, 'user', 'role');
+      expect(roleRows).toHaveLength(1);
+      expect(roleRows[0]?.memoryContentHash).toBe('role-hash');
+
+      // style: previously missing, now backfilled by the resume. The
+      // bug this fix addresses surfaces if this assertion fails —
+      // pre-fix it would be 0.
+      const styleRows = listProvenanceForMemory(db, session.id, 'user', 'style');
+      expect(styleRows).toHaveLength(1);
+      expect(styleRows[0]?.memoryContentHash).toBe('style-hash');
+    });
+
+    test('invalid memoryScope on one exposure does NOT abort run (audit drift)', async () => {
+      // The repo guard throws for bogus scopes; the loop must
+      // swallow + log to stderr so a bad inventory row doesn't
+      // crash session bring-up. Following rows still emit.
+      const original = process.stderr.write.bind(process.stderr);
+      const captured: string[] = [];
+      process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+        captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+        return true;
+      }) as typeof process.stderr.write;
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      try {
+        const result = await runAgent({
+          provider: handle.provider,
+          toolRegistry: registry,
+          permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+          db,
+          cwd: '/p',
+          userPrompt: 'hi',
+          eagerExposures: [
+            {
+              scope: 'bogus' as never,
+              name: 'broken',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+            {
+              scope: 'user',
+              name: 'good',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+          ],
+        });
+        expect(result.status).toBe('done');
+      } finally {
+        process.stderr.write = original;
+      }
+      expect(captured.join('')).toMatch(/AUDIT DRIFT.*eager exposure.*broken/);
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      // The good entry's row landed even though the bad entry threw.
+      expect(listProvenanceForMemory(db, sid, 'user', 'good')).toHaveLength(1);
+    });
+  });
+
+  describe('memoryExcludeScopes wraps the tool-facing registry (S5 review)', () => {
+    // Review regression: when memoryExcludeScopes is non-empty
+    // (shared trust probe returned verify_failed / deferred /
+    // revoked), the harness wired retrieve_context against an
+    // excluded registry but exposed the UNFILTERED registry to
+    // memory_list / memory_read / memory_search via
+    // ctx.memoryRegistry. The model could call those tools and
+    // enumerate / read project_shared bodies the operator marked
+    // offline — direct bypass of the trust gate eager-load and
+    // retrieval surfaces already respect.
+    //
+    // Coverage strategy: inject a synthetic tool that captures
+    // ctx.memoryRegistry on its first call, then prove every
+    // read-side method honors the exclusion. Avoids wiring the
+    // full memory_* tool tree into the loop test while still
+    // pinning the harness-level wrapping decision.
+
+    test('ctx.memoryRegistry sees only allowed scopes when memoryExcludeScopes is set', async () => {
+      const { mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createMemoryRegistry } = await import('../../src/memory/registry.ts');
+
+      // Seed both scopes with the same name so the precedence
+      // fallback assertion below has something to land on.
+      const repo = mkdtempSync(join(tmpdir(), 'forja-loop-mem-exclude-'));
+      const roots = {
+        user: join(repo, 'user'),
+        projectShared: join(repo, 'shared'),
+        projectLocal: join(repo, 'local'),
+      };
+      const writeIdx = (dir: string, body: string) => {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'MEMORY.md'), body);
+      };
+      const writeBody = (dir: string, name: string, body: string) => {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(
+          join(dir, `${name}.md`),
+          `---\nname: ${name}\ndescription: hook for ${name}\ntype: feedback\nsource: user_explicit\n---\n\n${body}\n`,
+        );
+      };
+      writeIdx(roots.projectShared, '- [Secret](secret.md) — shared\n');
+      writeBody(roots.projectShared, 'secret', 'ATTACKER_PAYLOAD');
+      writeIdx(roots.user, '- [Secret](secret.md) — user\n');
+      writeBody(roots.user, 'secret', 'benign user body');
+      const memoryRegistry = createMemoryRegistry({ roots });
+
+      // Synthetic tool that captures the ctx-exposed registry on
+      // first invocation. Returning a clean tool result lets the
+      // run finish normally.
+      let captured: typeof memoryRegistry | undefined;
+      const captureTool: Tool<{ x: number }, { ok: true }> = {
+        name: 'capture_registry',
+        description: 'capture ctx.memoryRegistry',
+        inputSchema: { type: 'object', properties: { x: { type: 'number' } } },
+        metadata: { category: 'misc', writes: false, idempotent: true },
+        async execute(_args, ctx) {
+          captured = ctx.memoryRegistry;
+          return { ok: true };
+        },
+      };
+
+      const provider = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'capture_registry', input: { x: 1 } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const tools = createToolRegistry();
+      tools.register(captureTool);
+
+      const result = await runAgent({
+        provider: provider.provider,
+        toolRegistry: tools,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        memoryRegistry,
+        memoryExcludeScopes: ['project_shared'],
+      });
+      expect(result.status).toBe('done');
+      if (captured === undefined) throw new Error('expected ctx.memoryRegistry to be captured');
+
+      // 1. list({}) excludes project_shared bodies entirely.
+      const listed = captured.list({});
+      expect(listed.map((l) => l.scope)).not.toContain('project_shared');
+
+      // 2. Precedence fallback: dedup-by-name lands user/secret (NOT
+      //    project_shared/secret which would normally win precedence
+      //    local > shared > user).
+      const deduped = captured.list({ deduplicateByName: true });
+      const dedupedScopes = deduped.filter((l) => l.name === 'secret').map((l) => l.scope);
+      expect(dedupedScopes).toEqual(['user']);
+
+      // 3. read(name) falls through to user when project_shared is
+      //    excluded. The shared body containing ATTACKER_PAYLOAD
+      //    MUST NOT leak through.
+      const readResult = captured.read('secret');
+      expect(readResult.kind).toBe('present');
+      if (readResult.kind === 'present') {
+        expect(readResult.scope).toBe('user');
+        expect(readResult.file.body).not.toContain('ATTACKER_PAYLOAD');
+      }
+
+      // 4. Pinned excluded scope is closed at every read-side
+      //    surface. Pre-fix the same calls would have returned the
+      //    project_shared entry.
+      expect(captured.list({ scope: 'project_shared' })).toEqual([]);
+      expect(captured.read('secret', { scope: 'project_shared' }).kind).toBe('unknown');
+      expect(captured.peek('secret', { scope: 'project_shared' }).kind).toBe('unknown');
+      expect(captured.search('ATTACKER', { scope: 'project_shared' })).toEqual([]);
+
+      // 5. Default-scope search filters out hits in excluded scope.
+      //    deep:true would read body bytes — even then, the shared
+      //    hit must NOT surface.
+      const deepHits = captured.search('ATTACKER', { deep: true });
+      expect(deepHits.map((h) => h.scope)).not.toContain('project_shared');
+    });
+
+    test('memoryExcludeScopes undefined → ctx.memoryRegistry is the unwrapped base', async () => {
+      // Sanity: the wrapping is conditional. Without exclusion the
+      // tool ctx must see the unmodified registry. Without this
+      // test, a future regression that wraps unconditionally would
+      // pay the closure cost on every read of every session.
+      const { mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createMemoryRegistry } = await import('../../src/memory/registry.ts');
+
+      const repo = mkdtempSync(join(tmpdir(), 'forja-loop-mem-noexclude-'));
+      const roots = {
+        user: join(repo, 'user'),
+        projectShared: join(repo, 'shared'),
+        projectLocal: join(repo, 'local'),
+      };
+      mkdirSync(roots.projectShared, { recursive: true });
+      writeFileSync(join(roots.projectShared, 'MEMORY.md'), '- [S](s.md) — shared\n');
+      writeFileSync(
+        join(roots.projectShared, 's.md'),
+        '---\nname: s\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const memoryRegistry = createMemoryRegistry({ roots });
+
+      let captured: typeof memoryRegistry | undefined;
+      const captureTool: Tool<{ x: number }, { ok: true }> = {
+        name: 'capture_registry',
+        description: 'capture ctx.memoryRegistry',
+        inputSchema: { type: 'object', properties: { x: { type: 'number' } } },
+        metadata: { category: 'misc', writes: false, idempotent: true },
+        async execute(_args, ctx) {
+          captured = ctx.memoryRegistry;
+          return { ok: true };
+        },
+      };
+      const provider = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'capture_registry', input: { x: 1 } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const tools = createToolRegistry();
+      tools.register(captureTool);
+
+      await runAgent({
+        provider: provider.provider,
+        toolRegistry: tools,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        memoryRegistry,
+      });
+      // Reference equality: no wrapping when exclusion is omitted.
+      expect(captured).toBe(memoryRegistry);
     });
   });
 });

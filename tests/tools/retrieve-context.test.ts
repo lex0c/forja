@@ -485,3 +485,137 @@ describe('buildRetrievalRunner — end-to-end', () => {
     expect(traces).toHaveLength(2);
   });
 });
+
+describe('buildRetrievalRunner — retrieve_context provenance (S1/T1.5)', () => {
+  const seedToolCall = async (): Promise<string> => {
+    const { createToolCall } = await import('../../src/storage/repos/tool-calls.ts');
+    const msgId = appendMessage(db, { sessionId, role: 'assistant', content: 'x' }).id;
+    return createToolCall(db, { messageId: msgId, toolName: 'retrieve_context', input: {} }).id;
+  };
+
+  test('emits one provenance row per included memory entry', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Auth](auth.md) — h\n- [Logs](logs.md) — h\n');
+    writeBody(roots.user, 'auth', 'auth body talks about authentication');
+    writeBody(roots.user, 'logs', 'logs body talks about authentication too');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const runner = buildRetrievalRunner({ db, sessionId, memoryRegistry: registry });
+    const toolCallId = await seedToolCall();
+
+    // loadBodies=true so the BM25 corpus indexes body content;
+    // the bodies (not names) carry the "authentication" token.
+    const result = await runner({ query: 'authentication', loadBodies: true }, undefined, {
+      toolCallId,
+    });
+    expect(result.contextSlot.included.length).toBeGreaterThan(0);
+
+    const { listExposuresInRetrieval } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    const rows = listExposuresInRetrieval(db, sessionId, result.queryId);
+    const memoryEntries = result.contextSlot.included.filter((e) => e.view === 'memory');
+    expect(rows).toHaveLength(memoryEntries.length);
+    for (const row of rows) {
+      expect(row.surface).toBe('retrieve_context');
+      expect(row.toolCallId).toBe(toolCallId);
+      expect(row.retrievalQueryId).toBe(result.queryId);
+      expect(row.memoryScope).toBe('user');
+      // Position 0 = top hit; sequential for the rest. Set
+      // comparison against the actual ordering.
+      expect(row.positionInCorpus).toBeGreaterThanOrEqual(0);
+      expect(row.positionInCorpus).toBeLessThan(memoryEntries.length);
+    }
+  });
+
+  test('position_in_corpus matches the entry index in slot.included', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBody(roots.user, 'a', 'zebra apple');
+    writeBody(roots.user, 'b', 'zebra banana');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const runner = buildRetrievalRunner({ db, sessionId, memoryRegistry: registry });
+    const toolCallId = await seedToolCall();
+
+    const result = await runner({ query: 'zebra', loadBodies: true }, undefined, { toolCallId });
+    const memoryEntries = result.contextSlot.included.filter((e) => e.view === 'memory');
+    const { listExposuresInRetrieval } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    const rows = listExposuresInRetrieval(db, sessionId, result.queryId);
+    // listExposuresInRetrieval orders by position_in_corpus ASC.
+    // Each row's position must match the index of the entry whose
+    // nodeId matches `memory:<scope>/<name>`.
+    for (const row of rows) {
+      const expectedNodeId = `memory:${row.memoryScope}/${row.memoryName}`;
+      const idx = memoryEntries.findIndex((e) => e.nodeId === expectedNodeId);
+      expect(row.positionInCorpus).toBe(idx);
+    }
+  });
+
+  test('hash + state captured per entry', async () => {
+    // The retrieval memory view filters to state='active' (see
+    // src/retrieval/views/memory.ts), so non-active memories never
+    // reach included/provenance. We pin the captured state on the
+    // active default — verifying that the snapshot pipeline reads
+    // and stores frontmatter.state correctly.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n');
+    writeBody(roots.user, 'a', 'zebra body');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const runner = buildRetrievalRunner({ db, sessionId, memoryRegistry: registry });
+    const toolCallId = await seedToolCall();
+
+    const result = await runner({ query: 'zebra', loadBodies: true }, undefined, { toolCallId });
+    const { listExposuresInRetrieval } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    const rows = listExposuresInRetrieval(db, sessionId, result.queryId);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]?.memoryContentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(rows[0]?.memoryStateAtExposure).toBe('active');
+  });
+
+  test('NO provenance emitted when toolCallId is absent (test-context posture)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n');
+    writeBody(roots.user, 'a', 'zebra body');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const runner = buildRetrievalRunner({ db, sessionId, memoryRegistry: registry });
+
+    const result = await runner({ query: 'zebra', loadBodies: true });
+    const { listExposuresInRetrieval } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    expect(listExposuresInRetrieval(db, sessionId, result.queryId)).toEqual([]);
+  });
+
+  test('session-view entries do NOT produce memory provenance rows', async () => {
+    // The pipeline mixes views in contextSlot.included; provenance
+    // is memory-specific. A session-view entry MUST NOT be
+    // mistaken for a memory exposure (different audit semantic —
+    // session messages are already captured in the `messages`
+    // table; conflating them with memory_provenance would invent
+    // a "memory" exposure that never happened).
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n');
+    writeBody(roots.user, 'a', 'zebra body');
+    appendMessage(db, { sessionId, role: 'user', content: 'zebra question' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const runner = buildRetrievalRunner({ db, sessionId, memoryRegistry: registry });
+    const toolCallId = await seedToolCall();
+
+    const result = await runner({ query: 'zebra', loadBodies: true }, undefined, { toolCallId });
+    const { listExposuresInRetrieval } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    const rows = listExposuresInRetrieval(db, sessionId, result.queryId);
+    // Only memory-view rows survive — session entries weren't
+    // emitted into memory_provenance.
+    expect(rows.length).toBe(result.contextSlot.included.filter((e) => e.view === 'memory').length);
+  });
+});

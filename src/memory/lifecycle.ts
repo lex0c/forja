@@ -1,7 +1,11 @@
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
-import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../storage/repos/eviction-events.ts';
+import {
+  OPERATOR_DRIVEN_EVIDENCE_MARKER,
+  getLastInvalidationEventsBatch,
+} from '../storage/repos/eviction-events.ts';
+import { isExpired } from './expires.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
   IndexError,
@@ -272,44 +276,26 @@ export interface ExpiredMemory {
   source: string;
 }
 
-// Compare ISO date strings lex-wise. YYYY-MM-DD format makes
-// chronological order = lexicographical order, no Date object
-// needed.
+// Expiry comparison delegates to the canonical `isExpired`
+// predicate in `expires.ts`. An earlier shape did lex compare on
+// `YYYY-MM-DD` against today's ISO date and treated
+// `expires <= todayStr` as expired — that diverged from `isExpired`
+// (which uses end-of-day cutoff: `expires: 2026-05-04` stays valid
+// through that day, expires at `2026-05-05 00:00 UTC`). The
+// divergence meant GC could evict a memory up to 24h before
+// `/memory list` / retrieval filters considered it gone. Reusing
+// the predicate keeps every consumer aligned on the same cutoff.
 //
-// UTC trade-off — the spec's `expires: YYYY-MM-DD` carries no
-// timezone, so there's no canonical answer for "what does
-// 2026-05-04 mean across timezones?". Two viable choices:
-//
-//   A. Operator-local-TZ today: matches the operator's mental
-//      model when they typed the date. Drawback — a memory
-//      written by operator A in UTC-4 then booted by B in UTC+9
-//      sees different "today" values; the same memory expires on
-//      different boots depending on whose machine you're on.
-//   B. UTC today (chosen): stable across machines and timezones.
-//      Drawback — operator in UTC-4 setting `expires: 2026-05-04`
-//      based on local calendar may see the memory removed at
-//      ~20:00 local on 2026-05-03 (which is 00:00 UTC 2026-05-04).
-//      Up to 24h "early" relative to local-calendar expectation.
-//
-// We pick UTC because cross-machine determinism matters more than
-// last-day-of-life precision — operators who care about exact
-// timing can subtract a day when setting `expires:` (or wait for
-// `/memory expire` slash command to land with explicit TZ
-// handling). Audit row carries the literal `expires` string so
+// `expires.ts` already documents the UTC choice (cross-machine
+// determinism over last-day-of-life precision) and the end-of-day
+// semantics. Audit row carries the literal `expires` string so
 // "why did this disappear?" forensic queries get the operator's
-// original input, not the comparison date.
-const todayIso = (now: Date = new Date()): string => {
-  const yyyy = now.getUTCFullYear();
-  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(now.getUTCDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-};
-
+// original input.
 export const findExpiredMemories = (
   registry: MemoryRegistry,
   today: Date = new Date(),
 ): ExpiredMemory[] => {
-  const todayStr = todayIso(today);
+  const nowMs = today.getTime();
   const expired: ExpiredMemory[] = [];
   // Scan ALL listings (no dedupe) — each scope's expiry is
   // independent; an expired user-scope shadow should be removed
@@ -321,12 +307,7 @@ export const findExpiredMemories = (
     if (peek.kind !== 'present') continue;
     const expires = peek.file.frontmatter.expires;
     if (expires === undefined) continue;
-    // Lex compare on YYYY-MM-DD: equal-or-past today = expired.
-    // Spec doesn't define equality semantics; we expire on the
-    // boundary day so an operator's `expires: 2026-05-04` with
-    // boot on 2026-05-04 removes the memory the same day they
-    // expected it gone.
-    if (expires <= todayStr) {
+    if (isExpired(expires, nowMs)) {
       expired.push({
         scope: listing.scope,
         name: listing.name,
@@ -625,7 +606,23 @@ export const gcPurgeExpiredTombstones = async (
     //     other writer can proceed.
     //   - Aborting mid-await is rare (sweep runs at boot, not on
     //     operator input); finally-ROLLBACK handles it.
-    db.exec('BEGIN IMMEDIATE');
+    //
+    // BEGIN IMMEDIATE can raise SQLITE_BUSY when another writer
+    // (concurrent boot, in-flight slash command) holds RESERVED.
+    // The bootstrap caller treats per-row failures as soft (one
+    // bad row shouldn't gate the session) — let lock contention
+    // ride the same rail: push a `failures` entry and move on.
+    // The next boot retries this row.
+    try {
+      db.exec('BEGIN IMMEDIATE');
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      failures.push({
+        evictionEventId: row.id,
+        reason: `BEGIN IMMEDIATE failed: ${reason}`,
+      });
+      continue;
+    }
     let committed = false;
     try {
       // Verify recency under the lock: a subsequent restore-then-
@@ -687,7 +684,21 @@ export const gcPurgeExpiredTombstones = async (
       db.exec('COMMIT');
       committed = true;
     } finally {
-      if (!committed) db.exec('ROLLBACK');
+      if (!committed) {
+        // ROLLBACK can throw too — typically when the connection
+        // was already kicked out of the transaction by a prior
+        // error (some SQLITE_BUSY paths land in this state) or
+        // when COMMIT half-succeeded. Swallow: the next loop
+        // iteration's BEGIN IMMEDIATE is the recovery point.
+        // Anything semantically meaningful was already pushed to
+        // `failures` from inside the try block; we don't want the
+        // rollback's own throw to escape and abort the sweep.
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Intentionally empty — see above.
+        }
+      }
     }
   }
 
@@ -1008,4 +1019,174 @@ const mapWriteFailure = (result: WriteMemoryResult): MoveMemoryResult => {
     case 'io_error':
       return { kind: 'io_error', reason: result.reason };
   }
+};
+
+// ─── invalidated retention sweep (invalidated → evicted) ────────────
+//
+// EVICTION.md §7.1 + MEMORY.md §6.5.6 mandate a 7-day window before
+// an `invalidated` memory progresses to `evicted`. The trust_revoked
+// detector (S5) mass-produces `invalidated` rows when the operator
+// declines / revokes shared-corpus trust; without this sweep, those
+// rows accumulate on disk indefinitely (the spec's promise of
+// "eventually evicted" never materializes).
+//
+// Sweep contract (mirrors `gcPurgeExpiredTombstones`):
+//   1. Scan the registry for memories with `state: invalidated` in
+//      frontmatter.
+//   2. For each, look up the most-recent applied `to_state=invalidated`
+//      eviction_events row (`getLastInvalidationEvent`) — that's the
+//      anchor for the 7d window.
+//   3. If `now - recorded_at >= 7d`, transition `invalidated → evicted`
+//      with motivo='shift' (the only motivo §4.1 admits for this
+//      edge), trigger='expired_at', actor='startup_probe'.
+//   4. Skip when no invalidation event is found (defensive — a memory
+//      whose frontmatter says invalidated without a matching audit
+//      row is a forensic anomaly worth flagging stderr, but the
+//      sweep doesn't try to "rescue" it).
+
+const STALE_INVALIDATED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface GcStaleInvalidatedOptions {
+  // Probe time for the 7-day window check. Defaults to Date.now().
+  // Tests pass fixed values for determinism.
+  now?: () => number;
+  // Audit attribution forwarded to the eviction_events + memory_events
+  // rows. Same shape as the other GC sweeps.
+  auditSessionId?: string;
+  auditCwd?: string;
+}
+
+export interface StaleInvalidatedMemory {
+  scope: MemoryScope;
+  name: string;
+  invalidatedAtMs: number;
+  source: 'user_explicit' | 'inferred' | 'imported';
+}
+
+export interface GcStaleInvalidatedResult {
+  // Memories whose 7d window expired and transitioned to evicted.
+  evicted: StaleInvalidatedMemory[];
+  // Per-memory failures (rare: state-machine illegal moves, hook
+  // blocks, IO errors during tombstone move).
+  failures: { memory: StaleInvalidatedMemory; reason: string }[];
+  // Memories with `state: invalidated` but no matching
+  // eviction_events row to anchor the window. Surface them to the
+  // caller so they don't silently rot.
+  orphans: { scope: MemoryScope; name: string }[];
+}
+
+export const gcStaleInvalidatedMemories = async (
+  db: DB,
+  registry: MemoryRegistry,
+  roots: ScopeRoots,
+  opts: GcStaleInvalidatedOptions = {},
+): Promise<GcStaleInvalidatedResult> => {
+  const nowFn = opts.now ?? (() => Date.now());
+  const nowMs = nowFn();
+  const evicted: StaleInvalidatedMemory[] = [];
+  const failures: { memory: StaleInvalidatedMemory; reason: string }[] = [];
+  const orphans: { scope: MemoryScope; name: string }[] = [];
+
+  // List invalidated memories per scope. The registry's `states`
+  // filter peeks each body fresh, which is what we need to read
+  // current frontmatter.state without trusting a stale snapshot.
+  const invalidated = registry.list({ states: ['invalidated'] });
+
+  // P1/F2: batch lookup of last-invalidation timestamp per memory.
+  // Pre-hardening this was an N-times ordered SELECT per boot;
+  // batch picks the latest `recorded_at` per (object_id, scope) in
+  // one round-trip. Map key shape mirrors what the
+  // `getLastInvalidationEventsBatch` returns.
+  const invalidationTs = getLastInvalidationEventsBatch(
+    db,
+    'memory',
+    invalidated.map((l) => ({ objectId: l.name, objectScope: l.scope })),
+  );
+
+  const baseTransitionInput = {
+    db,
+    registry,
+    roots,
+    toState: 'evicted' as const,
+    motivo: 'shift' as const,
+    trigger: 'expired_at',
+    actor: 'startup_probe' as const,
+    ...(opts.auditSessionId !== undefined ? { sessionId: opts.auditSessionId } : {}),
+    ...(opts.auditCwd !== undefined ? { cwd: opts.auditCwd } : {}),
+  };
+
+  for (const listing of invalidated) {
+    const lastRecordedAt = invalidationTs.get(`${listing.scope}/${listing.name}`);
+    if (lastRecordedAt === undefined) {
+      orphans.push({ scope: listing.scope, name: listing.name });
+      continue;
+    }
+    if (nowMs - lastRecordedAt < STALE_INVALIDATED_WINDOW_MS) continue;
+
+    // P1/F3: registry.list({states:[...]}) already peeked the body
+    // and attached `listing.file`. Read source from the cached
+    // frontmatter; falls back to peek only if the cache is absent
+    // (defensive — every code path that reaches here should have
+    // a file from the state-filtered list).
+    const fm =
+      listing.file?.frontmatter ??
+      (() => {
+        const p = registry.peek(listing.name, { scope: listing.scope });
+        return p.kind === 'present' ? p.file.frontmatter : null;
+      })();
+    if (fm === null) continue;
+    const mem: StaleInvalidatedMemory = {
+      scope: listing.scope,
+      name: listing.name,
+      invalidatedAtMs: lastRecordedAt,
+      source: fm.source,
+    };
+
+    // Per-memory now counter so back-to-back transitions get
+    // monotonically distinct recorded_at + tombstone ts values
+    // (same pattern as gcExpiredMemories).
+    let perMemNow = nowMs;
+    const tickNow = () => ++perMemNow;
+
+    const r = await transitionMemoryState({
+      ...baseTransitionInput,
+      scope: mem.scope,
+      name: mem.name,
+      // `_operator_driven` marker bypasses the §6.1 shift-evidence
+      // schema check (we don't have a fingerprint pair to record —
+      // the anchor evidence already lives in the prior invalidate
+      // row at `getLastInvalidationEvent`).
+      evidence: { [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true },
+      now: tickNow,
+      // Tombstone retention window per EVICTION.md §7.1 — without
+      // this, the resulting eviction_events row gets
+      // `purge_at = NULL`, and `listEvictedDueForPurge` filters
+      // `WHERE purge_at IS NOT NULL`, so tombstones from this
+      // sweep would accumulate indefinitely (never eligible for
+      // the `evicted → purged` GC). Matches `gcExpiredMemories`'
+      // identical stamp on its `quarantined → evicted` step.
+      purgeAt: perMemNow + MEMORY_TOMBSTONE_RETENTION_MS,
+    });
+
+    if (r.kind === 'applied') {
+      evicted.push(mem);
+    } else {
+      failures.push({ memory: mem, reason: gcFailureReason(r, 'invalidated→evicted') });
+    }
+  }
+
+  // Snapshot reload — once at least one memory transitioned, the
+  // registry's cached listing carries entries that no longer have
+  // bodies on disk (transitionMemoryState moved them to
+  // `.tombstones/` and dropped the index row). Downstream callers
+  // in the same bootstrap pass — chiefly `assembleMemorySection` —
+  // walk `registry.list()` and treat peek-missing as "uncertain →
+  // include", which would surface just-evicted memories in the
+  // eager prompt. Reloading aligns the in-memory snapshot with
+  // the on-disk truth before any consumer reads it. Skipped when
+  // nothing transitioned (avoid the index-re-read cost when the
+  // sweep was a no-op).
+  if (evicted.length > 0) registry.reload();
+
+  return { evicted, failures, orphans };
 };

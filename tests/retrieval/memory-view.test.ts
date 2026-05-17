@@ -283,13 +283,17 @@ describe('createMemoryView', () => {
     expect(cands).toEqual([]);
   });
 
-  test('quarantined memory does not surface as candidate (H1 regression)', async () => {
-    // The model must never see memories the operator quarantined.
-    // Pre-state-filter, `registry.list({ deduplicateByName: true })`
-    // returned every state — the view surfaced the candidate, BM25
-    // ranked it, and the body landed in the slot. Now the view
-    // passes `states: ['active']` so non-active states are excluded
-    // from the candidate pool.
+  test('quarantined memory surfaces with ranking penalty (S6/T6.1, EVICTION §9.7)', async () => {
+    // Walks back the H1 hard-filter: quarantined memories are now
+    // VISIBLE to retrieval with a ×0.3 penalty on bootstrap score.
+    // Spec EVICTION §9.7 + MEMORY.md §6.5.2 — penalty + visual flag
+    // is the spec'd behavior; hard-filtering was the safety
+    // shortcut. The model still sees the candidate but ranks it
+    // below an active sibling with comparable match quality.
+    //
+    // The `reason` string carries the `quarantined ×0.3` marker so
+    // retrieval_trace forensics can see why a candidate ranks
+    // where it does.
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.user, '- [Auth](auth.md) — auth conventions\n');
@@ -297,10 +301,77 @@ describe('createMemoryView', () => {
     const registry = createMemoryRegistry({ roots, db, sessionId });
     const view = createMemoryView({ registry });
     const cands = await view.search({ ...baseQuery, text: 'auth' });
-    expect(cands).toEqual([]);
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.nodeId).toBe('memory:user/auth');
+    expect(cands[0]?.reason).toContain('quarantined');
+    expect(cands[0]?.reason).toContain('×0.3');
   });
 
-  test('invalidated / proposed memories filtered out (H1)', async () => {
+  test('QUARANTINED_PENALTY constant value is exactly 0.3 (S6/T6.1 — pin)', async () => {
+    // Pinning the literal value (not just "quarantined < active").
+    // A silent change to 0.25 or 0.5 would still pass relative-
+    // ordering tests; the constant value is part of the behavioral
+    // contract documented in MEMORY.md §6.5.2 (~3.3× match needed
+    // for parity). Import + assert directly.
+    const { QUARANTINED_PENALTY } = await import('../../src/retrieval/views/memory.ts');
+    expect(QUARANTINED_PENALTY).toBe(0.3);
+  });
+
+  test('dedupe keeps quarantined local shadow when active shared sibling exists (S6 × H3)', async () => {
+    // Per the dedupe-after-filter ordering fix (commit 949fadf),
+    // state filter runs BEFORE dedupe-by-name. Pre-S6: `local:
+    // quarantined foo` was filtered out → dedupe saw only
+    // `shared: active foo` → shared surfaced. Post-S6: BOTH
+    // survive the state filter (quarantined now included), then
+    // dedupe-by-name picks local (most-specific scope wins).
+    //
+    // Net behavior: the model sees the quarantined local version,
+    // NOT the active shared sibling. This is spec'd (scope
+    // precedence trumps state preference) but a real semantic
+    // change from pre-S6 — pinned here so future refactors don't
+    // silently revert.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared auth hook\n');
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — local auth hook\n');
+    writeBody(roots.projectShared, 'foo', 'shared body content', { state: 'active' });
+    writeBody(roots.projectLocal, 'foo', 'local body content', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.nodeId).toBe('memory:project_local/foo');
+    expect(cands[0]?.reason).toContain('quarantined');
+  });
+
+  test('quarantined ranks below active sibling with comparable bootstrap (S6/T6.1)', async () => {
+    // Two memories with identical match shape; only state differs.
+    // Both surface; quarantined's bootstrapScore = active's × 0.3.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(
+      roots.user,
+      '- [Active](active.md) — auth\n- [Quarantined](quarantined.md) — auth\n',
+    );
+    writeBody(roots.user, 'active', 'auth body content', { state: 'active' });
+    writeBody(roots.user, 'quarantined', 'auth body content', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const cands = await view.search({ ...baseQuery, text: 'auth' });
+    expect(cands).toHaveLength(2);
+    const active = cands.find((c) => c.nodeId === 'memory:user/active');
+    const quarantined = cands.find((c) => c.nodeId === 'memory:user/quarantined');
+    expect(active).toBeDefined();
+    expect(quarantined).toBeDefined();
+    if (active === undefined || quarantined === undefined) return;
+    // Same match quality means same raw BM25 score; quarantined's
+    // bootstrapScore is exactly active's × 0.3 (within float
+    // tolerance). Active ranks above quarantined as a result.
+    expect(quarantined.bootstrapScore).toBeCloseTo(active.bootstrapScore * 0.3, 5);
+    expect(active.bootstrapScore).toBeGreaterThan(quarantined.bootstrapScore);
+  });
+
+  test('invalidated / proposed memories still filtered out (only quarantined survives penalty)', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(
@@ -354,5 +425,120 @@ describe('createMemoryView', () => {
     const view = createMemoryView({ registry });
     const cands = await view.search({ ...baseQuery, text: 'auth' });
     expect(cands.map((c) => c.nodeId)).toEqual(['memory:user/fresh']);
+  });
+
+  test('excludeScopes drops every candidate in the named scope (S5 CRIT/H2)', async () => {
+    // When the bootstrap's trust probe returns a non-confirmed
+    // outcome (verify_failed / deferred / revoked), it sets
+    // `memoryExcludeScopes: ['project_shared']` on the runner. The
+    // view MUST mirror the eager-load section's fail-closed
+    // posture — no project_shared bodies surface via
+    // retrieve_context, even if they'd otherwise score the highest.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Shared](shared.md) — fortress shared\n');
+    writeIndex(roots.projectLocal, '- [Local](local.md) — fortress local\n');
+    writeBody(roots.projectShared, 'shared', 'fortress body in shared');
+    writeBody(roots.projectLocal, 'local', 'fortress body in local');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    const baseline = await createMemoryView({ registry }).search({
+      ...baseQuery,
+      text: 'fortress',
+    });
+    expect(baseline.map((c) => c.nodeId).sort()).toEqual([
+      'memory:project_local/local',
+      'memory:project_shared/shared',
+    ]);
+
+    const offline = await createMemoryView({
+      registry,
+      excludeScopes: ['project_shared'],
+    }).search({ ...baseQuery, text: 'fortress' });
+    expect(offline.map((c) => c.nodeId)).toEqual(['memory:project_local/local']);
+  });
+
+  test('empty excludeScopes is a no-op (no behavior change)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — fortress\n');
+    writeBody(roots.projectShared, 's', 'fortress body');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const cands = await createMemoryView({ registry, excludeScopes: [] }).search({
+      ...baseQuery,
+      text: 'fortress',
+    });
+    expect(cands.map((c) => c.nodeId)).toEqual(['memory:project_shared/s']);
+  });
+
+  test('excludeScopes preserves precedence fallback when shadowed name lives in excluded scope', async () => {
+    // Review regression: pre-fix the view asked the registry for
+    // `deduplicateByName: true` and then filtered `excludeScopes`
+    // in JS afterward. Order broke the precedence-fallback contract.
+    //
+    // Setup: TWO memories named `foo`, one under project_shared and
+    // one under user. Scope precedence is local > shared > user
+    // (registry.ts SCOPE_ORDER), so without filtering, dedup picks
+    // project_shared/foo and drops user/foo. With `excludeScopes:
+    // ['project_shared']` the dedup-then-filter ordering would
+    // drop project_shared/foo AFTER it suppressed user/foo, leaving
+    // NO `foo` candidate at all — silently hiding a trusted body
+    // the model should still see.
+    //
+    // Post-fix the registry filters excludeScopes BEFORE dedup, so
+    // project_shared/foo is removed first, dedup operates only over
+    // permitted scopes, and user/foo surfaces as expected.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — castle from shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — castle from user\n');
+    writeBody(roots.projectShared, 'foo', 'castle body in shared scope');
+    writeBody(roots.user, 'foo', 'castle body in user scope');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    // Baseline (no exclusion): project_shared/foo wins precedence,
+    // user/foo is shadowed out by dedup. Pins the pre-condition the
+    // bug depended on: dedup IS hiding user/foo absent any filter.
+    const baseline = await createMemoryView({ registry }).search({
+      ...baseQuery,
+      text: 'castle',
+    });
+    expect(baseline.map((c) => c.nodeId)).toEqual(['memory:project_shared/foo']);
+
+    // With project_shared excluded: user/foo MUST surface. Pre-fix
+    // this returned [] (the post-dedup filter wiped the only entry).
+    const offline = await createMemoryView({
+      registry,
+      excludeScopes: ['project_shared'],
+    }).search({ ...baseQuery, text: 'castle' });
+    expect(offline.map((c) => c.nodeId)).toEqual(['memory:user/foo']);
+  });
+
+  test('excludeScopes precedence fallback also covers project_local shadow → project_shared survival', async () => {
+    // Symmetric regression: project_local > project_shared. Exclude
+    // project_local; the project_shared sibling should fall through
+    // dedup. Covers the other direction of the precedence ladder
+    // (the production case the bug report opened was shared→user,
+    // but the registry rule is local→shared→user and a future
+    // exclude policy could fail-close project_local too).
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Bar](bar.md) — moat from local\n');
+    writeIndex(roots.projectShared, '- [Bar](bar.md) — moat from shared\n');
+    writeBody(roots.projectLocal, 'bar', 'moat body in local scope');
+    writeBody(roots.projectShared, 'bar', 'moat body in shared scope');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    const baseline = await createMemoryView({ registry }).search({
+      ...baseQuery,
+      text: 'moat',
+    });
+    expect(baseline.map((c) => c.nodeId)).toEqual(['memory:project_local/bar']);
+
+    const offline = await createMemoryView({
+      registry,
+      excludeScopes: ['project_local'],
+    }).search({ ...baseQuery, text: 'moat' });
+    expect(offline.map((c) => c.nodeId)).toEqual(['memory:project_shared/bar']);
   });
 });

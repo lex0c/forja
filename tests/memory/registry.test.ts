@@ -3,12 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
-import { createMemoryRegistry } from '../../src/memory/registry.ts';
+import { createMemoryRegistry, createScopeFilteredRegistry } from '../../src/memory/registry.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listMemoryEventsByName } from '../../src/storage/repos/memory-events.ts';
+import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
+import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
+import { createToolCall } from '../../src/storage/repos/tool-calls.ts';
 
 const tmpDirs: string[] = [];
 
@@ -648,6 +651,40 @@ describe('createMemoryRegistry — search-deep audit (regression: S1)', () => {
     expect(hits).toEqual([]);
     expect(listMemoryEventsByName(db, 'a')).toEqual([]);
   });
+
+  test('auditLimit caps deep-body emit while limit governs the returned slice', () => {
+    // Review regression: `memory_search` over-fetches (limit + 1)
+    // to detect truncation, then drops the extra row before
+    // returning it to the model. Pre-fix, every body-match hit
+    // (including the dropped one) emitted a read + provenance
+    // event — inflating exposure counts for memories the model
+    // never saw. Post-fix the tool passes `auditLimit: limit` and
+    // only the first N body matches audit.
+    //
+    // Setup: five user-scope memories whose bodies all hit
+    // `zebra`. Call search with `limit: 4, auditLimit: 3` — the
+    // returned array has up to 4 hits but only 3 read events
+    // land. Asserts both the hit count AND the audit count.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const indexLines = ['a', 'b', 'c', 'd', 'e']
+      .map((n) => `- [${n.toUpperCase()}](${n}.md) — h\n`)
+      .join('');
+    writeIndex(roots.user, indexLines);
+    for (const n of ['a', 'b', 'c', 'd', 'e']) {
+      writeMemory(roots.user, n, fmUser(n), `${n} body has zebra inside\n`);
+    }
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const hits = reg.search('zebra', { deep: true, limit: 4, auditLimit: 3 });
+    expect(hits.length).toBe(4);
+    // Total `read` rows across all five memories must be exactly
+    // 3 — the audit cap. Pre-fix this would be 4 (one per hit
+    // returned) or 5 (if the loop didn't early-exit at limit).
+    const allReads = ['a', 'b', 'c', 'd', 'e'].flatMap((n) =>
+      listMemoryEventsByName(db, n).filter((e) => e.action === 'read'),
+    );
+    expect(allReads).toHaveLength(3);
+  });
 });
 
 describe('createMemoryRegistry — malformed href tolerance (regression: C1)', () => {
@@ -944,5 +981,319 @@ describe('createMemoryRegistry — write', () => {
     });
     expect(result.kind).toBe('created');
     // No db handle to assert on — just exercise the no-throw path.
+  });
+});
+
+describe('createMemoryRegistry — provenance emission (S1/T1.3)', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  const seedToolCall = (): string => {
+    const msgId = appendMessage(db, { sessionId, role: 'assistant', content: 'x' }).id;
+    return createToolCall(db, { messageId: msgId, toolName: 'memory_read', input: {} }).id;
+  };
+
+  test('read with auditToolCallId emits a memory_read provenance row', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'Body of role.\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const toolCallId = seedToolCall();
+
+    const result = reg.read('role', { auditToolCallId: toolCallId });
+    expect(result.kind).toBe('present');
+
+    const rows = listProvenanceForMemory(db, sessionId, 'project_local', 'role');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.surface).toBe('memory_read');
+    expect(rows[0]?.toolCallId).toBe(toolCallId);
+    expect(rows[0]?.memoryScope).toBe('project_local');
+    expect(rows[0]?.memoryStateAtExposure).toBe('active');
+    expect(rows[0]?.memoryContentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(rows[0]?.retrievalQueryId).toBeNull();
+    expect(rows[0]?.positionInCorpus).toBeNull();
+  });
+
+  test('read WITHOUT auditToolCallId emits NO provenance row (other surfaces own their path)', () => {
+    // The eager-load (T1.4) and retrieve_context (T1.5) paths
+    // pass their own surface — the registry MUST stay silent
+    // here so it doesn't double-emit or claim memory_read for
+    // exposures that aren't tool-call-driven.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'b');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    reg.read('role');
+    expect(listProvenanceForMemory(db, sessionId, 'project_local', 'role')).toEqual([]);
+    // But memory_events DID fire — that path is independent.
+    expect(listMemoryEventsByName(db, 'role')).toHaveLength(1);
+  });
+
+  test('read on missing body emits neither audit nor provenance', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — role\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const toolCallId = seedToolCall();
+    const result = reg.read('role', { auditToolCallId: toolCallId });
+    expect(result.kind).toBe('missing');
+    expect(listProvenanceForMemory(db, sessionId, 'user', 'role')).toEqual([]);
+  });
+
+  test('hash is stable across reads of the same content', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'Body.\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const tc1 = seedToolCall();
+    const tc2 = seedToolCall();
+    reg.read('role', { auditToolCallId: tc1 });
+    reg.read('role', { auditToolCallId: tc2 });
+    const rows = listProvenanceForMemory(db, sessionId, 'project_local', 'role');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.memoryContentHash).toBe(rows[1]?.memoryContentHash);
+    expect(rows[0]?.toolCallId).not.toBe(rows[1]?.toolCallId);
+  });
+
+  test('quarantined frontmatter state survives in provenance snapshot', () => {
+    // Operator could transition the memory later; the row must
+    // pin the state AT EXPOSURE TIME, not the latest.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', `${fmUser('role')}state: quarantined\n`, 'b');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const toolCallId = seedToolCall();
+    reg.read('role', { auditToolCallId: toolCallId });
+    const rows = listProvenanceForMemory(db, sessionId, 'project_local', 'role');
+    expect(rows[0]?.memoryStateAtExposure).toBe('quarantined');
+  });
+
+  test('provenance failure (invalid toolCallId FK) does NOT break the read', () => {
+    // Audit-drift posture: the body load already succeeded; a
+    // failure recording the exposure is best-effort and MUST NOT
+    // surface as an exception to the caller.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'body\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    const original = process.stderr.write.bind(process.stderr);
+    const captured: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      const result = reg.read('role', { auditToolCallId: 'does-not-exist' });
+      expect(result.kind).toBe('present');
+      if (result.kind === 'present') {
+        expect(result.file.body).toBe('body\n');
+      }
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join('')).toMatch(/AUDIT DRIFT.*exposure/);
+    expect(listProvenanceForMemory(db, sessionId, 'project_local', 'role')).toEqual([]);
+  });
+
+  test('search-deep body match emits a memory_read provenance row', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — surface\n');
+    writeMemory(roots.user, 'a', fmUser('a'), 'body has zebra inside\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const toolCallId = seedToolCall();
+    const hits = reg.search('zebra', { deep: true, auditToolCallId: toolCallId });
+    expect(hits).toHaveLength(1);
+    const rows = listProvenanceForMemory(db, sessionId, 'user', 'a');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.surface).toBe('memory_read');
+    expect(rows[0]?.toolCallId).toBe(toolCallId);
+  });
+});
+
+describe('createScopeFilteredRegistry — fail-closed scope blocking (S5 review)', () => {
+  // The harness loop wraps the memory registry with this filter
+  // when the shared-corpus trust probe lands a non-confirmed
+  // outcome. Without the wrapper, the tool context's
+  // memoryRegistry would still expose project_shared to
+  // memory_list / memory_read / memory_search even though the
+  // eager-load and retrieval surfaces filter it out — a direct
+  // bypass of the trust gate. These tests pin the wrapper's
+  // contract at the registry layer; e2e tool-level coverage
+  // lives in tests/harness/loop.test.ts.
+
+  test('list({}) filters excluded scope and runs filter BEFORE dedup-by-name', () => {
+    // The previous review fix established the contract: filter
+    // before dedup so a higher-precedence shadow in an excluded
+    // scope can't suppress an eligible lower-precedence sibling.
+    // Wrapper must route through ListOptions.excludeScopes to
+    // preserve that precedence-fallback.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    writeMemory(roots.user, 'foo', fmUser('foo'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+
+    // Without exclusion, dedup picks project_shared/foo (precedence
+    // local > shared > user; no project_local entry here so shared
+    // wins). With exclusion, user/foo MUST surface — precedence
+    // fallback is preserved.
+    const filtered = wrapped.list({ deduplicateByName: true });
+    expect(filtered.map((l) => `${l.scope}/${l.name}`)).toEqual(['user/foo']);
+  });
+
+  test('list({ scope: excludedScope }) returns empty (pin-and-bypass closed)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    expect(wrapped.list({ scope: 'project_shared' })).toEqual([]);
+  });
+
+  test('read(name, {}) walks SCOPE_ORDER and skips excluded scopes', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    writeMemory(roots.user, 'foo', fmUser('foo'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.read('foo');
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.scope).toBe('user');
+      expect(result.file.body).toContain('user body');
+    }
+  });
+
+  test('read(name, { scope: excludedScope }) returns unknown', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Secret](secret.md) — shared\n');
+    writeMemory(roots.projectShared, 'secret', fmUser('secret'), 'leak-me');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.read('secret', { scope: 'project_shared' });
+    expect(result.kind).toBe('unknown');
+  });
+
+  test('search filters hits in excluded scope (including pinned)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Castle](castle-s.md) — shared castle\n');
+    writeIndex(roots.user, '- [Castle](castle-u.md) — user castle\n');
+    writeMemory(roots.projectShared, 'castle-s', fmUser('castle-s'), 'shared');
+    writeMemory(roots.user, 'castle-u', fmUser('castle-u'), 'user');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+
+    // Default search (no scope pin) returns only the user hit.
+    const hits = wrapped.search('castle');
+    expect(hits.map((h) => `${h.scope}/${h.name}`).sort()).toEqual(['user/castle-u']);
+
+    // Pinning the excluded scope returns []. Pre-fix the same call
+    // against the unwrapped registry would have surfaced
+    // shared/castle-s.
+    expect(wrapped.search('castle', { scope: 'project_shared' })).toEqual([]);
+  });
+
+  test('search filters BEFORE limit — excluded high-precedence hit does NOT eat the cap', () => {
+    // Review regression. Pre-fix createScopeFilteredRegistry.search
+    // post-filtered hits AFTER base.search ran. Because base.search
+    // enforces `limit` while iterating in precedence order
+    // (project_local > project_shared > user), an excluded
+    // higher-precedence match could fill the cap and stop the loop
+    // before any allowed-scope sibling was considered. The wrapper
+    // then dropped the excluded hit and returned [] — losing the
+    // permitted memory that would have surfaced if the filter ran
+    // at candidate-build time.
+    //
+    // Post-fix the wrapper routes excludeScopes into
+    // SearchOptions.excludeScopes; the registry filters candidates
+    // before iterating, so the limit walks only allowed scopes and
+    // the precedence-fallback semantic from `list` extends to
+    // `search`. Two memories named `fortress`; the user-scope one
+    // MUST surface even when limit=1 cuts the walk after the first
+    // hit.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Fortress](fortress.md) — shared fortress hint\n');
+    writeIndex(roots.user, '- [Fortress](fortress.md) — user fortress hint\n');
+    writeMemory(roots.projectShared, 'fortress', fmUser('fortress'), 'shared body');
+    writeMemory(roots.user, 'fortress', fmUser('fortress'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+
+    // Baseline (no exclusion). project_shared/fortress wins
+    // precedence and fills limit=1; user/fortress is shadowed.
+    // Pins the precondition the bug depended on.
+    const baseline = base.search('fortress', { limit: 1 });
+    expect(baseline.map((h) => `${h.scope}/${h.name}`)).toEqual(['project_shared/fortress']);
+
+    // Wrapped. Pre-fix this returned []. Post-fix user/fortress
+    // surfaces because the excluded shared match never entered the
+    // loop, leaving the cap free for the user-scope hit.
+    const filtered = wrapped.search('fortress', { limit: 1 });
+    expect(filtered.map((h) => `${h.scope}/${h.name}`)).toEqual(['user/fortress']);
+  });
+
+  test('peek(name, {}) honors precedence fallback (matches read)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    writeMemory(roots.user, 'foo', fmUser('foo'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.peek('foo');
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.scope).toBe('user');
+    }
+  });
+
+  test('empty excludeScopes is degenerate — returns the base registry unchanged', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, []);
+    // Reference equality: an empty exclusion list is a no-op and
+    // the wrapper short-circuits to avoid an extra closure on the
+    // hot path.
+    expect(wrapped).toBe(base);
+  });
+
+  test('count({}) reflects the filtered view', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — shared\n');
+    writeIndex(roots.user, '- [U](u.md) — user\n');
+    writeMemory(roots.projectShared, 's', fmUser('s'), 'shared');
+    writeMemory(roots.user, 'u', fmUser('u'), 'user');
+    const base = createMemoryRegistry({ roots });
+    expect(base.count()).toBe(2);
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    expect(wrapped.count()).toBe(1);
   });
 });

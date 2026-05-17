@@ -91,3 +91,27 @@ export interface IndexEntry {
   href: string;
   hook: string;
 }
+
+// Frozen snapshot of one eager-loaded memory at system-prompt
+// assembly time. Produced by `assembleMemorySection`, consumed by
+// the harness loop right after createSession (the first moment a
+// sessionId exists to link against). Hash + state are pinned at
+// assembly, not at emit, because the operator may rewrite a file
+// between boot and session start — the spec semantic is "the
+// bytes the model saw at boot", and that's the moment to freeze.
+//
+// Lives in `memory/types.ts` (not `cli/memory-prompt.ts`) so the
+// harness can carry it through HarnessConfig.eagerExposures
+// without dragging a `cli/`-layer dependency into the harness.
+export interface EagerExposure {
+  scope: MemoryScope;
+  name: string;
+  // SHA-256 hex of the canonical serialization at assembly time.
+  // Null when hashing failed (best-effort; mirrors the schema's
+  // nullable column).
+  memoryContentHash: string | null;
+  // frontmatter.state at assembly time; defaults to 'active' when
+  // absent. The MemoryState string is stored as TEXT in the DB so
+  // schema-level forward compat works without a CHECK migration.
+  memoryStateAtExposure: string;
+}

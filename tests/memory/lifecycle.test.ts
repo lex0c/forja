@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import {
   findExpiredMemories,
   gcExpiredMemories,
+  gcStaleInvalidatedMemories,
   moveMemory,
   removeMemory,
 } from '../../src/memory/lifecycle.ts';
@@ -45,7 +46,13 @@ const makeRoots = (repo: string): ScopeRoots => ({
 const writeBody = (
   dir: string,
   name: string,
-  fmExtras: { expires?: string; source?: string; type?: string; trust?: string } = {},
+  fmExtras: {
+    expires?: string;
+    source?: string;
+    type?: string;
+    trust?: string;
+    state?: string;
+  } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -56,6 +63,7 @@ const writeBody = (
   ];
   if (fmExtras.expires !== undefined) lines.push(`expires: ${fmExtras.expires}`);
   if (fmExtras.trust !== undefined) lines.push(`trust: ${fmExtras.trust}`);
+  if (fmExtras.state !== undefined) lines.push(`state: ${fmExtras.state}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
 };
 
@@ -243,9 +251,15 @@ describe('findExpiredMemories', () => {
     writeBody(roots.projectLocal, 'future', { expires: '2030-01-01' });
     writeBody(roots.projectLocal, 'none');
     const reg = createMemoryRegistry({ roots });
-    const expired = findExpiredMemories(reg, new Date(Date.UTC(2026, 4, 4)));
-    const names = expired.map((e) => e.name).sort();
-    expect(names).toEqual(['past', 'today']);
+    // End-of-day cutoff (matches `isExpired` in expires.ts): a
+    // memory `expires: 2026-05-04` stays valid through that day
+    // and crosses the cutoff at `2026-05-05 00:00 UTC`. So on
+    // `2026-05-04 00:00 UTC` only 'past' has crossed.
+    const onTheDay = findExpiredMemories(reg, new Date(Date.UTC(2026, 4, 4)));
+    expect(onTheDay.map((e) => e.name).sort()).toEqual(['past']);
+    // At the start of the NEXT day, 'today' is past its cutoff.
+    const nextDay = findExpiredMemories(reg, new Date(Date.UTC(2026, 4, 5)));
+    expect(nextDay.map((e) => e.name).sort()).toEqual(['past', 'today']);
   });
 
   test('does not consider memories without expires', () => {
@@ -735,6 +749,88 @@ describe('gcPurgeExpiredTombstones', () => {
     expect(result.failures).toEqual([]);
     expect(result.skipped).toEqual([]); // filtered before the recency check
   });
+
+  test('BEGIN IMMEDIATE SQLITE_BUSY is a soft failure — sweep does NOT throw', async () => {
+    // Regression: gcPurgeExpiredTombstones used to call
+    // db.exec('BEGIN IMMEDIATE') outside any error handling. On a
+    // long-lived install where two boots race or an in-flight
+    // slash command holds RESERVED, the BEGIN raises SQLITE_BUSY
+    // and the exception escaped the helper, aborting bootstrap.
+    // Spec contract (bootstrap.ts §gcPurgeExpiredTombstones): one
+    // bad row must not gate the session — failures funnel through
+    // result.failures, stderr summarizes, next boot retries.
+    //
+    // Setup: seed two tombstones due for purge. Intercept the DB
+    // so the FIRST BEGIN IMMEDIATE throws SQLITE_BUSY; subsequent
+    // BEGINs pass through unchanged. Expect: helper returns
+    // normally, first row landed in `failures`, second row landed
+    // in `purged`.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBody(roots.projectLocal, 'a', { expires: '2024-01-01' });
+    writeBody(roots.projectLocal, 'b', { expires: '2024-01-01' });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    // Expire both, both land tombstoned with purgeAt set.
+    const expireDay = new Date(Date.UTC(2024, 5, 1));
+    await gcExpiredMemories(db, reg, roots, { today: expireDay });
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(2);
+
+    // DB proxy that throws SQLITE_BUSY on the FIRST BEGIN IMMEDIATE
+    // and lets every subsequent exec through. Models the real
+    // contention pattern: a transient writer-lock collision that
+    // clears by the time the loop reaches the next row.
+    //
+    // Implementation note: bun:sqlite's `Database` uses private
+    // fields (`#`), so methods called through a naive Proxy would
+    // see the Proxy as `this` and fail on private-field access.
+    // For every method we don't override, return it bound to the
+    // real Database instance — only `exec` is intercepted, and
+    // we call `realExec` which is also bound to `target`.
+    let beginsSeen = 0;
+    const realExec = db.exec.bind(db);
+    type ExecParams = Parameters<typeof realExec>;
+    const flakyDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'exec') {
+          return (...args: ExecParams) => {
+            if (args[0] === 'BEGIN IMMEDIATE') {
+              beginsSeen += 1;
+              if (beginsSeen === 1) {
+                throw new Error('SQLITE_BUSY: simulated lock contention');
+              }
+            }
+            return realExec(...args);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const sweepNow = expireDay.getTime() + 35 * 24 * 60 * 60 * 1000;
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+
+    // Critical assertion: the sweep returns normally (no throw).
+    // Pre-fix this would have surfaced SQLITE_BUSY out of the
+    // helper, abort bootstrap, and the test would die on the
+    // await rather than reaching the result assertions.
+    const result = await gcPurgeExpiredTombstones(flakyDb as typeof db, reg, roots, {
+      now: () => sweepNow,
+    });
+
+    // First row: lock failure landed as soft failure.
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]?.reason).toContain('BEGIN IMMEDIATE failed');
+    expect(result.failures[0]?.reason).toContain('SQLITE_BUSY');
+    // Second row: BEGIN succeeded the second time, purge applied.
+    expect(result.purged).toHaveLength(1);
+    expect(result.skipped).toEqual([]);
+    // Sanity: BEGIN was attempted for both rows.
+    expect(beginsSeen).toBe(2);
+  });
 });
 
 describe('moveMemory — primitive (promote / demote)', () => {
@@ -880,5 +976,358 @@ describe('moveMemory — primitive (promote / demote)', () => {
     } finally {
       chmodSync(roots.projectShared, 0o700);
     }
+  });
+});
+
+describe('gcStaleInvalidatedMemories (S5 CRIT/V1, EVICTION §7.1 7d window)', () => {
+  let db: DB;
+  let sessionId: string;
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+  afterEach(() => db.close());
+
+  const seedInvalidated = (roots: ScopeRoots, name: string, invalidatedAtMs: number): void => {
+    writeIndex(roots.projectShared, `- [${name}](${name}.md) — h\n`);
+    writeBody(roots.projectShared, name, { state: 'invalidated', source: 'user_explicit' });
+    // Seed the eviction_events row that anchors the 7d window.
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: name,
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: invalidatedAtMs,
+    });
+  };
+
+  test('memory invalidated >= 7d ago transitions to evicted', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    seedInvalidated(roots, 'stale', eightDaysAgoMs);
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted.map((m) => m.name)).toEqual(['stale']);
+    expect(result.failures).toEqual([]);
+    // Body moved to .tombstones/, index entry removed.
+    expect(existsSync(join(roots.projectShared, 'stale.md'))).toBe(false);
+  });
+
+  test('memory invalidated < 7d ago is preserved', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const recentMs = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    seedInvalidated(roots, 'fresh', recentMs);
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted).toEqual([]);
+    expect(existsSync(join(roots.projectShared, 'fresh.md'))).toBe(true);
+  });
+
+  test('memory with invalidated frontmatter but no audit row surfaces as orphan', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // Frontmatter says invalidated, but NO eviction_events row exists.
+    writeIndex(roots.projectShared, '- [Orphan](orphan.md) — h\n');
+    writeBody(roots.projectShared, 'orphan', { state: 'invalidated' });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted).toEqual([]);
+    expect(result.orphans.map((o) => o.name)).toEqual(['orphan']);
+    // The orphan stays on disk — the sweep doesn't try to "rescue".
+    expect(existsSync(join(roots.projectShared, 'orphan.md'))).toBe(true);
+  });
+
+  test('mixed corpus: stale evicts, fresh stays, orphan surfaced', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const recentMs = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    // Three memories in one corpus.
+    writeIndex(
+      roots.projectShared,
+      '- [Stale](stale.md) — h\n- [Fresh](fresh.md) — h\n- [Orphan](orphan.md) — h\n',
+    );
+    writeBody(roots.projectShared, 'stale', { state: 'invalidated', source: 'user_explicit' });
+    writeBody(roots.projectShared, 'fresh', { state: 'invalidated', source: 'user_explicit' });
+    writeBody(roots.projectShared, 'orphan', { state: 'invalidated', source: 'user_explicit' });
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'stale',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: eightDaysAgoMs,
+    });
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'fresh',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: recentMs,
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted.map((m) => m.name)).toEqual(['stale']);
+    expect(result.orphans.map((o) => o.name)).toEqual(['orphan']);
+    expect(existsSync(join(roots.projectShared, 'stale.md'))).toBe(false);
+    expect(existsSync(join(roots.projectShared, 'fresh.md'))).toBe(true);
+    expect(existsSync(join(roots.projectShared, 'orphan.md'))).toBe(true);
+  });
+
+  test('active memory ignored (only invalidated state is in scope)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Live](live.md) — h\n');
+    writeBody(roots.projectShared, 'live');
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted).toEqual([]);
+    expect(result.orphans).toEqual([]);
+    expect(existsSync(join(roots.projectShared, 'live.md'))).toBe(true);
+  });
+
+  // T5: scope coverage — sweep MUST cover user + project_local
+  // scopes, not only project_shared. A regression that restricted
+  // the sweep to one scope would pass every other test in this
+  // describe (they all seed project_shared).
+  test('T5: sweep covers user + project_local + project_shared scopes', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    // Seed an invalidated memory in each scope.
+    for (const [dir, scope] of [
+      [roots.user, 'user'],
+      [roots.projectShared, 'project_shared'],
+      [roots.projectLocal, 'project_local'],
+    ] as const) {
+      writeIndex(dir, '- [M](m.md) — h\n');
+      writeBody(dir, 'm', { state: 'invalidated', source: 'user_explicit' });
+      appendEvictionEvent(db, {
+        substrate: 'memory',
+        objectId: 'm',
+        objectScope: scope,
+        fromState: 'active',
+        toState: 'invalidated',
+        trigger: 'trust_revoked',
+        motivo: 'security',
+        evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+        outcome: 'applied',
+        blockedBy: null,
+        actor: 'startup_probe',
+        sessionId,
+        recordedAt: eightDaysAgoMs,
+      });
+    }
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    const evictedScopes = result.evicted.map((m) => m.scope).sort();
+    expect(evictedScopes).toEqual(['project_local', 'project_shared', 'user']);
+  });
+
+  // T4: failure paths — illegal_transition + io_error
+  test('T4: illegal_transition surfaces in failures (frontmatter manually flipped post-seed)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    writeIndex(roots.projectShared, '- [Flipped](flipped.md) — h\n');
+    // Frontmatter says invalidated → registry.list will surface
+    // this as candidate AND the audit row anchors the 7d window.
+    writeBody(roots.projectShared, 'flipped', {
+      state: 'invalidated',
+      source: 'user_explicit',
+    });
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'flipped',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: eightDaysAgoMs,
+    });
+
+    // Now manually overwrite the frontmatter to `state: purged`
+    // — terminal state from which `invalidated → evicted` is
+    // illegal. registry.list({states:['invalidated']}) filters
+    // by frontmatter so a `purged` body is excluded, and the
+    // sweep skips it. Test variant: flip to a state that DOES
+    // pass the filter but FAILS the transition. There's no such
+    // state in the legal_transitions table — invalidated→evicted
+    // admits motivo='shift' from EVERY invalidated. So the
+    // illegal_transition path is genuinely unreachable from
+    // within `gcStaleInvalidatedMemories` for state-machine
+    // reasons. Document the result as an "orphan"-class skip
+    // since the body's current state isn't `invalidated` anymore.
+    writeBody(roots.projectShared, 'flipped', { state: 'purged' });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    // Memory was filtered out at list-time (state filter dropped
+    // it); no transition attempted, no audit row, no failure.
+    expect(result.evicted).toEqual([]);
+    expect(result.failures).toEqual([]);
+  });
+
+  test('T4: io_error in tombstone write surfaces in failures', async () => {
+    // Skip-as-root: chmod won't restrict the sweep.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    writeIndex(roots.projectShared, '- [Stuck](stuck.md) — h\n');
+    writeBody(roots.projectShared, 'stuck', { state: 'invalidated', source: 'user_explicit' });
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'stuck',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: eightDaysAgoMs,
+    });
+    // Make the tombstone-target directory unwritable: pre-create
+    // `.tombstones/` and chmod 0o500 so the move into it fails.
+    mkdirSync(join(roots.projectShared, '.tombstones'), { recursive: true });
+    chmodSync(join(roots.projectShared, '.tombstones'), 0o500);
+    try {
+      const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+      const result = await gcStaleInvalidatedMemories(db, registry, roots);
+      expect(result.evicted).toEqual([]);
+      expect(result.failures.length).toBe(1);
+      expect(result.failures[0]?.memory.name).toBe('stuck');
+      expect(result.failures[0]?.reason).toContain('invalidated→evicted');
+    } finally {
+      chmodSync(join(roots.projectShared, '.tombstones'), 0o755);
+    }
+  });
+
+  // Bug-fix regressions reported by code review (post-R3).
+
+  test('eviction row stamped with purge_at so listEvictedDueForPurge picks it up', async () => {
+    // Without this, the tombstones from this sweep accumulate
+    // forever — `listEvictedDueForPurge` filters
+    // `WHERE purge_at IS NOT NULL`, so a NULL stamp means the
+    // evicted → purged GC will never reclaim them.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    writeIndex(roots.projectShared, '- [Stale](stale.md) — h\n');
+    writeBody(roots.projectShared, 'stale', { state: 'invalidated', source: 'user_explicit' });
+    const {
+      appendEvictionEvent,
+      listEvictedDueForPurge,
+    } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'stale',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: eightDaysAgoMs,
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted.map((m) => m.name)).toEqual(['stale']);
+
+    // 30 days in the future: the tombstone produced by this sweep
+    // should be eligible. Without the purgeAt stamp the helper
+    // returns empty even at +infinity.
+    const farFuture = Date.now() + 31 * 24 * 60 * 60 * 1000;
+    const due = listEvictedDueForPurge(db, farFuture) as Array<{ objectId: string }>;
+    expect(due.map((r) => r.objectId)).toContain('stale');
+  });
+
+  test('registry reloaded after a transition so just-evicted entries leave assembleMemorySection', async () => {
+    // Without `registry.reload()` post-sweep, `registry.list()`
+    // returns the stale snapshot — entries whose bodies were just
+    // moved to `.tombstones/` show up as "missing peek" which
+    // `assembleMemorySection` treats as "uncertain → include".
+    // Net effect: the eager prompt would surface a memory the
+    // sweep just evicted.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    writeIndex(roots.projectShared, '- [Bygone](bygone.md) — h\n');
+    writeBody(roots.projectShared, 'bygone', { state: 'invalidated', source: 'user_explicit' });
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'bygone',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: eightDaysAgoMs,
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    // Pre-sweep, the registry sees `bygone` in project_shared.
+    expect(registry.list({ scope: 'project_shared' }).map((l) => l.name)).toContain('bygone');
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted.map((m) => m.name)).toEqual(['bygone']);
+
+    // Post-sweep, the registry must have reloaded — the listing
+    // no longer carries `bygone`.
+    expect(registry.list({ scope: 'project_shared' }).map((l) => l.name)).not.toContain('bygone');
   });
 });

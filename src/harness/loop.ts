@@ -23,6 +23,7 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
+import { createScopeFilteredRegistry } from '../memory/registry.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -44,6 +45,7 @@ import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import { buildRetrievalRunner } from '../retrieval/index.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import {
   type CritiqueRunCode,
   type SessionStatus,
@@ -59,6 +61,7 @@ import {
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
+import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -887,6 +890,89 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         sessionId = session.id;
       }
 
+      // Eager-load provenance emit (MEMORY.md §11.2, S1/T1.4).
+      // The CLI bootstrap froze the inventory at system-prompt
+      // assembly time; this is the first moment a sessionId
+      // exists to link the exposures against. One row per
+      // (session, memory) with surface='eager' and
+      // tool_call_id=NULL — eager-load happens BEFORE any tool
+      // call exists, so the FK is intentionally absent.
+      //
+      // Idempotency gate: ask the repo which (scope, name) pairs
+      // are already recorded for this session and emit only the
+      // missing ones. An earlier shape used a coarse "any eager
+      // row exists?" probe (hasEagerProvenance); on resume after
+      // a previous emit that succeeded for SOME exposures then
+      // hit a transient SQLITE_BUSY / write failure, the next
+      // boot saw "some rows exist" and skipped backfill of the
+      // rest, permanently dropping the missing entries from the
+      // provenance trail. Per-key gating restores the contract:
+      // every system-prompt body ends up with a matching eager
+      // row, even across multiple partial resumes.
+      //
+      // Subagent first boots also use preassignedSessionId but
+      // have zero eager rows yet, so they emit normally — the
+      // existing-set is just empty.
+      //
+      // Best-effort: a DB failure here MUST NOT abort startup
+      // (provenance is observability, not correctness — same
+      // posture as registry.auditExposure). Failures land on
+      // stderr as AUDIT DRIFT. A read failure on the lookup
+      // itself (rare — `SELECT` paths don't ordinarily contend
+      // with the WAL writer lock) falls through to the
+      // `existing.has` checks below treating every exposure as
+      // missing, which is safe under "ALL rows exist already"
+      // (next emit duplicates, schema has no UNIQUE so duplicates
+      // accumulate) — accept that cost vs. an unhandled throw
+      // out of startup.
+      if (config.eagerExposures !== undefined && config.eagerExposures.length > 0) {
+        let existing: Set<string>;
+        try {
+          existing = getEagerProvenanceKeys(config.db, sessionId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: AUDIT DRIFT: failed to read eager provenance keys for session ${sessionId}: ${redactSecrets(msg)}\n`,
+          );
+          existing = new Set();
+        }
+        for (const exposure of config.eagerExposures) {
+          if (existing.has(`${exposure.scope}/${exposure.name}`)) continue;
+          try {
+            recordProvenance(config.db, {
+              sessionId,
+              toolCallId: null,
+              memoryScope: exposure.scope,
+              memoryName: exposure.name,
+              surface: 'eager',
+              memoryContentHash: exposure.memoryContentHash,
+              memoryStateAtExposure: exposure.memoryStateAtExposure,
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // Redact — SQLite errors may echo bound parameter
+            // values (the inventory's hash + state). Mirrors
+            // registry.ts AUDIT DRIFT redaction pattern.
+            process.stderr.write(
+              `memory: AUDIT DRIFT: failed to record eager exposure for ${exposure.name} (${exposure.scope}): ${redactSecrets(msg)}\n`,
+            );
+          }
+        }
+      }
+
+      // S2/verify_failed heuristic rolled back per policy:
+      // "todo o lifecycle de memória um llm-judge decide; sem
+      // heurísticas locais sobre texto". The verify scheduler +
+      // ProjectVerifier (regex path extraction + existsSync)
+      // shipped initially and were removed when their value-vs-
+      // false-positive analysis revealed the same fundamental
+      // limitation as S4's text heuristic: regex over prose
+      // can't distinguish assertion from historical mention.
+      // S11 (Phase 2 LLM-judge) is the replacement; until that
+      // lands, no verify-cycle runs in-session. The
+      // `verify_failed` trigger name is preserved for S11
+      // emission via the generic /memory audit --trigger filter.
+
       // bg manager creation MUST happen here, after sessionId is
       // resolved — every row insertBgProcess writes carries the
       // session_id FK, so a manager built before createSession would
@@ -1350,6 +1436,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             subagentRegistry: registry,
             ...(config.planMode === true ? { planMode: true } : {}),
             ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
+            // S5 CRIT/H3: forward shared-scope fail-closed verdict
+            // to the child. Without this, a subagent spawned after
+            // the operator revoked (or after verify_failed) would
+            // re-read disk and surface bodies the parent gated.
+            // Array → boolean translation: the child receives a
+            // single boolean via `--subagent-shared-scope-offline`
+            // (cleaner IPC than serializing an array of scopes);
+            // S5's only excluded scope is `project_shared` so the
+            // collapse is lossless today. If a future detector
+            // gates a different scope, this site widens to encode
+            // the array (and the spawn-factory grows a list flag).
+            ...(config.memoryExcludeScopes?.includes('project_shared')
+              ? { sharedScopeOffline: true }
+              : {}),
             ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
             depth: childDepth,
             // Forward the spawn factory test seam. Production
@@ -2454,6 +2554,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           spawnSubagentClosure = (args) => impl(args);
         }
 
+        // Scope-filtered registry for tool-facing surfaces. When the
+        // shared-corpus trust probe lands a non-confirmed outcome
+        // (verify_failed / deferred / revoked), bootstrap sets
+        // `memoryExcludeScopes: ['project_shared']`; without the
+        // wrapper, the tool context's `memoryRegistry` would still
+        // expose the unfiltered registry to memory_list /
+        // memory_read / memory_search, letting the model enumerate
+        // and read project_shared bodies under a fail-closed trust
+        // state — direct bypass of the trust gate that eager-load
+        // and retrieve_context already respect. Wrap once per run
+        // here so every tool invocation downstream sees the same
+        // filtered view; `retrieveContext` builds against the same
+        // wrapped registry below for surface symmetry.
+        const effectiveMemoryRegistry =
+          config.memoryRegistry !== undefined &&
+          config.memoryExcludeScopes !== undefined &&
+          config.memoryExcludeScopes.length > 0
+            ? createScopeFilteredRegistry(config.memoryRegistry, config.memoryExcludeScopes)
+            : config.memoryRegistry;
+
         const buildCtx = (tu: CollectedToolUse): ToolContext => ({
           signal,
           cwd: config.cwd,
@@ -2555,18 +2675,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               }
             }
           },
-          ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
+          ...(effectiveMemoryRegistry !== undefined
+            ? { memoryRegistry: effectiveMemoryRegistry }
+            : {}),
           // Retrieval subsystem runner (slice 4.9). Wired when the
           // memory registry is configured — db is always available
           // since harness can't run without it. retrieve_context
           // tool surfaces 'retrieval.unavailable' when this is
           // absent (headless / SDK runs without memory).
-          ...(config.memoryRegistry !== undefined
+          //
+          // Uses the same `effectiveMemoryRegistry` the tool ctx
+          // exposes, so the retrieval and direct-tool surfaces stay
+          // at parity on the trust posture (both filter excluded
+          // scopes; one couldn't legitimately bypass the other).
+          // `memoryExcludeScopes` still flows into the retrieval
+          // runner because the retrieval pipeline plumbs it
+          // separately (e.g., into the BM25 view's own filter
+          // path) — defense in depth: even if the wrapper missed
+          // something at some surface, the explicit memoryExcludeScopes
+          // there continues to enforce the same policy.
+          ...(effectiveMemoryRegistry !== undefined
             ? {
                 retrieveContext: buildRetrievalRunner({
                   db: config.db,
                   sessionId,
-                  memoryRegistry: config.memoryRegistry,
+                  memoryRegistry: effectiveMemoryRegistry,
+                  ...(config.memoryExcludeScopes !== undefined &&
+                  config.memoryExcludeScopes.length > 0
+                    ? { memoryExcludeScopes: config.memoryExcludeScopes }
+                    : {}),
                 }),
               }
             : {}),

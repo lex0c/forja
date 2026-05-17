@@ -1,6 +1,9 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
+import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
+import { isExpired } from './expires.ts';
+import { serializeMemoryFile } from './frontmatter.ts';
 import {
   type MemoryFileResult,
   type ScopeIndexResult,
@@ -46,6 +49,25 @@ export interface MemoryListing {
   // and hook without loading the body. `entry.href` is NOT trusted
   // for path resolution — see SECURITY CONTRACT in `index-file.ts`.
   entry: IndexEntry;
+  // Frontmatter state at the moment list() was called. Populated
+  // ONLY when `list()` already peeked the body for filtering
+  // (i.e., `opts.states` or `opts.includeExpired === false` was
+  // set). Undefined otherwise — caller that didn't request state
+  // filtering shouldn't pay the per-listing peek cost just to read
+  // the state field. Consumers that need state must EITHER pass
+  // a `states` filter (cheap reuse of the existing peek) OR peek
+  // directly. Document on the call site which path was chosen.
+  state?: MemoryState;
+  // Parsed MemoryFile from the same peek that populated `state`
+  // (P1/F3 hardening). Populated alongside `state` when `list()`
+  // ran a body peek for filtering — callers that consume the file
+  // (e.g., the bulk-invalidate path needs `frontmatter.source`
+  // for audit attribution; the stale-invalidated GC needs the
+  // full frontmatter to derive `StaleInvalidatedMemory.source`)
+  // can read `listing.file` instead of paying a SECOND peek.
+  // Undefined when `state` is undefined; reading `file` without
+  // setting a `states` filter requires an explicit `peek()` call.
+  file?: MemoryFile;
 }
 
 export interface MemoryRegistry {
@@ -187,6 +209,28 @@ export interface ListOptions {
   // `Date.now()`. Tests pin a fixed value so the filter is
   // deterministic against fixtures that hand-craft `expires`.
   nowMs?: number;
+  // Scope-level fail-closed exclusion (S5 retrieval-view review).
+  // Listings whose scope is in this list are dropped BEFORE the
+  // state/expires peek AND before `deduplicateByName` — order that
+  // matters because a higher-precedence shadow in an excluded
+  // scope would otherwise suppress an eligible lower-precedence
+  // sibling at dedup time, leaving NO candidate for that name even
+  // though a trusted one exists in a permitted scope.
+  //
+  // Mirrors the `excludeScopes` semantic that `assembleMemorySection`
+  // applies to the eager-load section: the trust probe's
+  // non-confirmed outcomes (`verify_failed` / `deferred` / `revoked`)
+  // make the bootstrap caller pass `['project_shared']` here so
+  // retrieval and eager-load share the same scope posture — the
+  // model can't pull unattested bodies via tool calls when the
+  // system prompt was already locked down.
+  //
+  // Empty / absent ≡ no exclusion. Distinct from the singular
+  // `scope` field (which RESTRICTS to one scope); these stack: a
+  // caller can pass `scope: 'user'` together with
+  // `excludeScopes: ['project_shared']` and the result is just
+  // user-scope listings.
+  excludeScopes?: readonly MemoryScope[];
 }
 
 export interface ScopeOption {
@@ -206,6 +250,15 @@ export interface ScopeOption {
 export interface AuditOverride {
   auditSessionId?: string;
   auditCwd?: string;
+  // Slice 1 — provenance. When set, every successful body load
+  // through `read()` (and `search(deep)`) ALSO emits a
+  // `memory_provenance` row with surface='memory_read', linking
+  // the exposure to the originating tool_call. Eager-load
+  // exposures (T1.4) and retrieve_context exposures (T1.5) emit
+  // through different paths with their own surface. Absent / null
+  // means "no provenance row" — the registry skips silently, which
+  // matches the registry's audit-best-effort posture.
+  auditToolCallId?: string;
 }
 
 export interface ReadOptions extends ScopeOption, AuditOverride {}
@@ -214,6 +267,38 @@ export interface SearchOptions extends AuditOverride {
   scope?: MemoryScope;
   deep?: boolean;
   limit?: number;
+  // Cap on how many deep-match hits emit `read` + provenance
+  // events. Defaults to `limit` — every hit returned to the caller
+  // is audited, which is the right behavior for callers that don't
+  // over-fetch.
+  //
+  // `memory_search` requests `limit + 1` results to detect
+  // truncation (extra row means there's more) but only returns
+  // `limit` to the model. Without this knob, the over-fetched row
+  // gets a body read + audit + provenance entry as if exposed,
+  // inflating exposure counts and skewing detectors that treat
+  // provenance as "visible to model" evidence. The tool sets
+  // `auditLimit: limit` so the over-fetch sentinel stays purely a
+  // truncation signal.
+  //
+  // Effective only when `deep: true`. Name/description matches do
+  // no body reads and emit nothing regardless of this cap.
+  auditLimit?: number;
+  // Scope-level fail-closed exclusion (S5 retrieval-view review).
+  // Listings whose scope is in this list are dropped BEFORE the
+  // precedence walk that fills `limit`. Mirrors the same field on
+  // `ListOptions` and is enforced for the same reason: a previous
+  // shape post-filtered hits after `search` had already short-
+  // circuited at the limit, so a higher-precedence excluded match
+  // could fill the cap before any allowed-scope sibling was
+  // considered — caller saw `[]` (or a too-short list) even when
+  // permitted memories matched. With the filter at candidate-
+  // build time, the precedence walk operates only over allowed
+  // scopes and `limit` covers what actually surfaces.
+  //
+  // Empty / absent ≡ no exclusion. Distinct from the singular
+  // `scope` field (which RESTRICTS to one scope); these stack.
+  excludeScopes?: readonly MemoryScope[];
 }
 
 // Inputs to `MemoryRegistry.write()`. The registry layer is
@@ -302,53 +387,6 @@ interface ScopeSnapshot {
   entries: IndexEntry[];
   diagnostic: ScopeIndexResult;
 }
-
-// Parse the spec-shaped `expires` value (`YYYY-MM-DD`) into an epoch
-// ms representing the END of that day (UTC). A memory with
-// `expires: 2026-05-15` is considered expired starting 2026-05-16
-// 00:00 UTC — matches the operator's intuition that "expires today"
-// means "valid through today" rather than "already expired at the
-// stroke of midnight". Returns null on malformed input so the
-// caller treats it as "no expiry set" and surfaces a stderr warning
-// elsewhere if needed (the validator already rejected this shape on
-// write; on read we're defensive against hand-edited files).
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-const parseExpiresEndOfDayMs = (expires: string): number | null => {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expires);
-  if (m === null) return null;
-  const year = Number.parseInt(m[1] ?? '', 10);
-  const month = Number.parseInt(m[2] ?? '', 10);
-  const day = Number.parseInt(m[3] ?? '', 10);
-  // Two-step parse: VALIDATE the input date first (catches
-  // `2026-02-31` → JS rolls to 2026-03-03, which we refuse), then
-  // compute end-of-day as start-of-next-day via simple ms addition.
-  // The earlier `day + 1` form mixed the two steps and rejected
-  // every legitimate last-day-of-month (`2026-01-31` → start = Feb
-  // 1 → month mismatch → rejected as malformed), which made
-  // `isExpired` return false for those memories and quietly kept
-  // expired entries visible to `list({ includeExpired: false })`.
-  const startOfDayMs = Date.UTC(year, month - 1, day, 0, 0, 0);
-  if (Number.isNaN(startOfDayMs)) return null;
-  const round = new Date(startOfDayMs);
-  if (
-    round.getUTCFullYear() !== year ||
-    round.getUTCMonth() !== month - 1 ||
-    round.getUTCDate() !== day
-  ) {
-    return null;
-  }
-  // Add exactly 24h. Crosses month / year boundaries correctly
-  // because epoch ms is independent of calendar structure.
-  return startOfDayMs + MS_PER_DAY;
-};
-
-const isExpired = (expires: string | undefined, nowMs: number): boolean => {
-  if (expires === undefined) return false;
-  const cutoffMs = parseExpiresEndOfDayMs(expires);
-  if (cutoffMs === null) return false; // malformed → treat as non-expiring
-  return nowMs >= cutoffMs;
-};
 
 // Split body into lines for snippet extraction. We keep raw lines
 // (no trim) so column offsets in matches stay meaningful when the
@@ -491,6 +529,59 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     }
   };
 
+  // Slice 1 / T1.3 — emit a `memory_provenance` row for the
+  // exposure. Same best-effort posture as `auditRead`: a DB
+  // failure here MUST NOT propagate (the body load already
+  // succeeded; the tool's contract to the model is satisfied).
+  // The exposure row is the lower bound — "these bytes WERE in
+  // the model's window" — and downstream detectors (S2/S3) layer
+  // correlation on top.
+  //
+  // Skipped when:
+  //   - no db is wired (headless / one-shot CLI sessions);
+  //   - no toolCallId is passed (caller is NOT a per-call surface;
+  //     eager-load and retrieve_context emit through their own
+  //     paths with the right surface in T1.4 / T1.5);
+  //   - no sessionId is resolvable (provenance is session-scoped
+  //     by design — see schema header).
+  //
+  // The hash is computed from the canonical serialization
+  // (`serializeMemoryFile`) — same producer the writer uses when
+  // it persists a memory, so a memory the system wrote round-trips
+  // through hash exactly. Operator-edited files with different
+  // whitespace will hash differently, which IS the signal: drift
+  // detection.
+  const auditExposure = (
+    listing: MemoryListing,
+    fileResult: MemoryFileResult,
+    override: AuditOverride = {},
+  ): void => {
+    if (db === undefined) return;
+    if (fileResult.kind !== 'present') return;
+    if (override.auditToolCallId === undefined) return;
+    const effectiveSessionId = override.auditSessionId ?? sessionId ?? null;
+    if (effectiveSessionId === null) return;
+    try {
+      const canonical = serializeMemoryFile(fileResult.file);
+      const hash = hashMemoryContent(canonical);
+      const stateAtExposure = fileResult.file.frontmatter.state ?? 'active';
+      recordProvenance(db, {
+        sessionId: effectiveSessionId,
+        toolCallId: override.auditToolCallId,
+        memoryScope: listing.scope,
+        memoryName: listing.name,
+        surface: 'memory_read',
+        memoryContentHash: hash,
+        memoryStateAtExposure: stateAtExposure,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to record exposure for ${listing.name} (${listing.scope}): ${redactSecrets(msg)}\n`,
+      );
+    }
+  };
+
   return {
     roots,
     list(opts: ListOptions = {}): MemoryListing[] {
@@ -498,6 +589,16 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       let filtered = all;
       if (opts.scope !== undefined) {
         filtered = filtered.filter((l) => l.scope === opts.scope);
+      }
+
+      // Scope-level fail-closed exclusion. Runs BEFORE the
+      // state/expires peek (saves N reads on excluded scopes) AND
+      // before `deduplicateByName` (so a shadow in an excluded
+      // scope can't suppress an eligible lower-precedence sibling).
+      // See ListOptions header for the spec rationale.
+      if (opts.excludeScopes !== undefined && opts.excludeScopes.length > 0) {
+        const excluded = new Set(opts.excludeScopes);
+        filtered = filtered.filter((l) => !excluded.has(l.scope));
       }
 
       // State / expires filter — gated on the option so callers
@@ -520,15 +621,39 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       const needFrontmatter = opts.states !== undefined || opts.includeExpired === false;
       if (needFrontmatter) {
         const nowMs = opts.nowMs ?? Date.now();
-        filtered = filtered.filter((l) => {
+        // map() + filter(null) instead of a plain filter so we
+        // can attach the read `state` to the surviving listing
+        // without a second peek downstream. Each listing's
+        // identity is preserved (same scope + name + entry); we
+        // just enrich with the state we read for filtering. The
+        // null-out form keeps the type narrow (no `MemoryListing
+        // | null` array intermediate).
+        //
+        // Race-window note: `listing.state` reflects state at
+        // list-time. If a downstream consumer re-peeks (e.g.,
+        // memory view's loadBodies path), the peek may observe a
+        // newer state (operator edited the file between list and
+        // body-load). The penalty multiplier downstream is tied
+        // to LIST-time state by design — a memory that's
+        // quarantined when retrieval starts ranks with the
+        // penalty for that retrieval, regardless of mid-flight
+        // edits. Cross-call consistency is the next list()
+        // call's responsibility.
+        const enriched: (MemoryListing | null)[] = filtered.map((l) => {
           const fileResult = readMemoryByName(roots, l.scope, l.name);
-          if (fileResult.kind !== 'present') return false;
+          if (fileResult.kind !== 'present') return null;
           const fm = fileResult.file.frontmatter;
           const state: MemoryState = fm.state ?? 'active';
-          if (opts.states !== undefined && !opts.states.includes(state)) return false;
-          if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return false;
-          return true;
+          if (opts.states !== undefined && !opts.states.includes(state)) return null;
+          if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return null;
+          // P1/F3: attach the peeked file so callers (gc sweeps,
+          // bulk-invalidate) don't pay a second peek to read the
+          // frontmatter.source / body. The file is already in
+          // memory from the filter peek above; sharing it costs
+          // nothing.
+          return { ...l, state, file: fileResult.file };
         });
+        filtered = enriched.filter((l): l is MemoryListing => l !== null);
       }
 
       if (opts.deduplicateByName === true) {
@@ -552,10 +677,13 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       if (listing === null) return { kind: 'unknown' };
       const fileResult = readMemoryByName(roots, listing.scope, name);
       if (fileResult.kind === 'present') {
-        auditRead(listing, fileResult, {
+        const auditOverride: AuditOverride = {
           ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
           ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-        });
+          ...(opts.auditToolCallId !== undefined ? { auditToolCallId: opts.auditToolCallId } : {}),
+        };
+        auditRead(listing, fileResult, auditOverride);
+        auditExposure(listing, fileResult, auditOverride);
         return { kind: 'present', scope: listing.scope, file: fileResult.file };
       }
       if (fileResult.kind === 'missing') {
@@ -585,14 +713,37 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       const q = query.trim();
       if (q.length === 0) return [];
       const limit = opts.limit ?? 50;
+      const auditLimit = opts.auditLimit ?? limit;
       const lower = q.toLowerCase();
 
-      const candidates =
-        opts.scope === undefined
-          ? allListings()
-          : allListings().filter((l) => l.scope === opts.scope);
+      // Candidate set. Scope restriction + scope exclusion BOTH
+      // happen here, BEFORE the precedence-walk + limit loop below.
+      // Filtering at this point is what gives `excludeScopes` its
+      // precedence-fallback guarantee: a higher-precedence excluded
+      // match never enters the loop, so the limit walks only over
+      // permitted scopes. (Mirrors the same invariant `list()`
+      // enforces with its own `excludeScopes` filter.)
+      let candidates = allListings();
+      if (opts.scope !== undefined) {
+        candidates = candidates.filter((l) => l.scope === opts.scope);
+      }
+      if (opts.excludeScopes !== undefined && opts.excludeScopes.length > 0) {
+        const excluded = new Set(opts.excludeScopes);
+        candidates = candidates.filter((l) => !excluded.has(l.scope));
+      }
 
       const hits: MemorySearchHit[] = [];
+      // Body-match audit queue. Each entry captures the data needed
+      // to fire `auditRead` + `auditExposure` AFTER the loop has
+      // settled which hits actually survive the limit. Deferring
+      // is what lets `memory_search` over-fetch (`limit + 1`) for
+      // truncation detection without leaking an exposure event for
+      // the extra row that the tool then drops from the response.
+      const pendingDeepAudits: Array<{
+        listing: MemoryListing;
+        fileResult: MemoryFileResult;
+        hitIndex: number;
+      }> = [];
 
       // Pass 1: cheap matches against name and description (no body
       // load required). The hit list grows in precedence order.
@@ -630,21 +781,12 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           if (fileResult.kind !== 'present') continue;
           const snippet = matchSnippet(splitBodyLines(fileResult.file.body), q);
           if (snippet === null) continue;
-          // Audit emission for body-match hits. The model receives
-          // a snippet of the body content via the search result, so
-          // for audit purposes this IS a read — same accountability
-          // as a direct memory_read call. Without this, an attacker
-          // monitoring memory_events for content exposure would
-          // miss search-deep hits entirely. Mirrors auditRead's
-          // best-effort try/catch (DB failures don't deny the
-          // search hit). Per-call audit override forwarded so
-          // top-level reads get attributed to the active session
-          // rather than NULL (the bootstrap-time constructor's
-          // sessionId is undefined).
-          auditRead(listing, fileResult, {
-            ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
-            ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-          });
+          // Defer the audit emission until we know which hits the
+          // caller will keep. See `pendingDeepAudits` header — the
+          // emission below the loop respects `auditLimit` so an
+          // over-fetched-but-dropped row doesn't get a spurious
+          // exposure row.
+          pendingDeepAudits.push({ listing, fileResult, hitIndex: hits.length });
           hits.push({
             scope: listing.scope,
             name: listing.name,
@@ -653,6 +795,26 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
             entry: listing.entry,
           });
         }
+      }
+
+      // Emit audits for body-match hits whose final index is within
+      // `auditLimit`. The model receives a body snippet via the
+      // search result, so each surviving hit IS a read for audit
+      // purposes — same accountability as a direct memory_read.
+      // Mirrors auditRead's best-effort try/catch (DB failures don't
+      // deny the search hit). Per-call audit override forwarded so
+      // top-level reads get attributed to the active session rather
+      // than NULL (the bootstrap-time constructor's sessionId is
+      // undefined).
+      const auditOverride: AuditOverride = {
+        ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
+        ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
+        ...(opts.auditToolCallId !== undefined ? { auditToolCallId: opts.auditToolCallId } : {}),
+      };
+      for (const pa of pendingDeepAudits) {
+        if (pa.hitIndex >= auditLimit) break;
+        auditRead(pa.listing, pa.fileResult, auditOverride);
+        auditExposure(pa.listing, pa.fileResult, auditOverride);
       }
       return hits.slice(0, limit);
     },
@@ -787,6 +949,187 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           `memory: AUDIT DRIFT: failed to record ${input.action} event for ${input.memoryName} (${input.scope}): ${redactSecrets(msg)}\n`,
         );
       }
+    },
+  };
+};
+
+// Wrap a `MemoryRegistry` so every read-side method (`list` /
+// `lookup` / `read` / `peek` / `search` / `count`) honors a
+// fail-closed `excludeScopes` policy. The harness loop applies
+// this when the shared-corpus trust probe returns a non-confirmed
+// outcome (`verify_failed` / `deferred` / `revoked`); without it,
+// `memory_list` / `memory_read` / `memory_search` tools would
+// expose the unfiltered registry and let the model enumerate and
+// read project_shared bodies the operator already marked offline
+// — a direct bypass of the trust gate that the eager-load and
+// retrieval surfaces already respect.
+//
+// Write-side methods (`write`, `recordEvent`) pass through. This
+// fix scopes to reads (the bypass the review flagged); whether a
+// trust-revoked session should ALSO block new shared writes is a
+// separate policy question the writer's own gates can handle.
+//
+// Read-side semantics:
+//   - `list({ scope: excludedScope })` → empty (caller pinned an
+//     excluded scope).
+//   - `list({})` → underlying ListOptions.excludeScopes is merged
+//     with the wrapper's set so the filter runs BEFORE dedup
+//     (preserves the precedence-fallback the previous review fix
+//     established — see ListOptions header).
+//   - `lookup` / `read` / `peek` with `opts.scope` set: excluded
+//     scope returns null / `unknown`; allowed scope delegates.
+//   - `lookup` / `read` / `peek` without `opts.scope`: walk
+//     SCOPE_ORDER, skip excluded scopes, return the first hit (or
+//     null / unknown). Audit emission only fires on the successful
+//     `present` outcome (same as the underlying registry's
+//     contract); intermediate misses across allowed scopes don't
+//     emit because the underlying `read`/`peek` skip audit when
+//     `kind !== 'present'`.
+//   - `search` filters hits AFTER the underlying call. A pinned
+//     `opts.scope` in an excluded set short-circuits to []. The
+//     `limit` / `auditLimit` semantics are preserved by passing
+//     them through; the wrapper's post-filter only removes hits in
+//     the excluded scopes (it can't add audit suppression on
+//     excluded hits because the underlying registry already
+//     audited them — but excluded scopes are blocked before the
+//     base call when caller pins them, and the only path that
+//     would emit for an excluded scope is when caller didn't pin
+//     and the underlying iterator happened to hit one; the
+//     wrapper accepts that minor overshoot as the cost of not
+//     restructuring SearchOptions to carry excludeScopes natively,
+//     since the audit row is operator-forensic and the model
+//     never sees the row anyway).
+//   - `count({})` excludes filtered scopes by walking `list`.
+//
+// `excludeScopes` is captured at wrapper-creation time; if the
+// trust posture changes mid-session (operator runs
+// `/memory trust accept`), the bootstrap re-builds the harness
+// config + re-wraps. The wrapper itself doesn't mutate.
+export const createScopeFilteredRegistry = (
+  base: MemoryRegistry,
+  excludeScopes: readonly MemoryScope[],
+): MemoryRegistry => {
+  // Empty exclusion is a degenerate case; callers should avoid
+  // wrapping in that situation, but if they do we just delegate
+  // everything to keep the wrapper neutral.
+  if (excludeScopes.length === 0) return base;
+  const excluded = new Set<MemoryScope>(excludeScopes);
+  // Local copy of the precedence order. Module-private constant
+  // SCOPE_ORDER inlined here so the wrapper's behavior tracks the
+  // registry's scope precedence exactly without exporting an
+  // internal symbol.
+  const ORDER: readonly MemoryScope[] = ['project_local', 'project_shared', 'user'];
+
+  const mergeListOptions = (opts: ListOptions = {}): ListOptions => {
+    const existing = opts.excludeScopes ?? [];
+    const combined = new Set<MemoryScope>([...existing, ...excludeScopes]);
+    return { ...opts, excludeScopes: Array.from(combined) };
+  };
+
+  // Walk the precedence order, skip excluded scopes, return the
+  // first result the `sentinel` says is terminal (non-miss). Used
+  // by lookup/read/peek so the wrapper preserves "fall through to
+  // the next allowed scope when the most-specific scope is
+  // excluded" — same fallback the eager-load and retrieval views
+  // get via list({ excludeScopes }).
+  const tryEachAllowedScope = <T>(
+    delegate: (s: MemoryScope) => T,
+    sentinel: (result: T) => boolean,
+  ): T | null => {
+    for (const s of ORDER) {
+      if (excluded.has(s)) continue;
+      const result = delegate(s);
+      if (!sentinel(result)) return result;
+    }
+    return null;
+  };
+
+  return {
+    roots: base.roots,
+
+    list(opts: ListOptions = {}): MemoryListing[] {
+      if (opts.scope !== undefined && excluded.has(opts.scope)) return [];
+      return base.list(mergeListOptions(opts));
+    },
+
+    lookup(name: string, opts: ScopeOption = {}): MemoryListing | null {
+      if (opts.scope !== undefined) {
+        if (excluded.has(opts.scope)) return null;
+        return base.lookup(name, opts);
+      }
+      return (
+        tryEachAllowedScope(
+          (s) => base.lookup(name, { ...opts, scope: s }),
+          (result) => result === null,
+        ) ?? null
+      );
+    },
+
+    read(name: string, opts: ReadOptions = {}): RegistryReadResult {
+      if (opts.scope !== undefined) {
+        if (excluded.has(opts.scope)) return { kind: 'unknown' };
+        return base.read(name, opts);
+      }
+      const found = tryEachAllowedScope(
+        (s) => base.read(name, { ...opts, scope: s }),
+        // `unknown` is the keep-walking sentinel — `missing` /
+        // `malformed` / `present` are terminal (the listing exists
+        // at this scope; surface that outcome).
+        (result) => result.kind === 'unknown',
+      );
+      return found ?? { kind: 'unknown' };
+    },
+
+    peek(name: string, opts: ScopeOption = {}): RegistryReadResult {
+      if (opts.scope !== undefined) {
+        if (excluded.has(opts.scope)) return { kind: 'unknown' };
+        return base.peek(name, opts);
+      }
+      const found = tryEachAllowedScope(
+        (s) => base.peek(name, { ...opts, scope: s }),
+        (result) => result.kind === 'unknown',
+      );
+      return found ?? { kind: 'unknown' };
+    },
+
+    search(query: string, opts: SearchOptions = {}): MemorySearchHit[] {
+      if (opts.scope !== undefined && excluded.has(opts.scope)) return [];
+      // Merge the wrapper's excludeScopes into the native field so
+      // candidate filtering runs BEFORE the precedence-walk + limit
+      // loop. A previous shape post-filtered after `base.search`
+      // returned, which meant a higher-precedence excluded match
+      // could fill the limit before any allowed-scope sibling was
+      // considered (e.g., `excludeScopes: ['project_shared']` +
+      // `limit: 1` returning [] even when user/foo would match).
+      // Routing into `SearchOptions.excludeScopes` puts the filter
+      // at candidate-build time and restores the precedence-fallback
+      // contract that `list` already enforces.
+      const existing = opts.excludeScopes ?? [];
+      const combined = new Set<MemoryScope>([...existing, ...excludeScopes]);
+      return base.search(query, { ...opts, excludeScopes: Array.from(combined) });
+    },
+
+    count(opts: { deduplicateByName?: boolean } = {}): number {
+      // Walk the wrapper's own list() to apply the filter; pass
+      // the dedupe flag through. Operator-facing surfaces (boot
+      // banner, footer tray) show the model-effective count, so
+      // shared-offline sessions surface a reduced number.
+      return this.list({
+        ...(opts.deduplicateByName === true ? { deduplicateByName: true } : {}),
+      }).length;
+    },
+
+    reload(): void {
+      base.reload();
+    },
+
+    write(input: WriteOptions): RegistryWriteResult {
+      // Writes pass through; see header for scope rationale.
+      return base.write(input);
+    },
+
+    recordEvent(input: RegistryEventInput): void {
+      base.recordEvent(input);
     },
   };
 };

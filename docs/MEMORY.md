@@ -227,11 +227,12 @@ The full operator surface ships via `/memory <subcommand>` (`src/cli/slash/comma
 | Command | What it does |
 |---|---|
 | `/memory` | One-line summary: total active memories per scope. |
-| `/memory list [scope]` | Index dump (no body) for `user` / `shared` / `local` / all. |
+| `/memory list [scope]` | Index dump (no body) for `user` / `shared` / `local` / all. Renders state + expires for each entry: `[QUARANTINED]` / `[INVALIDATED]` / `[PROPOSED]` / `[EXPIRED <date>]` prefix flags; `(expires <date>)` suffix on active entries with a future expiry; `[ORPHAN]` / `[MALFORMED]` markers for unreadable rows. |
 | `/memory show <name>` | Print the full body of a memory. |
-| `/memory audit` | Tail of `memory_events` for the current session. |
+| `/memory audit [--trigger <source>] [--name <n>] [--all] [--limit N]` | Tail of `memory_events`. `--trigger` accepts a literal value (e.g. `operator_driven`, `verify_failed`) or one of the semantic shortcuts: `operator` matches `operator_driven`; `detector` matches the 4 auto-detector triggers (`verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked`). |
 | `/memory metrics [--days N]` | Aggregated eviction pipeline metrics over the window — motivo distribution, restore rate, quarantine dwell, protection / hook block counts. Window default 30d. |
 | `/memory delete <name>` | Routes through `transitionMemoryState` (active → quarantined → evicted depending on current state). Asks for confirmation. |
+| `/memory quarantine <name> --motivo <kind> [--evidence "…"] [--scope <s>]` | Operator-driven `active → quarantined`. Motivo allow-list: `conflict`, `shift`, `security`, `low_roi`, `irrelevant`. Audit row lands with `trigger: operator_driven` so forensic queries can split manual transitions from the auto-detector triggers (`docs/TODO.md` Slices 2-5). |
 | `/memory restore <name>` | `evicted → proposed` from the latest tombstone. Operator passes the normal admission gate. |
 | `/memory promote shared <name>` | `local → shared`. Runs the extra promotion scanner (secrets + injection heuristics + 200-line body cap). Creates a `git status` change; does **not** auto-commit. |
 | `/memory demote local <name>` | `shared → local`. Inverse of promote. No extra scanner (going to less-trusted scope). |
@@ -534,17 +535,19 @@ Operators can opt in with `--allow-memory-write=local` for CI flows that genuine
 
 ## 11. Storage tables
 
-Two tables, both in `src/storage/migrations/`:
+Three tables, all in `src/storage/migrations/`:
 
 - **`memory_events`** (migration 040 + 048) — append-only log of memory operator-visible actions. Row per action; `details` JSONB carries diff / motivo / hash references.
 - **`eviction_events`** (migration 046, with hook-run tie-in at 047) — append-only log of cross-substrate eviction transitions. Memory shares the table with future substrates (policies, code-index entries, etc.); rows filter on `substrate='memory'`.
+- **`memory_provenance`** (migration 054) — append-only exposure trail: every moment a memory's bytes were visible to the model. Row per `(session, memory, surface, moment)`. Details below in §11.2.
 
 The tables are intentionally separate because they answer different questions:
 
 - "Who edited what when in this session?" → `memory_events`.
 - "Why did the state machine refuse this transition, and what was the upstream trigger?" → `eviction_events`.
+- "Which memories were visible to the model when this tool call fired?" → `memory_provenance`.
 
-Cross-table linkage via `memory_events.details.eviction_event_id` for transitions that emit both rows.
+Cross-table linkage via `memory_events.details.eviction_event_id` for transitions that emit both rows. `memory_provenance.tool_call_id` and `memory_provenance.retrieval_query_id` link the exposure trail to the canonical `tool_calls` and `retrieval_trace` tables respectively.
 
 ### 11.1 Audit split with `retrieval_trace`
 
@@ -563,6 +566,94 @@ A third table, `retrieval_trace` (migration 053), lives in the retrieval subsyst
 - Retrieval-internal paths (BM25 corpus build with `loadBodies=true`, compression fallback probing levels) use `registry.peek` so they don't emit `memory_events`. The model never sees the bodies they touch — those reads are pipeline-internal heuristics, not deliveries.
 
 This is the asymmetry that lets `/memory audit` stay focused on operator-driven actions without inflating with retrieval-internal noise, AT THE COST of needing two surfaces when the question is "what did the model receive."
+
+### 11.2 Provenance trail (`memory_provenance`)
+
+Records EXPOSURES — moments where a memory's bytes were visible in the model's window. NOT causation: the model can ignore an exposed memory entirely. Provenance is the lower bound — "the bytes WERE in the window" — and downstream detectors (`verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked` per `§6.5.2`) layer correlation analysis on top.
+
+#### What the schema does NOT claim
+
+Worth stating up front because the field names invite misreading:
+
+- **Causation.** The model may have ignored an exposed memory entirely. A `verify_failed` correlated with an exposure is *epistemic correlation*, not proof the memory drove the action.
+- **Use.** No signal today says "the model attended to this memory". Provenance answers a strictly weaker question.
+- **Replay completeness.** The system prompt's full bytes, the tool registry version, the model id, the decoding seed — none live here. Provenance is *one dimension* of cognitive observability, not all of it.
+
+The reframing ("exposed", not "caused") is load-bearing discipline; the schema header in `migrations/054-memory-provenance.ts` calls it out at the top.
+
+#### Three surfaces
+
+| `surface` | When | `tool_call_id` | `retrieval_query_id` | `position_in_corpus` |
+|---|---|---|---|---|
+| `eager` | System-prompt assembly at session boot — one row per `(session, memory)` (NOT per tool call) | NULL by construction (precedes any call) | NULL | NULL |
+| `memory_read` | Model called the `memory_read` tool by name, OR `memory_search` deep matched the body | Non-null (the call that surfaced the body) | NULL | NULL |
+| `retrieve_context` | A `retrieve_context` slot included the memory | Non-null (the tool call that issued the retrieval) | Non-null (FK to `retrieval_trace`) | 0 = top hit |
+
+Eager emits once per `(session, memory)` because the index lands in the system prompt and is visible for every tool call in the session — emitting N rows for N calls would inflate the table without adding signal. Per-call surfaces emit per call: each `memory_read` is a new row; each `retrieve_context` slot membership is a new row.
+
+#### Schema fields
+
+`memory_provenance(id PK, session_id FK CASCADE, tool_call_id FK CASCADE NULL, memory_scope TEXT CHECK, memory_name TEXT, surface TEXT CHECK, retrieval_query_id FK retrieval_trace SET NULL, position_in_corpus INTEGER NULL, memory_content_hash TEXT NULL, memory_state_at_exposure TEXT NULL, created_at INTEGER)`.
+
+Two fields freeze the memory at exposure time so replay stays honest after the operator edits the file:
+
+- **`memory_content_hash`** — SHA-256 hex of the canonical serialization (`serializeMemoryFile` output, same producer the writer uses). A memory the system wrote round-trips through the hash exactly; operator hand-edits with different whitespace hash differently — that drift IS the signal. NULL when the hashing call itself failed (best-effort: a hash glitch never blocks the exposure record).
+- **`memory_state_at_exposure`** — `frontmatter.state` snapshot at the exposure moment (defaults to `active` when absent). The memory may transition state after exposure; the snapshot answers "what was the state when the model saw this?" without needing time-travel queries against `memory_events`.
+
+#### Invariants enforced at the repo layer
+
+`src/storage/repos/memory-provenance.ts` validates before INSERT so DB CHECK errors stay the last line of defense:
+
+- **Surface enum** + **memoryScope enum** validated against canonical sets (`{eager, memory_read, retrieve_context}` and `{user, project_shared, project_local}`).
+- **`tool_call_id` nullability per surface**: `eager` MUST be null (the row precedes any call); per-call surfaces MUST be non-null (orphan rows from causal context are caller bugs).
+- **Retrieval-grouping invariant**: `surface='retrieve_context'` requires both `retrieval_query_id` AND `position_in_corpus`; other surfaces MUST set neither. Half-grouped rows would silently fail downstream "exposures from this retrieval" queries.
+
+#### Privacy-by-default at the query layer
+
+Every listing helper REQUIRES `sessionId`. Cross-session aggregation is reachable only via explicitly-named functions (`listGlobalProvenanceByName`, `listGlobalProvenanceForMemory`). This shape blocks the accidental-leak pattern: a caller writing session-scoped queries can't reach for the global helpers without typing the literal word `Global`. Same fix shape as commit `55ba11a`'s `listRetrievalTracesByWorkflow` regression.
+
+#### Three emitters
+
+- **`memory_read` tool** — `MemoryRegistry.read()` / `MemoryRegistry.search(deep)` emit `surface='memory_read'` alongside the existing `memory_events action=read` audit row. `auditExposure` mirrors `auditRead`'s best-effort posture: a DB failure stderr-logs as `AUDIT DRIFT` but never aborts the body load. The tool layer threads `ctx.toolCallId` (populated by `invoke-tool.ts` post-`createToolCall`) so the row links to its causal call.
+- **Eager load** — bootstrap captures an inventory at system-prompt assembly time (`AssembleMemorySectionResult.eagerLoaded`) and forwards it via `HarnessConfig.eagerExposures`. The harness loop emits one row per inventory entry right after `createSession` — the first moment a sessionId exists. Inventory is frozen at assembly, NOT at emit: operator rewrites between boot and session start would otherwise drift the hash from "what landed in the prompt" to "what's on disk now".
+- **`retrieve_context`** — the retrieval runner emits one row per `contextSlot.included` entry whose `view === 'memory'`, after `createRetrievalTrace` succeeds. Gated on `result.queryId.length > 0` because a persist-failed retrieval has no parent trace to FK against. Session-view entries are filtered out — provenance is memory-specific; session messages already live in `messages`.
+
+#### Operator surface: `/memory provenance`
+
+Three forensic modes, mutually exclusive at parse time:
+
+| Form | Answers |
+|---|---|
+| `/memory provenance <name>` | Every exposure of this memory in the current session. `--all` opts out for cross-session forensic. |
+| `/memory provenance --tool <tool_call_id>` | Every memory exposed during one tool call. Session-scoped (`tool_call_id` lives in a session). |
+| `/memory provenance --retrieval <retrieval_query_id>` | Group view of one `retrieve_context` call, ordered by `position_in_corpus ASC` so the slot's ranking shows up directly. |
+
+`--limit N` (default 50) caps the rendered batch across every mode. Output is one compact row per exposure: `timestamp · surface · scope/name · tc=<prefix> · state=<…> · hash=<prefix>` plus `retrieval=<qid-prefix> #<pos>` for retrieval rows. Eager rows render `tc=eager---` to flag the NULL-by-construction case.
+
+#### Retention
+
+Boot-time GC sweep at `bootstrap.ts` prunes rows older than `MEMORY_PROVENANCE_RETENTION_MS` (90 days, mirrors `eviction_events`). Best-effort: a sweep failure stderr-logs but doesn't abort boot — provenance is observability, not correctness, and one failed sweep retries on the next boot. The cutoff is exclusive (`created_at < olderThanMs`) so callers can treat the value as the inclusive lower-bound of the retention window. The constant lives next to the prune query so a future tuning PR (operator policy, longer windows for compliance) has one place to change.
+
+#### Failure posture (best-effort everywhere)
+
+Every emit site catches its own throw and logs `AUDIT DRIFT` to stderr without aborting the surrounding work:
+
+- The model's body load already succeeded (memory_read) or the slot was already returned (retrieve_context) or the session bootstrap already completed (eager) by the time the provenance INSERT runs. Failing the work because the audit row didn't land would punish correctness for an observability glitch.
+- A bad inventory row (invalid scope passing through a future refactor) gets logged and skipped; following rows still emit.
+- Boot-time sweep failures defer cleanup by one boot — never block the session.
+
+#### Cross-table audit reconciliation
+
+Provenance complements the existing audit split:
+
+| The operator asks… | Tables to consult |
+|---|---|
+| "Did the model see memory X in this session?" | `memory_provenance` (every surface, one query). |
+| "Did the model call `memory_read` on X?" | `memory_events action=read` for explicit calls; `memory_provenance surface='memory_read'` for the per-exposure link. |
+| "Which memories did `retrieve_context` deliver?" | `retrieval_trace.context_slot_json.included[]` for the slot itself; `memory_provenance surface='retrieve_context'` for the cross-cut "all retrieve_context exposures of memory Y across sessions". |
+| "What memories did THIS specific tool call surface?" | `memory_provenance` filtered by `tool_call_id`. |
+
+`memory_events` stays focused on operator-driven actions; `retrieval_trace` carries the slot contents; `memory_provenance` carries the cross-cut exposure index that joins them. None replaces the other.
 
 ---
 
@@ -769,21 +860,23 @@ Spec items called out so contributors don't infer them as bugs. Bucketed by cate
 
 - **`--allow-memory-write=local` opt-in flag** (`§5.6`). Today `memory_write` rejects in headless mode unconditionally (`src/tools/builtin/memory-write.ts:284`); no flag widens the gate for CI flows.
 
-### 14.3 Trust boundary
-
-- **Hash-based re-trust on `shared/` changes** (`§7.2` mitigation 8). The spec calls for the trust prompt to re-fire when the operator pulls a commit that changes anything under `.agent/memory/shared/`. No content hash check exists today — operators can pull and immediately exec without re-confirming the new shared body.
-
-### 14.4 Adaptation cross-cut
+### 14.3 Adaptation cross-cut
 
 - **Loop-frio-driven `low_roi` quarantine of stale memories** (`§6.2` + `FEEDBACK_ADAPTATION.md §3.2`). The eviction substrate accepts `motivo: 'low_roi'` and the adaptation pipeline exists, but no detector currently emits memory ROI signals for the loop frio to aggregate. Manual `/memory delete` is the operator path today.
 - **Distribution-shift-driven invalidation of `reference` memories** (`§6.5.6`, e.g., the Linear project pointed to was archived). Manual review for now — no probe runs at boot to dereference external refs.
 
-### 14.5 What IS shipped (corrects an earlier draft of this section)
+### 14.4 What IS shipped (corrects an earlier draft of this section)
 
 These were listed as deferred in a prior draft but are wired today:
 
 - The four **model-facing tools** — `memory_read`, `memory_write`, `memory_search`, `memory_list` — are registered in `src/tools/builtin/index.ts` and exposed to the model via the harness tool registry.
 - **`MemoryWrite` hook fire** — `memory_write` dispatches the chain via `ctx.fireHook` at `src/tools/builtin/memory-write.ts:417`, before persisting. Blocking hook lands a `refused` audit row and aborts the write.
 - **Trigger-based eager-load** — `bootstrap.ts:580` and `subagent-child.ts:874` call `evaluateBootTriggers(repoRoot)`; `memory-prompt.ts` consumes the resulting `BootContext` via `shouldEagerLoadByTriggers` to surface conditionally-loaded memories on session boot.
+- **Operator-driven quarantine + audit forensics** (`feat/memory-lifecycle-detectors` Slice 0): `/memory quarantine` slash, state + expires + visual flag rendering on `/memory list`, and `/memory audit --trigger <source>` filter (literal match plus `operator` / `detector` shortcuts).
+- **Exposure trail** (`feat/memory-lifecycle-detectors` Slice 1, §11.2 above). `memory_provenance` table records every moment a memory was visible to the model (eager, memory_read, retrieve_context). Three emitters wired (registry's read/search-deep, eager-load via `eagerExposures`, retrieval runner post-`createRetrievalTrace`); `/memory provenance` slash command exposes the trail with three modes (`<name>`, `--tool`, `--retrieval`); 90d boot-time retention sweep.
+- **`trust_revoked` detector** (`feat/memory-lifecycle-detectors` Slice 5, §6.5.2 + §7.2 rule 8). Boot-time SHA-256 fingerprint of `.agent/memory/shared/`; when the operator's last-confirmed hash diverges from the current corpus, a re-confirmation modal fires; revocation bulk-transitions every active shared memory to `invalidated` (motivo `security`, trigger `trust_revoked`) and the bulk effect is reflected in this very boot's system prompt rather than requiring a restart. `assembleMemorySection` filters `state === 'invalidated'` from the eager-load. `/memory trust status` slash inspector surfaces in-sync / diverged / never-confirmed / verify-failed state without re-running the modal.
+- **Quarantine penalty + visual flag** (`feat/memory-lifecycle-detectors` Slice 6, §6.5.2 + EVICTION.md §9.7). Retrieval ranking applies a numeric penalty to `quarantined` memories without filtering them out (they stay visible-but-cautioned); `assembleMemorySection` renders the `[memory: quarantined]` inline flag so the model sees the marker. The state filter expanded to `['active', 'quarantined']` covers both retrievable states.
+
+The three remaining auto-detectors named in §6.5.2 (`verify_failed`, `user_override_repeated`, `conflict_detected`) ship as **substrate-only** in Phase 1 (V1 trigger names + audit filters preserved); the detection logic itself is deferred to Phase 2 LLM-judge slices (S3 + S8 + S11 + S13). Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals (S8). The operator surface is production-ready to receive both detector verdicts and proposals.
 
 `docs/BACKLOG.md` carries the current milestone status; the FEEDBACK_ADAPTATION cross-cut (`docs/spec/FEEDBACK_ADAPTATION.md`) describes how loop-frio adaptation will eventually drive automatic `low_roi` quarantine / eviction proposals for stale memories.

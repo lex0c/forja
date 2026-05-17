@@ -604,4 +604,90 @@ describe('subagent e2e — real child harness over IPC (S4)', () => {
 
     parentDb.close();
   });
+
+  test('T3: child inherits parent sharedScopeOffline → no project_shared in systemPrompt', async () => {
+    // Pins the CRIT/H3 wiring end-to-end. Parent's
+    // `memoryExcludeScopes: ['project_shared']` becomes
+    // `sharedScopeOffline: true` at the boolean serialization
+    // boundary (per N1 docs), flows via runSubagent → spawn factory
+    // → runSubagentChild → assembleMemorySection's excludeScopes.
+    // We assert by capturing the child's HarnessConfig and reading
+    // its systemPrompt; the shared memory body MUST be excluded.
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-subagent-h3-'));
+    const sharedDir = join(parentCwd, '.agent', 'memory', 'shared');
+    mkdirSync(sharedDir, { recursive: true });
+    writeFileSync(join(sharedDir, 'MEMORY.md'), '- [Sensitive](sensitive.md) — h\n');
+    writeFileSync(
+      join(sharedDir, 'sensitive.md'),
+      '---\nname: sensitive\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nINHERITED_BODY\n',
+    );
+
+    const parentDb = openDb(dbPath);
+    migrate(parentDb);
+    const parent = createSession(parentDb, { model: 'mock/m', cwd: parentCwd });
+    const parentRegistry = createToolRegistry();
+    parentRegistry.register(echoTool);
+    const engine = createPermissionEngine(policy(), { cwd: parentCwd });
+
+    // Capture the systemPrompt the child's harness was built with.
+    // The stubProvider doesn't need to inspect it; we read the
+    // value off the child's HarnessConfig before the run starts.
+    let capturedChildPrompt: string | undefined;
+    const captureProvider = (text: string): Provider => {
+      const base = stubProvider(text);
+      return {
+        ...base,
+        generate(req: Parameters<Provider['generate']>[0]) {
+          capturedChildPrompt = (req as unknown as { system?: string }).system;
+          return base.generate(req);
+        },
+      } as Provider;
+    };
+
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: captureProvider(''),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+        memoryCwd: parentCwd, // child resolves memory roots from here
+        cwdTrusted: true, // need trust so memory section flows
+        // CRIT/H3 forwarded flag:
+        sharedScopeOffline: opts.sharedScopeOffline === true,
+      }).then((exitCode) => ({ exitCode }));
+      return { exited, kill: () => undefined, ipc: parentChannel };
+    };
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'noop',
+      parentSessionId: parent.id,
+      provider: stubProvider(''),
+      parentToolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db: parentDb,
+      cwd: parentCwd,
+      onChildEvent: () => {},
+      spawnChildProcess: spawn,
+      cwdTrusted: true,
+      sharedScopeOffline: true, // parent's verdict; expected at child
+    });
+
+    // The captured systemPrompt MUST NOT contain the shared body.
+    // (The provider stub records `req.system` on `generate`, which
+    // the harness loop populates from HarnessConfig.systemPrompt
+    // assembled in subagent-child.)
+    expect(capturedChildPrompt ?? '').not.toContain('INHERITED_BODY');
+    expect(capturedChildPrompt ?? '').not.toContain('sensitive');
+
+    parentDb.close();
+    rmSync(parentCwd, { recursive: true, force: true });
+  });
 });

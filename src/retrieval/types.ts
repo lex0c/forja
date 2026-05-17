@@ -323,9 +323,21 @@ export interface RetrieveContextOutput {
 // (workspace via ripgrep + Bun.spawn) is the case the signal
 // actually saves — an unresponsive subprocess would otherwise hold
 // the pipeline open until completion.
+// Optional per-call context the harness threads through the tool
+// invocation. `toolCallId` enables the `retrieve_context` provenance
+// emit (MEMORY.md §11.2, S1/T1.5): every `contextSlot.included`
+// memory becomes one `memory_provenance` row linking back to the
+// tool_call that issued the retrieval. Absent ⇒ no provenance row,
+// which matches the harness-bypass test-context posture used by
+// memory_read / memory_search.
+export interface RetrieveFnOpts {
+  toolCallId?: string;
+}
+
 export type RetrieveFn = (
   input: RetrieveContextInput,
   signal?: AbortSignal,
+  opts?: RetrieveFnOpts,
 ) => Promise<RetrieveContextOutput>;
 
 // ─── trace persistence (§10.1) ────────────────────────────────────────

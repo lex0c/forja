@@ -18,7 +18,11 @@ import { createRegistry as createModelRegistry } from '../../../src/providers/re
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import { createMemoryEvent } from '../../../src/storage/repos/memory-events.ts';
+import { recordProvenance } from '../../../src/storage/repos/memory-provenance.ts';
+import { appendMessage } from '../../../src/storage/repos/messages.ts';
+import { createRetrievalTrace } from '../../../src/storage/repos/retrieval-trace.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
+import { createToolCall } from '../../../src/storage/repos/tool-calls.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../src/tui/modal-manager.ts';
@@ -45,7 +49,13 @@ const writeIndex = (dir: string, body: string): void => {
 const writeBody = (
   dir: string,
   name: string,
-  fmExtras: { type?: string; source?: string; trust?: string; expires?: string } = {},
+  fmExtras: {
+    type?: string;
+    source?: string;
+    trust?: string;
+    expires?: string;
+    state?: string;
+  } = {},
   body = `body of ${name}`,
 ): void => {
   mkdirSync(dir, { recursive: true });
@@ -57,6 +67,7 @@ const writeBody = (
   ];
   if (fmExtras.expires !== undefined) lines.push(`expires: ${fmExtras.expires}`);
   if (fmExtras.trust !== undefined) lines.push(`trust: ${fmExtras.trust}`);
+  if (fmExtras.state !== undefined) lines.push(`state: ${fmExtras.state}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\n${body}\n`);
 };
 
@@ -250,6 +261,150 @@ describe('/memory list', () => {
     const text = (r.notes ?? []).join('\n');
     expect(text).toContain('[project_local] l');
     expect(text).not.toContain('[project_shared]');
+  });
+
+  test('quarantined memory renders [QUARANTINED] flag (T0.2)', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Q](q.md) — quarantined-h\n');
+    writeBody(roots.projectLocal, 'q', { state: 'quarantined' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[project_local] [QUARANTINED] q');
+  });
+
+  test('invalidated / proposed memories render their flags', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.user, '- [Inv](inv.md) — invalidated\n- [Prop](prop.md) — proposed\n');
+    writeBody(roots.user, 'inv', { type: 'user', state: 'invalidated' });
+    writeBody(roots.user, 'prop', { type: 'user', state: 'proposed' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[INVALIDATED] inv');
+    expect(text).toContain('[PROPOSED] prop');
+  });
+
+  test('expired memory renders [EXPIRED <date>] flag', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Stale](stale.md) — old\n');
+    writeBody(roots.projectLocal, 'stale', { expires: '2024-01-01' });
+    registry.reload();
+    // Override ctx.now to a date AFTER 2024-01-01 so the expiry
+    // check fires. Default fixture clock is 1ms epoch — would
+    // never produce an expired result.
+    ctx.now = () => Date.UTC(2026, 0, 1);
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[EXPIRED 2024-01-01] stale');
+  });
+
+  test('active memory with future expires shows (expires <date>) suffix', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Fresh](fresh.md) — fresh-h\n');
+    writeBody(roots.projectLocal, 'fresh', { expires: '2099-12-31' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[project_local] fresh — fresh-h (expires 2099-12-31)');
+    // Active state means NO bracketed prefix flag.
+    expect(text).not.toContain('[QUARANTINED]');
+    expect(text).not.toContain('[EXPIRED');
+  });
+
+  test('orphan listing (index entry without body file) renders [ORPHAN]', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.user, '- [Phantom](phantom.md) — has-index-no-body\n');
+    // Deliberately no writeBody.
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[user] [ORPHAN] phantom');
+  });
+
+  test('malformed frontmatter renders [MALFORMED] with parse error', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.user, '- [Broken](broken.md) — bad-fm\n');
+    mkdirSync(roots.user, { recursive: true });
+    writeFileSync(join(roots.user, 'broken.md'), '---\nname: broken\n');
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[user] [MALFORMED] broken');
+  });
+
+  test('state flag enriched with motivo/trigger/date when audit event exists (H2)', async () => {
+    // When the quarantined memory has a paired memory_events row
+    // (operator-driven via /memory quarantine, or future
+    // detector-driven via Slices 2-5), the [QUARANTINED] flag
+    // becomes [QUARANTINED — motivo/trigger YYYY-MM-DD], matching
+    // the spec format `[memory: quarantined — verify failed
+    // 2026-05-12]` from MEMORY.md §6.5.2.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { state: 'quarantined' });
+    const { createMemoryEvent } = await import('../../../src/storage/repos/memory-events.ts');
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'mem',
+      source: 'inferred',
+      sessionId: null,
+      cwd: '/p',
+      createdAt: Date.UTC(2026, 4, 12),
+      details: { motivo: 'conflict', trigger: 'operator_driven' },
+    });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[QUARANTINED — conflict/operator_driven 2026-05-12] mem');
+  });
+
+  test('state flag falls back to bare label when no matching audit row exists', async () => {
+    // Hand-edited file (state set but no audit pair) gets the
+    // basic `[QUARANTINED]` flag — resilient to legacy / corrupt
+    // state.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { state: 'quarantined' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[QUARANTINED] mem');
+    expect(text).not.toContain('[QUARANTINED —');
+  });
+
+  test('quarantine flag wins over expired suffix when both apply', async () => {
+    // A memory that's both quarantined AND past expires should
+    // render only the [QUARANTINED] flag — the operator action
+    // is more relevant than the calendar fact.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Both](both.md) — q+expired\n');
+    writeBody(roots.projectLocal, 'both', { state: 'quarantined', expires: '2024-01-01' });
+    registry.reload();
+    ctx.now = () => Date.UTC(2026, 0, 1);
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[QUARANTINED] both');
+    expect(text).not.toContain('[EXPIRED');
   });
 
   test('invalid scope arg errors with options list', async () => {
@@ -642,6 +797,154 @@ describe('/memory audit', () => {
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain("unknown flag '--bogus'");
   });
+
+  test('--trigger operator filters to operator_driven rows (T0.3)', async () => {
+    // Three rows: one operator-driven quarantine, one detector-driven
+    // (verify_failed), one unrelated (created). Operator filter
+    // surfaces only the first.
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'op-q',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 3000,
+      details: { motivo: 'conflict', trigger: 'operator_driven' },
+    });
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'det-q',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 2000,
+      details: { motivo: 'shift', trigger: 'verify_failed' },
+    });
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'plain',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 1000,
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'operator'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('trigger: operator');
+    expect(text).toContain('op-q');
+    expect(text).not.toContain('det-q');
+    expect(text).not.toContain('plain');
+  });
+
+  test('--trigger detector matches every spec auto-detector', async () => {
+    // Seed one row for each of the 4 detector triggers + one
+    // operator_driven to confirm the inverse.
+    const detectors = [
+      'verify_failed',
+      'user_override_repeated',
+      'conflict_detected',
+      'trust_revoked',
+    ];
+    let ts = 1000;
+    for (const trigger of detectors) {
+      createMemoryEvent(db, {
+        scope: 'project_local',
+        action: 'quarantined',
+        memoryName: `mem-${trigger}`,
+        source: 'inferred',
+        sessionId,
+        cwd: '/p',
+        createdAt: ts++,
+        details: { motivo: 'conflict', trigger },
+      });
+    }
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'mem-operator_driven',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: ts++,
+      details: { motivo: 'conflict', trigger: 'operator_driven' },
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'detector'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    for (const trigger of detectors) {
+      expect(text).toContain(`mem-${trigger}`);
+    }
+    expect(text).not.toContain('mem-operator_driven');
+  });
+
+  test('--trigger <literal> matches the literal trigger field', async () => {
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'vf',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 1000,
+      details: { motivo: 'shift', trigger: 'verify_failed' },
+    });
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'quarantined',
+      memoryName: 'cd',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 2000,
+      details: { motivo: 'conflict', trigger: 'conflict_detected' },
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'verify_failed'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('vf');
+    expect(text).not.toContain('cd');
+  });
+
+  test('--trigger filter with zero matches yields a clear message', async () => {
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'plain',
+      source: 'inferred',
+      sessionId,
+      cwd: '/p',
+      createdAt: 1000,
+    });
+    const r = await memoryCommand.exec(['audit', '--trigger', 'verify_failed'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('no audit rows matching --trigger verify_failed');
+  });
+
+  test('--trigger without a value errors', async () => {
+    const r = await memoryCommand.exec(['audit', '--trigger'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--trigger needs a value');
+  });
+
+  test('--trigger specified twice refuses with explicit error (M4)', async () => {
+    // Pre-fix the parser silently kept the last value; operator
+    // ran `--trigger op --trigger det` and got just detector
+    // results without a hint that --trigger op was ignored.
+    const r = await memoryCommand.exec(
+      ['audit', '--trigger', 'operator', '--trigger', 'detector'],
+      ctx,
+    );
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain('--trigger specified twice');
+      expect(r.message).toContain('operator');
+      expect(r.message).toContain('detector');
+    }
+  });
 });
 
 // Helper: stub modalManager.askMemoryAction to a fixed answer so
@@ -790,6 +1093,291 @@ describe('/memory delete', () => {
     const previewText = capture.calls[0]?.preview.join('\n') ?? '';
     expect(previewText).toContain('sensitive');
     expect(previewText).toContain('body');
+  });
+});
+
+describe('/memory quarantine', () => {
+  test('confirm yes: transitions active → quarantined, audit pair lands', async () => {
+    const repo = makeTmp();
+    const { ctx, db, registry, roots, sessionId } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--evidence', 'duplicates other.md'],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('quarantined project_local/mem');
+    expect(r.notes?.join('\n')).toContain('motivo: conflict');
+    expect(r.notes?.join('\n')).toContain('trigger: operator_driven');
+    expect(r.notes?.join('\n')).toContain('evidence: duplicates other.md');
+    // Body stays on disk (quarantine doesn't move to tombstones).
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    // Audit row landed with action=quarantined, scope+session attribution.
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const quarantinedEv = events.find((e) => e.action === 'quarantined');
+    expect(quarantinedEv).toBeDefined();
+    expect(quarantinedEv?.scope).toBe('project_local');
+    expect(quarantinedEv?.sessionId).toBe(sessionId);
+  });
+
+  test('confirm no: file untouched, no transition', async () => {
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'no');
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'low_roi'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('cancelled');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    expect(listMemoryEventsByName(db, 'mem')).toHaveLength(0);
+  });
+
+  test('missing name errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['quarantine'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing name');
+  });
+
+  test('missing --motivo errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['quarantine', 'mem'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--motivo is required');
+  });
+
+  test('invalid motivo errors with allowed list', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'made_up'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message).toContain("invalid motivo 'made_up'");
+      // The allowed list is enumerated so the operator can fix.
+      expect(r.message).toContain('conflict');
+      expect(r.message).toContain('low_roi');
+    }
+  });
+
+  test('non-admissible motivo (shift / security / irrelevant) refused', async () => {
+    // EVICTION §4.1 admits only conflict + low_roi for
+    // active → quarantined. Other valid EvictionMotivos
+    // (`shift` for active→invalidated, `security` for purges,
+    // `irrelevant` for proposed→evicted) are refused at the slash
+    // boundary so the operator sees a clear error rather than
+    // an `illegal_transition` outcome leaking state-machine
+    // vocabulary.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    for (const motivo of ['shift', 'security', 'irrelevant']) {
+      const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', motivo], ctx);
+      expect(r.kind).toBe('error');
+      if (r.kind === 'error') expect(r.message).toContain(`invalid motivo '${motivo}'`);
+    }
+  });
+
+  test('unknown flag errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--bogus'],
+      ctx,
+    );
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown flag '--bogus'");
+  });
+
+  test('unknown name errors before opening modal', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const capture = { calls: [] as { action: string; subject: string; preview: string[] }[] };
+    stubMemoryAction(ctx, 'yes', capture);
+    const r = await memoryCommand.exec(['quarantine', 'ghost', '--motivo', 'conflict'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("no memory named 'ghost'");
+    expect(capture.calls).toHaveLength(0);
+  });
+
+  test('non-active memory refused (operator must use the correct command)', async () => {
+    // Pre-quarantine the memory first, then try to quarantine
+    // again. The state filter on this command refuses non-active
+    // sources to avoid double-transitions producing confusing
+    // audit pairs.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    // Write with state:quarantined frontmatter to simulate.
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'mem.md'),
+      '---\nname: mem\ndescription: h\ntype: feedback\nsource: inferred\nstate: quarantined\n---\n\nbody\n',
+    );
+    registry.reload();
+    const r = await memoryCommand.exec(['quarantine', 'mem', '--motivo', 'conflict'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("already in state 'quarantined'");
+  });
+
+  test('low_roi motivo: evidence schema bypassed via OPERATOR_DRIVEN_EVIDENCE_MARKER (H5)', async () => {
+    // Per EVICTION §6.1 `low_roi` has a non-trivial evidence schema
+    // (tokens_consumed, load_bearing_count, ratio). The slash sends
+    // only `{ _operator_driven: true, source, note }` — the marker
+    // tells preflightValidateEvidence to bypass the schema. Test
+    // pins that the path completes without invalid_evidence rejection.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Stale](stale.md) — h\n');
+    writeBody(roots.projectLocal, 'stale');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(
+      ['quarantine', 'stale', '--motivo', 'low_roi', '--evidence', 'unused 30d'],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('quarantined project_local/stale');
+    expect(r.notes?.join('\n')).toContain('motivo: low_roi');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'stale');
+    expect(events.find((e) => e.action === 'quarantined')).toBeDefined();
+  });
+
+  test('actor=user bypasses cooldown protection (H4 — design invariant)', async () => {
+    // The 72h `user_explicit` cooldown gate at transitions.ts:490
+    // applies to low_roi/irrelevant motivos — but is unconditionally
+    // bypassed when `actor === 'user'` (line 472). /memory
+    // quarantine sets actor='user', so even a freshly-created
+    // user_explicit memory can be quarantined immediately by the
+    // operator. This test pins the bypass invariant — future
+    // detectors that DON'T use actor='user' will see the cooldown
+    // fire and produce blocked_by_protection outcomes, which is
+    // the spec'd safety net.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Fresh](fresh.md) — just-created\n');
+    writeBody(roots.projectLocal, 'fresh', { source: 'user_explicit' });
+    // Seed a `created` event so getEarliestMemoryCreatedAt returns
+    // a value inside the 72h window (default ctx.now() = 1ms so any
+    // recent createdAt qualifies as fresh).
+    const { createMemoryEvent } = await import('../../../src/storage/repos/memory-events.ts');
+    createMemoryEvent(db, {
+      scope: 'project_local',
+      action: 'created',
+      memoryName: 'fresh',
+      source: 'user_explicit',
+      sessionId: null,
+      cwd: '/p',
+      createdAt: 1,
+    });
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(
+      ['quarantine', 'fresh', '--motivo', 'low_roi', '--evidence', 'still bypasses'],
+      ctx,
+    );
+    // Operator path: no cooldown block.
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    expect(r.notes?.[0]).toContain('quarantined project_local/fresh');
+  });
+
+  test('evidence note with newlines / quotes survives audit JSON (M5)', async () => {
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    const evidenceWithSpecials = 'line1\nline2 with "quotes"\nand a tab\there';
+    const r = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--evidence', evidenceWithSpecials],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    // Audit row's details_json must round-trip the note safely
+    // through JSON.stringify (no SQL corruption / parse failure).
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'mem');
+    const quarantined = events.find((e) => e.action === 'quarantined');
+    expect(quarantined).toBeDefined();
+    // The note is persisted in eviction_events.evidence_json via
+    // transitionMemoryState; the memory_events row carries motivo
+    // / trigger but the full evidence stays on eviction_events.
+    // Either way: the slash didn't crash, the audit row landed.
+  });
+
+  test('preview includes motivo, current/next state, evidence note, scope', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectShared, 'mem');
+    registry.reload();
+    const capture = { calls: [] as { action: string; subject: string; preview: string[] }[] };
+    stubMemoryAction(ctx, 'yes', capture);
+    await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'low_roi', '--evidence', 'unused 30d'],
+      ctx,
+    );
+    expect(capture.calls).toHaveLength(1);
+    const preview = capture.calls[0]?.preview.join('\n') ?? '';
+    expect(preview).toContain('motivo:  low_roi');
+    expect(preview).toContain('state:   active → quarantined');
+    expect(preview).toContain('evidence: unused 30d');
+    expect(preview).toContain('scope:   project_shared');
+    expect(capture.calls[0]?.action).toBe('quarantine');
+  });
+});
+
+describe('/memory quarantine + /memory audit integration (M3)', () => {
+  test('quarantine → audit --trigger operator surfaces the same row end-to-end', async () => {
+    // Wires up the full chain: /memory quarantine produces a
+    // memory_events row with details.trigger='operator_driven';
+    // /memory audit --trigger operator filters on that string via
+    // OPERATOR_DRIVEN_TRIGGER constant; the same row appears in
+    // the audit output. Pre-fix this couldn't be asserted because
+    // the constant didn't exist — drift between emit site and
+    // filter site was possible.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+
+    // Step 1: quarantine.
+    const qr = await memoryCommand.exec(
+      ['quarantine', 'mem', '--motivo', 'conflict', '--evidence', 'duplicates foo'],
+      ctx,
+    );
+    if (qr.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(qr)}`);
+
+    // Step 2: audit --trigger operator → row appears.
+    const ar = await memoryCommand.exec(['audit', '--trigger', 'operator'], ctx);
+    if (ar.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(ar)}`);
+    const text = (ar.notes ?? []).join('\n');
+    expect(text).toContain('trigger: operator');
+    expect(text).toContain('mem');
+    expect(text).toContain('quarantined');
+
+    // Step 3: audit --trigger detector → NO row (operator_driven
+    // is not a detector trigger).
+    const dr = await memoryCommand.exec(['audit', '--trigger', 'detector'], ctx);
+    if (dr.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(dr)}`);
+    expect(dr.notes?.[0]).toContain('no audit rows matching --trigger detector');
   });
 });
 
@@ -1688,5 +2276,742 @@ describe('/memory unknown subcommand', () => {
     const r = await memoryCommand.exec(['nonsense'], ctx);
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain("unknown subcommand 'nonsense'");
+  });
+});
+
+describe('/memory provenance (S1/T1.6)', () => {
+  const seedToolCall = (db: DB, sessionId: string, name = 'memory_read'): string => {
+    const msgId = appendMessage(db, { sessionId, role: 'assistant', content: 'x' }).id;
+    return createToolCall(db, { messageId: msgId, toolName: name, input: {} }).id;
+  };
+
+  test('errors when no mode is selected', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('needs a memory name or --tool');
+  });
+
+  test('errors when modes are mixed', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', 'role', '--tool', 'tc-1'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('mutually exclusive');
+  });
+
+  test('errors when --all is combined with --tool', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', '--tool', 'tc-1', '--all'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--all only applies');
+  });
+
+  test('errors on unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+
+  test('name lookup returns session-scoped rows with surface labels', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId);
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'role',
+      surface: 'eager',
+      memoryContentHash: 'a'.repeat(64),
+      memoryStateAtExposure: 'active',
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'role',
+      surface: 'memory_read',
+      memoryContentHash: 'b'.repeat(64),
+      memoryStateAtExposure: 'active',
+      createdAt: 2000,
+    });
+    const r = await memoryCommand.exec(['provenance', 'role'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('current session');
+    expect(text).toContain('user/role');
+    expect(text).toContain('eager');
+    expect(text).toContain('memory_read');
+    expect(text).toContain(`tc=${tc.slice(0, 8)}`);
+  });
+
+  test('name lookup with no rows hints at --all', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['provenance', 'nope'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect((r.notes ?? []).join('\n')).toContain('--all');
+  });
+
+  test('--all surfaces rows from another session', async () => {
+    const repo = makeTmp();
+    const { ctx, db } = makeCtx(repo);
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    recordProvenance(db, {
+      sessionId: other,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+      createdAt: 100,
+    });
+    // Session-scoped query returns nothing.
+    const scoped = await memoryCommand.exec(['provenance', 'foo'], ctx);
+    if (scoped.kind !== 'ok') throw new Error('expected ok');
+    expect((scoped.notes ?? []).join('\n')).toContain('0 rows');
+    // Cross-session surfaces it.
+    const all = await memoryCommand.exec(['provenance', 'foo', '--all'], ctx);
+    if (all.kind !== 'ok') throw new Error('expected ok');
+    const text = (all.notes ?? []).join('\n');
+    expect(text).toContain('all sessions');
+    expect(text).toContain('user/foo');
+  });
+
+  test('--tool surfaces exposures during that tool call only', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc1 = seedToolCall(db, sessionId);
+    const tc2 = seedToolCall(db, sessionId);
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc1,
+      memoryScope: 'user',
+      memoryName: 'a',
+      surface: 'memory_read',
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc2,
+      memoryScope: 'user',
+      memoryName: 'b',
+      surface: 'memory_read',
+      createdAt: 1100,
+    });
+    const r = await memoryCommand.exec(['provenance', '--tool', tc1], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('user/a');
+    expect(text).not.toContain('user/b');
+  });
+
+  test('--retrieval surfaces grouped exposures from one retrieve_context call', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId, 'retrieve_context');
+    const trace = createRetrievalTrace(db, {
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: { searchMs: 0, expandMs: 0, rankMs: 0, compressMs: 0 },
+    });
+    // Top hit at position 0, second at position 1.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'top',
+      surface: 'retrieve_context',
+      retrievalQueryId: trace.id,
+      positionInCorpus: 0,
+      createdAt: 1000,
+    });
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: tc,
+      memoryScope: 'user',
+      memoryName: 'second',
+      surface: 'retrieve_context',
+      retrievalQueryId: trace.id,
+      positionInCorpus: 1,
+      createdAt: 1001,
+    });
+    const r = await memoryCommand.exec(['provenance', '--retrieval', trace.id], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('position order');
+    // Top hit should appear before second hit (position 0 → first line).
+    const topIdx = text.indexOf('user/top');
+    const secondIdx = text.indexOf('user/second');
+    expect(topIdx).toBeGreaterThan(-1);
+    expect(secondIdx).toBeGreaterThan(topIdx);
+    expect(text).toContain('#0');
+    expect(text).toContain('#1');
+  });
+
+  test('--tool errors without an active session', async () => {
+    // makeCtx always seeds a session for the rest of the suite;
+    // construct a tweaked ctx that overrides currentSessionId() to
+    // null. Mirrors how a fresh REPL boot looks before the first
+    // turn — provenance --tool MUST refuse the query rather than
+    // fall through to the global aggregate (tool_call ids are
+    // session-scoped; cross-session lookup by tool_call_id would
+    // surface unrelated calls under the same prefix).
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    const ctxNoSession: SlashContext = {
+      ...bundle.ctx,
+      currentSessionId: () => null,
+    };
+    const r = await memoryCommand.exec(['provenance', '--tool', 'tc-x'], ctxNoSession);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('needs an active session');
+  });
+
+  test('--limit caps the rendered batch', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    for (let i = 0; i < 8; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'spammy',
+        surface: 'eager',
+        createdAt: 1000 + i,
+      });
+    }
+    const r = await memoryCommand.exec(['provenance', 'spammy', '--limit', '3'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    // Header line + 3 rows = 4 notes.
+    expect(r.notes).toHaveLength(4);
+  });
+
+  test('--tool honors --limit (regression — was unbounded)', async () => {
+    // Review fix: pre-fix the --tool path ignored --limit and
+    // rendered every row the repo returned. With high-volume tool
+    // calls (many memory_read / retrieve_context exposures during
+    // one tool turn) that floods the slash output. Now --limit
+    // caps just like the name mode.
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId);
+    for (let i = 0; i < 8; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: tc,
+        memoryScope: 'user',
+        memoryName: `mem-${i}`,
+        surface: 'memory_read',
+        createdAt: 1000 + i,
+      });
+    }
+    const r = await memoryCommand.exec(['provenance', '--tool', tc, '--limit', '3'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    // Header line + 3 rows = 4 notes. Pre-fix this would have been
+    // 9 notes (header + all 8 rows).
+    expect(r.notes).toHaveLength(4);
+  });
+
+  test('--retrieval honors --limit (regression — was unbounded)', async () => {
+    // Symmetric regression for the --retrieval path.
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId, 'retrieve_context');
+    const trace = createRetrievalTrace(db, {
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: { searchMs: 0, expandMs: 0, rankMs: 0, compressMs: 0 },
+    });
+    for (let i = 0; i < 8; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: tc,
+        memoryScope: 'user',
+        memoryName: `mem-${i}`,
+        surface: 'retrieve_context',
+        retrievalQueryId: trace.id,
+        positionInCorpus: i,
+        createdAt: 1000 + i,
+      });
+    }
+    const r = await memoryCommand.exec(
+      ['provenance', '--retrieval', trace.id, '--limit', '3'],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(r.notes).toHaveLength(4);
+  });
+});
+
+describe('/memory conflicts (S4/T4.4)', () => {
+  test('empty state returns silent-bar hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['conflicts'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect((r.notes ?? []).join('\n')).toContain('no conflict_detected events recorded');
+  });
+
+  test('lists conflict_detected rows with winner/loser/kind/token', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const { appendEvictionEvent } = await import('../../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'b',
+      objectScope: 'user',
+      fromState: 'active',
+      toState: 'quarantined',
+      trigger: 'conflict_detected',
+      motivo: 'conflict',
+      evidenceJson: JSON.stringify({
+        winner_id: 'user/a',
+        loser_id: 'user/b',
+        conflict_kind: 'antonym_assertion',
+        shared_concept: 'tabs',
+        confidence: 0.85,
+        resolver_reason: 'provenance tier',
+        failures: 1,
+      }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'loop_cold',
+      sessionId,
+    });
+
+    const r = await memoryCommand.exec(['conflicts'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('conflict_detected events (1');
+    expect(text).toContain('antonym_assertion');
+    expect(text).toContain('winner=user/a');
+    expect(text).toContain('loser=user/b');
+    expect(text).toContain('concept="tabs"');
+    expect(text).toContain('conf=0.85');
+  });
+
+  test('--limit caps the rendered batch', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const { appendEvictionEvent } = await import('../../../src/storage/repos/eviction-events.ts');
+    for (let i = 0; i < 5; i++) {
+      appendEvictionEvent(db, {
+        substrate: 'memory',
+        objectId: `loser-${i}`,
+        objectScope: 'user',
+        fromState: 'active',
+        toState: 'quarantined',
+        trigger: 'conflict_detected',
+        motivo: 'conflict',
+        evidenceJson: JSON.stringify({
+          winner_id: `user/winner-${i}`,
+          loser_id: `user/loser-${i}`,
+          conflict_kind: 'antonym_assertion',
+          failures: 1,
+        }),
+        outcome: 'applied',
+        blockedBy: null,
+        actor: 'loop_cold',
+        sessionId,
+      });
+    }
+    const r = await memoryCommand.exec(['conflicts', '--limit', '2'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    // Header line + 2 rows = 3 notes.
+    expect(r.notes).toHaveLength(3);
+  });
+
+  test('rejects unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['conflicts', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+});
+
+// /memory trust status (S5/T5.4) — read-only inspector for the
+// shared-corpus trust state. Exercises:
+//   - never-confirmed path (no row → "next boot will silently seed")
+//   - in-sync path (row matches current hash → "in sync")
+//   - diverged path (row differs from current hash → "DIVERGED")
+//   - verify-failed path (no separate test — covered by the
+//     substrate; the slash branches identically off the null return)
+// Argument validation:
+//   - bare `/memory trust` → error with subcommand hint
+//   - unknown subcommand → error
+//   - extra args after `status` → error (explicit-is-better-than-
+//     implicit; future-proofs against silent typos)
+describe('/memory trust status', () => {
+  test('never confirmed + EMPTY corpus: signals safe silent-seed (CRIT/F1+V2)', async () => {
+    // sharedRoot doesn't exist at all → currentHash ===
+    // EMPTY_CORPUS_HASH → safe to silent-seed next boot.
+    const repo = makeTmp();
+    const { ctx, roots } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('shared corpus trust:');
+      expect(text).toContain(roots.projectShared);
+      expect(text).toContain('never confirmed');
+      expect(text).toContain('corpus is empty');
+      expect(text).toContain('silently seed');
+      expect(text).toMatch(/inventory: 0 files/);
+    }
+  });
+
+  test('NOT TRUSTED + non-empty corpus: signals first-visit modal next boot (CRIT/F1+V2)', async () => {
+    // No trust row + non-empty corpus → next boot fires first-visit
+    // modal. The old copy ("never confirmed (silently seed)") was
+    // wrong for this case AND for the post-revoke state. The new
+    // copy distinguishes EMPTY from NOT-TRUSTED clearly.
+    const repo = makeTmp();
+    const { ctx, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('NOT TRUSTED');
+      expect(text).toContain('first-visit modal');
+      // Critical: must NOT promise silent-seed for the non-empty case.
+      expect(text).not.toContain('silently seed');
+      expect(text).toMatch(/inventory: 2 files/);
+    }
+  });
+
+  test('in sync: matching hash renders timestamp and current hash prefix', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    const { computeSharedFingerprint, setSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const current = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, current, 1_700_000_000_000);
+
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('in sync');
+      // Full hash MUST appear — truncated prefixes are forgeable
+      // (12 hex = 48 bits, ~16M brute-force). S5 P1/F5 hardening
+      // dropped truncation.
+      expect(text).toContain(current);
+      expect(text).not.toContain('DIVERGED');
+      expect(text).not.toContain('…');
+    }
+  });
+
+  test('diverged: hash mismatch surfaces both prefixes and the divergence flag', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', {}, 'baseline body');
+    const { computeSharedFingerprint, setSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const baselineHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, baselineHash, 1_700_000_000_000);
+    // Mutate the corpus AFTER the trust row was stamped.
+    writeBody(roots.projectShared, 'a', {}, 'tampered body');
+
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('DIVERGED');
+      // S5 P1/F5: full hashes, not truncated prefixes.
+      expect(text).toContain(baselineHash);
+      const currentHash = computeSharedFingerprint(roots.projectShared) as string;
+      expect(text).toContain(currentHash);
+      expect(text).toContain('re-confirm modal will fire on next boot');
+    }
+  });
+
+  test('bare `/memory trust` errors with subcommand hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing subcommand');
+  });
+
+  test('unknown subcommand errors', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'foo'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown subcommand 'foo'");
+  });
+
+  test('extra args after `status` are refused (no silent typo absorption)', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'status', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unexpected extra args');
+  });
+
+  // /memory trust accept + forget (S5 IMP/F6)
+  test('accept: stamps current hash + reports follow-up boot semantics', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+
+    const r = await memoryCommand.exec(['trust', 'accept'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('recorded for');
+      expect(text).toContain('NEXT session');
+    }
+    // Trust row stamped at current hash.
+    const { computeSharedFingerprint, getSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored).not.toBeNull();
+    expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
+  });
+
+  test('accept: corpus unreadable → error, no trust row written', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    const { chmodSync } = await import('node:fs');
+    chmodSync(roots.projectShared, 0o000);
+    try {
+      const r = await memoryCommand.exec(['trust', 'accept'], ctx);
+      expect(r.kind).toBe('error');
+      if (r.kind === 'error') expect(r.message).toContain('corpus unreadable');
+    } finally {
+      chmodSync(roots.projectShared, 0o755);
+    }
+    const { getSharedTrust } = await import('../../../src/memory/trust-corpus.ts');
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+  });
+
+  test('forget: clears trust row, leaves memory state on disk untouched', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    // Pre-seed a trust row so forget has something to clear.
+    const { computeSharedFingerprint, getSharedTrust, setSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const hash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, hash, 1000);
+    expect(getSharedTrust(db, roots.projectShared)).not.toBeNull();
+
+    const r = await memoryCommand.exec(['trust', 'forget'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('cleared for');
+      expect(text).toContain('first-visit modal');
+    }
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+    // Memory file on disk is untouched — forget is trust-row only.
+    const aPath = join(roots.projectShared, 'a.md');
+    const { existsSync, readFileSync } = await import('node:fs');
+    expect(existsSync(aPath)).toBe(true);
+    const body = readFileSync(aPath, 'utf-8');
+    expect(body).toContain('name: a');
+    expect(body).not.toContain('state: invalidated');
+  });
+
+  test('accept: extra args refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'accept', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+  });
+
+  test('forget: extra args refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'forget', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+  });
+});
+
+// Phase 1 closure smoke (S7/T7.3). Single test exercising the full
+// operator-driven memory lifecycle across Slices 0 + 1 + 6 in one
+// session. Catches cross-slice integration regressions that the
+// per-slice unit tests would miss:
+//
+//   - Slice 0: /memory quarantine + /memory list + /memory audit
+//     + /memory delete + /memory restore round-trip.
+//   - Slice 6: `[memory: quarantined]` visual flag appears on
+//     /memory list AFTER quarantine, disappears after restore.
+//   - Slice 0 audit chain: every transition lands in
+//     memory_events queryable via /memory audit --trigger operator.
+//
+// The test deliberately uses the operator-driven path (motivo=
+// conflict, trigger=operator_driven). Detector-driven paths
+// (S5 trust_revoked) are covered by their own integration tests
+// (tests/cli/bootstrap.test.ts). The conflict_detected flow named
+// in the original TODO is deferred to Phase 2 (S13 LLM-judge), so
+// the smoke pivots to the operator surface that IS fully wired in
+// Phase 1.
+describe('memory lifecycle E2E smoke (S7/T7.3 — Phase 1 closure)', () => {
+  // Two parallel memories exercise the two operator-driven
+  // lifecycle paths that Phase 1 ships fully wired:
+  //
+  //   - 'flagger': write → quarantine → visual flag visible in
+  //     /memory list, quarantine event in /memory audit.
+  //   - 'roundtrip': write → delete (tombstone) → restore → back
+  //     to active with no flag, full audit chain.
+  //
+  // They can't be the SAME memory because /memory delete routes
+  // through removeMemory (legacy, no tombstone) when the source
+  // state is quarantined — tombstone semantics only fire on
+  // active→evicted via transitionMemoryState (per
+  // confirmAndDelete in src/cli/slash/commands/memory.ts). Two
+  // memories let one test cover both surfaces.
+  test('phase 1 lifecycle: quarantine flag (flagger) + delete/restore round-trip (roundtrip)', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(
+      roots.projectLocal,
+      '- [Flagger](flagger.md) — visible flag check\n- [Roundtrip](roundtrip.md) — delete/restore check\n',
+    );
+    writeBody(roots.projectLocal, 'flagger');
+    writeBody(roots.projectLocal, 'roundtrip');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+
+    // ─── Phase A: quarantine flag (flagger) ─────────────────
+    // Step A1 — baseline: both active, no flag.
+    const listA0 = await memoryCommand.exec(['list'], ctx);
+    if (listA0.kind !== 'ok') throw new Error(`listA0: ${JSON.stringify(listA0)}`);
+    const listA0Text = (listA0.notes ?? []).join('\n');
+    expect(listA0Text).toContain('flagger');
+    expect(listA0Text).toContain('roundtrip');
+    expect(listA0Text).not.toContain('[QUARANTINED');
+
+    // Step A2 — quarantine 'flagger'. Motivo conflict + free-text
+    // evidence per Slice 0 contract.
+    const q = await memoryCommand.exec(
+      ['quarantine', 'flagger', '--motivo', 'conflict', '--evidence', 'phase 1 closure smoke'],
+      ctx,
+    );
+    if (q.kind !== 'ok') throw new Error(`quarantine: ${JSON.stringify(q)}`);
+
+    // Step A3 — /memory list renders Slice 6 visual flag on
+    // 'flagger'; 'roundtrip' stays unflagged.
+    const listA1 = await memoryCommand.exec(['list'], ctx);
+    if (listA1.kind !== 'ok') throw new Error(`listA1: ${JSON.stringify(listA1)}`);
+    const listA1Text = (listA1.notes ?? []).join('\n');
+    // Flag shape: `[QUARANTINED — <motivo>/<trigger> <YYYY-MM-DD>]`
+    // (Slice 0 + Slice 6 list-line formatter). Prefix-only match
+    // keeps the smoke robust against motivo/date format changes.
+    expect(listA1Text).toContain('[QUARANTINED');
+    expect(listA1Text).toContain('flagger');
+    // The flag line is specific to flagger; roundtrip shares the
+    // line-line boundary but has no flag. Assert by checking the
+    // flagger-line includes [QUARANTINED, roundtrip-line doesn't.
+    const flaggerLine = listA1Text.split('\n').find((l) => l.includes('flagger')) ?? '';
+    const roundtripLine = listA1Text.split('\n').find((l) => l.includes('roundtrip')) ?? '';
+    expect(flaggerLine).toContain('[QUARANTINED');
+    expect(roundtripLine).not.toContain('[QUARANTINED');
+
+    // Step A4 — audit chain captures the quarantine via the
+    // operator trigger shortcut (Slice 0 T0.3). Raise --limit so
+    // multi-event chains in the same session don't get truncated.
+    const auditA = await memoryCommand.exec(
+      ['audit', '--trigger', 'operator', '--limit', '50'],
+      ctx,
+    );
+    if (auditA.kind !== 'ok') throw new Error(`auditA: ${JSON.stringify(auditA)}`);
+    const auditAText = (auditA.notes ?? []).join('\n');
+    expect(auditAText).toContain('quarantined');
+    expect(auditAText).toContain('flagger');
+
+    // ─── Phase B: delete + restore round-trip (roundtrip) ────
+    // Step B1 — delete 'roundtrip'. Active source → state-machine
+    // route → body moves to .tombstones/, index entry removed,
+    // eviction_events + memory_events audit pair lands.
+    const del = await memoryCommand.exec(['delete', 'roundtrip'], ctx);
+    if (del.kind !== 'ok') throw new Error(`delete: ${JSON.stringify(del)}`);
+
+    // /memory list no longer shows 'roundtrip' (index removed);
+    // 'flagger' still present with flag.
+    const listB1 = await memoryCommand.exec(['list'], ctx);
+    if (listB1.kind !== 'ok') throw new Error(`listB1: ${JSON.stringify(listB1)}`);
+    const listB1Text = (listB1.notes ?? []).join('\n');
+    expect(listB1Text).not.toContain('roundtrip');
+    expect(listB1Text).toContain('flagger');
+
+    // Step B2 — restore from tombstone. State machine:
+    // evicted → active (motivo 'any').
+    const rst = await memoryCommand.exec(['restore', 'roundtrip'], ctx);
+    if (rst.kind !== 'ok') throw new Error(`restore: ${JSON.stringify(rst)}`);
+
+    // /memory list shows 'roundtrip' again, no flag (restore
+    // drops the state marker, frontmatter is back to default
+    // active).
+    const listB2 = await memoryCommand.exec(['list'], ctx);
+    if (listB2.kind !== 'ok') throw new Error(`listB2: ${JSON.stringify(listB2)}`);
+    const listB2Text = (listB2.notes ?? []).join('\n');
+    expect(listB2Text).toContain('roundtrip');
+    const roundtripLineAfter = listB2Text.split('\n').find((l) => l.includes('roundtrip')) ?? '';
+    expect(roundtripLineAfter).not.toContain('[QUARANTINED');
+
+    // Step B3 — audit chain captures every transition. /memory
+    // delete uses `trigger=user_purge` (state-machine route in
+    // confirmAndDelete attributes the delete via user_purge, not
+    // operator_driven) and /memory restore uses its own trigger,
+    // so we can't pin to a single --trigger filter for ALL three.
+    // Drop the filter and bump --limit so the full chain lands.
+    const auditB = await memoryCommand.exec(['audit', '--limit', '50'], ctx);
+    if (auditB.kind !== 'ok') throw new Error(`auditB: ${JSON.stringify(auditB)}`);
+    const auditBText = (auditB.notes ?? []).join('\n');
+    expect(auditBText).toContain('quarantined');
+    expect(auditBText).toContain('evicted');
+    expect(auditBText).toContain('restored');
   });
 });

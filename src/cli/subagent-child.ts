@@ -151,6 +151,17 @@ export interface SubagentChildOptions {
   // `isCwdTrusted=false` (fail-closed); tools gating on trust
   // (memory_write inferred-source refusal) deny accordingly.
   cwdTrusted?: boolean;
+  // Parent's shared-corpus trust verdict forwarded via
+  // `--subagent-shared-scope-offline` (S5 CRIT/H3). When true,
+  // the child mirrors the parent's fail-closed posture by
+  // excluding `project_shared` from BOTH the eager-load section
+  // AND the `retrieve_context` tool surface. Without this, a
+  // child's separate `assembleMemorySection` call would re-read
+  // disk and surface shared bodies the parent specifically
+  // gated. Absence = false (parent confirmed OR ran without a
+  // probe). The flag is presence-only; the spawn factory emits
+  // it only when the parent's outcome is non-confirmed.
+  sharedScopeOffline?: boolean;
   // Per-subagent background-process log directory passed across
   // via `--subagent-bg-log-dir <path>`. The harness wires it
   // into the bg manager so `bash_background` / `bash_output` /
@@ -841,6 +852,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     const reflectionMode = audit.contextRecipe?.stepReflection;
     const promptWithReflection = composeWithReflectionBlock(promptWithSchema, reflectionMode);
     let resolvedSystemPrompt = composeWithParallelHint(promptWithReflection);
+    // Eager-load inventory captured at assembly so the harness
+    // can emit `memory_provenance` rows once the child's session
+    // is fully initialized (the loop fires after createSession;
+    // for preassigned-session subagents that's a verification
+    // step but the same emit-point). Empty array survives the
+    // "no memory" / "wantsMemory=false" branch without special
+    // casing on the consumer side.
+    let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
     if (opts.memoryCwd !== undefined && wantsMemory) {
       // Resolve repo root from the parent's cwd. Same fix as
       // bootstrap.ts: parent's invocation cwd may be a subdir
@@ -882,8 +901,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         registry: memoryRegistry,
         bootContext,
         ...(memoryFilter !== undefined ? { memoryFilter } : {}),
+        // S5 CRIT/H3: forward parent's fail-closed scope exclusion.
+        // The IPC boundary collapsed parent's `excludeScopes:
+        // MemoryScope[]` array to a single boolean (only
+        // `project_shared` is gated today; cleaner CLI flag than
+        // serializing a list). We rehydrate back to the array
+        // shape `assembleMemorySection` expects.
+        ...(opts.sharedScopeOffline === true ? { excludeScopes: ['project_shared'] as const } : {}),
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
+      eagerExposures = memorySection.eagerLoaded;
     }
 
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Three paths,
@@ -1048,6 +1075,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // source path; future tools may add more) silently denies
       // even when the operator trusted the parent's cwd.
       isCwdTrusted: opts.cwdTrusted === true,
+      // S5 CRIT/H3: mirror parent's shared-scope fail-closed
+      // posture on retrieval too. Eager-load already excludes
+      // via `excludeScopes` above; this gate keeps
+      // `retrieve_context` consistent — the model can't reach
+      // around the eager-load gate by asking for shared bodies
+      // via the tool surface.
+      ...(opts.sharedScopeOffline === true
+        ? { memoryExcludeScopes: ['project_shared'] as const }
+        : {}),
       // Checkpoints stay off — the worktree path already provides
       // a separate branch for changes; a per-step checkpoint chain
       // inside the worktree is a future addition.
@@ -1065,6 +1101,10 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // Conditional spread: omitted ⇒ registry stays undefined
       // ⇒ memory tools surface `registry_unavailable`.
       ...(memoryRegistry !== undefined ? { memoryRegistry } : {}),
+      // Eager-load provenance inventory (MEMORY.md §11.2). Always
+      // passed — empty array survives the no-memory branch and
+      // the loop's emit is a no-op then.
+      eagerExposures,
       // Hook chain resolved above. Always passed (even when
       // empty) — the harness's dispatch sites short-circuit on
       // empty arrays. Locked enterprise hooks reach the

@@ -1,9 +1,14 @@
 import {
   type BootContext,
   EMPTY_BOOT_CONTEXT,
+  type EagerExposure,
+  type MemoryFile,
   type MemoryRegistry,
+  type MemoryScope,
+  serializeMemoryFile,
   shouldEagerLoadByTriggers,
 } from '../memory/index.ts';
+import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';
 
 // Eager memory index injection into the system prompt.
 //
@@ -146,6 +151,16 @@ export interface AssembleMemorySectionInput {
   // narrowing the model's view inside a subagent context, not
   // the operator's.
   memoryFilter?: ReadonlyArray<string>;
+  // Hard scope exclusion list (S5 P0/H2-rob hardening). When set,
+  // every listing whose scope is in this set is dropped BEFORE the
+  // per-entry trust / state / trigger filters run — equivalent to
+  // "this scope is offline this boot". Use case: the shared-corpus
+  // trust probe returned `verify_failed` (filesystem unreadable);
+  // the bootstrap MUST fail-closed by excluding `project_shared`
+  // so an attacker who renders the corpus unreadable can't keep
+  // the previously-loaded shared memories in the model's context.
+  // Empty / absent = no exclusion (current behavior).
+  excludeScopes?: ReadonlyArray<MemoryScope>;
 }
 
 export interface AssembleMemorySectionResult {
@@ -158,6 +173,18 @@ export interface AssembleMemorySectionResult {
   // observability can use it to track "memory token cost"
   // ratios).
   entryCount: number;
+  // Inventory of memories that landed in the eager-load section,
+  // captured at assembly time. The harness loop consumes this
+  // right after `createSession` to emit one `memory_provenance`
+  // row per (session, memory) with surface='eager' (MEMORY.md
+  // §11.2). Hash + state-at-exposure are pinned here, not when
+  // the loop emits, because the operator may rewrite the file
+  // between assembly and session start — pinning at assembly
+  // matches the spec semantic: "the bytes that landed in the
+  // model's window at boot".
+  //
+  // Empty when no memories rendered (matches `entryCount: 0`).
+  eagerLoaded: readonly EagerExposure[];
 }
 
 export const assembleMemorySection = (
@@ -178,19 +205,55 @@ export const assembleMemorySection = (
   // more-specific scope is marked untrusted".
   const all = input.registry.list();
   if (all.length === 0) {
-    return { text: '', entryCount: 0 };
+    return { text: '', entryCount: 0, eagerLoaded: [] };
   }
+  // Scope-level fail-closed exclusion (S5 P0/H2-rob). Applied BEFORE
+  // the per-memory peek so an unreadable scope doesn't cost N extra
+  // disk reads just to drop every memory in it.
+  const excludeScopes =
+    input.excludeScopes !== undefined && input.excludeScopes.length > 0
+      ? new Set(input.excludeScopes)
+      : null;
   const bootContext = input.bootContext ?? EMPTY_BOOT_CONTEXT;
   // Combined per-memory filter: spec §7.2.2 trust + spec §4.3
   // boot-time triggers. Single peek per memory delivers both
   // pieces of state (frontmatter.trust + frontmatter.triggers),
   // saving disk reads vs filtering in two passes. See module
   // header for failure-mode rationale (uncertain peek → include).
-  const eligible = all.filter((l) => {
+  //
+  // The peek's MemoryFile is carried alongside the listing so the
+  // dedupe/render loop can derive eager-exposure metadata without
+  // a second peek. `null` when peek returned anything other than
+  // `present` (matches the "uncertainty → include" branch).
+  const eligible: Array<{ listing: (typeof all)[number]; file: MemoryFile | null }> = [];
+  for (const l of all) {
+    // Hard scope exclusion fires first. When the shared-corpus
+    // trust probe returned verify_failed, this branch drops every
+    // project_shared listing — even the "uncertain peek → include"
+    // path that normally serves resilience would be wrong here
+    // (we don't know what's in the file system, so we must NOT
+    // surface ANYTHING from that scope to the model).
+    if (excludeScopes?.has(l.scope)) continue;
     const peek = input.registry.peek(l.name, { scope: l.scope });
-    if (peek.kind !== 'present') return true; // uncertainty → include
-    if (peek.file.frontmatter.trust === 'untrusted') return false;
-    if (!shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext)) return false;
+    if (peek.kind !== 'present') {
+      eligible.push({ listing: l, file: null }); // uncertainty → include
+      continue;
+    }
+    if (peek.file.frontmatter.trust === 'untrusted') continue;
+    // State-based filter for non-retrievable lifecycle states
+    // (MEMORY.md §6): `invalidated` is "invariant broken" — kept on
+    // disk for audit but explicitly NOT eligible for retrieval or
+    // eager-load. Bulk-applied by the S5 `trust_revoked` detector
+    // (every active shared memory transitions to invalidated when
+    // operator revokes the shared corpus' trust). Without this
+    // skip, the system prompt would continue including those
+    // memories until the session restarted, defeating the
+    // revocation. `shadow` is similarly non-retrievable per spec
+    // but the shadow detector hasn't shipped — when it does, this
+    // is the call site to extend. `quarantined` deliberately stays
+    // eligible (visible with `[memory: quarantined]` flag per S6).
+    if (peek.file.frontmatter.state === 'invalidated') continue;
+    if (!shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext)) continue;
     // Per-playbook memory filter (slice 9). When the playbook's
     // context_recipe.memory_filter is set, keep only entries
     // whose `type` matches any filter value OR whose triggers
@@ -199,28 +262,73 @@ export const assembleMemorySection = (
       const ftype = peek.file.frontmatter.type;
       const fTriggers = peek.file.frontmatter.triggers ?? [];
       const matches = input.memoryFilter.some((f) => f === ftype || fTriggers.includes(f));
-      if (!matches) return false;
+      if (!matches) continue;
     }
-    return true;
-  });
+    eligible.push({ listing: l, file: peek.file });
+  }
   if (eligible.length === 0) {
     // Every memory was filtered out. Same empty-shape as a
     // registry that never had entries — bootstrap's length-zero
     // check passes through cleanly.
-    return { text: '', entryCount: 0 };
+    return { text: '', entryCount: 0, eagerLoaded: [] };
   }
   // Dedupe by name on the eligible list. precedence order is
   // preserved (most-specific surviving scope wins).
+  //
+  // Visual flag for quarantined memories (S6/T6.2, MEMORY.md §6.5.2):
+  // a `[memory: quarantined]` marker appears between the scope tag
+  // and the description so the model sees the state inline. Motivo
+  // + date enrichment (`[memory: quarantined — conflict 2026-04-15]`
+  // per spec) is deferred — same shape as T0.2's `/memory list`
+  // deferral — and requires a JOIN against `eviction_events` that
+  // isn't worth the wire-up complexity until operators ask for it.
+  // The flag without motivo+date still delivers the load-bearing
+  // signal: "model, this memory is under review; be cautious".
   const seen = new Set<string>();
   const lines: string[] = [MEMORY_SECTION_HEADER, ''];
+  const eagerLoaded: EagerExposure[] = [];
   let included = 0;
-  for (const l of eligible) {
-    if (seen.has(l.name)) continue;
-    seen.add(l.name);
-    lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);
+  for (const { listing, file } of eligible) {
+    if (seen.has(listing.name)) continue;
+    seen.add(listing.name);
+    const state = file?.frontmatter.state;
+    const flag = state === 'quarantined' ? ' [memory: quarantined]' : '';
+    lines.push(`- [${listing.scope}] ${listing.name}${flag} — ${listing.entry.hook}`);
     included++;
+    eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }
-  return { text: lines.join('\n'), entryCount: included };
+  return { text: lines.join('\n'), entryCount: included, eagerLoaded };
+};
+
+// Snapshot one eager-loaded entry. `file === null` happens for the
+// "uncertainty → include" path (peek returned missing / malformed):
+// the listing still ships in the index, but we have no body to
+// hash and no frontmatter.state to snapshot. Provenance row still
+// emits with NULL hash + 'active' default — the operator can
+// reconcile via the audit log seeing both the index entry and the
+// missing-body record.
+const toEagerExposure = (
+  scope: MemoryScope,
+  name: string,
+  file: MemoryFile | null,
+): EagerExposure => {
+  if (file === null) {
+    return { scope, name, memoryContentHash: null, memoryStateAtExposure: 'active' };
+  }
+  let memoryContentHash: string | null;
+  try {
+    memoryContentHash = hashMemoryContent(serializeMemoryFile(file));
+  } catch {
+    // Best-effort: a hash failure (e.g., FIPS-restricted host)
+    // must not block the eager render or the provenance emit.
+    memoryContentHash = null;
+  }
+  return {
+    scope,
+    name,
+    memoryContentHash,
+    memoryStateAtExposure: file.frontmatter.state ?? 'active',
+  };
 };
 
 // Compose the memory section onto an optional base prompt. The

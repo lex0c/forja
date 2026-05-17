@@ -2,6 +2,7 @@
 
 export { MEMORY_STATES } from './types.ts';
 export type {
+  EagerExposure,
   IndexEntry,
   MemoryFile,
   MemoryFrontmatter,
@@ -19,6 +20,8 @@ export {
   validateFrontmatter,
   validateName,
 } from './frontmatter.ts';
+
+export { isExpired, parseExpiresEndOfDayMs } from './expires.ts';
 
 export {
   IndexError,
@@ -102,6 +105,7 @@ export {
   findExpiredMemories,
   gcExpiredMemories,
   gcPurgeExpiredTombstones,
+  gcStaleInvalidatedMemories,
   moveMemory,
   removeMemory,
 } from './lifecycle.ts';
@@ -134,3 +138,22 @@ export {
   scanForSecrets,
 } from './scanner.ts';
 export type { ScanResult } from './scanner.ts';
+
+export {
+  EMPTY_CORPUS_HASH,
+  clearSharedTrust,
+  computeSharedFingerprint,
+  getSharedTrust,
+  listSharedCorpusFiles,
+  setSharedTrust,
+} from './trust-corpus.ts';
+export type { CorpusFile, CorpusListing, SharedTrustRow } from './trust-corpus.ts';
+
+export { probeSharedTrust } from './trust-corpus-probe.ts';
+export type {
+  ProbeCorpusFile,
+  ProbeSharedTrustInput,
+  ProbeSharedTrustResult,
+  SharedTrustModalMode,
+  SharedTrustProbeAnswer,
+} from './trust-corpus-probe.ts';

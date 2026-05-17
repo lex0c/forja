@@ -612,6 +612,51 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   let bootstrapped: BootstrapResult;
   try {
     const bootstrapFn = options.bootstrapFn ?? bootstrap;
+    // The shared-corpus trust probe fires INSIDE bootstrap (S5/T5.2).
+    // For its modal to receive input, stdin must already be
+    // subscribed — the modal-manager pushes its focus handler on
+    // the focus stack synchronously, but without an active stdin
+    // 'data' listener, no keystrokes flow in. The cwd-trust flow
+    // subscribes lazily AFTER pushing its handler, but that path
+    // only runs when cwd wasn't already trusted; the
+    // already-trusted operator would hit bootstrap without stdin
+    // subscribed and the modal would block until timeout. Pre-
+    // subscribe here so the modal handler can stack on top of an
+    // active listener.
+    //
+    // S5 P1/F6 hardening — preserve Ctrl+C as a bootstrap escape
+    // hatch. Raw mode (turned on by subscribeStdin via
+    // renderer.enableInput) converts Ctrl+C into a `\x03` byte that
+    // flows to the focus stack instead of generating SIGINT. Before
+    // this fix, that byte hit no handler during bootstrap (focus
+    // stack was empty; editor handler doesn't push until ~line
+    // 2431) and was silently consumed — operator could not abort a
+    // slow/hung boot. The handler below sits at the BOTTOM of the
+    // stack; it returns false on every key except Ctrl+C, letting
+    // modal handlers and (later) the editor handler take priority
+    // on top. When no modal is open, Ctrl+C falls through to this
+    // bottom handler and re-raises SIGINT to the process — the
+    // standard Unix abort semantic survives despite raw mode.
+    const preBootstrapCtrlCHandler: FocusHandler = (key) => {
+      if (key.kind === 'char' && key.ctrl && key.char === 'c') {
+        // Re-raise SIGINT so the standard shell handler (or Node's
+        // default) gets a chance to terminate the process. Wrapped
+        // because process.kill can throw on a detached / orphaned
+        // session and we'd rather let the operator try again than
+        // crash on the abort path.
+        try {
+          process.kill(process.pid, 'SIGINT');
+        } catch {
+          // Last-ditch — if kill failed, exit code 130 (the
+          // conventional "terminated by Ctrl+C" exit status).
+          process.exit(130);
+        }
+        return true;
+      }
+      return false;
+    };
+    focusStack.push(preBootstrapCtrlCHandler);
+    subscribeStdin();
     bootstrapped =
       options.bootstrapOverride ??
       (await bootstrapFn({
@@ -636,6 +681,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         ...(options.trustListPathOverride !== undefined
           ? { trustListPathOverride: options.trustListPathOverride }
           : {}),
+        // Shared-corpus trust modal (S5/T5.2). Thin adapter around
+        // `modalManager.askSharedTrust` so bootstrap stays
+        // independent of the TUI layer types. Timeout matches the
+        // cwd-trust modal's 5-minute fail-closed window — both are
+        // operator-attention prompts that an unattended terminal
+        // shouldn't block forever.
+        askSharedTrust: (a) =>
+          modalManager.askSharedTrust(
+            { path: a.path, mode: a.mode, corpusFiles: a.corpusFiles },
+            { timeoutMs: 5 * 60 * 1000 },
+          ),
       } satisfies BootstrapInput));
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
@@ -684,6 +740,59 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // bad value at REPL boot.
   for (const w of critiqueWarnings) {
     errSink(`forja: critique config: ${w}\n`);
+  }
+  // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
+  // single summary line so operators see what the modal decision
+  // resulted in WITHOUT having to scroll through the modal preview
+  // again. `seeded` and `unchanged` are silent (the happy path
+  // shouldn't spam stderr at every boot); `reconfirmed` and
+  // `revoked` echo the trust action the operator just took;
+  // `verify_failed` surfaces the I/O error so the operator knows
+  // the shared corpus' state is unknown and may need cleanup.
+  if (bootstrapped.sharedTrustProbe !== undefined) {
+    const p = bootstrapped.sharedTrustProbe;
+    if (p.kind === 'reconfirmed') {
+      errSink('forja: shared memory corpus re-confirmed — new hash trusted.\n');
+    } else if (p.kind === 'revoked') {
+      const invCount = p.invalidated.length;
+      const failCount = p.failed.length;
+      const invFrag = `${invCount} shared memor${invCount === 1 ? 'y' : 'ies'} invalidated`;
+      const failFrag = failCount > 0 ? `; ${failCount} failed` : '';
+      errSink(`forja: shared memory trust revoked — ${invFrag}${failFrag}.\n`);
+      for (const f of p.failed) {
+        errSink(`forja:   could not invalidate ${f.name}: ${f.reason}\n`);
+      }
+      // CRIT/F3 recovery hint. Operators who hit "No, revoke" by
+      // mistake have no slash to undo per-memory: the state
+      // machine forbids invalidated → active. Surface the manual
+      // path here AND echo the 7-day auto-eviction window so the
+      // operator knows their bodies aren't permanently gone yet
+      // (they're still in .agent/memory/shared/ on disk until
+      // gcStaleInvalidatedMemories progresses them to .tombstones/).
+      if (invCount > 0) {
+        errSink('forja:   recovery: edit the `.md` frontmatter to drop `state: invalidated`,\n');
+        errSink('            then re-add the entry to .agent/memory/shared/MEMORY.md.\n');
+        errSink('            Or accept the revoke — invalidated memories auto-evict to\n');
+        errSink('            .tombstones/ after 7 days (EVICTION.md §7.1).\n');
+      }
+    } else if (p.kind === 'deferred') {
+      // D1: surface WHY the prompt was deferred. Operator who hit
+      // Esc / let the modal timeout AND operator surprised by a
+      // TOCTOU swap during deliberation both arrive here, but the
+      // cause changes what they should do next: 'modal_cancel'
+      // means "answer the modal next boot", 'tocttou_during_prompt'
+      // means "something is writing to .agent/memory/shared/ on
+      // your behalf, investigate before re-confirming".
+      const reason =
+        p.cause === 'modal_cancel'
+          ? 'modal cancelled — re-prompt next boot.'
+          : 'corpus changed during prompt (TOCTOU) — re-prompt next boot; investigate concurrent writers.';
+      errSink(`forja: shared memory trust prompt deferred — ${reason}\n`);
+    } else if (p.kind === 'verify_failed') {
+      errSink(
+        `forja: shared memory corpus could not be verified at ${p.sharedRoot} — trust state unknown.\n`,
+      );
+    }
   }
 
   const project = basename(baseConfig.cwd) || baseConfig.cwd;

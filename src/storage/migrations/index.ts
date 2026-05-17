@@ -51,6 +51,8 @@ import { migration050Policies } from './050-policies.ts';
 import { migration051DispatchRewrites } from './051-dispatch-rewrites.ts';
 import { migration052EvictionThrashingScope } from './052-eviction-thrashing-scope.ts';
 import { migration053RetrievalTrace } from './053-retrieval-trace.ts';
+import { migration054MemoryProvenance } from './054-memory-provenance.ts';
+import { migration055SharedCorpusTrust } from './055-shared-corpus-trust.ts';
 
 export interface Migration {
   id: number;
@@ -112,4 +114,6 @@ export const MIGRATIONS: readonly Migration[] = [
   migration051DispatchRewrites,
   migration052EvictionThrashingScope,
   migration053RetrievalTrace,
+  migration054MemoryProvenance,
+  migration055SharedCorpusTrust,
 ];

@@ -721,10 +721,11 @@ export const invokeTool = async (
   // consume `ctx.sandboxProfile` to wrap argv via `buildBwrapArgv`.
   // Skipped (undefined) when the planner didn't run for this call —
   // legacy callers / misc category / pre-planner refusals.
-  const ctxForExecute: ToolContext =
-    decision.sandboxProfile === undefined
-      ? deps.ctx
-      : { ...deps.ctx, sandboxProfile: decision.sandboxProfile };
+  const ctxForExecute: ToolContext = {
+    ...deps.ctx,
+    toolCallId: toolCall.id,
+    ...(decision.sandboxProfile !== undefined ? { sandboxProfile: decision.sandboxProfile } : {}),
+  };
 
   let rawResult: unknown;
   let crashed = false;

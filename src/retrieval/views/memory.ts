@@ -22,7 +22,7 @@
 // they'll fold into the weighted token stream alongside title +
 // description.
 
-import type { MemoryRegistry } from '../../memory/index.ts';
+import type { MemoryRegistry, MemoryScope } from '../../memory/index.ts';
 import { type BM25Document, createBM25Index, tokenize } from '../bm25.ts';
 import type { ViewSearch } from '../pipeline.ts';
 import type { Candidate, RetrievalQuery, RetrievalView } from '../types.ts';
@@ -40,6 +40,28 @@ const DEFAULT_LIMIT = 20;
 // for cross-store joins.
 const memoryNodeId = (scope: string, name: string): string => `memory:${scope}/${name}`;
 
+// Ranking penalty for quarantined memories (EVICTION §9.7,
+// MEMORY.md §6.5.2). Multiplies the bootstrap score so the
+// candidate still surfaces but ranks below active siblings with
+// comparable match quality. 0.3 means a quarantined memory needs
+// ~3.3× the raw match score to tie an active one — enough to
+// suppress in routine queries, light enough that a very strong
+// match still gets ranked.
+//
+// The penalty applies at bootstrap; downstream signals (structural,
+// temporal, etc.) further scale the final score. The net effect:
+// a quarantined memory with average match quality lands below
+// active siblings; a quarantined memory with overwhelming match
+// quality still surfaces (the operator's quarantine flag was a
+// signal of "questionable", not "forbidden" — a model that asks
+// the right query should still find it).
+//
+// Exported so tests can pin the exact value — a silent change
+// to 0.25 / 0.5 would pass relative-ordering tests but shift the
+// penalty's behavior, so the constant value itself is part of the
+// behavioral contract.
+export const QUARANTINED_PENALTY = 0.3;
+
 export interface MemoryViewDeps {
   registry: MemoryRegistry;
   // When true, body content joins the BM25 corpus. Defaults to
@@ -51,6 +73,16 @@ export interface MemoryViewDeps {
   // fix a number; 20 balances downstream rank cost with coverage
   // for a typical registry (dozens to low hundreds of memories).
   limit?: number;
+  // Scope-level fail-closed exclusion (S5 CRIT/H2 hardening). When
+  // set, every listing whose scope is in this set is dropped
+  // before BM25 indexing — equivalent to "this scope is offline
+  // for retrieval this session". The bootstrap caller passes
+  // `['project_shared']` when the trust probe returned a non-
+  // confirmed outcome (verify_failed / deferred / revoked), so
+  // the model's `retrieve_context` tool sees the same scope
+  // posture as the eager-load section. Empty / absent = no
+  // exclusion.
+  excludeScopes?: ReadonlyArray<MemoryScope>;
 }
 
 export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
@@ -71,18 +103,64 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // for resolution; the retrieval surface should reflect what the
     // model would actually see.
     //
-    // Hard-filter on `state=active` and unexpired: the model must
-    // never see memories the operator has quarantined / invalidated
-    // / evicted / purged or that have aged past their `expires`
-    // date. `registry.list({})` returns everything by default
-    // (operator-facing tooling needs broad visibility); retrieval is
-    // the model-facing surface and tightens. Each opt-in costs one
-    // file read per surviving listing — tolerable at the dozens-of-
-    // memories scale and the safety win is worth the I/O.
+    // Include `active` + `quarantined`, exclude unexpired only.
+    // Spec EVICTION §9.7 and MEMORY.md §6.5.2: quarantined memories
+    // stay VISIBLE to the model with a ranking penalty + visual
+    // flag. The penalty (×QUARANTINED_PENALTY below) is applied at
+    // candidate emission; the eager-prompt visual flag is rendered
+    // by `cli/memory-prompt.ts`.
+    //
+    // Why visible at all: quarantining is a "model should know this
+    // is questionable, not deny access". Hard-filtering would
+    // mimic deletion semantics and break operator forensics
+    // ("did the model see X when it produced Y?" requires X to
+    // remain reachable). Penalty + flag gives the model the signal
+    // without auto-erasure.
+    //
+    // `invalidated` / `evicted` / `purged` stay excluded — those
+    // states ARE the deletion path. `includeExpired: false` keeps
+    // past-date memories out (a hard filter, not a penalty —
+    // expiration is operator-declared intent that the memory has
+    // no validity beyond a date).
+    //
+    // The peek for state filtering populates `listing.state`
+    // (MemoryListing extension) so we don't double-peek for the
+    // penalty multiplier below.
+    //
+    // Injection-surface widening note (AGENTIC_CLI.md §1.1.5):
+    // pre-S6 the state filter `['active']` excluded quarantined
+    // bodies from this slot entirely. Post-S6 they reach the slot
+    // (with penalty) — the only remaining gate against
+    // `trust: untrusted` bodies in retrieve_context is the missing
+    // trust filter acknowledged in MEMORY.md §14.3. S6 doesn't
+    // violate the §1.1.5 ledger (the gap is documented), but it
+    // widens the set of model-facing bodies. Closing the gap —
+    // adding a trust filter to the retrieval memory view — is the
+    // §14.3 follow-up; until then, operator quarantine discipline
+    // is the line of defense for untrusted+quarantined memories.
+    // S5 CRIT/H2: hard scope exclusion mirrors `assembleMemorySection`.
+    // When the trust probe couldn't confirm the shared corpus (or the
+    // operator revoked), the eager-load path drops `project_shared`;
+    // `retrieve_context` must do the same OR the model can pull
+    // unattested bodies via tool calls even though the system prompt
+    // excluded them.
+    //
+    // CRITICAL ORDER: pass `excludeScopes` INTO the registry call so
+    // the filter runs BEFORE `deduplicateByName`. The earlier shape
+    // (filter-after-dedup, post-S6) broke precedence fallback: a
+    // higher-precedence shadow in an excluded scope won the dedup
+    // walk and was then dropped, leaving the eligible lower-
+    // precedence sibling (in a permitted scope) unreachable for
+    // the model. With the filter inside list(), dedup operates only
+    // over allowed scopes and the local > shared > user fallback
+    // is preserved.
     const listings = deps.registry.list({
       deduplicateByName: true,
-      states: ['active'],
+      states: ['active', 'quarantined'],
       includeExpired: false,
+      ...(deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
+        ? { excludeScopes: deps.excludeScopes }
+        : {}),
     });
     if (listings.length === 0) return [];
 
@@ -146,18 +224,28 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // trace's scrub layer (paths redacted) before persistence;
     // memory names and scopes are stable identifiers, safe to
     // include.
+    //
+    // Quarantine penalty applies here: a listing with state ===
+    // 'quarantined' (carried forward from the registry's filter
+    // peek) gets bootstrapScore * QUARANTINED_PENALTY. The reason
+    // string carries the marker so trace consumers see why a
+    // candidate ranks where it does. The state field is undefined
+    // for the unreachable map-miss path; treat unknown as active
+    // (no penalty) — quarantined is the OPT-IN penalty path.
     return hits.map((hit) => {
       const listing = listingById.get(hit.id);
-      // Map miss here would be a bug (we just populated it from
-      // these listings) — fall through to a safe shape rather than
-      // crash a downstream consumer.
       const scopeLabel = listing?.scope ?? 'memory';
       const nameLabel = listing?.name ?? hit.id;
+      const isQuarantined = listing?.state === 'quarantined';
+      const bootstrapScore = isQuarantined ? hit.score * QUARANTINED_PENALTY : hit.score;
+      const reason = isQuarantined
+        ? `BM25 match in ${scopeLabel}/${nameLabel} (quarantined ×${QUARANTINED_PENALTY})`
+        : `BM25 match in ${scopeLabel}/${nameLabel}`;
       return {
         nodeId: hit.id,
         view: VIEW,
-        bootstrapScore: hit.score,
-        reason: `BM25 match in ${scopeLabel}/${nameLabel}`,
+        bootstrapScore,
+        reason,
       };
     });
   },

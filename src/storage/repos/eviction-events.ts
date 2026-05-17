@@ -89,6 +89,40 @@ export type EvictionOutcome = (typeof OUTCOMES)[number];
 export const ACTORS = ['loop_cold', 'compaction', 'user', 'hook', 'startup_probe'] as const;
 export type EvictionActor = (typeof ACTORS)[number];
 
+// ─── canonical trigger names ─────────────────────────────────────────
+//
+// Trigger strings live in `eviction_events.trigger` (TEXT) and in
+// `memory_events.details.trigger` (JSONB). They distinguish operator
+// commands from auto-detector firings in forensic queries —
+// `/memory audit --trigger operator` matches `OPERATOR_DRIVEN_TRIGGER`;
+// `--trigger detector` matches every entry in `DETECTOR_TRIGGERS`.
+//
+// Single source of truth so the slash command's filter set, the slash
+// command's quarantine emit path, and the future Slices 2-5 detector
+// implementations all agree on the same strings. A new detector lands
+// here AND in its emit site; a typo in either fails forensics
+// silently (visible only when the operator runs `--trigger detector`
+// and notices the missing row).
+
+// String emitted by every manual transition driven from a slash
+// command (`/memory quarantine`, `/memory delete`). Distinguishes
+// operator action from detector firings (which use the names below).
+export const OPERATOR_DRIVEN_TRIGGER = 'operator_driven';
+
+// The 4 auto-detector triggers spec'd in MEMORY.md §6.5.2 +
+// EVICTION.md §5.1. Slices 2-5 of feat/memory-lifecycle-detectors
+// emit these; the `/memory audit --trigger detector` semantic
+// shortcut matches against this set. Adding a new memory-side
+// detector MUST extend this set (build does not fail otherwise —
+// the operator just won't see the new rows under the shortcut).
+export const DETECTOR_TRIGGERS = [
+  'verify_failed',
+  'user_override_repeated',
+  'conflict_detected',
+  'trust_revoked',
+] as const;
+export type DetectorTrigger = (typeof DETECTOR_TRIGGERS)[number];
+
 // ─── state machine ───────────────────────────────────────────────────
 
 // Transitions table per EVICTION §4.1. Map: from-state → to-state →
@@ -865,6 +899,31 @@ export const getLastAppliedEvictionForObject = (
 // idx_evict_purge (partial index on purge_at IS NOT NULL).
 // Default ordering by recorded_at DESC, rowid DESC (monotonic
 // tiebreaker — same rationale as getLastEvictionForObject).
+// List recent eviction events by trigger source. Used by the
+// `/memory conflicts` slash (S4/T4.4) to surface
+// `conflict_detected` pairs forensically. Returns applied
+// outcomes only (the pair operator wants to see is the
+// quarantine that DID happen, not refused attempts).
+//
+// Cross-session by design: conflict history is operator-relevant
+// forensic data, not session-scoped state. Bounded by `limit`
+// (default 50 matches the slice convention from S0).
+export const listEvictionEventsByTrigger = (
+  db: DB,
+  trigger: string,
+  limit = 50,
+): EvictionEvent[] => {
+  const rows = db
+    .query<EvictionEventRow, [string, number]>(
+      `${SELECT_ALL}
+        WHERE trigger = ? AND outcome = 'applied'
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT ?`,
+    )
+    .all(trigger, limit);
+  return rows.map(fromRow);
+};
+
 export const listEvictableInWindow = (db: DB, nowMs: number): EvictionEvent[] => {
   const rows = db
     .query<EvictionEventRow, [number]>(
@@ -976,6 +1035,85 @@ export const getLastQuarantineEvent = (
     )
     .get(substrate, objectId, objectScope);
   return row !== null ? fromRow(row) : null;
+};
+
+// Mirror of `getLastQuarantineEvent` for invalidation transitions.
+// Used by the `gcStaleInvalidatedMemories` sweep (S5 CRIT/V1) to
+// determine when each invalidated memory crossed the 7-day window
+// spec'd by EVICTION.md §7.1 + MEMORY.md §6.5.6 for progression
+// to `evicted`. Without this, trust_revoked produces invalidated
+// rows that stay on disk forever.
+export const getLastInvalidationEvent = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objectId: string,
+  objectScope: string,
+): EvictionEvent | null => {
+  const row = db
+    .query<EvictionEventRow, [EvictionSubstrate, string, string]>(
+      `${SELECT_ALL}
+        WHERE substrate = ? AND object_id = ? AND object_scope = ?
+          AND to_state = 'invalidated' AND outcome = 'applied'
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT 1`,
+    )
+    .get(substrate, objectId, objectScope);
+  return row !== null ? fromRow(row) : null;
+};
+
+// Batch variant of `getLastInvalidationEvent` (P1/F2 hardening).
+// `gcStaleInvalidatedMemories` was calling the per-row helper N
+// times per boot (one ordered SELECT each), which scales with the
+// number of `state: invalidated` memories — for a corpus with 100
+// invalidated bodies that was 100 SELECTs every boot for the
+// duration of the 7-day window. The batch version groups by
+// `(object_id, object_scope)` and returns the latest `recorded_at`
+// for each tuple in one round-trip.
+//
+// Returns a Map keyed by `${scope}/${objectId}` → `recordedAt`.
+// Objects with no applied invalidation row are absent from the
+// map (caller treats absence as the "orphan" case).
+//
+// SCOPING (S5 review): the filter on the requested objects MUST
+// run in SQL, not in JS. A previous version selected MAX(recorded_at)
+// over EVERY invalidation row for the substrate and post-filtered
+// the result, so boot-time GC work scaled with TOTAL historical
+// invalidations, not the handful of currently-invalidated bodies
+// being checked. On a long-lived database this dominates boot
+// latency. The fix uses SQLite row-value IN — supported since
+// 3.15 (2016) and bundled in every supported Bun version — so
+// the SELECT walks only the requested (object_id, object_scope)
+// pairs via the `idx_evict_obj(substrate, object_id)` index.
+export const getLastInvalidationEventsBatch = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objects: ReadonlyArray<{ objectId: string; objectScope: string }>,
+): Map<string, number> => {
+  if (objects.length === 0) return new Map();
+  // Build the row-value IN list: `((?, ?), (?, ?), ...)` with one
+  // tuple per requested object. Parameters bind in order:
+  // [substrate, id_0, scope_0, id_1, scope_1, ...].
+  const tuples = objects.map(() => '(?, ?)').join(', ');
+  const params: (string | EvictionSubstrate)[] = [substrate];
+  for (const o of objects) {
+    params.push(o.objectId);
+    params.push(o.objectScope);
+  }
+  const rows = db
+    .query<{ object_id: string; object_scope: string; recorded_at: number }, typeof params>(
+      `SELECT object_id, object_scope, MAX(recorded_at) AS recorded_at
+         FROM eviction_events
+        WHERE substrate = ?
+          AND (object_id, object_scope) IN (${tuples})
+          AND to_state = 'invalidated' AND outcome = 'applied'
+        GROUP BY object_id, object_scope`,
+    )
+    .all(...params);
+  const out = new Map<string, number>();
+  for (const r of rows) {
+    out.set(`${r.object_scope}/${r.object_id}`, r.recorded_at);
+  }
+  return out;
 };
 
 export const countEvictionEvents = (db: DB): number => {
