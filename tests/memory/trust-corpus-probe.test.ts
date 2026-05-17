@@ -91,14 +91,14 @@ afterEach(() => {
 });
 
 describe('probeSharedTrust — state machine', () => {
-  test('seeded: no prior row + EMPTY corpus → silent stamp, no modal fired', async () => {
+  test('seeded: no prior row + absent shared dir → silent stamp, no modal fired', async () => {
     // P0/F2 hardening: silent seed is ONLY safe when there's nothing
-    // to consent to. An empty shared/ directory has no operator-
+    // to consent to. An absent shared/ directory has no operator-
     // influencing content to attest, so the cwd-trust modal already
-    // covers the implicit "I trust this directory" decision.
-    // sharedRoot doesn't exist at all in this fixture — that's
-    // strictly stricter than "exists but empty"; both seed silently
-    // because both produce EMPTY_CORPUS_HASH.
+    // covers the implicit "I trust this directory" decision. The
+    // sibling test below pins the same behavior for an EXISTING but
+    // file-less directory — both states have zero `.md` files and
+    // both silent-seed.
     const registry = createMemoryRegistry({ roots, db, cwd: repo });
 
     let modalCalls = 0;
@@ -119,6 +119,47 @@ describe('probeSharedTrust — state machine', () => {
     const stored = getSharedTrust(db, roots.projectShared);
     expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
     expect(stored?.lastConfirmedAtMs).toBe(1_700_000_000_000);
+  });
+
+  test('seeded: no prior row + present-but-empty shared dir → silent stamp, no modal fired', async () => {
+    // Review regression. The earlier branch only silent-seeded on
+    // `presentedHash === EMPTY_CORPUS_HASH`, which fingerprint
+    // returns ONLY when the shared/ directory is ENOENT. A
+    // directory that exists but has zero `.md` files hashes the
+    // domain separator alone (a distinct, non-sentinel value), so
+    // first boot fell into the first-visit modal path over an
+    // empty inventory; if the operator canceled (Esc / timeout /
+    // signal handler), the probe returned deferred(modal_cancel)
+    // and left the shared scope offline for the rest of the
+    // session — for a corpus that was literally empty.
+    //
+    // Setup: mkdir-the-directory but write no .md bodies and no
+    // MEMORY.md. enumerateCorpus returns []; the probe must
+    // silent-seed identically to the absent-directory case
+    // (asserted in the previous test) and the trust row must
+    // pin the actual fingerprint (NOT EMPTY_CORPUS_HASH — they
+    // differ here).
+    mkdirSync(roots.projectShared, { recursive: true });
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+
+    let modalCalls = 0;
+    const result = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        modalCalls++;
+        return 'yes';
+      },
+      now: () => 1_700_000_000_001,
+    });
+
+    expect(modalCalls).toBe(0);
+    expect(result.kind).toBe('seeded');
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
+    expect(stored?.lastConfirmedAtMs).toBe(1_700_000_000_001);
   });
 
   test('first-visit non-empty: modal fires in mode=first-visit (P0/F2)', async () => {

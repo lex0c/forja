@@ -14,10 +14,11 @@
 //
 //   2. Read the stored `shared_corpus_trust` row for this scope-root.
 //
-//        a. Row absent + corpus is EMPTY (no files at all)
-//           → silently SEED the row with EMPTY_CORPUS_HASH. Nothing
-//             to consent to; the cwd-trust modal already attests the
-//             directory itself.
+//        a. Row absent + corpus has zero `.md` files (directory
+//           absent OR directory present with empty `files[]`)
+//           → silently SEED the row with the current fingerprint.
+//             Nothing to consent to; the cwd-trust modal already
+//             attests the directory itself.
 //
 //        b. Row absent + corpus is NON-EMPTY (P0/F2 fix)
 //           → fire FIRST-VISIT modal. The cwd-trust modal attested
@@ -112,7 +113,6 @@ import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import {
-  EMPTY_CORPUS_HASH,
   type SharedTrustRow,
   computeSharedFingerprint,
   getSharedTrust,
@@ -175,8 +175,9 @@ export interface ProbeSharedTrustInput {
 }
 
 export type ProbeSharedTrustResult =
-  // First visit AND corpus was empty → row silently seeded with
-  // EMPTY_CORPUS_HASH. No modal fired.
+  // First visit AND corpus has zero `.md` files (directory absent
+  // OR present-but-empty) → row silently seeded with the current
+  // fingerprint. No modal fired.
   | { kind: 'seeded' }
   // Stored row present, hash unchanged. No-op.
   | { kind: 'unchanged' }
@@ -486,11 +487,31 @@ export const probeSharedTrust = async (
   //     clone of a poisoned repo would otherwise bless attacker-
   //     planted shared memories on the very first agent invocation.
   if (stored === null) {
-    if (presentedHash === EMPTY_CORPUS_HASH) {
+    // Silent-seed when there is no operator-influencing content to
+    // attest. Two filesystem states share this property:
+    //   - the shared/ directory is absent (ENOENT, listing.kind=
+    //     'absent', fingerprint = EMPTY_CORPUS_HASH).
+    //   - the directory exists but contains zero `.md` files
+    //     (listing.kind='present' with empty files[], fingerprint
+    //     = hash of just the domain separator — NOT
+    //     EMPTY_CORPUS_HASH).
+    //
+    // A prior shape only seeded on EMPTY_CORPUS_HASH, so the
+    // present-but-empty case (operator made the directory via init
+    // script / template but never put files there) fired the
+    // first-visit modal over an empty inventory. If the operator
+    // canceled (Esc / timeout / signal), the probe returned
+    // deferred(modal_cancel) — leaving the shared scope offline
+    // for the rest of the session even though there was literally
+    // nothing in it to mistrust. enumerateCorpus collapses both
+    // states into the same empty array (absent → kind!=='present'
+    // branch returns []), so a single `length === 0` gate covers
+    // both with no extra IO over the original code path.
+    const firstVisitCorpus = enumerateCorpus(input.sharedRoot);
+    if (firstVisitCorpus.length === 0) {
       setSharedTrust(input.db, input.sharedRoot, presentedHash, input.now?.());
       return { kind: 'seeded' };
     }
-    const firstVisitCorpus = enumerateCorpus(input.sharedRoot);
     // IMP/F5 hardening: dump the full inventory to stderr BEFORE
     // the modal opens. The modal caps the visible list at 8; the
     // operator can switch terminals and read every file by name

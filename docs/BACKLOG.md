@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Silent-seed when shared corpus has zero files
+
+Review observation: the probe's first-visit branch treated only `presentedHash === EMPTY_CORPUS_HASH` as "empty corpus, silent-seed". `computeSharedFingerprint` returns that sentinel **only** when the shared/ directory is absent (ENOENT). If the directory exists but contains zero `.md` files (operator made `mkdir .agent/memory/shared` via init script / template but never put files there), the fingerprint hashes only the domain separator — a distinct, non-sentinel value. The probe fell into the first-visit modal path over an empty inventory. Worst case: the operator hits Esc / timeout / signal during that modal, the probe returns `deferred(modal_cancel)`, and the shared scope stays offline for the entire session for a corpus that was literally empty.
+
+Fix: move `enumerateCorpus(input.sharedRoot)` to the top of the first-visit branch and silent-seed when `firstVisitCorpus.length === 0`. Both filesystem states (absent dir → listing.kind!=='present' → empty array; present-but-empty dir → listing.kind==='present', files: []) collapse to the same empty inventory through this gate — one check, no extra IO over the original path. The redundant `EMPTY_CORPUS_HASH` import on the probe goes away; the constant stays exported from `trust-corpus.ts` because it's still the documented sentinel returned by the fingerprint.
+
+Updated the FLOW comment + `ProbeSharedTrustResult.seeded` docstring to reflect "zero `.md` files (directory absent OR present-but-empty)" instead of "no files at all" / "seeded with EMPTY_CORPUS_HASH" (the latter was wrong post-fix — present-empty seeds with the actual fingerprint, not the sentinel).
+
+Bootstrap stays unchanged: the probe-result branching (verify_failed / deferred / revoked → offline) catches the new seeded outcome correctly (not offline). The no-probe fallback (`storedTrust === null` → offline) handles the very first headless boot; subsequent boots after any interactive probe land in the `unchanged` branch as expected.
+
+Regression test (`tests/memory/trust-corpus-probe.test.ts`): `mkdir`-create the shared/ directory but write no `.md` files, run the probe with `stored === null`, assert `kind === 'seeded'`, `modalCalls === 0`, trust row stamped with the current fingerprint (distinct from EMPTY_CORPUS_HASH). The existing absent-dir test's comment was tightened to reflect the new contract.
+
+Tests: 8297 pass (+1), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(slash) — Enforce --limit for tool/retrieval provenance queries
 
 Review observation: `/memory provenance` parsed `--limit` (default 50) but only honored it on the name mode (`listProvenanceByName` / `listGlobalProvenanceByName` took the limit). The `--tool` and `--retrieval` paths called `listProvenanceForToolCall` and `listExposuresInRetrieval` with no limit parameter — the SQL had no `LIMIT` clause, and every row matching the tool_call_id or retrieval_query_id rendered. For a high-volume session (many memory_read / retrieve_context exposures during one turn, or a retrieval over a large corpus) the slash flooded the terminal with hundreds of lines. Behavior contradicted the flag contract; operators expected `--limit` to cap uniformly.
