@@ -209,6 +209,28 @@ export interface ListOptions {
   // `Date.now()`. Tests pin a fixed value so the filter is
   // deterministic against fixtures that hand-craft `expires`.
   nowMs?: number;
+  // Scope-level fail-closed exclusion (S5 retrieval-view review).
+  // Listings whose scope is in this list are dropped BEFORE the
+  // state/expires peek AND before `deduplicateByName` — order that
+  // matters because a higher-precedence shadow in an excluded
+  // scope would otherwise suppress an eligible lower-precedence
+  // sibling at dedup time, leaving NO candidate for that name even
+  // though a trusted one exists in a permitted scope.
+  //
+  // Mirrors the `excludeScopes` semantic that `assembleMemorySection`
+  // applies to the eager-load section: the trust probe's
+  // non-confirmed outcomes (`verify_failed` / `deferred` / `revoked`)
+  // make the bootstrap caller pass `['project_shared']` here so
+  // retrieval and eager-load share the same scope posture — the
+  // model can't pull unattested bodies via tool calls when the
+  // system prompt was already locked down.
+  //
+  // Empty / absent ≡ no exclusion. Distinct from the singular
+  // `scope` field (which RESTRICTS to one scope); these stack: a
+  // caller can pass `scope: 'user'` together with
+  // `excludeScopes: ['project_shared']` and the result is just
+  // user-scope listings.
+  excludeScopes?: readonly MemoryScope[];
 }
 
 export interface ScopeOption {
@@ -535,6 +557,16 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       let filtered = all;
       if (opts.scope !== undefined) {
         filtered = filtered.filter((l) => l.scope === opts.scope);
+      }
+
+      // Scope-level fail-closed exclusion. Runs BEFORE the
+      // state/expires peek (saves N reads on excluded scopes) AND
+      // before `deduplicateByName` (so a shadow in an excluded
+      // scope can't suppress an eligible lower-precedence sibling).
+      // See ListOptions header for the spec rationale.
+      if (opts.excludeScopes !== undefined && opts.excludeScopes.length > 0) {
+        const excluded = new Set(opts.excludeScopes);
+        filtered = filtered.filter((l) => !excluded.has(l.scope));
       }
 
       // State / expires filter — gated on the option so callers

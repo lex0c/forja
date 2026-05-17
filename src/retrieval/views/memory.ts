@@ -138,23 +138,30 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // adding a trust filter to the retrieval memory view — is the
     // §14.3 follow-up; until then, operator quarantine discipline
     // is the line of defense for untrusted+quarantined memories.
-    const allListings = deps.registry.list({
-      deduplicateByName: true,
-      states: ['active', 'quarantined'],
-      includeExpired: false,
-    });
     // S5 CRIT/H2: hard scope exclusion mirrors `assembleMemorySection`.
     // When the trust probe couldn't confirm the shared corpus (or the
     // operator revoked), the eager-load path drops `project_shared`;
     // `retrieve_context` must do the same OR the model can pull
     // unattested bodies via tool calls even though the system prompt
     // excluded them.
-    const excludeScopes =
-      deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
-        ? new Set(deps.excludeScopes)
-        : null;
-    const listings =
-      excludeScopes === null ? allListings : allListings.filter((l) => !excludeScopes.has(l.scope));
+    //
+    // CRITICAL ORDER: pass `excludeScopes` INTO the registry call so
+    // the filter runs BEFORE `deduplicateByName`. The earlier shape
+    // (filter-after-dedup, post-S6) broke precedence fallback: a
+    // higher-precedence shadow in an excluded scope won the dedup
+    // walk and was then dropped, leaving the eligible lower-
+    // precedence sibling (in a permitted scope) unreachable for
+    // the model. With the filter inside list(), dedup operates only
+    // over allowed scopes and the local > shared > user fallback
+    // is preserved.
+    const listings = deps.registry.list({
+      deduplicateByName: true,
+      states: ['active', 'quarantined'],
+      includeExpired: false,
+      ...(deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
+        ? { excludeScopes: deps.excludeScopes }
+        : {}),
+    });
     if (listings.length === 0) return [];
 
     // id → listing lookup. Used twice: once when emitting the BM25

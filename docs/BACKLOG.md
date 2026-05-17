@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(retrieval) — Filter excludeScopes before deduplicating in memory view
+
+Review observation: `createMemoryView` called `registry.list({ deduplicateByName: true, … })` and then filtered `excludeScopes` in JS on the result. That order silently broke the precedence-fallback contract documented in `registry.ts` ("ORDER MATTERS: this runs BEFORE the dedupe-by-name pass"). When a fail-closed session ran with `excludeScopes: ['project_shared']`, dedup picked `project_shared/foo` (precedence local > shared > user) AND suppressed `user/foo`; the post-dedup JS filter then removed `project_shared/foo`, leaving NO `foo` candidate at all. The model lost a trusted body it should still have been able to retrieve.
+
+Fix: plumb `excludeScopes` into `ListOptions` so the registry filters BEFORE both the state/expires peek and the dedup pass. The view drops its JS-side post-filter and passes `excludeScopes` directly into `registry.list(...)`. The registry already had a comment block on the dedup ordering invariant — the new `excludeScopes` filter slots in next to the `scope` restrictor at the top of `list()` so dedup operates only over allowed scopes.
+
+Audit: `assembleMemorySection` (eager-load path) already filters BEFORE its dedupe-by-iteration loop (per H2-rob comment block), so no change needed there. Other `deduplicateByName: true` callers (`/memory list` slash, REPL banner count, status display) don't use exclude semantics and stay unchanged.
+
+Regression tests in `tests/retrieval/memory-view.test.ts`:
+- shared→user precedence fallback (the production case): `project_shared/foo` + `user/foo` + `excludeScopes: ['project_shared']` must surface `user/foo`. Pre-fix returned `[]`. Includes the baseline-without-exclusion assertion that pins the precondition (dedup IS hiding `user/foo` absent any filter), so the test fails for the right reason if the bug returns.
+- local→shared symmetric case: `project_local/bar` + `project_shared/bar` + `excludeScopes: ['project_local']` must surface `project_shared/bar`. Covers the other direction of the precedence ladder.
+
+Tests: 8290 pass (+2), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(memory) — Catch BEGIN IMMEDIATE lock failures in purge sweep
 
 Review observation: `gcPurgeExpiredTombstones` called `db.exec('BEGIN IMMEDIATE')` at the top of each per-row TOCTOU transaction with no surrounding error handler. SQLite raises `SQLITE_BUSY` when another writer holds RESERVED — a concurrent boot, an in-flight `/memory restore`, an ongoing slash mutation. The throw escaped the helper, aborting bootstrap entirely. That violates the spec contract documented in `cli/bootstrap.ts` (one bad row mustn't gate the session — failures funnel through `result.failures`, stderr summarizes them, the next boot retries).

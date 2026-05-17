@@ -470,4 +470,75 @@ describe('createMemoryView', () => {
     });
     expect(cands.map((c) => c.nodeId)).toEqual(['memory:project_shared/s']);
   });
+
+  test('excludeScopes preserves precedence fallback when shadowed name lives in excluded scope', async () => {
+    // Review regression: pre-fix the view asked the registry for
+    // `deduplicateByName: true` and then filtered `excludeScopes`
+    // in JS afterward. Order broke the precedence-fallback contract.
+    //
+    // Setup: TWO memories named `foo`, one under project_shared and
+    // one under user. Scope precedence is local > shared > user
+    // (registry.ts SCOPE_ORDER), so without filtering, dedup picks
+    // project_shared/foo and drops user/foo. With `excludeScopes:
+    // ['project_shared']` the dedup-then-filter ordering would
+    // drop project_shared/foo AFTER it suppressed user/foo, leaving
+    // NO `foo` candidate at all — silently hiding a trusted body
+    // the model should still see.
+    //
+    // Post-fix the registry filters excludeScopes BEFORE dedup, so
+    // project_shared/foo is removed first, dedup operates only over
+    // permitted scopes, and user/foo surfaces as expected.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — castle from shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — castle from user\n');
+    writeBody(roots.projectShared, 'foo', 'castle body in shared scope');
+    writeBody(roots.user, 'foo', 'castle body in user scope');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    // Baseline (no exclusion): project_shared/foo wins precedence,
+    // user/foo is shadowed out by dedup. Pins the pre-condition the
+    // bug depended on: dedup IS hiding user/foo absent any filter.
+    const baseline = await createMemoryView({ registry }).search({
+      ...baseQuery,
+      text: 'castle',
+    });
+    expect(baseline.map((c) => c.nodeId)).toEqual(['memory:project_shared/foo']);
+
+    // With project_shared excluded: user/foo MUST surface. Pre-fix
+    // this returned [] (the post-dedup filter wiped the only entry).
+    const offline = await createMemoryView({
+      registry,
+      excludeScopes: ['project_shared'],
+    }).search({ ...baseQuery, text: 'castle' });
+    expect(offline.map((c) => c.nodeId)).toEqual(['memory:user/foo']);
+  });
+
+  test('excludeScopes precedence fallback also covers project_local shadow → project_shared survival', async () => {
+    // Symmetric regression: project_local > project_shared. Exclude
+    // project_local; the project_shared sibling should fall through
+    // dedup. Covers the other direction of the precedence ladder
+    // (the production case the bug report opened was shared→user,
+    // but the registry rule is local→shared→user and a future
+    // exclude policy could fail-close project_local too).
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Bar](bar.md) — moat from local\n');
+    writeIndex(roots.projectShared, '- [Bar](bar.md) — moat from shared\n');
+    writeBody(roots.projectLocal, 'bar', 'moat body in local scope');
+    writeBody(roots.projectShared, 'bar', 'moat body in shared scope');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    const baseline = await createMemoryView({ registry }).search({
+      ...baseQuery,
+      text: 'moat',
+    });
+    expect(baseline.map((c) => c.nodeId)).toEqual(['memory:project_local/bar']);
+
+    const offline = await createMemoryView({
+      registry,
+      excludeScopes: ['project_local'],
+    }).search({ ...baseQuery, text: 'moat' });
+    expect(offline.map((c) => c.nodeId)).toEqual(['memory:project_shared/bar']);
+  });
 });
