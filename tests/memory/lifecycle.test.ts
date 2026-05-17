@@ -749,6 +749,88 @@ describe('gcPurgeExpiredTombstones', () => {
     expect(result.failures).toEqual([]);
     expect(result.skipped).toEqual([]); // filtered before the recency check
   });
+
+  test('BEGIN IMMEDIATE SQLITE_BUSY is a soft failure — sweep does NOT throw', async () => {
+    // Regression: gcPurgeExpiredTombstones used to call
+    // db.exec('BEGIN IMMEDIATE') outside any error handling. On a
+    // long-lived install where two boots race or an in-flight
+    // slash command holds RESERVED, the BEGIN raises SQLITE_BUSY
+    // and the exception escaped the helper, aborting bootstrap.
+    // Spec contract (bootstrap.ts §gcPurgeExpiredTombstones): one
+    // bad row must not gate the session — failures funnel through
+    // result.failures, stderr summarizes, next boot retries.
+    //
+    // Setup: seed two tombstones due for purge. Intercept the DB
+    // so the FIRST BEGIN IMMEDIATE throws SQLITE_BUSY; subsequent
+    // BEGINs pass through unchanged. Expect: helper returns
+    // normally, first row landed in `failures`, second row landed
+    // in `purged`.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBody(roots.projectLocal, 'a', { expires: '2024-01-01' });
+    writeBody(roots.projectLocal, 'b', { expires: '2024-01-01' });
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+
+    // Expire both, both land tombstoned with purgeAt set.
+    const expireDay = new Date(Date.UTC(2024, 5, 1));
+    await gcExpiredMemories(db, reg, roots, { today: expireDay });
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(join(roots.projectLocal, '.tombstones')).length).toBe(2);
+
+    // DB proxy that throws SQLITE_BUSY on the FIRST BEGIN IMMEDIATE
+    // and lets every subsequent exec through. Models the real
+    // contention pattern: a transient writer-lock collision that
+    // clears by the time the loop reaches the next row.
+    //
+    // Implementation note: bun:sqlite's `Database` uses private
+    // fields (`#`), so methods called through a naive Proxy would
+    // see the Proxy as `this` and fail on private-field access.
+    // For every method we don't override, return it bound to the
+    // real Database instance — only `exec` is intercepted, and
+    // we call `realExec` which is also bound to `target`.
+    let beginsSeen = 0;
+    const realExec = db.exec.bind(db);
+    type ExecParams = Parameters<typeof realExec>;
+    const flakyDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'exec') {
+          return (...args: ExecParams) => {
+            if (args[0] === 'BEGIN IMMEDIATE') {
+              beginsSeen += 1;
+              if (beginsSeen === 1) {
+                throw new Error('SQLITE_BUSY: simulated lock contention');
+              }
+            }
+            return realExec(...args);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const sweepNow = expireDay.getTime() + 35 * 24 * 60 * 60 * 1000;
+    const { gcPurgeExpiredTombstones } = await import('../../src/memory/lifecycle.ts');
+
+    // Critical assertion: the sweep returns normally (no throw).
+    // Pre-fix this would have surfaced SQLITE_BUSY out of the
+    // helper, abort bootstrap, and the test would die on the
+    // await rather than reaching the result assertions.
+    const result = await gcPurgeExpiredTombstones(flakyDb as typeof db, reg, roots, {
+      now: () => sweepNow,
+    });
+
+    // First row: lock failure landed as soft failure.
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]?.reason).toContain('BEGIN IMMEDIATE failed');
+    expect(result.failures[0]?.reason).toContain('SQLITE_BUSY');
+    // Second row: BEGIN succeeded the second time, purge applied.
+    expect(result.purged).toHaveLength(1);
+    expect(result.skipped).toEqual([]);
+    // Sanity: BEGIN was attempted for both rows.
+    expect(beginsSeen).toBe(2);
+  });
 });
 
 describe('moveMemory — primitive (promote / demote)', () => {

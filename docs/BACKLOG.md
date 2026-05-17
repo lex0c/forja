@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Catch BEGIN IMMEDIATE lock failures in purge sweep
+
+Review observation: `gcPurgeExpiredTombstones` called `db.exec('BEGIN IMMEDIATE')` at the top of each per-row TOCTOU transaction with no surrounding error handler. SQLite raises `SQLITE_BUSY` when another writer holds RESERVED — a concurrent boot, an in-flight `/memory restore`, an ongoing slash mutation. The throw escaped the helper, aborting bootstrap entirely. That violates the spec contract documented in `cli/bootstrap.ts` (one bad row mustn't gate the session — failures funnel through `result.failures`, stderr summarizes them, the next boot retries).
+
+Fix: wrap `BEGIN IMMEDIATE` in a try/catch. On any throw, push the row into `failures` with a `BEGIN IMMEDIATE failed: <reason>` line and `continue` to the next row. The paired `finally` ROLLBACK is now also guarded — a poisoned connection state (e.g., COMMIT half-succeeded and we threw later) used to surface its own throw from inside the finally, which would have escaped past the loop boundary in the same way the unhandled BEGIN did. The next loop iteration's BEGIN is the recovery point; anything semantically meaningful for the failed row is already in `failures`.
+
+Regression test: seed two due-for-purge tombstones, wrap the DB in a Proxy that throws `SQLITE_BUSY` on the FIRST `BEGIN IMMEDIATE` and passes every subsequent exec through unchanged (models a transient writer-lock collision that clears by the time the loop reaches the next row). Asserts the sweep returns normally, `failures` carries the first row with a `SQLITE_BUSY`-bearing reason, and `purged` carries the second row — proving the loop survives one BEGIN failure and processes subsequent rows. The Proxy is careful to bind non-overridden methods to the real `Database` instance because `bun:sqlite` uses private fields (`#`).
+
+Tests: 8288 pass (+1), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(storage) — Push invalidation batch filter into SQL
 
 Review observation: `getLastInvalidationEventsBatch` ran `SELECT object_id, object_scope, MAX(recorded_at) … GROUP BY object_id, object_scope` with only a `substrate` filter and then trimmed the result in JS via a `wanted` Set. On a long-lived database that meant boot-time `gcStaleInvalidatedMemories` did work proportional to TOTAL historical invalidation rows for the memory substrate, not the handful of currently-invalidated bodies being inspected. The original P1/F2 batching collapsed N round-trips into one, but the one query it left behind still scaled with history.

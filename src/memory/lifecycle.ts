@@ -606,7 +606,23 @@ export const gcPurgeExpiredTombstones = async (
     //     other writer can proceed.
     //   - Aborting mid-await is rare (sweep runs at boot, not on
     //     operator input); finally-ROLLBACK handles it.
-    db.exec('BEGIN IMMEDIATE');
+    //
+    // BEGIN IMMEDIATE can raise SQLITE_BUSY when another writer
+    // (concurrent boot, in-flight slash command) holds RESERVED.
+    // The bootstrap caller treats per-row failures as soft (one
+    // bad row shouldn't gate the session) — let lock contention
+    // ride the same rail: push a `failures` entry and move on.
+    // The next boot retries this row.
+    try {
+      db.exec('BEGIN IMMEDIATE');
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      failures.push({
+        evictionEventId: row.id,
+        reason: `BEGIN IMMEDIATE failed: ${reason}`,
+      });
+      continue;
+    }
     let committed = false;
     try {
       // Verify recency under the lock: a subsequent restore-then-
@@ -668,7 +684,21 @@ export const gcPurgeExpiredTombstones = async (
       db.exec('COMMIT');
       committed = true;
     } finally {
-      if (!committed) db.exec('ROLLBACK');
+      if (!committed) {
+        // ROLLBACK can throw too — typically when the connection
+        // was already kicked out of the transaction by a prior
+        // error (some SQLITE_BUSY paths land in this state) or
+        // when COMMIT half-succeeded. Swallow: the next loop
+        // iteration's BEGIN IMMEDIATE is the recovery point.
+        // Anything semantically meaningful was already pushed to
+        // `failures` from inside the try block; we don't want the
+        // rollback's own throw to escape and abort the sweep.
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Intentionally empty — see above.
+        }
+      }
     }
   }
 
