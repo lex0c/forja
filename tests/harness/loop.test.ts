@@ -2407,13 +2407,14 @@ describe('runAgent', () => {
       expect(listProvenanceForMemory(db, sid, 'user', 'role')).toEqual([]);
     });
 
-    test('eager emit is idempotent across resume: pre-existing eager rows skip the emit', async () => {
+    test('eager emit is per-key idempotent across resume: pre-existing (scope, name) skips, no duplicate', async () => {
       // Resume path (preassignedSessionId) reuses an existing session
       // row. The eager-emit block in the loop would otherwise re-emit
       // the same (session, memory, eager) rows every restart —
       // schema has no UNIQUE constraint so duplicates pile up. The
-      // hasEagerProvenance probe gates this: if any eager rows exist
-      // for the session, skip emit.
+      // getEagerProvenanceKeys lookup gates per-key: an exposure
+      // whose (scope, name) is already present is skipped; missing
+      // ones backfill (see the partial-write test below).
       const { recordProvenance } = await import('../../src/storage/repos/memory-provenance.ts');
       // Pre-create a session and seed an eager row to simulate the
       // "prior boot already emitted" state.
@@ -2451,9 +2452,80 @@ describe('runAgent', () => {
       expect(result.status).toBe('done');
       const rows = listProvenanceForMemory(db, session.id, 'user', 'role');
       // Exactly one row remains — the pre-existing one. The resume
-      // emit MUST have been skipped, so fresh-hash never landed.
+      // emit MUST have skipped this (scope, name), so fresh-hash
+      // never landed.
       expect(rows).toHaveLength(1);
       expect(rows[0]?.memoryContentHash).toBe('pre-existing');
+    });
+
+    test('eager emit resumes partial writes: missing inventory rows backfill on the next run', async () => {
+      // Review regression. Pre-fix the loop asked "does ANY eager row
+      // exist for this session?" If yes, skip the entire emit. So a
+      // previous boot that landed ONE exposure before hitting a
+      // transient SQLITE_BUSY trapped the session: the next resume
+      // saw the single row, declared "already done", and the missing
+      // inventory entries stayed missing forever — even after the DB
+      // recovered. Provenance accuracy this feature exists to add
+      // gets silently broken.
+      //
+      // Post-fix the loop reads the SET of recorded (scope, name)
+      // keys and emits only the missing ones, so a partial first
+      // write recovers on the next resume.
+      const { recordProvenance } = await import('../../src/storage/repos/memory-provenance.ts');
+      const session = createSession(db, { model: 'mock/m', cwd: '/p' });
+      // Simulate the partial-write state: `user/role` landed, but
+      // `user/style` did NOT. The next resume's inventory still
+      // contains both.
+      recordProvenance(db, {
+        sessionId: session.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'role',
+        surface: 'eager',
+        memoryContentHash: 'role-hash',
+        memoryStateAtExposure: 'active',
+      });
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      const result = await runAgent({
+        provider: handle.provider,
+        toolRegistry: registry,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        preassignedSessionId: session.id,
+        eagerExposures: [
+          {
+            scope: 'user',
+            name: 'role',
+            memoryContentHash: 'role-hash',
+            memoryStateAtExposure: 'active',
+          },
+          {
+            scope: 'user',
+            name: 'style',
+            memoryContentHash: 'style-hash',
+            memoryStateAtExposure: 'active',
+          },
+        ],
+      });
+      expect(result.status).toBe('done');
+
+      // role: still one row (pre-existing); resume MUST NOT have
+      // duplicated it.
+      const roleRows = listProvenanceForMemory(db, session.id, 'user', 'role');
+      expect(roleRows).toHaveLength(1);
+      expect(roleRows[0]?.memoryContentHash).toBe('role-hash');
+
+      // style: previously missing, now backfilled by the resume. The
+      // bug this fix addresses surfaces if this assertion fails —
+      // pre-fix it would be 0.
+      const styleRows = listProvenanceForMemory(db, session.id, 'user', 'style');
+      expect(styleRows).toHaveLength(1);
+      expect(styleRows[0]?.memoryContentHash).toBe('style-hash');
     });
 
     test('invalid memoryScope on one exposure does NOT abort run (audit drift)', async () => {

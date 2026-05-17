@@ -60,7 +60,7 @@ import {
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
-import { hasEagerProvenance, recordProvenance } from '../storage/repos/memory-provenance.ts';
+import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -897,24 +897,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // tool_call_id=NULL — eager-load happens BEFORE any tool
       // call exists, so the FK is intentionally absent.
       //
-      // Idempotency gate: skip emit when this session already has
-      // eager rows. Resume (preassignedSessionId reusing an
-      // existing session row) would otherwise re-emit the same
-      // (session, memory) pair every restart — schema has no
-      // UNIQUE constraint so duplicates pile up silently. Subagent
-      // first boots also use preassignedSessionId but have zero
-      // eager rows yet, so they still emit normally.
+      // Idempotency gate: ask the repo which (scope, name) pairs
+      // are already recorded for this session and emit only the
+      // missing ones. An earlier shape used a coarse "any eager
+      // row exists?" probe (hasEagerProvenance); on resume after
+      // a previous emit that succeeded for SOME exposures then
+      // hit a transient SQLITE_BUSY / write failure, the next
+      // boot saw "some rows exist" and skipped backfill of the
+      // rest, permanently dropping the missing entries from the
+      // provenance trail. Per-key gating restores the contract:
+      // every system-prompt body ends up with a matching eager
+      // row, even across multiple partial resumes.
+      //
+      // Subagent first boots also use preassignedSessionId but
+      // have zero eager rows yet, so they emit normally — the
+      // existing-set is just empty.
       //
       // Best-effort: a DB failure here MUST NOT abort startup
       // (provenance is observability, not correctness — same
       // posture as registry.auditExposure). Failures land on
-      // stderr as AUDIT DRIFT.
-      if (
-        config.eagerExposures !== undefined &&
-        config.eagerExposures.length > 0 &&
-        !hasEagerProvenance(config.db, sessionId)
-      ) {
+      // stderr as AUDIT DRIFT. A read failure on the lookup
+      // itself (rare — `SELECT` paths don't ordinarily contend
+      // with the WAL writer lock) falls through to the
+      // `existing.has` checks below treating every exposure as
+      // missing, which is safe under "ALL rows exist already"
+      // (next emit duplicates, schema has no UNIQUE so duplicates
+      // accumulate) — accept that cost vs. an unhandled throw
+      // out of startup.
+      if (config.eagerExposures !== undefined && config.eagerExposures.length > 0) {
+        let existing: Set<string>;
+        try {
+          existing = getEagerProvenanceKeys(config.db, sessionId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: AUDIT DRIFT: failed to read eager provenance keys for session ${sessionId}: ${redactSecrets(msg)}\n`,
+          );
+          existing = new Set();
+        }
         for (const exposure of config.eagerExposures) {
+          if (existing.has(`${exposure.scope}/${exposure.name}`)) continue;
           try {
             recordProvenance(config.db, {
               sessionId,

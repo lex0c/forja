@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(harness) — Gate eager provenance on full inventory, not any row
+
+Review observation: the resume guard in `harness/loop.ts` asked `hasEagerProvenance(db, sessionId)` — "does ANY eager row exist for this session?" — and skipped the entire emit if it returned true. Combined with the best-effort per-row write (try/catch around `recordProvenance`, AUDIT-DRIFT stderr on failure), a transient `SQLITE_BUSY` or other write failure mid-loop could leave the session in a partial state: one or more rows landed, the rest didn't. The next resume saw "some rows exist, skip", and the missing exposures stayed missing forever — even after the DB recovered. The provenance accuracy that whole T1.4 emit was added to provide gets silently broken for that session's lifetime.
+
+Fix: replace `hasEagerProvenance` with `getEagerProvenanceKeys(db, sessionId)`, which returns the SET of `${scope}/${name}` keys already recorded as eager for this session. The loop iterates `eagerExposures` and skips only the keys already present — missing keys backfill on the next resume. Same indexed scan as the old probe (`idx_memory_provenance_session_scope_name_created`), so cost is unchanged.
+
+Read-failure posture stays defensive: if the lookup itself throws (unusual — SELECTs don't ordinarily contend with the WAL writer lock), the loop logs to stderr as AUDIT DRIFT and falls through with an empty set, treating every exposure as missing. The downside is duplicate inserts when ALL rows were actually present (schema has no UNIQUE constraint), accepted as the lesser cost than an unhandled throw out of startup.
+
+Audit: `hasEagerProvenance` had no other callers — its sole user was the loop's emit gate. Dropped from the repo surface.
+
+Regression tests:
+- `tests/storage/memory-provenance.test.ts` — `getEagerProvenanceKeys` describe block (5 tests): empty session, per-call surfaces excluded from keyset, scope/name composite keying (same `foo` in two scopes is two entries), partial-write resume keyset shape, session-scoped isolation.
+- `tests/harness/loop.test.ts` — kept the existing per-key idempotency test (renamed + commentary updated). New `eager emit resumes partial writes` test: seed ONE of two exposures pre-loop, run the loop with both supplied, assert the pre-existing row stays unduplicated AND the missing one backfills. Pre-fix the second assertion would fail (the missing row stays 0).
+
+Tests: 8292 pass (+2), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(retrieval) — Filter excludeScopes before deduplicating in memory view
 
 Review observation: `createMemoryView` called `registry.list({ deduplicateByName: true, … })` and then filtered `excludeScopes` in JS on the result. That order silently broke the precedence-fallback contract documented in `registry.ts` ("ORDER MATTERS: this runs BEFORE the dedupe-by-name pass"). When a fail-closed session ran with `excludeScopes: ['project_shared']`, dedup picked `project_shared/foo` (precedence local > shared > user) AND suppressed `user/foo`; the post-dedup JS filter then removed `project_shared/foo`, leaving NO `foo` candidate at all. The model lost a trusted body it should still have been able to retrieve.

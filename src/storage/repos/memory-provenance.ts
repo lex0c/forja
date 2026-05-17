@@ -407,25 +407,38 @@ export const listGlobalProvenanceForMemory = (
   return rows.map(fromRow);
 };
 
-// Idempotency probe for the harness loop's eager emit. Returns
-// true when ANY eager provenance row already exists for this
-// session — used to distinguish "first boot of session" (emit)
-// from "resume of existing session" (skip, rows already landed)
-// AND to keep subagent first boots working (preassignedSessionId
-// is set but no eager rows exist yet).
+// Per-(scope, name) idempotency lookup for the harness loop's
+// eager emit. Returns the SET of `(memory_scope, memory_name)`
+// pairs already recorded as eager exposures for this session,
+// formatted as `${scope}/${name}` so callers can do `Set.has`
+// in one step.
 //
-// Single indexed lookup against the session-led composite index;
-// the LIMIT 1 stops at the first match.
-export const hasEagerProvenance = (db: DB, sessionId: string): boolean => {
-  const row = db
-    .query<{ n: number }, [string]>(
-      `SELECT 1 AS n
+// Why a set, not a boolean: an earlier "ANY eager row exists?"
+// gate (hasEagerProvenance) had a partial-write failure mode —
+// if a previous boot's emit loop wrote one row and then threw
+// (transient SQLITE_BUSY, disk pressure), the next resume saw
+// "rows exist, skip" and the missing exposures stayed missing
+// forever. Tracking which keys are PRESENT lets resume backfill
+// only what's missing, restoring the spec contract (every
+// system-prompt body has a matching eager provenance row).
+//
+// Single indexed scan against `idx_memory_provenance_session_
+// scope_name_created`; the planner reads just the index leaves
+// for this session's eager rows, so even an inventory with
+// many historical exposures stays sub-millisecond.
+export const getEagerProvenanceKeys = (db: DB, sessionId: string): Set<string> => {
+  const rows = db
+    .query<{ memory_scope: string; memory_name: string }, [string]>(
+      `SELECT memory_scope, memory_name
          FROM memory_provenance
-        WHERE session_id = ? AND surface = 'eager'
-        LIMIT 1`,
+        WHERE session_id = ? AND surface = 'eager'`,
     )
-    .get(sessionId);
-  return row !== null;
+    .all(sessionId);
+  const set = new Set<string>();
+  for (const r of rows) {
+    set.add(`${r.memory_scope}/${r.memory_name}`);
+  }
+  return set;
 };
 
 // Retention window for the boot-time GC sweep (S1/T1.7). 90 days

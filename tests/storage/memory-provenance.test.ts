@@ -16,7 +16,7 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   countExposuresInWindow,
-  hasEagerProvenance,
+  getEagerProvenanceKeys,
   hashMemoryContent,
   listExposuresInRetrieval,
   listGlobalProvenanceByName,
@@ -641,14 +641,15 @@ describe('listProvenanceByName (session-scoped by-name lookup, S1/T1.6)', () => 
   });
 });
 
-describe('hasEagerProvenance (resume idempotency probe, S1 post-review)', () => {
-  test('returns false when the session has no eager rows', () => {
-    expect(hasEagerProvenance(db, sessionId)).toBe(false);
+describe('getEagerProvenanceKeys (resume backfill probe, S1 post-review)', () => {
+  test('returns an empty set when the session has no eager rows', () => {
+    expect(getEagerProvenanceKeys(db, sessionId).size).toBe(0);
   });
 
-  test('returns false when the session has ONLY per-call surface rows', () => {
+  test('returns an empty set when the session has ONLY per-call surface rows', () => {
     // Per-call surfaces (memory_read / retrieve_context) MUST NOT
-    // gate the eager emit — they answer different questions.
+    // appear in the eager keyset — they answer different questions
+    // and would cause the loop to skip a legitimate eager emit.
     const tc = seedToolCall('memory_read');
     recordProvenance(db, {
       sessionId,
@@ -657,10 +658,10 @@ describe('hasEagerProvenance (resume idempotency probe, S1 post-review)', () => 
       memoryName: 'foo',
       surface: 'memory_read',
     });
-    expect(hasEagerProvenance(db, sessionId)).toBe(false);
+    expect(getEagerProvenanceKeys(db, sessionId).size).toBe(0);
   });
 
-  test('returns true after a single eager row lands', () => {
+  test('keys are scope/name composites — same name in two scopes is two distinct entries', () => {
     recordProvenance(db, {
       sessionId,
       toolCallId: null,
@@ -668,7 +669,47 @@ describe('hasEagerProvenance (resume idempotency probe, S1 post-review)', () => 
       memoryName: 'foo',
       surface: 'eager',
     });
-    expect(hasEagerProvenance(db, sessionId)).toBe(true);
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'project_shared',
+      memoryName: 'foo',
+      surface: 'eager',
+    });
+    const keys = getEagerProvenanceKeys(db, sessionId);
+    expect(keys.size).toBe(2);
+    expect(keys.has('user/foo')).toBe(true);
+    expect(keys.has('project_shared/foo')).toBe(true);
+    expect(keys.has('project_local/foo')).toBe(false);
+  });
+
+  test('partial-write resume: keyset reflects only landed rows, missing ones backfillable', () => {
+    // Models the bug this fix addresses. A previous boot landed one
+    // exposure then threw before the second one. The next resume's
+    // keyset must include the landed row AND exclude the missing
+    // one so the loop emits the missing one this time.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'foo',
+      surface: 'eager',
+    });
+    // Intentionally NOT recording user/bar — simulates the partial
+    // failure.
+    const keys = getEagerProvenanceKeys(db, sessionId);
+    expect(keys.has('user/foo')).toBe(true);
+    expect(keys.has('user/bar')).toBe(false);
+    // Backfill — caller writes only the missing key. Keyset grows
+    // to cover the new row.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'bar',
+      surface: 'eager',
+    });
+    expect(getEagerProvenanceKeys(db, sessionId).size).toBe(2);
   });
 
   test('is session-scoped: another session lit up does not bleed in', () => {
@@ -680,8 +721,8 @@ describe('hasEagerProvenance (resume idempotency probe, S1 post-review)', () => 
       memoryName: 'foo',
       surface: 'eager',
     });
-    expect(hasEagerProvenance(db, sessionId)).toBe(false);
-    expect(hasEagerProvenance(db, other)).toBe(true);
+    expect(getEagerProvenanceKeys(db, sessionId).size).toBe(0);
+    expect(getEagerProvenanceKeys(db, other).has('user/foo')).toBe(true);
   });
 });
 
