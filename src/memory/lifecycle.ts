@@ -1,7 +1,10 @@
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
-import { OPERATOR_DRIVEN_EVIDENCE_MARKER } from '../storage/repos/eviction-events.ts';
+import {
+  OPERATOR_DRIVEN_EVIDENCE_MARKER,
+  getLastInvalidationEvent,
+} from '../storage/repos/eviction-events.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
   IndexError,
@@ -1008,4 +1011,133 @@ const mapWriteFailure = (result: WriteMemoryResult): MoveMemoryResult => {
     case 'io_error':
       return { kind: 'io_error', reason: result.reason };
   }
+};
+
+// ─── invalidated retention sweep (invalidated → evicted) ────────────
+//
+// EVICTION.md §7.1 + MEMORY.md §6.5.6 mandate a 7-day window before
+// an `invalidated` memory progresses to `evicted`. The trust_revoked
+// detector (S5) mass-produces `invalidated` rows when the operator
+// declines / revokes shared-corpus trust; without this sweep, those
+// rows accumulate on disk indefinitely (the spec's promise of
+// "eventually evicted" never materializes).
+//
+// Sweep contract (mirrors `gcPurgeExpiredTombstones`):
+//   1. Scan the registry for memories with `state: invalidated` in
+//      frontmatter.
+//   2. For each, look up the most-recent applied `to_state=invalidated`
+//      eviction_events row (`getLastInvalidationEvent`) — that's the
+//      anchor for the 7d window.
+//   3. If `now - recorded_at >= 7d`, transition `invalidated → evicted`
+//      with motivo='shift' (the only motivo §4.1 admits for this
+//      edge), trigger='expired_at', actor='startup_probe'.
+//   4. Skip when no invalidation event is found (defensive — a memory
+//      whose frontmatter says invalidated without a matching audit
+//      row is a forensic anomaly worth flagging stderr, but the
+//      sweep doesn't try to "rescue" it).
+
+const STALE_INVALIDATED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface GcStaleInvalidatedOptions {
+  // Probe time for the 7-day window check. Defaults to Date.now().
+  // Tests pass fixed values for determinism.
+  now?: () => number;
+  // Audit attribution forwarded to the eviction_events + memory_events
+  // rows. Same shape as the other GC sweeps.
+  auditSessionId?: string;
+  auditCwd?: string;
+}
+
+export interface StaleInvalidatedMemory {
+  scope: MemoryScope;
+  name: string;
+  invalidatedAtMs: number;
+  source: 'user_explicit' | 'inferred' | 'imported';
+}
+
+export interface GcStaleInvalidatedResult {
+  // Memories whose 7d window expired and transitioned to evicted.
+  evicted: StaleInvalidatedMemory[];
+  // Per-memory failures (rare: state-machine illegal moves, hook
+  // blocks, IO errors during tombstone move).
+  failures: { memory: StaleInvalidatedMemory; reason: string }[];
+  // Memories with `state: invalidated` but no matching
+  // eviction_events row to anchor the window. Surface them to the
+  // caller so they don't silently rot.
+  orphans: { scope: MemoryScope; name: string }[];
+}
+
+export const gcStaleInvalidatedMemories = async (
+  db: DB,
+  registry: MemoryRegistry,
+  roots: ScopeRoots,
+  opts: GcStaleInvalidatedOptions = {},
+): Promise<GcStaleInvalidatedResult> => {
+  const nowFn = opts.now ?? (() => Date.now());
+  const nowMs = nowFn();
+  const evicted: StaleInvalidatedMemory[] = [];
+  const failures: { memory: StaleInvalidatedMemory; reason: string }[] = [];
+  const orphans: { scope: MemoryScope; name: string }[] = [];
+
+  // List invalidated memories per scope. The registry's `states`
+  // filter peeks each body fresh, which is what we need to read
+  // current frontmatter.state without trusting a stale snapshot.
+  const invalidated = registry.list({ states: ['invalidated'] });
+
+  const baseTransitionInput = {
+    db,
+    registry,
+    roots,
+    toState: 'evicted' as const,
+    motivo: 'shift' as const,
+    trigger: 'expired_at',
+    actor: 'startup_probe' as const,
+    ...(opts.auditSessionId !== undefined ? { sessionId: opts.auditSessionId } : {}),
+    ...(opts.auditCwd !== undefined ? { cwd: opts.auditCwd } : {}),
+  };
+
+  for (const listing of invalidated) {
+    const last = getLastInvalidationEvent(db, 'memory', listing.name, listing.scope);
+    if (last === null) {
+      orphans.push({ scope: listing.scope, name: listing.name });
+      continue;
+    }
+    if (nowMs - last.recordedAt < STALE_INVALIDATED_WINDOW_MS) continue;
+
+    // Read source for audit attribution.
+    const peek = registry.peek(listing.name, { scope: listing.scope });
+    if (peek.kind !== 'present') continue;
+    const mem: StaleInvalidatedMemory = {
+      scope: listing.scope,
+      name: listing.name,
+      invalidatedAtMs: last.recordedAt,
+      source: peek.file.frontmatter.source,
+    };
+
+    // Per-memory now counter so back-to-back transitions get
+    // monotonically distinct recorded_at + tombstone ts values
+    // (same pattern as gcExpiredMemories).
+    let perMemNow = nowMs;
+    const tickNow = () => ++perMemNow;
+
+    const r = await transitionMemoryState({
+      ...baseTransitionInput,
+      scope: mem.scope,
+      name: mem.name,
+      // `_operator_driven` marker bypasses the §6.1 shift-evidence
+      // schema check (we don't have a fingerprint pair to record —
+      // the anchor evidence already lives in the prior invalidate
+      // row at `getLastInvalidationEvent`).
+      evidence: { [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true },
+      now: tickNow,
+    });
+
+    if (r.kind === 'applied') {
+      evicted.push(mem);
+    } else {
+      failures.push({ memory: mem, reason: gcFailureReason(r, 'invalidated→evicted') });
+    }
+  }
+
+  return { evicted, failures, orphans };
 };

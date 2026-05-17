@@ -817,6 +817,16 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // S5 CRIT/H2 hardening. Scopes that must be excluded from
+  // retrieval (`retrieve_context` tool) for this session. Mirrors
+  // the eager-load exclusion the bootstrap applies to
+  // `assembleMemorySection` when the shared-corpus trust probe
+  // returned a non-confirmed outcome (verify_failed / deferred /
+  // revoked). Without this, the model could fetch project_shared
+  // bodies via retrieve_context even though the system prompt
+  // already excluded them — partial fail-closed. Absent / empty
+  // = no exclusion.
+  memoryExcludeScopes?: ReadonlyArray<import('../memory/index.ts').MemoryScope>;
   // Inventory of memories that landed in the eager-load section
   // of the system prompt (MEMORY.md §11.2 — provenance, surface
   // 'eager'). Populated by the CLI bootstrap from

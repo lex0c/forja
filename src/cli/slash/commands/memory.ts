@@ -23,11 +23,13 @@
 
 import { readFileSync } from 'node:fs';
 import {
+  EMPTY_CORPUS_HASH,
   type MemoryFile,
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
   type TombstoneEntry,
+  clearSharedTrust,
   computeSharedFingerprint,
   findLatestTombstone,
   getSharedTrust,
@@ -38,6 +40,7 @@ import {
   removeMemory,
   scanForInjection,
   scanForPromotion,
+  setSharedTrust,
   transitionMemoryState,
 } from '../../../memory/index.ts';
 import type { DB } from '../../../storage/db.ts';
@@ -977,24 +980,74 @@ const handleTrust = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
   if (sub === undefined) {
     return {
       kind: 'error',
-      message: '/memory trust: missing subcommand (try: status)',
+      message: '/memory trust: missing subcommand (try: status, accept, forget)',
     };
   }
-  if (sub !== 'status') {
+  if (sub !== 'status' && sub !== 'accept' && sub !== 'forget') {
     return {
       kind: 'error',
-      message: `/memory trust: unknown subcommand '${sub}' (try: status)`,
+      message: `/memory trust: unknown subcommand '${sub}' (try: status, accept, forget)`,
     };
   }
-  // Extra args beyond `status` are user error — refuse rather than
-  // silently ignoring, matching the spec's "explicit is better than
-  // implicit" stance for operator-facing surfaces.
+  // Extra args beyond `status`/`accept`/`forget` are user error —
+  // refuse rather than silently ignoring, matching the spec's
+  // "explicit is better than implicit" stance for operator-facing
+  // surfaces.
   if (args.length > 1) {
     return {
       kind: 'error',
-      message: `/memory trust status: unexpected extra args (${args.slice(1).join(' ')})`,
+      message: `/memory trust ${sub}: unexpected extra args (${args.slice(1).join(' ')})`,
     };
   }
+
+  const sharedRootForAction = registry.roots.projectShared;
+
+  // `/memory trust accept` (S5 IMP/F6). Operator-explicit consent
+  // recorded as a slash command — equivalent to answering 'yes' in
+  // the modal but without re-prompting (operator already typed the
+  // command; THAT is the explicit consent moment). Use case: the
+  // operator cancelled the boot modal (Esc/timeout) → 'deferred'
+  // outcome → eager-load excluded the scope this session. They
+  // want to enable it without restarting; `/memory trust accept`
+  // stamps the current hash and tells them the scope will load
+  // from the NEXT session.
+  if (sub === 'accept') {
+    const currentHash = computeSharedFingerprint(sharedRootForAction);
+    if (currentHash === null) {
+      return {
+        kind: 'error',
+        message: `/memory trust accept: corpus unreadable at ${sharedRootForAction} — cannot record trust`,
+      };
+    }
+    setSharedTrust(ctx.db, sharedRootForAction, currentHash, ctx.now());
+    return {
+      kind: 'ok',
+      notes: [
+        `shared corpus trust recorded for ${sharedRootForAction}`,
+        `  hash: ${currentHash}`,
+        "  (scope will load from the NEXT session boot — this session's eager-load",
+        '   inventory was frozen at bootstrap and is not retroactively patched)',
+      ],
+    };
+  }
+
+  // `/memory trust forget` (S5 IMP/F6). Operator-explicit clear —
+  // removes the stored trust row WITHOUT touching memory state on
+  // disk. Use case: operator wants the next boot to re-prompt as
+  // first-visit (e.g., after they manually edited shared/ and
+  // want a fresh confirmation flow), but does NOT want to
+  // invalidate the existing memories (that's `/memory delete`).
+  if (sub === 'forget') {
+    clearSharedTrust(ctx.db, sharedRootForAction);
+    return {
+      kind: 'ok',
+      notes: [
+        `shared corpus trust cleared for ${sharedRootForAction}`,
+        '  (next boot will fire the first-visit modal; memory states on disk are unchanged)',
+      ],
+    };
+  }
+  // Falls through to status.
 
   const sharedRoot = registry.roots.projectShared;
   const stored = getSharedTrust(ctx.db, sharedRoot);
@@ -1031,7 +1084,19 @@ const handleTrust = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
   // don't optimize for scrollback compactness at the cost of
   // forgeability.
   if (stored === null) {
-    lines.push('  status: never confirmed (next boot will silently seed the current hash)');
+    // Two distinct flavors of "no trust row" (S5 P0/F2 + CRIT/F1+V2
+    // post-hardening): an EMPTY corpus is safe to silent-seed next
+    // boot (nothing to consent to); a non-empty corpus will instead
+    // trigger a first-visit modal — that's typically the case after
+    // a recent revoke OR a fresh clone of a repo whose shared/ was
+    // never trusted on this machine.
+    if (currentHash === EMPTY_CORPUS_HASH) {
+      lines.push('  status: never confirmed · corpus is empty (next boot will silently seed)');
+    } else {
+      lines.push(
+        '  status: NOT TRUSTED · corpus has content but no trust row (next boot will fire the first-visit modal)',
+      );
+    }
     lines.push(`  current hash: ${currentHash}`);
   } else if (stored.lastConfirmedHash === currentHash) {
     lines.push(

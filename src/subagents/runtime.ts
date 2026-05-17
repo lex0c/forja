@@ -231,6 +231,13 @@ export interface RunSubagentInput {
   // `config.isCwdTrusted` so the in-flight run propagates the
   // verdict it's already operating under.
   cwdTrusted?: boolean;
+  // S5 CRIT/H3: forwarded from the parent's bootstrap when the
+  // shared-corpus trust probe returned a non-confirmed outcome
+  // (verify_failed / deferred / revoked). The child's harness
+  // mirrors the fail-closed posture on both `assembleMemorySection`
+  // (eager-load) and `retrieve_context` (tool surface). Absence =
+  // false (parent confirmed OR no probe ran).
+  sharedScopeOffline?: boolean;
   depth?: number;
   worktreeRootDir?: string;
   // Test seam: inject a fake subprocess factory. Production
@@ -696,6 +703,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.planMode === true ? { planMode: true } : {}),
       ...(input.cwdTrusted === true ? { cwdTrusted: true } : {}),
+      ...(input.sharedScopeOffline === true ? { sharedScopeOffline: true } : {}),
       // Forward the IPC opt-in. The default spawn factory
       // converts this into pipe streams + the `--ipc=<n>` argv
       // flag; injected fakes can either build their own channel

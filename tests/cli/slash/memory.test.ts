@@ -2612,7 +2612,29 @@ describe('/memory conflicts (S4/T4.4)', () => {
 //   - extra args after `status` → error (explicit-is-better-than-
 //     implicit; future-proofs against silent typos)
 describe('/memory trust status', () => {
-  test('never confirmed: signals next-boot-will-seed', async () => {
+  test('never confirmed + EMPTY corpus: signals safe silent-seed (CRIT/F1+V2)', async () => {
+    // sharedRoot doesn't exist at all → currentHash ===
+    // EMPTY_CORPUS_HASH → safe to silent-seed next boot.
+    const repo = makeTmp();
+    const { ctx, roots } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'status'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('shared corpus trust:');
+      expect(text).toContain(roots.projectShared);
+      expect(text).toContain('never confirmed');
+      expect(text).toContain('corpus is empty');
+      expect(text).toContain('silently seed');
+      expect(text).toMatch(/inventory: 0 files/);
+    }
+  });
+
+  test('NOT TRUSTED + non-empty corpus: signals first-visit modal next boot (CRIT/F1+V2)', async () => {
+    // No trust row + non-empty corpus → next boot fires first-visit
+    // modal. The old copy ("never confirmed (silently seed)") was
+    // wrong for this case AND for the post-revoke state. The new
+    // copy distinguishes EMPTY from NOT-TRUSTED clearly.
     const repo = makeTmp();
     const { ctx, roots } = makeCtx(repo);
     writeIndex(roots.projectShared, '- [A](a.md) — h\n');
@@ -2621,12 +2643,10 @@ describe('/memory trust status', () => {
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
       const text = (r.notes ?? []).join('\n');
-      expect(text).toContain('shared corpus trust:');
-      expect(text).toContain(roots.projectShared);
-      expect(text).toContain('never confirmed');
-      expect(text).toContain('next boot will silently seed');
-      // 2 files = a.md (the body) + MEMORY.md (the index); the
-      // fingerprint hashes both, the inventory line reports both.
+      expect(text).toContain('NOT TRUSTED');
+      expect(text).toContain('first-visit modal');
+      // Critical: must NOT promise silent-seed for the non-empty case.
+      expect(text).not.toContain('silently seed');
       expect(text).toMatch(/inventory: 2 files/);
     }
   });
@@ -2704,6 +2724,92 @@ describe('/memory trust status', () => {
     const r = await memoryCommand.exec(['trust', 'status', 'extra'], ctx);
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain('unexpected extra args');
+  });
+
+  // /memory trust accept + forget (S5 IMP/F6)
+  test('accept: stamps current hash + reports follow-up boot semantics', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+
+    const r = await memoryCommand.exec(['trust', 'accept'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('recorded for');
+      expect(text).toContain('NEXT session');
+    }
+    // Trust row stamped at current hash.
+    const { computeSharedFingerprint, getSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored).not.toBeNull();
+    expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
+  });
+
+  test('accept: corpus unreadable → error, no trust row written', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    const { chmodSync } = await import('node:fs');
+    chmodSync(roots.projectShared, 0o000);
+    try {
+      const r = await memoryCommand.exec(['trust', 'accept'], ctx);
+      expect(r.kind).toBe('error');
+      if (r.kind === 'error') expect(r.message).toContain('corpus unreadable');
+    } finally {
+      chmodSync(roots.projectShared, 0o755);
+    }
+    const { getSharedTrust } = await import('../../../src/memory/trust-corpus.ts');
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+  });
+
+  test('forget: clears trust row, leaves memory state on disk untouched', async () => {
+    const repo = makeTmp();
+    const { ctx, db, roots } = makeCtx(repo);
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a');
+    // Pre-seed a trust row so forget has something to clear.
+    const { computeSharedFingerprint, getSharedTrust, setSharedTrust } = await import(
+      '../../../src/memory/trust-corpus.ts'
+    );
+    const hash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, hash, 1000);
+    expect(getSharedTrust(db, roots.projectShared)).not.toBeNull();
+
+    const r = await memoryCommand.exec(['trust', 'forget'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain('cleared for');
+      expect(text).toContain('first-visit modal');
+    }
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+    // Memory file on disk is untouched — forget is trust-row only.
+    const aPath = join(roots.projectShared, 'a.md');
+    const { existsSync, readFileSync } = await import('node:fs');
+    expect(existsSync(aPath)).toBe(true);
+    const body = readFileSync(aPath, 'utf-8');
+    expect(body).toContain('name: a');
+    expect(body).not.toContain('state: invalidated');
+  });
+
+  test('accept: extra args refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'accept', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+  });
+
+  test('forget: extra args refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['trust', 'forget', 'extra'], ctx);
+    expect(r.kind).toBe('error');
   });
 });
 

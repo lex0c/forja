@@ -67,6 +67,30 @@
 //          option.
 //
 // ────────────────────────────────────────────────────────────────────
+// HOOK FIRING POLICY (deliberate skip)
+//
+// `transitionMemoryState` fires the `Eviction` hook when both
+// `fireHook` AND `sessionId` are wired. The probe runs at boot
+// time, BEFORE the harness creates a session — so passing a real
+// session id isn't possible without synthesizing one (which would
+// give operator hooks a fake "session" with no turns / messages /
+// provenance, harder to forensically reason about than a missing
+// hook fire).
+//
+// This matches the precedent set by `gcExpiredMemories` and the
+// provenance retention sweep: boot-time consistency actions skip
+// hooks. Operators who want to monitor trust revocation rely on
+// the durable audit trail (eviction_events row per transition,
+// memory_events 'refused' rows for skipped / failed entries, plus
+// the stderr summary line emitted by the REPL caller). The hook
+// system is reserved for in-session events with full provenance.
+//
+// If the spec evolves to demand hook fires on boot-time
+// detector actions, the probe gains a `fireHook` parameter and
+// a synthesized "boot probe" session id — but that's a spec PR,
+// not a probe-local decision.
+//
+// ────────────────────────────────────────────────────────────────────
 // WHY ORCHESTRATOR IS SEPARATE FROM `trust-corpus.ts`
 //
 // `trust-corpus.ts` is pure substrate — fingerprint + DB row CRUD,
@@ -89,7 +113,6 @@ import { transitionMemoryState } from './transitions.ts';
 import {
   EMPTY_CORPUS_HASH,
   type SharedTrustRow,
-  clearSharedTrust,
   computeSharedFingerprint,
   getSharedTrust,
   listSharedCorpusFiles,
@@ -190,6 +213,33 @@ export type ProbeSharedTrustResult =
   // corpus is trustworthy when it can't even be read.
   | { kind: 'verify_failed'; sharedRoot: string };
 
+// Stderr inventory dump emitted right before the trust modal opens
+// (S5 IMP/F5). The modal preview caps at 8 files for layout
+// stability; this dump gives the operator the FULL list so they
+// can review out-of-band without canceling the modal. The
+// warn-callback shape matches every other boot-time stderr emitter
+// in the bootstrap (gc failures, provenance sweep, etc.) so
+// `forja:` greps are uniform.
+const dumpInventoryToStderr = (
+  warn: ProbeSharedTrustInput['warn'],
+  sharedRoot: string,
+  mode: SharedTrustModalMode,
+  corpusFiles: readonly ProbeCorpusFile[],
+): void => {
+  if (warn === undefined) return;
+  const label = mode === 'first-visit' ? 'first-visit prompt' : 'drift prompt';
+  warn(`${label} at ${sharedRoot} — full corpus inventory (${corpusFiles.length} files):`);
+  if (corpusFiles.length === 0) {
+    warn('  (corpus is currently empty)');
+    return;
+  }
+  for (const f of corpusFiles) {
+    // Two-space indent matches the audit/list slash output
+    // convention; size in bytes for parity with the modal preview.
+    warn(`  ${f.name} — ${f.bytes} bytes`);
+  }
+};
+
 // List the current corpus inventory for modal rendering. Delegates
 // to the shared `listSharedCorpusFiles` so the modal preview, the
 // fingerprint, AND the `/memory trust status` slash all agree on
@@ -257,7 +307,32 @@ const bulkInvalidateShared = async (
     const peek = input.registry.peek(listing.name, { scope: listing.scope });
     if (peek.kind !== 'present') continue;
     const currentState = peek.file.frontmatter.state ?? 'active';
-    if (currentState !== 'active') continue;
+    if (currentState !== 'active') {
+      // IMP/M3-rel hardening: skipping silently was a forensic
+      // blind spot. Emit a `refused` row so /memory audit can
+      // explain "why didn't memory FOO get invalidated when I
+      // revoked trust at T?". The most common cause is a
+      // concurrent boot or a slash command racing with the probe;
+      // recording the observed state at skip-time gives the
+      // operator a starting trail.
+      input.registry.recordEvent({
+        action: 'refused',
+        scope: listing.scope,
+        memoryName: listing.name,
+        source: peek.file.frontmatter.source,
+        details: {
+          stage: 'trust_revoked_bulk',
+          reason: 'state_changed_concurrently',
+          previous_state: currentState,
+          trigger: 'trust_revoked',
+        },
+        ...(input.cwd !== undefined && input.cwd !== null ? { auditCwd: input.cwd } : {}),
+        ...(input.sessionId !== undefined && input.sessionId !== null
+          ? { sessionId: input.sessionId }
+          : {}),
+      });
+      continue;
+    }
 
     try {
       const result = await transitionMemoryState({
@@ -375,6 +450,11 @@ export const probeSharedTrust = async (
       return { kind: 'seeded', hash: presentedHash };
     }
     const firstVisitCorpus = enumerateCorpus(input.sharedRoot);
+    // IMP/F5 hardening: dump the full inventory to stderr BEFORE
+    // the modal opens. The modal caps the visible list at 8; the
+    // operator can switch terminals and read every file by name
+    // without canceling (which would defer + re-prompt next boot).
+    dumpInventoryToStderr(input.warn, input.sharedRoot, 'first-visit', firstVisitCorpus);
     const answer = await input.askSharedTrust({
       path: input.sharedRoot,
       corpusFiles: firstVisitCorpus,
@@ -397,13 +477,25 @@ export const probeSharedTrust = async (
       return { kind: 'deferred', hash: presentedHash, cause: 'modal_cancel' };
     }
     // First-visit 'no': operator wants the corpus to NOT load.
-    // Bulk-invalidate every active shared memory; there's no trust
-    // row to clear (already null).
+    // Bulk-invalidate every active shared memory, then STAMP the
+    // trust row with the post-invalidate hash so subsequent boots
+    // recognize "we know about this state" and don't re-prompt
+    // (CRIT/F2 hardening: prior behavior left the trust row null,
+    // and the next boot's listing still found the same `.md`
+    // files — only the frontmatter changed — producing a fresh
+    // first-visit modal every boot, forever).
+    //
+    // The post-invalidate hash differs from `presentedHash`
+    // because each invalidated body has its frontmatter `state:`
+    // field flipped. Recompute after bulk; stamp the actual final
+    // state.
     const { invalidated, failed } = await bulkInvalidateShared(input, presentedHash);
+    const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
+    setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
     return {
       kind: 'revoked',
       oldHash: null,
-      newHash: presentedHash,
+      newHash: postRevokeHash,
       mode: 'first-visit',
       invalidated,
       failed,
@@ -416,6 +508,8 @@ export const probeSharedTrust = async (
 
   // Drift branch — stored row exists but hash changed.
   const driftCorpus = enumerateCorpus(input.sharedRoot);
+  // IMP/F5: see header on the first-visit dump above.
+  dumpInventoryToStderr(input.warn, input.sharedRoot, 'drift', driftCorpus);
   const answer = await input.askSharedTrust({
     path: input.sharedRoot,
     corpusFiles: driftCorpus,
@@ -449,24 +543,35 @@ export const probeSharedTrust = async (
 
   // Explicit 'no' — revoke path.
   //
-  // P0/H1-rob ATOMICITY: bulk-invalidate FIRST, clear trust row
-  // AFTER. The previous order (clear → bulk) had a crash-window
-  // failure: if the process died mid-loop, the trust row was gone
-  // and N memories still active. Next boot would silently re-seed
-  // the row at the current hash → no re-prompt → surviving active
-  // memories silently re-enter the eager prompt.
+  // P0/H1-rob ATOMICITY: bulk-invalidate FIRST, stamp trust row
+  // AFTER. The previous (pre-hardening) order was clear → bulk,
+  // which had a crash-window where active memories survived AND
+  // the next boot re-seeded the row at current hash → no
+  // re-prompt → surviving actives silently re-loaded.
   //
-  // Reversed order: if the process dies mid-loop, the trust row
-  // still pins the OLD hash. Next boot recomputes, sees divergence,
-  // re-prompts; surviving active memories get a second chance to
-  // be invalidated. The cost is a duplicate modal next boot in the
-  // crash-recovery case — acceptable trade for the safer state.
+  // CRIT/F2 hardening adjusts the AFTER step from
+  // `clearSharedTrust` to `setSharedTrust(post-invalidate-hash)`.
+  // Clearing made the next boot fire the first-visit modal again
+  // (corpus non-empty + null row), which is the same perpetual-
+  // prompt loop the first-visit-no branch hit. Stamping the
+  // POST-invalidate hash means subsequent boots see `unchanged`
+  // (no modal); the invalidated frontmatter is the persistent
+  // record of decline, and eager-load / retrieval already filter
+  // it out.
+  //
+  // Crash-recovery semantics remain safe: if the process dies
+  // mid-bulk, the trust row still pins the OLD hash (we haven't
+  // stamped yet). Next boot recomputes — sees divergence (some
+  // memories invalidated, some still active) — fires the modal
+  // again; operator can re-revoke and the surviving actives get
+  // a second chance.
   const { invalidated, failed } = await bulkInvalidateShared(input, presentedHash);
-  clearSharedTrust(input.db, input.sharedRoot);
+  const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
+  setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
   return {
     kind: 'revoked',
     oldHash: stored.lastConfirmedHash,
-    newHash: presentedHash,
+    newHash: postRevokeHash,
     mode: 'drift',
     invalidated,
     failed,

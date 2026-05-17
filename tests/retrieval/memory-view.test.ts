@@ -426,4 +426,48 @@ describe('createMemoryView', () => {
     const cands = await view.search({ ...baseQuery, text: 'auth' });
     expect(cands.map((c) => c.nodeId)).toEqual(['memory:user/fresh']);
   });
+
+  test('excludeScopes drops every candidate in the named scope (S5 CRIT/H2)', async () => {
+    // When the bootstrap's trust probe returns a non-confirmed
+    // outcome (verify_failed / deferred / revoked), it sets
+    // `memoryExcludeScopes: ['project_shared']` on the runner. The
+    // view MUST mirror the eager-load section's fail-closed
+    // posture — no project_shared bodies surface via
+    // retrieve_context, even if they'd otherwise score the highest.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Shared](shared.md) — fortress shared\n');
+    writeIndex(roots.projectLocal, '- [Local](local.md) — fortress local\n');
+    writeBody(roots.projectShared, 'shared', 'fortress body in shared');
+    writeBody(roots.projectLocal, 'local', 'fortress body in local');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    const baseline = await createMemoryView({ registry }).search({
+      ...baseQuery,
+      text: 'fortress',
+    });
+    expect(baseline.map((c) => c.nodeId).sort()).toEqual([
+      'memory:project_local/local',
+      'memory:project_shared/shared',
+    ]);
+
+    const offline = await createMemoryView({
+      registry,
+      excludeScopes: ['project_shared'],
+    }).search({ ...baseQuery, text: 'fortress' });
+    expect(offline.map((c) => c.nodeId)).toEqual(['memory:project_local/local']);
+  });
+
+  test('empty excludeScopes is a no-op (no behavior change)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — fortress\n');
+    writeBody(roots.projectShared, 's', 'fortress body');
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const cands = await createMemoryView({ registry, excludeScopes: [] }).search({
+      ...baseQuery,
+      text: 'fortress',
+    });
+    expect(cands.map((c) => c.nodeId)).toEqual(['memory:project_shared/s']);
+  });
 });

@@ -98,6 +98,16 @@ export interface SpawnChildProcessOptions {
   // harness defaults `isCwdTrusted=false` and tools gating on
   // trust (memory_write inferred source) silently deny.
   cwdTrusted?: boolean;
+  // Shared-corpus trust verdict forwarded via
+  // `--subagent-shared-scope-offline` (S5 CRIT/H3). When the
+  // parent's trust probe returned a non-confirmed outcome
+  // (verify_failed / deferred / revoked), the parent's eager-load
+  // and retrieval BOTH exclude project_shared; the child inherits
+  // the same posture so a spawned subagent doesn't load bodies
+  // the operator just refused. Without this, a child's separate
+  // assembleMemorySection would re-read the disk and surface
+  // unattested content the parent specifically gated.
+  sharedScopeOffline?: boolean;
   // Per-subagent background-process log directory. Threaded
   // across via `--subagent-bg-log-dir`. Format:
   // `<parentCwd>/.agent/bg/<childSessionId>/`. Each subagent
@@ -333,6 +343,9 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   }
   if (opts.cwdTrusted === true) {
     appendArgs.push('--subagent-cwd-trusted');
+  }
+  if (opts.sharedScopeOffline === true) {
+    appendArgs.push('--subagent-shared-scope-offline');
   }
   if (opts.bgLogDir !== undefined) {
     appendArgs.push('--subagent-bg-log-dir', opts.bgLogDir);

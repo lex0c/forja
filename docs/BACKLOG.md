@@ -2,6 +2,51 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(memory) — Second-round review (operational + cross-subsystem + spec) closed
+
+Three parallel reviewers (operational flow, subsystem boundaries, spec adherence) found 12 more issues after P0/P1. All 12 closed in this pass — eight critical (would break daily operator flow or skip the security gate elsewhere in the system), four important.
+
+Critical fixes:
+
+- **V1 invalidated retention sweep.** Trust_revoked produced `invalidated` rows that stayed on disk forever — no GC progressed them to `evicted` despite the 7-day window mandated by EVICTION.md §7.1 + MEMORY.md §6.5.6. Added `gcStaleInvalidatedMemories` in `src/memory/lifecycle.ts` (mirrors `gcExpiredMemories`/`gcPurgeExpiredTombstones`) wired into bootstrap right after the existing sweeps. `motivo: 'shift', trigger: 'expired_at', actor: 'startup_probe'`. Orphans (frontmatter `state: invalidated` without a matching audit row) surface to stderr without being touched. 5 lifecycle tests.
+
+- **F2 perpetual first-visit prompt.** Operator declining the first-visit modal left the trust row null + files on disk → next boot re-enumerated the same `.md` files → first-visit modal fired again, forever. Fix: both first-visit AND drift revoke paths now stamp the trust row with the POST-invalidate hash (after `bulkInvalidateShared` mutated each frontmatter). Subsequent boots see `unchanged` → no modal. The invalidated frontmatter is the durable decline marker; the trust row records "we know about this state".
+
+- **F3 recovery path.** LEGAL_TRANSITIONS forbids `invalidated → active`, so `/memory restore` can't bring back a revoked corpus. Surfaced the manual recovery path (edit frontmatter + re-add to MEMORY.md, then `/memory trust accept`) in the modal preview AND the post-revoke stderr summary. Stronger fix (spec PR for the state-machine extension) deferred.
+
+- **H1 boot-time hook fire (deferred).** Bulk-invalidate transitions don't fire the Eviction hook because the probe runs pre-session. Documented as deliberate alignment with `gcExpiredMemories` precedent — boot-time consistency actions skip hooks per the existing pattern. If/when the spec demands hook fires for detector-driven boot actions, that's a separate spec PR.
+
+- **H2 retrieval excludeScopes.** `retrieve_context` tool bypassed the eager-load fail-closed gate. Added `excludeScopes` to `MemoryViewDeps` and threaded `memoryExcludeScopes` through `HarnessConfig` → `buildRetrievalRunner` → `createMemoryView`. Eager-load and retrieval now mirror each other on the trust posture. 2 view tests.
+
+- **H3 subagent inherits parent's trust verdict.** Child constructed its own MemoryRegistry + assembleMemorySection without knowing the parent revoked / verify_failed. Added `sharedScopeOffline` to the spawn-factory opts, args parser (`--subagent-shared-scope-offline`), subagent-child opts, runtime input, and harness loop's spawnSubagent closure. Child mirrors parent's eager-load AND retrieval exclusion.
+
+- **H4 plan mode skip.** `--plan` is read-only per AGENTIC_CLI.md §5; a 'no' answer was running destructive bulk-invalidate writes. Gate widened to `input.askSharedTrust !== undefined && isCwdTrusted && input.plan !== true`. Test pins it.
+
+- **F4+M4 headless fail-closed.** When `askSharedTrust` is omitted (CI, `agent run`, plan mode) OR cwd is untrusted, the probe is skipped — but the eager-load gate previously fired only on probe results. Now `sharedScopeOffline` is computed defensively: when the probe is skipped, the bootstrap reads the stored trust row + computes the current hash; only `stored !== null && stored.lastConfirmedHash === currentHash` lets the shared scope load. Untrusted cwd → always excluded. 3 bootstrap tests.
+
+Important fixes:
+
+- **F1+V2 status copy.** Post-revoke (or post-`/memory trust forget`), trust row is null + corpus non-empty. Old copy said "never confirmed (silently seed)" — wrong on both halves. New branch: `currentHash === EMPTY_CORPUS_HASH` → `silently seed`, else `NOT TRUSTED · corpus has content but no trust row (next boot will fire the first-visit modal)`. Two slash tests.
+
+- **M3 audit row for silent skip.** `bulkInvalidateShared` re-peeks state per memory; if state ≠ active (concurrent revoke, /memory delete race), the skip was silent. Now emits a `refused` memory_events row with `details.stage='trust_revoked_bulk', reason='state_changed_concurrently'`. Test uses a proxy registry to force the race deterministically.
+
+- **F5 modal inventory stderr dump.** Modal preview caps at 8 files; operator with >8 changed files had no way to inspect the rest without canceling (deferred + re-prompt next boot). Probe now emits the FULL inventory to stderr via `warn` before opening the modal — operator can switch terminals and `ls`/`cat` while the modal sits.
+
+- **F6 /memory trust accept + forget slash subcommands.** Operator stranded in `deferred` purgatory (cancel/timeout) had no slash to exit without restart. `/memory trust accept` re-fingerprints + stamps the row (operator's slash IS explicit consent). `/memory trust forget` clears the trust row without touching memory state on disk → next boot prompts as first-visit. 5 slash tests.
+
+Architecture footprint:
+- `src/cli/bootstrap.ts`: `sharedScopeOffline` lifted out of try-block; headless fail-closed branch added; `gcStaleInvalidatedMemories` wired between purge sweep and probe; `memoryExcludeScopes` plumbed into HarnessConfig.
+- `src/memory/trust-corpus-probe.ts`: post-revoke `setSharedTrust` replaces `clearSharedTrust`; M3 audit row on skip path; F5 stderr inventory dump; H1 deferral documented in header.
+- `src/memory/lifecycle.ts`: new `gcStaleInvalidatedMemories` sweep + `getLastInvalidationEvent` repo helper.
+- `src/harness/types.ts` + `src/harness/loop.ts`: `memoryExcludeScopes` on config + runner wiring; parent-to-child sharedScopeOffline forwarding.
+- `src/subagents/spawn-factory.ts` + `src/cli/args.ts` + `src/cli/subagent-child.ts` + `src/cli/index.ts` + `src/subagents/runtime.ts`: `--subagent-shared-scope-offline` flag end-to-end.
+- `src/retrieval/views/memory.ts` + `src/retrieval/runner.ts`: `excludeScopes` on `MemoryViewDeps` + `memoryExcludeScopes` on runner deps.
+- `src/cli/slash/commands/memory.ts`: `/memory trust accept` + `forget`; status copy branched.
+- `src/cli/repl.ts`: post-revoke recovery hint in stderr.
+- `src/tui/state.ts`: recovery prose in both first-visit and drift modal previews.
+
+Tests: 8263 pass (+20 vs pre-rodada-2), 0 fail.
+
 ## [2026-05-17] hardening(memory) — Phase 1 P0/P1 code-review findings closed (S5 trust_revoked)
 
 Three parallel agents (robustness / reliability / security) reviewed the Phase 1 S5 work and surfaced 5 P0 + 10 P1 issues. All 15 closed in this pass.

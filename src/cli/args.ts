@@ -162,6 +162,15 @@ export interface ParsedArgs {
   // `session.cwd` would also default false. Carrying the
   // parent's verdict explicitly is the only correct option.
   subagentCwdTrusted?: boolean;
+  // Internal: forwarded shared-corpus trust verdict
+  // (S5 CRIT/H3). True ⇒ parent's bootstrap shared-trust probe
+  // returned a non-confirmed outcome (verify_failed / deferred /
+  // revoked); child must mirror the fail-closed posture by
+  // excluding project_shared from BOTH eager-load AND retrieval.
+  // Absence = false (parent's probe confirmed OR didn't run, in
+  // which case the child also doesn't run its own probe — the
+  // memory subsystem is already set up for the parent's scope).
+  subagentSharedScopeOffline?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -1497,6 +1506,18 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         // against `~/.config/agent/trust.json`, so the child
         // inherits the same verdict without re-resolving.
         args.subagentCwdTrusted = true;
+        i += 1;
+        break;
+      case '--subagent-shared-scope-offline':
+        // Presence-only flag (S5 CRIT/H3). Set when the parent's
+        // shared-corpus trust probe returned a non-confirmed
+        // outcome (verify_failed / deferred / revoked). The child
+        // mirrors the parent's fail-closed posture: eager-load AND
+        // retrieval exclude project_shared. Without forwarding,
+        // the child would re-read disk via its own
+        // assembleMemorySection and surface bodies the parent
+        // specifically gated.
+        args.subagentSharedScopeOffline = true;
         i += 1;
         break;
       case '--subagent-temperature': {

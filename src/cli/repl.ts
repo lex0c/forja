@@ -762,6 +762,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       for (const f of p.failed) {
         errSink(`forja:   could not invalidate ${f.name}: ${f.reason}\n`);
       }
+      // CRIT/F3 recovery hint. Operators who hit "No, revoke" by
+      // mistake have no slash to undo per-memory: the state
+      // machine forbids invalidated → active. Surface the manual
+      // path here AND echo the 7-day auto-eviction window so the
+      // operator knows their bodies aren't permanently gone yet
+      // (they're still in .agent/memory/shared/ on disk until
+      // gcStaleInvalidatedMemories progresses them to .tombstones/).
+      if (invCount > 0) {
+        errSink('forja:   recovery: edit the `.md` frontmatter to drop `state: invalidated`,\n');
+        errSink('            then re-add the entry to .agent/memory/shared/MEMORY.md.\n');
+        errSink('            Or accept the revoke — invalidated memories auto-evict to\n');
+        errSink('            .tombstones/ after 7 days (EVICTION.md §7.1).\n');
+      }
     } else if (p.kind === 'verify_failed') {
       errSink(
         `forja: shared memory corpus could not be verified at ${p.sharedRoot} — trust state unknown.\n`,

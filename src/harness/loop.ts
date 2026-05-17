@@ -1413,6 +1413,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             subagentRegistry: registry,
             ...(config.planMode === true ? { planMode: true } : {}),
             ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
+            // S5 CRIT/H3: forward shared-scope fail-closed verdict
+            // to the child. Without this, a subagent spawned after
+            // the operator revoked (or after verify_failed) would
+            // re-read disk and surface bodies the parent gated.
+            ...(config.memoryExcludeScopes?.includes('project_shared')
+              ? { sharedScopeOffline: true }
+              : {}),
             ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
             depth: childDepth,
             // Forward the spawn factory test seam. Production
@@ -2630,6 +2637,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                   db: config.db,
                   sessionId,
                   memoryRegistry: config.memoryRegistry,
+                  ...(config.memoryExcludeScopes !== undefined &&
+                  config.memoryExcludeScopes.length > 0
+                    ? { memoryExcludeScopes: config.memoryExcludeScopes }
+                    : {}),
                 }),
               }
             : {}),

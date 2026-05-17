@@ -18,10 +18,13 @@ import {
   resolveHookShell,
 } from '../hooks/index.ts';
 import {
+  computeSharedFingerprint,
   createMemoryRegistry,
   evaluateBootTriggers,
   gcExpiredMemories,
   gcPurgeExpiredTombstones,
+  gcStaleInvalidatedMemories,
+  getSharedTrust,
   probeSharedTrust,
   resolveRepoRoot,
   resolveScopeRoots,
@@ -456,6 +459,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // empty array survives the no-memory path without conditional
   // spread on the consumer side.
   let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
+  // Whether the shared scope is offline for THIS session — drives
+  // both the eager-load section's `excludeScopes` AND the retrieval
+  // runner's `memoryExcludeScopes` (S5 CRIT/H2). Lifted out of the
+  // try-block so the post-try HarnessConfig builder can pass it
+  // straight into the config without re-deriving from
+  // `sharedTrustProbe`.
+  let sharedScopeOffline = false;
   // Probe outcome (S5/T5.2). Lifted out of the try-block for the
   // same reason as `eagerExposures` — present on BootstrapResult
   // for the CLI driver to render warnings, absent on the early-
@@ -613,6 +623,28 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         `forja: memory gc: failed to purge eviction_event ${failure.evictionEventId}: ${failure.reason}\n`,
       );
     }
+    // Stale-invalidated sweep (S5 CRIT/V1, EVICTION.md §7.1 +
+    // MEMORY.md §6.5.6 7-day window). Trust_revoked produces
+    // `invalidated` rows in bulk; without this sweep they
+    // accumulate on disk forever. Each memory whose invalidation
+    // event is older than 7 days transitions to `evicted` with
+    // motivo='shift' (the only motivo §4.1 admits for
+    // invalidated→evicted), trigger='expired_at',
+    // actor='startup_probe'. Failures and orphans surface to
+    // stderr like the other sweeps.
+    const staleResult = await gcStaleInvalidatedMemories(db, memoryRegistry, memoryRoots, {
+      auditCwd: cwd,
+    });
+    for (const failure of staleResult.failures) {
+      process.stderr.write(
+        `forja: memory gc: failed to evict stale invalidated ${failure.memory.scope}/${failure.memory.name}: ${failure.reason}\n`,
+      );
+    }
+    for (const orphan of staleResult.orphans) {
+      process.stderr.write(
+        `forja: memory gc: orphan invalidated frontmatter without audit row at ${orphan.scope}/${orphan.name}\n`,
+      );
+    }
     // Provenance sweep (MEMORY.md §11.2, S1/T1.7). Drops
     // exposure rows older than the retention window. Best-
     // effort: a DB failure here MUST NOT abort boot — provenance
@@ -633,20 +665,32 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       );
     }
     // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2
-    // `trust_revoked` detector). Runs ONLY when the operator
-    // supplied a callback AND the cwd is trusted at boot — without
-    // cwd trust, the operator hasn't even consented to operate in
-    // this directory, so prompting them about its shared corpus is
-    // premature. Placement intent: AFTER the GC sweeps (an active
-    // shared memory just auto-evicted by `gcExpiredMemories` would
-    // shift the hash, prompting unnecessarily — accepted as a
-    // documented false-positive given how rarely operators set
-    // `expires:` on shared memories) and BEFORE
-    // `assembleMemorySection` so the bulk-invalidate path on revoke
-    // actually keeps the invalidated memories out of THIS session's
-    // system prompt (otherwise the operator would need to restart
-    // for the revocation to take effect).
-    if (input.askSharedTrust !== undefined && isCwdTrusted) {
+    // `trust_revoked` detector). Runs ONLY when:
+    //   - the operator supplied a callback (no TUI ⇒ no consent
+    //     pathway; the headless eager-load gate covers fail-closed
+    //     downstream by computing the hash separately),
+    //   - the cwd is trusted at boot (without cwd trust, the
+    //     operator hasn't consented to operate in this directory,
+    //     so prompting them about its shared corpus is premature),
+    //   - we are NOT in `--plan` mode. Plan mode is the read-only
+    //     profile (AGENTIC_CLI §5); a 'no' answer would trigger
+    //     bulk-invalidate writes (.tombstones/, eviction_events,
+    //     memory_events, clearSharedTrust) that violate the no-
+    //     writes contract. We skip the probe in plan; the
+    //     downstream fail-closed gate still excludes the scope
+    //     when the stored hash diverges, so the model doesn't load
+    //     unattested content even when no modal fired.
+    //
+    // Placement intent: AFTER the GC sweeps (an active shared
+    // memory just auto-evicted by `gcExpiredMemories` would shift
+    // the hash, prompting unnecessarily — accepted as a documented
+    // false-positive given how rarely operators set `expires:` on
+    // shared memories) and BEFORE `assembleMemorySection` so the
+    // bulk-invalidate path on revoke keeps the invalidated
+    // memories out of THIS session's system prompt (otherwise the
+    // operator would need to restart for the revocation to take
+    // effect).
+    if (input.askSharedTrust !== undefined && isCwdTrusted && input.plan !== true) {
       sharedTrustProbe = await probeSharedTrust({
         db,
         registry: memoryRegistry,
@@ -728,15 +772,41 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //
     // 'seeded', 'unchanged', 'reconfirmed' all pass — those are
     // the states where the trust row pins a hash that matches what
-    // the model is about to see. Probe undefined (no callback) →
-    // no exclusion (the headless / test path retains its existing
-    // behavior; the gate fires only when the operator was given an
-    // opportunity to consent).
-    const sharedScopeOffline =
-      sharedTrustProbe !== undefined &&
-      (sharedTrustProbe.kind === 'verify_failed' ||
-        sharedTrustProbe.kind === 'deferred' ||
-        sharedTrustProbe.kind === 'revoked');
+    // the model is about to see.
+    //
+    // CRIT/F4+M4 hardening: headless callers (no askSharedTrust)
+    // and untrusted-cwd boots used to skip the gate entirely
+    // (fail-OPEN). They now fail-CLOSED by default: the scope
+    // loads ONLY when the stored trust row's hash matches the
+    // current corpus fingerprint (the post-decision unchanged
+    // state). This means:
+    //   - Headless `agent run` against a corpus that's drifted
+    //     since the operator's last interactive confirm: scope
+    //     excluded, no model exposure to unattested content. The
+    //     operator must run the interactive REPL to re-confirm.
+    //   - Untrusted cwd (operator declined cwd-trust): scope
+    //     excluded; aligns with the spec's "trust is per-project"
+    //     stance — no shared corpus without project trust.
+    //   - Plan mode (probe skipped per H4): same headless logic
+    //     applies; plan mode reads but doesn't bulk-invalidate.
+    sharedScopeOffline = (() => {
+      if (sharedTrustProbe !== undefined) {
+        return (
+          sharedTrustProbe.kind === 'verify_failed' ||
+          sharedTrustProbe.kind === 'deferred' ||
+          sharedTrustProbe.kind === 'revoked'
+        );
+      }
+      // No probe ran. Decide based on whether the corpus state
+      // matches what the operator last confirmed. Fail-closed on
+      // any unknown / mismatch.
+      if (!isCwdTrusted) return true;
+      const currentHash = computeSharedFingerprint(memoryRoots.projectShared);
+      if (currentHash === null) return true; // unreadable corpus
+      const storedTrust = getSharedTrust(db, memoryRoots.projectShared);
+      if (storedTrust === null) return true; // never confirmed
+      return storedTrust.lastConfirmedHash !== currentHash; // drift
+    })();
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
@@ -829,6 +899,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
     memoryRegistry,
+    // S5 CRIT/H2: thread the scope-offline decision down so the
+    // retrieval runner mirrors the eager-load posture. Empty
+    // array when scope is online — the harness loop's
+    // BuildRetrievalRunnerDeps spread treats empty as no-op.
+    ...(sharedScopeOffline ? { memoryExcludeScopes: ['project_shared'] as const } : {}),
     // Eager-load provenance (MEMORY.md §11.2, S1/T1.4). Frozen
     // here at assembly time; loop emits one provenance row per
     // entry right after createSession. Empty array passes

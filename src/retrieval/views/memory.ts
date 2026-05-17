@@ -22,7 +22,7 @@
 // they'll fold into the weighted token stream alongside title +
 // description.
 
-import type { MemoryRegistry } from '../../memory/index.ts';
+import type { MemoryRegistry, MemoryScope } from '../../memory/index.ts';
 import { type BM25Document, createBM25Index, tokenize } from '../bm25.ts';
 import type { ViewSearch } from '../pipeline.ts';
 import type { Candidate, RetrievalQuery, RetrievalView } from '../types.ts';
@@ -73,6 +73,16 @@ export interface MemoryViewDeps {
   // fix a number; 20 balances downstream rank cost with coverage
   // for a typical registry (dozens to low hundreds of memories).
   limit?: number;
+  // Scope-level fail-closed exclusion (S5 CRIT/H2 hardening). When
+  // set, every listing whose scope is in this set is dropped
+  // before BM25 indexing — equivalent to "this scope is offline
+  // for retrieval this session". The bootstrap caller passes
+  // `['project_shared']` when the trust probe returned a non-
+  // confirmed outcome (verify_failed / deferred / revoked), so
+  // the model's `retrieve_context` tool sees the same scope
+  // posture as the eager-load section. Empty / absent = no
+  // exclusion.
+  excludeScopes?: ReadonlyArray<MemoryScope>;
 }
 
 export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
@@ -128,11 +138,23 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // adding a trust filter to the retrieval memory view — is the
     // §14.3 follow-up; until then, operator quarantine discipline
     // is the line of defense for untrusted+quarantined memories.
-    const listings = deps.registry.list({
+    const allListings = deps.registry.list({
       deduplicateByName: true,
       states: ['active', 'quarantined'],
       includeExpired: false,
     });
+    // S5 CRIT/H2: hard scope exclusion mirrors `assembleMemorySection`.
+    // When the trust probe couldn't confirm the shared corpus (or the
+    // operator revoked), the eager-load path drops `project_shared`;
+    // `retrieve_context` must do the same OR the model can pull
+    // unattested bodies via tool calls even though the system prompt
+    // excluded them.
+    const excludeScopes =
+      deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
+        ? new Set(deps.excludeScopes)
+        : null;
+    const listings =
+      excludeScopes === null ? allListings : allListings.filter((l) => !excludeScopes.has(l.scope));
     if (listings.length === 0) return [];
 
     // id → listing lookup. Used twice: once when emitting the BM25

@@ -1037,6 +1037,30 @@ export const getLastQuarantineEvent = (
   return row !== null ? fromRow(row) : null;
 };
 
+// Mirror of `getLastQuarantineEvent` for invalidation transitions.
+// Used by the `gcStaleInvalidatedMemories` sweep (S5 CRIT/V1) to
+// determine when each invalidated memory crossed the 7-day window
+// spec'd by EVICTION.md §7.1 + MEMORY.md §6.5.6 for progression
+// to `evicted`. Without this, trust_revoked produces invalidated
+// rows that stay on disk forever.
+export const getLastInvalidationEvent = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objectId: string,
+  objectScope: string,
+): EvictionEvent | null => {
+  const row = db
+    .query<EvictionEventRow, [EvictionSubstrate, string, string]>(
+      `${SELECT_ALL}
+        WHERE substrate = ? AND object_id = ? AND object_scope = ?
+          AND to_state = 'invalidated' AND outcome = 'applied'
+        ORDER BY recorded_at DESC, rowid DESC
+        LIMIT 1`,
+    )
+    .get(substrate, objectId, objectScope);
+  return row !== null ? fromRow(row) : null;
+};
+
 export const countEvictionEvents = (db: DB): number => {
   const row = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM eviction_events').get() as {
     n: number;

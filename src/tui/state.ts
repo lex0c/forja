@@ -1617,12 +1617,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       previewLines.push('');
       if (event.mode === 'first-visit') {
         previewLines.push('If you trust: the corpus hash is recorded as your baseline.');
-        previewLines.push('If you decline: every memory above is invalidated and stays off');
-        previewLines.push('until you explicitly restore or re-confirm.');
+        previewLines.push('If you decline: every memory above is invalidated and stays off.');
+        previewLines.push('  Recovery is NOT one-click: invalidated memories cannot');
+        previewLines.push('  /memory restore (state machine forbids invalidated→active).');
+        previewLines.push('  Manual fix: edit `.md` frontmatter (remove `state: invalidated`)');
+        previewLines.push('  + re-add to MEMORY.md, then `/memory trust accept`.');
       } else {
         previewLines.push('If you trust this update: the new corpus hash will be stamped.');
-        previewLines.push('If you revoke: every active shared memory is invalidated and');
-        previewLines.push('the corpus will not load into context until you re-confirm.');
+        previewLines.push('If you revoke: every active shared memory is invalidated AND');
+        previewLines.push('the corpus stays off until you re-curate.');
+        previewLines.push('  Recovery is NOT one-click: invalidated memories cannot');
+        previewLines.push('  /memory restore (state machine forbids invalidated→active).');
+        previewLines.push('  Manual fix: edit `.md` frontmatter (remove `state: invalidated`)');
+        previewLines.push('  + re-add to MEMORY.md, then `/memory trust accept`.');
       }
       return {
         state: {

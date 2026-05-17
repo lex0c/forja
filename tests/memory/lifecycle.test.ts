@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import {
   findExpiredMemories,
   gcExpiredMemories,
+  gcStaleInvalidatedMemories,
   moveMemory,
   removeMemory,
 } from '../../src/memory/lifecycle.ts';
@@ -45,7 +46,13 @@ const makeRoots = (repo: string): ScopeRoots => ({
 const writeBody = (
   dir: string,
   name: string,
-  fmExtras: { expires?: string; source?: string; type?: string; trust?: string } = {},
+  fmExtras: {
+    expires?: string;
+    source?: string;
+    type?: string;
+    trust?: string;
+    state?: string;
+  } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -56,6 +63,7 @@ const writeBody = (
   ];
   if (fmExtras.expires !== undefined) lines.push(`expires: ${fmExtras.expires}`);
   if (fmExtras.trust !== undefined) lines.push(`trust: ${fmExtras.trust}`);
+  if (fmExtras.state !== undefined) lines.push(`state: ${fmExtras.state}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
 };
 
@@ -880,5 +888,145 @@ describe('moveMemory — primitive (promote / demote)', () => {
     } finally {
       chmodSync(roots.projectShared, 0o700);
     }
+  });
+});
+
+describe('gcStaleInvalidatedMemories (S5 CRIT/V1, EVICTION §7.1 7d window)', () => {
+  let db: DB;
+  let sessionId: string;
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+  afterEach(() => db.close());
+
+  const seedInvalidated = (roots: ScopeRoots, name: string, invalidatedAtMs: number): void => {
+    writeIndex(roots.projectShared, `- [${name}](${name}.md) — h\n`);
+    writeBody(roots.projectShared, name, { state: 'invalidated', source: 'user_explicit' });
+    // Seed the eviction_events row that anchors the 7d window.
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: name,
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: invalidatedAtMs,
+    });
+  };
+
+  test('memory invalidated >= 7d ago transitions to evicted', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    seedInvalidated(roots, 'stale', eightDaysAgoMs);
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted.map((m) => m.name)).toEqual(['stale']);
+    expect(result.failures).toEqual([]);
+    // Body moved to .tombstones/, index entry removed.
+    expect(existsSync(join(roots.projectShared, 'stale.md'))).toBe(false);
+  });
+
+  test('memory invalidated < 7d ago is preserved', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const recentMs = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    seedInvalidated(roots, 'fresh', recentMs);
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted).toEqual([]);
+    expect(existsSync(join(roots.projectShared, 'fresh.md'))).toBe(true);
+  });
+
+  test('memory with invalidated frontmatter but no audit row surfaces as orphan', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // Frontmatter says invalidated, but NO eviction_events row exists.
+    writeIndex(roots.projectShared, '- [Orphan](orphan.md) — h\n');
+    writeBody(roots.projectShared, 'orphan', { state: 'invalidated' });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted).toEqual([]);
+    expect(result.orphans.map((o) => o.name)).toEqual(['orphan']);
+    // The orphan stays on disk — the sweep doesn't try to "rescue".
+    expect(existsSync(join(roots.projectShared, 'orphan.md'))).toBe(true);
+  });
+
+  test('mixed corpus: stale evicts, fresh stays, orphan surfaced', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const recentMs = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    // Three memories in one corpus.
+    writeIndex(
+      roots.projectShared,
+      '- [Stale](stale.md) — h\n- [Fresh](fresh.md) — h\n- [Orphan](orphan.md) — h\n',
+    );
+    writeBody(roots.projectShared, 'stale', { state: 'invalidated', source: 'user_explicit' });
+    writeBody(roots.projectShared, 'fresh', { state: 'invalidated', source: 'user_explicit' });
+    writeBody(roots.projectShared, 'orphan', { state: 'invalidated', source: 'user_explicit' });
+    const { appendEvictionEvent } = require('../../src/storage/repos/eviction-events.ts');
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'stale',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: eightDaysAgoMs,
+    });
+    appendEvictionEvent(db, {
+      substrate: 'memory',
+      objectId: 'fresh',
+      objectScope: 'project_shared',
+      fromState: 'active',
+      toState: 'invalidated',
+      trigger: 'trust_revoked',
+      motivo: 'security',
+      evidenceJson: JSON.stringify({ trigger_source: 'test' }),
+      outcome: 'applied',
+      blockedBy: null,
+      actor: 'startup_probe',
+      sessionId,
+      recordedAt: recentMs,
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted.map((m) => m.name)).toEqual(['stale']);
+    expect(result.orphans.map((o) => o.name)).toEqual(['orphan']);
+    expect(existsSync(join(roots.projectShared, 'stale.md'))).toBe(false);
+    expect(existsSync(join(roots.projectShared, 'fresh.md'))).toBe(true);
+    expect(existsSync(join(roots.projectShared, 'orphan.md'))).toBe(true);
+  });
+
+  test('active memory ignored (only invalidated state is in scope)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Live](live.md) — h\n');
+    writeBody(roots.projectShared, 'live');
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
+    const result = await gcStaleInvalidatedMemories(db, registry, roots);
+    expect(result.evicted).toEqual([]);
+    expect(result.orphans).toEqual([]);
+    expect(existsSync(join(roots.projectShared, 'live.md'))).toBe(true);
   });
 });

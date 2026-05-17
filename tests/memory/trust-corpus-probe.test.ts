@@ -167,9 +167,13 @@ describe('probeSharedTrust — state machine', () => {
       expect(result.oldHash).toBeNull();
       expect(result.invalidated.map((q) => q.name)).toEqual(['alpha']);
     }
-    // No trust row was created on first-visit revoke — the absence
-    // of the row means the next boot will prompt again (correct).
-    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+    // CRIT/F2: trust row STAMPED with post-invalidate hash so the
+    // next boot doesn't re-prompt. The invalidated frontmatter is
+    // the persistent decline marker; the trust row records that
+    // the operator has seen and decided about this state.
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored).not.toBeNull();
+    expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
   });
 
   test('unchanged: prior row matches current hash → no-op, no modal', async () => {
@@ -286,8 +290,13 @@ describe('probeSharedTrust — state machine', () => {
       expect(names).toEqual(['alpha', 'beta']);
     }
 
-    // Trust row cleared so the NEXT boot re-prompts.
-    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+    // CRIT/F2: trust row stamped at post-invalidate hash so the
+    // NEXT boot sees `unchanged` (no modal). The invalidated
+    // frontmatter is the durable decline marker.
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored).not.toBeNull();
+    expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
+    expect(stored?.lastConfirmedAtMs).toBe(5_000);
 
     // Both memories now report state=invalidated when re-read via
     // the registry's state filter.
@@ -519,12 +528,98 @@ describe('probeSharedTrust — Phase 1 hardening pass (P0/P1)', () => {
     });
 
     expect(result.kind).toBe('revoked');
-    // Trust row cleared.
-    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+    // CRIT/F2: trust row stamped at post-invalidate hash. Next
+    // boot sees `unchanged`; no perpetual re-prompt loop.
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored).not.toBeNull();
+    expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
     // Both memories invalidated.
     if (result.kind === 'revoked') {
       expect(result.invalidated.map((q) => q.name).sort()).toEqual(['a', 'b']);
     }
+  });
+
+  test('CRIT/F2: subsequent boot after first-visit revoke sees unchanged (no re-prompt)', async () => {
+    // The whole point of stamping post-invalidate hash: next boot
+    // must NOT fire the first-visit modal again. This test is the
+    // direct counter-example to the perpetual-prompt-loop bug.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+
+    // Boot 1: first visit, operator says no.
+    let modalCallsBoot1 = 0;
+    await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        modalCallsBoot1++;
+        return 'no';
+      },
+    });
+    expect(modalCallsBoot1).toBe(1);
+
+    // Boot 2: same files on disk, all invalidated. Probe must see
+    // `unchanged` and NOT prompt.
+    let modalCallsBoot2 = 0;
+    const boot2 = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        modalCallsBoot2++;
+        return 'yes';
+      },
+    });
+    expect(modalCallsBoot2).toBe(0);
+    expect(boot2.kind).toBe('unchanged');
+  });
+
+  test('CRIT/F2: subsequent boot after drift revoke sees unchanged (no re-prompt)', async () => {
+    // Same invariant as the first-visit-no test, but starting from
+    // an established trust row. Drift revoke must also stamp the
+    // post-invalidate hash.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'baseline');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const baseline = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, baseline, 1_000);
+
+    // Drift: operator edits the body.
+    writeBody(roots.projectShared, 'a', 'drifted');
+
+    // Boot 1: drift modal fires, operator revokes.
+    let modalCallsBoot1 = 0;
+    const boot1 = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        modalCallsBoot1++;
+        return 'no';
+      },
+    });
+    expect(modalCallsBoot1).toBe(1);
+    expect(boot1.kind).toBe('revoked');
+
+    // Boot 2: same on-disk state. No modal.
+    let modalCallsBoot2 = 0;
+    const boot2 = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        modalCallsBoot2++;
+        return 'yes';
+      },
+    });
+    expect(modalCallsBoot2).toBe(0);
+    expect(boot2.kind).toBe('unchanged');
   });
 
   test('M3-rob: concurrent boots skip already-invalidated memories silently', async () => {
@@ -578,6 +673,62 @@ describe('probeSharedTrust — Phase 1 hardening pass (P0/P1)', () => {
       // entries.
       expect(second.failed).toEqual([]);
     }
+  });
+
+  test('IMP/M3-rel: silent skip emits a forensic audit row', async () => {
+    // The skip path fires when `registry.list({states:['active']})`
+    // candidates a memory but a per-listing re-peek shows it's no
+    // longer active. Single-threaded tests can't trigger this race
+    // directly through the real registry (list and peek both read
+    // fresh frontmatter from disk). We use a thin proxy that
+    // returns a synthetic candidate for `a` but reports state via
+    // the underlying registry's peek — which has already mutated
+    // it to `invalidated`. This deterministically exercises the
+    // skip branch.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body', 'quarantined');
+    const realRegistry = createMemoryRegistry({ roots, db, cwd: repo });
+    // Wrap the real registry: list() forges an "active" candidate
+    // for `a` so the bulk loop tries it. The underlying peek (the
+    // probe's re-peek) reads disk and sees `quarantined`.
+    const proxy = {
+      ...realRegistry,
+      list: () => [
+        {
+          scope: 'project_shared' as const,
+          name: 'a',
+          entry: { title: 'A', href: 'a.md', hook: 'h' },
+        },
+      ],
+    } as typeof realRegistry;
+
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    // Force divergence so the probe enters the drift modal path.
+    writeFileSync(join(roots.projectShared, 'MEMORY.md'), '- [A](a.md) — h — drifted\n');
+
+    await probeSharedTrust({
+      db,
+      registry: proxy,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => 'no',
+    });
+
+    // The skip row landed in memory_events.
+    const skipRows = db
+      .prepare("SELECT details FROM memory_events WHERE action = 'refused' AND memory_name = 'a'")
+      .all() as { details: string }[];
+    expect(skipRows.length).toBeGreaterThan(0);
+    const skipRow = skipRows
+      .map((r) => JSON.parse(r.details) as Record<string, unknown>)
+      .find(
+        (d) =>
+          d.stage === 'trust_revoked_bulk' &&
+          d.reason === 'state_changed_concurrently' &&
+          d.previous_state === 'quarantined',
+      );
+    expect(skipRow).toBeDefined();
   });
 
   test('H2-rel: bulk-invalidate audit row uses actor=startup_probe', async () => {

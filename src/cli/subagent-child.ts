@@ -151,6 +151,17 @@ export interface SubagentChildOptions {
   // `isCwdTrusted=false` (fail-closed); tools gating on trust
   // (memory_write inferred-source refusal) deny accordingly.
   cwdTrusted?: boolean;
+  // Parent's shared-corpus trust verdict forwarded via
+  // `--subagent-shared-scope-offline` (S5 CRIT/H3). When true,
+  // the child mirrors the parent's fail-closed posture by
+  // excluding `project_shared` from BOTH the eager-load section
+  // AND the `retrieve_context` tool surface. Without this, a
+  // child's separate `assembleMemorySection` call would re-read
+  // disk and surface shared bodies the parent specifically
+  // gated. Absence = false (parent confirmed OR ran without a
+  // probe). The flag is presence-only; the spawn factory emits
+  // it only when the parent's outcome is non-confirmed.
+  sharedScopeOffline?: boolean;
   // Per-subagent background-process log directory passed across
   // via `--subagent-bg-log-dir <path>`. The harness wires it
   // into the bg manager so `bash_background` / `bash_output` /
@@ -890,6 +901,10 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         registry: memoryRegistry,
         bootContext,
         ...(memoryFilter !== undefined ? { memoryFilter } : {}),
+        // S5 CRIT/H3: forward parent's fail-closed scope exclusion.
+        // When parent's probe returned non-confirmed, project_shared
+        // is offline for THIS subagent run too.
+        ...(opts.sharedScopeOffline === true ? { excludeScopes: ['project_shared'] as const } : {}),
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
       eagerExposures = memorySection.eagerLoaded;
@@ -1057,6 +1072,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // source path; future tools may add more) silently denies
       // even when the operator trusted the parent's cwd.
       isCwdTrusted: opts.cwdTrusted === true,
+      // S5 CRIT/H3: mirror parent's shared-scope fail-closed
+      // posture on retrieval too. Eager-load already excludes
+      // via `excludeScopes` above; this gate keeps
+      // `retrieve_context` consistent — the model can't reach
+      // around the eager-load gate by asking for shared bodies
+      // via the tool surface.
+      ...(opts.sharedScopeOffline === true
+        ? { memoryExcludeScopes: ['project_shared'] as const }
+        : {}),
       // Checkpoints stay off — the worktree path already provides
       // a separate branch for changes; a per-step checkpoint chain
       // inside the worktree is a future addition.

@@ -105,6 +105,7 @@ export {
   findExpiredMemories,
   gcExpiredMemories,
   gcPurgeExpiredTombstones,
+  gcStaleInvalidatedMemories,
   moveMemory,
   removeMemory,
 } from './lifecycle.ts';

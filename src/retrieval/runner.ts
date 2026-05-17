@@ -18,7 +18,7 @@
 // an explicit `views` set so future tests / fixtures can stub
 // individual views without rebuilding the whole runner.
 
-import { type MemoryRegistry, serializeMemoryFile } from '../memory/index.ts';
+import { type MemoryRegistry, type MemoryScope, serializeMemoryFile } from '../memory/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
@@ -72,6 +72,12 @@ export interface BuildRetrievalRunnerDeps {
   // canonical memory + session pair. Tests / fixtures pass
   // explicit views to stub one or both.
   views?: Partial<Record<RetrievalView, ViewSearch>>;
+  // S5 CRIT/H2 hardening. Forwarded to `createMemoryView`'s
+  // `excludeScopes` so the retrieval surface mirrors the eager-
+  // load fail-closed posture. The bootstrap caller computes this
+  // from the trust probe outcome (verify_failed / deferred /
+  // revoked → exclude `project_shared`).
+  memoryExcludeScopes?: ReadonlyArray<MemoryScope>;
 }
 
 export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn => {
@@ -87,7 +93,12 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
   // search call), so reuse is safe and matches the ViewSearch
   // contract.
   const wiredViews: Partial<Record<RetrievalView, ViewSearch>> = deps.views ?? {
-    memory: createMemoryView({ registry: deps.memoryRegistry }),
+    memory: createMemoryView({
+      registry: deps.memoryRegistry,
+      ...(deps.memoryExcludeScopes !== undefined && deps.memoryExcludeScopes.length > 0
+        ? { excludeScopes: deps.memoryExcludeScopes }
+        : {}),
+    }),
     session: createSessionView({ db: deps.db, sessionId: deps.sessionId }),
   };
   const resolver = createCompressionResolver({
@@ -137,6 +148,13 @@ export const buildRetrievalRunner = (deps: BuildRetrievalRunnerDeps): RetrieveFn
       viewsForCall.memory = createMemoryView({
         registry: deps.memoryRegistry,
         loadBodies: true,
+        // Keep the scope exclusion on the loadBodies-on variant —
+        // otherwise enabling loadBodies in a session whose trust
+        // probe returned non-confirmed would silently reintroduce
+        // the unattested scope.
+        ...(deps.memoryExcludeScopes !== undefined && deps.memoryExcludeScopes.length > 0
+          ? { excludeScopes: deps.memoryExcludeScopes }
+          : {}),
       });
     }
 
