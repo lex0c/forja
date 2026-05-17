@@ -122,7 +122,7 @@ export interface SharedTrustAskArgs {
   path: string;
   // 'first-visit' (no prior trust row + non-empty corpus) vs 'drift'
   // (prior row but hash diverged). Reducer adapts the prose to match.
-  mode: 'first-visit' | 'drift';
+  mode: import('../memory/trust-corpus-probe.ts').SharedTrustModalMode;
   // Current corpus snapshot — name + byte length per file. Renderer
   // wraps long lists with an explicit "(N more)" suffix; the
   // producer should NOT pre-truncate so the audit event carries the

@@ -365,7 +365,7 @@ export type SharedTrustAskEvent = BaseEvent & {
   // The renderer adapts prose per mode; the answer space is the
   // same ('yes' / 'no' / 'cancel') and the substrate handles
   // both modes uniformly downstream.
-  mode: 'first-visit' | 'drift';
+  mode: import('../memory/trust-corpus-probe.ts').SharedTrustModalMode;
   // Snapshot of the current corpus the operator is being asked to
   // (re-)confirm. Each entry is one `.md` file at the corpus root —
   // filename plus byte length so the operator can spot suspicious

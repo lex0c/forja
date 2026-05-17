@@ -1417,6 +1417,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // to the child. Without this, a subagent spawned after
             // the operator revoked (or after verify_failed) would
             // re-read disk and surface bodies the parent gated.
+            // Array → boolean translation: the child receives a
+            // single boolean via `--subagent-shared-scope-offline`
+            // (cleaner IPC than serializing an array of scopes);
+            // S5's only excluded scope is `project_shared` so the
+            // collapse is lossless today. If a future detector
+            // gates a different scope, this site widens to encode
+            // the array (and the spawn-factory grows a list flag).
             ...(config.memoryExcludeScopes?.includes('project_shared')
               ? { sharedScopeOffline: true }
               : {}),

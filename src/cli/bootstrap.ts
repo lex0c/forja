@@ -151,7 +151,7 @@ export interface BootstrapInput {
   // reconfirmed transition with a real timestamp).
   askSharedTrust?: (args: {
     path: string;
-    mode: 'first-visit' | 'drift';
+    mode: import('../memory/index.ts').SharedTrustModalMode;
     corpusFiles: readonly { name: string; bytes: number }[];
   }) => Promise<'yes' | 'no' | 'cancel'>;
 }
@@ -789,6 +789,18 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //     stance — no shared corpus without project trust.
     //   - Plan mode (probe skipped per H4): same headless logic
     //     applies; plan mode reads but doesn't bulk-invalidate.
+    // Why `sharedScopeOffline` is a boolean while downstream callers
+    // consume `excludeScopes: readonly MemoryScope[]`: the boolean
+    // shape serializes cleanly across the subagent IPC boundary
+    // (`--subagent-shared-scope-offline` flag, no list parsing), and
+    // S5's only excluded scope is `project_shared` — generality
+    // beyond that would be wasted today. Internal consumers of the
+    // boolean re-derive `excludeScopes: ['project_shared']` at the
+    // call site (see `bootstrap.ts:835`, `subagent-child.ts`, harness
+    // `loop.ts:1420`). The array shape stays for the
+    // `assembleMemorySection` / `createMemoryView` APIs that may
+    // grow more scopes (e.g., a future quarantine sweep that wants
+    // to gate `user` independently).
     sharedScopeOffline = (() => {
       if (sharedTrustProbe !== undefined) {
         return (
@@ -800,6 +812,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // No probe ran. Decide based on whether the corpus state
       // matches what the operator last confirmed. Fail-closed on
       // any unknown / mismatch.
+      //
+      // P1/F6 cost note (deferred): a CI run that boots N times
+      // against an unchanged corpus pays one full `.agent/memory/
+      // shared/` read per boot just to compute the hash that will
+      // match. A proper mtime fast-path would persist per-file
+      // (size, mtime) tuples alongside the trust row and skip the
+      // hash on stat-match — but a directory-mtime fast-path
+      // misses body-content edits (root mtime doesn't change on
+      // body writes), and a full per-file mtime persist requires
+      // a migration + a snapshot column. Cost-benefit: ~5-10ms
+      // per boot for a 100-file × 5KB corpus, dwarfed by Bun init
+      // + SQLite migration. Skipped for now; revisit if telemetry
+      // surfaces hot-path impact.
       if (!isCwdTrusted) return true;
       const currentHash = computeSharedFingerprint(memoryRoots.projectShared);
       if (currentHash === null) return true; // unreadable corpus

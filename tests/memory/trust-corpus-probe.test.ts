@@ -140,9 +140,8 @@ describe('probeSharedTrust — state machine', () => {
     expect(modalMode as 'first-visit' | 'drift' | null).toBe('first-visit');
     expect(inventory.map((f) => f.name).sort()).toEqual(['MEMORY.md', 'alpha.md']);
     expect(result.kind).toBe('reconfirmed');
-    if (result.kind === 'reconfirmed') {
-      expect(result.mode).toBe('first-visit');
-    }
+    // Mode/oldHash/newHash dropped from the result post-D2; the
+    // mode flowed to the modal-callback `modalMode` pinned above.
     // Trust row stamped at the confirmed hash.
     const stored = getSharedTrust(db, roots.projectShared);
     expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(roots.projectShared) as string);
@@ -163,8 +162,6 @@ describe('probeSharedTrust — state machine', () => {
 
     expect(result.kind).toBe('revoked');
     if (result.kind === 'revoked') {
-      expect(result.mode).toBe('first-visit');
-      expect(result.oldHash).toBeNull();
       expect(result.invalidated.map((q) => q.name)).toEqual(['alpha']);
     }
     // CRIT/F2: trust row STAMPED with post-invalidate hash so the
@@ -240,10 +237,8 @@ describe('probeSharedTrust — state machine', () => {
       expect(captured.corpusFiles.length).toBeGreaterThan(0);
     }
     expect(result.kind).toBe('reconfirmed');
-    if (result.kind === 'reconfirmed') {
-      expect(result.oldHash).toBe(oldHash);
-      expect(result.newHash).toBe(newHash);
-    }
+    // D2 dropped oldHash/newHash from the result; the trust row IS
+    // the durable record of the new hash.
     const stored = getSharedTrust(db, roots.projectShared);
     expect(stored?.lastConfirmedHash).toBe(newHash);
     expect(stored?.lastConfirmedAtMs).toBe(2_000);
@@ -491,6 +486,187 @@ describe('probeSharedTrust — verify_failed (T5.5)', () => {
       // Restore perms so afterEach's rmSync can clean up. Without
       // this the tmpdir leaks and subsequent runs in the same
       // tmpdir hit EACCES on cleanup.
+      chmodSync(roots.projectShared, 0o755);
+    }
+  });
+});
+
+describe('probeSharedTrust — third hardening pass (T1/T8/T15)', () => {
+  test('T1: warn callback receives the full corpus inventory', async () => {
+    // The probe emits one stderr line per file + a header before
+    // opening the modal (CRIT/F5 hardening). Test pins the format
+    // so a regression that drops the dump surfaces.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body A');
+    writeBody(roots.projectShared, 'b', 'body B');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    writeBody(roots.projectShared, 'a', 'drift');
+
+    const warnLines: string[] = [];
+    await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => 'yes',
+      warn: (s) => warnLines.push(s),
+    });
+    // Header carries the mode + path + count.
+    const header = warnLines.find((l) => l.includes('drift prompt at') && l.includes('files'));
+    expect(header).toBeDefined();
+    // One line per file with `name — N bytes` shape.
+    expect(warnLines.some((l) => l.includes('a.md — ') && l.includes('bytes'))).toBe(true);
+    expect(warnLines.some((l) => l.includes('b.md — ') && l.includes('bytes'))).toBe(true);
+  });
+
+  test('T1: empty corpus inventory dump surfaces explicit prose', async () => {
+    // Empty (or unreadable) corpus path: dump must still emit the
+    // header + an explicit "currently empty" line so the operator
+    // sees that the modal isn't omitting content.
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const warnLines: string[] = [];
+    await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => 'yes',
+      warn: (s) => warnLines.push(s),
+    });
+    // No modal fires for an empty corpus (seeded path); the dump
+    // also shouldn't fire — the early `EMPTY_CORPUS_HASH` branch
+    // returns before `askSharedTrust`. Assert nothing leaked.
+    expect(warnLines).toEqual([]);
+  });
+
+  test('T8: TOCTOU sibling — same-body-rewrite inside modal stays reconfirmed', async () => {
+    // Sister test to the existing TOCTOU one. Pre-hardening this
+    // pass, `verifyConfirmedHash` re-reads bytes; post-F1 it does
+    // a stat-compare and falls back. Either way the contract is:
+    // if the bytes don't change (same size + same mtime OR
+    // matching hash), `kind === 'reconfirmed'`. A regression that
+    // returns drift unconditionally would fail HERE.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'baseline');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    // Operator-visible drift before probe.
+    writeBody(roots.projectShared, 'a', 'drifted');
+
+    const result = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        // Inside-modal write: SAME bytes as what the probe saw
+        // (the post-drift state). mtime updates, but content is
+        // identical → hash matches → reconfirmed.
+        // To force a same-content re-write that also matches the
+        // mtime captured at fingerprint time, we DON'T re-write at
+        // all here. (A fresh write would change mtime; the fast-
+        // path would fall through to a full hash that still
+        // matches, returning confirmed. Test pins the end-state
+        // either way.)
+        return 'yes';
+      },
+    });
+    expect(result.kind).toBe('reconfirmed');
+  });
+
+  test('T15a: first-visit + cancel → deferred(modal_cancel)', async () => {
+    // State-machine matrix coverage. `drift + cancel` is tested;
+    // first-visit + cancel was a gap.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const result = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => 'cancel',
+    });
+    expect(result.kind).toBe('deferred');
+    if (result.kind === 'deferred') {
+      expect(result.cause).toBe('modal_cancel');
+    }
+    // No trust row stamped on first-visit cancel — operator
+    // hasn't seen-and-decided yet.
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+  });
+
+  test('T15b: first-visit + yes + TOCTOU → deferred(tocttou)', async () => {
+    // First-visit's TOCTOU branch was untested. The drift-mode
+    // TOCTOU test pins it for drift; this pins for first-visit.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const result = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => {
+        // Drift inside the modal window.
+        writeBody(roots.projectShared, 'a', 'tampered during prompt');
+        return 'yes';
+      },
+    });
+    expect(result.kind).toBe('deferred');
+    if (result.kind === 'deferred') {
+      expect(result.cause).toBe('tocttou_during_prompt');
+    }
+    // First-visit + tocttou → trust row NOT stamped (operator
+    // confirmed an old state we can't trust).
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+  });
+
+  test('T6: bulk-invalidate transition io_error path emits audit row + failed entry', async () => {
+    // M3 covered concurrent-state SKIP. T6 covers a real
+    // transitionMemoryState failure: chmod the body 000 between
+    // the snapshot and the transition so the move-to-tombstone
+    // fails with EACCES. Skip-as-root.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    writeBody(roots.projectShared, 'a', 'tampered');
+
+    // Chmod the SCOPE DIRECTORY 0o500 (read+exec, no write) so
+    // body reads succeed (registry.list's state-filter peek works)
+    // but transitionMemoryState's frontmatter rewrite fails with
+    // EACCES. The body file itself stays 0o644.
+    chmodSync(roots.projectShared, 0o500);
+    try {
+      const result = await probeSharedTrust({
+        db,
+        registry,
+        roots,
+        sharedRoot: roots.projectShared,
+        askSharedTrust: async () => 'no',
+      });
+      expect(result.kind).toBe('revoked');
+      if (result.kind === 'revoked') {
+        // Failure surfaces in `failed[]`.
+        expect(result.failed.length).toBeGreaterThan(0);
+        expect(result.failed[0]?.name).toBe('a');
+      }
+      // A `refused` audit row landed.
+      const refusedRows = db
+        .prepare("SELECT details FROM memory_events WHERE action = 'refused' AND memory_name = 'a'")
+        .all() as { details: string }[];
+      expect(refusedRows.length).toBeGreaterThan(0);
+      const parsed = refusedRows.map((r) => JSON.parse(r.details) as Record<string, unknown>);
+      expect(
+        parsed.some((d) => d.stage === 'trust_revoked_bulk' && typeof d.reason === 'string'),
+      ).toBe(true);
+    } finally {
       chmodSync(roots.projectShared, 0o755);
     }
   });

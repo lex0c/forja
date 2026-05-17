@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import {
   OPERATOR_DRIVEN_EVIDENCE_MARKER,
-  getLastInvalidationEvent,
+  getLastInvalidationEventsBatch,
 } from '../storage/repos/eviction-events.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
@@ -1084,6 +1084,17 @@ export const gcStaleInvalidatedMemories = async (
   // current frontmatter.state without trusting a stale snapshot.
   const invalidated = registry.list({ states: ['invalidated'] });
 
+  // P1/F2: batch lookup of last-invalidation timestamp per memory.
+  // Pre-hardening this was an N-times ordered SELECT per boot;
+  // batch picks the latest `recorded_at` per (object_id, scope) in
+  // one round-trip. Map key shape mirrors what the
+  // `getLastInvalidationEventsBatch` returns.
+  const invalidationTs = getLastInvalidationEventsBatch(
+    db,
+    'memory',
+    invalidated.map((l) => ({ objectId: l.name, objectScope: l.scope })),
+  );
+
   const baseTransitionInput = {
     db,
     registry,
@@ -1097,21 +1108,30 @@ export const gcStaleInvalidatedMemories = async (
   };
 
   for (const listing of invalidated) {
-    const last = getLastInvalidationEvent(db, 'memory', listing.name, listing.scope);
-    if (last === null) {
+    const lastRecordedAt = invalidationTs.get(`${listing.scope}/${listing.name}`);
+    if (lastRecordedAt === undefined) {
       orphans.push({ scope: listing.scope, name: listing.name });
       continue;
     }
-    if (nowMs - last.recordedAt < STALE_INVALIDATED_WINDOW_MS) continue;
+    if (nowMs - lastRecordedAt < STALE_INVALIDATED_WINDOW_MS) continue;
 
-    // Read source for audit attribution.
-    const peek = registry.peek(listing.name, { scope: listing.scope });
-    if (peek.kind !== 'present') continue;
+    // P1/F3: registry.list({states:[...]}) already peeked the body
+    // and attached `listing.file`. Read source from the cached
+    // frontmatter; falls back to peek only if the cache is absent
+    // (defensive — every code path that reaches here should have
+    // a file from the state-filtered list).
+    const fm =
+      listing.file?.frontmatter ??
+      (() => {
+        const p = registry.peek(listing.name, { scope: listing.scope });
+        return p.kind === 'present' ? p.file.frontmatter : null;
+      })();
+    if (fm === null) continue;
     const mem: StaleInvalidatedMemory = {
       scope: listing.scope,
       name: listing.name,
-      invalidatedAtMs: last.recordedAt,
-      source: peek.file.frontmatter.source,
+      invalidatedAtMs: lastRecordedAt,
+      source: fm.source,
     };
 
     // Per-memory now counter so back-to-back transitions get

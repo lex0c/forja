@@ -58,6 +58,16 @@ export interface MemoryListing {
   // a `states` filter (cheap reuse of the existing peek) OR peek
   // directly. Document on the call site which path was chosen.
   state?: MemoryState;
+  // Parsed MemoryFile from the same peek that populated `state`
+  // (P1/F3 hardening). Populated alongside `state` when `list()`
+  // ran a body peek for filtering — callers that consume the file
+  // (e.g., the bulk-invalidate path needs `frontmatter.source`
+  // for audit attribution; the stale-invalidated GC needs the
+  // full frontmatter to derive `StaleInvalidatedMemory.source`)
+  // can read `listing.file` instead of paying a SECOND peek.
+  // Undefined when `state` is undefined; reading `file` without
+  // setting a `states` filter requires an explicit `peek()` call.
+  file?: MemoryFile;
 }
 
 export interface MemoryRegistry {
@@ -572,7 +582,12 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           const state: MemoryState = fm.state ?? 'active';
           if (opts.states !== undefined && !opts.states.includes(state)) return null;
           if (opts.includeExpired === false && isExpired(fm.expires, nowMs)) return null;
-          return { ...l, state };
+          // P1/F3: attach the peeked file so callers (gc sweeps,
+          // bulk-invalidate) don't pay a second peek to read the
+          // frontmatter.source / body. The file is already in
+          // memory from the filter peek above; sharing it costs
+          // nothing.
+          return { ...l, state, file: fileResult.file };
         });
         filtered = enriched.filter((l): l is MemoryListing => l !== null);
       }

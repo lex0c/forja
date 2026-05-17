@@ -775,6 +775,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         errSink('            Or accept the revoke — invalidated memories auto-evict to\n');
         errSink('            .tombstones/ after 7 days (EVICTION.md §7.1).\n');
       }
+    } else if (p.kind === 'deferred') {
+      // D1: surface WHY the prompt was deferred. Operator who hit
+      // Esc / let the modal timeout AND operator surprised by a
+      // TOCTOU swap during deliberation both arrive here, but the
+      // cause changes what they should do next: 'modal_cancel'
+      // means "answer the modal next boot", 'tocttou_during_prompt'
+      // means "something is writing to .agent/memory/shared/ on
+      // your behalf, investigate before re-confirming".
+      const reason =
+        p.cause === 'modal_cancel'
+          ? 'modal cancelled — re-prompt next boot.'
+          : 'corpus changed during prompt (TOCTOU) — re-prompt next boot; investigate concurrent writers.';
+      errSink(`forja: shared memory trust prompt deferred — ${reason}\n`);
     } else if (p.kind === 'verify_failed') {
       errSink(
         `forja: shared memory corpus could not be verified at ${p.sharedRoot} — trust state unknown.\n`,

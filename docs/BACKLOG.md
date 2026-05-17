@@ -2,6 +2,38 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(memory) — Third-round review (architecture + performance + test quality) closed
+
+Three more parallel reviewers (architecture quality, performance & boot-time cost, test coverage gaps) surfaced 18 issues after the second round. All 18 closed.
+
+Architecture cleanup (D1/D2/DRY1/DRY2/N1):
+
+- **D1**: REPL now surfaces the `deferred` outcome's `cause` (`modal_cancel` vs `tocttou_during_prompt`) in stderr — operator-load-bearing distinction that was previously consumed only by tests.
+- **D2**: Shrunk `ProbeSharedTrustResult` to drop `oldHash`/`newHash`/`mode` on `reconfirmed`/`revoked`. The fields were synthetic / not load-bearing in production; durable forensic detail lives in `memory_events`, `eviction_events`, `shared_corpus_trust`. Tests updated to read from those.
+- **DRY1**: `SharedTrustModalMode` alias now imported at 3 prior inline sites (events.ts, modal-manager.ts, bootstrap.ts) — single source of truth.
+- **DRY2**: Extracted `auditAttribution(input)` helper in `bulkInvalidateShared`; 3× repeated conditional spreads collapse to one call site.
+- **N1**: Added WHY one-liners at the array↔boolean serialization boundaries (bootstrap.ts, loop.ts, subagent-child.ts) documenting why `excludeScopes: MemoryScope[]` and `sharedScopeOffline: boolean` are intentional shape divergence — boolean serializes cleanly across the subagent IPC boundary.
+
+Performance (F1/F2/F3, F6 deferred):
+
+- **F2**: `getLastInvalidationEvent` N+1 collapsed to a single batch SELECT (`getLastInvalidationEventsBatch`) grouped by `(object_id, object_scope)`. Drops boot cost from O(N queries) to O(1) for a corpus with N invalidated memories.
+- **F1**: Introduced `CorpusSnapshot = { hash, files: { name, size, mtimeMs }[] }` + `computeSharedFingerprintWithSnapshot` + `recomputeSharedFingerprintIfStale`. Probe captures snapshot once, threads through `verifyConfirmedHash`; fast-path skips re-reading bodies when (size, mtime) tuples unchanged. Falls back to full re-fingerprint on any deviation — no security weakening. Drops post-modal-yes path from 2× corpus reads to 1× read + N stats.
+- **F3+F4**: Extended `MemoryListing` with optional `file?: MemoryFile` populated alongside `state?` when the state filter triggered a peek. `gcStaleInvalidatedMemories` reads `listing.file.frontmatter.source` instead of re-peeking. Eliminated 1 of the 2 reads per invalidated body at boot (bulk-invalidate's per-iter peek stays for M3 concurrent-defense).
+- **F6**: mtime fast-path for headless deferred — documented in `bootstrap.ts` why: ROI is low (~5-10ms per boot), implementation needs migration 056 + per-file mtime persist (root-dir mtime misses body edits). Revisit when telemetry justifies the schema change.
+
+Test gaps (T1/T2/T3/T4/T5/T6/T8/T15a/T15b):
+
+- **T1**: F5 stderr inventory dump now pinned by tests — header + per-file lines + empty-corpus path.
+- **T2**: F3 recovery hint stderr pinned via repl.test.ts (synthesized `sharedTrustProbe: revoked` in stub bootstrap).
+- **T3**: Subagent inheritance E2E test in `tests/subagents/e2e.test.ts` — parent's `sharedScopeOffline: true` propagates through spawn factory → runSubagentChild → assembleMemorySection; captured child's `systemPrompt` does NOT contain shared body.
+- **T4**: gcStaleInvalidatedMemories failure paths — illegal_transition path (frontmatter manually flipped post-seed → filter excludes, accept), io_error path (chmod 000 on `.tombstones/` → failures array populated with correct reason).
+- **T5**: Sweep scope coverage — seeds invalidated memories in user + project_local + project_shared; asserts all three end up in `result.evicted`.
+- **T6**: Bulk-invalidate transition io_error — chmod 0o500 on scope dir (read+exec, no write) so registry.list peek works but transitionMemoryState's frontmatter rewrite fails. Asserts `result.failed` populated + `refused` audit row landed.
+- **T8**: TOCTOU sibling test — same-body modal path returns `reconfirmed` (proves `verifyConfirmedHash` distinguishes drift from non-drift).
+- **T15a/b**: First-visit + cancel and first-visit + yes + TOCTOU state-machine matrix gaps filled.
+
+Tests: 8275 pass (+12 vs pre-rodada-3), 0 fail.
+
 ## [2026-05-17] hardening(memory) — Second-round review (operational + cross-subsystem + spec) closed
 
 Three parallel reviewers (operational flow, subsystem boundaries, spec adherence) found 12 more issues after P0/P1. All 12 closed in this pass — eight critical (would break daily operator flow or skip the security gate elsewhere in the system), four important.

@@ -1061,6 +1061,46 @@ export const getLastInvalidationEvent = (
   return row !== null ? fromRow(row) : null;
 };
 
+// Batch variant of `getLastInvalidationEvent` (P1/F2 hardening).
+// `gcStaleInvalidatedMemories` was calling the per-row helper N
+// times per boot (one ordered SELECT each), which scales with the
+// number of `state: invalidated` memories — for a corpus with 100
+// invalidated bodies that was 100 SELECTs every boot for the
+// duration of the 7-day window. The batch version groups by
+// `(object_id, object_scope)` and returns the latest `recorded_at`
+// for each tuple in one round-trip.
+//
+// Returns a Map keyed by `${scope}/${objectId}` → `recordedAt`.
+// Objects with no applied invalidation row are absent from the
+// map (caller treats absence as the "orphan" case).
+export const getLastInvalidationEventsBatch = (
+  db: DB,
+  substrate: EvictionSubstrate,
+  objects: ReadonlyArray<{ objectId: string; objectScope: string }>,
+): Map<string, number> => {
+  if (objects.length === 0) return new Map();
+  // GROUP BY clause picks the latest `recorded_at` per
+  // (object_id, object_scope) for applied invalidation rows. The
+  // tuple-IN form isn't supported uniformly across SQLite versions,
+  // so we filter substrate once and let the SELECT walk the
+  // composite via the same indices the single-row variant uses.
+  const rows = db
+    .query<{ object_id: string; object_scope: string; recorded_at: number }, [EvictionSubstrate]>(
+      `SELECT object_id, object_scope, MAX(recorded_at) AS recorded_at
+         FROM eviction_events
+        WHERE substrate = ? AND to_state = 'invalidated' AND outcome = 'applied'
+        GROUP BY object_id, object_scope`,
+    )
+    .all(substrate);
+  const wanted = new Set(objects.map((o) => `${o.objectScope}/${o.objectId}`));
+  const out = new Map<string, number>();
+  for (const r of rows) {
+    const key = `${r.object_scope}/${r.object_id}`;
+    if (wanted.has(key)) out.set(key, r.recorded_at);
+  }
+  return out;
+};
+
 export const countEvictionEvents = (db: DB): number => {
   const row = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM eviction_events').get() as {
     n: number;

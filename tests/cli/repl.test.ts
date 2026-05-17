@@ -3749,3 +3749,73 @@ describe('repl — Alt+R recap terse (RECAP §3.3)', () => {
     expect(await promise).toBe(130);
   });
 });
+
+describe('REPL shared-trust probe stderr summaries (S5 hardening)', () => {
+  test('revoked outcome surfaces recovery hint (CRIT/F3)', async () => {
+    // Wrap makeBootstrapStub to attach a synthetic
+    // sharedTrustProbe result. The REPL's stderr summary runs
+    // unconditionally after bootstrap, so we don't need to feed
+    // any stdin — just boot + EOF.
+    const baseStub = makeBootstrapStub();
+    const stub: BootstrapResult = {
+      ...baseStub,
+      sharedTrustProbe: {
+        kind: 'revoked',
+        invalidated: [
+          { scope: 'project_shared', name: 'a' },
+          { scope: 'project_shared', name: 'b' },
+        ],
+        failed: [],
+      },
+    };
+    let stderr = '';
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04'); // EOF closes REPL.
+    await promise;
+    // Summary line + recovery hint MUST be present.
+    expect(stderr).toContain('shared memory trust revoked');
+    expect(stderr).toContain('2 shared memories invalidated');
+    expect(stderr).toContain('recovery: edit the `.md` frontmatter');
+    expect(stderr).toContain('7 days');
+  });
+
+  test('deferred outcome surfaces cause-specific stderr line (D1)', async () => {
+    // The post-D1 stderr branch distinguishes modal_cancel from
+    // tocttou_during_prompt. Both cases get a clear hint about
+    // what happens next.
+    const baseStub = makeBootstrapStub();
+    const stub: BootstrapResult = {
+      ...baseStub,
+      sharedTrustProbe: { kind: 'deferred', cause: 'tocttou_during_prompt', hash: 'x' },
+    };
+    let stderr = '';
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+    expect(stderr).toContain('deferred');
+    expect(stderr).toContain('TOCTOU');
+    expect(stderr).toContain('investigate concurrent writers');
+  });
+});

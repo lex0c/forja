@@ -111,11 +111,14 @@ import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import {
+  type CorpusSnapshot,
   EMPTY_CORPUS_HASH,
   type SharedTrustRow,
   computeSharedFingerprint,
+  computeSharedFingerprintWithSnapshot,
   getSharedTrust,
   listSharedCorpusFiles,
+  recomputeSharedFingerprintIfStale,
   setSharedTrust,
 } from './trust-corpus.ts';
 
@@ -176,24 +179,21 @@ export interface ProbeSharedTrustInput {
 export type ProbeSharedTrustResult =
   // First visit AND corpus was empty → row silently seeded with
   // EMPTY_CORPUS_HASH. No modal fired.
-  | { kind: 'seeded'; hash: string }
+  | { kind: 'seeded' }
   // Stored row present, hash unchanged. No-op.
-  | { kind: 'unchanged'; hash: string }
+  | { kind: 'unchanged' }
   // Modal answered 'yes' AND the re-computed fingerprint matches the
   // hash the operator was shown. Trust row stamped with the
-  // confirmed hash. For first-visit, `oldHash === EMPTY_CORPUS_HASH`
-  // semantically (no row existed before); we surface a synthetic
-  // `oldHash` value for caller uniformity but it's not load-bearing.
-  | { kind: 'reconfirmed'; oldHash: string; newHash: string; mode: SharedTrustModalMode }
-  // Modal answered 'no'. Bulk-invalidate ran, trust row cleared
-  // afterwards (in that order — P0/H1-rob atomicity). `invalidated`
-  // carries the names that transitioned; `failed` carries
-  // per-memory reasons.
+  // confirmed hash. Per-transition hash/mode forensic detail lives
+  // in the durable audit trail (memory_events, eviction_events,
+  // shared_corpus_trust) — the probe result carries only the
+  // discriminator the REPL caller needs to render a summary line.
+  | { kind: 'reconfirmed' }
+  // Modal answered 'no'. Bulk-invalidate ran. `invalidated` carries
+  // the names that transitioned (REPL renders the count); `failed`
+  // carries per-memory reasons (REPL renders the per-name line).
   | {
       kind: 'revoked';
-      oldHash: string | null;
-      newHash: string;
-      mode: SharedTrustModalMode;
       invalidated: { scope: 'project_shared'; name: string }[];
       failed: { name: string; reason: string }[];
     }
@@ -248,6 +248,20 @@ const dumpInventoryToStderr = (
 // listings the modal preview just renders an empty inventory; the
 // caller already knows about verify_failed via the upstream hash
 // path.
+// Conditional spreads for the `recordEvent` audit-attribution
+// fields. The substrate API needs `auditCwd?: string` and
+// `sessionId?: string` (NOT `string | null`), while the probe's
+// `ProbeSharedTrustInput` admits null on both. Inline spreads
+// were repeated 3× in `bulkInvalidateShared`; centralized here
+// for readability and so a future API tightening (e.g.,
+// accepting null at the substrate) is one-line.
+const auditAttribution = (
+  input: ProbeSharedTrustInput,
+): { auditCwd?: string; sessionId?: string } => ({
+  ...(input.cwd != null ? { auditCwd: input.cwd } : {}),
+  ...(input.sessionId != null ? { sessionId: input.sessionId } : {}),
+});
+
 const enumerateCorpus = (sharedRoot: string): ProbeCorpusFile[] => {
   const listing = listSharedCorpusFiles(sharedRoot);
   if (listing.kind !== 'present') return [];
@@ -326,10 +340,7 @@ const bulkInvalidateShared = async (
           previous_state: currentState,
           trigger: 'trust_revoked',
         },
-        ...(input.cwd !== undefined && input.cwd !== null ? { auditCwd: input.cwd } : {}),
-        ...(input.sessionId !== undefined && input.sessionId !== null
-          ? { sessionId: input.sessionId }
-          : {}),
+        ...auditAttribution(input),
       });
       continue;
     }
@@ -376,10 +387,7 @@ const bulkInvalidateShared = async (
           memoryName: listing.name,
           source: peek.file.frontmatter.source,
           details: { stage: 'trust_revoked_bulk', reason, trigger: 'trust_revoked' },
-          ...(input.cwd !== undefined && input.cwd !== null ? { auditCwd: input.cwd } : {}),
-          ...(input.sessionId !== undefined && input.sessionId !== null
-            ? { sessionId: input.sessionId }
-            : {}),
+          ...auditAttribution(input),
         });
         input.warn?.(`trust_revoked: failed invalidating ${listing.name}: ${reason}`);
       }
@@ -394,10 +402,7 @@ const bulkInvalidateShared = async (
         memoryName: listing.name,
         source: peek.file.frontmatter.source,
         details: { stage: 'trust_revoked_bulk', reason, trigger: 'trust_revoked' },
-        ...(input.cwd !== undefined && input.cwd !== null ? { auditCwd: input.cwd } : {}),
-        ...(input.sessionId !== undefined && input.sessionId !== null
-          ? { sessionId: input.sessionId }
-          : {}),
+        ...auditAttribution(input),
       });
       input.warn?.(`trust_revoked: threw invalidating ${listing.name}: ${reason}`);
     }
@@ -416,23 +421,33 @@ const bulkInvalidateShared = async (
 //               cause.
 type PostConfirmCheck = { kind: 'confirmed' } | { kind: 'drift' };
 
+// P1/F1: takes the pre-modal `CorpusSnapshot` so the fast-path
+// (stat-compare) can skip re-reading bodies when nothing on disk
+// changed. Falls back to full re-fingerprint on any deviation;
+// no security weakening (see CorpusSnapshot header).
 const verifyConfirmedHash = (
   input: ProbeSharedTrustInput,
-  presentedHash: string,
+  presentedSnapshot: CorpusSnapshot,
 ): PostConfirmCheck => {
-  const recomputed = computeSharedFingerprint(input.sharedRoot);
+  const recomputed = recomputeSharedFingerprintIfStale(input.sharedRoot, presentedSnapshot);
   if (recomputed === null) return { kind: 'drift' };
-  if (recomputed !== presentedHash) return { kind: 'drift' };
+  if (recomputed.hash !== presentedSnapshot.hash) return { kind: 'drift' };
   return { kind: 'confirmed' };
 };
 
 export const probeSharedTrust = async (
   input: ProbeSharedTrustInput,
 ): Promise<ProbeSharedTrustResult> => {
-  const presentedHash = computeSharedFingerprint(input.sharedRoot);
-  if (presentedHash === null) {
+  // P1/F1: compute the snapshot once. `verifyConfirmedHash` will
+  // re-use this snapshot's `(size, mtime)` per-file vector for a
+  // stat-only fast-path; only the post-bulk re-fingerprint
+  // (mandatory full recompute — frontmatter changed) reads bytes
+  // again.
+  const presented = computeSharedFingerprintWithSnapshot(input.sharedRoot);
+  if (presented === null) {
     return { kind: 'verify_failed', sharedRoot: input.sharedRoot };
   }
+  const presentedHash = presented.hash;
 
   const stored: SharedTrustRow | null = getSharedTrust(input.db, input.sharedRoot);
 
@@ -447,7 +462,7 @@ export const probeSharedTrust = async (
   if (stored === null) {
     if (presentedHash === EMPTY_CORPUS_HASH) {
       setSharedTrust(input.db, input.sharedRoot, presentedHash, input.now?.());
-      return { kind: 'seeded', hash: presentedHash };
+      return { kind: 'seeded' };
     }
     const firstVisitCorpus = enumerateCorpus(input.sharedRoot);
     // IMP/F5 hardening: dump the full inventory to stderr BEFORE
@@ -461,17 +476,12 @@ export const probeSharedTrust = async (
       mode: 'first-visit',
     });
     if (answer === 'yes') {
-      const check = verifyConfirmedHash(input, presentedHash);
+      const check = verifyConfirmedHash(input, presented);
       if (check.kind === 'drift') {
         return { kind: 'deferred', hash: presentedHash, cause: 'tocttou_during_prompt' };
       }
       setSharedTrust(input.db, input.sharedRoot, presentedHash, input.now?.());
-      return {
-        kind: 'reconfirmed',
-        oldHash: EMPTY_CORPUS_HASH,
-        newHash: presentedHash,
-        mode: 'first-visit',
-      };
+      return { kind: 'reconfirmed' };
     }
     if (answer === 'cancel') {
       return { kind: 'deferred', hash: presentedHash, cause: 'modal_cancel' };
@@ -492,18 +502,11 @@ export const probeSharedTrust = async (
     const { invalidated, failed } = await bulkInvalidateShared(input, presentedHash);
     const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
     setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
-    return {
-      kind: 'revoked',
-      oldHash: null,
-      newHash: postRevokeHash,
-      mode: 'first-visit',
-      invalidated,
-      failed,
-    };
+    return { kind: 'revoked', invalidated, failed };
   }
 
   if (stored.lastConfirmedHash === presentedHash) {
-    return { kind: 'unchanged', hash: presentedHash };
+    return { kind: 'unchanged' };
   }
 
   // Drift branch — stored row exists but hash changed.
@@ -517,7 +520,7 @@ export const probeSharedTrust = async (
   });
 
   if (answer === 'yes') {
-    const check = verifyConfirmedHash(input, presentedHash);
+    const check = verifyConfirmedHash(input, presented);
     if (check.kind === 'drift') {
       // P0/F3 TOCTOU: operator confirmed the hash they SAW, but the
       // corpus changed during the prompt window. Don't stamp the
@@ -526,12 +529,7 @@ export const probeSharedTrust = async (
       return { kind: 'deferred', hash: presentedHash, cause: 'tocttou_during_prompt' };
     }
     setSharedTrust(input.db, input.sharedRoot, presentedHash, input.now?.());
-    return {
-      kind: 'reconfirmed',
-      oldHash: stored.lastConfirmedHash,
-      newHash: presentedHash,
-      mode: 'drift',
-    };
+    return { kind: 'reconfirmed' };
   }
 
   if (answer === 'cancel') {
@@ -570,9 +568,6 @@ export const probeSharedTrust = async (
   setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
   return {
     kind: 'revoked',
-    oldHash: stored.lastConfirmedHash,
-    newHash: postRevokeHash,
-    mode: 'drift',
     invalidated,
     failed,
   };

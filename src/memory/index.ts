@@ -143,16 +143,25 @@ export {
   EMPTY_CORPUS_HASH,
   clearSharedTrust,
   computeSharedFingerprint,
+  computeSharedFingerprintWithSnapshot,
   getSharedTrust,
   listSharedCorpusFiles,
+  recomputeSharedFingerprintIfStale,
   setSharedTrust,
 } from './trust-corpus.ts';
-export type { CorpusFile, CorpusListing, SharedTrustRow } from './trust-corpus.ts';
+export type {
+  CorpusFile,
+  CorpusFileStat,
+  CorpusListing,
+  CorpusSnapshot,
+  SharedTrustRow,
+} from './trust-corpus.ts';
 
 export { probeSharedTrust } from './trust-corpus-probe.ts';
 export type {
   ProbeCorpusFile,
   ProbeSharedTrustInput,
   ProbeSharedTrustResult,
+  SharedTrustModalMode,
   SharedTrustProbeAnswer,
 } from './trust-corpus-probe.ts';

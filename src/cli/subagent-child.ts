@@ -902,8 +902,11 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         bootContext,
         ...(memoryFilter !== undefined ? { memoryFilter } : {}),
         // S5 CRIT/H3: forward parent's fail-closed scope exclusion.
-        // When parent's probe returned non-confirmed, project_shared
-        // is offline for THIS subagent run too.
+        // The IPC boundary collapsed parent's `excludeScopes:
+        // MemoryScope[]` array to a single boolean (only
+        // `project_shared` is gated today; cleaner CLI flag than
+        // serializing a list). We rehydrate back to the array
+        // shape `assembleMemorySection` expects.
         ...(opts.sharedScopeOffline === true ? { excludeScopes: ['project_shared'] as const } : {}),
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
