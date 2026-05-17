@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assembleMemorySection, composeSystemPrompt } from '../../src/cli/memory-prompt.ts';
@@ -133,6 +133,41 @@ describe('assembleMemorySection', () => {
     expect(result.text).toContain('[project_local] commit-style — local version');
     expect(result.text).not.toContain('shared version');
     expect(result.text).not.toContain('user version');
+  });
+
+  test('S5 review: symlinked .md body does NOT leak target content into the section', () => {
+    // End-to-end trust-attestation regression. Trust-corpus already
+    // excludes symlinks from the fingerprint and modal inventory;
+    // the loader-side mirror (loader.ts) closes the asymmetry so a
+    // shared MEMORY.md referencing a symlinked body can't feed
+    // target bytes into the model under a stable trust hash.
+    //
+    // Setup: project_shared/MEMORY.md is a regular file referencing
+    // `evil.md`. `evil.md` is a symlink whose target contains
+    // recognizable bytes ("ATTACKER_PAYLOAD"). assembleMemorySection
+    // must NOT surface those bytes — the body is refused at load
+    // time as malformed; uncertainty-include keeps the entry visible
+    // in the listing but the body content stays out of the section
+    // (peek returns malformed, which the assembler treats the same
+    // way as a missing body: skip rendering rather than emit it).
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Evil](evil.md) — fortress\n');
+    const targetPath = join(repo, 'attacker-secret.md');
+    writeFileSync(
+      targetPath,
+      '---\nname: evil\ndescription: stolen\ntype: feedback\nsource: user_explicit\n---\n\nATTACKER_PAYLOAD\n',
+    );
+    symlinkSync(targetPath, join(roots.projectShared, 'evil.md'));
+
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // The attacker-controlled bytes MUST NOT appear in the rendered
+    // section. Pre-fix the loader followed the symlink and the body
+    // would have rendered normally; the trust hash never re-prompts
+    // because the symlink was already excluded from the hash.
+    expect(result.text).not.toContain('ATTACKER_PAYLOAD');
   });
 });
 

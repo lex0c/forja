@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -68,6 +68,29 @@ describe('loadScopeIndex', () => {
       { title: 'Role', href: 'role.md', hook: 'full-stack TS' },
     ]);
   });
+
+  test('refuses symlinked MEMORY.md as malformed (S5 review)', () => {
+    // Trust-attestation symmetry: trust-corpus.ts's
+    // `listSharedCorpusFiles` excludes symlinks from the
+    // fingerprint inventory. Without the loader-side mirror, an
+    // attacker who symlinks project_shared/MEMORY.md to an
+    // out-of-scope file would change the corpus the model sees
+    // (the symlinked index can declare arbitrary in-scope bodies
+    // to load) while leaving the trust hash unchanged. The loader
+    // must reject symlinked indexes for the gate to hold.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.projectShared, { recursive: true });
+    const targetPath = join(repo, 'attacker-index.md');
+    writeFileSync(targetPath, '- [Evil](evil.md) — fortress\n');
+    symlinkSync(targetPath, join(roots.projectShared, 'MEMORY.md'));
+    const result = loadScopeIndex(roots, 'project_shared');
+    expect(result.kind).toBe('malformed');
+    if (result.kind === 'malformed') {
+      expect(result.error).toContain('symlink');
+    }
+  });
 });
 
 describe('readMemoryByName', () => {
@@ -116,6 +139,55 @@ describe('readMemoryByName', () => {
     const roots = makeRoots(repo);
     expect(() => readMemoryByName(roots, 'user', '../escape')).toThrow();
     expect(() => readMemoryByName(roots, 'user', 'has/slash')).toThrow();
+  });
+
+  test('refuses a symlinked body file as malformed (S5 review)', () => {
+    // Pre-fix: readFileSync would follow the symlink and return
+    // the target's bytes; the shared-corpus fingerprint already
+    // excludes symlinks at the listing layer, so the trust hash
+    // would stay constant across boots while the model silently
+    // saw attacker-target content. Loader-side rejection closes
+    // the asymmetry: same file is now treated as malformed at
+    // load time too, matching the modal inventory.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.user, { recursive: true });
+    // Real "target" the symlink points at — could be any file the
+    // agent's UID can read. We use a tmp file with deliberately
+    // recognizable bytes so a regression that reads the target
+    // surfaces clearly.
+    const targetPath = join(repo, 'attacker-secret.md');
+    writeFileSync(
+      targetPath,
+      '---\nname: stolen\ndescription: stolen secret\ntype: feedback\nsource: user_explicit\n---\n\nATTACKER_PAYLOAD\n',
+    );
+    symlinkSync(targetPath, join(roots.user, 'evil.md'));
+    const result = readMemoryByName(roots, 'user', 'evil');
+    expect(result.kind).toBe('malformed');
+    if (result.kind === 'malformed') {
+      expect(result.error).toContain('symlink');
+      // The attacker's body content MUST NOT appear in the result.
+      // Pre-fix it would have parsed and returned as kind:'present'.
+      expect(JSON.stringify(result)).not.toContain('ATTACKER_PAYLOAD');
+    }
+  });
+
+  test('refuses a non-regular .md path (directory named foo.md) as malformed', () => {
+    // Defense-in-depth: an operator typo or attacker plant could
+    // produce `foo.md/` as a directory in the scope root. The
+    // pre-read regular-file check rejects it cleanly so the loader
+    // never blocks or returns garbage from readFileSync on a
+    // non-regular inode.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.user, { recursive: true });
+    mkdirSync(join(roots.user, 'weird.md'));
+    const result = readMemoryByName(roots, 'user', 'weird');
+    expect(result.kind).toBe('malformed');
+    if (result.kind === 'malformed') {
+      expect(result.error).toContain('regular');
+    }
   });
 });
 

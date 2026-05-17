@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Loader rejects symlinked .md files (trust-attestation symmetry)
+
+Review observation (S5 trust gate): `listSharedCorpusFiles` in `trust-corpus.ts` lstat-rejects symlinks — symlinked `.md` files are excluded from both the shared-corpus fingerprint AND the modal inventory. But `readMemoryByName` and `loadScopeIndex` in `loader.ts` use plain `readFileSync(path, …)`, which follows symlinks. A malicious repo could ship `project_shared/MEMORY.md` referencing `evil.md` where `evil.md` is a symlink to any out-of-scope file the agent UID can read (`~/.ssh/id_rsa`, host config, neighboring project secrets). The fingerprint stays unchanged across boots because the symlink was already excluded from it, so no trust re-prompt fires, while the model silently sees target bytes in eager-load or retrieval. Same threat with a symlinked `MEMORY.md` itself: the attacker swaps which bodies the loader picks up under a stable trust hash.
+
+Fix: add a `checkRegularFile(path)` helper to `loader.ts` that lstats before any read. Both `loadScopeIndex` (MEMORY.md) and `readMemoryByName` (body files) gate on it — symlinks return `kind: 'malformed'` with a security-policy message; non-regular files (directories named `foo.md/`, fifos, sockets) return the same kind with a "not a regular file" message. The substrate's symlink policy is now uniform: modal sees what the model sees, no asymmetric bypass.
+
+Trust-row stays at the existing fingerprint (excludes symlinks); operator-facing surfaces (`/memory list`, `/memory show`) render the malformed entry with the policy message so an operator who intentionally placed a symlink sees a clear "refused" signal rather than silent dropping.
+
+Side note: the existing trust-corpus header on `listSharedCorpusFiles` claimed the rejection prevented leakage "into the eager-load section downstream" — that claim was wrong pre-fix because the eager-load went through this loader. With the mirror in place the comment becomes accurate.
+
+Regression tests:
+- `tests/memory/loader.test.ts` — three new cases: symlinked MEMORY.md → malformed with "symlink" in the message; symlinked body → malformed AND the attacker payload string is provably absent from the result (proof the bytes never enter process memory beyond the lstat); directory named `foo.md` → malformed with "regular" in the message.
+- `tests/cli/memory-prompt.test.ts` — end-to-end: `project_shared/MEMORY.md` is a real file referencing a symlinked body whose target contains `ATTACKER_PAYLOAD`; assert the rendered section does NOT contain those bytes. Pre-fix this would have surfaced them under a stable trust hash.
+
+Tests: 8303 pass (+4), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(memory) — Emit search provenance only for returned hits
 
 Review observation: `registry.search` emitted `auditRead` + `auditExposure` inline for every deep-mode body match. The `memory_search` tool intentionally over-fetches (`limit + 1`) to detect truncation and then drops the extra row before returning to the model. That meant at least one body the model never saw still got a `memory_events` `read` row + a `memory_provenance` row with surface=`memory_read`. Detectors that treat provenance as "visible to model" evidence (Slice 3 exposure-frequency / user_override_repeated) got inflated counts; `/memory provenance --tool` showed a phantom exposure operators couldn't reconcile against the search result they ran.
