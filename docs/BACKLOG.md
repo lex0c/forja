@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Sanitize corpus filenames before stderr emission
+
+Review observation: the trust probe's `dumpInventoryToStderr` (S5 IMP/F5) wrote `corpusFiles[i].name` and `sharedRoot` straight through `warn()` to stderr, and `bulkInvalidateShared` did the same with `listing.name` + `reason`. The modal-renderer path passes those strings through `sanitizeOneLineForDisplay` (stripping ANSI escapes and collapsing `\r\n\t` to spaces), but the stderr surface didn't — so a poisoned repo shipping a `.md` file whose name embeds ESC sequences, literal newlines, or carriage returns could inject terminal control bytes into the operator's trust-review output. Concrete attacks: clear-screen + cursor-move to repaint the modal prose, fake an additional inventory line so a malicious entry looks benign, or split a single warn line into two with a forged second line.
+
+Fix: thread `sanitizeOneLineForDisplay` through every operator-facing string the probe emits via `warn`. Three call sites covered — the header (`sharedRoot`), the per-file inventory line (`f.name`), and both bulk-invalidate failure paths (`listing.name` + `reason`). Picks up the same helper the modal reducer uses (`sanitize/ansi.ts`), so the stderr surface stays at parity with the in-TUI surface and a future tightening of the sanitizer benefits both.
+
+Regression test (T1b): creates a `.md` file whose filename embeds `[31m`, a literal newline, and a tab; pre-probe drifts so the drift modal fires; cancels the modal. Asserts the per-file warn line contains the legible portions (`tampered`, `fake-line`, `here`) — operator can still spot the suspicious filename — but is single-line with no ESC / LF / CR / TAB bytes, and the same constraint holds for every warn line emitted (header included).
+
+Tests: 8281 pass (+1 T1b), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(memory) — Rehash bytes on the trust-confirm path (reverts F1 fast-path)
 
 Review observation: `verifyConfirmedHash` short-circuited via `recomputeSharedFingerprintIfStale` when every file's `(size, mtimeMs)` matched the pre-modal snapshot. The header on `CorpusSnapshot` claimed this was security-neutral, but the threat model was wrong: an attacker who can write to disk can `utimes(2)` mtime back to the snapshot's value, and a same-second rewrite is naturally invisible on filesystems with coarse mtime granularity (FAT/exFAT, some network FS). In both cases a same-size content swap during the modal window would pass through as unchanged, and the probe would stamp `shared_corpus_trust` on bytes the operator never saw — the exact TOCTOU window `verifyConfirmedHash` is supposed to close.

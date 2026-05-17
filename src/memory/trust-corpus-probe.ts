@@ -106,6 +106,7 @@
 // imports `trust-corpus.ts` directly and skips this module.
 // ────────────────────────────────────────────────────────────────────
 
+import { sanitizeOneLineForDisplay } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
@@ -217,6 +218,21 @@ export type ProbeSharedTrustResult =
 // warn-callback shape matches every other boot-time stderr emitter
 // in the bootstrap (gc failures, provenance sweep, etc.) so
 // `forja:` greps are uniform.
+//
+// SECURITY: corpus filenames flow from `readdirSync` over a path
+// the attacker may control (a poisoned repo can ship a file whose
+// name embeds ESC / ANSI bytes, raw newlines, or carriage returns).
+// Emitting them verbatim through `warn` → stderr would let the
+// attacker repaint the operator's terminal during the trust review
+// — clearing screen, moving cursor over the modal prose, faking
+// the safe-looking inventory the operator thinks they're seeing.
+// The modal renderer sanitizes via `sanitizeOneLineForDisplay`
+// (state.ts §`shared-trust:ask`); apply the same helper here so
+// the stderr surface stays at parity. `sharedRoot` is also passed
+// through the helper as defense-in-depth: the cwd-trust modal
+// already attested the directory, but a layered attacker who
+// mutates `XDG_*` or `--cwd` could in principle pass through a
+// path the operator hasn't blessed at this hop.
 const dumpInventoryToStderr = (
   warn: ProbeSharedTrustInput['warn'],
   sharedRoot: string,
@@ -225,7 +241,8 @@ const dumpInventoryToStderr = (
 ): void => {
   if (warn === undefined) return;
   const label = mode === 'first-visit' ? 'first-visit prompt' : 'drift prompt';
-  warn(`${label} at ${sharedRoot} — full corpus inventory (${corpusFiles.length} files):`);
+  const safeRoot = sanitizeOneLineForDisplay(sharedRoot);
+  warn(`${label} at ${safeRoot} — full corpus inventory (${corpusFiles.length} files):`);
   if (corpusFiles.length === 0) {
     warn('  (corpus is currently empty)');
     return;
@@ -233,7 +250,7 @@ const dumpInventoryToStderr = (
   for (const f of corpusFiles) {
     // Two-space indent matches the audit/list slash output
     // convention; size in bytes for parity with the modal preview.
-    warn(`  ${f.name} — ${f.bytes} bytes`);
+    warn(`  ${sanitizeOneLineForDisplay(f.name)} — ${f.bytes} bytes`);
   }
 };
 
@@ -386,7 +403,14 @@ const bulkInvalidateShared = async (
           details: { stage: 'trust_revoked_bulk', reason, trigger: 'trust_revoked' },
           ...auditAttribution(input),
         });
-        input.warn?.(`trust_revoked: failed invalidating ${listing.name}: ${reason}`);
+        // Both `listing.name` (parsed from MEMORY.md link text — a
+        // poisoned index can ship arbitrary bytes) and `reason`
+        // (filesystem error message that can embed attacker-
+        // controlled path fragments) are sanitized before stderr.
+        // Same rationale as `dumpInventoryToStderr` above.
+        input.warn?.(
+          `trust_revoked: failed invalidating ${sanitizeOneLineForDisplay(listing.name)}: ${sanitizeOneLineForDisplay(reason)}`,
+        );
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -401,7 +425,9 @@ const bulkInvalidateShared = async (
         details: { stage: 'trust_revoked_bulk', reason, trigger: 'trust_revoked' },
         ...auditAttribution(input),
       });
-      input.warn?.(`trust_revoked: threw invalidating ${listing.name}: ${reason}`);
+      input.warn?.(
+        `trust_revoked: threw invalidating ${sanitizeOneLineForDisplay(listing.name)}: ${sanitizeOneLineForDisplay(reason)}`,
+      );
     }
   }
 

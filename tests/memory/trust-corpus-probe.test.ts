@@ -529,6 +529,71 @@ describe('probeSharedTrust — third hardening pass (T1/T8/T15)', () => {
     expect(warnLines.some((l) => l.includes('b.md — ') && l.includes('bytes'))).toBe(true);
   });
 
+  test('T1b: corpus filenames with ANSI / control bytes get sanitized in stderr', async () => {
+    // Disk-attacker-controlled filenames flow through readdirSync
+    // into the warn callback. Without sanitization, a `.md` file
+    // whose name embeds ESC sequences would let the attacker
+    // repaint the operator's terminal during the trust review
+    // (clear screen, move cursor over modal prose, fake a clean
+    // inventory). The modal reducer sanitizes via
+    // `sanitizeOneLineForDisplay`; stderr must match.
+    //
+    // Build a name with: ESC (`\x1b`) starting an ANSI red sequence,
+    // a literal newline (would split a single inventory line into
+    // two — even more dangerous if the second forged line repaints
+    // the screen), and a tab. All must be neutralized.
+    const evilLeaf = '\x1b[31mtampered\nfake-line\there';
+    writeIndex(roots.projectShared, `- [Evil](${evilLeaf}.md) — h\n`);
+    writeBody(roots.projectShared, evilLeaf, 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    // Pre-probe drift so the drift modal (and the dump) fires.
+    writeBody(roots.projectShared, evilLeaf, 'drifted');
+
+    const warnLines: string[] = [];
+    await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
+      askSharedTrust: async () => 'cancel',
+      warn: (s) => warnLines.push(s),
+    });
+
+    // Locate the per-file line. It must end with ` — N bytes` and
+    // the evil leaf rendered without ESC / newline / tab bytes —
+    // `sanitizeOneLineForDisplay` strips ANSI and collapses
+    // \r\n\t to a single space.
+    const fileLine = warnLines.find((l) => l.includes('.md — ') && l.includes('bytes'));
+    expect(fileLine).toBeDefined();
+    if (fileLine !== undefined) {
+      // Defensive: no raw control bytes anywhere in the emitted
+      // line. A single line, no embedded LF / CR / TAB / ESC.
+      expect(fileLine).not.toContain('\u001b');
+      expect(fileLine).not.toContain('\n');
+      expect(fileLine).not.toContain('\r');
+      expect(fileLine).not.toContain('\t');
+      // The legible portion of the name survives — `tampered`,
+      // `fake-line`, `here` are still present, just joined with
+      // spaces. The attack vector (the bytes that drive terminal
+      // control) is gone; the human-readable text is preserved
+      // so the operator can still spot the suspicious filename.
+      expect(fileLine).toContain('tampered');
+      expect(fileLine).toContain('fake-line');
+      expect(fileLine).toContain('here');
+    }
+
+    // Every warn line is single-line: ANY embedded newline would
+    // split it across the operator's stderr buffer and let the
+    // attacker forge an inventory entry. The header MUST also
+    // pass through sanitization.
+    for (const line of warnLines) {
+      expect(line).not.toContain('\n');
+      expect(line).not.toContain('\u001b');
+    }
+  });
+
   test('T1: empty corpus inventory dump surfaces explicit prose', async () => {
     // Empty (or unreadable) corpus path: dump must still emit the
     // header + an explicit "currently empty" line so the operator
