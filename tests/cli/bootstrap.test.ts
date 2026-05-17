@@ -1261,5 +1261,54 @@ Body.`,
       expect(result.config.systemPrompt ?? '').not.toContain('quokka');
       result.db.close();
     });
+
+    test('unchanged: prior row matches current hash → no modal, probe returns unchanged (T5.5)', async () => {
+      // T5.5 strengthening for the happy path inside bootstrap. The
+      // unit test in tests/memory/trust-corpus-probe.test.ts already
+      // pins this against the probe in isolation; this version
+      // verifies the bootstrap-layer plumbing doesn't somehow
+      // induce a divergence on the in-sync path (e.g., a registry
+      // construction quirk that wrote to the corpus and shifted
+      // its hash).
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const baselineHash = computeSharedFingerprint(sharedDir);
+      await seedFromMain({
+        seed: (db) => setSharedTrust(db, sharedDir, baselineHash as string, 1000),
+      });
+
+      let modalCalls = 0;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => {
+          modalCalls++;
+          return 'no';
+        },
+      });
+      expect(modalCalls).toBe(0);
+      expect(result.sharedTrustProbe?.kind).toBe('unchanged');
+      // The trust row stays put with its original timestamp — no
+      // re-stamp implied by "unchanged".
+      const { getSharedTrust } = await import('../../src/memory/trust-corpus.ts');
+      expect(getSharedTrust(result.db, sharedDir)?.lastConfirmedAtMs).toBe(1000);
+      result.db.close();
+    });
   });
 });

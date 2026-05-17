@@ -13,7 +13,7 @@
 // already-quarantined shared memories are skipped (not re-counted).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
@@ -179,6 +179,20 @@ describe('probeSharedTrust — state machine', () => {
     const stored = getSharedTrust(db, roots.projectShared);
     expect(stored?.lastConfirmedHash).toBe(newHash);
     expect(stored?.lastConfirmedAtMs).toBe(2_000);
+
+    // T5.5 strengthening: reconfirm MUST NOT emit any eviction
+    // event. The whole point of separating reconfirmed from revoked
+    // is that the operator's "yes" is a re-stamp only — no memory
+    // state changes hands. A regression where the bulk path
+    // somehow ran on the 'yes' branch would surface here without
+    // it being caught by the kind=='reconfirmed' assertion above.
+    const evictionCount = db.prepare('SELECT COUNT(*) AS c FROM eviction_events').get() as {
+      c: number;
+    };
+    expect(evictionCount.c).toBe(0);
+    // And the memory's state on disk remains active.
+    const active = registry.list({ scope: 'project_shared', states: ['active'] });
+    expect(active.map((l) => l.name)).toEqual(['a']);
   });
 
   test('revoked: hash differs + modal no → clear row + bulk-invalidate active shared', async () => {
@@ -306,5 +320,53 @@ describe('probeSharedTrust — selectivity', () => {
       askSharedTrust: async () => 'no',
     });
     expect(result.kind).toBe('seeded');
+  });
+});
+
+describe('probeSharedTrust — verify_failed (T5.5)', () => {
+  test('returns verify_failed when the shared root is unreadable (EACCES)', async () => {
+    // Simulate an fs error that is NOT ENOENT/ENOTDIR. chmod 000
+    // on the shared root makes `readdirSync` throw EACCES, which
+    // `computeSharedFingerprint` maps to `null`, which the probe
+    // surfaces as `verify_failed` — the only failure mode the
+    // caller MUST fail-closed against. Skipped on platforms where
+    // the test process runs as root (root bypasses unix perms and
+    // the chmod has no effect — false negative).
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      // Bun's typed-test runner doesn't have skip-in-test; bail
+      // softly so a root-running CI doesn't surface a failure.
+      return;
+    }
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+
+    let modalCalls = 0;
+    chmodSync(roots.projectShared, 0o000);
+    try {
+      const result = await probeSharedTrust({
+        db,
+        registry,
+        roots,
+        sharedRoot: roots.projectShared,
+        askSharedTrust: async () => {
+          modalCalls++;
+          return 'yes';
+        },
+      });
+      expect(result.kind).toBe('verify_failed');
+      if (result.kind === 'verify_failed') {
+        expect(result.sharedRoot).toBe(roots.projectShared);
+      }
+      // No modal fires for verify_failed — there's nothing to ask
+      // the operator about. Caller is expected to surface a
+      // separate warning (bootstrap does this via stderr).
+      expect(modalCalls).toBe(0);
+    } finally {
+      // Restore perms so afterEach's rmSync can clean up. Without
+      // this the tmpdir leaks and subsequent runs in the same
+      // tmpdir hit EACCES on cleanup.
+      chmodSync(roots.projectShared, 0o755);
+    }
   });
 });

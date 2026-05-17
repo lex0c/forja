@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] test(memory) — S5/T5.5 coverage strengthening; Slice 5 closed
+
+Three targeted assertions that close the `trust_revoked` slice:
+
+- **Reconfirm path emits zero eviction events.** Strengthens the reconfirmed test to assert `SELECT COUNT(*) FROM eviction_events == 0` AND the memory's frontmatter state on disk stays active. Guards against a future regression where the bulk-invalidate path accidentally runs on the 'yes' branch — the existing `kind === 'reconfirmed'` assertion wouldn't catch that since the result kind is set before the transitions fire.
+- **verify_failed path covered.** New test under `probeSharedTrust — verify_failed (T5.5)` simulates an unreadable corpus via `chmod 000` and asserts the probe returns `{ kind: 'verify_failed', sharedRoot }` AND no modal fires. Skipped under root since unix perms are bypassed (uid 0 false-negative). Restores perms in `finally` so tmpdir cleanup doesn't EACCES.
+- **Bootstrap-layer `unchanged` smoke.** New integration test in `tests/cli/bootstrap.test.ts` exercises the in-sync path through real bootstrap: no modal, probe returns `unchanged`, trust row's timestamp is not re-stamped.
+
+Slice 5 (`trust_revoked` detector) is functionally complete: substrate (T5.1), probe + modal + bulk-invalidate (T5.2+T5.3), `/memory trust status` slash inspector (T5.4), coverage strengthening (T5.5). All five sub-tasks ✅.
+
 ## [2026-05-16] feat(memory) — S5/T5.4 `/memory trust status` slash inspector
 
 Read-only operator surface for the shared-corpus trust state, closing the gap between "the agent computed a hash and stored it somewhere" and "the operator can see what the agent believes about this corpus without restarting".
