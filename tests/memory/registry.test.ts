@@ -651,6 +651,40 @@ describe('createMemoryRegistry — search-deep audit (regression: S1)', () => {
     expect(hits).toEqual([]);
     expect(listMemoryEventsByName(db, 'a')).toEqual([]);
   });
+
+  test('auditLimit caps deep-body emit while limit governs the returned slice', () => {
+    // Review regression: `memory_search` over-fetches (limit + 1)
+    // to detect truncation, then drops the extra row before
+    // returning it to the model. Pre-fix, every body-match hit
+    // (including the dropped one) emitted a read + provenance
+    // event — inflating exposure counts for memories the model
+    // never saw. Post-fix the tool passes `auditLimit: limit` and
+    // only the first N body matches audit.
+    //
+    // Setup: five user-scope memories whose bodies all hit
+    // `zebra`. Call search with `limit: 4, auditLimit: 3` — the
+    // returned array has up to 4 hits but only 3 read events
+    // land. Asserts both the hit count AND the audit count.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const indexLines = ['a', 'b', 'c', 'd', 'e']
+      .map((n) => `- [${n.toUpperCase()}](${n}.md) — h\n`)
+      .join('');
+    writeIndex(roots.user, indexLines);
+    for (const n of ['a', 'b', 'c', 'd', 'e']) {
+      writeMemory(roots.user, n, fmUser(n), `${n} body has zebra inside\n`);
+    }
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const hits = reg.search('zebra', { deep: true, limit: 4, auditLimit: 3 });
+    expect(hits.length).toBe(4);
+    // Total `read` rows across all five memories must be exactly
+    // 3 — the audit cap. Pre-fix this would be 4 (one per hit
+    // returned) or 5 (if the loop didn't early-exit at limit).
+    const allReads = ['a', 'b', 'c', 'd', 'e'].flatMap((n) =>
+      listMemoryEventsByName(db, n).filter((e) => e.action === 'read'),
+    );
+    expect(allReads).toHaveLength(3);
+  });
 });
 
 describe('createMemoryRegistry — malformed href tolerance (regression: C1)', () => {

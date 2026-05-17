@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Emit search provenance only for returned hits
+
+Review observation: `registry.search` emitted `auditRead` + `auditExposure` inline for every deep-mode body match. The `memory_search` tool intentionally over-fetches (`limit + 1`) to detect truncation and then drops the extra row before returning to the model. That meant at least one body the model never saw still got a `memory_events` `read` row + a `memory_provenance` row with surface=`memory_read`. Detectors that treat provenance as "visible to model" evidence (Slice 3 exposure-frequency / user_override_repeated) got inflated counts; `/memory provenance --tool` showed a phantom exposure operators couldn't reconcile against the search result they ran.
+
+Fix: add an optional `auditLimit` to `SearchOptions`. Defaults to `opts.limit` — every returned hit audits, which is correct for callers that don't over-fetch. The registry's deep loop now appends body matches into a `pendingDeepAudits` queue (capturing `{ listing, fileResult, hitIndex }`) instead of auditing inline; after the loop, only queue entries with `hitIndex < auditLimit` emit. `memory_search` passes `auditLimit: limit, limit: limit + 1` so the over-fetch sentinel stays purely a truncation signal — no audit event, no provenance row.
+
+The body still reads from disk during the loop (the snippet match needs it), but the bytes stay in process memory and never reach the model when the hit is dropped. That's not an exposure under MEMORY.md §11.2's contract.
+
+Regression tests:
+- `tests/memory/registry.test.ts` — `auditLimit caps deep-body emit while limit governs the returned slice`: seeds 5 deep-matchable memories, asks `limit: 4, auditLimit: 3`. Asserts 4 hits returned AND exactly 3 read events across the registry. Pre-fix would have been 4.
+- `tests/tools/memory-search.test.ts` — `deep over-fetch does NOT emit exposure for the dropped sentinel row`: 5 deep-matchable memories, tool called with `limit: 3`. Asserts `result.hits.length === 3`, `truncated: true`, exactly 3 `read` rows and 3 `memory_provenance` rows linked to the tool_call (all surface=`memory_read`). Pre-fix would have surfaced 4 of each.
+
+Tests: 8299 pass (+2), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(memory) — Silent-seed when shared corpus has zero files
 
 Review observation: the probe's first-visit branch treated only `presentedHash === EMPTY_CORPUS_HASH` as "empty corpus, silent-seed". `computeSharedFingerprint` returns that sentinel **only** when the shared/ directory is absent (ENOENT). If the directory exists but contains zero `.md` files (operator made `mkdir .agent/memory/shared` via init script / template but never put files there), the fingerprint hashes only the domain separator — a distinct, non-sentinel value. The probe fell into the first-visit modal path over an empty inventory. Worst case: the operator hits Esc / timeout / signal during that modal, the probe returns `deferred(modal_cancel)`, and the shared scope stays offline for the entire session for a corpus that was literally empty.

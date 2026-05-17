@@ -267,6 +267,23 @@ export interface SearchOptions extends AuditOverride {
   scope?: MemoryScope;
   deep?: boolean;
   limit?: number;
+  // Cap on how many deep-match hits emit `read` + provenance
+  // events. Defaults to `limit` — every hit returned to the caller
+  // is audited, which is the right behavior for callers that don't
+  // over-fetch.
+  //
+  // `memory_search` requests `limit + 1` results to detect
+  // truncation (extra row means there's more) but only returns
+  // `limit` to the model. Without this knob, the over-fetched row
+  // gets a body read + audit + provenance entry as if exposed,
+  // inflating exposure counts and skewing detectors that treat
+  // provenance as "visible to model" evidence. The tool sets
+  // `auditLimit: limit` so the over-fetch sentinel stays purely a
+  // truncation signal.
+  //
+  // Effective only when `deep: true`. Name/description matches do
+  // no body reads and emit nothing regardless of this cap.
+  auditLimit?: number;
 }
 
 // Inputs to `MemoryRegistry.write()`. The registry layer is
@@ -681,6 +698,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       const q = query.trim();
       if (q.length === 0) return [];
       const limit = opts.limit ?? 50;
+      const auditLimit = opts.auditLimit ?? limit;
       const lower = q.toLowerCase();
 
       const candidates =
@@ -689,6 +707,17 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           : allListings().filter((l) => l.scope === opts.scope);
 
       const hits: MemorySearchHit[] = [];
+      // Body-match audit queue. Each entry captures the data needed
+      // to fire `auditRead` + `auditExposure` AFTER the loop has
+      // settled which hits actually survive the limit. Deferring
+      // is what lets `memory_search` over-fetch (`limit + 1`) for
+      // truncation detection without leaking an exposure event for
+      // the extra row that the tool then drops from the response.
+      const pendingDeepAudits: Array<{
+        listing: MemoryListing;
+        fileResult: MemoryFileResult;
+        hitIndex: number;
+      }> = [];
 
       // Pass 1: cheap matches against name and description (no body
       // load required). The hit list grows in precedence order.
@@ -726,26 +755,12 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           if (fileResult.kind !== 'present') continue;
           const snippet = matchSnippet(splitBodyLines(fileResult.file.body), q);
           if (snippet === null) continue;
-          // Audit emission for body-match hits. The model receives
-          // a snippet of the body content via the search result, so
-          // for audit purposes this IS a read — same accountability
-          // as a direct memory_read call. Without this, an attacker
-          // monitoring memory_events for content exposure would
-          // miss search-deep hits entirely. Mirrors auditRead's
-          // best-effort try/catch (DB failures don't deny the
-          // search hit). Per-call audit override forwarded so
-          // top-level reads get attributed to the active session
-          // rather than NULL (the bootstrap-time constructor's
-          // sessionId is undefined).
-          const auditOverride: AuditOverride = {
-            ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
-            ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
-            ...(opts.auditToolCallId !== undefined
-              ? { auditToolCallId: opts.auditToolCallId }
-              : {}),
-          };
-          auditRead(listing, fileResult, auditOverride);
-          auditExposure(listing, fileResult, auditOverride);
+          // Defer the audit emission until we know which hits the
+          // caller will keep. See `pendingDeepAudits` header — the
+          // emission below the loop respects `auditLimit` so an
+          // over-fetched-but-dropped row doesn't get a spurious
+          // exposure row.
+          pendingDeepAudits.push({ listing, fileResult, hitIndex: hits.length });
           hits.push({
             scope: listing.scope,
             name: listing.name,
@@ -754,6 +769,26 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
             entry: listing.entry,
           });
         }
+      }
+
+      // Emit audits for body-match hits whose final index is within
+      // `auditLimit`. The model receives a body snippet via the
+      // search result, so each surviving hit IS a read for audit
+      // purposes — same accountability as a direct memory_read.
+      // Mirrors auditRead's best-effort try/catch (DB failures don't
+      // deny the search hit). Per-call audit override forwarded so
+      // top-level reads get attributed to the active session rather
+      // than NULL (the bootstrap-time constructor's sessionId is
+      // undefined).
+      const auditOverride: AuditOverride = {
+        ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
+        ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
+        ...(opts.auditToolCallId !== undefined ? { auditToolCallId: opts.auditToolCallId } : {}),
+      };
+      for (const pa of pendingDeepAudits) {
+        if (pa.hitIndex >= auditLimit) break;
+        auditRead(pa.listing, pa.fileResult, auditOverride);
+        auditExposure(pa.listing, pa.fileResult, auditOverride);
       }
       return hits.slice(0, limit);
     },
