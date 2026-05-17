@@ -188,6 +188,33 @@ export type {
 } from './repos/memory-events.ts';
 
 export {
+  DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD,
+  GOVERNANCE_PROPOSAL_KINDS,
+  GOVERNANCE_PROPOSAL_STATUSES,
+  GOVERNANCE_PROPOSAL_TTL_MS,
+  computeProposalFingerprint,
+  decideProposal,
+  expirePendingProposals,
+  getProposalById,
+  listPendingProposals,
+  listPendingProposalsForMemory,
+  listProposals,
+  listProposalsForMemory,
+  recordProposal,
+} from './repos/memory-governance.ts';
+export type {
+  DecideProposalInput,
+  ListProposalsOptions,
+  MemoryGovernanceProposalKind,
+  MemoryGovernanceProposalRow,
+  MemoryGovernanceProposalStatus,
+  MemoryKey,
+  MemorySnapshot,
+  RecordProposalInput,
+  RecordProposalResult,
+} from './repos/memory-governance.ts';
+
+export {
   createHookRun,
   listHookRunsByEvent,
   listHookRunsBySession,

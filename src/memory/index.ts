@@ -68,6 +68,15 @@ export type {
   TransitionMemoryStateResult,
 } from './transitions.ts';
 
+export { applyProposal } from './governance.ts';
+export type {
+  ApplyProposalInput,
+  ApplyProposalResult,
+  ApplyRejectionReason,
+  DriftedSnapshot,
+  TransitionRecord,
+} from './governance.ts';
+
 export { DEFAULT_AGENT_GITIGNORE, ensureAgentGitignore } from './gitignore.ts';
 export type { EnsureAgentGitignoreResult } from './gitignore.ts';
 

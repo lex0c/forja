@@ -535,17 +535,19 @@ Operators can opt in with `--allow-memory-write=local` for CI flows that genuine
 
 ## 11. Storage tables
 
-Three tables, all in `src/storage/migrations/`:
+Four tables, all in `src/storage/migrations/`:
 
 - **`memory_events`** (migration 040 + 048) — append-only log of memory operator-visible actions. Row per action; `details` JSONB carries diff / motivo / hash references.
 - **`eviction_events`** (migration 046, with hook-run tie-in at 047) — append-only log of cross-substrate eviction transitions. Memory shares the table with future substrates (policies, code-index entries, etc.); rows filter on `substrate='memory'`.
 - **`memory_provenance`** (migration 054) — append-only exposure trail: every moment a memory's bytes were visible to the model. Row per `(session, memory, surface, moment)`. Details below in §11.2.
+- **`memory_governance_proposals`** (migration 056) — MUTABLE-status table for the propose-not-mutate path: detectors emit proposals, operators decide, the apply path delegates to the state machine. Details in §11.3. Sibling `memory_governance_proposal_keys` is its derived index for cross-memory lookups.
 
 The tables are intentionally separate because they answer different questions:
 
 - "Who edited what when in this session?" → `memory_events`.
 - "Why did the state machine refuse this transition, and what was the upstream trigger?" → `eviction_events`.
 - "Which memories were visible to the model when this tool call fired?" → `memory_provenance`.
+- "What does a detector want to change about memory, and who decided what?" → `memory_governance_proposals`.
 
 Cross-table linkage via `memory_events.details.eviction_event_id` for transitions that emit both rows. `memory_provenance.tool_call_id` and `memory_provenance.retrieval_query_id` link the exposure trail to the canonical `tool_calls` and `retrieval_trace` tables respectively.
 
@@ -654,6 +656,100 @@ Provenance complements the existing audit split:
 | "What memories did THIS specific tool call surface?" | `memory_provenance` filtered by `tool_call_id`. |
 
 `memory_events` stays focused on operator-driven actions; `retrieval_trace` carries the slot contents; `memory_provenance` carries the cross-cut exposure index that joins them. None replaces the other.
+
+### 11.3 Governance proposals (`memory_governance_proposals`)
+
+The propose-not-mutate substrate. Detectors emit; operators decide; the apply path delegates to `transitionMemoryState`. Lands in Phase 2 / S8; LLM-judge detectors (S11 verify_failed, S13 conflict_detected) and the deterministic counter-driven detector (S3 user_override_repeated) all funnel through this table.
+
+#### Why a separate substrate
+
+`memory_events` is the audit log for operations that DID happen (`created`, `quarantined`, `restored`). `eviction_events` audits state-machine transitions. Neither answers "an LLM-judge subagent proposed a quarantine and the operator hasn't decided yet" — a pending proposal is mutable lifecycle state (`pending → applied | rejected | expired`) that doesn't fit either append-only audit shape. The table is **MUTABLE** on the decision columns (`status`, `decided_at`, `decided_by`, `decided_reason`) and append-only everywhere else.
+
+#### Architectural commitment
+
+Detectors NEVER mutate memory state directly. Every detector finding becomes a proposal; the operator approves; only then does the apply path call `transitionMemoryState`. This isolates the non-determinism of LLM-judge from the determinism of the state machine — when a memory transitions, there's always an operator approval row to trace back to.
+
+#### Six kinds
+
+`kind` enumerates what the proposal would do:
+
+| Kind | Apply-path semantic (S8 V1) |
+|---|---|
+| `quarantine`   | `active → quarantined` via state machine. Single-memory only. |
+| `restore`      | `quarantined/evicted → active` via state machine. Single-memory only. |
+| `demote`       | Schema accepts; apply path returns `unimplemented_kind` (needs file-move primitive). |
+| `merge`        | Schema accepts; apply path returns `unimplemented_kind` (needs file-rewrite primitive). |
+| `consolidate`  | Like merge but similarity-driven. Same deferral. |
+| `expire`       | Set/update `expires` frontmatter. Same deferral (needs frontmatter mutation primitive). |
+
+The substrate is forward-compatible with the four deferred kinds so a future detector can persist them before the apply path supports them. The apply path's confidence + staleness gates still run on those rows, so a deferred-kind proposal that fails preflight rejects normally; one that passes lands in `rejected` with `decided_by='system:unimplemented_kind'`.
+
+#### Schema fields (operator-facing)
+
+| Field | Purpose |
+|---|---|
+| `id` | UUID. The slash inspector + apply path key on this. |
+| `session_id` (FK SET NULL) | Session the detector was running in. NULL when emitted by a boot-time detector. SET NULL preserves the proposal trail across session purges. |
+| `kind` | One of the six above. |
+| `source_memory_keys` | JSON array of `{scope, name}` — every memory the proposal would mutate. Sorted canonically by the repo before persist. |
+| `target_payload` | JSON, kind-specific. `expire` carries `{expires: "YYYY-MM-DD"}`; `merge` / `consolidate` carry the resulting body. `quarantine` / `restore` may pass `{motivo, trigger}` to override defaults. |
+| `confidence` | `[0, 1]` for LLM-judge detectors; NULL for deterministic / operator proposals (NULL bypasses the apply-path confidence gate). |
+| `evidence` | JSON, detector-specific. The original LLM verdict / counter values / claim extracts. Survives the proposal lifecycle so forensic JOINs can read it after approval. |
+| `status` | `pending` → `applied` / `rejected` / `expired`. Default 'pending'. |
+| `proposed_by` | `subagent:<name>` for LLM detectors; `detector:<name>` for deterministic; `operator:<id>` for manual proposals. Drives the default `trigger` derivation at apply time. |
+| `proposal_fingerprint` | SHA-256 over `{kind, sorted(source_memory_keys), evidence_essence}`. UNIQUE partial index `WHERE status = 'pending'` enforces silent dedup. |
+| `source_memory_snapshots` | JSON array of `{scope, name, content_hash}` — every source memory's `hashMemoryContent(serializeMemoryFile(file))` at proposal-creation time. Closes the staleness gap (§ apply-path gates below). |
+| `decided_*` | NULL while pending; set when status transitions away from pending. `decided_by` distinguishes operator (`operator:slash`, `operator:api`) from system auto-decisions (`system:low_confidence`, `system:stale_evidence`, `system:unimplemented_kind`, `system:state_change`, `system:hook_blocked`, `system:invalid_evidence`, `system:ttl`). |
+| `created_at` | Epoch ms. Drives the 30d TTL sweep. |
+
+#### Apply-path gates (`src/memory/governance.ts:applyProposal`)
+
+Five sequential gates. Any failure rejects the proposal with `system:*` `decided_by`:
+
+1. **Existence + status** — proposal must exist and be `pending`.
+2. **Confidence** — `confidence === null` bypasses; otherwise `confidence >= DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD` (0.7 default, override per call). Below threshold → `system:low_confidence`.
+3. **Kind support** — quarantine / restore in S8 V1. Others → `system:unimplemented_kind`.
+4. **Single-memory** — supported kinds in S8 V1 admit one source memory each. Multi-memory → `system:multi_memory_unsupported`.
+5. **Staleness (drift wins over state_change)** — every snapshot in `source_memory_snapshots` must still equal the memory's current `hashMemoryContent(serializeMemoryFile(file))`. Any unreadable memory OR any hash mismatch → `system:stale_evidence` with the drifted memories listed in `decided_reason`. The ordering is deliberate: if the operator edited the body since the proposal, the decision is "the detector's evidence no longer applies" — telling them "memory state changed" would mislead.
+
+After the gates pass, `applyProposal` calls `transitionMemoryState` with `actor: 'user'` (operator approval IS the user action), `motivo` defaulted per kind (quarantine → `conflict`, restore → `shift`; `target_payload.motivo` overrides), `trigger` derived from `proposed_by` (`subagent:verify-semantic` → `verify_failed`, `subagent:verify-conflict` → `conflict_detected`, `detector:user_override_repeated` → `user_override_repeated`, else `operator_driven`; `target_payload.trigger` overrides), and an evidence payload carrying the `_operator_driven` marker plus trace fields (`proposal_id`, `proposed_by`, `proposal_fingerprint`, `detector_evidence`) so forensic queries can JOIN from `eviction_events` back to the originating proposal.
+
+Same-state pseudo-transitions (memory already in target state) reject with `system:state_change` — the proposal is moot, no audit row claiming "we did something" should land.
+
+Transition refusals from the state machine (illegal_transition, blocked_by_protection, blocked_by_hook, invalid_evidence) all reject the proposal with the matching reason kind; the memory state on disk did not change. `io_error` and `audit_drift` LEAVE the proposal pending so a retry can land cleanly — they signal infrastructure problems, not policy decisions.
+
+#### TTL sweep
+
+`expirePendingProposals` runs at boot from `bootstrap.ts` alongside the other memory sweeps. Default window 30d (`GOVERNANCE_PROPOSAL_TTL_MS`); pending rows older than `now - 30d` flip to `expired` with `decided_by='system:ttl'`. Best-effort same as `pruneMemoryProvenance`: a sweep failure logs `AUDIT DRIFT` to stderr and doesn't abort boot.
+
+The TTL is not just hygiene — a 30d-old proposal has likely outlived its evidence (the underlying memory + detector context drift). Forcing the detector to re-emit if the finding still holds is the right contract.
+
+#### Operator surface: `/memory governance`
+
+Five subcommands:
+
+| Form | Action |
+|---|---|
+| `/memory governance list [--status <s>] [--limit N]` | Inventory with status filter. Empty hint when nothing matches. |
+| `/memory governance show <id>` | Full proposal detail: kind, status, confidence, source memories, snapshots, evidence (truncated). |
+| `/memory governance approve <id>` | Invoke `applyProposal`. A bulk-confirmation modal for ≥3 memories is intentionally not wired in V1 since the apply path auto-rejects multi-memory proposals as `multi_memory_unsupported`; it will land alongside the `merge` / `consolidate` apply primitives. |
+| `/memory governance reject <id> [--reason "..."]` | Mark `rejected` with operator's reason. |
+| `/memory governance audit <id>` | Proposal detail + `memory_events` landed against the source memories since the proposal's `created_at` (lineage). |
+
+Arg-validation refuses unknown flags and out-of-range `--limit` so a typo doesn't take a default code path.
+
+#### What proposals do NOT do
+
+- **Mutate memory state without operator approval.** This is the architectural invariant. A detector landing a proposal is informational; the state machine doesn't move until the operator approves AND the apply-path gates all pass.
+- **Bypass the state machine.** Approve still delegates to `transitionMemoryState`. The same protection gates (cooldown, quarantine TTL, hook gating) fire on governance-driven transitions as on `/memory quarantine`-driven ones.
+- **Replace `/memory quarantine` + `/memory restore`.** Operators retain the direct slash flows for manual transitions. Governance is the detector ingress; the direct slashes are the operator ingress.
+- **Persist detector-internal reasoning.** `evidence` is a structured payload, not free-form prose. LLM-judge detectors validate output via JSON schema before recording (Phase 2 / S11+S13).
+
+#### Forward-compat hooks
+
+- `proposed_by` taxonomy is open — `subagent:<new-detector>` or `detector:<new-detector>` lands new origins without a schema change. The trigger derivation in the apply path has a small map (`subagent:verify-semantic` → `verify_failed`, etc.); new detectors that want canonical trigger attribution add a case. Anything not mapped falls back to `operator_driven` and still works.
+- `kind` accepts the four deferred values today — when an apply primitive lands for `expire` or `merge`, only `SUPPORTED_KINDS` in `src/memory/governance.ts` and the kind-specific branch need updating; the substrate is ready.
+- `target_payload` is opaque JSON; detector-specific schemas live in detector code (e.g., the future merge primitive validates `target_payload.body` shape on apply). The substrate doesn't gate schema beyond "valid JSON".
 
 ---
 
@@ -876,7 +972,8 @@ These were listed as deferred in a prior draft but are wired today:
 - **Exposure trail** (`feat/memory-lifecycle-detectors` Slice 1, §11.2 above). `memory_provenance` table records every moment a memory was visible to the model (eager, memory_read, retrieve_context). Three emitters wired (registry's read/search-deep, eager-load via `eagerExposures`, retrieval runner post-`createRetrievalTrace`); `/memory provenance` slash command exposes the trail with three modes (`<name>`, `--tool`, `--retrieval`); 90d boot-time retention sweep.
 - **`trust_revoked` detector** (`feat/memory-lifecycle-detectors` Slice 5, §6.5.2 + §7.2 rule 8). Boot-time SHA-256 fingerprint of `.agent/memory/shared/`; when the operator's last-confirmed hash diverges from the current corpus, a re-confirmation modal fires; revocation bulk-transitions every active shared memory to `invalidated` (motivo `security`, trigger `trust_revoked`) and the bulk effect is reflected in this very boot's system prompt rather than requiring a restart. `assembleMemorySection` filters `state === 'invalidated'` from the eager-load. `/memory trust status` slash inspector surfaces in-sync / diverged / never-confirmed / verify-failed state without re-running the modal.
 - **Quarantine penalty + visual flag** (`feat/memory-lifecycle-detectors` Slice 6, §6.5.2 + EVICTION.md §9.7). Retrieval ranking applies a numeric penalty to `quarantined` memories without filtering them out (they stay visible-but-cautioned); `assembleMemorySection` renders the `[memory: quarantined]` inline flag so the model sees the marker. The state filter expanded to `['active', 'quarantined']` covers both retrievable states.
+- **Governance proposal substrate + apply path** (`feat/memory-governance-llm` Slice 8, §11.3 above). `memory_governance_proposals` table (migration 056) carries the propose-not-mutate lifecycle: detectors emit `pending` proposals, operators decide via `/memory governance approve|reject`, the apply path validates confidence/staleness/state-machine gates and delegates to `transitionMemoryState`. 30d TTL sweep wired in bootstrap. Five-subcommand operator surface (`list`, `show`, `approve`, `reject`, `audit`). Supports `quarantine` and `restore` kinds in V1; `demote` / `merge` / `consolidate` / `expire` accepted at the substrate (forward-compat) and rejected at apply time with `system:unimplemented_kind`. Foundational for the LLM-judge detectors (S11 verify_failed, S13 conflict_detected) and the deterministic S3 user_override_repeated counter.
 
-The three remaining auto-detectors named in §6.5.2 (`verify_failed`, `user_override_repeated`, `conflict_detected`) ship as **substrate-only** in Phase 1 (V1 trigger names + audit filters preserved); the detection logic itself is deferred to Phase 2 LLM-judge slices (S3 + S8 + S11 + S13). Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals (S8). The operator surface is production-ready to receive both detector verdicts and proposals.
+The three remaining auto-detectors named in §6.5.2 (`verify_failed`, `user_override_repeated`, `conflict_detected`) ship as **substrate-only** in Phase 1 (V1 trigger names + audit filters preserved); the detection logic itself is deferred to Phase 2 LLM-judge slices (S3 + S11 + S13), all built on the S8 governance substrate above. Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals. The operator surface is production-ready to receive both detector verdicts and proposals.
 
 `docs/BACKLOG.md` carries the current milestone status; the FEEDBACK_ADAPTATION cross-cut (`docs/spec/FEEDBACK_ADAPTATION.md`) describes how loop-frio adaptation will eventually drive automatic `low_roi` quarantine / eviction proposals for stale memories.

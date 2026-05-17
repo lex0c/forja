@@ -47,6 +47,10 @@ import { scrubEnv } from '../sanitize/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import {
+  GOVERNANCE_PROPOSAL_TTL_MS,
+  expirePendingProposals,
+} from '../storage/repos/memory-governance.ts';
+import {
   MEMORY_PROVENANCE_RETENTION_MS,
   pruneMemoryProvenance,
 } from '../storage/repos/memory-provenance.ts';
@@ -662,6 +666,22 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // because SQLite errors may echo bound params.
       process.stderr.write(
         `memory: AUDIT DRIFT: failed to record retention sweep at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // Governance proposal TTL sweep (MEMORY.md §11.3, S8/T8.4).
+    // Pending proposals older than 30d auto-expire — a proposal
+    // that didn't get reviewed in that window has lost authority
+    // (underlying memory + detector context likely drifted).
+    // Detectors re-emit if the finding still holds. Best-effort
+    // same as the provenance sweep: a DB failure does not abort
+    // boot — operator-facing governance surfaces will fall back to
+    // surfacing stale rows until the next successful sweep.
+    try {
+      expirePendingProposals(db, Date.now() - GOVERNANCE_PROPOSAL_TTL_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to expire pending governance proposals at boot (will retry next boot): ${redactSecrets(msg)}\n`,
       );
     }
     // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2

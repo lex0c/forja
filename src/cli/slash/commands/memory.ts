@@ -29,6 +29,7 @@ import {
   type MemoryRegistry,
   type MemoryScope,
   type TombstoneEntry,
+  applyProposal,
   clearSharedTrust,
   computeSharedFingerprint,
   findLatestTombstone,
@@ -43,6 +44,7 @@ import {
   setSharedTrust,
   transitionMemoryState,
 } from '../../../memory/index.ts';
+import { sanitizeOneLineForDisplay } from '../../../sanitize/ansi.ts';
 import type { DB } from '../../../storage/db.ts';
 import {
   listMemoryEventsByName,
@@ -59,9 +61,18 @@ import {
 } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import {
+  GOVERNANCE_PROPOSAL_STATUSES,
+  type MemoryGovernanceProposalRow,
+  type MemoryGovernanceProposalStatus,
+  decideProposal,
+  getProposalById,
+  listProposals,
+} from '../../../storage/repos/memory-governance.ts';
+import {
   type MemoryProvenanceRow,
   listExposuresInRetrieval,
   listGlobalProvenanceByName,
+  listGlobalProvenanceForMemory,
   listProvenanceByName,
   listProvenanceForToolCall,
 } from '../../../storage/repos/memory-provenance.ts';
@@ -2328,12 +2339,447 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
   return { kind: 'error', message: `/memory ${infinitive}: ${reason}` };
 };
 
+// ─── /memory governance ──────────────────────────────────────────────
+//
+// Operator surface for the Phase 2 governance proposal substrate
+// (MEMORY.md §11.3, S8). Detectors emit proposals; this slash is
+// where operators inspect / decide them.
+//
+// Five subcommands:
+//   - `list   [--status <s>] [--limit N]`  inventory of proposals
+//   - `show   <id>`                         single proposal detail
+//   - `approve <id>`                        run apply path
+//   - `reject  <id> [--reason "..."]`       mark rejected
+//   - `audit   <id>`                        lineage (proposal → memory events / provenance)
+
+const GOVERNANCE_DECIDED_BY_OPERATOR = 'operator:slash';
+
+// Operator-facing display helper. Every string that originated outside
+// the slash (proposal ids from operator stdin, names/scopes from DB
+// rows that may have been authored by detectors, --reason input)
+// passes through this before being echoed to the scrollback bus.
+// sanitizeOneLineForDisplay strips ANSI escapes + collapses CR/LF/TAB,
+// so a malicious detector that embedded \x1b[2J\x1b[H in
+// `proposed_by` (or an operator passing `--reason $'\x1b[2J'`) cannot
+// repaint the operator's terminal via /memory governance output.
+const displayGov = (s: string): string => sanitizeOneLineForDisplay(s);
+
+const formatGovernanceTimestamp = (ms: number): string => {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+};
+
+const formatProposalLine = (p: MemoryGovernanceProposalRow): string => {
+  const ts = formatGovernanceTimestamp(p.createdAt);
+  const idShort = displayGov(p.id.slice(0, 8));
+  const conf = p.confidence === null ? '   --' : p.confidence.toFixed(2).padStart(5, ' ');
+  const keysCount = p.sourceMemoryKeys.length;
+  const keysPreview =
+    keysCount === 1 && p.sourceMemoryKeys[0] !== undefined
+      ? `${displayGov(p.sourceMemoryKeys[0].scope)}/${displayGov(p.sourceMemoryKeys[0].name)}`
+      : `${keysCount} memories`;
+  return `  ${ts} · ${idShort} · ${displayGov(p.status).padEnd(8)} · ${displayGov(p.kind).padEnd(11)} · conf=${conf} · ${keysPreview} · ${displayGov(p.proposedBy)}`;
+};
+
+interface GovernanceListFlags {
+  status: MemoryGovernanceProposalStatus | null;
+  limit: number;
+}
+
+const parseGovernanceListFlags = (args: string[]): GovernanceListFlags | { error: string } => {
+  let status: MemoryGovernanceProposalStatus | null = null;
+  let limit = 50;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--status') {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        return { error: '/memory governance list: --status requires a value' };
+      }
+      if (!GOVERNANCE_PROPOSAL_STATUSES.includes(raw as MemoryGovernanceProposalStatus)) {
+        return {
+          error: `/memory governance list: invalid --status '${raw}' (expected: ${GOVERNANCE_PROPOSAL_STATUSES.join(', ')})`,
+        };
+      }
+      status = raw as MemoryGovernanceProposalStatus;
+      i += 2;
+      continue;
+    }
+    if (a === '--limit') {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        return { error: '/memory governance list: --limit requires a value' };
+      }
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > 500) {
+        return {
+          error: `/memory governance list: --limit must be an integer 1..500 (got '${raw}')`,
+        };
+      }
+      limit = n;
+      i += 2;
+      continue;
+    }
+    return { error: `/memory governance list: unknown flag '${a}' (try --status, --limit)` };
+  }
+  return { status, limit };
+};
+
+const handleGovernanceList = (ctx: SlashContext, args: string[]): SlashResult => {
+  const parsed = parseGovernanceListFlags(args);
+  if ('error' in parsed) return { kind: 'error', message: parsed.error };
+  const rows = listProposals(ctx.db, {
+    ...(parsed.status !== null ? { status: parsed.status } : {}),
+    limit: parsed.limit,
+  });
+  if (rows.length === 0) {
+    const filter = parsed.status !== null ? ` (status=${parsed.status})` : '';
+    return {
+      kind: 'ok',
+      notes: [`no governance proposals${filter} — detectors haven't emitted any in this window`],
+    };
+  }
+  const header = `governance proposals${parsed.status !== null ? ` · status=${parsed.status}` : ''} (showing ${rows.length}):`;
+  return {
+    kind: 'ok',
+    notes: [header, ...rows.map(formatProposalLine)],
+  };
+};
+
+const truncateJson = (value: unknown, max = 240): string => {
+  const json = JSON.stringify(value);
+  if (json.length <= max) return json;
+  return `${json.slice(0, max)}… (+${json.length - max} chars)`;
+};
+
+const renderProposalDetail = (p: MemoryGovernanceProposalRow): string[] => {
+  const lines: string[] = [];
+  lines.push(`proposal ${displayGov(p.id)}`);
+  lines.push(`  kind:                ${displayGov(p.kind)}`);
+  lines.push(`  status:              ${displayGov(p.status)}`);
+  lines.push(`  proposed_by:         ${displayGov(p.proposedBy)}`);
+  lines.push(
+    `  confidence:          ${p.confidence === null ? '(null)' : p.confidence.toString()}`,
+  );
+  lines.push(`  fingerprint:         ${displayGov(p.proposalFingerprint)}`);
+  lines.push(`  created_at:          ${formatGovernanceTimestamp(p.createdAt)}`);
+  if (p.decidedAt !== null) {
+    lines.push(`  decided_at:          ${formatGovernanceTimestamp(p.decidedAt)}`);
+  }
+  if (p.decidedBy !== null) {
+    lines.push(`  decided_by:          ${displayGov(p.decidedBy)}`);
+  }
+  if (p.decidedReason !== null) {
+    lines.push(`  decided_reason:      ${displayGov(p.decidedReason)}`);
+  }
+  if (p.sessionId !== null) {
+    lines.push(`  session_id:          ${displayGov(p.sessionId)}`);
+  }
+  lines.push('  source memories:');
+  for (let i = 0; i < p.sourceMemoryKeys.length; i++) {
+    const k = p.sourceMemoryKeys[i];
+    const s = p.sourceMemorySnapshots[i];
+    if (k === undefined) continue;
+    // contentHash is SHA-256 hex from our own hashMemoryContent — no
+    // sanitization needed, but pass through for symmetry.
+    const hashPrefix =
+      s !== undefined ? ` (snapshot ${displayGov(s.contentHash).slice(0, 12)}…)` : '';
+    lines.push(`    - ${displayGov(k.scope)}/${displayGov(k.name)}${hashPrefix}`);
+  }
+  // truncateJson uses JSON.stringify which escapes control characters
+  // (e.g. \x1b → ) so ANSI injection through targetPayload /
+  // evidence values is already neutralized at the JSON layer.
+  if (p.targetPayload !== null) {
+    lines.push(`  target_payload:      ${truncateJson(p.targetPayload)}`);
+  }
+  lines.push(`  evidence:            ${truncateJson(p.evidence)}`);
+  return lines;
+};
+
+const handleGovernanceShow = (ctx: SlashContext, args: string[]): SlashResult => {
+  if (args.length === 0) {
+    return { kind: 'error', message: '/memory governance show: missing proposal id' };
+  }
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/memory governance show: too many args (got '${displayGov(args[1] as string)}' after id)`,
+    };
+  }
+  const id = args[0] as string;
+  const proposal = getProposalById(ctx.db, id);
+  if (proposal === null) {
+    return {
+      kind: 'error',
+      message: `/memory governance show: proposal '${displayGov(id)}' not found`,
+    };
+  }
+  return { kind: 'ok', notes: renderProposalDetail(proposal) };
+};
+
+const handleGovernanceApprove = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  if (args.length === 0) {
+    return { kind: 'error', message: '/memory governance approve: missing proposal id' };
+  }
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/memory governance approve: too many args (got '${displayGov(args[1] as string)}' after id)`,
+    };
+  }
+  const id = args[0] as string;
+  const proposal = getProposalById(ctx.db, id);
+  if (proposal === null) {
+    return {
+      kind: 'error',
+      message: `/memory governance approve: proposal '${displayGov(id)}' not found`,
+    };
+  }
+  if (proposal.status !== 'pending') {
+    return {
+      kind: 'error',
+      message: `/memory governance approve: proposal '${displayGov(id)}' already ${displayGov(proposal.status)} (decided by ${displayGov(proposal.decidedBy ?? 'unknown')})`,
+    };
+  }
+  // Bulk-effect confirmation modal (T8.5 "≥3 memories prompts extra")
+  // is intentionally NOT wired in V1: the apply path's single-memory
+  // gate (`src/memory/governance.ts:applyProposal`) auto-rejects every
+  // multi-memory proposal with `multi_memory_unsupported` before the
+  // modal would have a chance to fire. Wiring it now would be dead
+  // code. Re-introduce here when `merge` / `consolidate` apply
+  // primitives land and multi-memory transitions become reachable.
+  const sessionId = ctx.currentSessionId();
+  const result = await applyProposal({
+    db: ctx.db,
+    registry,
+    proposalId: id,
+    decidedBy: GOVERNANCE_DECIDED_BY_OPERATOR,
+    sessionId: sessionId ?? null,
+    cwd: ctx.baseConfig.cwd ?? null,
+    ...(ctx.dispatchHooks !== undefined ? { fireHook: ctx.dispatchHooks } : {}),
+    now: ctx.now,
+  });
+  if (result.outcome === 'applied') {
+    registry.reload();
+    const lines = [`approved proposal ${displayGov(id)} (${displayGov(proposal.kind)})`];
+    for (const t of result.transitions) {
+      lines.push(
+        `  ${displayGov(t.scope)}/${displayGov(t.name)}: ${t.fromState} → ${t.toState} (eviction_event ${displayGov(t.evictionEventId).slice(0, 8)})`,
+      );
+    }
+    return { kind: 'ok', notes: lines };
+  }
+  if (result.outcome === 'not_found') {
+    return {
+      kind: 'error',
+      message: `/memory governance approve: proposal '${displayGov(id)}' not found`,
+    };
+  }
+  if (result.outcome === 'already_decided') {
+    return {
+      kind: 'error',
+      message: `/memory governance approve: proposal '${displayGov(id)}' is ${displayGov(result.currentStatus)} (decided by ${displayGov(result.decidedBy ?? 'unknown')})`,
+    };
+  }
+  // outcome === 'rejected' — the apply path persisted the decision
+  // already. Echo the reason so the operator sees what gated.
+  // result.message is system-built from user/detector input (drifted
+  // memories names, transition reasons) — sanitize for display.
+  return {
+    kind: 'error',
+    message: `/memory governance approve: rejected (${result.reason}): ${displayGov(result.message)}`,
+  };
+};
+
+interface GovernanceRejectFlags {
+  reason: string | null;
+}
+
+const parseGovernanceRejectFlags = (args: string[]): GovernanceRejectFlags | { error: string } => {
+  let reason: string | null = null;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--reason') {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        return { error: '/memory governance reject: --reason requires a value' };
+      }
+      reason = raw;
+      i += 2;
+      continue;
+    }
+    return { error: `/memory governance reject: unknown flag '${a}' (try --reason)` };
+  }
+  return { reason };
+};
+
+const handleGovernanceReject = (ctx: SlashContext, args: string[]): SlashResult => {
+  if (args.length === 0) {
+    return { kind: 'error', message: '/memory governance reject: missing proposal id' };
+  }
+  const id = args[0] as string;
+  const parsed = parseGovernanceRejectFlags(args.slice(1));
+  if ('error' in parsed) return { kind: 'error', message: parsed.error };
+  const proposal = getProposalById(ctx.db, id);
+  if (proposal === null) {
+    return {
+      kind: 'error',
+      message: `/memory governance reject: proposal '${displayGov(id)}' not found`,
+    };
+  }
+  if (proposal.status !== 'pending') {
+    return {
+      kind: 'error',
+      message: `/memory governance reject: proposal '${displayGov(id)}' already ${displayGov(proposal.status)} (decided by ${displayGov(proposal.decidedBy ?? 'unknown')})`,
+    };
+  }
+  // Persist the operator's reason verbatim (audit trail value) but
+  // sanitize it when echoing back to scrollback so ANSI / control
+  // chars in --reason don't corrupt the operator's terminal.
+  const changed = decideProposal(ctx.db, id, {
+    status: 'rejected',
+    decidedBy: GOVERNANCE_DECIDED_BY_OPERATOR,
+    decidedReason: parsed.reason,
+    decidedAt: ctx.now(),
+  });
+  if (!changed) {
+    // Race: another writer landed a terminal status between getProposalById
+    // and the UPDATE. Re-load to render the actual end state.
+    const latest = getProposalById(ctx.db, id);
+    return {
+      kind: 'error',
+      message: `/memory governance reject: proposal '${displayGov(id)}' is no longer pending (current status: ${displayGov(latest?.status ?? 'unknown')})`,
+    };
+  }
+  return {
+    kind: 'ok',
+    notes: [
+      `rejected proposal ${displayGov(id)} (${displayGov(proposal.kind)})`,
+      parsed.reason !== null ? `  reason: ${displayGov(parsed.reason)}` : '  (no reason supplied)',
+    ],
+  };
+};
+
+const handleGovernanceAudit = (ctx: SlashContext, args: string[]): SlashResult => {
+  if (args.length === 0) {
+    return { kind: 'error', message: '/memory governance audit: missing proposal id' };
+  }
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/memory governance audit: too many args (got '${displayGov(args[1] as string)}' after id)`,
+    };
+  }
+  const id = args[0] as string;
+  const proposal = getProposalById(ctx.db, id);
+  if (proposal === null) {
+    return {
+      kind: 'error',
+      message: `/memory governance audit: proposal '${displayGov(id)}' not found`,
+    };
+  }
+  const lines = renderProposalDetail(proposal);
+  // Lineage: for each source memory, surface (a) memory_events that
+  // landed on or after the proposal's created_at — approval
+  // transitions, subsequent restores, unrelated edits — and (b) any
+  // memory_provenance exposures recorded since the proposal, so the
+  // operator sees both what changed AND what the model saw of the
+  // memory after the detector emitted. Cross-session by design: the
+  // proposal may have been approved (or the memory exposed) in a
+  // different REPL session than the one running this slash.
+  //
+  // eviction_events JOIN by proposal_id (which the apply path threads
+  // into evidence_json) is deferred: a SQL LIKE on JSON is fragile,
+  // and adding a dedicated index requires a schema change. Use
+  // `/memory audit --name <name>` for the eviction trail today.
+  const sinceMs = proposal.createdAt - 1; // inclusive of proposal createdAt
+  lines.push('');
+  lines.push('lineage:');
+  let anyLineage = false;
+  for (const key of proposal.sourceMemoryKeys) {
+    const events = listMemoryEventsByName(ctx.db, key.name, 20).filter(
+      (e) => e.scope === key.scope && e.createdAt >= sinceMs,
+    );
+    const exposures = listGlobalProvenanceForMemory(ctx.db, key.scope, key.name, 20).filter(
+      (e) => e.createdAt >= sinceMs,
+    );
+    if (events.length === 0 && exposures.length === 0) {
+      lines.push(
+        `  ${displayGov(key.scope)}/${displayGov(key.name)}: (no events or exposures since proposal)`,
+      );
+      continue;
+    }
+    anyLineage = true;
+    lines.push(`  ${displayGov(key.scope)}/${displayGov(key.name)}:`);
+    if (events.length > 0) {
+      lines.push(`    events (${events.length}):`);
+      for (const e of events) {
+        lines.push(`      ${formatAuditRow(e).trimStart()}`);
+      }
+    }
+    if (exposures.length > 0) {
+      lines.push(`    exposures (${exposures.length}):`);
+      for (const ex of exposures) {
+        const ts = formatGovernanceTimestamp(ex.createdAt);
+        const tc = ex.toolCallId === null ? 'eager---' : displayGov(ex.toolCallId).slice(0, 8);
+        const session = displayGov(ex.sessionId).slice(0, 8);
+        lines.push(`      ${ts} · ${ex.surface.padEnd(16)} · session=${session} · tc=${tc}`);
+      }
+    }
+  }
+  if (!anyLineage) {
+    lines.push(
+      '  (no downstream memory_events or memory_provenance entries recorded since this proposal was created)',
+    );
+  }
+  return { kind: 'ok', notes: lines };
+};
+
+const handleGovernance = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  const sub = args[0];
+  if (sub === undefined) {
+    return {
+      kind: 'error',
+      message: '/memory governance: subcommand required (try: list, show, approve, reject, audit)',
+    };
+  }
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'list':
+      return handleGovernanceList(ctx, rest);
+    case 'show':
+      return handleGovernanceShow(ctx, rest);
+    case 'approve':
+      return handleGovernanceApprove(registry, ctx, rest);
+    case 'reject':
+      return handleGovernanceReject(ctx, rest);
+    case 'audit':
+      return handleGovernanceAudit(ctx, rest);
+    default:
+      return {
+        kind: 'error',
+        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, audit)`,
+      };
+  }
+};
+
 // ─── command export ──────────────────────────────────────────────────
 
 export const memoryCommand: SlashCommand = {
   name: 'memory',
   description:
-    'manage cross-session memories (list/show/audit/provenance/delete/quarantine/restore/promote/demote/trust)',
+    'manage cross-session memories (list/show/audit/provenance/governance/delete/quarantine/restore/promote/demote/trust)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -2369,10 +2815,12 @@ export const memoryCommand: SlashCommand = {
         return handleDemote(registry, ctx, args.slice(1));
       case 'trust':
         return handleTrust(registry, ctx, args.slice(1));
+      case 'governance':
+        return handleGovernance(registry, ctx, args.slice(1));
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote, trust)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote, trust, governance)`,
         };
     }
   },

@@ -2,6 +2,75 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(memory) — S8 governance post-review (critical + medium + test gaps)
+
+Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 12 real findings on S8 after the initial slice landed. All closed in this pass.
+
+**Critical fixes (would bite in production):**
+
+- **F1 — nested transaction safety.** `recordProposal` opened BEGIN/COMMIT manually. Inside another `withTransaction`, the nested BEGIN throws and the catch's ROLLBACK unwinds the OUTER transaction. Replaced with `withTransaction(db, fn)` which uses bun:sqlite's SAVEPOINT shape — nests safely. Test: a recordProposal inside withTransaction now leaves an unrelated outer-txn UPDATE committed.
+
+- **F4 — `rejectProposal` race-aware.** Apply path's error branches called `rejectProposal` but ignored its boolean return. A proposal flipped between `getProposalById` and `transitionMemoryState` (e.g. by the TTL sweep) would silently no-op the rejection UPDATE while the caller returned `outcome: 'rejected'` — pure drift between result and persisted state. Introduced `concludeRejection` helper that checks the return; on no-op, re-reads and surfaces `outcome: 'already_decided'` with the actual `currentStatus` / `decidedBy`. All 10 rejection call sites converted. Test: pre-decide a row to `'expired'` (race simulation) then trigger an error branch; result now correctly says `already_decided`, currentStatus=expired, decidedBy=`system:ttl`.
+
+- **F5 — `audit_drift` posture reworked.** Previous shape left the proposal pending hoping a retry would land — but the retry hits the staleness gate (the frontmatter rewrite mutated the canonical bytes) and auto-rejects forever as `system:stale_evidence`. Permanent dead row. Correct posture: the memory IS in the target state on disk, so the proposal IS applied from the operator's perspective. Mark `applied` with `decidedReason` flagging the missing audit row, emit `memory: AUDIT DRIFT` stderr alert with the proposal id, synthesize sentinel `evictionEventId = audit-drift:<proposalId>` so callers can grep this prefix to distinguish from real eviction rows.
+
+- **F3 — `restore` reads from `.tombstones/`.** Apply path's staleness gate called `registry.read` which only looks at the scope root; for evicted source the body lives in `.tombstones/`. Every restore-from-evicted proposal auto-rejected as `system:stale_evidence` — `restore` kind was mechanically broken. Added tombstone fallback gated on `kind === 'restore'` via `findLatestTombstone` + `parseMemoryFile`. The other kinds (quarantine etc.) keep the strict scope-root semantics. Quarantined→active restore (body still at scope root) was the only path that happened to work pre-fix and is unchanged. Spec divergence (`MEMORY.md §6.5.5` says restore→`proposed`, not `active`) replicates inherited drift from `/memory restore` slash and is flagged for a separate spec-PR-first cleanup.
+
+**Medium fixes:**
+
+- **F2 — canonical `evidenceEssence` default.** Old default `JSON.stringify(input.evidence)` is JS-key-order-dependent (insertion order); two detectors emitting equivalent evidence in different field orders would compute different fingerprints and the silent-dedup gate would never fire. Added recursive `canonicalJsonStringify` (sorts object keys, preserves array order) as the new default. Test: two proposals with the same fields in different orders now dedup correctly.
+
+- **F6 — `target_payload.motivo` / `target_payload.trigger` validation.** Both fields reached `transitionMemoryState` unvalidated. `motivoForKind` cast unknown strings to `EvictionMotivo` and surfaced as `illegal_transition` later (less informative). `trigger` accepted arbitrary strings into the TEXT column that has no CHECK — a malicious detector could poison the audit trail with ANSI escapes, oversize strings, control chars. Both helpers now return `ResolvedMotivo` / `ResolvedTrigger` discriminated unions; invalid override → `concludeRejection` with `system:invalid_evidence`. Trigger regex: `[A-Za-z0-9_-]{1,64}`. Motivo: against the `MOTIVOS` Set.
+
+- **F7 — staleness gate uses `peek` (not `read`).** Pre-fix every apply attempt — including auto-rejected ones — emitted `memory_events action=read` + a `memory_provenance` row for every source memory. Audit / detector-quality queries would over-count "model saw this memory" by the rejection rate. Switched to `registry.peek` since the staleness check is internal verification, not a model-visible read.
+
+- **F8 — slash output sanitization.** Operator-supplied `--reason` and DB-sourced `proposed_by` / `decidedReason` / `decidedBy` were echoed verbatim to scrollback. Hostile detector embedding ANSI in `proposed_by` (or operator passing `--reason $'\x1b[2J'`) could repaint the trust modal / clear the operator's terminal. Added `displayGov` helper wrapping `sanitizeOneLineForDisplay` over every dynamic external string in `formatProposalLine`, `renderProposalDetail`, and the 4 handler error/note surfaces. Audit row keeps the original bytes (forensic value); only display is sanitized.
+
+- **F9 — removed dead bulk modal.** The `>= 3 memories → modal confirm` branch in `handleGovernanceApprove` is unreachable: the apply path's single-memory gate (V1) rejects multi-memory proposals before the modal would fire. Removed the dead code, left a comment for re-introduction when `merge`/`consolidate` apply primitives ship. Doc §11.3 updated.
+
+- **F10 — audit lineage extended with provenance.** `/memory governance audit <id>` only read `memory_events`; TODO T8.5b promised 4-table lineage. Added `listGlobalProvenanceForMemory` lookup per source memory, surfaced as a separate `exposures (N):` section. `eviction_events` JOIN via `evidence_json LIKE` deferred (fragile against JSON serialization; needs a dedicated index for it to be hot-path safe).
+
+**Test footprint:** +43 tests across the three S8 test files.
+
+- `tests/storage/memory-governance.test.ts` (+14): DB-level CHECK bypass (kind / status / decided_at); FK SET NULL on session purge; empty `proposedBy`; non-positive `createdAt`; invalid memory scope; duplicate-key UNIQUE constraint at the keys table; PRIMARY KEY collision with caller-supplied id; `listProposals` null-session filter; `listPendingProposalsForMemory` scope isolation; nested-transaction safety (F1); key-order-stable default essence (F2); pinned fingerprint hex for canonical input.
+
+- `tests/memory/governance.test.ts` (+15): confidence at exactly threshold; `confidenceThreshold` override (loose + strict); restore from tombstone with real `active→quarantined→evicted` chain via same-chain bypass; restore with no tombstone exists; `blocked_by_hook` mapping; `blocked_by_protection` documented (apply path's `actor='user'` bypasses protection by spec — pinning the architectural decision); invalid `motivo` override; invalid `trigger` override with ANSI; `target_payload.trigger` override propagation; unknown `proposedBy` prefix fallback to `operator_driven`; `buildEvidence` ordering pins detector evidence can't spoof the operator-driven trace markers; race-aware reject path (F4); peek-not-read (F7); audit_drift posture sentinel (F5).
+
+- `tests/cli/slash/memory.test.ts` (+14): approve/reject/audit arg-validation (missing id, too-many args, unknown id); `--reason` without value; ANSI sanitization in proposed_by via raw INSERT (F8); ANSI sanitization in operator `--reason` (F8); ANSI sanitization in id arg (F8); approve rejection reasons coverage (`stale_evidence`, `unimplemented_kind`, `multi_memory_unsupported`); audit lineage surfaces `memory_provenance` entries (F10).
+
+Full suite: 8422 pass / 0 fail / 10 skip (+43 vs the S8 baseline of 8379).
+
+**Falsely positive review findings (documented for posterity):**
+
+- "Same-state pseudo-transition leaves drift between governance + eviction substrates" — by spec, `trigger_fired_no_action` rows in `eviction_events` are exactly the "we tried but didn't move state" audit signal. Pairing with a `rejected` governance row is two substrates honestly auditing two different aspects.
+- "Trust untrusted cwd lost between detector and apply" — concerns Phase 2 / S11 (subagent injection surface), not S8 substrate.
+
+## [2026-05-17] feat(memory) — S8 governance proposal substrate (Phase 2 opens)
+
+First slice of Phase 2 (`feat/memory-governance-llm`, branched off `feat/memory` after the Phase 1 merge). Lands the propose-not-mutate substrate every LLM-judge detector (S11 verify_failed, S13 conflict_detected) and the deterministic counter (S3 user_override_repeated) will hang off of. Zero LLM cost in S8 itself — this is the spine, not a detector.
+
+Shipped (T8.1 → T8.7):
+
+- **Migration 056** (renumbered from the TODO's draft 055 — that slot was already taken by `shared-corpus-trust` in Phase 1). Parent `memory_governance_proposals` with all six kinds in CHECK (`quarantine`, `restore`, `demote`, `merge`, `consolidate`, `expire`), UNIQUE partial index on `proposal_fingerprint WHERE status='pending'` for silent dedup, `source_memory_snapshots` JSON for the staleness gate. Auxiliary `memory_governance_proposal_keys` (FK CASCADE) is the per-memory index that backs `listProposalsForMemory` without JSON LIKE'ing into the parent column.
+
+- **Repo `src/storage/repos/memory-governance.ts`.** `recordProposal` validates kinds/scopes/snapshot bijection/confidence in `[0,1]`, computes the fingerprint (`SHA-256(kind, sorted source keys, evidence_essence)`), INSERTs parent + keys in one transaction, catches `SQLITE_CONSTRAINT` from the partial UNIQUE and returns the existing pending row's id with `deduped: true`. Listings (`listProposals`, `listPendingProposals`, `listProposalsForMemory`, `listPendingProposalsForMemory`) all take explicit limits; the JOIN-backed memory lookups serve the S11 pre-dispatch dedup guard cheaply. `decideProposal` is `status='pending'` gated + idempotent; `expirePendingProposals` is the bulk TTL sweep.
+
+- **Apply path `src/memory/governance.ts:applyProposal`.** Five sequential gates: existence + status, confidence (`DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD = 0.7`; NULL bypasses for operator/deterministic proposals), kind support (V1 implements `quarantine` + `restore`; other kinds reject with `system:unimplemented_kind`), single-memory only (multi-memory keys reserved for `merge` / `consolidate`), staleness (every snapshot must match the current `hashMemoryContent(serializeMemoryFile(file))`; drift wins over state_change in the rejection reason — if the operator edited the body since the proposal, the decision is "evidence stale" not "state changed"). After the gates pass, `transitionMemoryState` runs with `actor: 'user'` (operator approval IS the user action), motivo defaulted per kind (`quarantine → conflict`, `restore → shift`; `target_payload.motivo` overrides), trigger derived from `proposed_by` (`subagent:verify-semantic` → `verify_failed`, etc.) with `target_payload.trigger` override, and an evidence payload carrying `_operator_driven`, `proposal_id`, `proposed_by`, `proposal_fingerprint`, and `detector_evidence`. State-machine refusals (illegal_transition, blocked_by_protection, blocked_by_hook, invalid_evidence) all map to a rejection on the proposal with the matching reason; `io_error` and `audit_drift` leave the proposal pending so a retry can land cleanly.
+
+- **TTL sweep** wired in `bootstrap.ts` between `pruneMemoryProvenance` and the shared-corpus trust probe. Default `GOVERNANCE_PROPOSAL_TTL_MS = 30d`; sweep updates `status='expired'` with `decided_by='system:ttl'`. Best-effort with `AUDIT DRIFT` stderr on failure, same posture as the provenance sweep.
+
+- **Slash `/memory governance`** with five subcommands: `list [--status <s>] [--limit N]`, `show <id>`, `approve <id>` (modal confirm when affecting ≥3 memories), `reject <id> [--reason "..."]`, `audit <id>` (proposal detail + lineage from `memory_events` filtered by source scope/name + post-proposal timestamp). Strict arg validation refuses unknown flags / missing ids / extra positionals.
+
+- **`docs/MEMORY.md` §11.3** documents the substrate end-to-end: why a separate table (mutable status semantic doesn't fit append-only audit), the six kinds + what V1 actually executes, schema fields, the five apply-path gates, TTL semantics, operator surface, and what proposals deliberately do NOT do (mutate state without approval, bypass the state machine, replace direct `/memory quarantine` flows). §11 (tables) extended from 3 to 4. §14.4 "What IS shipped" lists the new slice and how it slots in front of S11/S13.
+
+- **TODO**: Slice 8 marked ✅ done with task-level state; dependency graph + recommended order updated; migration number correction noted (055 → 056).
+
+Test footprint: 67 new tests across three files — 27 (`tests/storage/memory-governance.test.ts`) cover the repo + schema CHECK + FK CASCADE; 16 (`tests/memory/governance.test.ts`) cover the apply path end-to-end with real FS fixtures (pre-flight gates each exercised; happy quarantine path asserts on-disk frontmatter mutation + paired eviction_events row + trace fields; restore happy path; same-state pseudo-transition rejected as state_change; hook fires when wired; `target_payload.motivo` override); 24 (`tests/cli/slash/memory.test.ts`) cover the five subcommands + arg validation + dispatcher errors.
+
+Full suite: 8379 pass / 0 fail / 10 skip (+84 vs the Phase 1 baseline of 8295).
+
+Phase 2 remainder (S3, S11, S13) can ship in any order on top of S8; LLM-judge slices add the injection-aware subagent infrastructure on top of the foundation that landed here.
+
 ## [2026-05-17] fix(memory) — Filter excluded scopes before applying search limit
 
 Review observation: `createScopeFilteredRegistry.search` post-filtered hits AFTER `base.search` returned. The base loop enforces `limit` while iterating in precedence order (`project_local` > `project_shared` > `user`); when `project_shared` was excluded and `limit` was small (e.g., 1), the shared match was picked first, filled the cap, and stopped the loop before any allowed-scope sibling was considered. The wrapper then dropped the shared hit and returned `[]` — silently losing the permitted memory. Same precedence-fallback bug pattern the previous `ListOptions.excludeScopes` fix addressed for `list`, just on the search surface.
