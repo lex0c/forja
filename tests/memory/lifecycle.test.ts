@@ -251,9 +251,15 @@ describe('findExpiredMemories', () => {
     writeBody(roots.projectLocal, 'future', { expires: '2030-01-01' });
     writeBody(roots.projectLocal, 'none');
     const reg = createMemoryRegistry({ roots });
-    const expired = findExpiredMemories(reg, new Date(Date.UTC(2026, 4, 4)));
-    const names = expired.map((e) => e.name).sort();
-    expect(names).toEqual(['past', 'today']);
+    // End-of-day cutoff (matches `isExpired` in expires.ts): a
+    // memory `expires: 2026-05-04` stays valid through that day
+    // and crosses the cutoff at `2026-05-05 00:00 UTC`. So on
+    // `2026-05-04 00:00 UTC` only 'past' has crossed.
+    const onTheDay = findExpiredMemories(reg, new Date(Date.UTC(2026, 4, 4)));
+    expect(onTheDay.map((e) => e.name).sort()).toEqual(['past']);
+    // At the start of the NEXT day, 'today' is past its cutoff.
+    const nextDay = findExpiredMemories(reg, new Date(Date.UTC(2026, 4, 5)));
+    expect(nextDay.map((e) => e.name).sort()).toEqual(['past', 'today']);
   });
 
   test('does not consider memories without expires', () => {

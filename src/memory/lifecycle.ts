@@ -5,6 +5,7 @@ import {
   OPERATOR_DRIVEN_EVIDENCE_MARKER,
   getLastInvalidationEventsBatch,
 } from '../storage/repos/eviction-events.ts';
+import { isExpired } from './expires.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
   IndexError,
@@ -275,44 +276,26 @@ export interface ExpiredMemory {
   source: string;
 }
 
-// Compare ISO date strings lex-wise. YYYY-MM-DD format makes
-// chronological order = lexicographical order, no Date object
-// needed.
+// Expiry comparison delegates to the canonical `isExpired`
+// predicate in `expires.ts`. An earlier shape did lex compare on
+// `YYYY-MM-DD` against today's ISO date and treated
+// `expires <= todayStr` as expired — that diverged from `isExpired`
+// (which uses end-of-day cutoff: `expires: 2026-05-04` stays valid
+// through that day, expires at `2026-05-05 00:00 UTC`). The
+// divergence meant GC could evict a memory up to 24h before
+// `/memory list` / retrieval filters considered it gone. Reusing
+// the predicate keeps every consumer aligned on the same cutoff.
 //
-// UTC trade-off — the spec's `expires: YYYY-MM-DD` carries no
-// timezone, so there's no canonical answer for "what does
-// 2026-05-04 mean across timezones?". Two viable choices:
-//
-//   A. Operator-local-TZ today: matches the operator's mental
-//      model when they typed the date. Drawback — a memory
-//      written by operator A in UTC-4 then booted by B in UTC+9
-//      sees different "today" values; the same memory expires on
-//      different boots depending on whose machine you're on.
-//   B. UTC today (chosen): stable across machines and timezones.
-//      Drawback — operator in UTC-4 setting `expires: 2026-05-04`
-//      based on local calendar may see the memory removed at
-//      ~20:00 local on 2026-05-03 (which is 00:00 UTC 2026-05-04).
-//      Up to 24h "early" relative to local-calendar expectation.
-//
-// We pick UTC because cross-machine determinism matters more than
-// last-day-of-life precision — operators who care about exact
-// timing can subtract a day when setting `expires:` (or wait for
-// `/memory expire` slash command to land with explicit TZ
-// handling). Audit row carries the literal `expires` string so
+// `expires.ts` already documents the UTC choice (cross-machine
+// determinism over last-day-of-life precision) and the end-of-day
+// semantics. Audit row carries the literal `expires` string so
 // "why did this disappear?" forensic queries get the operator's
-// original input, not the comparison date.
-const todayIso = (now: Date = new Date()): string => {
-  const yyyy = now.getUTCFullYear();
-  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(now.getUTCDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-};
-
+// original input.
 export const findExpiredMemories = (
   registry: MemoryRegistry,
   today: Date = new Date(),
 ): ExpiredMemory[] => {
-  const todayStr = todayIso(today);
+  const nowMs = today.getTime();
   const expired: ExpiredMemory[] = [];
   // Scan ALL listings (no dedupe) — each scope's expiry is
   // independent; an expired user-scope shadow should be removed
@@ -324,12 +307,7 @@ export const findExpiredMemories = (
     if (peek.kind !== 'present') continue;
     const expires = peek.file.frontmatter.expires;
     if (expires === undefined) continue;
-    // Lex compare on YYYY-MM-DD: equal-or-past today = expired.
-    // Spec doesn't define equality semantics; we expire on the
-    // boundary day so an operator's `expires: 2026-05-04` with
-    // boot on 2026-05-04 removes the memory the same day they
-    // expected it gone.
-    if (expires <= todayStr) {
+    if (isExpired(expires, nowMs)) {
       expired.push({
         scope: listing.scope,
         name: listing.name,
