@@ -292,6 +292,28 @@ describe('listProvenanceForToolCall', () => {
     const rows = listProvenanceForToolCall(db, sessionId, 'tool-1');
     expect(rows).toEqual([]);
   });
+
+  test('honors the limit (default 50, explicit narrower)', () => {
+    // Review regression: this function previously had no LIMIT
+    // clause and returned every matching row. The slash
+    // `/memory provenance --tool` path passed no limit, so high-
+    // volume tool calls flooded the operator's output. Now the
+    // default is 50 (matches listProvenanceForMemory) and a smaller
+    // explicit limit caps tighter.
+    const toolCallId = seedToolCall();
+    for (let i = 0; i < 60; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId,
+        memoryScope: 'user',
+        memoryName: `mem-${i}`,
+        surface: 'memory_read',
+        createdAt: 1000 + i,
+      });
+    }
+    expect(listProvenanceForToolCall(db, sessionId, toolCallId)).toHaveLength(50);
+    expect(listProvenanceForToolCall(db, sessionId, toolCallId, 5)).toHaveLength(5);
+  });
 });
 
 describe('listProvenanceForMemory', () => {
@@ -402,6 +424,44 @@ describe('listExposuresInRetrieval', () => {
     });
     const rows = listExposuresInRetrieval(db, sessionId, qid);
     expect(rows.map((r) => r.memoryName)).toEqual(['top', 'mid', 'tail']);
+  });
+
+  test('honors the limit (default 50, explicit narrower)', async () => {
+    // Review regression: this function previously had no LIMIT
+    // clause and returned every matching row. The slash
+    // `/memory provenance --retrieval` path passed no limit, so a
+    // retrieval that touched a large corpus could flood operator
+    // output. Now the default is 50 (matches the rest of the repo)
+    // and a smaller explicit limit caps tighter.
+    const { createRetrievalTrace } = await import('../../src/storage/repos/retrieval-trace.ts');
+    const trace = createRetrievalTrace(db, {
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: { searchMs: 0, expandMs: 0, rankMs: 0, compressMs: 0 },
+    });
+    const qid = trace.id;
+    const toolCallId = seedToolCall('retrieve_context');
+    for (let i = 0; i < 60; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId,
+        memoryScope: 'user',
+        memoryName: `mem-${i}`,
+        surface: 'retrieve_context',
+        retrievalQueryId: qid,
+        positionInCorpus: i,
+        createdAt: 1000 + i,
+      });
+    }
+    expect(listExposuresInRetrieval(db, sessionId, qid)).toHaveLength(50);
+    expect(listExposuresInRetrieval(db, sessionId, qid, 5)).toHaveLength(5);
   });
 });
 

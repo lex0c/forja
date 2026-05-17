@@ -831,7 +831,7 @@ const handleProvenance = (ctx: SlashContext, args: string[]): SlashResult => {
           '/memory provenance --tool: needs an active session (tool_call ids are session-scoped)',
       };
     }
-    rows = listProvenanceForToolCall(ctx.db, sessionId, flags.toolCallId as string);
+    rows = listProvenanceForToolCall(ctx.db, sessionId, flags.toolCallId as string, flags.limit);
     header = `exposures during tool_call ${(flags.toolCallId as string).slice(0, 8)}`;
   } else {
     // retrieval mode
@@ -842,7 +842,12 @@ const handleProvenance = (ctx: SlashContext, args: string[]): SlashResult => {
           '/memory provenance --retrieval: needs an active session (retrieval_query ids are session-scoped)',
       };
     }
-    rows = listExposuresInRetrieval(ctx.db, sessionId, flags.retrievalQueryId as string);
+    rows = listExposuresInRetrieval(
+      ctx.db,
+      sessionId,
+      flags.retrievalQueryId as string,
+      flags.limit,
+    );
     header = `exposures from retrieval ${(flags.retrievalQueryId as string).slice(0, 8)} (position order)`;
   }
 

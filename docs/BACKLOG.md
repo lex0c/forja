@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(slash) — Enforce --limit for tool/retrieval provenance queries
+
+Review observation: `/memory provenance` parsed `--limit` (default 50) but only honored it on the name mode (`listProvenanceByName` / `listGlobalProvenanceByName` took the limit). The `--tool` and `--retrieval` paths called `listProvenanceForToolCall` and `listExposuresInRetrieval` with no limit parameter — the SQL had no `LIMIT` clause, and every row matching the tool_call_id or retrieval_query_id rendered. For a high-volume session (many memory_read / retrieve_context exposures during one turn, or a retrieval over a large corpus) the slash flooded the terminal with hundreds of lines. Behavior contradicted the flag contract; operators expected `--limit` to cap uniformly.
+
+Fix: append an optional `limit = 50` parameter to both repo functions (matching `listProvenanceByName` / `listProvenanceForMemory` signature shape) and a `LIMIT ?` in the SQL. Thread `flags.limit` through the two call sites in `slash/commands/memory.ts`. Other callers (tests, retrieve-context spec) don't pass a limit and pick up the default — no behavior change there.
+
+Repo-level regression tests in `tests/storage/memory-provenance.test.ts`: for each of `listProvenanceForToolCall` and `listExposuresInRetrieval`, seed 60 rows, assert the default returns exactly 50 and an explicit `limit: 5` returns 5.
+
+Slash-level regression tests in `tests/cli/slash/memory.test.ts`: `provenance --tool <id> --limit 3` over 8 seeded rows returns header + 3 = 4 notes; same shape for `--retrieval`. Pre-fix both would have returned header + all 8 = 9 notes.
+
+Tests: 8296 pass (+4), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(harness) — Gate eager provenance on full inventory, not any row
 
 Review observation: the resume guard in `harness/loop.ts` asked `hasEagerProvenance(db, sessionId)` — "does ANY eager row exist for this session?" — and skipped the entire emit if it returned true. Combined with the best-effort per-row write (try/catch around `recordProvenance`, AUDIT-DRIFT stderr on failure), a transient `SQLITE_BUSY` or other write failure mid-loop could leave the session in a partial state: one or more rows landed, the rest didn't. The next resume saw "some rows exist, skip", and the missing exposures stayed missing forever — even after the DB recovered. The provenance accuracy that whole T1.4 emit was added to provide gets silently broken for that session's lifetime.

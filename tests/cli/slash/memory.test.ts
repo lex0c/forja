@@ -2506,6 +2506,71 @@ describe('/memory provenance (S1/T1.6)', () => {
     // Header line + 3 rows = 4 notes.
     expect(r.notes).toHaveLength(4);
   });
+
+  test('--tool honors --limit (regression — was unbounded)', async () => {
+    // Review fix: pre-fix the --tool path ignored --limit and
+    // rendered every row the repo returned. With high-volume tool
+    // calls (many memory_read / retrieve_context exposures during
+    // one tool turn) that floods the slash output. Now --limit
+    // caps just like the name mode.
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId);
+    for (let i = 0; i < 8; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: tc,
+        memoryScope: 'user',
+        memoryName: `mem-${i}`,
+        surface: 'memory_read',
+        createdAt: 1000 + i,
+      });
+    }
+    const r = await memoryCommand.exec(['provenance', '--tool', tc, '--limit', '3'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    // Header line + 3 rows = 4 notes. Pre-fix this would have been
+    // 9 notes (header + all 8 rows).
+    expect(r.notes).toHaveLength(4);
+  });
+
+  test('--retrieval honors --limit (regression — was unbounded)', async () => {
+    // Symmetric regression for the --retrieval path.
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    const tc = seedToolCall(db, sessionId, 'retrieve_context');
+    const trace = createRetrievalTrace(db, {
+      sessionId,
+      queryText: 'q',
+      workflow: 'default',
+      queryType: 'semantic',
+      budgetTokens: 100,
+      candidatesRaw: [],
+      candidatesExpanded: [],
+      candidatesRanked: [],
+      contextSlot: { included: [], skipped: [] },
+      timings: { searchMs: 0, expandMs: 0, rankMs: 0, compressMs: 0 },
+    });
+    for (let i = 0; i < 8; i++) {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: tc,
+        memoryScope: 'user',
+        memoryName: `mem-${i}`,
+        surface: 'retrieve_context',
+        retrievalQueryId: trace.id,
+        positionInCorpus: i,
+        createdAt: 1000 + i,
+      });
+    }
+    const r = await memoryCommand.exec(
+      ['provenance', '--retrieval', trace.id, '--limit', '3'],
+      ctx,
+    );
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(r.notes).toHaveLength(4);
+  });
 });
 
 describe('/memory conflicts (S4/T4.4)', () => {

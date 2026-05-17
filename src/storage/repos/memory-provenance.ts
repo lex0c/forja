@@ -257,14 +257,16 @@ export const listProvenanceForToolCall = (
   db: DB,
   sessionId: string,
   toolCallId: string,
+  limit = 50,
 ): MemoryProvenanceRow[] => {
   const rows = db
-    .query<MemoryProvenanceDbRow, [string, string]>(
+    .query<MemoryProvenanceDbRow, [string, string, number]>(
       `${SELECT_ALL}
         WHERE session_id = ? AND tool_call_id = ?
-        ORDER BY created_at DESC, id DESC`,
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
     )
-    .all(sessionId, toolCallId);
+    .all(sessionId, toolCallId, limit);
   return rows.map(fromRow);
 };
 
@@ -324,14 +326,16 @@ export const listExposuresInRetrieval = (
   db: DB,
   sessionId: string,
   retrievalQueryId: string,
+  limit = 50,
 ): MemoryProvenanceRow[] => {
   const rows = db
-    .query<MemoryProvenanceDbRow, [string, string]>(
+    .query<MemoryProvenanceDbRow, [string, string, number]>(
       `${SELECT_ALL}
         WHERE session_id = ? AND retrieval_query_id = ?
-        ORDER BY position_in_corpus ASC, id DESC`,
+        ORDER BY position_in_corpus ASC, id DESC
+        LIMIT ?`,
     )
-    .all(sessionId, retrievalQueryId);
+    .all(sessionId, retrievalQueryId, limit);
   return rows.map(fromRow);
 };
 
