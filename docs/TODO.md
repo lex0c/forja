@@ -159,9 +159,9 @@ Foundational table + repo + approval flow. No LLM yet — this is the determinis
 
 **Acceptance met:** operator runs `/memory governance list` and sees pending proposals. `approve <id>` applies via `transitionMemoryState`; row status flips to `applied`, `decided_at` + `decided_by` set, `eviction_events` row carries `proposal_id` trace field. Pending proposals expire silently after 30d via boot sweep. No memory state mutates without explicit approval — every transition driven by S8 carries an `operator:slash` (or equivalent) `decided_by` on the proposal AND an `actor='user'` on the eviction_events row.
 
-## Slice 11 — Semantic verify_failed (LLM-judge primary path)
+## Slice 11 — Semantic verify_failed (LLM-judge primary path) · ✅ DONE
 
-THE detector for factual contradiction in memory subsystem. S2's heuristic was rolled back; LLM-judge is the only path. Routes factual memories (`type: project` or `reference`) through a sandboxed subagent that does semantic verification with FS tools (read_file, grep, memory_read).
+THE detector for factual contradiction in memory subsystem. Shipped on `feat/memory-governance-llm`. S2's heuristic was rolled back; LLM-judge is the only path. Routes factual memories (`type: project` or `reference`) through a sandboxed subagent that does semantic verification with FS tools (read_file, grep, memory_read).
 
 **Cost-bounded:** opt-in flag (`--memory-verify-llm` or policy), per-session dispatch cap + cost cap, content-hash + recency dedup so unchanged memories don't re-trigger. The cost discipline that S2's heuristic-first layering provided is now provided by these guardrails instead.
 
@@ -232,13 +232,13 @@ Phase 1 — substrate + audit family (NO text heuristics — policy decision)
 
 Phase 2 — LLM-judge governance (`feat/memory-governance-llm`)
   S8  (proposal substrate)        →  ✅ done, unblocks S3/S11/S13
-  S11 (LLM-judge verify_failed)   →  PRIMARY detector for factual drift; depends on S8
-  S13 (LLM-judge conflict)        →  depends on S8 + S4 audit substrate
+  S11 (LLM-judge verify_failed)   →  ✅ done, PRIMARY detector for factual drift
+  S13 (LLM-judge conflict)        →  depends on S8 + S4 audit substrate (uses S11 subagent infra)
   S10 (consolidation subagent)    →  depends on S8, deferred
   S12 (confidence separation)     →  independent, deferred
 ```
 
-Recommended order: **S0 ✅ → S1 ✅ → S2 🔁 → S6 ✅ → S4 ✅ → S5 ✅ → S7 ✅ → S8 ✅ → S3 / S11 / S13** (Phase 2 remainder; can ship in any order on top of S8).
+Recommended order: **S0 ✅ → S1 ✅ → S2 🔁 → S6 ✅ → S4 ✅ → S5 ✅ → S7 ✅ → S8 ✅ → S11 ✅ → S3 / S13** (Phase 2 remainder; can ship in any order on top of S8 + S11's subagent infra).
 
 Architectural commitment: zero text-heuristic for memory lifecycle decisions in this codebase. All prose judgment defers to LLM-judge via S8 governance proposals (propose-not-mutate; operator approves). Deterministic substrate (state machine, audit, frontmatter, hashing, expiry, scope precedence) stays.
 

@@ -54,6 +54,7 @@ import { migration053RetrievalTrace } from './053-retrieval-trace.ts';
 import { migration054MemoryProvenance } from './054-memory-provenance.ts';
 import { migration055SharedCorpusTrust } from './055-shared-corpus-trust.ts';
 import { migration056MemoryGovernanceProposals } from './056-memory-governance-proposals.ts';
+import { migration057MemoryVerifyAttempts } from './057-memory-verify-attempts.ts';
 
 export interface Migration {
   id: number;
@@ -118,4 +119,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration054MemoryProvenance,
   migration055SharedCorpusTrust,
   migration056MemoryGovernanceProposals,
+  migration057MemoryVerifyAttempts,
 ];

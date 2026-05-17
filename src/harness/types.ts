@@ -827,6 +827,16 @@ export interface HarnessConfig {
   // already excluded them — partial fail-closed. Absent / empty
   // = no exclusion.
   memoryExcludeScopes?: ReadonlyArray<import('../memory/index.ts').MemoryScope>;
+  // S11 opt-in for the LLM-judge semantic verifier (MEMORY.md §11.x /
+  // Phase 2). Default false ⇒ no LLM calls fire, no scheduler runs.
+  // When true: every step boundary polls memory_provenance for newly-
+  // exposed factual memories (type=project / reference) and dispatches
+  // the verify-semantic subagent (gated by cost / dispatch caps + the
+  // memory_verify_attempts dedup table). Operator opts in via
+  // `--memory-verify-llm` (CLI) or `[memory.verify].llm = true` (policy).
+  // Surfaced via `/memory governance status`. See `src/memory/verify-
+  // semantic.ts` for the constants + flow.
+  memorySemanticVerify?: boolean;
   // Inventory of memories that landed in the eager-load section
   // of the system prompt (MEMORY.md §11.2 — provenance, surface
   // 'eager'). Populated by the CLI bootstrap from

@@ -214,6 +214,23 @@ export type {
   RecordProposalResult,
 } from './repos/memory-governance.ts';
 
+export { listSessionExposuresSince } from './repos/memory-provenance.ts';
+
+export {
+  MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
+  SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
+  SEMANTIC_VERIFY_VERDICTS,
+  listRecentAttempts,
+  lookupRecentAttempt,
+  pruneVerifyAttempts,
+  recordAttempt,
+} from './repos/memory-verify-attempts.ts';
+export type {
+  MemoryVerifyAttemptRow,
+  RecordAttemptInput,
+  SemanticVerifyVerdict,
+} from './repos/memory-verify-attempts.ts';
+
 export {
   createHookRun,
   listHookRunsByEvent,

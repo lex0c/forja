@@ -23,7 +23,11 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
-import { createScopeFilteredRegistry } from '../memory/registry.ts';
+import { type MemoryRegistry, createScopeFilteredRegistry } from '../memory/registry.ts';
+import {
+  type SemanticVerifyScheduler,
+  createSemanticVerifyScheduler,
+} from '../memory/verify-semantic-scheduler.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -783,6 +787,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // so they don't mask the run's HarnessResult, and the DB is
   // converged via markRunningAsKilled inside cleanup() regardless of
   // whether the OS kill landed.
+  //
+  // S11 — declared outside the try so the outer finally can call
+  // .shutdown() on it. Constructed inside the try once sessionId is
+  // resolved (the scheduler captures it). Undefined when opt-in is
+  // off / definition unavailable / running as a subagent child.
+  let semanticVerifyScheduler: SemanticVerifyScheduler | undefined;
   try {
     try {
       // Resume vs new session. In resume mode, the prior session id
@@ -1037,6 +1047,61 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           },
         });
+      }
+
+      // S11 — semantic-verify scheduler (MEMORY.md §11.x). Created
+      // once per top-level session when the opt-in flag is set AND
+      // the verify-semantic definition is loaded. Top-level only:
+      // subagent children don't run their own scheduler (avoids
+      // recursive verification + their session has no
+      // memory_provenance trail meaningful for the detector).
+      //
+      // The scheduler captures runtime deps that don't exist
+      // outside the loop scope (provider, parentToolRegistry,
+      // permissionEngine), so creation lives here rather than in
+      // bootstrap. Lifecycle: poll() fires at each step boundary
+      // (end of the while(true) below); shutdown() drains in the
+      // outer finally.
+      // semanticVerifyScheduler is declared in the outer scope so
+      // the outer finally can shutdown() it even on early throw.
+      if (
+        config.memorySemanticVerify === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.subagentRegistry !== undefined
+      ) {
+        const verifyDef = config.subagentRegistry.byName.get('verify-semantic');
+        if (verifyDef !== undefined) {
+          semanticVerifyScheduler = createSemanticVerifyScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: verifyDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            // S5 mirror — when bootstrap excluded scopes via the
+            // shared-corpus trust gate, the scheduler honors the
+            // same posture so the verify-semantic subagent never
+            // sees bodies the operator marked untrusted.
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            // F9: forward parent-runtime envelope into each dispatch
+            // so the verify child runs under the parent's resolved
+            // verdicts (Ctrl-C, trust, hooks, capabilities) rather
+            // than defaults.
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_semantic_disabled: --memory-verify-llm set but verify-semantic definition not loaded\n',
+          );
+        }
       }
 
       // §13.6 degraded banner emitter (slice 92). One emitter per
@@ -3467,11 +3532,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             if (overage !== null) return await finish('maxCostUsd', overage);
           }
         }
+
+        // S11 — semantic-verify scheduler tick at step boundary
+        // (MEMORY.md §11.x / T11.9). Polls memory_provenance for new
+        // factual-memory exposures landed during this step and
+        // dispatches AT MOST one verification before the next
+        // provider call. Awaited (not fire-and-forget) so the
+        // dispatch's cost lands in the session totals before the
+        // next iteration's cost-cap check; tests pin the synchronous
+        // outcome. Best-effort: scheduler failures stderr-log inside
+        // its own implementation and never throw out.
+        if (semanticVerifyScheduler !== undefined) {
+          try {
+            await semanticVerifyScheduler.poll();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`memory: verify_semantic_poll_unhandled: ${redactSecrets(msg)}\n`);
+          }
+        }
       }
     } catch (e) {
       return await guardedFinish(e);
     }
   } finally {
+    // Shut down the semantic-verify scheduler first. Subsequent
+    // poll() calls no-op; any in-flight dispatch from the last
+    // poll already awaited above (the loop awaits per-step), so
+    // nothing remains in flight here. Idempotent — safe to call
+    // even when the scheduler was never created.
+    semanticVerifyScheduler?.shutdown();
     // Drain the lazy retention sweep BEFORE anything else in the
     // finally fires. The caller (cli/run.ts) is allowed to close the
     // DB right after runAgent returns; without this drain the purge

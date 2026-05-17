@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { projectAgentsDir, userAgentsDir } from './paths.ts';
+import { BUILTIN_AGENTS_DIR, projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
   ClarifyMode,
@@ -1002,6 +1002,11 @@ export interface LoadSubagentsOptions {
   userDir?: string | null;
   // Same shape for project scope. Defaults to <cwd>/.agent/agents.
   projectDir?: string | null;
+  // Built-in scope path. Defaults to `src/subagents/builtin/`
+  // (resolved at module load via import.meta.dir; see
+  // `paths.ts:BUILTIN_AGENTS_DIR`). Pass null to disable entirely
+  // (some tests don't want to depend on the shipped definitions).
+  builtinDir?: string | null;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -1025,13 +1030,23 @@ export interface SubagentSet {
   shadows: ShadowedDefinition[];
 }
 
-// Discover and parse every subagent definition under user + project
-// dirs. Project shadows user on name collision. Within a single
-// scope, duplicate names ARE an error — two files both claiming
-// `name: explore` in the same dir is a definition mistake, not a
-// shadow.
+// Discover and parse every subagent definition under builtin + user +
+// project dirs. Precedence: project > user > builtin on name
+// collision. Within a single scope, duplicate names ARE an error —
+// two files both claiming `name: explore` in the same dir is a
+// definition mistake, not a shadow.
+//
+// Shadow surfacing is asymmetric:
+//   - project shadowing user is reported (operator authored both;
+//     they want to know which won).
+//   - user OR project shadowing builtin is SILENT (operators
+//     intentionally override built-in behavior; surfacing every
+//     shadow on every boot would be noise — `verify-semantic` is
+//     the canonical override target).
 export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
   const env = options.env ?? process.env;
+  const builtinPath =
+    options.builtinDir === null ? null : (options.builtinDir ?? BUILTIN_AGENTS_DIR);
   const userPath = options.userDir === null ? null : (options.userDir ?? userAgentsDir(env));
   const projectPath =
     options.projectDir === null ? null : (options.projectDir ?? projectAgentsDir(options.cwd));
@@ -1055,15 +1070,45 @@ export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
     return out;
   };
 
+  const builtinDefs = loadScope(builtinPath, 'builtin');
   const userDefs = loadScope(userPath, 'user');
   const projectDefs = loadScope(projectPath, 'project');
 
   const byName = new Map<string, SubagentDefinition>();
-  for (const def of userDefs) byName.set(def.name, def);
+  for (const def of builtinDefs) byName.set(def.name, def);
   const shadows: ShadowedDefinition[] = [];
+  // PROTECTED builtins — shadowing these is allowed (the loader
+  // doesn't enforce uniqueness past name precedence) but ALWAYS
+  // surfaces as a shadow row so the operator sees that a project /
+  // user-scope file has replaced the shipped definition. The S11
+  // review surfaced the risk: a project shipping
+  // `.agent/agents/verify-semantic.md` with `tools: [bash,
+  // write_file]` silently replaces the safe built-in the moment the
+  // operator opts into `--memory-verify-llm` in that repo. Surfacing
+  // the shadow is defense-in-depth; the operator's trust modal +
+  // hooks chain are the actual enforcement.
+  const PROTECTED_BUILTINS: ReadonlySet<string> = new Set(['verify-semantic']);
+  for (const def of userDefs) {
+    const prior = byName.get(def.name);
+    if (prior !== undefined && prior.scope === 'builtin' && PROTECTED_BUILTINS.has(def.name)) {
+      shadows.push({ name: def.name, shadowed: prior, winning: def });
+    }
+    // user overrides builtin: shadow is silent for unprotected
+    // names (operator-authored shadows of generic built-ins are
+    // expected, not a warning surface).
+    byName.set(def.name, def);
+  }
   for (const def of projectDefs) {
     const prior = byName.get(def.name);
     if (prior !== undefined && prior.scope === 'user') {
+      // Operator authored both — surface so they see which won.
+      shadows.push({ name: def.name, shadowed: prior, winning: def });
+    } else if (
+      prior !== undefined &&
+      prior.scope === 'builtin' &&
+      PROTECTED_BUILTINS.has(def.name)
+    ) {
+      // Project shadow of a protected built-in — always loud.
       shadows.push({ name: def.name, shadowed: prior, winning: def });
     }
     byName.set(def.name, def);

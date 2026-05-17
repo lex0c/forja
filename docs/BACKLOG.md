@@ -2,6 +2,122 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(memory) — S11 LLM-judge post-review (critical + high + med + test gaps)
+
+Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 18 findings on S11 after the slice landed. All 18 closed in this pass.
+
+**Critical fixes:**
+
+- **F1 — ship `verify-semantic.md`.** The `.md` definition that the entire S11 detector depends on was missing from disk — the file `Write` call earlier in the session silently failed (extraneous params on the tool invocation). `loadSubagents` never found the definition; harness emitted `verify_semantic_disabled` on every opt-in boot. Feature was a silent no-op in production. Wrote the file (90 lines, 5.3KB) + smoke test that `loadSubagents` resolves the canonical shape (`scope: 'builtin'`, tools whitelist, budget caps).
+
+- **F2 — scheduler honors `memoryExcludeScopes`.** Pre-fix, the scheduler received the unwrapped `config.memoryRegistry` and peeked + dispatched `project_shared` bodies even when the bootstrap's S5 shared-corpus trust probe had marked the scope offline. Direct security regression — fail-open path bypassing the trust gate. Added `memoryExcludeScopes` to scheduler deps; filtered candidates at the dedupe stage (cheap string check, no peek for excluded scopes); threaded `config.memoryExcludeScopes` through the harness loop. Cursor still advances past excluded candidates so they're not re-considered (trust verdict for the session is stable).
+
+- **F3 — cost cap per-dispatch headroom.** Cap was checked BEFORE dispatch with cost added AFTER — a single expensive dispatch could blow the session budget by an arbitrary overage. Added headroom check: `counters.costUsdSpent + SEMANTIC_VERIFY_SUBAGENT_MAX_COST_USD > maxCost` latches the cap. The subagent's declared budget (0.10 USD) is the worst case under spec; a dispatch that respects its declared budget always fits.
+
+- **F4 — fix intra-poll dedupe out-of-order.** Cenário `(foo @1000, bar @2000, foo @3000)`: pre-fix tracking `seen.set(key, max(prior, createdAt))` advanced cursor to `foo`'s latest sighting (3000) after dispatch, dropping `bar @2000` forever. Switched to `Set<string>` (first-sight only) and advance cursor only past the dispatched candidate's first createdAt — `foo @3000` re-emits next poll (where it dedup-hits cheaply in the dispatcher) but `bar @2000` survives.
+
+- **F5 — sub-threshold contradicted records auto-rejected proposal.** TODO T11.7 was explicit: sub-threshold contradicted verdicts auto-archive as `status=rejected, decidedBy=system:low_confidence`. Pre-fix only recorded an attempt; operator forensic via `/memory governance list --status rejected` was blind. Now records the proposal with the full evidence shape, then immediately decides it as `rejected` with the threshold gate in the `decided_reason`.
+
+**High fixes:**
+
+- **F6 — builtin loader compile-safe (documented).** `import.meta.dir` in `bun build --compile` resolves to a virtual `/$bunfs/` path that `readdirSync` cannot enumerate — built-ins effectively lost in compile mode. Documented the limitation in `src/subagents/paths.ts` header. Operator-facing surface (the existing `verify_semantic_disabled` stderr line in the harness loop) flags the gap loudly when opt-in is set without a resolvable definition. Compile-safe distribution via TS const embedding deferred — tracked as a follow-up since a real fix needs Bun text imports / asset embedding investigation.
+
+- **F7 — shadow guard for protected builtins.** Pre-fix, project-scope `.agent/agents/verify-semantic.md` silently replaced the safe built-in — a malicious repo opting an operator into bash/write_file tools the moment they enable `--memory-verify-llm`. Added a `PROTECTED_BUILTINS` set (`verify-semantic` for now). User AND project shadows of protected builtins ALWAYS surface in the `shadows` array — the existing CLI surface emits these on boot so the operator sees the override. Unprotected built-ins keep the silent-override semantic.
+
+- **F8 — hallucination guard verifies `evidence_paths` exist.** Pre-fix only checked `paths.length > 0`; a clever subagent emitting `evidence_paths: ['fake/file.ts']` satisfied the guard and quarantined real memories on the operator's auto-rejected path. Added `fs.existsSync(join(cwd, p))` per path with absolute-path rejection and `cwd` boundary check (refuses path traversal). Contradicted verdict with any bogus path → `malformed`.
+
+- **F9 — thread `runSubagent` context fields.** Pre-fix dispatcher omitted `softStopSignal`, `cwdTrusted`, `sharedScopeOffline`, `hooksSnapshot`, `effectiveCapabilities` when calling `runSubagent` — operator Ctrl-C didn't interrupt the spawn, trust-gated tools degraded, S5 fail-closed posture was lost, hooks drift window opened. Added fields to scheduler deps + dispatcher input; threaded from `config.softStopSignal` / `config.isCwdTrusted` / `config.hooks` in the harness loop wire-up. `sharedScopeOffline` mirrored from `memoryExcludeScopes` per-candidate.
+
+- **F10 — wire `pruneVerifyAttempts` at boot.** Pre-fix the retention sweep was exported but never called; `memory_verify_attempts` would grow unbounded. Mirrored the existing `pruneMemoryProvenance` sweep in `bootstrap.ts` with the same AUDIT DRIFT stderr posture.
+
+- **F11 — TOCTOU body re-read inside dispatcher.** Operator edit between scheduler peek and dispatcher hash left a stale snapshot — `scanForInjection` + content hash + attempts row landed against bytes whose underlying file no longer existed. Added optional `registry` to `DispatchSemanticVerifyInput`; when present, the dispatcher re-peeks BEFORE scan and refuses the dispatch with `{kind: 'skipped', reason: 'stale_snapshot'}` if the canonical serialization diverged. Scheduler always passes registry. Next poll re-evaluates against the fresh body.
+
+- **F12 — refuse `--memory-verify-llm` in subagent context.** Pre-fix, the flag was accepted unconditionally; a `.envrc`-injected flag in a subagent-child invocation would silently be a no-op (the harness loop's `subagentDepth > 0` guard prevents scheduler creation but doesn't surface to the operator). Now `parseArgs` rejects the combination at the args layer — same discipline `--subagent-shared-scope-offline` already had.
+
+**Med fixes:**
+
+- **F13 — `peek=malformed` emits stderr.** Pre-fix the scheduler silently skipped memories whose frontmatter was corrupt. Now emits `memory: verify_semantic_peek_malformed` so the operator sees the corruption signal.
+
+- **F14 — sanitize scheduler/dispatcher stderr.** Memory names + model_ids + error strings could embed ANSI escapes that repaint the operator's terminal (same shape S8 review caught for other surfaces). All six `stderr(...)` call sites now route through `sanitizeOneLineForDisplay`; the harness loop's `verify_semantic_poll_unhandled` line goes through `redactSecrets`.
+
+- **F15 — state filter in scheduler.** Already-`quarantined` / `invalidated` / `evicted` memories were re-verified on every step, wasting LLM budget on outcomes the lifecycle had already decided. Now skipped with cursor advance.
+
+- **F16 — strip unimplemented policy hint.** `/memory governance status` said "no (default; pass --memory-verify-llm or set policy)" but `[memory.verify].llm` policy was never parsed. Stripped the misleading "or set policy" — opt-in is CLI-flag only in V1.
+
+- **F17 — `verify_skipped` stderr line.** TODO T11.2 promised it; pre-fix silent. Now emits `memory: verify_skipped: <scope>/<name>: injection_detected | stale_snapshot` so opt-in operators see WHY the judge never fires on a memory they expected verified.
+
+- **F18 — `recordAttempt` FK race protection.** Concurrent session purge could delete the child's `subagent_runs` row between `runSubagent` returning and the attempt INSERT — the FK threw `SQLITE_CONSTRAINT_FOREIGNKEY`. Now caught + retried with `subagentRunSessionId: null` so the dedup cache entry still lands (forensic detail about the run is lost, but the cache value matters more for the next dispatch).
+
+**Test footprint:** +15 tests across four files.
+
+- `tests/memory/verify-semantic-scheduler.test.ts` (+5): F2 excluded-scope skip, F4 out-of-order dedupe regression, F13 peek=malformed stderr, F15 quarantined skip, F17 verify_skipped emission.
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+2): F8 non-existent path → malformed, F8 absolute path → malformed.
+- `tests/subagents/load.test.ts` (+5 in new `loadSubagents (S11 builtin scope)` describe): builtin loads from real ship dir, builtinDir=null disables, project shadow of protected builtin surfaces, user shadow of protected builtin surfaces, user shadow of unprotected builtin stays silent.
+- `tests/cli/args.test.ts` (+3): `--memory-verify-llm` parses, defaults undefined, F12 conflict with `--subagent-session-id` rejected.
+
+Plus the pre-existing dispatcher / scheduler / repo test files updated where the new behavior changed assertions (the F5 sub-threshold test re-pinned to expect a `rejected` proposal landed, F3 cost cap test arithmetic adjusted for the headroom-aware threshold).
+
+Full suite: **8484 pass / 0 fail / 10 skip** (+15 vs S11 baseline of 8469, +62 vs S8 baseline of 8422).
+
+**Falsely-positive review findings (documented for posterity):**
+
+- "Parallel-poll race within one session" — confirmed not possible (loop single-threaded + await sequential).
+- "Cost cap when result.costUsd === 0 allows infinite dispatches" — dispatch counter increments regardless, so dispatch cap bounds zero-cost loops.
+
+**Deferred (tracked):**
+
+- Compile-safe builtin distribution via TS const embedding (F6 partial). Today's loader works in dev mode; compiled binaries need either Bun text imports or an embedded-definition fallback. The runtime-side surface emits a loud `verify_semantic_disabled` stderr when opt-in is set without a resolvable definition.
+
+## [2026-05-17] feat(memory) — S11 LLM-judge `verify_failed` detector
+
+Second slice of Phase 2 on `feat/memory-governance-llm`. The S2 heuristic was rolled back months ago; until S11, `verify_failed` lived as a trigger name + audit filter with no detector behind it. This slice ships the actual detection pipeline: a sandboxed subagent reads the repository and decides whether each exposed factual memory still agrees with the code.
+
+**Auto-trigger, opt-in.** `--memory-verify-llm` defaults off (zero LLM cost in default-driver sessions). When the operator opts in, the harness loop runs a scheduler tick at each step boundary — polls `memory_provenance` for newly-exposed `type: project` / `reference` memories, dispatches AT MOST ONE verification per poll through the gate sequence below.
+
+Shipped (T11.1 → T11.13):
+
+- **Migration 057** `memory_verify_attempts` (`src/storage/migrations/057-memory-verify-attempts.ts`). Content-addressed cross-session dedup cache. Schema: `(scope, name, content_hash, verdict, confidence, model_id, prompt_hash, subagent_run_session_id, attempted_at)`. Verdict CHECK + confidence CHECK + indexes for `(scope, name, content_hash, attempted_at DESC)` dedup queries and `(attempted_at)` retention. FK `subagent_run_session_id → subagent_runs(session_id) ON DELETE SET NULL` (subagent_runs PKs on session_id, not on a separate id column — initial draft used the wrong column and broke every FK test until corrected mid-slice).
+
+- **Repo `memory-verify-attempts.ts`.** `recordAttempt` validates the input shape (scope, verdict, confidence range, non-empty model/prompt hashes); `lookupRecentAttempt` enforces the dedup semantic — `contradicted` ALWAYS re-dispatches (high-stakes; cheap re-confirmation), `passed` / `inconclusive` dedup for 7d (`SEMANTIC_VERIFY_DEDUP_WINDOW_MS`); `listRecentAttempts` for `/memory governance status`; `pruneVerifyAttempts` for the 90d retention sweep.
+
+- **HarnessConfig flag + CLI plumbing.** `memorySemanticVerify?: boolean` on `HarnessConfig` (default off; subagent children don't inherit — top-level only, avoids recursive verification). `--memory-verify-llm` argv flag in `args.ts`, threaded through `bootstrap.ts` into the config.
+
+- **Tunables in `src/memory/verify-semantic.ts`.** `SEMANTIC_VERIFY_MIN_CONFIDENCE = 0.7`, `MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION = 10`, `MEMORY_VERIFY_SEMANTIC_MAX_COST_USD = 0.50`, `SEMANTIC_VERIFY_ELIGIBLE_TYPES = ['project', 'reference']`. Constants live in a substrate module so `/memory governance status`, tests, and policy all share one import surface.
+
+- **Built-in subagent loader.** New `src/subagents/builtin/` directory + `loadBuiltinSubagents` flow inside `loadSubagents`. Precedence: project > user > builtin (user/project override built-ins SILENTLY — the shadow surfacing pattern reserved for user/project conflicts where the operator authored both). `SubagentScope` extended to include `'builtin'`; the storage-side `subagent_runs.scope` CHECK still constrains `('user','project')`, so `runtime.ts` maps `'builtin' → 'user'` when inserting the audit row (documented as inherited drift; widening the CHECK is a separate migration).
+
+- **`verify-semantic.md` definition** (`src/subagents/builtin/verify-semantic.md`). Tools: `read_file`, `grep`, `glob`, `memory_read` (read-only — no writes, no bash). Output schema: `{verdict, confidence, claim_extracted, ground_truth_observed, evidence_paths}`. Budget: `max_steps: 15, max_cost_usd: 0.10`. System prompt frames the memory body as adversarial input, requires honest calibration of confidence, and rejects contradicted verdicts that omit evidence_paths (hallucination guard).
+
+- **Dispatcher core** (`src/memory/verify-semantic-dispatcher.ts`). Five-step per-memory orchestrator: (1) `scanForInjection` short-circuits BEFORE the spawn (hostile bytes never reach the judge); (2) `lookupRecentAttempt` short-circuits BEFORE the spawn (content-addressed dedup); (3) `runSubagent` with the verify-semantic definition; (4) `parseOutputAsObject` + JSON-schema validation (verdict enum / confidence range / contradicted-requires-evidence_paths); (5) `recordAttempt` always (suppresses re-dispatch within the dedup window), AND only when `verdict === 'contradicted' AND confidence >= SEMANTIC_VERIFY_MIN_CONFIDENCE` does it emit a `quarantine` governance proposal via S8 (with stable evidence-essence so two contradictions collide on the partial UNIQUE fingerprint).
+
+- **Scheduler** (`src/memory/verify-semantic-scheduler.ts`). Created once per top-level session when opt-in is set AND the verify-semantic definition resolved. `poll()` queries `listSessionExposuresSince(cursorAt)`, dedups by (scope, name), and walks candidates applying the gate sequence: cost / dispatch cap latch (`capExhausted`), type gate (only project / reference), pending-proposal short-circuit (skips memories with an active quarantine proposal — saves the LLM cost since the fingerprint UNIQUE index would refuse the INSERT anyway), then dispatch. ONE real dispatch per poll (single-shot keeps the per-step LLM cost predictable). Cursor advances incrementally per consumed candidate so unprocessed siblings survive into the next poll; counters.lastPolledAt always advances per poll attempt regardless.
+
+- **Wire-up in `src/harness/loop.ts`.** Scheduler instance declared in the outer try scope, constructed once after `sessionId` resolves, polled at end of each step iteration (after compaction's cost cap check; before next iteration's signal/cap checks), shutdown in the outer finally. Subagent children skip creation (`config.subagentDepth ?? 0 === 0` guard) — no recursive verification, no scheduler ticks inside the verify-semantic child itself.
+
+- **`/memory governance status` subcommand** (`src/cli/slash/commands/memory.ts:handleGovernanceStatus`). Read-only inspector: shows enabled state, configured caps, dedup window, last 10 attempts cross-session (model + verdict + confidence + scope/name). The slash can't reach the live scheduler instance, so counters come from `listRecentAttempts` — operator reconstructs "what the verifier has been doing" from substrate, not in-memory state.
+
+- **Provenance helper** `listSessionExposuresSince` (`src/storage/repos/memory-provenance.ts`). Cross-session exposures since a timestamp cutoff; the scheduler's primary query.
+
+- **Subagent storage scope mapping.** `runtime.ts:insertSubagentRun` maps `definition.scope === 'builtin' → 'user'` so the migration-012 CHECK constraint (`scope IN ('user','project')`) doesn't reject built-in subagent rows. Documented as inherited drift; widening the CHECK is a separate spec amendment.
+
+**Test footprint:** +47 tests across three new files + one extension.
+
+- `tests/storage/memory-verify-attempts.test.ts` (+21): repo validation, DB CHECK bypass coverage (verdict / confidence / attempted_at), dedup semantics (contradicted always re-dispatches, window boundary exclusive, content_hash discrimination, windowMs override), `listRecentAttempts` ordering + limit, `pruneVerifyAttempts` cutoff semantics.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+10): injection pre-check short-circuits BEFORE spawn, dedup cache hit short-circuits BEFORE spawn, malformed YAML / hallucination guard / spawn_failed mapping, `runSubagent` throws → spawn_failed, passed verdict = attempt only, contradicted high-confidence = attempt + proposal, contradicted low-confidence = attempt only, two contradicted dispatches collapse to one pending proposal via fingerprint dedup.
+
+- `tests/memory/verify-semantic-scheduler.test.ts` (+13): undefined definition / shutdown / no exposures no-op, type gate (user/feedback rejected, project/reference accepted), pending-quarantine-proposal short-circuit, one dispatch per poll with two eligible memories, intra-poll dedupe by (scope, name), dispatch cap fires + latches, cost cap fires + latches, lastPolledAt advances per poll.
+
+- `tests/cli/slash/memory.test.ts` (+3): `/memory governance status` disabled by default + caps rendering + empty hint, enabled state, unexpected arg refused.
+
+Full suite: **8469 pass / 0 fail / 10 skip** (+47 vs S8 baseline of 8422).
+
+**What S11 does NOT do (deferred):**
+
+- **Consolidation** (N similar memories → 1). Subagent infrastructure built here is the building block for Slice 10; the consolidation prompt + flow lands separately.
+- **Conflict detection between memories** (pairwise). Slice 13 — different subagent (`verify-conflict.md`), pair-selection scheduler with BM25 prefilter to avoid O(N²) dispatch.
+- **Drift detection across time** (memory written 90 days ago, codebase migrated since). Requires cross-session subagent infrastructure that doesn't exist today.
+
 ## [2026-05-17] hardening(memory) — S8 governance post-review (critical + medium + test gaps)
 
 Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 12 real findings on S8 after the initial slice landed. All closed in this pass.

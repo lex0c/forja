@@ -46,3 +46,21 @@ export const userAgentsDir = (
 
 export const projectAgentsDir = (cwd: string): string =>
   pathMod(process.platform).join(cwd, '.agent', 'agents');
+
+// Built-in subagent definitions ship inside the binary at
+// `src/subagents/builtin/`. Returned as an absolute path computed at
+// module-load time via `import.meta.dir`. Dev runs (`bun run dev`)
+// resolve to the source path directly. Compiled binaries
+// (`bun build --compile`) instead surface a virtual `/$bunfs/...`
+// path that `readdirSync` cannot enumerate — meaning built-ins are
+// effectively LOST in compile mode under the current loader. The
+// harness loop emits `verify_semantic_disabled` when an opt-in
+// flag is set without a resolvable definition, so the operator
+// surface flags the gap loudly instead of silently no-opping.
+//
+// Compile-safe distribution is tracked as deferred work
+// (`docs/TODO.md` — embedded builtin definitions via TS const +
+// loader fallback). Until that ships, S11 in compiled binaries
+// requires the operator to ship a user / project shadow of
+// `verify-semantic.md` to substitute the built-in.
+export const BUILTIN_AGENTS_DIR = pathMod(process.platform).join(import.meta.dir, 'builtin');

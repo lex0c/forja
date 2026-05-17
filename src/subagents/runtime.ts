@@ -531,7 +531,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     insertSubagentRun(input.db, {
       sessionId: childSession.id,
       name: definition.name,
-      scope: definition.scope,
+      // The storage schema (migration 012) constrains scope to
+      // ('user','project') via CHECK. Built-in definitions land
+      // here under their nearest analogue — `user` — because the
+      // operator-facing equivalence is "this was a definition the
+      // operator could have overridden in their user scope". A
+      // future schema migration to widen the CHECK can drop this
+      // mapping; until then the audit row records `user` and the
+      // forensic readers cross-reference the registry to learn
+      // the definition was actually shipped from `builtin/`.
+      scope: definition.scope === 'builtin' ? 'user' : definition.scope,
       sourcePath: definition.sourcePath,
       sourceSha256: definition.sourceSha256,
       systemPrompt: definition.systemPrompt,

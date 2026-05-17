@@ -322,6 +322,32 @@ export const listProvenanceByName = (
 // is a UUID that's effectively unguessable, but we still take it
 // for the symmetric API shape (also helps slash commands surface
 // it under the right session context).
+// All exposures in a session since a timestamp cutoff. Used by the
+// S11 semantic-verify scheduler to poll new exposures between step
+// boundaries; the scheduler tracks its own lastPolledAt and feeds it
+// here. ORDER BY created_at ASC so the scheduler processes oldest-
+// first (closer to user-facing turn order than DESC).
+//
+// Cutoff is EXCLUSIVE: a row at exactly `sinceMs` is NOT returned —
+// the next poll's `sinceMs = lastSeen.createdAt` won't re-emit the
+// same row. Returns empty array when no new exposures landed.
+export const listSessionExposuresSince = (
+  db: DB,
+  sessionId: string,
+  sinceMs: number,
+  limit = 200,
+): MemoryProvenanceRow[] => {
+  const rows = db
+    .query<MemoryProvenanceDbRow, [string, number, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ? AND created_at > ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?`,
+    )
+    .all(sessionId, sinceMs, limit);
+  return rows.map(fromRow);
+};
+
 export const listExposuresInRetrieval = (
   db: DB,
   sessionId: string,

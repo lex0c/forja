@@ -171,6 +171,14 @@ export interface ParsedArgs {
   // which case the child also doesn't run its own probe — the
   // memory subsystem is already set up for the parent's scope).
   subagentSharedScopeOffline?: boolean;
+  // S11 opt-in (MEMORY.md §11.x). Enables the LLM-judge semantic
+  // verifier: at each step boundary the scheduler polls memory_provenance
+  // for newly-exposed factual memories and dispatches the
+  // verify-semantic subagent (gated by cost/dispatch caps + dedup
+  // table). Default off ⇒ no LLM cost, no scheduler running. Forwarded
+  // to subagent children so spawned children also opt in if the parent
+  // does.
+  memoryVerifyLlm?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -1520,6 +1528,15 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.subagentSharedScopeOffline = true;
         i += 1;
         break;
+      case '--memory-verify-llm':
+        // Presence-only opt-in for the LLM-judge semantic verifier
+        // (S11). Default off; operator MUST type the flag to enable
+        // because dispatches cost LLM tokens. Cost + dispatch caps
+        // in MEMORY_VERIFY_SEMANTIC_MAX_* constants throttle the
+        // spend even with the flag on.
+        args.memoryVerifyLlm = true;
+        i += 1;
+        break;
       case '--subagent-temperature': {
         const value = argv[i + 1];
         if (value === undefined) {
@@ -1665,6 +1682,19 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     return {
       ok: false,
       message: '--ipc is an internal flag and requires --subagent-session-id',
+    };
+  }
+  // S11 review F12: `--memory-verify-llm` is a top-level operator
+  // opt-in for the LLM-judge semantic verifier. Subagent children
+  // never run their own scheduler (avoids recursive verification),
+  // so the flag has no effect there and would only confuse the
+  // operator who set it via .envrc or similar. Reject early so the
+  // misconfiguration surfaces at parse time.
+  if (args.memoryVerifyLlm === true && args.subagentSessionId !== undefined) {
+    return {
+      ok: false,
+      message:
+        '--memory-verify-llm is a top-level flag and conflicts with --subagent-session-id (subagent children do not run the verify scheduler)',
     };
   }
   return { ok: true, args };

@@ -3518,6 +3518,40 @@ describe('/memory governance — additional approve rejection reasons', () => {
   });
 });
 
+describe('/memory governance status (S11)', () => {
+  test('renders disabled state by default + caps + empty attempts hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('semantic-verify (S11');
+    expect(text).toContain('enabled:             no');
+    expect(text).toContain('confidence floor');
+    expect(text).toContain('max dispatches/sess');
+    expect(text).toContain('max cost/sess');
+    expect(text).toContain('dedup window');
+    expect(text).toContain('none recorded yet');
+  });
+
+  test('renders enabled state when memorySemanticVerify=true on baseConfig', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    (ctx.baseConfig as { memorySemanticVerify?: boolean }).memorySemanticVerify = true;
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    expect((r.notes ?? []).join('\n')).toContain('enabled:             yes');
+  });
+
+  test('refuses unexpected arg', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status', 'bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unexpected arg 'bogus'");
+  });
+});
+
 describe('/memory governance audit — F10 provenance lineage', () => {
   test('lineage surfaces memory_provenance entries since proposal', async () => {
     const repo = makeTmp();

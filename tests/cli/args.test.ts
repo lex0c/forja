@@ -1078,4 +1078,29 @@ describe('--broker (§13.7 mode flag, slice 87)', () => {
     expect(r.message).toContain("'in-process' or 'spawn'");
     expect(r.message).toContain('magic');
   });
+
+  // ── S11 review (F12 + flag plumbing) ────────────────────────────
+
+  test('--memory-verify-llm parses as a presence-only opt-in', () => {
+    const r = parseArgs(['--memory-verify-llm', 'do', 'thing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBe(true);
+    expect(r.args.prompt).toBe('do thing');
+  });
+
+  test('--memory-verify-llm defaults to undefined when omitted', () => {
+    const r = parseArgs(['hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBeUndefined();
+  });
+
+  test('--memory-verify-llm with --subagent-session-id is rejected (F12)', () => {
+    const r = parseArgs(['--subagent-session-id', 'child-id', '--memory-verify-llm', 'hello']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-verify-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
 });

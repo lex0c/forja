@@ -54,6 +54,10 @@ import {
   MEMORY_PROVENANCE_RETENTION_MS,
   pruneMemoryProvenance,
 } from '../storage/repos/memory-provenance.ts';
+import {
+  MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
+  pruneVerifyAttempts,
+} from '../storage/repos/memory-verify-attempts.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
@@ -140,6 +144,12 @@ export interface BootstrapInput {
   // binary mode is currently unsupported — bootstrap throws a
   // clear error when the worker source isn't on disk.
   brokerMode?: 'in-process' | 'spawn';
+  // S11 opt-in for the LLM-judge semantic verifier (MEMORY.md §11.x).
+  // Default false; threaded straight through to HarnessConfig.
+  // memorySemanticVerify. The CLI run.ts surfaces this from
+  // `args.memoryVerifyLlm`; programmatic callers (tests) pass it
+  // directly.
+  memorySemanticVerify?: boolean;
   // Shared-corpus trust modal callback (MEMORY.md §6.5.2
   // `trust_revoked` detector, S5/T5.2). Fired by `probeSharedTrust`
   // when the operator previously confirmed trust for this scope-
@@ -684,6 +694,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         `memory: AUDIT DRIFT: failed to expire pending governance proposals at boot (will retry next boot): ${redactSecrets(msg)}\n`,
       );
     }
+    // S11 verify-attempts retention sweep (MEMORY.md §11.x, S11/T11.10).
+    // Content-addressed dedup cache; rows older than 90d are dropped
+    // (the content_hash has almost certainly drifted past that point
+    // and the value of suppressing re-dispatch becomes negative).
+    // Best-effort same as the sister sweeps above.
+    try {
+      pruneVerifyAttempts(db, Date.now() - MEMORY_VERIFY_ATTEMPTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_verify_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
     // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2
     // `trust_revoked` detector). Runs ONLY when:
     //   - the operator supplied a callback (no TUI ⇒ no consent
@@ -975,6 +998,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
+    ...(input.memorySemanticVerify === true ? { memorySemanticVerify: true } : {}),
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.resumeFromSessionId !== undefined

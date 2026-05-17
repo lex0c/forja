@@ -1241,6 +1241,7 @@ describe('loadSubagents (directory discovery)', () => {
       cwd: workspace,
       userDir: join(workspace, 'no-user'),
       projectDir: join(workspace, 'no-project'),
+      builtinDir: null,
     });
     expect(set.byName.size).toBe(0);
     expect(set.shadows).toEqual([]);
@@ -1261,7 +1262,7 @@ describe('loadSubagents (directory discovery)', () => {
         'User-only review.',
       ),
     );
-    const set = loadSubagents({ cwd: workspace, userDir, projectDir });
+    const set = loadSubagents({ cwd: workspace, userDir, projectDir, builtinDir: null });
     expect(set.byName.size).toBe(2);
     expect(set.byName.get('explore')?.scope).toBe('project');
     expect(set.byName.get('explore')?.description).toBe('Project override.');
@@ -1288,7 +1289,12 @@ describe('loadSubagents (directory discovery)', () => {
     writeFile(join(dir, 'README.txt'), 'noise');
     mkdirSync(join(dir, 'nested-dir'), { recursive: true });
     writeFile(join(dir, 'nested-dir', 'inside.md'), VALID);
-    const set = loadSubagents({ cwd: workspace, userDir: dir, projectDir: null });
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: dir,
+      projectDir: null,
+      builtinDir: null,
+    });
     expect(set.byName.size).toBe(1);
     expect(set.byName.get('explore')?.sourcePath).toBe(join(dir, 'explore.md'));
   });
@@ -1296,8 +1302,93 @@ describe('loadSubagents (directory discovery)', () => {
   test('userDir=null disables the user scope entirely', () => {
     const projectDir = join(workspace, '.agent', 'agents');
     writeFile(join(projectDir, 'explore.md'), VALID);
-    const set = loadSubagents({ cwd: workspace, userDir: null, projectDir });
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: null,
+      projectDir,
+      builtinDir: null,
+    });
     expect(set.byName.get('explore')?.scope).toBe('project');
     expect(set.shadows).toEqual([]);
+  });
+});
+
+// ── post-S11 review (F1 + F7): built-in scope loading ────────────
+
+describe('loadSubagents (S11 builtin scope)', () => {
+  test('verify-semantic builtin loads from the real ship dir', () => {
+    // Uses the production BUILTIN_AGENTS_DIR. Pinned to catch
+    // regressions where the file moves / renames / gets removed.
+    const set = loadSubagents({ cwd: workspace, userDir: null, projectDir: null });
+    const def = set.byName.get('verify-semantic');
+    expect(def).toBeDefined();
+    expect(def?.scope).toBe('builtin');
+    expect(def?.tools).toEqual(['read_file', 'grep', 'glob', 'memory_read']);
+    expect(def?.budget.maxSteps).toBe(15);
+    expect(def?.budget.maxCostUsd).toBeCloseTo(0.1);
+    expect(def?.isolation).toBe('none');
+    expect(set.shadows).toEqual([]);
+  });
+
+  test('builtinDir=null disables the scope entirely', () => {
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: null,
+      projectDir: null,
+      builtinDir: null,
+    });
+    expect(set.byName.size).toBe(0);
+  });
+
+  test('project shadow of a protected builtin (verify-semantic) surfaces a shadow row', () => {
+    const projectDir = join(workspace, '.agent', 'agents');
+    writeFile(
+      join(projectDir, 'verify-semantic.md'),
+      VALID.replace('name: explore', 'name: verify-semantic').replace(
+        'Read-only codebase exploration.',
+        'malicious override.',
+      ),
+    );
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: null,
+      projectDir,
+    });
+    // Project wins by precedence.
+    expect(set.byName.get('verify-semantic')?.scope).toBe('project');
+    // Shadow surfaces (loud) — operator sees it on boot.
+    expect(set.shadows.some((s) => s.name === 'verify-semantic')).toBe(true);
+    const shadow = set.shadows.find((s) => s.name === 'verify-semantic');
+    expect(shadow?.shadowed.scope).toBe('builtin');
+    expect(shadow?.winning.scope).toBe('project');
+  });
+
+  test('user shadow of a protected builtin (verify-semantic) also surfaces', () => {
+    const userDir = join(workspace, 'user-agents');
+    writeFile(
+      join(userDir, 'verify-semantic.md'),
+      VALID.replace('name: explore', 'name: verify-semantic'),
+    );
+    const set = loadSubagents({ cwd: workspace, userDir, projectDir: null });
+    expect(set.byName.get('verify-semantic')?.scope).toBe('user');
+    expect(set.shadows.some((s) => s.name === 'verify-semantic')).toBe(true);
+  });
+
+  test('user shadow of an UNprotected builtin stays silent', () => {
+    // Synthesize an "unprotected" builtin by loading from a custom
+    // builtinDir; user override should not appear in shadows[].
+    const builtinDir = join(workspace, 'fake-builtin');
+    writeFile(join(builtinDir, 'helper.md'), VALID.replace('name: explore', 'name: helper'));
+    const userDir = join(workspace, 'user-agents');
+    writeFile(
+      join(userDir, 'helper.md'),
+      VALID.replace('name: explore', 'name: helper').replace(
+        'Read-only codebase exploration.',
+        'user override.',
+      ),
+    );
+    const set = loadSubagents({ cwd: workspace, userDir, projectDir: null, builtinDir });
+    expect(set.byName.get('helper')?.scope).toBe('user');
+    expect(set.shadows.some((s) => s.name === 'helper')).toBe(false);
   });
 });

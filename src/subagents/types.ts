@@ -30,7 +30,16 @@ export interface SubagentBudget {
   maxWallClockMs?: number;
 }
 
-export type SubagentScope = 'user' | 'project';
+// Subagent definition scopes:
+//   - 'builtin' — ships with the binary (`src/subagents/builtin/`).
+//     Loaded last so user and project can shadow by name. Operators
+//     can opt out of a builtin entirely by writing a same-name file
+//     to their project or user scope (the loader's shadow surface
+//     stays SILENT for builtin shadows — they're expected; surfacing
+//     them on every boot would be noise for every install).
+//   - 'user' — `~/.config/agent/agents/`. Shadows builtin.
+//   - 'project' — `.agent/agents/` in the cwd. Shadows user + builtin.
+export type SubagentScope = 'builtin' | 'user' | 'project';
 
 // Isolation strategy declared by the subagent author. Spec §11.2:
 // `none` (default) runs the child in the parent's working tree with

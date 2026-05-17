@@ -44,6 +44,12 @@ import {
   setSharedTrust,
   transitionMemoryState,
 } from '../../../memory/index.ts';
+import {
+  MEMORY_VERIFY_SEMANTIC_MAX_COST_USD,
+  MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION,
+  SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
+  SEMANTIC_VERIFY_MIN_CONFIDENCE,
+} from '../../../memory/verify-semantic.ts';
 import { sanitizeOneLineForDisplay } from '../../../sanitize/ansi.ts';
 import type { DB } from '../../../storage/db.ts';
 import {
@@ -76,6 +82,7 @@ import {
   listProvenanceByName,
   listProvenanceForToolCall,
 } from '../../../storage/repos/memory-provenance.ts';
+import { listRecentAttempts } from '../../../storage/repos/memory-verify-attempts.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 // ─── scope arg helpers ───────────────────────────────────────────────
@@ -2742,6 +2749,56 @@ const handleGovernanceAudit = (ctx: SlashContext, args: string[]): SlashResult =
   return { kind: 'ok', notes: lines };
 };
 
+const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult => {
+  if (args.length > 0) {
+    return {
+      kind: 'error',
+      message: `/memory governance status: unexpected arg '${displayGov(args[0] as string)}' (no flags or positionals supported)`,
+    };
+  }
+  // The scheduler instance (and thus its live counters) lives inside
+  // the harness loop scope; the slash can't reach it. We surface what
+  // we CAN see substrate-side: opt-in state, configured caps, and a
+  // recent-attempts summary read from memory_verify_attempts (cross-
+  // session — the table has no session_id column by design).
+  const enabled = ctx.baseConfig.memorySemanticVerify === true;
+  const lines: string[] = [];
+  lines.push('semantic-verify (S11 / LLM-judge):');
+  lines.push(
+    `  enabled:             ${enabled ? 'yes (--memory-verify-llm)' : 'no (default; pass --memory-verify-llm to opt in)'}`,
+  );
+  lines.push(
+    `  confidence floor:    ${SEMANTIC_VERIFY_MIN_CONFIDENCE.toFixed(2)} (proposals below floor auto-archived)`,
+  );
+  lines.push(`  max dispatches/sess: ${MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION}`);
+  lines.push(`  max cost/sess:       $${MEMORY_VERIFY_SEMANTIC_MAX_COST_USD.toFixed(2)}`);
+  const dedupDays = Math.round(SEMANTIC_VERIFY_DEDUP_WINDOW_MS / (24 * 60 * 60 * 1000));
+  lines.push(
+    `  dedup window:        ${dedupDays}d (passed/inconclusive; contradicted always re-dispatches)`,
+  );
+  let recent: ReturnType<typeof listRecentAttempts>;
+  try {
+    recent = listRecentAttempts(ctx.db, 10);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    lines.push(`  recent attempts:     (read failed: ${displayGov(msg)})`);
+    return { kind: 'ok', notes: lines };
+  }
+  if (recent.length === 0) {
+    lines.push('  recent attempts:     (none recorded yet)');
+    return { kind: 'ok', notes: lines };
+  }
+  lines.push(`  recent attempts (most-recent first, showing ${recent.length}):`);
+  for (const a of recent) {
+    const ts = formatGovernanceTimestamp(a.attemptedAt);
+    const conf = a.confidence.toFixed(2);
+    lines.push(
+      `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.memoryScope)}/${displayGov(a.memoryName)} · ${displayGov(a.modelId)}`,
+    );
+  }
+  return { kind: 'ok', notes: lines };
+};
+
 const handleGovernance = async (
   registry: MemoryRegistry,
   ctx: SlashContext,
@@ -2751,7 +2808,8 @@ const handleGovernance = async (
   if (sub === undefined) {
     return {
       kind: 'error',
-      message: '/memory governance: subcommand required (try: list, show, approve, reject, audit)',
+      message:
+        '/memory governance: subcommand required (try: list, show, approve, reject, audit, status)',
     };
   }
   const rest = args.slice(1);
@@ -2766,10 +2824,12 @@ const handleGovernance = async (
       return handleGovernanceReject(ctx, rest);
     case 'audit':
       return handleGovernanceAudit(ctx, rest);
+    case 'status':
+      return handleGovernanceStatus(ctx, rest);
     default:
       return {
         kind: 'error',
-        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, audit)`,
+        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, audit, status)`,
       };
   }
 };
