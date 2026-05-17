@@ -170,36 +170,6 @@ export const EMPTY_CORPUS_HASH = createHash('sha256')
   .update('forja:no-shared-corpus')
   .digest('hex');
 
-// File-level summary captured alongside the fingerprint. Used by
-// `recomputeSharedFingerprintIfStale` as the fast-path key — if every
-// file's `(size, mtimeMs)` matches the snapshot, the bytes are
-// assumed unchanged and the cached hash is returned without re-
-// reading. mtime alone isn't enough (touch(1) without content change
-// would invalidate the cache for nothing); size alone isn't enough
-// (same-size content edit slips through); the pair gives a cheap
-// approximation that's correct in the operator-doesn't-write-mid-
-// modal case and conservatively falls back to a full re-hash
-// otherwise.
-//
-// SECURITY: this is a PERFORMANCE OPTIMIZATION, not a trust signal.
-// An attacker who can write to disk can also `utimes(2)` mtimes to
-// match an old snapshot. The fast-path is only safe because the
-// fingerprint that anchors it was computed from raw bytes (which
-// the attacker would have to also leave untouched to slip through).
-// `recomputeSharedFingerprintIfStale` falls back to full hashing on
-// any deviation — the worst case under attack is "we re-hash and
-// detect drift", same as the pre-cache behavior.
-export interface CorpusFileStat {
-  name: string;
-  size: number;
-  mtimeMs: number;
-}
-
-export interface CorpusSnapshot {
-  hash: string;
-  files: readonly CorpusFileStat[];
-}
-
 // Compute a deterministic SHA-256 fingerprint of the shared corpus
 // rooted at `sharedRoot` (typically the path returned by
 // `projectScopeRoots(repoRoot).shared`). Returns `null` only if a
@@ -207,29 +177,23 @@ export interface CorpusSnapshot {
 // caller MUST treat null as "could not verify trust" (fail-closed
 // — re-prompt) rather than "no change".
 //
+// Always reads every body. A prior (size, mtime) stat-compare
+// fast-path was removed because it could pass a same-size content
+// swap with restored mtime (utimes(2), or filesystems whose 1-2s
+// mtime granularity makes a same-second rewrite invisible). The
+// probe's confirm step calls this twice — once before the modal
+// (presented hash) and once after a 'yes' (TOCTOU re-verify) —
+// and stamps trust on what we re-verify, so it MUST hash bytes.
+//
 // Performance note: shared corpora are bounded by spec (§5.4 caps
 // each body at SHARED_BODY_LINE_CAP=200 lines, ~10KB; operator-
 // curated lists rarely exceed a few dozen entries). Synchronous
 // readSync is appropriate at this scale — boot-time blocking <1ms
 // in practice, dwarfed by SQLite migration cost.
 export const computeSharedFingerprint = (sharedRoot: string): string | null => {
-  const snap = computeSharedFingerprintWithSnapshot(sharedRoot);
-  return snap === null ? null : snap.hash;
-};
-
-// Variant returning the fingerprint AND the per-file (size, mtime)
-// tuple used by `recomputeSharedFingerprintIfStale` to skip a full
-// re-hash when nothing on disk changed. The probe (P1/F1) calls
-// this once and threads the snapshot into its `verifyConfirmedHash`
-// step — saves 1 corpus read on the operator-clicks-yes path
-// without weakening TOCTOU detection (any stat-pair mismatch falls
-// back to full re-hash).
-export const computeSharedFingerprintWithSnapshot = (sharedRoot: string): CorpusSnapshot | null => {
   const listing = listSharedCorpusFiles(sharedRoot);
   if (listing.kind === 'unreadable') return null;
-  if (listing.kind === 'absent') {
-    return { hash: EMPTY_CORPUS_HASH, files: [] };
-  }
+  if (listing.kind === 'absent') return EMPTY_CORPUS_HASH;
 
   const hash = createHash('sha256');
   // Domain separator. Without this, a future caller that hashes
@@ -237,15 +201,10 @@ export const computeSharedFingerprintWithSnapshot = (sharedRoot: string): Corpus
   // with corpus hashes. Cheap insurance.
   hash.update('forja:shared-corpus:v1\n');
 
-  const files: CorpusFileStat[] = [];
   for (const { name } of listing.files) {
     let body: Buffer;
-    let mtimeMs: number;
     try {
       body = readFileSync(join(sharedRoot, name));
-      // lstatSync to read mtime without following symlinks (which
-      // listSharedCorpusFiles already rejected, but defensive).
-      mtimeMs = lstatSync(join(sharedRoot, name)).mtimeMs;
     } catch {
       // Skip transient disappearances between listing and read. A
       // persistent read failure on a single body (e.g., EACCES)
@@ -267,71 +226,9 @@ export const computeSharedFingerprintWithSnapshot = (sharedRoot: string): Corpus
     hash.update('\n');
     hash.update(body);
     hash.update('\n');
-    files.push({ name, size: body.length, mtimeMs });
   }
 
-  return { hash: hash.digest('hex'), files };
-};
-
-// Fast-path re-verification (P1/F1 hardening). Re-stats every file
-// in `snapshot.files`; if (size, mtime) tuples ALL match AND the
-// current listing has no additional files, returns the snapshot
-// unchanged (no bytes re-read). On ANY deviation — new file,
-// missing file, size mismatch, mtime change — falls back to a
-// full `computeSharedFingerprintWithSnapshot`.
-//
-// Why this is safe even against a TOCTOU attacker: the attacker
-// who edits content between the original fingerprint and the
-// verify call changes mtime (writes update it) and likely size;
-// the fast-path detects both and re-hashes. The attacker who
-// `utimes(2)`s to match the snapshot's mtime AND keeps size
-// identical would slip through — but that requires a same-size
-// content swap, which is the same vulnerability the original
-// (cache-free) fingerprint had: identical-bytes-but-different-
-// meaning evades hashing regardless of fast-path. The cache adds
-// no security weakness.
-export const recomputeSharedFingerprintIfStale = (
-  sharedRoot: string,
-  snapshot: CorpusSnapshot,
-): CorpusSnapshot | null => {
-  const listing = listSharedCorpusFiles(sharedRoot);
-  if (listing.kind === 'unreadable') return null;
-  if (listing.kind === 'absent') {
-    // Disagreement: snapshot says corpus had files, current state
-    // says nothing. Fast-path can't return snapshot unchanged.
-    if (snapshot.files.length === 0) return snapshot;
-    return computeSharedFingerprintWithSnapshot(sharedRoot);
-  }
-  // Build a name → stat map from the listing to compare against
-  // snapshot.files. Both sides are sorted lexicographically by
-  // `listSharedCorpusFiles`, so we can walk in lockstep — but a
-  // map lookup is more resilient to spurious sort drifts and lets
-  // us detect added files cheaply.
-  const currentByName = new Map<string, CorpusFileStat>();
-  for (const f of listing.files) {
-    let mtimeMs: number;
-    try {
-      mtimeMs = lstatSync(join(sharedRoot, f.name)).mtimeMs;
-    } catch {
-      // Transient — fall back to full re-fingerprint.
-      return computeSharedFingerprintWithSnapshot(sharedRoot);
-    }
-    currentByName.set(f.name, { name: f.name, size: f.bytes, mtimeMs });
-  }
-  if (currentByName.size !== snapshot.files.length) {
-    return computeSharedFingerprintWithSnapshot(sharedRoot);
-  }
-  for (const cached of snapshot.files) {
-    const cur = currentByName.get(cached.name);
-    if (cur === undefined) {
-      return computeSharedFingerprintWithSnapshot(sharedRoot);
-    }
-    if (cur.size !== cached.size || cur.mtimeMs !== cached.mtimeMs) {
-      return computeSharedFingerprintWithSnapshot(sharedRoot);
-    }
-  }
-  // All stat tuples agree → trust the cached hash.
-  return snapshot;
+  return hash.digest('hex');
 };
 
 // Repository row shape. Mirrors the columns of

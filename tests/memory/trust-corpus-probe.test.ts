@@ -13,7 +13,15 @@
 // already-quarantined shared memories are skipped (not re-counted).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
@@ -541,13 +549,12 @@ describe('probeSharedTrust — third hardening pass (T1/T8/T15)', () => {
     expect(warnLines).toEqual([]);
   });
 
-  test('T8: TOCTOU sibling — same-body-rewrite inside modal stays reconfirmed', async () => {
-    // Sister test to the existing TOCTOU one. Pre-hardening this
-    // pass, `verifyConfirmedHash` re-reads bytes; post-F1 it does
-    // a stat-compare and falls back. Either way the contract is:
-    // if the bytes don't change (same size + same mtime OR
-    // matching hash), `kind === 'reconfirmed'`. A regression that
-    // returns drift unconditionally would fail HERE.
+  test('T8: TOCTOU sibling — no inside-modal write stays reconfirmed', async () => {
+    // The confirm path's contract: if the post-modal re-hash
+    // matches the pre-modal hash, return `reconfirmed`. The
+    // operator-visible drift here happens BEFORE the probe runs,
+    // and nothing changes during the modal window, so both reads
+    // see identical bytes.
     writeIndex(roots.projectShared, '- [A](a.md) — h\n');
     writeBody(roots.projectShared, 'a', 'baseline');
     const registry = createMemoryRegistry({ roots, db, cwd: repo });
@@ -561,20 +568,58 @@ describe('probeSharedTrust — third hardening pass (T1/T8/T15)', () => {
       registry,
       roots,
       sharedRoot: roots.projectShared,
+      askSharedTrust: async () => 'yes',
+    });
+    expect(result.kind).toBe('reconfirmed');
+  });
+
+  test('T8b: same-size content swap with restored mtime detected → deferred', async () => {
+    // Regression for the (size, mtime) fast-path footgun. A prior
+    // verifyConfirmedHash short-circuited when every file's
+    // (size, mtime) tuple matched the pre-modal snapshot — that
+    // missed a TOCTOU attacker who swapped same-size content and
+    // restored mtime via utimes(2). Same threat surfaces naturally
+    // on filesystems with coarse mtime granularity (FAT/exFAT,
+    // some network FS) where a same-second rewrite is invisible
+    // to stat. The confirm path MUST re-hash bytes — pin that
+    // here so the fast-path can't sneak back in.
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'aaaaaaaa');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    // Pre-probe drift so we enter the drift branch (presented
+    // hash differs from stored). Capture the body's stat AFTER
+    // this write — that's the (size, mtime) the probe will see
+    // when it computes the presented fingerprint.
+    writeBody(roots.projectShared, 'a', 'bbbbbbbb');
+    const presentedStat = lstatSync(join(roots.projectShared, 'a.md'));
+
+    const result = await probeSharedTrust({
+      db,
+      registry,
+      roots,
+      sharedRoot: roots.projectShared,
       askSharedTrust: async () => {
-        // Inside-modal write: SAME bytes as what the probe saw
-        // (the post-drift state). mtime updates, but content is
-        // identical → hash matches → reconfirmed.
-        // To force a same-content re-write that also matches the
-        // mtime captured at fingerprint time, we DON'T re-write at
-        // all here. (A fresh write would change mtime; the fast-
-        // path would fall through to a full hash that still
-        // matches, returning confirmed. Test pins the end-state
-        // either way.)
+        // Inside-modal TOCTOU: swap to a DIFFERENT same-size body
+        // and restore mtime to the presented stat. A stat-only
+        // fast-path would see (size, mtime) unchanged and stamp
+        // trust on bytes the operator never saw. Bytes-on-confirm
+        // rejects this.
+        writeBody(roots.projectShared, 'a', 'cccccccc');
+        utimesSync(join(roots.projectShared, 'a.md'), presentedStat.atime, presentedStat.mtime);
         return 'yes';
       },
     });
-    expect(result.kind).toBe('reconfirmed');
+    expect(result.kind).toBe('deferred');
+    if (result.kind === 'deferred') {
+      expect(result.cause).toBe('tocttou_during_prompt');
+    }
+    // Trust row UNCHANGED — still pinned to oldHash + original
+    // timestamp. Operator-confirmed an old state we can't trust.
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored?.lastConfirmedHash).toBe(oldHash);
+    expect(stored?.lastConfirmedAtMs).toBe(1000);
   });
 
   test('T15a: first-visit + cancel → deferred(modal_cancel)', async () => {

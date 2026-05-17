@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Rehash bytes on the trust-confirm path (reverts F1 fast-path)
+
+Review observation: `verifyConfirmedHash` short-circuited via `recomputeSharedFingerprintIfStale` when every file's `(size, mtimeMs)` matched the pre-modal snapshot. The header on `CorpusSnapshot` claimed this was security-neutral, but the threat model was wrong: an attacker who can write to disk can `utimes(2)` mtime back to the snapshot's value, and a same-second rewrite is naturally invisible on filesystems with coarse mtime granularity (FAT/exFAT, some network FS). In both cases a same-size content swap during the modal window would pass through as unchanged, and the probe would stamp `shared_corpus_trust` on bytes the operator never saw — the exact TOCTOU window `verifyConfirmedHash` is supposed to close.
+
+Fix: drop the fast path. `verifyConfirmedHash` now always re-hashes the corpus from bytes via `computeSharedFingerprint`. The pre-modal and post-modal computations both read every body; the second read is the same cost as the first (~<1ms at spec-bounded sizes per §5.4) and runs at most once per probe.
+
+Cleanup: removed the now-dead `recomputeSharedFingerprintIfStale` helper, the `computeSharedFingerprintWithSnapshot` variant, and the `CorpusSnapshot`/`CorpusFileStat` types. They existed solely to back the fast path; keeping them as exported but unused surface is an attractive nuisance that invites the same regression to be re-introduced elsewhere.
+
+Regression test (T8b): writes body X, captures its stat; pre-probe writes a different body of the same size; inside the modal swaps to a third same-size body and `utimesSync`-restores atime+mtime to the captured stat. A stat-only fast-path would see `(size, mtime)` unchanged and stamp; bytes-on-confirm detects drift, returns `deferred(tocttou_during_prompt)`, leaves the trust row pinned to the old hash + original timestamp. T8 commentary updated to drop the fast-path references.
+
+Side cleanup: ran `biome check --write` on `tests/memory/lifecycle.test.ts` to absorb formatting drift from `b5cf7be`. Pure mechanical reformat, no logic change.
+
+Tests: 8280 pass (+1 vs prior baseline of 8279), 10 skip, 0 fail.
+
 ## [2026-05-17] hardening(memory) — Third-round review (architecture + performance + test quality) closed
 
 Three more parallel reviewers (architecture quality, performance & boot-time cost, test coverage gaps) surfaced 18 issues after the second round. All 18 closed.

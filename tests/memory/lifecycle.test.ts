@@ -1177,9 +1177,10 @@ describe('gcStaleInvalidatedMemories (S5 CRIT/V1, EVICTION §7.1 7d window)', ()
     const eightDaysAgoMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
     writeIndex(roots.projectShared, '- [Stale](stale.md) — h\n');
     writeBody(roots.projectShared, 'stale', { state: 'invalidated', source: 'user_explicit' });
-    const { appendEvictionEvent, listEvictedDueForPurge } = require(
-      '../../src/storage/repos/eviction-events.ts',
-    );
+    const {
+      appendEvictionEvent,
+      listEvictedDueForPurge,
+    } = require('../../src/storage/repos/eviction-events.ts');
     appendEvictionEvent(db, {
       substrate: 'memory',
       objectId: 'stale',
@@ -1238,21 +1239,13 @@ describe('gcStaleInvalidatedMemories (S5 CRIT/V1, EVICTION §7.1 7d window)', ()
     const registry = createMemoryRegistry({ roots, db, sessionId, cwd: repo });
 
     // Pre-sweep, the registry sees `bygone` in project_shared.
-    expect(
-      registry
-        .list({ scope: 'project_shared' })
-        .map((l) => l.name),
-    ).toContain('bygone');
+    expect(registry.list({ scope: 'project_shared' }).map((l) => l.name)).toContain('bygone');
 
     const result = await gcStaleInvalidatedMemories(db, registry, roots);
     expect(result.evicted.map((m) => m.name)).toEqual(['bygone']);
 
     // Post-sweep, the registry must have reloaded — the listing
     // no longer carries `bygone`.
-    expect(
-      registry
-        .list({ scope: 'project_shared' })
-        .map((l) => l.name),
-    ).not.toContain('bygone');
+    expect(registry.list({ scope: 'project_shared' }).map((l) => l.name)).not.toContain('bygone');
   });
 });

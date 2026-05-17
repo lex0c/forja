@@ -111,14 +111,11 @@ import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import {
-  type CorpusSnapshot,
   EMPTY_CORPUS_HASH,
   type SharedTrustRow,
   computeSharedFingerprint,
-  computeSharedFingerprintWithSnapshot,
   getSharedTrust,
   listSharedCorpusFiles,
-  recomputeSharedFingerprintIfStale,
   setSharedTrust,
 } from './trust-corpus.ts';
 
@@ -421,33 +418,36 @@ const bulkInvalidateShared = async (
 //               cause.
 type PostConfirmCheck = { kind: 'confirmed' } | { kind: 'drift' };
 
-// P1/F1: takes the pre-modal `CorpusSnapshot` so the fast-path
-// (stat-compare) can skip re-reading bodies when nothing on disk
-// changed. Falls back to full re-fingerprint on any deviation;
-// no security weakening (see CorpusSnapshot header).
+// Always re-read every body and recompute the fingerprint from
+// bytes. A prior implementation took a pre-modal `CorpusSnapshot`
+// and short-circuited on matching `(size, mtime)` tuples — that
+// missed TOCTOU swaps that preserved size and restored mtime
+// (utimes(2), or coarse-mtime filesystems whose 1-2s mtime
+// granularity makes a same-second rewrite invisible). The confirm
+// path stamps trust on what we re-verify, so it MUST hash bytes.
+// The pre-modal `computeSharedFingerprint` is already a full read;
+// this second one is the same cost (~<1ms at spec-bounded corpus
+// sizes) and runs at most once per probe invocation.
 const verifyConfirmedHash = (
   input: ProbeSharedTrustInput,
-  presentedSnapshot: CorpusSnapshot,
+  presentedHash: string,
 ): PostConfirmCheck => {
-  const recomputed = recomputeSharedFingerprintIfStale(input.sharedRoot, presentedSnapshot);
+  const recomputed = computeSharedFingerprint(input.sharedRoot);
   if (recomputed === null) return { kind: 'drift' };
-  if (recomputed.hash !== presentedSnapshot.hash) return { kind: 'drift' };
+  if (recomputed !== presentedHash) return { kind: 'drift' };
   return { kind: 'confirmed' };
 };
 
 export const probeSharedTrust = async (
   input: ProbeSharedTrustInput,
 ): Promise<ProbeSharedTrustResult> => {
-  // P1/F1: compute the snapshot once. `verifyConfirmedHash` will
-  // re-use this snapshot's `(size, mtime)` per-file vector for a
-  // stat-only fast-path; only the post-bulk re-fingerprint
-  // (mandatory full recompute — frontmatter changed) reads bytes
-  // again.
-  const presented = computeSharedFingerprintWithSnapshot(input.sharedRoot);
-  if (presented === null) {
+  // Compute the pre-modal fingerprint from bytes. If the operator
+  // confirms, `verifyConfirmedHash` re-reads bytes once more to
+  // detect any TOCTOU swap during the prompt window.
+  const presentedHash = computeSharedFingerprint(input.sharedRoot);
+  if (presentedHash === null) {
     return { kind: 'verify_failed', sharedRoot: input.sharedRoot };
   }
-  const presentedHash = presented.hash;
 
   const stored: SharedTrustRow | null = getSharedTrust(input.db, input.sharedRoot);
 
@@ -476,7 +476,7 @@ export const probeSharedTrust = async (
       mode: 'first-visit',
     });
     if (answer === 'yes') {
-      const check = verifyConfirmedHash(input, presented);
+      const check = verifyConfirmedHash(input, presentedHash);
       if (check.kind === 'drift') {
         return { kind: 'deferred', hash: presentedHash, cause: 'tocttou_during_prompt' };
       }
@@ -532,7 +532,7 @@ export const probeSharedTrust = async (
   });
 
   if (answer === 'yes') {
-    const check = verifyConfirmedHash(input, presented);
+    const check = verifyConfirmedHash(input, presentedHash);
     if (check.kind === 'drift') {
       // P0/F3 TOCTOU: operator confirmed the hash they SAW, but the
       // corpus changed during the prompt window. Don't stamp the
