@@ -499,9 +499,21 @@ export const probeSharedTrust = async (
     // because each invalidated body has its frontmatter `state:`
     // field flipped. Recompute after bulk; stamp the actual final
     // state.
+    //
+    // PARTIAL-FAILURE GATE: stamp ONLY when every memory
+    // transitioned cleanly. If `failed.length > 0`, some active
+    // shared memories survived (io_error, illegal_transition,
+    // hook block, etc.). Stamping the new hash would let the
+    // next boot's `unchanged` path re-enable the scope and
+    // surface those survivors — exactly the content the operator
+    // explicitly rejected. Leave the trust row untouched (still
+    // null on first-visit) so the next boot fires the prompt
+    // again and the operator can retry.
     const { invalidated, failed } = await bulkInvalidateShared(input, presentedHash);
-    const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
-    setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
+    if (failed.length === 0) {
+      const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
+      setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
+    }
     return { kind: 'revoked', invalidated, failed };
   }
 
@@ -563,9 +575,19 @@ export const probeSharedTrust = async (
   // memories invalidated, some still active) — fires the modal
   // again; operator can re-revoke and the surviving actives get
   // a second chance.
+  //
+  // PARTIAL-FAILURE GATE (mirrors the first-visit-no path above):
+  // when `failed.length > 0`, leave the trust row pinned to its
+  // OLD hash. Surviving active shared memories (io_error,
+  // illegal_transition, hook block) would otherwise be re-
+  // exposed on the next boot's `unchanged` outcome. Keeping the
+  // old hash forces a drift re-prompt next boot so the operator
+  // can retry.
   const { invalidated, failed } = await bulkInvalidateShared(input, presentedHash);
-  const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
-  setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
+  if (failed.length === 0) {
+    const postRevokeHash = computeSharedFingerprint(input.sharedRoot) ?? presentedHash;
+    setSharedTrust(input.db, input.sharedRoot, postRevokeHash, input.now?.());
+  }
   return {
     kind: 'revoked',
     invalidated,

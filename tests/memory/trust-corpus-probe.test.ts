@@ -670,6 +670,77 @@ describe('probeSharedTrust — third hardening pass (T1/T8/T15)', () => {
       chmodSync(roots.projectShared, 0o755);
     }
   });
+
+  test('drift revoke with partial failure keeps trust row pinned to OLD hash', async () => {
+    // Partial-failure gate: when bulkInvalidateShared reports
+    // failures, the post-revoke stamp MUST be skipped. Otherwise
+    // surviving active memories would be re-exposed on the next
+    // boot's `unchanged` outcome, defeating the operator's
+    // explicit "no" answer.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+    const oldHash = computeSharedFingerprint(roots.projectShared) as string;
+    setSharedTrust(db, roots.projectShared, oldHash, 1000);
+    writeBody(roots.projectShared, 'a', 'tampered');
+
+    chmodSync(roots.projectShared, 0o500); // forces transition io_error
+    try {
+      const result = await probeSharedTrust({
+        db,
+        registry,
+        roots,
+        sharedRoot: roots.projectShared,
+        askSharedTrust: async () => 'no',
+      });
+      expect(result.kind).toBe('revoked');
+      if (result.kind === 'revoked') {
+        expect(result.failed.length).toBeGreaterThan(0);
+      }
+    } finally {
+      chmodSync(roots.projectShared, 0o755);
+    }
+    // Trust row UNCHANGED: still at the original oldHash + ts.
+    // Next boot will see drift again (because the body file still
+    // says state: active — the bulk failed to flip it) and the
+    // modal fires again, giving the operator a retry.
+    const stored = getSharedTrust(db, roots.projectShared);
+    expect(stored).not.toBeNull();
+    expect(stored?.lastConfirmedHash).toBe(oldHash);
+    expect(stored?.lastConfirmedAtMs).toBe(1000);
+  });
+
+  test('first-visit revoke with partial failure leaves trust row null', async () => {
+    // First-visit variant of the partial-failure gate. The trust
+    // row starts null; the gate must NOT stamp post-revoke when
+    // failures exist. Otherwise next boot's `unchanged` outcome
+    // would silently bless the (partially-revoked) state.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    writeIndex(roots.projectShared, '- [A](a.md) — h\n');
+    writeBody(roots.projectShared, 'a', 'body');
+    const registry = createMemoryRegistry({ roots, db, cwd: repo });
+
+    chmodSync(roots.projectShared, 0o500);
+    try {
+      const result = await probeSharedTrust({
+        db,
+        registry,
+        roots,
+        sharedRoot: roots.projectShared,
+        askSharedTrust: async () => 'no',
+      });
+      expect(result.kind).toBe('revoked');
+      if (result.kind === 'revoked') {
+        expect(result.failed.length).toBeGreaterThan(0);
+      }
+    } finally {
+      chmodSync(roots.projectShared, 0o755);
+    }
+    // Trust row REMAINS null — next boot fires first-visit modal
+    // again (corpus non-empty + no row) and operator can retry.
+    expect(getSharedTrust(db, roots.projectShared)).toBeNull();
+  });
 });
 
 describe('probeSharedTrust — Phase 1 hardening pass (P0/P1)', () => {
