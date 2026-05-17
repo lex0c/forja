@@ -1150,6 +1150,14 @@ export const gcStaleInvalidatedMemories = async (
       // row at `getLastInvalidationEvent`).
       evidence: { [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true },
       now: tickNow,
+      // Tombstone retention window per EVICTION.md §7.1 — without
+      // this, the resulting eviction_events row gets
+      // `purge_at = NULL`, and `listEvictedDueForPurge` filters
+      // `WHERE purge_at IS NOT NULL`, so tombstones from this
+      // sweep would accumulate indefinitely (never eligible for
+      // the `evicted → purged` GC). Matches `gcExpiredMemories`'
+      // identical stamp on its `quarantined → evicted` step.
+      purgeAt: perMemNow + MEMORY_TOMBSTONE_RETENTION_MS,
     });
 
     if (r.kind === 'applied') {
@@ -1158,6 +1166,19 @@ export const gcStaleInvalidatedMemories = async (
       failures.push({ memory: mem, reason: gcFailureReason(r, 'invalidated→evicted') });
     }
   }
+
+  // Snapshot reload — once at least one memory transitioned, the
+  // registry's cached listing carries entries that no longer have
+  // bodies on disk (transitionMemoryState moved them to
+  // `.tombstones/` and dropped the index row). Downstream callers
+  // in the same bootstrap pass — chiefly `assembleMemorySection` —
+  // walk `registry.list()` and treat peek-missing as "uncertain →
+  // include", which would surface just-evicted memories in the
+  // eager prompt. Reloading aligns the in-memory snapshot with
+  // the on-disk truth before any consumer reads it. Skipped when
+  // nothing transitioned (avoid the index-re-read cost when the
+  // sweep was a no-op).
+  if (evicted.length > 0) registry.reload();
 
   return { evicted, failures, orphans };
 };
