@@ -23,6 +23,7 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
+import { createScopeFilteredRegistry } from '../memory/registry.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -2553,6 +2554,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           spawnSubagentClosure = (args) => impl(args);
         }
 
+        // Scope-filtered registry for tool-facing surfaces. When the
+        // shared-corpus trust probe lands a non-confirmed outcome
+        // (verify_failed / deferred / revoked), bootstrap sets
+        // `memoryExcludeScopes: ['project_shared']`; without the
+        // wrapper, the tool context's `memoryRegistry` would still
+        // expose the unfiltered registry to memory_list /
+        // memory_read / memory_search, letting the model enumerate
+        // and read project_shared bodies under a fail-closed trust
+        // state — direct bypass of the trust gate that eager-load
+        // and retrieve_context already respect. Wrap once per run
+        // here so every tool invocation downstream sees the same
+        // filtered view; `retrieveContext` builds against the same
+        // wrapped registry below for surface symmetry.
+        const effectiveMemoryRegistry =
+          config.memoryRegistry !== undefined &&
+          config.memoryExcludeScopes !== undefined &&
+          config.memoryExcludeScopes.length > 0
+            ? createScopeFilteredRegistry(config.memoryRegistry, config.memoryExcludeScopes)
+            : config.memoryRegistry;
+
         const buildCtx = (tu: CollectedToolUse): ToolContext => ({
           signal,
           cwd: config.cwd,
@@ -2654,18 +2675,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               }
             }
           },
-          ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
+          ...(effectiveMemoryRegistry !== undefined
+            ? { memoryRegistry: effectiveMemoryRegistry }
+            : {}),
           // Retrieval subsystem runner (slice 4.9). Wired when the
           // memory registry is configured — db is always available
           // since harness can't run without it. retrieve_context
           // tool surfaces 'retrieval.unavailable' when this is
           // absent (headless / SDK runs without memory).
-          ...(config.memoryRegistry !== undefined
+          //
+          // Uses the same `effectiveMemoryRegistry` the tool ctx
+          // exposes, so the retrieval and direct-tool surfaces stay
+          // at parity on the trust posture (both filter excluded
+          // scopes; one couldn't legitimately bypass the other).
+          // `memoryExcludeScopes` still flows into the retrieval
+          // runner because the retrieval pipeline plumbs it
+          // separately (e.g., into the BM25 view's own filter
+          // path) — defense in depth: even if the wrapper missed
+          // something at some surface, the explicit memoryExcludeScopes
+          // there continues to enforce the same policy.
+          ...(effectiveMemoryRegistry !== undefined
             ? {
                 retrieveContext: buildRetrievalRunner({
                   db: config.db,
                   sessionId,
-                  memoryRegistry: config.memoryRegistry,
+                  memoryRegistry: effectiveMemoryRegistry,
                   ...(config.memoryExcludeScopes !== undefined &&
                   config.memoryExcludeScopes.length > 0
                     ? { memoryExcludeScopes: config.memoryExcludeScopes }

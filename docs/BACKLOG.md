@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(harness) — Enforce shared-scope block on all memory tools
+
+Review observation: when `memoryExcludeScopes` was set (shared trust probe → `verify_failed` / `deferred` / `revoked`), the harness wired `retrieve_context` against the exclusion correctly but exposed the **unfiltered** `memoryRegistry` to `memory_list` / `memory_read` / `memory_search` via `ctx.memoryRegistry`. The model could call those tools and enumerate / read `project_shared` bodies the operator had marked offline — direct bypass of the trust gate the eager-load and retrieval surfaces already respect. Test harness pinning the shared-scope exclusion existed for retrieval and eager-load, but the per-tool surface was unprotected.
+
+Fix: introduce `createScopeFilteredRegistry(base, excludeScopes)` in `src/memory/registry.ts` — a thin wrapper around `MemoryRegistry` that filters every read-side method (`list` / `lookup` / `read` / `peek` / `search` / `count`). Write-side methods (`write`, `recordEvent`, `reload`) pass through; this fix scopes to reads (the bypass the review flagged). Wire it in `src/harness/loop.ts`: when `memoryExcludeScopes` is non-empty, wrap once per run before exposing as `ctx.memoryRegistry`. The retrieval runner builds against the same wrapped registry for surface symmetry, with the explicit `memoryExcludeScopes` still threaded as defense-in-depth.
+
+Wrapper semantics, picked to mirror the existing fail-closed contract:
+- `list({ scope: excluded })` → `[]`. Caller pinned a forbidden scope.
+- `list({})` → routes `excludeScopes` into the native `ListOptions.excludeScopes` so the filter runs BEFORE `deduplicateByName` (preserves the precedence-fallback the previous review fix established — a higher-precedence shadow in an excluded scope no longer suppresses an eligible lower-precedence sibling).
+- `lookup` / `read` / `peek` with `opts.scope`: excluded → `null` / `{ kind: 'unknown' }`; allowed → delegate.
+- `lookup` / `read` / `peek` without `opts.scope`: walk `SCOPE_ORDER` (local > shared > user), skip excluded scopes, return the first hit. Audit emission only fires on `present` (same contract as base), so the wrapper doesn't multiply audit rows.
+- `search` filters hits in excluded scopes; pinned excluded scope short-circuits to `[]`.
+- `count` reflects the filtered view so boot banner / footer tray show the model-effective count.
+
+Empty `excludeScopes` is a degenerate no-op: the wrapper short-circuits to the base registry (reference equality), so unprotected sessions pay zero overhead. The subagent path inherits the wrapping for free because subagent boots re-enter the same harness wiring.
+
+Regression tests:
+- `tests/memory/registry.test.ts` — eight new tests under `createScopeFilteredRegistry`: list dedup-fallback after exclusion, list pinned-excluded → `[]`, read SCOPE_ORDER fallback, read pinned-excluded → `unknown`, search filters hits, peek matches read, empty-exclusion short-circuit (reference equality), count reflects filtered view.
+- `tests/harness/loop.test.ts` — two e2e tests via `runAgent`: (1) with `memoryExcludeScopes: ['project_shared']` and an `ATTACKER_PAYLOAD` body in shared, a synthetic capture tool grabs `ctx.memoryRegistry` and proves all six surfaces (`list({})`, `list({ deduplicateByName: true })`, `read`, `peek`, `search` default + pinned + deep) refuse the shared content. (2) without exclusion, `ctx.memoryRegistry` is the unwrapped base — pinning the conditional so future regressions wrapping unconditionally fail loudly.
+
+Tests: 8313 pass (+10), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(memory) — Loader rejects symlinked .md files (trust-attestation symmetry)
 
 Review observation (S5 trust gate): `listSharedCorpusFiles` in `trust-corpus.ts` lstat-rejects symlinks — symlinked `.md` files are excluded from both the shared-corpus fingerprint AND the modal inventory. But `readMemoryByName` and `loadScopeIndex` in `loader.ts` use plain `readFileSync(path, …)`, which follows symlinks. A malicious repo could ship `project_shared/MEMORY.md` referencing `evil.md` where `evil.md` is a symlink to any out-of-scope file the agent UID can read (`~/.ssh/id_rsa`, host config, neighboring project secrets). The fingerprint stays unchanged across boots because the symlink was already excluded from it, so no trust re-prompt fires, while the model silently sees target bytes in eager-load or retrieval. Same threat with a symlinked `MEMORY.md` itself: the attacker swaps which bodies the loader picks up under a stable trust hash.

@@ -927,6 +927,175 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
   };
 };
 
+// Wrap a `MemoryRegistry` so every read-side method (`list` /
+// `lookup` / `read` / `peek` / `search` / `count`) honors a
+// fail-closed `excludeScopes` policy. The harness loop applies
+// this when the shared-corpus trust probe returns a non-confirmed
+// outcome (`verify_failed` / `deferred` / `revoked`); without it,
+// `memory_list` / `memory_read` / `memory_search` tools would
+// expose the unfiltered registry and let the model enumerate and
+// read project_shared bodies the operator already marked offline
+// — a direct bypass of the trust gate that the eager-load and
+// retrieval surfaces already respect.
+//
+// Write-side methods (`write`, `recordEvent`) pass through. This
+// fix scopes to reads (the bypass the review flagged); whether a
+// trust-revoked session should ALSO block new shared writes is a
+// separate policy question the writer's own gates can handle.
+//
+// Read-side semantics:
+//   - `list({ scope: excludedScope })` → empty (caller pinned an
+//     excluded scope).
+//   - `list({})` → underlying ListOptions.excludeScopes is merged
+//     with the wrapper's set so the filter runs BEFORE dedup
+//     (preserves the precedence-fallback the previous review fix
+//     established — see ListOptions header).
+//   - `lookup` / `read` / `peek` with `opts.scope` set: excluded
+//     scope returns null / `unknown`; allowed scope delegates.
+//   - `lookup` / `read` / `peek` without `opts.scope`: walk
+//     SCOPE_ORDER, skip excluded scopes, return the first hit (or
+//     null / unknown). Audit emission only fires on the successful
+//     `present` outcome (same as the underlying registry's
+//     contract); intermediate misses across allowed scopes don't
+//     emit because the underlying `read`/`peek` skip audit when
+//     `kind !== 'present'`.
+//   - `search` filters hits AFTER the underlying call. A pinned
+//     `opts.scope` in an excluded set short-circuits to []. The
+//     `limit` / `auditLimit` semantics are preserved by passing
+//     them through; the wrapper's post-filter only removes hits in
+//     the excluded scopes (it can't add audit suppression on
+//     excluded hits because the underlying registry already
+//     audited them — but excluded scopes are blocked before the
+//     base call when caller pins them, and the only path that
+//     would emit for an excluded scope is when caller didn't pin
+//     and the underlying iterator happened to hit one; the
+//     wrapper accepts that minor overshoot as the cost of not
+//     restructuring SearchOptions to carry excludeScopes natively,
+//     since the audit row is operator-forensic and the model
+//     never sees the row anyway).
+//   - `count({})` excludes filtered scopes by walking `list`.
+//
+// `excludeScopes` is captured at wrapper-creation time; if the
+// trust posture changes mid-session (operator runs
+// `/memory trust accept`), the bootstrap re-builds the harness
+// config + re-wraps. The wrapper itself doesn't mutate.
+export const createScopeFilteredRegistry = (
+  base: MemoryRegistry,
+  excludeScopes: readonly MemoryScope[],
+): MemoryRegistry => {
+  // Empty exclusion is a degenerate case; callers should avoid
+  // wrapping in that situation, but if they do we just delegate
+  // everything to keep the wrapper neutral.
+  if (excludeScopes.length === 0) return base;
+  const excluded = new Set<MemoryScope>(excludeScopes);
+  // Local copy of the precedence order. Module-private constant
+  // SCOPE_ORDER inlined here so the wrapper's behavior tracks the
+  // registry's scope precedence exactly without exporting an
+  // internal symbol.
+  const ORDER: readonly MemoryScope[] = ['project_local', 'project_shared', 'user'];
+
+  const mergeListOptions = (opts: ListOptions = {}): ListOptions => {
+    const existing = opts.excludeScopes ?? [];
+    const combined = new Set<MemoryScope>([...existing, ...excludeScopes]);
+    return { ...opts, excludeScopes: Array.from(combined) };
+  };
+
+  // Walk the precedence order, skip excluded scopes, return the
+  // first result the `sentinel` says is terminal (non-miss). Used
+  // by lookup/read/peek so the wrapper preserves "fall through to
+  // the next allowed scope when the most-specific scope is
+  // excluded" — same fallback the eager-load and retrieval views
+  // get via list({ excludeScopes }).
+  const tryEachAllowedScope = <T>(
+    delegate: (s: MemoryScope) => T,
+    sentinel: (result: T) => boolean,
+  ): T | null => {
+    for (const s of ORDER) {
+      if (excluded.has(s)) continue;
+      const result = delegate(s);
+      if (!sentinel(result)) return result;
+    }
+    return null;
+  };
+
+  return {
+    roots: base.roots,
+
+    list(opts: ListOptions = {}): MemoryListing[] {
+      if (opts.scope !== undefined && excluded.has(opts.scope)) return [];
+      return base.list(mergeListOptions(opts));
+    },
+
+    lookup(name: string, opts: ScopeOption = {}): MemoryListing | null {
+      if (opts.scope !== undefined) {
+        if (excluded.has(opts.scope)) return null;
+        return base.lookup(name, opts);
+      }
+      return (
+        tryEachAllowedScope(
+          (s) => base.lookup(name, { ...opts, scope: s }),
+          (result) => result === null,
+        ) ?? null
+      );
+    },
+
+    read(name: string, opts: ReadOptions = {}): RegistryReadResult {
+      if (opts.scope !== undefined) {
+        if (excluded.has(opts.scope)) return { kind: 'unknown' };
+        return base.read(name, opts);
+      }
+      const found = tryEachAllowedScope(
+        (s) => base.read(name, { ...opts, scope: s }),
+        // `unknown` is the keep-walking sentinel — `missing` /
+        // `malformed` / `present` are terminal (the listing exists
+        // at this scope; surface that outcome).
+        (result) => result.kind === 'unknown',
+      );
+      return found ?? { kind: 'unknown' };
+    },
+
+    peek(name: string, opts: ScopeOption = {}): RegistryReadResult {
+      if (opts.scope !== undefined) {
+        if (excluded.has(opts.scope)) return { kind: 'unknown' };
+        return base.peek(name, opts);
+      }
+      const found = tryEachAllowedScope(
+        (s) => base.peek(name, { ...opts, scope: s }),
+        (result) => result.kind === 'unknown',
+      );
+      return found ?? { kind: 'unknown' };
+    },
+
+    search(query: string, opts: SearchOptions = {}): MemorySearchHit[] {
+      if (opts.scope !== undefined && excluded.has(opts.scope)) return [];
+      return base.search(query, opts).filter((h) => !excluded.has(h.scope));
+    },
+
+    count(opts: { deduplicateByName?: boolean } = {}): number {
+      // Walk the wrapper's own list() to apply the filter; pass
+      // the dedupe flag through. Operator-facing surfaces (boot
+      // banner, footer tray) show the model-effective count, so
+      // shared-offline sessions surface a reduced number.
+      return this.list({
+        ...(opts.deduplicateByName === true ? { deduplicateByName: true } : {}),
+      }).length;
+    },
+
+    reload(): void {
+      base.reload();
+    },
+
+    write(input: WriteOptions): RegistryWriteResult {
+      // Writes pass through; see header for scope rationale.
+      return base.write(input);
+    },
+
+    recordEvent(input: RegistryEventInput): void {
+      base.recordEvent(input);
+    },
+  };
+};
+
 // Map a `WriteMemoryResult` non-success variant to a one-line
 // reason string. Stable across releases — UI / audit consumers
 // may match on these strings. Hoisted out of the closure so

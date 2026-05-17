@@ -2576,4 +2576,185 @@ describe('runAgent', () => {
       expect(listProvenanceForMemory(db, sid, 'user', 'good')).toHaveLength(1);
     });
   });
+
+  describe('memoryExcludeScopes wraps the tool-facing registry (S5 review)', () => {
+    // Review regression: when memoryExcludeScopes is non-empty
+    // (shared trust probe returned verify_failed / deferred /
+    // revoked), the harness wired retrieve_context against an
+    // excluded registry but exposed the UNFILTERED registry to
+    // memory_list / memory_read / memory_search via
+    // ctx.memoryRegistry. The model could call those tools and
+    // enumerate / read project_shared bodies the operator marked
+    // offline — direct bypass of the trust gate eager-load and
+    // retrieval surfaces already respect.
+    //
+    // Coverage strategy: inject a synthetic tool that captures
+    // ctx.memoryRegistry on its first call, then prove every
+    // read-side method honors the exclusion. Avoids wiring the
+    // full memory_* tool tree into the loop test while still
+    // pinning the harness-level wrapping decision.
+
+    test('ctx.memoryRegistry sees only allowed scopes when memoryExcludeScopes is set', async () => {
+      const { mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createMemoryRegistry } = await import('../../src/memory/registry.ts');
+
+      // Seed both scopes with the same name so the precedence
+      // fallback assertion below has something to land on.
+      const repo = mkdtempSync(join(tmpdir(), 'forja-loop-mem-exclude-'));
+      const roots = {
+        user: join(repo, 'user'),
+        projectShared: join(repo, 'shared'),
+        projectLocal: join(repo, 'local'),
+      };
+      const writeIdx = (dir: string, body: string) => {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'MEMORY.md'), body);
+      };
+      const writeBody = (dir: string, name: string, body: string) => {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(
+          join(dir, `${name}.md`),
+          `---\nname: ${name}\ndescription: hook for ${name}\ntype: feedback\nsource: user_explicit\n---\n\n${body}\n`,
+        );
+      };
+      writeIdx(roots.projectShared, '- [Secret](secret.md) — shared\n');
+      writeBody(roots.projectShared, 'secret', 'ATTACKER_PAYLOAD');
+      writeIdx(roots.user, '- [Secret](secret.md) — user\n');
+      writeBody(roots.user, 'secret', 'benign user body');
+      const memoryRegistry = createMemoryRegistry({ roots });
+
+      // Synthetic tool that captures the ctx-exposed registry on
+      // first invocation. Returning a clean tool result lets the
+      // run finish normally.
+      let captured: typeof memoryRegistry | undefined;
+      const captureTool: Tool<{ x: number }, { ok: true }> = {
+        name: 'capture_registry',
+        description: 'capture ctx.memoryRegistry',
+        inputSchema: { type: 'object', properties: { x: { type: 'number' } } },
+        metadata: { category: 'misc', writes: false, idempotent: true },
+        async execute(_args, ctx) {
+          captured = ctx.memoryRegistry;
+          return { ok: true };
+        },
+      };
+
+      const provider = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'capture_registry', input: { x: 1 } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const tools = createToolRegistry();
+      tools.register(captureTool);
+
+      const result = await runAgent({
+        provider: provider.provider,
+        toolRegistry: tools,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        memoryRegistry,
+        memoryExcludeScopes: ['project_shared'],
+      });
+      expect(result.status).toBe('done');
+      if (captured === undefined) throw new Error('expected ctx.memoryRegistry to be captured');
+
+      // 1. list({}) excludes project_shared bodies entirely.
+      const listed = captured.list({});
+      expect(listed.map((l) => l.scope)).not.toContain('project_shared');
+
+      // 2. Precedence fallback: dedup-by-name lands user/secret (NOT
+      //    project_shared/secret which would normally win precedence
+      //    local > shared > user).
+      const deduped = captured.list({ deduplicateByName: true });
+      const dedupedScopes = deduped.filter((l) => l.name === 'secret').map((l) => l.scope);
+      expect(dedupedScopes).toEqual(['user']);
+
+      // 3. read(name) falls through to user when project_shared is
+      //    excluded. The shared body containing ATTACKER_PAYLOAD
+      //    MUST NOT leak through.
+      const readResult = captured.read('secret');
+      expect(readResult.kind).toBe('present');
+      if (readResult.kind === 'present') {
+        expect(readResult.scope).toBe('user');
+        expect(readResult.file.body).not.toContain('ATTACKER_PAYLOAD');
+      }
+
+      // 4. Pinned excluded scope is closed at every read-side
+      //    surface. Pre-fix the same calls would have returned the
+      //    project_shared entry.
+      expect(captured.list({ scope: 'project_shared' })).toEqual([]);
+      expect(captured.read('secret', { scope: 'project_shared' }).kind).toBe('unknown');
+      expect(captured.peek('secret', { scope: 'project_shared' }).kind).toBe('unknown');
+      expect(captured.search('ATTACKER', { scope: 'project_shared' })).toEqual([]);
+
+      // 5. Default-scope search filters out hits in excluded scope.
+      //    deep:true would read body bytes — even then, the shared
+      //    hit must NOT surface.
+      const deepHits = captured.search('ATTACKER', { deep: true });
+      expect(deepHits.map((h) => h.scope)).not.toContain('project_shared');
+    });
+
+    test('memoryExcludeScopes undefined → ctx.memoryRegistry is the unwrapped base', async () => {
+      // Sanity: the wrapping is conditional. Without exclusion the
+      // tool ctx must see the unmodified registry. Without this
+      // test, a future regression that wraps unconditionally would
+      // pay the closure cost on every read of every session.
+      const { mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createMemoryRegistry } = await import('../../src/memory/registry.ts');
+
+      const repo = mkdtempSync(join(tmpdir(), 'forja-loop-mem-noexclude-'));
+      const roots = {
+        user: join(repo, 'user'),
+        projectShared: join(repo, 'shared'),
+        projectLocal: join(repo, 'local'),
+      };
+      mkdirSync(roots.projectShared, { recursive: true });
+      writeFileSync(join(roots.projectShared, 'MEMORY.md'), '- [S](s.md) — shared\n');
+      writeFileSync(
+        join(roots.projectShared, 's.md'),
+        '---\nname: s\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const memoryRegistry = createMemoryRegistry({ roots });
+
+      let captured: typeof memoryRegistry | undefined;
+      const captureTool: Tool<{ x: number }, { ok: true }> = {
+        name: 'capture_registry',
+        description: 'capture ctx.memoryRegistry',
+        inputSchema: { type: 'object', properties: { x: { type: 'number' } } },
+        metadata: { category: 'misc', writes: false, idempotent: true },
+        async execute(_args, ctx) {
+          captured = ctx.memoryRegistry;
+          return { ok: true };
+        },
+      };
+      const provider = mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'capture_registry', input: { x: 1 } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]);
+      const tools = createToolRegistry();
+      tools.register(captureTool);
+
+      await runAgent({
+        provider: provider.provider,
+        toolRegistry: tools,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        memoryRegistry,
+      });
+      // Reference equality: no wrapping when exclusion is omitted.
+      expect(captured).toBe(memoryRegistry);
+    });
+  });
 });

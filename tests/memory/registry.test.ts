@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
-import { createMemoryRegistry } from '../../src/memory/registry.ts';
+import { createMemoryRegistry, createScopeFilteredRegistry } from '../../src/memory/registry.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -1122,5 +1122,138 @@ describe('createMemoryRegistry — provenance emission (S1/T1.3)', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.surface).toBe('memory_read');
     expect(rows[0]?.toolCallId).toBe(toolCallId);
+  });
+});
+
+describe('createScopeFilteredRegistry — fail-closed scope blocking (S5 review)', () => {
+  // The harness loop wraps the memory registry with this filter
+  // when the shared-corpus trust probe lands a non-confirmed
+  // outcome. Without the wrapper, the tool context's
+  // memoryRegistry would still expose project_shared to
+  // memory_list / memory_read / memory_search even though the
+  // eager-load and retrieval surfaces filter it out — a direct
+  // bypass of the trust gate. These tests pin the wrapper's
+  // contract at the registry layer; e2e tool-level coverage
+  // lives in tests/harness/loop.test.ts.
+
+  test('list({}) filters excluded scope and runs filter BEFORE dedup-by-name', () => {
+    // The previous review fix established the contract: filter
+    // before dedup so a higher-precedence shadow in an excluded
+    // scope can't suppress an eligible lower-precedence sibling.
+    // Wrapper must route through ListOptions.excludeScopes to
+    // preserve that precedence-fallback.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    writeMemory(roots.user, 'foo', fmUser('foo'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+
+    // Without exclusion, dedup picks project_shared/foo (precedence
+    // local > shared > user; no project_local entry here so shared
+    // wins). With exclusion, user/foo MUST surface — precedence
+    // fallback is preserved.
+    const filtered = wrapped.list({ deduplicateByName: true });
+    expect(filtered.map((l) => `${l.scope}/${l.name}`)).toEqual(['user/foo']);
+  });
+
+  test('list({ scope: excludedScope }) returns empty (pin-and-bypass closed)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    expect(wrapped.list({ scope: 'project_shared' })).toEqual([]);
+  });
+
+  test('read(name, {}) walks SCOPE_ORDER and skips excluded scopes', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    writeMemory(roots.user, 'foo', fmUser('foo'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.read('foo');
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.scope).toBe('user');
+      expect(result.file.body).toContain('user body');
+    }
+  });
+
+  test('read(name, { scope: excludedScope }) returns unknown', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Secret](secret.md) — shared\n');
+    writeMemory(roots.projectShared, 'secret', fmUser('secret'), 'leak-me');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.read('secret', { scope: 'project_shared' });
+    expect(result.kind).toBe('unknown');
+  });
+
+  test('search filters hits in excluded scope (including pinned)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Castle](castle-s.md) — shared castle\n');
+    writeIndex(roots.user, '- [Castle](castle-u.md) — user castle\n');
+    writeMemory(roots.projectShared, 'castle-s', fmUser('castle-s'), 'shared');
+    writeMemory(roots.user, 'castle-u', fmUser('castle-u'), 'user');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+
+    // Default search (no scope pin) returns only the user hit.
+    const hits = wrapped.search('castle');
+    expect(hits.map((h) => `${h.scope}/${h.name}`).sort()).toEqual(['user/castle-u']);
+
+    // Pinning the excluded scope returns []. Pre-fix the same call
+    // against the unwrapped registry would have surfaced
+    // shared/castle-s.
+    expect(wrapped.search('castle', { scope: 'project_shared' })).toEqual([]);
+  });
+
+  test('peek(name, {}) honors precedence fallback (matches read)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — shared\n');
+    writeIndex(roots.user, '- [Foo](foo.md) — user\n');
+    writeMemory(roots.projectShared, 'foo', fmUser('foo'), 'shared body');
+    writeMemory(roots.user, 'foo', fmUser('foo'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.peek('foo');
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.scope).toBe('user');
+    }
+  });
+
+  test('empty excludeScopes is degenerate — returns the base registry unchanged', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, []);
+    // Reference equality: an empty exclusion list is a no-op and
+    // the wrapper short-circuits to avoid an extra closure on the
+    // hot path.
+    expect(wrapped).toBe(base);
+  });
+
+  test('count({}) reflects the filtered view', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — shared\n');
+    writeIndex(roots.user, '- [U](u.md) — user\n');
+    writeMemory(roots.projectShared, 's', fmUser('s'), 'shared');
+    writeMemory(roots.user, 'u', fmUser('u'), 'user');
+    const base = createMemoryRegistry({ roots });
+    expect(base.count()).toBe(2);
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    expect(wrapped.count()).toBe(1);
   });
 });
