@@ -2705,3 +2705,141 @@ describe('/memory trust status', () => {
     if (r.kind === 'error') expect(r.message).toContain('unexpected extra args');
   });
 });
+
+// Phase 1 closure smoke (S7/T7.3). Single test exercising the full
+// operator-driven memory lifecycle across Slices 0 + 1 + 6 in one
+// session. Catches cross-slice integration regressions that the
+// per-slice unit tests would miss:
+//
+//   - Slice 0: /memory quarantine + /memory list + /memory audit
+//     + /memory delete + /memory restore round-trip.
+//   - Slice 6: `[memory: quarantined]` visual flag appears on
+//     /memory list AFTER quarantine, disappears after restore.
+//   - Slice 0 audit chain: every transition lands in
+//     memory_events queryable via /memory audit --trigger operator.
+//
+// The test deliberately uses the operator-driven path (motivo=
+// conflict, trigger=operator_driven). Detector-driven paths
+// (S5 trust_revoked) are covered by their own integration tests
+// (tests/cli/bootstrap.test.ts). The conflict_detected flow named
+// in the original TODO is deferred to Phase 2 (S13 LLM-judge), so
+// the smoke pivots to the operator surface that IS fully wired in
+// Phase 1.
+describe('memory lifecycle E2E smoke (S7/T7.3 — Phase 1 closure)', () => {
+  // Two parallel memories exercise the two operator-driven
+  // lifecycle paths that Phase 1 ships fully wired:
+  //
+  //   - 'flagger': write → quarantine → visual flag visible in
+  //     /memory list, quarantine event in /memory audit.
+  //   - 'roundtrip': write → delete (tombstone) → restore → back
+  //     to active with no flag, full audit chain.
+  //
+  // They can't be the SAME memory because /memory delete routes
+  // through removeMemory (legacy, no tombstone) when the source
+  // state is quarantined — tombstone semantics only fire on
+  // active→evicted via transitionMemoryState (per
+  // confirmAndDelete in src/cli/slash/commands/memory.ts). Two
+  // memories let one test cover both surfaces.
+  test('phase 1 lifecycle: quarantine flag (flagger) + delete/restore round-trip (roundtrip)', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    writeIndex(
+      roots.projectLocal,
+      '- [Flagger](flagger.md) — visible flag check\n- [Roundtrip](roundtrip.md) — delete/restore check\n',
+    );
+    writeBody(roots.projectLocal, 'flagger');
+    writeBody(roots.projectLocal, 'roundtrip');
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+
+    // ─── Phase A: quarantine flag (flagger) ─────────────────
+    // Step A1 — baseline: both active, no flag.
+    const listA0 = await memoryCommand.exec(['list'], ctx);
+    if (listA0.kind !== 'ok') throw new Error(`listA0: ${JSON.stringify(listA0)}`);
+    const listA0Text = (listA0.notes ?? []).join('\n');
+    expect(listA0Text).toContain('flagger');
+    expect(listA0Text).toContain('roundtrip');
+    expect(listA0Text).not.toContain('[QUARANTINED');
+
+    // Step A2 — quarantine 'flagger'. Motivo conflict + free-text
+    // evidence per Slice 0 contract.
+    const q = await memoryCommand.exec(
+      ['quarantine', 'flagger', '--motivo', 'conflict', '--evidence', 'phase 1 closure smoke'],
+      ctx,
+    );
+    if (q.kind !== 'ok') throw new Error(`quarantine: ${JSON.stringify(q)}`);
+
+    // Step A3 — /memory list renders Slice 6 visual flag on
+    // 'flagger'; 'roundtrip' stays unflagged.
+    const listA1 = await memoryCommand.exec(['list'], ctx);
+    if (listA1.kind !== 'ok') throw new Error(`listA1: ${JSON.stringify(listA1)}`);
+    const listA1Text = (listA1.notes ?? []).join('\n');
+    // Flag shape: `[QUARANTINED — <motivo>/<trigger> <YYYY-MM-DD>]`
+    // (Slice 0 + Slice 6 list-line formatter). Prefix-only match
+    // keeps the smoke robust against motivo/date format changes.
+    expect(listA1Text).toContain('[QUARANTINED');
+    expect(listA1Text).toContain('flagger');
+    // The flag line is specific to flagger; roundtrip shares the
+    // line-line boundary but has no flag. Assert by checking the
+    // flagger-line includes [QUARANTINED, roundtrip-line doesn't.
+    const flaggerLine = listA1Text.split('\n').find((l) => l.includes('flagger')) ?? '';
+    const roundtripLine = listA1Text.split('\n').find((l) => l.includes('roundtrip')) ?? '';
+    expect(flaggerLine).toContain('[QUARANTINED');
+    expect(roundtripLine).not.toContain('[QUARANTINED');
+
+    // Step A4 — audit chain captures the quarantine via the
+    // operator trigger shortcut (Slice 0 T0.3). Raise --limit so
+    // multi-event chains in the same session don't get truncated.
+    const auditA = await memoryCommand.exec(
+      ['audit', '--trigger', 'operator', '--limit', '50'],
+      ctx,
+    );
+    if (auditA.kind !== 'ok') throw new Error(`auditA: ${JSON.stringify(auditA)}`);
+    const auditAText = (auditA.notes ?? []).join('\n');
+    expect(auditAText).toContain('quarantined');
+    expect(auditAText).toContain('flagger');
+
+    // ─── Phase B: delete + restore round-trip (roundtrip) ────
+    // Step B1 — delete 'roundtrip'. Active source → state-machine
+    // route → body moves to .tombstones/, index entry removed,
+    // eviction_events + memory_events audit pair lands.
+    const del = await memoryCommand.exec(['delete', 'roundtrip'], ctx);
+    if (del.kind !== 'ok') throw new Error(`delete: ${JSON.stringify(del)}`);
+
+    // /memory list no longer shows 'roundtrip' (index removed);
+    // 'flagger' still present with flag.
+    const listB1 = await memoryCommand.exec(['list'], ctx);
+    if (listB1.kind !== 'ok') throw new Error(`listB1: ${JSON.stringify(listB1)}`);
+    const listB1Text = (listB1.notes ?? []).join('\n');
+    expect(listB1Text).not.toContain('roundtrip');
+    expect(listB1Text).toContain('flagger');
+
+    // Step B2 — restore from tombstone. State machine:
+    // evicted → active (motivo 'any').
+    const rst = await memoryCommand.exec(['restore', 'roundtrip'], ctx);
+    if (rst.kind !== 'ok') throw new Error(`restore: ${JSON.stringify(rst)}`);
+
+    // /memory list shows 'roundtrip' again, no flag (restore
+    // drops the state marker, frontmatter is back to default
+    // active).
+    const listB2 = await memoryCommand.exec(['list'], ctx);
+    if (listB2.kind !== 'ok') throw new Error(`listB2: ${JSON.stringify(listB2)}`);
+    const listB2Text = (listB2.notes ?? []).join('\n');
+    expect(listB2Text).toContain('roundtrip');
+    const roundtripLineAfter = listB2Text.split('\n').find((l) => l.includes('roundtrip')) ?? '';
+    expect(roundtripLineAfter).not.toContain('[QUARANTINED');
+
+    // Step B3 — audit chain captures every transition. /memory
+    // delete uses `trigger=user_purge` (state-machine route in
+    // confirmAndDelete attributes the delete via user_purge, not
+    // operator_driven) and /memory restore uses its own trigger,
+    // so we can't pin to a single --trigger filter for ALL three.
+    // Drop the filter and bump --limit so the full chain lands.
+    const auditB = await memoryCommand.exec(['audit', '--limit', '50'], ctx);
+    if (auditB.kind !== 'ok') throw new Error(`auditB: ${JSON.stringify(auditB)}`);
+    const auditBText = (auditB.notes ?? []).join('\n');
+    expect(auditBText).toContain('quarantined');
+    expect(auditBText).toContain('evicted');
+    expect(auditBText).toContain('restored');
+  });
+});

@@ -860,23 +860,23 @@ Spec items called out so contributors don't infer them as bugs. Bucketed by cate
 
 - **`--allow-memory-write=local` opt-in flag** (`§5.6`). Today `memory_write` rejects in headless mode unconditionally (`src/tools/builtin/memory-write.ts:284`); no flag widens the gate for CI flows.
 
-### 14.3 Trust boundary
-
-- **Hash-based re-trust on `shared/` changes** (`§7.2` mitigation 8). The spec calls for the trust prompt to re-fire when the operator pulls a commit that changes anything under `.agent/memory/shared/`. No content hash check exists today — operators can pull and immediately exec without re-confirming the new shared body.
-
-### 14.4 Adaptation cross-cut
+### 14.3 Adaptation cross-cut
 
 - **Loop-frio-driven `low_roi` quarantine of stale memories** (`§6.2` + `FEEDBACK_ADAPTATION.md §3.2`). The eviction substrate accepts `motivo: 'low_roi'` and the adaptation pipeline exists, but no detector currently emits memory ROI signals for the loop frio to aggregate. Manual `/memory delete` is the operator path today.
 - **Distribution-shift-driven invalidation of `reference` memories** (`§6.5.6`, e.g., the Linear project pointed to was archived). Manual review for now — no probe runs at boot to dereference external refs.
 
-### 14.5 What IS shipped (corrects an earlier draft of this section)
+### 14.4 What IS shipped (corrects an earlier draft of this section)
 
 These were listed as deferred in a prior draft but are wired today:
 
 - The four **model-facing tools** — `memory_read`, `memory_write`, `memory_search`, `memory_list` — are registered in `src/tools/builtin/index.ts` and exposed to the model via the harness tool registry.
 - **`MemoryWrite` hook fire** — `memory_write` dispatches the chain via `ctx.fireHook` at `src/tools/builtin/memory-write.ts:417`, before persisting. Blocking hook lands a `refused` audit row and aborts the write.
 - **Trigger-based eager-load** — `bootstrap.ts:580` and `subagent-child.ts:874` call `evaluateBootTriggers(repoRoot)`; `memory-prompt.ts` consumes the resulting `BootContext` via `shouldEagerLoadByTriggers` to surface conditionally-loaded memories on session boot.
-- **Operator-driven quarantine + audit forensics** (`feat/memory-lifecycle-detectors` Slice 0): `/memory quarantine` slash, state + expires + visual flag rendering on `/memory list`, and `/memory audit --trigger <source>` filter (literal match plus `operator` / `detector` shortcuts). The 4 auto-detectors named in `§6.5.2` (`verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked`) ship as **substrate-only** in Phase 1 (V1 trigger names + audit filters preserved); the detection logic itself is deferred to Phase 2 LLM-judge slices (S11/S13). Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals (S8). The operator surface is production-ready to receive both detector verdicts and proposals.
-- **Exposure trail** (`feat/memory-lifecycle-detectors` Slice 1, §11.2 above). `memory_provenance` table records every moment a memory was visible to the model (eager, memory_read, retrieve_context). Three emitters wired (registry's read/search-deep, eager-load via `eagerExposures`, retrieval runner post-`createRetrievalTrace`); `/memory provenance` slash command exposes the trail with three modes (`<name>`, `--tool`, `--retrieval`); 90d boot-time retention sweep. Foundational for Slices 2 (`verify_failed` runs against exposed memories) and 3 (`user_override_repeated` counts overrides per exposed memory).
+- **Operator-driven quarantine + audit forensics** (`feat/memory-lifecycle-detectors` Slice 0): `/memory quarantine` slash, state + expires + visual flag rendering on `/memory list`, and `/memory audit --trigger <source>` filter (literal match plus `operator` / `detector` shortcuts).
+- **Exposure trail** (`feat/memory-lifecycle-detectors` Slice 1, §11.2 above). `memory_provenance` table records every moment a memory was visible to the model (eager, memory_read, retrieve_context). Three emitters wired (registry's read/search-deep, eager-load via `eagerExposures`, retrieval runner post-`createRetrievalTrace`); `/memory provenance` slash command exposes the trail with three modes (`<name>`, `--tool`, `--retrieval`); 90d boot-time retention sweep.
+- **`trust_revoked` detector** (`feat/memory-lifecycle-detectors` Slice 5, §6.5.2 + §7.2 rule 8). Boot-time SHA-256 fingerprint of `.agent/memory/shared/`; when the operator's last-confirmed hash diverges from the current corpus, a re-confirmation modal fires; revocation bulk-transitions every active shared memory to `invalidated` (motivo `security`, trigger `trust_revoked`) and the bulk effect is reflected in this very boot's system prompt rather than requiring a restart. `assembleMemorySection` filters `state === 'invalidated'` from the eager-load. `/memory trust status` slash inspector surfaces in-sync / diverged / never-confirmed / verify-failed state without re-running the modal.
+- **Quarantine penalty + visual flag** (`feat/memory-lifecycle-detectors` Slice 6, §6.5.2 + EVICTION.md §9.7). Retrieval ranking applies a numeric penalty to `quarantined` memories without filtering them out (they stay visible-but-cautioned); `assembleMemorySection` renders the `[memory: quarantined]` inline flag so the model sees the marker. The state filter expanded to `['active', 'quarantined']` covers both retrievable states.
+
+The three remaining auto-detectors named in §6.5.2 (`verify_failed`, `user_override_repeated`, `conflict_detected`) ship as **substrate-only** in Phase 1 (V1 trigger names + audit filters preserved); the detection logic itself is deferred to Phase 2 LLM-judge slices (S3 + S8 + S11 + S13). Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals (S8). The operator surface is production-ready to receive both detector verdicts and proposals.
 
 `docs/BACKLOG.md` carries the current milestone status; the FEEDBACK_ADAPTATION cross-cut (`docs/spec/FEEDBACK_ADAPTATION.md`) describes how loop-frio adaptation will eventually drive automatic `low_roi` quarantine / eviction proposals for stale memories.

@@ -124,10 +124,10 @@ Walk back the H1+H6 hard-filter (commit `949fadf`) to spec'd behavior: quarantin
 
 | Task | Description |
 |---|---|
-| **T7.1** | `docs/MEMORY.md §14` update — remove shipped items. |
-| **T7.2** | `docs/spec/MEMORY.md` annotations if implementation revealed ambiguity (ask before editing per CLAUDE.md). |
-| **T7.3** | E2E smoke — single test: write 2 contradicting memories → second triggers `conflict_detected` → loser quarantined → operator `/memory restore` → memory back to active. |
-| **T7.4** | `docs/BACKLOG.md` comprehensive entry summarizing slice closure. |
+| **T7.1 ✅** | `docs/MEMORY.md §14` update — removed §14.3 "Trust boundary" (shipped via S5), renumbered §14.4 → §14.3 / §14.5 → §14.4, and rewrote the "What IS shipped" entry to break out S5 (`trust_revoked` detector full impl) + S6 (quarantine penalty + visual flag) as separate bullets; the substrate-only roster shrinks from 4 to 3 detectors (`verify_failed`, `user_override_repeated`, `conflict_detected`). Updated TODO cross-refs (lines 219, 273). |
+| **T7.2 ⊘** | Skipped per operator decision (2026-05-16). No spec ambiguity surfaced during Phase 1; the only mismatch (initial draft of S5 targeted `active → quarantined` instead of `active → invalidated`) was a TODO error caught by the spec, not the other way around. |
+| **T7.3 ✅** | E2E smoke — single test in `tests/cli/slash/memory.test.ts`. The original framing (contradicting memories → `conflict_detected`) is dead since the detector is Phase 2 / S13; pivoted to the operator-driven surfaces that ARE wired in Phase 1: write two project_local memories, quarantine one (assert `[QUARANTINED — motivo/trigger date]` visual flag in `/memory list` AND quarantine row in `/memory audit --trigger operator`), delete the other (state-machine route to `.tombstones/`, no entry in list), restore from tombstone (back to active, no flag). Full audit chain queried via `/memory audit --limit 50`. |
+| **T7.4 ✅** | `docs/BACKLOG.md` Phase 1 closure entry summarizing shipped slices (S0/S1/S5/S6/S7 ✅, S2/S4 substrate-only) and the Phase 2 cluster handoff (S8 → S3 → S11 → S13). |
 
 ---
 
@@ -216,7 +216,7 @@ Why deferred to Phase 2 alongside S11:
 
 - **`distribution_shift` / `source_removed` detectors** — listed in EVICTION §5.1 but tied to startup probes for external sources. Tracked separately as "reference dereference probe".
 - **Compaction × quarantine cross-lifecycle** (EVICTION §9.7) — context-tuning subsystem's responsibility, not memory's.
-- **`roi_below_threshold` detector** — depends on loop frio aggregation (FEEDBACK_ADAPTATION §3.2); listed in `docs/MEMORY.md §14.4`.
+- **`roi_below_threshold` detector** — depends on loop frio aggregation (FEEDBACK_ADAPTATION §3.2); listed in `docs/MEMORY.md §14.3`.
 
 ## Dependency graph
 
@@ -270,7 +270,7 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 **Cost when pulled:** ~1 disk-cached SQL query per quarantined entry per render. For a session with N quarantined (likely < 5), negligible.
 
-## Memory trust filter on `retrieve_context` slot (MEMORY.md §14.3, AGENTIC_CLI §1.1.5)
+## Memory trust filter on `retrieve_context` slot (AGENTIC_CLI §1.1.5)
 
 **Status:** acknowledged gap pre-S6; widened by S6 (quarantined memories now reach the slot, but no trust filter).
 

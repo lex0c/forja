@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-16] docs+test(memory) — S7 Phase 1 closure (docs/MEMORY.md §14 refresh + E2E smoke)
+
+Phase 1 of the memory lifecycle detectors line closes here. S7 was scoped as docs + E2E smoke; the substantive work was reconciling `docs/MEMORY.md §14` with what actually shipped and replacing the original (now-impossible) E2E smoke premise with one anchored on the operator surfaces.
+
+Changes:
+
+- **`docs/MEMORY.md §14`** — removed §14.3 "Trust boundary" (S5 shipped the hash-based re-trust); renumbered §14.4 → §14.3 (Adaptation cross-cut) and §14.5 → §14.4 (What IS shipped). The "What IS shipped" entry was rewritten so S5 (`trust_revoked` detector, full impl) and S6 (quarantine penalty + visual flag) each get their own bullet describing what landed and where. The substrate-only roster shrinks from 4 to 3 detectors (`verify_failed`, `user_override_repeated`, `conflict_detected`).
+- **`docs/TODO.md`** — fixed cross-refs to the renumbered §14 sections (lines 219, 273). S3 marked for Phase 2 (re-grouped with S8 governance proposals + S11 + S13 in the LLM-judge cluster) since its trip-handler depends on S8.
+- **`tests/cli/slash/memory.test.ts`** — new E2E smoke (`memory lifecycle E2E smoke (S7/T7.3 — Phase 1 closure)`) covering two parallel memories in one session: 'flagger' exercises the quarantine + visual flag + audit path (Slices 0+6), 'roundtrip' exercises the delete (state-machine route to `.tombstones/`) + restore (tombstone → active) round-trip (Slice 0 lifecycle primitives). The split is required because `/memory delete` on a quarantined source falls through to `removeMemory` (legacy, no tombstone) per `confirmAndDelete` in `src/cli/slash/commands/memory.ts` — only an active source takes the state-machine route. The smoke was originally framed around `conflict_detected` per the TODO; pivoted to operator-driven flows since the detector is Phase 2 / S13.
+- **T7.2 skipped** by operator decision: the spec was consistent; the only mismatch (initial S5 TODO drafted `active → quarantined`) was a planning error that the spec already contradicted in §6.5.2 + EVICTION.md §4.1.
+
+Phase 1 final scope shipped:
+- **S0** ✅ Operator escape hatch (`/memory quarantine`, list rendering, audit --trigger filter)
+- **S1** ✅ Memory exposure infrastructure (provenance trail, 3 emitters, 90d retention)
+- **S2** 🔁 Substrate-only (verify_failed trigger name + audit filter; detector deferred to Phase 2 S11)
+- **S4** ✅ Substrate-only (`/memory conflicts` slash + listEvictionEventsByTrigger; detector deferred to Phase 2 S13)
+- **S5** ✅ `trust_revoked` detector (full impl: substrate + boot probe + modal + bulk-invalidate + `/memory trust status` slash inspector + coverage strengthening)
+- **S6** ✅ Quarantine penalty + visual flag (retrieval ranking + assembleMemorySection inline marker)
+- **S7** ✅ Docs + E2E smoke (this entry)
+
+Phase 2 (LLM-judge governance) carries:
+- **S8** governance proposal substrate (required by S3, S11, S13)
+- **S3** `user_override_repeated` detector (counter + S8-mediated proposal flow)
+- **S11** semantic `verify_failed` via LLM-judge (replaces the rolled-back regex heuristic)
+- **S13** `conflict_detected` via LLM-judge (replaces the rolled-back textual heuristic)
+
+Architectural commitment carried forward to Phase 2: zero text-heuristic for memory lifecycle decisions; deterministic substrate (counters, hashes, state machine, audit) + LLM-judge for prose judgment, never auto-mutating — proposals only, operator approves.
+
 ## [2026-05-16] test(memory) — S5/T5.5 coverage strengthening; Slice 5 closed
 
 Three targeted assertions that close the `trust_revoked` slice:
