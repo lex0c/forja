@@ -21,8 +21,7 @@
 // the dispatcher's `notes` channel; mutation subcommands (Tier 2)
 // add modal-confirm + audit-row emission paths.
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import {
   type MemoryFile,
   type MemoryListing,
@@ -33,6 +32,7 @@ import {
   findLatestTombstone,
   getSharedTrust,
   isExpired,
+  listSharedCorpusFiles,
   moveMemory,
   parseMemoryFile,
   removeMemory,
@@ -1011,47 +1011,39 @@ const handleTrust = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
     return { kind: 'ok', notes: lines };
   }
 
-  // Inventory line (file count + total bytes). Recomputed here
-  // rather than threaded through the substrate so the slash works
-  // even when bootstrap hasn't run the probe this session. Uses
-  // the same definition as `computeSharedFingerprint` (`.md` files
-  // at the corpus root, excluding `.tombstones/` and subdirs).
-  let fileCount = 0;
+  // Inventory line (file count + total bytes). Delegates to the
+  // single corpus-enumeration helper that the fingerprint and the
+  // modal preview also use — symlink rejection and `.tombstones/`
+  // exclusion stay aligned across surfaces by construction.
+  const listing = listSharedCorpusFiles(sharedRoot);
+  const inventory = listing.kind === 'present' ? listing.files : [];
+  const fileCount = inventory.length;
   let totalBytes = 0;
-  try {
-    for (const name of readdirSync(sharedRoot)) {
-      if (!name.endsWith('.md')) continue;
-      try {
-        const st = statSync(join(sharedRoot, name));
-        if (st.isFile()) {
-          fileCount++;
-          totalBytes += st.size;
-        }
-      } catch {
-        // Transient — skip; the operator's status snapshot tolerates
-        // a missed entry, the source of truth is the fingerprint.
-      }
-    }
-  } catch {
-    // sharedRoot doesn't exist or unreadable — fileCount stays 0.
-    // currentHash already reflects this case (EMPTY_CORPUS_HASH for
-    // ENOENT, null for EACCES — null branched above).
-  }
+  for (const f of inventory) totalBytes += f.bytes;
 
+  // Hash display: full 64-char SHA-256, NOT truncated. A truncated
+  // 12-char prefix is only 48 bits — an attacker who can choose
+  // corpus content can brute-force a hash with the same prefix
+  // (birthday collision ≈ 2^24, seconds on a workstation) and trick
+  // an operator scanning the slash output into believing "barely
+  // diverged" when the substrate already determined DIVERGED on the
+  // full hash. The operator's terminal width handles the line; we
+  // don't optimize for scrollback compactness at the cost of
+  // forgeability.
   if (stored === null) {
     lines.push('  status: never confirmed (next boot will silently seed the current hash)');
-    lines.push(`  current hash: ${currentHash.slice(0, 12)}…`);
+    lines.push(`  current hash: ${currentHash}`);
   } else if (stored.lastConfirmedHash === currentHash) {
     lines.push(
       `  status: in sync · last confirmed ${formatAuditTimestamp(stored.lastConfirmedAtMs)}`,
     );
-    lines.push(`  current hash: ${currentHash.slice(0, 12)}…`);
+    lines.push(`  current hash: ${currentHash}`);
   } else {
     lines.push(
       `  status: DIVERGED · last confirmed ${formatAuditTimestamp(stored.lastConfirmedAtMs)}`,
     );
-    lines.push(`  last hash:    ${stored.lastConfirmedHash.slice(0, 12)}…`);
-    lines.push(`  current hash: ${currentHash.slice(0, 12)}…`);
+    lines.push(`  last hash:    ${stored.lastConfirmedHash}`);
+    lines.push(`  current hash: ${currentHash}`);
     lines.push('  (a re-confirm modal will fire on next boot if the divergence persists)');
   }
   lines.push(`  inventory: ${fileCount} file${fileCount === 1 ? '' : 's'}, ${totalBytes} bytes`);

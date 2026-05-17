@@ -65,8 +65,92 @@
 
 import type { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+
+// Single corpus entry — used by every layer that asks "what's in the
+// shared corpus right now?" (fingerprint, modal preview, slash
+// status). Exported so callers can render byte sizes without
+// re-running the underlying readdir/lstat dance.
+export interface CorpusFile {
+  name: string;
+  bytes: number;
+}
+
+// Listing outcome. Three states with distinct downstream meaning:
+//   - 'present': directory exists and was enumerable. `files` may be
+//     empty if no `.md` regular files are present.
+//   - 'absent': directory itself doesn't exist (ENOENT / ENOTDIR).
+//     Caller treats as "no corpus" — fingerprint returns the
+//     EMPTY_CORPUS_HASH sentinel, modal renders "currently empty",
+//     slash shows zero inventory.
+//   - 'unreadable': other fs error (EACCES, EIO). Caller treats as
+//     verify-failed — fingerprint returns null, the probe surfaces
+//     `kind: 'verify_failed'`, the bootstrap path fails-closed by
+//     excluding the project_shared scope from eager-load.
+export type CorpusListing =
+  | { kind: 'present'; files: CorpusFile[] }
+  | { kind: 'absent' }
+  | { kind: 'unreadable' };
+
+// List the `.md` files at the shared-corpus root. Single source of
+// truth for what counts as "in the corpus" — used by:
+//
+//   - `computeSharedFingerprint` (the hash these files feed into)
+//   - `enumerateCorpus` in trust-corpus-probe.ts (the modal preview
+//     the operator sees during re-confirmation)
+//   - `handleTrust` in cli/slash/commands/memory.ts (the
+//     `/memory trust status` inspector)
+//
+// Pre-extraction these three sites had inline near-duplicate logic
+// and could drift on future cases (hidden files, subdirs other than
+// `.tombstones/`, symlinks). One helper means one decision surface.
+//
+// SYMLINK REJECTION (S5 P1/F4 hardening). `lstatSync` instead of
+// `statSync` so we DON'T follow the link. A symlinked `.md` body
+// would otherwise leak its target's bytes into BOTH the trust
+// fingerprint AND the eager-load section downstream — an
+// exfiltration channel through the modal-trusted shared-memory
+// pipeline. An operator who genuinely wants to share content across
+// projects must materialize a real file; the substrate refuses to
+// attest content it can't pin to a specific inode under the
+// scope root.
+export const listSharedCorpusFiles = (sharedRoot: string): CorpusListing => {
+  let entries: string[];
+  try {
+    entries = readdirSync(sharedRoot);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { kind: 'absent' };
+    return { kind: 'unreadable' };
+  }
+
+  const files: CorpusFile[] = [];
+  for (const name of entries) {
+    if (!name.endsWith('.md')) continue;
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(join(sharedRoot, name));
+    } catch {
+      // Transient disappearance between readdir and stat — skip
+      // silently. The fingerprint stays stable if the entry was
+      // never going to participate anyway.
+      continue;
+    }
+    // Refuse symlinks AND non-regular files (directories named
+    // `foo.md/` from an operator typo, sockets, fifos). A regular
+    // file is the only shape the loader downstream is prepared to
+    // read as a memory body.
+    if (st.isSymbolicLink()) continue;
+    if (!st.isFile()) continue;
+    files.push({ name, bytes: st.size });
+  }
+
+  // Deterministic lexicographic order. `sort()` with no comparator
+  // uses UTF-16 code-unit comparison — same result across platforms.
+  files.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return { kind: 'present', files };
+};
 
 // The canonical "no shared corpus exists at all" hash. Returned by
 // `computeSharedFingerprint` when the scope root itself is absent
@@ -75,7 +159,16 @@ import { join } from 'node:path';
 // differently). Operators newly cloning a project with NO shared
 // memories see this hash; if a later `git pull` introduces
 // shared/, the hash changes and a re-prompt fires.
-const EMPTY_CORPUS_HASH = createHash('sha256').update('forja:no-shared-corpus').digest('hex');
+// Exported so the probe orchestrator can distinguish "first-visit
+// with empty corpus → safe to silent-seed" from "first-visit with
+// non-empty corpus → must prompt" (P0/F2 hardening). The sentinel
+// stays distinct from any real corpus hash by construction: real
+// hashes use the `'forja:shared-corpus:v1\n'` domain separator
+// followed by framed file contents, while the sentinel hashes the
+// disjoint `'forja:no-shared-corpus'` string.
+export const EMPTY_CORPUS_HASH = createHash('sha256')
+  .update('forja:no-shared-corpus')
+  .digest('hex');
 
 // Compute a deterministic SHA-256 fingerprint of the shared corpus
 // rooted at `sharedRoot` (typically the path returned by
@@ -90,42 +183,9 @@ const EMPTY_CORPUS_HASH = createHash('sha256').update('forja:no-shared-corpus').
 // readSync is appropriate at this scale — boot-time blocking <1ms
 // in practice, dwarfed by SQLite migration cost.
 export const computeSharedFingerprint = (sharedRoot: string): string | null => {
-  let entries: string[];
-  try {
-    entries = readdirSync(sharedRoot);
-  } catch (err) {
-    // ENOENT is the normal "no shared corpus" case (operator never
-    // wrote a shared memory). Any other error (EACCES, EIO) is a
-    // genuine read failure — return null to signal "verify failed".
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return EMPTY_CORPUS_HASH;
-    return null;
-  }
-
-  // Filter to corpus members: `.md` files at the root, excluding
-  // `.tombstones/` and any other subdirs. The MEMORY.md index is
-  // a regular `.md` file and gets the same framing as bodies —
-  // operator-relevant changes include index reordering.
-  const corpusFiles: string[] = [];
-  for (const name of entries) {
-    if (!name.endsWith('.md')) continue;
-    // Defensive: skip if the .md path is actually a directory
-    // (operator could have `mkdir foo.md/` for whatever reason).
-    let isFile = false;
-    try {
-      isFile = statSync(join(sharedRoot, name)).isFile();
-    } catch {
-      // Stat failure on a single entry: skip but don't fail the
-      // whole hash — readdirSync said it was there, so a transient
-      // disappearance between readdir and stat is benign.
-      continue;
-    }
-    if (isFile) corpusFiles.push(name);
-  }
-
-  // Stable order. `sort()` with no comparator uses lexicographic
-  // UTF-16 ordering — deterministic across platforms.
-  corpusFiles.sort();
+  const listing = listSharedCorpusFiles(sharedRoot);
+  if (listing.kind === 'unreadable') return null;
+  if (listing.kind === 'absent') return EMPTY_CORPUS_HASH;
 
   const hash = createHash('sha256');
   // Domain separator. Without this, a future caller that hashes
@@ -133,15 +193,17 @@ export const computeSharedFingerprint = (sharedRoot: string): string | null => {
   // with corpus hashes. Cheap insurance.
   hash.update('forja:shared-corpus:v1\n');
 
-  for (const filename of corpusFiles) {
+  for (const { name } of listing.files) {
     let body: Buffer;
     try {
-      body = readFileSync(join(sharedRoot, filename));
+      body = readFileSync(join(sharedRoot, name));
     } catch {
-      // Same rationale as the stat fallback: skip transient
-      // disappearances. A persistent read failure on a member
-      // file (e.g., EACCES on a single body) WILL be reported as
-      // a hash change next boot, which is the safe outcome.
+      // Skip transient disappearances between listing and read. A
+      // persistent read failure on a single body (e.g., EACCES)
+      // WILL be reported as a hash change next boot, which is the
+      // safe outcome — the corpus content the operator sees in
+      // the eager-load loader will also exclude that file, so
+      // hash and effective corpus stay aligned.
       continue;
     }
     // Frame: `filename\n<byte length>\n<raw bytes>\n`. The length
@@ -150,7 +212,7 @@ export const computeSharedFingerprint = (sharedRoot: string): string | null => {
     // `a.md = "helloworld"` `b.md = ""`. The trailing `\n` after
     // the body separates frames so a body that ends mid-line
     // doesn't bleed into the next filename.
-    hash.update(filename);
+    hash.update(name);
     hash.update('\n');
     hash.update(`${body.length}`);
     hash.update('\n');

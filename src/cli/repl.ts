@@ -621,12 +621,41 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // only runs when cwd wasn't already trusted; the
     // already-trusted operator would hit bootstrap without stdin
     // subscribed and the modal would block until timeout. Pre-
-    // subscribing here is idempotent (the cwd-trust path's call
-    // is a no-op afterward) and trades the Ctrl+C-during-slow-
-    // bootstrap-yields-SIGINT semantics for a working shared-trust
-    // prompt — the modal hands SIGINT-shaped events to the focus
-    // stack, where the editor's idle Ctrl+C handler still routes
-    // operator-cancel intent correctly.
+    // subscribe here so the modal handler can stack on top of an
+    // active listener.
+    //
+    // S5 P1/F6 hardening — preserve Ctrl+C as a bootstrap escape
+    // hatch. Raw mode (turned on by subscribeStdin via
+    // renderer.enableInput) converts Ctrl+C into a `\x03` byte that
+    // flows to the focus stack instead of generating SIGINT. Before
+    // this fix, that byte hit no handler during bootstrap (focus
+    // stack was empty; editor handler doesn't push until ~line
+    // 2431) and was silently consumed — operator could not abort a
+    // slow/hung boot. The handler below sits at the BOTTOM of the
+    // stack; it returns false on every key except Ctrl+C, letting
+    // modal handlers and (later) the editor handler take priority
+    // on top. When no modal is open, Ctrl+C falls through to this
+    // bottom handler and re-raises SIGINT to the process — the
+    // standard Unix abort semantic survives despite raw mode.
+    const preBootstrapCtrlCHandler: FocusHandler = (key) => {
+      if (key.kind === 'char' && key.ctrl && key.char === 'c') {
+        // Re-raise SIGINT so the standard shell handler (or Node's
+        // default) gets a chance to terminate the process. Wrapped
+        // because process.kill can throw on a detached / orphaned
+        // session and we'd rather let the operator try again than
+        // crash on the abort path.
+        try {
+          process.kill(process.pid, 'SIGINT');
+        } catch {
+          // Last-ditch — if kill failed, exit code 130 (the
+          // conventional "terminated by Ctrl+C" exit status).
+          process.exit(130);
+        }
+        return true;
+      }
+      return false;
+    };
+    focusStack.push(preBootstrapCtrlCHandler);
     subscribeStdin();
     bootstrapped =
       options.bootstrapOverride ??
@@ -660,7 +689,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // shouldn't block forever.
         askSharedTrust: (a) =>
           modalManager.askSharedTrust(
-            { path: a.path, corpusFiles: a.corpusFiles },
+            { path: a.path, mode: a.mode, corpusFiles: a.corpusFiles },
             { timeoutMs: 5 * 60 * 1000 },
           ),
       } satisfies BootstrapInput));

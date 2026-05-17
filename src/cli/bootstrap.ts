@@ -148,6 +148,7 @@ export interface BootstrapInput {
   // reconfirmed transition with a real timestamp).
   askSharedTrust?: (args: {
     path: string;
+    mode: 'first-visit' | 'drift';
     corpusFiles: readonly { name: string; bytes: number }[];
   }) => Promise<'yes' | 'no' | 'cancel'>;
 }
@@ -702,9 +703,44 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       isRepoRootTrusted,
     });
     resolvedSystemPrompt = composeWithProjectPointer(resolvedSystemPrompt, projectPointer.text);
+    // S5 fail-closed eager-load gating. The project_shared scope
+    // is eligible for the eager-load section ONLY when the trust
+    // probe established confidence in the corpus' current state.
+    // Three outcomes block the scope:
+    //
+    //   - 'verify_failed' (P0/H2-rob): substrate couldn't read the
+    //     corpus. System has no idea what's on disk; surfacing
+    //     previously-snapshotted bodies would be fail-open against
+    //     an attacker who EACCES'd the directory.
+    //   - 'deferred' (P0/F3 + P1/M4-rob): modal was cancelled (Esc,
+    //     timeout) OR a TOCTOU drift was detected after the
+    //     operator's 'yes'. Either way, operator hasn't confirmed
+    //     the current state.
+    //   - 'revoked' (P1/F7): operator just said "I don't trust this
+    //     corpus". The probe's bulk-invalidate cleared every ACTIVE
+    //     shared memory, but quarantined-shared memories cannot
+    //     transition to `invalidated` via motivo `security` (state
+    //     machine admits only `shift` for that edge per
+    //     EVICTION.md §4.1). Hard-excluding the whole scope at
+    //     eager-load drops those survivors out of the model's
+    //     window for THIS session — the operator can `/memory
+    //     delete` for hard removal across boots.
+    //
+    // 'seeded', 'unchanged', 'reconfirmed' all pass — those are
+    // the states where the trust row pins a hash that matches what
+    // the model is about to see. Probe undefined (no callback) →
+    // no exclusion (the headless / test path retains its existing
+    // behavior; the gate fires only when the operator was given an
+    // opportunity to consent).
+    const sharedScopeOffline =
+      sharedTrustProbe !== undefined &&
+      (sharedTrustProbe.kind === 'verify_failed' ||
+        sharedTrustProbe.kind === 'deferred' ||
+        sharedTrustProbe.kind === 'revoked');
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
+      ...(sharedScopeOffline ? { excludeScopes: ['project_shared'] as const } : {}),
     });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
     eagerExposures = memorySection.eagerLoaded;

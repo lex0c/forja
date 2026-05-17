@@ -139,12 +139,14 @@ export {
 export type { ScanResult } from './scanner.ts';
 
 export {
+  EMPTY_CORPUS_HASH,
   clearSharedTrust,
   computeSharedFingerprint,
   getSharedTrust,
+  listSharedCorpusFiles,
   setSharedTrust,
 } from './trust-corpus.ts';
-export type { SharedTrustRow } from './trust-corpus.ts';
+export type { CorpusFile, CorpusListing, SharedTrustRow } from './trust-corpus.ts';
 
 export { probeSharedTrust } from './trust-corpus-probe.ts';
 export type {

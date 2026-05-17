@@ -114,16 +114,21 @@ export type TrustAnswer = 'yes' | 'no' | 'cancel';
 // Shared-corpus trust re-confirmation flavor (MEMORY.md §6.5.2
 // `trust_revoked` detector). Distinct from `TrustAskArgs` even though
 // the answer shape is identical — the producer wires very different
-// consequences to `no/cancel` (bulk-invalidate vs exit), so keeping
-// the type discriminant strict prevents a future refactor from
-// accidentally swapping them.
+// consequences to `no/cancel` (bulk-invalidate / defer vs exit), so
+// keeping the type discriminant strict prevents a future refactor
+// from accidentally swapping them.
 export interface SharedTrustAskArgs {
   // Absolute path of the shared-corpus root (`<repo>/.agent/memory/shared`).
   path: string;
+  // 'first-visit' (no prior trust row + non-empty corpus) vs 'drift'
+  // (prior row but hash diverged). Reducer adapts the prose to match.
+  mode: 'first-visit' | 'drift';
   // Current corpus snapshot — name + byte length per file. Renderer
   // wraps long lists with an explicit "(N more)" suffix; the
   // producer should NOT pre-truncate so the audit event carries the
-  // full inventory.
+  // full inventory. Filenames may contain operator-untrusted bytes
+  // (attacker with commit access on `.agent/memory/shared/`); the
+  // reducer sanitizes before rendering.
   corpusFiles: readonly { name: string; bytes: number }[];
 }
 
@@ -748,6 +753,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           ts: now(),
           promptId,
           path: args.path,
+          mode: args.mode,
           corpusFiles: args.corpusFiles,
         }),
         SHARED_TRUST_OPTIONS,

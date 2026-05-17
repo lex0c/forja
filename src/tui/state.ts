@@ -15,6 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
+import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 import { buildPermissionOptions } from './modal-manager.ts';
 
@@ -1528,17 +1529,46 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'shared-trust:ask': {
-      // Re-confirmation flavor for the `trust_revoked` detector
-      // (MEMORY.md §6.5.2, §7.2 rule 8). Triggered when the shared
-      // corpus' aggregate SHA-256 differs from the operator's last
-      // confirmation — most commonly after a `git pull` that touched
-      // `.agent/memory/shared/`. The two answer paths have very
-      // different consequences (yes → re-stamp, no → bulk-invalidate
-      // + clear trust row), so the prose makes both visible up front.
+      // Trust modal for the `trust_revoked` detector (MEMORY.md
+      // §6.5.2, §7.2 rule 8). Two modes share this flavor — see the
+      // event type doc — and the prose adapts:
+      //
+      //   - 'first-visit': non-empty corpus, no prior trust row.
+      //     The cwd-trust modal attested the directory; the shared
+      //     bodies are still unattested. Confirm before they enter
+      //     eager-load.
+      //   - 'drift': stored hash diverged from current (usually
+      //     after a `git pull` touched `.agent/memory/shared/`).
+      //
+      // Both modes share answer space: yes → re-stamp (after TOCTOU
+      // recheck), no → bulk-invalidate, cancel → defer.
       const options: ConfirmOption[] = [
-        { key: '1', label: 'Yes, I trust the updated corpus', value: 'yes' },
-        { key: '2', label: 'No, revoke trust', value: 'no' },
+        {
+          key: '1',
+          label:
+            event.mode === 'first-visit'
+              ? 'Yes, I trust this shared corpus'
+              : 'Yes, I trust the updated corpus',
+          value: 'yes',
+        },
+        {
+          key: '2',
+          label: event.mode === 'first-visit' ? 'No, do not load' : 'No, revoke trust',
+          value: 'no',
+        },
       ];
+
+      // SECURITY (P0/F1 hardening). Filenames flow from
+      // disk-attacker-controlled readdirSync (an attacker with
+      // commit access to `.agent/memory/shared/` can name a file
+      // `\x1b[2J\x1b[Hfake.md` and repaint the entire modal). The
+      // sanitizer strips ANSI escapes, collapses \r/\n/\t to single
+      // spaces, and caps length. `event.path` is operator-derived
+      // today (projectScopeRoots(repoRoot).shared), but sanitizing
+      // it costs nothing and protects against a future call site
+      // that threads attacker-influenced data into the path field.
+      const safePath = sanitizeOneLineForDisplay(event.path);
+
       // Layout mirrors `trust:ask`: subject null, path on its own
       // preview row, prose explains the situation + consequences,
       // then a bounded inventory cap so a malicious corpus can't
@@ -1550,14 +1580,23 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const MAX_LIST = 8;
       const visible = event.corpusFiles.slice(0, MAX_LIST);
       const overflow = event.corpusFiles.length - visible.length;
-      const previewLines: PreviewLine[] = [
-        event.path,
-        '',
-        'The shared memory corpus changed since you last confirmed trust.',
-        'This commonly happens after a `git pull` that modifies, adds, or removes',
-        'files under `.agent/memory/shared/`. Review the current contents below:',
-        '',
-      ];
+
+      const previewLines: PreviewLine[] = [safePath, ''];
+      if (event.mode === 'first-visit') {
+        previewLines.push(
+          'This project ships a shared memory corpus that you have not yet confirmed.',
+          'These files load into model context on every session in this directory.',
+          'Review the current contents below before confirming trust:',
+        );
+      } else {
+        previewLines.push(
+          'The shared memory corpus changed since you last confirmed trust.',
+          'This commonly happens after a `git pull` that modifies, adds, or removes',
+          'files under `.agent/memory/shared/`. Review the current contents below:',
+        );
+      }
+      previewLines.push('');
+
       if (visible.length === 0) {
         // The corpus exists from a hash-mismatch standpoint but the
         // current listing is empty — every previously-trusted file
@@ -1567,23 +1606,34 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         previewLines.push('(the corpus is currently empty)');
       } else {
         for (const f of visible) {
-          previewLines.push(`  ${f.name} — ${f.bytes} bytes`);
+          // P0/F1: sanitize EACH filename. The byte count is from
+          // lstatSync — a number, no injection surface.
+          previewLines.push(`  ${sanitizeOneLineForDisplay(f.name)} — ${f.bytes} bytes`);
         }
         if (overflow > 0) {
           previewLines.push(`  …and ${overflow} more file${overflow === 1 ? '' : 's'} not shown`);
         }
       }
       previewLines.push('');
-      previewLines.push('If you trust this update: the new corpus hash will be stamped.');
-      previewLines.push('If you revoke: every active shared memory is invalidated and');
-      previewLines.push('the corpus will not load into context until you re-confirm.');
+      if (event.mode === 'first-visit') {
+        previewLines.push('If you trust: the corpus hash is recorded as your baseline.');
+        previewLines.push('If you decline: every memory above is invalidated and stays off');
+        previewLines.push('until you explicitly restore or re-confirm.');
+      } else {
+        previewLines.push('If you trust this update: the new corpus hash will be stamped.');
+        previewLines.push('If you revoke: every active shared memory is invalidated and');
+        previewLines.push('the corpus will not load into context until you re-confirm.');
+      }
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'shared-trust',
-            title: 'Shared memory trust:',
+            title:
+              event.mode === 'first-visit'
+                ? 'Shared memory trust (first visit):'
+                : 'Shared memory trust:',
             subject: null,
             preview: previewLines,
             question: null,
@@ -1591,7 +1641,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // D65: last option is the conservative default. Operator
             // hitting Enter without reading chooses "No, revoke" —
             // safer outcome for a corpus that just changed under
-            // their feet.
+            // their feet (or that they haven't reviewed).
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
             queueDepth: 0,

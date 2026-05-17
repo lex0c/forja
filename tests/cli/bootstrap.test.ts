@@ -1128,14 +1128,10 @@ Body.`,
       result.db.close();
     });
 
-    test('seeded on first visit: probe runs, no modal fires, hash persisted', async () => {
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
-      mkdirSync(sharedDir, { recursive: true });
-      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
-      writeFileSync(
-        join(sharedDir, 'a.md'),
-        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
-      );
+    test('seeded silently when no shared corpus exists (empty case)', async () => {
+      // P0/F2: silent seed is reserved for the case where there's
+      // nothing to consent to. No `.agent/memory/shared/` directory
+      // at all → EMPTY_CORPUS_HASH → no modal fires.
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
 
@@ -1155,6 +1151,43 @@ Body.`,
       });
       expect(modalCalls).toBe(0);
       expect(result.sharedTrustProbe?.kind).toBe('seeded');
+      result.db.close();
+    });
+
+    test('first-visit non-empty: modal fires in mode=first-visit (P0/F2)', async () => {
+      // Pre-populated shared/ + cwd already trusted MUST trigger the
+      // first-visit modal. Silent seeding here would let a poisoned
+      // repo's `.agent/memory/shared/` flow into the model on the
+      // very first agent invocation after `git clone`.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      let modalCalls = 0;
+      let receivedMode: 'first-visit' | 'drift' | null = null;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async (args) => {
+          modalCalls++;
+          receivedMode = args.mode;
+          return 'yes';
+        },
+      });
+      expect(modalCalls).toBe(1);
+      expect(receivedMode as 'first-visit' | 'drift' | null).toBe('first-visit');
+      expect(result.sharedTrustProbe?.kind).toBe('reconfirmed');
       result.db.close();
     });
 
@@ -1310,5 +1343,19 @@ Body.`,
       expect(getSharedTrust(result.db, sharedDir)?.lastConfirmedAtMs).toBe(1000);
       result.db.close();
     });
+
+    // NOTE: A bootstrap-level integration test for verify_failed
+    // (probe-result kind 'verify_failed' → exclude project_shared
+    // from system prompt) is intentionally NOT here. The natural
+    // way to trigger verify_failed in production is to make the
+    // shared root unreadable (EACCES) — but that ALSO makes the
+    // registry's MEMORY.md read fail BEFORE the probe runs, so
+    // bootstrap throws at registry construction. The probe-layer
+    // unit test (`tests/memory/trust-corpus-probe.test.ts:
+    // 'returns verify_failed when the shared root is unreadable'`)
+    // and the assembleMemorySection unit test
+    // (`tests/cli/memory-prompt.test.ts: 'drops every listing in
+    // an excluded scope ...'`) together cover the two halves; the
+    // bootstrap wiring is a single conditional that fans them out.
   });
 });

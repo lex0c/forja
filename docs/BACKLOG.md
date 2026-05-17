@@ -2,6 +2,48 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(memory) — Phase 1 P0/P1 code-review findings closed (S5 trust_revoked)
+
+Three parallel agents (robustness / reliability / security) reviewed the Phase 1 S5 work and surfaced 5 P0 + 10 P1 issues. All 15 closed in this pass.
+
+P0 (critical, would have shipped with bypasses):
+
+- **F1 Modal preview ANSI injection.** Attacker-controlled `.agent/memory/shared/` filenames flowed verbatim into the trust modal — a name like `\x1b[2J\x1b[H<fake>.md` lets the attacker repaint the entire trust gate UI. Fix: `state.ts` runs `sanitizeOneLineForDisplay` on every filename AND on `event.path` before rendering. Test in `tests/tui/state.test.ts` covers ANSI escapes, CR/LF/TAB, and path-level injection.
+- **F2 First-visit silent seed.** Pre-S5-hardening, the probe silently stamped any first-visit hash. A poisoned `git clone` with cwd already trusted + pre-populated shared/ → eager-load attacker's content with zero operator consent. Fix: distinguish `EMPTY_CORPUS_HASH` (safe to silent-seed) from non-empty corpus (must prompt in first-visit mode). New `SharedTrustModalMode = 'first-visit' | 'drift'` plumbed through the modal event + reducer + bootstrap callback.
+- **F3 TOCTOU between fingerprint compute and modal answer.** Modal can sit open for minutes; attacker could swap corpus during deliberation and operator's "yes" would stamp the unsesen new hash. Fix: re-compute fingerprint AFTER 'yes'; if it differs from the originally-presented hash, return `{ kind: 'deferred', cause: 'tocttou_during_prompt' }`.
+- **H1-rob Atomic revoke ordering.** Prior order (clear-trust → bulk-invalidate) had a crash-window where surviving active memories silently re-loaded next boot because the re-seed of the trust row at current hash would never fire a re-prompt. Fix: bulk-invalidate FIRST, clear trust row AFTER. Crash mid-bulk leaves the trust row pinned to OLD hash → next boot recomputes, sees divergence, re-prompts; surviving actives get a second chance.
+- **H2-rob Fail-closed on `verify_failed`.** Bootstrap previously ran `assembleMemorySection` unconditionally after the probe; `verify_failed` left the previously-loadable shared bodies visible to the model. Fix: extend `assembleMemorySection` with `excludeScopes?: MemoryScope[]`; bootstrap excludes `project_shared` on any non-confirmed probe outcome (`verify_failed`, `deferred`, OR `revoked`). The latter also closes F7 by hard-excluding quarantined-shared survivors of revoke.
+
+P1 (medium):
+
+- **F4 Symlink rejection.** Extracted `listSharedCorpusFiles` in `trust-corpus.ts` as the single source of truth for "what's in the corpus"; uses `lstatSync` and refuses symlinks. The fingerprint, modal preview, AND `/memory trust status` slash all consume the same helper — no more drift between three inline implementations. Closes exfil channel (symlinked `.md` body → `/etc/passwd` bytes in trust hash + eager prompt).
+- **F5 Full SHA-256 in `/memory trust status`.** 12-hex truncation = 48 bits = forgeable by ~16M brute force. Slash now prints full 64-char hashes. Tests updated to require the full hash AND assert no truncation ellipsis.
+- **F6 SIGINT during pre-bootstrap.** Raw mode converts Ctrl+C to `\x03`; with empty focus stack the byte was silently consumed → operator lost the abort hatch during slow boots. Fix: push a low-priority `preBootstrapCtrlCHandler` that re-raises SIGINT on Ctrl+C and returns false otherwise; modal handlers stack on top normally.
+- **F7 Quarantined-shared survival.** Subsumed by H2-rob — `excludeScopes: ['project_shared']` fires for `revoked` outcomes too, dropping quarantined survivors from THIS session's eager-load. The on-disk state stays `quarantined` (state machine doesn't admit `quarantined → invalidated` via `security`); operator can `/memory delete` for hard removal.
+- **M3-rob Concurrent boots / already-invalidated.** Second process hit `illegal_transition` against memories the first invalidated. Fix: re-peek state in `bulkInvalidateShared` per listing immediately before transition; skip silently if no longer `active`.
+- **M4-rob Cancel vs explicit no.** 'cancel' (Esc / timeout / signal) now returns `{ kind: 'deferred', cause: 'modal_cancel' }` — trust row pinned to OLD hash, no bulk action. Only explicit "No, revoke" triggers destructive bulk.
+- **H2-rel `actor: 'startup_probe'`.** Bulk-invalidate transitions now attribute to `startup_probe` (boot-time consistency sweep) instead of `user` (operator command). `motivo: security` already bypasses cooldown/TTL gates so functional behavior is unchanged; the audit attribution is the fix.
+- **M1-rel Per-failure audit row.** Non-applied `transitionMemoryState` results (illegal_transition, invalid_evidence, thrown errors) now emit a `refused` memory_events row in addition to the in-memory `failed` array — `/memory audit` can surface "why didn't this memory get invalidated" forensically.
+- **M2-rel Reducer test coverage.** New `shared-trust:ask reducer` describe in `tests/tui/state.test.ts` covers 8 cases: mode-specific prose + options + title, conservative default selectedIndex, F1 sanitization, overflow caption, empty-corpus prose.
+- **H1-rel cwd threading test.** Bulk-invalidate's threading of `input.cwd` through to `memory_events.cwd` now has an explicit assertion in the probe test suite.
+
+Net delta:
+
+- 16 probe tests (state machine + selectivity + verify_failed + hardening sub-describe)
+- 24 substrate tests (added symlink-rejection coverage + listing helper contract)
+- 8 reducer tests (new describe)
+- 3 memory-prompt excludeScopes tests
+- 2 bootstrap integration tests added/updated for first-visit modal + adjusted seeded test for empty-corpus-only path
+
+Architectural footprint:
+- `src/memory/trust-corpus.ts`: new `listSharedCorpusFiles` helper + `CorpusListing` type + exported `EMPTY_CORPUS_HASH`. Substrate is the single source of truth for corpus enumeration.
+- `src/memory/trust-corpus-probe.ts`: state machine grew `'deferred'` outcome with two causes (`modal_cancel`, `tocttou_during_prompt`); `'reconfirmed'` and `'revoked'` results carry `mode: 'first-visit' | 'drift'`.
+- `src/tui/events.ts` / `src/tui/modal-manager.ts`: `mode` field added to `SharedTrustAskEvent` / `SharedTrustAskArgs`.
+- `src/tui/state.ts`: reducer adapts prose + options per mode; sanitizes every operator-untrusted string.
+- `src/cli/memory-prompt.ts`: `excludeScopes?: MemoryScope[]` added; applied as the first filter pass.
+- `src/cli/bootstrap.ts`: scope-offline computation drives `excludeScopes` for `verify_failed | deferred | revoked` outcomes.
+- `src/cli/repl.ts`: pre-bootstrap focus handler preserves Ctrl+C as SIGINT.
+
 ## [2026-05-16] docs+test(memory) — S7 Phase 1 closure (docs/MEMORY.md §14 refresh + E2E smoke)
 
 Phase 1 of the memory lifecycle detectors line closes here. S7 was scoped as docs + E2E smoke; the substantive work was reconciling `docs/MEMORY.md §14` with what actually shipped and replacing the original (now-impossible) E2E smoke premise with one anchored on the operator surfaces.

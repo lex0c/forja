@@ -2647,12 +2647,12 @@ describe('/memory trust status', () => {
     if (r.kind === 'ok') {
       const text = (r.notes ?? []).join('\n');
       expect(text).toContain('in sync');
-      // Hash prefix (12 chars + ellipsis) — first chars of the
-      // actual hash MUST appear; tests aren't allowed to be
-      // hash-blind because that would let truncation regressions
-      // pass silently.
-      expect(text).toContain(`${current.slice(0, 12)}…`);
+      // Full hash MUST appear — truncated prefixes are forgeable
+      // (12 hex = 48 bits, ~16M brute-force). S5 P1/F5 hardening
+      // dropped truncation.
+      expect(text).toContain(current);
       expect(text).not.toContain('DIVERGED');
+      expect(text).not.toContain('…');
     }
   });
 
@@ -2674,9 +2674,10 @@ describe('/memory trust status', () => {
     if (r.kind === 'ok') {
       const text = (r.notes ?? []).join('\n');
       expect(text).toContain('DIVERGED');
-      expect(text).toContain(`${baselineHash.slice(0, 12)}…`);
+      // S5 P1/F5: full hashes, not truncated prefixes.
+      expect(text).toContain(baselineHash);
       const currentHash = computeSharedFingerprint(roots.projectShared) as string;
-      expect(text).toContain(`${currentHash.slice(0, 12)}…`);
+      expect(text).toContain(currentHash);
       expect(text).toContain('re-confirm modal will fire on next boot');
     }
   });

@@ -151,6 +151,16 @@ export interface AssembleMemorySectionInput {
   // narrowing the model's view inside a subagent context, not
   // the operator's.
   memoryFilter?: ReadonlyArray<string>;
+  // Hard scope exclusion list (S5 P0/H2-rob hardening). When set,
+  // every listing whose scope is in this set is dropped BEFORE the
+  // per-entry trust / state / trigger filters run — equivalent to
+  // "this scope is offline this boot". Use case: the shared-corpus
+  // trust probe returned `verify_failed` (filesystem unreadable);
+  // the bootstrap MUST fail-closed by excluding `project_shared`
+  // so an attacker who renders the corpus unreadable can't keep
+  // the previously-loaded shared memories in the model's context.
+  // Empty / absent = no exclusion (current behavior).
+  excludeScopes?: ReadonlyArray<MemoryScope>;
 }
 
 export interface AssembleMemorySectionResult {
@@ -197,6 +207,13 @@ export const assembleMemorySection = (
   if (all.length === 0) {
     return { text: '', entryCount: 0, eagerLoaded: [] };
   }
+  // Scope-level fail-closed exclusion (S5 P0/H2-rob). Applied BEFORE
+  // the per-memory peek so an unreadable scope doesn't cost N extra
+  // disk reads just to drop every memory in it.
+  const excludeScopes =
+    input.excludeScopes !== undefined && input.excludeScopes.length > 0
+      ? new Set(input.excludeScopes)
+      : null;
   const bootContext = input.bootContext ?? EMPTY_BOOT_CONTEXT;
   // Combined per-memory filter: spec §7.2.2 trust + spec §4.3
   // boot-time triggers. Single peek per memory delivers both
@@ -210,6 +227,13 @@ export const assembleMemorySection = (
   // `present` (matches the "uncertainty → include" branch).
   const eligible: Array<{ listing: (typeof all)[number]; file: MemoryFile | null }> = [];
   for (const l of all) {
+    // Hard scope exclusion fires first. When the shared-corpus
+    // trust probe returned verify_failed, this branch drops every
+    // project_shared listing — even the "uncertain peek → include"
+    // path that normally serves resilience would be wrong here
+    // (we don't know what's in the file system, so we must NOT
+    // surface ANYTHING from that scope to the model).
+    if (excludeScopes?.has(l.scope)) continue;
     const peek = input.registry.peek(l.name, { scope: l.scope });
     if (peek.kind !== 'present') {
       eligible.push({ listing: l, file: null }); // uncertainty → include

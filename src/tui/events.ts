@@ -321,35 +321,53 @@ export type TrustAskEvent = BaseEvent & {
 };
 
 // Shared-corpus trust re-confirmation (MEMORY.md §6.5.2 `trust_revoked`
-// detector, §7.2 rule 8). Fires AFTER bootstrap when the operator
-// previously confirmed trust for this scope-root but the corpus' SHA-256
-// fingerprint has since changed — typically because a `git pull` brought
-// in commits that modify `.agent/memory/shared/`. Distinct from
-// `trust:ask` (first-visit cwd trust) in both trigger and consequence:
+// detector, §7.2 rule 8). Fires after bootstrap when either:
+//
+//   - the shared/ corpus is non-empty AND no prior trust row exists
+//     (mode 'first-visit' — P0/F2 hardening; the cwd-trust modal
+//     attested the directory, NOT the shared-memory content); OR
+//   - a stored trust row's hash diverged from the current corpus
+//     fingerprint (mode 'drift' — typically after `git pull` that
+//     modified `.agent/memory/shared/`).
+//
+// Distinct from `trust:ask` (first-visit cwd trust) in both trigger
+// and consequence:
 //
 //   - trust:ask resolves `yes` → cwd added to `trusted_dirs.json`.
 //     A `no/cancel` → operator hasn't entered the REPL at all yet, so
 //     we exit cleanly with no side-effects.
-//   - shared-trust:ask resolves `yes` → the new corpus hash is stamped
-//     into `shared_corpus_trust`. A `no/cancel` → operator stays in the
-//     REPL but the bulk-invalidate path runs against every state=active
-//     shared memory (T5.3), the trust row is cleared so the NEXT boot
-//     re-prompts, and `trust_revoked` is the eviction-event trigger.
+//   - shared-trust:ask resolves `yes` → the corpus hash is stamped
+//     into `shared_corpus_trust` (after a TOCTOU re-check). `no` →
+//     bulk-invalidate every state=active shared memory + clear trust
+//     row. `cancel` → defer (leave trust row pinned to old hash; next
+//     boot re-prompts). `trust_revoked` is the eviction-event
+//     trigger; `invalidated` is the target state.
 //
-// `path` is the absolute shared-corpus root (`<repo>/.agent/memory/shared`)
-// rather than the cwd — operator distinguishes "I trusted this cwd" from
-// "the shared/ within it just changed". `corpusFiles` is the current
-// inventory the operator would be re-confirming (name + byte length); no
-// prior snapshot is rendered because the substrate only stores ONE
-// aggregate hash. If/when per-file hashing lands as a follow-up, this
-// event grows a `changedFiles` field — additive, no breaking change to
-// the existing producer (the empty default keeps current consumers happy).
+// `path` is the absolute shared-corpus root (`<repo>/.agent/memory/
+// shared`) rather than the cwd — operator distinguishes "I trusted
+// this cwd" from "the shared/ within it just changed". `corpusFiles`
+// is the current inventory (name + byte length); no prior snapshot
+// is rendered because the substrate only stores ONE aggregate hash.
+//
+// SECURITY: filename strings flow from disk-attacker-controlled
+// readdirSync. The reducer MUST sanitize before rendering to avoid
+// ANSI/control-byte injection that would let an attacker repaint the
+// trust modal (P0/F1 hardening). The renderer trusts whatever
+// `corpusFiles[i].name` contains, so sanitization happens at the
+// reducer boundary, not here.
 export type SharedTrustAskEvent = BaseEvent & {
   type: 'shared-trust:ask';
   promptId: string;
   path: string;
+  // 'first-visit': no prior trust row, non-empty corpus. The
+  //                operator has never attested this content.
+  // 'drift':       trust row existed; current hash differs.
+  // The renderer adapts prose per mode; the answer space is the
+  // same ('yes' / 'no' / 'cancel') and the substrate handles
+  // both modes uniformly downstream.
+  mode: 'first-visit' | 'drift';
   // Snapshot of the current corpus the operator is being asked to
-  // re-confirm. Each entry is one `.md` file at the corpus root —
+  // (re-)confirm. Each entry is one `.md` file at the corpus root —
   // filename plus byte length so the operator can spot suspicious
   // size growth ("foo.md is suddenly 50KB?") without the modal
   // rendering raw bodies inline (would explode preview height for

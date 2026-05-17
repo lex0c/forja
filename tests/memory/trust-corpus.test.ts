@@ -13,7 +13,7 @@
 // exercised here — those land in T5.5 once T5.2/T5.3 are in.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -172,6 +172,79 @@ describe('computeSharedFingerprint — corpus filter', () => {
     // isFile() stat check.
     mkdirSync(join(dir, 'mistake.md'), { recursive: true });
     expect(computeSharedFingerprint(dir)).toBe(baseline);
+  });
+
+  test('symlinked .md body is rejected (S5 P1/F4 hardening)', () => {
+    // Threat: attacker commits a symlink under .agent/memory/shared/
+    // pointing at /etc/passwd (or any operator-private file). Without
+    // lstatSync rejection, the target's bytes would (a) participate
+    // in the trust hash so the modal "trusts" them on confirm, and
+    // (b) flow into the eager-load section as a memory body. Both
+    // are exfil channels. Rejection at the substrate keeps the link
+    // out of BOTH the fingerprint and the modal inventory.
+    const dir = makeTmp();
+    writeFile(dir, 'alpha.md', 'real body\n');
+    const baseline = computeSharedFingerprint(dir);
+    // Sensitive target the attacker would aim at. Path can be
+    // anything outside the corpus root; the substrate doesn't even
+    // resolve it.
+    const sensitive = makeTmp();
+    writeFile(sensitive, 'secret.txt', 'PRIVATE_TOKEN\n');
+    symlinkSync(join(sensitive, 'secret.txt'), join(dir, 'evil.md'));
+    // Adding the symlink MUST NOT change the hash — the substrate
+    // ignores it entirely (same as a non-`.md` file would be).
+    expect(computeSharedFingerprint(dir)).toBe(baseline);
+  });
+
+  test('symlink to a directory under the corpus root is rejected', () => {
+    // Variation: attacker symlinks foo.md to a directory. Without
+    // lstatSync, statSync would follow into the dir; even with
+    // isFile() filtering the dir would be skipped — but the symlink
+    // itself is the structural risk. Pin the contract explicitly.
+    const dir = makeTmp();
+    writeFile(dir, 'alpha.md', 'body\n');
+    const baseline = computeSharedFingerprint(dir);
+    const otherDir = makeTmp();
+    symlinkSync(otherDir, join(dir, 'linkedDir.md'));
+    expect(computeSharedFingerprint(dir)).toBe(baseline);
+  });
+});
+
+describe('listSharedCorpusFiles — explicit listing contract', () => {
+  afterEach(() => {
+    for (const dir of tmpDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('absent root returns kind=absent (distinct from empty)', async () => {
+    const { listSharedCorpusFiles } = await import('../../src/memory/trust-corpus.ts');
+    const listing = listSharedCorpusFiles('/nonexistent/forja-test-path');
+    expect(listing.kind).toBe('absent');
+  });
+
+  test('present empty dir returns kind=present with empty files', async () => {
+    const { listSharedCorpusFiles } = await import('../../src/memory/trust-corpus.ts');
+    const dir = makeTmp();
+    const listing = listSharedCorpusFiles(dir);
+    expect(listing.kind).toBe('present');
+    if (listing.kind === 'present') {
+      expect(listing.files).toEqual([]);
+    }
+  });
+
+  test('symlinks are excluded from the listing files array', async () => {
+    const { listSharedCorpusFiles } = await import('../../src/memory/trust-corpus.ts');
+    const dir = makeTmp();
+    writeFile(dir, 'real.md', 'body');
+    const target = makeTmp();
+    writeFile(target, 'secret.txt', 'PRIVATE');
+    symlinkSync(join(target, 'secret.txt'), join(dir, 'fake.md'));
+    const listing = listSharedCorpusFiles(dir);
+    expect(listing.kind).toBe('present');
+    if (listing.kind === 'present') {
+      expect(listing.files.map((f) => f.name)).toEqual(['real.md']);
+    }
   });
 });
 

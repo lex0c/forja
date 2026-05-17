@@ -335,6 +335,59 @@ describe('assembleMemorySection — lifecycle state filter (spec MEMORY.md §6)'
   });
 });
 
+describe('assembleMemorySection — excludeScopes (S5 P0/H2-rob fail-closed)', () => {
+  test('drops every listing in an excluded scope before per-entry filters', () => {
+    // Scenario: shared-trust probe returned verify_failed.
+    // assembleMemorySection MUST exclude project_shared entirely;
+    // even otherwise-loadable shared memories don't surface.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Shared](shared.md) — h\n');
+    writeBody(roots.projectShared, 'shared');
+    writeIndex(roots.projectLocal, '- [Local](local.md) — h\n');
+    writeBody(roots.projectLocal, 'local');
+    writeIndex(roots.user, '- [User](user.md) — h\n');
+    writeBody(roots.user, 'user', { type: 'user' });
+    const registry = createMemoryRegistry({ roots });
+
+    const result = assembleMemorySection({ registry, excludeScopes: ['project_shared'] });
+    expect(result.entryCount).toBe(2);
+    expect(result.text).toContain('local');
+    expect(result.text).toContain('user');
+    expect(result.text).not.toContain('shared');
+  });
+
+  test('excluded scope also drops missing-body "uncertain peek" entries (fail-closed)', () => {
+    // Index entry without a body file normally falls into the
+    // "uncertain peek → include" branch (resilience: don't lose
+    // operator visibility just because the body went missing). But
+    // when the scope is hard-excluded, the bootstrap intent is "we
+    // don't know what's there, so surface NOTHING". The fail-
+    // closed exclusion must beat the resilience path.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Ghost](ghost.md) — body absent\n');
+    // No writeBody for ghost — peek returns 'missing'.
+    const registry = createMemoryRegistry({ roots });
+
+    const result = assembleMemorySection({ registry, excludeScopes: ['project_shared'] });
+    expect(result.entryCount).toBe(0);
+    expect(result.text).toBe('');
+  });
+
+  test('empty excludeScopes list is a no-op (no behavior change)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Shared](shared.md) — h\n');
+    writeBody(roots.projectShared, 'shared');
+    const registry = createMemoryRegistry({ roots });
+
+    const result = assembleMemorySection({ registry, excludeScopes: [] });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('shared');
+  });
+});
+
 describe('assembleMemorySection — boot trigger filter (spec §4.3)', () => {
   const makeCtx = (...triggers: BootTrigger[]): BootContext => ({
     triggers: new Set(triggers),
