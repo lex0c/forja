@@ -1217,6 +1217,46 @@ describe('createScopeFilteredRegistry — fail-closed scope blocking (S5 review)
     expect(wrapped.search('castle', { scope: 'project_shared' })).toEqual([]);
   });
 
+  test('search filters BEFORE limit — excluded high-precedence hit does NOT eat the cap', () => {
+    // Review regression. Pre-fix createScopeFilteredRegistry.search
+    // post-filtered hits AFTER base.search ran. Because base.search
+    // enforces `limit` while iterating in precedence order
+    // (project_local > project_shared > user), an excluded
+    // higher-precedence match could fill the cap and stop the loop
+    // before any allowed-scope sibling was considered. The wrapper
+    // then dropped the excluded hit and returned [] — losing the
+    // permitted memory that would have surfaced if the filter ran
+    // at candidate-build time.
+    //
+    // Post-fix the wrapper routes excludeScopes into
+    // SearchOptions.excludeScopes; the registry filters candidates
+    // before iterating, so the limit walks only allowed scopes and
+    // the precedence-fallback semantic from `list` extends to
+    // `search`. Two memories named `fortress`; the user-scope one
+    // MUST surface even when limit=1 cuts the walk after the first
+    // hit.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Fortress](fortress.md) — shared fortress hint\n');
+    writeIndex(roots.user, '- [Fortress](fortress.md) — user fortress hint\n');
+    writeMemory(roots.projectShared, 'fortress', fmUser('fortress'), 'shared body');
+    writeMemory(roots.user, 'fortress', fmUser('fortress'), 'user body');
+    const base = createMemoryRegistry({ roots });
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+
+    // Baseline (no exclusion). project_shared/fortress wins
+    // precedence and fills limit=1; user/fortress is shadowed.
+    // Pins the precondition the bug depended on.
+    const baseline = base.search('fortress', { limit: 1 });
+    expect(baseline.map((h) => `${h.scope}/${h.name}`)).toEqual(['project_shared/fortress']);
+
+    // Wrapped. Pre-fix this returned []. Post-fix user/fortress
+    // surfaces because the excluded shared match never entered the
+    // loop, leaving the cap free for the user-scope hit.
+    const filtered = wrapped.search('fortress', { limit: 1 });
+    expect(filtered.map((h) => `${h.scope}/${h.name}`)).toEqual(['user/fortress']);
+  });
+
   test('peek(name, {}) honors precedence fallback (matches read)', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

@@ -284,6 +284,21 @@ export interface SearchOptions extends AuditOverride {
   // Effective only when `deep: true`. Name/description matches do
   // no body reads and emit nothing regardless of this cap.
   auditLimit?: number;
+  // Scope-level fail-closed exclusion (S5 retrieval-view review).
+  // Listings whose scope is in this list are dropped BEFORE the
+  // precedence walk that fills `limit`. Mirrors the same field on
+  // `ListOptions` and is enforced for the same reason: a previous
+  // shape post-filtered hits after `search` had already short-
+  // circuited at the limit, so a higher-precedence excluded match
+  // could fill the cap before any allowed-scope sibling was
+  // considered — caller saw `[]` (or a too-short list) even when
+  // permitted memories matched. With the filter at candidate-
+  // build time, the precedence walk operates only over allowed
+  // scopes and `limit` covers what actually surfaces.
+  //
+  // Empty / absent ≡ no exclusion. Distinct from the singular
+  // `scope` field (which RESTRICTS to one scope); these stack.
+  excludeScopes?: readonly MemoryScope[];
 }
 
 // Inputs to `MemoryRegistry.write()`. The registry layer is
@@ -701,10 +716,21 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       const auditLimit = opts.auditLimit ?? limit;
       const lower = q.toLowerCase();
 
-      const candidates =
-        opts.scope === undefined
-          ? allListings()
-          : allListings().filter((l) => l.scope === opts.scope);
+      // Candidate set. Scope restriction + scope exclusion BOTH
+      // happen here, BEFORE the precedence-walk + limit loop below.
+      // Filtering at this point is what gives `excludeScopes` its
+      // precedence-fallback guarantee: a higher-precedence excluded
+      // match never enters the loop, so the limit walks only over
+      // permitted scopes. (Mirrors the same invariant `list()`
+      // enforces with its own `excludeScopes` filter.)
+      let candidates = allListings();
+      if (opts.scope !== undefined) {
+        candidates = candidates.filter((l) => l.scope === opts.scope);
+      }
+      if (opts.excludeScopes !== undefined && opts.excludeScopes.length > 0) {
+        const excluded = new Set(opts.excludeScopes);
+        candidates = candidates.filter((l) => !excluded.has(l.scope));
+      }
 
       const hits: MemorySearchHit[] = [];
       // Body-match audit queue. Each entry captures the data needed
@@ -1068,7 +1094,19 @@ export const createScopeFilteredRegistry = (
 
     search(query: string, opts: SearchOptions = {}): MemorySearchHit[] {
       if (opts.scope !== undefined && excluded.has(opts.scope)) return [];
-      return base.search(query, opts).filter((h) => !excluded.has(h.scope));
+      // Merge the wrapper's excludeScopes into the native field so
+      // candidate filtering runs BEFORE the precedence-walk + limit
+      // loop. A previous shape post-filtered after `base.search`
+      // returned, which meant a higher-precedence excluded match
+      // could fill the limit before any allowed-scope sibling was
+      // considered (e.g., `excludeScopes: ['project_shared']` +
+      // `limit: 1` returning [] even when user/foo would match).
+      // Routing into `SearchOptions.excludeScopes` puts the filter
+      // at candidate-build time and restores the precedence-fallback
+      // contract that `list` already enforces.
+      const existing = opts.excludeScopes ?? [];
+      const combined = new Set<MemoryScope>([...existing, ...excludeScopes]);
+      return base.search(query, { ...opts, excludeScopes: Array.from(combined) });
     },
 
     count(opts: { deduplicateByName?: boolean } = {}): number {

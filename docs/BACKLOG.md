@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(memory) — Filter excluded scopes before applying search limit
+
+Review observation: `createScopeFilteredRegistry.search` post-filtered hits AFTER `base.search` returned. The base loop enforces `limit` while iterating in precedence order (`project_local` > `project_shared` > `user`); when `project_shared` was excluded and `limit` was small (e.g., 1), the shared match was picked first, filled the cap, and stopped the loop before any allowed-scope sibling was considered. The wrapper then dropped the shared hit and returned `[]` — silently losing the permitted memory. Same precedence-fallback bug pattern the previous `ListOptions.excludeScopes` fix addressed for `list`, just on the search surface.
+
+Fix: add `excludeScopes?: readonly MemoryScope[]` to `SearchOptions`. The registry's search filters candidates by it at candidate-build time (alongside the existing `scope` restriction), BEFORE the iteration loop. The wrapper's `search` now merges its own `excludeScopes` into the option and delegates without any post-filter. Precedence-fallback is restored: the limit walks only over allowed scopes.
+
+Audit-trail impact: the deferred `auditRead` / `auditExposure` emission in the base loop only ever sees the surviving candidates, so the audit row count tracks "what the model actually saw" the same way it did before. Pinned-excluded-scope short-circuit at the wrapper layer stays — a caller asking `search('x', { scope: 'project_shared' })` against a wrapper that excludes `project_shared` still gets `[]` immediately, no base call.
+
+Regression test (`tests/memory/registry.test.ts`): two memories named `fortress`, one in `project_shared` and one in `user`. With no exclusion, `base.search('fortress', { limit: 1 })` returns `project_shared/fortress` (pins the precondition). With `createScopeFilteredRegistry(base, ['project_shared'])` and the same `limit: 1`, the wrapped search MUST surface `user/fortress`. Pre-fix this returned `[]`.
+
+Tests: 8314 pass (+1), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(harness) — Enforce shared-scope block on all memory tools
 
 Review observation: when `memoryExcludeScopes` was set (shared trust probe → `verify_failed` / `deferred` / `revoked`), the harness wired `retrieve_context` against the exclusion correctly but exposed the **unfiltered** `memoryRegistry` to `memory_list` / `memory_read` / `memory_search` via `ctx.memoryRegistry`. The model could call those tools and enumerate / read `project_shared` bodies the operator had marked offline — direct bypass of the trust gate the eager-load and retrieval surfaces already respect. Test harness pinning the shared-scope exclusion existed for retrieval and eager-load, but the per-tool surface was unprotected.
