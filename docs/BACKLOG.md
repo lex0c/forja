@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(storage) — Push invalidation batch filter into SQL
+
+Review observation: `getLastInvalidationEventsBatch` ran `SELECT object_id, object_scope, MAX(recorded_at) … GROUP BY object_id, object_scope` with only a `substrate` filter and then trimmed the result in JS via a `wanted` Set. On a long-lived database that meant boot-time `gcStaleInvalidatedMemories` did work proportional to TOTAL historical invalidation rows for the memory substrate, not the handful of currently-invalidated bodies being inspected. The original P1/F2 batching collapsed N round-trips into one, but the one query it left behind still scaled with history.
+
+Fix: push the per-object filter into SQL via row-value IN — `WHERE substrate = ? AND (object_id, object_scope) IN ((?, ?), …)`. The clause builds with one tuple per requested object, parameters bind in order, and the JS-side `wanted` filter is gone (correctness still holds — only requested rows are returned). Row-value IN is supported in SQLite ≥3.15 (2016) and Bun bundles 3.45+; smoke-checked against `bun:sqlite` before landing.
+
+Index usage stays correct: `idx_evict_obj(substrate, object_id)` is hit per IN tuple, then `object_scope` + `to_state` + `outcome` filter at the leaf. Cost now scales with the requested key count, not historical row count.
+
+Regression tests: six new tests under `getLastInvalidationEventsBatch` — basic batch correctness, scope isolation for same id across scopes, empty-objects short-circuit, the **scoping** test (seed 50 unrelated invalidations + 2 requested, assert map.size === 2 and none of the noise leaks), outcome/to_state filter (an applied + a blocked_by_protection + a quarantine row at the same key — only the applied invalidation surfaces), and substrate isolation across memory/policy.
+
+Tests: 8287 pass (+6), 10 skip, 0 fail.
+
 ## [2026-05-17] fix(memory) — Sanitize corpus filenames before stderr emission
 
 Review observation: the trust probe's `dumpInventoryToStderr` (S5 IMP/F5) wrote `corpusFiles[i].name` and `sharedRoot` straight through `warn()` to stderr, and `bulkInvalidateShared` did the same with `listing.name` + `reason`. The modal-renderer path passes those strings through `sanitizeOneLineForDisplay` (stripping ANSI escapes and collapsing `\r\n\t` to spaces), but the stderr surface didn't — so a poisoned repo shipping a `.md` file whose name embeds ESC sequences, literal newlines, or carriage returns could inject terminal control bytes into the operator's trust-review output. Concrete attacks: clear-screen + cursor-move to repaint the modal prose, fake an additional inventory line so a malicious entry looks benign, or split a single warn line into two with a forged second line.

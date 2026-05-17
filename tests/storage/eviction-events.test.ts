@@ -10,6 +10,7 @@ import {
   detectTriggerThrashing,
   getLastAppliedEvictionForObject,
   getLastEvictionForObject,
+  getLastInvalidationEventsBatch,
   getLastQuarantineEvent,
   isLegalTransition,
   listEvictableInWindow,
@@ -1025,5 +1026,167 @@ describe('detectTriggerThrashing', () => {
     }
     // sinceMs = 250 includes only recordedAt ∈ {300, 400} ⇒ 2 hits.
     expect(detectTriggerThrashing(db, 250, 1)[0]?.count).toBe(2);
+  });
+});
+
+describe('getLastInvalidationEventsBatch', () => {
+  // Helper: seed an applied `* → invalidated` row for a given key.
+  // Uses `from_state: active` so the transition is legal under
+  // LEGAL_TRANSITIONS without per-test motivo gymnastics.
+  const seedInvalidation = (objectId: string, objectScope: string, recordedAt: number): void => {
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId,
+        objectScope,
+        fromState: 'active',
+        toState: 'invalidated',
+        trigger: 'trust_revoked',
+        motivo: 'security',
+        evidenceJson: JSON.stringify({ trigger_source: 'hook' }),
+        recordedAt,
+      }),
+    );
+  };
+
+  test('returns latest recorded_at per (object_id, object_scope) for requested keys', () => {
+    seedInvalidation('alpha', 'project_shared', 1000);
+    seedInvalidation('alpha', 'project_shared', 1500); // newer wins
+    seedInvalidation('beta', 'project_shared', 2000);
+    seedInvalidation('gamma', 'project_local', 3000);
+
+    const map = getLastInvalidationEventsBatch(db, 'memory', [
+      { objectId: 'alpha', objectScope: 'project_shared' },
+      { objectId: 'beta', objectScope: 'project_shared' },
+      { objectId: 'gamma', objectScope: 'project_local' },
+    ]);
+    expect(map.get('project_shared/alpha')).toBe(1500);
+    expect(map.get('project_shared/beta')).toBe(2000);
+    expect(map.get('project_local/gamma')).toBe(3000);
+    expect(map.size).toBe(3);
+  });
+
+  test('isolates by scope — same id in two scopes returns two distinct entries', () => {
+    seedInvalidation('shared', 'project_shared', 1000);
+    seedInvalidation('shared', 'project_local', 2000);
+
+    const map = getLastInvalidationEventsBatch(db, 'memory', [
+      { objectId: 'shared', objectScope: 'project_shared' },
+      { objectId: 'shared', objectScope: 'project_local' },
+    ]);
+    expect(map.get('project_shared/shared')).toBe(1000);
+    expect(map.get('project_local/shared')).toBe(2000);
+  });
+
+  test('empty objects list short-circuits to empty map without hitting SQL', () => {
+    // Seed something — if the helper ran the SELECT anyway it would
+    // come back with this row; an empty IN list would be a SQL
+    // syntax error. Confirms the early-return guards both
+    // correctness and the malformed-query risk.
+    seedInvalidation('alpha', 'project_shared', 1000);
+    expect(getLastInvalidationEventsBatch(db, 'memory', []).size).toBe(0);
+  });
+
+  test('keys not requested are absent — query SCOPED to requested objects, not all history', () => {
+    // Review-driven scoping fix: the helper used to GROUP BY over
+    // every invalidation row for the substrate and post-filter in
+    // JS. On long-lived DBs that meant boot-time GC scanned all
+    // historical invalidations regardless of how few memories were
+    // currently invalidated. Now the (object_id, object_scope)
+    // filter runs in SQL, so the result excludes (and the planner
+    // never visits) un-requested rows.
+    //
+    // Seed 50 unrelated invalidation events for distinct keys; ask
+    // only about 2 of them. Only those 2 must come back, and the
+    // map size must be exactly 2 (no leakage from the other 48).
+    for (let i = 0; i < 50; i++) {
+      seedInvalidation(`noise-${i}`, 'project_shared', 100 + i);
+    }
+    seedInvalidation('wanted-a', 'project_shared', 5000);
+    seedInvalidation('wanted-b', 'project_local', 6000);
+
+    const map = getLastInvalidationEventsBatch(db, 'memory', [
+      { objectId: 'wanted-a', objectScope: 'project_shared' },
+      { objectId: 'wanted-b', objectScope: 'project_local' },
+    ]);
+    expect(map.size).toBe(2);
+    expect(map.get('project_shared/wanted-a')).toBe(5000);
+    expect(map.get('project_local/wanted-b')).toBe(6000);
+    // Sanity: no `noise-N` slipped through under the cross-scope
+    // composite key.
+    for (let i = 0; i < 50; i++) {
+      expect(map.has(`project_shared/noise-${i}`)).toBe(false);
+    }
+  });
+
+  test('ignores non-applied and non-invalidated rows for the requested key', () => {
+    // Same (id, scope) gets three rows: an applied invalidation
+    // (the one we want), a `blocked_by_protection` invalidation
+    // attempt (outcome filter rejects), and a quarantine row
+    // (to_state filter rejects). The batch must return only the
+    // applied row's recorded_at.
+    seedInvalidation('alpha', 'project_shared', 2000);
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'alpha',
+        objectScope: 'project_shared',
+        fromState: 'active',
+        toState: 'invalidated',
+        trigger: 'trust_revoked',
+        motivo: 'security',
+        evidenceJson: JSON.stringify({ trigger_source: 'hook' }),
+        outcome: 'blocked_by_protection',
+        blockedBy: 'protected',
+        recordedAt: 3000, // newer but blocked
+      }),
+    );
+    appendEvictionEvent(
+      db,
+      validInput({
+        objectId: 'alpha',
+        objectScope: 'project_shared',
+        fromState: 'active',
+        toState: 'quarantined',
+        trigger: 'admission_gate',
+        motivo: 'conflict',
+        evidenceJson: JSON.stringify({ failures: 3 }),
+        recordedAt: 4000, // newer but not an invalidation
+      }),
+    );
+    const map = getLastInvalidationEventsBatch(db, 'memory', [
+      { objectId: 'alpha', objectScope: 'project_shared' },
+    ]);
+    expect(map.get('project_shared/alpha')).toBe(2000);
+  });
+
+  test('substrate filter isolates results — `policy` invalidations never leak into `memory`', () => {
+    seedInvalidation('alpha', 'project_shared', 1000);
+    // Same (id, scope) under a DIFFERENT substrate — must not
+    // appear when querying for substrate='memory'.
+    appendEvictionEvent(
+      db,
+      validInput({
+        substrate: 'policy',
+        objectId: 'alpha',
+        objectScope: 'project_shared',
+        fromState: 'active',
+        toState: 'invalidated',
+        trigger: 'trust_revoked',
+        motivo: 'security',
+        evidenceJson: JSON.stringify({ trigger_source: 'hook' }),
+        recordedAt: 2000,
+      }),
+    );
+
+    const memMap = getLastInvalidationEventsBatch(db, 'memory', [
+      { objectId: 'alpha', objectScope: 'project_shared' },
+    ]);
+    expect(memMap.get('project_shared/alpha')).toBe(1000);
+
+    const polMap = getLastInvalidationEventsBatch(db, 'policy', [
+      { objectId: 'alpha', objectScope: 'project_shared' },
+    ]);
+    expect(polMap.get('project_shared/alpha')).toBe(2000);
   });
 });

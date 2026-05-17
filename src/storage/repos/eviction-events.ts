@@ -1073,30 +1073,45 @@ export const getLastInvalidationEvent = (
 // Returns a Map keyed by `${scope}/${objectId}` → `recordedAt`.
 // Objects with no applied invalidation row are absent from the
 // map (caller treats absence as the "orphan" case).
+//
+// SCOPING (S5 review): the filter on the requested objects MUST
+// run in SQL, not in JS. A previous version selected MAX(recorded_at)
+// over EVERY invalidation row for the substrate and post-filtered
+// the result, so boot-time GC work scaled with TOTAL historical
+// invalidations, not the handful of currently-invalidated bodies
+// being checked. On a long-lived database this dominates boot
+// latency. The fix uses SQLite row-value IN — supported since
+// 3.15 (2016) and bundled in every supported Bun version — so
+// the SELECT walks only the requested (object_id, object_scope)
+// pairs via the `idx_evict_obj(substrate, object_id)` index.
 export const getLastInvalidationEventsBatch = (
   db: DB,
   substrate: EvictionSubstrate,
   objects: ReadonlyArray<{ objectId: string; objectScope: string }>,
 ): Map<string, number> => {
   if (objects.length === 0) return new Map();
-  // GROUP BY clause picks the latest `recorded_at` per
-  // (object_id, object_scope) for applied invalidation rows. The
-  // tuple-IN form isn't supported uniformly across SQLite versions,
-  // so we filter substrate once and let the SELECT walk the
-  // composite via the same indices the single-row variant uses.
+  // Build the row-value IN list: `((?, ?), (?, ?), ...)` with one
+  // tuple per requested object. Parameters bind in order:
+  // [substrate, id_0, scope_0, id_1, scope_1, ...].
+  const tuples = objects.map(() => '(?, ?)').join(', ');
+  const params: (string | EvictionSubstrate)[] = [substrate];
+  for (const o of objects) {
+    params.push(o.objectId);
+    params.push(o.objectScope);
+  }
   const rows = db
-    .query<{ object_id: string; object_scope: string; recorded_at: number }, [EvictionSubstrate]>(
+    .query<{ object_id: string; object_scope: string; recorded_at: number }, typeof params>(
       `SELECT object_id, object_scope, MAX(recorded_at) AS recorded_at
          FROM eviction_events
-        WHERE substrate = ? AND to_state = 'invalidated' AND outcome = 'applied'
+        WHERE substrate = ?
+          AND (object_id, object_scope) IN (${tuples})
+          AND to_state = 'invalidated' AND outcome = 'applied'
         GROUP BY object_id, object_scope`,
     )
-    .all(substrate);
-  const wanted = new Set(objects.map((o) => `${o.objectScope}/${o.objectId}`));
+    .all(...params);
   const out = new Map<string, number>();
   for (const r of rows) {
-    const key = `${r.object_scope}/${r.object_id}`;
-    if (wanted.has(key)) out.set(key, r.recorded_at);
+    out.set(`${r.object_scope}/${r.object_id}`, r.recorded_at);
   }
   return out;
 };
