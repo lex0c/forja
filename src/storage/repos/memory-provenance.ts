@@ -324,27 +324,43 @@ export const listProvenanceByName = (
 // it under the right session context).
 // All exposures in a session since a timestamp cutoff. Used by the
 // S11 semantic-verify scheduler to poll new exposures between step
-// boundaries; the scheduler tracks its own lastPolledAt and feeds it
-// here. ORDER BY created_at ASC so the scheduler processes oldest-
-// first (closer to user-facing turn order than DESC).
+// boundaries; the scheduler tracks its own cursor (createdAt + id)
+// and feeds it here. ORDER BY (created_at ASC, id ASC) so the
+// scheduler processes oldest-first (closer to user-facing turn
+// order than DESC) and lexicographically stable for siblings that
+// share a timestamp.
 //
-// Cutoff is EXCLUSIVE: a row at exactly `sinceMs` is NOT returned —
-// the next poll's `sinceMs = lastSeen.createdAt` won't re-emit the
-// same row. Returns empty array when no new exposures landed.
+// Cutoff is EXCLUSIVE on the (created_at, id) lexicographic tuple:
+//   - `(sinceMs, '')` returns every row with created_at >= sinceMs
+//     when sinceId is omitted (id > '' is true for any UUID).
+//   - `(sinceMs, sinceId)` skips the row whose (created_at, id)
+//     equals the cursor, so the next poll picks up siblings with
+//     the SAME created_at but lexicographically greater id.
+//
+// Pre-fix the cursor was a bare timestamp and the predicate was
+// `created_at > sinceMs`. When several exposures landed in the
+// same millisecond (eager-load burst, parallel tool calls), the
+// scheduler would dispatch one, advance to its createdAt, and
+// permanently lose its siblings — they could never reappear in
+// later polls because `created_at > X` excluded them. The (created_at,
+// id) tuple cursor preserves the round-robin across siblings while
+// still moving forward.
 export const listSessionExposuresSince = (
   db: DB,
   sessionId: string,
   sinceMs: number,
   limit = 200,
+  sinceId = '',
 ): MemoryProvenanceRow[] => {
   const rows = db
-    .query<MemoryProvenanceDbRow, [string, number, number]>(
+    .query<MemoryProvenanceDbRow, [string, number, number, string, number]>(
       `${SELECT_ALL}
-        WHERE session_id = ? AND created_at > ?
+        WHERE session_id = ?
+          AND (created_at > ? OR (created_at = ? AND id > ?))
         ORDER BY created_at ASC, id ASC
         LIMIT ?`,
     )
-    .all(sessionId, sinceMs, limit);
+    .all(sessionId, sinceMs, sinceMs, sinceId, limit);
   return rows.map(fromRow);
 };
 

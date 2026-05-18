@@ -141,12 +141,22 @@ export const createSemanticVerifyScheduler = (
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(line));
 
   let stopped = false;
-  // cursorAt is the listSessionExposuresSince cutoff. It advances
-  // INCREMENTALLY per consumed candidate so a single-dispatch-per-poll
-  // doesn't leak the unprocessed siblings out of the next poll's
-  // window. Distinct from counters.lastPolledAt (which tracks
-  // "last time poll was invoked" for the status surface).
+  // Cursor tuple (cursorAt, cursorId) is the listSessionExposuresSince
+  // cutoff. It advances INCREMENTALLY per consumed candidate so a
+  // single-dispatch-per-poll doesn't leak the unprocessed siblings
+  // out of the next poll's window. Distinct from counters.lastPolledAt
+  // (which tracks "last time poll was invoked" for the status surface).
+  //
+  // Why a tuple instead of bare timestamp: provenance rows can share
+  // the same `created_at` (eager-load burst, parallel tool calls all
+  // landing in the same millisecond). A bare `created_at > X` cutoff
+  // would permanently drop every sibling of the dispatched candidate —
+  // verify would never see them in later polls. The (created_at, id)
+  // tuple cursor + `(created_at, id) > (X, Y)` predicate at the SQL
+  // layer keeps the round-robin across siblings while still moving
+  // forward.
   let cursorAt = 0;
+  let cursorId = '';
   const counters: SemanticVerifySchedulerCounters = {
     dispatched: 0,
     costUsdSpent: 0,
@@ -198,22 +208,31 @@ export const createSemanticVerifyScheduler = (
 
     let exposures: ReturnType<typeof listSessionExposuresSince>;
     try {
-      exposures = listSessionExposuresSince(deps.db, deps.parentSessionId, cursorAt, maxExposures);
+      exposures = listSessionExposuresSince(
+        deps.db,
+        deps.parentSessionId,
+        cursorAt,
+        maxExposures,
+        cursorId,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       stderr(`memory: verify_semantic_poll_failed: ${displayErr(msg)}\n`);
       return;
     }
 
-    // Helper: advance the cursor to the candidate's createdAt so
-    // the next poll's cutoff sits past it. Bumping incrementally
-    // (per consumed candidate) instead of jumping to pollStart
-    // preserves any candidates that REMAIN unprocessed when we
-    // early-return for one-dispatch-per-poll — those still appear in
-    // the next listSessionExposuresSince call.
-    const advanceTo = (createdAt: number): void => {
-      if (createdAt > cursorAt) {
+    // Helper: advance the cursor to a specific exposure's
+    // (createdAt, id) so the next poll's cutoff sits past it.
+    // Bumping incrementally (per consumed candidate) instead of
+    // jumping to pollStart preserves any candidates that REMAIN
+    // unprocessed when we early-return for one-dispatch-per-poll —
+    // those still appear in the next listSessionExposuresSince
+    // call. Lexicographic on the tuple: only advance when the new
+    // position is strictly past the current cursor.
+    const advanceTo = (createdAt: number, id: string): void => {
+      if (createdAt > cursorAt || (createdAt === cursorAt && id > cursorId)) {
         cursorAt = createdAt;
+        cursorId = id;
       }
     };
 
@@ -235,24 +254,35 @@ export const createSemanticVerifyScheduler = (
     // past them so they're not re-considered on the next poll (the
     // trust verdict for this session is stable).
     const seen = new Set<string>();
-    const candidates: { scope: MemoryScope; name: string; createdAt: number }[] = [];
+    const candidates: {
+      scope: MemoryScope;
+      name: string;
+      createdAt: number;
+      exposureId: string;
+    }[] = [];
     for (const e of exposures) {
       if (excludedScopes.has(e.memoryScope)) {
-        advanceTo(e.createdAt);
+        advanceTo(e.createdAt, e.id);
         continue;
       }
       const key = `${e.memoryScope}/${e.memoryName}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      candidates.push({ scope: e.memoryScope, name: e.memoryName, createdAt: e.createdAt });
+      candidates.push({
+        scope: e.memoryScope,
+        name: e.memoryName,
+        createdAt: e.createdAt,
+        exposureId: e.id,
+      });
     }
 
     for (const cand of candidates) {
       if (stopped) return;
-      // Advance only past the candidate's FIRST sighting createdAt
+      // Advance only past the candidate's FIRST sighting (createdAt, id)
       // — see the dedup comment above for why latest-sighting
       // semantics would drop intervening siblings.
       const advanceAt = cand.createdAt;
+      const advanceId = cand.exposureId;
 
       // Cap re-check INSIDE the loop — caps may have crossed during
       // an earlier candidate's dispatch on this same poll. DON'T
@@ -278,11 +308,11 @@ export const createSemanticVerifyScheduler = (
             `memory: verify_semantic_peek_malformed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${displayErr(peek.error)}\n`,
           );
         }
-        advanceTo(advanceAt);
+        advanceTo(advanceAt, advanceId);
         continue;
       }
       if (!isEligibleType.has(peek.file.frontmatter.type)) {
-        advanceTo(advanceAt);
+        advanceTo(advanceAt, advanceId);
         continue;
       }
       // Trust filter (G3 — AGENTIC_CLI.md §1.1.5 canonical gate).
@@ -294,7 +324,7 @@ export const createSemanticVerifyScheduler = (
       // candidate — trust verdict on this body is stable for the
       // session.
       if (peek.file.frontmatter.trust === 'untrusted') {
-        advanceTo(advanceAt);
+        advanceTo(advanceAt, advanceId);
         continue;
       }
       // F15: state filter. Already-quarantined / invalidated / evicted
@@ -304,7 +334,7 @@ export const createSemanticVerifyScheduler = (
       // absent (per MEMORY.md §3.1.1).
       const state = peek.file.frontmatter.state ?? 'active';
       if (state !== 'active') {
-        advanceTo(advanceAt);
+        advanceTo(advanceAt, advanceId);
         continue;
       }
 
@@ -323,7 +353,7 @@ export const createSemanticVerifyScheduler = (
         continue;
       }
       if (pending.some((p) => p.kind === 'quarantine')) {
-        advanceTo(advanceAt);
+        advanceTo(advanceAt, advanceId);
         continue;
       }
 
@@ -388,7 +418,7 @@ export const createSemanticVerifyScheduler = (
         stderr(
           `memory: verify_semantic_dispatch_failed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${displayErr(msg)}\n`,
         );
-        advanceTo(advanceAt);
+        advanceTo(advanceAt, advanceId);
         continue;
       }
 
@@ -431,7 +461,7 @@ export const createSemanticVerifyScheduler = (
         // — proceeds. Only pathological "operator edits between
         // every poll" would loop, which the cost cap bounds.
         if (outcome.reason !== 'stale_snapshot') {
-          advanceTo(advanceAt);
+          advanceTo(advanceAt, advanceId);
         }
         continue;
       }
@@ -455,7 +485,7 @@ export const createSemanticVerifyScheduler = (
       // it's not re-considered next poll (the attempts-cache would
       // dedup-skip it anyway, but advancing avoids the wasted
       // peek + lookup).
-      advanceTo(advanceAt);
+      advanceTo(advanceAt, advanceId);
       return;
     }
   };

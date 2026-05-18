@@ -444,6 +444,40 @@ describe('scheduler — F4 out-of-order dedupe regression', () => {
   });
 });
 
+// Cursor tuple (createdAt, id) — pre-fix the cursor was a bare
+// timestamp and listSessionExposuresSince used `created_at > sinceMs`.
+// Siblings sharing a millisecond timestamp (eager-load burst,
+// parallel tool calls landing simultaneously) were permanently
+// dropped after the first sibling dispatched — `created_at > X`
+// excluded them and they never reappeared.
+describe('scheduler — same-millisecond siblings (cursor tuple tiebreaker)', () => {
+  test('three exposures with identical createdAt all reach dispatch across polls', async () => {
+    seedMemoryFiles(roots.projectLocal, [
+      { name: 'a', type: 'project' },
+      { name: 'b', type: 'project' },
+      { name: 'c', type: 'project' },
+    ]);
+    // All three exposures landed in the SAME millisecond — common
+    // shape on a turn that eager-loads multiple memos at once.
+    seedExposure('a', 5_000);
+    seedExposure('b', 5_000);
+    seedExposure('c', 5_000);
+    const sched = buildScheduler();
+    // Three polls — one dispatch per poll (the production cap).
+    // Pre-fix: poll 1 dispatched the first sibling and advanced
+    // cursor to 5_000; polls 2/3 returned zero exposures because
+    // `created_at > 5_000` excluded b and c. Post-fix: cursor
+    // advances by (createdAt, id) tuple; lexicographically later
+    // siblings re-appear next poll.
+    await sched.poll();
+    expect(sched.getCounters().dispatched).toBe(1);
+    await sched.poll();
+    expect(sched.getCounters().dispatched).toBe(2);
+    await sched.poll();
+    expect(sched.getCounters().dispatched).toBe(3);
+  });
+});
+
 describe('scheduler — F13 peek=malformed stderr', () => {
   test('emits verify_semantic_peek_malformed when a memory file is corrupt', async () => {
     mkdirSync(roots.projectLocal, { recursive: true });
