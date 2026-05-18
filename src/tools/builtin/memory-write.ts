@@ -356,6 +356,14 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
             proposed_source: source,
             modal_stage: 'modal',
           },
+          // bootstrap creates memoryRegistry without a constructor
+          // sessionId (the harness loop creates the session later);
+          // recordOverrideSignal no-ops when both ctor sessionId
+          // and auditSessionId are missing, so the signal silently
+          // drops and S3 threshold never trips. Pass ctx.sessionId
+          // here (and on the user_scope_modal branch below) to keep
+          // parity with every other audit call in this file.
+          auditSessionId: ctx.sessionId,
         });
       }
       return {
@@ -433,6 +441,10 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
               proposed_source: source,
               modal_stage: 'user_scope_modal',
             },
+            // Same auditSessionId rationale as the first modal
+            // branch above — bootstrap-built registry has no
+            // constructor sessionId.
+            auditSessionId: ctx.sessionId,
           });
         }
         return {
