@@ -156,6 +156,19 @@ export const createSemanticVerifyScheduler = (
 
   const isEligibleType: ReadonlySet<string> = new Set(SEMANTIC_VERIFY_ELIGIBLE_TYPES);
   const excludedScopes: ReadonlySet<MemoryScope> = new Set(deps.memoryExcludeScopes ?? []);
+  // S5 fail-closed posture forwarded to every dispatched verify
+  // child, INDEPENDENT of which scope the candidate-being-verified
+  // belongs to. The candidate-scope check at the call site was
+  // tautologically false (excluded scopes are filtered upstream in
+  // the poll loop), so the forwarded boolean would stay false even
+  // when the bootstrap had marked project_shared offline — leaving
+  // the verify child free to call `memory_read('project_shared',
+  // …)` against bodies the operator just refused to trust. Today
+  // only `project_shared` is a shared-corpus scope; if a future
+  // detector gates additional scopes the check generalizes
+  // automatically (any "shared" scope present in the exclude list
+  // triggers the offline posture).
+  const sharedScopeOffline = excludedScopes.has('project_shared');
 
   const checkCapsBeforeDispatch = (): SchedulerCapExhausted => {
     if (counters.dispatched >= maxDispatches) return 'dispatch';
@@ -341,11 +354,19 @@ export const createSemanticVerifyScheduler = (
           ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
           ...(deps.softStopSignal !== undefined ? { softStopSignal: deps.softStopSignal } : {}),
           ...(deps.cwdTrusted !== undefined ? { cwdTrusted: deps.cwdTrusted } : {}),
-          // sharedScopeOffline mirrors memoryExcludeScopes — the
-          // dispatcher's field is a boolean. When the scope is in
-          // the excluded list (F2), we mark the child's posture
-          // accordingly.
-          ...(excludedScopes.has(cand.scope) ? { sharedScopeOffline: true } : {}),
+          // sharedScopeOffline reflects the SESSION-wide trust
+          // verdict for shared scopes, not the candidate's own
+          // scope. The earlier filter in poll() already dropped
+          // candidates whose own scope is excluded — so checking
+          // `excludedScopes.has(cand.scope)` here is always false
+          // and the flag never got forwarded. Pre-fix a verify
+          // dispatched for a `user` memo could still call
+          // `memory_read('project_shared', …)` against bodies the
+          // operator just marked untrusted. Now: forward the
+          // session-level boolean computed above so the child's
+          // eager-load + retrieve_context honor the same posture
+          // the parent does.
+          ...(sharedScopeOffline ? { sharedScopeOffline: true } : {}),
           ...(deps.hooksSnapshot !== undefined ? { hooksSnapshot: deps.hooksSnapshot } : {}),
           ...(deps.effectiveCapabilities !== undefined
             ? { effectiveCapabilities: deps.effectiveCapabilities }

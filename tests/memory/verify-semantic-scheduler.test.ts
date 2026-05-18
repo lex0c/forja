@@ -342,6 +342,57 @@ describe('scheduler — counters', () => {
 
 // ── post-review hardening (F2, F4, F13, F15, F17) ─────────────────
 
+// ── sharedScopeOffline forwarding ─────────────────────────────────
+//
+// Pre-fix the scheduler computed `sharedScopeOffline` from
+// `excludedScopes.has(cand.scope)` AT THE DISPATCH SITE. But the
+// upstream filter in poll() already dropped candidates whose own
+// scope was excluded, so the check was tautologically false and
+// the flag never reached the child. A verify dispatched for a
+// memo in `user` could call `memory_read('project_shared', …)`
+// during its work and slip past the operator's trust revocation.
+// Fix: derive `sharedScopeOffline` from the session-wide exclude
+// list once (any "shared" scope present ⇒ child runs offline),
+// forward unconditionally for every dispatch.
+
+describe('scheduler — sharedScopeOffline forwarding (R3 review fix)', () => {
+  test('memoryExcludeScopes contains project_shared ⇒ every dispatch carries sharedScopeOffline:true', async () => {
+    // Seed a memo in `project_local` (NOT in the exclude list) so
+    // it survives the upstream filter and actually dispatches.
+    // The fix's load-bearing claim is: sharedScopeOffline forwards
+    // EVEN when the dispatched candidate's own scope isn't the
+    // excluded one (the parent's trust posture must travel).
+    seedMemoryFile(roots.projectLocal, 'foo', 'project');
+    seedExposure('foo', 1_000);
+    let captured: Record<string, unknown> | undefined;
+    const captureSpawn = (async (input: Record<string, unknown>) => {
+      captured = input;
+      return passedResult();
+    }) as never;
+    const sched = buildScheduler({
+      memoryExcludeScopes: ['project_shared'],
+      spawnSubagentFn: captureSpawn,
+    });
+    await sched.poll();
+    expect(captured).toBeDefined();
+    expect(captured?.sharedScopeOffline).toBe(true);
+  });
+
+  test('memoryExcludeScopes empty ⇒ sharedScopeOffline omitted (legacy posture)', async () => {
+    seedMemoryFile(roots.projectLocal, 'foo', 'project');
+    seedExposure('foo', 1_000);
+    let captured: Record<string, unknown> | undefined;
+    const captureSpawn = (async (input: Record<string, unknown>) => {
+      captured = input;
+      return passedResult();
+    }) as never;
+    const sched = buildScheduler({ spawnSubagentFn: captureSpawn });
+    await sched.poll();
+    expect(captured).toBeDefined();
+    expect(captured?.sharedScopeOffline).toBeUndefined();
+  });
+});
+
 describe('scheduler — F2 excludeScopes', () => {
   test('memories in excluded scopes are filtered upstream — no peek, no dispatch', async () => {
     seedMemoryFile(roots.projectShared, 'sensitive', 'project');
