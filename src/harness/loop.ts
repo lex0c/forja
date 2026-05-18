@@ -1090,6 +1090,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           'memory: verify_semantic_disabled: cannot run inside a subagent context (refused at runtime)\n',
         );
       }
+      // Plan-mode gate (post-review fix): `--plan` declares a read-
+      // only session ("show me what you'd do, don't write"). The
+      // LLM-judge detectors are writes against the governance
+      // substrate — every dispatch lands a `memory_verify_attempts`
+      // row and (on a contradicted verdict) a pending proposal that
+      // mutates `memory_governance_proposals`. Spending LLM budget
+      // and writing audit rows during plan mode contradicts the
+      // operator's "read-only" framing. Refuse scheduler
+      // construction at the top-level gate so poll() never runs
+      // (forwarding `planMode: true` to the dispatcher only gates
+      // the spawn-side, after the attempt row has already landed).
+      if (
+        config.memorySemanticVerify === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_semantic_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
       // R6 — guard on memoryRegistry availability. Pre-fix the cast
       // `as MemoryRegistry` would land `undefined` into the scheduler
       // and every poll would TypeError on `registry.peek(...)`. The
@@ -1099,6 +1119,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       if (
         config.memorySemanticVerify === true &&
         (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
         config.subagentRegistry !== undefined
       ) {
         const verifyDef = config.subagentRegistry.byName.get('verify-semantic');
@@ -1136,10 +1157,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               : {}),
             ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
-            // R6 — forward plan-mode posture + spawn factory test
-            // seam to verify dispatches. Symmetric with the task-tool
-            // spawn path (loop.ts:1535-1558).
-            ...(config.planMode === true ? { planMode: true } : {}),
+            // Plan-mode forwarding intentionally absent: the
+            // construction gate above refuses scheduler creation
+            // entirely when planMode is true, so this branch is
+            // unreachable in plan mode. If the construction gate
+            // is ever weakened, restore the
+            // `config.planMode === true ? { planMode: true } : {}`
+            // forward as defense-in-depth.
             ...(config.spawnChildProcess !== undefined
               ? { spawnChildProcess: config.spawnChildProcess }
               : {}),
@@ -1209,9 +1233,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           'memory: verify_conflict_disabled: cannot run inside a subagent context (refused at runtime)\n',
         );
       }
+      // Plan-mode gate — mirror of the verify-semantic case above.
+      // Same rationale: scheduler poll writes governance proposals
+      // on contradicted-pair verdicts, which is a write surface.
       if (
         config.memoryConflictDetect === true &&
         (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_conflict_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      if (
+        config.memoryConflictDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
         config.subagentRegistry !== undefined
       ) {
         const conflictDef = config.subagentRegistry.byName.get('verify-conflict');
@@ -1241,7 +1278,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               : {}),
             ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
-            ...(config.planMode === true ? { planMode: true } : {}),
+            // Plan-mode forwarding intentionally absent: construction
+            // gate above refuses scheduler creation when planMode is
+            // true (mirror of verify-semantic).
             ...(config.spawnChildProcess !== undefined
               ? { spawnChildProcess: config.spawnChildProcess }
               : {}),
@@ -1280,9 +1319,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           'memory: verify_override_disabled: cannot run inside a subagent context (refused at runtime)\n',
         );
       }
+      // Plan-mode gate — mirror of verify-semantic / verify-conflict.
+      // S3 dispatcher writes memory_verify_override_attempts +
+      // governance proposals on misguiding verdicts; same write-
+      // surface refusal in plan mode.
       if (
         config.memoryOverrideDetect === true &&
         (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_override_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      if (
+        config.memoryOverrideDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
         config.subagentRegistry !== undefined
       ) {
         const overrideDef = config.subagentRegistry.byName.get('verify-override');
@@ -1312,7 +1365,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               : {}),
             ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
-            ...(config.planMode === true ? { planMode: true } : {}),
+            // Plan-mode forwarding intentionally absent: construction
+            // gate above refuses scheduler creation when planMode is
+            // true (mirror of verify-semantic).
             ...(config.spawnChildProcess !== undefined
               ? { spawnChildProcess: config.spawnChildProcess }
               : {}),
