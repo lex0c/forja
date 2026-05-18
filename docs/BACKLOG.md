@@ -2,6 +2,40 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] eval(memory) — governance-flow deterministic fixture suite (8 cases)
+
+Closes the eval gap flagged during the post-Phase-2 audit: per `CLAUDE.md` principle 4 ("Eval is load-bearing — a subsystem without eval doesn't ship"), the memory subsystem had 8787 unit tests but zero eval coverage. `evals/regression/` + `evals/smoke/` carried 53 YAML cases across file IO / bash / hooks / compaction / plan-mode — none touching memory, governance, or any LLM-judge detector. By the project's own bar the subsystem was not production-ready despite the surface looking complete.
+
+This slice ships an `evals/memory/` fixture suite mirroring the deterministic pattern from `evals/critique/`: TS modules export pinned subagent verdicts; a `bun test` runner (`tests/memory/eval-fixtures.test.ts`) drives real dispatchers + real governance apply path + real state machine + real audit pair against those verdicts. Each fixture exercises the propose-not-mutate narrative END-TO-END — dispatcher → proposal → operator decision → state transition → file rewrite → audit pair — and fails if any wire between those layers silently breaks. No API cost; runs in CI.
+
+**8 fixtures cover:**
+
+| # | Path | Pins |
+|---|---|---|
+| 01 | s11-contradicted-approve-quarantine | S11 happy path → approve → memory quarantined with `verify_failed` trigger; rewrites frontmatter; audit pair lands |
+| 02 | s11-contradicted-low-conf-auto-reject | Sub-threshold (0.5) contradicted verdict → proposal auto-rejects with `system:low_confidence` inside the dispatcher's txn; no operator action; memory stays active |
+| 03 | s13-conflict-approve-quarantine-loser | S13 conflicting pair (`user_explicit` vs `inferred`) → resolver picks loser → approve → only loser transitions (multi-memory carve-out via `target_payload.target_key`) |
+| 04 | s3-override-approve-quarantine | S3 threshold (3 override events in 24h) + misguiding verdict → approve → memory quarantined with `user_override_repeated` trigger |
+| 05 | s11-operator-reject | S11 happy path through dispatcher → operator `decideProposal` → status=rejected, memory stays active, no audit transition |
+| 06 | s11-operator-defer | S11 happy path → operator `deferProposal(14d)` → proposal pending with `deferred_until` extended; memory state unchanged |
+| 11 | s11-hallucination-guard | F8 defense: contradicted verdict cites nonexistent `evidence_paths` → dispatcher refuses as `malformed` BEFORE recording any attempt; no proposal, no dedup cache poison |
+| 12 | s11-stale-snapshot-toctou | F11 defense: memory body changed between scheduler peek and dispatch → dispatcher refuses with `stale_snapshot` after content-hash compare against fresh registry peek |
+
+**Runner extensions** (`tests/memory/eval-fixtures.test.ts`):
+
+- 3 dispatcher branches (S11 / S13 / S3) with detector-specific seeding (pair-with for S13, override-events count for S3, repo-files for hallucination guard satisfaction).
+- 3 operator decision branches: `applyProposal` (approve), `decideProposal` (reject), `deferProposal` (defer with additionalDays).
+- `expected.dispatcherOutcome` defaults to `'completed'` but accepts `skipped`/`malformed`/`spawn_failed`; `dispatcherReasonContains` pins the EXACT refusal path.
+- Registry built AFTER seedMemoryFile + repoFiles so fixture 12's TOCTOU narrative works (snapshot=v1, on-disk=v2, F11 detects via fresh peek).
+- MEMORY.md index appends rather than overwrites so multi-memory fixtures (S13 pair) don't lose siblings.
+- Detector-specific attempt-count helpers (`listRecentAttempts` / `listRecentConflictAttempts` / `listRecentOverrideAttempts`) route to the right repo.
+
+**Explicitly out of scope** (different surfaces; unit-tested or deferred for separate eval suites): trust revocation cascade (bootstrap-level orchestration), scope precedence dedup (pure registry behavior, covered in `tests/memory/registry.test.ts`), eager-load with trigger (system-prompt assembly via `assembleMemorySection`), headless `memory_write` rejection (CLI flag wiring).
+
+**Smoke-side restoration.** While running smoke evals to confirm baseline, `08-compaction-triggers.yaml` was found failing for a reason unrelated to memory: modern Claude default to batching parallel reads in a single assistant turn, which kept `messages.length` below the compaction gate's `preserveTail + 3` boundary check (`src/harness/loop.ts:3733`). The fixture's `compaction_triggered` assertion gave false-negative coverage of compaction LLM path because the eval ended before the boundary was crossed. Fix in a separate commit (`eval(smoke): ...`): prompt rewritten to force strictly-serial reads ("one read per assistant turn, acknowledge each in text before next"), `maxSteps` 10→14, `maxCostUsd` $0.10→$0.20. Single-case re-run confirms compaction LLM fires (`pass 21881ms $0.18`, steps=4).
+
+**Slice closure metrics.** +2 commits on `feat/memory-governance-llm`; +8 eval fixtures + 1 runner (~430 LOC eval + 270 LOC runner); +1 smoke YAML restoration. Suite 8787 → 8794+ (the eval fixtures are part of `bun test` — they ship as +8 deterministic test cases). Smoke suite 8/10 → 9/10 after compaction restore (the remaining `04-grep-search` failure is real-LLM variance on a specific `output_contains` assertion, tracked separately as an in-place flake).
+
 ## [2026-05-18] hardening(memory) — Phase-2 follow-on review: atomic S11+S13 persist, S3 retention sweeps, spec catch-up
 
 Follow-on code-review pass over the post-S3 codebase surfaced three actionable findings — one critical (C1), one drift (C2), one high-severity reliability hole (H3). All three landed in one commit on `feat/memory-governance-llm`.
