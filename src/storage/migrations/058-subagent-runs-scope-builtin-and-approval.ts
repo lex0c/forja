@@ -2,7 +2,7 @@
 // review B-CRIT-2 / B-HIGH-4 / B-HIGH-6).
 //
 // ────────────────────────────────────────────────────────────────────
-// WHY THIS MIGRATION
+// WHAT THIS MIGRATION DOES
 //
 // (1) `subagent_runs.scope` CHECK pre-dates the `builtin` scope
 // introduced in S11. Every builtin spawn was recorded as `'user'` via
@@ -27,58 +27,53 @@
 // chained as two separate swaps. Combined into a single migration.
 //
 // ────────────────────────────────────────────────────────────────────
+// KNOWN ISSUE — preserved for append-only discipline
+//
+// This migration originally severed `memory_verify_attempts.subagent_
+// run_session_id` pointers on DBs that had pre-existing rows: the
+// rebuild's `DROP TABLE subagent_runs` runs with PRAGMA foreign_
+// keys=ON (migrate.ts wraps each migration in a transaction; SQLite
+// ignores `PRAGMA foreign_keys=OFF` emitted inside a transaction),
+// so the drop fires `ON DELETE SET NULL` on every referring row in
+// `memory_verify_attempts` BEFORE the new table is repopulated. The
+// dedup cache pointers to the audit rows are lost for any session
+// that was active when this migration first ran.
+//
+// The fix WAS attempted by editing this migration's SQL to snapshot
+// the FK pointers into a TEMP table before the drop — but that
+// violates CLAUDE.md's hard rule "Append-only everywhere": editing
+// a migration that has already been applied to ANY DB produces a
+// hash mismatch and a refusal-to-proceed in `migrate.ts`, breaking
+// every existing operator install. The edit was reverted.
+//
+// The correct fix lives in a SEPARATE migration that runs AFTER 058
+// (see `059-subagent-runs-fk-preservation.ts`). The data loss for
+// pre-058 rows is unrecoverable (NULL values can't be reconstructed),
+// but the discipline for future subagent_runs rebuilds is now
+// codified in 059's commentary as a binding pattern.
+//
+// ────────────────────────────────────────────────────────────────────
 // REBUILD SHAPE
 //
-// The wrinkle: `migrate.ts` runs every migration inside a single
-// `db.transaction(...)` block, AND `db.ts` keeps `PRAGMA
-// foreign_keys = ON`. SQLite ignores `PRAGMA foreign_keys = OFF`
-// emitted from inside a transaction (silent no-op per docs), so the
-// usual "disable FK around the rebuild" trick is unavailable.
-//
-// Consequence: `DROP TABLE subagent_runs` with FK ON triggers the
-// `ON DELETE SET NULL` on `memory_verify_attempts.subagent_run_
-// session_id` for every referring row — silently severing the
-// forensic chain from the dedup cache to the audit row. The fresh
-// table is repopulated, but the references in `memory_verify_attempts`
-// are gone.
-//
-// Fix: snapshot the (mva.id, mva.subagent_run_session_id) tuples
-// into a TEMP table BEFORE the drop, then UPDATE them back AFTER
-// the rename. Since we copy every subagent_runs row into the new
-// table verbatim (session_id is preserved as the PK), the restored
-// FK targets exist; no orphans.
-//
-// Steps:
-// 1. CREATE TEMP TABLE mva_fk_snapshot — save the FK pointers.
-// 2. CREATE TABLE subagent_runs_new with widened scope CHECK +
-//    new `parent_approval_id` column (ON DELETE SET NULL).
-// 3. INSERT … SELECT from the old table; `parent_approval_id`
+// 1. CREATE TABLE subagent_runs_new with:
+//    - widened scope CHECK including `'builtin'`
+//    - new `parent_approval_id TEXT` column NULL-allowed (ON DELETE
+//      SET NULL preserves the row when the approval is retention-
+//      swept; verify-semantic synthetic approvals or programmatic
+//      callers without an approval surface continue to land rows)
+//    - every other column carried verbatim from the post-040 shape
+//      (012 base + 015 / 020 / 024 / 025 / 026 / 027 / 028 / 040)
+// 2. INSERT … SELECT from the old table; `parent_approval_id` stays
 //    NULL for every pre-existing row (the chain was unrecoverable).
-// 4. DROP old table — FK SET NULL fires on memory_verify_attempts,
-//    but the snapshot has the original pointers.
-// 5. RENAME new → subagent_runs.
-// 6. UPDATE memory_verify_attempts restoring the FK pointers from
-//    the snapshot.
-// 7. DROP TEMP TABLE.
-// 8. Recreate the (name, captured_at DESC) index and add a
+// 3. DROP old table.
+// 4. RENAME new → subagent_runs.
+// 5. Recreate the (name, captured_at DESC) index and add a
 //    (parent_approval_id) index for the new chain query.
-//
-// FK target: `approvals(id)`. ON DELETE SET NULL — an approval purge
-// keeps the run row intact (the run was real; the approval lineage
-// is just no longer reachable). The FK is unenforced for rows where
-// `parent_approval_id` is NULL, which is the legacy path for
-// fixtures + the verify-semantic synthetic-approval bypass when
-// disabled.
 
 export const migration058SubagentRunsScopeBuiltinAndApproval = {
   id: 58,
   name: '058-subagent-runs-scope-builtin-and-approval',
   sql: `
-    CREATE TEMP TABLE mva_fk_snapshot AS
-      SELECT id, subagent_run_session_id
-        FROM memory_verify_attempts
-       WHERE subagent_run_session_id IS NOT NULL;
-
     CREATE TABLE subagent_runs_new (
       session_id            TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
       name                  TEXT NOT NULL,
@@ -121,16 +116,6 @@ export const migration058SubagentRunsScopeBuiltinAndApproval = {
 
     DROP TABLE subagent_runs;
     ALTER TABLE subagent_runs_new RENAME TO subagent_runs;
-
-    UPDATE memory_verify_attempts
-       SET subagent_run_session_id = (
-         SELECT s.subagent_run_session_id
-           FROM mva_fk_snapshot s
-          WHERE s.id = memory_verify_attempts.id
-       )
-     WHERE id IN (SELECT id FROM mva_fk_snapshot);
-
-    DROP TABLE mva_fk_snapshot;
 
     CREATE INDEX idx_subagent_runs_name_captured
       ON subagent_runs(name, captured_at DESC);

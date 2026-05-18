@@ -56,6 +56,7 @@ import { migration055SharedCorpusTrust } from './055-shared-corpus-trust.ts';
 import { migration056MemoryGovernanceProposals } from './056-memory-governance-proposals.ts';
 import { migration057MemoryVerifyAttempts } from './057-memory-verify-attempts.ts';
 import { migration058SubagentRunsScopeBuiltinAndApproval } from './058-subagent-runs-scope-builtin-and-approval.ts';
+import { migration059MemoryVerifyAttemptsFkDiscipline } from './059-memory-verify-attempts-fk-discipline.ts';
 
 export interface Migration {
   id: number;
@@ -122,4 +123,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration056MemoryGovernanceProposals,
   migration057MemoryVerifyAttempts,
   migration058SubagentRunsScopeBuiltinAndApproval,
+  migration059MemoryVerifyAttemptsFkDiscipline,
 ];

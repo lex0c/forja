@@ -137,14 +137,18 @@ describe('migrate', () => {
   // R3 / migration 058 — rebuilds subagent_runs to widen the scope
   // CHECK and add parent_approval_id. The DROP TABLE step runs with
   // PRAGMA foreign_keys=ON (migrate.ts wraps each migration in a
-  // transaction; SQLite ignores PRAGMA foreign_keys=OFF inside one).
-  // Pre-fix the drop fired ON DELETE SET NULL on
-  // memory_verify_attempts.subagent_run_session_id — silently severing
-  // the forensic chain from the dedup cache to the audit row. The
-  // current migration snapshots those FK pointers into a TEMP table
-  // BEFORE the drop and restores them after the rename. This test
-  // pins both halves: rows survive AND the FK link is preserved.
-  test('migration 058 preserves memory_verify_attempts.subagent_run_session_id across the table rebuild', async () => {
+  // transaction; SQLite ignores PRAGMA foreign_keys=OFF inside one),
+  // so the drop fires ON DELETE SET NULL on
+  // memory_verify_attempts.subagent_run_session_id — the forensic
+  // chain from the dedup cache to the audit row is severed for rows
+  // that existed before 058 ran. This is a KNOWN data-loss documented
+  // in 058's comment block and codified in 059's binding pattern for
+  // future rebuilds. Editing 058 to preserve the pointers would have
+  // broken append-only (every existing operator install would have
+  // hit a hash mismatch). The test pins the actual behavior so a
+  // future regression that thinks it's "fixing" 058 by editing the
+  // SQL in place fails this test loud.
+  test('migration 058: pre-existing memory_verify_attempts.subagent_run_session_id is severed by the rebuild (documented audit drift)', async () => {
     const { MIGRATIONS } = await import('../../src/storage/migrations/index.ts');
     const { createSession } = await import('../../src/storage/repos/sessions.ts');
     const pre058 = MIGRATIONS.filter((m) => m.id < 58);
@@ -164,13 +168,13 @@ describe('migrate', () => {
         subagent_run_session_id, attempted_at)
        VALUES ('mva-058', 'user', 'foo', 'abc', 'passed', 0.9, 'm', 'h', ?, 1)`,
     ).run(child.id);
-    // Apply 058.
+    // Apply 058 only (NOT 059 yet — we want to observe the raw 058 effect).
     migrate(
       db,
       MIGRATIONS.filter((m) => m.id <= 58),
     );
     // subagent_runs row survived with original scope (pre-058 the
-    // mapping wrote 'user'; we don't rewrite history for old rows).
+    // mapping wrote 'user').
     const run = db
       .query<{ scope: string; parent_approval_id: string | null }, []>(
         'SELECT scope, parent_approval_id FROM subagent_runs',
@@ -178,16 +182,35 @@ describe('migrate', () => {
       .get();
     expect(run?.scope).toBe('user');
     expect(run?.parent_approval_id).toBeNull();
-    // FK pointer in memory_verify_attempts survived the rebuild.
+    // FK pointer in memory_verify_attempts was severed by the DROP
+    // TABLE (ON DELETE SET NULL fired). Documented data loss.
     const mva = db
       .query<{ subagent_run_session_id: string | null }, []>(
         'SELECT subagent_run_session_id FROM memory_verify_attempts WHERE id = ?',
       )
       .get('mva-058');
-    expect(mva?.subagent_run_session_id).toBe(child.id);
-    // FK integrity intact.
+    expect(mva?.subagent_run_session_id).toBeNull();
+    // FK integrity itself is intact (the SET NULL is a clean
+    // operation; only the forensic pointer is gone).
     const violations = db.query('PRAGMA foreign_key_check').all();
     expect(violations).toEqual([]);
+    db.close();
+  });
+
+  // R3 / migration 059 — codifies the FK preservation discipline for
+  // future subagent_runs rebuilds + adds a `provenance_drift_at`
+  // column to memory_verify_attempts so forensic readers can
+  // discriminate "pointer was always NULL" from "pointer was severed
+  // by 058 on date X". The column itself is just an ALTER ADD; the
+  // binding pattern lives in 059's comment block. This test pins the
+  // column shape so a future schema reformat fails if the column is
+  // dropped without a successor migration documenting the move.
+  test('migration 059 adds provenance_drift_at to memory_verify_attempts', async () => {
+    const db = openMemoryDb();
+    migrate(db);
+    const cols = db.query<{ name: string }, []>('PRAGMA table_info(memory_verify_attempts)').all();
+    const names = cols.map((c) => c.name);
+    expect(names).toContain('provenance_drift_at');
     db.close();
   });
 });

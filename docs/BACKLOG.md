@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(storage) — revert migration 058 edit + add migration 059 (append-only discipline)
+
+Caught at install time by an operator running the newly-built binary against an existing `~/.local/share/forja/sessions.db`: migration 058 had been edited in the previous commit (4dade9c) to add a TEMP-table snapshot/restore around the table rebuild — a "fix" for the FK-pointer severing bug that itself violated CLAUDE.md's "Append-only everywhere" hard rule. Result: hash mismatch on next startup (`applied hash: dcbfd31… current hash: d0b932…`) and a refuse-to-proceed from `migrate.ts` — the migration guard correctly refused to silently re-run an altered migration, but the binary was unusable.
+
+**Fix:**
+
+- **Reverted `058-subagent-runs-scope-builtin-and-approval.ts` SQL** to its original shape (the one already in the operator's DB). Hash now matches `dcbfd31…` again. Comment block updated to document the original FK-severing bug + lesson learned: "migration edits to a landed file break every existing install; the fix MUST live in a new migration."
+- **Created `059-memory-verify-attempts-fk-discipline.ts`.** Adds `provenance_drift_at INTEGER` column to `memory_verify_attempts` so forensic readers can discriminate "pointer was always NULL" from "pointer was severed by 058's drop on date X". Migration body is intentionally minimal; the load-bearing content is the comment block, which codifies the FK preservation pattern (TEMP table snapshot + restore around the drop) as a binding rule for any future migration that rebuilds `subagent_runs` or any table referenced via `ON DELETE SET NULL`.
+- **Pre-058 FK pointers are unrecoverable.** SQLite's `ON DELETE SET NULL` writes NULL irreversibly; the original `session_id` values aren't preserved anywhere correlatable. Operators can still cross-correlate by timestamp via `attempted_at` against `subagent_runs.captured_at`. New rows INSERTed after 058 ran always have intact pointers; the data loss is bounded to rows that existed at the moment of the migration.
+
+**Test update:** `tests/storage/migrate.test.ts` test pinning the wrong claim ("058 preserves the pointer") replaced by one that pins the actual behavior ("058 severs the pre-existing pointer — documented audit drift"). A future reviewer who thinks they can "fix" 058 by editing the SQL hits this test failure loud. Added a second test pinning that 059 lands the `provenance_drift_at` column shape.
+
+**Validated:** smoke script simulating "operator with 058 already applied" + the current MIGRATIONS array — second migrate pass applies only `059` (one row), 058 is correctly skipped via hash match, schema lands intact.
+
+Full suite: **8520 pass / 0 fail / 10 skip** (+1 vs R1-R7 baseline of 8519, the new 059 column test).
+
+**Lesson logged for future rounds:** any "small SQL fix" to a landed migration is a load-bearing breach of the append-only invariant. The bypass route is always: revert + new migration. Smoke-test against an existing DB BEFORE commit when a migration changes shape.
+
 ## [2026-05-17] hardening(harness+subagents) — loop ↔ subagent flow review pass (R1–R7)
 
 Third multi-reviewer pass on `feat/memory-governance-llm`, this time focused on the harness loop ↔ subagent runtime boundary (not S11 specifically). Three parallel agents (correctness/robustness, spec/architecture, test quality) surfaced 7 CRIT, 10 HIGH, ~15 MED, ~12 LOW findings clustered in 8 themes. All criticals + highs + actionable meds closed in this pass; remaining items deferred with explicit notes in `docs/TODO.md`.
