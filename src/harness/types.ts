@@ -851,6 +851,17 @@ export interface HarnessConfig {
   // optionality.
   memoryConflictDetect?: boolean;
   memoryConflictDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // S3 LLM-judge override detector (MEMORY.md §11.x / Phase 2, spec
+  // §6.5.2). When true: every step boundary polls
+  // memory_override_events for memories whose override counter
+  // tripped the threshold (3 events in 24h) and dispatches the
+  // verify-override subagent (gated by cost / dispatch caps + the
+  // memory_verify_override_attempts cooldown). Opt-out via slash +
+  // config will mirror S11/S13 (S3.5 follow-up adds the loader
+  // + CLI flag + slash subcommand). Optional in type so callers
+  // pre-S3.5 omit (loop treats undefined as "off").
+  memoryOverrideDetect?: boolean;
+  memoryOverrideDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
   // Inventory of memories that landed in the eager-load section
   // of the system prompt (MEMORY.md §11.2 — provenance, surface
   // 'eager'). Populated by the CLI bootstrap from

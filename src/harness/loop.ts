@@ -799,6 +799,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let conflictDetectorScheduler:
     | import('../memory/verify-conflict-scheduler.ts').ConflictDetectorScheduler
     | undefined;
+  // S3 — verify-override scheduler. Same lifecycle posture (top-level
+  // only, optional, declared at outer scope so the finally block can
+  // shutdown() even on early throws).
+  let overrideVerifyScheduler:
+    | import('../memory/verify-override-scheduler.ts').OverrideVerifyScheduler
+    | undefined;
   try {
     try {
       // Resume vs new session. In resume mode, the prior session id
@@ -1261,6 +1267,84 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         } else {
           process.stderr.write(
             'memory: verify_conflict_disabled: --memory-conflict-llm set but verify-conflict definition not loaded\n',
+          );
+        }
+      }
+
+      // S3 — verify-override scheduler. Same wiring posture as
+      // verify-semantic + verify-conflict: top-level only, gated on
+      // memory registry availability, capabilities sealed via
+      // intersect.
+      if (config.memoryOverrideDetect === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_override_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      if (
+        config.memoryOverrideDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.subagentRegistry !== undefined
+      ) {
+        const overrideDef = config.subagentRegistry.byName.get('verify-override');
+        if (overrideDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_override_disabled: memoryOverrideDetect set but memory registry not wired\n',
+          );
+        } else if (overrideDef !== undefined && config.memoryRegistry !== undefined) {
+          const { createOverrideVerifyScheduler } = await import(
+            '../memory/verify-override-scheduler.ts'
+          );
+          overrideVerifyScheduler = createOverrideVerifyScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: overrideDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            ...(config.planMode === true ? { planMode: true } : {}),
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            // Capability envelope intersect — same shape as verify-
+            // semantic / verify-conflict. The verify-override.md
+            // declares EMPTY tools[] so the intersected envelope is
+            // empty too — no capability-resolving tools land in the
+            // child's gate. Mismatch (declared cap not covered by
+            // parent) stderr-logs as a warning; pure-empty declared
+            // → no warning, the loop just hands the child no tools.
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = overrideDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_override_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_override_disabled: memoryOverrideDetect set but verify-override definition not loaded\n',
           );
         }
       }
@@ -3755,6 +3839,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             process.stderr.write(`memory: verify_conflict_poll_unhandled: ${redactSecrets(msg)}\n`);
           }
         }
+        // S3 — override-verify scheduler tick. Same posture as the
+        // S11 + S13 schedulers: independent budget, fail-soft, await
+        // so the dispatch cost lands in counters before the next
+        // step's cap check.
+        if (overrideVerifyScheduler !== undefined) {
+          try {
+            await overrideVerifyScheduler.poll();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`memory: verify_override_poll_unhandled: ${redactSecrets(msg)}\n`);
+          }
+        }
       }
     } catch (e) {
       return await guardedFinish(e);
@@ -3767,6 +3863,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // even when the scheduler was never created.
     semanticVerifyScheduler?.shutdown();
     conflictDetectorScheduler?.shutdown();
+    overrideVerifyScheduler?.shutdown();
     // Drain the lazy retention sweep BEFORE anything else in the
     // finally fires. The caller (cli/run.ts) is allowed to close the
     // DB right after runAgent returns; without this drain the purge
