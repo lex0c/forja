@@ -44,9 +44,13 @@ export interface PlaybookDispatchInput {
 export type PlaybookDispatcher = (input: PlaybookDispatchInput) => Promise<RunSubagentResult>;
 
 export interface SlashContext {
-  // Read-only snapshot of the harness config the REPL bootstrapped
-  // with. Commands read model id, plan flag, budget caps from here.
-  // Mutation commands (future slice) will need a different shape.
+  // Shared mutable harness-config handle the REPL bootstrapped
+  // with. Commands read model id, plan flag, budget caps from
+  // here. Mutation commands (`/model`, `/memory governance
+  // enable|disable`) update fields IN PLACE; the next `startTurn`
+  // reads the updated value via its spread copy. Current in-flight
+  // turn is unaffected — its config was already snapshot at turn
+  // start.
   baseConfig: HarnessConfig;
   // Persistent DB handle for commands that read history (/sessions).
   db: DB;

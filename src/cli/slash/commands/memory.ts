@@ -3290,6 +3290,25 @@ const handleGovernanceToggle = (
   if (!result.ok) {
     return { kind: 'error', message: `/memory governance ${verb}: ${result.reason}` };
   }
+  // Mirror the patch onto ctx.baseConfig so the NEXT startTurn
+  // snapshot reflects the new state. Without this, startTurn keeps
+  // building HarnessConfig from the pre-bootstrap value — the
+  // scheduler still fires for at least one more turn after a
+  // disable, despite the note below saying "next turn boundary".
+  // Source flips to 'project-config' because the project config is
+  // where we just wrote; status surface renders accordingly.
+  if (target.verify) {
+    ctx.baseConfig.memorySemanticVerify = value;
+    ctx.baseConfig.memorySemanticVerifySource = 'project-config';
+  }
+  if (target.conflict) {
+    ctx.baseConfig.memoryConflictDetect = value;
+    ctx.baseConfig.memoryConflictDetectSource = 'project-config';
+  }
+  if (target.override) {
+    ctx.baseConfig.memoryOverrideDetect = value;
+    ctx.baseConfig.memoryOverrideDetectSource = 'project-config';
+  }
   const fields: string[] = [];
   if (target.verify) fields.push(`memory.verify_semantic_llm = ${value}`);
   if (target.conflict) fields.push(`memory.conflict_detect_llm = ${value}`);

@@ -115,6 +115,73 @@ describe('/memory governance disable', () => {
     expect(raw).toContain('override_detect_llm = false');
   });
 
+  test('mutates ctx.baseConfig live so the next startTurn picks up the disable (post-review)', async () => {
+    // Pre-fix, the toggle only wrote .agent/config.toml. startTurn
+    // builds the next HarnessConfig from ctx.baseConfig, which still
+    // carried the pre-disable values until process restart — the
+    // scheduler kept firing for one or more turns despite the
+    // command's "effect applies at next turn boundary" note. Live
+    // mutation closes the gap.
+    //
+    // Cast to `unknown` then re-read through a HarnessConfig-typed
+    // local so TS doesn't narrow the source field to the literal we
+    // just assigned (otherwise `toBe('project-config')` trips
+    // because the inferred expected type is the narrowed `'default'`).
+    const cfg = ctx.baseConfig as unknown as HarnessConfig;
+    cfg.memorySemanticVerify = true;
+    cfg.memorySemanticVerifySource = 'default';
+    cfg.memoryConflictDetect = true;
+    cfg.memoryConflictDetectSource = 'default';
+    cfg.memoryOverrideDetect = true;
+    cfg.memoryOverrideDetectSource = 'default';
+    const r = await memoryCommand.exec(['governance', 'disable', 'all'], ctx);
+    expect(r.kind).toBe('ok');
+    const after = ctx.baseConfig as unknown as HarnessConfig;
+    expect(after.memorySemanticVerify).toBe(false);
+    expect(after.memorySemanticVerifySource).toBe('project-config');
+    expect(after.memoryConflictDetect).toBe(false);
+    expect(after.memoryConflictDetectSource).toBe('project-config');
+    expect(after.memoryOverrideDetect).toBe(false);
+    expect(after.memoryOverrideDetectSource).toBe('project-config');
+  });
+
+  test('mutates ctx.baseConfig back to true on enable (live re-enable round-trip)', async () => {
+    // Symmetric pin: a re-enable after a disable in the same session
+    // also flips the live value, so the operator can toggle without
+    // restarting the REPL.
+    const cfg = ctx.baseConfig as unknown as HarnessConfig;
+    cfg.memorySemanticVerify = false;
+    cfg.memorySemanticVerifySource = 'project-config';
+    const r = await memoryCommand.exec(['governance', 'enable', 'verify'], ctx);
+    expect(r.kind).toBe('ok');
+    const after = ctx.baseConfig as unknown as HarnessConfig;
+    expect(after.memorySemanticVerify).toBe(true);
+    expect(after.memorySemanticVerifySource).toBe('project-config');
+  });
+
+  test('targeted disable only mutates the targeted detector in ctx.baseConfig', async () => {
+    // Verify the target.{verify|conflict|override} branches are
+    // independent — disabling 'conflict' must NOT touch the
+    // verify/override live values even though all three keys land
+    // in the file.
+    const cfg = ctx.baseConfig as unknown as HarnessConfig;
+    cfg.memorySemanticVerify = true;
+    cfg.memorySemanticVerifySource = 'default';
+    cfg.memoryConflictDetect = true;
+    cfg.memoryConflictDetectSource = 'default';
+    cfg.memoryOverrideDetect = true;
+    cfg.memoryOverrideDetectSource = 'default';
+    const r = await memoryCommand.exec(['governance', 'disable', 'conflict'], ctx);
+    expect(r.kind).toBe('ok');
+    const after = ctx.baseConfig as unknown as HarnessConfig;
+    expect(after.memorySemanticVerify).toBe(true);
+    expect(after.memorySemanticVerifySource).toBe('default');
+    expect(after.memoryConflictDetect).toBe(false);
+    expect(after.memoryConflictDetectSource).toBe('project-config');
+    expect(after.memoryOverrideDetect).toBe(true);
+    expect(after.memoryOverrideDetectSource).toBe('default');
+  });
+
   test('preserves [critique] section data through round-trip (comments lost)', async () => {
     // Round-trip semantics: parse → mutate → canonical emit. Table
     // *data* survives (keys + values are re-emitted from the parsed
