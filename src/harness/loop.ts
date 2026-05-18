@@ -1140,23 +1140,42 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // That reintroduced the exact gap migration 040 fixed
             // (audit row recorded "child ran under parent's full
             // envelope" when the operator's intent was a read-only
-            // fact-checker). Now: parse declared (`[]` = pure-LLM)
-            // and intersect; the empty intersection produces an
-            // empty effective set, sealed into the audit row.
+            // fact-checker).
             //
-            // The intersection cannot produce `excess` for an
-            // intentionally-empty declared set (no entries to be
-            // unbacked), so this site never needs to refuse the
-            // spawn — divergent from the task-tool path which can
-            // and does refuse on excess. Worth re-checking if any
-            // future verify-semantic.md edit widens `capabilities`.
+            // The verify-semantic playbook declares `read-fs:**`
+            // (the minimum its read_file / grep / glob whitelist
+            // needs to inspect repo state). The intersection narrows
+            // that to whatever subset of read-fs the parent grants.
+            // An earlier R2 draft used `capabilities: []` (intending
+            // "pure-LLM") — but every read_file call in the child
+            // engine would then have been refused with `subagent
+            // capability outside declared envelope`, degrading the
+            // fact-checker into a hallucination engine. Empty
+            // declared envelope means the child can't call
+            // capability-resolving tools AT ALL; only misc-category
+            // tools survive.
+            //
+            // Excess (declared cap not covered by parent) is logged
+            // as a stderr warning but doesn't refuse the spawn — an
+            // operator who scoped reads to `src/**` should still get
+            // a verifier that can verify `src/**` claims rather than
+            // losing the detector entirely.
             effectiveCapabilities: ((): readonly string[] => {
               const declaredRaw = verifyDef.capabilities ?? [];
               const declared = declaredRaw.map(parseCapability);
               const parent =
                 config.permissionEngine.effectiveCapabilities() ??
                 deriveParentCapabilities(config.permissionEngine.policy());
-              const { effective } = intersectCapabilities(parent, declared);
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_semantic_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
               return effective.map(formatCapability);
             })(),
           });

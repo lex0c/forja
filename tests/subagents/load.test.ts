@@ -1415,12 +1415,17 @@ describe('loadSubagents (S11 builtin scope)', () => {
     // that strips either should fail this test.
     expect(def?.systemPrompt).toContain('adversarial');
     expect(def?.systemPrompt).toContain('Phantom citations');
-    // R2: verify-semantic declares `capabilities: []` (pure-LLM).
-    // The runtime intersects against the parent's envelope and
-    // seals an empty effective set into the audit row. A refactor
-    // that drops the declaration would silently re-grant the
-    // parent's full envelope.
-    expect(def?.capabilities).toEqual([]);
+    // R2 + follow-up: verify-semantic declares the MINIMUM
+    // capabilities its read_file / grep / glob tools need.
+    // `read-fs:**` lets the verifier inspect any file the operator's
+    // parent envelope allows; the intersection narrows that to the
+    // parent's actual read-fs grants. A regression that dropped
+    // the declaration (or re-set it to `[]`) would either re-grant
+    // the parent's full envelope (audit drift) or — worse — refuse
+    // every read_file the verifier needs ("subagent capability
+    // outside declared envelope") and turn the fact-checker into
+    // a hallucination engine.
+    expect(def?.capabilities).toEqual(['read-fs:**']);
   });
 
   test('builtinDir=null disables the scope entirely', () => {

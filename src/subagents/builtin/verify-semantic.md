@@ -3,14 +3,24 @@ name: verify-semantic
 description: Verifies a single memory body against the current repository. Returns a structured verdict the governance substrate consumes.
 tools: [read_file, grep, glob, memory_read]
 isolation: none
-# PERMISSION_ENGINE.md §10.1: declared capabilities. Empty array
-# means "pure-LLM" — the runtime intersects against the parent's
-# envelope and seals an empty effective set into the audit row, so
-# the child engine refuses any capability-consuming tool even if a
-# future regression widens the tools[] whitelist by accident. The
-# tools listed above are all read-only and footprint-free; widening
-# this declaration requires a deliberate spec-PR.
-capabilities: []
+# PERMISSION_ENGINE.md §10.1: declared capabilities. The
+# tools[] above (read_file, grep, glob) all resolve to `read-fs:<path>`
+# at evaluation time, so they require `read-fs` coverage in the
+# child's effective envelope. memory_read is category='misc' and
+# resolves to no capability — covered trivially. An empty `[]`
+# declaration would silently break the verifier (every read_file
+# call denied with `subagent capability outside declared envelope`),
+# degrading the fact-checker into a hallucination engine.
+#
+# `read-fs:**` is the minimum that lets the verifier inspect any
+# file the operator's parent envelope allows it to. The child still
+# can't write or execute anything — `tools[]` excludes write/edit/
+# bash, and the runtime tool-list gate enforces that BEFORE this
+# envelope is even consulted. Widening to exec or net would require
+# adding capabilities here AND a tool to consume them, both of which
+# need explicit operator opt-in via the spec PR process.
+capabilities:
+  - read-fs:**
 budget:
   max_steps: 15
   max_cost_usd: 0.10
