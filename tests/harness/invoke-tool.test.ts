@@ -434,6 +434,64 @@ describe('invokeTool', () => {
     expect(typeof approvals[0]?.reason).toBe('string');
   });
 
+  test('confirm_no: S3 override signal omits toolCallId, preserves it in details (post-review fix)', async () => {
+    // Pre-fix, invoke-tool passed `toolCallId: callId` to
+    // recordOverrideSignal. The registry's helper then routed to
+    // `listProvenanceForToolCall(toolCallId)` — but non-memory tools
+    // (bash, write_file, edit) NEVER emit memory_provenance rows,
+    // so the lookup always returned zero exposures and the signal
+    // silently dropped. The S3 detector therefore never saw
+    // permission_denied attributions for the dominant case (operator
+    // rejecting a write / bash prompt with a misguiding memory in
+    // context).
+    //
+    // Post-fix: omit `toolCallId` from the registry call so the
+    // helper falls through to `listRecentSessionExposures`, which
+    // correctly finds memories eager-loaded or memory_read'd earlier
+    // in the session. The tool_call_id is preserved in `details`
+    // for forensic JOIN against `tool_calls`.
+    const captured: Array<{ signal: string; toolCallId?: unknown; details?: unknown }> = [];
+    const spyRegistry = {
+      recordOverrideSignal: (input: {
+        signal: string;
+        toolCallId?: string | null;
+        details?: Record<string, unknown>;
+      }) => {
+        captured.push({
+          signal: input.signal,
+          ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
+          ...(input.details !== undefined ? { details: input.details } : {}),
+        });
+        return { attributedCount: 0 };
+      },
+      // Stubs for the rest of the MemoryRegistry surface — invoke-tool
+      // only touches recordOverrideSignal in this branch, so the
+      // others can no-op without crashing the type check.
+    };
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      ctx: makeCtx({ cwd: '/p', memoryRegistry: spyRegistry as never }),
+      confirmPermission: async () => false,
+    };
+    await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(captured).toHaveLength(1);
+    const [signal] = captured;
+    expect(signal?.signal).toBe('permission_denied');
+    // toolCallId is NOT passed (it would route to the per-tool-call
+    // provenance path which is empty for non-memory tools).
+    expect(signal?.toolCallId).toBeUndefined();
+    // tool_call_id IS preserved in details for forensic JOIN.
+    const details = signal?.details as Record<string, unknown>;
+    expect(details?.tool_name).toBe('write_file');
+    expect(typeof details?.tool_call_id).toBe('string');
+    expect((details?.tool_call_id as string).length).toBeGreaterThan(0);
+  });
+
   test('tool returns ToolError: persists status=error, surfaces error result', async () => {
     const deps = buildDeps(errorReturningTool);
     const inv = await invokeTool(

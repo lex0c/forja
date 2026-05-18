@@ -554,22 +554,31 @@ export const invokeTool = async (
         });
       });
       // S3 signal (b): operator denied a permission_ask for this
-      // tool call. Attribute to the factual memories exposed at
-      // THIS call (via memory_provenance(tool_call_id)) — those
-      // memories were in the model's context when it issued the
-      // call the operator just rejected. The registry's helper
-      // filters to factual / active / trusted and caps fan-out at
-      // MAX_OVERRIDE_ATTRIBUTION_DEPTH. Best-effort: helper catches
-      // throws internally. Skipped when memoryRegistry isn't wired
-      // (headless / test contexts).
+      // tool call. Attribute to factual memories exposed in this
+      // session via the registry's session-recent path (no
+      // `toolCallId` argument) — the rejected tool call itself
+      // (bash, edit, write_file, …) does NOT emit memory_provenance
+      // rows, so a per-tool-call lookup would always return zero
+      // and silently drop the signal. The relevant memories were
+      // exposed earlier in the session (eager-load, memory_read,
+      // retrieve_context); recordOverrideSignal's session-recent
+      // path picks them up correctly. The `tool_call_id` is still
+      // preserved in `details` for forensic JOINs against
+      // `tool_calls` (operator can trace WHICH denial triggered
+      // the row even though the attribution is session-scoped).
+      //
+      // The registry helper filters to factual / active / trusted
+      // and caps fan-out at MAX_OVERRIDE_ATTRIBUTION_DEPTH. Best-
+      // effort: catches throws internally. Skipped when
+      // memoryRegistry isn't wired (headless / test contexts).
       const memReg = deps.ctx.memoryRegistry;
       if (memReg !== undefined) {
         try {
           memReg.recordOverrideSignal({
             signal: 'permission_denied',
-            toolCallId: callId,
             details: {
               tool_name: input.toolName,
+              tool_call_id: callId,
               prompt: setup.prompt,
             },
             auditSessionId: deps.ctx.sessionId,
