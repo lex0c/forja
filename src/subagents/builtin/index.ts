@@ -42,4 +42,9 @@ export const PROTECTED_BUILTIN_NAMES: ReadonlySet<string> = new Set([
   // shadow could widen tools[] to bash / write_file under the
   // operator's opt-in. Same protection rationale as verify-semantic.
   'verify-conflict',
+  // S3 — runs at every step boundary when the override threshold
+  // trips (3 events in 24h). EMPTY tools[] in the shipped
+  // definition; a project shadow widening tools is the canonical
+  // privilege-escalation vector this list defends against.
+  'verify-override',
 ]);

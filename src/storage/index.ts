@@ -222,7 +222,10 @@ export type {
   RecordProposalResult,
 } from './repos/memory-governance.ts';
 
-export { listSessionExposuresSince } from './repos/memory-provenance.ts';
+export {
+  listRecentSessionExposures,
+  listSessionExposuresSince,
+} from './repos/memory-provenance.ts';
 
 export {
   MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,

@@ -329,6 +329,25 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
         auditSessionId: ctx.sessionId,
         auditCwd: ctx.cwd,
       });
+      // S3 signal (a): operator explicitly declined an inferred
+      // memory write. Attribute to the factual memories that were
+      // recently exposed in this session — those are the candidates
+      // whose presence in context could have led the model to
+      // propose the rejected write. Cancellations (esc/timeout) are
+      // excluded: spec language is "user rejeitou", an esc-cancel
+      // is ambiguous (could be accidental, modal timeout). Best-
+      // effort: helper itself catches throws.
+      if (answer === 'no') {
+        registry.recordOverrideSignal({
+          signal: 'memory_write_rejected',
+          details: {
+            proposed_scope: scope,
+            proposed_name: args.name,
+            proposed_source: source,
+            modal_stage: 'modal',
+          },
+        });
+      }
       return {
         outcome: 'rejected',
         scope,
@@ -388,6 +407,21 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
           auditSessionId: ctx.sessionId,
           auditCwd: ctx.cwd,
         });
+        // S3 signal (a): same attribution as the first modal. User-
+        // scope rejection is structurally the same operator action
+        // ("don't persist this proposal") — the second modal is just
+        // extra friction for user-scope, not a different signal.
+        if (scopeAnswer === 'no') {
+          registry.recordOverrideSignal({
+            signal: 'memory_write_rejected',
+            details: {
+              proposed_scope: scope,
+              proposed_name: args.name,
+              proposed_source: source,
+              modal_stage: 'user_scope_modal',
+            },
+          });
+        }
         return {
           outcome: 'rejected',
           scope,

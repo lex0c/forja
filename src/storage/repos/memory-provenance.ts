@@ -364,6 +364,30 @@ export const listSessionExposuresSince = (
   return rows.map(fromRow);
 };
 
+// Most-recent-first session-wide exposure list. Backs the S3
+// override signal attribution (src/memory/override-signal.ts):
+// when an operator rejects an inferred memory_write modal, the
+// detector attributes the override to the most recently exposed
+// factual memories in the session — those are the candidates that
+// could have influenced the model's proposal. `listSessionExposures
+// Since` orders ASC for the verify-semantic cursor poll; this
+// helper orders DESC for "what was the model just looking at?".
+export const listRecentSessionExposures = (
+  db: DB,
+  sessionId: string,
+  limit = 50,
+): MemoryProvenanceRow[] => {
+  const rows = db
+    .query<MemoryProvenanceDbRow, [string, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(sessionId, limit);
+  return rows.map(fromRow);
+};
+
 export const listExposuresInRetrieval = (
   db: DB,
   sessionId: string,

@@ -166,3 +166,5 @@ export type {
   SharedTrustModalMode,
   SharedTrustProbeAnswer,
 } from './trust-corpus-probe.ts';
+
+export { MAX_OVERRIDE_ATTRIBUTION_DEPTH } from './registry.ts';

@@ -240,6 +240,13 @@ const triggerForProposal = (proposedBy: string, override: unknown): ResolvedTrig
   // operator-driven trigger.
   if (proposedBy === 'subagent:verify-semantic') return { ok: true, value: 'verify_failed' };
   if (proposedBy === 'subagent:verify-conflict') return { ok: true, value: 'conflict_detected' };
+  // S3.3 — verify-override is the LLM-judge variant that emits via
+  // a subagent; the deterministic counter (detector:user_override_
+  // repeated) is the future direct path for non-LLM detectors.
+  // Both resolve to the same trigger value per spec §6.5.2.
+  if (proposedBy === 'subagent:verify-override') {
+    return { ok: true, value: 'user_override_repeated' };
+  }
   if (proposedBy === 'detector:user_override_repeated') {
     return { ok: true, value: 'user_override_repeated' };
   }

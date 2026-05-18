@@ -553,6 +553,34 @@ export const invokeTool = async (
           error: 'denied by user',
         });
       });
+      // S3 signal (b): operator denied a permission_ask for this
+      // tool call. Attribute to the factual memories exposed at
+      // THIS call (via memory_provenance(tool_call_id)) — those
+      // memories were in the model's context when it issued the
+      // call the operator just rejected. The registry's helper
+      // filters to factual / active / trusted and caps fan-out at
+      // MAX_OVERRIDE_ATTRIBUTION_DEPTH. Best-effort: helper catches
+      // throws internally. Skipped when memoryRegistry isn't wired
+      // (headless / test contexts).
+      const memReg = deps.ctx.memoryRegistry;
+      if (memReg !== undefined) {
+        try {
+          memReg.recordOverrideSignal({
+            signal: 'permission_denied',
+            toolCallId: callId,
+            details: {
+              tool_name: input.toolName,
+              prompt: setup.prompt,
+            },
+            auditSessionId: deps.ctx.sessionId,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: override_signal_attribute_failed (permission_denied): ${msg}\n`,
+          );
+        }
+      }
       return {
         // Bare "denied by user" — no engine-prompt suffix because
         // the prompt is why the engine ASKED, not why the user

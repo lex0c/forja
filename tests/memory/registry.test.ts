@@ -1297,3 +1297,365 @@ describe('createScopeFilteredRegistry — fail-closed scope blocking (S5 review)
     expect(wrapped.count()).toBe(1);
   });
 });
+
+describe('createMemoryRegistry — recordOverrideSignal (S3.2)', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  const fmProject = (name: string): string =>
+    `name: ${name}\ndescription: hook for ${name}\ntype: project\nsource: user_explicit\n`;
+  const fmReference = (name: string): string =>
+    `name: ${name}\ndescription: hook for ${name}\ntype: reference\nsource: user_explicit\n`;
+  const fmUserType = (name: string): string =>
+    `name: ${name}\ndescription: hook for ${name}\ntype: user\nsource: user_explicit\n`;
+  const fmFeedback = (name: string): string =>
+    `name: ${name}\ndescription: hook for ${name}\ntype: feedback\nsource: user_explicit\n`;
+  const fmProjectQuarantined = (name: string): string =>
+    `name: ${name}\ndescription: hook for ${name}\ntype: project\nsource: user_explicit\nstate: quarantined\n`;
+  const fmProjectUntrusted = (name: string): string =>
+    `name: ${name}\ndescription: hook for ${name}\ntype: project\nsource: user_explicit\ntrust: untrusted\n`;
+
+  const seedToolCall = (): string => {
+    const msgId = appendMessage(db, { sessionId, role: 'assistant', content: 'x' }).id;
+    return createToolCall(db, { messageId: msgId, toolName: 'bash', input: {} }).id;
+  };
+
+  // Inject a memory_provenance row directly. Tests want to assert
+  // attribution against a controlled exposure set without spinning
+  // up the full eager-load / retrieve_context path.
+  const seedExposure = (
+    scope: 'user' | 'project_shared' | 'project_local',
+    name: string,
+    opts: { toolCallId?: string; surface?: 'memory_read' | 'retrieve_context' | 'eager' } = {},
+  ): void => {
+    const surface = opts.surface ?? 'memory_read';
+    const toolCallId = opts.toolCallId ?? null;
+    db.query(
+      `INSERT INTO memory_provenance
+         (id, session_id, tool_call_id, memory_scope, memory_name, surface,
+          retrieval_query_id, position_in_corpus, memory_content_hash,
+          memory_state_at_exposure, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'active', ?)`,
+    ).run(crypto.randomUUID(), sessionId, toolCallId, scope, name, surface, Date.now());
+  };
+
+  test('attributes to factual memories exposed in the session', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P](p.md) — p\n- [R](r.md) — r\n');
+    writeMemory(roots.projectLocal, 'p', fmProject('p'), 'body p');
+    writeMemory(roots.projectLocal, 'r', fmReference('r'), 'body r');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_local', 'p');
+    seedExposure('project_local', 'r');
+
+    const result = reg.recordOverrideSignal({
+      signal: 'memory_write_rejected',
+      details: { test: 'value' },
+    });
+    expect(result.attributedCount).toBe(2);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_local', 'p').length).toBe(1);
+    expect(listRecentOverridesForMemory(db, 'project_local', 'r').length).toBe(1);
+  });
+
+  test('filters out non-factual types (user, feedback)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [U](u.md) — u\n- [F](f.md) — f\n- [P](p.md) — p\n');
+    writeMemory(roots.projectLocal, 'u', fmUserType('u'), 'body u');
+    writeMemory(roots.projectLocal, 'f', fmFeedback('f'), 'body f');
+    writeMemory(roots.projectLocal, 'p', fmProject('p'), 'body p');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_local', 'u');
+    seedExposure('project_local', 'f');
+    seedExposure('project_local', 'p');
+
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_local', 'u').length).toBe(0);
+    expect(listRecentOverridesForMemory(db, 'project_local', 'f').length).toBe(0);
+    expect(listRecentOverridesForMemory(db, 'project_local', 'p').length).toBe(1);
+  });
+
+  test('filters out untrusted memories', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P](p.md) — p\n');
+    writeMemory(roots.projectLocal, 'p', fmProjectUntrusted('p'), 'body p');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_local', 'p');
+
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(0);
+  });
+
+  test('filters out non-active state memories', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P](p.md) — p\n');
+    writeMemory(roots.projectLocal, 'p', fmProjectQuarantined('p'), 'body p');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_local', 'p');
+
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(0);
+  });
+
+  test('toolCallId scopes attribution to memories exposed at that call', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P1](p1.md) — p1\n- [P2](p2.md) — p2\n');
+    writeMemory(roots.projectLocal, 'p1', fmProject('p1'), 'body p1');
+    writeMemory(roots.projectLocal, 'p2', fmProject('p2'), 'body p2');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    const tc = seedToolCall();
+    // p1 exposed at this tool call; p2 exposed in session but not at this call.
+    seedExposure('project_local', 'p1', { toolCallId: tc });
+    seedExposure('project_local', 'p2'); // no toolCallId
+
+    const result = reg.recordOverrideSignal({
+      signal: 'permission_denied',
+      toolCallId: tc,
+    });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_local', 'p1').length).toBe(1);
+    expect(listRecentOverridesForMemory(db, 'project_local', 'p2').length).toBe(0);
+  });
+
+  test('caps fan-out at MAX_OVERRIDE_ATTRIBUTION_DEPTH', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const indexLines: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      indexLines.push(`- [P${i}](p${i}.md) — p${i}`);
+      writeMemory(roots.projectLocal, `p${i}`, fmProject(`p${i}`), `body p${i}`);
+    }
+    writeIndex(roots.projectLocal, `${indexLines.join('\n')}\n`);
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    for (let i = 0; i < 10; i++) {
+      seedExposure('project_local', `p${i}`);
+    }
+
+    const { MAX_OVERRIDE_ATTRIBUTION_DEPTH } = await import('../../src/memory/registry.ts');
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(MAX_OVERRIDE_ATTRIBUTION_DEPTH);
+  });
+
+  test('dedupes exposures by (scope, name) — repeat exposure counts once', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P](p.md) — p\n');
+    writeMemory(roots.projectLocal, 'p', fmProject('p'), 'body p');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    // Three exposures of the same memory (e.g. memory_read called
+    // three times across the session). The override should attribute
+    // ONCE — one row per memory, not one row per exposure.
+    seedExposure('project_local', 'p');
+    seedExposure('project_local', 'p');
+    seedExposure('project_local', 'p');
+
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_local', 'p').length).toBe(1);
+  });
+
+  test('no exposures => no-op (attributedCount 0)', () => {
+    const repo = makeTmp();
+    const reg = createMemoryRegistry({
+      roots: makeRoots(repo),
+      db,
+      sessionId,
+      cwd: '/p',
+    });
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(0);
+  });
+
+  test('no db => no-op (registry constructed without persistence)', () => {
+    const repo = makeTmp();
+    const reg = createMemoryRegistry({ roots: makeRoots(repo) });
+    const result = reg.recordOverrideSignal({ signal: 'memory_write_rejected' });
+    expect(result.attributedCount).toBe(0);
+  });
+
+  test('persists details JSON verbatim', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P](p.md) — p\n');
+    writeMemory(roots.projectLocal, 'p', fmProject('p'), 'body p');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_local', 'p');
+
+    reg.recordOverrideSignal({
+      signal: 'memory_write_rejected',
+      details: {
+        proposed_scope: 'project_local',
+        proposed_name: 'foo',
+        modal_stage: 'modal',
+      },
+    });
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    const rows = listRecentOverridesForMemory(db, 'project_local', 'p');
+    expect(rows[0]?.details).toEqual({
+      proposed_scope: 'project_local',
+      proposed_name: 'foo',
+      modal_stage: 'modal',
+    });
+  });
+
+  test('excludeScopes input drops exposures in excluded scopes BEFORE peek', async () => {
+    // Fail-closed posture: a caller (typically the scope-filtered
+    // wrapper applying an S5 trust-probe revocation) can pass
+    // excludeScopes to prevent override attribution to memories in
+    // those scopes — even when the session's provenance trail still
+    // shows them as exposed (the operator saw them during the
+    // trusted window, before revocation).
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — shared\n');
+    writeIndex(roots.projectLocal, '- [L](l.md) — local\n');
+    writeMemory(roots.projectShared, 's', fmProject('s'), 'body s');
+    writeMemory(roots.projectLocal, 'l', fmProject('l'), 'body l');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_shared', 's');
+    seedExposure('project_local', 'l');
+
+    const result = reg.recordOverrideSignal({
+      signal: 'memory_write_rejected',
+      excludeScopes: ['project_shared'],
+    });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_local', 'l').length).toBe(1);
+    expect(listRecentOverridesForMemory(db, 'project_shared', 's').length).toBe(0);
+  });
+
+  test('createScopeFilteredRegistry passes its excluded set through recordOverrideSignal', async () => {
+    // The S5 trust-probe wrapper constructs a filtered registry
+    // with `excludeScopes: ['project_shared']` when shared corpus
+    // trust can't be confirmed. The wrapper MUST pass its excluded
+    // set through `recordOverrideSignal` — otherwise a permission
+    // deny on a session whose provenance still references shared
+    // memos would emit override rows against memories the operator
+    // can no longer reach via read methods, violating the
+    // fail-closed contract symmetry.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — shared\n');
+    writeIndex(roots.projectLocal, '- [L](l.md) — local\n');
+    writeMemory(roots.projectShared, 's', fmProject('s'), 'body s');
+    writeMemory(roots.projectLocal, 'l', fmProject('l'), 'body l');
+    const base = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_shared', 's');
+    seedExposure('project_local', 'l');
+
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.recordOverrideSignal({
+      signal: 'permission_denied',
+      toolCallId: null,
+    });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_shared', 's').length).toBe(0);
+    expect(listRecentOverridesForMemory(db, 'project_local', 'l').length).toBe(1);
+  });
+
+  test('wrapper merges its excluded set with caller-supplied excludeScopes (union, not replace)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [S](s.md) — shared\n');
+    writeIndex(roots.projectLocal, '- [L](l.md) — local\n');
+    writeIndex(roots.user, '- [U](u.md) — user\n');
+    writeMemory(roots.projectShared, 's', fmProject('s'), 'body s');
+    writeMemory(roots.projectLocal, 'l', fmProject('l'), 'body l');
+    writeMemory(roots.user, 'u', fmProject('u'), 'body u');
+    const base = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+
+    seedExposure('project_shared', 's');
+    seedExposure('project_local', 'l');
+    seedExposure('user', 'u');
+
+    const wrapped = createScopeFilteredRegistry(base, ['project_shared']);
+    const result = wrapped.recordOverrideSignal({
+      signal: 'memory_write_rejected',
+      // Caller adds `user` to the exclude set; wrapper adds
+      // `project_shared`. The union should exclude both.
+      excludeScopes: ['user'],
+    });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    expect(listRecentOverridesForMemory(db, 'project_shared', 's').length).toBe(0);
+    expect(listRecentOverridesForMemory(db, 'user', 'u').length).toBe(0);
+    expect(listRecentOverridesForMemory(db, 'project_local', 'l').length).toBe(1);
+  });
+
+  test('auditSessionId override propagates to memory_override_events.session_id', async () => {
+    // For top-level invocations where the registry was constructed
+    // before the session existed, callers pass auditSessionId so
+    // the persisted row attributes to the live session.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [P](p.md) — p\n');
+    writeMemory(roots.projectLocal, 'p', fmProject('p'), 'body p');
+    // Construct WITHOUT sessionId — like bootstrap does pre-session.
+    const reg = createMemoryRegistry({ roots, db, cwd: '/p' });
+
+    seedExposure('project_local', 'p');
+
+    const result = reg.recordOverrideSignal({
+      signal: 'memory_write_rejected',
+      auditSessionId: sessionId,
+    });
+    expect(result.attributedCount).toBe(1);
+
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    const rows = listRecentOverridesForMemory(db, 'project_local', 'p');
+    expect(rows[0]?.sessionId).toBe(sessionId);
+  });
+});
