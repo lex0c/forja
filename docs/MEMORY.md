@@ -102,10 +102,15 @@ Boot order (top-level operator run, not subagent):
 2. open SQLite + run migrations
 3. registry construction (createMemoryRegistry; reload() walks scopes)
 4. lifecycle sweeps:
-     gcExpiredMemories         — quarantine past-date entries
-     gcPurgeExpiredTombstones  — drop tombstones past retention window
-     pruneMemoryProvenance     — drop provenance rows older than 90d
-     expirePendingProposals    — flip governance proposals past 30d to `expired`
+     gcExpiredMemories          — quarantine past-date entries
+     gcPurgeExpiredTombstones   — drop tombstones past retention window
+     gcStaleInvalidatedMemories — evict invalidated entries past stale window
+     pruneMemoryProvenance      — drop provenance rows older than 90d
+     expirePendingProposals     — flip governance proposals past 30d to `expired`
+     pruneVerifyAttempts        — drop S11 verify-semantic attempts past 90d
+     pruneConflictAttempts      — drop S13 verify-conflict attempts past 90d
+     pruneOverrideEvents        — drop S3 override-event signals past 90d
+     pruneOverrideAttempts      — drop S3 verify-override attempts past 90d
 5. trust probe — verifies the project_shared hash against the operator's
    last-confirmed value; revocation cascades active shared memories to
    `invalidated` and excludes the scope from eager-load this session
@@ -636,6 +641,34 @@ When a memory enters `evicted` or `purged`, **other memories that reference it b
 ### 9.4 Trigger-based eager load
 
 `evaluateBootTriggers` (`src/memory/triggers.ts`) supports the `triggers:` frontmatter array. When a session starts in a directory matching a trigger (e.g., a `.env` file present, or the operator's first prompt mentions `git commit`), the corresponding memory is eager-loaded into context regardless of the index. Spec reference: `MEMORY.md §4.3`.
+
+### 9.5 Session shutdown
+
+The harness loop's outer `try/finally` (`src/harness/loop.ts:3858`) is the session-end cleanup hook. It fires on every exit path — clean turn return, soft-stop signal, operator Ctrl-C, uncaught exception — and runs the steps in this order:
+
+1. **`semanticVerifyScheduler?.shutdown()`** (S11) — flips an internal `stopped` flag. Subsequent `poll()` calls no-op. An in-flight `dispatchSemanticVerify(...)` from the last step boundary was already awaited inside the loop body (each tick awaits its dispatch), so no LLM-judge spawn remains in flight here. Idempotent — safe to call when the scheduler was never created (the `?.` covers the disabled-detector case).
+2. **`conflictDetectorScheduler?.shutdown()`** (S13) — same shape as S11.
+3. **`overrideVerifyScheduler?.shutdown()`** (S3) — same shape.
+4. **`await checkpointsPurgeInFlight`** — the lazy retention sweep for checkpoint blobs (kicked off during a step, runs on a detached Promise chain). The await is a synchronization point against `cli/run.ts` closing the SQLite handle right after `runAgent` returns; without it the purge would race against `db.close()` and hit a closed handle. The `.catch()` chain at construction already swallowed errors; the await here is purely a barrier.
+5. **`await subagentHandleStore.drain('parent_drain')`** — cancels every still-running subagent record and awaits all promises (including the cancelled-before-dispatch synthesis). Uses `Promise.allSettled` internally so a hard parent abort still leaves children with a clean termination point. Errors are swallowed — drain failures must not mask the run result.
+6. **`await bgManager.cleanup()`** — terminates background processes the session spawned via `bash --run-in-background`. Best-effort: cleanup failures don't escape the harness boundary. Zombies left behind stay visible via the `background_processes` audit table for forensic recovery.
+7. **`todoStore.clear(sessionId)`** — defensive in today's ownership model (the store is a function-local `Map` on line ~125 of `runAgent`, so GC reclaims it on return). Kept as a forward-compat hook for a future daemon mode that hoists the store to a process-level singleton.
+
+What deliberately does **not** happen at shutdown:
+
+- **No `MemoryRegistry.close()`** — the registry is a plain object owning an in-memory entries map and a reference to the `db`. It has no resource to release; GC reclaims it when `runAgent` returns. The `db` handle is owned by `cli/run.ts` and closed there, after the finally block runs.
+- **No `memory_events` finalization row** — the audit pair is per-action, not per-session. A session boundary is observable from outside via the gap in `messages.session_id`, not from a dedicated row.
+- **No mid-tick scheduler abort** — schedulers don't dispatch from a setInterval; they tick on step boundaries and the await at the call site means a tick either completes or the loop never reached it. There's no half-flushed dispatch state to worry about.
+
+What persists across the shutdown into the next session's boot:
+
+- **Tombstones** in `<scope>/.tombstones/` — boot's `gcPurgeExpiredTombstones` is the only path that moves them to `purged`.
+- **Pending governance proposals** in `memory_governance_proposals` — boot's `expirePendingProposals` is the only path that auto-expires them (30d TTL).
+- **Provenance trail** in `memory_provenance` — boot's `pruneMemoryProvenance` enforces the 90d retention.
+- **Detector dedup caches** (`memory_verify_attempts`, `memory_conflict_attempts`, `memory_verify_override_attempts`, `memory_override_events`) — each has a boot-time sweep with a 90d window (§1 step 4).
+- **Scheduler cursors** are NOT persisted — each scheduler keeps its `(createdAt, id)` tuple in a closure variable that dies with the process. Next boot the cursor starts at `(0, 0)` (epoch), so the first poll re-considers every row in the source table. Dedup caches (`memory_verify_attempts` / `memory_conflict_attempts` / `memory_verify_override_attempts`) are the authority on "already processed" across sessions; the cursor is just an intra-session optimization that lets each subsequent tick poll only new rows. The first poll pays an O(table-size) scan on a small table — the windows are bounded by the 90d retention sweeps.
+
+The shutdown sequence is intentionally non-reentrant: calling `shutdown()` twice is safe (each scheduler's `stopped` flag is sticky), but the surrounding promises are awaited in the `finally`, so a second `runAgent` invocation in the same process would need a fresh harness instance (today: `cli/run.ts` exits after `runAgent` returns, so reentrance isn't a path).
 
 ---
 
