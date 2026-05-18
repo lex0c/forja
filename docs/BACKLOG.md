@@ -2,6 +2,39 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] hardening(memory + harness) — Post-Phase-2 review round 2 (12 commits)
+
+Second pass of code review over the post-S3 memory governance + the eval suite landed in this same day. Findings split between substrate gaps (bugs that affect operator-facing behavior), one fuzz-target flake, and one missing surface (compile-mode builtin distribution). All twelve landed as individual commits on `feat/memory-governance-llm` for atomic review:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `179021a` | eval | memory | governance-flow deterministic fixture suite (8 cases) |
+| `2dfb08a` | eval | smoke | force serial reads on compaction-triggers fixture |
+| `0b8d8e2` | fix | subagents | embed builtin definitions for `bun build --compile` |
+| `57f19bb` | fix | fuzz | amortize migrations in chain target (5371ms → 298ms; kills timeout flake) |
+| `7cbf1d7` | fix | memory | surface decideProposal race in applyProposal via `governanceDrift` |
+| `7f66cba` | fix | memory | SELECT `deferred_until` + `defer_count` in memory-scoped proposal queries |
+| `c12bccd` | fix | harness | attribute `permission_denied` to session exposures, not denied tool call |
+| `312a755` | fix | memory | gate `memory_write_rejected` override signal on `source=inferred` |
+| `73c75fb` | fix | memory | emit save-guidance header even when no memories exist |
+| `ed77024` | fix | memory | apply governance toggle to live `ctx.baseConfig`, not just config file |
+| `993e83a` | fix | memory | propagate config-loader warnings through `BootstrapResult` to stderr |
+| `fa9d80a` | fix | harness | gate memory governance schedulers on `planMode=false` |
+
+**Themes:**
+
+- **Default-on detectors leak budget if any safety gate is missing.** Three of the fixes (`fa9d80a` plan-mode, `c12bccd` permission_denied attribution, `312a755` source=inferred) close paths where a default-on LLM-judge detector could fire (or fail to fire) against the operator's intent — burning API tokens + landing governance writes in read-only sessions, mis-attributing signals to memories that didn't drive the operator's action, or counting the operator's own corrections against unrelated memories. All silent-failure shapes pre-fix.
+- **Live state mutation matters.** Two commits address "the operator changed something but the next turn doesn't see it" gaps: `ed77024` (toggle didn't touch `ctx.baseConfig`) and `993e83a` (malformed `[memory]` TOML silently fell back to defaults with no diagnostic). Both contradict the slash command's "effect at next turn boundary" promise.
+- **Distribution mode bit-rot.** `0b8d8e2` and `57f19bb` are non-memory but tied: the compiled binary silently lost LLM-judge detectors because `import.meta.dir` doesn't enumerate under `/$bunfs/`, and the chain fuzz target's 200-iteration headline test sat right at the bun:test 5s timeout because migration count grew past what the original "~10ms/iter" comment assumed.
+- **API contract honesty.** `7cbf1d7` and `7f66cba` close two narrow contract gaps: `applyProposal` returning `applied` even when the post-transition stamp raced (memory mutated but the row credits someone else), and `listProposalsForMemory` returning rows with `undefined` instead of `null` for `deferredUntil` (consumers doing `!== null` saw "deferred" everywhere).
+- **First-session UX.** `73c75fb` flips the prior "no memories → no header" gate (which optimized for tokens) to "always render the header" because fresh sessions are exactly when the model is most likely to propose bad inferred saves and needs the save criteria + DO-NOT-save list in context.
+
+**Eval coverage.** First commit shipped the `evals/memory/` deterministic fixture suite (8 fixtures covering all three detectors + all three operator decisions + two defense gates F8/F11). Closes the eval gap flagged by the original Phase-2 review under CLAUDE.md principle 4.
+
+**Test deltas.** Suite went from 8787 → 8809 across the 12 commits (+22 tests, dominated by the eval suite at +8 and the rollback/race/regression pins). Typecheck + lint clean throughout. Smoke 9/10 (`04-grep-search` real-LLM variance is pre-existing, tracked separately).
+
+**Production-readiness shift.** Before this round: subsystem was "shipped per spec" but had eval gap + several silent-failure surfaces. After: eval-covered for the governance flow, no known silent-failure paths in the default-on detectors, slash toggle has live-mutation semantic, compiled binaries actually carry the built-in subagents. The phase-2 fixes are no longer load-bearing on follow-up work.
+
 ## [2026-05-18] eval(memory) — governance-flow deterministic fixture suite (8 cases)
 
 Closes the eval gap flagged during the post-Phase-2 audit: per `CLAUDE.md` principle 4 ("Eval is load-bearing — a subsystem without eval doesn't ship"), the memory subsystem had 8787 unit tests but zero eval coverage. `evals/regression/` + `evals/smoke/` carried 53 YAML cases across file IO / bash / hooks / compaction / plan-mode — none touching memory, governance, or any LLM-judge detector. By the project's own bar the subsystem was not production-ready despite the surface looking complete.
