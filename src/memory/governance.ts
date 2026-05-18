@@ -149,6 +149,7 @@ export type ApplyRejectionReason =
   | 'stale_evidence'
   | 'unimplemented_kind'
   | 'multi_memory_unsupported'
+  | 'invalid_target_key'
   | 'state_change'
   | 'illegal_transition'
   | 'blocked_by_protection'
@@ -384,10 +385,23 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
     );
   }
 
-  // (4) Single-memory gate for the supported kinds. quarantine /
-  // restore admit one source memory each in S8 V1; multi-memory
-  // proposals are reserved for merge / consolidate (unsupported).
-  if (proposal.sourceMemoryKeys.length !== 1) {
+  // (4) Single-memory gate with a multi-memory carve-out for
+  // `quarantine + target_key` (MEMORY.md §11.3 gate-list).
+  // Pair detectors (S13's verify-conflict is the canonical caller)
+  // emit `sourceMemoryKeys = [winner, loser]` so the operator sees
+  // both bodies on `/memory governance show`, but only the loser
+  // (designated via `target_payload.target_key`) transitions on
+  // approve. Restore + every other multi-memory shape still bounces
+  // here.
+  const targetPayload = proposal.targetPayload ?? {};
+  const targetKeyRaw = targetPayload.target_key;
+  const isMultiQuarantineWithTargetKey =
+    proposal.kind === 'quarantine' &&
+    proposal.sourceMemoryKeys.length > 1 &&
+    targetKeyRaw !== null &&
+    typeof targetKeyRaw === 'object' &&
+    !Array.isArray(targetKeyRaw);
+  if (proposal.sourceMemoryKeys.length !== 1 && !isMultiQuarantineWithTargetKey) {
     const reasonMsg = `kind '${proposal.kind}' requires exactly one source memory (got ${proposal.sourceMemoryKeys.length})`;
     return concludeRejection(
       db,
@@ -399,6 +413,32 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
       reasonMsg,
       { kind: proposal.kind, count: proposal.sourceMemoryKeys.length },
     );
+  }
+  // (4b) Validate the multi-memory carve-out: target_key shape +
+  // bijection against source_memory_keys. A malformed target_key OR
+  // one that names a memory not in the source list is a contract
+  // violation — the proposal can't be applied because we don't know
+  // which memory should transition.
+  let targetKey: { scope: MemoryScope; name: string } | null = null;
+  if (isMultiQuarantineWithTargetKey) {
+    const tk = targetKeyRaw as { scope?: unknown; name?: unknown };
+    const scope = typeof tk.scope === 'string' ? tk.scope : '';
+    const name = typeof tk.name === 'string' ? tk.name : '';
+    const matched = proposal.sourceMemoryKeys.find((k) => k.scope === scope && k.name === name);
+    if (matched === undefined) {
+      const reasonMsg = `target_payload.target_key {scope:${JSON.stringify(scope)}, name:${JSON.stringify(name)}} does not match any source_memory_keys entry`;
+      return concludeRejection(
+        db,
+        proposalId,
+        'system:invalid_target_key',
+        reasonMsg,
+        nowMs,
+        'invalid_target_key',
+        reasonMsg,
+        { target_key: { scope, name }, source_keys: proposal.sourceMemoryKeys },
+      );
+    }
+    targetKey = { scope: matched.scope, name: matched.name };
   }
 
   // (5) Staleness gate (drift wins over state_change per TODO S8.3).
@@ -502,19 +542,27 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
     );
   }
 
-  // (6) Execute the kind. Single-memory path for both quarantine
-  // and restore in S8 V1. Multi-memory will land alongside the
-  // merge / consolidate apply primitives.
-  const sourceKey = proposal.sourceMemoryKeys[0];
+  // (6) Execute the kind. Single-memory path for quarantine
+  // (without target_key) / restore in S8 V1. The multi-memory
+  // quarantine-with-target_key carve-out lands the SAME transition
+  // shape — only the chosen `sourceKey` differs. Merge / consolidate
+  // will land alongside future apply primitives.
+  const sourceKey =
+    targetKey !== null
+      ? proposal.sourceMemoryKeys.find(
+          (k) => k.scope === targetKey.scope && k.name === targetKey.name,
+        )
+      : proposal.sourceMemoryKeys[0];
   if (sourceKey === undefined) {
-    // Length-1 invariant verified above; defensive bail.
+    // Length-1 OR target_key bijection invariant verified above;
+    // defensive bail.
     return {
       outcome: 'rejected',
       reason: 'multi_memory_unsupported',
-      message: 'source memory key missing despite length check',
+      message: 'source memory key missing despite gate checks',
     };
   }
-  const target = proposal.targetPayload ?? {};
+  const target = targetPayload;
   const motivoResult = motivoForKind(proposal.kind, target.motivo);
   if (!motivoResult.ok) {
     return concludeRejection(

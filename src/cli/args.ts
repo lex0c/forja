@@ -179,6 +179,11 @@ export interface ParsedArgs {
   // to subagent children so spawned children also opt in if the parent
   // does.
   memoryVerifyLlm?: boolean;
+  // S13: opt-in for the LLM-judge conflict detector. Independent
+  // of memoryVerifyLlm — operator may enable either, both, or
+  // neither. Same top-level-only constraint (subagent children
+  // don't run their own scheduler). Default off ⇒ no LLM cost.
+  memoryConflictLlm?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -1537,6 +1542,14 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.memoryVerifyLlm = true;
         i += 1;
         break;
+      case '--memory-conflict-llm':
+        // S13 opt-in for the LLM-judge conflict detector. Same
+        // posture as --memory-verify-llm: presence-only, default
+        // off, top-level only. Cost / dispatch caps live in
+        // MEMORY_VERIFY_CONFLICT_MAX_* and are independent of S11.
+        args.memoryConflictLlm = true;
+        i += 1;
+        break;
       case '--subagent-temperature': {
         const value = argv[i + 1];
         if (value === undefined) {
@@ -1695,6 +1708,16 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       ok: false,
       message:
         '--memory-verify-llm is a top-level flag and conflicts with --subagent-session-id (subagent children do not run the verify scheduler)',
+    };
+  }
+  // S13: same shape as --memory-verify-llm rejection above. The
+  // conflict detector scheduler is top-level-only; pushing the
+  // flag into a subagent context would silently no-op.
+  if (args.memoryConflictLlm === true && args.subagentSessionId !== undefined) {
+    return {
+      ok: false,
+      message:
+        '--memory-conflict-llm is a top-level flag and conflicts with --subagent-session-id (subagent children do not run the conflict scheduler)',
     };
   }
   return { ok: true, args };

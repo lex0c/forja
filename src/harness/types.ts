@@ -837,6 +837,15 @@ export interface HarnessConfig {
   // Surfaced via `/memory governance status`. See `src/memory/verify-
   // semantic.ts` for the constants + flow.
   memorySemanticVerify?: boolean;
+  // S13: opt-in for the LLM-judge conflict detector. When true,
+  // every step boundary polls memory_events for newly-written
+  // memories and dispatches the verify-conflict subagent against
+  // BM25-prefiltered same-scope siblings. Independent of
+  // memorySemanticVerify; either / both / neither may be set.
+  // Operator opts in via `--memory-conflict-llm` (CLI). Surfaced
+  // via `/memory governance status`. See `src/memory/verify-
+  // conflict.ts` for the constants + flow.
+  memoryConflictDetect?: boolean;
   // Inventory of memories that landed in the eager-load section
   // of the system prompt (MEMORY.md §11.2 — provenance, surface
   // 'eager'). Populated by the CLI bootstrap from

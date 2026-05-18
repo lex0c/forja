@@ -2,6 +2,106 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] hardening(memory) — S13 post-review (3 CRIT + 11 HIGH + MEDs + test gaps)
+
+Three parallel reviewers (correctness, spec/architecture, test quality) on the S13 slice surfaced findings spread across the slice. All criticals + highs closed in this pass (P1-P10) BEFORE the S13 commit landed; the slice ships shippable.
+
+**Critical fixes:**
+
+- **P1+P2+P3 (B-CRIT-1) — multi-memory quarantine carve-out.** Pre-fix dispatcher emitted `sourceMemoryKeys=[winner, loser]` (2 elements) into the S8 governance substrate. Apply path gate #4 in `governance.ts:390` rejected EVERY S13 proposal with `system:multi_memory_unsupported` (single-memory-only contract pinned in `tests/memory/governance.test.ts:226`). T13.8 acceptance "operator approves → loser quarantines" was literally unattainable. Fixed via path (b) — spec PR + apply-path widening:
+  - MEMORY.md §11.3: `target_payload.target_key={scope,name}` schema added; gate #4 admits multi-memory quarantine WHEN target_key designates which entry transitions AND that key appears in source_memory_keys.
+  - `governance.ts`: gate #4 widened; new `system:invalid_target_key` rejection for target_key not matching any source key; source resolution uses target_key when present, else `sourceMemoryKeys[0]`.
+  - Dispatcher uses `targetPayload: {target_key: {scope, name}}` for the loser.
+  - +3 tests in `governance.test.ts` pinning: multi-memory quarantine + valid target_key applies (only loser transitions, winner untouched); target_key not in source_keys → `invalid_target_key`; restore + multi-memory still rejected (carve-out is quarantine-only).
+
+- **P4 (B-CRIT-2) — pre-dispatch pending-proposal gate.** Pre-fix S13 lacked the gate S11 has (verify-semantic-scheduler:341-358). Combined with `conflicting` verdicts ALWAYS re-dispatching (cache miss by design) and the at-most-one-per-poll cursor-stationary semantic, the same pair re-fired every step boundary until cost cap latched. Operator paid up to $0.50 to land 1 pending proposal. Now: `listPendingProposalsForMemory` for both written + each top-K sibling; quarantine-kind pending → skip. New scheduler test pins.
+
+- **C-CRIT-1/2/3 — test gaps mirrored from S11.** Spawn error path (sync throw + non-done status); F18 FK retry (would be `recordConflictAttempt`'s `FOREIGN KEY constraint` regex); F11 TOCTOU re-read on either body. New tests in dispatcher + scheduler suites.
+
+**High fixes:**
+
+- **P5 (A-HIGH-1) — sub-threshold dedup destroys valid pending proposal.** Bug present in BOTH dispatchers (S11 + S13): when `recordProposal` silently dedups against an existing pending row, `decideProposal(rejected, system:low_confidence)` fires unconditionally if the CURRENT confidence is sub-threshold — flipping the prior high-confidence proposal to rejected. Fix: `if (confidence < threshold && !proposalResult.deduped) decideProposal(...)`. Same guard applied to S11 dispatcher. Test pins the high→low sequence; pending stays pending with original confidence.
+
+- **P6 (A-HIGH-2) — `stale_snapshot` was advancing cursor (G5 regression).** When all top-K pairs returned `stale_snapshot` (just-written body drifted between scheduler peek and dispatcher re-peek), `!dispatchedThisPoll` fell through to `advanceTo` — write event lost forever, fresh body never re-evaluated. Mirror of G5 from S11. Track `staleSeen` across the for-loop, skip advance when set.
+
+- **P7 (C-HIGH 1-6) — test gaps closed.** G6 shutdown-during-await guard (scheduler `if (stopped) return` post-await); dispatch cap latch + stderr; F3 cost cap headroom misconfig (maxCostUsd < SUBAGENT_MAX); same-millisecond cursor tuple; pending-proposal gate; sharedScopeOffline negative case. +6 scheduler tests.
+
+**Med fixes:**
+
+- **P8 (A-MED-2) — quarantined siblings excluded from candidate pool.** Pre-fix `states: ['active', 'quarantined']` admitted quarantined siblings into the pair-judge pool. Resolver could pick quarantined as winner via stronger provenance, generating quarantine proposal against an active memory based on a quarantined memo's "authority". Now `states: ['active']` — semantically sound: quarantined memos are already flagged.
+
+- **P8 (C-MED-1) — CLI flag parse tests.** 4 new tests in `tests/cli/args.test.ts`: `--memory-conflict-llm` parses, defaults undefined, rejected with `--subagent-session-id`, coexists with `--memory-verify-llm`.
+
+- **P9 (B-HIGH-3) — audit-chain bypass doc updated for S13.** §14.4 paragraph now covers BOTH verify-semantic AND verify-conflict; cross-references `memory_conflict_attempts.subagent_run_session_id` chain.
+
+- **P9 (B-MED-1) — §14.4 detector roster updated.** S13 moved from "substrate-only" deferred to shipped, with full posture summary; TODO.md S13 marked ✅ DONE.
+
+**Test footprint:** +18 across 4 files.
+
+- `tests/memory/governance.test.ts` (+3): multi-memory quarantine + target_key applies; invalid target_key rejects; restore multi-memory still rejected.
+- `tests/memory/verify-conflict-dispatcher.test.ts` (+3): spawn throw, status≠done, sub-threshold dedup guard.
+- `tests/memory/verify-conflict-scheduler.test.ts` (+6): dispatch cap latch, cost headroom misconfig, G6 shutdown-during-await, same-ms cursor tuple, pending-proposal gate skip, sharedScopeOffline negative.
+- `tests/cli/args.test.ts` (+4): CLI flag tests (parse, default, conflict, coexist).
+- Pre-existing dispatcher test: `targetPayload` shape pin updated to `{target_key: {...}}`.
+
+Full suite: **8593 pass / 0 fail / 10 skip** (+16 vs S13 baseline of 8577).
+
+**Falsely-positive review findings (documented):**
+
+- "S13 has no end-to-end test" (B-HIGH-1) — partially closed by the multi-memory governance tests in `governance.test.ts` (apply-path proved end-to-end). Full harness loop → scheduler → dispatcher → governance integration test remains deferred (same gap as S11; tracked).
+- "Migration 061 CHECK cross-column idiom novel" (B-MED-2) — confirmed; idiom is intentional defense-in-depth, comment justifies it. Kept.
+
+**Deferred (tracked):**
+
+- Loop wire-up 5 branches tests (C-HIGH-6) — same gap as S11's "4 branches deferred"; closing requires bootstrap mock harness, scheduled with the S11 carry-over.
+- Governance status S13 block render test (C-MED-2) — render code is simple, would be cheap; deferred to keep this round bounded.
+- BM25 `tokenize` ASCII-only unicode degradation (A-MED-6) — documented (PT-BR memo bodies lose accent tokens; CJK-only bodies produce empty tokens → BM25 hit zero, scheduler advances cursor silently). Real fix requires unicode-aware tokenizer touch in retrieval pipeline (out of scope).
+
+## [2026-05-18] feat(memory) — S13 LLM-judge `conflict_detected` detector
+
+Third slice of Phase 2 on `feat/memory-governance-llm`. Closes the last remaining auto-detector listed in `docs/MEMORY.md §14.4` substrate-only roster. Replaces the heuristic textual matcher that S4 attempted and rolled back: pair of operator-authored memos goes to an LLM judge, structured verdict → S8 governance proposal → operator approves → loser quarantines via the state machine.
+
+**Auto-trigger, opt-in.** `--memory-conflict-llm` defaults off (zero LLM cost in default sessions). When the operator opts in, the harness loop runs a conflict scheduler tick at each step boundary, polling `memory_events` for `action='created'|'edited'` and dispatching AT MOST ONE pair verification per poll through the gate sequence below.
+
+Shipped (T13.1 → T13.8):
+
+- **`verify-conflict.md` subagent** (`src/subagents/builtin/verify-conflict.md`). Pair-judge: takes TWO operator-authored memory bodies, emits `{conflicting, conflict_kind, confidence, evidence: {shared_concept, polarity_a, polarity_b}}`. Tool whitelist: `memory_read` only (bodies already in input). `capabilities: []` (pure-LLM — memory_read is misc category and resolves to no capability footprint). 6 steps / $0.06 budget. Listed in `PROTECTED_BUILTIN_NAMES` so project / user shadows surface loudly.
+
+- **BM25 pair-selection scheduler** (`src/memory/verify-conflict-scheduler.ts`). Polls `memory_events` for write actions since last poll's cursor, builds BM25 index over same-scope sibling bodies, takes top-K (`CONFLICT_PREFILTER_K = 5`). Caps LLM dispatch at K — for a scope with N=200 siblings the worst case is 5 calls per just-written, a 40× cost reduction over O(N) pairwise. Cursor uses `(createdAt, id)` tuple (mirror the S11 fix); same-ms event bursts don't drop siblings. `at-most-one-dispatch-per-poll` semantic: cursor stays past the just-written event until all its top-K pairs are dedup-hit OR LLM-verified.
+
+- **Per-pair dispatcher** (`src/memory/verify-conflict-dispatcher.ts`). Per-pair contract: TOCTOU re-read both bodies → scanForInjection on BOTH → canonicalize pair → dedup lookup → spawn → validate output → resolveConflictWinner → recordConflictAttempt → recordProposal (S8). Mirrors verify-semantic-dispatcher in shape; pair-shape differences: injection scan fires twice (either body trips), prompt frames BOTH bodies as adversarial between paired delimiters, dedup keyed on canonical pair tuple.
+
+- **Deterministic resolver** (`src/memory/conflict-resolver.ts`). Pure function `resolveConflictWinner(a, b)` with tiebreak chain: provenance (`user_explicit > inferred > imported`) → recency (newer mtime wins) → scope specificity (`project_local > user > project_shared`) → body length (longer wins) → lexicographic name. Returns `{winner, loser, tier}` so the governance proposal's evidence payload records WHICH tier decided. LLM-agnostic — the audit trail can be replayed without the LLM ever firing again.
+
+- **Migration 061 `memory_conflict_attempts`** (`src/storage/migrations/061-memory-conflict-attempts.ts`). Cross-session pair-keyed dedup cache. Schema: `(scope_a/name_a/content_hash_a, scope_b/name_b/content_hash_b, verdict, conflict_kind, confidence, model_id, prompt_hash, subagent_run_session_id, attempted_at)`. CHECK constraint enforces canonical pair order at SQL level (`scope_a/name_a < scope_b/name_b`); the repo's `canonicalizePair` helper does the sort up front. Dedup window 7d for `compatible` verdicts (mirror S11); `conflicting` always re-dispatches. 90d retention.
+
+- **Repo + canonicalization** (`src/storage/repos/memory-conflict-attempts.ts`). `canonicalizePair`, `recordConflictAttempt`, `lookupRecentConflictAttempt`, `listRecentConflictAttempts`, `pruneConflictAttempts`. Pair canonicalization is exposed AND enforced at SQL CHECK level — a caller that bypasses the helper hits a constraint error instead of silently inserting a duplicate row.
+
+- **Governance proposal emission**. Reuses S8 `recordProposal` with `kind='quarantine'`, `targetPayload={scope, name}` for the loser, `sourceMemoryKeys=[winner, loser]`, evidence rich with `{verdict, conflict_kind, confidence, shared_concept, polarity_a, polarity_b, winner_scope/name, loser_scope/name, resolver_tier, prompt_hash, subagent_run_session_id, model_id}`. Confidence below `SEMANTIC_CONFLICT_MIN_CONFIDENCE = 0.7` auto-archives as `rejected` with `decidedBy='system:low_confidence'` — same posture as S11. `triggerForProposal` already maps `'subagent:verify-conflict' → 'conflict_detected'` (was pre-stitched in `src/memory/governance.ts`).
+
+- **CLI flag + harness wire** (`--memory-conflict-llm`). parseArgs accepts the presence-only flag; F12 mirror refuses combination with `--subagent-session-id` (top-level only). Harness loop creates the scheduler when (a) `memoryConflictDetect=true`, (b) `subagentDepth===0`, (c) `subagentRegistry !== undefined`, (d) `verify-conflict` definition loaded, (e) `memoryRegistry !== undefined`. Capabilities sealed via intersection (`parent ∩ declared`); excess logs `verify_conflict_envelope_narrowed` to stderr. Independent counters from S11 (`MEMORY_VERIFY_CONFLICT_MAX_DISPATCHES_PER_SESSION = 10`, `MEMORY_VERIFY_CONFLICT_MAX_COST_USD = 0.5`).
+
+- **`/memory governance status`** renders S13 block alongside S11: enabled state + caps + recent attempts. Each recent attempt shows verdict, confidence, pair, conflict_kind, model.
+
+- **Bootstrap pruneConflictAttempts** wired alongside `pruneVerifyAttempts`. Same 90d retention sweep posture.
+
+**Tests:** +29 across 4 files.
+
+- `tests/memory/conflict-resolver.test.ts` (+13): one test per tier + chained tier-ordering invariants. Pins the deterministic tiebreak as a contract — a refactor that flips a tier order fails loud.
+- `tests/storage/memory-conflict-attempts.test.ts` (+14): canonicalizePair, recordConflictAttempt happy paths + rejection of non-canonical pairs (repo + SQL CHECK), lookup with verdict + window semantics, content_hash drift busting dedup, pruneConflictAttempts.
+- `tests/memory/verify-conflict-dispatcher.test.ts` (+10): injection scan on either body, same-pair short-circuit, dedup cache hit, conflicting+high-confidence proposal landed, sub-threshold auto-reject, compatible attempt-only, malformed output paths.
+- `tests/memory/verify-conflict-scheduler.test.ts` (+5): definition undefined no-op, happy path (write event + sibling → dispatch), BM25 prefilter cap (disjoint siblings never reach LLM), cost cap latches `capExhausted='cost'`, sharedScopeOffline forwarded from session-wide exclude list.
+
+Full suite: **8577 pass / 0 fail / 10 skip** (+44 vs S13 baseline of 8533).
+
+**What S13 does NOT do (deferred):**
+
+- E2e integration tests through the harness loop (CLI → bootstrap → real scheduler → real subagent spawn → governance proposal). Same gap as S11's hardening backlog; tracked there.
+- Cross-scope pairing. Intra-scope only by design — pairing a user-global preference against a project-local fact conflates concept layers and the resolver's scope-specificity tier already handles cross-scope precedence. A future detector that wants cross-scope can compose this one differently.
+- Multi-element merge proposals (`source_memory_keys.length > 2`). S8 substrate admits the shape; S13's resolver is strictly pair-based. Listed in MEMORY.md §14 as "consolidate" detector — a separate slice if/when needed.
+
+**Operator surface ready.** With `--memory-conflict-llm` set, writing a memo that semantically contradicts an existing same-scope sibling generates a pending governance proposal within one turn. `/memory governance status` shows the verdict; `/memory governance approve <id>` quarantines the loser; `/memory audit --trigger conflict_detected` cross-references the eviction event back through the proposal's evidence payload.
+
 ## [2026-05-17] fix(permissions) — carve out `/run/media` and `/run/user` from the deny tier
 
 Caught by an operator running Forja from `/run/media/lex/<volume>/Workspaces/forja/` (a workspace on an external drive mounted by udisks2 — Manjaro / Arch / Debian / Ubuntu / Fedora default). Every tool call against any file in the workspace failed instantly:

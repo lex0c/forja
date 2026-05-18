@@ -58,6 +58,7 @@ import { migration057MemoryVerifyAttempts } from './057-memory-verify-attempts.t
 import { migration058SubagentRunsScopeBuiltinAndApproval } from './058-subagent-runs-scope-builtin-and-approval.ts';
 import { migration059MemoryVerifyAttemptsFkDiscipline } from './059-memory-verify-attempts-fk-discipline.ts';
 import { migration060MemoryVerifyAttemptsBackfillDrift } from './060-memory-verify-attempts-backfill-drift.ts';
+import { migration061MemoryConflictAttempts } from './061-memory-conflict-attempts.ts';
 
 export interface Migration {
   id: number;
@@ -126,4 +127,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration058SubagentRunsScopeBuiltinAndApproval,
   migration059MemoryVerifyAttemptsFkDiscipline,
   migration060MemoryVerifyAttemptsBackfillDrift,
+  migration061MemoryConflictAttempts,
 ];

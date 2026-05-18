@@ -255,6 +255,140 @@ describe('applyProposal — pre-flight gates', () => {
     if (result.outcome === 'rejected') expect(result.reason).toBe('multi_memory_unsupported');
     expect(getProposalById(db, p.id)?.decidedBy).toBe('system:multi_memory_unsupported');
   });
+
+  // MEMORY.md §11.3 gate #4 carve-out: multi-memory quarantine WITH
+  // a valid target_key transitions ONLY the designated memory. S13
+  // (verify-conflict) emits [winner, loser] + target_key=loser so
+  // the operator sees both bodies on /memory governance show but
+  // only the loser flips state.
+  test('multi-memory quarantine + target_key transitions ONLY the designated memory', async () => {
+    const roots = makeRoots();
+    // seedActiveMemory overwrites MEMORY.md on each call — write
+    // both memos then rewrite the index covering both.
+    seedActiveMemory(roots.projectLocal, 'winner');
+    seedActiveMemory(roots.projectLocal, 'loser');
+    writeFileSync(
+      join(roots.projectLocal, 'MEMORY.md'),
+      '# Memory index\n\n- [winner](winner.md) - hook for winner\n- [loser](loser.md) - hook for loser\n',
+    );
+    const registry = baseRegistry();
+    const hashWinner = computeSnapshotHash(roots.projectLocal, 'winner');
+    const hashLoser = computeSnapshotHash(roots.projectLocal, 'loser');
+    const p = recordProposal(db, {
+      sessionId,
+      kind: 'quarantine',
+      sourceMemoryKeys: [
+        { scope: 'project_local', name: 'winner' },
+        { scope: 'project_local', name: 'loser' },
+      ],
+      sourceMemorySnapshots: [
+        { scope: 'project_local', name: 'winner', contentHash: hashWinner },
+        { scope: 'project_local', name: 'loser', contentHash: hashLoser },
+      ],
+      targetPayload: { target_key: { scope: 'project_local', name: 'loser' } },
+      evidence: { reason: 'pair-judge conflict' },
+      proposedBy: 'subagent:verify-conflict',
+      confidence: 0.9,
+    });
+    const result = await applyProposal({
+      db,
+      registry,
+      proposalId: p.id,
+      decidedBy: 'operator:test',
+    });
+    expect(result.outcome).toBe('applied');
+    // Loser transitions; winner untouched.
+    expect(registry.peek('loser', { scope: 'project_local' }).kind).toBe('present');
+    const loserPeek = registry.peek('loser', { scope: 'project_local' });
+    if (loserPeek.kind === 'present') {
+      expect(loserPeek.file.frontmatter.state ?? 'active').toBe('quarantined');
+    }
+    const winnerPeek = registry.peek('winner', { scope: 'project_local' });
+    if (winnerPeek.kind === 'present') {
+      // Winner stays active (no state field OR explicit 'active').
+      expect(winnerPeek.file.frontmatter.state ?? 'active').toBe('active');
+    }
+  });
+
+  test('multi-memory quarantine + target_key not in source_memory_keys → invalid_target_key', async () => {
+    const roots = makeRoots();
+    seedActiveMemory(roots.projectLocal, 'a');
+    seedActiveMemory(roots.projectLocal, 'b');
+    writeFileSync(
+      join(roots.projectLocal, 'MEMORY.md'),
+      '# Memory index\n\n- [a](a.md) - hook for a\n- [b](b.md) - hook for b\n',
+    );
+    const registry = baseRegistry();
+    const hashA = computeSnapshotHash(roots.projectLocal, 'a');
+    const hashB = computeSnapshotHash(roots.projectLocal, 'b');
+    const p = recordProposal(db, {
+      sessionId,
+      kind: 'quarantine',
+      sourceMemoryKeys: [
+        { scope: 'project_local', name: 'a' },
+        { scope: 'project_local', name: 'b' },
+      ],
+      sourceMemorySnapshots: [
+        { scope: 'project_local', name: 'a', contentHash: hashA },
+        { scope: 'project_local', name: 'b', contentHash: hashB },
+      ],
+      // target_key points at a memory NOT in source_memory_keys.
+      targetPayload: { target_key: { scope: 'project_local', name: 'mystery' } },
+      evidence: {},
+      proposedBy: 'subagent:verify-conflict',
+      confidence: 0.9,
+    });
+    const result = await applyProposal({
+      db,
+      registry,
+      proposalId: p.id,
+      decidedBy: 'operator:test',
+    });
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') expect(result.reason).toBe('invalid_target_key');
+    expect(getProposalById(db, p.id)?.decidedBy).toBe('system:invalid_target_key');
+  });
+
+  test('multi-memory restore (NOT quarantine) is still rejected even with target_key', async () => {
+    // The carve-out admits quarantine only. restore + multi-memory
+    // is still multi_memory_unsupported regardless of target_key
+    // shape — there's no spec contract for "restore one and leave
+    // others as evidence".
+    const roots = makeRoots();
+    seedActiveMemory(roots.projectLocal, 'a');
+    seedActiveMemory(roots.projectLocal, 'b');
+    writeFileSync(
+      join(roots.projectLocal, 'MEMORY.md'),
+      '# Memory index\n\n- [a](a.md) - hook for a\n- [b](b.md) - hook for b\n',
+    );
+    const registry = baseRegistry();
+    const hashA = computeSnapshotHash(roots.projectLocal, 'a');
+    const hashB = computeSnapshotHash(roots.projectLocal, 'b');
+    const p = recordProposal(db, {
+      sessionId,
+      kind: 'restore',
+      sourceMemoryKeys: [
+        { scope: 'project_local', name: 'a' },
+        { scope: 'project_local', name: 'b' },
+      ],
+      sourceMemorySnapshots: [
+        { scope: 'project_local', name: 'a', contentHash: hashA },
+        { scope: 'project_local', name: 'b', contentHash: hashB },
+      ],
+      targetPayload: { target_key: { scope: 'project_local', name: 'a' } },
+      evidence: {},
+      proposedBy: 'operator:bulk',
+      confidence: 0.9,
+    });
+    const result = await applyProposal({
+      db,
+      registry,
+      proposalId: p.id,
+      decidedBy: 'operator:test',
+    });
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') expect(result.reason).toBe('multi_memory_unsupported');
+  });
 });
 
 describe('applyProposal — staleness gate', () => {

@@ -150,6 +150,9 @@ export interface BootstrapInput {
   // `args.memoryVerifyLlm`; programmatic callers (tests) pass it
   // directly.
   memorySemanticVerify?: boolean;
+  // S13 opt-in for the LLM-judge conflict detector. Independent of
+  // memorySemanticVerify. CLI surfaces from `args.memoryConflictLlm`.
+  memoryConflictDetect?: boolean;
   // Shared-corpus trust modal callback (MEMORY.md §6.5.2
   // `trust_revoked` detector, S5/T5.2). Fired by `probeSharedTrust`
   // when the operator previously confirmed trust for this scope-
@@ -707,6 +710,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         `memory: AUDIT DRIFT: failed to prune memory_verify_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
       );
     }
+    // S13 conflict-attempts retention sweep. Same shape as
+    // verify-attempts; independent table (memory_conflict_attempts).
+    try {
+      const { pruneConflictAttempts, MEMORY_CONFLICT_ATTEMPTS_RETENTION_MS } = await import(
+        '../storage/repos/memory-conflict-attempts.ts'
+      );
+      pruneConflictAttempts(db, Date.now() - MEMORY_CONFLICT_ATTEMPTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_conflict_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
     // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2
     // `trust_revoked` detector). Runs ONLY when:
     //   - the operator supplied a callback (no TUI ⇒ no consent
@@ -999,6 +1015,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
     ...(input.memorySemanticVerify === true ? { memorySemanticVerify: true } : {}),
+    ...(input.memoryConflictDetect === true ? { memoryConflictDetect: true } : {}),
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.resumeFromSessionId !== undefined

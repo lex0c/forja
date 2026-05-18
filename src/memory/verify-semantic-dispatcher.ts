@@ -538,10 +538,18 @@ export const dispatchSemanticVerify = async (
     createdAt: nowMs,
   });
 
-  if (output.confidence < SEMANTIC_VERIFY_MIN_CONFIDENCE) {
+  if (output.confidence < SEMANTIC_VERIFY_MIN_CONFIDENCE && !proposalResult.deduped) {
     // Auto-decide as rejected so the operator can still see the
     // judge's verdict in `/memory governance list --status rejected`
     // even though it never lands in the pending review queue.
+    //
+    // `!proposalResult.deduped` guard (S13 review HIGH-1): when the
+    // fingerprint matches an existing PENDING proposal (silent dedup
+    // hit), calling decideProposal here flips THAT proposal — which
+    // may have been emitted earlier with high confidence — to
+    // rejected. A noisy second LLM run shouldn't destroy a valid
+    // prior verdict; only auto-reject when this run actually
+    // inserted a new row.
     decideProposal(db, proposalResult.id, {
       status: 'rejected',
       decidedBy: 'system:low_confidence',

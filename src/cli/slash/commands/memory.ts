@@ -45,6 +45,11 @@ import {
   transitionMemoryState,
 } from '../../../memory/index.ts';
 import {
+  MEMORY_VERIFY_CONFLICT_MAX_COST_USD,
+  MEMORY_VERIFY_CONFLICT_MAX_DISPATCHES_PER_SESSION,
+  SEMANTIC_CONFLICT_MIN_CONFIDENCE,
+} from '../../../memory/verify-conflict.ts';
+import {
   MEMORY_VERIFY_SEMANTIC_MAX_COST_USD,
   MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION,
   SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
@@ -66,6 +71,10 @@ import {
   listEvictionEventsByTrigger,
 } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
+import {
+  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
+  listRecentConflictAttempts,
+} from '../../../storage/repos/memory-conflict-attempts.ts';
 import {
   GOVERNANCE_PROPOSAL_STATUSES,
   type MemoryGovernanceProposalRow,
@@ -2794,6 +2803,45 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
     const conf = a.confidence.toFixed(2);
     lines.push(
       `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.memoryScope)}/${displayGov(a.memoryName)} · ${displayGov(a.modelId)}`,
+    );
+  }
+
+  // S13 — conflict detector summary. Same shape: enabled state +
+  // caps + recent attempts. Independent counters from S11.
+  lines.push('');
+  lines.push('verify-conflict (S13 / LLM-judge):');
+  const conflictEnabled = ctx.baseConfig.memoryConflictDetect === true;
+  lines.push(
+    `  enabled:             ${conflictEnabled ? 'yes (--memory-conflict-llm)' : 'no (default; pass --memory-conflict-llm to opt in)'}`,
+  );
+  lines.push(
+    `  confidence floor:    ${SEMANTIC_CONFLICT_MIN_CONFIDENCE.toFixed(2)} (proposals below floor auto-archived)`,
+  );
+  lines.push(`  max dispatches/sess: ${MEMORY_VERIFY_CONFLICT_MAX_DISPATCHES_PER_SESSION}`);
+  lines.push(`  max cost/sess:       $${MEMORY_VERIFY_CONFLICT_MAX_COST_USD.toFixed(2)}`);
+  const conflictDedupDays = Math.round(SEMANTIC_CONFLICT_DEDUP_WINDOW_MS / (24 * 60 * 60 * 1000));
+  lines.push(
+    `  dedup window:        ${conflictDedupDays}d (compatible verdicts; conflicting always re-dispatches)`,
+  );
+  let recentConflicts: ReturnType<typeof listRecentConflictAttempts>;
+  try {
+    recentConflicts = listRecentConflictAttempts(ctx.db, 10);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    lines.push(`  recent attempts:     (read failed: ${displayGov(msg)})`);
+    return { kind: 'ok', notes: lines };
+  }
+  if (recentConflicts.length === 0) {
+    lines.push('  recent attempts:     (none recorded yet)');
+    return { kind: 'ok', notes: lines };
+  }
+  lines.push(`  recent attempts (most-recent first, showing ${recentConflicts.length}):`);
+  for (const a of recentConflicts) {
+    const ts = formatGovernanceTimestamp(a.attemptedAt);
+    const conf = a.confidence.toFixed(2);
+    const kind = a.conflictKind !== null ? ` (${displayGov(a.conflictKind)})` : '';
+    lines.push(
+      `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.scopeA)}/${displayGov(a.nameA)} vs ${displayGov(a.scopeB)}/${displayGov(a.nameB)}${kind} · ${displayGov(a.modelId)}`,
     );
   }
   return { kind: 'ok', notes: lines };

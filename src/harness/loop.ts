@@ -793,6 +793,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // resolved (the scheduler captures it). Undefined when opt-in is
   // off / definition unavailable / running as a subagent child.
   let semanticVerifyScheduler: SemanticVerifyScheduler | undefined;
+  // S13 parallel: conflict-detector scheduler. Same lifecycle posture
+  // (top-level only, optional, declared at outer scope so the finally
+  // block can shutdown() even on early throws).
+  let conflictDetectorScheduler:
+    | import('../memory/verify-conflict-scheduler.ts').ConflictDetectorScheduler
+    | undefined;
   try {
     try {
       // Resume vs new session. In resume mode, the prior session id
@@ -1182,6 +1188,77 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         } else {
           process.stderr.write(
             'memory: verify_semantic_disabled: --memory-verify-llm set but verify-semantic definition not loaded\n',
+          );
+        }
+      }
+
+      // S13 — conflict detector scheduler. Same wiring posture as
+      // the verify-semantic scheduler above: top-level only, gated on
+      // memory registry availability, capabilities sealed via
+      // intersect.
+      if (config.memoryConflictDetect === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_conflict_disabled: --memory-conflict-llm cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      if (
+        config.memoryConflictDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.subagentRegistry !== undefined
+      ) {
+        const conflictDef = config.subagentRegistry.byName.get('verify-conflict');
+        if (conflictDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_conflict_disabled: --memory-conflict-llm set but memory registry not wired\n',
+          );
+        } else if (conflictDef !== undefined && config.memoryRegistry !== undefined) {
+          const { createConflictDetectorScheduler } = await import(
+            '../memory/verify-conflict-scheduler.ts'
+          );
+          conflictDetectorScheduler = createConflictDetectorScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: conflictDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            ...(config.planMode === true ? { planMode: true } : {}),
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = conflictDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_conflict_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_conflict_disabled: --memory-conflict-llm set but verify-conflict definition not loaded\n',
           );
         }
       }
@@ -3664,6 +3741,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             process.stderr.write(`memory: verify_semantic_poll_unhandled: ${redactSecrets(msg)}\n`);
           }
         }
+        // S13 conflict-detector scheduler tick. Independent of the
+        // S11 scheduler — both can be configured; both run per step
+        // boundary; failures stderr-log inside the scheduler and the
+        // catch here is defense-in-depth (programmer errors only).
+        if (conflictDetectorScheduler !== undefined) {
+          try {
+            await conflictDetectorScheduler.poll();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`memory: verify_conflict_poll_unhandled: ${redactSecrets(msg)}\n`);
+          }
+        }
       }
     } catch (e) {
       return await guardedFinish(e);
@@ -3675,6 +3764,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // nothing remains in flight here. Idempotent — safe to call
     // even when the scheduler was never created.
     semanticVerifyScheduler?.shutdown();
+    conflictDetectorScheduler?.shutdown();
     // Drain the lazy retention sweep BEFORE anything else in the
     // finally fires. The caller (cli/run.ts) is allowed to close the
     // DB right after runAgent returns; without this drain the purge

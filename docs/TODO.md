@@ -186,7 +186,7 @@ THE detector for factual contradiction in memory subsystem. Shipped on `feat/mem
 - Conflict detection between memories (pairwise) — Slice 13 below (V1 of S4 shipped audit substrate only; the LLM-judge conflict detector lands here).
 - Drift detection across time (memory written 90 days ago, codebase migrated) — would need cross-session subagent that doesn't exist today. Future infrastructure.
 
-## Slice 13 — LLM-judge `conflict_detected` detector
+## Slice 13 — LLM-judge `conflict_detected` detector · ✅ DONE
 
 Replaces the heuristic textual matcher that S4 attempted and rolled back. The audit substrate (`/memory conflicts` slash + `listEvictionEventsByTrigger` repo helper) shipped in S4 V1; S13 wires the actual detection pipeline through S8's governance proposal substrate + S11's subagent infrastructure.
 

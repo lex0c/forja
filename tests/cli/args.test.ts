@@ -1103,4 +1103,37 @@ describe('--broker (§13.7 mode flag, slice 87)', () => {
     expect(r.message).toContain('--memory-verify-llm');
     expect(r.message).toContain('--subagent-session-id');
   });
+
+  // ── S13 flag plumbing (parallel to F12 mirror) ──────────────────
+
+  test('--memory-conflict-llm parses as a presence-only opt-in', () => {
+    const r = parseArgs(['--memory-conflict-llm', 'do', 'thing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryConflictLlm).toBe(true);
+    expect(r.args.prompt).toBe('do thing');
+  });
+
+  test('--memory-conflict-llm defaults to undefined when omitted', () => {
+    const r = parseArgs(['hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryConflictLlm).toBeUndefined();
+  });
+
+  test('--memory-conflict-llm with --subagent-session-id is rejected', () => {
+    const r = parseArgs(['--subagent-session-id', 'child-id', '--memory-conflict-llm', 'hi']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-conflict-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  test('--memory-verify-llm + --memory-conflict-llm coexist (independent flags)', () => {
+    const r = parseArgs(['--memory-verify-llm', '--memory-conflict-llm', 'go']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBe(true);
+    expect(r.args.memoryConflictLlm).toBe(true);
+  });
 });

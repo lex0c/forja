@@ -690,6 +690,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
       ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
       ...(args.memoryVerifyLlm === true ? { memorySemanticVerify: true } : {}),
+      ...(args.memoryConflictLlm === true ? { memoryConflictDetect: true } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };

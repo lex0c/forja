@@ -37,6 +37,9 @@ export const PROTECTED_BUILTIN_NAMES: ReadonlySet<string> = new Set([
   // set; tool whitelist + isolation = none keeps it safe under the
   // shipped definition, but a project shadow could widen both.
   'verify-semantic',
-  // Future entries (e.g., 'verify-conflict' for S13) join here when
-  // the .md ships. Add alongside the .md in the same commit.
+  // S13 — runs at every step boundary when --memory-conflict-llm
+  // is set; pair-judge with memory_read whitelist only. Project
+  // shadow could widen tools[] to bash / write_file under the
+  // operator's opt-in. Same protection rationale as verify-semantic.
+  'verify-conflict',
 ]);
