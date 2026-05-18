@@ -284,6 +284,44 @@ describe('list helpers', () => {
     expect(listPendingProposalsForMemory(db, 'project_local', 'foo')).toHaveLength(0);
     expect(listProposalsForMemory(db, 'project_local', 'foo')).toHaveLength(1);
   });
+
+  test('memory-scoped queries SELECT deferred_until + defer_count (regression)', () => {
+    // Pre-fix, both `listProposalsForMemory` and
+    // `listPendingProposalsForMemory` omitted `p.deferred_until` and
+    // `p.defer_count` from the SELECT list — `fromRow` then read
+    // `undefined` instead of the persisted values. Consumers doing
+    // `deferredUntil !== null` (e.g.,
+    // `cli/slash/commands/memory.ts:2507`) treated `undefined` as
+    // "deferred" and rendered "deferred_until: undefined" in the
+    // governance show output.
+    //
+    // This pin catches the regression at the repo boundary: fresh
+    // proposals expose `null` / `0`, deferred proposals expose the
+    // real values — `undefined` is never a legal observation.
+    const r = recordProposal(db, baseProposal());
+
+    const freshList = listProposalsForMemory(db, 'project_local', 'foo');
+    expect(freshList).toHaveLength(1);
+    expect(freshList[0]?.deferredUntil).toBeNull();
+    expect(freshList[0]?.deferCount).toBe(0);
+
+    const freshPending = listPendingProposalsForMemory(db, 'project_local', 'foo');
+    expect(freshPending).toHaveLength(1);
+    expect(freshPending[0]?.deferredUntil).toBeNull();
+    expect(freshPending[0]?.deferCount).toBe(0);
+
+    const deferResult = deferProposal(db, r.id, { additionalDays: 7, nowMs: Date.now() });
+    expect(deferResult.ok).toBe(true);
+    if (!deferResult.ok) return;
+
+    const deferredList = listProposalsForMemory(db, 'project_local', 'foo');
+    expect(deferredList[0]?.deferredUntil).toBe(deferResult.deferredUntil);
+    expect(deferredList[0]?.deferCount).toBe(1);
+
+    const deferredPending = listPendingProposalsForMemory(db, 'project_local', 'foo');
+    expect(deferredPending[0]?.deferredUntil).toBe(deferResult.deferredUntil);
+    expect(deferredPending[0]?.deferCount).toBe(1);
+  });
 });
 
 describe('decideProposal', () => {

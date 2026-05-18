@@ -581,7 +581,8 @@ export const listProposalsForMemory = (
     .query<RawProposalRow, [MemoryScope, string, number]>(
       `SELECT p.id, p.session_id, p.kind, p.source_memory_keys, p.target_payload,
               p.confidence, p.evidence, p.status, p.proposed_by, p.proposal_fingerprint,
-              p.source_memory_snapshots, p.decided_reason, p.created_at, p.decided_at, p.decided_by
+              p.source_memory_snapshots, p.decided_reason, p.created_at, p.decided_at, p.decided_by,
+              p.deferred_until, p.defer_count
          FROM memory_governance_proposals p
          INNER JOIN memory_governance_proposal_keys k ON k.proposal_id = p.id
         WHERE k.memory_scope = ? AND k.memory_name = ?
@@ -608,7 +609,8 @@ export const listPendingProposalsForMemory = (
     .query<RawProposalRow, [MemoryScope, string, number]>(
       `SELECT p.id, p.session_id, p.kind, p.source_memory_keys, p.target_payload,
               p.confidence, p.evidence, p.status, p.proposed_by, p.proposal_fingerprint,
-              p.source_memory_snapshots, p.decided_reason, p.created_at, p.decided_at, p.decided_by
+              p.source_memory_snapshots, p.decided_reason, p.created_at, p.decided_at, p.decided_by,
+              p.deferred_until, p.defer_count
          FROM memory_governance_proposals p
          INNER JOIN memory_governance_proposal_keys k ON k.proposal_id = p.id
         WHERE k.memory_scope = ? AND k.memory_name = ? AND p.status = 'pending'
