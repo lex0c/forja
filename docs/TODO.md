@@ -219,6 +219,36 @@ Why deferred to Phase 2 alongside S11:
 
 ## Deferred — actionable but parked
 
+### Extract `createDetectorScheduler<TCandidate>` abstraction
+
+**Status:** the three LLM-judge governance detector schedulers (`src/memory/verify-semantic-scheduler.ts` 505 LOC, `verify-conflict-scheduler.ts` 540 LOC, `verify-override-scheduler.ts` 421 LOC = ~1466 LOC total) are ~80% structurally identical: cursor tuple `(createdAt, id)` + `advanceTo` helper, cap-check with worst-case headroom (`costUsdSpent + worst > maxCost`), exposures fetch + dedup loop, type/trust/state filter, pending-proposal short-circuit, dispatcher invocation, post-shutdown bail (G6), counters + `capExhausted` field, `sharedScopeOffline` derivation, forward-flag boilerplate (`...(deps.signal !== undefined ? { signal: deps.signal } : {})` × 8). What actually differs per detector: source query (`listSessionExposuresSince` vs `listMemoryEventsSince` vs `listOverrideEventsSince`), candidate shape (single memory / pair / memory + events), dispatcher function.
+
+**Problem:** every cross-cutting fix touches all three files — the post-Phase-2 review round 2 (2026-05-18) had several commits that each had to land identical edits 3×: plan-mode gate (`fa9d80a`), `governanceDrift` mirror, registry sessionId. Easy-to-miss-one-site drift risk that already burned operator-facing surface (S3's `auditSessionId` omission survived two rounds of review before landing as commit `5daed95`). Adding a fourth detector (e.g., the deferred `edit_reverted` signal collector for S3.2) means another 400+ LOC of mostly-copy-paste.
+
+**Fix shape:** extract a generic `createDetectorScheduler<TCandidate, TOutcome>({ pollSource, candidateBuilder, eligibilityFilter, dispatcher, ... })` factory in `src/memory/detector-scheduler.ts`. Each detector becomes ~80 LOC of adapter wiring (source query + candidate shape + dispatcher reference). Shared core handles cursor, cap, dedup, filter, dispatch wrap, shutdown, counters. Estimated reduction: 1466 → ~600 LOC (~60% cut). Cross-cutting fix surface drops from 3 sites to 1.
+
+Companion: extract `isFactualMemoryEligible(file): boolean` to share the type/trust/state filter between the scheduler's pre-flight gate AND the dispatcher's TOCTOU re-peek. Today the two implementations can drift (and a new state filter added to one would silently skip the other).
+
+Companion: extract `pickDefined(obj, keys)` (or use `lodash.pickBy(obj, isDefined)`) to replace the 30+ `...(deps.X !== undefined ? { X: deps.X } : {})` lines per scheduler with a single `pickDefined(deps, FORWARD_KEYS)`.
+
+**Pull-in signal:** (a) a fourth detector lands (signal `edit_reverted` for S3, or any new governance LLM-judge), OR (b) a fifth round-of-fixes hits the "had to edit all three schedulers" pattern. Either is a real signal the abstraction is overdue.
+
+**Risk:** harder to grep "everything about verify-semantic" in one file. Mitigated by keeping each adapter file focused on detector-specific shape + a single import from the shared core. The shared core's documentation needs to be load-bearing — operators tracking detector behavior shouldn't have to jump between two files for the common path.
+
+**Spec reference:** none — pure internal refactor, no contract change. The detector outputs + audit chain shape stay identical.
+
+### Persist scheduler cursor across process restarts
+
+**Status:** each scheduler keeps its `(createdAt, id)` cursor in a closure variable. Initial value `(0, 0)` means the first poll after every process restart re-scans the entire source table from epoch. The attempts dedup cache (`memory_verify_attempts` etc.) prevents re-dispatch, so correctness is fine; only perf is at stake.
+
+**Problem:** with 90d retention + heavy use, the source tables (`memory_provenance`, `memory_events`, `memory_override_events`) grow to thousands of rows. Every boot pays O(N) scan + N peek + N pending-proposal lookups before the cursor advances past the historical bulk. Latency at boot, not at steady state.
+
+**Fix shape:** add a tiny `poll_cursors` kv table (PK: `(detector_name, parent_session_id)`, columns: `cursor_at INTEGER`, `cursor_id TEXT`, `updated_at INTEGER`). Persist on `advanceTo`; load on scheduler construction. Or land per-session in `sessions` table as a JSON blob. Either way the boot path skips historical noise.
+
+**Pull-in signal:** boot-time scheduler scan starts showing up in performance traces (today probably <50ms, hard to notice).
+
+**Spec reference:** none — internal optimization.
+
 ### Sync `task` subagent under cap-watchdog
 
 **Status:** the cap watchdog in `runAgent` (`src/harness/loop.ts`) listens to `cost_update` IPC events per active subagent and fires `subagentHandleStore.cancelAll('cap_watchdog')` when cumulative live spend crosses `budget.maxCostUsd`. The store walks its `records` map.
