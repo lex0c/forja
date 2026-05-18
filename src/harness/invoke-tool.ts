@@ -12,6 +12,7 @@ import {
   withTransaction,
 } from '../storage/index.ts';
 import { linkApprovalToToolCall } from '../storage/repos/approval-call-links.ts';
+import type { Approval } from '../storage/repos/approvals.ts';
 import {
   type Tool,
   type ToolContext,
@@ -471,6 +472,15 @@ export const invokeTool = async (
   // the callback (rare — modal manager normally resolves false on
   // close/timeout) collapses to denied so the run doesn't hang on
   // a stuck pending row.
+  //
+  // Migration 058 — capture the approval row for the `confirm_yes`
+  // branch so its id flows into `ctx.approvalId` like the
+  // policy-allow branch. Without this the audit chain is broken
+  // specifically for user-confirmed task spawns (the recordApproval
+  // result was previously dropped on the floor; ctx.approvalId
+  // would be undefined and subagent_runs.parent_approval_id would
+  // land NULL even though an authoritative approval row existed).
+  let confirmYesApproval: Approval | undefined;
   if (setup.phase === 'confirm_pending') {
     const askUser = deps.confirmPermission;
     if (askUser === undefined) {
@@ -562,7 +572,7 @@ export const invokeTool = async (
     // explanatory; engine prompt belongs in the deny path.
     // startToolCall is deferred to the post-PreToolUse step
     // (same rationale as the policy-allow branch above).
-    recordApproval(deps.db, {
+    confirmYesApproval = recordApproval(deps.db, {
       toolCallId: callId,
       decision: 'confirm_yes',
       decidedBy: 'user',
@@ -723,9 +733,22 @@ export const invokeTool = async (
   // legacy callers / misc category / pre-planner refusals.
   // Migration 058: thread approval id into the ctx so spawning tools
   // (task family) can populate subagent_runs.parent_approval_id and
-  // keep the audit chain one-hop. `setup.phase` is 'started' here by
-  // exhaustive elimination above; TS narrows accordingly.
-  const approvalIdForCtx = setup.phase === 'started' ? setup.approvalId : undefined;
+  // keep the audit chain one-hop. Two sources of an authoritative
+  // approval row reach this point:
+  //   - Policy-allow path: `setup.phase === 'started'` carries the
+  //     approval id captured inside the setup transaction.
+  //   - Confirm-yes path: `setup.phase === 'confirm_pending'` and
+  //     the user approved above; `confirmYesApproval` carries the
+  //     row recorded post-confirm.
+  // Both are valid lineage anchors for spawning tools; only the
+  // hook-block / deny / confirm-no branches return before this
+  // point and therefore don't reach the execute step at all.
+  const approvalIdForCtx =
+    setup.phase === 'started'
+      ? setup.approvalId
+      : confirmYesApproval !== undefined
+        ? confirmYesApproval.id
+        : undefined;
   const ctxForExecute: ToolContext = {
     ...deps.ctx,
     toolCallId: toolCall.id,

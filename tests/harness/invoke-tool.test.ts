@@ -130,6 +130,55 @@ describe('invokeTool', () => {
     expect(observedApprovalId).toBe(approvals[0]?.id);
   });
 
+  // R3 follow-up — same wire for the confirm_yes branch. The bridged
+  // confirm path records a separate approval (decidedBy='user',
+  // decision='confirm_yes') AFTER the user approves; pre-fix
+  // ctx.approvalId was derived only from setup.phase === 'started',
+  // so the confirm-yes branch dropped the approval id silently —
+  // every task spawn through a user-confirmed tool call landed
+  // subagent_runs.parent_approval_id = NULL even though an
+  // authoritative approval row existed. Now both branches flow into
+  // the ctx.
+  test('R3 e2e: ctx.approvalId populated from the confirm_yes approval row id', async () => {
+    let observedApprovalId: string | undefined;
+    const capturingTool: Tool = {
+      name: 'write_file', // matches policy section so confirm_paths binds
+      description: 'captures ctx.approvalId after user confirm',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+      metadata: { category: 'fs.write', writes: true, idempotent: false },
+      async execute(_args, ctx) {
+        observedApprovalId = ctx.approvalId;
+        return { ok: true };
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(capturingTool);
+    const deps = {
+      db,
+      registry,
+      engine: createPermissionEngine(
+        policy({ tools: { write_file: { confirm_paths: ['x.ts'] } } }),
+        { cwd: '/p' },
+      ),
+      ctx: makeCtx({ cwd: '/p' }),
+      confirmPermission: async () => true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(observedApprovalId).toBeDefined();
+    // confirm path records TWO approvals: nothing for the pending
+    // window, then the confirm_yes after the user decided. The
+    // captured id is the confirm_yes row.
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.decision).toBe('confirm_yes');
+    expect(approvals[0]?.decidedBy).toBe('user');
+    expect(observedApprovalId).toBe(approvals[0]?.id);
+  });
+
   test('happy path: allow → execute → done', async () => {
     const deps = buildDeps(okTool, {
       tools: { write_file: { allow_paths: ['**'] } },
