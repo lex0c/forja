@@ -192,6 +192,7 @@ export {
   GOVERNANCE_PROPOSAL_KINDS,
   GOVERNANCE_PROPOSAL_STATUSES,
   GOVERNANCE_PROPOSAL_TTL_MS,
+  canonicalJsonStringify,
   computeProposalFingerprint,
   decideProposal,
   expirePendingProposals,

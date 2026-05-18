@@ -24,6 +24,7 @@ import {
   hashMemoryContent,
   recordProvenance,
 } from '../../../src/storage/repos/memory-provenance.ts';
+import { recordAttempt } from '../../../src/storage/repos/memory-verify-attempts.ts';
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { createRetrievalTrace } from '../../../src/storage/repos/retrieval-trace.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
@@ -3549,6 +3550,87 @@ describe('/memory governance status (S11)', () => {
     const r = await memoryCommand.exec(['governance', 'status', 'bogus'], ctx);
     expect(r.kind).toBe('error');
     if (r.kind === 'error') expect(r.message).toContain("unexpected arg 'bogus'");
+  });
+
+  test('G8/F16: disabled-state output does NOT mention the (unimplemented) policy', async () => {
+    // Pre-G8 the hint said "or set policy". Policy parsing was
+    // never wired; the hint misled operators. Assert absence so a
+    // regression re-adding it fails loud.
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).not.toContain('or set policy');
+    expect(text).not.toContain('[memory.verify]');
+  });
+
+  test('renders recent attempts when memory_verify_attempts has rows', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    const sampleHash = 'a'.repeat(64);
+    recordAttempt(bundle.db, {
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      contentHash: sampleHash,
+      verdict: 'passed',
+      confidence: 0.9,
+      modelId: 'test/model',
+      promptHash: 'b'.repeat(64),
+      attemptedAt: 2_000_000_000_000,
+    });
+    recordAttempt(bundle.db, {
+      memoryScope: 'user',
+      memoryName: 'pref',
+      contentHash: 'c'.repeat(64),
+      verdict: 'contradicted',
+      confidence: 0.85,
+      modelId: 'test/model',
+      promptHash: 'd'.repeat(64),
+      attemptedAt: 2_000_000_000_500,
+    });
+    const r = await memoryCommand.exec(['governance', 'status'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('recent attempts (most-recent first, showing 2):');
+    expect(text).toContain('contradicted');
+    expect(text).toContain('passed');
+    expect(text).toContain('user/pref');
+    expect(text).toContain('project_local/foo');
+    expect(text).toContain('test/model');
+  });
+
+  test('graceful error when listRecentAttempts throws', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    // Wrap db to make the recent-attempts SELECT throw — emulates
+    // disk corruption / FS error. The slash should NOT throw out;
+    // it must return ok with the read-failed hint.
+    const realDb = bundle.db;
+    const dbProxy: typeof realDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (sql: string) => {
+            if (
+              typeof sql === 'string' &&
+              sql.includes('FROM memory_verify_attempts') &&
+              sql.includes('ORDER BY attempted_at DESC')
+            ) {
+              throw new Error('disk read failed');
+            }
+            return target.query(sql);
+          };
+        }
+        return Reflect.get(target as object, prop, receiver);
+      },
+    }) as typeof realDb;
+    (bundle.ctx as { db: typeof realDb }).db = dbProxy;
+    const r = await memoryCommand.exec(['governance', 'status'], bundle.ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('read failed:');
+    expect(text).toContain('disk read failed');
   });
 });
 

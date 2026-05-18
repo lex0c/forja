@@ -1328,6 +1328,13 @@ describe('loadSubagents (S11 builtin scope)', () => {
     expect(def?.budget.maxCostUsd).toBeCloseTo(0.1);
     expect(def?.isolation).toBe('none');
     expect(set.shadows).toEqual([]);
+    // G11: pin two load-bearing safety phrases from the system
+    // prompt — the dispatcher's runtime guards (injection + path
+    // existence) assume the model was told to treat the body as
+    // adversarial and to refuse phantom citations. A silent refactor
+    // that strips either should fail this test.
+    expect(def?.systemPrompt).toContain('adversarial');
+    expect(def?.systemPrompt).toContain('Phantom citations');
   });
 
   test('builtinDir=null disables the scope entirely', () => {

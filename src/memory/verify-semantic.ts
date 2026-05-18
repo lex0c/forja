@@ -14,8 +14,6 @@
 // because tests + policy + slash all need to import them without
 // pulling in the LLM-spawn machinery.
 
-import type { MemoryScope } from './index.ts';
-
 // ─── tunables ─────────────────────────────────────────────────────────
 
 // Confidence floor for a `contradicted` verdict to land as a pending
@@ -115,15 +113,3 @@ export const VERIFY_SEMANTIC_SUBAGENT_NAME = 'verify-semantic';
 // `src/memory/governance.ts:triggerForProposal` so the audit chain
 // renders the right trigger (`verify_failed`) on the eviction row.
 export const VERIFY_SEMANTIC_PROPOSED_BY = 'subagent:verify-semantic';
-
-// Sentinel scope hint for the scheduler when filtering provenance.
-// The scheduler queries memory_provenance and joins against the
-// registry to determine the memory's `type` field — only memories
-// whose type is in SEMANTIC_VERIFY_ELIGIBLE_TYPES land in the
-// dispatch queue. Other scopes (user / project_local / project_shared)
-// are ALL eligible — type, not scope, is the gate.
-export const SEMANTIC_VERIFY_ELIGIBLE_SCOPES: ReadonlyArray<MemoryScope> = [
-  'user',
-  'project_shared',
-  'project_local',
-];

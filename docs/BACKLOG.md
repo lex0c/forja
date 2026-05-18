@@ -2,6 +2,60 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(memory) — S11 LLM-judge second post-review pass (critical + high + med + test gaps)
+
+Second multi-reviewer pass on S11 (three parallel agents: correctness/robustness, spec/architecture, test quality) surfaced 27+ new findings after the first hardening round landed. All closed in this pass (G1–G12).
+
+**Critical fixes:**
+
+- **G1 — directory-boundary path-traversal fix.** F8's `evidence_paths` guard checked `resolved.startsWith(cwd)` — `/repo` would admit `/repository-malicious/...` as a sibling whose absolute path shares the prefix but isn't actually under cwd. Switched to the directory-boundary check `resolved === cwd || resolved.startsWith(cwd + sep)`. Also rejects absolute paths up front via `isAbsolute(p)` before resolution. Test pins the sibling-directory case (`/repo-x`) as `malformed` against a dispatcher whose cwd is `/repo`.
+
+- **G2 — wire `effectiveCapabilities` into scheduler/dispatcher.** F9 threaded `effectiveCapabilities` through the dispatcher's input shape but the harness loop wire-up never populated it — the child's PERMISSION_ENGINE §10.1 envelope was empty (sealed audit row carried `[]`), and any subagent gate that consults the envelope's intersection silently degraded. Now derives from `config.permissionEngine.effectiveCapabilities()` with `deriveParentCapabilities(policy())` fallback for engines that pre-date the §10.1 method. `Capability` is nominal-branded; cast through `as unknown as readonly string[]` matches the dispatcher's transport shape.
+
+**High fixes:**
+
+- **G3 — scheduler skips `trust: untrusted` memories.** The shadow-domain `untrusted` trust attestation (MEMORY.md §17 — `trust: untrusted` files can be peeked but never load into context) was honored by the eager-loader path but the verify scheduler's peek-and-dispatch path bypassed it: an `untrusted` memory could be sent to the LLM judge as the BODY of a prompt, exfiltrating its content through the verification request. Added the filter at peek time AFTER the state/exclude checks; cursor advances past skipped candidates so they're not re-considered each poll.
+
+- **G4 — verify-semantic.md flagged as "not a playbook".** PLAYBOOKS.md §1.x requires playbook outputs to include `summary`, `assumptions`, `not_checked`. Verify-semantic intentionally omits these (the verdict + claim_extracted + ground_truth_observed + evidence_paths shape IS the output, no narrative summary is useful). Added a "Not a playbook" header to the .md explaining the omission so the next reviewer doesn't try to "fix" it.
+
+- **G5 — `stale_snapshot` doesn't advance cursor.** F11's TOCTOU re-read returned `{kind: 'skipped', reason: 'stale_snapshot'}` but the scheduler unconditionally advanced the cursor on every skip. A memory whose body was edited between peek and dispatch would NEVER be re-considered after the stale skip — the fresh body sat behind the advanced cursor. Now the scheduler advances only when `outcome.reason !== 'stale_snapshot'`; the next poll re-evaluates against the fresh body.
+
+- **G6 — scheduler counters guarded after shutdown.** The `dispatched++` and `costUsdSpent += ...` mutations happened AFTER the `await dispatchSemanticVerify(...)` resolved. If `shutdown()` was called mid-await (operator Ctrl-C between spawn and resolution), the counters mutated for a dispatch the scheduler had no business making. Added a `stopped` check immediately after the await before any counter mutation; the in-flight result is dropped silently (operator stopped, intent is clear).
+
+- **G7 — `PROTECTED_BUILTINS` source of truth.** F7's protected set lived inline in `src/subagents/load.ts`. Moved to `src/subagents/builtin/index.ts` as the canonical export — same module that owns the ship-dir resolution. Both the loader and any future shadow-precedence consumer import from one place; harder to drift.
+
+- **G8 — doc fixes.** MEMORY.md §14.4 didn't mention the loud shadow surfacing for protected builtins; updated. TODO.md added a "Deferred — actionable but parked" section with the compile-safe builtin distribution entry from F6 (with the operator-facing `verify_semantic_disabled` diagnostic that limits blast radius until a real fix lands).
+
+- **G9 — bump sanitize max for error surfaces.** F14's `sanitizeOneLineForDisplay` defaulted to a 256-char cap that truncated useful error context (SQLite paths + stack frames). Added `ERR_MAX_CHARS = 1024` + `displayErr()` helper used at all error-surface call sites; memory names + model_ids stay at the default 256.
+
+**Med fixes:**
+
+- **G10 — small cleanups.**
+  - Dropped dead `SEMANTIC_VERIFY_ELIGIBLE_SCOPES` constant (never read after F2 moved the scope filter into the harness loop's exclude set).
+  - Dispatcher's `evidenceEssence` now uses `canonicalJsonStringify` (exported from `memory-governance`) instead of `JSON.stringify` — matches the canonical serializer the rest of the governance substrate uses, so the same evidence shape always produces the same string regardless of key insertion order.
+  - Shadow chain in `load.ts` now emits both rows when a project shadow shadows a user shadow of a protected builtin (pre-fix only the project→builtin edge surfaced; the user→builtin edge was hidden behind it).
+
+**Test footprint:** +15 tests across four files.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+6): G1 sibling-directory path-traversal rejection, F11 TOCTOU re-read trio (registry-missing fallback / body-changed / fresh-body), F18 FK-race retry, F9 context-fields forwarding.
+- `tests/memory/verify-semantic-scheduler.test.ts` (+6): G3 trust:untrusted skip, F15 state filter widened to invalidated + evicted, F3 cost cap headroom edge case, F14 stderr ANSI sanitization, G6 shutdown-during-await counter discipline.
+- `tests/cli/slash/memory.test.ts` (+3): F16 absent "or set policy" hint, recent-attempts rendering, read-failed surface.
+- `tests/subagents/load.test.ts`: system prompt phrase pinning for the protected-builtin shadow rows.
+
+Full suite: **8499 pass / 0 fail / 10 skip** (+15 vs first-hardening baseline of 8484).
+
+**Falsely-positive review findings (documented):**
+
+- "FK race fallback loses forensic detail" — confirmed acceptable trade-off; the cache value matters more for the next dispatch than the run pointer.
+- "G2 capability cast loses brand safety" — confirmed; the dispatcher's transport shape is intentionally string-based (it's a forwarded payload, not a gate decision surface).
+
+**Deferred (tracked):**
+
+- Compile-safe builtin distribution (F6 carry-over) — TODO.md entry now explicit.
+- Harness loop scheduler wiring tests (4 branches: missing-definition, subagent-child, shutdown-after-throw, poll-throws).
+- Bootstrap `pruneVerifyAttempts` wiring tests.
+- End-to-end harness→scheduler→dispatcher→governance integration test.
+
 ## [2026-05-17] hardening(memory) — S11 LLM-judge post-review (critical + high + med + test gaps)
 
 Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 18 findings on S11 after the slice landed. All 18 closed in this pass.

@@ -173,7 +173,7 @@ const canonicalKeyOrder = (keys: readonly MemoryKey[]): MemoryKey[] => {
 // (operator-facing slash truncates display at 240 chars; detector
 // outputs are JSON-schema-validated to a few fields) so the cost is
 // negligible against the SHA-256 hashing it feeds.
-const canonicalJsonStringify = (value: unknown): string => {
+export const canonicalJsonStringify = (value: unknown): string => {
   const canonicalize = (v: unknown): unknown => {
     if (v === null || typeof v !== 'object') return v;
     if (Array.isArray(v)) return v.map(canonicalize);

@@ -27,6 +27,14 @@ import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
+
+// G9: error-context surfaces (subagent crash dumps, transient SQLite
+// failures) need more headroom than the default 200 chars so an
+// operator chasing a regression doesn't lose the failure cause. Short
+// labels (scope/name) keep the default. The 1024 cap is generous but
+// still bounded — a runaway error string can't blow up the log line.
+const ERR_MAX_CHARS = 1024;
+const displayErr = (s: string): string => sanitizeOneLineForDisplay(s, ERR_MAX_CHARS);
 import type { DB } from '../storage/db.ts';
 import { listPendingProposalsForMemory } from '../storage/repos/memory-governance.ts';
 import { listSessionExposuresSince } from '../storage/repos/memory-provenance.ts';
@@ -175,7 +183,7 @@ export const createSemanticVerifyScheduler = (
       exposures = listSessionExposuresSince(deps.db, deps.parentSessionId, cursorAt, maxExposures);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      stderr(`memory: verify_semantic_poll_failed: ${sanitizeOneLineForDisplay(msg)}\n`);
+      stderr(`memory: verify_semantic_poll_failed: ${displayErr(msg)}\n`);
       return;
     }
 
@@ -249,13 +257,25 @@ export const createSemanticVerifyScheduler = (
           // would mask a memory file with broken frontmatter from
           // the verifier loop forever.
           stderr(
-            `memory: verify_semantic_peek_malformed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${sanitizeOneLineForDisplay(peek.error)}\n`,
+            `memory: verify_semantic_peek_malformed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${displayErr(peek.error)}\n`,
           );
         }
         advanceTo(advanceAt);
         continue;
       }
       if (!isEligibleType.has(peek.file.frontmatter.type)) {
+        advanceTo(advanceAt);
+        continue;
+      }
+      // Trust filter (G3 — AGENTIC_CLI.md §1.1.5 canonical gate).
+      // memory-prompt.ts:242 + memory-read.ts:199 both honor
+      // `frontmatter.trust === 'untrusted'`; the scheduler MUST
+      // mirror so an inferred write in an untrusted cwd doesn't
+      // sneak a body into the verify-semantic subagent's window
+      // via the provenance trail. Cursor advances past the
+      // candidate — trust verdict on this body is stable for the
+      // session.
+      if (peek.file.frontmatter.trust === 'untrusted') {
         advanceTo(advanceAt);
         continue;
       }
@@ -279,7 +299,7 @@ export const createSemanticVerifyScheduler = (
         pending = listPendingProposalsForMemory(deps.db, cand.scope, cand.name, 5);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        stderr(`memory: verify_semantic_pending_check_failed: ${sanitizeOneLineForDisplay(msg)}\n`);
+        stderr(`memory: verify_semantic_pending_check_failed: ${displayErr(msg)}\n`);
         // Don't advance — next poll retries. Lookup failures are
         // transient; advancing would lose the candidate permanently.
         continue;
@@ -335,11 +355,23 @@ export const createSemanticVerifyScheduler = (
         // change won't help.
         const msg = err instanceof Error ? err.message : String(err);
         stderr(
-          `memory: verify_semantic_dispatch_failed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${sanitizeOneLineForDisplay(msg)}\n`,
+          `memory: verify_semantic_dispatch_failed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${displayErr(msg)}\n`,
         );
         advanceTo(advanceAt);
         continue;
       }
+
+      // G6: shutdown() may have fired during the awaited dispatch.
+      // Post-await mutations (counter bumps, stderr, cursor advance)
+      // would otherwise land after shutdown was requested — tests
+      // asserting clean post-shutdown counter shape would see one
+      // extra dispatch, and the verify-semantic-status surface would
+      // count a dispatch the operator believes was cancelled. Bail
+      // BEFORE the bookkeeping. The on-disk attempt + governance
+      // proposal landed inside the dispatcher already — those are
+      // not rolled back; recording the in-memory counter is the
+      // only thing skipped here.
+      if (stopped) return;
 
       if (outcome.kind === 'skipped') {
         // No LLM cost incurred — try next candidate without bumping
@@ -354,7 +386,22 @@ export const createSemanticVerifyScheduler = (
             `memory: verify_skipped: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${outcome.reason}\n`,
           );
         }
-        advanceTo(advanceAt);
+        // G5: stale_snapshot does NOT advance the cursor — the
+        // operator's edit needs to land in a fresh poll's peek so
+        // the dispatcher can run against the latest body. If we
+        // advanced here, the candidate would only re-emit after a
+        // new exposure landed (a memory_read / retrieve_context
+        // tool call), which can be far in the future. Other skip
+        // reasons (injection_detected gating definitively, dedup_hit
+        // already cached) DO advance — the candidate was gated for
+        // good. Loop-prevention: the next poll re-peeks via the
+        // scheduler, gets the fresh body, passes it as the new
+        // snapshot to the dispatcher, whose re-read inside matches
+        // — proceeds. Only pathological "operator edits between
+        // every poll" would loop, which the cost cap bounds.
+        if (outcome.reason !== 'stale_snapshot') {
+          advanceTo(advanceAt);
+        }
         continue;
       }
 
@@ -365,11 +412,11 @@ export const createSemanticVerifyScheduler = (
 
       if (outcome.kind === 'malformed') {
         stderr(
-          `memory: verify_semantic_malformed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${sanitizeOneLineForDisplay(outcome.reason)}\n`,
+          `memory: verify_semantic_malformed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${displayErr(outcome.reason)}\n`,
         );
       } else if (outcome.kind === 'spawn_failed') {
         stderr(
-          `memory: verify_semantic_spawn_failed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${sanitizeOneLineForDisplay(outcome.reason)}\n`,
+          `memory: verify_semantic_spawn_failed: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${displayErr(outcome.reason)}\n`,
         );
       }
 

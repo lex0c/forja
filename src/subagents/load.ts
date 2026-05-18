@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { PROTECTED_BUILTIN_NAMES } from './builtin/index.ts';
 import { BUILTIN_AGENTS_DIR, projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
@@ -1087,10 +1088,13 @@ export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
   // operator opts into `--memory-verify-llm` in that repo. Surfacing
   // the shadow is defense-in-depth; the operator's trust modal +
   // hooks chain are the actual enforcement.
-  const PROTECTED_BUILTINS: ReadonlySet<string> = new Set(['verify-semantic']);
+  // G7: source of truth for protected built-ins lives in
+  // `./builtin/index.ts` so a future author registering a new
+  // built-in has one obvious place to update — closes the
+  // "easy-to-forget hardcoded set" risk.
   for (const def of userDefs) {
     const prior = byName.get(def.name);
-    if (prior !== undefined && prior.scope === 'builtin' && PROTECTED_BUILTINS.has(def.name)) {
+    if (prior !== undefined && prior.scope === 'builtin' && PROTECTED_BUILTIN_NAMES.has(def.name)) {
       shadows.push({ name: def.name, shadowed: prior, winning: def });
     }
     // user overrides builtin: shadow is silent for unprotected
@@ -1103,12 +1107,25 @@ export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
     if (prior !== undefined && prior.scope === 'user') {
       // Operator authored both — surface so they see which won.
       shadows.push({ name: def.name, shadowed: prior, winning: def });
+      // G10: if the user def itself shadowed a protected built-in,
+      // ALSO surface the project→builtin row so the chain's
+      // original protected entry stays visible. Otherwise an
+      // operator who set up `user/verify-semantic.md` and then has
+      // a project file shadow it would lose visibility on the
+      // original built-in replacement.
+      if (PROTECTED_BUILTIN_NAMES.has(def.name)) {
+        const original = builtinDefs.find((b) => b.name === def.name);
+        if (original !== undefined) {
+          shadows.push({ name: def.name, shadowed: original, winning: def });
+        }
+      }
     } else if (
       prior !== undefined &&
       prior.scope === 'builtin' &&
-      PROTECTED_BUILTINS.has(def.name)
+      PROTECTED_BUILTIN_NAMES.has(def.name)
     ) {
-      // Project shadow of a protected built-in — always loud.
+      // Project shadow of a protected built-in (no user
+      // intermediate) — always loud.
       shadows.push({ name: def.name, shadowed: prior, winning: def });
     }
     byName.set(def.name, def);

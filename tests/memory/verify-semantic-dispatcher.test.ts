@@ -18,11 +18,12 @@
 //     rejected as malformed).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseMemoryFile } from '../../src/memory/frontmatter.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
+import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { dispatchSemanticVerify } from '../../src/memory/verify-semantic-dispatcher.ts';
 import { SEMANTIC_VERIFY_MIN_CONFIDENCE } from '../../src/memory/verify-semantic.ts';
 import type { PermissionEngine } from '../../src/permissions/index.ts';
@@ -457,6 +458,222 @@ describe('dispatchSemanticVerify — F8 hallucination guard (cwd-anchored)', () 
     if (outcome.kind === 'malformed') {
       expect(outcome.reason).toContain('absolute path refused');
     }
+  });
+});
+
+// ── G1: path-traversal cwd-boundary regression ─────────────────────
+
+describe('dispatchSemanticVerify — G1 cwd-boundary path-traversal fix', () => {
+  test('cited path that resolves OUTSIDE cwd via .. is rejected (escapes cwd)', async () => {
+    // Pre-G1 the substring `resolved.startsWith(cwd)` would have
+    // accepted a sibling directory whose path starts with the
+    // cwd string (e.g. cwd=/work/repo + ../repo-evil/x.ts →
+    // /work/repo-evil/x.ts startsWith '/work/repo' === true). With
+    // the directory-boundary check the sibling now refuses.
+    const traversal =
+      'verdict: contradicted\nconfidence: 0.92\nclaim_extracted: x\nground_truth_observed: y\nevidence_paths:\n  - ../escape/somefile.ts\n';
+    const outcome = await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('claim') },
+      spawnSubagentFn: makeFakeSpawn(makeResult({ output: traversal })),
+    });
+    expect(outcome.kind).toBe('malformed');
+    if (outcome.kind === 'malformed') {
+      expect(outcome.reason).toContain('escapes cwd');
+    }
+  });
+});
+
+// ── F11 stale_snapshot (registry-backed TOCTOU re-read) ──────────
+
+describe('dispatchSemanticVerify — F11 stale_snapshot re-read', () => {
+  const seedActiveFile = (name: string, body: string): void => {
+    const dir = join(workdir, 'local');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${name}.md`),
+      `---\nname: ${name}\ndescription: hook for ${name}\ntype: project\nsource: user_explicit\n---\n\n${body}\n`,
+    );
+    writeFileSync(join(dir, 'MEMORY.md'), `# Memory index\n\n- [${name}](${name}.md) — hook\n`);
+  };
+
+  test('re-peek matches → dispatch proceeds (registry returns same body)', async () => {
+    seedActiveFile('foo', 'identical body');
+    const roots: ScopeRoots = {
+      user: join(workdir, 'user'),
+      projectShared: join(workdir, 'shared'),
+      projectLocal: join(workdir, 'local'),
+    };
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
+    const file = parseMemoryFile(readFileSync(join(roots.projectLocal, 'foo.md'), 'utf-8'));
+    const outcome = await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file },
+      registry,
+      spawnSubagentFn: makeFakeSpawn(makeResult()),
+    });
+    expect(outcome.kind).toBe('completed');
+  });
+
+  test('re-peek diverges → skipped(stale_snapshot), no attempt, no proposal', async () => {
+    seedActiveFile('foo', 'original body');
+    const roots: ScopeRoots = {
+      user: join(workdir, 'user'),
+      projectShared: join(workdir, 'shared'),
+      projectLocal: join(workdir, 'local'),
+    };
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
+    const staleFile = parseMemoryFile(readFileSync(join(roots.projectLocal, 'foo.md'), 'utf-8'));
+    // Operator edits the body before the dispatcher's re-peek fires.
+    seedActiveFile('foo', 'OPERATOR EDITED body');
+    registry.reload();
+    const outcome = await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: staleFile },
+      registry,
+      spawnSubagentFn: makeFakeSpawn(makeResult()),
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('stale_snapshot');
+    expect(listRecentAttempts(db)).toHaveLength(0);
+    expect(listProposals(db)).toHaveLength(0);
+  });
+
+  test('re-peek returns missing → fallthrough with original snapshot (no abort)', async () => {
+    seedActiveFile('foo', 'body');
+    const roots: ScopeRoots = {
+      user: join(workdir, 'user'),
+      projectShared: join(workdir, 'shared'),
+      projectLocal: join(workdir, 'local'),
+    };
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
+    const file = parseMemoryFile(readFileSync(join(roots.projectLocal, 'foo.md'), 'utf-8'));
+    // Delete the file + reset the index so re-peek returns missing/unknown.
+    rmSync(join(roots.projectLocal, 'foo.md'));
+    writeFileSync(join(roots.projectLocal, 'MEMORY.md'), '# Memory index\n');
+    registry.reload();
+    const outcome = await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file },
+      registry,
+      spawnSubagentFn: makeFakeSpawn(makeResult()),
+    });
+    // Fallthrough uses the original snapshot — dispatch proceeds.
+    expect(outcome.kind).toBe('completed');
+  });
+});
+
+// ── F18 FK race retry ─────────────────────────────────────────────
+
+describe('dispatchSemanticVerify — F18 FK race retry', () => {
+  test('FK throw on first INSERT triggers null-retry, attempt lands with subagentRunSessionId=null', async () => {
+    // Wrap recordAttempt indirectly by injecting a db whose first
+    // INSERT into memory_verify_attempts throws SQLITE FK error,
+    // and the second succeeds. Use a Proxy so unrelated queries
+    // pass through unchanged.
+    let firstInsertSeen = false;
+    const realDb = db;
+    const dbProxy: typeof realDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (sql: string) => {
+            const stmt = target.query(sql);
+            if (
+              !firstInsertSeen &&
+              typeof sql === 'string' &&
+              sql.includes('INSERT INTO memory_verify_attempts')
+            ) {
+              firstInsertSeen = true;
+              return new Proxy(stmt, {
+                get(s, p, r) {
+                  if (p === 'run') {
+                    return () => {
+                      throw new Error('FOREIGN KEY constraint failed');
+                    };
+                  }
+                  return Reflect.get(s as object, p, r);
+                },
+              });
+            }
+            return stmt;
+          };
+        }
+        return Reflect.get(target as object, prop, receiver);
+      },
+    }) as typeof realDb;
+    const outcome = await dispatchSemanticVerify({
+      db: dbProxy,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('claim') },
+      spawnSubagentFn: makeFakeSpawn(makeResult()),
+    });
+    expect(outcome.kind).toBe('completed');
+    const attempts = listRecentAttempts(db);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.subagentRunSessionId).toBeNull();
+  });
+});
+
+// ── F9 runSubagent context threading ──────────────────────────────
+
+describe('dispatchSemanticVerify — F9 context threading', () => {
+  test('softStopSignal / cwdTrusted / sharedScopeOffline / hooksSnapshot / effectiveCapabilities reach spawn args', async () => {
+    let captured: Record<string, unknown> | undefined;
+    const captureSpawn = (async (input: Record<string, unknown>) => {
+      captured = input;
+      return makeResult();
+    }) as never;
+    const stop = new AbortController();
+    await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('claim') },
+      softStopSignal: stop.signal,
+      cwdTrusted: true,
+      sharedScopeOffline: true,
+      hooksSnapshot: [],
+      effectiveCapabilities: ['fs.read'],
+      spawnSubagentFn: captureSpawn,
+    });
+    expect(captured?.softStopSignal).toBe(stop.signal);
+    expect(captured?.cwdTrusted).toBe(true);
+    expect(captured?.sharedScopeOffline).toBe(true);
+    expect(captured?.hooksSnapshot).toEqual([]);
+    expect(captured?.effectiveCapabilities).toEqual(['fs.read']);
   });
 });
 

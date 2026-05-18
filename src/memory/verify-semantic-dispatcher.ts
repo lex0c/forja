@@ -16,13 +16,14 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { isAbsolute, sep as pathSep, resolve as resolvePath } from 'node:path';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
   type MemorySnapshot,
+  canonicalJsonStringify,
   decideProposal,
   recordProposal,
 } from '../storage/repos/memory-governance.ts';
@@ -364,7 +365,14 @@ export const dispatchSemanticVerify = async (
         continue;
       }
       const resolved = resolvePath(input.cwd, p);
-      if (!resolved.startsWith(input.cwd)) {
+      // Directory-boundary check (NOT substring): `cwd='/work/repo'`
+      // and path `../repo-evil/x.ts` resolves to `/work/repo-evil/x.ts`
+      // which would pass a naive `startsWith(cwd)` substring match.
+      // We require either an exact match (the resolved path IS cwd
+      // — odd but technically inside) OR a prefix bounded by the
+      // platform separator so a sibling directory with a name that
+      // begins like cwd can't sneak through.
+      if (resolved !== input.cwd && !resolved.startsWith(input.cwd + pathSep)) {
         bogusPaths.push(`${p} (escapes cwd)`);
         continue;
       }
@@ -448,8 +456,13 @@ export const dispatchSemanticVerify = async (
   // Stable evidence-essence for fingerprint dedup: claim + observed
   // + sorted evidence paths. Two identical contradictions emitted
   // by separate dispatches (same body, same finding) collapse to
-  // one pending proposal via the partial UNIQUE index.
-  const evidenceEssence = JSON.stringify({
+  // one pending proposal via the partial UNIQUE index. Pass through
+  // `canonicalJsonStringify` (S8 hardening helper) instead of raw
+  // `JSON.stringify` so a future hand-edit reordering fields here
+  // can't silently drift the fingerprint (key-sorted recursion
+  // makes the serialization order-invariant regardless of how the
+  // object literal is authored).
+  const evidenceEssence = canonicalJsonStringify({
     claim: output.claim_extracted,
     observed: output.ground_truth_observed,
     paths: [...output.evidence_paths].sort(),

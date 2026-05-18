@@ -1096,6 +1096,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               : {}),
             ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // PERMISSION_ENGINE.md §10.1: seal the verify subagent's
+            // effective envelope. Mirror the task-tool spawn shape
+            // (loop.ts:1289) — prefer the engine's intersected value
+            // when available, else derive from the policy. Without
+            // this the verify child runs under the parent's full
+            // envelope and the dispatcher's effectiveCapabilities
+            // forwarding is dead code. The verify-semantic.md tool
+            // whitelist is read-only by declaration; sealing the
+            // envelope makes the runtime gate enforce it too.
+            //
+            // Cast: Capability is a nominal brand of string; the
+            // dispatcher/scheduler accept `readonly string[]` so
+            // any consumer (audit row, downstream test) sees plain
+            // strings. The brand still travels through bunched
+            // type-safe call sites within permissions/.
+            effectiveCapabilities: (config.permissionEngine.effectiveCapabilities() ??
+              deriveParentCapabilities(
+                config.permissionEngine.policy(),
+              )) as unknown as readonly string[],
           });
         } else {
           process.stderr.write(
