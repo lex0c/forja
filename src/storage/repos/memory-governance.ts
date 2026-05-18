@@ -27,7 +27,7 @@
 
 import { createHash } from 'node:crypto';
 import type { MemoryScope } from '../../memory/index.ts';
-import { type DB, withTransaction } from '../db.ts';
+import { type DB, withImmediateTransaction, withTransaction } from '../db.ts';
 
 // ─── kinds + statuses (mirror migration CHECK constraints) ────────────
 
@@ -59,6 +59,22 @@ const VALID_SCOPES: ReadonlySet<MemoryScope> = new Set(['user', 'project_shared'
 // finding still holds. Constant is exported so the bootstrap sweep
 // + tests can reference the same value.
 export const GOVERNANCE_PROPOSAL_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Operator-controlled extension of a pending proposal's expiry
+// (MEMORY.md §11.3, migration 062). `deferProposal` adds time to a
+// proposal's deadline but never past this ceiling measured from
+// `created_at`. 90d == 3× the default TTL and matches
+// `memory_provenance` retention — far enough to absorb a slow
+// review cycle, close enough that a proposal can't outlive the
+// detector context that generated it.
+export const MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS = 90 * 24 * 60 * 60 * 1000;
+
+// `deferProposal` rejects requests outside this range. 1 day floor
+// because zero-day defers are no-ops (and negative makes no sense);
+// 90 day ceiling because requests larger than the absolute horizon
+// can never succeed regardless of `created_at`.
+export const MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS = 1;
+export const MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS = 90;
 
 // Default minimum confidence for the apply path's auto-reject gate.
 // Phase 2 LLM-judge slices (S11 / S13) override this via constants
@@ -103,6 +119,16 @@ export interface MemoryGovernanceProposalRow {
   createdAt: number;
   decidedAt: number | null;
   decidedBy: string | null;
+  // Operator-controlled expiry override (migration 062). NULL means
+  // "honor the default TTL from created_at". When set, the TTL
+  // sweep evaluates `deferred_until < now` instead. See
+  // `deferProposal`.
+  deferredUntil: number | null;
+  // Count of defers applied. Audit signal — many defers on the
+  // same proposal hint at operator dithering; zero is the default.
+  // Not a cap (the horizon ceiling is); surfaced on
+  // `/memory governance show`.
+  deferCount: number;
 }
 
 export interface RecordProposalInput {
@@ -285,6 +311,8 @@ interface RawProposalRow {
   created_at: number;
   decided_at: number | null;
   decided_by: string | null;
+  deferred_until: number | null;
+  defer_count: number;
 }
 
 const parseJsonOrThrow = <T>(raw: string, field: string, id: string): T => {
@@ -344,13 +372,16 @@ const fromRow = (row: RawProposalRow): MemoryGovernanceProposalRow => {
     createdAt: row.created_at,
     decidedAt: row.decided_at,
     decidedBy: row.decided_by,
+    deferredUntil: row.deferred_until,
+    deferCount: row.defer_count,
   };
 };
 
 const SELECT_ALL = `
   SELECT id, session_id, kind, source_memory_keys, target_payload,
          confidence, evidence, status, proposed_by, proposal_fingerprint,
-         source_memory_snapshots, decided_reason, created_at, decided_at, decided_by
+         source_memory_snapshots, decided_reason, created_at, decided_at, decided_by,
+         deferred_until, defer_count
     FROM memory_governance_proposals
 `;
 
@@ -624,27 +655,163 @@ export const decideProposal = (db: DB, id: string, input: DecideProposalInput): 
   return Number(result.changes) > 0;
 };
 
+// ─── deferProposal ────────────────────────────────────────────────────
+
+export interface DeferProposalInput {
+  additionalDays: number;
+  nowMs?: number;
+}
+
+export type DeferProposalResult =
+  | {
+      ok: true;
+      // New effective expiry; future TTL sweeps honor this.
+      deferredUntil: number;
+      // Post-increment count.
+      deferCount: number;
+    }
+  | {
+      ok: false;
+      reason:
+        | 'not_pending' // unknown id, or status != 'pending'
+        | 'invalid_days' // outside [MIN, MAX] or non-integer
+        | 'horizon_exceeded'; // would push past created_at + 90d
+    };
+
+// Extend a pending proposal's expiry by `additionalDays`. Anchors
+// on the LATER of (now, current effective expiry) so calling defer
+// twice doesn't lose runway — the second call adds to the first's
+// extension, not to wall-clock now.
+//
+// Capped at `MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS` measured from
+// `created_at`. A request that would push past the ceiling rejects
+// with `horizon_exceeded` (the operator's only recourse is to
+// approve or reject the proposal — eternal pending is not on the
+// table).
+//
+// Concurrency contract: read → compute → UPDATE is wrapped in a
+// SQLite IMMEDIATE transaction (BEGIN IMMEDIATE acquires the writer
+// lock at the start). Two simultaneous defers on the same row
+// serialize through that lock — the second caller's `getProposalById`
+// reads the post-first-commit snapshot, so its baseline anchors on
+// the just-updated `deferred_until` and its `deferCount` increment
+// returns the real post-update value. Without the immediate
+// transaction, both callers could read the same pre-state and the
+// second's `deferred_until` would overwrite the first's (last
+// writer wins) while reporting a stale `deferCount` in the result.
+export const deferProposal = (
+  db: DB,
+  id: string,
+  input: DeferProposalInput,
+): DeferProposalResult => {
+  if (
+    !Number.isInteger(input.additionalDays) ||
+    input.additionalDays < MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS ||
+    input.additionalDays > MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS
+  ) {
+    return { ok: false, reason: 'invalid_days' };
+  }
+  const now = input.nowMs ?? Date.now();
+  if (now <= 0) {
+    throw new Error(`deferProposal: nowMs must be > 0 (got ${now})`);
+  }
+  return withImmediateTransaction(db, () => {
+    const row = getProposalById(db, id);
+    if (row === null || row.status !== 'pending') {
+      return { ok: false, reason: 'not_pending' };
+    }
+    // Anchor: later of (now, existing effective expiry). The default
+    // expiry of a non-deferred proposal is `created_at + TTL`.
+    const currentExpiry = row.deferredUntil ?? row.createdAt + GOVERNANCE_PROPOSAL_TTL_MS;
+    const baseline = Math.max(now, currentExpiry);
+    const additionalMs = input.additionalDays * 24 * 60 * 60 * 1000;
+    const newDeferredUntil = baseline + additionalMs;
+    // Hard ceiling: never past `created_at + MAX_DEFER_HORIZON_MS`.
+    const ceiling = row.createdAt + MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS;
+    if (newDeferredUntil > ceiling) {
+      return { ok: false, reason: 'horizon_exceeded' };
+    }
+    const result = db
+      .query(
+        `UPDATE memory_governance_proposals
+            SET deferred_until = ?, defer_count = defer_count + 1
+          WHERE id = ? AND status = 'pending'`,
+      )
+      .run(newDeferredUntil, id);
+    if (Number(result.changes) === 0) {
+      // Under the immediate-transaction lock this is unreachable —
+      // status='pending' was confirmed by getProposalById and no
+      // concurrent writer can have moved it. Keep the branch as a
+      // belt-and-suspenders signal: if a future refactor breaks the
+      // lock invariant, the slash command sees `not_pending` rather
+      // than a silent partial write.
+      return { ok: false, reason: 'not_pending' };
+    }
+    return { ok: true, deferredUntil: newDeferredUntil, deferCount: row.deferCount + 1 };
+  });
+};
+
 // ─── expirePendingProposals ───────────────────────────────────────────
 
-// Bulk-transition every pending proposal with created_at < cutoff
-// to status='expired', decided_by='system:ttl'. Returns the row
-// count for telemetry. Used by the bootstrap-time sweep (T8.4).
+export interface ExpirePendingProposalsInput {
+  // The TTL window. The sweep flips rows whose effective expiry
+  // (deferred_until ?? created_at + ttlMs) is past nowMs. Passed
+  // explicitly so the bootstrap caller — which knows
+  // `GOVERNANCE_PROPOSAL_TTL_MS` — can also drive tests with
+  // shorter windows.
+  ttlMs: number;
+  nowMs?: number;
+}
+
+// Bulk-transition every pending proposal whose effective expiry has
+// passed to status='expired', decided_by='system:ttl'. Returns the
+// row count for telemetry. Used by the bootstrap-time sweep (T8.4).
 //
-// The cutoff is EXCLUSIVE — a row at exactly cutoff is KEPT. Same
-// semantic as pruneMemoryProvenance for consistency.
-export const expirePendingProposals = (db: DB, olderThanMs: number, nowMs?: number): number => {
-  const decidedAt = nowMs ?? Date.now();
-  if (decidedAt <= 0) {
-    throw new Error(`expirePendingProposals: nowMs must be > 0 (got ${decidedAt})`);
+// Effective expiry = `deferred_until` when set, else
+// `created_at + ttlMs`. The COALESCE pattern lets a single sweep
+// handle both deferred and non-deferred rows without a UNION.
+//
+// Comparison is strict less-than: a row whose effective expiry is
+// exactly `nowMs` is KEPT (same semantic as pruneMemoryProvenance).
+export const expirePendingProposals = (
+  db: DB,
+  input: ExpirePendingProposalsInput | number,
+  legacyNowMs?: number,
+): number => {
+  // Backward compatibility: the old signature took `olderThanMs`
+  // (== now - ttlMs) directly as a number. New callers pass an
+  // options object so the SQL can honor deferred_until without
+  // bleeding the ttlMs back through arithmetic on the cutoff.
+  let ttlMs: number;
+  let now: number;
+  if (typeof input === 'number') {
+    // Legacy path: input is olderThanMs (cutoff), legacyNowMs is now.
+    // Translate: ttlMs = now - cutoff.
+    now = legacyNowMs ?? Date.now();
+    ttlMs = now - input;
+  } else {
+    ttlMs = input.ttlMs;
+    now = input.nowMs ?? Date.now();
   }
+  if (now <= 0) {
+    throw new Error(`expirePendingProposals: nowMs must be > 0 (got ${now})`);
+  }
+  // ttlMs <= 0 is intentionally allowed: a 0-cutoff sweep with the
+  // legacy `(now, now)` shape was a no-op (no rows whose created_at
+  // < now would be pending in a fresh fixture), and tests exercise
+  // it as the "empty registry returns 0" path. Negative ttlMs is
+  // similarly harmless under the COALESCE SQL — it would expire
+  // nothing, since `created_at + ttlMs < now` becomes
+  // `created_at < now - |ttlMs|`, which past-shifts the cutoff.
   const result = db
     .query(
       `UPDATE memory_governance_proposals
           SET status = 'expired', decided_by = 'system:ttl',
               decided_reason = 'pending > 30d retention window',
               decided_at = ?
-        WHERE status = 'pending' AND created_at < ?`,
+        WHERE status = 'pending'
+          AND COALESCE(deferred_until, created_at + ?) < ?`,
     )
-    .run(decidedAt, olderThanMs);
+    .run(now, ttlMs, now);
   return Number(result.changes);
 };

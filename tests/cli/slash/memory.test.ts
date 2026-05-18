@@ -3280,6 +3280,117 @@ describe('/memory governance reject', () => {
   });
 });
 
+describe('/memory governance defer', () => {
+  test('happy path: bumps deferred_until + reports new expiry', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('deferred proposal');
+    expect(text).toContain('by 7d');
+    expect(text).toContain('defer_count=1');
+    const row = getProposalById(bundle.db, id);
+    expect(row?.deferredUntil).not.toBeNull();
+    expect(row?.deferCount).toBe(1);
+    expect(row?.status).toBe('pending');
+  });
+
+  test('rejects non-integer days argument', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, 'seven'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('must be an integer');
+  });
+
+  test('rejects when days is out of range', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '0'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('must be in');
+  });
+
+  test('rejects when push would exceed 90d horizon', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    // Default expiry = createdAt + 30d. +90d would land at +120d
+    // total, past the 90d ceiling from createdAt.
+    const r = await memoryCommand.exec(['governance', 'defer', id, '90'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('past the 90d horizon');
+  });
+
+  test('rejects when proposal not pending', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'reject', id], bundle.ctx);
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('already rejected');
+  });
+
+  test('rejects unknown proposal id', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'defer', 'no-such-id', '7'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('not found');
+  });
+
+  test('rejects missing days arg', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing arguments');
+  });
+
+  test('rejects extra positional arg', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7', 'extra'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unexpected extra arg');
+  });
+
+  test('subsequent /memory governance show surfaces deferred_until line', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'defer', id, '14'], bundle.ctx);
+    const r = await memoryCommand.exec(['governance', 'show', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('deferred_until:');
+    expect(text).toContain('count=1');
+  });
+});
+
 describe('/memory governance audit', () => {
   test('lineage includes post-approval memory_events for the affected memory', async () => {
     const repo = makeTmp();

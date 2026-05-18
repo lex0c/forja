@@ -796,7 +796,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // boot — operator-facing governance surfaces will fall back to
     // surfacing stale rows until the next successful sweep.
     try {
-      expirePendingProposals(db, Date.now() - GOVERNANCE_PROPOSAL_TTL_MS);
+      expirePendingProposals(db, { ttlMs: GOVERNANCE_PROPOSAL_TTL_MS });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(

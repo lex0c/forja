@@ -278,6 +278,65 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 # DEFERRED — items intentionally left for later
 
+## LLM-judge detector caps: push notification when latched (MEMORY.md §12.5.5)
+
+**Status:** noted during the post-Slice-Q architecture review (2026-05-18). Companion to TODO entry "Aggregate observability for memory-governance detectors" below — both close the loop on the default-ON detector posture.
+
+**What it is:** the verify-semantic + verify-conflict schedulers hold per-session counters (`dispatched`, `costUsdSpent`) with caps (`MAX_DISPATCHES_PER_SESSION = 10`, `MAX_COST_USD = 0.5`). When either cap latches, the scheduler:
+
+1. Sets `counters.capExhausted = 'dispatch' | 'cost'`.
+2. Writes one stderr line.
+3. Returns early on subsequent ticks for the rest of the session.
+
+The stderr line scrolls off; the `capExhausted` state is only readable via `/memory governance status` (pull). An operator in a long session can lose visibility on the fact that the detector silently stopped running — exactly the kind of "default-ON that silently degrades" failure mode the Slice Q first-boot banner was designed to prevent.
+
+**Why deferred:** ergonomics, not correctness. Cap-latch is rare in normal use ($0.50 / 10 dispatches is enough headroom for typical sessions); ship the visible-pull surface first and let real operator feedback drive the push surface.
+
+**Where it would land:**
+
+- `src/memory/verify-semantic-scheduler.ts` + `src/memory/verify-conflict-scheduler.ts` — when the cap first latches, emit a TUI bus event (e.g. `governance:cap_exhausted` payload `{detector: 'verify_semantic'|'verify_conflict', cap: 'dispatch'|'cost', counters}`) once per scheduler instance (latch-edge, not every tick).
+- `src/cli/slash/commands/memory.ts` — bare `/memory` summary line surfaces a `(governance: 1 detector capped — see /memory governance status)` suffix when any scheduler is capped in the current session.
+- Alternative surface: inline notification (existing `addInlineNote` / similar) on the first `/memory <anything>` after the latch — operators typing memory slash commands are the ones who'd act on the signal.
+
+Decision when pulled: push (event-driven, visible immediately) vs lazy (next operator query). Edge case: a session that hits the cap and never types another `/memory ...` would still miss the lazy surface — push is safer for the default-ON posture.
+
+**Pull-in signal:** any of: (a) operator-reported incident where a detector stopped running and the operator only noticed via `/memory governance status` later; (b) telemetry shows non-trivial fraction of sessions reach cap; (c) the post-Slice-Q "is the default ON actually producing useful proposals?" review (the companion observability entry below) makes cap visibility a prerequisite.
+
+**Cost when pulled:** small (~50 lines + tests). The TUI bus already exists; the scheduler already tracks `capExhausted`. Mostly wiring.
+
+## Aggregate observability for memory-governance detectors (MEMORY.md §12.5)
+
+**Status:** noted during the post-Slice-Q architecture review (2026-05-18). Companion to the "caps push notification" entry above.
+
+**What it is:** `/memory metrics` covers the eviction pipeline (motivo distribution, restore rate, quarantine dwell, block counts). No analog exists for the LLM-judge detectors. Questions like:
+
+- "What's the detector's true-positive rate? How many `contradicted`/`conflicting` verdicts landed as proposals, and how many of those did operators approve?"
+- "Which memories generate the most quarantine proposals?" (signals: noisy memory, ambient drift in the repo around a stable memory, detector false-positive bias)
+- "What's the cumulative dollar cost per session window?" (mid-flight visibility into the `MAX_COST_USD` cap)
+- "Which memories have never been exposed?" (the inverse of proposals — memories that aren't earning their slot in eager-load)
+
+…require manual SQL joins across `memory_verify_attempts` + `memory_conflict_attempts` + `memory_governance_proposals` + `memory_events` + `memory_provenance`. Operator-side this is fragile. The pull-in is exactly when defaults flipped ON (Slice Q): "are these detectors helping or making noise?" stops being theoretical.
+
+**Why deferred:** scoped out of Slice Q (Slice Q was about inverting the default + opt-out surface, not new observability). The substrate to compute these metrics already exists — only the rendering + slash surface is missing.
+
+**Where it would land:**
+
+- `src/cli/slash/commands/memory.ts` — new subcommand `/memory detector metrics [--days N]` aggregating:
+  - **Per-detector** (S11 verify-semantic / S13 verify-conflict):
+    - dispatches in window (total, by verdict — passed/contradicted/inconclusive for S11, compatible/conflicting for S13)
+    - proposals emitted (verdicts that crossed `confidence >= threshold`)
+    - sub-threshold auto-archived count (the silent drop path)
+    - approval rate of emitted proposals (approved / (approved + rejected + expired); pending excluded)
+    - cumulative cost / mean cost per dispatch
+    - dedup-cache hit rate (cache hits / total attempts)
+  - **Memory ranking**: top N memories by proposal count (cross-detector); top N memories with zero exposures over the window.
+- `src/storage/repos/memory-governance.ts` (or sibling) — aggregator queries returning typed structs. Pure SELECT; no schema changes.
+- `tests/cli/slash/memory.test.ts` + repo tests pinning the aggregates against seeded fixtures.
+
+**Pull-in signal:** any of: (a) first operator who hits "is verify_semantic actually finding bugs?" and runs out of patience with raw SQL; (b) `MAX_COST_USD` cap latches in real use and the post-mortem needs "where did the money go?"; (c) tuning the confidence threshold needs sub-threshold-drop visibility to choose between 0.6 and 0.8.
+
+**Cost when pulled:** medium. ~150-200 lines of SQL + rendering + tests. The harder design question is what the table shape should be — operator-facing aggregates need a clear narrative ("here's whether the detector is helping you"), not just "here are the numbers".
+
 ## Memory quarantine flag enrichment: motivo + date (MEMORY.md §6.5.2)
 
 **Status:** noted during Slice 0 (T0.2) and Slice 6 (T6.2) implementation. Same deferral shape on two surfaces.

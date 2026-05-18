@@ -78,9 +78,12 @@ import {
 } from '../../../storage/repos/memory-conflict-attempts.ts';
 import {
   GOVERNANCE_PROPOSAL_STATUSES,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS,
   type MemoryGovernanceProposalRow,
   type MemoryGovernanceProposalStatus,
   decideProposal,
+  deferProposal,
   getProposalById,
   listProposals,
 } from '../../../storage/repos/memory-governance.ts';
@@ -2494,6 +2497,11 @@ const renderProposalDetail = (p: MemoryGovernanceProposalRow): string[] => {
   if (p.sessionId !== null) {
     lines.push(`  session_id:          ${displayGov(p.sessionId)}`);
   }
+  if (p.deferredUntil !== null) {
+    lines.push(
+      `  deferred_until:      ${formatGovernanceTimestamp(p.deferredUntil)} (count=${p.deferCount})`,
+    );
+  }
   lines.push('  source memories:');
   for (let i = 0; i < p.sourceMemoryKeys.length; i++) {
     const k = p.sourceMemoryKeys[i];
@@ -2680,6 +2688,74 @@ const handleGovernanceReject = (ctx: SlashContext, args: string[]): SlashResult 
     notes: [
       `rejected proposal ${displayGov(id)} (${displayGov(proposal.kind)})`,
       parsed.reason !== null ? `  reason: ${displayGov(parsed.reason)}` : '  (no reason supplied)',
+    ],
+  };
+};
+
+const handleGovernanceDefer = (ctx: SlashContext, args: string[]): SlashResult => {
+  if (args.length < 2) {
+    return {
+      kind: 'error',
+      message: `/memory governance defer: missing arguments (usage: /memory governance defer <id> <days>; days in [${MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS}, ${MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS}])`,
+    };
+  }
+  if (args.length > 2) {
+    return {
+      kind: 'error',
+      message: `/memory governance defer: unexpected extra arg '${displayGov(args[2] as string)}'`,
+    };
+  }
+  const id = args[0] as string;
+  const daysRaw = args[1] as string;
+  const days = Number(daysRaw);
+  if (!Number.isInteger(days)) {
+    return {
+      kind: 'error',
+      message: `/memory governance defer: <days> must be an integer (got '${displayGov(daysRaw)}')`,
+    };
+  }
+  const proposal = getProposalById(ctx.db, id);
+  if (proposal === null) {
+    return {
+      kind: 'error',
+      message: `/memory governance defer: proposal '${displayGov(id)}' not found`,
+    };
+  }
+  if (proposal.status !== 'pending') {
+    return {
+      kind: 'error',
+      message: `/memory governance defer: proposal '${displayGov(id)}' already ${displayGov(proposal.status)} (decided by ${displayGov(proposal.decidedBy ?? 'unknown')})`,
+    };
+  }
+  const result = deferProposal(ctx.db, id, { additionalDays: days, nowMs: ctx.now() });
+  if (!result.ok) {
+    if (result.reason === 'invalid_days') {
+      return {
+        kind: 'error',
+        message: `/memory governance defer: <days> must be in [${MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS}, ${MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS}] (got ${days})`,
+      };
+    }
+    if (result.reason === 'horizon_exceeded') {
+      return {
+        kind: 'error',
+        message:
+          '/memory governance defer: would push expiry past the 90d horizon from created_at; approve or reject the proposal instead',
+      };
+    }
+    // not_pending — raced with a terminal transition between the
+    // read above and the UPDATE. Surface the actual end state.
+    const latest = getProposalById(ctx.db, id);
+    return {
+      kind: 'error',
+      message: `/memory governance defer: proposal '${displayGov(id)}' is no longer pending (current status: ${displayGov(latest?.status ?? 'unknown')})`,
+    };
+  }
+  const newExpiryDate = new Date(result.deferredUntil).toISOString().slice(0, 10);
+  return {
+    kind: 'ok',
+    notes: [
+      `deferred proposal ${displayGov(id)} (${displayGov(proposal.kind)}) by ${days}d`,
+      `  new effective expiry: ${newExpiryDate} (defer_count=${result.deferCount})`,
     ],
   };
 };
@@ -3092,7 +3168,7 @@ const handleGovernance = async (
     return {
       kind: 'error',
       message:
-        '/memory governance: subcommand required (try: list, show, approve, reject, audit, status, enable, disable)',
+        '/memory governance: subcommand required (try: list, show, approve, reject, defer, audit, status, enable, disable)',
     };
   }
   const rest = args.slice(1);
@@ -3105,6 +3181,8 @@ const handleGovernance = async (
       return handleGovernanceApprove(registry, ctx, rest);
     case 'reject':
       return handleGovernanceReject(ctx, rest);
+    case 'defer':
+      return handleGovernanceDefer(ctx, rest);
     case 'audit':
       return handleGovernanceAudit(ctx, rest);
     case 'status':
@@ -3116,7 +3194,7 @@ const handleGovernance = async (
     default:
       return {
         kind: 'error',
-        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, audit, status, enable, disable)`,
+        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, defer, audit, status, enable, disable)`,
       };
   }
 };

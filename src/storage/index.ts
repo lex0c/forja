@@ -192,9 +192,13 @@ export {
   GOVERNANCE_PROPOSAL_KINDS,
   GOVERNANCE_PROPOSAL_STATUSES,
   GOVERNANCE_PROPOSAL_TTL_MS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS,
+  MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS,
   canonicalJsonStringify,
   computeProposalFingerprint,
   decideProposal,
+  deferProposal,
   expirePendingProposals,
   getProposalById,
   listPendingProposals,
@@ -205,6 +209,9 @@ export {
 } from './repos/memory-governance.ts';
 export type {
   DecideProposalInput,
+  DeferProposalInput,
+  DeferProposalResult,
+  ExpirePendingProposalsInput,
   ListProposalsOptions,
   MemoryGovernanceProposalKind,
   MemoryGovernanceProposalRow,

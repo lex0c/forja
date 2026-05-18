@@ -838,23 +838,44 @@ Transition refusals from the state machine (illegal_transition, blocked_by_prote
 
 #### TTL sweep
 
-`expirePendingProposals` runs at boot from `bootstrap.ts` alongside the other memory sweeps. Default window 30d (`GOVERNANCE_PROPOSAL_TTL_MS`); pending rows older than `now - 30d` flip to `expired` with `decided_by='system:ttl'`. Best-effort same as `pruneMemoryProvenance`: a sweep failure logs `AUDIT DRIFT` to stderr and doesn't abort boot.
+`expirePendingProposals` runs at boot from `bootstrap.ts` alongside the other memory sweeps. Default window 30d (`GOVERNANCE_PROPOSAL_TTL_MS`); pending rows whose effective expiry has passed flip to `expired` with `decided_by='system:ttl'`. Best-effort same as `pruneMemoryProvenance`: a sweep failure logs `AUDIT DRIFT` to stderr and doesn't abort boot.
 
-The TTL is not just hygiene — a 30d-old proposal has likely outlived its evidence (the underlying memory + detector context drift). Forcing the detector to re-emit if the finding still holds is the right contract.
+**Effective expiry** = `COALESCE(deferred_until, created_at + TTL)`. A non-deferred row uses the canonical 30d window; a deferred row honors `deferred_until` instead (set by `deferProposal`; see below). One SQL pass handles both cases.
+
+The TTL is not just hygiene — a 30d-old proposal has likely outlived its evidence (the underlying memory + detector context drift). Forcing the detector to re-emit if the finding still holds is the right contract. Defer is the operator escape valve for "I need more time to research before deciding", capped to 90d total horizon from `created_at` so a proposal can't outlive the detector context indefinitely.
+
+#### Defer (operator-controlled expiry extension)
+
+`deferProposal(db, id, { additionalDays, nowMs? })` pushes a pending proposal's `deferred_until` forward. Anchors on the LATER of (now, current effective expiry), so calling defer twice doesn't lose runway — the second call adds to the first's extension, not to wall-clock now.
+
+| Repo input | Range | Behavior |
+|---|---|---|
+| `additionalDays` | integer in `[MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS, MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS]` (1..90) | Out of range → `invalid_days` |
+| `nowMs` | `> 0`; defaults to `Date.now()` | `≤ 0` throws |
+
+Result shape:
+
+- `{ ok: true, deferredUntil, deferCount }` — UPDATE succeeded; `deferred_until` columns visible on subsequent `getProposalById` reads.
+- `{ ok: false, reason: 'not_pending' }` — unknown id, terminal status, or lost a race to a concurrent terminal transition (the UPDATE matched zero rows).
+- `{ ok: false, reason: 'invalid_days' }` — caller error; row untouched.
+- `{ ok: false, reason: 'horizon_exceeded' }` — request would push `deferred_until` past `created_at + MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS` (90d). Operator must approve / reject instead — eternal pending is not on the table.
+
+The `defer_count` column tracks how many defers landed on the proposal (audit signal: many defers on one proposal hint at dithering). Surfaced on `/memory governance show` as `deferred_until: <date> (count=N)` when set.
 
 #### Operator surface: `/memory governance`
 
-Five subcommands:
+Six subcommands:
 
 | Form | Action |
 |---|---|
 | `/memory governance list [--status <s>] [--limit N]` | Inventory with status filter. Empty hint when nothing matches. |
-| `/memory governance show <id>` | Full proposal detail: kind, status, confidence, source memories, snapshots, evidence (truncated). |
+| `/memory governance show <id>` | Full proposal detail: kind, status, confidence, source memories, snapshots, evidence (truncated), `deferred_until` when set. |
 | `/memory governance approve <id>` | Invoke `applyProposal`. A bulk-confirmation modal for ≥3 memories is intentionally not wired in V1 since the apply path auto-rejects multi-memory proposals as `multi_memory_unsupported`; it will land alongside the `merge` / `consolidate` apply primitives. |
 | `/memory governance reject <id> [--reason "..."]` | Mark `rejected` with operator's reason. |
+| `/memory governance defer <id> <days>` | Extend expiry by `<days>` (1..90, integer). Rejects with `past the 90d horizon` when the request would push past `created_at + 90d`. Anchors on existing expiry so successive defers stack. |
 | `/memory governance audit <id>` | Proposal detail + `memory_events` landed against the source memories since the proposal's `created_at` (lineage). |
 
-Arg-validation refuses unknown flags and out-of-range `--limit` so a typo doesn't take a default code path.
+Arg-validation refuses unknown flags and out-of-range `--limit` so a typo doesn't take a default code path. The status surface (`/memory governance status`) lives separately (§11.4) and reports detector enabled state, not proposal queue contents.
 
 #### What proposals do NOT do
 
@@ -1430,7 +1451,7 @@ These were listed as deferred in a prior draft but are wired today:
 - **Exposure trail** (`feat/memory-lifecycle-detectors` Slice 1, §11.2 above). `memory_provenance` table records every moment a memory was visible to the model (eager, memory_read, retrieve_context). Three emitters wired (registry's read/search-deep, eager-load via `eagerExposures`, retrieval runner post-`createRetrievalTrace`); `/memory provenance` slash command exposes the trail with three modes (`<name>`, `--tool`, `--retrieval`); 90d boot-time retention sweep.
 - **`trust_revoked` detector** (`feat/memory-lifecycle-detectors` Slice 5, §6.5.2 + §7.2 rule 8). Boot-time SHA-256 fingerprint of `.agent/memory/shared/`; when the operator's last-confirmed hash diverges from the current corpus, a re-confirmation modal fires; revocation bulk-transitions every active shared memory to `invalidated` (motivo `security`, trigger `trust_revoked`) and the bulk effect is reflected in this very boot's system prompt rather than requiring a restart. `assembleMemorySection` filters `state === 'invalidated'` from the eager-load. `/memory trust status` slash inspector surfaces in-sync / diverged / never-confirmed / verify-failed state without re-running the modal.
 - **Quarantine penalty + visual flag** (`feat/memory-lifecycle-detectors` Slice 6, §6.5.2 + EVICTION.md §9.7). Retrieval ranking applies a numeric penalty to `quarantined` memories without filtering them out (they stay visible-but-cautioned); `assembleMemorySection` renders the `[memory: quarantined]` inline flag so the model sees the marker. The state filter expanded to `['active', 'quarantined']` covers both retrievable states.
-- **Governance proposal substrate + apply path** (`feat/memory-governance-llm` Slice 8, §11.3 above). `memory_governance_proposals` table (migration 056) carries the propose-not-mutate lifecycle: detectors emit `pending` proposals, operators decide via `/memory governance approve|reject`, the apply path validates confidence/staleness/state-machine gates and delegates to `transitionMemoryState`. 30d TTL sweep wired in bootstrap. Five-subcommand operator surface (`list`, `show`, `approve`, `reject`, `audit`). Supports `quarantine` and `restore` kinds in V1; `demote` / `merge` / `consolidate` / `expire` accepted at the substrate (forward-compat) and rejected at apply time with `system:unimplemented_kind`. Foundational for the LLM-judge detectors (S11 verify_failed, S13 conflict_detected) and the deterministic S3 user_override_repeated counter.
+- **Governance proposal substrate + apply path** (`feat/memory-governance-llm` Slice 8, §11.3 above). `memory_governance_proposals` table (migration 056) carries the propose-not-mutate lifecycle: detectors emit `pending` proposals, operators decide via `/memory governance approve|reject`, the apply path validates confidence/staleness/state-machine gates and delegates to `transitionMemoryState`. 30d TTL sweep wired in bootstrap; **`/memory governance defer <id> <days>`** lets operators extend a proposal's expiry up to a 90d horizon from `created_at` (migration 062 adds `deferred_until` + `defer_count` columns; effective expiry is `COALESCE(deferred_until, created_at + 30d)`). Six-subcommand operator surface (`list`, `show`, `approve`, `reject`, `defer`, `audit`). Supports `quarantine` and `restore` kinds in V1; `demote` / `merge` / `consolidate` / `expire` accepted at the substrate (forward-compat) and rejected at apply time with `system:unimplemented_kind`. Foundational for the LLM-judge detectors (S11 verify_failed, S13 conflict_detected) and the deterministic S3 user_override_repeated counter.
 - **`verify_failed` LLM-judge detector** (`feat/memory-governance-llm` Slice 11, MEMORY.md §11.x). **Default ON** since Slice Q (post-S13). Opt-out via `/memory governance disable verify` (per-project, persisted in `.agent/config.toml [memory] verify_semantic_llm = false`) or session-only via `--no-memory-verify-llm` CLI flag. The `--memory-verify-llm` flag still exists as a session-only override-ON for scripts that want explicit opt-in even when project config disabled. At each harness step boundary, the scheduler polls `memory_provenance` for new exposures of factual memories (`type: project` / `reference`, `trust !== untrusted`, `state === active`), runs pre-dispatch gates (cost cap with per-dispatch headroom, dispatch cap, pending-proposal dedup, excluded-scope filter mirroring the S5 shared-corpus trust posture), then invokes the `verify-semantic` built-in subagent on ONE memory per poll. The subagent reads the repo with `read_file` / `grep` / `glob` / `memory_read` (no writes, no bash) and emits a structured `{verdict, confidence, claim_extracted, ground_truth_observed, evidence_paths}` payload. Contradicted-with-high-confidence verdicts land as `pending` governance proposals (`proposedBy: subagent:verify-semantic`); operator approves via `/memory governance approve` and the apply path transitions the memory to `quarantined` with trigger `verify_failed`. Substrate: migration 057 (`memory_verify_attempts` — content-addressed cross-session dedup; 7d window for passed/inconclusive, contradicted always re-dispatches), `src/memory/verify-semantic*.ts` (dispatcher + scheduler + constants), `src/subagents/builtin/verify-semantic.md` (definition). User / project scope can shadow the built-in by name; for the `verify-semantic` built-in (and any others listed in `src/subagents/builtin/index.ts:PROTECTED_BUILTIN_NAMES`) the shadow ALWAYS surfaces in the loader's `shadows` output so the operator sees the override on boot — a defense against malicious projects shipping bash-enabled overrides. `/memory governance status` surfaces enabled state + configured caps + recent attempts.
 
 > **Audit-chain bypass (intentional, R3 round-2 + S13).** Verify-scheduler dispatches (BOTH `verify-semantic` for S11 AND `verify-conflict` for S13) do NOT flow through the `task` tool surface — the schedulers call `runSubagent` directly. This means `subagent_runs.parent_approval_id` (migration 058) is NULL for verify spawns; the standard "subagent_runs → approvals → tool_calls → messages" forensic chain (`PERMISSION_ENGINE.md §10.2`) has no anchor. The alternative chain is intentional: `memory_verify_attempts.subagent_run_session_id → subagent_runs.session_id` (S11) and `memory_conflict_attempts.subagent_run_session_id → subagent_runs.session_id` (S13) let operators JOIN from the per-detector dedup cache to the audit row, and `/memory governance audit` surfaces the lineage with the right discrimination. Operator-initiated spawns via `task` populate `parent_approval_id` and use the standard chain. Future spec amendment may land a synthetic `approvals.decided_by='system:semantic_verify' / 'system:semantic_conflict'` row (requires CHECK widening) — until then the dual-chain is documented and accepted.

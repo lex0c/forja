@@ -17,11 +17,14 @@ import { type DB, openMemoryDb, withTransaction } from '../../src/storage/db.ts'
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   GOVERNANCE_PROPOSAL_TTL_MS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS,
   type MemoryKey,
   type MemorySnapshot,
   type RecordProposalInput,
   computeProposalFingerprint,
   decideProposal,
+  deferProposal,
   expirePendingProposals,
   getProposalById,
   listPendingProposals,
@@ -372,6 +375,180 @@ describe('expirePendingProposals', () => {
 
   test('returns 0 when no pending rows exist', () => {
     expect(expirePendingProposals(db, Date.now(), Date.now())).toBe(0);
+  });
+
+  test('new options-object signature handles ttlMs + nowMs', () => {
+    const now = 2_000_000_000_000;
+    const old = recordProposal(
+      db,
+      baseProposal({ createdAt: now - GOVERNANCE_PROPOSAL_TTL_MS - 1 }),
+    );
+    const fresh = recordProposal(db, baseProposal({ createdAt: now, evidenceEssence: 'e2' }));
+    const expired = expirePendingProposals(db, {
+      ttlMs: GOVERNANCE_PROPOSAL_TTL_MS,
+      nowMs: now,
+    });
+    expect(expired).toBe(1);
+    expect(getProposalById(db, old.id)?.status).toBe('expired');
+    expect(getProposalById(db, fresh.id)?.status).toBe('pending');
+  });
+
+  test('deferred_until overrides created_at + ttlMs when set', () => {
+    const now = 2_000_000_000_000;
+    // Old enough that the default TTL would expire it…
+    const r = recordProposal(db, baseProposal({ createdAt: now - GOVERNANCE_PROPOSAL_TTL_MS - 1 }));
+    // …but operator defers 30 more days, pushing effective expiry
+    // past `now` (the proposal stays pending past the original cutoff).
+    const result = deferProposal(db, r.id, { additionalDays: 30, nowMs: now });
+    expect(result.ok).toBe(true);
+    const expired = expirePendingProposals(db, {
+      ttlMs: GOVERNANCE_PROPOSAL_TTL_MS,
+      nowMs: now,
+    });
+    expect(expired).toBe(0);
+    expect(getProposalById(db, r.id)?.status).toBe('pending');
+  });
+
+  test('deferred row whose deferred_until has passed expires normally', () => {
+    const now = 2_000_000_000_000;
+    const r = recordProposal(db, baseProposal({ createdAt: now - 1000 }));
+    // Defer puts deferred_until at `Math.max(now, createdAt+TTL) +
+    // 1d`. After the cutoff sweep at now + 1d + 1, the row expires.
+    deferProposal(db, r.id, { additionalDays: 1, nowMs: now });
+    const cutoffNow = now + GOVERNANCE_PROPOSAL_TTL_MS + 24 * 60 * 60 * 1000 + 1;
+    const expired = expirePendingProposals(db, {
+      ttlMs: GOVERNANCE_PROPOSAL_TTL_MS,
+      nowMs: cutoffNow,
+    });
+    expect(expired).toBe(1);
+    expect(getProposalById(db, r.id)?.status).toBe('expired');
+  });
+});
+
+describe('deferProposal', () => {
+  test('happy path: bumps deferred_until and increments defer_count', () => {
+    const now = 2_000_000_000_000;
+    const r = recordProposal(db, baseProposal({ createdAt: now }));
+    const result = deferProposal(db, r.id, { additionalDays: 7, nowMs: now });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('unreachable');
+    // Anchor = max(now, createdAt + 30d) = createdAt + 30d; +7d on top.
+    expect(result.deferredUntil).toBe(now + GOVERNANCE_PROPOSAL_TTL_MS + 7 * 24 * 60 * 60 * 1000);
+    expect(result.deferCount).toBe(1);
+    const reread = getProposalById(db, r.id);
+    expect(reread?.deferredUntil).toBe(result.deferredUntil);
+    expect(reread?.deferCount).toBe(1);
+  });
+
+  test('successive defers stack on the prior expiry, not on wall-clock now', () => {
+    const now = 2_000_000_000_000;
+    const r = recordProposal(db, baseProposal({ createdAt: now }));
+    const first = deferProposal(db, r.id, { additionalDays: 10, nowMs: now });
+    expect(first.ok).toBe(true);
+    const second = deferProposal(db, r.id, { additionalDays: 5, nowMs: now });
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) throw new Error('unreachable');
+    expect(second.deferredUntil).toBe(first.deferredUntil + 5 * 24 * 60 * 60 * 1000);
+    expect(second.deferCount).toBe(2);
+  });
+
+  test('defer past the 90d horizon from created_at rejects', () => {
+    const now = 2_000_000_000_000;
+    const r = recordProposal(db, baseProposal({ createdAt: now }));
+    // 90d total ceiling = createdAt + 90d. 30d default expiry +
+    // 90d defer would land at createdAt + 120d, past the ceiling.
+    const result = deferProposal(db, r.id, {
+      additionalDays: MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+      nowMs: now,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.reason).toBe('horizon_exceeded');
+    // Row stays untouched.
+    const reread = getProposalById(db, r.id);
+    expect(reread?.deferredUntil).toBeNull();
+    expect(reread?.deferCount).toBe(0);
+  });
+
+  test('horizon ceiling exactly: 60d (TTL + 60 = 90d) succeeds, 61d fails', () => {
+    const now = 2_000_000_000_000;
+    const sixtyDays = 60;
+    const a = recordProposal(db, baseProposal({ createdAt: now }));
+    const okResult = deferProposal(db, a.id, { additionalDays: sixtyDays, nowMs: now });
+    expect(okResult.ok).toBe(true);
+    if (!okResult.ok) throw new Error('unreachable');
+    expect(okResult.deferredUntil).toBe(now + MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS);
+    const b = recordProposal(db, baseProposal({ createdAt: now, evidenceEssence: 'e2' }));
+    const failResult = deferProposal(db, b.id, { additionalDays: sixtyDays + 1, nowMs: now });
+    expect(failResult.ok).toBe(false);
+    if (failResult.ok) throw new Error('unreachable');
+    expect(failResult.reason).toBe('horizon_exceeded');
+  });
+
+  test('rejects on non-pending status', () => {
+    const r = recordProposal(db, baseProposal());
+    decideProposal(db, r.id, { status: 'applied', decidedBy: 'op' });
+    const result = deferProposal(db, r.id, { additionalDays: 5 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.reason).toBe('not_pending');
+  });
+
+  test('rejects unknown id with not_pending', () => {
+    const result = deferProposal(db, '00000000-0000-0000-0000-000000000000', {
+      additionalDays: 5,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.reason).toBe('not_pending');
+  });
+
+  test('rejects zero / negative / non-integer days as invalid_days', () => {
+    const r = recordProposal(db, baseProposal());
+    for (const days of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const result = deferProposal(db, r.id, { additionalDays: days });
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.reason).toBe('invalid_days');
+    }
+  });
+
+  test('rejects days > MAX as invalid_days (before consulting horizon)', () => {
+    const r = recordProposal(db, baseProposal());
+    const result = deferProposal(db, r.id, {
+      additionalDays: MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS + 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.reason).toBe('invalid_days');
+  });
+
+  test('serialization: result fields match post-update DB state after each defer', () => {
+    // Pins the IMMEDIATE-transaction contract: even when defers
+    // stack against the same row, each call's returned
+    // `deferredUntil` + `deferCount` must equal what a fresh read
+    // would observe right after. JS single-threading means the two
+    // calls below execute serially (not truly concurrent), but the
+    // assertion shape catches regressions where the result is
+    // computed off a stale read instead of inside the lock.
+    const now = 2_000_000_000_000;
+    const r = recordProposal(db, baseProposal({ createdAt: now }));
+    const first = deferProposal(db, r.id, { additionalDays: 3, nowMs: now });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('unreachable');
+    const afterFirst = getProposalById(db, r.id);
+    expect(afterFirst?.deferredUntil).toBe(first.deferredUntil);
+    expect(afterFirst?.deferCount).toBe(first.deferCount);
+
+    const second = deferProposal(db, r.id, { additionalDays: 4, nowMs: now });
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error('unreachable');
+    const afterSecond = getProposalById(db, r.id);
+    expect(afterSecond?.deferredUntil).toBe(second.deferredUntil);
+    expect(afterSecond?.deferCount).toBe(second.deferCount);
+    // Second's deferredUntil anchors on first's (not on `now`):
+    expect(second.deferredUntil).toBe(first.deferredUntil + 4 * 24 * 60 * 60 * 1000);
+    expect(second.deferCount).toBe(2);
   });
 });
 
