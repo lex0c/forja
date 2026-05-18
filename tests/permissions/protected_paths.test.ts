@@ -31,6 +31,33 @@ describe('classifyProtectedPath — system deny tier', () => {
       classifyProtectedPath({ absPath: '/systemd-something', op: 'read', home: HOME, cwd: CWD }),
     ).toBeNull();
   });
+
+  // Carve-outs from the /run deny prefix. Real user-facing paths
+  // live under /run on modern Linux: removable media mount points
+  // (udisks2 default surface) and XDG_RUNTIME_DIR (per-user
+  // tmpfs). Pre-fix every read or write under either prefix
+  // landed as deny tier, including operators with their workspace
+  // on an external drive (e.g. /run/media/<user>/<volume>/repo)
+  // — the .gitignore in such a repo was deny-tier protected and
+  // every edit was refused with no modal escape hatch.
+  test.each([
+    ['/run/media/lex/disk/Workspaces/forja/.gitignore', 'read'],
+    ['/run/media/lex/disk/Workspaces/forja/.gitignore', 'write'],
+    ['/run/media/alice/usb/notes.md', 'write'],
+    ['/run/user/1000/wayland-0', 'write'],
+    ['/run/user/1000/dbus-session', 'read'],
+  ] as const)('%s (op=%s) → null (user-owned carve-out under /run)', (absPath, op) => {
+    expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBeNull();
+  });
+
+  test.each([
+    ['/run/postgresql/.s.PGSQL.5432', 'read'],
+    ['/run/dbus/system_bus_socket', 'write'],
+    ['/run/systemd/private', 'write'],
+    ['/var/run/docker.sock', 'write'],
+  ] as const)('%s (op=%s) → deny (privileged daemon socket, NOT in carve-out)', (absPath, op) => {
+    expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBe('deny');
+  });
 });
 
 describe('classifyProtectedPath — escalate tier (writes only)', () => {

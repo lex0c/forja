@@ -185,7 +185,7 @@ describe('migrate', () => {
     // FK pointer in memory_verify_attempts was severed by the DROP
     // TABLE (ON DELETE SET NULL fired). Documented data loss.
     const mva = db
-      .query<{ subagent_run_session_id: string | null }, []>(
+      .query<{ subagent_run_session_id: string | null }, [string]>(
         'SELECT subagent_run_session_id FROM memory_verify_attempts WHERE id = ?',
       )
       .get('mva-058');

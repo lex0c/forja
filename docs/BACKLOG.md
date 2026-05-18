@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] fix(permissions) — carve out `/run/media` and `/run/user` from the deny tier
+
+Caught by an operator running Forja from `/run/media/lex/<volume>/Workspaces/forja/` (a workspace on an external drive mounted by udisks2 — Manjaro / Arch / Debian / Ubuntu / Fedora default). Every tool call against any file in the workspace failed instantly:
+
+```
+Denied in 45ms
+└─ path is in protected zone (deny tier): /run/media/.../forja/.gitignore
+```
+
+No modal, no confirm escape hatch — the engine emitted a categorical deny because the cwd happened to start with `/run`, which is in `SYSTEM_DENY_ROOTS`. The original intent of that deny prefix is to block reads/writes against privileged-daemon sockets (`/run/dbus/system_bus_socket`, `/run/postgresql/.s.PGSQL.5432`, `/run/docker.sock`); refusing every file under `/run/media/<user>/<volume>` is a false-positive that makes Forja unusable on external-drive workspaces. Same shape for `/run/user/<uid>/` (XDG_RUNTIME_DIR — per-user runtime tmpfs that applications legitimately write to all day).
+
+**Fix:** added `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` to `protected_paths.ts`. The deny classifier now skips the deny verdict when the absolute path starts with either prefix; everything outside those prefixes (the original `/run/postgresql/...`, `/run/dbus/...`, `/run/systemd/...` shapes) still hard-denies. Carve-outs are explicit and minimal — anything new under `/run` that operators legitimately need would land here.
+
+**Tests:** +9 in `tests/permissions/protected_paths.test.ts` — 5 carve-out cases (workspace paths under `/run/media/<user>/...`, XDG runtime dir under `/run/user/<uid>/...`) classify as `null`; 4 privileged-daemon socket cases stay `deny`. Pins both halves so a future "simplify the exception list" regression fails loud either way.
+
+Full suite: **8529 pass / 0 fail / 10 skip**.
+
+**Investigation note:** the operator-visible symptom looked like a missing modal ("modal ask nao aparece. pode ser bug"). Turned out the modal was never going to fire — the deny was decided categorically before the modal layer was reachable. Documenting because the same shape ("missing modal") can hide either a missing wire OR an upstream categorical deny that pre-empts the modal entirely.
+
 ## [2026-05-17] fix(storage) — revert migration 058 edit + add migration 059 (append-only discipline)
 
 Caught at install time by an operator running the newly-built binary against an existing `~/.local/share/forja/sessions.db`: migration 058 had been edited in the previous commit (4dade9c) to add a TEMP-table snapshot/restore around the table rebuild — a "fix" for the FK-pointer severing bug that itself violated CLAUDE.md's "Append-only everywhere" hard rule. Result: hash mismatch on next startup (`applied hash: dcbfd31… current hash: d0b932…`) and a refuse-to-proceed from `migrate.ts` — the migration guard correctly refused to silently re-run an altered migration, but the binary was unusable.

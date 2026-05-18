@@ -71,6 +71,23 @@ export interface ProtectedClassifyInput {
 // some embedded) still have a real `/var/run`.
 const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev', '/run', '/var/run'];
 
+// Carve-outs from the deny prefixes above. Two real user-facing
+// paths live under `/run` on modern Linux:
+//   - `/run/media/<user>/<volume>` — mount points for removable
+//     media (udisks2, the default mount surface on Debian / Ubuntu /
+//     Arch / Manjaro / Fedora etc.). An operator can legitimately
+//     have their working repo on an external drive; everything
+//     under this prefix is a regular filesystem they own.
+//   - `/run/user/<uid>` — XDG_RUNTIME_DIR. Per-user runtime state
+//     (often a tmpfs scoped to the login session). Standard target
+//     for application config, IPC, and ephemeral caches; users
+//     write here all day. NOT the same as the system-wide sockets
+//     in /run/dbus, /run/systemd, etc.
+// Refusing deny for paths starting with these prefixes preserves
+// the original threat coverage (privileged daemon sockets stay
+// blocked) without false-positiving user workspaces.
+const SYSTEM_DENY_EXCEPTIONS: readonly string[] = ['/run/media', '/run/user'];
+
 // Tilde-rooted files that escalate on write. Each entry is
 // resolved against the operator's `$HOME` at classification time.
 // Lists canonical shell rc files plus the agent's own config
@@ -233,9 +250,21 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
   const { absPath, op, home, cwd } = input;
 
   // Tier `deny` — applies to reads and writes alike. SYSTEM_DENY_ROOTS
-  // is a constant (no per-call resolve needed).
+  // is a constant (no per-call resolve needed). Exceptions list
+  // covers user-facing carve-outs inside /run (see comment on
+  // SYSTEM_DENY_EXCEPTIONS): /run/media/<user> for removable media
+  // mount points, /run/user/<uid> for XDG_RUNTIME_DIR.
   for (const root of SYSTEM_DENY_ROOTS) {
-    if (startsWithSegment(absPath, root)) return 'deny';
+    if (!startsWithSegment(absPath, root)) continue;
+    let excepted = false;
+    for (const ex of SYSTEM_DENY_EXCEPTIONS) {
+      if (startsWithSegment(absPath, ex)) {
+        excepted = true;
+        break;
+      }
+    }
+    if (excepted) continue;
+    return 'deny';
   }
 
   // Tier `escalate` — only writes/deletes are upgraded. Reads pass
