@@ -4,10 +4,39 @@
 //
 // This module exists so a future built-in author has ONE place to
 // register the new subagent's metadata. The loader (`load.ts`) reads
-// the `.md` files from disk; THIS module declares cross-cutting
-// policy that the loader / scheduler / dispatcher need at runtime —
-// without forcing each `.md` to embed runtime configuration in its
-// frontmatter.
+// the `.md` files from disk in dev mode; THIS module declares
+// cross-cutting policy (PROTECTED_BUILTIN_NAMES) and the EMBEDDED
+// fallback the loader uses in compiled binaries (where `import.meta
+// .dir` points at /$bunfs/... and readdirSync can't enumerate).
+
+import verifyConflictMd from './verify-conflict.md' with { type: 'text' };
+import verifyOverrideMd from './verify-override.md' with { type: 'text' };
+import verifySemanticMd from './verify-semantic.md' with { type: 'text' };
+
+/**
+ * Built-in subagent definitions embedded at compile time via Bun text
+ * imports. The loader (`src/subagents/load.ts:loadSubagents`) falls
+ * back to this list when the default `BUILTIN_AGENTS_DIR` resolves
+ * empty — which is the case under `bun build --compile`, where
+ * `import.meta.dir` becomes the virtual `/$bunfs/...` path that
+ * `readdirSync` cannot enumerate. Dev mode (`bun run dev`) hits the
+ * filesystem path first and never reaches the fallback.
+ *
+ * Authors of new built-ins MUST add an entry here AND ship the `.md`
+ * file alongside the other definitions. A regression test
+ * (`tests/subagents/builtin-embedded.test.ts`) fails the build when
+ * the on-disk set and the embedded set diverge — without it, a new
+ * built-in works in `bun run dev` but is silently missing from
+ * compiled binaries.
+ */
+export const EMBEDDED_BUILTINS: ReadonlyArray<{
+  filename: string;
+  raw: string;
+}> = [
+  { filename: 'verify-conflict.md', raw: verifyConflictMd },
+  { filename: 'verify-override.md', raw: verifyOverrideMd },
+  { filename: 'verify-semantic.md', raw: verifySemanticMd },
+];
 
 /**
  * Built-in subagents whose project / user-scope shadows MUST surface

@@ -219,18 +219,6 @@ Why deferred to Phase 2 alongside S11:
 
 ## Deferred — actionable but parked
 
-### Compile-safe distribution of built-in subagent definitions
-
-**Status:** S11 (`feat/memory-governance-llm`) ships `verify-semantic.md` under `src/subagents/builtin/`. The loader (`loadSubagents`) reads via `readdirSync(BUILTIN_AGENTS_DIR)` where `BUILTIN_AGENTS_DIR = join(import.meta.dir, 'builtin')`.
-
-**Problem:** under `bun build --compile`, `import.meta.dir` resolves to a virtual `/$bunfs/...` path that `readdirSync` cannot enumerate — the loader sees an empty built-in scope, the `verify-semantic` definition never resolves, and the harness emits `verify_semantic_disabled` on every opt-in session. Dev / source-mode runs (`bun run dev`) work end-to-end; only compiled binaries fail.
-
-**Fix shape:** either (a) Bun text imports — `import verifySemanticMd from './verify-semantic.md' with { type: 'text' }` — which Bun bundles at compile time and the loader parses via `loadSubagentFromSource` with a synthetic path, OR (b) a TypeScript const registry inside `src/subagents/builtin/index.ts` exporting each definition's pre-parsed shape that the loader appends after the filesystem scan.
-
-**Pull-in signal:** the first user reporting that `--memory-verify-llm` doesn't work in a packaged binary, OR the first packaged distribution channel that ships Forja (Homebrew, apt, the binary download). Until then dev / source-mode is the supported path.
-
-**Spec reference:** none — this is an implementation gap inherited from how `import.meta.dir` resolves under Bun compile, not a spec divergence.
-
 ### Sync `task` subagent under cap-watchdog
 
 **Status:** the cap watchdog in `runAgent` (`src/harness/loop.ts`) listens to `cost_update` IPC events per active subagent and fires `subagentHandleStore.cancelAll('cap_watchdog')` when cumulative live spend crosses `budget.maxCostUsd`. The store walks its `records` map.

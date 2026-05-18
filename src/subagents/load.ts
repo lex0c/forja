@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { formatCapability, parseCapability } from '../permissions/capabilities.ts';
-import { PROTECTED_BUILTIN_NAMES } from './builtin/index.ts';
+import { EMBEDDED_BUILTINS, PROTECTED_BUILTIN_NAMES } from './builtin/index.ts';
 import { BUILTIN_AGENTS_DIR, projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
@@ -1132,7 +1132,21 @@ export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
     return out;
   };
 
-  const builtinDefs = loadScope(builtinPath, 'builtin');
+  // Builtin scope: filesystem first (dev mode). If the default
+  // BUILTIN_AGENTS_DIR returns zero defs, fall back to the bundled
+  // `EMBEDDED_BUILTINS` table — required under `bun build --compile`
+  // where `import.meta.dir` becomes a virtual `/$bunfs/...` path that
+  // `readdirSync` cannot enumerate (paths.ts comment for context).
+  // The fallback ONLY triggers for the default path so a custom
+  // builtinDir (tests, operator override) that's deliberately empty
+  // stays empty — that's a fixture choice we honor verbatim.
+  const fsBuiltinDefs = loadScope(builtinPath, 'builtin');
+  const builtinDefs =
+    fsBuiltinDefs.length > 0 || builtinPath !== BUILTIN_AGENTS_DIR
+      ? fsBuiltinDefs
+      : EMBEDDED_BUILTINS.map(({ filename, raw }) =>
+          loadSubagentFromString(raw, 'builtin', `<embedded>/${filename}`),
+        );
   const userDefs = loadScope(userPath, 'user');
   const projectDefs = loadScope(projectPath, 'project');
 
