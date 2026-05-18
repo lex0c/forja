@@ -2692,17 +2692,61 @@ const handleGovernanceReject = (ctx: SlashContext, args: string[]): SlashResult 
   };
 };
 
-const handleGovernanceDefer = (ctx: SlashContext, args: string[]): SlashResult => {
+interface GovernanceDeferFlags {
+  reason: string | null;
+}
+
+const parseGovernanceDeferFlags = (args: string[]): GovernanceDeferFlags | { error: string } => {
+  let reason: string | null = null;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] as string;
+    if (a === '--reason') {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        return { error: '/memory governance defer: --reason requires a value' };
+      }
+      reason = raw;
+      i += 2;
+      continue;
+    }
+    return { error: `/memory governance defer: unknown flag '${a}' (try --reason)` };
+  }
+  return { reason };
+};
+
+// Resolve the memory the proposal would transition on approve.
+// Mirrors `applyProposal`'s target resolution: target_key when set
+// (multi-memory quarantine carve-out), else sourceMemoryKeys[0]
+// (single-memory path). Returns null if the row carries no keys
+// (caller refuses with not_pending earlier — this is belt-and-
+// suspenders against a future schema regression).
+const resolveProposalTargetMemory = (
+  p: MemoryGovernanceProposalRow,
+): { scope: MemoryScope; name: string } | null => {
+  const payload = p.targetPayload;
+  if (payload !== null) {
+    const tk = (payload as Record<string, unknown>).target_key;
+    if (tk !== null && typeof tk === 'object' && !Array.isArray(tk)) {
+      const tkObj = tk as Record<string, unknown>;
+      if (typeof tkObj.scope === 'string' && typeof tkObj.name === 'string') {
+        return { scope: tkObj.scope as MemoryScope, name: tkObj.name };
+      }
+    }
+  }
+  const first = p.sourceMemoryKeys[0];
+  return first === undefined ? null : { scope: first.scope, name: first.name };
+};
+
+const handleGovernanceDefer = (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): SlashResult => {
   if (args.length < 2) {
     return {
       kind: 'error',
-      message: `/memory governance defer: missing arguments (usage: /memory governance defer <id> <days>; days in [${MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS}, ${MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS}])`,
-    };
-  }
-  if (args.length > 2) {
-    return {
-      kind: 'error',
-      message: `/memory governance defer: unexpected extra arg '${displayGov(args[2] as string)}'`,
+      message: `/memory governance defer: missing arguments (usage: /memory governance defer <id> <days> [--reason "..."]; days in [${MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS}, ${MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS}])`,
     };
   }
   const id = args[0] as string;
@@ -2714,6 +2758,8 @@ const handleGovernanceDefer = (ctx: SlashContext, args: string[]): SlashResult =
       message: `/memory governance defer: <days> must be an integer (got '${displayGov(daysRaw)}')`,
     };
   }
+  const parsedFlags = parseGovernanceDeferFlags(args.slice(2));
+  if ('error' in parsedFlags) return { kind: 'error', message: parsedFlags.error };
   const proposal = getProposalById(ctx.db, id);
   if (proposal === null) {
     return {
@@ -2750,12 +2796,39 @@ const handleGovernanceDefer = (ctx: SlashContext, args: string[]): SlashResult =
       message: `/memory governance defer: proposal '${displayGov(id)}' is no longer pending (current status: ${displayGov(latest?.status ?? 'unknown')})`,
     };
   }
-  const newExpiryDate = new Date(result.deferredUntil).toISOString().slice(0, 10);
+
+  // Audit emit: best-effort, mirrors the registry's other
+  // recordEvent paths (auditRead, governance approve). A disk
+  // error here stderr-logs `AUDIT DRIFT` but does NOT roll back the
+  // defer — the proposal row already committed inside its own
+  // immediate transaction, so the defer happened from the
+  // operator's perspective even when the audit row didn't land.
+  const target = resolveProposalTargetMemory(proposal);
+  if (target !== null) {
+    const peek = registry.peek(target.name, { scope: target.scope });
+    const source = peek.kind === 'present' ? peek.file.frontmatter.source : 'inferred';
+    registry.recordEvent({
+      scope: target.scope,
+      action: 'deferred',
+      memoryName: target.name,
+      source,
+      details: {
+        proposal_id: id,
+        kind: proposal.kind,
+        additional_days: days,
+        new_deferred_until: result.deferredUntil,
+        defer_count: result.deferCount,
+        ...(parsedFlags.reason !== null ? { reason: parsedFlags.reason } : {}),
+      },
+    });
+  }
+
   return {
     kind: 'ok',
     notes: [
       `deferred proposal ${displayGov(id)} (${displayGov(proposal.kind)}) by ${days}d`,
-      `  new effective expiry: ${newExpiryDate} (defer_count=${result.deferCount})`,
+      `  new effective expiry: ${formatGovernanceTimestamp(result.deferredUntil)} (defer_count=${result.deferCount})`,
+      ...(parsedFlags.reason !== null ? [`  reason: ${displayGov(parsedFlags.reason)}`] : []),
     ],
   };
 };
@@ -3182,7 +3255,7 @@ const handleGovernance = async (
     case 'reject':
       return handleGovernanceReject(ctx, rest);
     case 'defer':
-      return handleGovernanceDefer(ctx, rest);
+      return handleGovernanceDefer(registry, ctx, rest);
     case 'audit':
       return handleGovernanceAudit(ctx, rest);
     case 'status':

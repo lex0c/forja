@@ -862,6 +862,10 @@ Result shape:
 
 The `defer_count` column tracks how many defers landed on the proposal (audit signal: many defers on one proposal hint at dithering). Surfaced on `/memory governance show` as `deferred_until: <date> (count=N)` when set.
 
+Each defer also emits a `memory_events` row with `action='deferred'` (migration 063), attributed to the memory the proposal would transition on approve — `target_payload.target_key` when set (S13 multi-memory pair), else `sourceMemoryKeys[0]` (S11 single-memory path). Details payload: `{proposal_id, kind, additional_days, new_deferred_until, defer_count, reason?}`. The audit row makes `/memory audit --name <memory>` reflect the expiry-extension activity alongside transitions; without it, defer mutations are visible only via `/memory governance show`. Emission is best-effort (mirror of `registry.recordEvent` everywhere else): a disk error stderr-logs `AUDIT DRIFT` but does NOT roll back the defer — the proposal row already committed in its own immediate transaction.
+
+Optional `--reason "..."` flag captures the operator's note in the audit row's `details.reason` and echoes back in the response. Use it when stacked defers risk losing context ("why did this proposal need 30+30+30 days?" answered by the reason chain in `/memory audit --name <memory>`).
+
 #### Operator surface: `/memory governance`
 
 Six subcommands:
@@ -872,7 +876,7 @@ Six subcommands:
 | `/memory governance show <id>` | Full proposal detail: kind, status, confidence, source memories, snapshots, evidence (truncated), `deferred_until` when set. |
 | `/memory governance approve <id>` | Invoke `applyProposal`. A bulk-confirmation modal for ≥3 memories is intentionally not wired in V1 since the apply path auto-rejects multi-memory proposals as `multi_memory_unsupported`; it will land alongside the `merge` / `consolidate` apply primitives. |
 | `/memory governance reject <id> [--reason "..."]` | Mark `rejected` with operator's reason. |
-| `/memory governance defer <id> <days>` | Extend expiry by `<days>` (1..90, integer). Rejects with `past the 90d horizon` when the request would push past `created_at + 90d`. Anchors on existing expiry so successive defers stack. |
+| `/memory governance defer <id> <days> [--reason "..."]` | Extend expiry by `<days>` (1..90, integer). Rejects with `past the 90d horizon` when the request would push past `created_at + 90d`. Anchors on existing expiry so successive defers stack. Optional `--reason` lands in the audit row's `details.reason`. Emits `memory_events action='deferred'` attributed to the proposal's target memory (migration 063). |
 | `/memory governance audit <id>` | Proposal detail + `memory_events` landed against the source memories since the proposal's `created_at` (lineage). |
 
 Arg-validation refuses unknown flags and out-of-range `--limit` so a typo doesn't take a default code path. The status surface (`/memory governance status`) lives separately (§11.4) and reports detector enabled state, not proposal queue contents.

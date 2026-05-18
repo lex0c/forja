@@ -3365,7 +3365,7 @@ describe('/memory governance defer', () => {
     if (r.kind === 'error') expect(r.message).toContain('missing arguments');
   });
 
-  test('rejects extra positional arg', async () => {
+  test('rejects unknown positional/flag after <days>', async () => {
     const repo = makeTmp();
     const bundle = makeCtx(repo);
     seedActiveLocal(bundle.roots, 'foo');
@@ -3373,7 +3373,7 @@ describe('/memory governance defer', () => {
     const id = seedProposal(bundle, 'foo');
     const r = await memoryCommand.exec(['governance', 'defer', id, '7', 'extra'], bundle.ctx);
     expect(r.kind).toBe('error');
-    if (r.kind === 'error') expect(r.message).toContain('unexpected extra arg');
+    if (r.kind === 'error') expect(r.message).toContain("unknown flag 'extra'");
   });
 
   test('subsequent /memory governance show surfaces deferred_until line', async () => {
@@ -3388,6 +3388,77 @@ describe('/memory governance defer', () => {
     const text = (r.notes ?? []).join('\n');
     expect(text).toContain('deferred_until:');
     expect(text).toContain('count=1');
+  });
+
+  test('emits memory_events action=deferred attributed to target memory', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    expect(r.kind).toBe('ok');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(bundle.db, 'foo');
+    const defers = events.filter((e) => e.action === 'deferred');
+    expect(defers.length).toBe(1);
+    expect(defers[0]?.scope).toBe('project_local');
+    expect(defers[0]?.memoryName).toBe('foo');
+    expect(defers[0]?.details).not.toBeNull();
+    const details = defers[0]?.details as Record<string, unknown> | null;
+    expect(details?.proposal_id).toBe(id);
+    expect(details?.kind).toBe('quarantine');
+    expect(details?.additional_days).toBe(7);
+    expect(details?.defer_count).toBe(1);
+    expect(typeof details?.new_deferred_until).toBe('number');
+  });
+
+  test('--reason persists in audit details and surfaces in the response', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(
+      ['governance', 'defer', id, '14', '--reason', 'awaiting RFC outcome'],
+      bundle.ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('reason: awaiting RFC outcome');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(bundle.db, 'foo');
+    const defer = events.find((e) => e.action === 'deferred');
+    const details = defer?.details as Record<string, unknown> | null;
+    expect(details?.reason).toBe('awaiting RFC outcome');
+  });
+
+  test('--reason without value rejects', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7', '--reason'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--reason requires a value');
+  });
+
+  test('display: new expiry uses formatGovernanceTimestamp (UTC, full timestamp)', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    // formatGovernanceTimestamp renders as `YYYY-MM-DD HH:MM:SS`
+    // (matches the show command's created_at / decided_at format).
+    // Pre-fix the slash used `toISOString().slice(0, 10)` (date
+    // only) — inconsistent with show. Regression: both surfaces
+    // now produce the same full-timestamp shape.
+    expect(text).toMatch(/new effective expiry: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
   });
 });
 

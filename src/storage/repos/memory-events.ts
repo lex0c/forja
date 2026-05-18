@@ -28,7 +28,13 @@ export type MemoryEventAction =
   | 'invalidated'
   | 'evicted'
   | 'restored'
-  | 'purged';
+  | 'purged'
+  // Migration 063: governance proposal expiry-extension audit
+  // (`/memory governance defer <id> <days>`). One row per defer
+  // attributed to the memory the proposal would transition on
+  // approve (target_key when multi-memory, else
+  // sourceMemoryKeys[0]).
+  | 'deferred';
 export type MemoryEventSource = 'user_explicit' | 'inferred' | 'imported';
 
 export interface MemoryEvent {

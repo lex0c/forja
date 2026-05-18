@@ -60,6 +60,7 @@ import { migration059MemoryVerifyAttemptsFkDiscipline } from './059-memory-verif
 import { migration060MemoryVerifyAttemptsBackfillDrift } from './060-memory-verify-attempts-backfill-drift.ts';
 import { migration061MemoryConflictAttempts } from './061-memory-conflict-attempts.ts';
 import { migration062MemoryGovernanceProposalsDefer } from './062-memory-governance-proposals-defer.ts';
+import { migration063MemoryEventsDeferredAction } from './063-memory-events-deferred-action.ts';
 
 export interface Migration {
   id: number;
@@ -130,4 +131,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration060MemoryVerifyAttemptsBackfillDrift,
   migration061MemoryConflictAttempts,
   migration062MemoryGovernanceProposalsDefer,
+  migration063MemoryEventsDeferredAction,
 ];
