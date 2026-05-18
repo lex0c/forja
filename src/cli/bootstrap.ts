@@ -840,6 +840,39 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         `memory: AUDIT DRIFT: failed to prune memory_conflict_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
       );
     }
+    // S3 override-events retention sweep (post-Phase-2 review C1).
+    // Signal collector populates this table on every modal-reject /
+    // permission-deny; without the sweep the table grows unbounded
+    // and the threshold counter's `countOverridesInWindow` query
+    // slows over time. 90d retention matches memory_provenance —
+    // the override events feed the threshold which feeds proposals;
+    // symmetric retention keeps the audit JOIN valid for that window.
+    try {
+      const { pruneOverrideEvents, MEMORY_OVERRIDE_EVENTS_RETENTION_MS } = await import(
+        '../storage/repos/memory-override-events.ts'
+      );
+      pruneOverrideEvents(db, Date.now() - MEMORY_OVERRIDE_EVENTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_override_events at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // S3 override-attempts retention sweep (post-Phase-2 review C1).
+    // Companion to verify-attempts + conflict-attempts; rows older
+    // than 90d are content-addressed-stale and the cooldown semantic
+    // breaks down past that horizon.
+    try {
+      const { pruneOverrideAttempts, MEMORY_VERIFY_OVERRIDE_ATTEMPTS_RETENTION_MS } = await import(
+        '../storage/repos/memory-verify-override-attempts.ts'
+      );
+      pruneOverrideAttempts(db, Date.now() - MEMORY_VERIFY_OVERRIDE_ATTEMPTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_verify_override_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
     // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2
     // `trust_revoked` detector). Runs ONLY when:
     //   - the operator supplied a callback (no TUI ⇒ no consent

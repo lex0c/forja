@@ -688,27 +688,28 @@ Sem eval, critic vira ruído (warnings constantes que user aprende a ignorar).
 
 ### 5.4.1 Memory governance detectors (per-project opt-out)
 
-Os detectores LLM-judge do memory subsystem (`verify_failed` em [`MEMORY.md`](./MEMORY.md) §11, `conflict_detected` em §11) são **default ON** por default. Operator faz opt-out via `.agent/config.toml`:
+Os três detectores LLM-judge do memory subsystem (`verify_failed` em [`MEMORY.md`](./MEMORY.md) §11, `conflict_detected` em §11, `user_override_repeated` em §11) são **default ON** por default. Operator faz opt-out via `.agent/config.toml`:
 
 ```toml
 # ~/.config/agent/config.toml ou .agent/config.toml
 [memory]
 verify_semantic_llm = false        # desliga S11 verify_failed (default true)
 conflict_detect_llm = false        # desliga S13 conflict_detected (default true)
+override_detect_llm = false        # desliga S3 user_override_repeated (default true)
 ```
 
 **Precedência** (first-match wins):
 
-1. **CLI flag** explicit — `--memory-verify-llm` / `--no-memory-verify-llm` (idem conflict). Session-only override; ignora config.
+1. **CLI flag** explicit — `--memory-verify-llm` / `--no-memory-verify-llm` (idem `--memory-conflict-llm` e `--memory-override-llm`). Session-only override; ignora config.
 2. **Project config** — `<cwd>/.agent/config.toml [memory]`. Per-projeto, versionado pelo time.
 3. **User config** — `~/.config/agent/config.toml [memory]`. Per-user, cross-project.
 4. **Default ON** — hardcoded em `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG`.
 
 **Layers (2):** user + project. Sem enterprise layer ainda — mirror do `[critique]` block; spec amenda quando regulated environment surfacar. Snake_case canonical; camelCase aliases aceitos (mesma posture de `[critique]`).
 
-**Slash:** `/memory governance enable | disable verify|conflict|all` escreve `.agent/config.toml [memory]`. Efeito vale a partir do próximo turn boundary (snapshot semantic).
+**Slash:** `/memory governance enable | disable verify|conflict|override|all` escreve `.agent/config.toml [memory]`. `all` cobre os três detectores. Efeito vale a partir do próximo turn boundary (snapshot semantic).
 
-**First-boot advisory:** quando AMBOS detectores resolvem ON via default (nenhum layer setou, nenhuma CLI flag), boot emite uma linha stderr `memory: governance LLM detectors enabled by default (verify=on, conflict=on). Disable: /memory governance disable verify|conflict|all`. Suppressed em `--json` mode, subagent context, e após primeira sessão (marker em `~/.local/share/forja/`).
+**First-boot advisory:** quando OS TRÊS detectores resolvem ON via default (nenhum layer setou, nenhuma CLI flag, marker em `~/.local/share/forja/.governance-banner-shown` ausente), boot emite uma linha stderr `memory: governance LLM detectors enabled by default (verify=on, conflict=on, override=on). Disable: /memory governance disable verify|conflict|override|all`. Suppressed em `--json` mode, subagent context, e após primeira sessão (marker em `~/.local/share/forja/`).
 
 ---
 

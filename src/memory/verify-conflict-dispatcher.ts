@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
-import type { DB } from '../storage/db.ts';
+import { type DB, withTransaction } from '../storage/db.ts';
 import {
   type CanonicalConflictPair,
   type ConflictVerdict,
@@ -371,41 +371,22 @@ export const dispatchConflictVerify = async (
     promptHash,
     attemptedAt: nowMs,
   };
-  let attempt: ReturnType<typeof recordConflictAttempt>;
-  try {
-    attempt = recordConflictAttempt(db, {
-      ...attemptBase,
-      subagentRunSessionId: result.sessionId,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/FOREIGN KEY constraint/i.test(msg)) {
-      attempt = recordConflictAttempt(db, {
-        ...attemptBase,
-        subagentRunSessionId: null,
-      });
-    } else {
-      throw err;
-    }
-  }
+  // (5–7) Atomic persistence of attempt + (for conflicting verdicts)
+  // proposal + (optional) auto-reject decision. Mirror of S11 (verify-
+  // semantic-dispatcher) post-Phase-2 review #3. Pre-fix, a
+  // recordProposal failure after recordConflictAttempt succeeded left
+  // an orphaned attempt — the 7d dedup cache gated future polls while
+  // no operator-visible proposal landed. Wrapping in `withTransaction`
+  // rolls back the attempt when the proposal write throws.
+  //
+  // F18 FK retry stays inside the transaction: a concurrent purge of
+  // the subagent_runs row between runSubagent returning and the INSERT
+  // triggers a FOREIGN KEY constraint; retry with
+  // subagentRunSessionId=null. Both attempts stay atomic with proposal.
 
-  // (6) Compatible / sub-confident-compatible verdicts: attempt
-  // suffices, no proposal. (Below-threshold-compatible is the
-  // "the LLM said no but with low confidence" case; not interesting
-  // enough to land in /memory governance.)
-  if (!output.conflicting) {
-    return {
-      kind: 'completed',
-      verdict: 'compatible',
-      conflictKind: output.conflict_kind,
-      confidence: output.confidence,
-      attemptId: attempt.id,
-      costUsd: result.costUsd,
-    };
-  }
-
-  // (7) Conflicting verdict — run the deterministic resolver and
-  // emit a governance proposal targeting the loser.
+  // Conflicting verdict — run the deterministic resolver and gather
+  // proposal payload BEFORE entering the transaction (pure compute, no
+  // DB access, so it doesn't extend lock duration).
   const candA: ConflictCandidate = {
     scope: input.pair.a.scope,
     name: input.pair.a.name,
@@ -420,7 +401,7 @@ export const dispatchConflictVerify = async (
     mtimeMs: input.pair.b.mtimeMs,
     body: workingB.body,
   };
-  const resolution = resolveConflictWinner(candA, candB);
+  const resolution = output.conflicting ? resolveConflictWinner(candA, candB) : null;
 
   // sourceMemoryKeys carries BOTH sides (winner + loser). The repo
   // canonical-sorts so the order at the call site doesn't matter for
@@ -428,86 +409,149 @@ export const dispatchConflictVerify = async (
   // future "merge into one body" payloads; for quarantine it's the
   // loser's key duplicated, which the apply path reads to confirm
   // which side transitions.
-  const sourceMemoryKeys = [
-    { scope: resolution.winner.scope, name: resolution.winner.name },
-    { scope: resolution.loser.scope, name: resolution.loser.name },
-  ];
-  const snapshots: MemorySnapshot[] = [
-    {
-      scope: resolution.winner.scope,
-      name: resolution.winner.name,
-      contentHash: resolution.winner === candA ? hashA : hashB,
-    },
-    {
-      scope: resolution.loser.scope,
-      name: resolution.loser.name,
-      contentHash: resolution.loser === candA ? hashA : hashB,
-    },
-  ];
+  let attempt: ReturnType<typeof recordConflictAttempt> | undefined;
+  let proposalResult: ReturnType<typeof recordProposal> | undefined;
+  try {
+    withTransaction(db, () => {
+      try {
+        attempt = recordConflictAttempt(db, {
+          ...attemptBase,
+          subagentRunSessionId: result.sessionId,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/FOREIGN KEY constraint/i.test(msg)) {
+          attempt = recordConflictAttempt(db, {
+            ...attemptBase,
+            subagentRunSessionId: null,
+          });
+        } else {
+          throw err;
+        }
+      }
 
-  // Evidence essence for fingerprint dedup. Two LLM dispatches that
-  // return equivalent verdicts on the same canonical pair collapse
-  // to one pending proposal via the partial UNIQUE index. We omit
-  // ephemeral fields (model_id, prompt_hash) from the essence so a
-  // model swap between runs doesn't multiply pending proposals.
-  const evidenceEssence = canonicalJsonStringify({
-    pair: [
-      { scope: canonical.a.scope, name: canonical.a.name, hash: canonical.a.contentHash },
-      { scope: canonical.b.scope, name: canonical.b.name, hash: canonical.b.contentHash },
-    ],
-    conflict_kind: output.conflict_kind,
-    shared_concept: output.evidence.shared_concept,
-  });
+      // Compatible verdicts: attempt suffices, no proposal.
+      // (Below-threshold-compatible is the "the LLM said no but with
+      // low confidence" case; not interesting enough to land in
+      // /memory governance.)
+      if (!output.conflicting || resolution === null) return;
 
-  const proposalResult = recordProposal(db, {
-    sessionId: input.parentSessionId,
-    kind: 'quarantine',
-    sourceMemoryKeys,
-    sourceMemorySnapshots: snapshots,
-    // MEMORY.md §11.3 gate #4: multi-memory quarantine MUST carry
-    // target_key designating which entry transitions. The apply
-    // path uses target_key (not sourceMemoryKeys[0]) so the loser
-    // is the only one whose state flips on operator approve; the
-    // winner stays as forensic context for `/memory governance show`.
-    targetPayload: {
-      target_key: {
-        scope: resolution.loser.scope,
-        name: resolution.loser.name,
-      },
-    },
-    evidence: {
-      verdict: 'conflicting',
-      conflict_kind: output.conflict_kind,
-      confidence: output.confidence,
-      shared_concept: output.evidence.shared_concept,
-      polarity_a: output.evidence.polarity_a,
-      polarity_b: output.evidence.polarity_b,
-      winner_scope: resolution.winner.scope,
-      winner_name: resolution.winner.name,
-      loser_scope: resolution.loser.scope,
-      loser_name: resolution.loser.name,
-      resolver_tier: resolution.tier,
-      prompt_hash: promptHash,
-      subagent_run_session_id: result.sessionId,
-      model_id: modelId,
-    },
-    proposedBy: VERIFY_CONFLICT_PROPOSED_BY,
-    confidence: output.confidence,
-    evidenceEssence,
-    createdAt: nowMs,
-  });
+      const sourceMemoryKeys = [
+        { scope: resolution.winner.scope, name: resolution.winner.name },
+        { scope: resolution.loser.scope, name: resolution.loser.name },
+      ];
+      const snapshots: MemorySnapshot[] = [
+        {
+          scope: resolution.winner.scope,
+          name: resolution.winner.name,
+          contentHash: resolution.winner === candA ? hashA : hashB,
+        },
+        {
+          scope: resolution.loser.scope,
+          name: resolution.loser.name,
+          contentHash: resolution.loser === candA ? hashA : hashB,
+        },
+      ];
 
-  // Sub-threshold auto-reject — gated on `!proposalResult.deduped`
-  // to avoid destroying a prior valid pending proposal when a noisy
-  // second LLM run hits the same fingerprint (S13 review HIGH-1).
-  // Mirror of the same guard in verify-semantic-dispatcher.
-  if (output.confidence < SEMANTIC_CONFLICT_MIN_CONFIDENCE && !proposalResult.deduped) {
-    decideProposal(db, proposalResult.id, {
-      status: 'rejected',
-      decidedBy: 'system:low_confidence',
-      decidedReason: `confidence ${output.confidence.toFixed(2)} below threshold ${SEMANTIC_CONFLICT_MIN_CONFIDENCE.toFixed(2)}`,
-      decidedAt: nowMs,
+      // Evidence essence for fingerprint dedup. Two LLM dispatches that
+      // return equivalent verdicts on the same canonical pair collapse
+      // to one pending proposal via the partial UNIQUE index. We omit
+      // ephemeral fields (model_id, prompt_hash) from the essence so a
+      // model swap between runs doesn't multiply pending proposals.
+      const evidenceEssence = canonicalJsonStringify({
+        pair: [
+          { scope: canonical.a.scope, name: canonical.a.name, hash: canonical.a.contentHash },
+          { scope: canonical.b.scope, name: canonical.b.name, hash: canonical.b.contentHash },
+        ],
+        conflict_kind: output.conflict_kind,
+        shared_concept: output.evidence.shared_concept,
+      });
+
+      proposalResult = recordProposal(db, {
+        sessionId: input.parentSessionId,
+        kind: 'quarantine',
+        sourceMemoryKeys,
+        sourceMemorySnapshots: snapshots,
+        // MEMORY.md §11.3 gate #4: multi-memory quarantine MUST carry
+        // target_key designating which entry transitions. The apply
+        // path uses target_key (not sourceMemoryKeys[0]) so the loser
+        // is the only one whose state flips on operator approve; the
+        // winner stays as forensic context for `/memory governance show`.
+        targetPayload: {
+          target_key: {
+            scope: resolution.loser.scope,
+            name: resolution.loser.name,
+          },
+        },
+        evidence: {
+          verdict: 'conflicting',
+          conflict_kind: output.conflict_kind,
+          confidence: output.confidence,
+          shared_concept: output.evidence.shared_concept,
+          polarity_a: output.evidence.polarity_a,
+          polarity_b: output.evidence.polarity_b,
+          winner_scope: resolution.winner.scope,
+          winner_name: resolution.winner.name,
+          loser_scope: resolution.loser.scope,
+          loser_name: resolution.loser.name,
+          resolver_tier: resolution.tier,
+          prompt_hash: promptHash,
+          subagent_run_session_id: result.sessionId,
+          model_id: modelId,
+        },
+        proposedBy: VERIFY_CONFLICT_PROPOSED_BY,
+        confidence: output.confidence,
+        evidenceEssence,
+        createdAt: nowMs,
+      });
+
+      // Sub-threshold auto-reject — gated on `!proposalResult.deduped`
+      // to avoid destroying a prior valid pending proposal when a noisy
+      // second LLM run hits the same fingerprint (S13 review HIGH-1).
+      // Mirror of the same guard in verify-semantic-dispatcher.
+      if (output.confidence < SEMANTIC_CONFLICT_MIN_CONFIDENCE && !proposalResult.deduped) {
+        decideProposal(db, proposalResult.id, {
+          status: 'rejected',
+          decidedBy: 'system:low_confidence',
+          decidedReason: `confidence ${output.confidence.toFixed(2)} below threshold ${SEMANTIC_CONFLICT_MIN_CONFIDENCE.toFixed(2)}`,
+          decidedAt: nowMs,
+        });
+      }
     });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      kind: 'spawn_failed',
+      reason: `persistence_failed: ${reason}`,
+      costUsd: result.costUsd,
+    };
+  }
+
+  if (attempt === undefined) {
+    return {
+      kind: 'spawn_failed',
+      reason: 'persistence_failed: attempt missing post-commit',
+      costUsd: result.costUsd,
+    };
+  }
+
+  if (!output.conflicting || resolution === null) {
+    return {
+      kind: 'completed',
+      verdict: 'compatible',
+      conflictKind: output.conflict_kind,
+      confidence: output.confidence,
+      attemptId: attempt.id,
+      costUsd: result.costUsd,
+    };
+  }
+
+  if (proposalResult === undefined) {
+    return {
+      kind: 'spawn_failed',
+      reason: 'persistence_failed: proposal missing post-commit',
+      costUsd: result.costUsd,
+    };
   }
 
   return {

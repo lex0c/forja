@@ -20,7 +20,7 @@ import { isAbsolute, sep as pathSep, resolve as resolvePath } from 'node:path';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
-import type { DB } from '../storage/db.ts';
+import { type DB, withTransaction } from '../storage/db.ts';
 import {
   type MemorySnapshot,
   canonicalJsonStringify,
@@ -439,19 +439,20 @@ export const dispatchSemanticVerify = async (
     }
   }
 
-  // (5) Record the attempt — succeeds even when the verdict is
-  // sub-threshold (no proposal lands, but the attempt still
-  // suppresses re-dispatch within the dedup window).
+  // (5 + 6) Atomic persistence of attempt + (optional) proposal +
+  // (optional) auto-reject decision. Mirror of the verify-override
+  // fix (post-Phase-2 review #3) and verify-conflict's parallel
+  // hardening. Pre-fix, a recordProposal failure AFTER recordAttempt
+  // succeeded left an orphaned attempt — the dedup cache gated future
+  // polls (7d window) but no operator-visible proposal landed.
+  // Wrapping in `withTransaction` rolls back the attempt when the
+  // proposal write throws. Net: persistent failures burn LLM budget
+  // faster (the cost cap is the rate-limit), but no silent gating.
   //
-  // F18: a concurrent purge / retention sweep could delete the
-  // child's subagent_runs row between `runSubagent` returning and
-  // this INSERT firing — the FK `subagent_run_session_id ->
-  // subagent_runs(session_id) ON DELETE SET NULL` only nulls on
-  // existing rows, but an INSERT against a missing FK target throws
-  // SQLITE_CONSTRAINT_FOREIGNKEY. Catch the FK throw and retry
-  // with subagentRunSessionId=null so the attempt row still lands
-  // (forensic detail about the run is lost, but the dedup cache
-  // entry is what matters for the next dispatch).
+  // F18 FK retry stays inside the transaction: a concurrent purge of
+  // the subagent_runs row between runSubagent returning and the
+  // INSERT triggers a FOREIGN KEY constraint; retry with
+  // subagentRunSessionId=null. The retry stays atomic with proposal.
   const modelId = input.provider.id;
   const attemptBase = {
     memoryScope: memory.scope,
@@ -463,35 +464,95 @@ export const dispatchSemanticVerify = async (
     promptHash,
     attemptedAt: nowMs,
   };
-  let attempt: ReturnType<typeof recordAttempt>;
+  let attempt: ReturnType<typeof recordAttempt> | undefined;
+  let proposalResult: ReturnType<typeof recordProposal> | undefined;
   try {
-    attempt = recordAttempt(db, {
-      ...attemptBase,
-      subagentRunSessionId: result.sessionId,
+    withTransaction(db, () => {
+      try {
+        attempt = recordAttempt(db, {
+          ...attemptBase,
+          subagentRunSessionId: result.sessionId,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/FOREIGN KEY constraint/i.test(msg)) {
+          attempt = recordAttempt(db, {
+            ...attemptBase,
+            subagentRunSessionId: null,
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      // Governance proposal per verdict:
+      //   - passed / inconclusive → no proposal (attempt cached only).
+      //   - contradicted → proposal lands. confidence >= floor stays
+      //     `pending`; below floor auto-rejects with
+      //     `system:low_confidence` so forensic queries still surface
+      //     the verdict via `/memory governance list --status rejected`.
+      if (output.verdict !== 'contradicted') return;
+
+      // Stable evidence-essence for fingerprint dedup.
+      const evidenceEssence = canonicalJsonStringify({
+        claim: output.claim_extracted,
+        observed: output.ground_truth_observed,
+        paths: [...output.evidence_paths].sort(),
+      });
+      const snapshots: MemorySnapshot[] = [{ scope: memory.scope, name: memory.name, contentHash }];
+      proposalResult = recordProposal(db, {
+        sessionId: input.parentSessionId,
+        kind: 'quarantine',
+        sourceMemoryKeys: [{ scope: memory.scope, name: memory.name }],
+        sourceMemorySnapshots: snapshots,
+        evidence: {
+          verdict: output.verdict,
+          confidence: output.confidence,
+          claim_extracted: output.claim_extracted,
+          ground_truth_observed: output.ground_truth_observed,
+          evidence_paths: output.evidence_paths,
+          prompt_hash: promptHash,
+          subagent_run_session_id: result.sessionId,
+          model_id: modelId,
+        },
+        proposedBy: VERIFY_SEMANTIC_PROPOSED_BY,
+        confidence: output.confidence,
+        evidenceEssence,
+        createdAt: nowMs,
+      });
+
+      if (output.confidence < SEMANTIC_VERIFY_MIN_CONFIDENCE && !proposalResult.deduped) {
+        // `!proposalResult.deduped` guard (S13 review HIGH-1): when
+        // the fingerprint matches an existing PENDING proposal
+        // (silent dedup hit), calling decideProposal here flips
+        // THAT proposal — which may carry a prior high-confidence
+        // verdict — to rejected. Only auto-reject when this run
+        // actually inserted a new row.
+        decideProposal(db, proposalResult.id, {
+          status: 'rejected',
+          decidedBy: 'system:low_confidence',
+          decidedReason: `confidence ${output.confidence.toFixed(2)} below threshold ${SEMANTIC_VERIFY_MIN_CONFIDENCE.toFixed(2)}`,
+          decidedAt: nowMs,
+        });
+      }
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/FOREIGN KEY constraint/i.test(msg)) {
-      attempt = recordAttempt(db, {
-        ...attemptBase,
-        subagentRunSessionId: null,
-      });
-    } else {
-      throw err;
-    }
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      kind: 'spawn_failed',
+      reason: `persistence_failed: ${reason}`,
+      costUsd: result.costUsd,
+    };
   }
 
-  // (6) Governance proposal handling per verdict:
-  //   - passed / inconclusive: no proposal (attempt cached for dedup;
-  //     nothing for the governance substrate to act on).
-  //   - contradicted (any confidence): proposal IS recorded. When
-  //     confidence >= threshold the proposal stays `pending` for
-  //     operator review. When BELOW threshold it's auto-decided as
-  //     'rejected' with decidedBy 'system:low_confidence' so the
-  //     operator can still inspect the judge's verdict via
-  //     `/memory governance list --status rejected` — closes the
-  //     forensic gap where sub-threshold contradicted verdicts
-  //     previously only landed as attempt rows (TODO T11.7).
+  if (attempt === undefined) {
+    return {
+      kind: 'spawn_failed',
+      reason: 'persistence_failed: attempt missing post-commit',
+      costUsd: result.costUsd,
+    };
+  }
+
   if (output.verdict !== 'contradicted') {
     return {
       kind: 'completed',
@@ -502,67 +563,10 @@ export const dispatchSemanticVerify = async (
     };
   }
 
-  // Stable evidence-essence for fingerprint dedup: claim + observed
-  // + sorted evidence paths. Two identical contradictions emitted
-  // by separate dispatches (same body, same finding) collapse to
-  // one pending proposal via the partial UNIQUE index. Pass through
-  // `canonicalJsonStringify` (S8 hardening helper) instead of raw
-  // `JSON.stringify` so a future hand-edit reordering fields here
-  // can't silently drift the fingerprint (key-sorted recursion
-  // makes the serialization order-invariant regardless of how the
-  // object literal is authored).
-  const evidenceEssence = canonicalJsonStringify({
-    claim: output.claim_extracted,
-    observed: output.ground_truth_observed,
-    paths: [...output.evidence_paths].sort(),
-  });
-  const snapshots: MemorySnapshot[] = [{ scope: memory.scope, name: memory.name, contentHash }];
-  const proposalResult = recordProposal(db, {
-    sessionId: input.parentSessionId,
-    kind: 'quarantine',
-    sourceMemoryKeys: [{ scope: memory.scope, name: memory.name }],
-    sourceMemorySnapshots: snapshots,
-    evidence: {
-      verdict: output.verdict,
-      confidence: output.confidence,
-      claim_extracted: output.claim_extracted,
-      ground_truth_observed: output.ground_truth_observed,
-      evidence_paths: output.evidence_paths,
-      prompt_hash: promptHash,
-      subagent_run_session_id: result.sessionId,
-      model_id: modelId,
-    },
-    proposedBy: VERIFY_SEMANTIC_PROPOSED_BY,
-    confidence: output.confidence,
-    evidenceEssence,
-    createdAt: nowMs,
-  });
-
-  if (output.confidence < SEMANTIC_VERIFY_MIN_CONFIDENCE && !proposalResult.deduped) {
-    // Auto-decide as rejected so the operator can still see the
-    // judge's verdict in `/memory governance list --status rejected`
-    // even though it never lands in the pending review queue.
-    //
-    // `!proposalResult.deduped` guard (S13 review HIGH-1): when the
-    // fingerprint matches an existing PENDING proposal (silent dedup
-    // hit), calling decideProposal here flips THAT proposal — which
-    // may have been emitted earlier with high confidence — to
-    // rejected. A noisy second LLM run shouldn't destroy a valid
-    // prior verdict; only auto-reject when this run actually
-    // inserted a new row.
-    decideProposal(db, proposalResult.id, {
-      status: 'rejected',
-      decidedBy: 'system:low_confidence',
-      decidedReason: `confidence ${output.confidence.toFixed(2)} below threshold ${SEMANTIC_VERIFY_MIN_CONFIDENCE.toFixed(2)}`,
-      decidedAt: nowMs,
-    });
+  if (proposalResult === undefined) {
     return {
-      kind: 'completed',
-      verdict: output.verdict,
-      confidence: output.confidence,
-      attemptId: attempt.id,
-      proposalId: proposalResult.id,
-      proposalDeduped: proposalResult.deduped,
+      kind: 'spawn_failed',
+      reason: 'persistence_failed: proposal missing post-commit',
       costUsd: result.costUsd,
     };
   }

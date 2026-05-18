@@ -406,3 +406,43 @@ describe('dispatchConflictVerify — malformed output', () => {
     expect(outcome.kind).toBe('malformed');
   });
 });
+
+// ── post-Phase-2 review H3: atomic persistence rollback ───────────
+
+describe('dispatchConflictVerify — atomic persistence (H3)', () => {
+  test('proposal failure rolls back attempt (no orphaned dedup row)', async () => {
+    // Post-Phase-2 review H3: pre-fix, attempt landed before
+    // recordProposal threw, leaving the 7d dedup cache primed with
+    // NO operator-visible proposal. Fix wraps attempt + proposal +
+    // optional auto-reject in withTransaction so any inner failure
+    // rolls back the attempt too.
+    //
+    // Force the failure by passing parentSessionId pointing at a
+    // non-existent session — recordProposal's FK to sessions(id)
+    // throws SQLITE_CONSTRAINT_FOREIGNKEY at INSERT time.
+    const ghostSessionId = '00000000-0000-0000-0000-0000000000ff';
+    const a = makeMember('alpha', 'use JWT for auth in src/auth', { source: 'user_explicit' });
+    const b = makeMember('beta', 'auth flow uses OAuth via src/auth/oauth.ts', {
+      source: 'inferred',
+    });
+    const spawnFn = (async () => makeResult()) as never;
+    const outcome = await dispatchConflictVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: ghostSessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      pair: { a, b },
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('spawn_failed');
+    if (outcome.kind === 'spawn_failed') {
+      expect(outcome.reason).toContain('persistence_failed');
+      expect(outcome.costUsd).toBeGreaterThan(0);
+    }
+    expect(listRecentConflictAttempts(db)).toHaveLength(0);
+    expect(listProposals(db)).toHaveLength(0);
+  });
+});
