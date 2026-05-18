@@ -563,20 +563,121 @@ model = "anthropic/imaginary-future-model"
 // Same TOML file as [critique]; [memory] section.
 
 describe('loadMemoryConfig — empty layers', () => {
-  test('no files anywhere → defaults (both true) + no warnings + both userHadField/projectHadField false', () => {
+  test('no files anywhere → defaults (all three true) + no warnings + all hadField false', () => {
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
     try {
       const result = loadMemoryConfig({ cwd, env: { HOME: home } });
       expect(result.config.verifySemanticLlm).toBe(DEFAULT_MEMORY_CONFIG.verifySemanticLlm);
       expect(result.config.conflictDetectLlm).toBe(DEFAULT_MEMORY_CONFIG.conflictDetectLlm);
+      expect(result.config.overrideDetectLlm).toBe(DEFAULT_MEMORY_CONFIG.overrideDetectLlm);
       expect(result.config.verifySemanticLlm).toBe(true);
       expect(result.config.conflictDetectLlm).toBe(true);
+      expect(result.config.overrideDetectLlm).toBe(true);
       expect(result.userHadField.verifySemanticLlm).toBe(false);
       expect(result.userHadField.conflictDetectLlm).toBe(false);
+      expect(result.userHadField.overrideDetectLlm).toBe(false);
       expect(result.projectHadField.verifySemanticLlm).toBe(false);
       expect(result.projectHadField.conflictDetectLlm).toBe(false);
+      expect(result.projectHadField.overrideDetectLlm).toBe(false);
       expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadMemoryConfig — override_detect_llm (S3.5)', () => {
+  test('project [memory] override_detect_llm = false → resolved false + hadField true', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+override_detect_llm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.overrideDetectLlm).toBe(false);
+      expect(result.projectHadField.overrideDetectLlm).toBe(true);
+      // Other two stay at default.
+      expect(result.config.verifySemanticLlm).toBe(true);
+      expect(result.config.conflictDetectLlm).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('camelCase alias overrideDetectLlm accepted', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+overrideDetectLlm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.overrideDetectLlm).toBe(false);
+      expect(result.projectHadField.overrideDetectLlm).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('snake + camel both present emits dual-key warning; snake wins', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+override_detect_llm = false
+overrideDetectLlm = true
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.overrideDetectLlm).toBe(false);
+      expect(
+        result.warnings.some(
+          (w) => w.includes('override_detect_llm') && w.includes('overrideDetectLlm'),
+        ),
+      ).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('user + project override fields merge with project winning', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'agent', 'config.toml'),
+        `
+[memory]
+override_detect_llm = true
+`,
+      );
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+override_detect_llm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.config.overrideDetectLlm).toBe(false);
+      expect(result.userHadField.overrideDetectLlm).toBe(true);
+      expect(result.projectHadField.overrideDetectLlm).toBe(true);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });

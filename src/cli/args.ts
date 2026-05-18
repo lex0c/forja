@@ -189,6 +189,11 @@ export interface ParsedArgs {
   // children don't run their own scheduler). Same default-ON +
   // config-opt-out posture as memoryVerifyLlm (Slice Q).
   memoryConflictLlm?: boolean;
+  // S3 session-only override for the LLM-judge override detector.
+  // Independent of memoryVerifyLlm + memoryConflictLlm. Same
+  // top-level-only constraint and config-opt-out posture as the
+  // other two detectors (S3.5 wiring).
+  memoryOverrideLlm?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -1566,6 +1571,17 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.memoryConflictLlm = false;
         i += 1;
         break;
+      case '--memory-override-llm':
+        // S3 LLM-judge override detector — session-only override-ON.
+        // Mirror of --memory-verify-llm + --memory-conflict-llm.
+        args.memoryOverrideLlm = true;
+        i += 1;
+        break;
+      case '--no-memory-override-llm':
+        // S3 LLM-judge — session-only override-OFF.
+        args.memoryOverrideLlm = false;
+        i += 1;
+        break;
       case '--subagent-temperature': {
         const value = argv[i + 1];
         if (value === undefined) {
@@ -1731,6 +1747,12 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       message: '--memory-conflict-llm and --no-memory-conflict-llm are mutually exclusive',
     };
   }
+  if (seen.has('--memory-override-llm') && seen.has('--no-memory-override-llm')) {
+    return {
+      ok: false,
+      message: '--memory-override-llm and --no-memory-override-llm are mutually exclusive',
+    };
+  }
   // S11/S13 — top-level-only flags (verify scheduler + conflict
   // scheduler never run in subagent context). Both polarities
   // (--memory-verify-llm and --no-memory-verify-llm) must refuse
@@ -1749,6 +1771,13 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       ok: false,
       message:
         '--memory-conflict-llm / --no-memory-conflict-llm are top-level flags and conflict with --subagent-session-id (subagent children do not run the conflict scheduler)',
+    };
+  }
+  if (args.memoryOverrideLlm !== undefined && args.subagentSessionId !== undefined) {
+    return {
+      ok: false,
+      message:
+        '--memory-override-llm / --no-memory-override-llm are top-level flags and conflict with --subagent-session-id (subagent children do not run the override scheduler)',
     };
   }
   return { ok: true, args };

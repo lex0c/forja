@@ -154,6 +154,10 @@ export interface BootstrapInput {
   // S13 opt-in for the LLM-judge conflict detector. Independent of
   // memorySemanticVerify. CLI surfaces from `args.memoryConflictLlm`.
   memoryConflictDetect?: boolean;
+  // S3 opt-in for the LLM-judge override detector. Independent of
+  // memorySemanticVerify + memoryConflictDetect. CLI surfaces from
+  // `args.memoryOverrideLlm` (S3.5 follow-up wires the flag).
+  memoryOverrideDetect?: boolean;
   // Slice Q — suppress operator-facing stderr banners when the CLI
   // is producing structured NDJSON. The boot banner for the default-
   // ON governance detectors fires when both resolve via default;
@@ -362,13 +366,20 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     input.memoryConflictDetect === undefined &&
     !memoryLoaded.projectHadField.conflictDetectLlm &&
     !memoryLoaded.userHadField.conflictDetectLlm;
+  const overrideFromDefault =
+    input.memoryOverrideDetect === undefined &&
+    !memoryLoaded.projectHadField.overrideDetectLlm &&
+    !memoryLoaded.userHadField.overrideDetectLlm;
   const resolvedVerify = input.memorySemanticVerify ?? memoryLoaded.config.verifySemanticLlm;
   const resolvedConflict = input.memoryConflictDetect ?? memoryLoaded.config.conflictDetectLlm;
+  const resolvedOverride = input.memoryOverrideDetect ?? memoryLoaded.config.overrideDetectLlm;
   const shouldShowBanner =
     verifyFromDefault &&
     conflictFromDefault &&
+    overrideFromDefault &&
     resolvedVerify &&
     resolvedConflict &&
+    resolvedOverride &&
     input.json !== true;
   if (shouldShowBanner) {
     // Per-machine marker: when input.governanceBannerMarkerDir is
@@ -398,7 +409,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     }
     if (!markerExists) {
       process.stderr.write(
-        'memory: governance LLM detectors enabled by default (verify=on, conflict=on). Disable: /memory governance disable verify|conflict|all\n',
+        'memory: governance LLM detectors enabled by default (verify=on, conflict=on, override=on). Disable: /memory governance disable verify|conflict|override|all\n',
       );
     }
   }
@@ -1140,6 +1151,15 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         : memoryLoaded.projectHadField.conflictDetectLlm
           ? 'project-config'
           : memoryLoaded.userHadField.conflictDetectLlm
+            ? 'user-config'
+            : 'default',
+    memoryOverrideDetect: input.memoryOverrideDetect ?? memoryLoaded.config.overrideDetectLlm,
+    memoryOverrideDetectSource:
+      input.memoryOverrideDetect !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.overrideDetectLlm
+          ? 'project-config'
+          : memoryLoaded.userHadField.overrideDetectLlm
             ? 'user-config'
             : 'default',
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),

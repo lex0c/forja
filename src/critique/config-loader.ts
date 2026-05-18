@@ -315,15 +315,19 @@ export interface MemoryConfigKeys {
   verifySemanticLlm: boolean;
   // S13 LLM-judge `conflict_detected` detector.
   conflictDetectLlm: boolean;
+  // S3 LLM-judge `user_override_repeated` detector.
+  overrideDetectLlm: boolean;
 }
 
-// Inverted default since Slice Q (post-S13): both LLM-judge detectors
-// are ON unless an operator-or-config layer explicitly disables them.
-// The boot banner in bootstrap.ts surfaces this on first-run so an
-// upgrading operator isn't surprised when proposals start landing.
+// Inverted default since Slice Q (post-S13) and extended to S3 in
+// the S3.5 slice: all three LLM-judge detectors are ON unless an
+// operator-or-config layer explicitly disables them. The boot
+// banner in bootstrap.ts surfaces this on first-run so an upgrading
+// operator isn't surprised when proposals start landing.
 export const DEFAULT_MEMORY_CONFIG: MemoryConfigKeys = {
   verifySemanticLlm: true,
   conflictDetectLlm: true,
+  overrideDetectLlm: true,
 };
 
 // Provenance signal for the boot banner. `false` means the field was
@@ -335,6 +339,7 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfigKeys = {
 export interface MemoryConfigPresence {
   verifySemanticLlm: boolean;
   conflictDetectLlm: boolean;
+  overrideDetectLlm: boolean;
 }
 
 export interface LoadedMemoryConfig {
@@ -351,15 +356,21 @@ export interface LoadedMemoryConfig {
 interface PartialMemoryLayer {
   verifySemanticLlm?: boolean;
   conflictDetectLlm?: boolean;
+  overrideDetectLlm?: boolean;
   hadVerifyField: boolean;
   hadConflictField: boolean;
+  hadOverrideField: boolean;
 }
 
 const parseMemoryLayer = (
   path: string | null,
   source: string,
 ): { layer: PartialMemoryLayer; warnings: string[] } => {
-  const layer: PartialMemoryLayer = { hadVerifyField: false, hadConflictField: false };
+  const layer: PartialMemoryLayer = {
+    hadVerifyField: false,
+    hadConflictField: false,
+    hadOverrideField: false,
+  };
   const warnings: string[] = [];
   if (path === null) return { layer, warnings };
   if (!existsSync(path)) return { layer, warnings };
@@ -445,6 +456,27 @@ const parseMemoryLayer = (
     }
   }
 
+  // S3 — override_detect_llm. Same shape as verify + conflict.
+  const snakeOverride = m.override_detect_llm;
+  const camelOverride = m.overrideDetectLlm;
+  if (snakeOverride !== undefined && camelOverride !== undefined) {
+    warnings.push(
+      `${source} config (${path}): [memory] declares both override_detect_llm and overrideDetectLlm; snake_case wins, camelCase ignored`,
+    );
+  }
+  const overrideVal = snakeOverride ?? camelOverride;
+  const overrideKey = snakeOverride !== undefined ? 'override_detect_llm' : 'overrideDetectLlm';
+  if (overrideVal !== undefined) {
+    if (typeof overrideVal !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [memory].${overrideKey}=${fmtBad(overrideVal)} must be a boolean; ignoring`,
+      );
+    } else {
+      layer.overrideDetectLlm = overrideVal;
+      layer.hadOverrideField = true;
+    }
+  }
+
   return { layer, warnings };
 };
 
@@ -474,6 +506,10 @@ export const loadMemoryConfig = (input: LoadMemoryConfigInput): LoadedMemoryConf
       projectResult.layer.conflictDetectLlm ??
       userResult.layer.conflictDetectLlm ??
       DEFAULT_MEMORY_CONFIG.conflictDetectLlm,
+    overrideDetectLlm:
+      projectResult.layer.overrideDetectLlm ??
+      userResult.layer.overrideDetectLlm ??
+      DEFAULT_MEMORY_CONFIG.overrideDetectLlm,
   };
 
   return {
@@ -481,10 +517,12 @@ export const loadMemoryConfig = (input: LoadMemoryConfigInput): LoadedMemoryConf
     userHadField: {
       verifySemanticLlm: userResult.layer.hadVerifyField,
       conflictDetectLlm: userResult.layer.hadConflictField,
+      overrideDetectLlm: userResult.layer.hadOverrideField,
     },
     projectHadField: {
       verifySemanticLlm: projectResult.layer.hadVerifyField,
       conflictDetectLlm: projectResult.layer.hadConflictField,
+      overrideDetectLlm: projectResult.layer.hadOverrideField,
     },
     userPath,
     projectPath,

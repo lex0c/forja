@@ -1191,4 +1191,42 @@ describe('--broker (§13.7 mode flag, slice 87)', () => {
     if (r.ok) return;
     expect(r.message).toContain('--memory-conflict-llm');
   });
+
+  // S3.5 — --memory-override-llm / --no-memory-override-llm
+  test('--memory-override-llm parses as explicit on', () => {
+    const r = parseArgs(['--memory-override-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryOverrideLlm).toBe(true);
+  });
+
+  test('--no-memory-override-llm parses as explicit off', () => {
+    const r = parseArgs(['--no-memory-override-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryOverrideLlm).toBe(false);
+  });
+
+  test('--memory-override-llm + --no-memory-override-llm are mutually exclusive', () => {
+    const r = parseArgs(['--memory-override-llm', '--no-memory-override-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('mutually exclusive');
+    expect(r.message).toContain('--memory-override-llm');
+  });
+
+  test('--no-memory-override-llm + --subagent-session-id is rejected (F12 mirror)', () => {
+    const r = parseArgs(['--subagent-session-id', 'child', '--no-memory-override-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-override-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  test('omission of override flag → undefined', () => {
+    const r = parseArgs(['just a prompt']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryOverrideLlm).toBeUndefined();
+  });
 });

@@ -696,6 +696,9 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.memoryConflictLlm !== undefined
         ? { memoryConflictDetect: args.memoryConflictLlm }
         : {}),
+      ...(args.memoryOverrideLlm !== undefined
+        ? { memoryOverrideDetect: args.memoryOverrideLlm }
+        : {}),
       // Slice Q — pipe --json through so bootstrap's first-boot
       // governance banner can suppress for NDJSON consumers.
       json: args.json,

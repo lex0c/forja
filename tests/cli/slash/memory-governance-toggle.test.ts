@@ -84,22 +84,35 @@ describe('/memory governance disable', () => {
     expect(raw).toContain('[memory]');
     expect(raw).toContain('verify_semantic_llm = false');
     expect(raw).toContain('conflict_detect_llm = true');
+    // S3.5 — override key always materialized in the emitted block.
+    expect(raw).toContain('override_detect_llm = true');
   });
 
-  test('disable conflict: only conflict flips, verify stays true', async () => {
+  test('disable conflict: only conflict flips, verify + override stay true', async () => {
     const r = await memoryCommand.exec(['governance', 'disable', 'conflict'], ctx);
     expect(r.kind).toBe('ok');
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
     expect(raw).toContain('verify_semantic_llm = true');
     expect(raw).toContain('conflict_detect_llm = false');
+    expect(raw).toContain('override_detect_llm = true');
   });
 
-  test('disable all: both flip to false', async () => {
+  test('disable override: only override flips, verify + conflict stay true', async () => {
+    const r = await memoryCommand.exec(['governance', 'disable', 'override'], ctx);
+    expect(r.kind).toBe('ok');
+    const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
+    expect(raw).toContain('verify_semantic_llm = true');
+    expect(raw).toContain('conflict_detect_llm = true');
+    expect(raw).toContain('override_detect_llm = false');
+  });
+
+  test('disable all: all three flip to false', async () => {
     const r = await memoryCommand.exec(['governance', 'disable', 'all'], ctx);
     expect(r.kind).toBe('ok');
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
     expect(raw).toContain('verify_semantic_llm = false');
     expect(raw).toContain('conflict_detect_llm = false');
+    expect(raw).toContain('override_detect_llm = false');
   });
 
   test('preserves [critique] section data through round-trip (comments lost)', async () => {
@@ -176,13 +189,14 @@ conflict_detect_llm = true
 });
 
 describe('/memory governance enable', () => {
-  test('enable all reverses doubly-disabled state', async () => {
+  test('enable all reverses triply-disabled state', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(
       join(workdir, '.agent', 'config.toml'),
       `[memory]
 verify_semantic_llm = false
 conflict_detect_llm = false
+override_detect_llm = false
 `,
     );
     const r = await memoryCommand.exec(['governance', 'enable', 'all'], ctx);
@@ -190,6 +204,25 @@ conflict_detect_llm = false
     const loaded = loadMemoryConfig({ cwd: workdir });
     expect(loaded.config.verifySemanticLlm).toBe(true);
     expect(loaded.config.conflictDetectLlm).toBe(true);
+    expect(loaded.config.overrideDetectLlm).toBe(true);
+  });
+
+  test('enable override: only override flips back, others stay', async () => {
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      `[memory]
+verify_semantic_llm = false
+conflict_detect_llm = false
+override_detect_llm = false
+`,
+    );
+    const r = await memoryCommand.exec(['governance', 'enable', 'override'], ctx);
+    expect(r.kind).toBe('ok');
+    const loaded = loadMemoryConfig({ cwd: workdir });
+    expect(loaded.config.verifySemanticLlm).toBe(false);
+    expect(loaded.config.conflictDetectLlm).toBe(false);
+    expect(loaded.config.overrideDetectLlm).toBe(true);
   });
 });
 

@@ -3033,14 +3033,16 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
 
 const parseDetectorTarget = (
   arg: string | undefined,
-): { verify: boolean; conflict: boolean } | null => {
+): { verify: boolean; conflict: boolean; override: boolean } | null => {
   switch (arg) {
     case 'verify':
-      return { verify: true, conflict: false };
+      return { verify: true, conflict: false, override: false };
     case 'conflict':
-      return { verify: false, conflict: true };
+      return { verify: false, conflict: true, override: false };
+    case 'override':
+      return { verify: false, conflict: false, override: true };
     case 'all':
-      return { verify: true, conflict: true };
+      return { verify: true, conflict: true, override: true };
     default:
       return null;
   }
@@ -3113,7 +3115,11 @@ const emitTomlDoc = (doc: Record<string, unknown>): string => {
 
 const mutateMemoryConfig = (params: {
   filePath: string;
-  patches: { verifySemanticLlm?: boolean; conflictDetectLlm?: boolean };
+  patches: {
+    verifySemanticLlm?: boolean;
+    conflictDetectLlm?: boolean;
+    overrideDetectLlm?: boolean;
+  };
 }): { ok: true } | { ok: false; reason: string } => {
   const { filePath, patches } = params;
   const dir = dirname(filePath);
@@ -3148,16 +3154,20 @@ const mutateMemoryConfig = (params: {
   // the loader honors), then apply patches.
   let verify = true;
   let conflict = true;
+  let override = true;
   const existing = doc.memory;
   if (existing !== null && typeof existing === 'object' && !Array.isArray(existing)) {
     const m = existing as Record<string, unknown>;
     const v = m.verify_semantic_llm ?? m.verifySemanticLlm;
     const c = m.conflict_detect_llm ?? m.conflictDetectLlm;
+    const o = m.override_detect_llm ?? m.overrideDetectLlm;
     if (typeof v === 'boolean') verify = v;
     if (typeof c === 'boolean') conflict = c;
+    if (typeof o === 'boolean') override = o;
   }
   if (patches.verifySemanticLlm !== undefined) verify = patches.verifySemanticLlm;
   if (patches.conflictDetectLlm !== undefined) conflict = patches.conflictDetectLlm;
+  if (patches.overrideDetectLlm !== undefined) override = patches.overrideDetectLlm;
 
   // Always re-emit the [memory] block with canonical snake_case
   // keys (per MEMORY.md §11.x). Drop any camelCase aliases that
@@ -3165,6 +3175,7 @@ const mutateMemoryConfig = (params: {
   doc.memory = {
     verify_semantic_llm: verify,
     conflict_detect_llm: conflict,
+    override_detect_llm: override,
   };
 
   const outRaw = emitTomlDoc(doc);
@@ -3194,7 +3205,7 @@ const handleGovernanceToggle = (
   if (target === null) {
     return {
       kind: 'error',
-      message: `/memory governance ${verb}: expected 'verify' | 'conflict' | 'all' (got ${args[0] !== undefined ? `'${displayGov(args[0])}'` : 'nothing'})`,
+      message: `/memory governance ${verb}: expected 'verify' | 'conflict' | 'override' | 'all' (got ${args[0] !== undefined ? `'${displayGov(args[0])}'` : 'nothing'})`,
     };
   }
   if (args.length > 1) {
@@ -3208,6 +3219,7 @@ const handleGovernanceToggle = (
   const patches: Parameters<typeof mutateMemoryConfig>[0]['patches'] = {};
   if (target.verify) patches.verifySemanticLlm = value;
   if (target.conflict) patches.conflictDetectLlm = value;
+  if (target.override) patches.overrideDetectLlm = value;
   const result = mutateMemoryConfig({ filePath, patches });
   if (!result.ok) {
     return { kind: 'error', message: `/memory governance ${verb}: ${result.reason}` };
@@ -3215,10 +3227,20 @@ const handleGovernanceToggle = (
   const fields: string[] = [];
   if (target.verify) fields.push(`memory.verify_semantic_llm = ${value}`);
   if (target.conflict) fields.push(`memory.conflict_detect_llm = ${value}`);
+  if (target.override) fields.push(`memory.override_detect_llm = ${value}`);
+  // Render the affected scope label.
+  const affected =
+    target.verify && target.conflict && target.override
+      ? 'all three detectors'
+      : target.verify
+        ? 'verify'
+        : target.conflict
+          ? 'conflict'
+          : 'override';
   return {
     kind: 'ok',
     notes: [
-      `${verb}d ${target.verify && target.conflict ? 'both detectors' : target.verify ? 'verify' : 'conflict'} in ${filePath}`,
+      `${verb}d ${affected} in ${filePath}`,
       ...fields,
       'effect applies at the next turn boundary',
     ],
