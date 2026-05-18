@@ -205,7 +205,18 @@ export const assembleMemorySection = (
   // more-specific scope is marked untrusted".
   const all = input.registry.list();
   if (all.length === 0) {
-    return { text: '', entryCount: 0, eagerLoaded: [] };
+    // Header-only render. The save-criteria + 4-type semantics +
+    // "DO NOT save" list are load-bearing on FRESH sessions —
+    // exactly the moment the model is most likely to propose a
+    // bad inferred save (no precedent to look at, no operator
+    // shadow to imitate). Pre-fix, the early-return shipped an
+    // empty string and the model saw only the tool description's
+    // one-line summary; the full taxonomy + anti-list lived
+    // behind an "only when at least one memory exists" gate that
+    // inverted the need (more memories = more orientation; zero
+    // memories = no orientation). +~250 prompt tokens accepted as
+    // the cost of consistent save guidance across all sessions.
+    return { text: MEMORY_SECTION_HEADER, entryCount: 0, eagerLoaded: [] };
   }
   // Scope-level fail-closed exclusion (S5 P0/H2-rob). Applied BEFORE
   // the per-memory peek so an unreadable scope doesn't cost N extra
@@ -267,10 +278,12 @@ export const assembleMemorySection = (
     eligible.push({ listing: l, file: peek.file });
   }
   if (eligible.length === 0) {
-    // Every memory was filtered out. Same empty-shape as a
-    // registry that never had entries — bootstrap's length-zero
-    // check passes through cleanly.
-    return { text: '', entryCount: 0, eagerLoaded: [] };
+    // Every memory was filtered out (trust / triggers / state /
+    // playbook filter dropped everything). Still emit the header
+    // so save guidance is present — same rationale as the
+    // registry-empty branch above. The eagerLoaded inventory
+    // stays empty because no entries actually shipped.
+    return { text: MEMORY_SECTION_HEADER, entryCount: 0, eagerLoaded: [] };
   }
   // Dedupe by name on the eligible list. precedence order is
   // preserved (most-specific surviving scope wins).
@@ -335,10 +348,15 @@ const toEagerExposure = (
 // memory section is appended after the base (spec §4.1: memory
 // index sits AFTER project context / AGENTS.md). When the base
 // is undefined and there are memories, the section becomes the
-// system prompt by itself. When the section is empty, the
-// existing base passes through unchanged — including `undefined`,
-// which preserves the "no prompt" semantics existing tests rely
-// on.
+// system prompt by itself. When the section is empty (caller
+// explicitly passed ""), the existing base passes through
+// unchanged — including `undefined`, preserving the "no prompt"
+// semantics. Note: assembleMemorySection NEVER returns ""
+// today; even a registry with zero entries renders the
+// MEMORY_SECTION_HEADER so the model gets save-criteria
+// guidance on fresh sessions. The empty-string branch here is
+// preserved as the contract surface for programmatic callers
+// that want to suppress the section explicitly.
 export const composeSystemPrompt = (
   basePrompt: string | undefined,
   memorySection: string,
