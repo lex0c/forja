@@ -62,6 +62,7 @@ import { migration061MemoryConflictAttempts } from './061-memory-conflict-attemp
 import { migration062MemoryGovernanceProposalsDefer } from './062-memory-governance-proposals-defer.ts';
 import { migration063MemoryEventsDeferredAction } from './063-memory-events-deferred-action.ts';
 import { migration064MemoryOverrideEvents } from './064-memory-override-events.ts';
+import { migration065MemoryVerifyOverrideAttempts } from './065-memory-verify-override-attempts.ts';
 
 export interface Migration {
   id: number;
@@ -134,4 +135,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration062MemoryGovernanceProposalsDefer,
   migration063MemoryEventsDeferredAction,
   migration064MemoryOverrideEvents,
+  migration065MemoryVerifyOverrideAttempts,
 ];

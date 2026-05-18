@@ -261,6 +261,20 @@ export type {
 } from './repos/memory-override-events.ts';
 
 export {
+  MEMORY_VERIFY_OVERRIDE_ATTEMPTS_RETENTION_MS,
+  OVERRIDE_SUGGESTED_MOTIVOS,
+  listRecentOverrideAttempts,
+  lookupRecentOverrideAttempt,
+  pruneOverrideAttempts,
+  recordOverrideAttempt,
+} from './repos/memory-verify-override-attempts.ts';
+export type {
+  MemoryVerifyOverrideAttemptRow,
+  OverrideSuggestedMotivo,
+  RecordOverrideAttemptInput,
+} from './repos/memory-verify-override-attempts.ts';
+
+export {
   createHookRun,
   listHookRunsByEvent,
   listHookRunsBySession,
