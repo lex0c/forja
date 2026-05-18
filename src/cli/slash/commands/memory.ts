@@ -2605,6 +2605,17 @@ const handleGovernanceApprove = async (
         `  ${displayGov(t.scope)}/${displayGov(t.name)}: ${t.fromState} → ${t.toState} (eviction_event ${displayGov(t.evictionEventId).slice(0, 8)})`,
       );
     }
+    // governanceDrift surfaces when the post-transition decideProposal
+    // UPDATE raced with another actor (TTL sweep, parallel decision).
+    // Memory transition still landed; the proposal row attribution
+    // does NOT credit this approve. Operator needs to see this so
+    // they don't wonder why /memory governance audit shows their
+    // approve under someone else's decided_by.
+    if (result.governanceDrift !== undefined) {
+      lines.push(
+        `  ⚠ governance row race: proposal now status=${displayGov(result.governanceDrift.currentStatus)} decided_by=${displayGov(result.governanceDrift.decidedBy ?? 'unknown')} — memory transitioned, audit row not stamped by this approve (see stderr AUDIT DRIFT)`,
+      );
+    }
     return { kind: 'ok', notes: lines };
   }
   if (result.outcome === 'not_found') {

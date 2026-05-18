@@ -158,8 +158,26 @@ export type ApplyRejectionReason =
   | 'io_error'
   | 'audit_drift';
 
+// Set on `applied` outcomes when the post-transition `decideProposal`
+// UPDATE raced with another actor (TTL sweep, concurrent operator
+// decision, etc.) and could not stamp our `decidedBy` / `decidedAt`
+// onto the row. The memory transition recorded in `transitions` DID
+// happen (it landed before this race could fire); the audit chain
+// just no longer attributes the row's terminal state to this apply.
+// AUDIT DRIFT is also emitted to stderr — operators can reconcile by
+// joining `transitions[].evictionEventId` with the proposal row.
+export interface GovernanceRowDrift {
+  // What the row reads NOW (after the race winner committed).
+  currentStatus: MemoryGovernanceProposalStatus;
+  decidedBy: string | null;
+}
+
 export type ApplyProposalResult =
-  | { outcome: 'applied'; transitions: TransitionRecord[] }
+  | {
+      outcome: 'applied';
+      transitions: TransitionRecord[];
+      governanceDrift?: GovernanceRowDrift;
+    }
   | { outcome: 'not_found'; proposalId: string }
   | {
       outcome: 'already_decided';
@@ -299,6 +317,64 @@ const rejectProposal = (
   // another writer already set status='applied' would misrepresent
   // persisted state.
   return decideProposal(db, proposalId, input);
+};
+
+// Stamp `applied` on the proposal row and produce the apply-path
+// success result, honoring concurrent decisions. `decideProposal`
+// returns false when the row is no longer pending — TTL expiry, a
+// racing reject, or a parallel apply path. The memory transition
+// recorded in `transitions` already landed (this helper runs AFTER
+// `transitionMemoryState` returned 'applied'); we cannot undo it.
+//
+// On race: re-read the row to capture who/what won, emit AUDIT DRIFT
+// to stderr with the proposal id + memory key so operators can
+// reconcile, and surface the actual row state via `governanceDrift`
+// on the result. Callers that ignore drift see backward-compatible
+// `outcome: 'applied'` plus transitions; callers that surface drift
+// (slash commands, /memory governance audit) can flag the apply as
+// having an unattributed governance row.
+const settleApplied = (
+  db: DB,
+  proposalId: string,
+  decidedBy: string,
+  decidedReason: string | undefined,
+  nowMs: number,
+  transitions: TransitionRecord[],
+  proposalKindLabel: string,
+): ApplyProposalResult => {
+  const input: DecideProposalInput = {
+    status: 'applied',
+    decidedBy,
+    ...(decidedReason !== undefined ? { decidedReason } : {}),
+    decidedAt: nowMs,
+  };
+  const persisted = decideProposal(db, proposalId, input);
+  if (persisted) {
+    return { outcome: 'applied', transitions };
+  }
+  const latest = getProposalById(db, proposalId);
+  const targetSummary =
+    transitions.length > 0
+      ? transitions.map((t) => `${t.scope}/${t.name} ${t.fromState}→${t.toState}`).join(', ')
+      : '<no transitions>';
+  process.stderr.write(
+    `memory: AUDIT DRIFT: proposal ${proposalId} (${proposalKindLabel}): ${targetSummary} landed but post-apply decideProposal raced — row now status=${latest?.status ?? '<missing>'} decided_by=${latest?.decidedBy ?? '<null>'}; manual reconciliation may be needed (join transitions[].evictionEventId with the proposal row)\n`,
+  );
+  if (latest === null) {
+    // Row vanished entirely. Shouldn't happen for governance proposals
+    // (no DELETE surface) but surface a sentinel rather than silently
+    // claiming clean apply.
+    return {
+      outcome: 'applied',
+      transitions,
+      governanceDrift: { currentStatus: 'expired', decidedBy: null },
+    };
+  }
+  return {
+    outcome: 'applied',
+    transitions,
+    governanceDrift: { currentStatus: latest.status, decidedBy: latest.decidedBy },
+  };
 };
 
 // Build an apply-path rejection result, honoring concurrent decisions:
@@ -639,15 +715,13 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
         },
       );
     }
-    decideProposal(db, proposalId, {
-      status: 'applied',
-      decidedBy: input.decidedBy,
-      ...(input.decidedReason !== undefined ? { decidedReason: input.decidedReason } : {}),
-      decidedAt: nowMs,
-    });
-    return {
-      outcome: 'applied',
-      transitions: [
+    return settleApplied(
+      db,
+      proposalId,
+      input.decidedBy,
+      input.decidedReason ?? undefined,
+      nowMs,
+      [
         {
           scope: sourceKey.scope,
           name: sourceKey.name,
@@ -656,7 +730,8 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
           evictionEventId: transitionResult.evictionEventId,
         },
       ],
-    };
+      `${proposal.kind} of ${sourceKey.scope}/${sourceKey.name}`,
+    );
   }
 
   // Non-applied paths — proposal rejected with a reason that
@@ -762,15 +837,13 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
   process.stderr.write(
     `memory: AUDIT DRIFT: proposal ${proposalId} (${proposal.kind} of ${sourceKey.scope}/${sourceKey.name}): on-disk transition ${transitionResult.fromState} → ${transitionResult.toState} completed but eviction_events row did NOT land; manual reconciliation may be needed (${transitionResult.reason})\n`,
   );
-  decideProposal(db, proposalId, {
-    status: 'applied',
-    decidedBy: input.decidedBy,
-    decidedReason: `audit_drift: transition completed on disk; eviction_events row missing — manual reconciliation may be needed (${transitionResult.reason})`,
-    decidedAt: nowMs,
-  });
-  return {
-    outcome: 'applied',
-    transitions: [
+  return settleApplied(
+    db,
+    proposalId,
+    input.decidedBy,
+    `audit_drift: transition completed on disk; eviction_events row missing — manual reconciliation may be needed (${transitionResult.reason})`,
+    nowMs,
+    [
       {
         scope: sourceKey.scope,
         name: sourceKey.name,
@@ -782,5 +855,6 @@ export const applyProposal = async (input: ApplyProposalInput): Promise<ApplyPro
         evictionEventId: `audit-drift:${proposalId}`,
       },
     ],
-  };
+    `${proposal.kind} of ${sourceKey.scope}/${sourceKey.name}`,
+  );
 };

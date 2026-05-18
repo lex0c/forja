@@ -1262,7 +1262,12 @@ describe('applyProposal — audit_drift posture (F5)', () => {
     // (decide as applied, not rejected) is documented by the
     // governance.ts comment; pin via grep that the comment exists.
     const govSrc = readFileSync('src/memory/governance.ts', 'utf-8');
-    expect(govSrc).toContain('decideProposal(db, proposalId, {');
+    // The audit_drift branch delegates the proposal stamp to
+    // `settleApplied` (shared helper that also handles the
+    // decideProposal-raced concurrent-decision case). Pin that the
+    // helper is invoked here so a future refactor that loses the
+    // audit_drift→applied posture trips this assertion.
+    expect(govSrc).toContain('settleApplied(');
     expect(govSrc).toContain("status: 'applied'");
     expect(govSrc).toContain('audit-drift:');
     expect(govSrc).toMatch(/AUDIT DRIFT.*proposal/);
@@ -1274,6 +1279,78 @@ describe('applyProposal — audit_drift posture (F5)', () => {
       decidedBy: 'operator:test',
     });
     expect(result.outcome).toBe('applied');
+  });
+
+  test('decideProposal race after applied transition surfaces governanceDrift, not silent applied', async () => {
+    // Concurrent-decision race (post-review finding): another actor
+    // (TTL sweep, parallel reject) flips the proposal status between
+    // the existence-gate check and applyProposal's final
+    // decideProposal stamp. Pre-fix, the stamp UPDATE silently
+    // returned false and applyProposal still returned outcome:
+    // 'applied' — caller thinks the row credits them, but the row
+    // actually says expired/rejected/applied-by-X. The audit chain
+    // is decoupled from the apply.
+    //
+    // Post-fix: the row IS reloaded after the failed UPDATE; the
+    // current status surfaces via `governanceDrift` on the result;
+    // AUDIT DRIFT lands in stderr; transitions[] still reflects the
+    // memory mutation that DID happen.
+    //
+    // Simulation trick: applyProposal threads `fireHook` into
+    // transitionMemoryState. The Eviction hook fires AFTER the row
+    // existence gate but BEFORE applyProposal's final decideProposal
+    // — giving us a deterministic seam to mutate the proposal row
+    // mid-apply without race timing tricks.
+    const roots = makeRoots();
+    seedActiveMemory(roots.projectLocal, 'foo');
+    const registry = baseRegistry();
+    const hash = computeSnapshotHash(roots.projectLocal, 'foo');
+    const p = recordProposal(db, {
+      sessionId,
+      kind: 'quarantine',
+      sourceMemoryKeys: [{ scope: 'project_local', name: 'foo' }],
+      sourceMemorySnapshots: [{ scope: 'project_local', name: 'foo', contentHash: hash }],
+      evidence: { claim: 'x' },
+      proposedBy: 'subagent:test',
+      confidence: 0.9,
+    });
+    // The hook fires inside transitionMemoryState after the
+    // protection gate passes but before the file rewrite + audit
+    // pair. Flip the proposal to 'expired' here so the post-apply
+    // decideProposal UPDATE is racing against a terminal row.
+    const fireHook = async (_payload: HookEventPayload): Promise<HookChainResult | null> => {
+      db.query(
+        "UPDATE memory_governance_proposals SET status = 'expired', decided_by = 'system:ttl', decided_at = ? WHERE id = ?",
+      ).run(Date.now(), p.id);
+      // Allow the transition to continue — the test pins the
+      // applied-with-drift path, not the hook-block path.
+      return null;
+    };
+    const result = await applyProposal({
+      db,
+      registry,
+      proposalId: p.id,
+      decidedBy: 'operator:test',
+      sessionId, // required for transitionMemoryState's hook fire
+      fireHook,
+    });
+    // The transition landed on disk + audit pair → outcome=applied.
+    expect(result.outcome).toBe('applied');
+    if (result.outcome === 'applied') {
+      expect(result.transitions).toHaveLength(1);
+      expect(result.transitions[0]?.toState).toBe('quarantined');
+      // governanceDrift surfaces the actual row state — the hook's
+      // expired stamp won, our applied stamp lost.
+      expect(result.governanceDrift).toBeDefined();
+      expect(result.governanceDrift?.currentStatus).toBe('expired');
+      expect(result.governanceDrift?.decidedBy).toBe('system:ttl');
+    }
+    // Row state on disk: governance.proposals.status === 'expired'
+    // (not 'applied'); the apply path did NOT overwrite the racing
+    // actor's terminal stamp.
+    const row = getProposalById(db, p.id);
+    expect(row?.status).toBe('expired');
+    expect(row?.decidedBy).toBe('system:ttl');
   });
 
   // Use appendEvictionEvent so the test compile keeps the import live
