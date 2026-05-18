@@ -77,13 +77,18 @@ export interface SemanticVerifySchedulerDeps {
   provider: Provider;
   parentToolRegistry: ToolRegistry;
   permissionEngine: PermissionEngine;
-  // Parent-runtime context forwarded into each dispatch (F9). See
-  // dispatcher.ts:DispatchSemanticVerifyInput for the rationale on
-  // each field.
+  // Parent-runtime context forwarded into each dispatch (F9 + R1).
+  // See dispatcher.ts:DispatchSemanticVerifyInput for the rationale
+  // on each field. `signal` is the HARD abort (Ctrl-C×2 +
+  // wall-clock); `softStopSignal` is COOPERATIVE.
+  signal?: AbortSignal;
   softStopSignal?: AbortSignal;
   cwdTrusted?: boolean;
   hooksSnapshot?: readonly HookSpec[];
   effectiveCapabilities?: readonly string[];
+  // R6 — see dispatcher.ts:DispatchSemanticVerifyInput.
+  planMode?: boolean;
+  spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
   // Test seam — replaces runSubagent inside the dispatcher.
   spawnSubagentFn?: typeof import('../subagents/runtime.ts').runSubagent;
   // Test seam — clock override.
@@ -330,9 +335,10 @@ export const createSemanticVerifyScheduler = (
           // posture documented in F2 (excluded scopes never reach
           // this point anyway — the scheduler filtered upstream).
           registry: deps.registry,
-          // Forward parent-runtime context (F9). The scheduler is
-          // the place where these values are reachable; dispatcher
+          // Forward parent-runtime context (F9 + R1). The scheduler
+          // is the place where these values are reachable; dispatcher
           // is per-call.
+          ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
           ...(deps.softStopSignal !== undefined ? { softStopSignal: deps.softStopSignal } : {}),
           ...(deps.cwdTrusted !== undefined ? { cwdTrusted: deps.cwdTrusted } : {}),
           // sharedScopeOffline mirrors memoryExcludeScopes — the
@@ -343,6 +349,10 @@ export const createSemanticVerifyScheduler = (
           ...(deps.hooksSnapshot !== undefined ? { hooksSnapshot: deps.hooksSnapshot } : {}),
           ...(deps.effectiveCapabilities !== undefined
             ? { effectiveCapabilities: deps.effectiveCapabilities }
+            : {}),
+          ...(deps.planMode === true ? { planMode: true } : {}),
+          ...(deps.spawnChildProcess !== undefined
+            ? { spawnChildProcess: deps.spawnChildProcess }
             : {}),
           ...(deps.spawnSubagentFn !== undefined ? { spawnSubagentFn: deps.spawnSubagentFn } : {}),
           now: nowFn,

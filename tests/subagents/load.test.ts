@@ -1315,6 +1315,86 @@ describe('loadSubagents (directory discovery)', () => {
 
 // ── post-S11 review (F1 + F7): built-in scope loading ────────────
 
+describe('playbook surface — capabilities (R2)', () => {
+  // The capabilities frontmatter field lets a playbook author declare
+  // its PERMISSION_ENGINE §10.1 ask. The loader validates each entry
+  // via parseCapability and rejects malformed ones at load time
+  // (source-aware error) rather than letting them surface as a
+  // confusing `subagent_escalation` envelope mid-run. Absence ⇒
+  // legacy behavior (parent's full envelope verbatim). Empty array
+  // is meaningful: pure-LLM run.
+
+  const withCaps = (yaml: string) => `---
+name: t
+description: t
+tools: [read_file]
+budget:
+  max_steps: 5
+  max_cost_usd: 0.1
+${yaml}
+---
+body`;
+
+  test('absent ⇒ undefined (legacy fallback)', () => {
+    const def = loadSubagentFromString(VALID, 'user', '/fake/t.md');
+    expect(def.capabilities).toBeUndefined();
+  });
+
+  test('empty array ⇒ [] (pure-LLM, distinct from absent)', () => {
+    const def = loadSubagentFromString(withCaps('capabilities: []'), 'user', '/fake/t.md');
+    expect(def.capabilities).toEqual([]);
+  });
+
+  test('canonical entries round-trip through parse + format', () => {
+    const def = loadSubagentFromString(
+      withCaps('capabilities:\n  - read-fs:src/**\n  - exec:shell'),
+      'user',
+      '/fake/t.md',
+    );
+    expect(def.capabilities).toEqual(['read-fs:src/**', 'exec:shell']);
+  });
+
+  test('rejects non-array', () => {
+    expect(() =>
+      loadSubagentFromString(withCaps("capabilities: 'read-fs:**'"), 'user', '/f.md'),
+    ).toThrow(/'capabilities' must be an array/);
+  });
+
+  test('rejects non-string entry', () => {
+    expect(() => loadSubagentFromString(withCaps('capabilities: [42]'), 'user', '/f.md')).toThrow(
+      /'capabilities\[0\]' must be a string/,
+    );
+  });
+
+  test('rejects empty entry', () => {
+    expect(() => loadSubagentFromString(withCaps('capabilities: [""]'), 'user', '/f.md')).toThrow(
+      /'capabilities\[0\]' must be a non-empty/,
+    );
+  });
+
+  test('rejects whitespace-padded entry', () => {
+    expect(() =>
+      loadSubagentFromString(withCaps('capabilities: ["read-fs:** "]'), 'user', '/f.md'),
+    ).toThrow(/leading or trailing whitespace/);
+  });
+
+  test('rejects malformed capability', () => {
+    expect(() =>
+      loadSubagentFromString(withCaps('capabilities: ["bogus-kind:x"]'), 'user', '/f.md'),
+    ).toThrow(/not a valid capability/);
+  });
+
+  test('rejects duplicate canonical form', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withCaps('capabilities:\n  - read-fs:src/**\n  - read-fs:src/**'),
+        'user',
+        '/f.md',
+      ),
+    ).toThrow(/'capabilities' lists 'read-fs:src\/\*\*' twice/);
+  });
+});
+
 describe('loadSubagents (S11 builtin scope)', () => {
   test('verify-semantic builtin loads from the real ship dir', () => {
     // Uses the production BUILTIN_AGENTS_DIR. Pinned to catch
@@ -1335,6 +1415,12 @@ describe('loadSubagents (S11 builtin scope)', () => {
     // that strips either should fail this test.
     expect(def?.systemPrompt).toContain('adversarial');
     expect(def?.systemPrompt).toContain('Phantom citations');
+    // R2: verify-semantic declares `capabilities: []` (pure-LLM).
+    // The runtime intersects against the parent's envelope and
+    // seals an empty effective set into the audit row. A refactor
+    // that drops the declaration would silently re-grant the
+    // parent's full envelope.
+    expect(def?.capabilities).toEqual([]);
   });
 
   test('builtinDir=null disables the scope entirely', () => {

@@ -90,6 +90,46 @@ const buildDeps = (tool: Tool, policyOverrides: Partial<Policy> = {}) => {
 };
 
 describe('invokeTool', () => {
+  // R3 — migration 058 wires `parent_approval_id` end-to-end.
+  // `invoke-tool` populates `ctx.approvalId` from the allow approval
+  // row before calling `tool.execute`. Tools that spawn subagents
+  // (`task` family) forward it via SpawnSubagentArgs into
+  // `subagent_runs.parent_approval_id`. Test pins the populate step:
+  // the executing tool sees `ctx.approvalId` matching the approval
+  // row id in the database.
+  test('R3 e2e: ctx.approvalId populated from the allow approval row id', async () => {
+    let observedApprovalId: string | undefined;
+    const capturingTool: Tool = {
+      name: 'capture',
+      description: 'captures ctx.approvalId',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute(_args, ctx) {
+        observedApprovalId = ctx.approvalId;
+        return { ok: true };
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(capturingTool);
+    const deps = {
+      db,
+      registry,
+      engine: createPermissionEngine(policy({}), { cwd: '/p' }),
+      ctx: makeCtx({ cwd: '/p' }),
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'capture', args: {}, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(observedApprovalId).toBeDefined();
+    // The captured id is the exact approval row id from the DB.
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.decision).toBe('allow');
+    expect(observedApprovalId).toBe(approvals[0]?.id);
+  });
+
   test('happy path: allow → execute → done', async () => {
     const deps = buildDeps(okTool, {
       tools: { write_file: { allow_paths: ['**'] } },

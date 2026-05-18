@@ -675,6 +675,77 @@ describe('dispatchSemanticVerify — F9 context threading', () => {
     expect(captured?.hooksSnapshot).toEqual([]);
     expect(captured?.effectiveCapabilities).toEqual(['fs.read']);
   });
+
+  // ── R1: hard signal + IPC enable ────────────────────────────────────
+  // Pre-fix the dispatcher accepted only `softStopSignal`; the hard
+  // abort (Ctrl-C×2 + harness wall-clock) was unreachable inside the
+  // verify spawn, so a Ctrl-C-twice from the operator hung the loop
+  // until the subagent's own 10-min budget self-killed. Also pre-fix
+  // the spawn omitted `ipc: true`, leaving the soft-interrupt path
+  // dead code inside waitForChild. Both regressions silently
+  // degraded operator responsiveness. These tests pin the wire.
+
+  test('R1: signal reaches spawn args when supplied', async () => {
+    let captured: Record<string, unknown> | undefined;
+    const captureSpawn = (async (input: Record<string, unknown>) => {
+      captured = input;
+      return makeResult();
+    }) as never;
+    const hardAbort = new AbortController();
+    await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('claim') },
+      signal: hardAbort.signal,
+      spawnSubagentFn: captureSpawn,
+    });
+    expect(captured?.signal).toBe(hardAbort.signal);
+  });
+
+  test('R1: ipc: true is always set so soft-interrupt branch is live', async () => {
+    let captured: Record<string, unknown> | undefined;
+    const captureSpawn = (async (input: Record<string, unknown>) => {
+      captured = input;
+      return makeResult();
+    }) as never;
+    await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('claim') },
+      spawnSubagentFn: captureSpawn,
+    });
+    expect(captured?.ipc).toBe(true);
+  });
+
+  test('R1: signal omitted when caller omits', async () => {
+    let captured: Record<string, unknown> | undefined;
+    const captureSpawn = (async (input: Record<string, unknown>) => {
+      captured = input;
+      return makeResult();
+    }) as never;
+    await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('claim') },
+      spawnSubagentFn: captureSpawn,
+    });
+    expect(captured?.signal).toBeUndefined();
+  });
 });
 
 // Type pin (avoids unused-import lint on ScopeRoots) — ScopeRoots is

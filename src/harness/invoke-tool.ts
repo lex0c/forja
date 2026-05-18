@@ -350,7 +350,7 @@ export const invokeTool = async (
     // The post-transaction code awaits confirmPermission and then
     // commits a second transaction with the approval + start/finish.
     | { phase: 'confirm_pending'; toolCall: { id: string }; prompt: string }
-    | { phase: 'started'; toolCall: { id: string } };
+    | { phase: 'started'; toolCall: { id: string }; approvalId: string };
 
   const setup = withTransaction(deps.db, (): Setup => {
     const toolCall = createToolCall(deps.db, {
@@ -420,7 +420,7 @@ export const invokeTool = async (
     }
 
     // allow
-    recordApproval(deps.db, {
+    const approval = recordApproval(deps.db, {
       toolCallId: toolCall.id,
       decision: 'allow',
       decidedBy: 'policy',
@@ -435,7 +435,7 @@ export const invokeTool = async (
     // (matches the comment in tool-calls.ts:90). Deferring keeps
     // the lifecycle: pending → denied (hook-blocked) OR
     // pending → running → done/error (normal completion).
-    return { phase: 'started', toolCall };
+    return { phase: 'started', toolCall, approvalId: approval.id };
   });
 
   if (setup.phase === 'denied') {
@@ -721,9 +721,15 @@ export const invokeTool = async (
   // consume `ctx.sandboxProfile` to wrap argv via `buildBwrapArgv`.
   // Skipped (undefined) when the planner didn't run for this call —
   // legacy callers / misc category / pre-planner refusals.
+  // Migration 058: thread approval id into the ctx so spawning tools
+  // (task family) can populate subagent_runs.parent_approval_id and
+  // keep the audit chain one-hop. `setup.phase` is 'started' here by
+  // exhaustive elimination above; TS narrows accordingly.
+  const approvalIdForCtx = setup.phase === 'started' ? setup.approvalId : undefined;
   const ctxForExecute: ToolContext = {
     ...deps.ctx,
     toolCallId: toolCall.id,
+    ...(approvalIdForCtx !== undefined ? { approvalId: approvalIdForCtx } : {}),
     ...(decision.sandboxProfile !== undefined ? { sandboxProfile: decision.sandboxProfile } : {}),
   };
 

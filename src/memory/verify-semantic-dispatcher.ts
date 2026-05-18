@@ -82,8 +82,16 @@ export interface DispatchSemanticVerifyInput {
   // Tests omit when the in-process snapshot is the source of truth.
   registry?: MemoryRegistry;
   // Parent-runtime context forwarded into runSubagent so the verify
-  // subagent inherits the right operating envelope (S11 review F9):
-  //   - softStopSignal: operator Ctrl-C reaches the child mid-spawn
+  // subagent inherits the right operating envelope (S11 review F9 +
+  // round-2 R1):
+  //   - signal: HARD abort (Ctrl-C×2 + wall-clock). Without this the
+  //     verify dispatch hangs until the subagent's own 10-min budget
+  //     expires; loop.ts's outer finally cannot run. Symmetric with
+  //     the task-tool spawn path (loop.ts:1516).
+  //   - softStopSignal: COOPERATIVE Ctrl-C. Effective only when IPC
+  //     is open (`ipc: true` below) — without IPC the soft branch is
+  //     dead code (handle.ipc?.send is no-op) and only the 5s grace
+  //     escalation eventually delivers SIGTERM.
   //   - cwdTrusted: trust-gated tools (memory_write inferred path)
   //     don't fail closed silently
   //   - sharedScopeOffline: S5 fail-closed posture mirrors into the
@@ -92,11 +100,25 @@ export interface DispatchSemanticVerifyInput {
   //     (no disk re-resolve drift window)
   //   - effectiveCapabilities: PERMISSION_ENGINE §10.1 envelope
   //     sealed into the child's audit row + gate
+  signal?: AbortSignal;
   softStopSignal?: AbortSignal;
   cwdTrusted?: boolean;
   sharedScopeOffline?: boolean;
   hooksSnapshot?: readonly HookSpec[];
   effectiveCapabilities?: readonly string[];
+  // R6 — forward parent's plan-mode posture so a future
+  // verify-semantic.md edit that widens the tool whitelist
+  // (e.g., adding `bash` for repo inspection) doesn't bypass
+  // plan-mode write refusal via the verify path. Today's
+  // whitelist is all read-only; defense-in-depth.
+  planMode?: boolean;
+  // R6 — forward the parent's spawnChildProcess test seam so
+  // verify dispatches in test environments hit the same fake
+  // subprocess as task-tool spawns. Without this, tests that
+  // wire a fake `spawnChildProcess` see verify dispatch hit
+  // the real `Bun.spawn` — surprising and a source of flaky
+  // CI runs.
+  spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
   // Test seam — replaces runSubagent. Production callers omit; tests
   // inject a fake that resolves a `RunSubagentResult` synchronously
   // without spawning a subprocess.
@@ -294,12 +316,21 @@ export const dispatchSemanticVerify = async (
       permissionEngine: input.permissionEngine,
       db,
       cwd: input.cwd,
+      // R1: open the IPC channel so softStopSignal can actually
+      // deliver `interrupt:soft`. Without this the cooperative
+      // branch in waitForChild is dead code (handle.ipc?.send
+      // resolves to undefined) and the only kill path left is the
+      // 5s grace escalation to SIGTERM. Setting `ipc: true`
+      // matches the task-tool path's default for spawns that need
+      // to be cancellable from the parent.
+      ipc: true,
       // Forward the parent's operating envelope so the verify child
       // inherits Ctrl-C interrupt, cwd-trust, shared-scope posture,
       // hooks snapshot, and effective capabilities — closes the
       // drift window where the child runs under defaults instead of
       // the parent's resolved verdicts. See F9 in BACKLOG entry for
       // the review-driven rationale.
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
       ...(input.softStopSignal !== undefined ? { softStopSignal: input.softStopSignal } : {}),
       ...(input.cwdTrusted !== undefined ? { cwdTrusted: input.cwdTrusted } : {}),
       ...(input.sharedScopeOffline !== undefined
@@ -308,6 +339,10 @@ export const dispatchSemanticVerify = async (
       ...(input.hooksSnapshot !== undefined ? { hooksSnapshot: input.hooksSnapshot } : {}),
       ...(input.effectiveCapabilities !== undefined
         ? { effectiveCapabilities: input.effectiveCapabilities }
+        : {}),
+      ...(input.planMode === true ? { planMode: true } : {}),
+      ...(input.spawnChildProcess !== undefined
+        ? { spawnChildProcess: input.spawnChildProcess }
         : {}),
     });
   } catch (err) {
@@ -376,7 +411,21 @@ export const dispatchSemanticVerify = async (
         bogusPaths.push(`${p} (escapes cwd)`);
         continue;
       }
-      if (!existsSync(resolved)) {
+      // R6 — existsSync can throw on EACCES / ELOOP / EMFILE; the
+      // dispatcher's outer catch would surface that as
+      // `verify_semantic_dispatch_failed` and skip the attempt-
+      // row INSERT, silently disabling dedup for this memory.
+      // Treat throws as "not found" — the operator-visible signal
+      // is the same (the verdict was contradicted-but-malformed),
+      // and the dedup cache still lands so the next dispatch
+      // short-circuits.
+      let exists: boolean;
+      try {
+        exists = existsSync(resolved);
+      } catch {
+        exists = false;
+      }
+      if (!exists) {
         bogusPaths.push(`${p} (not found)`);
       }
     }

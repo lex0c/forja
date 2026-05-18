@@ -2,6 +2,74 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-17] hardening(harness+subagents) — loop ↔ subagent flow review pass (R1–R7)
+
+Third multi-reviewer pass on `feat/memory-governance-llm`, this time focused on the harness loop ↔ subagent runtime boundary (not S11 specifically). Three parallel agents (correctness/robustness, spec/architecture, test quality) surfaced 7 CRIT, 10 HIGH, ~15 MED, ~12 LOW findings clustered in 8 themes. All criticals + highs + actionable meds closed in this pass; remaining items deferred with explicit notes in `docs/TODO.md`.
+
+**Critical fixes:**
+
+- **R1 — hard signal threading + IPC enable for verify dispatch.** Pre-fix the dispatcher accepted only `softStopSignal`; the harness's combined hard abort (Ctrl-C×2 + wall-clock) was unreachable. Ctrl-C-twice during poll hung the loop until the verify subagent's own 10-min wall-clock self-killed. ALSO pre-fix the spawn omitted `ipc: true`, leaving the cooperative interrupt branch in `waitForChild` as dead code (`handle.ipc?.send` was no-op). Symmetric with the task-tool spawn path (loop.ts:1516) which already wired both. Now: `signal` and `ipc: true` thread through `SemanticVerifySchedulerDeps` → `DispatchSemanticVerifyInput` → `runSubagent`.
+
+- **R2 — capability sealing for verify child.** The most-grave finding. R2's first round threaded `effectiveCapabilities()` into the verify spawn, but what got passed was the parent's FULL envelope verbatim — `verify-semantic.md` had no `capabilities` frontmatter field and the loader didn't expose one, so the audit row recorded "verify child ran under parent's full envelope" when the operator's intent was a read-only fact-checker. Exactly the gap migration 040 closed, reintroduced through the scheduler path. Today's blast radius was bounded by the read-only tools whitelist, but a future tools-widening would have silently inherited the full envelope. Now: `SubagentDefinition.capabilities?: string[]` added to types + loader (with full parseCapability round-trip validation), `verify-semantic.md` declares `capabilities: []` (pure-LLM — the spec-prescribed shape for read-only fact-checkers), and the scheduler creation site uses `intersectCapabilities(parent, declared)` mirroring the task-tool path. Loader test bundle (+8) pins parse/reject behavior; load.test.ts pin re-pins `verify-semantic.md` declares `capabilities: []` so a regression that strips it would fail.
+
+- **R3 — migrations 058 (scope='builtin' + parent_approval_id).** Two distinct audit-chain gaps fixed in one table rebuild.
+  - **Scope CHECK widening.** The `subagent_runs.scope` CHECK admitted only `('user','project')`; every builtin spawn was mapped to `'user'` via a runtime hack (`runtime.ts:543`) — forensic queries that filter "shipped vs. operator-authored" returned the same scope for both, contradicting AUDIT.md §0 ("substrato de audit nunca muta retroativamente"). Migration 058 rebuilds the table with `('user','project','builtin')`; the runtime mapping is removed and `definition.scope` lands directly. Pre-058 sessions are unrecoverable (recorded `'user'`), but new dispatches are honest.
+  - **`parent_approval_id` FK column.** PERMISSION_ENGINE.md §10.2 prescribes a one-hop FK from `subagent_runs` back to the `approvals` row that authorized the spawn. Pre-058 the chain was multi-hop via `messages.tool_call_id` → `tool_calls.id` → `approvals.tool_call_id`, fragile under retention sweeps. Migration 058 adds `parent_approval_id TEXT REFERENCES approvals(id) ON DELETE SET NULL`; wired end-to-end through `ToolContext.approvalId` (populated in `invoke-tool.ts` after the allow approval lands) → `SpawnSubagentArgs.parentApprovalId` → `runSubagent.parentApprovalId` → `insertSubagentRun.parentApprovalId`. Verify-scheduler dispatches intentionally bypass this chain (no `tool_call` exists for them); documented in MEMORY.md as an intentional dual-chain with forensics via `memory_verify_attempts.subagent_run_session_id`. A future amendment may land a synthetic approval row (requires `approvals.decided_by` CHECK widening — separate migration).
+  - **FK preservation during table rebuild.** `migrate.ts` wraps each migration in a transaction; SQLite ignores `PRAGMA foreign_keys=OFF` inside one (silent no-op per docs). So the rebuild's `DROP TABLE subagent_runs` fired `ON DELETE SET NULL` on `memory_verify_attempts.subagent_run_session_id` for every referring row — silently severing the forensic chain from the dedup cache to the audit row that the migration was supposed to STRENGTHEN. Caught via a manual smoke test before commit. Migration now snapshots the (mva.id, mva.subagent_run_session_id) tuples into a TEMP table BEFORE the drop and restores them via UPDATE after the rename. New `tests/storage/migrate.test.ts` test pins both halves (FK link preserved + `PRAGMA foreign_key_check` empty).
+
+**High fixes:**
+
+- **R4 — IPC `cost_update` payload validation.** `IPC.md §7` ("mensagens do filho NÃO são confiáveis") demanded boundary validation; the parent's reservation tracker + cap watchdog were consuming `delta`/`cumulative` with `typeof number` only. A malformed child could trip cancelAll or grow the reservation silently. Now rejects non-finite values and negatives at the boundary (loop.ts:1424); rejected updates stderr-log with the offending values for forensics.
+
+- **R4 — `console.error` → `process.stderr.write` in cost-progress persist catch.** `console.error` violates the hard rule "stdout is pure, stderr is for logs" from CLAUDE.md — Bun sometimes routes it to stdout under specific conditions. Routed explicitly to `process.stderr.write` to keep `--json` NDJSON stdout clean.
+
+- **R6 — runtime defense for `--memory-verify-llm` in subagent context.** `parseArgs` already refuses the combination at boot (F12), but a programmatic caller / future code path that constructs `HarnessConfig` directly could still set the flag with `subagentDepth > 0`. Pre-fix the scheduler block silently skipped construction; now stderr-logs `verify_semantic_disabled: cannot run inside a subagent context` so the misconfiguration surfaces.
+
+- **R6 — scheduler creation guard on `memoryRegistry !== undefined`.** Pre-fix the cast `as MemoryRegistry` would land `undefined` into the scheduler; every poll TypeError'd on `registry.peek(...)` and the outer catch swallowed it silently each step. Now refuses construction loudly when registry is missing — mirror of the verify-def absent path.
+
+- **R6 — `cleanupOnFail` surfaces non-clean cleanup outcomes.** Pre-fix `cleanupWorktree(...).catch(() => undefined)` swallowed both success and failure. A cleanup that removed the worktree dir but failed on `git branch -D <agent>` left a stale branch with no logged signal — the operator's branch list grew silently. Now the catch logs to stderr with the failure message; the throw is still swallowed (cleanup remains best-effort) but the breadcrumb is preserved.
+
+- **R6 — forward `planMode` + `spawnChildProcess` test seam to verify scheduler.** Asymmetric with the task-tool spawn path (loop.ts:1535-1558). For `planMode`: today's `verify-semantic.md` whitelist is all read-only so the gap isn't disparable, but a future widening would silently bypass plan-mode write refusal via the verify path. For `spawnChildProcess`: tests wiring a fake subprocess factory saw verify dispatches hit real `Bun.spawn`, a source of CI flakiness. Both threaded through the scheduler + dispatcher + into `runSubagent`.
+
+**Med fixes:**
+
+- **R5 — `recordProvenance` per-row independence pinned.** Existing test covered ONE bad scope not aborting the run; new test pins the stronger invariant: `(good, bad, good)` triple — both goods land even though the middle one throws. A refactor moving the try/catch outside the for-of loop would silently break the backfill on first error; the new test fails immediately.
+
+- **R6 — `existsSync` try/catch in evidence path guard.** `existsSync` can throw on EACCES/ELOOP/EMFILE; the dispatcher's outer catch would have surfaced that as `verify_semantic_dispatch_failed` and skipped the attempt-row INSERT, silently disabling dedup for the affected memory. Now caught locally and treated as "not found" — the verdict still rolls up as contradicted-but-malformed and the cache lands for next-time short-circuit.
+
+**Test footprint:** +16 tests across 5 files.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+3): R1 signal threading (present / absent / IPC always-true).
+- `tests/subagents/load.test.ts` (+8): R2 capabilities loader (absent vs `[]` vs canonical vs reject paths × 6 + verify-semantic.md pin).
+- `tests/storage/subagent-runs.test.ts` (+3): R3 migration 058 widened scope + parentApprovalId round-trip + omitted-id NULL.
+- `tests/storage/migrate.test.ts` (+1): R3 FK preservation through the migration 058 table rebuild (snapshot + restore proves the chain survives DROP TABLE under FK ON).
+- `tests/harness/invoke-tool.test.ts` (+1): R3 e2e — `ctx.approvalId` populated from the allow approval row id at execute time.
+- `tests/tools/task.test.ts` (+2): R3 e2e — `ctx.approvalId` forwarded as `SpawnSubagentArgs.parentApprovalId`; absent-id omitted.
+- `tests/harness/loop.test.ts` (+1): R5 recordProvenance per-row independence (sandwich pattern).
+- `tests/tools/_helpers.ts`: makeCtx now forwards `approvalId` override.
+
+Full suite: **8519 pass / 0 fail / 10 skip** (+20 vs. second-hardening baseline of 8499).
+
+**Falsely-positive review findings (documented):**
+
+- "Hard-abort signal not threaded" (A-CRIT-1) ⇒ confirmed; closed by R1.
+- "Scheduler poll throws caught but in-flight state inconsistent" (A-HIGH-3) ⇒ confirmed at the registry-missing path; closed by R6 (loud refusal at construction time).
+- "Loop skips effective-capabilities derivation in subagent context" (HIGH-1 spec) ⇒ confirmed silent; closed by R6 stderr.
+- "Audit row records scope='user' for builtin" (B-CRIT-2) ⇒ confirmed; closed by R3 migration 058.
+- "`subagent_runs` lacks `parent_approval_id`" (B-HIGH-4) ⇒ confirmed; closed by R3 migration 058.
+- "Verify spawns bypass approval-chain" (B-HIGH-6) ⇒ confirmed; intentionally documented as bypass in MEMORY.md §11.x (forensics via `memory_verify_attempts.subagent_run_session_id`).
+- "wallClockTimer leak on guardedFinish throw" (A-HIGH-2) ⇒ self-demoted by reviewer during pass — `clearTimeout` is first line of `finish()`.
+
+**Deferred (tracked):**
+
+- **NaN/Infinity child cost guard test** (C-HIGH-1). The guard at loop.ts:1648 exists and is correct; pinning it via test requires either runtime injection of a fake child terminal envelope (deep wiring) or extraction of the guard into a testable surface. Deferred — guard is small, defense-in-depth, and any future refactor would have to consciously remove it.
+- **`dispatchChain` sync-throw in `dispatchHooks` catch** (C-HIGH-4). The catch correctly returns `null` (fail-open per CONTRACTS.md §10 line 1057); pinning requires a mock dispatcher that sync-throws. Low risk because `dispatchChain` is async and the implementation surface is small.
+- **Critique-aborted `recordCritiqueRun` persistence assert** (C-HIGH-5). The catch + recordCritiqueRun-before-rethrow pattern is in place; pinning requires a fake critique provider that aborts mid-stream.
+- **Scheduler wire-up 4 branches end-to-end** (C-CRIT-1, carry-over from second hardening). Two branches are now covered by R5 + new construction tests; the 4 named branches (missing-def / subagent-child / shutdown-after-throw / poll-throws) remain partially covered.
+- **`task` synchronous cap-watchdog** (A-MED-3). Sync `task` spawns bypass the `subagentHandleStore`, so cap watchdog doesn't pre-empt overage. Documented in `docs/TODO.md` "Deferred — actionable but parked" with the fix shape + pull-in signal. Worst case bounded by `definition.budget.maxCostUsd` validation.
+- **`validate.ts` capabilities_declared check** (B-MED-1). Whitelist guard checks `metadata.writes` but not `metadata.capabilities_declared` — a typo in playbook tools[] doesn't fail at load. Engine still gates at evaluation; current behavior is "deferred load-time error to first invocation". Smaller surface, low priority.
+- **`cost_soft_cap_warn` semantic confusion** (B-MED-4). Spec says the warn fires on CHILD playbook cap; loop emits on PARENT session cap. Two conflated signals. Spec-PR-first to clarify; code change minor once spec is amended.
+
 ## [2026-05-17] hardening(memory) — S11 LLM-judge second post-review pass (critical + high + med + test gaps)
 
 Second multi-reviewer pass on S11 (three parallel agents: correctness/robustness, spec/architecture, test quality) surfaced 27+ new findings after the first hardening round landed. All closed in this pass (G1–G12).

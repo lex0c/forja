@@ -1064,13 +1064,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // outer finally.
       // semanticVerifyScheduler is declared in the outer scope so
       // the outer finally can shutdown() it even on early throw.
+      // R6 — runtime defense in depth. `parseArgs` already refuses
+      // `--memory-verify-llm` in subagent context (F12), but a
+      // programmatic caller / future code path that builds
+      // HarnessConfig directly could still set `memorySemanticVerify`
+      // with `subagentDepth > 0`. Stay silent ⇒ operator wonders why
+      // verify never fires. Emit a diagnostic and continue without
+      // wiring the scheduler.
+      if (config.memorySemanticVerify === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_semantic_disabled: --memory-verify-llm cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // R6 — guard on memoryRegistry availability. Pre-fix the cast
+      // `as MemoryRegistry` would land `undefined` into the scheduler
+      // and every poll would TypeError on `registry.peek(...)`. The
+      // outer catch swallows the throw silently every step; operator
+      // sees nothing. Now we mirror the verify-def absent path and
+      // refuse construction loudly when registry is missing.
       if (
         config.memorySemanticVerify === true &&
         (config.subagentDepth ?? 0) === 0 &&
         config.subagentRegistry !== undefined
       ) {
         const verifyDef = config.subagentRegistry.byName.get('verify-semantic');
-        if (verifyDef !== undefined) {
+        if (verifyDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_semantic_disabled: --memory-verify-llm set but memory registry not wired\n',
+          );
+        } else if (verifyDef !== undefined && config.memoryRegistry !== undefined) {
           semanticVerifyScheduler = createSemanticVerifyScheduler({
             db: config.db,
             registry: config.memoryRegistry as MemoryRegistry,
@@ -1087,34 +1109,56 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(config.memoryExcludeScopes !== undefined
               ? { memoryExcludeScopes: config.memoryExcludeScopes }
               : {}),
-            // F9: forward parent-runtime envelope into each dispatch
-            // so the verify child runs under the parent's resolved
-            // verdicts (Ctrl-C, trust, hooks, capabilities) rather
-            // than defaults.
+            // F9 + R1: forward parent-runtime envelope into each
+            // dispatch so the verify child runs under the parent's
+            // resolved verdicts (hard signal, Ctrl-C, trust, hooks,
+            // capabilities) rather than defaults. `signal` is the
+            // combined caller+wall-clock abort; without it the
+            // dispatch hangs until the subagent's own 10-min budget
+            // and operator Ctrl-C×2 cannot interrupt.
+            signal,
             ...(config.softStopSignal !== undefined
               ? { softStopSignal: config.softStopSignal }
               : {}),
             ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // R6 — forward plan-mode posture + spawn factory test
+            // seam to verify dispatches. Symmetric with the task-tool
+            // spawn path (loop.ts:1535-1558).
+            ...(config.planMode === true ? { planMode: true } : {}),
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
             // PERMISSION_ENGINE.md §10.1: seal the verify subagent's
             // effective envelope. Mirror the task-tool spawn shape
-            // (loop.ts:1289) — prefer the engine's intersected value
-            // when available, else derive from the policy. Without
-            // this the verify child runs under the parent's full
-            // envelope and the dispatcher's effectiveCapabilities
-            // forwarding is dead code. The verify-semantic.md tool
-            // whitelist is read-only by declaration; sealing the
-            // envelope makes the runtime gate enforce it too.
+            // (loop.ts:1289) — intersect parent's envelope against
+            // the playbook's declared capabilities.
             //
-            // Cast: Capability is a nominal brand of string; the
-            // dispatcher/scheduler accept `readonly string[]` so
-            // any consumer (audit row, downstream test) sees plain
-            // strings. The brand still travels through bunched
-            // type-safe call sites within permissions/.
-            effectiveCapabilities: (config.permissionEngine.effectiveCapabilities() ??
-              deriveParentCapabilities(
-                config.permissionEngine.policy(),
-              )) as unknown as readonly string[],
+            // Pre-R2 the loop passed the parent's FULL envelope
+            // verbatim because verify-semantic.md didn't declare
+            // capabilities and the loader didn't expose the field.
+            // That reintroduced the exact gap migration 040 fixed
+            // (audit row recorded "child ran under parent's full
+            // envelope" when the operator's intent was a read-only
+            // fact-checker). Now: parse declared (`[]` = pure-LLM)
+            // and intersect; the empty intersection produces an
+            // empty effective set, sealed into the audit row.
+            //
+            // The intersection cannot produce `excess` for an
+            // intentionally-empty declared set (no entries to be
+            // unbacked), so this site never needs to refuse the
+            // spawn — divergent from the task-tool path which can
+            // and does refuse on excess. Worth re-checking if any
+            // future verify-semantic.md edit widens `capabilities`.
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = verifyDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective } = intersectCapabilities(parent, declared);
+              return effective.map(formatCapability);
+            })(),
           });
         } else {
           process.stderr.write(
@@ -1394,6 +1438,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     e.type === 'subagent_progress' &&
                     e.lastEvent.type === 'cost_update'
                   ) {
+                    // R4 — defensive validation on the IPC boundary.
+                    // IPC.md §7 ("mensagens do filho NÃO são
+                    // confiáveis"): a malformed cost_update (negative
+                    // values, cumulative-regression, NaN) could
+                    // mis-steer the cap watchdog into a false trip
+                    // (cancelAll fires) or — worse — silently grow
+                    // the reservation under the cap. The handle-store's
+                    // monotonic guard catches REGRESSION but accepts
+                    // any non-negative finite value; reject upstream.
+                    const { delta, cumulative } = e.lastEvent;
+                    if (
+                      !Number.isFinite(delta) ||
+                      !Number.isFinite(cumulative) ||
+                      delta < 0 ||
+                      cumulative < 0
+                    ) {
+                      process.stderr.write(
+                        `subagent ${trackerHandleId}: cost_update rejected (delta=${delta}, cumulative=${cumulative})\n`,
+                      );
+                      return;
+                    }
                     trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
                     // Persist the cost-update into the audit
                     // stream (migration 022, audit fix #2). The
@@ -1431,8 +1496,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     } catch (persistErr) {
                       const message =
                         persistErr instanceof Error ? persistErr.message : String(persistErr);
-                      console.error(
-                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}`,
+                      // R4: `console.error` violates the hard rule
+                      // "stdout is pure, stderr is for logs" — Bun
+                      // sometimes interleaves console.error with
+                      // stdout in --json mode despite the underlying
+                      // routing. Route to process.stderr explicitly
+                      // to keep --json's NDJSON stdout clean.
+                      process.stderr.write(
+                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}\n`,
                       );
                     }
                     if (budget.maxCostUsd !== undefined) {
@@ -1502,6 +1573,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             permissionEngine: config.permissionEngine,
             db: config.db,
             cwd: config.cwd,
+            // Migration 058 — back-link the audit row to the approval
+            // that admitted the spawning tool call.
+            ...(args.parentApprovalId !== undefined
+              ? { parentApprovalId: args.parentApprovalId }
+              : {}),
             ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
             // §10.1 effective envelope (slice 95). When the model

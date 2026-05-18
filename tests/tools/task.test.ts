@@ -40,6 +40,42 @@ describe('task tool', () => {
     expect(calls).toEqual([{ name: 'explore', prompt: 'go', declaredCapabilities: [] }]);
   });
 
+  // R3 — migration 058 wires `parent_approval_id` end-to-end.
+  // `invoke-tool` populates `ctx.approvalId`; the task tool forwards
+  // it via `SpawnSubagentArgs.parentApprovalId` so the spawned
+  // child's audit row links back to the approval that admitted the
+  // spawn. Pre-fix the task tool ignored ctx.approvalId entirely and
+  // every spawn landed `subagent_runs.parent_approval_id = NULL`.
+  test('R3 e2e: ctx.approvalId is forwarded as SpawnSubagentArgs.parentApprovalId', async () => {
+    const calls: SpawnSubagentArgs[] = [];
+    const ctx = makeCtx({
+      approvalId: 'approval-xyz',
+      spawnSubagent: async (args) => {
+        calls.push(args);
+        return ranEnvelope();
+      },
+    });
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
+    expect(isToolError(result)).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.parentApprovalId).toBe('approval-xyz');
+  });
+
+  test('R3: ctx.approvalId absent ⇒ parentApprovalId omitted from spawn args', async () => {
+    const calls: SpawnSubagentArgs[] = [];
+    const ctx = makeCtx({
+      spawnSubagent: async (args) => {
+        calls.push(args);
+        return ranEnvelope();
+      },
+    });
+    await taskTool.execute({ subagent: 'explore', prompt: 'go', capabilities: [] }, ctx);
+    expect(calls[0]?.parentApprovalId).toBeUndefined();
+  });
+
   test('errors when no spawnSubagent is wired', async () => {
     const ctx = makeCtx();
     const result = await taskTool.execute(

@@ -79,5 +79,6 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   ...(overrides.fireHook !== undefined ? { fireHook: overrides.fireHook } : {}),
   ...(overrides.sandboxProfile !== undefined ? { sandboxProfile: overrides.sandboxProfile } : {}),
   ...(overrides.toolCallId !== undefined ? { toolCallId: overrides.toolCallId } : {}),
+  ...(overrides.approvalId !== undefined ? { approvalId: overrides.approvalId } : {}),
   broker: overrides.broker ?? defaultBroker(),
 });

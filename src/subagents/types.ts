@@ -237,6 +237,17 @@ export interface SubagentDefinition {
   promptVersion?: number;
   contextRecipeVersion?: number;
   phases?: PhaseDef[];
+  // Declared capabilities (PERMISSION_ENGINE.md §10.1). Strings in
+  // the canonical capability format (e.g. `read-fs:src/**`,
+  // `exec:shell`, `net-egress:*`). The runtime intersects this
+  // list against the parent's effective envelope and seals the
+  // result into `subagent_runs.effective_capabilities`. Absence
+  // ⇒ "not declared"; the runtime falls back to the parent's
+  // envelope verbatim (legacy behavior, preserved for
+  // unannotated playbooks). An empty array `[]` is meaningful:
+  // pure-LLM run (no capabilities granted) — spec-prescribed
+  // shape for read-only fact-checkers like verify-semantic.
+  capabilities?: string[];
   // Untyped frontmatter overflow. Anything the loader didn't
   // map into a strongly-typed field lives here so future slices
   // can read frontmatter without a loader bump. Validation of

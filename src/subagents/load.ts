@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { formatCapability, parseCapability } from '../permissions/capabilities.ts';
 import { PROTECTED_BUILTIN_NAMES } from './builtin/index.ts';
 import { BUILTIN_AGENTS_DIR, projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
@@ -883,6 +884,7 @@ const parseDefinition = (
     'context_recipe_version',
   );
   const phases = parsePhases(fm.phases, sourcePath);
+  const capabilities = parseCapabilitiesField(fm.capabilities, sourcePath);
 
   // Every frontmatter key that has a typed parser above is in this
   // set. Anything outside still lands in `meta` for forward
@@ -904,6 +906,7 @@ const parseDefinition = (
     'prompt_version',
     'context_recipe_version',
     'phases',
+    'capabilities',
   ]);
   const meta: Record<string, unknown> = {};
   for (const k of Object.keys(fm)) {
@@ -930,8 +933,66 @@ const parseDefinition = (
     ...(promptVersion !== undefined ? { promptVersion } : {}),
     ...(contextRecipeVersion !== undefined ? { contextRecipeVersion } : {}),
     ...(phases !== undefined ? { phases } : {}),
+    ...(capabilities !== undefined ? { capabilities } : {}),
     meta,
   };
+};
+
+// Parse the optional `capabilities` frontmatter field. Each entry is
+// a canonical capability string (`read-fs:src/**`, `exec:shell`,
+// `net-egress:*`). Validated by round-tripping through parseCapability
+// + formatCapability so a typo (`read-fs:` with no scope, or
+// `exec:psh`) fails at load time with a source-aware error instead of
+// at child spawn (where the catch synthesizes a confusing
+// `subagent_escalation` envelope).
+//
+// Absence ⇒ undefined (legacy behavior; runtime falls back to the
+// parent's full envelope). Empty array `[]` is meaningful: spec-
+// prescribed "pure-LLM" shape (no capabilities granted) — preserve
+// as `[]`, not undefined.
+const parseCapabilitiesField = (raw: unknown, sourcePath: string): string[] | undefined => {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error(`subagent ${sourcePath}: 'capabilities' must be an array of strings`);
+  }
+  const seen = new Map<string, number>();
+  const normalized: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (typeof entry !== 'string') {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' must be a string (got ${typeof entry})`,
+      );
+    }
+    if (entry.trim().length === 0) {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' must be a non-empty capability`,
+      );
+    }
+    if (entry !== entry.trim()) {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' has leading or trailing whitespace (got ${JSON.stringify(entry)})`,
+      );
+    }
+    let canonical: string;
+    try {
+      canonical = formatCapability(parseCapability(entry));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' is not a valid capability (got ${JSON.stringify(entry)}): ${msg}`,
+      );
+    }
+    const prior = seen.get(canonical);
+    if (prior !== undefined) {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities' lists '${canonical}' twice (index ${prior} and index ${i})`,
+      );
+    }
+    seen.set(canonical, i);
+    normalized.push(canonical);
+  }
+  return normalized;
 };
 
 // Parse the optional `isolation` frontmatter field. Defaults to

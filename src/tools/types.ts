@@ -151,6 +151,15 @@ export interface ToolContext {
   // those callers get no provenance row, which mirrors how
   // bgManager / todoStore degrade cleanly when absent.
   toolCallId?: string;
+  // Migration 058 — id of the `approvals` row that admitted this
+  // tool call. Populated by invoke-tool after `recordApproval` lands
+  // the allow row. Only tools that spawn subagents (`task` family)
+  // read this — it threads through SpawnSubagentArgs into
+  // `subagent_runs.parent_approval_id` so the audit chain is
+  // one-hop instead of multi-hop via messages/tool_calls.
+  // Optional because test contexts construct ToolContext without
+  // going through invoke-tool.
+  approvalId?: string;
   permissions: PermissionsView;
   // §6.5 sandbox profile the engine planner chose for THIS call.
   // Populated by `invoke-tool.ts` from `decision.sandboxProfile`
@@ -406,6 +415,14 @@ export interface SpawnSubagentArgs {
   prompt: string;
   declaredCapabilities?: readonly string[];
   parentCapabilities?: readonly string[];
+  // Migration 058 — approval row that authorized the parent's task
+  // tool call. Threaded into `subagent_runs.parent_approval_id` so
+  // the audit chain stays one-hop from the run back to the policy
+  // decision. Optional because (a) test fixtures construct
+  // SpawnSubagentArgs without invoke-tool, (b) the verify-semantic
+  // scheduler bypasses the approval path entirely (forensics via
+  // memory_verify_attempts.subagent_run_session_id instead).
+  parentApprovalId?: string;
 }
 
 // Result discriminated by `kind` so the calling tool can map an

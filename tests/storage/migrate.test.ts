@@ -133,4 +133,61 @@ describe('migrate', () => {
     expect(() => migrate(db, MIGRATIONS)).toThrow(/id=9999.*NEWER Forja/);
     db.close();
   });
+
+  // R3 / migration 058 — rebuilds subagent_runs to widen the scope
+  // CHECK and add parent_approval_id. The DROP TABLE step runs with
+  // PRAGMA foreign_keys=ON (migrate.ts wraps each migration in a
+  // transaction; SQLite ignores PRAGMA foreign_keys=OFF inside one).
+  // Pre-fix the drop fired ON DELETE SET NULL on
+  // memory_verify_attempts.subagent_run_session_id — silently severing
+  // the forensic chain from the dedup cache to the audit row. The
+  // current migration snapshots those FK pointers into a TEMP table
+  // BEFORE the drop and restores them after the rename. This test
+  // pins both halves: rows survive AND the FK link is preserved.
+  test('migration 058 preserves memory_verify_attempts.subagent_run_session_id across the table rebuild', async () => {
+    const { MIGRATIONS } = await import('../../src/storage/migrations/index.ts');
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const pre058 = MIGRATIONS.filter((m) => m.id < 58);
+    const db = openMemoryDb();
+    migrate(db, pre058);
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const child = createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    db.query(
+      `INSERT INTO subagent_runs
+       (session_id, name, scope, source_path, source_sha256, system_prompt, tools_whitelist,
+        budget_max_steps, budget_max_cost_usd, captured_at)
+       VALUES (?, 'verify-semantic', 'user', '/builtin/v.md', 'a', 'p', '[]', 15, 0.1, 1)`,
+    ).run(child.id);
+    db.query(
+      `INSERT INTO memory_verify_attempts
+       (id, memory_scope, memory_name, content_hash, verdict, confidence, model_id, prompt_hash,
+        subagent_run_session_id, attempted_at)
+       VALUES ('mva-058', 'user', 'foo', 'abc', 'passed', 0.9, 'm', 'h', ?, 1)`,
+    ).run(child.id);
+    // Apply 058.
+    migrate(
+      db,
+      MIGRATIONS.filter((m) => m.id <= 58),
+    );
+    // subagent_runs row survived with original scope (pre-058 the
+    // mapping wrote 'user'; we don't rewrite history for old rows).
+    const run = db
+      .query<{ scope: string; parent_approval_id: string | null }, []>(
+        'SELECT scope, parent_approval_id FROM subagent_runs',
+      )
+      .get();
+    expect(run?.scope).toBe('user');
+    expect(run?.parent_approval_id).toBeNull();
+    // FK pointer in memory_verify_attempts survived the rebuild.
+    const mva = db
+      .query<{ subagent_run_session_id: string | null }, []>(
+        'SELECT subagent_run_session_id FROM memory_verify_attempts WHERE id = ?',
+      )
+      .get('mva-058');
+    expect(mva?.subagent_run_session_id).toBe(child.id);
+    // FK integrity intact.
+    const violations = db.query('PRAGMA foreign_key_check').all();
+    expect(violations).toEqual([]);
+    db.close();
+  });
 });

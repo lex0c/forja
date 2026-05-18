@@ -134,6 +134,78 @@ describe('subagent_runs repo', () => {
     ).toThrow();
   });
 
+  // R3 — migration 058 widened the CHECK to include 'builtin'.
+  // Pre-058 a builtin spawn landed as `'user'` via a runtime mapping
+  // (AUDIT.md §0 drift). Locking the new shape so a future migration
+  // that re-narrows the CHECK fails this test.
+  test("CHECK constraint admits 'builtin' scope (migration 058)", () => {
+    const child = seedSession(seedSession().id);
+    insertSubagentRun(db, {
+      sessionId: child.id,
+      name: 'verify-semantic',
+      scope: 'builtin',
+      sourcePath: '/builtin/verify-semantic.md',
+      sourceSha256: 'b'.repeat(64),
+      systemPrompt: 'p',
+      toolsWhitelist: [],
+      budgetMaxSteps: 15,
+      budgetMaxCostUsd: 0.1,
+    });
+    const run = getSubagentRun(db, child.id);
+    expect(run?.scope).toBe('builtin');
+  });
+
+  test('parentApprovalId round-trips (migration 058)', () => {
+    const child = seedSession(seedSession().id);
+    // Synthesize a real approval row (FK target). We bypass the
+    // recordApproval helper to avoid pulling its full transitive
+    // surface; the schema just needs a row in `approvals` with
+    // matching id.
+    const approvalId = crypto.randomUUID();
+    db.exec(
+      `INSERT INTO messages (id, session_id, role, content, created_at)
+       VALUES ('m-r3', '${child.id}', 'user', '[]', 0)`,
+    );
+    db.exec(
+      `INSERT INTO tool_calls (id, message_id, tool_name, input, status, created_at)
+       VALUES ('tc-r3', 'm-r3', 'task', '{}', 'pending', 0)`,
+    );
+    db.exec(
+      `INSERT INTO approvals (id, tool_call_id, decision, decided_by, decided_at)
+       VALUES ('${approvalId}', 'tc-r3', 'allow', 'policy', 0)`,
+    );
+    insertSubagentRun(db, {
+      sessionId: child.id,
+      name: 'explore',
+      scope: 'user',
+      sourcePath: '/u/explore.md',
+      sourceSha256: 'e'.repeat(64),
+      systemPrompt: 'p',
+      toolsWhitelist: [],
+      budgetMaxSteps: 1,
+      budgetMaxCostUsd: 0.01,
+      parentApprovalId: approvalId,
+    });
+    const run = getSubagentRun(db, child.id);
+    expect(run?.parentApprovalId).toBe(approvalId);
+  });
+
+  test('parentApprovalId omitted ⇒ column null (legacy / verify-scheduler bypass)', () => {
+    const child = seedSession(seedSession().id);
+    insertSubagentRun(db, {
+      sessionId: child.id,
+      name: 'explore',
+      scope: 'user',
+      sourcePath: '/u/explore.md',
+      sourceSha256: 'e'.repeat(64),
+      systemPrompt: 'p',
+      toolsWhitelist: [],
+      budgetMaxSteps: 1,
+      budgetMaxCostUsd: 0.01,
+    });
+    expect(getSubagentRun(db, child.id)?.parentApprovalId).toBeNull();
+  });
+
   test('toolsWhitelist round-trips JSON correctly', () => {
     // Defense for the JSON serialization path. Empty array,
     // single-element, multi-element. If the parser flips to

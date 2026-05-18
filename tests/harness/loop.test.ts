@@ -2575,6 +2575,71 @@ describe('runAgent', () => {
       // The good entry's row landed even though the bad entry threw.
       expect(listProvenanceForMemory(db, sid, 'user', 'good')).toHaveLength(1);
     });
+
+    test('R5: exposure throw mid-loop does NOT abort following rows (per-row independence)', async () => {
+      // Pre-fix the per-row try/catch was the only thing keeping a
+      // bad row from cascading; an existing test confirmed ONE bad
+      // entry doesn't crash the run, but not that subsequent good
+      // entries still land. This pins the loop-continues-after-throw
+      // invariant: bad sandwiched between two goods → both goods
+      // land, AUDIT DRIFT line emitted for the bad one only.
+      const original = process.stderr.write.bind(process.stderr);
+      const captured: string[] = [];
+      process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+        captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+        return true;
+      }) as typeof process.stderr.write;
+
+      const handle = mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]);
+      const registry = createToolRegistry();
+      registry.register(echoTool);
+      try {
+        const result = await runAgent({
+          provider: handle.provider,
+          toolRegistry: registry,
+          permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+          db,
+          cwd: '/p',
+          userPrompt: 'hi',
+          eagerExposures: [
+            {
+              scope: 'user',
+              name: 'first',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+            {
+              scope: 'bogus' as never,
+              name: 'middle-bad',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+            {
+              scope: 'user',
+              name: 'after-bad',
+              memoryContentHash: null,
+              memoryStateAtExposure: 'active',
+            },
+          ],
+        });
+        expect(result.status).toBe('done');
+      } finally {
+        process.stderr.write = original;
+      }
+      const sid = listSessions(db)[0]?.id;
+      if (sid === undefined) throw new Error('expected a session');
+      // First good landed (proved before the throw).
+      expect(listProvenanceForMemory(db, sid, 'user', 'first')).toHaveLength(1);
+      // After-bad good landed (the throw didn't cascade).
+      expect(listProvenanceForMemory(db, sid, 'user', 'after-bad')).toHaveLength(1);
+      // AUDIT DRIFT line for the bad one only.
+      const drift = captured
+        .join('')
+        .split('\n')
+        .filter((l) => l.includes('AUDIT DRIFT') && l.includes('eager exposure'));
+      expect(drift).toHaveLength(1);
+      expect(drift[0]).toContain('middle-bad');
+    });
   });
 
   describe('memoryExcludeScopes wraps the tool-facing registry (S5 review)', () => {

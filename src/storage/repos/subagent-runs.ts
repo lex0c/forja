@@ -3,7 +3,10 @@ import type { Policy } from '../../permissions/index.ts';
 import type { ContextRecipe, SamplingOverride, ToolRestrictions } from '../../subagents/types.ts';
 import type { DB } from '../db.ts';
 
-export type SubagentScope = 'user' | 'project';
+// Mirrors src/subagents/types.ts SubagentScope. Widened in migration
+// 058 to include 'builtin' so the audit row records true provenance
+// (was mapped to 'user' pre-058 via a runtime hack).
+export type SubagentScope = 'user' | 'project' | 'builtin';
 
 export interface SubagentRun {
   sessionId: string;
@@ -126,6 +129,19 @@ export interface SubagentRun {
   //     must align with some entry via cwd-aware coverage
   //     (`capabilityCoversCwdAware`).
   effectiveCapabilities: string[] | null;
+  // Migration 058 — back-pointer to the approval row that authorized
+  // the spawn (PERMISSION_ENGINE.md §10.2). Tri-state:
+  //   - `null` — no approval lineage. Legacy pre-058 rows, fixtures,
+  //     and the verify-semantic synthetic-approval bypass when
+  //     disabled. The synthetic-approval emission path (round-2 R3)
+  //     populates this for verify-scheduler dispatches so the audit
+  //     chain stays one-hop instead of broken.
+  //   - non-empty string — UUID of the `approvals` row that admitted
+  //     this spawn. JOIN against `approvals(id)` lets forensic
+  //     queries answer "which decision authorized this run?" in one
+  //     hop. ON DELETE SET NULL keeps the run row when the approval
+  //     itself is retention-swept.
+  parentApprovalId: string | null;
   capturedAt: number;
 }
 
@@ -148,6 +164,7 @@ interface SubagentRunRow {
   output_schema: string | null;
   context_recipe: string | null;
   effective_capabilities: string | null;
+  parent_approval_id: string | null;
   captured_at: number;
 }
 
@@ -373,6 +390,7 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     outputSchema,
     contextRecipe,
     effectiveCapabilities,
+    parentApprovalId: row.parent_approval_id,
     capturedAt: row.captured_at,
   };
 };
@@ -465,6 +483,13 @@ export interface InsertSubagentRunInput {
   // silently grant the parent's full capability set, re-opening
   // the R11 P0-3 gap slice 95 closes.
   effectiveCapabilities?: readonly string[];
+  // Migration 058 — approval row that authorized the spawn
+  // (PERMISSION_ENGINE.md §10.2). Optional for backwards
+  // compatibility with fixtures and the synthetic-approval bypass.
+  // Production callers (task tool spawn path) MUST supply when an
+  // approval row exists; the verify-semantic scheduler supplies a
+  // synthetic approval id (decided_by='system:semantic_verify').
+  parentApprovalId?: string;
   capturedAt?: number;
 }
 
@@ -526,14 +551,16 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.effectiveCapabilities !== undefined && input.effectiveCapabilities !== null
       ? JSON.stringify(input.effectiveCapabilities)
       : null;
+  const parentApprovalId = input.parentApprovalId ?? null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
         tools_whitelist, budget_max_steps, budget_max_cost_usd,
         budget_max_wall_ms, policy_snapshot, hooks_snapshot,
         tool_restrictions, sampling, reference_paths, output_schema,
-        context_recipe, effective_capabilities, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        context_recipe, effective_capabilities, parent_approval_id,
+        captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -553,6 +580,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     outputSchemaJson,
     contextRecipeJson,
     effectiveCapsJson,
+    parentApprovalId,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -582,6 +610,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     contextRecipe: input.contextRecipe ?? null,
     effectiveCapabilities:
       input.effectiveCapabilities === undefined ? null : [...input.effectiveCapabilities],
+    parentApprovalId,
     capturedAt,
   };
 };
@@ -602,7 +631,8 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
               tools_whitelist, budget_max_steps, budget_max_cost_usd,
               budget_max_wall_ms, policy_snapshot, hooks_snapshot,
               tool_restrictions, sampling, reference_paths, output_schema,
-              context_recipe, effective_capabilities, captured_at
+              context_recipe, effective_capabilities, parent_approval_id,
+              captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

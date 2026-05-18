@@ -3,6 +3,14 @@ name: verify-semantic
 description: Verifies a single memory body against the current repository. Returns a structured verdict the governance substrate consumes.
 tools: [read_file, grep, glob, memory_read]
 isolation: none
+# PERMISSION_ENGINE.md §10.1: declared capabilities. Empty array
+# means "pure-LLM" — the runtime intersects against the parent's
+# envelope and seals an empty effective set into the audit row, so
+# the child engine refuses any capability-consuming tool even if a
+# future regression widens the tools[] whitelist by accident. The
+# tools listed above are all read-only and footprint-free; widening
+# this declaration requires a deliberate spec-PR.
+capabilities: []
 budget:
   max_steps: 15
   max_cost_usd: 0.10

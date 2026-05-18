@@ -231,6 +231,18 @@ Why deferred to Phase 2 alongside S11:
 
 **Spec reference:** none — this is an implementation gap inherited from how `import.meta.dir` resolves under Bun compile, not a spec divergence.
 
+### Sync `task` subagent under cap-watchdog
+
+**Status:** the cap watchdog in `runAgent` (`src/harness/loop.ts`) listens to `cost_update` IPC events per active subagent and fires `subagentHandleStore.cancelAll('cap_watchdog')` when cumulative live spend crosses `budget.maxCostUsd`. The store walks its `records` map.
+
+**Problem:** sync `task` / `task_sync` spawns flow through `spawnSubagentImpl` WITHOUT a `handleId`, so no record is created in the store. A long-running sync subagent that overshoots its declared estimate mid-execution does NOT get cancelled by the watchdog; it runs to completion, charging `cumulativeChildCostUsd` after the fact. The hard cap may be exceeded by up to one sync child's actual cost.
+
+**Fix shape:** either (a) plumb sync spawns through the store with an implicit `cap=1` slot so the watchdog reaches them, OR (b) attach a passive cost-update observer to sync runs that drives the same `cancelAll` logic. Both require deciding how sync's awaiting parent handles a watchdog-driven cancel (the parent is blocked on `await runSubagent`; cancellation needs to flow back through the abort signal already wired).
+
+**Pull-in signal:** an operator reports a sync subagent overshooting `budget.maxCostUsd` by a non-trivial margin. Today's worst case is bounded by `definition.budget.maxCostUsd` (which the load gate already validates is finite + positive); ergonomic operators see the overage in their session totals but not at runtime.
+
+**Spec reference:** `ORCHESTRATION.md §3.5` (in-flight cap enforcement) — currently silent on sync vs. async asymmetry; spec amendment should land alongside the fix.
+
 ## Dependency graph
 
 ```
