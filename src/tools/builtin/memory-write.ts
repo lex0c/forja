@@ -337,7 +337,17 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
       // excluded: spec language is "user rejeitou", an esc-cancel
       // is ambiguous (could be accidental, modal timeout). Best-
       // effort: helper itself catches throws.
-      if (answer === 'no') {
+      //
+      // Source gate: only `inferred` writes count as override
+      // signals. `user_explicit` means the operator themselves
+      // asked to save and then declined/corrected — that's a
+      // user changing their mind about their OWN proposal, not
+      // a model misalignment. Attributing it to recently-loaded
+      // factual memories would surface false positives that could
+      // wrongly trip the S3 quarantine flow against unrelated
+      // memories. `imported` shares the same "not model-inferred"
+      // posture and is excluded for the same reason.
+      if (answer === 'no' && source === 'inferred') {
         registry.recordOverrideSignal({
           signal: 'memory_write_rejected',
           details: {
@@ -411,7 +421,10 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
         // scope rejection is structurally the same operator action
         // ("don't persist this proposal") — the second modal is just
         // extra friction for user-scope, not a different signal.
-        if (scopeAnswer === 'no') {
+        // Same source gate as the first modal: only `inferred`
+        // counts as override signal; `user_explicit` is the user
+        // changing their mind about their own request.
+        if (scopeAnswer === 'no' && source === 'inferred') {
           registry.recordOverrideSignal({
             signal: 'memory_write_rejected',
             details: {
