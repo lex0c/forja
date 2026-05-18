@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  DEFAULT_MEMORY_CONFIG,
   loadCritiqueConfig,
+  loadMemoryConfig,
   projectConfigPath,
   userConfigPath,
 } from '../../src/critique/config-loader.ts';
@@ -552,6 +554,235 @@ model = "anthropic/imaginary-future-model"
       expect(result.warnings[0]).toContain('not a known model');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// MEMORY CONFIG (Slice Q — default-ON inversion + per-project opt-out)
+// Same TOML file as [critique]; [memory] section.
+
+describe('loadMemoryConfig — empty layers', () => {
+  test('no files anywhere → defaults (both true) + no warnings + both userHadField/projectHadField false', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.config.verifySemanticLlm).toBe(DEFAULT_MEMORY_CONFIG.verifySemanticLlm);
+      expect(result.config.conflictDetectLlm).toBe(DEFAULT_MEMORY_CONFIG.conflictDetectLlm);
+      expect(result.config.verifySemanticLlm).toBe(true);
+      expect(result.config.conflictDetectLlm).toBe(true);
+      expect(result.userHadField.verifySemanticLlm).toBe(false);
+      expect(result.userHadField.conflictDetectLlm).toBe(false);
+      expect(result.projectHadField.verifySemanticLlm).toBe(false);
+      expect(result.projectHadField.conflictDetectLlm).toBe(false);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadMemoryConfig — project layer', () => {
+  test('project [memory] verify_semantic_llm = false → resolved false + projectHadField true (banner-suppress signal)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.verifySemanticLlm).toBe(false);
+      expect(result.config.conflictDetectLlm).toBe(true);
+      expect(result.projectHadField.verifySemanticLlm).toBe(true);
+      expect(result.projectHadField.conflictDetectLlm).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('camelCase aliases (verifySemanticLlm) parsed equivalently', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+verifySemanticLlm = false
+conflictDetectLlm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.verifySemanticLlm).toBe(false);
+      expect(result.config.conflictDetectLlm).toBe(false);
+      expect(result.projectHadField.verifySemanticLlm).toBe(true);
+      expect(result.projectHadField.conflictDetectLlm).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadMemoryConfig — validation warnings', () => {
+  test('non-boolean value → warning + skip + default retained + hadField false (banner-eligible)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = "no"
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      // Bad value → ignored → default retained.
+      expect(result.config.verifySemanticLlm).toBe(true);
+      // hadField stays false → banner still fires (operator never
+      // explicitly set the field).
+      expect(result.projectHadField.verifySemanticLlm).toBe(false);
+      expect(
+        result.warnings.some((w) => w.includes('verify_semantic_llm') && w.includes('boolean')),
+      ).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('dual-key (snake + camel for same field) emits warning; snake wins', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = false
+verifySemanticLlm = true
+conflict_detect_llm = true
+conflictDetectLlm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      // snake_case wins for both.
+      expect(result.config.verifySemanticLlm).toBe(false);
+      expect(result.config.conflictDetectLlm).toBe(true);
+      // Two dual-key warnings (one per field).
+      const dualKeyWarnings = result.warnings.filter((w) =>
+        w.includes('snake_case wins, camelCase ignored'),
+      );
+      expect(dualKeyWarnings.length).toBe(2);
+      expect(dualKeyWarnings.some((w) => w.includes('verify_semantic_llm'))).toBe(true);
+      expect(dualKeyWarnings.some((w) => w.includes('conflict_detect_llm'))).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('single-spelling files do NOT emit dual-key warning', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = false
+conflictDetectLlm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.verifySemanticLlm).toBe(false);
+      expect(result.config.conflictDetectLlm).toBe(false);
+      expect(result.warnings.some((w) => w.includes('snake_case wins, camelCase ignored'))).toBe(
+        false,
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('malformed TOML in user → warning, project still parses cleanly', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(join(home, '.config', 'agent', 'config.toml'), 'not = valid = toml\n');
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+conflict_detect_llm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.warnings.some((w) => w.toLowerCase().includes('toml parse failed'))).toBe(true);
+      expect(result.config.conflictDetectLlm).toBe(false);
+      expect(result.config.verifySemanticLlm).toBe(true); // default retained
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadMemoryConfig — layer merge (project overrides user)', () => {
+  test('user disable + project absent → resolved false, userHadField true (banner-suppress signal)', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.config.verifySemanticLlm).toBe(false);
+      expect(result.userHadField.verifySemanticLlm).toBe(true);
+      expect(result.projectHadField.verifySemanticLlm).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('user true + project false → project wins (resolved false)', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = true
+`,
+      );
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[memory]
+verify_semantic_llm = false
+`,
+      );
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.config.verifySemanticLlm).toBe(false); // project wins
+      expect(result.userHadField.verifySemanticLlm).toBe(true);
+      expect(result.projectHadField.verifySemanticLlm).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

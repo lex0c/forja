@@ -8,6 +8,7 @@ import {
   createInProcessBroker,
   createSpawnBroker,
 } from '../broker/index.ts';
+import { loadMemoryConfig } from '../critique/config-loader.ts';
 import { loadCritiqueConfig } from '../critique/index.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
@@ -153,6 +154,21 @@ export interface BootstrapInput {
   // S13 opt-in for the LLM-judge conflict detector. Independent of
   // memorySemanticVerify. CLI surfaces from `args.memoryConflictLlm`.
   memoryConflictDetect?: boolean;
+  // Slice Q — suppress operator-facing stderr banners when the CLI
+  // is producing structured NDJSON. The boot banner for the default-
+  // ON governance detectors fires when both resolve via default;
+  // setting this to `true` suppresses it unconditionally, mirroring
+  // the existing "stderr is for logs" stack rule (CLAUDE.md). When
+  // omitted, the banner emits per its own gating logic.
+  json?: boolean;
+  // Slice Q — directory for the first-boot banner marker
+  // (~/.local/share/forja/.governance-banner-shown by default).
+  // The banner is suppressed once the marker exists. Tests pass an
+  // isolated tmp dir to avoid polluting the operator's real state.
+  // `null` disables the marker entirely (banner fires every boot
+  // when other gates pass — useful for CI environments that scrape
+  // first-boot output deterministically).
+  governanceBannerMarkerDir?: string | null;
   // Shared-corpus trust modal callback (MEMORY.md §6.5.2
   // `trust_revoked` detector, S5/T5.2). Fired by `probeSharedTrust`
   // when the operator previously confirmed trust for this scope-
@@ -296,6 +312,96 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // to defaults, not a hard exit). The warnings array is exposed
   // on BootstrapResult for the CLI driver to print.
   const critiqueLoaded = loadCritiqueConfig({ cwd, registry });
+
+  // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
+  // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
+  // pair as [critique]; project field wins. `userHadField` /
+  // `projectHadField` per-field provenance signals drive the
+  // first-run banner emission below: banner fires ONLY when both
+  // detectors resolved to ON via DEFAULT (no layer explicitly named
+  // the field, no CLI override).
+  const memoryLoaded = loadMemoryConfig({ cwd });
+
+  // First-run banner. Fires once per machine when:
+  //   (a) both detectors resolve to ON,
+  //   (b) the resolution came from the hardcoded default (no config
+  //       layer touched the field, no CLI override),
+  //   (c) we're not in `--json` mode (stack rule: NDJSON consumers
+  //       expect predictable stderr; one-line banner pollutes
+  //       structured log capture),
+  //   (d) the per-machine marker file doesn't exist yet (or marker
+  //       was disabled via input.governanceBannerMarkerDir=null).
+  //
+  // subagent-child.ts has its own boot path; this function is only
+  // reached by top-level operator runs, so the banner is naturally
+  // suppressed for subagents.
+  //
+  // Design decision — emit ONE banner covering both detectors,
+  // suppress when ANY layer touched EITHER field (not per-detector
+  // independent banners):
+  //   - Rationale: an operator who already wrote `[memory]
+  //     verify_semantic_llm = false` is signaling awareness of the
+  //     memory governance subsystem. Emitting the conflict-half of
+  //     a per-detector banner on their next boot would be noise
+  //     ("we know, we configured it").
+  //   - Counter-argument (rejected): a per-detector banner would
+  //     warn when only ONE detector is silently on. We accept that
+  //     trade-off: configured operators read `/memory governance
+  //     status` (Slice Q surfaces source-labels there); unconfigured
+  //     operators get the canonical single-line advisory once.
+  //   - Edge: if an operator config-disables only one field, the
+  //     banner suppresses entirely — even though the OTHER field
+  //     came from default. This is intentional. The status command
+  //     and docs/MEMORY.md §11.4 cover the operator's information
+  //     path from that point on.
+  const verifyFromDefault =
+    input.memorySemanticVerify === undefined &&
+    !memoryLoaded.projectHadField.verifySemanticLlm &&
+    !memoryLoaded.userHadField.verifySemanticLlm;
+  const conflictFromDefault =
+    input.memoryConflictDetect === undefined &&
+    !memoryLoaded.projectHadField.conflictDetectLlm &&
+    !memoryLoaded.userHadField.conflictDetectLlm;
+  const resolvedVerify = input.memorySemanticVerify ?? memoryLoaded.config.verifySemanticLlm;
+  const resolvedConflict = input.memoryConflictDetect ?? memoryLoaded.config.conflictDetectLlm;
+  const shouldShowBanner =
+    verifyFromDefault &&
+    conflictFromDefault &&
+    resolvedVerify &&
+    resolvedConflict &&
+    input.json !== true;
+  if (shouldShowBanner) {
+    // Per-machine marker: when input.governanceBannerMarkerDir is
+    // explicitly null the marker is disabled (banner re-emits every
+    // boot — useful for CI / determinism). Otherwise default to
+    // `~/.local/share/forja/`. mkdirSync+writeFile errors degrade
+    // silently to "no marker, emit anyway" — better than refusing
+    // the banner on a wonky filesystem.
+    const markerDir =
+      input.governanceBannerMarkerDir === undefined
+        ? join(homedir(), '.local', 'share', 'forja')
+        : input.governanceBannerMarkerDir;
+    let markerExists = false;
+    if (markerDir !== null) {
+      try {
+        const markerFs = await import('node:fs');
+        const markerPath = join(markerDir, '.governance-banner-shown');
+        markerExists = markerFs.existsSync(markerPath);
+        if (!markerExists) {
+          markerFs.mkdirSync(markerDir, { recursive: true });
+          markerFs.writeFileSync(markerPath, `${Date.now()}\n`);
+        }
+      } catch {
+        // Best-effort. If we can't write the marker, banner fires —
+        // worse to suppress when the operator never saw it.
+      }
+    }
+    if (!markerExists) {
+      process.stderr.write(
+        'memory: governance LLM detectors enabled by default (verify=on, conflict=on). Disable: /memory governance disable verify|conflict|all\n',
+      );
+    }
+  }
 
   const toolRegistry = createToolRegistry();
   registerBuiltinTools(toolRegistry);
@@ -1014,8 +1120,28 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
-    ...(input.memorySemanticVerify === true ? { memorySemanticVerify: true } : {}),
-    ...(input.memoryConflictDetect === true ? { memoryConflictDetect: true } : {}),
+    // Slice Q — resolved state (always boolean, never undefined).
+    // Precedence: CLI explicit > project config > user config > default ON.
+    // memorySemanticVerifySource carries provenance for /memory
+    // governance status rendering + first-run banner suppression.
+    memorySemanticVerify: input.memorySemanticVerify ?? memoryLoaded.config.verifySemanticLlm,
+    memorySemanticVerifySource:
+      input.memorySemanticVerify !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.verifySemanticLlm
+          ? 'project-config'
+          : memoryLoaded.userHadField.verifySemanticLlm
+            ? 'user-config'
+            : 'default',
+    memoryConflictDetect: input.memoryConflictDetect ?? memoryLoaded.config.conflictDetectLlm,
+    memoryConflictDetectSource:
+      input.memoryConflictDetect !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.conflictDetectLlm
+          ? 'project-config'
+          : memoryLoaded.userHadField.conflictDetectLlm
+            ? 'user-config'
+            : 'default',
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.resumeFromSessionId !== undefined

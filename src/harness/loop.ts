@@ -1071,15 +1071,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // semanticVerifyScheduler is declared in the outer scope so
       // the outer finally can shutdown() it even on early throw.
       // R6 — runtime defense in depth. `parseArgs` already refuses
-      // `--memory-verify-llm` in subagent context (F12), but a
-      // programmatic caller / future code path that builds
-      // HarnessConfig directly could still set `memorySemanticVerify`
-      // with `subagentDepth > 0`. Stay silent ⇒ operator wonders why
-      // verify never fires. Emit a diagnostic and continue without
-      // wiring the scheduler.
+      // `--memory-verify-llm` / `--no-memory-verify-llm` in subagent
+      // context (F12 + Slice Q), but a programmatic caller / future
+      // code path that builds HarnessConfig directly could still set
+      // `memorySemanticVerify` with `subagentDepth > 0`. Stay silent
+      // ⇒ operator wonders why verify never fires. Emit a diagnostic
+      // and continue without wiring the scheduler. Post-Slice-Q the
+      // default is ON; opt-out is `/memory governance disable verify`
+      // (persisted) or `--no-memory-verify-llm` (session-only).
       if (config.memorySemanticVerify === true && (config.subagentDepth ?? 0) > 0) {
         process.stderr.write(
-          'memory: verify_semantic_disabled: --memory-verify-llm cannot run inside a subagent context (refused at runtime)\n',
+          'memory: verify_semantic_disabled: cannot run inside a subagent context (refused at runtime)\n',
         );
       }
       // R6 — guard on memoryRegistry availability. Pre-fix the cast
@@ -1198,7 +1200,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // intersect.
       if (config.memoryConflictDetect === true && (config.subagentDepth ?? 0) > 0) {
         process.stderr.write(
-          'memory: verify_conflict_disabled: --memory-conflict-llm cannot run inside a subagent context (refused at runtime)\n',
+          'memory: verify_conflict_disabled: cannot run inside a subagent context (refused at runtime)\n',
         );
       }
       if (

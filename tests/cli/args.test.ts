@@ -1136,4 +1136,59 @@ describe('--broker (§13.7 mode flag, slice 87)', () => {
     expect(r.args.memoryVerifyLlm).toBe(true);
     expect(r.args.memoryConflictLlm).toBe(true);
   });
+
+  // ── Slice Q: --no-* flags + mutual-exclusion ────────────────────
+
+  test('--no-memory-verify-llm parses as explicit off (false, not undefined)', () => {
+    const r = parseArgs(['--no-memory-verify-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBe(false);
+  });
+
+  test('--no-memory-conflict-llm parses as explicit off', () => {
+    const r = parseArgs(['--no-memory-conflict-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryConflictLlm).toBe(false);
+  });
+
+  test('omission → undefined (no CLI override; config layer resolves)', () => {
+    const r = parseArgs(['just a prompt']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBeUndefined();
+    expect(r.args.memoryConflictLlm).toBeUndefined();
+  });
+
+  test('--memory-verify-llm + --no-memory-verify-llm are mutually exclusive', () => {
+    const r = parseArgs(['--memory-verify-llm', '--no-memory-verify-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('mutually exclusive');
+    expect(r.message).toContain('--memory-verify-llm');
+  });
+
+  test('--memory-conflict-llm + --no-memory-conflict-llm are mutually exclusive', () => {
+    const r = parseArgs(['--memory-conflict-llm', '--no-memory-conflict-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('mutually exclusive');
+    expect(r.message).toContain('--memory-conflict-llm');
+  });
+
+  test('--no-memory-verify-llm + --subagent-session-id is also rejected (F12 mirror)', () => {
+    const r = parseArgs(['--subagent-session-id', 'child', '--no-memory-verify-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-verify-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  test('--no-memory-conflict-llm + --subagent-session-id is rejected', () => {
+    const r = parseArgs(['--subagent-session-id', 'child', '--no-memory-conflict-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-conflict-llm');
+  });
 });

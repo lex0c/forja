@@ -2,6 +2,65 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] hardening(memory) — Slice Q post-review (5 CRIT + 14 HIGH + MEDs)
+
+Three parallel reviewers on the Slice Q diff surfaced 5 CRIT + 14 HIGH + ~16 MED findings — banner UX, mutator robustness, doc/code drift, status-render coverage. All criticals + highs + bug-class meds closed in this pass (R1-R8) BEFORE the Slice Q commit lands; suite stays green at every step.
+
+**R1 — Spec + operator-doc anchor.** Added `docs/spec/AGENTIC_CLI.md §5.4.1` declaring `[memory]` config block (snake_case + camelCase aliases, precedence table, 2 config layers — no enterprise yet) and `docs/spec/MEMORY.md §6.6` "Detectores LLM-judge — default ON, opt-out via slash + config". Promoted operator-guide `docs/MEMORY.md §11.4` from `####` subsection to top-level peer of §11.3, removed PT-BR fragments, added spec cross-references, documented the `~/.local/share/forja/.governance-banner-shown` marker file.
+
+**R2 (B-CRIT-3 + A-M5) — first-boot banner suppression.** Banner now respects `--json` mode (NDJSON consumers expect predictable stderr) AND a per-machine marker at `~/.local/share/forja/.governance-banner-shown`. `BootstrapInput.governanceBannerMarkerDir?: string | null` for test injection (`null` disables marker entirely, useful for CI determinism). Default location uses `homedir()`. Errors writing marker degrade silently to "emit anyway" (better than suppressing a banner the operator never saw).
+
+**R3 (A-H1/2/3 + A-M1/4) — `mutateMemoryConfig` round-trip.** Pre-fix was text-level extract-and-replace of the `[memory]` block via section-header regex; defeated by multi-line basic strings (embedded `[memory]` lookalike), quoted-key tables, whitespace inside `[ memory ]`, BOM, CRLF, and `lastIndexOf('/')` on Windows. Refactored to `Bun.TOML.parse(raw) → mutate object → emit canonical` via a 40-line TOML emitter handling scalars + flat tables (exhaustive for `.agent/config.toml`'s schema; extends naturally if a future subsystem adds nested tables). Trade-off (lose comments + original whitespace) documented in code. `dirname()` for Windows compat; require() hoisted to top-level imports.
+
+**R4 (C-CRIT-1 + C-CRIT-2) — bootstrap end-to-end tests.** New `tests/cli/bootstrap-memory-defaults.test.ts` (+8 tests): fresh-repo defaults ON via source=`'default'`, first-boot banner emits with marker creation, second-boot stays silent (marker gate), `--json` suppresses banner without writing marker, explicit CLI override bumps source to `'cli'`, project/user config sets `'project-config'`/`'user-config'` source, project wins over user when both touch verify, marker dir=null disables marker (banner re-fires every boot).
+
+**R5 (C-H4) — source-label render matrix.** New describe block in `tests/cli/slash/memory.test.ts` (+16 tests) pinning all 16 distinct enabled/source label strings (8 verify × 8 conflict). Found and fixed a real bug along the way: `handleGovernanceStatus` was early-returning when verify had no recorded attempts or the read failed, suppressing the entire S13 block. Now both blocks always render; recent-attempts is the only conditional within each block.
+
+**R6 (B-M1 + B-H2) — language policy fix + dual-key warning.** PT-BR fragments in `src/cli/args.ts:1730-1732` ("polariades / precisam refusar a combinação / estendido") rewritten in English per project policy. Stale "Default off" comments on `memoryVerifyLlm` / `memoryConflictLlm` fields updated to reflect Slice Q inversion. `config-loader.parseMemoryLayer` now emits a warning when BOTH spellings of the same field appear in `[memory]` (snake wins, camel silently ignored pre-fix → operator confusion). +2 tests in `tests/critique/config-loader.test.ts` (dual-key warning fires; single-spelling stays quiet).
+
+**R7 — test-gap rollup.** Slice Q + R3-R6 added robustness coverage that subsumed the originally-tracked minor gaps (multi-line string in `[critique]`, whitespace-inside-brackets, CRLF round-trip, empty-file gain `[memory]`, camelCase→snake_case normalization on rewrite, malformed-TOML refuses write). +6 tests in `tests/cli/slash/memory-governance-toggle.test.ts`.
+
+**R8 (A-M6 + B-H5) — banner emit-both decision comment.** Documented in `src/cli/bootstrap.ts` the deliberate choice to emit ONE banner gated on BOTH detectors-from-default (instead of per-detector banners): an operator who config-touched EITHER field has signaled awareness of the subsystem; emitting half-of-a-per-detector banner on subsequent boots would be noise. Counter-argument noted + rejected with trade-off rationale.
+
+**Test footprint:** +42 new tests across 4 files. Suite: **8649 pass / 0 fail / 10 skip** (was 8617 pre-hardening). `bun run typecheck` + `bun run lint` clean.
+
+## [2026-05-18] feat(memory) — Slice Q: invert S11+S13 LLM-judge default to ON; opt-out via slash + per-project config
+
+Operator decision: the two LLM-judge detectors (`verify_failed` / S11, `conflict_detected` / S13) inverted from default OFF to default ON. Cost not a limitation; coverage is. Opt-out via slash command persisted per-project — mirroring the `[critique]` precedent in `.agent/config.toml`.
+
+**Resolved precedence chain** (boot-time, first-match wins):
+
+1. CLI flag explicit (`--memory-verify-llm` / `--no-memory-verify-llm` ditto for conflict). Session-only.
+2. Project config `.agent/config.toml [memory] verify_semantic_llm = false`.
+3. User config `~/.config/agent/config.toml [memory] verify_semantic_llm = false`.
+4. **Default ON** (the new default).
+
+Shipped (Q1-Q7):
+
+- **Q1**: spec + doc edits. `docs/MEMORY.md §11.4` (Detector opt-out & per-project config) precedence table. §14.4 audit-chain-bypass extended to cover both detectors. Lines 976/980 inverted from "Opt-in via" to "Default ON; opt-out via".
+- **Q2**: `loadMemoryConfig` in `src/critique/config-loader.ts` reusing `userConfigPath` / `projectConfigPath` / fail-soft warnings. Returns `{config, userHadField, projectHadField, warnings, paths}` — provenance signals drive banner suppression. snake_case + camelCase aliases.
+- **Q3**: bootstrap integration. `HarnessConfig.memorySemanticVerify`/`memoryConflictDetect` (still optional in type for fixture compat); `HarnessConfig.memorySemanticVerifySource`/`memoryConflictDetectSource` provenance fields. Boot banner: when BOTH resolve to ON via default + CLI absent → single stderr line `memory: governance LLM detectors enabled by default ... Disable: /memory governance disable verify|conflict|all`. Subagent context naturally suppresses (subagent-child has its own boot path).
+- **Q4**: CLI `--no-memory-verify-llm` / `--no-memory-conflict-llm` siblings. Mutual-exclusion guard: `--x` + `--no-x` in same argv → parse error. F12 mirror extended to refuse either polarity in subagent context. `run.ts` propagates both `true` and `false` (semantic: `undefined` = no CLI override).
+- **Q5**: `/memory governance enable|disable verify|conflict|all` slash subcommands. Text-level `[memory]` block extract-and-replace (preserves `[critique]` + comments). Atomic tmp+rename. Creates `.agent/` + file if absent. Replaces in-place when block exists (no duplicate).
+- **Q6**: harness loop comments updated (linhas 1074, 1082) reflect new opt-out path; stderr messages dropped flag-specific suffixes since the flag is now optional.
+- **Q7**: `/memory governance status` enabled-state strings use source provenance: `yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, etc.
+
+**Test footprint:** +24 across 3 files.
+
+- `tests/critique/config-loader.test.ts` (+8): defaults, project override, camelCase aliases, type errors, malformed TOML in user, user+project merge precedence.
+- `tests/cli/args.test.ts` (+7): `--no-*` parse, undefined-when-omitted, mutex `--x + --no-x`, F12 mirror for `--no-*`.
+- `tests/cli/slash/memory-governance-toggle.test.ts` (+10): fresh repo creates, disable verify/conflict/all, preserves existing `[critique]` verbatim, replaces in-place, round-trip via loadMemoryConfig, invalid target, extra positional, missing target, enable reverses doubly-disabled.
+
+Suite: **8617 pass / 0 fail / 10 skip** (+24 vs Slice Q baseline of 8593).
+
+**Migration risk mitigated by banner:** operator com config explicit ou CLI flag não é afetado (suprime). Operator que upgradar com nada explícito vê 1 linha no boot apontando para slash de disable.
+
+**Deferred (tracked):**
+
+- Bootstrap-level integration test (`tests/cli/bootstrap-memory-defaults.test.ts` proposto no plano) — Q2/Q3/Q5 cobrem as 3 camadas separately + round-trip. End-to-end seria mais defensivo mas complex de fixturizar; deferred.
+- `/memory governance status` source label tests — Q5 toggle tests cobrem o lado oposto (write); read-side label is rendered text, deferred.
+- Harness loop sanity test sobre scheduler creation via config path — same gap as S11's "4 branches deferred"; symmetric.
+
 ## [2026-05-18] hardening(memory) — S13 post-review (3 CRIT + 11 HIGH + MEDs + test gaps)
 
 Three parallel reviewers (correctness, spec/architecture, test quality) on the S13 slice surfaced findings spread across the slice. All criticals + highs closed in this pass (P1-P10) BEFORE the S13 commit landed; the slice ships shippable.

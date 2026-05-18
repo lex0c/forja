@@ -3634,6 +3634,102 @@ describe('/memory governance status (S11)', () => {
   });
 });
 
+// Per-source label render coverage (Slice Q). Each of the 4 sources
+// {cli, project-config, user-config, default} crosses {enabled,
+// disabled} for both detectors -> 16 distinct labels. The map below
+// pins each to its emitted string so a regression in source-label
+// wiring fails one assertion per row, not one giant blob match.
+describe('/memory governance status: source-label render matrix', () => {
+  const setVerify = (
+    ctx: ReturnType<typeof makeCtx>['ctx'],
+    enabled: boolean,
+    source: 'cli' | 'project-config' | 'user-config' | 'default',
+  ) => {
+    const c = ctx.baseConfig as {
+      memorySemanticVerify?: boolean;
+      memorySemanticVerifySource?: string;
+    };
+    c.memorySemanticVerify = enabled;
+    c.memorySemanticVerifySource = source;
+  };
+  const setConflict = (
+    ctx: ReturnType<typeof makeCtx>['ctx'],
+    enabled: boolean,
+    source: 'cli' | 'project-config' | 'user-config' | 'default',
+  ) => {
+    const c = ctx.baseConfig as {
+      memoryConflictDetect?: boolean;
+      memoryConflictDetectSource?: string;
+    };
+    c.memoryConflictDetect = enabled;
+    c.memoryConflictDetectSource = source;
+  };
+
+  const verifyMatrix: Array<{
+    enabled: boolean;
+    source: 'cli' | 'project-config' | 'user-config' | 'default';
+    label: string;
+  }> = [
+    { enabled: true, source: 'cli', label: 'yes (--memory-verify-llm)' },
+    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    {
+      enabled: true,
+      source: 'default',
+      label: 'yes (default; disable: /memory governance disable verify)',
+    },
+    { enabled: false, source: 'cli', label: 'no (--no-memory-verify-llm)' },
+    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'default', label: 'no (default)' },
+  ];
+  for (const row of verifyMatrix) {
+    test(`verify ${row.enabled ? 'on' : 'off'} from ${row.source} -> "${row.label}"`, async () => {
+      const repo = makeTmp();
+      const { ctx } = makeCtx(repo);
+      setVerify(ctx, row.enabled, row.source);
+      const r = await memoryCommand.exec(['governance', 'status'], ctx);
+      if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain(`enabled:             ${row.label}`);
+    });
+  }
+
+  const conflictMatrix: Array<{
+    enabled: boolean;
+    source: 'cli' | 'project-config' | 'user-config' | 'default';
+    label: string;
+  }> = [
+    { enabled: true, source: 'cli', label: 'yes (--memory-conflict-llm)' },
+    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    {
+      enabled: true,
+      source: 'default',
+      label: 'yes (default; disable: /memory governance disable conflict)',
+    },
+    { enabled: false, source: 'cli', label: 'no (--no-memory-conflict-llm)' },
+    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'default', label: 'no (default)' },
+  ];
+  for (const row of conflictMatrix) {
+    test(`conflict ${row.enabled ? 'on' : 'off'} from ${row.source} -> "${row.label}"`, async () => {
+      const repo = makeTmp();
+      const { ctx } = makeCtx(repo);
+      setConflict(ctx, row.enabled, row.source);
+      const r = await memoryCommand.exec(['governance', 'status'], ctx);
+      if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+      // Several conflict labels collide with verify labels (e.g.
+      // 'no (.agent/config.toml)'); split the rendered text at the
+      // S13 header so the assertion only sees the conflict block.
+      const text = (r.notes ?? []).join('\n');
+      const conflictBlock = text.split('verify-conflict (S13')[1] ?? '';
+      expect(conflictBlock).toContain(`enabled:             ${row.label}`);
+    });
+  }
+});
+
 describe('/memory governance audit — F10 provenance lineage', () => {
   test('lineage surfaces memory_provenance entries since proposal', async () => {
     const repo = makeTmp();

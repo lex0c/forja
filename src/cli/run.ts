@@ -689,8 +689,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
       ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
       ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
-      ...(args.memoryVerifyLlm === true ? { memorySemanticVerify: true } : {}),
-      ...(args.memoryConflictLlm === true ? { memoryConflictDetect: true } : {}),
+      // Slice Q — propagate both true AND false (not just true).
+      // `undefined` = no CLI override; bootstrap resolves from config
+      // or default. `true` / `false` = explicit operator opt-in/out.
+      ...(args.memoryVerifyLlm !== undefined ? { memorySemanticVerify: args.memoryVerifyLlm } : {}),
+      ...(args.memoryConflictLlm !== undefined
+        ? { memoryConflictDetect: args.memoryConflictLlm }
+        : {}),
+      // Slice Q — pipe --json through so bootstrap's first-boot
+      // governance banner can suppress for NDJSON consumers.
+      json: args.json,
       signal,
       ...(options.bootstrapOverride ?? {}),
     };

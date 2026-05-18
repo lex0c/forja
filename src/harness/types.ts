@@ -827,25 +827,30 @@ export interface HarnessConfig {
   // already excluded them — partial fail-closed. Absent / empty
   // = no exclusion.
   memoryExcludeScopes?: ReadonlyArray<import('../memory/index.ts').MemoryScope>;
-  // S11 opt-in for the LLM-judge semantic verifier (MEMORY.md §11.x /
-  // Phase 2). Default false ⇒ no LLM calls fire, no scheduler runs.
-  // When true: every step boundary polls memory_provenance for newly-
-  // exposed factual memories (type=project / reference) and dispatches
-  // the verify-semantic subagent (gated by cost / dispatch caps + the
-  // memory_verify_attempts dedup table). Operator opts in via
-  // `--memory-verify-llm` (CLI) or `[memory.verify].llm = true` (policy).
-  // Surfaced via `/memory governance status`. See `src/memory/verify-
-  // semantic.ts` for the constants + flow.
+  // S11 LLM-judge semantic verifier (MEMORY.md §11.x / Phase 2).
+  // DEFAULT ON since Slice Q (post-S13). When true: every step
+  // boundary polls memory_provenance for newly-exposed factual
+  // memories (type=project / reference) and dispatches the
+  // verify-semantic subagent (gated by cost / dispatch caps + the
+  // memory_verify_attempts dedup table). Opt-out:
+  //   - `/memory governance disable verify` (per-project, persisted
+  //     in `.agent/config.toml [memory] verify_semantic_llm = false`)
+  //   - `--no-memory-verify-llm` (session-only)
+  // Optional in the type so test fixtures + programmatic callers
+  // that don't model memory governance can omit the field (loop.ts
+  // treats undefined as "off"); CLI bootstrap ALWAYS sets it
+  // explicitly post-Slice-Q.
   memorySemanticVerify?: boolean;
-  // S13: opt-in for the LLM-judge conflict detector. When true,
-  // every step boundary polls memory_events for newly-written
-  // memories and dispatches the verify-conflict subagent against
-  // BM25-prefiltered same-scope siblings. Independent of
-  // memorySemanticVerify; either / both / neither may be set.
-  // Operator opts in via `--memory-conflict-llm` (CLI). Surfaced
-  // via `/memory governance status`. See `src/memory/verify-
-  // conflict.ts` for the constants + flow.
+  // Source provenance for /memory governance status rendering + the
+  // first-run banner suppression. Boot resolves which layer
+  // produced `memorySemanticVerify`'s value. Optional because
+  // legacy fixtures don't populate it.
+  memorySemanticVerifySource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // S13 LLM-judge conflict detector (MEMORY.md §11.x / Phase 2).
+  // DEFAULT ON since Slice Q. Mirror of memorySemanticVerify
+  // optionality.
   memoryConflictDetect?: boolean;
+  memoryConflictDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
   // Inventory of memories that landed in the eager-load section
   // of the system prompt (MEMORY.md §11.2 — provenance, surface
   // 'eager'). Populated by the CLI bootstrap from

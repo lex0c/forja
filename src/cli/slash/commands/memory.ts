@@ -21,7 +21,8 @@
 // the dispatcher's `notes` channel; mutation subcommands (Tier 2)
 // add modal-confirm + audit-row emission paths.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
   EMPTY_CORPUS_HASH,
   type MemoryFile,
@@ -2770,12 +2771,24 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   // we CAN see substrate-side: opt-in state, configured caps, and a
   // recent-attempts summary read from memory_verify_attempts (cross-
   // session — the table has no session_id column by design).
+  // Slice Q: enabled flag + source provenance label. Source resolved
+  // at boot (CLI > project config > user config > default ON). The
+  // label tells operator HOW the value was decided.
   const enabled = ctx.baseConfig.memorySemanticVerify === true;
+  const verifySource = ctx.baseConfig.memorySemanticVerifySource ?? 'default';
+  const verifyLabel = (() => {
+    if (enabled && verifySource === 'cli') return 'yes (--memory-verify-llm)';
+    if (enabled && verifySource === 'project-config') return 'yes (.agent/config.toml)';
+    if (enabled && verifySource === 'user-config') return 'yes (~/.config/agent/config.toml)';
+    if (enabled) return 'yes (default; disable: /memory governance disable verify)';
+    if (verifySource === 'cli') return 'no (--no-memory-verify-llm)';
+    if (verifySource === 'project-config') return 'no (.agent/config.toml)';
+    if (verifySource === 'user-config') return 'no (~/.config/agent/config.toml)';
+    return 'no (default)';
+  })();
   const lines: string[] = [];
   lines.push('semantic-verify (S11 / LLM-judge):');
-  lines.push(
-    `  enabled:             ${enabled ? 'yes (--memory-verify-llm)' : 'no (default; pass --memory-verify-llm to opt in)'}`,
-  );
+  lines.push(`  enabled:             ${verifyLabel}`);
   lines.push(
     `  confidence floor:    ${SEMANTIC_VERIFY_MIN_CONFIDENCE.toFixed(2)} (proposals below floor auto-archived)`,
   );
@@ -2785,25 +2798,29 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   lines.push(
     `  dedup window:        ${dedupDays}d (passed/inconclusive; contradicted always re-dispatches)`,
   );
-  let recent: ReturnType<typeof listRecentAttempts>;
+  // Render verify-attempts AND the S13 block unconditionally — a
+  // read failure or empty table on the verify side must not hide
+  // the conflict detector status (pre-fix bug: early returns
+  // suppressed the S13 block whenever memory_verify_attempts was
+  // empty or unreadable).
+  let recent: ReturnType<typeof listRecentAttempts> = [];
   try {
     recent = listRecentAttempts(ctx.db, 10);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     lines.push(`  recent attempts:     (read failed: ${displayGov(msg)})`);
-    return { kind: 'ok', notes: lines };
   }
   if (recent.length === 0) {
     lines.push('  recent attempts:     (none recorded yet)');
-    return { kind: 'ok', notes: lines };
-  }
-  lines.push(`  recent attempts (most-recent first, showing ${recent.length}):`);
-  for (const a of recent) {
-    const ts = formatGovernanceTimestamp(a.attemptedAt);
-    const conf = a.confidence.toFixed(2);
-    lines.push(
-      `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.memoryScope)}/${displayGov(a.memoryName)} · ${displayGov(a.modelId)}`,
-    );
+  } else {
+    lines.push(`  recent attempts (most-recent first, showing ${recent.length}):`);
+    for (const a of recent) {
+      const ts = formatGovernanceTimestamp(a.attemptedAt);
+      const conf = a.confidence.toFixed(2);
+      lines.push(
+        `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.memoryScope)}/${displayGov(a.memoryName)} · ${displayGov(a.modelId)}`,
+      );
+    }
   }
 
   // S13 — conflict detector summary. Same shape: enabled state +
@@ -2811,9 +2828,19 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   lines.push('');
   lines.push('verify-conflict (S13 / LLM-judge):');
   const conflictEnabled = ctx.baseConfig.memoryConflictDetect === true;
-  lines.push(
-    `  enabled:             ${conflictEnabled ? 'yes (--memory-conflict-llm)' : 'no (default; pass --memory-conflict-llm to opt in)'}`,
-  );
+  const conflictSource = ctx.baseConfig.memoryConflictDetectSource ?? 'default';
+  const conflictLabel = (() => {
+    if (conflictEnabled && conflictSource === 'cli') return 'yes (--memory-conflict-llm)';
+    if (conflictEnabled && conflictSource === 'project-config') return 'yes (.agent/config.toml)';
+    if (conflictEnabled && conflictSource === 'user-config')
+      return 'yes (~/.config/agent/config.toml)';
+    if (conflictEnabled) return 'yes (default; disable: /memory governance disable conflict)';
+    if (conflictSource === 'cli') return 'no (--no-memory-conflict-llm)';
+    if (conflictSource === 'project-config') return 'no (.agent/config.toml)';
+    if (conflictSource === 'user-config') return 'no (~/.config/agent/config.toml)';
+    return 'no (default)';
+  })();
+  lines.push(`  enabled:             ${conflictLabel}`);
   lines.push(
     `  confidence floor:    ${SEMANTIC_CONFLICT_MIN_CONFIDENCE.toFixed(2)} (proposals below floor auto-archived)`,
   );
@@ -2823,29 +2850,237 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   lines.push(
     `  dedup window:        ${conflictDedupDays}d (compatible verdicts; conflicting always re-dispatches)`,
   );
-  let recentConflicts: ReturnType<typeof listRecentConflictAttempts>;
+  let recentConflicts: ReturnType<typeof listRecentConflictAttempts> = [];
   try {
     recentConflicts = listRecentConflictAttempts(ctx.db, 10);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     lines.push(`  recent attempts:     (read failed: ${displayGov(msg)})`);
-    return { kind: 'ok', notes: lines };
   }
   if (recentConflicts.length === 0) {
     lines.push('  recent attempts:     (none recorded yet)');
-    return { kind: 'ok', notes: lines };
-  }
-  lines.push(`  recent attempts (most-recent first, showing ${recentConflicts.length}):`);
-  for (const a of recentConflicts) {
-    const ts = formatGovernanceTimestamp(a.attemptedAt);
-    const conf = a.confidence.toFixed(2);
-    const kind = a.conflictKind !== null ? ` (${displayGov(a.conflictKind)})` : '';
-    lines.push(
-      `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.scopeA)}/${displayGov(a.nameA)} vs ${displayGov(a.scopeB)}/${displayGov(a.nameB)}${kind} · ${displayGov(a.modelId)}`,
-    );
+  } else {
+    lines.push(`  recent attempts (most-recent first, showing ${recentConflicts.length}):`);
+    for (const a of recentConflicts) {
+      const ts = formatGovernanceTimestamp(a.attemptedAt);
+      const conf = a.confidence.toFixed(2);
+      const kind = a.conflictKind !== null ? ` (${displayGov(a.conflictKind)})` : '';
+      lines.push(
+        `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.scopeA)}/${displayGov(a.nameA)} vs ${displayGov(a.scopeB)}/${displayGov(a.nameB)}${kind} · ${displayGov(a.modelId)}`,
+      );
+    }
   }
   return { kind: 'ok', notes: lines };
 };
+
+// ─── Slice Q: /memory governance enable | disable ─────────────────
+//
+// Slash surface for the operator to opt OUT of the (default-ON since
+// Slice Q) LLM-judge detectors per-project. Writes `.agent/config.toml
+// [memory]` keys; effect applies at next turn boundary (same snapshot
+// semantic as /model and /critique mode). Creates `.agent/` + the
+// file if absent; preserves other sections (`[critique]`, etc.)
+// verbatim via a text-level edit of the `[memory]` block.
+
+const parseDetectorTarget = (
+  arg: string | undefined,
+): { verify: boolean; conflict: boolean } | null => {
+  switch (arg) {
+    case 'verify':
+      return { verify: true, conflict: false };
+    case 'conflict':
+      return { verify: false, conflict: true };
+    case 'all':
+      return { verify: true, conflict: true };
+    default:
+      return null;
+  }
+};
+
+// Canonical TOML emitter for `.agent/config.toml`. Bun ships only
+// TOML.parse — no stringify — so we round-trip the file as
+// parse → mutate → emit-canonical instead of text-level splicing
+// the `[memory]` block. Round-trip is robust against the shapes
+// that defeat a regex-driven splice: multi-line basic strings,
+// quoted-key tables, whitespace inside `[ memory ]`, BOM, `\r\n`,
+// and section-header lookalikes nested inside string literals.
+//
+// Trade-off: round-trip loses comments and original whitespace —
+// `[critique]` and `[memory]` are re-emitted in a normalized
+// shape (snake_case keys, alphabetical-ish by insertion order,
+// blank line between tables). Operators editing the file by hand
+// should expect rewrites to normalize formatting on the next
+// `/memory governance enable|disable`. Forja's `.agent/config.
+// toml` schema is flat (no array-of-tables, no nested sub-tables),
+// so the 40-line emitter below covers it exhaustively; if a
+// future subsystem adds nested tables, extend `emitTomlDoc`.
+const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
+
+const emitTomlScalar = (v: unknown): string => {
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'number' && Number.isFinite(v)) return v.toString();
+  if (typeof v === 'string') {
+    return `"${v
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r')
+      .replace(/\t/g, '\\t')}"`;
+  }
+  if (Array.isArray(v)) return `[${v.map(emitTomlScalar).join(', ')}]`;
+  return '""';
+};
+
+const emitTomlKey = (k: string): string => {
+  if (TOML_BARE_KEY_RE.test(k)) return k;
+  return `"${k.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+};
+
+const isScalarValue = (v: unknown): boolean =>
+  v === null || typeof v !== 'object' || Array.isArray(v);
+
+const emitTomlDoc = (doc: Record<string, unknown>): string => {
+  const sections: string[] = [];
+  const topLevel: string[] = [];
+  for (const [k, v] of Object.entries(doc)) {
+    if (isScalarValue(v)) {
+      topLevel.push(`${emitTomlKey(k)} = ${emitTomlScalar(v)}`);
+    }
+  }
+  if (topLevel.length > 0) sections.push(topLevel.join('\n'));
+  for (const [k, v] of Object.entries(doc)) {
+    if (!isScalarValue(v)) {
+      const lines: string[] = [`[${emitTomlKey(k)}]`];
+      for (const [kk, vv] of Object.entries(v as Record<string, unknown>)) {
+        if (isScalarValue(vv)) {
+          lines.push(`${emitTomlKey(kk)} = ${emitTomlScalar(vv)}`);
+        }
+      }
+      sections.push(lines.join('\n'));
+    }
+  }
+  return sections.length > 0 ? `${sections.join('\n\n')}\n` : '';
+};
+
+const mutateMemoryConfig = (params: {
+  filePath: string;
+  patches: { verifySemanticLlm?: boolean; conflictDetectLlm?: boolean };
+}): { ok: true } | { ok: false; reason: string } => {
+  const { filePath, patches } = params;
+  const dir = dirname(filePath);
+  let raw = '';
+  if (existsSync(filePath)) {
+    try {
+      raw = readFileSync(filePath, 'utf8');
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `could not read ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  let doc: Record<string, unknown> = {};
+  if (raw.length > 0) {
+    try {
+      const parsed = Bun.TOML.parse(raw);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        doc = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return {
+        ok: false,
+        reason: `existing ${filePath} has malformed TOML; edit manually or remove the file`,
+      };
+    }
+  }
+
+  // Resolve current [memory] values (accepting camelCase aliases
+  // the loader honors), then apply patches.
+  let verify = true;
+  let conflict = true;
+  const existing = doc.memory;
+  if (existing !== null && typeof existing === 'object' && !Array.isArray(existing)) {
+    const m = existing as Record<string, unknown>;
+    const v = m.verify_semantic_llm ?? m.verifySemanticLlm;
+    const c = m.conflict_detect_llm ?? m.conflictDetectLlm;
+    if (typeof v === 'boolean') verify = v;
+    if (typeof c === 'boolean') conflict = c;
+  }
+  if (patches.verifySemanticLlm !== undefined) verify = patches.verifySemanticLlm;
+  if (patches.conflictDetectLlm !== undefined) conflict = patches.conflictDetectLlm;
+
+  // Always re-emit the [memory] block with canonical snake_case
+  // keys (per MEMORY.md §11.x). Drop any camelCase aliases that
+  // were present — the emitted snake_case forms are authoritative.
+  doc.memory = {
+    verify_semantic_llm: verify,
+    conflict_detect_llm: conflict,
+  };
+
+  const outRaw = emitTomlDoc(doc);
+
+  // Atomic temp+rename (mirror of src/memory/writer.ts pattern).
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+    writeFileSync(tmp, outRaw);
+    renameSync(tmp, filePath);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `could not write ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  return { ok: true };
+};
+
+const handleGovernanceToggle = (
+  ctx: SlashContext,
+  args: string[],
+  value: boolean,
+  verb: 'enable' | 'disable',
+): SlashResult => {
+  const target = parseDetectorTarget(args[0]);
+  if (target === null) {
+    return {
+      kind: 'error',
+      message: `/memory governance ${verb}: expected 'verify' | 'conflict' | 'all' (got ${args[0] !== undefined ? `'${displayGov(args[0])}'` : 'nothing'})`,
+    };
+  }
+  if (args.length > 1) {
+    return {
+      kind: 'error',
+      message: `/memory governance ${verb}: unexpected arg '${displayGov(args[1] as string)}' (single positional only)`,
+    };
+  }
+  const path = require('node:path') as typeof import('node:path');
+  const filePath = path.join(ctx.baseConfig.cwd, '.agent', 'config.toml');
+  const patches: Parameters<typeof mutateMemoryConfig>[0]['patches'] = {};
+  if (target.verify) patches.verifySemanticLlm = value;
+  if (target.conflict) patches.conflictDetectLlm = value;
+  const result = mutateMemoryConfig({ filePath, patches });
+  if (!result.ok) {
+    return { kind: 'error', message: `/memory governance ${verb}: ${result.reason}` };
+  }
+  const fields: string[] = [];
+  if (target.verify) fields.push(`memory.verify_semantic_llm = ${value}`);
+  if (target.conflict) fields.push(`memory.conflict_detect_llm = ${value}`);
+  return {
+    kind: 'ok',
+    notes: [
+      `${verb}d ${target.verify && target.conflict ? 'both detectors' : target.verify ? 'verify' : 'conflict'} in ${filePath}`,
+      ...fields,
+      'effect applies at the next turn boundary',
+    ],
+  };
+};
+
+const handleGovernanceEnable = (ctx: SlashContext, args: string[]): SlashResult =>
+  handleGovernanceToggle(ctx, args, true, 'enable');
+
+const handleGovernanceDisable = (ctx: SlashContext, args: string[]): SlashResult =>
+  handleGovernanceToggle(ctx, args, false, 'disable');
 
 const handleGovernance = async (
   registry: MemoryRegistry,
@@ -2857,7 +3092,7 @@ const handleGovernance = async (
     return {
       kind: 'error',
       message:
-        '/memory governance: subcommand required (try: list, show, approve, reject, audit, status)',
+        '/memory governance: subcommand required (try: list, show, approve, reject, audit, status, enable, disable)',
     };
   }
   const rest = args.slice(1);
@@ -2874,10 +3109,14 @@ const handleGovernance = async (
       return handleGovernanceAudit(ctx, rest);
     case 'status':
       return handleGovernanceStatus(ctx, rest);
+    case 'enable':
+      return handleGovernanceEnable(ctx, rest);
+    case 'disable':
+      return handleGovernanceDisable(ctx, rest);
     default:
       return {
         kind: 'error',
-        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, audit, status)`,
+        message: `/memory governance: unknown subcommand '${sub}' (try: list, show, approve, reject, audit, status, enable, disable)`,
       };
   }
 };

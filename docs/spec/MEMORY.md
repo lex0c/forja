@@ -551,6 +551,35 @@ Re-promoção **não reaproveita evidence antiga** ([`EVICTION.md §4.2`](./EVIC
 
 Metadata em `eviction_events` **nunca** é purgada — só conteúdo. Garante prova de despejo para compliance/forensics.
 
+### 6.6 Detectores LLM-judge — default ON, opt-out via slash + config
+
+Dois detectores LLM-judge rodam por default ([`AGENTIC_CLI.md §5.4.1`](./AGENTIC_CLI.md) carrega a declaração do bloco `[memory]`):
+
+| Detector | Trigger fonte | Slice |
+|---|---|---|
+| `verify_failed` | exposure de memória factual (eager-load OR memory_read) | S11 |
+| `conflict_detected` | write de memória (memory_events action=created/edited) | S13 |
+
+**Opt-out** (precedência first-match-wins):
+
+1. **CLI flag**: `--no-memory-verify-llm` / `--no-memory-conflict-llm` (session-only). `--memory-verify-llm` / `--memory-conflict-llm` continuam como override-ON para scripts que queiram forçar ativação mesmo com project config OFF.
+2. **Project config** `.agent/config.toml [memory] verify_semantic_llm = false` / `conflict_detect_llm = false` — persisted, committed.
+3. **User config** `~/.config/agent/config.toml [memory] ...` — per-user, cross-project.
+4. **Default ON** — hardcoded em `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG`.
+
+**Slash:** `/memory governance disable verify | conflict | all` escreve no project config. `enable` reverte. Efeito vale a partir do próximo turn boundary (snapshot semantic, mesmo padrão de `/model` e `/critique mode`).
+
+**Substrate detalhe:**
+
+- Spawn isolado em subagent (definitions em `src/subagents/builtin/verify-semantic.md` + `verify-conflict.md`).
+- Cost cap independente (`MEMORY_VERIFY_SEMANTIC_MAX_COST_USD` + `MEMORY_VERIFY_CONFLICT_MAX_COST_USD`).
+- Propose-not-mutate — verdicts viram pending proposals via S8 governance substrate; operator decide via `/memory governance approve` ou `reject`.
+- BOTH detectors podem propor `quarantine` kind. Pair-judge (S13) emite multi-memory proposal com `target_payload.target_key` designando o loser; resolver determinístico (provenance > recência > scope > body length > lexicographic) escolhe quem perde.
+
+**Layers:** 2 (user + project) — mirror de `[critique]`. Enterprise layer fica adiada até regulated environment surfacar (mesmo trade-off de critique).
+
+Detalhes operacionais e cost caps em [`MEMORY.md`](../MEMORY.md) §11.4 (operator guide).
+
 ---
 
 ## 7. Trust & Injection
