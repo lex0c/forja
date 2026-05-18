@@ -240,6 +240,24 @@ export type {
 } from './repos/memory-verify-attempts.ts';
 
 export {
+  MEMORY_OVERRIDE_EVENTS_RETENTION_MS,
+  MEMORY_OVERRIDE_THRESHOLD_COUNT,
+  MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
+  OVERRIDE_SIGNALS,
+  countOverridesInWindow,
+  listOverrideEventsSince,
+  listRecentOverridesForMemory,
+  pruneOverrideEvents,
+  recordOverrideEvent,
+} from './repos/memory-override-events.ts';
+export type {
+  MemoryOverrideEventRow,
+  OverrideSignal,
+  RecordOverrideEventInput,
+  RecordOverrideEventResult,
+} from './repos/memory-override-events.ts';
+
+export {
   createHookRun,
   listHookRunsByEvent,
   listHookRunsBySession,
