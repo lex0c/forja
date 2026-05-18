@@ -275,4 +275,48 @@ verify_semantic_llm = false
     // Marker dir disabled -> banner fires every boot.
     expect(stderrJoined()).toContain('governance LLM detectors enabled by default');
   });
+
+  test('malformed [memory] value surfaces in BootstrapResult.memoryConfigWarnings', async () => {
+    // Post-review fix: loadMemoryConfig records warnings for bad
+    // values but bootstrap never propagated them to BootstrapResult.
+    // Operator who typed `verify_semantic_llm = "false"` (string
+    // instead of boolean) was silently kept on the default-on
+    // detector and paid LLM-judge cost with no diagnostic.
+    //
+    // Pin: malformed value lands a warning AND the field falls back
+    // to default (true). Both observations needed — the warning is
+    // useless if the field actually opted out silently, and the
+    // fallback is the very behavior that makes the warning
+    // load-bearing.
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      '[memory]\nverify_semantic_llm = "false"\nconflict_detect_llm = "no"\noverride_detect_llm = 0\n',
+    );
+    const result = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      governanceBannerMarkerDir: markerDir,
+    });
+    try {
+      // Each bad value produces a warning; loader didn't silently swallow.
+      expect(result.memoryConfigWarnings.length).toBeGreaterThanOrEqual(3);
+      const joined = result.memoryConfigWarnings.join('\n');
+      expect(joined).toContain('verify_semantic_llm');
+      expect(joined).toContain('conflict_detect_llm');
+      expect(joined).toContain('override_detect_llm');
+      // Fields fell back to defaults (true) — the operator's opt-out
+      // attempt did NOT take effect, so the diagnostic is the only
+      // path to fix.
+      expect(result.config.memorySemanticVerify).toBe(true);
+      expect(result.config.memoryConflictDetect).toBe(true);
+      expect(result.config.memoryOverrideDetect).toBe(true);
+    } finally {
+      result.db.close();
+    }
+  });
 });

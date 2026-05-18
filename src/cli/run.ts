@@ -712,6 +712,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       subagents,
       hookWarnings,
       critiqueWarnings,
+      memoryConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -793,6 +794,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       // gating as the hook / subagent warnings above.
       for (const w of critiqueWarnings) {
         errSink(`forja: critique config: ${w}\n`);
+      }
+      // Memory governance config warnings (`.agent/config.toml
+      // [memory]`). Loader degrades to defaults (currently
+      // default-ON detectors) on bad values rather than aborting
+      // boot. Surface here so an operator who typoed
+      // `verify_semantic_llm = "false"` (string) sees the diag
+      // and isn't silently billed for default-on LLM-judge work
+      // they thought they had opted out of.
+      for (const w of memoryConfigWarnings) {
+        errSink(`forja: memory config: ${w}\n`);
       }
     }
 

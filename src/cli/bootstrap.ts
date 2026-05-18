@@ -223,6 +223,15 @@ export interface BootstrapResult {
   // a bad value degrades to defaults rather than aborting boot.
   // Empty in the happy path.
   critiqueWarnings: readonly string[];
+  // Warnings from the memory governance config loader
+  // (`.agent/config.toml [memory]` keys). Loader degrades to
+  // defaults (currently default-ON) on bad values rather than
+  // aborting boot — without this surface, an operator who writes
+  // `verify_semantic_llm = "false"` (string instead of boolean)
+  // would silently keep the default-on detector running and pay
+  // the LLM-judge cost without diagnostic. CLI driver renders
+  // these on stderr alongside the hook + critique warnings.
+  memoryConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -1234,6 +1243,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     subagents,
     hookWarnings: resolvedHooks.warnings,
     critiqueWarnings: critiqueLoaded.warnings,
+    memoryConfigWarnings: memoryLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

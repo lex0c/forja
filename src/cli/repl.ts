@@ -714,6 +714,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     policyLayers,
     hookWarnings,
     critiqueWarnings,
+    memoryConfigWarnings,
   } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
@@ -740,6 +741,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // bad value at REPL boot.
   for (const w of critiqueWarnings) {
     errSink(`forja: critique config: ${w}\n`);
+  }
+  // Memory governance config warnings (`.agent/config.toml [memory]`).
+  // Same surfacing as run.ts: loader degrades to defaults on bad
+  // values, so the operator needs stderr visibility to spot a
+  // silent opt-out failure (e.g., typed `verify_semantic_llm =
+  // "false"` and got default-on detectors billing LLM-judge work).
+  for (const w of memoryConfigWarnings) {
+    errSink(`forja: memory config: ${w}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision
