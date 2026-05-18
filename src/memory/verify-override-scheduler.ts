@@ -362,17 +362,23 @@ export const createOverrideVerifyScheduler = (
       if (stopped) return;
 
       if (outcome.kind === 'skipped') {
-        // injection / dedup_hit / stale_snapshot / empty_events.
-        // Surface injection + stale_snapshot for operator visibility;
-        // dedup_hit + empty_events are expected silent skips.
-        if (outcome.reason === 'injection_detected' || outcome.reason === 'stale_snapshot') {
+        // injection / dedup_hit / stale_snapshot / empty_events /
+        // target_gone. Surface adversarial / drift / deletion paths
+        // for operator visibility; dedup_hit + empty_events are
+        // expected silent skips.
+        if (
+          outcome.reason === 'injection_detected' ||
+          outcome.reason === 'stale_snapshot' ||
+          outcome.reason === 'target_gone'
+        ) {
           stderr(
             `memory: verify_override_skipped: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${outcome.reason}\n`,
           );
         }
         // G5 mirror: stale_snapshot does NOT advance — operator's
         // edit needs to land in a fresh poll's peek so the dispatcher
-        // re-reads the latest body. Other skips DO advance.
+        // re-reads the latest body. target_gone DOES advance — the
+        // memory file is gone, no future poll will recover it.
         if (outcome.reason !== 'stale_snapshot') {
           advanceTo(advanceAt, advanceId);
         }

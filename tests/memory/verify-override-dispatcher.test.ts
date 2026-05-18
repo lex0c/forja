@@ -368,6 +368,83 @@ describe('dispatchOverrideVerify — output handling', () => {
   });
 });
 
+describe('dispatchOverrideVerify — prompt size discipline (post-Phase-2 review #5)', () => {
+  test('per-event details truncate at MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT', async () => {
+    // Capture the prompt the dispatcher hands to runSubagent so we
+    // can assert the truncation marker. The spawn fake's first arg
+    // carries the rendered prompt.
+    let observedPrompt: string | undefined;
+    const spawnFn = (async (spawnArgs: { prompt: string }) => {
+      observedPrompt = spawnArgs.prompt;
+      return makeResult();
+    }) as never;
+    const { MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT } = await import(
+      '../../src/memory/verify-override-dispatcher.ts'
+    );
+    // Build an event whose details JSON blows past the cap.
+    const hugePrompt = 'A'.repeat(MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT * 3);
+    const bigEvent = makeEvent({ details: { tool_name: 'bash', prompt: hugePrompt } });
+    const outcome = await dispatchOverrideVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('rule') },
+      overrideEvents: [bigEvent, makeEvent(), makeEvent()],
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('completed');
+    expect(observedPrompt).toBeDefined();
+    if (observedPrompt === undefined) throw new Error('unreachable');
+    // The truncation marker appears in the prompt.
+    expect(observedPrompt).toContain('…[truncated');
+    expect(observedPrompt).toContain('bytes]');
+    // The full hugePrompt does NOT appear (we truncated it).
+    expect(observedPrompt).not.toContain(hugePrompt);
+    // The cap bounds the per-event details rendering. Total prompt
+    // can grow with N events but each one stays bounded.
+    const detailsLines = observedPrompt.split('\n').filter((l) => l.startsWith('  details:'));
+    for (const line of detailsLines) {
+      // Each details line ≤ cap + marker overhead (~25 chars
+      // for `…[truncated N bytes]`). Generous 100-char buffer.
+      expect(line.length).toBeLessThan(
+        MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT + 100 + '  details: '.length,
+      );
+    }
+  });
+
+  test('small details pass through unchanged (no truncation marker)', async () => {
+    let observedPrompt: string | undefined;
+    const spawnFn = (async (spawnArgs: { prompt: string }) => {
+      observedPrompt = spawnArgs.prompt;
+      return makeResult();
+    }) as never;
+    const outcome = await dispatchOverrideVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('rule') },
+      overrideEvents: [
+        makeEvent({ details: { stage: 'modal', reason: 'declined' } }),
+        makeEvent(),
+        makeEvent(),
+      ],
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('completed');
+    if (observedPrompt === undefined) throw new Error('unreachable');
+    expect(observedPrompt).not.toContain('truncated');
+    expect(observedPrompt).toContain('"stage":"modal"');
+  });
+});
+
 describe('dispatchOverrideVerify — verdict routing', () => {
   test('misguiding=false → attempt cached, NO proposal landed', async () => {
     const out =
@@ -488,6 +565,118 @@ describe('dispatchOverrideVerify — TOCTOU re-read', () => {
     });
     expect(outcome.kind).toBe('skipped');
     if (outcome.kind === 'skipped') expect(outcome.reason).toBe('stale_snapshot');
+    expect(spawnCalled).toBe(false);
+  });
+
+  test('memory file gone (peek=missing) → skipped target_gone (no LLM cost)', async () => {
+    // Post-Phase-2 review #4: when the operator deletes the memory
+    // between threshold-trip and dispatch, the dispatcher should
+    // short-circuit BEFORE paying LLM cost. Without the guard, the
+    // dispatcher would proceed with the originally-passed snapshot
+    // and applyProposal would later refuse the proposal as
+    // stale_evidence anyway — wasted cost.
+    const roots = makeRoots(workdir);
+    mkdirSync(roots.projectLocal, { recursive: true });
+    // Seed an index entry pointing at a memory whose file we then
+    // delete — registry.peek returns kind='missing' (entry in
+    // MEMORY.md, body file absent).
+    writeFileSync(join(roots.projectLocal, 'MEMORY.md'), '- [foo](foo.md) — original\n');
+    // intentionally NO foo.md on disk
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
+
+    let spawnCalled = false;
+    const spawnFn = (async () => {
+      spawnCalled = true;
+      return makeResult();
+    }) as never;
+
+    const outcome = await dispatchOverrideVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('original body') },
+      overrideEvents: [makeEvent(), makeEvent(), makeEvent()],
+      registry,
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
+    expect(spawnCalled).toBe(false);
+    // No attempt row landed (no LLM cost).
+    expect(listRecentOverrideAttempts(db)).toHaveLength(0);
+  });
+
+  test('proposal failure rolls back attempt (no orphaned cooldown row)', async () => {
+    // Post-Phase-2 review #3: pre-fix, attempt landed before
+    // recordProposal threw, leaving the dedup cache primed for 24h
+    // with NO operator-visible proposal. Fix wraps attempt +
+    // proposal in withTransaction so any proposal failure rolls
+    // back the attempt too.
+    //
+    // Force the failure by passing parentSessionId pointing at a
+    // non-existent session — recordProposal's FK to sessions(id)
+    // throws SQLITE_CONSTRAINT_FOREIGNKEY at INSERT time.
+    const ghostSessionId = '00000000-0000-0000-0000-000000000ff';
+    const out = `misguiding: true\nconfidence: 0.85\nrule_extracted: "use --no-verify"\noverride_pattern_observed: "3 rejections of the rule"\nsuggested_motivo: conflict\n`;
+    const outcome = await dispatchOverrideVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: ghostSessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('rule') },
+      overrideEvents: [makeEvent(), makeEvent(), makeEvent()],
+      spawnSubagentFn: makeFakeSpawn(makeResult({ output: out })),
+    });
+    expect(outcome.kind).toBe('spawn_failed');
+    if (outcome.kind === 'spawn_failed') {
+      expect(outcome.reason).toContain('persistence_failed');
+      // Cost was incurred — surface via costUsd so caps latch.
+      expect(outcome.costUsd).toBeGreaterThan(0);
+    }
+    // No orphaned attempt row.
+    expect(listRecentOverrideAttempts(db)).toHaveLength(0);
+    // No proposal either (would have failed FK).
+    const { listProposals } = await import('../../src/storage/repos/memory-governance.ts');
+    expect(listProposals(db)).toHaveLength(0);
+  });
+
+  test('memory listing gone entirely (peek=unknown) → target_gone', async () => {
+    // Stronger case: not just file deleted but MEMORY.md entry
+    // also removed (operator ran `/memory delete`). peek returns
+    // kind='unknown'. Same short-circuit.
+    const roots = makeRoots(workdir);
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(join(roots.projectLocal, 'MEMORY.md'), '# Memory index\n\n');
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
+
+    let spawnCalled = false;
+    const spawnFn = (async () => {
+      spawnCalled = true;
+      return makeResult();
+    }) as never;
+
+    const outcome = await dispatchOverrideVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file: makeFile('original body') },
+      overrideEvents: [makeEvent(), makeEvent(), makeEvent()],
+      registry,
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
     expect(spawnCalled).toBe(false);
   });
 });

@@ -532,6 +532,47 @@ describe('applyProposal — happy paths', () => {
     expect(ev?.trigger).toBe('user_override_repeated');
   });
 
+  test('quarantine via subagent:verify-override → trigger user_override_repeated', async () => {
+    // S3.3 trigger mapping pin: governance.ts:triggerForProposal
+    // resolves `subagent:verify-override` to `user_override_repeated`,
+    // matching spec §6.5.2. This test pins the mapping so a refactor
+    // of the switch case can't silently drift to `operator_driven`.
+    const roots = makeRoots();
+    seedActiveMemory(roots.projectLocal, 'foo');
+    const registry = baseRegistry();
+    const hash = computeSnapshotHash(roots.projectLocal, 'foo');
+    const p = recordProposal(db, {
+      sessionId,
+      kind: 'quarantine',
+      sourceMemoryKeys: [{ scope: 'project_local', name: 'foo' }],
+      sourceMemorySnapshots: [{ scope: 'project_local', name: 'foo', contentHash: hash }],
+      targetPayload: { motivo: 'conflict' },
+      evidence: {
+        misguiding: true,
+        confidence: 0.85,
+        rule_extracted: 'always use rebase, never merge',
+        override_pattern_observed: 'operator rejected 3 inferred memos that imply the rule',
+        suggested_motivo: 'conflict',
+      },
+      proposedBy: 'subagent:verify-override',
+      confidence: 0.85,
+    });
+    const result = await applyProposal({
+      db,
+      registry,
+      proposalId: p.id,
+      decidedBy: 'operator:slash',
+    });
+    expect(result.outcome).toBe('applied');
+    const ev = getLastEvictionForObject(db, 'memory', 'foo', 'project_local');
+    expect(ev?.trigger).toBe('user_override_repeated');
+    expect(ev?.toState).toBe('quarantined');
+    expect(ev?.motivo).toBe('conflict');
+    const evJson = JSON.parse(ev?.evidenceJson ?? '{}');
+    expect(evJson.proposed_by).toBe('subagent:verify-override');
+    expect(evJson.detector_evidence?.misguiding).toBe(true);
+  });
+
   test('quarantine on an already-quarantined memory rejects with state_change', async () => {
     const roots = makeRoots();
     seedQuarantinedMemory(roots.projectLocal, 'foo');

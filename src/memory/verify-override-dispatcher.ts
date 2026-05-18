@@ -26,7 +26,7 @@ import { createHash } from 'node:crypto';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
-import type { DB } from '../storage/db.ts';
+import { type DB, withTransaction } from '../storage/db.ts';
 import {
   type MemorySnapshot,
   canonicalJsonStringify,
@@ -97,7 +97,12 @@ export interface DispatchOverrideVerifyInput {
 export type DispatchOverrideOutcome =
   | {
       kind: 'skipped';
-      reason: 'injection_detected' | 'dedup_hit' | 'stale_snapshot' | 'empty_events';
+      reason:
+        | 'injection_detected'
+        | 'dedup_hit'
+        | 'stale_snapshot'
+        | 'empty_events'
+        | 'target_gone';
       priorAttempt?: MemoryVerifyOverrideAttemptRow;
     }
   | {
@@ -200,9 +205,32 @@ const validateOutput = (
   };
 };
 
+// Per-event details truncation cap (post-Phase-2 review #5). Signal
+// collectors today produce bounded `details` (modal_stage / tool_name
+// / proposed_name etc.), but `permission_denied` carries the
+// permission engine's prompt — operator-authored via policy YAML —
+// which has no upstream size bound. A hostile or buggy policy could
+// emit a multi-KB prompt; 10 events × KB-scale details would inflate
+// the verify-override prompt enough to risk context-window pressure
+// AND cost amplification. Cap each rendered event's details JSON
+// at this byte budget; truncated values land with a `…[truncated
+// N bytes]` marker so the judge sees the elision honestly. Memory
+// body is intentionally NOT truncated: it's the primary input the
+// judge reasons over; the operator promotion gate caps shared
+// bodies at 200 lines (MEMORY.md §8.1) and unbounded `local` bodies
+// are already in the model's context whenever the memory loads.
+export const MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT = 512;
+
+const truncateDetailsForPrompt = (detailsStr: string): string => {
+  if (detailsStr.length <= MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT) return detailsStr;
+  const dropped = detailsStr.length - MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT;
+  return `${detailsStr.slice(0, MAX_OVERRIDE_DETAILS_BYTES_IN_PROMPT)}…[truncated ${dropped} bytes]`;
+};
+
 const formatEvent = (e: MemoryOverrideEventRow): string => {
   const ts = new Date(e.createdAt).toISOString();
-  const detailsStr = e.details === null ? '{}' : canonicalJsonStringify(e.details);
+  const detailsRaw = e.details === null ? '{}' : canonicalJsonStringify(e.details);
+  const detailsStr = truncateDetailsForPrompt(detailsRaw);
   return `- signal: ${e.signal}\n  timestamp: ${ts}\n  details: ${detailsStr}`;
 };
 
@@ -243,9 +271,12 @@ export const dispatchOverrideVerify = async (
     return { kind: 'skipped', reason: 'empty_events' };
   }
 
-  // (1a) TOCTOU re-read gate (mirror of verify-semantic F11).
-  // Operator may have edited the body between threshold-trip and
-  // dispatch; the fresh body is what the judge should see.
+  // (1a) TOCTOU re-read gate (mirror of verify-semantic F11) +
+  // target-gone short-circuit (post-Phase-2 review #4): operator
+  // may have edited OR deleted the memory between threshold-trip
+  // and dispatch. Drift → stale_snapshot, gone → target_gone. Both
+  // skip BEFORE paying LLM cost; applyProposal would refuse a
+  // post-dispatch proposal as `system:stale_evidence` anyway.
   let workingFile = memory.file;
   if (input.registry !== undefined) {
     const repeek = input.registry.peek(memory.name, { scope: memory.scope });
@@ -256,6 +287,14 @@ export const dispatchOverrideVerify = async (
         return { kind: 'skipped', reason: 'stale_snapshot' };
       }
       workingFile = repeek.file;
+    } else {
+      // peek.kind ∈ {missing, malformed, unknown}: the memory file
+      // is no longer present (deleted) or corrupt. Refuse dispatch;
+      // operator's edit / deletion wins. Next poll's threshold
+      // check would also fail (the candidate disappears from the
+      // registry) — this is a defensive short-circuit when the
+      // scheduler captured the candidate before deletion.
+      return { kind: 'skipped', reason: 'target_gone' };
     }
   }
 
@@ -354,10 +393,21 @@ export const dispatchOverrideVerify = async (
   }
   const output = validated.value;
 
-  // (5) Record the attempt — mirrors verify-semantic F18 FK retry.
-  // A concurrent purge could delete the child's subagent_runs row
-  // between runSubagent returning and this INSERT. Catch the FK
-  // throw and retry with subagentRunSessionId=null.
+  // (5 + 6) Atomic persistence of attempt + (optional) proposal +
+  // (optional) auto-reject decision. Post-Phase-2 review #3: pre-
+  // fix, a recordProposal failure AFTER recordOverrideAttempt
+  // succeeded left an orphaned attempt — the cooldown cache gated
+  // future polls but no operator-visible proposal ever landed.
+  // Wrapping both in `withTransaction` rolls back the attempt when
+  // the proposal write throws. Net: persistent failures burn LLM
+  // budget faster (the cost cap is the rate-limit), but no silent
+  // gating.
+  //
+  // Internal FK retry on recordOverrideAttempt mirrors verify-
+  // semantic F18: a concurrent purge of the subagent_runs row
+  // between runSubagent returning and this INSERT triggers a
+  // FOREIGN KEY constraint; retry with subagentRunSessionId=null.
+  // The retry stays inside the same transaction.
   const modelId = input.provider.id;
   const attemptBase = {
     memoryScope: memory.scope,
@@ -370,31 +420,102 @@ export const dispatchOverrideVerify = async (
     promptHash,
     attemptedAt: nowMs,
   };
-  let attempt: ReturnType<typeof recordOverrideAttempt>;
+  let attempt: ReturnType<typeof recordOverrideAttempt> | undefined;
+  let proposalResult: ReturnType<typeof recordProposal> | undefined;
   try {
-    attempt = recordOverrideAttempt(db, {
-      ...attemptBase,
-      subagentRunSessionId: result.sessionId,
+    withTransaction(db, () => {
+      try {
+        attempt = recordOverrideAttempt(db, {
+          ...attemptBase,
+          subagentRunSessionId: result.sessionId,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/FOREIGN KEY constraint/i.test(msg)) {
+          attempt = recordOverrideAttempt(db, {
+            ...attemptBase,
+            subagentRunSessionId: null,
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      if (!output.misguiding) return; // misguiding=false → attempt only
+
+      // Stable evidence-essence: rule + pattern + sorted event ids.
+      const evidenceEssence = canonicalJsonStringify({
+        rule: output.rule_extracted,
+        pattern: output.override_pattern_observed,
+        motivo: output.suggested_motivo,
+        event_ids: input.overrideEvents.map((e) => e.id).sort(),
+      });
+      const snapshots: MemorySnapshot[] = [{ scope: memory.scope, name: memory.name, contentHash }];
+      proposalResult = recordProposal(db, {
+        sessionId: input.parentSessionId,
+        kind: 'quarantine',
+        sourceMemoryKeys: [{ scope: memory.scope, name: memory.name }],
+        sourceMemorySnapshots: snapshots,
+        targetPayload: {
+          motivo: output.suggested_motivo,
+        },
+        evidence: {
+          misguiding: output.misguiding,
+          confidence: output.confidence,
+          rule_extracted: output.rule_extracted,
+          override_pattern_observed: output.override_pattern_observed,
+          suggested_motivo: output.suggested_motivo,
+          prompt_hash: promptHash,
+          subagent_run_session_id: result.sessionId,
+          model_id: modelId,
+          override_event_ids: input.overrideEvents.map((e) => e.id),
+        },
+        proposedBy: VERIFY_OVERRIDE_PROPOSED_BY,
+        confidence: output.confidence,
+        evidenceEssence,
+        createdAt: nowMs,
+      });
+
+      if (output.confidence < SEMANTIC_OVERRIDE_MIN_CONFIDENCE && !proposalResult.deduped) {
+        // Same guard as verify-semantic: only auto-reject when
+        // this run actually inserted a new row. If the fingerprint
+        // matched an existing PENDING proposal (silent dedup),
+        // don't flip THAT proposal — which may carry a prior high-
+        // confidence verdict — to rejected based on this noisy run.
+        decideProposal(db, proposalResult.id, {
+          status: 'rejected',
+          decidedBy: 'system:low_confidence',
+          decidedReason: `confidence ${output.confidence.toFixed(2)} below threshold ${SEMANTIC_OVERRIDE_MIN_CONFIDENCE.toFixed(2)}`,
+          decidedAt: nowMs,
+        });
+      }
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/FOREIGN KEY constraint/i.test(msg)) {
-      attempt = recordOverrideAttempt(db, {
-        ...attemptBase,
-        subagentRunSessionId: null,
-      });
-    } else {
-      throw err;
-    }
+    // Transaction rolled back: no attempt, no proposal. The LLM
+    // cost was already incurred and surfaces via costUsd so the
+    // scheduler's per-session cap latches accordingly. Next poll
+    // re-dispatches against the same body (no cooldown cache).
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      kind: 'spawn_failed',
+      reason: `persistence_failed: ${reason}`,
+      costUsd: result.costUsd,
+    };
   }
 
-  // (6) Governance proposal per verdict:
-  //   - misguiding=false: no proposal (cached for dedup; nothing
-  //     for the operator queue).
-  //   - misguiding=true (any confidence): proposal recorded. When
-  //     confidence >= threshold the proposal stays `pending`. When
-  //     BELOW threshold it auto-rejects with `system:low_confidence`
-  //     so forensic queries still surface the verdict.
+  // After commit: attempt is guaranteed assigned by the closure.
+  if (attempt === undefined) {
+    // Defensive — unreachable when withTransaction returns without
+    // throwing (the closure assigns attempt on every code path
+    // including FK retry).
+    return {
+      kind: 'spawn_failed',
+      reason: 'persistence_failed: attempt missing post-commit',
+      costUsd: result.costUsd,
+    };
+  }
+
+  // (6) Build the completion outcome from persisted state.
   if (!output.misguiding) {
     return {
       kind: 'completed',
@@ -406,54 +527,14 @@ export const dispatchOverrideVerify = async (
     };
   }
 
-  // Stable evidence-essence: rule + pattern + sorted event ids.
-  // Two dispatches that emit the same finding against the same body
-  // + same evidence collapse to one pending proposal via the
-  // fingerprint UNIQUE partial index.
-  const evidenceEssence = canonicalJsonStringify({
-    rule: output.rule_extracted,
-    pattern: output.override_pattern_observed,
-    motivo: output.suggested_motivo,
-    event_ids: input.overrideEvents.map((e) => e.id).sort(),
-  });
-  const snapshots: MemorySnapshot[] = [{ scope: memory.scope, name: memory.name, contentHash }];
-  const proposalResult = recordProposal(db, {
-    sessionId: input.parentSessionId,
-    kind: 'quarantine',
-    sourceMemoryKeys: [{ scope: memory.scope, name: memory.name }],
-    sourceMemorySnapshots: snapshots,
-    targetPayload: {
-      motivo: output.suggested_motivo,
-    },
-    evidence: {
-      misguiding: output.misguiding,
-      confidence: output.confidence,
-      rule_extracted: output.rule_extracted,
-      override_pattern_observed: output.override_pattern_observed,
-      suggested_motivo: output.suggested_motivo,
-      prompt_hash: promptHash,
-      subagent_run_session_id: result.sessionId,
-      model_id: modelId,
-      override_event_ids: input.overrideEvents.map((e) => e.id),
-    },
-    proposedBy: VERIFY_OVERRIDE_PROPOSED_BY,
-    confidence: output.confidence,
-    evidenceEssence,
-    createdAt: nowMs,
-  });
-
-  if (output.confidence < SEMANTIC_OVERRIDE_MIN_CONFIDENCE && !proposalResult.deduped) {
-    // Same guard as verify-semantic: only auto-reject when this run
-    // actually inserted a new row. If the fingerprint matched an
-    // existing PENDING proposal (silent dedup), don't flip THAT
-    // proposal — which may carry a prior high-confidence verdict —
-    // to rejected based on this noisy run.
-    decideProposal(db, proposalResult.id, {
-      status: 'rejected',
-      decidedBy: 'system:low_confidence',
-      decidedReason: `confidence ${output.confidence.toFixed(2)} below threshold ${SEMANTIC_OVERRIDE_MIN_CONFIDENCE.toFixed(2)}`,
-      decidedAt: nowMs,
-    });
+  if (proposalResult === undefined) {
+    // Defensive — closure assigns proposalResult when misguiding
+    // is true and the txn committed. Unreachable in practice.
+    return {
+      kind: 'spawn_failed',
+      reason: 'persistence_failed: proposal missing post-commit',
+      costUsd: result.costUsd,
+    };
   }
 
   return {
