@@ -896,7 +896,7 @@ Arg-validation refuses unknown flags and out-of-range `--limit` so a typo doesn'
 
 ### 11.4 Detector opt-out & per-project config
 
-Canonical declaration of the memory-governance LLM-judge detectors' opt-out surface. The detectors (`verify_failed` / S11, `conflict_detected` / S13) are **default ON** since Slice Q (post-S13).
+Canonical declaration of the memory-governance LLM-judge detectors' opt-out surface. All three detectors (`verify_failed` / S11, `conflict_detected` / S13, `user_override_repeated` / S3) are **default ON** since Slice Q (S3 joined the default-ON posture in S3.5).
 
 #### Precedence
 
@@ -904,10 +904,10 @@ Operators control opt-out at three layers; first-match wins:
 
 | Layer | Where | Scope | Wins over |
 |---|---|---|---|
-| **CLI flag** | `--memory-verify-llm` / `--no-memory-verify-llm` (same shape for conflict) | session-only | everything else |
-| **Project config** | `.agent/config.toml [memory] verify_semantic_llm = false` (same key shape for `conflict_detect_llm`) | per-project, committed (operators who keep `.agent/` under git ship the policy team-wide) | user config |
+| **CLI flag** | `--memory-verify-llm` / `--no-memory-verify-llm` (same shape for `--memory-conflict-llm` and `--memory-override-llm`) | session-only | everything else |
+| **Project config** | `.agent/config.toml [memory] verify_semantic_llm = false` (same key shape for `conflict_detect_llm` and `override_detect_llm`) | per-project, committed (operators who keep `.agent/` under git ship the policy team-wide) | user config |
 | **User config** | `~/.config/agent/config.toml [memory] verify_semantic_llm = false` | per-user, cross-project | default |
-| **Default** | hardcoded in `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG` (both = `true`) | global | — |
+| **Default** | hardcoded in `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG` (all three = `true`) | global | — |
 
 #### Config block shape
 
@@ -915,26 +915,27 @@ Operators control opt-out at three layers; first-match wins:
 [memory]
 verify_semantic_llm = false    # disables S11 verify_failed detector
 conflict_detect_llm = false    # disables S13 conflict_detected detector
+override_detect_llm = false    # disables S3 user_override_repeated detector
 ```
 
-Snake_case is canonical (matches the `[critique]` block precedent). camelCase aliases (`verifySemanticLlm`, `conflictDetectLlm`) are accepted for copy-paste tolerance from the HarnessConfig API surface; snake wins on tie. Layer precedence runs per-field — a project file that only sets `verify_semantic_llm` leaves `conflict_detect_llm` to inherit from user or default.
+Snake_case is canonical (matches the `[critique]` block precedent). camelCase aliases (`verifySemanticLlm`, `conflictDetectLlm`, `overrideDetectLlm`) are accepted for copy-paste tolerance from the HarnessConfig API surface; snake wins on tie. Layer precedence runs per-field — a project file that only sets `verify_semantic_llm` leaves `conflict_detect_llm` and `override_detect_llm` to inherit from user or default.
 
 Spec backing: [`docs/spec/AGENTIC_CLI.md §5.4.1`](./spec/AGENTIC_CLI.md) (config.toml declaration) + [`docs/spec/MEMORY.md §6.6`](./spec/MEMORY.md) (detector contract).
 
 #### Slash commands
 
-- `/memory governance disable verify | conflict | all` — writes `false` to project config.
-- `/memory governance enable verify | conflict | all` — writes `true` to project config.
-- `/memory governance status` — shows resolved state per detector with source label (`yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (~/.config/agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, `no (default)`).
+- `/memory governance disable verify | conflict | override | all` — writes `false` to project config.
+- `/memory governance enable verify | conflict | override | all` — writes `true` to project config. `all` covers all three detectors.
+- `/memory governance status` — shows resolved state per detector with source label (`yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (~/.config/agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, `no (default)`). Three blocks: `semantic-verify (S11)`, `verify-conflict (S13)`, `verify-override (S3)`. Each block renders enabled state + caps + recent attempts.
 
 Side effects: idempotent atomic write to `.agent/config.toml` (creates `.agent/` + file if absent; preserves other sections like `[critique]` verbatim via TOML round-trip; canonical re-emit so unknown comments are NOT preserved on touched blocks). Effect applies at **next turn boundary** — not mid-session — matching the snapshot semantic of `/model` and `/critique mode`.
 
 #### First-boot stderr advisory
 
-When both detectors resolve to ON via default (no config layer touched the field, no CLI flag) the boot emits a single stderr line:
+When all three detectors resolve to ON via default (no config layer touched the field, no CLI flag) the boot emits a single stderr line:
 
 ```
-memory: governance LLM detectors enabled by default (verify=on, conflict=on). Disable: /memory governance disable verify|conflict|all
+memory: governance LLM detectors enabled by default (verify=on, conflict=on, override=on). Disable: /memory governance disable verify|conflict|override|all
 ```
 
 So operators upgrading from pre-Slice-Q (when defaults were OFF) aren't surprised by proposals surging in `/memory governance`. Suppressed in:
@@ -942,8 +943,9 @@ So operators upgrading from pre-Slice-Q (when defaults were OFF) aren't surprise
 - `--json` mode (NDJSON consumers don't need stderr noise; toggled via `BootstrapInput.json`).
 - subagent context (subagent-child has its own boot path; doesn't pass through this code).
 - after first appearance (marker file in `~/.local/share/forja/.governance-banner-shown` — created on first emit, checked on subsequent boots).
+- when ANY config layer (user or project) explicitly named ANY of the three fields — operator awareness of the subsystem is the signal.
 
-To suppress permanently without touching `.agent/config.toml`: run `/memory governance enable all` or `disable all` once — both materialize the field in project config and trip the explicit-source branch on next boot.
+To suppress permanently without touching `.agent/config.toml`: run `/memory governance enable all` or `disable all` once — both materialize the field(s) in project config and trip the explicit-source branch on next boot.
 
 ---
 
@@ -1111,36 +1113,36 @@ bootstrapScore = state === 'quarantined' ? rawScore × 0.3 : rawScore
 - **No tag match** — the spec calls out tag-based match as a future signal. `IndexEntry` doesn't carry tags today; when the listing shape grows them, they fold in alongside name + description.
 - **No trust filter on `retrieve_context`** — the eager-load path drops `trust: untrusted` bodies; the retrieval view doesn't (the gap is acknowledged in §14.3). Operator quarantine discipline is the current line of defense.
 
-### 12.5 LLM-judge detector pipeline (S11 + S13)
+### 12.5 LLM-judge detector pipeline (S11 + S13 + S3)
 
-Two detectors run as isolated subagents at every harness step boundary. The architecture commitment is **propose-not-mutate**: detectors emit `pending` proposals into `memory_governance_proposals`; the operator decides; the apply path delegates to the state machine. No detector touches memory state directly.
+Three detectors run as isolated subagents at every harness step boundary. The architecture commitment is **propose-not-mutate**: detectors emit `pending` proposals into `memory_governance_proposals`; the operator decides; the apply path delegates to the state machine. No detector touches memory state directly.
 
 #### 12.5.1 Why a subagent
 
-The detectors invoke an LLM to judge prose claims against the live repo. Doing that inline in the parent loop would:
+The detectors invoke an LLM to judge prose claims against the live repo OR the operator's override history. Doing that inline in the parent loop would:
 
 - Leak detector reasoning into the parent's context (and audit trail).
 - Block the parent on a multi-step subagent run with its own tool calls.
 - Mix non-deterministic LLM judgment with deterministic loop state.
 
-So each detector runs in a separate isolated subagent (`runSubagent` with `parentApprovalId: null`; new session id; capability whitelist limited to read-only filesystem tools — `read_file`, `grep`, `glob`, `memory_read`; no `bash`, no `write_file`, no `edit_file`). Output is a structured JSON payload validated against a schema before being recorded. The subagent's session is rooted at the parent's cwd, so its file reads reach the same repo the operator is working in.
+So each detector runs in a separate isolated subagent (`runSubagent` with `parentApprovalId: null`; new session id; capability whitelist limited to read-only filesystem tools — `read_file`, `grep`, `glob`, `memory_read` for S11; `memory_read` only for S13; empty `[]` for S3). Output is a structured JSON payload validated against a schema before being recorded. The subagent's session is rooted at the parent's cwd, so its file reads reach the same repo the operator is working in.
 
-#### 12.5.2 The two detectors
+#### 12.5.2 The three detectors
 
-| | S11 verify-semantic | S13 verify-conflict |
-|---|---|---|
-| **Trigger source** | `memory_provenance` exposures (the model just saw a body) | `memory_events action='created'\|'edited'` (a memory just landed) |
-| **Cardinality** | One memory per dispatch | One pair per dispatch (just-written + BM25-prefiltered sibling) |
-| **Question asked** | "Does this memory's claim hold against the current repo state?" | "Do these two memories conflict semantically?" |
-| **Eligible types** | `project`, `reference` (factual; not `user` / `feedback`) | `project`, `reference` |
-| **Subagent name** | `verify-semantic` | `verify-conflict` |
-| **Subagent caps** | `max_steps: 15`, `max_cost: $0.10` | `max_steps: 6`, `max_cost: $0.06` |
-| **Session caps** | `MAX_DISPATCHES_PER_SESSION: 10`, `MAX_COST_USD: $0.50` | same |
-| **Confidence floor** | `0.7` (sub-floor proposals auto-archived) | `0.7` |
-| **Verdict shape** | `{verdict: 'passed'\|'contradicted'\|'inconclusive', confidence, claim_extracted, ground_truth_observed, evidence_paths}` | `{conflicting: bool, conflict_kind, confidence, evidence: {shared_concept, polarity_a, polarity_b}}` |
-| **Dedup window** | 7d for `passed`/`inconclusive`; `contradicted` always re-dispatches (cache miss by design) | Same shape, pair-keyed |
-| **Dedup substrate** | `memory_verify_attempts` (migration 057) — content-hash keyed | `memory_conflict_attempts` (migration 061) — pair-key + canonical SQL CHECK |
-| **Proposal kind** | `quarantine` with `sourceMemoryKeys=[name]` | `quarantine` with `sourceMemoryKeys=[winner, loser]` + `target_payload.target_key={scope, name}` of loser |
+| | S11 verify-semantic | S13 verify-conflict | S3 verify-override |
+|---|---|---|---|
+| **Trigger source** | `memory_provenance` exposures (the model just saw a body) | `memory_events action='created'\|'edited'` (a memory just landed) | `memory_override_events` threshold tripped (3 operator overrides in 24h pointing at this memory) |
+| **Cardinality** | One memory per dispatch | One pair per dispatch (just-written + BM25-prefiltered sibling) | One memory per dispatch (with its recent override events as judge context) |
+| **Question asked** | "Does this memory's claim hold against the current repo state?" | "Do these two memories conflict semantically?" | "Is this memory plausibly driving the operator's rejection pattern?" |
+| **Eligible types** | `project`, `reference` (factual; not `user` / `feedback`) | `project`, `reference` | `project`, `reference` |
+| **Subagent name** | `verify-semantic` | `verify-conflict` | `verify-override` |
+| **Subagent caps** | `max_steps: 15`, `max_cost: $0.10` | `max_steps: 6`, `max_cost: $0.06` | `max_steps: 8`, `max_cost: $0.08` |
+| **Session caps** | `MAX_DISPATCHES_PER_SESSION: 10`, `MAX_COST_USD: $0.50` | same | same |
+| **Confidence floor** | `0.7` (sub-floor proposals auto-archived) | `0.7` | `0.7` |
+| **Verdict shape** | `{verdict: 'passed'\|'contradicted'\|'inconclusive', confidence, claim_extracted, ground_truth_observed, evidence_paths}` | `{conflicting: bool, conflict_kind, confidence, evidence: {shared_concept, polarity_a, polarity_b}}` | `{misguiding: bool, confidence, rule_extracted, override_pattern_observed, suggested_motivo}` |
+| **Dedup window** | 7d for `passed`/`inconclusive`; `contradicted` always re-dispatches (cache miss by design) | Same shape, pair-keyed | 24h cooldown (both verdicts; the pending-proposal gate upstream prevents queue duplicates) |
+| **Dedup substrate** | `memory_verify_attempts` (migration 057) — content-hash keyed | `memory_conflict_attempts` (migration 061) — pair-key + canonical SQL CHECK | `memory_verify_override_attempts` (migration 065) — content-hash keyed |
+| **Proposal kind** | `quarantine` with `sourceMemoryKeys=[name]` | `quarantine` with `sourceMemoryKeys=[winner, loser]` + `target_payload.target_key={scope, name}` of loser | `quarantine` with `sourceMemoryKeys=[name]` + `target_payload.motivo` from the subagent's `suggested_motivo` |
 
 The verify-conflict dispatcher uses a deterministic **conflict resolver** (`src/memory/conflict-resolver.ts`) to pick winner/loser AFTER the LLM judges them conflicting. The chain (lower = wins):
 
@@ -1462,6 +1464,8 @@ These were listed as deferred in a prior draft but are wired today:
 
 - **`conflict_detected` LLM-judge detector** (`feat/memory-governance-llm` Slice 13, MEMORY.md §11.x). **Default ON** since Slice Q (post-S13). Opt-out via `/memory governance disable conflict` (per-project, persisted in `.agent/config.toml [memory] conflict_detect_llm = false`) or session-only via `--no-memory-conflict-llm` CLI flag. `--memory-conflict-llm` flag preserved as session-only override-ON. Same architectural posture as S11 (propose-not-mutate, scheduler at step boundary, dispatcher per-pair, subagent isolated). Differences: takes PAIR of memos (just-written via `memory_events` action='created'|'edited' + BM25-prefiltered top-K=5 same-scope siblings, intra-scope only). Subagent `verify-conflict` (built-in) emits `{conflicting, conflict_kind, confidence, evidence: {shared_concept, polarity_a, polarity_b}}`. Deterministic resolver (`src/memory/conflict-resolver.ts`) picks winner/loser via tier chain (provenance > recency > scope > body length > lexicographic). `quarantine` proposal carries `sourceMemoryKeys=[winner, loser]` for forensic context + `target_payload.target_key={scope, name}` of loser; the apply path's multi-memory carve-out (§11.3 gate #4) transitions ONLY the loser. Cost cap $0.50/session / 10 dispatches independent from S11 counters. Substrate: migration 061 (`memory_conflict_attempts` — pair-keyed dedup with canonical SQL CHECK), `src/memory/verify-conflict*.ts` (dispatcher + scheduler + constants + resolver), `src/subagents/builtin/verify-conflict.md`. Pre-dispatch pending-proposal gate skips when a quarantine for either side is already in the operator queue (avoids cost amplification loop). Shadow-protected like `verify-semantic` via `PROTECTED_BUILTIN_NAMES`.
 
-The remaining auto-detector named in §6.5.2 (`user_override_repeated`) ships as **substrate-only** today; the detection logic itself is deferred to Phase 2 follow-up slice (S3), built on the S8 governance substrate above. Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals. The operator surface is production-ready to receive both detector verdicts and proposals. Detector opt-out + per-project config in §11.4 above.
+- **`user_override_repeated` LLM-judge detector** (`feat/memory-governance-llm` S3, MEMORY.md §11.x). **Default ON** as of S3.5. Opt-out via `/memory governance disable override` (per-project, persisted in `.agent/config.toml [memory] override_detect_llm = false`) or session-only via `--no-memory-override-llm` CLI flag. `--memory-override-llm` flag preserved as session-only override-ON. Same architectural posture as S11/S13 (propose-not-mutate, scheduler at step boundary, dispatcher per-memory, subagent isolated, capability envelope intersected). Differences: input is one memory + N operator override events; subagent reasons over operator BEHAVIOR (rejected modals, denied tool calls, reverted edits) instead of repo state; output is `{misguiding, confidence, rule_extracted, override_pattern_observed, suggested_motivo}`. The deterministic threshold gate (3 events in 24h via `countOverridesInWindow`) sits BEFORE the LLM dispatch — below threshold zero LLM cost. Signal collectors (S3.2) populate `memory_override_events` via `MemoryRegistry.recordOverrideSignal` from two operator surfaces: modal-reject in `memory_write` and permission-deny in `invoke-tool` (the `confirm_no` async path). Attribution via `memory_provenance` lookup → top-K=5 factual exposures; signal (c) `edit_reverted` substrate-ready but collector deferred. Substrate: migration 064 (`memory_override_events` — 3 signal kinds, threshold-windowed counter) + migration 065 (`memory_verify_override_attempts` — content-hash keyed cooldown cache, 24h). `src/memory/verify-override*.ts` (dispatcher + scheduler + constants). `src/subagents/builtin/verify-override.md` (empty tools[], anti-injection guidance, structured output schema). Shadow-protected via `PROTECTED_BUILTIN_NAMES`. Pre-dispatch gates: cap check → threshold check → type/trust/state filter (defense in depth over signal collector's filter) → pending-proposal short-circuit → cooldown dedup. `/memory governance status` surfaces enabled state + caps + recent attempts.
+
+Architectural commitment: zero text-heuristic for memory lifecycle decisions; all prose judgment defers to LLM-judge via governance proposals. The four detectors named in spec §6.5.2 (`verify_failed`, `conflict_detected`, `trust_revoked`, `user_override_repeated`) are all production-wired as of S3.5. Detector opt-out + per-project config in §11.4 above.
 
 `docs/BACKLOG.md` carries the current milestone status; the FEEDBACK_ADAPTATION cross-cut (`docs/spec/FEEDBACK_ADAPTATION.md`) describes how loop-frio adaptation will eventually drive automatic `low_roi` quarantine / eviction proposals for stale memories.

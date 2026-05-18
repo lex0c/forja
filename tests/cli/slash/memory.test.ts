@@ -3906,10 +3906,68 @@ describe('/memory governance status: source-label render matrix', () => {
       // 'no (.agent/config.toml)'); split the rendered text at the
       // S13 header so the assertion only sees the conflict block.
       const text = (r.notes ?? []).join('\n');
-      const conflictBlock = text.split('verify-conflict (S13')[1] ?? '';
+      const conflictBlock =
+        text.split('verify-conflict (S13')[1]?.split('verify-override (S3')[0] ?? '';
       expect(conflictBlock).toContain(`enabled:             ${row.label}`);
     });
   }
+
+  const setOverride = (
+    ctx: ReturnType<typeof makeCtx>['ctx'],
+    enabled: boolean,
+    source: 'cli' | 'project-config' | 'user-config' | 'default',
+  ) => {
+    const c = ctx.baseConfig as {
+      memoryOverrideDetect?: boolean;
+      memoryOverrideDetectSource?: string;
+    };
+    c.memoryOverrideDetect = enabled;
+    c.memoryOverrideDetectSource = source;
+  };
+
+  const overrideMatrix: Array<{
+    enabled: boolean;
+    source: 'cli' | 'project-config' | 'user-config' | 'default';
+    label: string;
+  }> = [
+    { enabled: true, source: 'cli', label: 'yes (--memory-override-llm)' },
+    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    {
+      enabled: true,
+      source: 'default',
+      label: 'yes (default; disable: /memory governance disable override)',
+    },
+    { enabled: false, source: 'cli', label: 'no (--no-memory-override-llm)' },
+    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'default', label: 'no (default)' },
+  ];
+  for (const row of overrideMatrix) {
+    test(`override ${row.enabled ? 'on' : 'off'} from ${row.source} -> "${row.label}"`, async () => {
+      const repo = makeTmp();
+      const { ctx } = makeCtx(repo);
+      setOverride(ctx, row.enabled, row.source);
+      const r = await memoryCommand.exec(['governance', 'status'], ctx);
+      if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+      // Several override labels collide with verify + conflict ones;
+      // split at the S3 header so the assertion sees only its block.
+      const text = (r.notes ?? []).join('\n');
+      const overrideBlock = text.split('verify-override (S3')[1] ?? '';
+      expect(overrideBlock).toContain(`enabled:             ${row.label}`);
+    });
+  }
+
+  test('status renders all three detector blocks unconditionally', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('semantic-verify (S11');
+    expect(text).toContain('verify-conflict (S13');
+    expect(text).toContain('verify-override (S3');
+  });
 });
 
 describe('/memory governance audit — F10 provenance lineage', () => {

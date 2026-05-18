@@ -51,6 +51,12 @@ import {
   SEMANTIC_CONFLICT_MIN_CONFIDENCE,
 } from '../../../memory/verify-conflict.ts';
 import {
+  MEMORY_VERIFY_OVERRIDE_MAX_COST_USD,
+  MEMORY_VERIFY_OVERRIDE_MAX_DISPATCHES_PER_SESSION,
+  SEMANTIC_OVERRIDE_COOLDOWN_MS,
+  SEMANTIC_OVERRIDE_MIN_CONFIDENCE,
+} from '../../../memory/verify-override.ts';
+import {
   MEMORY_VERIFY_SEMANTIC_MAX_COST_USD,
   MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION,
   SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
@@ -96,6 +102,7 @@ import {
   listProvenanceForToolCall,
 } from '../../../storage/repos/memory-provenance.ts';
 import { listRecentAttempts } from '../../../storage/repos/memory-verify-attempts.ts';
+import { listRecentOverrideAttempts } from '../../../storage/repos/memory-verify-override-attempts.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 // ─── scope arg helpers ───────────────────────────────────────────────
@@ -3016,6 +3023,54 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
       const kind = a.conflictKind !== null ? ` (${displayGov(a.conflictKind)})` : '';
       lines.push(
         `    ${ts} · ${displayGov(a.verdict).padEnd(12)} · conf=${conf} · ${displayGov(a.scopeA)}/${displayGov(a.nameA)} vs ${displayGov(a.scopeB)}/${displayGov(a.nameB)}${kind} · ${displayGov(a.modelId)}`,
+      );
+    }
+  }
+
+  // S3 — override detector summary. Same shape as S11 + S13: enabled
+  // state + caps + recent attempts. Independent counters.
+  lines.push('');
+  lines.push('verify-override (S3 / LLM-judge):');
+  const overrideEnabled = ctx.baseConfig.memoryOverrideDetect === true;
+  const overrideSource = ctx.baseConfig.memoryOverrideDetectSource ?? 'default';
+  const overrideLabel = (() => {
+    if (overrideEnabled && overrideSource === 'cli') return 'yes (--memory-override-llm)';
+    if (overrideEnabled && overrideSource === 'project-config') return 'yes (.agent/config.toml)';
+    if (overrideEnabled && overrideSource === 'user-config')
+      return 'yes (~/.config/agent/config.toml)';
+    if (overrideEnabled) return 'yes (default; disable: /memory governance disable override)';
+    if (overrideSource === 'cli') return 'no (--no-memory-override-llm)';
+    if (overrideSource === 'project-config') return 'no (.agent/config.toml)';
+    if (overrideSource === 'user-config') return 'no (~/.config/agent/config.toml)';
+    return 'no (default)';
+  })();
+  lines.push(`  enabled:             ${overrideLabel}`);
+  lines.push(
+    `  confidence floor:    ${SEMANTIC_OVERRIDE_MIN_CONFIDENCE.toFixed(2)} (proposals below floor auto-archived)`,
+  );
+  lines.push(`  max dispatches/sess: ${MEMORY_VERIFY_OVERRIDE_MAX_DISPATCHES_PER_SESSION}`);
+  lines.push(`  max cost/sess:       $${MEMORY_VERIFY_OVERRIDE_MAX_COST_USD.toFixed(2)}`);
+  const overrideCooldownDays = Math.round(SEMANTIC_OVERRIDE_COOLDOWN_MS / (24 * 60 * 60 * 1000));
+  lines.push(
+    `  cooldown window:     ${overrideCooldownDays}d (per-memory; both verdicts dedup until body or window changes)`,
+  );
+  let recentOverrides: ReturnType<typeof listRecentOverrideAttempts> = [];
+  try {
+    recentOverrides = listRecentOverrideAttempts(ctx.db, 10);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    lines.push(`  recent attempts:     (read failed: ${displayGov(msg)})`);
+  }
+  if (recentOverrides.length === 0) {
+    lines.push('  recent attempts:     (none recorded yet)');
+  } else {
+    lines.push(`  recent attempts (most-recent first, showing ${recentOverrides.length}):`);
+    for (const a of recentOverrides) {
+      const ts = formatGovernanceTimestamp(a.attemptedAt);
+      const conf = a.confidence.toFixed(2);
+      const verdict = a.misguiding ? 'misguiding' : 'noise';
+      lines.push(
+        `    ${ts} · ${verdict.padEnd(12)} · conf=${conf} · motivo=${displayGov(a.suggestedMotivo)} · ${displayGov(a.memoryScope)}/${displayGov(a.memoryName)} · ${displayGov(a.modelId)}`,
       );
     }
   }
