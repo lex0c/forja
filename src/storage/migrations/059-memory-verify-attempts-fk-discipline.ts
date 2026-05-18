@@ -24,13 +24,31 @@
 // Two things:
 //
 // (1) Adds a `provenance_drift_at` column to `memory_verify_attempts`
-// recording the moment this migration ran. Forensic readers querying
-// rows with `subagent_run_session_id IS NULL` can JOIN against this
-// column to discriminate "the pointer was always NULL" from "the
-// pointer was severed by migration 058 on date X". The column stays
-// NULL for any row INSERTed after this migration runs, so the
-// presence of a non-NULL value is a one-shot drift marker tied to
-// the historical event.
+// for forensic discrimination of rows whose `subagent_run_session_id`
+// is NULL (was-always-NULL vs. severed-by-058).
+//
+// IMPORTANT — this migration only adds the COLUMN. It does NOT
+// backfill the marker for pre-existing rows. That oversight was
+// caught in review after the migration had already shipped to
+// operator installs: editing the SQL here to add an UPDATE would
+// break append-only (every install would hit a hash mismatch on the
+// next startup). The backfill lives in `060-memory-verify-attempts-
+// backfill-drift.ts`, which UPDATEs every NULL-pointer row with the
+// migration-run epoch ms.
+//
+// Operators reading the column post-060 should interpret:
+//   - `provenance_drift_at IS NOT NULL` AND
+//     `subagent_run_session_id IS NULL` → row pre-existed 060;
+//     either always-NULL or 058-severed (the originals weren't
+//     distinguishable). The forensic chain to the audit row is
+//     gone; cross-correlate by timestamp instead.
+//   - `provenance_drift_at IS NULL` AND
+//     `subagent_run_session_id IS NULL` → row INSERTed after 060
+//     with a genuinely-absent pointer (spawn failed before
+//     subagent_runs row landed, or programmatic caller didn't
+//     model it).
+//   - `subagent_run_session_id IS NOT NULL` → intact one-hop chain,
+//     `provenance_drift_at` value irrelevant.
 //
 // (2) Codifies the FK preservation pattern in this comment as a
 // binding rule for any FUTURE migration that drops or rebuilds

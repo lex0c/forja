@@ -213,4 +213,73 @@ describe('migrate', () => {
     expect(names).toContain('provenance_drift_at');
     db.close();
   });
+
+  // Migration 060 — backfills the drift marker for rows pre-existing
+  // 060 with NULL subagent_run_session_id. 059 only added the
+  // column; rows that pre-dated 060 stayed indistinguishable from
+  // rows INSERTed afterwards, defeating the discriminator. Editing
+  // 059 would have violated append-only; the fix landed in 060.
+  test('migration 060 backfills provenance_drift_at for pre-existing NULL-pointer rows', async () => {
+    const { MIGRATIONS } = await import('../../src/storage/migrations/index.ts');
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const pre060 = MIGRATIONS.filter((m) => m.id < 60);
+    const db = openMemoryDb();
+    migrate(db, pre060);
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const child = createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    db.query(
+      `INSERT INTO subagent_runs
+       (session_id, name, scope, source_path, source_sha256, system_prompt, tools_whitelist,
+        budget_max_steps, budget_max_cost_usd, captured_at)
+       VALUES (?, 'verify-semantic', 'user', '/builtin/v.md', 'a', 'p', '[]', 15, 0.1, 1)`,
+    ).run(child.id);
+    db.query(
+      `INSERT INTO memory_verify_attempts
+       (id, memory_scope, memory_name, content_hash, verdict, confidence, model_id, prompt_hash,
+        subagent_run_session_id, attempted_at)
+       VALUES ('mva-null', 'user', 'foo', 'a', 'passed', 0.9, 'm', 'h', NULL, 1)`,
+    ).run();
+    db.query(
+      `INSERT INTO memory_verify_attempts
+       (id, memory_scope, memory_name, content_hash, verdict, confidence, model_id, prompt_hash,
+        subagent_run_session_id, attempted_at)
+       VALUES ('mva-intact', 'user', 'bar', 'b', 'passed', 0.9, 'm', 'h', ?, 2)`,
+    ).run(child.id);
+    migrate(
+      db,
+      MIGRATIONS.filter((m) => m.id <= 60),
+    );
+    const rows = db
+      .query<
+        { id: string; subagent_run_session_id: string | null; provenance_drift_at: number | null },
+        []
+      >(
+        'SELECT id, subagent_run_session_id, provenance_drift_at FROM memory_verify_attempts ORDER BY id',
+      )
+      .all();
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    expect(byId.get('mva-null')?.provenance_drift_at).not.toBeNull();
+    expect(byId.get('mva-null')?.provenance_drift_at).toBeGreaterThan(0);
+    expect(byId.get('mva-intact')?.provenance_drift_at).toBeNull();
+    expect(byId.get('mva-intact')?.subagent_run_session_id).toBe(child.id);
+    db.close();
+  });
+
+  test('migration 060: rows INSERTed AFTER 060 with NULL pointer are not retroactively marked', async () => {
+    const db = openMemoryDb();
+    migrate(db);
+    db.query(
+      `INSERT INTO memory_verify_attempts
+       (id, memory_scope, memory_name, content_hash, verdict, confidence, model_id, prompt_hash,
+        subagent_run_session_id, attempted_at)
+       VALUES ('mva-post', 'user', 'baz', 'c', 'inconclusive', 0.3, 'm', 'h', NULL, 100)`,
+    ).run();
+    const row = db
+      .query<{ provenance_drift_at: number | null }, [string]>(
+        'SELECT provenance_drift_at FROM memory_verify_attempts WHERE id = ?',
+      )
+      .get('mva-post');
+    expect(row?.provenance_drift_at).toBeNull();
+    db.close();
+  });
 });
