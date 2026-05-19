@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(cli) — unified `agent init` scaffolding (post-work)
+
+Closes the pre-work entry below. Two commits on `feat/init-unified-scaffold`:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `47080c5` | docs | spec | widen `agent init` to scaffold the four bootstrap artifacts |
+| `4bca315` | feat | cli | unify `agent init` scaffold across four bootstrap artifacts |
+
+**Outcome.** One `agent init` invocation now writes all four `.agent/` artifacts (`permissions.yaml`, `.gitignore`, `config.toml`, 10 canonical playbooks) instead of the prior two-invocation dance (`init` then `init --playbooks`). Each step is idempotent (skip-if-exists), so re-runs after partial failure or after `git pull` are safe and operator hand-edits survive. The operator-facing surface gained `--only=csv` (subset selection) and `--force[=csv]` (bare = `'all'`; CSV = subset of force-eligible steps), and lost `--playbooks` (legacy flag explicitly rejected with a pointer to `--only=playbooks`).
+
+**Decisions that survived the in-flight review:**
+
+- **`--playbooks` is a clean break, not a deprecated alias.** Parser surfaces a single-line error pointing at `--only=playbooks`. Rationale: no shipped binary depends on the old shape, the spec was already moving, and silent aliasing teaches the wrong shape long-term.
+- **`.gitignore` is excluded from the force-eligible set at the type level.** `ForceEligibleStep = Exclude<InitStep, 'gitignore'>`. The runtime parser additionally rejects `--force=gitignore` with a pointer to `MEMORY.md §2.5` — defense in depth for an operator who bypasses TS via headless invocation. Regeneration path is "delete the file and re-run init" (the file's own scaffold step is naturally idempotent and will re-create on absence).
+- **`config.toml` scaffold is no-op until edited.** Every key commented; defaults live in the loader (`src/critique/config-loader.ts`). Wording landed in the round-of-review pass: `[memory]` describes uncommenting as DISABLING detectors (default ON inversion), `[critique]` describes uncommenting as ACTIVATING critique (default OFF). Same idiom ("uncomment to take effect"), opposite polarities — surfaced explicitly so an operator skimming the file doesn't misread the direction.
+- **No rollback on partial failure.** Mirrors the existing `runInitPlaybooks` posture. Exit 1, surviving writes stay, re-run with `--force=<failed-step>` after fixing. Justification: rollback would either delete operator-edited surviving files (bad) or distinguish "we wrote this" from "this was already here" (state-tracking complexity unjustified for a one-shot CLI).
+- **Two-source-of-truth for the step list** (`DEFAULT_STEPS` in `init.ts`, `VALID_INIT_STEPS` in `args.ts`). Trade-off: lazy-import posture preserved (args parser doesn't pull fs + the playbook asset bundle on the `--help` path) at the cost of a manual sync. A new drift-guard test (`tests/cli/args.test.ts` — "parser accepts every step that the orchestrator runs") pins parity through behavior so a future `'hooks'` step lands the test failure before the operator sees "unknown step".
+
+**Round-of-review fixes that landed before commit:**
+
+- `parseCsvSubset` deduplicates — `--only=permissions,permissions` runs the step once, first occurrence wins (preserves operator-intended order). Pinned by `tests/cli/args.test.ts — --only deduplicates repeated entries`.
+- `config.toml` template comment block was previously ambiguous about default polarity; now explicitly states uncommenting `[memory]` disables (default ON) while uncommenting `[critique]` activates (default off). The `model` / `prompt_version` example values flag themselves as illustrative with a pointer to the canonical loader for current defaults.
+- Drift-guard test added.
+
+**Items flagged in review and intentionally NOT addressed:**
+
+- **TOCTOU between `existsSync` and `writeFileSync` in `scaffoldPermissions` / `scaffoldConfig`.** `ensureAgentGitignore` uses `wx` (atomic create-or-fail); the other two use the check-then-write pattern. Fixing would require either splitting the force path from the create path (two writeFileSync calls per step) or switching to `wx`-then-`w`-fallback. Mitigation: operators don't run two `agent init` concurrently; concern is theoretical for the use case. Documented inline.
+- **`--force=all` rejected with "valid: permissions, config, playbooks" instead of being a synonym for bare `--force`.** Operator with muscle memory may try `--force=all` expecting it to work. Trade-off: special-casing `all` adds a parser branch + spec wording exception. Leaving as-is; the error message is clear.
+- **`scaffoldPermissions` and `scaffoldConfig` have near-identical 60-line bodies.** Two usages don't amortize a `scaffoldFileTemplate` helper. If a 3rd file-template step lands (`hooks.toml`?), refactor then.
+- **Mid-loop failure inside `scaffoldPlaybooks` not test-covered.** The partial-failure test exercises step-boundary failure (sentinel file at `.agent/agents` → mkdirSync ENOTDIR). Within-step partial failure (e.g., entry 5 of 10 throws on writeFileSync) is harder to inject without mocking fs and isn't covered. Behavior on this path: aggregate summary suppressed (early-return), per-file output already streamed, exit 1, operator re-runs.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1` — `init` table row broadened; new `§2.1.1` defines the scaffolded `config.toml` schema with worked example.
+- `AGENTIC_CLI.md §8` — bootstrap-path paragraph extended; explicit note that `.gitignore` is operator-owned post-creation and rejected from `--force`.
+- `MEMORY.md §2.5` — `.gitignore` ownership moved from "first invocation" to "init scaffold step"; idempotency + never-overwrite semantics preserved; regeneration path documented.
+- `PLAYBOOKS.md` — new `§12` documenting bundled distribution (canonical 10 copied to `.agent/agents/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Existing `§12–§15` renumbered to `§13–§16`. Cross-refs in `src/cli/init.ts:3` and `src/cli/init-playbooks/index.ts:1` updated.
+
+**Test deltas.** `tests/cli/init.test.ts` rewritten in 5 describe blocks (permissions / gitignore / config / playbooks / full-bundle); `tests/cli/init-config-template.test.ts` new (6 cases — TOML validity, empty-parse pin, section/key presence, spec ref, trailing newline); `tests/cli/args.test.ts` init describe expanded (15 → 19 cases including `--force` shapes, `--only` shapes, dedup, drift guard, legacy `--playbooks` rejection, `--force=gitignore` rejection). 186 tests pass across the three files; typecheck + lint clean.
+
+**Production-readiness shift.** Before: first-time operator had to run `init` twice (permissions, then `--playbooks`) and still got `.agent/config.toml` only by grepping source. After: one invocation scaffolds the entire bootstrap bundle; `config.toml` documents every available toggle in the file itself; granular re-copy (`--only`) and overwrite (`--force[=csv]`) cover the maintenance flows; idempotent re-runs are safe by default.
+
 ## [2026-05-19] feat(cli) — unify `agent init` scaffolding (pre-work plan)
 
 `agent init` today scaffolds exactly one artifact: `.agent/permissions.yaml`. The `--playbooks` flag is mutually exclusive — it instead copies the 10 canonical playbooks under `.agent/agents/`. A first-time operator on a fresh repo therefore has to run `agent init` TWICE (once for permissions, once for playbooks) and still doesn't get `.agent/.gitignore` (auto-generated lazily by the memory subsystem on first session via `ensureAgentGitignore` in `src/memory/gitignore.ts:47`) or `.agent/config.toml` (no scaffolder exists; the file is "optional" but governance toggles + critique config live there and without it the operator can't discover the schema short of grepping the source).
