@@ -2,6 +2,50 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent gc` distinguishes missing DB from real failures in dry-run
+
+Operator-reported bug. The dry-run readonly-open fix (commit `706b344`) collapsed ALL open failures into "fresh install case" — empty report, exit 0, stderr warning. Concrete consequence: a corrupted DB, perm-denied DB, locked DB, or integrity-check failure would surface as "all good, 0 rows to sweep" to scripts/cron jobs, masking real operational failures.
+
+**Concrete failure mode.** Operator's `~/.local/share/forja/sessions.db` is corrupted (cosmic ray, torn page after kernel crash, hostile FS write). Cron job runs `agent gc --json` nightly. Pre-fix:
+```
+{"mode":"dry-run","tables":[],"errors":[],"command":"agent gc --force"}
+```
+Exit 0. Cron silently thinks hygiene is healthy. Operator never notices the DB is broken until something else (a normal `agent` session) hits the corruption.
+
+Post-fix:
+```
+forja gc: DB at /path/sessions.db exists but cannot be opened in dry-run: file is not a database
+```
+Exit 1. Stdout empty. Cron alerts.
+
+**Fix.** Pre-check `existsSync(dbPath)` BEFORE `openDb(dbPath, { readonly: true })`. On open failure:
+- `dbExistedBeforeOpen === false` → legitimate fresh-install case. Empty report + helpful "Run X to create + migrate" pointer + exit 0.
+- `dbExistedBeforeOpen === true` → real failure. Surface stderr + exit 1. No empty report — pretending to have row counts would mask the failure.
+
+Stderr messages distinguish:
+- Fresh install: `"DB not yet created at <path> (fresh install — no rows to sweep). Run <forceCommand> to create + migrate."`
+- Real failure: `"DB at <path> exists but cannot be opened in dry-run: <reason>"`
+
+**existsSync race.** Theoretical: file could be created/removed between `existsSync` and `openDb`. Cases:
+- `exists=true, openDb succeeds` → normal path
+- `exists=true, openDb fails` → real failure (rare race where file vanished mid-call is treated as failure; fine, vanished mid-call is itself unusual)
+- `exists=false, openDb succeeds` → file appeared (concurrent process); proceed normally
+- `exists=false, openDb fails` → fresh install path
+
+All four cases produce sane behavior.
+
+**Tests.** 1 new + 1 rewritten in `tests/cli/gc.test.ts` describe `runGcCli — DB inaccessible`:
+- **NEW**: `dry-run on EXISTING but unopenable DB: exit 1 + surface error` — load-bearing. Writes corrupt content to a valid-looking path (`writeFileSync(dbPath, 'NOT A SQLITE DATABASE')`), verifies SQLite throws on open, asserts exit 1 + `stderr contains "exists but cannot be opened"` + `stdout is empty`.
+- **Rewritten**: `dry-run on missing DB file: exit 0 + fresh-install message` — replaces the previous "DB inaccessible" test that used a blocker path (parent-is-a-file). With the new discrimination, blocker scenario actually triggers fresh-install path (file absent, even if path is patho-invalid); the test now uses an explicitly-missing path and asserts the fresh-install message contains "fresh install".
+
+**Verification:**
+- 19/19 gc CLI tests pass (was 18, +1 new + 1 rewritten net)
+- 80/80 across gc + audit
+- typecheck + lint clean
+- Smoke E2E: corrupt sessions.db at real `defaultDbPath()` path → `exit 1` + stderr "file is not a database"; missing path → `exit 0` + fresh-install message.
+
+**Pre-existing operator state.** Operators with corrupted DBs who relied on cron-driven `agent gc --json` checks may have missed the corruption. The fix surfaces it on next run; recovery is the same as any DB corruption (restore from backup, rotate via `agent permission rotate-chain`, or `rm` and start fresh if no audit history is needed). No automated migration — this fix CATCHES the regression, doesn't repair existing damage.
+
 ## [2026-05-19] fix(cli) — `agent purge` TOCTOU symlink race in removeTree
 
 Operator-reported **security** bug. The purge walker's symlink defense was load-bearing for the "won't delete files outside `.agent/`" contract in spec §2.1.2, but had a TOCTOU window that defeated it under concurrent FS mutation.

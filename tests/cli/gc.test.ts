@@ -250,15 +250,12 @@ describe('runGcCli — config provenance', () => {
 });
 
 describe('runGcCli — DB inaccessible', () => {
-  test('dry-run reports empty + warning, exit 0 (fresh-install-friendly)', async () => {
-    // Post-fix: dry-run uses readonly open. A missing or broken DB
-    // is the common case (operator never ran a force-mode command
-    // yet). We surface the reason on stderr but exit 0 with an
-    // empty report — operator running --json dry-run on fresh
-    // install gets `{tables: [], errors: []}` instead of a crash.
-    const blocker = join(xdgHome, 'blocker');
-    writeFileSync(blocker, 'not-a-dir');
-    const impossibleDb = join(blocker, 'sub', 'db.sqlite');
+  test('dry-run on missing DB file: exit 0 + fresh-install message', async () => {
+    // File absent is a legitimate "no rows to sweep yet" case
+    // (operator just installed Forja, no session created the DB).
+    // Downgrade to empty report + helpful pointer to force command.
+    const missing = join(xdgHome, 'never-existed.db');
+    expect(existsSync(missing)).toBe(false);
     const code = await runGcCli({
       cwd,
       force: false,
@@ -266,11 +263,11 @@ describe('runGcCli — DB inaccessible', () => {
       tables: [],
       out,
       err,
-      dbPath: impossibleDb,
+      dbPath: missing,
       now: () => NOW,
     });
     expect(code).toBe(0);
-    expect(errBuf.join('')).toContain('DB not readable in dry-run');
+    expect(errBuf.join('')).toContain('fresh install');
     const parsed = JSON.parse(outBuf.join('').trim()) as {
       mode: string;
       tables: unknown[];
@@ -279,6 +276,34 @@ describe('runGcCli — DB inaccessible', () => {
     expect(parsed.mode).toBe('dry-run');
     expect(parsed.tables).toEqual([]);
     expect(parsed.errors).toEqual([]);
+  });
+
+  test('dry-run on EXISTING but unopenable DB: exit 1 + surface error', async () => {
+    // Operator-reported bug: pre-fix, ALL open failures (including
+    // corrupted file, perm denied, integrity_check refusal) were
+    // treated as fresh-install and silently downgraded to exit 0.
+    // That masked real operational failures for scripts/cron jobs.
+    // Post-fix: file present but unopenable → exit 1 + stderr error.
+    const corruptDb = join(xdgHome, 'corrupt.db');
+    // Write garbage that isn't a valid SQLite file — SQLite will
+    // refuse to open with "file is not a database" or similar.
+    writeFileSync(corruptDb, 'NOT A SQLITE DATABASE - corrupt content');
+    expect(existsSync(corruptDb)).toBe(true);
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: false,
+      tables: [],
+      out,
+      err,
+      dbPath: corruptDb,
+      now: () => NOW,
+    });
+    expect(code).toBe(1);
+    expect(errBuf.join('')).toContain('exists but cannot be opened');
+    // No empty report on stdout — we DON'T know the row counts,
+    // pretending we do would mask the failure.
+    expect(outBuf.join('')).toBe('');
   });
 
   test('--force still exit 1 when DB cannot be opened (write path)', async () => {

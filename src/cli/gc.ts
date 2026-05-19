@@ -12,6 +12,7 @@
 //     is no "audit row" to skip.
 //   - Cross-project by design (the cutoffs are age-based).
 
+import { existsSync } from 'node:fs';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
 import type { GcReport, GcTable, TableReport } from '../audit/gc.ts';
 import { GC_TABLES, runGc } from '../audit/gc.ts';
@@ -206,21 +207,48 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
         // PRAGMAs + chmod'd — silently mutating operator state
         // despite the "DRY RUN" header. Same shape as the purge
         // dry-run bug; fixed there + missed here.
+        // Pre-check file existence to distinguish the two open-fail
+        // shapes:
+        //   - File absent → fresh-install case. Legitimate "no rows
+        //     to sweep yet"; downgrade to empty report + exit 0.
+        //     Operator just installed Forja and ran `agent gc` before
+        //     any session created the DB.
+        //   - File present but open fails → real operational failure
+        //     (corruption, perm denied, integrity_check refusal,
+        //     locked by other process). MUST surface with non-zero
+        //     exit so cron jobs / CI scripts notice and operators
+        //     get a clear signal rather than a misleading "all good,
+        //     0 rows swept" report.
+        //
+        // existsSync race: file could be created/removed between
+        // this check and openDb. Cases:
+        //   - exists=true, openDb succeeds → normal path
+        //   - exists=true, openDb fails → real failure (rare race
+        //     where file vanished is treated as failure; that's
+        //     fine — vanished mid-call is itself unusual)
+        //   - exists=false, openDb succeeds → file appeared (some
+        //     other process created it); we proceed normally
+        //   - exists=false, openDb fails → fresh install path
+        const dbExistedBeforeOpen = existsSync(dbPath);
         try {
           db = openDb(dbPath, { readonly: true });
         } catch (e) {
           const reason = e instanceof Error ? e.message : String(e);
-          // SQLITE_CANTOPEN on a non-existent file is the common
-          // case (fresh install, never ran any agent command). All
-          // sweep counts are 0; report cleanly without opening
-          // anything. Other errors (corrupted DB, perm denied) get
-          // the same surface — operator sees the reason in stderr
-          // and the report shows zero rows.
+          if (dbExistedBeforeOpen) {
+            // File exists but unopenable: real failure. Surface with
+            // exit 1 so scripts notice. Don't render an "empty
+            // report" because we DON'T know if there are rows —
+            // pretending we do would mask the failure.
+            err(`forja gc: DB at ${dbPath} exists but cannot be opened in dry-run: ${reason}\n`);
+            return 1;
+          }
+          // File absent: legitimate fresh-install case. Empty report
+          // + exit 0 + helpful pointer to the force command that
+          // would create it.
           const forceCommand = buildForceCommand(tables);
           err(
-            `forja gc: DB not readable in dry-run (${reason}); reporting empty counts — run \`${forceCommand}\` to create + migrate the DB.\n`,
+            `forja gc: DB not yet created at ${dbPath} (fresh install — no rows to sweep). Run \`${forceCommand}\` to create + migrate.\n`,
           );
-          // Synthesize an empty report so the renderer still works.
           const emptyReport: GcReport = {
             mode: 'dry-run',
             nowMs: nowFn(),
