@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { loadRetentionConfig } from '../audit/config-loader.ts';
 import {
   type Broker,
   type SandboxRunner,
@@ -393,6 +394,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // detectors resolved to ON via DEFAULT (no layer explicitly named
   // the field, no CLI override).
   const memoryLoaded = loadMemoryConfig({ cwd: projectConfigCwd });
+  // [audit] config — picks up `run_gc_on_stop` + `[audit.retention]`
+  // windows. Threaded into HarnessConfig.auditRetention so the
+  // session-end loop knows whether to fire the built-in gc trigger
+  // (AGENTIC_CLI §2.1.3 Stop hook integration). Loader degrades to
+  // defaults on misconfig; warnings surface via the same stderr
+  // banner machinery as the other config loaders.
+  const auditLoaded = loadRetentionConfig({ cwd: projectConfigCwd });
 
   // First-run banner. Fires once per machine when:
   //   (a) both detectors resolve to ON,
@@ -1231,6 +1239,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(critiqueLoaded.critiqueProvider !== null
       ? { critiqueProvider: critiqueLoaded.critiqueProvider }
       : {}),
+    // [audit] config thread-through. Empty `[audit]` block resolves
+    // to DEFAULT_RETENTION (all defaults, runGcOnStop=false), which
+    // is identical to NOT setting auditRetention at all — both
+    // shapes leave the session-end gc trigger off. We pass the
+    // resolved config regardless so the loop has the retention
+    // windows ready if/when the operator flips run_gc_on_stop.
+    auditRetention: auditLoaded.config,
     // Budget resolution: project/user [budget] config layers merged
     // first (per-key, project winning over user via loader's own
     // merge), then CLI input.budget on top. Harness applies

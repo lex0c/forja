@@ -110,6 +110,10 @@ const TIGHT_CONFIG = {
   retrieval_trace_days: 1,
   context_pins_days: 1,
   bg_processes_days: 1,
+  // runGcOnStop is irrelevant to the orchestrator tests — that flag
+  // is consumed by the harness loop wiring, not by runGc itself.
+  // Set explicitly to satisfy the RetentionConfig type.
+  runGcOnStop: false,
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;

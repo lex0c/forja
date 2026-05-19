@@ -138,7 +138,11 @@ describe('loadRetentionConfig', () => {
   });
 
   test('handles [audit] without [audit.retention] subsection', () => {
-    writeFileSync(projectPath, '[audit]\nsomething_else = "x"\n');
+    // Uses a known [audit] key (run_gc_on_stop) so the typo guard
+    // doesn't fire — the test's purpose is to confirm the loader
+    // doesn't trip when the retention subsection is absent, not to
+    // pin typo behavior (covered separately).
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = false\n');
     const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
     expect(r.config).toEqual(DEFAULT_RETENTION);
     expect(r.warnings).toEqual([]);
@@ -183,5 +187,94 @@ describe('loadRetentionConfig', () => {
     const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
     expect(r.sources.user).toBeNull();
     expect(r.sources.project).toBe(projectPath);
+  });
+});
+
+describe('loadRetentionConfig — [audit].run_gc_on_stop (Phase 5 Stop hook trigger)', () => {
+  test('defaults to false when absent', () => {
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath: null });
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('user layer can enable it', () => {
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath: null });
+    expect(r.config.runGcOnStop).toBe(true);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('project layer can enable it', () => {
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+  });
+
+  test('project false EXPLICITLY overrides user true (the ?? trap)', () => {
+    // Boolean merge needs `!== undefined` instead of nullish-coalescing
+    // because `false ?? true` would silently flip to true. This test
+    // pins the explicit-false-wins semantic so a future refactor that
+    // accidentally regresses to `??` lands the failure here.
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = true\n');
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('project true overrides user false (symmetric)', () => {
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = false\n');
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+  });
+
+  test('user value used when project file has no [audit] section', () => {
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = true\n');
+    writeFileSync(projectPath, '[audit.retention]\nretrieval_trace = 30\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+    // Retention still picks up project's override too.
+    expect(r.config.retrieval_trace_days).toBe(30);
+  });
+
+  test('warns on non-boolean and falls back', () => {
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = "yes"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('run_gc_on_stop'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('must be a boolean'))).toBe(true);
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('coexists with [audit.retention] in the same project file', () => {
+    writeFileSync(
+      projectPath,
+      '[audit]\nrun_gc_on_stop = true\n\n[audit.retention]\nbg_processes = 7\n',
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+    expect(r.config.bg_processes_days).toBe(7);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('typo at [audit].xxx surfaces a warning (symmetric with [audit.retention] guard)', () => {
+    // Operator who learned to expect typo guards from [audit.retention]
+    // would be surprised if [audit].run_gc_on_stp = true silently
+    // dropped. Both sections now warn on unknown keys.
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stp = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('run_gc_on_stp'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('not a known audit key'))).toBe(true);
+    // Misconfig doesn't break the loader — defaults fill in.
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('known [audit] keys do NOT warn', () => {
+    // Polarity check: `retention` and `run_gc_on_stop` are both in
+    // KNOWN_AUDIT_KEYS, so a file using both produces zero warnings.
+    writeFileSync(
+      projectPath,
+      '[audit]\nrun_gc_on_stop = false\n\n[audit.retention]\nretrieval_trace = 60\n',
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings).toEqual([]);
   });
 });

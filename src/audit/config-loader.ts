@@ -31,11 +31,18 @@ import { loadTomlSection } from '../config/section.ts';
 // `DEFAULT_RECAP_CACHE_TTL_MS = 1h` internally — the spec key
 // covers the override path for ops who want shorter / longer
 // freshness windows).
+//
+// `runGcOnStop` is the Phase 5 built-in trigger: when true, the
+// harness calls runGc({force: true, ...}) at session end (after
+// the operator-declared Stop hooks fire). Default false — opt-in.
+// Lives in `[audit]` (sibling of `[audit.retention]`), not nested,
+// because it's an operational toggle rather than a TTL.
 export const DEFAULT_RETENTION = {
   recap_cache_ttl_ms: 60 * 60 * 1000, // 1h
   retrieval_trace_days: 90,
   context_pins_days: 90,
   bg_processes_days: 30,
+  runGcOnStop: false,
 } as const;
 
 export interface RetentionConfig {
@@ -43,6 +50,7 @@ export interface RetentionConfig {
   retrieval_trace_days: number;
   context_pins_days: number;
   bg_processes_days: number;
+  runGcOnStop: boolean;
 }
 
 // AUDIT §1.2 schema keys. Phase 1 only validates the 4 below;
@@ -73,6 +81,12 @@ const KNOWN_SCHEMA_KEYS = new Set([
 ]);
 
 const PHASE_1_KEYS = new Set(['recap_cache', 'retrieval_trace', 'context_pins', 'bg_processes']);
+
+// Known keys directly under `[audit]` (siblings of `[audit.retention]`).
+// Operator typos like `[audit].run_gc_on_stp = true` would otherwise
+// be silently dropped. Mirrors the KNOWN_SCHEMA_KEYS typo guard for
+// `[audit.retention].*` so both sections behave symmetrically.
+const KNOWN_AUDIT_KEYS = new Set(['run_gc_on_stop', 'retention']);
 
 type PartialLayer = Partial<RetentionConfig>;
 
@@ -138,10 +152,39 @@ const parseLayer = (path: string | null, source: string): ParseResult => {
     warnings.push(section.warning);
     return { layer, warnings };
   }
-  // `[audit]` IS the section we found. The retention block is
-  // nested as `[audit.retention]` which TOML serializes as
-  // section.section.retention being a Record. Drill down.
+  // `[audit]` IS the section we found. Parse the sibling
+  // `run_gc_on_stop` flag (operational toggle, not a TTL — lives
+  // alongside `[audit.retention]`, not inside it) BEFORE drilling
+  // down. Boolean: rejects strings/numbers with a warning. Absent
+  // → falls through to default.
   const auditTable = section.section;
+
+  // Typo guard at the `[audit].*` level. Symmetric with the
+  // `[audit.retention].*` guard below — operator who wrote
+  // `[audit].run_gc_on_stp = true` (typo) gets a warning instead
+  // of silent default. Without this, the asymmetry would surprise
+  // an operator who learned to expect typo guards from the
+  // retention section.
+  for (const key of Object.keys(auditTable)) {
+    if (!KNOWN_AUDIT_KEYS.has(key)) {
+      warnings.push(
+        `${source} config (${path}): [audit].${key} is not a known audit key; ignoring`,
+      );
+    }
+  }
+
+  if (auditTable.run_gc_on_stop !== undefined) {
+    if (typeof auditTable.run_gc_on_stop !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [audit].run_gc_on_stop=${fmtBad(auditTable.run_gc_on_stop)} must be a boolean (true|false); ignoring`,
+      );
+    } else {
+      layer.runGcOnStop = auditTable.run_gc_on_stop;
+    }
+  }
+
+  // The retention block is nested as `[audit.retention]` which TOML
+  // serializes as `auditTable.retention` being a Record. Drill down.
   const retention = auditTable.retention;
   if (retention === undefined) return { layer, warnings };
   if (retention === null || typeof retention !== 'object' || Array.isArray(retention)) {
@@ -262,6 +305,17 @@ export const loadRetentionConfig = (input: LoadRetentionInput): LoadedRetentionC
       projectParse.layer.bg_processes_days ??
       userParse.layer.bg_processes_days ??
       DEFAULT_RETENTION.bg_processes_days,
+    // Boolean merge needs `!== undefined` instead of `??` because
+    // `false ?? user_true` evaluates to `user_true` — the project's
+    // explicit `false` would be silently dropped. Operator that
+    // disables gc-on-Stop in a specific project (despite enabling
+    // it user-wide) MUST win.
+    runGcOnStop:
+      projectParse.layer.runGcOnStop !== undefined
+        ? projectParse.layer.runGcOnStop
+        : userParse.layer.runGcOnStop !== undefined
+          ? userParse.layer.runGcOnStop
+          : DEFAULT_RETENTION.runGcOnStop,
   };
 
   // `sources` reflects file EXISTENCE, not just path resolution.

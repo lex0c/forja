@@ -2,6 +2,105 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (post-work)
+
+Closes the pre-work entry below. Phase 5 piece of the gc roadmap that shipped (the other Phase 5 piece, `--reclaim-space`, still deferred). Single branch `feat/purge-command`.
+
+**Round-of-review fixes that landed BEFORE this commit** (self-review caught 2 issues):
+
+- **M1 — dynamic import on hot path eliminated.** First draft used `await import('../audit/gc.ts')` inside the session-end branch. The deps of `audit/gc.ts` (storage repos) are already pulled by the harness via memory/retrieval paths, so lazy loading saved nothing and just added a `await` on the hot session-end path. Fix moves to static `import { runGc } from '../audit/gc.ts'` at the top of `loop.ts`. Branch body is now sync.
+- **M2 + T2 — asymmetric typo guard fixed.** The loader caught typos in `[audit.retention].*` (`retreival_trace = 90` → warning) but stayed silent on typos in `[audit].*` (`run_gc_on_stp = true` would silently drop). Operator who learned the typo-guard pattern in retention would be surprised. Fix adds `KNOWN_AUDIT_KEYS = new Set(['run_gc_on_stop', 'retention'])` + the same iterate-and-warn loop applied to `auditTable`. Two new test cases pin: typo warns (negative polarity) AND known keys don't warn (positive polarity).
+
+**Outcome.** `[audit] run_gc_on_stop = true` in `config.toml` turns on a built-in retention sweep at every session-end. Harness runs `runGc({force: true, ...})` synchronously after the operator-declared Stop hooks fire. Default off — opt-in. Cron-free hygiene for operators who don't want crontab wiring.
+
+**Operator surface** (full config example for clarity):
+
+```toml
+# ~/.config/agent/config.toml  OR  <cwd>/.agent/config.toml
+
+[audit]
+run_gc_on_stop = true            # default: false (opt-in)
+
+[audit.retention]
+recap_cache    = "1h"             # already shipped in the gc Phase 1 slice
+retrieval_trace = 90
+context_pins   = 90
+bg_processes   = 30
+```
+
+**Decisions that survived in-flight review:**
+
+- **Config flag, not always-on.** Default `false` so existing operators see zero behavior change. Operator who wants automatic hygiene opts in with one line.
+- **Synchronous execution.** Session-end awaits gc completion. Aligns with the no-daemon discipline (§1.1.2 — no background workers). Phase 1 sweeps are fast (4 tables, simple DELETEs); won't dominate session-end latency in typical DBs.
+- **Errors → stderr, never abort.** A failed gc sweep is hygiene drift, not a task failure. Session exit code reflects the task outcome; gc errors land in stderr for CI log capture.
+- **Reuse harness's DB handle.** Session already has DB open + migrated; no second `openDb` / `migrate` cycle. Pass through to `runGc({db, ...})` directly. Cleaner and faster.
+- **Runs AFTER operator-declared Stop hooks.** Operator hook that needs the pre-gc state (e.g., backup, export) sees the DB untouched. Future `PostGc` event (out of scope) would cover the symmetric case.
+- **Boolean merge needs `!== undefined`, not `??`.** `false ?? user_true` evaluates to `user_true` — silent footgun. The project's explicit `false` MUST override user's `true` (operator wants gc-on-Stop disabled in this specific project despite the user-wide default). Pinned by a dedicated test ("the ?? trap").
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1.3` — Phase 5 entry split: `--reclaim-space` stays deferred; "Stop hook integration" moved to `(shipped)` with a new subsection covering the flag, sync semantics, error handling, when-to-use / when-NOT-to-use, and composition with operator-declared Stop hooks.
+
+**Code deltas (5 files modified):**
+
+- `src/audit/config-loader.ts` — `RetentionConfig` ganha `runGcOnStop: boolean`; `DEFAULT_RETENTION.runGcOnStop = false`; parser handles `[audit].run_gc_on_stop` (boolean, sibling of `[audit.retention]`); merge respects explicit `false` via `!== undefined` comparison.
+- `src/harness/types.ts` — `HarnessConfig.auditRetention?: RetentionConfig` (optional; existing call sites without audit concerns leave it undefined and the loop skips the gc trigger entirely).
+- `src/harness/loop.ts` — after `dispatchHooks Stop`, check `config.auditRetention?.runGcOnStop === true`; if true, run gc synchronously with try/catch; surface per-table errors and unexpected throws to stderr.
+- `src/cli/bootstrap.ts` — calls `loadRetentionConfig({cwd: projectConfigCwd})` (mirrors the existing critique/budget/memory loader pattern), threads `auditLoaded.config` into `HarnessConfig.auditRetention`.
+- `tests/audit/config-loader.test.ts` — 8 new cases pinning `runGcOnStop`: defaults, user/project enables, **explicit project `false` wins over user `true`** (the `??` trap), symmetric (project `true` wins over user `false`), user-only path when project has only retention, non-boolean rejection, coexistence with `[audit.retention]` in the same file.
+
+**Verification:**
+- `bun run typecheck`: clean
+- `bun run lint`: clean (928 files; Biome auto-fix for one formatting nit in bootstrap)
+- 69/69 gc tests pass (was 61, +8 from `runGcOnStop`)
+- 250 adjacent-file tests pass (bootstrap, args, index, init, harness budget-defaults, harness output-tokens)
+
+**Items NOT addressed** (logged for follow-up):
+
+- Operator-visible "gc ran" output at session end. Today gc-on-Stop is silent unless it errors. Could emit "gc swept N rows" alongside the terse line; deferred as UX polish.
+- gc failure telemetry. Errors go to stderr (forensic) but no `outcome_signals` / `failure_events` row. Phase 3 (approvals_log) likely revisits — gc becomes audit-relevant.
+- Full session-lifecycle integration test. The harness loop is hard to exercise in isolation; current coverage relies on the unit tests for `runGc` itself + the trivial branch in `loop.ts` (one boolean check + one call). Low risk per the diff size.
+
+**Production-readiness shift.** Before this slice: operator wanting automatic hygiene had to set up cron (`crontab -e`). After: one config line + zero infra. The gc roadmap's most-asked-for piece (Stop hook integration) now ships; the remaining Phase 5 piece (`--reclaim-space`) is a niche need that can wait for a concrete request.
+
+## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (pre-work plan)
+
+The gc Phase 1 entry below deferred "Stop hook integration" to Phase 5. This slice ships exactly that piece — operator declares `[audit] run_gc_on_stop = true` in `config.toml`, and the harness automatically runs `gc --force` at the end of every session. Cron-friendly hygiene without the operator wiring crontab.
+
+**Scope (decisions confirmed up front):**
+
+- **Activation via config flag** (not always-on, not doc-only). Default `false` — opt-in. The flag lives in `[audit]` (sibling of `[audit.retention]`), not nested inside retention, because it's an operational toggle, not a TTL.
+- **Synchronous execution.** Session-end awaits gc completion. Operator-visible latency but deterministic ("when the command returns, hygiene is done"). Phase 1 sweeps are fast (4 tables, SELECT COUNT + DELETE on simple indexes); won't dominate runtime in typical DBs. Aligns with the no-daemon discipline (§1.1.2) — no background workers spawned.
+- **Errors land on stderr, do NOT abort session-end.** A failed gc sweep is hygiene drift, not a task failure. Session exit code reflects task outcome; gc errors are forensic noise the operator captures in CI logs.
+- **Reuses existing DB handle from the harness.** No new openDb / migrate cycle — the session already has the DB open and migrated. Pass through to `runGc({db, force: true, config: retention, ...})`.
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1.3` — remove "Stop hook integration" from the Phase 5 deferred list, add it to "shipped". Document the flag, sync semantics, error handling, default-off rationale. Cross-reference `§10.1` (Stop event) for operator hooks that want different/additional behavior on top.
+
+**Phase 1 — Loader extension.**
+
+- `src/audit/config-loader.ts` — `RetentionConfig` ganha `runGcOnStop: boolean`. Loader parses `[audit].run_gc_on_stop` (boolean, defaults to false). Merge respects explicit `false` (project=`false` overrides user=`true`); the `??` operator doesn't work for booleans — needs `!== undefined` check.
+
+**Phase 2 — Bootstrap + harness wiring.**
+
+- `src/cli/bootstrap.ts` — calls `loadRetentionConfig({cwd})` (already does today for `agent gc`); threads the resolved `RetentionConfig` into the `HarnessConfig` shape.
+- `src/harness/types.ts:HarnessConfig` — new `auditRetention?: RetentionConfig` field. Optional so existing call sites (tests, subagent runtime) don't need to populate it when they have no audit concerns.
+- `src/harness/loop.ts:~700` — after `dispatchHooks Stop` returns, check `config.auditRetention?.runGcOnStop === true`. If true, call `runGc({db, config: auditRetention, nowMs: Date.now(), dryRun: false})` synchronously inside a try/catch. Errors → stderr via existing `process.stderr.write` (matches the pattern used for outcome_signals emit failures on the same code path).
+
+**Phase 3 — Tests.**
+
+- `tests/audit/config-loader.test.ts` — new `[audit] run_gc_on_stop` cases: parses true/false, rejects non-boolean, false-respecting merge (project=`false` wins over user=`true`).
+- Integration-style test (light-touch): the harness loop is hard to test in isolation, so we pin the behavior via a focused unit on the "would-run" decision — given `auditRetention.runGcOnStop === true`, the path is taken; given false/undefined, it isn't. Full session-lifecycle test deferred to existing harness coverage (which will incidentally exercise the false path on every other test).
+
+**Items NOT addressed** (logged for follow-up):
+
+- **Stop hook integration test for ALL phase-1 tables in a real session lifecycle.** Hard to set up (needs real session, real seed data, real wall-clock for `Date.now`). Existing `tests/audit/gc.test.ts` covers `runGc` directly; the wiring is one boolean check + one call — low risk per the diff size.
+- **Operator-visible "gc ran" output at session end.** Today, gc-on-Stop is silent unless it errors. Emitting "gc swept N rows" at session end would be helpful but pollutes the terse-line / recap output operator already sees. Future UX polish.
+- **Failure detection telemetry.** gc errors go to stderr (forensic), but no `outcome_signals` / `failure_events` row records them. Phase 3 of gc (approvals_log) will likely revisit this — gc itself becomes an audit-relevant operation.
+
+Same branch `feat/purge-command`. Post-work entry follows once code + tests land.
+
 ## [2026-05-19] feat(cli + audit) — `agent gc` Phase 1 (post-work)
 
 Closes the pre-work entry below. Single branch `feat/purge-command` (gc shares the branch with purge — both are operator-fired DB / FS lifecycle verbs that compose).

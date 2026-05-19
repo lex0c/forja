@@ -372,7 +372,7 @@ Retention: 365d (par com `approvals_log`); sem hash chain (purge é evento opera
 
 #### 2.1.3 `agent gc` — retention sweep age-based
 
-`agent gc` é o verbo operator-facing que materializa o contrato declarado em `AUDIT.md §1.2`: cada tabela append-only tem um TTL (`[audit.retention]` em `config.toml`), e rows que ultrapassam o TTL são apagadas. Cron-friendly (`agent gc --force --json` lê limpo em log parser); composeable com `Stop` hook (operacional, Phase 5).
+`agent gc` é o verbo operator-facing que materializa o contrato declarado em `AUDIT.md §1.2`: cada tabela append-only tem um TTL (`[audit.retention]` em `config.toml`), e rows que ultrapassam o TTL são apagadas. Cron-friendly (`agent gc --force --json` lê limpo em log parser); built-in trigger no `Stop` hook via flag `[audit] run_gc_on_stop = true` (default false).
 
 **Cross-project por design.** Diferente do `agent purge` (per-cwd), o GC é **age-based**: opera no DB global inteiro, todas as projects, todas as sessions. O critério é "row mais velha que retention", não "row deste projeto". Não há flag `--project` — quem precisa de filtro por projeto usa a peça separada (vacuum-per-project, fora do roadmap atual).
 
@@ -402,7 +402,41 @@ Retention: 365d (par com `approvals_log`); sem hash chain (purge é evento opera
 - **Phase 2 (audit-cascade tables, FK CASCADE com `sessions`):** `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`. Cada uma tem semantic edge case (`outcome_signals.ttl_expires_at` per-row per-`signal_kind`; `failure_events` tem chain hash per-session). Slice dedicado.
 - **Phase 3 (hash-chained):** `approvals_log`. Age-based DELETE quebra `permission verify`. Requer wire de `chain-rotation` (migration 035 + verb `agent permission rotate-chain`) num trigger age-based: rotaciona segmento arquivado, depois apaga. Slice dedicado.
 - **Phase 4 (sessions + cascade):** `sessions`. Quando uma session é gc'd, FK CASCADE drop ~12 tabelas dependentes. Blast radius maior; revisão dedicada.
-- **Phase 5 — flags operacionais:** `--reclaim-space` (roda SQLite `VACUUM` pós-delete pra liberar disco; lock global), integração com `Stop` hook (cron-via-session-end).
+- **Phase 5 — flags operacionais:** `--reclaim-space` (roda SQLite `VACUUM` pós-delete pra liberar disco; lock global). **Stop hook integration shippou** — vide subsection seguinte.
+
+##### Built-in no `Stop` hook (shipped)
+
+Operator declara `[audit] run_gc_on_stop = true` no `config.toml` (user OU project layer). Default `false` — opt-in. Quando true, o harness chama `runGc({force: true, ...})` automaticamente ao final de cada session, depois do `dispatchHooks Stop` retornar.
+
+```toml
+# ~/.config/agent/config.toml  OU  <cwd>/.agent/config.toml
+
+[audit]
+run_gc_on_stop = true          # gc roda ao final de cada session (default: false)
+
+[audit.retention]
+retrieval_trace = 30           # opera com as mesmas retention windows do verbo
+```
+
+**Semântica:**
+
+- **Síncrono.** Session-end aguarda gc terminar. Latency operator-visível mas determinístico: quando o `agent` command retorna, hygiene já completou. Phase 1 sweeps são rápidos (4 tabelas, SELECT COUNT + DELETE em índices simples). DB grande pode somar segundos; aceitável pelo trade-off de não ter daemon (alinhado com §1.1.2 no-daemon discipline).
+- **Reusa o DB handle aberto pelo harness.** Sem novo `openDb` + `migrate` — sessão já tem DB aberto e migrado. Custo é apenas as queries de count + delete.
+- **Erros vão pro stderr, NÃO abortam session-end.** Falha do gc é hygiene drift, não falha de tarefa. Session exit code reflete o outcome da task; gc errors são forensic noise pro CI log capturar.
+- **Boolean merge respeita `false` explícito.** Project=`false` sobrepõe user=`true`. O operator que QUER desabilitar em um projeto específico (apesar de ter habilitado globalmente) consegue.
+
+**Quando usar:**
+
+- Workflows curtos de uma session (CI runner, batch task) — gc-on-Stop garante limpeza per-job sem cron.
+- Operator que NÃO quer mexer no crontab — flag única, hygiene automática.
+
+**Quando NÃO usar:**
+
+- Sessions interativas longas — gc no final adiciona latency operator-visível antes do prompt retornar.
+- DB muito grande (>1GB) — gc Phase 1 ainda é rápido, mas Phase 2/3 (quando landar) podem fazer sweeps mais pesados. Operator pode quer manter cron user-side com janela noturna.
+- Pipelines onde session-end latency importa (e.g., agent invocado em script com hot-loop). Use cron user-side.
+
+**Composição com hooks operator-declarados:** o built-in roda DEPOIS do `dispatchHooks Stop`. Operator hook que precisa do estado pré-gc (ex: backup) lê o DB intocado; operator hook que precisa do estado pós-gc não tem suporte (built-in é o último side-effect antes do `db.close()`). Esse caso futuro entraria como `PostGc` event, fora do escopo Phase 5.
 
 **Output do dry-run (human):**
 
