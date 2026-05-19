@@ -1097,6 +1097,8 @@ Matching é **prefix + glob**, não regex. Regex em política é pé na bola.
 
 `trusted_hosts` (additive sobre `DEFAULT_TRUSTED_HOSTS` em `src/permissions/risk-score.ts`) reduz o risk-score de fetches pra esses hosts — útil pra time que tem CDN interno, GitHub Enterprise, ou outros endpoints conhecidos-bons. NÃO é um allowlist: `deny_hosts` continua tendo precedência (host trusted que também aparece em deny ainda é negado). A lista hardcoded cobre o consensus público (`github.com`, `npmjs.com`, etc.); o per-projeto trusted_hosts é pra a hidden surface de cada repo.
 
+Patterns aceitos via `matcher.ts:matchHost` — mesma semântica de `allow_hosts` / `deny_hosts` no mesmo bloco. `*.corp.internal` silencia subdomínios; `github.com` casa exatamente. Operador escrevendo as três listas do `fetch_url` (allow/deny/trusted) lê pelas mesmas regras.
+
 Modos:
 - `strict` (default) — confirma o que é confirmável, nega o resto.
 - `acceptEdits` — aceita edits sem confirmação, ainda nega o que é deny.

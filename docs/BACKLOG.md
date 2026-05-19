@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(permissions) — honor host globs in `trusted_hosts`
+
+`risk-score.ts:isUntrustedEgressHost` was checking trust with `trusted.includes(host)` — exact string match — while the sibling `allow_hosts` / `deny_hosts` lists on the SAME `fetch_url` schema use `matcher.ts:matchHost` which honors `*.corp.internal` style patterns. Operator declaring `trusted_hosts: ["*.corp.internal"]` in `.agent/permissions.yaml` saw `foo.corp.internal` continue triggering the `untrusted_egress` risk component despite the policy explicitly trusting the entire `*.corp.internal` subdomain space. Operator-visible divergence within a single policy section.
+
+Fix: replace `trusted.includes(host)` with `for (const pattern of trusted) if (matchHost(pattern, host)) return false` — reuse the existing host matcher. Exact strings still match exactly (`github.com` → `github.com`); globs now match consistently with the rest of the section.
+
+Considered the alternative (reject patterns in `trusted_hosts` as unsupported with a validator warning). Rejected: schema schizophrenia ("why does this list support globs but that one doesn't?") would be more confusing than just making the semantics uniform. The fix mirrors the matcher allow/deny already use, no new mental model.
+
+**Tests** (`tests/permissions/risk-score.test.ts`):
+
+- Glob pattern in trusted_hosts silences subdomain matches (`*.corp.internal` makes `foo.corp.internal` silent).
+- Multiple subdomain depths covered (`api.foo.corp.internal` also silent under `*.corp.internal`) — points at matchHost's own pinned behavior rather than re-specifying it.
+- Non-match still flagged (polarity check: pattern is a narrow trust, not a free pass).
+- Exact-string pattern still works (`github.com` literal) — backward-compat with `DEFAULT_TRUSTED_HOSTS` which is all exact strings.
+
+**Spec** (`AGENTIC_CLI.md §8`): `trusted_hosts` description gained a paragraph documenting that patterns are honored via `matchHost` — same semantic as `allow_hosts`/`deny_hosts`. `FetchPolicy.trusted_hosts` type docstring updated for symmetry.
+
+57 risk-score tests pass; typecheck + lint clean.
+
 ## [2026-05-19] fix(permissions) — recompute trustedHosts on policy hot-reload
 
 `engine.ts:1277` captured `trustedHosts` as a closure-const at engine construction. `reloadPolicy` was swapping policy / policyHash / mode / provenance correctly, but the risk-score input kept using the construction-time list. Operator edits to `<repo>/.agent/permissions.yaml` adding an internal CDN to `fetch_url.trusted_hosts` (or removing a no-longer-trusted host) saw the policy hash advance, `source.layer` updated, audit row reflected the swap — but `untrusted_egress` continued firing (or failing to fire) against the OLD set until process restart. `config != runtime` divergence on the hot-reload path.

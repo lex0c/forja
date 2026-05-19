@@ -41,6 +41,12 @@ export interface FetchPolicy {
   // or any endpoint outside the hardcoded public-registry default.
   // NOT an allowlist: `deny_hosts` still wins. Empty/absent leaves
   // the engine at the default set.
+  //
+  // Patterns honored via `matcher.ts:matchHost` — same semantic as
+  // `allow_hosts` / `deny_hosts` on this section. `*.corp.internal`
+  // silences subdomains; `github.com` matches exactly. Operators
+  // can read both `allow_hosts` examples and `trusted_hosts`
+  // examples as the same matcher rules.
   trusted_hosts?: readonly string[];
   locked?: boolean;
 }

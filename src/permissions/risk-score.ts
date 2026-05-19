@@ -21,7 +21,7 @@
 
 import type { Capability } from './capabilities.ts';
 import type { Confidence } from './grant-types.ts';
-import { containsShellInjection } from './matcher.ts';
+import { containsShellInjection, matchHost } from './matcher.ts';
 import type { EngineState } from './state-machine.ts';
 
 // Same domain as `ApprovalLogConfidence` in
@@ -128,9 +128,23 @@ const isUntrustedEgressHost = (host: string | null, trusted: readonly string[]):
   // Wildcard egress is counted under `wildcard_scope` instead of
   // `untrusted_egress` — same shape, different penalty.
   if (host === '*') return false;
-  // Plain string match; trust list is small (under 20 entries
-  // typical) so linear scan is fine.
-  return !trusted.includes(host);
+  // Use the same host matcher `allow_hosts` / `deny_hosts` use
+  // (`matcher.ts:matchHost`) so `trusted_hosts: ["*.corp.internal"]`
+  // silences subdomains consistently with the rest of the
+  // fetch_url policy schema. Pre-fix this was `trusted.includes(host)`
+  // — exact string compare — and operator-declared patterns
+  // silently failed to take effect, flagging
+  // `foo.corp.internal` as untrusted even though the policy
+  // explicitly trusted `*.corp.internal`.
+  //
+  // Trust list is small (typical < 20 entries); the regex cache
+  // inside matchHost compiles each pattern once and reuses on
+  // subsequent calls, so per-check cost is O(n) regex-test which
+  // is well within risk-score's existing budget.
+  for (const pattern of trusted) {
+    if (matchHost(pattern, host)) return false;
+  }
+  return true;
 };
 
 // Threshold at which the `recent_errors` feature fires: three
