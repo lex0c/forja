@@ -20,7 +20,15 @@
 // We're WRITING files the engine would later read, so loading the
 // engine here would be a chicken-and-egg dependency.
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DEFAULT_MEMORY_CONFIG } from '../critique/config-loader.ts';
 import { DEFAULT_CRITIQUE_CONFIG } from '../critique/types.ts';
@@ -79,6 +87,87 @@ interface StepResult {
   overwritten: number;
 }
 
+// Atomic write helper. Writes `content` to a temp file alongside
+// `target`, then renames into place. The rename is a single
+// filesystem syscall and is atomic on POSIX/NTFS for same-volume
+// renames — so a process killed mid-write can leave behind a
+// `<target>.tmp-<pid>-<ts>` orphan but NEVER a partially-written
+// target file. Without this, a fresh `permissions.yaml` truncated
+// at byte 500 would refuse parse on next boot (engine goes refusing,
+// operator has no way to know which file is corrupt).
+//
+// Permission-bit preservation: if `target` already exists, we
+// capture its mode via `statSync` BEFORE writing and `chmodSync`
+// the temp to match BEFORE the rename. Operators who
+// `chmod 600 .agent/config.toml` for a security-tightened repo
+// keep that mode after `init --force=config`. Without this,
+// rename adopts the temp's default mode (typically 0644 modulated
+// by umask) and silently relaxes the restriction.
+//
+// Best-effort orphan cleanup on write failure: if writeFileSync /
+// chmodSync / renameSync throws, we unlinkSync the temp before
+// re-raising. Failure to unlink (EACCES, race with another
+// process) is swallowed — the operator's broader EACCES surface is
+// the original failure; a secondary unlink error would just
+// confuse the diagnostic.
+//
+// Not durable across system crashes: data may remain in OS page
+// cache after rename; a power loss between rename and the next
+// kernel flush can lose the write. `fsyncSync` would close that
+// window but is overkill for config files (we accept the trade-off
+// per `AGENTIC_CLI.md` §13 — config files are not transactional
+// state). Production state that needs crash-durability lives in
+// SQLite, where `bun:sqlite` honors WAL durability semantics.
+//
+// Symlink note: if `target` is a symlink, `renameSync` replaces the
+// SYMLINK with the regular file. The link breaks. Operator who
+// linked `.agent/permissions.yaml → ~/shared-policy.yaml` and
+// runs `init --force=permissions` ends up with a regular file at
+// the .agent path, no longer following the shared policy.
+//
+// Mirrors the temp+rename idiom from `cli/slash/commands/memory.ts`
+// (`mutateMemoryConfig`) and `memory/writer.ts`. TODO: extract to
+// `src/storage/atomic-write.ts` when a fourth consumer surfaces —
+// today's two impls have slight semantic differences (this one
+// preserves mode + cleans up on failure; memory's keeps it
+// minimal) and consolidating prematurely risks regressing one of
+// the divergent behaviors.
+const atomicWrite = (target: string, content: string): void => {
+  // Capture existing mode (if any) so the rename below doesn't
+  // silently relax permissions an operator deliberately tightened.
+  let preservedMode: number | undefined;
+  try {
+    preservedMode = statSync(target).mode & 0o777;
+  } catch {
+    // Target doesn't exist (first-write case) — write inherits the
+    // platform default mode modulated by umask. Nothing to preserve.
+  }
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, content, { encoding: 'utf8' });
+    if (preservedMode !== undefined) {
+      chmodSync(tmp, preservedMode);
+    }
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // ignore; the original write error is what matters
+    }
+    throw err;
+  }
+  try {
+    renameSync(tmp, target);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+};
+
 const forcedFor = (force: InitOptions['force'], step: ForceEligibleStep): boolean => {
   if (force === 'all') return true;
   if (Array.isArray(force)) return force.includes(step);
@@ -97,7 +186,7 @@ const scaffoldPermissions = (options: InitOptions, force: boolean): StepResult |
   }
   try {
     mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, renderInitTemplate(mode), { encoding: 'utf8' });
+    atomicWrite(target, renderInitTemplate(mode));
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     err(`forja: failed to write ${target}: ${msg}\n`);
@@ -141,7 +230,7 @@ const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null
     // Scaffold sources all four section values from the canonical
     // code defaults so a re-run with `--force=config` (or a fresh
     // init after a bump) re-syncs to the current values.
-    writeFileSync(
+    atomicWrite(
       target,
       renderInitConfigTemplate({
         model: DEFAULT_MODEL,
@@ -149,7 +238,6 @@ const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null
         memory: DEFAULT_MEMORY_CONFIG,
         critique: DEFAULT_CRITIQUE_CONFIG,
       }),
-      { encoding: 'utf8' },
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -189,7 +277,7 @@ const scaffoldPlaybooks = (options: InitOptions, force: boolean): StepResult | n
       continue;
     }
     try {
-      writeFileSync(target, playbook.content, { encoding: 'utf8' });
+      atomicWrite(target, playbook.content);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       err(`forja: failed to write ${target}: ${msg}\n`);

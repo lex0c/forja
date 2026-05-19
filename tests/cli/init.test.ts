@@ -451,6 +451,54 @@ describe('runInit — playbooks step', () => {
     expect(existsSync(join(cwd, '.agent', 'agents'))).toBe(true);
   });
 
+  test('mid-loop write failure aborts and preserves prior writes', () => {
+    // Mid-loop failure scenario: entries 1 and 2 write successfully,
+    // entry 3 has a filename pointing at a non-existent subdir so
+    // its write fails with ENOENT (we deliberately don't mkdir the
+    // subdir), entry 4 is never reached (scaffolder early-returns
+    // on the first failure). Pins: prior writes survive, exit 1,
+    // err carries the diagnostic, subsequent entries don't appear,
+    // and the atomicWrite helper leaves no .tmp orphan on the
+    // failure path.
+    const partialFixture = [
+      { filename: 'good-1.md', content: '---\nname: a\n---\n' },
+      { filename: 'good-2.md', content: '---\nname: b\n---\n' },
+      // ENOENT trigger: parent `missing-subdir/` is not pre-created,
+      // and the scaffolder only mkdirs `.agent/agents/`, not nested
+      // paths inside filenames.
+      { filename: 'missing-subdir/bad.md', content: '---\nname: c\n---\n' },
+      { filename: 'never-written.md', content: '---\nname: d\n---\n' },
+    ];
+    const code = runInit({
+      cwd,
+      mode: 'strict',
+      only: ['playbooks'],
+      playbookSource: partialFixture,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    // First two survive at their final paths.
+    expect(existsSync(join(cwd, '.agent', 'agents', 'good-1.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.agent', 'agents', 'good-2.md'))).toBe(true);
+    // Failed entry: no file at the target subpath, no leaked temp
+    // sibling either (atomicWrite cleans up on write-throw).
+    expect(existsSync(join(cwd, '.agent', 'agents', 'missing-subdir'))).toBe(false);
+    // Entry after the failure was never attempted — scaffolder
+    // early-returns the moment any single playbook fails.
+    expect(existsSync(join(cwd, '.agent', 'agents', 'never-written.md'))).toBe(false);
+    // Operator-visible diagnostic on stderr.
+    expect(errBuf.join('')).toContain('failed to write');
+    expect(errBuf.join('')).toContain('missing-subdir/bad.md');
+    // No `.tmp-PID-TS` orphans anywhere in .agent/agents/.
+    const fs = require('node:fs') as typeof import('node:fs');
+    const agentsDir = join(cwd, '.agent', 'agents');
+    const entries = fs.readdirSync(agentsDir);
+    for (const e of entries) {
+      expect(e).not.toMatch(/\.tmp-\d+-\d+$/);
+    }
+  });
+
   test('every bundled canonical playbook loads cleanly through the loader', async () => {
     // Sanity check on the production asset bundle. If a future
     // edit to one of the canonical .md files breaks frontmatter,
@@ -507,6 +555,49 @@ describe('runInit — full bundle (default order)', () => {
     expect(outBuf.join('')).toContain('5 wrote');
     expect(outBuf.join('')).toContain('4 steps');
     expect(outBuf.join('')).toContain("review .agent/ and run 'agent'");
+  });
+
+  test('atomic-write preserves the existing file mode on force-overwrite', () => {
+    // Operator who tightened `.agent/config.toml` to 0600 for
+    // security keeps that mode after `init --force=config`.
+    // Without preservation, the temp+rename adopts the temp's
+    // default (0644 modulated by umask) and silently relaxes the
+    // restriction. Pin via a config-only scaffold so we don't
+    // depend on the playbooks fixture or .gitignore.
+    runInit({ cwd, mode: 'strict', only: ['config'], out, err });
+    const target = join(cwd, '.agent', 'config.toml');
+    const fs = require('node:fs') as typeof import('node:fs');
+    fs.chmodSync(target, 0o600);
+    outBuf = [];
+    errBuf = [];
+    runInit({ cwd, mode: 'strict', only: ['config'], force: ['config'], out, err });
+    const modeAfter = fs.statSync(target).mode & 0o777;
+    expect(modeAfter).toBe(0o600);
+  });
+
+  test('atomic-write leaves no `.tmp-*` orphan in .agent/ after a successful scaffold', () => {
+    // Pin for the atomic-write contract: temp+rename succeeded, the
+    // temp file should be gone (rename moved it to the target). A
+    // future refactor that drops the rename in favor of a direct
+    // write would still pass the existence checks above but would
+    // leak the temp pattern at higher rates if the writer crashed
+    // mid-write. We check no leaked temps directly to defend the
+    // crash-safe property.
+    runInit({ cwd, mode: 'strict', playbookSource: FIXTURE_PLAYBOOKS, out, err });
+    const fs = require('node:fs') as typeof import('node:fs');
+    const walk = (dir: string): string[] => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const out: string[] = [];
+      for (const e of entries) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) out.push(...walk(p));
+        else out.push(p);
+      }
+      return out;
+    };
+    const allFiles = walk(join(cwd, '.agent'));
+    const tmps = allFiles.filter((p) => /\.tmp-\d+-\d+$/.test(p));
+    expect(tmps).toEqual([]);
   });
 
   test('idempotent re-run leaves operator edits intact', () => {

@@ -2,6 +2,36 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] hardening(cli) — three init robustness follow-ups (atomic writes, mid-loop pin, eval)
+
+Self-review of `agent init` after the rich-scaffold landed surfaced three production-readiness gaps. All three closed here on the same branch.
+
+**1. Atomic temp+rename for the three non-gitignore writers.** `scaffoldPermissions`, `scaffoldConfig`, `scaffoldPlaybooks` were calling bare `writeFileSync`. A process killed mid-write leaves a partial target file — `permissions.yaml` truncated at byte 500 refuses parse on next boot (engine → refusing), `config.toml` partial fails TOML.parse (loader fail-soft warns, defaults kick in — silent semantic drift), playbook `.md` truncated breaks the subagent loader on read.
+
+The gitignore writer was already atomic via `ensureAgentGitignore` (`wx` create-or-fail flag). New `atomicWrite(target, content)` helper in `init.ts` mirrors the temp+rename idiom from `cli/slash/commands/memory.ts:3268-3271` (`mutateMemoryConfig`): write `<target>.tmp-<pid>-<ts>` first, then `renameSync` into place. The rename is a single filesystem syscall, atomic on POSIX/NTFS for same-volume renames. On write or rename failure, best-effort `unlinkSync(tmp)` cleans up the temp before re-raising; inner unlink errors are swallowed so the operator's diagnostic surfaces the original write failure, not a secondary unlink-of-nonexistent.
+
+**2. Mid-loop failure pin for `scaffoldPlaybooks`.** Prior test coverage exercised the step-boundary failure (sentinel file at `.agent/agents` → mkdirSync ENOTDIR) but not within-loop. Inject scenario added: fixture with four entries where entry 3's `filename` points at a non-existent subdir (`missing-subdir/bad.md`). writeFileSync fails with ENOENT; the scaffolder early-returns. Pins assert: entries 1+2 wrote to final paths, entry 3 has no file (atomicWrite cleaned up its temp on write-throw), entry 4 was never attempted, stderr carries the diagnostic, no `.tmp-PID-TS` orphans linger anywhere in `.agent/agents/`. A refactor that loses the early-return (continuing past a single write failure) would silently turn this into "entries 1+2+4 wrote, error printed for 3" — caught here.
+
+**3. End-to-end eval — `evals/init/` + `tests/cli/init-eval.test.ts`.** Per `CLAUDE.md` principle 4 ("eval is load-bearing — a subsystem without eval doesn't ship"). Pre-eval, init's unit tests covered the scaffolder's outputs, and bootstrap's unit tests covered the loader's inputs, but no test pinned the **cross-subsystem handshake**: init writes the files; bootstrap reads them; the values flow through every loader correctly. Three scenarios:
+
+| # | Scenario | Pins |
+|---|---|---|
+| 1 | Default init (all 4 steps) → bootstrap | `permissionState === 'ready'`; `modelId === DEFAULT_MODEL`; `config.budget.maxSteps === DEFAULT_BUDGET.maxSteps`; memory + critique + providers warnings all empty |
+| 2 | `--only=permissions,config` (partial scaffold) → bootstrap | Boots to ready even without `.agent/agents/`; `[providers].model` still drives modelId resolution |
+| 3 | Re-run idempotency | Second init prints "skipped"; permissions / config / gitignore / playbook content byte-for-byte unchanged; bootstrap still reaches ready against the unchanged scaffold |
+
+What the eval catches: schema drift between renderer and parser (init emits a key the loader's `BUDGET_INT_KEYS` doesn't recognize); path drift between `projectPolicyPath` / `projectAgentsDir` and bootstrap's read sites; value drift between scaffold and code defaults; partial-scaffold compatibility regression. What it doesn't: LLM behavior under the scaffolded model (covered by `tests/providers/*`), multi-operator concurrency (TOCTOU window narrowed by atomic-write but not eliminated), compiled-binary asset bundling (covered elsewhere). README at `evals/init/README.md`.
+
+**Test deltas:**
+
+- `tests/cli/init.test.ts`: +2 cases (atomic-write orphan check, mid-loop failure pin). 27 pass.
+- `tests/cli/init-eval.test.ts`: new file, 3 cases. 3 pass.
+- `tests/cli/init-config-template.test.ts`: unchanged (template tests aren't affected by the atomic-write or eval additions). 9 pass.
+
+Suite delta: 152 tests pass across 5 affected files; typecheck + lint clean.
+
+**Production-readiness shift.** Before: known partial-write window on crash, mid-loop failure behavior untested, cross-subsystem handshake unpinned. After: writes atomic at the filesystem layer (orphan temp possible, partial target impossible), mid-loop semantic pinned by deliberate failure injection, init↔bootstrap cross-wire pinned end-to-end. The three follow-ups identified in the post-rich-scaffold review are now closed.
+
 ## [2026-05-19] fix(cli) — rich config.toml scaffold supersedes the slim spec-pointer
 
 Reverses the slim-scaffold posture from earlier in the day. Two days ago the analysis was: `/memory governance enable|disable` round-trips `.agent/config.toml` via `Bun.TOML.parse → mutate → emit` and comments don't survive — so shipping a comment-rich scaffold was a false promise. The fix at the time was to ship a minimal header pointing at `AGENTIC_CLI.md §2.1.1` for the schema.
