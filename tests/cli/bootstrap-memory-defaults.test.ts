@@ -319,4 +319,53 @@ verify_semantic_llm = false
       result.db.close();
     }
   });
+
+  test('loads [memory] from repo-root .agent/config.toml when launched from a subdirectory (post-review)', async () => {
+    // Pre-fix: loadMemoryConfig received the raw invocation cwd, so
+    // bootstrap from `<repo>/src/sub` read `<repo>/src/sub/.agent/
+    // config.toml` (nonexistent) and missed the operator's actual
+    // opt-out at `<repo>/.agent/config.toml`. Default-on detectors
+    // re-enabled silently, LLM budget burned despite the configured
+    // disable.
+    //
+    // Post-fix: bootstrap hoists `resolveRepoRoot(cwd)` once and
+    // passes it to BOTH config loaders + the memory scope-roots
+    // construction. Symmetric with the trigger-probe fix
+    // documented inline at the registry construction site.
+    //
+    // Setup: `git init` the workdir so resolveRepoRoot finds the
+    // root via `git rev-parse --show-toplevel`. Drop the opt-out
+    // config at the root. Bootstrap with cwd = subdir.
+    const { spawnSync } = await import('node:child_process');
+    spawnSync('git', ['init', '-q', workdir], { stdio: 'ignore' });
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      '[memory]\nverify_semantic_llm = false\n',
+    );
+    const subdir = join(workdir, 'src', 'components');
+    mkdirSync(subdir, { recursive: true });
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: subdir, // operator launched from a subdir
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      governanceBannerMarkerDir: markerDir,
+    });
+    try {
+      // Repo-root opt-out resolved correctly even though bootstrap
+      // was launched from a subdir.
+      expect(config.memorySemanticVerify).toBe(false);
+      expect(config.memorySemanticVerifySource).toBe('project-config');
+      // Untouched detectors keep the default (their absent keys
+      // shouldn't shadow user/default layers — separate fix
+      // `3bfba73`).
+      expect(config.memoryConflictDetect).toBe(true);
+      expect(config.memoryOverrideDetect).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
 });

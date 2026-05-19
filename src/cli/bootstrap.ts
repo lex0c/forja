@@ -324,7 +324,21 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // is non-fatal by design (a malformed [critique] block degrades
   // to defaults, not a hard exit). The warnings array is exposed
   // on BootstrapResult for the CLI driver to print.
-  const critiqueLoaded = loadCritiqueConfig({ cwd, registry });
+  //
+  // BOTH loaders take cwd → `.agent/config.toml` at that dir. The
+  // canonical project config lives at `<repo-root>/.agent/config
+  // .toml`, NOT under the operator's invocation cwd. When `agent`
+  // is launched from a subdirectory (the common case), passing raw
+  // cwd would miss the repo-rooted file entirely — the operator
+  // would set `verify_semantic_llm = false` at `<repo>/.agent/
+  // config.toml` and bootstrap would still resolve detectors via
+  // default + spend LLM budget. Resolve repo root ONCE up here and
+  // reuse below for the memory scope-roots construction; falls
+  // back to cwd when not in a git repo, matching the historical
+  // "config lives where the operator invoked from" behavior for
+  // non-repo workflows.
+  const projectConfigCwd = resolveRepoRoot(cwd);
+  const critiqueLoaded = loadCritiqueConfig({ cwd: projectConfigCwd, registry });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
@@ -333,7 +347,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // first-run banner emission below: banner fires ONLY when both
   // detectors resolved to ON via DEFAULT (no layer explicitly named
   // the field, no CLI override).
-  const memoryLoaded = loadMemoryConfig({ cwd });
+  const memoryLoaded = loadMemoryConfig({ cwd: projectConfigCwd });
 
   // First-run banner. Fires once per machine when:
   //   (a) both detectors resolve to ON,
@@ -717,8 +731,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // `.git` / `package.json` / `tsconfig.json` etc. Memories
     // tagged with those triggers got filtered out even though
     // the same session loaded the project memory containing them.
-    // Single `repoRoot` value keeps the two consumers aligned.
-    const repoRoot = resolveRepoRoot(cwd);
+    // Single `repoRoot` value keeps the three consumers
+    // aligned: critique/memory config loader (hoisted above),
+    // memory scope roots, and the trigger-probe section below.
+    const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
     // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-evicts
