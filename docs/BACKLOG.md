@@ -2,6 +2,41 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent purge` TOCTOU verifier checks `dev` alongside `ino`
+
+Operator-reported security follow-up to commit `75779ce` (TOCTOU symlink race fix). The `verifySamePostReaddir` detector compared only `stAfter.ino === preStat.ino` to confirm directory identity after `readdirSync`. Inode numbers are **only unique per filesystem** — a cross-device swap (adversary mounting a crafted FS at the path with a directory whose ino collides with the original) would pass the check and let the walker recurse into the swapped tree.
+
+**Attack shape.** Adversary with mount privileges (or via FUSE / user namespaces in some configurations) mounts a tmpfs / crafted ext4 at the dir's path between `lstatSync` and `readdirSync`. Crafts the directory inode value to match the original (trivial: SQLite/tmpfs let you control ino at creation in some cases, or just try until you hit a collision — small ino space). The post-readdir re-stat returns the SAME ino — verifier passes. Walker recurses into the mount's contents — deletes files outside `.agent/`.
+
+Real-world feasibility: requires mount rights OR FUSE setup. Lower than the basic symlink race but still within the operator's threat model (multi-user host, container escape recovery, hostile sysadmin scenarios).
+
+**Fix.** Add `stAfter.dev === preStat.dev` to the identity check:
+
+```ts
+return (
+  stAfter.isDirectory() &&
+  !stAfter.isSymbolicLink() &&
+  stAfter.ino === preStat.ino &&
+  stAfter.dev === preStat.dev    // <- new
+);
+```
+
+The `dev + ino` pair is the kernel-level unique identifier across all mounts. Together they pin "this is the same filesystem object" — a swap that changes either field is detected.
+
+**Tests.** 1 new pin in `tests/cli/purge.test.ts` describe `verifySamePostReaddir — TOCTOU race detector`:
+- `returns false when dev differs (cross-device swap with same ino)` — forge a `Stats` object with same `ino` as the real one but `dev: realStat.dev + 1`. Verifier's post-stat (real `lstatSync`) returns the actual dev; if it compared only ino, would return true. Asserts false.
+
+Real cross-device mount isn't feasible in a unit test (needs root + loop device or FUSE). Forged Stats is the cleanest way to pin the dev check is actually consulted.
+
+**Residual race window unchanged.** The post-readdir-to-walkRemove window still exists (microseconds; documented in prior fix entry). Cross-device swap during THAT window remains the residual theoretical risk.
+
+**Verification:**
+- 38/38 purge tests pass (was 37, +1 new pin)
+- 49/49 across purge + args-purge
+- typecheck + lint clean
+
+**Pre-existing operator state.** Same as the original TOCTOU fix — only triggers under concurrent FS modification by a malicious local process with mount rights. Normal single-process workflows were never affected. This fix tightens the identity check; an adversary winning the residual post-stat race remains the only theoretical hole, deferred until exploit reported.
+
 ## [2026-05-19] fix(cli) — `agent gc` distinguishes missing DB from real failures in dry-run
 
 Operator-reported bug. The dry-run readonly-open fix (commit `706b344`) collapsed ALL open failures into "fresh install case" — empty report, exit 0, stderr warning. Concrete consequence: a corrupted DB, perm-denied DB, locked DB, or integrity-check failure would surface as "all good, 0 rows to sweep" to scripts/cron jobs, masking real operational failures.

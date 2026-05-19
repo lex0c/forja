@@ -16,6 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
+  type Stats,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -863,6 +864,34 @@ describe('verifySamePostReaddir — TOCTOU race detector', () => {
     rmSync(realDir, { recursive: true, force: true });
     writeFileSync(realDir, 'now a file');
     expect(verifySamePostReaddir(realDir, preStat)).toBe(false);
+  });
+
+  test('returns false when dev differs (cross-device swap with same ino)', () => {
+    // Operator-reported security follow-up: inode numbers are only
+    // unique per filesystem. An adversary mounting a crafted FS at
+    // the path with a directory whose ino collides with the
+    // original would pass an ino-only check. The dev+ino pair is
+    // the kernel-level unique identifier across all mounts.
+    //
+    // Real cross-device mount isn't feasible in a unit test (needs
+    // root + loop device). Instead, forge a preStat with the same
+    // ino as the real one but a different `dev`. The verifier's
+    // post-stat (real lstat) returns the actual dev; if the
+    // verifier only compared `ino`, this would return true.
+    const realDir = join(workdir, 'real');
+    mkdirSync(realDir);
+    const realStat = lstatSync(realDir);
+    // Construct a Stats-like with same ino but different dev.
+    // Spread loses prototype methods, so re-attach the ones
+    // verifySamePostReaddir doesn't actually consult on the
+    // PRE-stat (it only reads .ino + .dev fields). Type cast.
+    const forgedPreStat = {
+      ...realStat,
+      dev: realStat.dev + 1, // different device
+    } as Stats;
+    expect(forgedPreStat.ino).toBe(realStat.ino);
+    expect(forgedPreStat.dev).not.toBe(realStat.dev);
+    expect(verifySamePostReaddir(realDir, forgedPreStat)).toBe(false);
   });
 });
 

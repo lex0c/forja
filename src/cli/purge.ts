@@ -276,8 +276,12 @@ const hasInitMarker = (agentDir: string): boolean => {
 // defeating the top-of-walk symlink defense.
 //
 // This helper re-runs lstat AFTER readdir and verifies the path
-// still points at the same inode of a real directory. If not, the
-// caller refuses to recurse into the listed entries.
+// still points at the same real directory. Identity check requires
+// BOTH `dev` AND `ino` to match — inode numbers are only unique
+// per filesystem, so a cross-device swap (e.g., adversary mounts a
+// crafted FS at the path with a directory whose ino collides with
+// the original) would pass an ino-only check. The dev+ino pair is
+// the kernel-level unique identifier across all mounts.
 //
 // Residual race: adversary can still swap between this re-stat and
 // the per-child walkRemove call. That window is much narrower
@@ -295,7 +299,12 @@ export const verifySamePostReaddir = (path: string, preStat: Stats): boolean => 
     // (don't recurse into a path that's no longer there).
     return false;
   }
-  return stAfter.isDirectory() && !stAfter.isSymbolicLink() && stAfter.ino === preStat.ino;
+  return (
+    stAfter.isDirectory() &&
+    !stAfter.isSymbolicLink() &&
+    stAfter.ino === preStat.ino &&
+    stAfter.dev === preStat.dev
+  );
 };
 
 // Removes a tree rooted at `target`, lstat-aware. Symlinks are
