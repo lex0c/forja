@@ -529,17 +529,31 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // (render) and force (compare against actual removal).
   const walk = walkAgentDir(agentDir);
 
-  // Probe DB writability. CRITICAL: dry-run must use the
-  // non-mutating probe — opening + migrating the DB in a "DRY
-  // RUN (nothing will be modified)" path would create the global
-  // sessions.db file (or apply pending migrations to an existing
-  // one) before the operator opts in. Force path uses the
-  // mutating probe (open + migrate) because the audit row write
-  // requires the schema in place anyway.
+  // Probe DB writability. Three-way gate:
+  //
+  //   1. --no-audit set → SKIP the probe entirely. Synthesize an
+  //      audit object describing the opt-out. Critical for fresh
+  //      installs: operator opting out of audit logging shouldn't
+  //      have their `~/.local/share/forja/sessions.db` created
+  //      as a side effect of the probe. Same load-bearing
+  //      "no DB dependency" property the operator expects when
+  //      they pass --no-audit.
+  //
+  //   2. Force + audit wanted → mutating probe (open + migrate).
+  //      We need the schema in place for the upcoming audit row
+  //      write anyway.
+  //
+  //   3. Dry-run + audit observable → non-mutating probe (pure
+  //      FS check). Dry-run must not create the file or apply
+  //      migrations; warning if the parent dir isn't writable
+  //      so the operator gets feedback before opting into
+  //      --force.
   const dbPath = options.dbPath ?? defaultDbPath();
-  const audit = force
-    ? probeAuditWritabilityMutating(dbPath)
-    : probeAuditWritabilityNonMutating(dbPath);
+  const audit: AuditWritability = noAudit
+    ? { writable: false, dbPath, reason: 'skipped (--no-audit; DB not probed)' }
+    : force
+      ? probeAuditWritabilityMutating(dbPath)
+      : probeAuditWritabilityNonMutating(dbPath);
 
   // ────────────────────────────────────────────────────────────
   // Dry-run path
@@ -582,9 +596,10 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // the forensic trail.
   let auditId: number | null = null;
   if (noAudit) {
-    err(
-      `forja purge: --no-audit set; skipping audit row (db ${audit.writable ? 'writable but opt-out honored' : `unreachable: ${audit.reason ?? 'unknown'}`})\n`,
-    );
+    // Probe was skipped entirely (DB not touched). Single uniform
+    // message — operator who passed --no-audit knows the DB state
+    // wasn't even queried.
+    err('forja purge: --no-audit set; audit row skipped (DB not probed)\n');
   } else {
     if (!audit.writable) {
       err(

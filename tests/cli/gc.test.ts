@@ -435,3 +435,114 @@ describe('runGcCli — repoRoot resolution', () => {
     expect(parsed.configSources.project).toBe(projectConfigPath);
   });
 });
+
+describe('runGcCli — suggested force command preserves scope', () => {
+  // Operator-reported safety bug: dry-run with --table=X suggested
+  // a bare `agent gc --force` command. Copy-pasting widened the
+  // sweep to ALL tables — data loss outside the inspected scope.
+  // Fix: the suggested command echoes the same --table=X flags.
+
+  test('no --table → "agent gc --force" (unscoped)', async () => {
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: true,
+      tables: [],
+      out,
+      err,
+      dbPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
+    expect(parsed.command).toBe('agent gc --force');
+  });
+
+  test('single --table → preserved in suggestion', async () => {
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: true,
+      tables: ['context_pins'],
+      out,
+      err,
+      dbPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
+    expect(parsed.command).toBe('agent gc --force --table=context_pins');
+  });
+
+  test('multiple --table → all preserved, order maintained', async () => {
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: true,
+      tables: ['memory_events', 'hook_runs', 'outcomes'],
+      out,
+      err,
+      dbPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
+    expect(parsed.command).toBe(
+      'agent gc --force --table=memory_events --table=hook_runs --table=outcomes',
+    );
+  });
+
+  test('human output echoes scoped command', async () => {
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: false,
+      tables: ['retrieval_trace'],
+      out,
+      err,
+      dbPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const stdout = outBuf.join('');
+    expect(stdout).toContain('agent gc --force --table=retrieval_trace');
+    // Negative polarity: bare suggestion must NOT appear (would
+    // otherwise indicate the scope was dropped).
+    expect(stdout).not.toMatch(/agent gc --force\n/);
+  });
+
+  test('force mode JSON omits command (no follow-up to suggest)', async () => {
+    const code = await runGcCli({
+      cwd,
+      force: true,
+      json: true,
+      tables: ['context_pins'],
+      out,
+      err,
+      dbPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
+    expect(parsed.command).toBeUndefined();
+  });
+
+  test('DB-unreadable dry-run path also preserves scope', async () => {
+    // The empty-report emergency path (SQLITE_CANTOPEN catch) also
+    // emits a suggested command; that path must preserve scope too.
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: true,
+      tables: ['bg_processes'],
+      out,
+      err,
+      dbPath: join(xdgHome, 'never-existed.db'),
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
+    expect(parsed.command).toBe('agent gc --force --table=bg_processes');
+    expect(errBuf.join('')).toContain('agent gc --force --table=bg_processes');
+  });
+});

@@ -2,6 +2,96 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent gc` dry-run suggestion preserves `--table` scope
+
+Operator-safety bug. Dry-run output (both human "To execute: agent gc --force" line AND JSON `command` field) was hardcoded to `agent gc --force` — no `--table=X` flags echoed back.
+
+**Concrete failure mode.** Operator:
+1. Runs `agent gc --table=memory_events` to inspect ONLY one table's deletion impact.
+2. Reads dry-run output, sees "To execute: agent gc --force".
+3. Copy-pastes that line into the shell.
+4. Force run sweeps ALL 10 covered tables, deleting data outside the inspected scope.
+
+The dry-run's purpose is to let the operator validate impact before committing. Losing the scope in the suggestion turns the dry-run into a trap.
+
+**Fix.** New `buildForceCommand(tables: ReadonlyArray<string>): string` helper:
+- Empty `tables` → `'agent gc --force'`
+- Non-empty → `'agent gc --force --table=X --table=Y'` (each filter explicitly echoed)
+
+Applied to all 5 hardcoded sites in `cli/gc.ts`:
+1. `renderHumanDryRun` final "To execute" line
+2. JSON `command` field on the normal dry-run path
+3. JSON `command` field on the DB-unreadable empty-report path
+4. stderr "run X to create + migrate the DB" warning on the DB-unreadable path
+5. `cmd` variable in the JSON force-vs-dry-run branch
+
+`renderHumanDryRun` now takes the command as a parameter (was hardcoded inside). All call sites updated.
+
+Force-mode JSON still omits `command` entirely (no follow-up to suggest).
+
+**Tests.** 6 new pins in `tests/cli/gc.test.ts` describe `runGcCli — suggested force command preserves scope`:
+- `no --table → "agent gc --force" (unscoped)` — baseline still works.
+- `single --table → preserved in suggestion`
+- `multiple --table → all preserved, order maintained`
+- `human output echoes scoped command` — includes negative polarity assertion (`stdout NOT matching /agent gc --force\n/` to catch regression to bare suggestion).
+- `force mode JSON omits command (no follow-up to suggest)`
+- `DB-unreadable dry-run path also preserves scope` — covers the empty-report emergency path, easy regression spot.
+
+**Verification:**
+- 18/18 gc CLI tests pass (was 12, +6 new pins)
+- 79/79 across gc CLI + args-gc + audit/
+- typecheck + lint clean
+- Smoke E2E: `agent gc --table=context_pins --table=bg_processes` in fresh tempdir → output echoes `agent gc --force --table=context_pins --table=bg_processes` in both stderr warning AND suggestion footer.
+
+**Pre-existing operator state.** Operators who copy-pasted the bare suggestion from a scoped dry-run before this fix may have swept tables outside their intended scope. No automated recovery — the deletions are by-table-retention-windows, idempotent on re-run; operator who wanted narrower scope can re-establish their config and let normal retention rebuild the dataset over time (or restore from backup if available).
+
+## [2026-05-19] fix(cli) — `agent purge --no-audit` skips DB probe entirely
+
+Third operator-reported bug on the `--no-audit` escape hatch in two commits. Sequence:
+
+1. **First fix (`0747faf`)**: `--no-audit` only honored as an error bypass — healthy DB still wrote a row. Made `--no-audit` the PRIMARY gate so the write was correctly skipped.
+2. **This fix**: even after gating the WRITE, the PROBE (`openDb + migrate`) still ran first. So `agent purge --force --no-audit` on a fresh install CREATED `~/.local/share/forja/sessions.db` and applied 66 migrations to it before the noAudit check fired. Operator opted out of audit logging and still got DB side effects.
+
+The escape hatch is meant for emergencies — DB corrupted, fresh install where the global DB shouldn't exist yet, recovery scenarios where any DB touch is risky. Probing first defeats the entire purpose.
+
+**Fix.** Three-way gate on the probe selection:
+```ts
+const audit = noAudit
+  ? { writable: false, dbPath, reason: 'skipped (--no-audit; DB not probed)' }
+  : force
+    ? probeAuditWritabilityMutating(dbPath)
+    : probeAuditWritabilityNonMutating(dbPath);
+```
+
+When `--no-audit` is set, the probe is bypassed entirely. The `audit` object is synthesized with `writable: false` and a reason field describing the opt-out. No `openDb`, no `migrate`, no file creation, no chmod, no sidecars — zero DB-side effects.
+
+Stderr message unified to a single line regardless of force/dry-run + DB state when opt-out is in play:
+```
+forja purge: --no-audit set; audit row skipped (DB not probed)
+```
+
+(Operator who explicitly opted out of audit logging knows the DB state wasn't queried.)
+
+**JSON output semantic change.** `audit.writable: false` now signals BOTH "DB broken" AND "opt-out". Operator scripting that needs to distinguish reads `audit.reason`:
+- `'skipped (--no-audit; DB not probed)'` — opt-out (no DB touch)
+- `'<ENOENT/EACCES message>'` — actual probe failure
+
+Tests in this commit pin both signal paths.
+
+**Tests.** 1 new + 2 updated in `tests/cli/purge.test.ts`:
+- **NEW**: `--force --no-audit on a FRESH install does not create sessions.db` — load-bearing. With non-existent dbPath, FS purge happens but `existsSync(freshDb) === false` after.
+- **Updated**: `--force --no-audit on a HEALTHY DB skips both probe and audit row` — now expects the uniform stderr message + `auditWritable: false` (NOT true as before, because probe never ran).
+- **Updated**: `--force --no-audit JSON output reflects no audit row and skipped probe` — `auditId: null` + `auditWritable: false`.
+- **Updated**: `--force --no-audit proceeds even when DB is unwriteable` — same uniform stderr message expectation.
+
+**Verification:**
+- 28/28 purge tests pass (was 27, +1 new pin)
+- 51/51 across purge + args-purge + purge-events repo
+- typecheck + lint clean
+- Smoke E2E: `agent purge --force --no-audit` with non-existent `XDG_DATA_HOME` → FS purge happens, **no DB created**.
+
+**Pre-existing operator state.** Operators who ran `agent purge --force --no-audit` on a fresh install before this fix have an unwanted `~/.local/share/forja/sessions.db` (created by the probe, migrated, but with no rows). Remove via `rm ~/.local/share/forja/sessions.db*` if not used for real session activity.
+
 ## [2026-05-19] fix(cli) — `agent gc` dry-run uses readonly DB open (no file/sidecar creation)
 
 Operator-reported bug. The dry-run path still called `openDb(dbPath)` before the force check — and `openDb` without `{readonly: true}` does substantial mutation:

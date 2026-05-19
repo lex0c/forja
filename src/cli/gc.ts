@@ -52,6 +52,18 @@ const formatAge = (cutoffMs: number, nowMs: number): string => {
   return `${days}d ago`;
 };
 
+// Build the suggested `agent gc --force` command, preserving the
+// caller's `--table=X` filters. Operator who runs
+// `agent gc --table=memory_events` (scoped dry-run) should see the
+// suggested command echo the same scope — otherwise copy-pasting
+// the suggestion sweeps every table, deleting data outside the
+// inspected scope. Operator safety > brevity.
+const buildForceCommand = (tables: ReadonlyArray<string>): string => {
+  if (tables.length === 0) return 'agent gc --force';
+  const flags = tables.map((t) => `--table=${t}`).join(' ');
+  return `agent gc --force ${flags}`;
+};
+
 const formatCutoffIso = (cutoffMs: number): string => {
   // Operator-facing date string. ISO is universally parseable; we
   // drop subsecond precision because cutoffs are derived from
@@ -66,6 +78,7 @@ const formatCutoffIso = (cutoffMs: number): string => {
 const renderHumanDryRun = (
   report: GcReport,
   configSources: { user: string | null; project: string | null },
+  forceCommand: string,
   out: (s: string) => void,
 ): void => {
   out('forja gc — DRY RUN (nothing will be modified)\n\n');
@@ -98,7 +111,7 @@ const renderHumanDryRun = (
       out(`  ${e.table.padEnd(18)} ${e.reason}\n`);
     }
   }
-  out('\nTo execute:\n  agent gc --force\n');
+  out(`\nTo execute:\n  ${forceCommand}\n`);
 };
 
 const renderHumanForce = (report: GcReport, out: (s: string) => void): void => {
@@ -203,8 +216,9 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
           // anything. Other errors (corrupted DB, perm denied) get
           // the same surface — operator sees the reason in stderr
           // and the report shows zero rows.
+          const forceCommand = buildForceCommand(tables);
           err(
-            `forja gc: DB not readable in dry-run (${reason}); reporting empty counts — run \`agent gc --force\` to create + migrate the DB.\n`,
+            `forja gc: DB not readable in dry-run (${reason}); reporting empty counts — run \`${forceCommand}\` to create + migrate the DB.\n`,
           );
           // Synthesize an empty report so the renderer still works.
           const emptyReport: GcReport = {
@@ -215,11 +229,9 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
             errors: [],
           };
           if (json) {
-            out(
-              `${JSON.stringify(serializeReport(emptyReport, loaded.sources, 'agent gc --force'))}\n`,
-            );
+            out(`${JSON.stringify(serializeReport(emptyReport, loaded.sources, forceCommand))}\n`);
           } else {
-            renderHumanDryRun(emptyReport, loaded.sources, out);
+            renderHumanDryRun(emptyReport, loaded.sources, forceCommand, out);
           }
           return 0;
         }
@@ -245,12 +257,16 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
     });
 
     if (json) {
-      const cmd = force ? null : 'agent gc --force';
+      // Preserve the operator's --table=X scope in the suggested
+      // command so copy-pasting the dry-run output doesn't widen
+      // the sweep to all tables. Force-mode JSON omits the field
+      // entirely (no follow-up to suggest).
+      const cmd = force ? null : buildForceCommand(tables);
       out(`${JSON.stringify(serializeReport(report, loaded.sources, cmd))}\n`);
     } else if (force) {
       renderHumanForce(report, out);
     } else {
-      renderHumanDryRun(report, loaded.sources, out);
+      renderHumanDryRun(report, loaded.sources, buildForceCommand(tables), out);
     }
 
     // Errors are per-table best-effort; surface as non-zero exit

@@ -550,16 +550,21 @@ describe('runPurge — --no-audit escape hatch', () => {
     expect(code).toBe(0);
     // FS removal happened despite no audit row.
     expect(existsSync(join(cwd, '.agent'))).toBe(false);
-    // stderr explains the bypass.
-    expect(errBuf.join('')).toContain('skipping audit row');
+    // stderr explains the bypass (uniform message — probe was
+    // skipped, so we don't even know whether the DB is broken).
+    expect(errBuf.join('')).toContain('audit row skipped (DB not probed)');
   });
 
-  test('--force --no-audit on a HEALTHY DB skips the audit row (opt-out is primary)', async () => {
-    // Operator-reported bug: pre-fix, --no-audit was only honored
-    // as an error bypass — when the DB was writable, the audit row
-    // was written anyway, contradicting the documented "opt out of
-    // audit logging" intent. Fix: --no-audit is the PRIMARY gate;
-    // writable DB doesn't override the opt-out.
+  test('--force --no-audit on a HEALTHY DB skips both probe and audit row', async () => {
+    // Two operator-reported bugs converge here:
+    //   1. Pre-first-fix: --no-audit was only honored as an error
+    //      bypass — writable DB still wrote a row.
+    //   2. Pre-second-fix: even after gating the WRITE behind
+    //      --no-audit, the PROBE (openDb + migrate) still ran
+    //      first, so the DB got created/migrated on fresh installs
+    //      despite "opt out of audit logging" intent.
+    // Combined fix: --no-audit skips BOTH the probe AND the row
+    // write. No DB side effects at all.
     seedMinimal();
     const code = await runPurge({
       cwd,
@@ -573,18 +578,20 @@ describe('runPurge — --no-audit escape hatch', () => {
     expect(code).toBe(0);
     // FS removal happened.
     expect(existsSync(join(cwd, '.agent'))).toBe(false);
-    // stderr confirms opt-out honored (not "unreachable").
-    expect(errBuf.join('')).toContain('skipping audit row');
-    expect(errBuf.join('')).toContain('writable but opt-out honored');
-    // The load-bearing assertion: NO purge_events row landed even
-    // though the DB was perfectly writable.
+    // stderr confirms opt-out — single uniform message regardless
+    // of DB state (operator who passed --no-audit knows the DB
+    // wasn't even queried).
+    expect(errBuf.join('')).toContain('audit row skipped (DB not probed)');
+    // The load-bearing assertion: NO purge_events row landed.
+    // (Open + migrate the DB here, in the TEST, to inspect — the
+    // production code path never opened it.)
     const db = openDb(dbPath);
     migrate(db);
     expect(listPurgeEventsByCwd(db, cwd)).toEqual([]);
     db.close();
   });
 
-  test('--force --no-audit JSON output reflects no audit row', async () => {
+  test('--force --no-audit JSON output reflects no audit row and skipped probe', async () => {
     seedMinimal();
     const code = await runPurge({
       cwd,
@@ -602,10 +609,39 @@ describe('runPurge — --no-audit escape hatch', () => {
       auditWritable: boolean;
     };
     expect(parsed.mode).toBe('force');
-    // auditId is null because we opted out, NOT because the DB
-    // failed. auditWritable still reports true (the DB IS writable).
+    // Both fields signal opt-out:
+    //   auditId: null   — no row written
+    //   auditWritable: false — probe skipped (NOT "DB broken")
+    // Operator scripting distinguishes opt-out from DB-broken via
+    // the audit.reason field (`'skipped (--no-audit; DB not probed)'`
+    // for opt-out vs ENOENT/EACCES for real failures).
     expect(parsed.auditId).toBeNull();
-    expect(parsed.auditWritable).toBe(true);
+    expect(parsed.auditWritable).toBe(false);
+  });
+
+  test('--force --no-audit on a FRESH install does not create sessions.db', async () => {
+    // Load-bearing: combines --force + --no-audit + non-existent DB.
+    // Pre-fix the mutating probe ran before the noAudit gate,
+    // creating the file. Post-fix: probe is gated, DB never touched.
+    seedMinimal();
+    const freshDb = join(xdgHome, 'never-existed.db');
+    expect(existsSync(freshDb)).toBe(false);
+    const code = await runPurge({
+      cwd,
+      force: true,
+      json: false,
+      noAudit: true,
+      out,
+      err,
+      dbPath: freshDb,
+    });
+    expect(code).toBe(0);
+    // FS purge happened.
+    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    // DB and sidecars NOT created.
+    expect(existsSync(freshDb)).toBe(false);
+    expect(existsSync(`${freshDb}-shm`)).toBe(false);
+    expect(existsSync(`${freshDb}-wal`)).toBe(false);
   });
 });
 
