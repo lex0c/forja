@@ -199,9 +199,9 @@ Quando agente consulta, ordem (mais específico → mais genérico):
 
 Conflito: scope mais específico sobrepõe genérico (local > shared > user). Toda decisão logada em `memory_events` com `resolved_from` indicando origem.
 
-### 2.5 Default `.gitignore` (auto-gerado)
+### 2.5 Default `.gitignore` (scaffoldado pelo `agent init`)
 
-Em `agent init` ou primeira invocação num repo sem `.agent/.gitignore`, agente gera:
+`agent init` (`AGENTIC_CLI.md §2.1`) scaffolda `.agent/.gitignore` como um dos quatro passos do bootstrap, junto com `permissions.yaml`, `config.toml` e os playbooks canônicos. Em repo sem o arquivo, o conteúdo gerado é:
 
 ```gitignore
 # .agent/.gitignore (auto-generated; safe to edit)
@@ -213,7 +213,7 @@ memory/local/
 *.log
 ```
 
-User pode editar livremente. Agente **nunca sobrescreve** após geração inicial.
+User pode editar livremente. Agente **nunca sobrescreve** após geração inicial — `agent init --force` **não** inclui `.gitignore` justamente porque o arquivo é operator-owned após criação. Pra regenerar, o operador apaga manualmente e re-roda `init` (que detecta a ausência e re-scaffolda o template default acima).
 
 ---
 

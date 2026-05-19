@@ -2,6 +2,38 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(cli) — unify `agent init` scaffolding (pre-work plan)
+
+`agent init` today scaffolds exactly one artifact: `.agent/permissions.yaml`. The `--playbooks` flag is mutually exclusive — it instead copies the 10 canonical playbooks under `.agent/agents/`. A first-time operator on a fresh repo therefore has to run `agent init` TWICE (once for permissions, once for playbooks) and still doesn't get `.agent/.gitignore` (auto-generated lazily by the memory subsystem on first session via `ensureAgentGitignore` in `src/memory/gitignore.ts:47`) or `.agent/config.toml` (no scaffolder exists; the file is "optional" but governance toggles + critique config live there and without it the operator can't discover the schema short of grepping the source).
+
+This slice unifies the scaffold: one `agent init` writes all four artifacts — `permissions.yaml`, `.gitignore`, `config.toml`, and the 10 playbooks — each step idempotent (skip-if-exists) so reruns don't clobber operator edits. `--playbooks` is removed; granularity moves to `--only=<csv>` (subset of the four steps) and `--force[=csv]` (overwrite all or a subset).
+
+**Phase 0 — Spec PR (mandatory first per `CLAUDE.md` hard rule "Diverging from the spec requires a PR against the spec first, code after").**
+
+- `AGENTIC_CLI.md §2.1` — broaden `agent init` table row; document `--only=<csv>` and `--force[=csv]`; remove `--playbooks` from the synopsis. Update the bootstrap-path paragraph in §8 (which currently says "`agent init` … generates a baseline `permissions.yaml`") to mention the three additional artifacts.
+- `MEMORY.md §2.5` — move `.gitignore` ownership from "first invocation" to "`agent init` scaffold step". Semantics stay (idempotent; operator-owned after creation; agent never overwrites).
+- `PLAYBOOKS.md` — new §12 documenting bundled distribution via `agent init` (canonical 10 copied to `.agent/agents/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Renumber existing §12–15 to §13–16.
+- New subsection (in `AGENTIC_CLI.md §2.1` or §3) defining the scaffolded `config.toml` schema: `[memory]` (3 governance toggles: `verify_semantic_llm`, `conflict_detect_llm`, `override_detect_llm`) + `[critique]` (`mode`, `threshold`, `model`, `prompt_version`), all entries commented so the file is a no-op until the operator edits.
+
+**Phase 1 — Config template.** New `src/cli/init-config-template.ts` mirroring `init-template.ts`. Header comment + spec ref. `[memory]` and `[critique]` sections with every key commented and a short explanation per key. Snapshot test + `Bun.TOML.parse` validation pinning that the rendered file parses as valid TOML (and that the commented form produces empty parsed sections).
+
+**Phase 2 — Init orchestrator refactor.** Break `src/cli/init.ts` into 4 step functions (`scaffoldPermissions`, `scaffoldGitignore`, `scaffoldConfig`, `scaffoldPlaybooks`), each idempotent, each returning `{ wrote | skipped | overwritten }`. `runInit` walks all 4 (or the filtered subset from `--only`). Final summary line aggregating counts. Exit 1 on any step failure; no rollback (mirrors current `runInitPlaybooks` policy).
+
+**Phase 3 — Args parser.** `src/cli/args.ts`: remove `playbooks: boolean` from `InitArgs`; add `only?: ReadonlyArray<'permissions'|'gitignore'|'config'|'playbooks'>` and `force?: 'all' | ReadonlyArray<'permissions'|'config'|'playbooks'>` (bare `--force` = `'all'`; `--force=csv` = subset; `.gitignore` is not force-able). Reject legacy `--playbooks` with `"--playbooks removed; use --only=playbooks"`. Update help text (lines 1789–1816) + `src/cli/welcome.ts:107`.
+
+**Phase 4 — Tests.** `tests/cli/init.test.ts` extended: full scaffold from empty repo (4 artifacts materialized), idempotent rerun (all skipped), `--only=permissions`, `--only=playbooks,config`, `--force` global vs `--force=permissions`, partial failure (mock fs throw mid-walk → preceding steps stay, subsequent steps don't run, exit 1), legacy `--playbooks` rejection, `--mode acceptEdits` applies only to `permissions.yaml`, `.gitignore` content matches `DEFAULT_AGENT_GITIGNORE`. New `tests/cli/init-config-template.test.ts` (snapshot + `Bun.TOML.parse`).
+
+**Decisions baked in (operator-facing surface):**
+
+- Legacy `--playbooks` removed (no shipped binary depends on the old shape; clean break is simpler than maintaining a deprecation window).
+- `--force` accepts both shapes (`--force` = all; `--force=permissions,config` = subset) for parity with `--only`.
+- `config.toml` posture: every key commented (file is no-op until edited); defaults already live in code, the template is documentation that becomes config when uncommented.
+- `.gitignore` does NOT accept `--force` — idempotent-by-design and operator-owned after creation per `MEMORY.md §2.5`. To regenerate, operator deletes manually then re-runs `init`.
+- No rollback on partial failure (operator re-runs with `--force=<failed-step>` after fixing).
+- Single branch `feat/init-unified-scaffold`; spec commits land first, code commits after — same branch (per-subsystem branch strategy).
+
+Post-work entry will follow once code + tests land.
+
 ## [2026-05-18] hardening(memory + cli + permissions) — Post-Phase-2 review round 3 (9 commits)
 
 Third pass of code review over the post-S3 memory governance, plus one finding outside memory in `src/permissions/protected_paths.ts` (XDG_RUNTIME_DIR socket carve-out). All landed as individual commits on `feat/memory-governance-llm` for atomic review:

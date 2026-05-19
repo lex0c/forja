@@ -208,7 +208,37 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **List sessions** | `agent --list-sessions [opções]` | lista sessões com filtros; JSON-friendly via `--json` |
 | **Replay** | `agent --replay <id>` | re-executa sessão (debug/eval) |
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
-| **Init** | `agent init [--force] [--mode strict\|acceptEdits]` | escreve `.agent/permissions.yaml` com baseline de policy editável; refuse-on-exists sem `--force`. Sem este passo o operador roda em strict default-deny (§8). |
+| **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
+
+#### 2.1.1 Schema do `config.toml` scaffoldado por `agent init`
+
+`agent init` escreve `.agent/config.toml` **com todas as entradas comentadas** — o arquivo é no-op até o operador descomentar uma chave. Defaults reais vivem em código (loaders em `src/critique/config-loader.ts`). Postura deliberada: o scaffold serve de documentação inline; nada em `config.toml` muda comportamento até o operador editar.
+
+```toml
+# .agent/config.toml — Forja per-project config (auto-scaffolded; safe to edit).
+#
+# Spec: AGENTIC_CLI.md §2.1.1 (this schema) + §8 (hierarchy).
+# Resolution order: enterprise → user (~/.config/agent/config.toml) →
+# project (this file) → session (CLI flag).
+
+# [memory] — three LLM-judge governance detectors, all default ON.
+# Uncomment a key to disable the corresponding detector for this project.
+#
+# [memory]
+# verify_semantic_llm = false   # S11: post-write semantic verification
+# conflict_detect_llm = false   # S13: cross-memory conflict detection
+# override_detect_llm = false   # S3: repeated-override threshold detector
+
+# [critique] — write-time self-critique. Default mode = off.
+#
+# [critique]
+# mode = "on_writes"            # off | on_writes | always
+# threshold = 0.65              # 0..1; severity threshold to surface
+# model = "anthropic/claude-haiku-4-5"
+# prompt_version = "v1"
+```
+
+Seções futuras (`[providers]`, `[telemetry]`, …) entram aqui pelo mesmo padrão: template scaffoldado comentado, defaults em código. Schema-creep no template é aceitável (custo: token bloat no editor do operador); schema-creep nos defaults em código requer PR contra esta seção primeiro.
 
 ### 2.2 Composição (Unix philosophy)
 
@@ -1047,6 +1077,8 @@ Hierarquia: **enterprise** (`/etc/agent/`) → **user** (`~/.config/agent/`) →
 Cada decisão vai pra tabela `approvals` (auditoria).
 
 **Bootstrap path.** A engine não inventa allow rules — sem `.agent/permissions.yaml` o projeto roda em strict default-deny e toda gated tool retorna `kind: 'deny'`. O operador escreve o arquivo manualmente OU roda `agent init` (§2.1), que gera um baseline editável: strict mode, allow whitelist conservador (`git status`, `ls`, `rg`), confirm pra ações observáveis (`git push`, `rm`, `*install`), deny pra padrões catastróficos (`rm -rf /*`, `sudo`, `curl|sh`), e protections de path/host óbvias (`.env*`, `.git/`, loopback). O REPL detecta a ausência do arquivo no boot e emite uma linha vermelha apontando pra `agent init` / `/perms` (§17).
+
+Além do `permissions.yaml`, `agent init` scaffolda no mesmo passo três outros artefatos no `.agent/`: o `.gitignore` (template em [`MEMORY.md`](./MEMORY.md) §2.5), o `config.toml` documentando o schema com todas as chaves comentadas (§2.1.1), e os 10 playbooks canônicos sob `agents/` (lista em [`PLAYBOOKS.md`](./PLAYBOOKS.md)). Cada passo é idempotente — re-rodar `init` em repo já parcialmente scaffoldado preenche só o que falta sem tocar nas edições do operador. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks`; `--force` (ou `--force=csv`) sobrescreve. Note que `.gitignore` **não** é aceito em `--force` — é operator-owned após criação (§2.5 do `MEMORY.md`).
 
 ---
 
