@@ -199,6 +199,26 @@ export const createConflictDetectorScheduler = (
     return null;
   };
 
+  // Pairs whose dispatch failed before reaching recordConflictAttempt
+  // (malformed / spawn_failed paths in the dispatcher). The dedup
+  // cache (memory_conflict_attempts) is NOT populated for those
+  // outcomes, so the default "next poll re-considers the event and
+  // dedup-skips the just-dispatched pair" logic would re-emit the
+  // same failing pair on every poll until the session cap latches.
+  // We track them in-memory + skip in the sibling loop to keep the
+  // event live (so OTHER siblings can fire) without retrying the
+  // known-bad pair. Bounded by maxDispatches (10 entries max);
+  // resets on session end (in-process state only).
+  const failedPairsThisSession = new Set<string>();
+  const canonicalPairKey = (
+    a: { scope: string; name: string },
+    b: { scope: string; name: string },
+  ): string => {
+    const keyA = `${a.scope}/${a.name}`;
+    const keyB = `${b.scope}/${b.name}`;
+    return keyA < keyB ? `${keyA}|${keyB}` : `${keyB}|${keyA}`;
+  };
+
   const advanceTo = (createdAt: number, id: string): void => {
     if (createdAt > cursorAt || (createdAt === cursorAt && id > cursorId)) {
       cursorAt = createdAt;
@@ -402,6 +422,14 @@ export const createConflictDetectorScheduler = (
           continue;
         }
         if (pendingForSibling.some((p) => p.kind === 'quarantine')) continue;
+        // In-session blacklist: skip pairs whose dispatch already
+        // failed pre-attempt-row (malformed / spawn_failed). Pre-
+        // fix, those pairs re-emitted every poll until cap latched.
+        const pairKey = canonicalPairKey(
+          { scope: cand.scope, name: cand.memoryName },
+          { scope: sibling.scope, name: sibling.name },
+        );
+        if (failedPairsThisSession.has(pairKey)) continue;
         const writtenMtime = mtimeForMemory(deps.registry, cand.scope, cand.memoryName);
         const siblingMtime = mtimeForMemory(deps.registry, sibling.scope, sibling.name);
         let outcome: Awaited<ReturnType<typeof dispatchConflictVerify>>;
@@ -486,6 +514,11 @@ export const createConflictDetectorScheduler = (
           counters.costUsdSpent += outcome.costUsd;
           counters.dispatched += 1;
           dispatchedThisPoll = true;
+          // No memory_conflict_attempts row was written (dispatcher
+          // returns spawn_failed before recordConflictAttempt).
+          // Blacklist the pair in-session so next poll skips it
+          // instead of looping into the same failing dispatch.
+          failedPairsThisSession.add(pairKey);
           break;
         }
 
@@ -496,6 +529,9 @@ export const createConflictDetectorScheduler = (
           counters.costUsdSpent += outcome.costUsd;
           counters.dispatched += 1;
           dispatchedThisPoll = true;
+          // Same posture as spawn_failed above — dispatcher returns
+          // before recordConflictAttempt, so no dedup row exists.
+          failedPairsThisSession.add(pairKey);
           break;
         }
 

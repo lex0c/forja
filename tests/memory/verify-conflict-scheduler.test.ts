@@ -391,3 +391,132 @@ describe('conflict scheduler — excluded scope filter', () => {
     expect(captured?.sharedScopeOffline).toBe(true);
   });
 });
+
+describe('conflict scheduler — failed-pair in-session blacklist (post-review)', () => {
+  // Pre-fix: when a top-K pair's dispatch returns malformed /
+  // spawn_failed, the dispatcher returns BEFORE writing
+  // memory_conflict_attempts. The scheduler's comment "next poll
+  // re-considers this event; the dedup cache skips the just-
+  // dispatched pair" relied on the attempts row existing. With
+  // no row, the next poll re-emits the same pair → same failing
+  // dispatch → repeats until the session cap latches. Other
+  // siblings + later events starve.
+  //
+  // Post-fix: scheduler tracks an in-session Set of failed pair
+  // keys. Sibling loop skips pairs already in the set. Cursor
+  // still stays stationary so OTHER siblings of the same event
+  // can fire — only the known-failing pair is blacklisted.
+
+  test('malformed pair is NOT re-dispatched on subsequent polls', async () => {
+    seedMemory(roots.projectLocal, 'foo', 'authentication uses JWT in src/auth');
+    seedMemory(roots.projectLocal, 'bar', 'authentication via OAuth in src/auth/oauth.ts');
+    writeIndex(roots.projectLocal, ['foo', 'bar']);
+    seedWriteEvent('foo', 1_000);
+    let spawnCalls = 0;
+    const sched = buildSched({
+      spawnSubagentFn: (async (): Promise<RunSubagentResult> => {
+        spawnCalls++;
+        // Malformed output — dispatcher returns 'malformed' before
+        // recordConflictAttempt lands.
+        return {
+          output: 'this is not yaml :::: <>',
+          sessionId: childSessionId,
+          status: 'done',
+          reason: 'done',
+          costUsd: 0.02,
+          steps: 1,
+          durationMs: 50,
+        };
+      }) as never,
+    });
+    await sched.poll();
+    expect(spawnCalls).toBe(1);
+    expect(sched.getCounters().dispatched).toBe(1);
+    // Second poll: pre-fix would re-dispatch the same pair (no
+    // dedup row). Post-fix the blacklist skips it.
+    await sched.poll();
+    expect(spawnCalls).toBe(1);
+    expect(sched.getCounters().dispatched).toBe(1);
+    // Third poll: still 1, blacklist persists in-session.
+    await sched.poll();
+    expect(spawnCalls).toBe(1);
+  });
+
+  test('spawn_failed pair is NOT re-dispatched on subsequent polls', async () => {
+    seedMemory(roots.projectLocal, 'foo', 'authentication uses JWT in src/auth');
+    seedMemory(roots.projectLocal, 'bar', 'authentication via OAuth in src/auth/oauth.ts');
+    writeIndex(roots.projectLocal, ['foo', 'bar']);
+    seedWriteEvent('foo', 1_000);
+    let spawnCalls = 0;
+    const sched = buildSched({
+      spawnSubagentFn: (async (): Promise<RunSubagentResult> => {
+        spawnCalls++;
+        // Non-done status — dispatcher returns 'spawn_failed'
+        // before recordConflictAttempt lands.
+        return {
+          output: '',
+          sessionId: childSessionId,
+          status: 'error',
+          reason: 'providerError',
+          detail: 'simulated provider error',
+          costUsd: 0.01,
+          steps: 0,
+          durationMs: 20,
+        };
+      }) as never,
+    });
+    await sched.poll();
+    expect(spawnCalls).toBe(1);
+    await sched.poll();
+    expect(spawnCalls).toBe(1);
+  });
+
+  test('blacklist does NOT block OTHER siblings of the same event', async () => {
+    // Three same-scope memos. `foo` is the just-written event;
+    // both `bar` and `baz` overlap via BM25 (auth keyword). First
+    // poll dispatches one (foo, X) pair and gets malformed →
+    // blacklist adds the pair. Second poll: scheduler still
+    // considers foo's event, blacklist skips the first pair,
+    // top-K cycle reaches the alternative sibling → fresh dispatch.
+    //
+    // We assert dispatch count alone (not which pairs surfaced),
+    // because the runSubagent test seam receives the rendered
+    // prompt, not a structured `pair` object.
+    seedMemory(roots.projectLocal, 'foo', 'authentication uses JWT in src/auth');
+    seedMemory(roots.projectLocal, 'bar', 'authentication via OAuth in src/auth/oauth.ts');
+    seedMemory(roots.projectLocal, 'baz', 'authentication via SAML in src/auth/saml.ts');
+    writeIndex(roots.projectLocal, ['foo', 'bar', 'baz']);
+    seedWriteEvent('foo', 1_000);
+    let spawnCalls = 0;
+    const sched = buildSched({
+      spawnSubagentFn: (async (): Promise<RunSubagentResult> => {
+        spawnCalls++;
+        // First spawn: malformed → triggers blacklist entry.
+        // Second spawn: compatible → confirms the alternative
+        // sibling can fire.
+        if (spawnCalls === 1) {
+          return {
+            output: 'this is not yaml :::: <>',
+            sessionId: childSessionId,
+            status: 'done',
+            reason: 'done',
+            costUsd: 0.02,
+            steps: 1,
+            durationMs: 50,
+          };
+        }
+        return compatibleResult();
+      }) as never,
+    });
+    await sched.poll();
+    expect(spawnCalls).toBe(1);
+    await sched.poll();
+    // Second poll dispatched against the alternative sibling.
+    // Pre-fix the malformed pair would have re-dispatched into
+    // its own retry loop here (spawnCalls would stay 1 on the
+    // second poll AFTER the cursor stationary semantics, then
+    // increment to 2 on the SAME failing pair). The post-fix
+    // path skips it and selects baz/bar (whichever wasn't tried).
+    expect(spawnCalls).toBe(2);
+  });
+});
