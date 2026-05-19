@@ -31,37 +31,29 @@ import { purgeExpiredRecapCache } from '../storage/repos/recap-cache.ts';
 import { pruneRetrievalTrace } from '../storage/repos/retrieval-trace.ts';
 import type { RetentionConfig } from './config-loader.ts';
 
-// Phase 1 — low-sensitivity tables (no chain integrity).
-export const PHASE_1_TABLES = [
-  'recap_cache',
-  'retrieval_trace',
-  'context_pins',
-  'bg_processes',
-] as const;
-
-// Phase 2 — audit-cascade tables (FK SET NULL or CASCADE with
-// sessions). Each has per-table semantic edge case documented in
-// the corresponding prune helper.
-export const PHASE_2_TABLES = [
-  'memory_events',
-  'hook_runs',
-  'failure_events',
-  'eviction_events',
-  'outcomes',
-  'outcome_signals',
-] as const;
-
-// Union: every table the orchestrator knows how to sweep.
-// `args.ts` derives `KNOWN_GC_TABLES` from this so a new entry
-// here automatically widens the parser's --table=X accept-set.
+// The table-name constants + types live in a separate zero-imports
+// module (`gc-tables.ts`) so that `cli/args.ts` can import them
+// without pulling the gc runtime graph (storage repos + memory
+// chain via eviction-events). args.ts is loaded by EVERY agent
+// invocation including --help and --version; depending on the
+// runtime graph there breaks lightweight commands when any deep
+// storage dep is unavailable. We re-export them here so existing
+// consumers of audit/gc.ts (orchestrator + CLI handler) don't
+// need to change their import paths.
+//
 // Adding a table without wiring the switches in `sweepOne` /
-// `computeCutoffForTable` / `countWouldDelete` below is a
-// refactor footgun — keep them in lockstep.
-export const GC_TABLES = [...PHASE_1_TABLES, ...PHASE_2_TABLES] as const;
-
-export type Phase1Table = (typeof PHASE_1_TABLES)[number];
-export type Phase2Table = (typeof PHASE_2_TABLES)[number];
-export type GcTable = (typeof GC_TABLES)[number];
+// `computeCutoffForTable` / `countWouldDelete` below is a refactor
+// footgun — keep them in lockstep with the table list in
+// gc-tables.ts.
+export {
+  GC_TABLES,
+  PHASE_1_TABLES,
+  PHASE_2_TABLES,
+  type GcTable,
+  type Phase1Table,
+  type Phase2Table,
+} from './gc-tables.ts';
+import { GC_TABLES, type GcTable } from './gc-tables.ts';
 
 export interface TableReport {
   table: GcTable;

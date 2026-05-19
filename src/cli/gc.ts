@@ -14,8 +14,12 @@
 
 import { existsSync } from 'node:fs';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
-import type { GcReport, GcTable, TableReport } from '../audit/gc.ts';
-import { GC_TABLES, runGc } from '../audit/gc.ts';
+// Table constants from the zero-imports module so the import
+// graph stays narrow even if a future call site imports cli/gc.ts
+// eagerly. Runtime symbols (runGc, types) stay on audit/gc.ts.
+import { GC_TABLES, type GcTable } from '../audit/gc-tables.ts';
+import type { GcReport, TableReport } from '../audit/gc.ts';
+import { runGc } from '../audit/gc.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import type { DB } from '../storage/index.ts';
 import { countPendingMigrations, defaultDbPath, migrate, openDb } from '../storage/index.ts';

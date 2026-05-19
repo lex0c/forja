@@ -64,6 +64,7 @@ import {
   MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
   pruneVerifyAttempts,
 } from '../storage/repos/memory-verify-attempts.ts';
+import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
@@ -401,6 +402,15 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // defaults on misconfig; warnings surface via the same stderr
   // banner machinery as the other config loaders.
   const auditLoaded = loadRetentionConfig({ cwd: projectConfigCwd });
+  // Wire the resolved recap_cache TTL into the cache writer's
+  // effective default. Without this, operators who set
+  // `[audit.retention].recap_cache = "5m"` (or any non-default
+  // value) see the config parsed + surfaced in `gc --json` output
+  // but the actual writes from /recap + auto-display still use
+  // the 1h hardcoded default — silently ineffective config.
+  // Single-call wire here keeps the threading out of every cache
+  // writer's call signature.
+  setRecapCacheTtlOverride(auditLoaded.config.recap_cache_ttl_ms);
 
   // First-run banner. Fires once per machine when:
   //   (a) both detectors resolve to ON,

@@ -2,6 +2,86 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli + audit) — decouple `args.ts` from gc runtime graph
+
+Operator-reported bug. The gc Phase 2 refactor (`4ee6de0`) replaced `args.ts`'s import of `PHASE_1_TABLES` (4-element array) with `GC_TABLES` from `audit/gc.ts`. But `audit/gc.ts` is the orchestrator — it imports every gc-covered table's prune helper, which transitively pulls the entire storage/memory graph (e.g., `eviction-events.ts` → `memory/scanner.ts`).
+
+**Concrete failure mode.** `src/cli/args.ts` is loaded by EVERY agent invocation — `agent`, `agent --help`, `agent --version`, `agent <prompt>`. After the refactor, that means the storage repos chain is also loaded at module-graph-resolution time for ALL of those. If any deep dep is unavailable (broken native binding, partial install, missing peer dep, FS issue during install), even `agent --help` fails before reaching the dispatcher. The CLI's lazy-import posture in `cli/index.ts` (runtime handlers like `run.ts`, `purge.ts`, `gc.ts` are all `await import(...)`-loaded INSIDE `main()`) becomes fragile because args.ts pre-loads what those handlers were supposed to defer.
+
+The original `PHASE_1_TABLES` import worked because the symbol was already in args.ts's own subsystem (we kept the source of truth in audit/gc.ts but did NOT pull storage repos eagerly). The Phase 2 commit "fixed" the drift-guard by deriving from `GC_TABLES`, but the cure brought a worse coupling.
+
+**Fix.** New zero-imports module `src/audit/gc-tables.ts` owns the table-name constants + types:
+```ts
+// ZERO IMPORTS. Adding any import here re-introduces the coupling.
+export const PHASE_1_TABLES = [...] as const;
+export const PHASE_2_TABLES = [...] as const;
+export const GC_TABLES = [...PHASE_1_TABLES, ...PHASE_2_TABLES] as const;
+export type GcTable = (typeof GC_TABLES)[number];
+// + Phase1Table, Phase2Table types
+```
+
+- `cli/args.ts` imports `GC_TABLES` from `audit/gc-tables.ts` — pulls only the pure data.
+- `audit/gc.ts` re-exports the same symbols from `gc-tables.ts` (backward compat for existing consumers like cli/gc.ts, tests).
+- `cli/gc.ts` migrated to import table data from `gc-tables.ts` directly, runtime symbols (`runGc`, type `GcReport`) still from `audit/gc.ts`. Consistency cleanup; not strictly necessary since cli/gc.ts is lazy-loaded.
+
+Single-source-of-truth preserved — `gc-tables.ts` is the canonical list, audit/gc.ts re-exports.
+
+**Tests.** 3 new pins in `tests/cli/args-gc.test.ts` describe `parseArgs — independence from gc runtime`:
+- **NEG**: `args.ts does NOT statically import from audit/gc.ts (heavy graph)` — regex check on source content. Catches regression where someone "consolidates" the import back to `audit/gc.ts`.
+- **POS**: `args.ts DOES import from audit/gc-tables.ts (zero-imports module)` — the table list must come from somewhere; pinning the right somewhere preserves drift-guard.
+- **LOAD-BEARING**: `gc-tables.ts has ZERO imports` — if anyone adds even a type-only import to this module, args.ts inherits the coupling and lightweight commands become fragile again.
+
+Static source checks (not runtime). Simulating "storage dep missing" at runtime is hard; the file-content regex catches the regression at its root cause.
+
+**Verification:**
+- 16/16 args-gc tests pass (was 13, +3 new pins)
+- 238/238 across args + args-gc + audit + gc CLI
+- typecheck + lint clean
+- Smoke E2E: `agent --version` → `0.0.0`; `agent --help` → usage banner. Both load cleanly without dragging storage/memory chain.
+
+**Pre-existing operator state.** Operators with broken storage deps (rare but reported by partial-install scenarios) couldn't even run `agent --help` before this fix to diagnose. After this fix, lightweight commands work regardless of storage state, restoring the CLI's "help/version always work" contract.
+
+## [2026-05-19] fix(storage + bootstrap) — wire `[audit.retention].recap_cache` into write path
+
+Operator-reported bug. The Phase 2 gc commit (`4ee6de0`) parsed `[audit.retention].recap_cache` from config.toml and surfaced it in `gc --json` output, but never wired it into the cache writer. Operators who shortened/extended the TTL (e.g., `recap_cache = "5m"`) saw the gc dry-run report the new value AND the gc sweep honor it (`expires_at <= now` is unchanged regardless of TTL) — but **the writes themselves still used the 1h hardcoded `DEFAULT_RECAP_CACHE_TTL_MS`**. So `expires_at = generatedAt + 1h` in every row, regardless of config. Config silently ineffective.
+
+**Why the gc sweep alone doesn't help.** gc sweeps rows where `expires_at <= now`. If writer puts 1h into `expires_at`, gc waits 1h to delete. Operator wanting 5m TTL gets 1h lifetime. Operator wanting 24h TTL gets 1h lifetime + nothing in the data path tells them why.
+
+**Threading challenge.** `writeRecapCache` has 3 callers (`/recap` slash + `recap_mini` cache + `auto-display` at session end) reached via different code paths (REPL ctx, harness loop). Plumbing the audit config through every call signature would be invasive.
+
+**Fix.** Module-level effective default in `storage/repos/recap-cache.ts` with a single setter:
+```ts
+let effectiveDefaultTtlMs: number = DEFAULT_RECAP_CACHE_TTL_MS;
+
+export const setRecapCacheTtlOverride = (ttlMs: number | undefined): void => {
+  effectiveDefaultTtlMs = ttlMs ?? DEFAULT_RECAP_CACHE_TTL_MS;
+};
+
+// in writeRecapCache:
+const ttlMs = input.ttlMs ?? effectiveDefaultTtlMs;
+```
+
+Bootstrap calls `setRecapCacheTtlOverride(auditLoaded.config.recap_cache_ttl_ms)` right after `loadRetentionConfig`. Single-call wiring; no churn in N callers. Per-call `ttlMs` (passed explicitly) still wins — the override only fires when callers are silent on TTL (current state for all 3 callers).
+
+**Trade-off honest.** Module-level mutable state isn't ideal but matches the existing pattern (`DEFAULT_BUDGET`, `DEFAULT_CRITIQUE_CONFIG` etc. are global constants that could be similarly setter-driven for runtime override). Alternatives considered:
+- Thread config through every caller signature — would touch 4 files including the harness loop's auto-display call, recap.ts (×2), and ctx type. Higher LOC, more invasive.
+- Per-write injection via a context object — would require operator ctx wiring through harness internals. Out of scope.
+
+The setter approach is the minimum-invasive fix; tests reset the override in `afterEach` to avoid state leaking across the suite.
+
+**Tests.** 4 new pins in `tests/storage/recap-cache.test.ts` describe `setRecapCacheTtlOverride — config-driven TTL wiring`:
+- `baseline: getEffectiveRecapCacheTtlMs returns DEFAULT` — initial state pin.
+- `override changes the value used by writeRecapCache (no explicit ttlMs)` — load-bearing: setter at 5m + write without explicit ttl → `expires_at = generatedAt + 5m`, NOT the 1h default.
+- `explicit ttlMs still wins over the override (per-call escape)` — per-call escape hatch preserved.
+- `setRecapCacheTtlOverride(undefined) reverts to DEFAULT` — reset semantic for tests + operators who remove the config key.
+
+**Verification:**
+- 20/20 recap-cache tests pass (was 16, +4 new)
+- 116/116 across recap-cache + bootstrap + audit
+- typecheck + lint clean (Biome auto-fix for one formatting nit in bootstrap)
+
+**Pre-existing operator state.** Operators who set non-default `recap_cache` config before this fix had their setting silently ignored — writes used 1h regardless. After this fix, the next bootstrap (any agent command) picks up the config and subsequent writes honor it. Pre-existing rows in `recap_cache` already have their `expires_at` written under the old (1h) regime; they survive until the existing TTL elapses. Operator who wants the new TTL to apply retroactively can `agent gc --force --table=recap_cache` (which uses the canonical `<=` sweep predicate; doesn't depend on the config TTL).
+
 ## [2026-05-19] fix(cli) — `agent purge` TOCTOU verifier checks `dev` alongside `ino`
 
 Operator-reported security follow-up to commit `75779ce` (TOCTOU symlink race fix). The `verifySamePostReaddir` detector compared only `stAfter.ino === preStat.ino` to confirm directory identity after `readdirSync`. Inode numbers are **only unique per filesystem** — a cross-device swap (adversary mounting a crafted FS at the path with a directory whose ino collides with the original) would pass the check and let the walker recurse into the swapped tree.

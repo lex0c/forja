@@ -23,6 +23,30 @@ import { canonicalJson } from '../json-safe.ts';
 
 export const DEFAULT_RECAP_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 
+// Effective default TTL for new writes. Starts at the canonical
+// 1h default; bootstrap calls `setRecapCacheTtlOverride` with the
+// operator's `[audit.retention].recap_cache` value (parsed by the
+// audit config loader). This wiring is needed because the cache
+// writer is called from multiple sites (slash /recap, auto-display
+// at session end) that don't all have access to the audit config
+// — a module-level effective default keeps the threading at the
+// single bootstrap call site rather than churning every caller.
+//
+// Per-call `ttlMs` still wins (callers that explicitly pass a TTL
+// override both this AND the canonical default). The override is
+// only consulted when the caller is silent on TTL.
+let effectiveDefaultTtlMs: number = DEFAULT_RECAP_CACHE_TTL_MS;
+
+// Bootstrap-time setter. `undefined` reverts to the canonical
+// DEFAULT_RECAP_CACHE_TTL_MS (used by tests + by operators who
+// remove the config key).
+export const setRecapCacheTtlOverride = (ttlMs: number | undefined): void => {
+  effectiveDefaultTtlMs = ttlMs ?? DEFAULT_RECAP_CACHE_TTL_MS;
+};
+
+// Test seam: read the current effective default for assertions.
+export const getEffectiveRecapCacheTtlMs = (): number => effectiveDefaultTtlMs;
+
 export type RecapCacheRenderer = 'pr' | 'changelog' | 'slack' | 'terse' | 'human' | 'mini';
 
 export interface RecapCacheKeyInput {
@@ -173,7 +197,7 @@ export interface WriteRecapCacheInput {
 // write; the second write wins. The result is identical (cache
 // is content-keyed) so order does not matter.
 export const writeRecapCache = (db: DB, input: WriteRecapCacheInput): RecapCacheEntry => {
-  const ttlMs = input.ttlMs ?? DEFAULT_RECAP_CACHE_TTL_MS;
+  const ttlMs = input.ttlMs ?? effectiveDefaultTtlMs;
   const expiresAt = input.generatedAt + ttlMs;
   db.query(
     `INSERT OR REPLACE INTO recap_cache

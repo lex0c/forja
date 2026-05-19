@@ -2,7 +2,13 @@
 // enough that adding `commander` would be more code than this. Anything
 // not a recognized flag is collected as the prompt (joined by spaces).
 
-import { GC_TABLES } from '../audit/gc.ts';
+// Import from gc-tables.ts (zero-imports module) instead of
+// audit/gc.ts. The orchestrator pulls the entire storage/memory
+// graph at module load; args.ts is loaded by --help / --version
+// / every entrypoint, so depending on the runtime there makes
+// lightweight commands fragile to unrelated runtime deps.
+// See src/audit/gc-tables.ts header for the rationale.
+import { GC_TABLES } from '../audit/gc-tables.ts';
 import type { ForceEligibleStep, InitStep } from './init.ts';
 
 export interface ParsedArgs {
