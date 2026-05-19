@@ -90,6 +90,95 @@ const buildDeps = (tool: Tool, policyOverrides: Partial<Policy> = {}) => {
 };
 
 describe('invokeTool', () => {
+  // R3 — migration 058 wires `parent_approval_id` end-to-end.
+  // `invoke-tool` populates `ctx.approvalId` from the allow approval
+  // row before calling `tool.execute`. Tools that spawn subagents
+  // (`task` family) forward it via SpawnSubagentArgs into
+  // `subagent_runs.parent_approval_id`. Test pins the populate step:
+  // the executing tool sees `ctx.approvalId` matching the approval
+  // row id in the database.
+  test('R3 e2e: ctx.approvalId populated from the allow approval row id', async () => {
+    let observedApprovalId: string | undefined;
+    const capturingTool: Tool = {
+      name: 'capture',
+      description: 'captures ctx.approvalId',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute(_args, ctx) {
+        observedApprovalId = ctx.approvalId;
+        return { ok: true };
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(capturingTool);
+    const deps = {
+      db,
+      registry,
+      engine: createPermissionEngine(policy({}), { cwd: '/p' }),
+      ctx: makeCtx({ cwd: '/p' }),
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'capture', args: {}, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(observedApprovalId).toBeDefined();
+    // The captured id is the exact approval row id from the DB.
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.decision).toBe('allow');
+    expect(observedApprovalId).toBe(approvals[0]?.id);
+  });
+
+  // R3 follow-up — same wire for the confirm_yes branch. The bridged
+  // confirm path records a separate approval (decidedBy='user',
+  // decision='confirm_yes') AFTER the user approves; pre-fix
+  // ctx.approvalId was derived only from setup.phase === 'started',
+  // so the confirm-yes branch dropped the approval id silently —
+  // every task spawn through a user-confirmed tool call landed
+  // subagent_runs.parent_approval_id = NULL even though an
+  // authoritative approval row existed. Now both branches flow into
+  // the ctx.
+  test('R3 e2e: ctx.approvalId populated from the confirm_yes approval row id', async () => {
+    let observedApprovalId: string | undefined;
+    const capturingTool: Tool = {
+      name: 'write_file', // matches policy section so confirm_paths binds
+      description: 'captures ctx.approvalId after user confirm',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+      metadata: { category: 'fs.write', writes: true, idempotent: false },
+      async execute(_args, ctx) {
+        observedApprovalId = ctx.approvalId;
+        return { ok: true };
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(capturingTool);
+    const deps = {
+      db,
+      registry,
+      engine: createPermissionEngine(
+        policy({ tools: { write_file: { confirm_paths: ['x.ts'] } } }),
+        { cwd: '/p' },
+      ),
+      ctx: makeCtx({ cwd: '/p' }),
+      confirmPermission: async () => true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(observedApprovalId).toBeDefined();
+    // confirm path records TWO approvals: nothing for the pending
+    // window, then the confirm_yes after the user decided. The
+    // captured id is the confirm_yes row.
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.decision).toBe('confirm_yes');
+    expect(approvals[0]?.decidedBy).toBe('user');
+    expect(observedApprovalId).toBe(approvals[0]?.id);
+  });
+
   test('happy path: allow → execute → done', async () => {
     const deps = buildDeps(okTool, {
       tools: { write_file: { allow_paths: ['**'] } },
@@ -343,6 +432,64 @@ describe('invokeTool', () => {
     const approvals = listApprovalsByToolCall(db, inv.toolCallId);
     expect(approvals[0]?.reason).not.toBeNull();
     expect(typeof approvals[0]?.reason).toBe('string');
+  });
+
+  test('confirm_no: S3 override signal omits toolCallId, preserves it in details (post-review fix)', async () => {
+    // Pre-fix, invoke-tool passed `toolCallId: callId` to
+    // recordOverrideSignal. The registry's helper then routed to
+    // `listProvenanceForToolCall(toolCallId)` — but non-memory tools
+    // (bash, write_file, edit) NEVER emit memory_provenance rows,
+    // so the lookup always returned zero exposures and the signal
+    // silently dropped. The S3 detector therefore never saw
+    // permission_denied attributions for the dominant case (operator
+    // rejecting a write / bash prompt with a misguiding memory in
+    // context).
+    //
+    // Post-fix: omit `toolCallId` from the registry call so the
+    // helper falls through to `listRecentSessionExposures`, which
+    // correctly finds memories eager-loaded or memory_read'd earlier
+    // in the session. The tool_call_id is preserved in `details`
+    // for forensic JOIN against `tool_calls`.
+    const captured: Array<{ signal: string; toolCallId?: unknown; details?: unknown }> = [];
+    const spyRegistry = {
+      recordOverrideSignal: (input: {
+        signal: string;
+        toolCallId?: string | null;
+        details?: Record<string, unknown>;
+      }) => {
+        captured.push({
+          signal: input.signal,
+          ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
+          ...(input.details !== undefined ? { details: input.details } : {}),
+        });
+        return { attributedCount: 0 };
+      },
+      // Stubs for the rest of the MemoryRegistry surface — invoke-tool
+      // only touches recordOverrideSignal in this branch, so the
+      // others can no-op without crashing the type check.
+    };
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      ctx: makeCtx({ cwd: '/p', memoryRegistry: spyRegistry as never }),
+      confirmPermission: async () => false,
+    };
+    await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(captured).toHaveLength(1);
+    const [signal] = captured;
+    expect(signal?.signal).toBe('permission_denied');
+    // toolCallId is NOT passed (it would route to the per-tool-call
+    // provenance path which is empty for non-memory tools).
+    expect(signal?.toolCallId).toBeUndefined();
+    // tool_call_id IS preserved in details for forensic JOIN.
+    const details = signal?.details as Record<string, unknown>;
+    expect(details?.tool_name).toBe('write_file');
+    expect(typeof details?.tool_call_id).toBe('string');
+    expect((details?.tool_call_id as string).length).toBeGreaterThan(0);
   });
 
   test('tool returns ToolError: persists status=error, surfaces error result', async () => {

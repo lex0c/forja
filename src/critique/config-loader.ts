@@ -298,3 +298,234 @@ export const loadCritiqueConfig = (input: LoadCritiqueConfigInput): LoadedCritiq
     warnings,
   };
 };
+
+// ────────────────────────────────────────────────────────────────────
+// MEMORY DETECTOR CONFIG (Slice Q — invert S11/S13 default to ON)
+//
+// Same TOML file (`.agent/config.toml`), same user+project precedence,
+// same fail-soft parse posture as [critique] above. Lives here (and
+// not in `src/memory/config-loader.ts`) to reuse `userConfigPath` /
+// `projectConfigPath` / fail-soft warnings + Bun.TOML.parse plumbing
+// — adding a sibling file would duplicate ~50 lines for no payoff.
+// TODO: when a third config consumer surfaces, split into
+// `src/config/loader.ts` and re-export from both feature modules.
+
+export interface MemoryConfigKeys {
+  // S11 LLM-judge `verify_failed` detector.
+  verifySemanticLlm: boolean;
+  // S13 LLM-judge `conflict_detected` detector.
+  conflictDetectLlm: boolean;
+  // S3 LLM-judge `user_override_repeated` detector.
+  overrideDetectLlm: boolean;
+}
+
+// Inverted default since Slice Q (post-S13) and extended to S3 in
+// the S3.5 slice: all three LLM-judge detectors are ON unless an
+// operator-or-config layer explicitly disables them. The boot
+// banner in bootstrap.ts surfaces this on first-run so an upgrading
+// operator isn't surprised when proposals start landing.
+export const DEFAULT_MEMORY_CONFIG: MemoryConfigKeys = {
+  verifySemanticLlm: true,
+  conflictDetectLlm: true,
+  overrideDetectLlm: true,
+};
+
+// Provenance signal for the boot banner. `false` means the field was
+// ABSENT from the layer (default applies); `true` means the layer
+// explicitly declared a value (banner suppressed). Distinct from the
+// resolved boolean — an operator setting `= true` deliberately should
+// still suppress the banner even though the resolved value matches
+// the default.
+export interface MemoryConfigPresence {
+  verifySemanticLlm: boolean;
+  conflictDetectLlm: boolean;
+  overrideDetectLlm: boolean;
+}
+
+export interface LoadedMemoryConfig {
+  config: MemoryConfigKeys;
+  // Source provenance per field — boot uses these to suppress the
+  // first-run banner when ANY layer explicitly named the field.
+  userHadField: MemoryConfigPresence;
+  projectHadField: MemoryConfigPresence;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+interface PartialMemoryLayer {
+  verifySemanticLlm?: boolean;
+  conflictDetectLlm?: boolean;
+  overrideDetectLlm?: boolean;
+  hadVerifyField: boolean;
+  hadConflictField: boolean;
+  hadOverrideField: boolean;
+}
+
+const parseMemoryLayer = (
+  path: string | null,
+  source: string,
+): { layer: PartialMemoryLayer; warnings: string[] } => {
+  const layer: PartialMemoryLayer = {
+    hadVerifyField: false,
+    hadConflictField: false,
+    hadOverrideField: false,
+  };
+  const warnings: string[] = [];
+  if (path === null) return { layer, warnings };
+  if (!existsSync(path)) return { layer, warnings };
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    warnings.push(
+      `${source} config (${path}) could not be read: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { layer, warnings };
+  }
+  let parsed: unknown;
+  try {
+    parsed = Bun.TOML.parse(raw);
+  } catch (err) {
+    warnings.push(
+      `${source} config (${path}) TOML parse failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { layer, warnings };
+  }
+  if (parsed === null || typeof parsed !== 'object') return { layer, warnings };
+  const top = parsed as Record<string, unknown>;
+  const section = top.memory;
+  if (section === undefined) return { layer, warnings };
+  if (section === null || typeof section !== 'object') {
+    warnings.push(`${source} config (${path}): [memory] is not a table`);
+    return { layer, warnings };
+  }
+  const m = section as Record<string, unknown>;
+
+  const fmtBad = (v: unknown): string => {
+    try {
+      return JSON.stringify(v) ?? String(v);
+    } catch {
+      return String(v);
+    }
+  };
+
+  // Accept snake_case (TOML idiom) AND camelCase (matches the
+  // HarnessConfig field stems, copy-paste friendly). snake wins on
+  // tie. Mirror of the [critique] dual-key tolerance above. When
+  // BOTH spellings are present the camelCase value is silently
+  // dropped — emit a warning so the operator can see which value
+  // is authoritative (B-M1 hardening).
+  const snakeVerify = m.verify_semantic_llm;
+  const camelVerify = m.verifySemanticLlm;
+  if (snakeVerify !== undefined && camelVerify !== undefined) {
+    warnings.push(
+      `${source} config (${path}): [memory] declares both verify_semantic_llm and verifySemanticLlm; snake_case wins, camelCase ignored`,
+    );
+  }
+  const verifyVal = snakeVerify ?? camelVerify;
+  const verifyKey = snakeVerify !== undefined ? 'verify_semantic_llm' : 'verifySemanticLlm';
+  if (verifyVal !== undefined) {
+    if (typeof verifyVal !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [memory].${verifyKey}=${fmtBad(verifyVal)} must be a boolean; ignoring`,
+      );
+    } else {
+      layer.verifySemanticLlm = verifyVal;
+      layer.hadVerifyField = true;
+    }
+  }
+
+  const snakeConflict = m.conflict_detect_llm;
+  const camelConflict = m.conflictDetectLlm;
+  if (snakeConflict !== undefined && camelConflict !== undefined) {
+    warnings.push(
+      `${source} config (${path}): [memory] declares both conflict_detect_llm and conflictDetectLlm; snake_case wins, camelCase ignored`,
+    );
+  }
+  const conflictVal = snakeConflict ?? camelConflict;
+  const conflictKey = snakeConflict !== undefined ? 'conflict_detect_llm' : 'conflictDetectLlm';
+  if (conflictVal !== undefined) {
+    if (typeof conflictVal !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [memory].${conflictKey}=${fmtBad(conflictVal)} must be a boolean; ignoring`,
+      );
+    } else {
+      layer.conflictDetectLlm = conflictVal;
+      layer.hadConflictField = true;
+    }
+  }
+
+  // S3 — override_detect_llm. Same shape as verify + conflict.
+  const snakeOverride = m.override_detect_llm;
+  const camelOverride = m.overrideDetectLlm;
+  if (snakeOverride !== undefined && camelOverride !== undefined) {
+    warnings.push(
+      `${source} config (${path}): [memory] declares both override_detect_llm and overrideDetectLlm; snake_case wins, camelCase ignored`,
+    );
+  }
+  const overrideVal = snakeOverride ?? camelOverride;
+  const overrideKey = snakeOverride !== undefined ? 'override_detect_llm' : 'overrideDetectLlm';
+  if (overrideVal !== undefined) {
+    if (typeof overrideVal !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [memory].${overrideKey}=${fmtBad(overrideVal)} must be a boolean; ignoring`,
+      );
+    } else {
+      layer.overrideDetectLlm = overrideVal;
+      layer.hadOverrideField = true;
+    }
+  }
+
+  return { layer, warnings };
+};
+
+export interface LoadMemoryConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadMemoryConfig = (input: LoadMemoryConfigInput): LoadedMemoryConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+
+  const userResult = parseMemoryLayer(userPath, 'user');
+  const projectResult = parseMemoryLayer(projectPath, 'project');
+  const warnings: string[] = [...userResult.warnings, ...projectResult.warnings];
+
+  // Per-field merge (project overrides user). A project file that
+  // only sets `verify_semantic_llm = false` leaves `conflictDetectLlm`
+  // to inherit from user or default.
+  const config: MemoryConfigKeys = {
+    verifySemanticLlm:
+      projectResult.layer.verifySemanticLlm ??
+      userResult.layer.verifySemanticLlm ??
+      DEFAULT_MEMORY_CONFIG.verifySemanticLlm,
+    conflictDetectLlm:
+      projectResult.layer.conflictDetectLlm ??
+      userResult.layer.conflictDetectLlm ??
+      DEFAULT_MEMORY_CONFIG.conflictDetectLlm,
+    overrideDetectLlm:
+      projectResult.layer.overrideDetectLlm ??
+      userResult.layer.overrideDetectLlm ??
+      DEFAULT_MEMORY_CONFIG.overrideDetectLlm,
+  };
+
+  return {
+    config,
+    userHadField: {
+      verifySemanticLlm: userResult.layer.hadVerifyField,
+      conflictDetectLlm: userResult.layer.hadConflictField,
+      overrideDetectLlm: userResult.layer.hadOverrideField,
+    },
+    projectHadField: {
+      verifySemanticLlm: projectResult.layer.hadVerifyField,
+      conflictDetectLlm: projectResult.layer.hadConflictField,
+      overrideDetectLlm: projectResult.layer.hadOverrideField,
+    },
+    userPath,
+    projectPath,
+    warnings,
+  };
+};

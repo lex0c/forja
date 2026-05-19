@@ -68,6 +68,15 @@ export type {
   TransitionMemoryStateResult,
 } from './transitions.ts';
 
+export { applyProposal } from './governance.ts';
+export type {
+  ApplyProposalInput,
+  ApplyProposalResult,
+  ApplyRejectionReason,
+  DriftedSnapshot,
+  TransitionRecord,
+} from './governance.ts';
+
 export { DEFAULT_AGENT_GITIGNORE, ensureAgentGitignore } from './gitignore.ts';
 export type { EnsureAgentGitignoreResult } from './gitignore.ts';
 
@@ -157,3 +166,5 @@ export type {
   SharedTrustModalMode,
   SharedTrustProbeAnswer,
 } from './trust-corpus-probe.ts';
+
+export { MAX_OVERRIDE_ATTRIBUTION_DEPTH } from './registry.ts';

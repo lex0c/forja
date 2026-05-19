@@ -12,13 +12,19 @@ import { memoryCommand } from '../../../src/cli/slash/commands/memory.ts';
 import type { SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { parseMemoryFile, serializeMemoryFile } from '../../../src/memory/frontmatter.ts';
 import type { ScopeRoots } from '../../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../../src/memory/registry.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import { createMemoryEvent } from '../../../src/storage/repos/memory-events.ts';
-import { recordProvenance } from '../../../src/storage/repos/memory-provenance.ts';
+import { getProposalById, recordProposal } from '../../../src/storage/repos/memory-governance.ts';
+import {
+  hashMemoryContent,
+  recordProvenance,
+} from '../../../src/storage/repos/memory-provenance.ts';
+import { recordAttempt } from '../../../src/storage/repos/memory-verify-attempts.ts';
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { createRetrievalTrace } from '../../../src/storage/repos/retrieval-trace.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
@@ -3013,5 +3019,990 @@ describe('memory lifecycle E2E smoke (S7/T7.3 — Phase 1 closure)', () => {
     expect(auditBText).toContain('quarantined');
     expect(auditBText).toContain('evicted');
     expect(auditBText).toContain('restored');
+  });
+});
+
+// ─── /memory governance — Phase 2 / S8 ───────────────────────────────
+
+const seedActiveLocal = (roots: ScopeRoots, name: string, body = `body of ${name}`): void => {
+  writeBody(roots.projectLocal, name, {}, body);
+  writeIndex(roots.projectLocal, `# Memory index\n\n- [${name}](${name}.md) — hook\n`);
+};
+
+const snapshotHashOf = (roots: ScopeRoots, name: string): string => {
+  const raw = readFileSync(join(roots.projectLocal, `${name}.md`), 'utf-8');
+  return hashMemoryContent(serializeMemoryFile(parseMemoryFile(raw)));
+};
+
+const seedProposal = (
+  bundle: CtxBundle,
+  name: string,
+  overrides: {
+    kind?: 'quarantine' | 'restore';
+    confidence?: number | null;
+    evidenceEssence?: string;
+  } = {},
+): string => {
+  const hash = snapshotHashOf(bundle.roots, name);
+  return recordProposal(bundle.db, {
+    sessionId: bundle.sessionId,
+    kind: overrides.kind ?? 'quarantine',
+    sourceMemoryKeys: [{ scope: 'project_local', name }],
+    sourceMemorySnapshots: [{ scope: 'project_local', name, contentHash: hash }],
+    evidence: {
+      claim_extracted: `memory '${name}' contradicts code`,
+      evidence_paths: ['src/x.ts'],
+    },
+    proposedBy: 'subagent:verify-semantic',
+    confidence: overrides.confidence ?? 0.85,
+    ...(overrides.evidenceEssence !== undefined
+      ? { evidenceEssence: overrides.evidenceEssence }
+      : {}),
+  }).id;
+};
+
+describe('/memory governance list', () => {
+  test('empty state hint when no proposals exist', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'list'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(r.notes?.[0]).toContain('no governance proposals');
+  });
+
+  test('renders pending proposals most-recent first', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    seedActiveLocal(bundle.roots, 'bar');
+    bundle.registry.reload();
+    const idFoo = seedProposal(bundle, 'foo');
+    const idBar = seedProposal(bundle, 'bar');
+    const r = await memoryCommand.exec(['governance', 'list'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const joined = (r.notes ?? []).join('\n');
+    expect(joined).toContain(idFoo.slice(0, 8));
+    expect(joined).toContain(idBar.slice(0, 8));
+    expect(joined).toContain('pending');
+    expect(joined).toContain('quarantine');
+  });
+
+  test('--status filters', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'reject', id, '--reason', 'manual'], bundle.ctx);
+    const pending = await memoryCommand.exec(
+      ['governance', 'list', '--status', 'pending'],
+      bundle.ctx,
+    );
+    expect(pending.kind).toBe('ok');
+    if (pending.kind === 'ok') expect(pending.notes?.[0]).toContain('no governance proposals');
+    const rejected = await memoryCommand.exec(
+      ['governance', 'list', '--status', 'rejected'],
+      bundle.ctx,
+    );
+    expect(rejected.kind).toBe('ok');
+    if (rejected.kind === 'ok') {
+      expect((rejected.notes ?? []).join('\n')).toContain(id.slice(0, 8));
+      expect((rejected.notes ?? []).join('\n')).toContain('rejected');
+    }
+  });
+
+  test('rejects invalid --status', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'list', '--status', 'bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('invalid --status');
+  });
+
+  test('rejects out-of-range --limit', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'list', '--limit', '0'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--limit');
+  });
+
+  test('rejects unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'list', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+});
+
+describe('/memory governance show', () => {
+  test('renders full proposal detail by id', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'show', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain(`proposal ${id}`);
+    expect(text).toContain('kind:                quarantine');
+    expect(text).toContain('proposed_by:         subagent:verify-semantic');
+    expect(text).toContain('project_local/foo');
+  });
+
+  test('errors when id is unknown', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'show', 'nope'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('not found');
+  });
+
+  test('refuses missing id arg', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'show'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing proposal id');
+  });
+
+  test('refuses extra positional args', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'show', 'a', 'b'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('too many args');
+  });
+});
+
+describe('/memory governance approve', () => {
+  test('happy path: quarantine fires and proposal flips to applied', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'approve', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain(`approved proposal ${id}`);
+    expect(text).toContain('active → quarantined');
+    expect(getProposalById(bundle.db, id)?.status).toBe('applied');
+    expect(getProposalById(bundle.db, id)?.decidedBy).toBe('operator:slash');
+    expect(readFileSync(join(bundle.roots.projectLocal, 'foo.md'), 'utf-8')).toContain(
+      'state: quarantined',
+    );
+  });
+
+  test('errors when id is unknown', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'approve', 'nope'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('not found');
+  });
+
+  test('errors when proposal already decided', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'reject', id], bundle.ctx);
+    const r = await memoryCommand.exec(['governance', 'approve', id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('already rejected');
+  });
+
+  test('apply-path rejection surfaces with reason', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo', { confidence: 0.2 });
+    const r = await memoryCommand.exec(['governance', 'approve', id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('low_confidence');
+    expect(getProposalById(bundle.db, id)?.status).toBe('rejected');
+  });
+});
+
+describe('/memory governance reject', () => {
+  test('rejects pending proposal with reason', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(
+      ['governance', 'reject', id, '--reason', 'manual veto'],
+      bundle.ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    expect((r.notes ?? []).join('\n')).toContain('manual veto');
+    const row = getProposalById(bundle.db, id);
+    expect(row?.status).toBe('rejected');
+    expect(row?.decidedBy).toBe('operator:slash');
+    expect(row?.decidedReason).toBe('manual veto');
+  });
+
+  test('rejects without reason still flags decided_reason as null', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'reject', id], bundle.ctx);
+    expect(getProposalById(bundle.db, id)?.decidedReason).toBeNull();
+  });
+
+  test('errors when proposal not pending', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'reject', id], bundle.ctx);
+    const second = await memoryCommand.exec(['governance', 'reject', id], bundle.ctx);
+    expect(second.kind).toBe('error');
+    if (second.kind === 'error') expect(second.message).toContain('already rejected');
+  });
+
+  test('rejects unknown flag', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'reject', 'someid', '--bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unknown flag');
+  });
+});
+
+describe('/memory governance defer', () => {
+  test('happy path: bumps deferred_until + reports new expiry', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('deferred proposal');
+    expect(text).toContain('by 7d');
+    expect(text).toContain('defer_count=1');
+    const row = getProposalById(bundle.db, id);
+    expect(row?.deferredUntil).not.toBeNull();
+    expect(row?.deferCount).toBe(1);
+    expect(row?.status).toBe('pending');
+  });
+
+  test('rejects non-integer days argument', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, 'seven'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('must be an integer');
+  });
+
+  test('rejects when days is out of range', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '0'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('must be in');
+  });
+
+  test('rejects when push would exceed 90d horizon', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    // Default expiry = createdAt + 30d. +90d would land at +120d
+    // total, past the 90d ceiling from createdAt.
+    const r = await memoryCommand.exec(['governance', 'defer', id, '90'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('past the 90d horizon');
+  });
+
+  test('rejects when proposal not pending', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'reject', id], bundle.ctx);
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('already rejected');
+  });
+
+  test('rejects unknown proposal id', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'defer', 'no-such-id', '7'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('not found');
+  });
+
+  test('rejects missing days arg', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing arguments');
+  });
+
+  test('rejects unknown positional/flag after <days>', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7', 'extra'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown flag 'extra'");
+  });
+
+  test('subsequent /memory governance show surfaces deferred_until line', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'defer', id, '14'], bundle.ctx);
+    const r = await memoryCommand.exec(['governance', 'show', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('deferred_until:');
+    expect(text).toContain('count=1');
+  });
+
+  test('emits memory_events action=deferred attributed to target memory', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    expect(r.kind).toBe('ok');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(bundle.db, 'foo');
+    const defers = events.filter((e) => e.action === 'deferred');
+    expect(defers.length).toBe(1);
+    expect(defers[0]?.scope).toBe('project_local');
+    expect(defers[0]?.memoryName).toBe('foo');
+    expect(defers[0]?.details).not.toBeNull();
+    const details = defers[0]?.details as Record<string, unknown> | null;
+    expect(details?.proposal_id).toBe(id);
+    expect(details?.kind).toBe('quarantine');
+    expect(details?.additional_days).toBe(7);
+    expect(details?.defer_count).toBe(1);
+    expect(typeof details?.new_deferred_until).toBe('number');
+  });
+
+  test('--reason persists in audit details and surfaces in the response', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(
+      ['governance', 'defer', id, '14', '--reason', 'awaiting RFC outcome'],
+      bundle.ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('reason: awaiting RFC outcome');
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(bundle.db, 'foo');
+    const defer = events.find((e) => e.action === 'deferred');
+    const details = defer?.details as Record<string, unknown> | null;
+    expect(details?.reason).toBe('awaiting RFC outcome');
+  });
+
+  test('--reason without value rejects', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7', '--reason'], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--reason requires a value');
+  });
+
+  test('display: new expiry uses formatGovernanceTimestamp (UTC, full timestamp)', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'defer', id, '7'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    // formatGovernanceTimestamp renders as `YYYY-MM-DD HH:MM:SS`
+    // (matches the show command's created_at / decided_at format).
+    // Pre-fix the slash used `toISOString().slice(0, 10)` (date
+    // only) — inconsistent with show. Regression: both surfaces
+    // now produce the same full-timestamp shape.
+    expect(text).toMatch(/new effective expiry: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  });
+});
+
+describe('/memory governance audit', () => {
+  test('lineage includes post-approval memory_events for the affected memory', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    await memoryCommand.exec(['governance', 'approve', id], bundle.ctx);
+    const r = await memoryCommand.exec(['governance', 'audit', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain(`proposal ${id}`);
+    expect(text).toContain('lineage:');
+    expect(text).toContain('project_local/foo');
+    expect(text).toContain('quarantined');
+  });
+
+  test('renders no-lineage hint when memory has no events since proposal', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const r = await memoryCommand.exec(['governance', 'audit', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('no events or exposures since proposal');
+  });
+});
+
+describe('/memory governance — dispatcher', () => {
+  test('bare subcommand surfaces usage hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('subcommand required');
+  });
+
+  test('unknown subcommand surfaces hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unknown subcommand 'bogus'");
+  });
+});
+
+// ── post-review hardening (F8 sanitization + uncovered handler paths) ──
+
+describe('/memory governance — additional handler arg validation', () => {
+  test('approve missing-id surfaces hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'approve'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing proposal id');
+  });
+
+  test('approve too-many-args refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'approve', 'a', 'b'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('too many args');
+  });
+
+  test('reject missing-id surfaces hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'reject'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing proposal id');
+  });
+
+  test('reject --reason without value refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'reject', 'someid', '--reason'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('--reason requires a value');
+  });
+
+  test('audit missing-id surfaces hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'audit'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('missing proposal id');
+  });
+
+  test('audit too-many-args refused', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'audit', 'a', 'b'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('too many args');
+  });
+
+  test('audit unknown id surfaces not-found', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'audit', 'nope'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('not found');
+  });
+});
+
+describe('/memory governance — F8 ANSI / control-char sanitization', () => {
+  test('proposed_by with ANSI escapes is stripped from show output', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    // Bypass the repo to force a hostile proposed_by — simulates a
+    // detector that landed bytes the validation didn't catch.
+    bundle.db
+      .query(
+        `INSERT INTO memory_governance_proposals
+           (id, kind, source_memory_keys, evidence, status, proposed_by,
+            proposal_fingerprint, source_memory_snapshots, created_at)
+         VALUES ('hostile-id', 'quarantine',
+                 '[{"scope":"project_local","name":"foo"}]',
+                 '{}', 'pending',
+                 ?, 'fp-1',
+                 '[{"scope":"project_local","name":"foo","content_hash":"x"}]',
+                 1000)`,
+      )
+      .run('\x1b[2J\x1b[Hsubagent:hostile\x1b[0m');
+    const r = await memoryCommand.exec(['governance', 'show', 'hostile-id'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    // ESC byte (\x1b) and other C0 controls (\x00-\x1f, \x7f) must
+    // not appear; the legible portion of the string survives.
+    expect(text.includes(String.fromCharCode(0x1b))).toBe(false);
+    expect(text).toContain('subagent:hostile');
+  });
+
+  test('--reason with control chars sanitized in echo (operator-controlled input)', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    const hostileReason = '\x1b[31mfake\x1b[0m\nnewlines\there';
+    const r = await memoryCommand.exec(
+      ['governance', 'reject', id, '--reason', hostileReason],
+      bundle.ctx,
+    );
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    // Sanitized echo: no ESC, no embedded newlines or tabs in the
+    // echoed line (the helper collapses CR/LF/TAB to spaces).
+    expect(text.includes(String.fromCharCode(0x1b))).toBe(false);
+    expect(text).toContain('fake');
+    expect(text).toContain('newlines');
+    // The DB row preserves the operator's reason verbatim (audit).
+    const row = getProposalById(bundle.db, id);
+    expect(row?.decidedReason).toBe(hostileReason);
+  });
+
+  test('approve error echoes sanitized id (no terminal injection via id arg)', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'approve', '\x1b[2J\x1b[Hghost'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') {
+      expect(r.message.includes(String.fromCharCode(0x1b))).toBe(false);
+      expect(r.message).toContain('ghost');
+    }
+  });
+});
+
+describe('/memory governance — additional approve rejection reasons', () => {
+  test('approve surfaces stale_evidence reason after operator edit', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo', 'original body');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    // Operator edits body after proposal.
+    seedActiveLocal(bundle.roots, 'foo', 'EDITED body');
+    bundle.registry.reload();
+    const r = await memoryCommand.exec(['governance', 'approve', id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('stale_evidence');
+  });
+
+  test('approve surfaces unimplemented_kind for deferred kinds', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const hash = snapshotHashOf(bundle.roots, 'foo');
+    const r0 = recordProposal(bundle.db, {
+      sessionId: bundle.sessionId,
+      kind: 'expire',
+      sourceMemoryKeys: [{ scope: 'project_local', name: 'foo' }],
+      sourceMemorySnapshots: [{ scope: 'project_local', name: 'foo', contentHash: hash }],
+      evidence: { reason: 'cleanup' },
+      proposedBy: 'detector:test',
+      confidence: 0.9,
+    });
+    const r = await memoryCommand.exec(['governance', 'approve', r0.id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('unimplemented_kind');
+  });
+
+  test('approve surfaces multi_memory_unsupported for multi-key proposals', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    writeBody(bundle.roots.user, 'bar', { type: 'user' });
+    writeIndex(bundle.roots.user, '# Memory index\n\n- [bar](bar.md) — hook\n');
+    bundle.registry.reload();
+    const fooHash = snapshotHashOf(bundle.roots, 'foo');
+    const userBarRaw = readFileSync(join(bundle.roots.user, 'bar.md'), 'utf-8');
+    const barHash = hashMemoryContent(serializeMemoryFile(parseMemoryFile(userBarRaw)));
+    const r0 = recordProposal(bundle.db, {
+      sessionId: bundle.sessionId,
+      kind: 'quarantine',
+      sourceMemoryKeys: [
+        { scope: 'project_local', name: 'foo' },
+        { scope: 'user', name: 'bar' },
+      ],
+      sourceMemorySnapshots: [
+        { scope: 'project_local', name: 'foo', contentHash: fooHash },
+        { scope: 'user', name: 'bar', contentHash: barHash },
+      ],
+      evidence: { claim: 'multi-memory quarantine attempt' },
+      proposedBy: 'subagent:test',
+      confidence: 0.9,
+    });
+    const r = await memoryCommand.exec(['governance', 'approve', r0.id], bundle.ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain('multi_memory_unsupported');
+  });
+});
+
+describe('/memory governance status (S11)', () => {
+  test('renders disabled state by default + caps + empty attempts hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('semantic-verify (S11');
+    expect(text).toContain('enabled:             no');
+    expect(text).toContain('confidence floor');
+    expect(text).toContain('max dispatches/sess');
+    expect(text).toContain('max cost/sess');
+    expect(text).toContain('dedup window');
+    expect(text).toContain('none recorded yet');
+  });
+
+  test('renders enabled state when memorySemanticVerify=true on baseConfig', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    (ctx.baseConfig as { memorySemanticVerify?: boolean }).memorySemanticVerify = true;
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    expect((r.notes ?? []).join('\n')).toContain('enabled:             yes');
+  });
+
+  test('refuses unexpected arg', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status', 'bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.message).toContain("unexpected arg 'bogus'");
+  });
+
+  test('G8/F16: disabled-state output does NOT mention the (unimplemented) policy', async () => {
+    // Pre-G8 the hint said "or set policy". Policy parsing was
+    // never wired; the hint misled operators. Assert absence so a
+    // regression re-adding it fails loud.
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).not.toContain('or set policy');
+    expect(text).not.toContain('[memory.verify]');
+  });
+
+  test('renders recent attempts when memory_verify_attempts has rows', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    const sampleHash = 'a'.repeat(64);
+    recordAttempt(bundle.db, {
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      contentHash: sampleHash,
+      verdict: 'passed',
+      confidence: 0.9,
+      modelId: 'test/model',
+      promptHash: 'b'.repeat(64),
+      attemptedAt: 2_000_000_000_000,
+    });
+    recordAttempt(bundle.db, {
+      memoryScope: 'user',
+      memoryName: 'pref',
+      contentHash: 'c'.repeat(64),
+      verdict: 'contradicted',
+      confidence: 0.85,
+      modelId: 'test/model',
+      promptHash: 'd'.repeat(64),
+      attemptedAt: 2_000_000_000_500,
+    });
+    const r = await memoryCommand.exec(['governance', 'status'], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('recent attempts (most-recent first, showing 2):');
+    expect(text).toContain('contradicted');
+    expect(text).toContain('passed');
+    expect(text).toContain('user/pref');
+    expect(text).toContain('project_local/foo');
+    expect(text).toContain('test/model');
+  });
+
+  test('graceful error when listRecentAttempts throws', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    // Wrap db to make the recent-attempts SELECT throw — emulates
+    // disk corruption / FS error. The slash should NOT throw out;
+    // it must return ok with the read-failed hint.
+    const realDb = bundle.db;
+    const dbProxy: typeof realDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (sql: string) => {
+            if (
+              typeof sql === 'string' &&
+              sql.includes('FROM memory_verify_attempts') &&
+              sql.includes('ORDER BY attempted_at DESC')
+            ) {
+              throw new Error('disk read failed');
+            }
+            return target.query(sql);
+          };
+        }
+        return Reflect.get(target as object, prop, receiver);
+      },
+    }) as typeof realDb;
+    (bundle.ctx as { db: typeof realDb }).db = dbProxy;
+    const r = await memoryCommand.exec(['governance', 'status'], bundle.ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('read failed:');
+    expect(text).toContain('disk read failed');
+  });
+});
+
+// Per-source label render coverage (Slice Q). Each of the 4 sources
+// {cli, project-config, user-config, default} crosses {enabled,
+// disabled} for both detectors -> 16 distinct labels. The map below
+// pins each to its emitted string so a regression in source-label
+// wiring fails one assertion per row, not one giant blob match.
+describe('/memory governance status: source-label render matrix', () => {
+  const setVerify = (
+    ctx: ReturnType<typeof makeCtx>['ctx'],
+    enabled: boolean,
+    source: 'cli' | 'project-config' | 'user-config' | 'default',
+  ) => {
+    const c = ctx.baseConfig as {
+      memorySemanticVerify?: boolean;
+      memorySemanticVerifySource?: string;
+    };
+    c.memorySemanticVerify = enabled;
+    c.memorySemanticVerifySource = source;
+  };
+  const setConflict = (
+    ctx: ReturnType<typeof makeCtx>['ctx'],
+    enabled: boolean,
+    source: 'cli' | 'project-config' | 'user-config' | 'default',
+  ) => {
+    const c = ctx.baseConfig as {
+      memoryConflictDetect?: boolean;
+      memoryConflictDetectSource?: string;
+    };
+    c.memoryConflictDetect = enabled;
+    c.memoryConflictDetectSource = source;
+  };
+
+  const verifyMatrix: Array<{
+    enabled: boolean;
+    source: 'cli' | 'project-config' | 'user-config' | 'default';
+    label: string;
+  }> = [
+    { enabled: true, source: 'cli', label: 'yes (--memory-verify-llm)' },
+    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    {
+      enabled: true,
+      source: 'default',
+      label: 'yes (default; disable: /memory governance disable verify)',
+    },
+    { enabled: false, source: 'cli', label: 'no (--no-memory-verify-llm)' },
+    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'default', label: 'no (default)' },
+  ];
+  for (const row of verifyMatrix) {
+    test(`verify ${row.enabled ? 'on' : 'off'} from ${row.source} -> "${row.label}"`, async () => {
+      const repo = makeTmp();
+      const { ctx } = makeCtx(repo);
+      setVerify(ctx, row.enabled, row.source);
+      const r = await memoryCommand.exec(['governance', 'status'], ctx);
+      if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+      const text = (r.notes ?? []).join('\n');
+      expect(text).toContain(`enabled:             ${row.label}`);
+    });
+  }
+
+  const conflictMatrix: Array<{
+    enabled: boolean;
+    source: 'cli' | 'project-config' | 'user-config' | 'default';
+    label: string;
+  }> = [
+    { enabled: true, source: 'cli', label: 'yes (--memory-conflict-llm)' },
+    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    {
+      enabled: true,
+      source: 'default',
+      label: 'yes (default; disable: /memory governance disable conflict)',
+    },
+    { enabled: false, source: 'cli', label: 'no (--no-memory-conflict-llm)' },
+    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'default', label: 'no (default)' },
+  ];
+  for (const row of conflictMatrix) {
+    test(`conflict ${row.enabled ? 'on' : 'off'} from ${row.source} -> "${row.label}"`, async () => {
+      const repo = makeTmp();
+      const { ctx } = makeCtx(repo);
+      setConflict(ctx, row.enabled, row.source);
+      const r = await memoryCommand.exec(['governance', 'status'], ctx);
+      if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+      // Several conflict labels collide with verify labels (e.g.
+      // 'no (.agent/config.toml)'); split the rendered text at the
+      // S13 header so the assertion only sees the conflict block.
+      const text = (r.notes ?? []).join('\n');
+      const conflictBlock =
+        text.split('verify-conflict (S13')[1]?.split('verify-override (S3')[0] ?? '';
+      expect(conflictBlock).toContain(`enabled:             ${row.label}`);
+    });
+  }
+
+  const setOverride = (
+    ctx: ReturnType<typeof makeCtx>['ctx'],
+    enabled: boolean,
+    source: 'cli' | 'project-config' | 'user-config' | 'default',
+  ) => {
+    const c = ctx.baseConfig as {
+      memoryOverrideDetect?: boolean;
+      memoryOverrideDetectSource?: string;
+    };
+    c.memoryOverrideDetect = enabled;
+    c.memoryOverrideDetectSource = source;
+  };
+
+  const overrideMatrix: Array<{
+    enabled: boolean;
+    source: 'cli' | 'project-config' | 'user-config' | 'default';
+    label: string;
+  }> = [
+    { enabled: true, source: 'cli', label: 'yes (--memory-override-llm)' },
+    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    {
+      enabled: true,
+      source: 'default',
+      label: 'yes (default; disable: /memory governance disable override)',
+    },
+    { enabled: false, source: 'cli', label: 'no (--no-memory-override-llm)' },
+    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'default', label: 'no (default)' },
+  ];
+  for (const row of overrideMatrix) {
+    test(`override ${row.enabled ? 'on' : 'off'} from ${row.source} -> "${row.label}"`, async () => {
+      const repo = makeTmp();
+      const { ctx } = makeCtx(repo);
+      setOverride(ctx, row.enabled, row.source);
+      const r = await memoryCommand.exec(['governance', 'status'], ctx);
+      if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+      // Several override labels collide with verify + conflict ones;
+      // split at the S3 header so the assertion sees only its block.
+      const text = (r.notes ?? []).join('\n');
+      const overrideBlock = text.split('verify-override (S3')[1] ?? '';
+      expect(overrideBlock).toContain(`enabled:             ${row.label}`);
+    });
+  }
+
+  test('status renders all three detector blocks unconditionally', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['governance', 'status'], ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('semantic-verify (S11');
+    expect(text).toContain('verify-conflict (S13');
+    expect(text).toContain('verify-override (S3');
+  });
+});
+
+describe('/memory governance audit — F10 provenance lineage', () => {
+  test('lineage surfaces memory_provenance entries since proposal', async () => {
+    const repo = makeTmp();
+    const bundle = makeCtx(repo);
+    seedActiveLocal(bundle.roots, 'foo');
+    bundle.registry.reload();
+    const id = seedProposal(bundle, 'foo');
+    // Seed a provenance exposure after the proposal landed. Use the
+    // canonical helpers so NOT NULL columns + FK chains stay clean.
+    const msgId = appendMessage(bundle.db, {
+      sessionId: bundle.sessionId,
+      role: 'assistant',
+      content: 'x',
+    }).id;
+    const tcId = createToolCall(bundle.db, {
+      messageId: msgId,
+      toolName: 'memory_read',
+      input: {},
+    }).id;
+    recordProvenance(bundle.db, {
+      sessionId: bundle.sessionId,
+      toolCallId: tcId,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      surface: 'memory_read',
+      memoryContentHash: 'h'.repeat(64),
+      memoryStateAtExposure: 'active',
+      createdAt: Date.now() + 1000,
+    });
+    const r = await memoryCommand.exec(['governance', 'audit', id], bundle.ctx);
+    if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('exposures');
+    expect(text).toContain('memory_read');
   });
 });

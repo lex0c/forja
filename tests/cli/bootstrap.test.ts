@@ -564,13 +564,20 @@ Body.`,
       enterprisePolicyPath: null,
       userPolicyPath: null,
     });
-    // Post-D227: systemPrompt is the parallelism hint alone
-    // when no memory entries and no caller prompt. The hint is
-    // unconditional; only the memory section is gated on
-    // having entries.
+    // Post-review: the memory header ALWAYS renders when the
+    // registry is wired (even with zero entries), so the model
+    // sees the save-criteria + 4-type semantics + DO-NOT-save list
+    // on fresh sessions — exactly when it's most likely to propose
+    // a bad inferred save. The header lands without any index
+    // lines when the registry has zero memories.
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
-    expect(config.systemPrompt).not.toContain('# Memory');
+    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt).toContain('memory_write when');
+    // Header-only: no inventory lines render with zero entries.
+    expect(config.systemPrompt).not.toContain('- [project_local]');
+    expect(config.systemPrompt).not.toContain('- [project_shared]');
+    expect(config.systemPrompt).not.toContain('- [user]');
     // And the registry is still threaded through for tools.
     expect(config.memoryRegistry).toBeDefined();
     expect(config.memoryRegistry?.list()).toEqual([]);

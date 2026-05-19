@@ -54,12 +54,24 @@ afterEach(() => {
 });
 
 describe('assembleMemorySection', () => {
-  test('returns empty string and zero count when no memories exist', () => {
+  test('renders header-only block with zero count when no memories exist', () => {
+    // Post-review fix: save-criteria + 4-type semantics + DO-NOT-save
+    // list are load-bearing on FRESH sessions (the moment the model
+    // is most likely to propose a bad inferred save). Pre-fix this
+    // returned text === '' and the model saw only the tool
+    // description's one-liner; now the full header always renders.
     const repo = makeTmp();
     const registry = createMemoryRegistry({ roots: makeRoots(repo) });
     const result = assembleMemorySection({ registry });
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).toContain('memory_write when');
+    expect(result.text).toContain('Do NOT save');
     expect(result.entryCount).toBe(0);
+    // No index lines when there are no entries — the bullet list
+    // is what differs between empty + populated states.
+    expect(result.text).not.toContain('- [');
+    // eagerLoaded stays empty because no memories actually shipped.
+    expect(result.eagerLoaded).toHaveLength(0);
   });
 
   test('renders entries with scope prefix', () => {
@@ -95,14 +107,20 @@ describe('assembleMemorySection', () => {
     expect(text.toLowerCase()).toContain('drift');
   });
 
-  test('verify-before-act guidance does NOT render when the memory section is empty', () => {
-    // No memories → no section, hence no guidance. Avoids
-    // wasting tokens on a verification rule with nothing to
-    // verify.
+  test('verify-before-act guidance renders even when no memories exist (post-review)', () => {
+    // Inverted from the prior "empty → no guidance" pin. The
+    // verification rule + save criteria are MORE useful on empty
+    // states (model has no precedent to imitate), so we accept the
+    // ~250-token cost in exchange for consistent guidance across
+    // every session.
     const repo = makeTmp();
     const registry = createMemoryRegistry({ roots: makeRoots(repo) });
-    const result = assembleMemorySection({ registry });
-    expect(result.text).toBe('');
+    const text = assembleMemorySection({ registry }).text;
+    expect(text).toContain('FACTUAL');
+    expect(text).toContain('PREFERENCE');
+    expect(text).toContain('grep');
+    expect(text).toContain('read_file');
+    expect(text.toLowerCase()).toContain('drift');
   });
 
   test('orders entries by scope precedence (local > shared > user)', () => {
@@ -200,7 +218,7 @@ describe('assembleMemorySection — trust filter (spec §7.2.2)', () => {
     expect(result.text).toContain('pref');
   });
 
-  test('returns empty section when every entry is untrusted', () => {
+  test('returns header-only section when every entry is untrusted', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Only](only.md) — h\n');
@@ -208,7 +226,10 @@ describe('assembleMemorySection — trust filter (spec §7.2.2)', () => {
     const registry = createMemoryRegistry({ roots });
     const result = assembleMemorySection({ registry });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    // Filter dropped everything → no index lines, but the save-
+    // guidance header still renders (post-review behavior).
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('uncertain peek (missing body) defaults to INCLUDE the index entry', () => {
@@ -276,7 +297,8 @@ describe('assembleMemorySection — trust filter (spec §7.2.2)', () => {
     const registry = createMemoryRegistry({ roots });
     const result = assembleMemorySection({ registry });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('peek call does NOT emit memory_events read rows (no audit)', async () => {
@@ -407,7 +429,8 @@ describe('assembleMemorySection — excludeScopes (S5 P0/H2-rob fail-closed)', (
 
     const result = assembleMemorySection({ registry, excludeScopes: ['project_shared'] });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('empty excludeScopes list is a no-op (no behavior change)', () => {
@@ -490,7 +513,8 @@ describe('assembleMemorySection — boot trigger filter (spec §4.3)', () => {
     // boot context has no `git` trigger
     const result = assembleMemorySection({ registry, bootContext: makeCtx('env') });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('operator-defined runtime tag (no well-known): unconditional load (rule 2)', () => {
@@ -678,7 +702,7 @@ describe('assembleMemorySection — memory_filter (slice 9)', () => {
     expect(result.text).not.toContain('— h\n- [project_local] c');
   });
 
-  test('no entry matches → empty section', () => {
+  test('no entry matches → header-only section (no index lines)', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [A](a.md) — h\n');
@@ -686,7 +710,8 @@ describe('assembleMemorySection — memory_filter (slice 9)', () => {
     const registry = createMemoryRegistry({ roots });
     const result = assembleMemorySection({ registry, memoryFilter: ['nonexistent'] });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 });
 

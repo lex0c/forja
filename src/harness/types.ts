@@ -827,6 +827,41 @@ export interface HarnessConfig {
   // already excluded them — partial fail-closed. Absent / empty
   // = no exclusion.
   memoryExcludeScopes?: ReadonlyArray<import('../memory/index.ts').MemoryScope>;
+  // S11 LLM-judge semantic verifier (MEMORY.md §11.x / Phase 2).
+  // DEFAULT ON since Slice Q (post-S13). When true: every step
+  // boundary polls memory_provenance for newly-exposed factual
+  // memories (type=project / reference) and dispatches the
+  // verify-semantic subagent (gated by cost / dispatch caps + the
+  // memory_verify_attempts dedup table). Opt-out:
+  //   - `/memory governance disable verify` (per-project, persisted
+  //     in `.agent/config.toml [memory] verify_semantic_llm = false`)
+  //   - `--no-memory-verify-llm` (session-only)
+  // Optional in the type so test fixtures + programmatic callers
+  // that don't model memory governance can omit the field (loop.ts
+  // treats undefined as "off"); CLI bootstrap ALWAYS sets it
+  // explicitly post-Slice-Q.
+  memorySemanticVerify?: boolean;
+  // Source provenance for /memory governance status rendering + the
+  // first-run banner suppression. Boot resolves which layer
+  // produced `memorySemanticVerify`'s value. Optional because
+  // legacy fixtures don't populate it.
+  memorySemanticVerifySource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // S13 LLM-judge conflict detector (MEMORY.md §11.x / Phase 2).
+  // DEFAULT ON since Slice Q. Mirror of memorySemanticVerify
+  // optionality.
+  memoryConflictDetect?: boolean;
+  memoryConflictDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // S3 LLM-judge override detector (MEMORY.md §11.x / Phase 2, spec
+  // §6.5.2). When true: every step boundary polls
+  // memory_override_events for memories whose override counter
+  // tripped the threshold (3 events in 24h) and dispatches the
+  // verify-override subagent (gated by cost / dispatch caps + the
+  // memory_verify_override_attempts cooldown). Opt-out via slash +
+  // config will mirror S11/S13 (S3.5 follow-up adds the loader
+  // + CLI flag + slash subcommand). Optional in type so callers
+  // pre-S3.5 omit (loop treats undefined as "off").
+  memoryOverrideDetect?: boolean;
+  memoryOverrideDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
   // Inventory of memories that landed in the eager-load section
   // of the system prompt (MEMORY.md §11.2 — provenance, surface
   // 'eager'). Populated by the CLI bootstrap from

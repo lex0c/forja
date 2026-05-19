@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
@@ -333,6 +333,151 @@ describe('memory_write tool — modal flow', () => {
     const events = listMemoryEventsByName(db, 'no-console-log');
     const refused = events.find((e) => e.action === 'refused');
     expect(refused?.details?.reason).toBe('cancelled');
+  });
+
+  test('modal no: source=inferred records S3 override signal (post-review gate)', async () => {
+    // S3 signal contract: model-inferred memory proposal declined
+    // at the modal IS an override signal — operator is rejecting
+    // model judgement, attribute to recently-loaded factual memories.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const captured: Array<{
+      signal: string;
+      details?: Record<string, unknown>;
+      auditSessionId?: string;
+    }> = [];
+    const spyReg = new Proxy(reg, {
+      get(target, prop, receiver) {
+        if (prop === 'recordOverrideSignal') {
+          return (input: {
+            signal: string;
+            details?: Record<string, unknown>;
+            auditSessionId?: string;
+          }) => {
+            captured.push({
+              signal: input.signal,
+              ...(input.details !== undefined ? { details: input.details } : {}),
+              ...(input.auditSessionId !== undefined
+                ? { auditSessionId: input.auditSessionId }
+                : {}),
+            });
+            return { attributedCount: 0 };
+          };
+        }
+        return Reflect.get(target as object, prop, receiver);
+      },
+    });
+    const ctx = makeCtx({
+      memoryRegistry: spyReg,
+      sessionId,
+      confirmMemoryWrite: async () => 'no',
+    });
+    const result = await memoryWriteTool.execute(validInput({ source: 'inferred' }), ctx);
+    if (isToolError(result)) throw new Error(`unexpected error: ${result.error_message}`);
+    expect(result.outcome).toBe('rejected');
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.signal).toBe('memory_write_rejected');
+    expect(captured[0]?.details?.proposed_source).toBe('inferred');
+    expect(captured[0]?.details?.modal_stage).toBe('modal');
+    // Post-review fix: ctx.sessionId must be forwarded so registries
+    // constructed without a sessionId (the bootstrap shape) still
+    // attribute the signal. Without this, recordOverrideSignal
+    // early-returns and the row never lands.
+    expect(captured[0]?.auditSessionId).toBe(sessionId);
+  });
+
+  test('modal no: signal lands on memory_override_events even when registry was constructed WITHOUT sessionId', async () => {
+    // Bootstrap creates memoryRegistry without a constructor sessionId
+    // (the harness loop assigns it later). Pre-fix, both modal
+    // branches in memory-write.ts skipped `auditSessionId`, so
+    // recordOverrideSignal's `effectiveSessionId === null` guard
+    // silently dropped the signal — the row never landed in
+    // memory_override_events, S3 threshold never tripped from modal
+    // rejections in a normal CLI session.
+    //
+    // Pin: bootstrap-shaped registry (no ctor sessionId) + ctx.sessionId
+    // set + source=inferred + modal=no → memory_override_events
+    // gains a row. Tests the full path, not the spy.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // Crucial: no `sessionId` field — mirrors bootstrap.ts:723.
+    const reg = createMemoryRegistry({ roots, db, cwd: '/p' });
+    // Pre-seed an eligible exposure so attribution has something to
+    // find (otherwise zero attribution, row still doesn't land).
+    const { hashMemoryContent, recordProvenance } = await import(
+      '../../src/storage/repos/memory-provenance.ts'
+    );
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'role.md'),
+      '---\nname: role\ndescription: r\ntype: project\nsource: user_explicit\n---\nbody\n',
+    );
+    writeFileSync(
+      join(roots.projectLocal, 'MEMORY.md'),
+      '# Memory index\n\n- [Role](role.md) — role hook\n',
+    );
+    reg.reload();
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'project_local',
+      memoryName: 'role',
+      surface: 'eager',
+      memoryContentHash: hashMemoryContent('body'),
+      memoryStateAtExposure: 'active',
+    });
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async () => 'no',
+    });
+    const result = await memoryWriteTool.execute(validInput({ source: 'inferred' }), ctx);
+    if (isToolError(result)) throw new Error(`unexpected error: ${result.error_message}`);
+    expect(result.outcome).toBe('rejected');
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    const rows = listRecentOverridesForMemory(db, 'project_local', 'role', 10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.signal).toBe('memory_write_rejected');
+    expect(rows[0]?.sessionId).toBe(sessionId);
+  });
+
+  test('modal no: source=user_explicit does NOT record override signal (post-review gate)', async () => {
+    // Pre-fix, every modal "no" recorded a memory_write_rejected
+    // signal regardless of source. For user_explicit the operator
+    // is rejecting their OWN earlier request to save — not a model
+    // misalignment. Attribution to recently-loaded factual memories
+    // would surface false positives that could wrongly trip the
+    // S3 quarantine flow against unrelated memories.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const captured: Array<{ signal: string }> = [];
+    const spyReg = new Proxy(reg, {
+      get(target, prop, receiver) {
+        if (prop === 'recordOverrideSignal') {
+          return (input: { signal: string }) => {
+            captured.push({ signal: input.signal });
+            return { attributedCount: 0 };
+          };
+        }
+        return Reflect.get(target as object, prop, receiver);
+      },
+    });
+    const ctx = makeCtx({
+      memoryRegistry: spyReg,
+      sessionId,
+      confirmMemoryWrite: async () => 'no',
+    });
+    const result = await memoryWriteTool.execute(validInput({ source: 'user_explicit' }), ctx);
+    if (isToolError(result)) throw new Error(`unexpected error: ${result.error_message}`);
+    expect(result.outcome).toBe('rejected');
+    // No override signal at all — user explicit changing their mind
+    // is not an S3 candidate.
+    expect(captured).toHaveLength(0);
   });
 });
 

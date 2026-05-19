@@ -1,7 +1,17 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
-import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
+import {
+  type OverrideSignal,
+  recordOverrideEvent,
+} from '../storage/repos/memory-override-events.ts';
+import {
+  type MemoryProvenanceRow,
+  hashMemoryContent,
+  listProvenanceForToolCall,
+  listRecentSessionExposures,
+  recordProvenance,
+} from '../storage/repos/memory-provenance.ts';
 import { isExpired } from './expires.ts';
 import { serializeMemoryFile } from './frontmatter.ts';
 import {
@@ -172,6 +182,24 @@ export interface MemoryRegistry {
   // silently no-ops when the registry was constructed without a
   // db handle.
   recordEvent(input: RegistryEventInput): void;
+
+  // Attribute an operator override (memory_write reject, permission
+  // deny, edit revert — see spec §6.5.2 detector signals) to the
+  // factual memories that could have driven the rejected behavior.
+  // Inserts one `memory_override_events` row per attributed memory.
+  //
+  // Resolves the candidate pool via `memory_provenance`:
+  //   - `toolCallId` set → memories exposed at that specific call
+  //   - `toolCallId` absent → session's most-recent exposures
+  // Filters to factual types (project / reference), trust !==
+  // untrusted, state === active. Cap at MAX_OVERRIDE_ATTRIBUTION_DEPTH
+  // memories per override (bounds amplification).
+  //
+  // Best-effort — silently no-ops when the registry was constructed
+  // without a db handle OR no session is attributed. Per-row INSERT
+  // failures stderr-log and continue (mirror of `recordEvent`).
+  // Returns the count of attributed rows for tests / forensics.
+  recordOverrideSignal(input: RegistryOverrideSignalInput): { attributedCount: number };
 }
 
 export interface ListOptions {
@@ -343,6 +371,29 @@ export interface RegistryEventInput extends AuditOverride {
   details?: Record<string, unknown>;
 }
 
+export interface RegistryOverrideSignalInput extends AuditOverride {
+  signal: OverrideSignal;
+  // When the override has a specific causal tool call (signal
+  // `permission_denied`, future `edit_reverted`), pass its id to
+  // scope attribution to memories exposed at that call. Absent for
+  // signals upstream of dispatch (signal `memory_write_rejected`).
+  toolCallId?: string | null;
+  // Signal-specific opaque context. Persisted verbatim in
+  // memory_override_events.details — detector / forensic code OWNS
+  // the per-signal schema.
+  details?: Record<string, unknown> | null;
+  // Scopes to exclude from attribution. Mirrors the
+  // `list({excludeScopes})` semantic so the scope-filtered
+  // wrapper (S5 trust-probe revoked / verify-failed / deferred)
+  // can preserve fail-closed posture symmetrically across
+  // read-side methods AND override attribution. Without this,
+  // a memory exposed during the trusted window of a session that
+  // later revoked could still accumulate override events even
+  // though the operator can no longer see / read it. External
+  // callers normally omit (no exclusion).
+  excludeScopes?: ReadonlyArray<MemoryScope>;
+}
+
 export type RegistryReadResult =
   | { kind: 'present'; scope: MemoryScope; file: MemoryFile }
   | { kind: 'missing'; scope: MemoryScope }
@@ -412,6 +463,14 @@ const matchSnippet = (lines: string[], query: string): string | null => {
   }
   return null;
 };
+
+// Cap on attribution depth for `recordOverrideSignal`: one operator
+// override produces at most K `memory_override_events` rows even
+// when more than K factual memories were exposed. Bounds
+// amplification; the threshold gate (spec §6.5.2: 3 per memory in
+// 24h) still needs multiple overrides per memory to trip,
+// regardless of K. Exported so tests can pin the contract.
+export const MAX_OVERRIDE_ATTRIBUTION_DEPTH = 5;
 
 export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRegistry => {
   const { roots, db, sessionId, cwd } = input;
@@ -950,6 +1009,86 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         );
       }
     },
+
+    recordOverrideSignal(input: RegistryOverrideSignalInput): { attributedCount: number } {
+      if (db === undefined) return { attributedCount: 0 };
+      const effectiveSessionId = input.auditSessionId ?? sessionId ?? null;
+      if (effectiveSessionId === null) return { attributedCount: 0 };
+      // S5 fail-closed posture: when the wrapping `createScope
+      // FilteredRegistry` passes `excludeScopes`, the same scopes
+      // that read-side methods refuse are also kept out of override
+      // attribution. External callers normally omit; the wrapper
+      // pre-merges its excluded set before delegating here.
+      const excludedScopeSet: ReadonlySet<MemoryScope> =
+        input.excludeScopes !== undefined ? new Set(input.excludeScopes) : new Set();
+      // Pull a generous candidate pool (3× depth) so the filter has
+      // headroom — if the top-N exposures fail the factual / active /
+      // trusted filter, K survivors still emerge deeper in the list.
+      const limit = MAX_OVERRIDE_ATTRIBUTION_DEPTH * 3;
+      let exposures: MemoryProvenanceRow[];
+      try {
+        if (input.toolCallId !== undefined && input.toolCallId !== null) {
+          exposures = listProvenanceForToolCall(db, effectiveSessionId, input.toolCallId, limit);
+        } else {
+          exposures = listRecentSessionExposures(db, effectiveSessionId, limit);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `memory: AUDIT DRIFT: failed to fetch exposures for override ${input.signal}: ${redactSecrets(msg)}\n`,
+        );
+        return { attributedCount: 0 };
+      }
+      if (exposures.length === 0) return { attributedCount: 0 };
+
+      // Filter to factual + active + trusted, deduplicating by
+      // (scope, name) so a memory exposed multiple times doesn't
+      // double-count toward the threshold from a single override.
+      // Exposures in excluded scopes are dropped FIRST (before the
+      // peek + frontmatter checks) so the fail-closed posture
+      // doesn't depend on disk reads.
+      const seen = new Set<string>();
+      const attributed: { scope: MemoryScope; name: string }[] = [];
+      for (const e of exposures) {
+        if (attributed.length >= MAX_OVERRIDE_ATTRIBUTION_DEPTH) break;
+        if (excludedScopeSet.has(e.memoryScope)) continue;
+        const key = `${e.memoryScope}/${e.memoryName}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const listing = findListing(e.memoryName, e.memoryScope);
+        if (listing === null) continue;
+        const fileResult = readMemoryByName(roots, listing.scope, e.memoryName);
+        if (fileResult.kind !== 'present') continue;
+        const fm = fileResult.file.frontmatter;
+        if (fm.type !== 'project' && fm.type !== 'reference') continue;
+        if (fm.trust === 'untrusted') continue;
+        if ((fm.state ?? 'active') !== 'active') continue;
+        attributed.push({ scope: e.memoryScope, name: e.memoryName });
+      }
+
+      let attributedCount = 0;
+      for (const m of attributed) {
+        try {
+          recordOverrideEvent(db, {
+            sessionId: effectiveSessionId,
+            memoryScope: m.scope,
+            memoryName: m.name,
+            signal: input.signal,
+            toolCallId: input.toolCallId ?? null,
+            details: input.details ?? null,
+          });
+          attributedCount++;
+        } catch (err) {
+          // Best-effort: stderr-log + continue. One bad row never
+          // blocks the rest of the attribution chain.
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: override_signal_record_failed: ${m.scope}/${m.name} ${input.signal}: ${redactSecrets(msg)}\n`,
+          );
+        }
+      }
+      return { attributedCount };
+    },
   };
 };
 
@@ -1130,6 +1269,25 @@ export const createScopeFilteredRegistry = (
 
     recordEvent(input: RegistryEventInput): void {
       base.recordEvent(input);
+    },
+
+    recordOverrideSignal(input: RegistryOverrideSignalInput): { attributedCount: number } {
+      // S5 fail-closed posture: merge the wrapper's `excluded` set
+      // with any caller-supplied `excludeScopes` before delegating.
+      // Without this, the base impl's findListing wouldn't filter
+      // (it's the unwrapped local closure, not the wrapper's
+      // `lookup`) and a memory in an excluded scope still in the
+      // session's exposure pool could accumulate override events
+      // even though the operator can no longer see / read it
+      // through the wrapped read methods.
+      const merged = new Set<MemoryScope>(excluded);
+      if (input.excludeScopes !== undefined) {
+        for (const s of input.excludeScopes) merged.add(s);
+      }
+      return base.recordOverrideSignal({
+        ...input,
+        excludeScopes: Array.from(merged),
+      });
     },
   };
 };

@@ -1078,4 +1078,155 @@ describe('--broker (§13.7 mode flag, slice 87)', () => {
     expect(r.message).toContain("'in-process' or 'spawn'");
     expect(r.message).toContain('magic');
   });
+
+  // ── S11 review (F12 + flag plumbing) ────────────────────────────
+
+  test('--memory-verify-llm parses as a presence-only opt-in', () => {
+    const r = parseArgs(['--memory-verify-llm', 'do', 'thing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBe(true);
+    expect(r.args.prompt).toBe('do thing');
+  });
+
+  test('--memory-verify-llm defaults to undefined when omitted', () => {
+    const r = parseArgs(['hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBeUndefined();
+  });
+
+  test('--memory-verify-llm with --subagent-session-id is rejected (F12)', () => {
+    const r = parseArgs(['--subagent-session-id', 'child-id', '--memory-verify-llm', 'hello']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-verify-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  // ── S13 flag plumbing (parallel to F12 mirror) ──────────────────
+
+  test('--memory-conflict-llm parses as a presence-only opt-in', () => {
+    const r = parseArgs(['--memory-conflict-llm', 'do', 'thing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryConflictLlm).toBe(true);
+    expect(r.args.prompt).toBe('do thing');
+  });
+
+  test('--memory-conflict-llm defaults to undefined when omitted', () => {
+    const r = parseArgs(['hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryConflictLlm).toBeUndefined();
+  });
+
+  test('--memory-conflict-llm with --subagent-session-id is rejected', () => {
+    const r = parseArgs(['--subagent-session-id', 'child-id', '--memory-conflict-llm', 'hi']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-conflict-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  test('--memory-verify-llm + --memory-conflict-llm coexist (independent flags)', () => {
+    const r = parseArgs(['--memory-verify-llm', '--memory-conflict-llm', 'go']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBe(true);
+    expect(r.args.memoryConflictLlm).toBe(true);
+  });
+
+  // ── Slice Q: --no-* flags + mutual-exclusion ────────────────────
+
+  test('--no-memory-verify-llm parses as explicit off (false, not undefined)', () => {
+    const r = parseArgs(['--no-memory-verify-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBe(false);
+  });
+
+  test('--no-memory-conflict-llm parses as explicit off', () => {
+    const r = parseArgs(['--no-memory-conflict-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryConflictLlm).toBe(false);
+  });
+
+  test('omission → undefined (no CLI override; config layer resolves)', () => {
+    const r = parseArgs(['just a prompt']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryVerifyLlm).toBeUndefined();
+    expect(r.args.memoryConflictLlm).toBeUndefined();
+  });
+
+  test('--memory-verify-llm + --no-memory-verify-llm are mutually exclusive', () => {
+    const r = parseArgs(['--memory-verify-llm', '--no-memory-verify-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('mutually exclusive');
+    expect(r.message).toContain('--memory-verify-llm');
+  });
+
+  test('--memory-conflict-llm + --no-memory-conflict-llm are mutually exclusive', () => {
+    const r = parseArgs(['--memory-conflict-llm', '--no-memory-conflict-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('mutually exclusive');
+    expect(r.message).toContain('--memory-conflict-llm');
+  });
+
+  test('--no-memory-verify-llm + --subagent-session-id is also rejected (F12 mirror)', () => {
+    const r = parseArgs(['--subagent-session-id', 'child', '--no-memory-verify-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-verify-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  test('--no-memory-conflict-llm + --subagent-session-id is rejected', () => {
+    const r = parseArgs(['--subagent-session-id', 'child', '--no-memory-conflict-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-conflict-llm');
+  });
+
+  // S3.5 — --memory-override-llm / --no-memory-override-llm
+  test('--memory-override-llm parses as explicit on', () => {
+    const r = parseArgs(['--memory-override-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryOverrideLlm).toBe(true);
+  });
+
+  test('--no-memory-override-llm parses as explicit off', () => {
+    const r = parseArgs(['--no-memory-override-llm', 'hello']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryOverrideLlm).toBe(false);
+  });
+
+  test('--memory-override-llm + --no-memory-override-llm are mutually exclusive', () => {
+    const r = parseArgs(['--memory-override-llm', '--no-memory-override-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('mutually exclusive');
+    expect(r.message).toContain('--memory-override-llm');
+  });
+
+  test('--no-memory-override-llm + --subagent-session-id is rejected (F12 mirror)', () => {
+    const r = parseArgs(['--subagent-session-id', 'child', '--no-memory-override-llm', 'x']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory-override-llm');
+    expect(r.message).toContain('--subagent-session-id');
+  });
+
+  test('omission of override flag → undefined', () => {
+    const r = parseArgs(['just a prompt']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memoryOverrideLlm).toBeUndefined();
+  });
 });

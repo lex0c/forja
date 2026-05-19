@@ -322,6 +322,72 @@ export const listProvenanceByName = (
 // is a UUID that's effectively unguessable, but we still take it
 // for the symmetric API shape (also helps slash commands surface
 // it under the right session context).
+// All exposures in a session since a timestamp cutoff. Used by the
+// S11 semantic-verify scheduler to poll new exposures between step
+// boundaries; the scheduler tracks its own cursor (createdAt + id)
+// and feeds it here. ORDER BY (created_at ASC, id ASC) so the
+// scheduler processes oldest-first (closer to user-facing turn
+// order than DESC) and lexicographically stable for siblings that
+// share a timestamp.
+//
+// Cutoff is EXCLUSIVE on the (created_at, id) lexicographic tuple:
+//   - `(sinceMs, '')` returns every row with created_at >= sinceMs
+//     when sinceId is omitted (id > '' is true for any UUID).
+//   - `(sinceMs, sinceId)` skips the row whose (created_at, id)
+//     equals the cursor, so the next poll picks up siblings with
+//     the SAME created_at but lexicographically greater id.
+//
+// Pre-fix the cursor was a bare timestamp and the predicate was
+// `created_at > sinceMs`. When several exposures landed in the
+// same millisecond (eager-load burst, parallel tool calls), the
+// scheduler would dispatch one, advance to its createdAt, and
+// permanently lose its siblings — they could never reappear in
+// later polls because `created_at > X` excluded them. The (created_at,
+// id) tuple cursor preserves the round-robin across siblings while
+// still moving forward.
+export const listSessionExposuresSince = (
+  db: DB,
+  sessionId: string,
+  sinceMs: number,
+  limit = 200,
+  sinceId = '',
+): MemoryProvenanceRow[] => {
+  const rows = db
+    .query<MemoryProvenanceDbRow, [string, number, number, string, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ?
+          AND (created_at > ? OR (created_at = ? AND id > ?))
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?`,
+    )
+    .all(sessionId, sinceMs, sinceMs, sinceId, limit);
+  return rows.map(fromRow);
+};
+
+// Most-recent-first session-wide exposure list. Backs the S3
+// override signal attribution (src/memory/override-signal.ts):
+// when an operator rejects an inferred memory_write modal, the
+// detector attributes the override to the most recently exposed
+// factual memories in the session — those are the candidates that
+// could have influenced the model's proposal. `listSessionExposures
+// Since` orders ASC for the verify-semantic cursor poll; this
+// helper orders DESC for "what was the model just looking at?".
+export const listRecentSessionExposures = (
+  db: DB,
+  sessionId: string,
+  limit = 50,
+): MemoryProvenanceRow[] => {
+  const rows = db
+    .query<MemoryProvenanceDbRow, [string, number]>(
+      `${SELECT_ALL}
+        WHERE session_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(sessionId, limit);
+  return rows.map(fromRow);
+};
+
 export const listExposuresInRetrieval = (
   db: DB,
   sessionId: string,

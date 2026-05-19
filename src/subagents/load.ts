@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { projectAgentsDir, userAgentsDir } from './paths.ts';
+import { formatCapability, parseCapability } from '../permissions/capabilities.ts';
+import { EMBEDDED_BUILTINS, PROTECTED_BUILTIN_NAMES } from './builtin/index.ts';
+import { BUILTIN_AGENTS_DIR, projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
   ClarifyMode,
@@ -882,6 +884,7 @@ const parseDefinition = (
     'context_recipe_version',
   );
   const phases = parsePhases(fm.phases, sourcePath);
+  const capabilities = parseCapabilitiesField(fm.capabilities, sourcePath);
 
   // Every frontmatter key that has a typed parser above is in this
   // set. Anything outside still lands in `meta` for forward
@@ -903,6 +906,7 @@ const parseDefinition = (
     'prompt_version',
     'context_recipe_version',
     'phases',
+    'capabilities',
   ]);
   const meta: Record<string, unknown> = {};
   for (const k of Object.keys(fm)) {
@@ -929,8 +933,66 @@ const parseDefinition = (
     ...(promptVersion !== undefined ? { promptVersion } : {}),
     ...(contextRecipeVersion !== undefined ? { contextRecipeVersion } : {}),
     ...(phases !== undefined ? { phases } : {}),
+    ...(capabilities !== undefined ? { capabilities } : {}),
     meta,
   };
+};
+
+// Parse the optional `capabilities` frontmatter field. Each entry is
+// a canonical capability string (`read-fs:src/**`, `exec:shell`,
+// `net-egress:*`). Validated by round-tripping through parseCapability
+// + formatCapability so a typo (`read-fs:` with no scope, or
+// `exec:psh`) fails at load time with a source-aware error instead of
+// at child spawn (where the catch synthesizes a confusing
+// `subagent_escalation` envelope).
+//
+// Absence ⇒ undefined (legacy behavior; runtime falls back to the
+// parent's full envelope). Empty array `[]` is meaningful: spec-
+// prescribed "pure-LLM" shape (no capabilities granted) — preserve
+// as `[]`, not undefined.
+const parseCapabilitiesField = (raw: unknown, sourcePath: string): string[] | undefined => {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error(`subagent ${sourcePath}: 'capabilities' must be an array of strings`);
+  }
+  const seen = new Map<string, number>();
+  const normalized: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (typeof entry !== 'string') {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' must be a string (got ${typeof entry})`,
+      );
+    }
+    if (entry.trim().length === 0) {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' must be a non-empty capability`,
+      );
+    }
+    if (entry !== entry.trim()) {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' has leading or trailing whitespace (got ${JSON.stringify(entry)})`,
+      );
+    }
+    let canonical: string;
+    try {
+      canonical = formatCapability(parseCapability(entry));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities[${i}]' is not a valid capability (got ${JSON.stringify(entry)}): ${msg}`,
+      );
+    }
+    const prior = seen.get(canonical);
+    if (prior !== undefined) {
+      throw new Error(
+        `subagent ${sourcePath}: 'capabilities' lists '${canonical}' twice (index ${prior} and index ${i})`,
+      );
+    }
+    seen.set(canonical, i);
+    normalized.push(canonical);
+  }
+  return normalized;
 };
 
 // Parse the optional `isolation` frontmatter field. Defaults to
@@ -1002,6 +1064,11 @@ export interface LoadSubagentsOptions {
   userDir?: string | null;
   // Same shape for project scope. Defaults to <cwd>/.agent/agents.
   projectDir?: string | null;
+  // Built-in scope path. Defaults to `src/subagents/builtin/`
+  // (resolved at module load via import.meta.dir; see
+  // `paths.ts:BUILTIN_AGENTS_DIR`). Pass null to disable entirely
+  // (some tests don't want to depend on the shipped definitions).
+  builtinDir?: string | null;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -1025,13 +1092,23 @@ export interface SubagentSet {
   shadows: ShadowedDefinition[];
 }
 
-// Discover and parse every subagent definition under user + project
-// dirs. Project shadows user on name collision. Within a single
-// scope, duplicate names ARE an error — two files both claiming
-// `name: explore` in the same dir is a definition mistake, not a
-// shadow.
+// Discover and parse every subagent definition under builtin + user +
+// project dirs. Precedence: project > user > builtin on name
+// collision. Within a single scope, duplicate names ARE an error —
+// two files both claiming `name: explore` in the same dir is a
+// definition mistake, not a shadow.
+//
+// Shadow surfacing is asymmetric:
+//   - project shadowing user is reported (operator authored both;
+//     they want to know which won).
+//   - user OR project shadowing builtin is SILENT (operators
+//     intentionally override built-in behavior; surfacing every
+//     shadow on every boot would be noise — `verify-semantic` is
+//     the canonical override target).
 export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
   const env = options.env ?? process.env;
+  const builtinPath =
+    options.builtinDir === null ? null : (options.builtinDir ?? BUILTIN_AGENTS_DIR);
   const userPath = options.userDir === null ? null : (options.userDir ?? userAgentsDir(env));
   const projectPath =
     options.projectDir === null ? null : (options.projectDir ?? projectAgentsDir(options.cwd));
@@ -1055,15 +1132,75 @@ export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
     return out;
   };
 
+  // Builtin scope: filesystem first (dev mode). If the default
+  // BUILTIN_AGENTS_DIR returns zero defs, fall back to the bundled
+  // `EMBEDDED_BUILTINS` table — required under `bun build --compile`
+  // where `import.meta.dir` becomes a virtual `/$bunfs/...` path that
+  // `readdirSync` cannot enumerate (paths.ts comment for context).
+  // The fallback ONLY triggers for the default path so a custom
+  // builtinDir (tests, operator override) that's deliberately empty
+  // stays empty — that's a fixture choice we honor verbatim.
+  const fsBuiltinDefs = loadScope(builtinPath, 'builtin');
+  const builtinDefs =
+    fsBuiltinDefs.length > 0 || builtinPath !== BUILTIN_AGENTS_DIR
+      ? fsBuiltinDefs
+      : EMBEDDED_BUILTINS.map(({ filename, raw }) =>
+          loadSubagentFromString(raw, 'builtin', `<embedded>/${filename}`),
+        );
   const userDefs = loadScope(userPath, 'user');
   const projectDefs = loadScope(projectPath, 'project');
 
   const byName = new Map<string, SubagentDefinition>();
-  for (const def of userDefs) byName.set(def.name, def);
+  for (const def of builtinDefs) byName.set(def.name, def);
   const shadows: ShadowedDefinition[] = [];
+  // PROTECTED builtins — shadowing these is allowed (the loader
+  // doesn't enforce uniqueness past name precedence) but ALWAYS
+  // surfaces as a shadow row so the operator sees that a project /
+  // user-scope file has replaced the shipped definition. The S11
+  // review surfaced the risk: a project shipping
+  // `.agent/agents/verify-semantic.md` with `tools: [bash,
+  // write_file]` silently replaces the safe built-in the moment the
+  // operator opts into `--memory-verify-llm` in that repo. Surfacing
+  // the shadow is defense-in-depth; the operator's trust modal +
+  // hooks chain are the actual enforcement.
+  // G7: source of truth for protected built-ins lives in
+  // `./builtin/index.ts` so a future author registering a new
+  // built-in has one obvious place to update — closes the
+  // "easy-to-forget hardcoded set" risk.
+  for (const def of userDefs) {
+    const prior = byName.get(def.name);
+    if (prior !== undefined && prior.scope === 'builtin' && PROTECTED_BUILTIN_NAMES.has(def.name)) {
+      shadows.push({ name: def.name, shadowed: prior, winning: def });
+    }
+    // user overrides builtin: shadow is silent for unprotected
+    // names (operator-authored shadows of generic built-ins are
+    // expected, not a warning surface).
+    byName.set(def.name, def);
+  }
   for (const def of projectDefs) {
     const prior = byName.get(def.name);
     if (prior !== undefined && prior.scope === 'user') {
+      // Operator authored both — surface so they see which won.
+      shadows.push({ name: def.name, shadowed: prior, winning: def });
+      // G10: if the user def itself shadowed a protected built-in,
+      // ALSO surface the project→builtin row so the chain's
+      // original protected entry stays visible. Otherwise an
+      // operator who set up `user/verify-semantic.md` and then has
+      // a project file shadow it would lose visibility on the
+      // original built-in replacement.
+      if (PROTECTED_BUILTIN_NAMES.has(def.name)) {
+        const original = builtinDefs.find((b) => b.name === def.name);
+        if (original !== undefined) {
+          shadows.push({ name: def.name, shadowed: original, winning: def });
+        }
+      }
+    } else if (
+      prior !== undefined &&
+      prior.scope === 'builtin' &&
+      PROTECTED_BUILTIN_NAMES.has(def.name)
+    ) {
+      // Project shadow of a protected built-in (no user
+      // intermediate) — always loud.
       shadows.push({ name: def.name, shadowed: prior, winning: def });
     }
     byName.set(def.name, def);

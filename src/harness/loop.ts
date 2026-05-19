@@ -23,7 +23,11 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
-import { createScopeFilteredRegistry } from '../memory/registry.ts';
+import { type MemoryRegistry, createScopeFilteredRegistry } from '../memory/registry.ts';
+import {
+  type SemanticVerifyScheduler,
+  createSemanticVerifyScheduler,
+} from '../memory/verify-semantic-scheduler.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -783,6 +787,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // so they don't mask the run's HarnessResult, and the DB is
   // converged via markRunningAsKilled inside cleanup() regardless of
   // whether the OS kill landed.
+  //
+  // S11 — declared outside the try so the outer finally can call
+  // .shutdown() on it. Constructed inside the try once sessionId is
+  // resolved (the scheduler captures it). Undefined when opt-in is
+  // off / definition unavailable / running as a subagent child.
+  let semanticVerifyScheduler: SemanticVerifyScheduler | undefined;
+  // S13 parallel: conflict-detector scheduler. Same lifecycle posture
+  // (top-level only, optional, declared at outer scope so the finally
+  // block can shutdown() even on early throws).
+  let conflictDetectorScheduler:
+    | import('../memory/verify-conflict-scheduler.ts').ConflictDetectorScheduler
+    | undefined;
+  // S3 — verify-override scheduler. Same lifecycle posture (top-level
+  // only, optional, declared at outer scope so the finally block can
+  // shutdown() even on early throws).
+  let overrideVerifyScheduler:
+    | import('../memory/verify-override-scheduler.ts').OverrideVerifyScheduler
+    | undefined;
   try {
     try {
       // Resume vs new session. In resume mode, the prior session id
@@ -1037,6 +1059,349 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           },
         });
+      }
+
+      // S11 — semantic-verify scheduler (MEMORY.md §11.x). Created
+      // once per top-level session when the opt-in flag is set AND
+      // the verify-semantic definition is loaded. Top-level only:
+      // subagent children don't run their own scheduler (avoids
+      // recursive verification + their session has no
+      // memory_provenance trail meaningful for the detector).
+      //
+      // The scheduler captures runtime deps that don't exist
+      // outside the loop scope (provider, parentToolRegistry,
+      // permissionEngine), so creation lives here rather than in
+      // bootstrap. Lifecycle: poll() fires at each step boundary
+      // (end of the while(true) below); shutdown() drains in the
+      // outer finally.
+      // semanticVerifyScheduler is declared in the outer scope so
+      // the outer finally can shutdown() it even on early throw.
+      // R6 — runtime defense in depth. `parseArgs` already refuses
+      // `--memory-verify-llm` / `--no-memory-verify-llm` in subagent
+      // context (F12 + Slice Q), but a programmatic caller / future
+      // code path that builds HarnessConfig directly could still set
+      // `memorySemanticVerify` with `subagentDepth > 0`. Stay silent
+      // ⇒ operator wonders why verify never fires. Emit a diagnostic
+      // and continue without wiring the scheduler. Post-Slice-Q the
+      // default is ON; opt-out is `/memory governance disable verify`
+      // (persisted) or `--no-memory-verify-llm` (session-only).
+      if (config.memorySemanticVerify === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_semantic_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // Plan-mode gate (post-review fix): `--plan` declares a read-
+      // only session ("show me what you'd do, don't write"). The
+      // LLM-judge detectors are writes against the governance
+      // substrate — every dispatch lands a `memory_verify_attempts`
+      // row and (on a contradicted verdict) a pending proposal that
+      // mutates `memory_governance_proposals`. Spending LLM budget
+      // and writing audit rows during plan mode contradicts the
+      // operator's "read-only" framing. Refuse scheduler
+      // construction at the top-level gate so poll() never runs
+      // (forwarding `planMode: true` to the dispatcher only gates
+      // the spawn-side, after the attempt row has already landed).
+      if (
+        config.memorySemanticVerify === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_semantic_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      // R6 — guard on memoryRegistry availability. Pre-fix the cast
+      // `as MemoryRegistry` would land `undefined` into the scheduler
+      // and every poll would TypeError on `registry.peek(...)`. The
+      // outer catch swallows the throw silently every step; operator
+      // sees nothing. Now we mirror the verify-def absent path and
+      // refuse construction loudly when registry is missing.
+      if (
+        config.memorySemanticVerify === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
+        config.subagentRegistry !== undefined
+      ) {
+        const verifyDef = config.subagentRegistry.byName.get('verify-semantic');
+        if (verifyDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_semantic_disabled: --memory-verify-llm set but memory registry not wired\n',
+          );
+        } else if (verifyDef !== undefined && config.memoryRegistry !== undefined) {
+          semanticVerifyScheduler = createSemanticVerifyScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: verifyDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            // S5 mirror — when bootstrap excluded scopes via the
+            // shared-corpus trust gate, the scheduler honors the
+            // same posture so the verify-semantic subagent never
+            // sees bodies the operator marked untrusted.
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            // F9 + R1: forward parent-runtime envelope into each
+            // dispatch so the verify child runs under the parent's
+            // resolved verdicts (hard signal, Ctrl-C, trust, hooks,
+            // capabilities) rather than defaults. `signal` is the
+            // combined caller+wall-clock abort; without it the
+            // dispatch hangs until the subagent's own 10-min budget
+            // and operator Ctrl-C×2 cannot interrupt.
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // Plan-mode forwarding intentionally absent: the
+            // construction gate above refuses scheduler creation
+            // entirely when planMode is true, so this branch is
+            // unreachable in plan mode. If the construction gate
+            // is ever weakened, restore the
+            // `config.planMode === true ? { planMode: true } : {}`
+            // forward as defense-in-depth.
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            // PERMISSION_ENGINE.md §10.1: seal the verify subagent's
+            // effective envelope. Mirror the task-tool spawn shape
+            // (loop.ts:1289) — intersect parent's envelope against
+            // the playbook's declared capabilities.
+            //
+            // Pre-R2 the loop passed the parent's FULL envelope
+            // verbatim because verify-semantic.md didn't declare
+            // capabilities and the loader didn't expose the field.
+            // That reintroduced the exact gap migration 040 fixed
+            // (audit row recorded "child ran under parent's full
+            // envelope" when the operator's intent was a read-only
+            // fact-checker).
+            //
+            // The verify-semantic playbook declares `read-fs:**`
+            // (the minimum its read_file / grep / glob whitelist
+            // needs to inspect repo state). The intersection narrows
+            // that to whatever subset of read-fs the parent grants.
+            // An earlier R2 draft used `capabilities: []` (intending
+            // "pure-LLM") — but every read_file call in the child
+            // engine would then have been refused with `subagent
+            // capability outside declared envelope`, degrading the
+            // fact-checker into a hallucination engine. Empty
+            // declared envelope means the child can't call
+            // capability-resolving tools AT ALL; only misc-category
+            // tools survive.
+            //
+            // Excess (declared cap not covered by parent) is logged
+            // as a stderr warning but doesn't refuse the spawn — an
+            // operator who scoped reads to `src/**` should still get
+            // a verifier that can verify `src/**` claims rather than
+            // losing the detector entirely.
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = verifyDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_semantic_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_semantic_disabled: --memory-verify-llm set but verify-semantic definition not loaded\n',
+          );
+        }
+      }
+
+      // S13 — conflict detector scheduler. Same wiring posture as
+      // the verify-semantic scheduler above: top-level only, gated on
+      // memory registry availability, capabilities sealed via
+      // intersect.
+      if (config.memoryConflictDetect === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_conflict_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // Plan-mode gate — mirror of the verify-semantic case above.
+      // Same rationale: scheduler poll writes governance proposals
+      // on contradicted-pair verdicts, which is a write surface.
+      if (
+        config.memoryConflictDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_conflict_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      if (
+        config.memoryConflictDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
+        config.subagentRegistry !== undefined
+      ) {
+        const conflictDef = config.subagentRegistry.byName.get('verify-conflict');
+        if (conflictDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_conflict_disabled: --memory-conflict-llm set but memory registry not wired\n',
+          );
+        } else if (conflictDef !== undefined && config.memoryRegistry !== undefined) {
+          const { createConflictDetectorScheduler } = await import(
+            '../memory/verify-conflict-scheduler.ts'
+          );
+          conflictDetectorScheduler = createConflictDetectorScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: conflictDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // Plan-mode forwarding intentionally absent: construction
+            // gate above refuses scheduler creation when planMode is
+            // true (mirror of verify-semantic).
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = conflictDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_conflict_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_conflict_disabled: --memory-conflict-llm set but verify-conflict definition not loaded\n',
+          );
+        }
+      }
+
+      // S3 — verify-override scheduler. Same wiring posture as
+      // verify-semantic + verify-conflict: top-level only, gated on
+      // memory registry availability, capabilities sealed via
+      // intersect.
+      if (config.memoryOverrideDetect === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_override_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // Plan-mode gate — mirror of verify-semantic / verify-conflict.
+      // S3 dispatcher writes memory_verify_override_attempts +
+      // governance proposals on misguiding verdicts; same write-
+      // surface refusal in plan mode.
+      if (
+        config.memoryOverrideDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_override_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      if (
+        config.memoryOverrideDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
+        config.subagentRegistry !== undefined
+      ) {
+        const overrideDef = config.subagentRegistry.byName.get('verify-override');
+        if (overrideDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_override_disabled: memoryOverrideDetect set but memory registry not wired\n',
+          );
+        } else if (overrideDef !== undefined && config.memoryRegistry !== undefined) {
+          const { createOverrideVerifyScheduler } = await import(
+            '../memory/verify-override-scheduler.ts'
+          );
+          overrideVerifyScheduler = createOverrideVerifyScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: overrideDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // Plan-mode forwarding intentionally absent: construction
+            // gate above refuses scheduler creation when planMode is
+            // true (mirror of verify-semantic).
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            // Capability envelope intersect — same shape as verify-
+            // semantic / verify-conflict. The verify-override.md
+            // declares EMPTY tools[] so the intersected envelope is
+            // empty too — no capability-resolving tools land in the
+            // child's gate. Mismatch (declared cap not covered by
+            // parent) stderr-logs as a warning; pure-empty declared
+            // → no warning, the loop just hands the child no tools.
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = overrideDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_override_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_override_disabled: memoryOverrideDetect set but verify-override definition not loaded\n',
+          );
+        }
       }
 
       // §13.6 degraded banner emitter (slice 92). One emitter per
@@ -1310,6 +1675,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     e.type === 'subagent_progress' &&
                     e.lastEvent.type === 'cost_update'
                   ) {
+                    // R4 — defensive validation on the IPC boundary.
+                    // IPC.md §7 ("mensagens do filho NÃO são
+                    // confiáveis"): a malformed cost_update (negative
+                    // values, cumulative-regression, NaN) could
+                    // mis-steer the cap watchdog into a false trip
+                    // (cancelAll fires) or — worse — silently grow
+                    // the reservation under the cap. The handle-store's
+                    // monotonic guard catches REGRESSION but accepts
+                    // any non-negative finite value; reject upstream.
+                    const { delta, cumulative } = e.lastEvent;
+                    if (
+                      !Number.isFinite(delta) ||
+                      !Number.isFinite(cumulative) ||
+                      delta < 0 ||
+                      cumulative < 0
+                    ) {
+                      process.stderr.write(
+                        `subagent ${trackerHandleId}: cost_update rejected (delta=${delta}, cumulative=${cumulative})\n`,
+                      );
+                      return;
+                    }
                     trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
                     // Persist the cost-update into the audit
                     // stream (migration 022, audit fix #2). The
@@ -1347,8 +1733,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     } catch (persistErr) {
                       const message =
                         persistErr instanceof Error ? persistErr.message : String(persistErr);
-                      console.error(
-                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}`,
+                      // R4: `console.error` violates the hard rule
+                      // "stdout is pure, stderr is for logs" — Bun
+                      // sometimes interleaves console.error with
+                      // stdout in --json mode despite the underlying
+                      // routing. Route to process.stderr explicitly
+                      // to keep --json's NDJSON stdout clean.
+                      process.stderr.write(
+                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}\n`,
                       );
                     }
                     if (budget.maxCostUsd !== undefined) {
@@ -1418,6 +1810,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             permissionEngine: config.permissionEngine,
             db: config.db,
             cwd: config.cwd,
+            // Migration 058 — back-link the audit row to the approval
+            // that admitted the spawning tool call.
+            ...(args.parentApprovalId !== undefined
+              ? { parentApprovalId: args.parentApprovalId }
+              : {}),
             ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
             // §10.1 effective envelope (slice 95). When the model
@@ -3467,11 +3864,94 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             if (overage !== null) return await finish('maxCostUsd', overage);
           }
         }
+
+        // S11/S13/S3 — detector scheduler ticks at step boundary
+        // (MEMORY.md §11.x / T11.9 + T13.x + S3.4). Each scheduler
+        // polls its source surface (memory_provenance / memory_events
+        // / memory_override_events), runs gates, and dispatches AT
+        // MOST one verification before the next provider call.
+        // Awaited (not fire-and-forget) so the dispatch's cost
+        // lands in the session totals before the next iteration's
+        // cost-cap check.
+        //
+        // Cost wiring (post-review fix): each detector's LLM-judge
+        // dispatch is a real billed call but only tracked in
+        // scheduler-local counters until this helper folds the
+        // delta into `cumulativeChildCostUsd`. Pre-fix, a session
+        // at/near `maxCostUsd` could still run verify-* dispatches
+        // because `costCapDetailIfExceeded()` only consults
+        // {totalCostUsd, cumulativeChildCostUsd, reserved} — never
+        // the scheduler counters. With default-on detectors,
+        // operator's hard cap was silently exceeded by the
+        // detector spend. The helper folds delta in + fires a
+        // cost_update event (with the FULL composite cumulative
+        // so the renderer's footer reflects reality) + immediately
+        // checks the cap so a burst that pushes past doesn't wait
+        // for the next top-of-loop check.
+        //
+        // Best-effort: scheduler failures stderr-log here AND
+        // inside the scheduler implementation (defense in depth
+        // against programmer errors that escape the inner catch).
+        const chargeSchedulerThenCheckCap = async (
+          scheduler:
+            | {
+                poll: () => Promise<void>;
+                getCounters: () => { costUsdSpent: number };
+              }
+            | undefined,
+          label: 'verify_semantic' | 'verify_conflict' | 'verify_override',
+        ): Promise<string | null> => {
+          if (scheduler === undefined) return null;
+          const before = scheduler.getCounters().costUsdSpent;
+          try {
+            await scheduler.poll();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`memory: ${label}_poll_unhandled: ${redactSecrets(msg)}\n`);
+          }
+          const after = scheduler.getCounters().costUsdSpent;
+          const delta = after - before;
+          if (delta > 0) {
+            cumulativeChildCostUsd += delta;
+            safeEmit(config.onEvent, {
+              type: 'cost_update',
+              delta,
+              cumulative: priorCostUsd + totalCostUsd + cumulativeChildCostUsd,
+            });
+          }
+          return costCapDetailIfExceeded();
+        };
+
+        const semanticOverage = await chargeSchedulerThenCheckCap(
+          semanticVerifyScheduler,
+          'verify_semantic',
+        );
+        if (semanticOverage !== null) return await finish('maxCostUsd', semanticOverage);
+
+        const conflictOverage = await chargeSchedulerThenCheckCap(
+          conflictDetectorScheduler,
+          'verify_conflict',
+        );
+        if (conflictOverage !== null) return await finish('maxCostUsd', conflictOverage);
+
+        const overrideOverage = await chargeSchedulerThenCheckCap(
+          overrideVerifyScheduler,
+          'verify_override',
+        );
+        if (overrideOverage !== null) return await finish('maxCostUsd', overrideOverage);
       }
     } catch (e) {
       return await guardedFinish(e);
     }
   } finally {
+    // Shut down the semantic-verify scheduler first. Subsequent
+    // poll() calls no-op; any in-flight dispatch from the last
+    // poll already awaited above (the loop awaits per-step), so
+    // nothing remains in flight here. Idempotent — safe to call
+    // even when the scheduler was never created.
+    semanticVerifyScheduler?.shutdown();
+    conflictDetectorScheduler?.shutdown();
+    overrideVerifyScheduler?.shutdown();
     // Drain the lazy retention sweep BEFORE anything else in the
     // finally fires. The caller (cli/run.ts) is allowed to close the
     // DB right after runAgent returns; without this drain the purge

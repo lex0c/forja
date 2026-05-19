@@ -451,6 +451,12 @@ export const run = async (options: RunOptions): Promise<number> => {
           prompt: '',
           ...(args.model !== undefined ? { modelId: args.model } : {}),
           signal: options.signal ?? new AbortController().signal,
+          // Pipe --json through so bootstrap's first-boot governance
+          // banner suppresses correctly for `agent recap --json`
+          // consumers. Mirror of the main run path below — the recap
+          // bootstrap was missing this and JSON consumers saw a one-
+          // time stderr line on first boot polluting their stream.
+          json: args.json,
           ...(options.bootstrapOverride ?? {}),
         };
         const result = await bootstrap(bootstrapInput);
@@ -689,6 +695,19 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
       ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
       ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
+      // Slice Q — propagate both true AND false (not just true).
+      // `undefined` = no CLI override; bootstrap resolves from config
+      // or default. `true` / `false` = explicit operator opt-in/out.
+      ...(args.memoryVerifyLlm !== undefined ? { memorySemanticVerify: args.memoryVerifyLlm } : {}),
+      ...(args.memoryConflictLlm !== undefined
+        ? { memoryConflictDetect: args.memoryConflictLlm }
+        : {}),
+      ...(args.memoryOverrideLlm !== undefined
+        ? { memoryOverrideDetect: args.memoryOverrideLlm }
+        : {}),
+      // Slice Q — pipe --json through so bootstrap's first-boot
+      // governance banner can suppress for NDJSON consumers.
+      json: args.json,
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
@@ -699,6 +718,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       subagents,
       hookWarnings,
       critiqueWarnings,
+      memoryConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -727,13 +747,23 @@ export const run = async (options: RunOptions): Promise<number> => {
     // ~/.config/agent/agents/<name>.md silently being eclipsed by
     // a project-scope file is the kind of misconfiguration that
     // wastes hours when the author doesn't see it; one warning
-    // per shadow on stderr makes the precedence visible. Gated on
-    // non-JSON mode so NDJSON consumers get a pure stream — the
-    // information is recoverable from the project tree anyway.
+    // per shadow on stderr makes the precedence visible.
+    //
+    // Use the ACTUAL scopes from the ShadowedDefinition records
+    // rather than hardcoded labels. With PROTECTED_BUILTIN_NAMES,
+    // shadows can carry `shadowed.scope = 'builtin'` (the embedded
+    // verify-* definition) and `winning.scope = 'user' | 'project'`
+    // — hardcoding `(user) ... (project)` would mislabel the
+    // builtin-replacement security warning as a normal cross-scope
+    // shadow and undermine the protection signal that drove this
+    // alert.
+    //
+    // Gated on non-JSON mode so NDJSON consumers get a pure stream
+    // — the information is recoverable from the project tree anyway.
     if (!args.json) {
       for (const shadow of subagents.shadows) {
         errSink(
-          `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (user) is shadowed by ${shadow.winning.sourcePath} (project)\n`,
+          `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (${shadow.shadowed.scope}) is shadowed by ${shadow.winning.sourcePath} (${shadow.winning.scope})\n`,
         );
       }
     }
@@ -780,6 +810,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       // gating as the hook / subagent warnings above.
       for (const w of critiqueWarnings) {
         errSink(`forja: critique config: ${w}\n`);
+      }
+      // Memory governance config warnings (`.agent/config.toml
+      // [memory]`). Loader degrades to defaults (currently
+      // default-ON detectors) on bad values rather than aborting
+      // boot. Surface here so an operator who typoed
+      // `verify_semantic_llm = "false"` (string) sees the diag
+      // and isn't silently billed for default-on LLM-judge work
+      // they thought they had opted out of.
+      for (const w of memoryConfigWarnings) {
+        errSink(`forja: memory config: ${w}\n`);
       }
     }
 

@@ -2,6 +2,653 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] hardening(memory + cli + permissions) — Post-Phase-2 review round 3 (9 commits)
+
+Third pass of code review over the post-S3 memory governance, plus one finding outside memory in `src/permissions/protected_paths.ts` (XDG_RUNTIME_DIR socket carve-out). All landed as individual commits on `feat/memory-governance-llm` for atomic review:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `5daed95` | fix | memory | pass ctx.sessionId to recordOverrideSignal in memory-write modal branches |
+| `a5d4b6d` | docs | todo | defer scheduler abstraction refactor + cursor persistence |
+| `4231cd5` | fix | memory | bound override scheduler cursor + evidence fetch to threshold window |
+| `6762a9b` | fix | memory | blacklist failed conflict pairs in-session to break retry loop |
+| `3bfba73` | fix | memory | preserve untouched detector keys when toggling at project scope |
+| `ed6989a` | fix | cli | pipe json into recap bootstrap to suppress governance banner |
+| `3ac479c` | fix | cli | render actual scopes in subagent shadow warning |
+| `c21a279` | fix | memory | skip conflict dispatch when pair member disappeared from registry |
+| `d22a143` | fix | permissions | re-deny XDG_RUNTIME_DIR socket subpaths inside /run/user carve-out |
+
+**Themes:**
+
+- **Silent budget-leak windows in default-on detectors.** Three commits close paths where an LLM-judge detector silently drained API budget without producing the signal the operator expected. `5daed95` fixed memory-write modal rejections silently no-op'ing the S3 override signal (bootstrap-built registry has no constructor sessionId; `recordOverrideSignal` early-returned without the explicit `auditSessionId` arg). `4231cd5` fixed the override scheduler initializing cursor at epoch (drained 90d retained rows before reaching fresh threshold-tripping events) AND fetching events outside the threshold window into the LLM judge's prompt + persisted evidence. `6762a9b` fixed the conflict scheduler looping on malformed/spawn_failed pairs (dispatcher returned before writing the attempt row, scheduler retried the same failing pair on every poll until cap latch).
+
+- **Precedence / scope misattribution.** Two commits close paths where the slash command surface lied about resolved state. `3bfba73` fixed the toggle materializing all three detector keys as `true` defaults when only one was patched (silently shadowed user-config opt-outs via project precedence). `3ac479c` fixed the subagent shadow warning hardcoding `(user)` and `(project)` labels — the PROTECTED_BUILTIN_NAMES path produces shadows with `shadowed.scope = 'builtin'`, so the labels mis-stated the security warning's subject.
+
+- **Edge cases in concurrent / TOCTOU paths.** `c21a279` fixed the conflict dispatcher silently dispatching against a stale snapshot when `registry.peek` returned non-present for either pair member — the operator deleted a memory between scheduler peek and dispatch, but the LLM judge still ran and landed a quarantine proposal for the gone memory. Mirror of the S3 `target_gone` path now wired through the conflict scheduler.
+
+- **NDJSON pollution.** `ed6989a` fixed the recap CLI path not propagating `--json` into the bootstrap, so `agent recap --json` first-boot consumers saw the governance banner pollute their stream (the main run path already piped json through; the recap branch was missed).
+
+- **Permissions surface mis-narrowing (off-memory).** `d22a143` was the one finding outside the memory subsystem. `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` re-admitted ALL paths under `/run/user/<uid>`, including ssh-agent / gpg-agent sockets, user dbus, container engines, Wayland, etc. — exactly the IPC surface the `/run` deny tier was meant to block. Carve-out narrowed via a `XDG_RUNTIME_SOCKET_SEGMENTS` denylist matching the first segment after the uid directory; regular files under `$XDG_RUNTIME_DIR/<app>/` still pass.
+
+- **Architectural follow-up captured.** `a5d4b6d` deferred two refactoring items to `docs/TODO.md` (the third-round review pass made the abstraction debt visible — several fixes in this slate had to land identical edits across S11/S13/S3 schedulers): (a) extract a `createDetectorScheduler<TCandidate>` factory to collapse the ~1466 LOC three-way duplication, (b) persist scheduler cursor across process restarts so the first poll doesn't re-scan retained tables from epoch. Each entry includes a pull-in signal so the refactor doesn't land prematurely.
+
+**Verification posture.** Most fixes include a `git stash` pre-fix repro confirmation in their commit message — the test pin was checked to fail with the buggy code, prove the fix changes behavior, then validated under post-fix. This pattern surfaces over commit `4231cd5`, `6762a9b`, `3bfba73`, `3ac479c`, `c21a279`, `d22a143`. Two fixes (`5daed95`, `ed6989a`) ship without the stash repro: `5daed95`'s new test is a strict superset of the existing source-gate pin and inspects an additional field; `ed6989a` is a one-line wiring fix where the existing bootstrap-level test (line 134 of `bootstrap-memory-defaults.test.ts`) already pins the `json=true → no banner` contract.
+
+**Test deltas.** Suite went from ~8809 → ~8855 across the 9 commits (~46 new test cases dominated by `protected_paths.test.ts` +20 and the various per-fix regression pins). Typecheck + lint clean throughout. All fixes localized to their subsystem — no cross-cutting refactors. The architectural debt those cross-cutting paths surface is tracked in `docs/TODO.md` (entries from `a5d4b6d`).
+
+**Production-readiness shift.** Round 2 closed the eval gap + the highest-severity silent-failure paths. Round 3 closes the long-tail of "subtle silent-failure windows" — operator-visible bugs that the eval suite didn't catch because they were observable only under specific operator workflows (custom config layers, plan mode + recap, manual disable+reenable cycles, sibling-deletion race). After this round there are no known operator-visible silent-failure windows in the default-on detector paths. The memory subsystem's "production-ready for the LLM-judge governance flow" claim from round 2's BACKLOG entry holds; this round hardens the surface around it.
+
+## [2026-05-18] hardening(memory + harness) — Post-Phase-2 review round 2 (12 commits)
+
+Second pass of code review over the post-S3 memory governance + the eval suite landed in this same day. Findings split between substrate gaps (bugs that affect operator-facing behavior), one fuzz-target flake, and one missing surface (compile-mode builtin distribution). All twelve landed as individual commits on `feat/memory-governance-llm` for atomic review:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `179021a` | eval | memory | governance-flow deterministic fixture suite (8 cases) |
+| `2dfb08a` | eval | smoke | force serial reads on compaction-triggers fixture |
+| `0b8d8e2` | fix | subagents | embed builtin definitions for `bun build --compile` |
+| `57f19bb` | fix | fuzz | amortize migrations in chain target (5371ms → 298ms; kills timeout flake) |
+| `7cbf1d7` | fix | memory | surface decideProposal race in applyProposal via `governanceDrift` |
+| `7f66cba` | fix | memory | SELECT `deferred_until` + `defer_count` in memory-scoped proposal queries |
+| `c12bccd` | fix | harness | attribute `permission_denied` to session exposures, not denied tool call |
+| `312a755` | fix | memory | gate `memory_write_rejected` override signal on `source=inferred` |
+| `73c75fb` | fix | memory | emit save-guidance header even when no memories exist |
+| `ed77024` | fix | memory | apply governance toggle to live `ctx.baseConfig`, not just config file |
+| `993e83a` | fix | memory | propagate config-loader warnings through `BootstrapResult` to stderr |
+| `fa9d80a` | fix | harness | gate memory governance schedulers on `planMode=false` |
+
+**Themes:**
+
+- **Default-on detectors leak budget if any safety gate is missing.** Three of the fixes (`fa9d80a` plan-mode, `c12bccd` permission_denied attribution, `312a755` source=inferred) close paths where a default-on LLM-judge detector could fire (or fail to fire) against the operator's intent — burning API tokens + landing governance writes in read-only sessions, mis-attributing signals to memories that didn't drive the operator's action, or counting the operator's own corrections against unrelated memories. All silent-failure shapes pre-fix.
+- **Live state mutation matters.** Two commits address "the operator changed something but the next turn doesn't see it" gaps: `ed77024` (toggle didn't touch `ctx.baseConfig`) and `993e83a` (malformed `[memory]` TOML silently fell back to defaults with no diagnostic). Both contradict the slash command's "effect at next turn boundary" promise.
+- **Distribution mode bit-rot.** `0b8d8e2` and `57f19bb` are non-memory but tied: the compiled binary silently lost LLM-judge detectors because `import.meta.dir` doesn't enumerate under `/$bunfs/`, and the chain fuzz target's 200-iteration headline test sat right at the bun:test 5s timeout because migration count grew past what the original "~10ms/iter" comment assumed.
+- **API contract honesty.** `7cbf1d7` and `7f66cba` close two narrow contract gaps: `applyProposal` returning `applied` even when the post-transition stamp raced (memory mutated but the row credits someone else), and `listProposalsForMemory` returning rows with `undefined` instead of `null` for `deferredUntil` (consumers doing `!== null` saw "deferred" everywhere).
+- **First-session UX.** `73c75fb` flips the prior "no memories → no header" gate (which optimized for tokens) to "always render the header" because fresh sessions are exactly when the model is most likely to propose bad inferred saves and needs the save criteria + DO-NOT-save list in context.
+
+**Eval coverage.** First commit shipped the `evals/memory/` deterministic fixture suite (8 fixtures covering all three detectors + all three operator decisions + two defense gates F8/F11). Closes the eval gap flagged by the original Phase-2 review under CLAUDE.md principle 4.
+
+**Test deltas.** Suite went from 8787 → 8809 across the 12 commits (+22 tests, dominated by the eval suite at +8 and the rollback/race/regression pins). Typecheck + lint clean throughout. Smoke 9/10 (`04-grep-search` real-LLM variance is pre-existing, tracked separately).
+
+**Production-readiness shift.** Before this round: subsystem was "shipped per spec" but had eval gap + several silent-failure surfaces. After: eval-covered for the governance flow, no known silent-failure paths in the default-on detectors, slash toggle has live-mutation semantic, compiled binaries actually carry the built-in subagents. The phase-2 fixes are no longer load-bearing on follow-up work.
+
+## [2026-05-18] eval(memory) — governance-flow deterministic fixture suite (8 cases)
+
+Closes the eval gap flagged during the post-Phase-2 audit: per `CLAUDE.md` principle 4 ("Eval is load-bearing — a subsystem without eval doesn't ship"), the memory subsystem had 8787 unit tests but zero eval coverage. `evals/regression/` + `evals/smoke/` carried 53 YAML cases across file IO / bash / hooks / compaction / plan-mode — none touching memory, governance, or any LLM-judge detector. By the project's own bar the subsystem was not production-ready despite the surface looking complete.
+
+This slice ships an `evals/memory/` fixture suite mirroring the deterministic pattern from `evals/critique/`: TS modules export pinned subagent verdicts; a `bun test` runner (`tests/memory/eval-fixtures.test.ts`) drives real dispatchers + real governance apply path + real state machine + real audit pair against those verdicts. Each fixture exercises the propose-not-mutate narrative END-TO-END — dispatcher → proposal → operator decision → state transition → file rewrite → audit pair — and fails if any wire between those layers silently breaks. No API cost; runs in CI.
+
+**8 fixtures cover:**
+
+| # | Path | Pins |
+|---|---|---|
+| 01 | s11-contradicted-approve-quarantine | S11 happy path → approve → memory quarantined with `verify_failed` trigger; rewrites frontmatter; audit pair lands |
+| 02 | s11-contradicted-low-conf-auto-reject | Sub-threshold (0.5) contradicted verdict → proposal auto-rejects with `system:low_confidence` inside the dispatcher's txn; no operator action; memory stays active |
+| 03 | s13-conflict-approve-quarantine-loser | S13 conflicting pair (`user_explicit` vs `inferred`) → resolver picks loser → approve → only loser transitions (multi-memory carve-out via `target_payload.target_key`) |
+| 04 | s3-override-approve-quarantine | S3 threshold (3 override events in 24h) + misguiding verdict → approve → memory quarantined with `user_override_repeated` trigger |
+| 05 | s11-operator-reject | S11 happy path through dispatcher → operator `decideProposal` → status=rejected, memory stays active, no audit transition |
+| 06 | s11-operator-defer | S11 happy path → operator `deferProposal(14d)` → proposal pending with `deferred_until` extended; memory state unchanged |
+| 11 | s11-hallucination-guard | F8 defense: contradicted verdict cites nonexistent `evidence_paths` → dispatcher refuses as `malformed` BEFORE recording any attempt; no proposal, no dedup cache poison |
+| 12 | s11-stale-snapshot-toctou | F11 defense: memory body changed between scheduler peek and dispatch → dispatcher refuses with `stale_snapshot` after content-hash compare against fresh registry peek |
+
+**Runner extensions** (`tests/memory/eval-fixtures.test.ts`):
+
+- 3 dispatcher branches (S11 / S13 / S3) with detector-specific seeding (pair-with for S13, override-events count for S3, repo-files for hallucination guard satisfaction).
+- 3 operator decision branches: `applyProposal` (approve), `decideProposal` (reject), `deferProposal` (defer with additionalDays).
+- `expected.dispatcherOutcome` defaults to `'completed'` but accepts `skipped`/`malformed`/`spawn_failed`; `dispatcherReasonContains` pins the EXACT refusal path.
+- Registry built AFTER seedMemoryFile + repoFiles so fixture 12's TOCTOU narrative works (snapshot=v1, on-disk=v2, F11 detects via fresh peek).
+- MEMORY.md index appends rather than overwrites so multi-memory fixtures (S13 pair) don't lose siblings.
+- Detector-specific attempt-count helpers (`listRecentAttempts` / `listRecentConflictAttempts` / `listRecentOverrideAttempts`) route to the right repo.
+
+**Explicitly out of scope** (different surfaces; unit-tested or deferred for separate eval suites): trust revocation cascade (bootstrap-level orchestration), scope precedence dedup (pure registry behavior, covered in `tests/memory/registry.test.ts`), eager-load with trigger (system-prompt assembly via `assembleMemorySection`), headless `memory_write` rejection (CLI flag wiring).
+
+**Smoke-side restoration.** While running smoke evals to confirm baseline, `08-compaction-triggers.yaml` was found failing for a reason unrelated to memory: modern Claude default to batching parallel reads in a single assistant turn, which kept `messages.length` below the compaction gate's `preserveTail + 3` boundary check (`src/harness/loop.ts:3733`). The fixture's `compaction_triggered` assertion gave false-negative coverage of compaction LLM path because the eval ended before the boundary was crossed. Fix in a separate commit (`eval(smoke): ...`): prompt rewritten to force strictly-serial reads ("one read per assistant turn, acknowledge each in text before next"), `maxSteps` 10→14, `maxCostUsd` $0.10→$0.20. Single-case re-run confirms compaction LLM fires (`pass 21881ms $0.18`, steps=4).
+
+**Slice closure metrics.** +2 commits on `feat/memory-governance-llm`; +8 eval fixtures + 1 runner (~430 LOC eval + 270 LOC runner); +1 smoke YAML restoration. Suite 8787 → 8794+ (the eval fixtures are part of `bun test` — they ship as +8 deterministic test cases). Smoke suite 8/10 → 9/10 after compaction restore (the remaining `04-grep-search` failure is real-LLM variance on a specific `output_contains` assertion, tracked separately as an in-place flake).
+
+## [2026-05-18] hardening(memory) — Phase-2 follow-on review: atomic S11+S13 persist, S3 retention sweeps, spec catch-up
+
+Follow-on code-review pass over the post-S3 codebase surfaced three actionable findings — one critical (C1), one drift (C2), one high-severity reliability hole (H3). All three landed in one commit on `feat/memory-governance-llm`.
+
+**H3 — atomic persistence on S11/S13 dispatchers.** Pre-fix mirrored the verify-override bug that an earlier review pass already closed: `recordAttempt` lands first, `recordProposal` lands second; if proposal write throws (FK violation, disk-full, malformed payload), the attempt row stays but no operator-visible proposal exists — the 7d cooldown dedup gates future polls without producing any surface. `src/memory/verify-semantic-dispatcher.ts` and `src/memory/verify-conflict-dispatcher.ts` now wrap `recordAttempt + recordProposal + decideProposal` in `withTransaction`. F18 FK retry (concurrent subagent_runs purge → INSERT throws FOREIGN KEY → retry with `subagent_run_session_id=null`) stays inside the txn so the retry stays atomic with the proposal. Two new test pins (one per dispatcher) force a FK failure via a ghost `parentSessionId` (non-existent session) and assert `outcome.kind === 'spawn_failed'` + `listRecentAttempts/listRecentConflictAttempts` zero + `listProposals` zero, proving the rollback. Existing F18 retry test's db Proxy was breaking on `withTransaction` because bun:sqlite's native `Database.transaction` accesses private fields on `this` that a Proxy doesn't expose; fix delegates the `transaction` property to the real db inside the Proxy so the closure body still runs against the proxied query path. +2 tests.
+
+**C1 — bootstrap retention sweeps for S3 tables.** `pruneOverrideEvents` and `pruneOverrideAttempts` are exported by their repos with documented 90d windows, but bootstrap was missing the callers. Without the sweeps `memory_override_events` and `memory_verify_override_attempts` grew unbounded across sessions. Two new try/catch blocks in `src/cli/bootstrap.ts` mirror the existing S11/S13 sweeps: best-effort, `AUDIT DRIFT` to stderr on failure, do not abort boot. Operator guide `docs/MEMORY.md §1` updated to list all 9 boot sweeps that actually run (the prior list named only 4; missed 5 including the pre-existing `gcStaleInvalidatedMemories`, `pruneVerifyAttempts`, `pruneConflictAttempts`, plus the two new S3 sweeps).
+
+**C2 — spec catches up with S3 detector.** `docs/spec/MEMORY.md §6.6` and `docs/spec/AGENTIC_CLI.md §5.4.1` were written when only S11 and S13 existed; S3 shipped without amending them, so the "two detectors" framing in the spec contradicted the "three detectors" reality in code + operator docs. Both updated to "Três detectores LLM-judge", with: new trigger-table row (`user_override_repeated | threshold counter (3 events em 24h) | S3`), `--memory-override-llm` / `--no-memory-override-llm` flag entries, `override_detect_llm` config key, `verify-override.md` subagent definition, `MEMORY_VERIFY_OVERRIDE_MAX_COST_USD` cost cap, and a "Threshold-first em S3" note explaining why S3 is gated on a deterministic counter (`countOverridesInWindow`) BEFORE the LLM dispatch — below-threshold polls cost zero.
+
+**Slice closure.** +1 commit on `feat/memory-governance-llm`; 7 files modified (~390 insertions, ~220 deletions); suite 8765+ → 8787 (+2 new rollback test pins); typecheck + lint clean. No production behavior change beyond the three findings — H3 closes a silent-failure window, C1 closes a disk-growth window, C2 is doc-only.
+
+## [2026-05-18] feat(memory) — S3 verify-override LLM-judge detector (4th of the 4 spec'd detectors)
+
+Closes the 4-detector quartet from `docs/spec/MEMORY.md §6.5.2`. The deterministic threshold gate (3 operator overrides in 24h per memory) feeds an isolated LLM-judge subagent that decides whether the memory is plausibly driving the rejection pattern, emits a `pending` quarantine proposal through the S8 governance substrate, and lets the operator approve / reject / defer via the existing slash surface. The other three detectors (`verify_failed` / S11, `conflict_detected` / S13, `trust_revoked`) already shipped; S3 lands the closing piece with the same architectural posture (propose-not-mutate, scheduler-at-step-boundary, capability envelope intersected, cooldown-based dedup, capped session budget).
+
+Six commits delivered across the slice, all on `feat/memory-governance-llm`:
+
+**S3.1 — Substrate (commit 15565e2).** Migration 064 `memory_override_events` (3 signal kinds: `memory_write_rejected`, `permission_denied`, `edit_reverted`; FK SET NULL on session + tool_call) + repo with `recordOverrideEvent`, `countOverridesInWindow` (sliding-window counter for threshold), `listOverrideEventsSince` (cursor poll for scheduler), `listRecentOverridesForMemory` (forensics + LLM-judge context), `pruneOverrideEvents` (90d retention sweep). Constants: `MEMORY_OVERRIDE_THRESHOLD_COUNT = 3`, `MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS = 24h` matching spec §6.5.2. +20 tests.
+
+**S3.2 + S3.3 scaffolding (commit 18d2743).** Signal collectors wire `memory_override_events` from operator actions: `MemoryRegistry.recordOverrideSignal({signal, toolCallId?, details?, excludeScopes?})` looks up factual exposures via `memory_provenance` (toolCallId-scoped or session-recent), filters to type ∈ {project, reference} ∧ trust ≠ untrusted ∧ state = active, caps fan-out at MAX_OVERRIDE_ATTRIBUTION_DEPTH=5, emits one row per attributed memory. Hooked into `src/tools/builtin/memory-write.ts` (modal + user-scope modal rejects on operator `'no'`) and `src/harness/invoke-tool.ts` (the `confirm_no` async path where the operator explicitly denied a permission ask). S5 fail-closed posture: wrapper merges its `excluded` set with caller-supplied scopes before delegating to base (HIGH bug fixed pre-commit during code review). Scaffolding for S3.3: `src/memory/verify-override.ts` (constants + types: misguiding bool, confidence, rule_extracted, override_pattern_observed, suggested_motivo ∈ {conflict, shift, low_roi}), `src/subagents/builtin/verify-override.md` (empty tools[], cap 8 steps / $0.08, anti-injection guidance), `PROTECTED_BUILTIN_NAMES` extended, governance trigger map `subagent:verify-override → user_override_repeated`. +14 tests in registry.test.ts.
+
+**S3.3 dispatcher (commit 274d789).** Migration 065 `memory_verify_override_attempts` (content-hash + suggested_motivo + boolean misguiding stored as INTEGER 0/1) + repo with `recordOverrideAttempt`, `lookupRecentOverrideAttempt` (cooldown-gated), `listRecentOverrideAttempts` (status surface), `pruneOverrideAttempts`. Dispatcher `src/memory/verify-override-dispatcher.ts` mirrors verify-semantic: empty_events guard → TOCTOU re-read → scan → 24h cooldown dedup → spawn → validate (hallucination guard for misguiding=true without rule/pattern) → record attempt (FK retry on subagent_runs purge) → governance proposal (pending for high-conf, auto-rejected with `system:low_confidence` for low-conf, no proposal for misguiding=false). +26 tests.
+
+**S3.4 scheduler + harness (commit 202af9a).** `src/memory/verify-override-scheduler.ts` mirror of verify-semantic-scheduler with threshold gate substituted for type-only gate. Per poll: pull events since cursor (createdAt, id), dedup by (scope, name) preserving first-sight, check threshold via `countOverridesInWindow`, run defense-in-depth filters, pending-proposal short-circuit, one dispatch per poll. Harness loop wires construction (gated on memoryOverrideDetect + memoryRegistry + verify-override definition + non-subagent context), step-boundary tick (awaited), finally-block shutdown. Capability envelope intersected via the same `parseCapability` / `intersectCapabilities` shape as S11/S13. `HarnessConfig.memoryOverrideDetect?: boolean` + `memoryOverrideDetectSource` provenance. +21 tests.
+
+**S3.5 opt-out wiring (commit 74fedc3).** `MemoryConfigKeys.overrideDetectLlm`, `DEFAULT_MEMORY_CONFIG.overrideDetectLlm = true` (default ON, joining the S11/S13 posture from Slice Q). `parseMemoryLayer` accepts `override_detect_llm` (snake, canonical) + `overrideDetectLlm` (camelCase, accepted), warns on dual-key. Bootstrap: `BootstrapInput.memoryOverrideDetect`, banner gate extended to require `overrideFromDefault`, banner text updated to `(verify=on, conflict=on, override=on)` + `verify|conflict|override|all`, HarnessConfig populated with source provenance. CLI: `args.memoryOverrideLlm` + `--memory-override-llm` / `--no-memory-override-llm` flags + mutex + F12 mirror. Slash: `parseDetectorTarget` accepts `'override'` and `'all'` covers all three. `mutateMemoryConfig` writes `override_detect_llm` to the canonical block alongside the other two keys; reads accept both casings. +18 tests (config-loader 4, args 5, slash toggle 5 new + 4 adjusted existing).
+
+**S3.6 status surface + docs (this commit).** `/memory governance status` renders a third block `verify-override (S3 / LLM-judge):` with enabled state + source label (all 8 source × enabled combinations covered in the test matrix), caps, cooldown, recent attempts (most-recent first, showing misguiding/noise verdict + confidence + motivo + memory key + model id). docs/MEMORY.md §11.4 updated: "all three detectors" framing, config block shape includes `override_detect_llm`, slash commands list includes `override` target, first-boot banner advisory mentions all three. §12.5 "LLM-judge detector pipeline" table extended to three columns. §14.4 "What IS shipped" gains the canonical S3 entry replacing the prior "substrate-only" line. +9 tests in the source-label render matrix (8 source × enabled combos + 1 "renders all three blocks unconditionally").
+
+**Architectural posture.** All four detectors (S11 + S13 + S3 + trust_revoked) wired with the same shape:
+
+- **Propose-not-mutate** — every detector emits to `memory_governance_proposals`; only `applyProposal` calls `transitionMemoryState`; only after the operator approves through `/memory governance approve` does memory state change.
+- **Default ON with three-layer opt-out** — CLI flag > project config (`.agent/config.toml [memory]`) > user config (`~/.config/agent/config.toml [memory]`) > hardcoded default. First-boot stderr banner once, then silent.
+- **Cost-bounded** — per-session dispatch + cost caps (10 dispatches / $0.50) per detector with per-dispatch headroom check. Cap-latch is sticky (`capExhausted` field on `getCounters()`); follow-up TODO entry tracks "push notification when latched" since today the cap-latch state is pull-only via `/memory governance status`.
+- **Isolated subagents** — `parentApprovalId: null`, new session id, capability envelope intersected with parent's, structured output schema validated before any persisted side effects. `PROTECTED_BUILTIN_NAMES` surfaces project/user shadows in the loader so a malicious override doesn't silently widen the tools[] envelope.
+- **Cooldown / dedup substrate** — each detector has its own attempts table (memory_verify_attempts / memory_conflict_attempts / memory_verify_override_attempts) keyed on `content_hash`; rebuild on operator edit; 7d window for verify-semantic + verify-conflict (high-stakes verdicts re-dispatch), 24h cooldown for verify-override (both verdicts dedup because the pending-proposal gate upstream prevents queue duplicates).
+- **Audit chain** — `/memory governance audit <id>` surfaces proposal + linked memory_events. Both LLM-judge spawn paths populate `subagent_runs.session_id` linked from the attempts table; the alternative-chain bypass (audit-chain through attempts table instead of via `parent_approval_id`) documented in §14.4 "Audit-chain bypass" stays consistent across all three.
+
+**Slice closure metrics.** +6 commits (S3.1 through S3.6); +~3500 lines of code + ~3000 lines of tests; suite count 8649 → 8765+ (+~120 new tests across the slice, the rest of the diff is test infrastructure that re-fired across other suites). Zero regressions outside the pre-existing `chainFuzzTarget` host-load flake. Lint + typecheck clean throughout.
+
+## [2026-05-18] hardening(memory) — Slice Q post-review (5 CRIT + 14 HIGH + MEDs)
+
+Three parallel reviewers on the Slice Q diff surfaced 5 CRIT + 14 HIGH + ~16 MED findings — banner UX, mutator robustness, doc/code drift, status-render coverage. All criticals + highs + bug-class meds closed in this pass (R1-R8) BEFORE the Slice Q commit lands; suite stays green at every step.
+
+**R1 — Spec + operator-doc anchor.** Added `docs/spec/AGENTIC_CLI.md §5.4.1` declaring `[memory]` config block (snake_case + camelCase aliases, precedence table, 2 config layers — no enterprise yet) and `docs/spec/MEMORY.md §6.6` "Detectores LLM-judge — default ON, opt-out via slash + config". Promoted operator-guide `docs/MEMORY.md §11.4` from `####` subsection to top-level peer of §11.3, removed PT-BR fragments, added spec cross-references, documented the `~/.local/share/forja/.governance-banner-shown` marker file.
+
+**R2 (B-CRIT-3 + A-M5) — first-boot banner suppression.** Banner now respects `--json` mode (NDJSON consumers expect predictable stderr) AND a per-machine marker at `~/.local/share/forja/.governance-banner-shown`. `BootstrapInput.governanceBannerMarkerDir?: string | null` for test injection (`null` disables marker entirely, useful for CI determinism). Default location uses `homedir()`. Errors writing marker degrade silently to "emit anyway" (better than suppressing a banner the operator never saw).
+
+**R3 (A-H1/2/3 + A-M1/4) — `mutateMemoryConfig` round-trip.** Pre-fix was text-level extract-and-replace of the `[memory]` block via section-header regex; defeated by multi-line basic strings (embedded `[memory]` lookalike), quoted-key tables, whitespace inside `[ memory ]`, BOM, CRLF, and `lastIndexOf('/')` on Windows. Refactored to `Bun.TOML.parse(raw) → mutate object → emit canonical` via a 40-line TOML emitter handling scalars + flat tables (exhaustive for `.agent/config.toml`'s schema; extends naturally if a future subsystem adds nested tables). Trade-off (lose comments + original whitespace) documented in code. `dirname()` for Windows compat; require() hoisted to top-level imports.
+
+**R4 (C-CRIT-1 + C-CRIT-2) — bootstrap end-to-end tests.** New `tests/cli/bootstrap-memory-defaults.test.ts` (+8 tests): fresh-repo defaults ON via source=`'default'`, first-boot banner emits with marker creation, second-boot stays silent (marker gate), `--json` suppresses banner without writing marker, explicit CLI override bumps source to `'cli'`, project/user config sets `'project-config'`/`'user-config'` source, project wins over user when both touch verify, marker dir=null disables marker (banner re-fires every boot).
+
+**R5 (C-H4) — source-label render matrix.** New describe block in `tests/cli/slash/memory.test.ts` (+16 tests) pinning all 16 distinct enabled/source label strings (8 verify × 8 conflict). Found and fixed a real bug along the way: `handleGovernanceStatus` was early-returning when verify had no recorded attempts or the read failed, suppressing the entire S13 block. Now both blocks always render; recent-attempts is the only conditional within each block.
+
+**R6 (B-M1 + B-H2) — language policy fix + dual-key warning.** PT-BR fragments in `src/cli/args.ts:1730-1732` ("polariades / precisam refusar a combinação / estendido") rewritten in English per project policy. Stale "Default off" comments on `memoryVerifyLlm` / `memoryConflictLlm` fields updated to reflect Slice Q inversion. `config-loader.parseMemoryLayer` now emits a warning when BOTH spellings of the same field appear in `[memory]` (snake wins, camel silently ignored pre-fix → operator confusion). +2 tests in `tests/critique/config-loader.test.ts` (dual-key warning fires; single-spelling stays quiet).
+
+**R7 — test-gap rollup.** Slice Q + R3-R6 added robustness coverage that subsumed the originally-tracked minor gaps (multi-line string in `[critique]`, whitespace-inside-brackets, CRLF round-trip, empty-file gain `[memory]`, camelCase→snake_case normalization on rewrite, malformed-TOML refuses write). +6 tests in `tests/cli/slash/memory-governance-toggle.test.ts`.
+
+**R8 (A-M6 + B-H5) — banner emit-both decision comment.** Documented in `src/cli/bootstrap.ts` the deliberate choice to emit ONE banner gated on BOTH detectors-from-default (instead of per-detector banners): an operator who config-touched EITHER field has signaled awareness of the subsystem; emitting half-of-a-per-detector banner on subsequent boots would be noise. Counter-argument noted + rejected with trade-off rationale.
+
+**Test footprint:** +42 new tests across 4 files. Suite: **8649 pass / 0 fail / 10 skip** (was 8617 pre-hardening). `bun run typecheck` + `bun run lint` clean.
+
+## [2026-05-18] feat(memory) — Slice Q: invert S11+S13 LLM-judge default to ON; opt-out via slash + per-project config
+
+Operator decision: the two LLM-judge detectors (`verify_failed` / S11, `conflict_detected` / S13) inverted from default OFF to default ON. Cost not a limitation; coverage is. Opt-out via slash command persisted per-project — mirroring the `[critique]` precedent in `.agent/config.toml`.
+
+**Resolved precedence chain** (boot-time, first-match wins):
+
+1. CLI flag explicit (`--memory-verify-llm` / `--no-memory-verify-llm` ditto for conflict). Session-only.
+2. Project config `.agent/config.toml [memory] verify_semantic_llm = false`.
+3. User config `~/.config/agent/config.toml [memory] verify_semantic_llm = false`.
+4. **Default ON** (the new default).
+
+Shipped (Q1-Q7):
+
+- **Q1**: spec + doc edits. `docs/MEMORY.md §11.4` (Detector opt-out & per-project config) precedence table. §14.4 audit-chain-bypass extended to cover both detectors. Lines 976/980 inverted from "Opt-in via" to "Default ON; opt-out via".
+- **Q2**: `loadMemoryConfig` in `src/critique/config-loader.ts` reusing `userConfigPath` / `projectConfigPath` / fail-soft warnings. Returns `{config, userHadField, projectHadField, warnings, paths}` — provenance signals drive banner suppression. snake_case + camelCase aliases.
+- **Q3**: bootstrap integration. `HarnessConfig.memorySemanticVerify`/`memoryConflictDetect` (still optional in type for fixture compat); `HarnessConfig.memorySemanticVerifySource`/`memoryConflictDetectSource` provenance fields. Boot banner: when BOTH resolve to ON via default + CLI absent → single stderr line `memory: governance LLM detectors enabled by default ... Disable: /memory governance disable verify|conflict|all`. Subagent context naturally suppresses (subagent-child has its own boot path).
+- **Q4**: CLI `--no-memory-verify-llm` / `--no-memory-conflict-llm` siblings. Mutual-exclusion guard: `--x` + `--no-x` in same argv → parse error. F12 mirror extended to refuse either polarity in subagent context. `run.ts` propagates both `true` and `false` (semantic: `undefined` = no CLI override).
+- **Q5**: `/memory governance enable|disable verify|conflict|all` slash subcommands. Text-level `[memory]` block extract-and-replace (preserves `[critique]` + comments). Atomic tmp+rename. Creates `.agent/` + file if absent. Replaces in-place when block exists (no duplicate).
+- **Q6**: harness loop comments updated (linhas 1074, 1082) reflect new opt-out path; stderr messages dropped flag-specific suffixes since the flag is now optional.
+- **Q7**: `/memory governance status` enabled-state strings use source provenance: `yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, etc.
+
+**Test footprint:** +24 across 3 files.
+
+- `tests/critique/config-loader.test.ts` (+8): defaults, project override, camelCase aliases, type errors, malformed TOML in user, user+project merge precedence.
+- `tests/cli/args.test.ts` (+7): `--no-*` parse, undefined-when-omitted, mutex `--x + --no-x`, F12 mirror for `--no-*`.
+- `tests/cli/slash/memory-governance-toggle.test.ts` (+10): fresh repo creates, disable verify/conflict/all, preserves existing `[critique]` verbatim, replaces in-place, round-trip via loadMemoryConfig, invalid target, extra positional, missing target, enable reverses doubly-disabled.
+
+Suite: **8617 pass / 0 fail / 10 skip** (+24 vs Slice Q baseline of 8593).
+
+**Migration risk mitigated by banner:** operator com config explicit ou CLI flag não é afetado (suprime). Operator que upgradar com nada explícito vê 1 linha no boot apontando para slash de disable.
+
+**Deferred (tracked):**
+
+- Bootstrap-level integration test (`tests/cli/bootstrap-memory-defaults.test.ts` proposto no plano) — Q2/Q3/Q5 cobrem as 3 camadas separately + round-trip. End-to-end seria mais defensivo mas complex de fixturizar; deferred.
+- `/memory governance status` source label tests — Q5 toggle tests cobrem o lado oposto (write); read-side label is rendered text, deferred.
+- Harness loop sanity test sobre scheduler creation via config path — same gap as S11's "4 branches deferred"; symmetric.
+
+## [2026-05-18] hardening(memory) — S13 post-review (3 CRIT + 11 HIGH + MEDs + test gaps)
+
+Three parallel reviewers (correctness, spec/architecture, test quality) on the S13 slice surfaced findings spread across the slice. All criticals + highs closed in this pass (P1-P10) BEFORE the S13 commit landed; the slice ships shippable.
+
+**Critical fixes:**
+
+- **P1+P2+P3 (B-CRIT-1) — multi-memory quarantine carve-out.** Pre-fix dispatcher emitted `sourceMemoryKeys=[winner, loser]` (2 elements) into the S8 governance substrate. Apply path gate #4 in `governance.ts:390` rejected EVERY S13 proposal with `system:multi_memory_unsupported` (single-memory-only contract pinned in `tests/memory/governance.test.ts:226`). T13.8 acceptance "operator approves → loser quarantines" was literally unattainable. Fixed via path (b) — spec PR + apply-path widening:
+  - MEMORY.md §11.3: `target_payload.target_key={scope,name}` schema added; gate #4 admits multi-memory quarantine WHEN target_key designates which entry transitions AND that key appears in source_memory_keys.
+  - `governance.ts`: gate #4 widened; new `system:invalid_target_key` rejection for target_key not matching any source key; source resolution uses target_key when present, else `sourceMemoryKeys[0]`.
+  - Dispatcher uses `targetPayload: {target_key: {scope, name}}` for the loser.
+  - +3 tests in `governance.test.ts` pinning: multi-memory quarantine + valid target_key applies (only loser transitions, winner untouched); target_key not in source_keys → `invalid_target_key`; restore + multi-memory still rejected (carve-out is quarantine-only).
+
+- **P4 (B-CRIT-2) — pre-dispatch pending-proposal gate.** Pre-fix S13 lacked the gate S11 has (verify-semantic-scheduler:341-358). Combined with `conflicting` verdicts ALWAYS re-dispatching (cache miss by design) and the at-most-one-per-poll cursor-stationary semantic, the same pair re-fired every step boundary until cost cap latched. Operator paid up to $0.50 to land 1 pending proposal. Now: `listPendingProposalsForMemory` for both written + each top-K sibling; quarantine-kind pending → skip. New scheduler test pins.
+
+- **C-CRIT-1/2/3 — test gaps mirrored from S11.** Spawn error path (sync throw + non-done status); F18 FK retry (would be `recordConflictAttempt`'s `FOREIGN KEY constraint` regex); F11 TOCTOU re-read on either body. New tests in dispatcher + scheduler suites.
+
+**High fixes:**
+
+- **P5 (A-HIGH-1) — sub-threshold dedup destroys valid pending proposal.** Bug present in BOTH dispatchers (S11 + S13): when `recordProposal` silently dedups against an existing pending row, `decideProposal(rejected, system:low_confidence)` fires unconditionally if the CURRENT confidence is sub-threshold — flipping the prior high-confidence proposal to rejected. Fix: `if (confidence < threshold && !proposalResult.deduped) decideProposal(...)`. Same guard applied to S11 dispatcher. Test pins the high→low sequence; pending stays pending with original confidence.
+
+- **P6 (A-HIGH-2) — `stale_snapshot` was advancing cursor (G5 regression).** When all top-K pairs returned `stale_snapshot` (just-written body drifted between scheduler peek and dispatcher re-peek), `!dispatchedThisPoll` fell through to `advanceTo` — write event lost forever, fresh body never re-evaluated. Mirror of G5 from S11. Track `staleSeen` across the for-loop, skip advance when set.
+
+- **P7 (C-HIGH 1-6) — test gaps closed.** G6 shutdown-during-await guard (scheduler `if (stopped) return` post-await); dispatch cap latch + stderr; F3 cost cap headroom misconfig (maxCostUsd < SUBAGENT_MAX); same-millisecond cursor tuple; pending-proposal gate; sharedScopeOffline negative case. +6 scheduler tests.
+
+**Med fixes:**
+
+- **P8 (A-MED-2) — quarantined siblings excluded from candidate pool.** Pre-fix `states: ['active', 'quarantined']` admitted quarantined siblings into the pair-judge pool. Resolver could pick quarantined as winner via stronger provenance, generating quarantine proposal against an active memory based on a quarantined memo's "authority". Now `states: ['active']` — semantically sound: quarantined memos are already flagged.
+
+- **P8 (C-MED-1) — CLI flag parse tests.** 4 new tests in `tests/cli/args.test.ts`: `--memory-conflict-llm` parses, defaults undefined, rejected with `--subagent-session-id`, coexists with `--memory-verify-llm`.
+
+- **P9 (B-HIGH-3) — audit-chain bypass doc updated for S13.** §14.4 paragraph now covers BOTH verify-semantic AND verify-conflict; cross-references `memory_conflict_attempts.subagent_run_session_id` chain.
+
+- **P9 (B-MED-1) — §14.4 detector roster updated.** S13 moved from "substrate-only" deferred to shipped, with full posture summary; TODO.md S13 marked ✅ DONE.
+
+**Test footprint:** +18 across 4 files.
+
+- `tests/memory/governance.test.ts` (+3): multi-memory quarantine + target_key applies; invalid target_key rejects; restore multi-memory still rejected.
+- `tests/memory/verify-conflict-dispatcher.test.ts` (+3): spawn throw, status≠done, sub-threshold dedup guard.
+- `tests/memory/verify-conflict-scheduler.test.ts` (+6): dispatch cap latch, cost headroom misconfig, G6 shutdown-during-await, same-ms cursor tuple, pending-proposal gate skip, sharedScopeOffline negative.
+- `tests/cli/args.test.ts` (+4): CLI flag tests (parse, default, conflict, coexist).
+- Pre-existing dispatcher test: `targetPayload` shape pin updated to `{target_key: {...}}`.
+
+Full suite: **8593 pass / 0 fail / 10 skip** (+16 vs S13 baseline of 8577).
+
+**Falsely-positive review findings (documented):**
+
+- "S13 has no end-to-end test" (B-HIGH-1) — partially closed by the multi-memory governance tests in `governance.test.ts` (apply-path proved end-to-end). Full harness loop → scheduler → dispatcher → governance integration test remains deferred (same gap as S11; tracked).
+- "Migration 061 CHECK cross-column idiom novel" (B-MED-2) — confirmed; idiom is intentional defense-in-depth, comment justifies it. Kept.
+
+**Deferred (tracked):**
+
+- Loop wire-up 5 branches tests (C-HIGH-6) — same gap as S11's "4 branches deferred"; closing requires bootstrap mock harness, scheduled with the S11 carry-over.
+- Governance status S13 block render test (C-MED-2) — render code is simple, would be cheap; deferred to keep this round bounded.
+- BM25 `tokenize` ASCII-only unicode degradation (A-MED-6) — documented (PT-BR memo bodies lose accent tokens; CJK-only bodies produce empty tokens → BM25 hit zero, scheduler advances cursor silently). Real fix requires unicode-aware tokenizer touch in retrieval pipeline (out of scope).
+
+## [2026-05-18] feat(memory) — S13 LLM-judge `conflict_detected` detector
+
+Third slice of Phase 2 on `feat/memory-governance-llm`. Closes the last remaining auto-detector listed in `docs/MEMORY.md §14.4` substrate-only roster. Replaces the heuristic textual matcher that S4 attempted and rolled back: pair of operator-authored memos goes to an LLM judge, structured verdict → S8 governance proposal → operator approves → loser quarantines via the state machine.
+
+**Auto-trigger, opt-in.** `--memory-conflict-llm` defaults off (zero LLM cost in default sessions). When the operator opts in, the harness loop runs a conflict scheduler tick at each step boundary, polling `memory_events` for `action='created'|'edited'` and dispatching AT MOST ONE pair verification per poll through the gate sequence below.
+
+Shipped (T13.1 → T13.8):
+
+- **`verify-conflict.md` subagent** (`src/subagents/builtin/verify-conflict.md`). Pair-judge: takes TWO operator-authored memory bodies, emits `{conflicting, conflict_kind, confidence, evidence: {shared_concept, polarity_a, polarity_b}}`. Tool whitelist: `memory_read` only (bodies already in input). `capabilities: []` (pure-LLM — memory_read is misc category and resolves to no capability footprint). 6 steps / $0.06 budget. Listed in `PROTECTED_BUILTIN_NAMES` so project / user shadows surface loudly.
+
+- **BM25 pair-selection scheduler** (`src/memory/verify-conflict-scheduler.ts`). Polls `memory_events` for write actions since last poll's cursor, builds BM25 index over same-scope sibling bodies, takes top-K (`CONFLICT_PREFILTER_K = 5`). Caps LLM dispatch at K — for a scope with N=200 siblings the worst case is 5 calls per just-written, a 40× cost reduction over O(N) pairwise. Cursor uses `(createdAt, id)` tuple (mirror the S11 fix); same-ms event bursts don't drop siblings. `at-most-one-dispatch-per-poll` semantic: cursor stays past the just-written event until all its top-K pairs are dedup-hit OR LLM-verified.
+
+- **Per-pair dispatcher** (`src/memory/verify-conflict-dispatcher.ts`). Per-pair contract: TOCTOU re-read both bodies → scanForInjection on BOTH → canonicalize pair → dedup lookup → spawn → validate output → resolveConflictWinner → recordConflictAttempt → recordProposal (S8). Mirrors verify-semantic-dispatcher in shape; pair-shape differences: injection scan fires twice (either body trips), prompt frames BOTH bodies as adversarial between paired delimiters, dedup keyed on canonical pair tuple.
+
+- **Deterministic resolver** (`src/memory/conflict-resolver.ts`). Pure function `resolveConflictWinner(a, b)` with tiebreak chain: provenance (`user_explicit > inferred > imported`) → recency (newer mtime wins) → scope specificity (`project_local > user > project_shared`) → body length (longer wins) → lexicographic name. Returns `{winner, loser, tier}` so the governance proposal's evidence payload records WHICH tier decided. LLM-agnostic — the audit trail can be replayed without the LLM ever firing again.
+
+- **Migration 061 `memory_conflict_attempts`** (`src/storage/migrations/061-memory-conflict-attempts.ts`). Cross-session pair-keyed dedup cache. Schema: `(scope_a/name_a/content_hash_a, scope_b/name_b/content_hash_b, verdict, conflict_kind, confidence, model_id, prompt_hash, subagent_run_session_id, attempted_at)`. CHECK constraint enforces canonical pair order at SQL level (`scope_a/name_a < scope_b/name_b`); the repo's `canonicalizePair` helper does the sort up front. Dedup window 7d for `compatible` verdicts (mirror S11); `conflicting` always re-dispatches. 90d retention.
+
+- **Repo + canonicalization** (`src/storage/repos/memory-conflict-attempts.ts`). `canonicalizePair`, `recordConflictAttempt`, `lookupRecentConflictAttempt`, `listRecentConflictAttempts`, `pruneConflictAttempts`. Pair canonicalization is exposed AND enforced at SQL CHECK level — a caller that bypasses the helper hits a constraint error instead of silently inserting a duplicate row.
+
+- **Governance proposal emission**. Reuses S8 `recordProposal` with `kind='quarantine'`, `targetPayload={scope, name}` for the loser, `sourceMemoryKeys=[winner, loser]`, evidence rich with `{verdict, conflict_kind, confidence, shared_concept, polarity_a, polarity_b, winner_scope/name, loser_scope/name, resolver_tier, prompt_hash, subagent_run_session_id, model_id}`. Confidence below `SEMANTIC_CONFLICT_MIN_CONFIDENCE = 0.7` auto-archives as `rejected` with `decidedBy='system:low_confidence'` — same posture as S11. `triggerForProposal` already maps `'subagent:verify-conflict' → 'conflict_detected'` (was pre-stitched in `src/memory/governance.ts`).
+
+- **CLI flag + harness wire** (`--memory-conflict-llm`). parseArgs accepts the presence-only flag; F12 mirror refuses combination with `--subagent-session-id` (top-level only). Harness loop creates the scheduler when (a) `memoryConflictDetect=true`, (b) `subagentDepth===0`, (c) `subagentRegistry !== undefined`, (d) `verify-conflict` definition loaded, (e) `memoryRegistry !== undefined`. Capabilities sealed via intersection (`parent ∩ declared`); excess logs `verify_conflict_envelope_narrowed` to stderr. Independent counters from S11 (`MEMORY_VERIFY_CONFLICT_MAX_DISPATCHES_PER_SESSION = 10`, `MEMORY_VERIFY_CONFLICT_MAX_COST_USD = 0.5`).
+
+- **`/memory governance status`** renders S13 block alongside S11: enabled state + caps + recent attempts. Each recent attempt shows verdict, confidence, pair, conflict_kind, model.
+
+- **Bootstrap pruneConflictAttempts** wired alongside `pruneVerifyAttempts`. Same 90d retention sweep posture.
+
+**Tests:** +29 across 4 files.
+
+- `tests/memory/conflict-resolver.test.ts` (+13): one test per tier + chained tier-ordering invariants. Pins the deterministic tiebreak as a contract — a refactor that flips a tier order fails loud.
+- `tests/storage/memory-conflict-attempts.test.ts` (+14): canonicalizePair, recordConflictAttempt happy paths + rejection of non-canonical pairs (repo + SQL CHECK), lookup with verdict + window semantics, content_hash drift busting dedup, pruneConflictAttempts.
+- `tests/memory/verify-conflict-dispatcher.test.ts` (+10): injection scan on either body, same-pair short-circuit, dedup cache hit, conflicting+high-confidence proposal landed, sub-threshold auto-reject, compatible attempt-only, malformed output paths.
+- `tests/memory/verify-conflict-scheduler.test.ts` (+5): definition undefined no-op, happy path (write event + sibling → dispatch), BM25 prefilter cap (disjoint siblings never reach LLM), cost cap latches `capExhausted='cost'`, sharedScopeOffline forwarded from session-wide exclude list.
+
+Full suite: **8577 pass / 0 fail / 10 skip** (+44 vs S13 baseline of 8533).
+
+**What S13 does NOT do (deferred):**
+
+- E2e integration tests through the harness loop (CLI → bootstrap → real scheduler → real subagent spawn → governance proposal). Same gap as S11's hardening backlog; tracked there.
+- Cross-scope pairing. Intra-scope only by design — pairing a user-global preference against a project-local fact conflates concept layers and the resolver's scope-specificity tier already handles cross-scope precedence. A future detector that wants cross-scope can compose this one differently.
+- Multi-element merge proposals (`source_memory_keys.length > 2`). S8 substrate admits the shape; S13's resolver is strictly pair-based. Listed in MEMORY.md §14 as "consolidate" detector — a separate slice if/when needed.
+
+**Operator surface ready.** With `--memory-conflict-llm` set, writing a memo that semantically contradicts an existing same-scope sibling generates a pending governance proposal within one turn. `/memory governance status` shows the verdict; `/memory governance approve <id>` quarantines the loser; `/memory audit --trigger conflict_detected` cross-references the eviction event back through the proposal's evidence payload.
+
+## [2026-05-17] fix(permissions) — carve out `/run/media` and `/run/user` from the deny tier
+
+Caught by an operator running Forja from `/run/media/lex/<volume>/Workspaces/forja/` (a workspace on an external drive mounted by udisks2 — Manjaro / Arch / Debian / Ubuntu / Fedora default). Every tool call against any file in the workspace failed instantly:
+
+```
+Denied in 45ms
+└─ path is in protected zone (deny tier): /run/media/.../forja/.gitignore
+```
+
+No modal, no confirm escape hatch — the engine emitted a categorical deny because the cwd happened to start with `/run`, which is in `SYSTEM_DENY_ROOTS`. The original intent of that deny prefix is to block reads/writes against privileged-daemon sockets (`/run/dbus/system_bus_socket`, `/run/postgresql/.s.PGSQL.5432`, `/run/docker.sock`); refusing every file under `/run/media/<user>/<volume>` is a false-positive that makes Forja unusable on external-drive workspaces. Same shape for `/run/user/<uid>/` (XDG_RUNTIME_DIR — per-user runtime tmpfs that applications legitimately write to all day).
+
+**Fix:** added `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` to `protected_paths.ts`. The deny classifier now skips the deny verdict when the absolute path starts with either prefix; everything outside those prefixes (the original `/run/postgresql/...`, `/run/dbus/...`, `/run/systemd/...` shapes) still hard-denies. Carve-outs are explicit and minimal — anything new under `/run` that operators legitimately need would land here.
+
+**Tests:** +9 in `tests/permissions/protected_paths.test.ts` — 5 carve-out cases (workspace paths under `/run/media/<user>/...`, XDG runtime dir under `/run/user/<uid>/...`) classify as `null`; 4 privileged-daemon socket cases stay `deny`. Pins both halves so a future "simplify the exception list" regression fails loud either way.
+
+Full suite: **8529 pass / 0 fail / 10 skip**.
+
+**Investigation note:** the operator-visible symptom looked like a missing modal ("modal ask nao aparece. pode ser bug"). Turned out the modal was never going to fire — the deny was decided categorically before the modal layer was reachable. Documenting because the same shape ("missing modal") can hide either a missing wire OR an upstream categorical deny that pre-empts the modal entirely.
+
+## [2026-05-17] fix(storage) — revert migration 058 edit + add migration 059 (append-only discipline)
+
+Caught at install time by an operator running the newly-built binary against an existing `~/.local/share/forja/sessions.db`: migration 058 had been edited in the previous commit (4dade9c) to add a TEMP-table snapshot/restore around the table rebuild — a "fix" for the FK-pointer severing bug that itself violated CLAUDE.md's "Append-only everywhere" hard rule. Result: hash mismatch on next startup (`applied hash: dcbfd31… current hash: d0b932…`) and a refuse-to-proceed from `migrate.ts` — the migration guard correctly refused to silently re-run an altered migration, but the binary was unusable.
+
+**Fix:**
+
+- **Reverted `058-subagent-runs-scope-builtin-and-approval.ts` SQL** to its original shape (the one already in the operator's DB). Hash now matches `dcbfd31…` again. Comment block updated to document the original FK-severing bug + lesson learned: "migration edits to a landed file break every existing install; the fix MUST live in a new migration."
+- **Created `059-memory-verify-attempts-fk-discipline.ts`.** Adds `provenance_drift_at INTEGER` column to `memory_verify_attempts` so forensic readers can discriminate "pointer was always NULL" from "pointer was severed by 058's drop on date X". Migration body is intentionally minimal; the load-bearing content is the comment block, which codifies the FK preservation pattern (TEMP table snapshot + restore around the drop) as a binding rule for any future migration that rebuilds `subagent_runs` or any table referenced via `ON DELETE SET NULL`.
+- **Pre-058 FK pointers are unrecoverable.** SQLite's `ON DELETE SET NULL` writes NULL irreversibly; the original `session_id` values aren't preserved anywhere correlatable. Operators can still cross-correlate by timestamp via `attempted_at` against `subagent_runs.captured_at`. New rows INSERTed after 058 ran always have intact pointers; the data loss is bounded to rows that existed at the moment of the migration.
+
+**Test update:** `tests/storage/migrate.test.ts` test pinning the wrong claim ("058 preserves the pointer") replaced by one that pins the actual behavior ("058 severs the pre-existing pointer — documented audit drift"). A future reviewer who thinks they can "fix" 058 by editing the SQL hits this test failure loud. Added a second test pinning that 059 lands the `provenance_drift_at` column shape.
+
+**Validated:** smoke script simulating "operator with 058 already applied" + the current MIGRATIONS array — second migrate pass applies only `059` (one row), 058 is correctly skipped via hash match, schema lands intact.
+
+Full suite: **8520 pass / 0 fail / 10 skip** (+1 vs R1-R7 baseline of 8519, the new 059 column test).
+
+**Lesson logged for future rounds:** any "small SQL fix" to a landed migration is a load-bearing breach of the append-only invariant. The bypass route is always: revert + new migration. Smoke-test against an existing DB BEFORE commit when a migration changes shape.
+
+## [2026-05-17] hardening(harness+subagents) — loop ↔ subagent flow review pass (R1–R7)
+
+Third multi-reviewer pass on `feat/memory-governance-llm`, this time focused on the harness loop ↔ subagent runtime boundary (not S11 specifically). Three parallel agents (correctness/robustness, spec/architecture, test quality) surfaced 7 CRIT, 10 HIGH, ~15 MED, ~12 LOW findings clustered in 8 themes. All criticals + highs + actionable meds closed in this pass; remaining items deferred with explicit notes in `docs/TODO.md`.
+
+**Critical fixes:**
+
+- **R1 — hard signal threading + IPC enable for verify dispatch.** Pre-fix the dispatcher accepted only `softStopSignal`; the harness's combined hard abort (Ctrl-C×2 + wall-clock) was unreachable. Ctrl-C-twice during poll hung the loop until the verify subagent's own 10-min wall-clock self-killed. ALSO pre-fix the spawn omitted `ipc: true`, leaving the cooperative interrupt branch in `waitForChild` as dead code (`handle.ipc?.send` was no-op). Symmetric with the task-tool spawn path (loop.ts:1516) which already wired both. Now: `signal` and `ipc: true` thread through `SemanticVerifySchedulerDeps` → `DispatchSemanticVerifyInput` → `runSubagent`.
+
+- **R2 — capability sealing for verify child.** The most-grave finding. R2's first round threaded `effectiveCapabilities()` into the verify spawn, but what got passed was the parent's FULL envelope verbatim — `verify-semantic.md` had no `capabilities` frontmatter field and the loader didn't expose one, so the audit row recorded "verify child ran under parent's full envelope" when the operator's intent was a read-only fact-checker. Exactly the gap migration 040 closed, reintroduced through the scheduler path. Today's blast radius was bounded by the read-only tools whitelist, but a future tools-widening would have silently inherited the full envelope. Now: `SubagentDefinition.capabilities?: string[]` added to types + loader (with full parseCapability round-trip validation), `verify-semantic.md` declares `capabilities: []` (pure-LLM — the spec-prescribed shape for read-only fact-checkers), and the scheduler creation site uses `intersectCapabilities(parent, declared)` mirroring the task-tool path. Loader test bundle (+8) pins parse/reject behavior; load.test.ts pin re-pins `verify-semantic.md` declares `capabilities: []` so a regression that strips it would fail.
+
+- **R3 — migrations 058 (scope='builtin' + parent_approval_id).** Two distinct audit-chain gaps fixed in one table rebuild.
+  - **Scope CHECK widening.** The `subagent_runs.scope` CHECK admitted only `('user','project')`; every builtin spawn was mapped to `'user'` via a runtime hack (`runtime.ts:543`) — forensic queries that filter "shipped vs. operator-authored" returned the same scope for both, contradicting AUDIT.md §0 ("substrato de audit nunca muta retroativamente"). Migration 058 rebuilds the table with `('user','project','builtin')`; the runtime mapping is removed and `definition.scope` lands directly. Pre-058 sessions are unrecoverable (recorded `'user'`), but new dispatches are honest.
+  - **`parent_approval_id` FK column.** PERMISSION_ENGINE.md §10.2 prescribes a one-hop FK from `subagent_runs` back to the `approvals` row that authorized the spawn. Pre-058 the chain was multi-hop via `messages.tool_call_id` → `tool_calls.id` → `approvals.tool_call_id`, fragile under retention sweeps. Migration 058 adds `parent_approval_id TEXT REFERENCES approvals(id) ON DELETE SET NULL`; wired end-to-end through `ToolContext.approvalId` (populated in `invoke-tool.ts` after the allow approval lands) → `SpawnSubagentArgs.parentApprovalId` → `runSubagent.parentApprovalId` → `insertSubagentRun.parentApprovalId`. Verify-scheduler dispatches intentionally bypass this chain (no `tool_call` exists for them); documented in MEMORY.md as an intentional dual-chain with forensics via `memory_verify_attempts.subagent_run_session_id`. A future amendment may land a synthetic approval row (requires `approvals.decided_by` CHECK widening — separate migration).
+  - **FK preservation during table rebuild.** `migrate.ts` wraps each migration in a transaction; SQLite ignores `PRAGMA foreign_keys=OFF` inside one (silent no-op per docs). So the rebuild's `DROP TABLE subagent_runs` fired `ON DELETE SET NULL` on `memory_verify_attempts.subagent_run_session_id` for every referring row — silently severing the forensic chain from the dedup cache to the audit row that the migration was supposed to STRENGTHEN. Caught via a manual smoke test before commit. Migration now snapshots the (mva.id, mva.subagent_run_session_id) tuples into a TEMP table BEFORE the drop and restores them via UPDATE after the rename. New `tests/storage/migrate.test.ts` test pins both halves (FK link preserved + `PRAGMA foreign_key_check` empty).
+
+**High fixes:**
+
+- **R4 — IPC `cost_update` payload validation.** `IPC.md §7` ("mensagens do filho NÃO são confiáveis") demanded boundary validation; the parent's reservation tracker + cap watchdog were consuming `delta`/`cumulative` with `typeof number` only. A malformed child could trip cancelAll or grow the reservation silently. Now rejects non-finite values and negatives at the boundary (loop.ts:1424); rejected updates stderr-log with the offending values for forensics.
+
+- **R4 — `console.error` → `process.stderr.write` in cost-progress persist catch.** `console.error` violates the hard rule "stdout is pure, stderr is for logs" from CLAUDE.md — Bun sometimes routes it to stdout under specific conditions. Routed explicitly to `process.stderr.write` to keep `--json` NDJSON stdout clean.
+
+- **R6 — runtime defense for `--memory-verify-llm` in subagent context.** `parseArgs` already refuses the combination at boot (F12), but a programmatic caller / future code path that constructs `HarnessConfig` directly could still set the flag with `subagentDepth > 0`. Pre-fix the scheduler block silently skipped construction; now stderr-logs `verify_semantic_disabled: cannot run inside a subagent context` so the misconfiguration surfaces.
+
+- **R6 — scheduler creation guard on `memoryRegistry !== undefined`.** Pre-fix the cast `as MemoryRegistry` would land `undefined` into the scheduler; every poll TypeError'd on `registry.peek(...)` and the outer catch swallowed it silently each step. Now refuses construction loudly when registry is missing — mirror of the verify-def absent path.
+
+- **R6 — `cleanupOnFail` surfaces non-clean cleanup outcomes.** Pre-fix `cleanupWorktree(...).catch(() => undefined)` swallowed both success and failure. A cleanup that removed the worktree dir but failed on `git branch -D <agent>` left a stale branch with no logged signal — the operator's branch list grew silently. Now the catch logs to stderr with the failure message; the throw is still swallowed (cleanup remains best-effort) but the breadcrumb is preserved.
+
+- **R6 — forward `planMode` + `spawnChildProcess` test seam to verify scheduler.** Asymmetric with the task-tool spawn path (loop.ts:1535-1558). For `planMode`: today's `verify-semantic.md` whitelist is all read-only so the gap isn't disparable, but a future widening would silently bypass plan-mode write refusal via the verify path. For `spawnChildProcess`: tests wiring a fake subprocess factory saw verify dispatches hit real `Bun.spawn`, a source of CI flakiness. Both threaded through the scheduler + dispatcher + into `runSubagent`.
+
+**Med fixes:**
+
+- **R5 — `recordProvenance` per-row independence pinned.** Existing test covered ONE bad scope not aborting the run; new test pins the stronger invariant: `(good, bad, good)` triple — both goods land even though the middle one throws. A refactor moving the try/catch outside the for-of loop would silently break the backfill on first error; the new test fails immediately.
+
+- **R6 — `existsSync` try/catch in evidence path guard.** `existsSync` can throw on EACCES/ELOOP/EMFILE; the dispatcher's outer catch would have surfaced that as `verify_semantic_dispatch_failed` and skipped the attempt-row INSERT, silently disabling dedup for the affected memory. Now caught locally and treated as "not found" — the verdict still rolls up as contradicted-but-malformed and the cache lands for next-time short-circuit.
+
+**Test footprint:** +16 tests across 5 files.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+3): R1 signal threading (present / absent / IPC always-true).
+- `tests/subagents/load.test.ts` (+8): R2 capabilities loader (absent vs `[]` vs canonical vs reject paths × 6 + verify-semantic.md pin).
+- `tests/storage/subagent-runs.test.ts` (+3): R3 migration 058 widened scope + parentApprovalId round-trip + omitted-id NULL.
+- `tests/storage/migrate.test.ts` (+1): R3 FK preservation through the migration 058 table rebuild (snapshot + restore proves the chain survives DROP TABLE under FK ON).
+- `tests/harness/invoke-tool.test.ts` (+1): R3 e2e — `ctx.approvalId` populated from the allow approval row id at execute time.
+- `tests/tools/task.test.ts` (+2): R3 e2e — `ctx.approvalId` forwarded as `SpawnSubagentArgs.parentApprovalId`; absent-id omitted.
+- `tests/harness/loop.test.ts` (+1): R5 recordProvenance per-row independence (sandwich pattern).
+- `tests/tools/_helpers.ts`: makeCtx now forwards `approvalId` override.
+
+Full suite: **8519 pass / 0 fail / 10 skip** (+20 vs. second-hardening baseline of 8499).
+
+**Falsely-positive review findings (documented):**
+
+- "Hard-abort signal not threaded" (A-CRIT-1) ⇒ confirmed; closed by R1.
+- "Scheduler poll throws caught but in-flight state inconsistent" (A-HIGH-3) ⇒ confirmed at the registry-missing path; closed by R6 (loud refusal at construction time).
+- "Loop skips effective-capabilities derivation in subagent context" (HIGH-1 spec) ⇒ confirmed silent; closed by R6 stderr.
+- "Audit row records scope='user' for builtin" (B-CRIT-2) ⇒ confirmed; closed by R3 migration 058.
+- "`subagent_runs` lacks `parent_approval_id`" (B-HIGH-4) ⇒ confirmed; closed by R3 migration 058.
+- "Verify spawns bypass approval-chain" (B-HIGH-6) ⇒ confirmed; intentionally documented as bypass in MEMORY.md §11.x (forensics via `memory_verify_attempts.subagent_run_session_id`).
+- "wallClockTimer leak on guardedFinish throw" (A-HIGH-2) ⇒ self-demoted by reviewer during pass — `clearTimeout` is first line of `finish()`.
+
+**Deferred (tracked):**
+
+- **NaN/Infinity child cost guard test** (C-HIGH-1). The guard at loop.ts:1648 exists and is correct; pinning it via test requires either runtime injection of a fake child terminal envelope (deep wiring) or extraction of the guard into a testable surface. Deferred — guard is small, defense-in-depth, and any future refactor would have to consciously remove it.
+- **`dispatchChain` sync-throw in `dispatchHooks` catch** (C-HIGH-4). The catch correctly returns `null` (fail-open per CONTRACTS.md §10 line 1057); pinning requires a mock dispatcher that sync-throws. Low risk because `dispatchChain` is async and the implementation surface is small.
+- **Critique-aborted `recordCritiqueRun` persistence assert** (C-HIGH-5). The catch + recordCritiqueRun-before-rethrow pattern is in place; pinning requires a fake critique provider that aborts mid-stream.
+- **Scheduler wire-up 4 branches end-to-end** (C-CRIT-1, carry-over from second hardening). Two branches are now covered by R5 + new construction tests; the 4 named branches (missing-def / subagent-child / shutdown-after-throw / poll-throws) remain partially covered.
+- **`task` synchronous cap-watchdog** (A-MED-3). Sync `task` spawns bypass the `subagentHandleStore`, so cap watchdog doesn't pre-empt overage. Documented in `docs/TODO.md` "Deferred — actionable but parked" with the fix shape + pull-in signal. Worst case bounded by `definition.budget.maxCostUsd` validation.
+- **`validate.ts` capabilities_declared check** (B-MED-1). Whitelist guard checks `metadata.writes` but not `metadata.capabilities_declared` — a typo in playbook tools[] doesn't fail at load. Engine still gates at evaluation; current behavior is "deferred load-time error to first invocation". Smaller surface, low priority.
+- **`cost_soft_cap_warn` semantic confusion** (B-MED-4). Spec says the warn fires on CHILD playbook cap; loop emits on PARENT session cap. Two conflated signals. Spec-PR-first to clarify; code change minor once spec is amended.
+
+## [2026-05-17] hardening(memory) — S11 LLM-judge second post-review pass (critical + high + med + test gaps)
+
+Second multi-reviewer pass on S11 (three parallel agents: correctness/robustness, spec/architecture, test quality) surfaced 27+ new findings after the first hardening round landed. All closed in this pass (G1–G12).
+
+**Critical fixes:**
+
+- **G1 — directory-boundary path-traversal fix.** F8's `evidence_paths` guard checked `resolved.startsWith(cwd)` — `/repo` would admit `/repository-malicious/...` as a sibling whose absolute path shares the prefix but isn't actually under cwd. Switched to the directory-boundary check `resolved === cwd || resolved.startsWith(cwd + sep)`. Also rejects absolute paths up front via `isAbsolute(p)` before resolution. Test pins the sibling-directory case (`/repo-x`) as `malformed` against a dispatcher whose cwd is `/repo`.
+
+- **G2 — wire `effectiveCapabilities` into scheduler/dispatcher.** F9 threaded `effectiveCapabilities` through the dispatcher's input shape but the harness loop wire-up never populated it — the child's PERMISSION_ENGINE §10.1 envelope was empty (sealed audit row carried `[]`), and any subagent gate that consults the envelope's intersection silently degraded. Now derives from `config.permissionEngine.effectiveCapabilities()` with `deriveParentCapabilities(policy())` fallback for engines that pre-date the §10.1 method. `Capability` is nominal-branded; cast through `as unknown as readonly string[]` matches the dispatcher's transport shape.
+
+**High fixes:**
+
+- **G3 — scheduler skips `trust: untrusted` memories.** The shadow-domain `untrusted` trust attestation (MEMORY.md §17 — `trust: untrusted` files can be peeked but never load into context) was honored by the eager-loader path but the verify scheduler's peek-and-dispatch path bypassed it: an `untrusted` memory could be sent to the LLM judge as the BODY of a prompt, exfiltrating its content through the verification request. Added the filter at peek time AFTER the state/exclude checks; cursor advances past skipped candidates so they're not re-considered each poll.
+
+- **G4 — verify-semantic.md flagged as "not a playbook".** PLAYBOOKS.md §1.x requires playbook outputs to include `summary`, `assumptions`, `not_checked`. Verify-semantic intentionally omits these (the verdict + claim_extracted + ground_truth_observed + evidence_paths shape IS the output, no narrative summary is useful). Added a "Not a playbook" header to the .md explaining the omission so the next reviewer doesn't try to "fix" it.
+
+- **G5 — `stale_snapshot` doesn't advance cursor.** F11's TOCTOU re-read returned `{kind: 'skipped', reason: 'stale_snapshot'}` but the scheduler unconditionally advanced the cursor on every skip. A memory whose body was edited between peek and dispatch would NEVER be re-considered after the stale skip — the fresh body sat behind the advanced cursor. Now the scheduler advances only when `outcome.reason !== 'stale_snapshot'`; the next poll re-evaluates against the fresh body.
+
+- **G6 — scheduler counters guarded after shutdown.** The `dispatched++` and `costUsdSpent += ...` mutations happened AFTER the `await dispatchSemanticVerify(...)` resolved. If `shutdown()` was called mid-await (operator Ctrl-C between spawn and resolution), the counters mutated for a dispatch the scheduler had no business making. Added a `stopped` check immediately after the await before any counter mutation; the in-flight result is dropped silently (operator stopped, intent is clear).
+
+- **G7 — `PROTECTED_BUILTINS` source of truth.** F7's protected set lived inline in `src/subagents/load.ts`. Moved to `src/subagents/builtin/index.ts` as the canonical export — same module that owns the ship-dir resolution. Both the loader and any future shadow-precedence consumer import from one place; harder to drift.
+
+- **G8 — doc fixes.** MEMORY.md §14.4 didn't mention the loud shadow surfacing for protected builtins; updated. TODO.md added a "Deferred — actionable but parked" section with the compile-safe builtin distribution entry from F6 (with the operator-facing `verify_semantic_disabled` diagnostic that limits blast radius until a real fix lands).
+
+- **G9 — bump sanitize max for error surfaces.** F14's `sanitizeOneLineForDisplay` defaulted to a 256-char cap that truncated useful error context (SQLite paths + stack frames). Added `ERR_MAX_CHARS = 1024` + `displayErr()` helper used at all error-surface call sites; memory names + model_ids stay at the default 256.
+
+**Med fixes:**
+
+- **G10 — small cleanups.**
+  - Dropped dead `SEMANTIC_VERIFY_ELIGIBLE_SCOPES` constant (never read after F2 moved the scope filter into the harness loop's exclude set).
+  - Dispatcher's `evidenceEssence` now uses `canonicalJsonStringify` (exported from `memory-governance`) instead of `JSON.stringify` — matches the canonical serializer the rest of the governance substrate uses, so the same evidence shape always produces the same string regardless of key insertion order.
+  - Shadow chain in `load.ts` now emits both rows when a project shadow shadows a user shadow of a protected builtin (pre-fix only the project→builtin edge surfaced; the user→builtin edge was hidden behind it).
+
+**Test footprint:** +15 tests across four files.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+6): G1 sibling-directory path-traversal rejection, F11 TOCTOU re-read trio (registry-missing fallback / body-changed / fresh-body), F18 FK-race retry, F9 context-fields forwarding.
+- `tests/memory/verify-semantic-scheduler.test.ts` (+6): G3 trust:untrusted skip, F15 state filter widened to invalidated + evicted, F3 cost cap headroom edge case, F14 stderr ANSI sanitization, G6 shutdown-during-await counter discipline.
+- `tests/cli/slash/memory.test.ts` (+3): F16 absent "or set policy" hint, recent-attempts rendering, read-failed surface.
+- `tests/subagents/load.test.ts`: system prompt phrase pinning for the protected-builtin shadow rows.
+
+Full suite: **8499 pass / 0 fail / 10 skip** (+15 vs first-hardening baseline of 8484).
+
+**Falsely-positive review findings (documented):**
+
+- "FK race fallback loses forensic detail" — confirmed acceptable trade-off; the cache value matters more for the next dispatch than the run pointer.
+- "G2 capability cast loses brand safety" — confirmed; the dispatcher's transport shape is intentionally string-based (it's a forwarded payload, not a gate decision surface).
+
+**Deferred (tracked):**
+
+- Compile-safe builtin distribution (F6 carry-over) — TODO.md entry now explicit.
+- Harness loop scheduler wiring tests (4 branches: missing-definition, subagent-child, shutdown-after-throw, poll-throws).
+- Bootstrap `pruneVerifyAttempts` wiring tests.
+- End-to-end harness→scheduler→dispatcher→governance integration test.
+
+## [2026-05-17] hardening(memory) — S11 LLM-judge post-review (critical + high + med + test gaps)
+
+Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 18 findings on S11 after the slice landed. All 18 closed in this pass.
+
+**Critical fixes:**
+
+- **F1 — ship `verify-semantic.md`.** The `.md` definition that the entire S11 detector depends on was missing from disk — the file `Write` call earlier in the session silently failed (extraneous params on the tool invocation). `loadSubagents` never found the definition; harness emitted `verify_semantic_disabled` on every opt-in boot. Feature was a silent no-op in production. Wrote the file (90 lines, 5.3KB) + smoke test that `loadSubagents` resolves the canonical shape (`scope: 'builtin'`, tools whitelist, budget caps).
+
+- **F2 — scheduler honors `memoryExcludeScopes`.** Pre-fix, the scheduler received the unwrapped `config.memoryRegistry` and peeked + dispatched `project_shared` bodies even when the bootstrap's S5 shared-corpus trust probe had marked the scope offline. Direct security regression — fail-open path bypassing the trust gate. Added `memoryExcludeScopes` to scheduler deps; filtered candidates at the dedupe stage (cheap string check, no peek for excluded scopes); threaded `config.memoryExcludeScopes` through the harness loop. Cursor still advances past excluded candidates so they're not re-considered (trust verdict for the session is stable).
+
+- **F3 — cost cap per-dispatch headroom.** Cap was checked BEFORE dispatch with cost added AFTER — a single expensive dispatch could blow the session budget by an arbitrary overage. Added headroom check: `counters.costUsdSpent + SEMANTIC_VERIFY_SUBAGENT_MAX_COST_USD > maxCost` latches the cap. The subagent's declared budget (0.10 USD) is the worst case under spec; a dispatch that respects its declared budget always fits.
+
+- **F4 — fix intra-poll dedupe out-of-order.** Cenário `(foo @1000, bar @2000, foo @3000)`: pre-fix tracking `seen.set(key, max(prior, createdAt))` advanced cursor to `foo`'s latest sighting (3000) after dispatch, dropping `bar @2000` forever. Switched to `Set<string>` (first-sight only) and advance cursor only past the dispatched candidate's first createdAt — `foo @3000` re-emits next poll (where it dedup-hits cheaply in the dispatcher) but `bar @2000` survives.
+
+- **F5 — sub-threshold contradicted records auto-rejected proposal.** TODO T11.7 was explicit: sub-threshold contradicted verdicts auto-archive as `status=rejected, decidedBy=system:low_confidence`. Pre-fix only recorded an attempt; operator forensic via `/memory governance list --status rejected` was blind. Now records the proposal with the full evidence shape, then immediately decides it as `rejected` with the threshold gate in the `decided_reason`.
+
+**High fixes:**
+
+- **F6 — builtin loader compile-safe (documented).** `import.meta.dir` in `bun build --compile` resolves to a virtual `/$bunfs/` path that `readdirSync` cannot enumerate — built-ins effectively lost in compile mode. Documented the limitation in `src/subagents/paths.ts` header. Operator-facing surface (the existing `verify_semantic_disabled` stderr line in the harness loop) flags the gap loudly when opt-in is set without a resolvable definition. Compile-safe distribution via TS const embedding deferred — tracked as a follow-up since a real fix needs Bun text imports / asset embedding investigation.
+
+- **F7 — shadow guard for protected builtins.** Pre-fix, project-scope `.agent/agents/verify-semantic.md` silently replaced the safe built-in — a malicious repo opting an operator into bash/write_file tools the moment they enable `--memory-verify-llm`. Added a `PROTECTED_BUILTINS` set (`verify-semantic` for now). User AND project shadows of protected builtins ALWAYS surface in the `shadows` array — the existing CLI surface emits these on boot so the operator sees the override. Unprotected built-ins keep the silent-override semantic.
+
+- **F8 — hallucination guard verifies `evidence_paths` exist.** Pre-fix only checked `paths.length > 0`; a clever subagent emitting `evidence_paths: ['fake/file.ts']` satisfied the guard and quarantined real memories on the operator's auto-rejected path. Added `fs.existsSync(join(cwd, p))` per path with absolute-path rejection and `cwd` boundary check (refuses path traversal). Contradicted verdict with any bogus path → `malformed`.
+
+- **F9 — thread `runSubagent` context fields.** Pre-fix dispatcher omitted `softStopSignal`, `cwdTrusted`, `sharedScopeOffline`, `hooksSnapshot`, `effectiveCapabilities` when calling `runSubagent` — operator Ctrl-C didn't interrupt the spawn, trust-gated tools degraded, S5 fail-closed posture was lost, hooks drift window opened. Added fields to scheduler deps + dispatcher input; threaded from `config.softStopSignal` / `config.isCwdTrusted` / `config.hooks` in the harness loop wire-up. `sharedScopeOffline` mirrored from `memoryExcludeScopes` per-candidate.
+
+- **F10 — wire `pruneVerifyAttempts` at boot.** Pre-fix the retention sweep was exported but never called; `memory_verify_attempts` would grow unbounded. Mirrored the existing `pruneMemoryProvenance` sweep in `bootstrap.ts` with the same AUDIT DRIFT stderr posture.
+
+- **F11 — TOCTOU body re-read inside dispatcher.** Operator edit between scheduler peek and dispatcher hash left a stale snapshot — `scanForInjection` + content hash + attempts row landed against bytes whose underlying file no longer existed. Added optional `registry` to `DispatchSemanticVerifyInput`; when present, the dispatcher re-peeks BEFORE scan and refuses the dispatch with `{kind: 'skipped', reason: 'stale_snapshot'}` if the canonical serialization diverged. Scheduler always passes registry. Next poll re-evaluates against the fresh body.
+
+- **F12 — refuse `--memory-verify-llm` in subagent context.** Pre-fix, the flag was accepted unconditionally; a `.envrc`-injected flag in a subagent-child invocation would silently be a no-op (the harness loop's `subagentDepth > 0` guard prevents scheduler creation but doesn't surface to the operator). Now `parseArgs` rejects the combination at the args layer — same discipline `--subagent-shared-scope-offline` already had.
+
+**Med fixes:**
+
+- **F13 — `peek=malformed` emits stderr.** Pre-fix the scheduler silently skipped memories whose frontmatter was corrupt. Now emits `memory: verify_semantic_peek_malformed` so the operator sees the corruption signal.
+
+- **F14 — sanitize scheduler/dispatcher stderr.** Memory names + model_ids + error strings could embed ANSI escapes that repaint the operator's terminal (same shape S8 review caught for other surfaces). All six `stderr(...)` call sites now route through `sanitizeOneLineForDisplay`; the harness loop's `verify_semantic_poll_unhandled` line goes through `redactSecrets`.
+
+- **F15 — state filter in scheduler.** Already-`quarantined` / `invalidated` / `evicted` memories were re-verified on every step, wasting LLM budget on outcomes the lifecycle had already decided. Now skipped with cursor advance.
+
+- **F16 — strip unimplemented policy hint.** `/memory governance status` said "no (default; pass --memory-verify-llm or set policy)" but `[memory.verify].llm` policy was never parsed. Stripped the misleading "or set policy" — opt-in is CLI-flag only in V1.
+
+- **F17 — `verify_skipped` stderr line.** TODO T11.2 promised it; pre-fix silent. Now emits `memory: verify_skipped: <scope>/<name>: injection_detected | stale_snapshot` so opt-in operators see WHY the judge never fires on a memory they expected verified.
+
+- **F18 — `recordAttempt` FK race protection.** Concurrent session purge could delete the child's `subagent_runs` row between `runSubagent` returning and the attempt INSERT — the FK threw `SQLITE_CONSTRAINT_FOREIGNKEY`. Now caught + retried with `subagentRunSessionId: null` so the dedup cache entry still lands (forensic detail about the run is lost, but the cache value matters more for the next dispatch).
+
+**Test footprint:** +15 tests across four files.
+
+- `tests/memory/verify-semantic-scheduler.test.ts` (+5): F2 excluded-scope skip, F4 out-of-order dedupe regression, F13 peek=malformed stderr, F15 quarantined skip, F17 verify_skipped emission.
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+2): F8 non-existent path → malformed, F8 absolute path → malformed.
+- `tests/subagents/load.test.ts` (+5 in new `loadSubagents (S11 builtin scope)` describe): builtin loads from real ship dir, builtinDir=null disables, project shadow of protected builtin surfaces, user shadow of protected builtin surfaces, user shadow of unprotected builtin stays silent.
+- `tests/cli/args.test.ts` (+3): `--memory-verify-llm` parses, defaults undefined, F12 conflict with `--subagent-session-id` rejected.
+
+Plus the pre-existing dispatcher / scheduler / repo test files updated where the new behavior changed assertions (the F5 sub-threshold test re-pinned to expect a `rejected` proposal landed, F3 cost cap test arithmetic adjusted for the headroom-aware threshold).
+
+Full suite: **8484 pass / 0 fail / 10 skip** (+15 vs S11 baseline of 8469, +62 vs S8 baseline of 8422).
+
+**Falsely-positive review findings (documented for posterity):**
+
+- "Parallel-poll race within one session" — confirmed not possible (loop single-threaded + await sequential).
+- "Cost cap when result.costUsd === 0 allows infinite dispatches" — dispatch counter increments regardless, so dispatch cap bounds zero-cost loops.
+
+**Deferred (tracked):**
+
+- Compile-safe builtin distribution via TS const embedding (F6 partial). Today's loader works in dev mode; compiled binaries need either Bun text imports or an embedded-definition fallback. The runtime-side surface emits a loud `verify_semantic_disabled` stderr when opt-in is set without a resolvable definition.
+
+## [2026-05-17] feat(memory) — S11 LLM-judge `verify_failed` detector
+
+Second slice of Phase 2 on `feat/memory-governance-llm`. The S2 heuristic was rolled back months ago; until S11, `verify_failed` lived as a trigger name + audit filter with no detector behind it. This slice ships the actual detection pipeline: a sandboxed subagent reads the repository and decides whether each exposed factual memory still agrees with the code.
+
+**Auto-trigger, opt-in.** `--memory-verify-llm` defaults off (zero LLM cost in default-driver sessions). When the operator opts in, the harness loop runs a scheduler tick at each step boundary — polls `memory_provenance` for newly-exposed `type: project` / `reference` memories, dispatches AT MOST ONE verification per poll through the gate sequence below.
+
+Shipped (T11.1 → T11.13):
+
+- **Migration 057** `memory_verify_attempts` (`src/storage/migrations/057-memory-verify-attempts.ts`). Content-addressed cross-session dedup cache. Schema: `(scope, name, content_hash, verdict, confidence, model_id, prompt_hash, subagent_run_session_id, attempted_at)`. Verdict CHECK + confidence CHECK + indexes for `(scope, name, content_hash, attempted_at DESC)` dedup queries and `(attempted_at)` retention. FK `subagent_run_session_id → subagent_runs(session_id) ON DELETE SET NULL` (subagent_runs PKs on session_id, not on a separate id column — initial draft used the wrong column and broke every FK test until corrected mid-slice).
+
+- **Repo `memory-verify-attempts.ts`.** `recordAttempt` validates the input shape (scope, verdict, confidence range, non-empty model/prompt hashes); `lookupRecentAttempt` enforces the dedup semantic — `contradicted` ALWAYS re-dispatches (high-stakes; cheap re-confirmation), `passed` / `inconclusive` dedup for 7d (`SEMANTIC_VERIFY_DEDUP_WINDOW_MS`); `listRecentAttempts` for `/memory governance status`; `pruneVerifyAttempts` for the 90d retention sweep.
+
+- **HarnessConfig flag + CLI plumbing.** `memorySemanticVerify?: boolean` on `HarnessConfig` (default off; subagent children don't inherit — top-level only, avoids recursive verification). `--memory-verify-llm` argv flag in `args.ts`, threaded through `bootstrap.ts` into the config.
+
+- **Tunables in `src/memory/verify-semantic.ts`.** `SEMANTIC_VERIFY_MIN_CONFIDENCE = 0.7`, `MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION = 10`, `MEMORY_VERIFY_SEMANTIC_MAX_COST_USD = 0.50`, `SEMANTIC_VERIFY_ELIGIBLE_TYPES = ['project', 'reference']`. Constants live in a substrate module so `/memory governance status`, tests, and policy all share one import surface.
+
+- **Built-in subagent loader.** New `src/subagents/builtin/` directory + `loadBuiltinSubagents` flow inside `loadSubagents`. Precedence: project > user > builtin (user/project override built-ins SILENTLY — the shadow surfacing pattern reserved for user/project conflicts where the operator authored both). `SubagentScope` extended to include `'builtin'`; the storage-side `subagent_runs.scope` CHECK still constrains `('user','project')`, so `runtime.ts` maps `'builtin' → 'user'` when inserting the audit row (documented as inherited drift; widening the CHECK is a separate migration).
+
+- **`verify-semantic.md` definition** (`src/subagents/builtin/verify-semantic.md`). Tools: `read_file`, `grep`, `glob`, `memory_read` (read-only — no writes, no bash). Output schema: `{verdict, confidence, claim_extracted, ground_truth_observed, evidence_paths}`. Budget: `max_steps: 15, max_cost_usd: 0.10`. System prompt frames the memory body as adversarial input, requires honest calibration of confidence, and rejects contradicted verdicts that omit evidence_paths (hallucination guard).
+
+- **Dispatcher core** (`src/memory/verify-semantic-dispatcher.ts`). Five-step per-memory orchestrator: (1) `scanForInjection` short-circuits BEFORE the spawn (hostile bytes never reach the judge); (2) `lookupRecentAttempt` short-circuits BEFORE the spawn (content-addressed dedup); (3) `runSubagent` with the verify-semantic definition; (4) `parseOutputAsObject` + JSON-schema validation (verdict enum / confidence range / contradicted-requires-evidence_paths); (5) `recordAttempt` always (suppresses re-dispatch within the dedup window), AND only when `verdict === 'contradicted' AND confidence >= SEMANTIC_VERIFY_MIN_CONFIDENCE` does it emit a `quarantine` governance proposal via S8 (with stable evidence-essence so two contradictions collide on the partial UNIQUE fingerprint).
+
+- **Scheduler** (`src/memory/verify-semantic-scheduler.ts`). Created once per top-level session when opt-in is set AND the verify-semantic definition resolved. `poll()` queries `listSessionExposuresSince(cursorAt)`, dedups by (scope, name), and walks candidates applying the gate sequence: cost / dispatch cap latch (`capExhausted`), type gate (only project / reference), pending-proposal short-circuit (skips memories with an active quarantine proposal — saves the LLM cost since the fingerprint UNIQUE index would refuse the INSERT anyway), then dispatch. ONE real dispatch per poll (single-shot keeps the per-step LLM cost predictable). Cursor advances incrementally per consumed candidate so unprocessed siblings survive into the next poll; counters.lastPolledAt always advances per poll attempt regardless.
+
+- **Wire-up in `src/harness/loop.ts`.** Scheduler instance declared in the outer try scope, constructed once after `sessionId` resolves, polled at end of each step iteration (after compaction's cost cap check; before next iteration's signal/cap checks), shutdown in the outer finally. Subagent children skip creation (`config.subagentDepth ?? 0 === 0` guard) — no recursive verification, no scheduler ticks inside the verify-semantic child itself.
+
+- **`/memory governance status` subcommand** (`src/cli/slash/commands/memory.ts:handleGovernanceStatus`). Read-only inspector: shows enabled state, configured caps, dedup window, last 10 attempts cross-session (model + verdict + confidence + scope/name). The slash can't reach the live scheduler instance, so counters come from `listRecentAttempts` — operator reconstructs "what the verifier has been doing" from substrate, not in-memory state.
+
+- **Provenance helper** `listSessionExposuresSince` (`src/storage/repos/memory-provenance.ts`). Cross-session exposures since a timestamp cutoff; the scheduler's primary query.
+
+- **Subagent storage scope mapping.** `runtime.ts:insertSubagentRun` maps `definition.scope === 'builtin' → 'user'` so the migration-012 CHECK constraint (`scope IN ('user','project')`) doesn't reject built-in subagent rows. Documented as inherited drift; widening the CHECK is a separate spec amendment.
+
+**Test footprint:** +47 tests across three new files + one extension.
+
+- `tests/storage/memory-verify-attempts.test.ts` (+21): repo validation, DB CHECK bypass coverage (verdict / confidence / attempted_at), dedup semantics (contradicted always re-dispatches, window boundary exclusive, content_hash discrimination, windowMs override), `listRecentAttempts` ordering + limit, `pruneVerifyAttempts` cutoff semantics.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+10): injection pre-check short-circuits BEFORE spawn, dedup cache hit short-circuits BEFORE spawn, malformed YAML / hallucination guard / spawn_failed mapping, `runSubagent` throws → spawn_failed, passed verdict = attempt only, contradicted high-confidence = attempt + proposal, contradicted low-confidence = attempt only, two contradicted dispatches collapse to one pending proposal via fingerprint dedup.
+
+- `tests/memory/verify-semantic-scheduler.test.ts` (+13): undefined definition / shutdown / no exposures no-op, type gate (user/feedback rejected, project/reference accepted), pending-quarantine-proposal short-circuit, one dispatch per poll with two eligible memories, intra-poll dedupe by (scope, name), dispatch cap fires + latches, cost cap fires + latches, lastPolledAt advances per poll.
+
+- `tests/cli/slash/memory.test.ts` (+3): `/memory governance status` disabled by default + caps rendering + empty hint, enabled state, unexpected arg refused.
+
+Full suite: **8469 pass / 0 fail / 10 skip** (+47 vs S8 baseline of 8422).
+
+**What S11 does NOT do (deferred):**
+
+- **Consolidation** (N similar memories → 1). Subagent infrastructure built here is the building block for Slice 10; the consolidation prompt + flow lands separately.
+- **Conflict detection between memories** (pairwise). Slice 13 — different subagent (`verify-conflict.md`), pair-selection scheduler with BM25 prefilter to avoid O(N²) dispatch.
+- **Drift detection across time** (memory written 90 days ago, codebase migrated since). Requires cross-session subagent infrastructure that doesn't exist today.
+
+## [2026-05-17] hardening(memory) — S8 governance post-review (critical + medium + test gaps)
+
+Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 12 real findings on S8 after the initial slice landed. All closed in this pass.
+
+**Critical fixes (would bite in production):**
+
+- **F1 — nested transaction safety.** `recordProposal` opened BEGIN/COMMIT manually. Inside another `withTransaction`, the nested BEGIN throws and the catch's ROLLBACK unwinds the OUTER transaction. Replaced with `withTransaction(db, fn)` which uses bun:sqlite's SAVEPOINT shape — nests safely. Test: a recordProposal inside withTransaction now leaves an unrelated outer-txn UPDATE committed.
+
+- **F4 — `rejectProposal` race-aware.** Apply path's error branches called `rejectProposal` but ignored its boolean return. A proposal flipped between `getProposalById` and `transitionMemoryState` (e.g. by the TTL sweep) would silently no-op the rejection UPDATE while the caller returned `outcome: 'rejected'` — pure drift between result and persisted state. Introduced `concludeRejection` helper that checks the return; on no-op, re-reads and surfaces `outcome: 'already_decided'` with the actual `currentStatus` / `decidedBy`. All 10 rejection call sites converted. Test: pre-decide a row to `'expired'` (race simulation) then trigger an error branch; result now correctly says `already_decided`, currentStatus=expired, decidedBy=`system:ttl`.
+
+- **F5 — `audit_drift` posture reworked.** Previous shape left the proposal pending hoping a retry would land — but the retry hits the staleness gate (the frontmatter rewrite mutated the canonical bytes) and auto-rejects forever as `system:stale_evidence`. Permanent dead row. Correct posture: the memory IS in the target state on disk, so the proposal IS applied from the operator's perspective. Mark `applied` with `decidedReason` flagging the missing audit row, emit `memory: AUDIT DRIFT` stderr alert with the proposal id, synthesize sentinel `evictionEventId = audit-drift:<proposalId>` so callers can grep this prefix to distinguish from real eviction rows.
+
+- **F3 — `restore` reads from `.tombstones/`.** Apply path's staleness gate called `registry.read` which only looks at the scope root; for evicted source the body lives in `.tombstones/`. Every restore-from-evicted proposal auto-rejected as `system:stale_evidence` — `restore` kind was mechanically broken. Added tombstone fallback gated on `kind === 'restore'` via `findLatestTombstone` + `parseMemoryFile`. The other kinds (quarantine etc.) keep the strict scope-root semantics. Quarantined→active restore (body still at scope root) was the only path that happened to work pre-fix and is unchanged. Spec divergence (`MEMORY.md §6.5.5` says restore→`proposed`, not `active`) replicates inherited drift from `/memory restore` slash and is flagged for a separate spec-PR-first cleanup.
+
+**Medium fixes:**
+
+- **F2 — canonical `evidenceEssence` default.** Old default `JSON.stringify(input.evidence)` is JS-key-order-dependent (insertion order); two detectors emitting equivalent evidence in different field orders would compute different fingerprints and the silent-dedup gate would never fire. Added recursive `canonicalJsonStringify` (sorts object keys, preserves array order) as the new default. Test: two proposals with the same fields in different orders now dedup correctly.
+
+- **F6 — `target_payload.motivo` / `target_payload.trigger` validation.** Both fields reached `transitionMemoryState` unvalidated. `motivoForKind` cast unknown strings to `EvictionMotivo` and surfaced as `illegal_transition` later (less informative). `trigger` accepted arbitrary strings into the TEXT column that has no CHECK — a malicious detector could poison the audit trail with ANSI escapes, oversize strings, control chars. Both helpers now return `ResolvedMotivo` / `ResolvedTrigger` discriminated unions; invalid override → `concludeRejection` with `system:invalid_evidence`. Trigger regex: `[A-Za-z0-9_-]{1,64}`. Motivo: against the `MOTIVOS` Set.
+
+- **F7 — staleness gate uses `peek` (not `read`).** Pre-fix every apply attempt — including auto-rejected ones — emitted `memory_events action=read` + a `memory_provenance` row for every source memory. Audit / detector-quality queries would over-count "model saw this memory" by the rejection rate. Switched to `registry.peek` since the staleness check is internal verification, not a model-visible read.
+
+- **F8 — slash output sanitization.** Operator-supplied `--reason` and DB-sourced `proposed_by` / `decidedReason` / `decidedBy` were echoed verbatim to scrollback. Hostile detector embedding ANSI in `proposed_by` (or operator passing `--reason $'\x1b[2J'`) could repaint the trust modal / clear the operator's terminal. Added `displayGov` helper wrapping `sanitizeOneLineForDisplay` over every dynamic external string in `formatProposalLine`, `renderProposalDetail`, and the 4 handler error/note surfaces. Audit row keeps the original bytes (forensic value); only display is sanitized.
+
+- **F9 — removed dead bulk modal.** The `>= 3 memories → modal confirm` branch in `handleGovernanceApprove` is unreachable: the apply path's single-memory gate (V1) rejects multi-memory proposals before the modal would fire. Removed the dead code, left a comment for re-introduction when `merge`/`consolidate` apply primitives ship. Doc §11.3 updated.
+
+- **F10 — audit lineage extended with provenance.** `/memory governance audit <id>` only read `memory_events`; TODO T8.5b promised 4-table lineage. Added `listGlobalProvenanceForMemory` lookup per source memory, surfaced as a separate `exposures (N):` section. `eviction_events` JOIN via `evidence_json LIKE` deferred (fragile against JSON serialization; needs a dedicated index for it to be hot-path safe).
+
+**Test footprint:** +43 tests across the three S8 test files.
+
+- `tests/storage/memory-governance.test.ts` (+14): DB-level CHECK bypass (kind / status / decided_at); FK SET NULL on session purge; empty `proposedBy`; non-positive `createdAt`; invalid memory scope; duplicate-key UNIQUE constraint at the keys table; PRIMARY KEY collision with caller-supplied id; `listProposals` null-session filter; `listPendingProposalsForMemory` scope isolation; nested-transaction safety (F1); key-order-stable default essence (F2); pinned fingerprint hex for canonical input.
+
+- `tests/memory/governance.test.ts` (+15): confidence at exactly threshold; `confidenceThreshold` override (loose + strict); restore from tombstone with real `active→quarantined→evicted` chain via same-chain bypass; restore with no tombstone exists; `blocked_by_hook` mapping; `blocked_by_protection` documented (apply path's `actor='user'` bypasses protection by spec — pinning the architectural decision); invalid `motivo` override; invalid `trigger` override with ANSI; `target_payload.trigger` override propagation; unknown `proposedBy` prefix fallback to `operator_driven`; `buildEvidence` ordering pins detector evidence can't spoof the operator-driven trace markers; race-aware reject path (F4); peek-not-read (F7); audit_drift posture sentinel (F5).
+
+- `tests/cli/slash/memory.test.ts` (+14): approve/reject/audit arg-validation (missing id, too-many args, unknown id); `--reason` without value; ANSI sanitization in proposed_by via raw INSERT (F8); ANSI sanitization in operator `--reason` (F8); ANSI sanitization in id arg (F8); approve rejection reasons coverage (`stale_evidence`, `unimplemented_kind`, `multi_memory_unsupported`); audit lineage surfaces `memory_provenance` entries (F10).
+
+Full suite: 8422 pass / 0 fail / 10 skip (+43 vs the S8 baseline of 8379).
+
+**Falsely positive review findings (documented for posterity):**
+
+- "Same-state pseudo-transition leaves drift between governance + eviction substrates" — by spec, `trigger_fired_no_action` rows in `eviction_events` are exactly the "we tried but didn't move state" audit signal. Pairing with a `rejected` governance row is two substrates honestly auditing two different aspects.
+- "Trust untrusted cwd lost between detector and apply" — concerns Phase 2 / S11 (subagent injection surface), not S8 substrate.
+
+## [2026-05-17] feat(memory) — S8 governance proposal substrate (Phase 2 opens)
+
+First slice of Phase 2 (`feat/memory-governance-llm`, branched off `feat/memory` after the Phase 1 merge). Lands the propose-not-mutate substrate every LLM-judge detector (S11 verify_failed, S13 conflict_detected) and the deterministic counter (S3 user_override_repeated) will hang off of. Zero LLM cost in S8 itself — this is the spine, not a detector.
+
+Shipped (T8.1 → T8.7):
+
+- **Migration 056** (renumbered from the TODO's draft 055 — that slot was already taken by `shared-corpus-trust` in Phase 1). Parent `memory_governance_proposals` with all six kinds in CHECK (`quarantine`, `restore`, `demote`, `merge`, `consolidate`, `expire`), UNIQUE partial index on `proposal_fingerprint WHERE status='pending'` for silent dedup, `source_memory_snapshots` JSON for the staleness gate. Auxiliary `memory_governance_proposal_keys` (FK CASCADE) is the per-memory index that backs `listProposalsForMemory` without JSON LIKE'ing into the parent column.
+
+- **Repo `src/storage/repos/memory-governance.ts`.** `recordProposal` validates kinds/scopes/snapshot bijection/confidence in `[0,1]`, computes the fingerprint (`SHA-256(kind, sorted source keys, evidence_essence)`), INSERTs parent + keys in one transaction, catches `SQLITE_CONSTRAINT` from the partial UNIQUE and returns the existing pending row's id with `deduped: true`. Listings (`listProposals`, `listPendingProposals`, `listProposalsForMemory`, `listPendingProposalsForMemory`) all take explicit limits; the JOIN-backed memory lookups serve the S11 pre-dispatch dedup guard cheaply. `decideProposal` is `status='pending'` gated + idempotent; `expirePendingProposals` is the bulk TTL sweep.
+
+- **Apply path `src/memory/governance.ts:applyProposal`.** Five sequential gates: existence + status, confidence (`DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD = 0.7`; NULL bypasses for operator/deterministic proposals), kind support (V1 implements `quarantine` + `restore`; other kinds reject with `system:unimplemented_kind`), single-memory only (multi-memory keys reserved for `merge` / `consolidate`), staleness (every snapshot must match the current `hashMemoryContent(serializeMemoryFile(file))`; drift wins over state_change in the rejection reason — if the operator edited the body since the proposal, the decision is "evidence stale" not "state changed"). After the gates pass, `transitionMemoryState` runs with `actor: 'user'` (operator approval IS the user action), motivo defaulted per kind (`quarantine → conflict`, `restore → shift`; `target_payload.motivo` overrides), trigger derived from `proposed_by` (`subagent:verify-semantic` → `verify_failed`, etc.) with `target_payload.trigger` override, and an evidence payload carrying `_operator_driven`, `proposal_id`, `proposed_by`, `proposal_fingerprint`, and `detector_evidence`. State-machine refusals (illegal_transition, blocked_by_protection, blocked_by_hook, invalid_evidence) all map to a rejection on the proposal with the matching reason; `io_error` and `audit_drift` leave the proposal pending so a retry can land cleanly.
+
+- **TTL sweep** wired in `bootstrap.ts` between `pruneMemoryProvenance` and the shared-corpus trust probe. Default `GOVERNANCE_PROPOSAL_TTL_MS = 30d`; sweep updates `status='expired'` with `decided_by='system:ttl'`. Best-effort with `AUDIT DRIFT` stderr on failure, same posture as the provenance sweep.
+
+- **Slash `/memory governance`** with five subcommands: `list [--status <s>] [--limit N]`, `show <id>`, `approve <id>` (modal confirm when affecting ≥3 memories), `reject <id> [--reason "..."]`, `audit <id>` (proposal detail + lineage from `memory_events` filtered by source scope/name + post-proposal timestamp). Strict arg validation refuses unknown flags / missing ids / extra positionals.
+
+- **`docs/MEMORY.md` §11.3** documents the substrate end-to-end: why a separate table (mutable status semantic doesn't fit append-only audit), the six kinds + what V1 actually executes, schema fields, the five apply-path gates, TTL semantics, operator surface, and what proposals deliberately do NOT do (mutate state without approval, bypass the state machine, replace direct `/memory quarantine` flows). §11 (tables) extended from 3 to 4. §14.4 "What IS shipped" lists the new slice and how it slots in front of S11/S13.
+
+- **TODO**: Slice 8 marked ✅ done with task-level state; dependency graph + recommended order updated; migration number correction noted (055 → 056).
+
+Test footprint: 67 new tests across three files — 27 (`tests/storage/memory-governance.test.ts`) cover the repo + schema CHECK + FK CASCADE; 16 (`tests/memory/governance.test.ts`) cover the apply path end-to-end with real FS fixtures (pre-flight gates each exercised; happy quarantine path asserts on-disk frontmatter mutation + paired eviction_events row + trace fields; restore happy path; same-state pseudo-transition rejected as state_change; hook fires when wired; `target_payload.motivo` override); 24 (`tests/cli/slash/memory.test.ts`) cover the five subcommands + arg validation + dispatcher errors.
+
+Full suite: 8379 pass / 0 fail / 10 skip (+84 vs the Phase 1 baseline of 8295).
+
+Phase 2 remainder (S3, S11, S13) can ship in any order on top of S8; LLM-judge slices add the injection-aware subagent infrastructure on top of the foundation that landed here.
+
 ## [2026-05-17] fix(memory) — Filter excluded scopes before applying search limit
 
 Review observation: `createScopeFilteredRegistry.search` post-filtered hits AFTER `base.search` returned. The base loop enforces `limit` while iterating in precedence order (`project_local` > `project_shared` > `user`); when `project_shared` was excluded and `limit` was small (e.g., 1), the shared match was picked first, filled the cap, and stopped the loop before any allowed-scope sibling was considered. The wrapper then dropped the shared hit and returned `[]` — silently losing the permitted memory. Same precedence-fallback bug pattern the previous `ListOptions.excludeScopes` fix addressed for `list`, just on the search surface.
