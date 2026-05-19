@@ -210,35 +210,59 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
 | **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
 
-#### 2.1.1 Schema do `config.toml` scaffoldado por `agent init`
+#### 2.1.1 `config.toml` — scaffold slim + schema reference
 
-`agent init` escreve `.agent/config.toml` **com todas as entradas comentadas** — o arquivo é no-op até o operador descomentar uma chave. Defaults reais vivem em código (loaders em `src/critique/config-loader.ts`). Postura deliberada: o scaffold serve de documentação inline; nada em `config.toml` muda comportamento até o operador editar.
+`agent init` escreve um `.agent/config.toml` **slim**: apenas um header apontando pra esta seção, sem exemplos inline. Discovery do schema fica aqui, não no arquivo.
+
+**Scaffold literal** (o que o `init` materializa em `.agent/config.toml`):
 
 ```toml
-# .agent/config.toml — Forja per-project config (auto-scaffolded; safe to edit).
+# .agent/config.toml — Forja per-project config (safe to edit).
 #
-# Spec: AGENTIC_CLI.md §2.1.1 (this schema) + §8 (hierarchy).
+# Schema: AGENTIC_CLI.md §2.1.1.
 # Resolution order: enterprise → user (~/.config/agent/config.toml) →
 # project (this file) → session (CLI flag).
-
-# [memory] — three LLM-judge governance detectors, all default ON.
-# Uncomment a key to disable the corresponding detector for this project.
 #
-# [memory]
-# verify_semantic_llm = false   # S11: post-write semantic verification
-# conflict_detect_llm = false   # S13: cross-memory conflict detection
-# override_detect_llm = false   # S3: repeated-override threshold detector
-
-# [critique] — write-time self-critique. Default mode = off.
+# This file is empty by design. Add a [memory] or [critique] section
+# to override loader defaults for this project. See the spec for the
+# full toggle list; defaults live in code (src/critique/config-loader.ts).
 #
-# [critique]
-# mode = "on_writes"            # off | on_writes | always
-# threshold = 0.65              # 0..1; severity threshold to surface
-# model = "anthropic/claude-haiku-4-5"
-# prompt_version = "v1"
+# Note: `/memory governance enable|disable` rewrites this file and
+# normalizes formatting (comments NOT preserved). Hand-edits to
+# inactive sections survive; comments do not. Keep notes in the
+# spec or your team's docs, not inline here.
 ```
 
-Seções futuras (`[providers]`, `[telemetry]`, …) entram aqui pelo mesmo padrão: template scaffoldado comentado, defaults em código. Schema-creep no template é aceitável (custo: token bloat no editor do operador); schema-creep nos defaults em código requer PR contra esta seção primeiro.
+**Por que slim e não rico-com-comentários.** O slash `/memory governance enable|disable verify|conflict|override|all` reescreve `config.toml` por round-trip (parse → mutate → emit), e `Bun.TOML.parse` não preserva comments. Um scaffold rico em comentários **perderia toda a documentação inline na primeira invocação do slash** — exatamente quando o operador acabou de aprender a usá-lo. Discovery via spec evita essa falsa promessa.
+
+**Schema reference** — o conjunto canônico de toggles que `config.toml` aceita. Defaults reais vivem em código (`src/critique/config-loader.ts`); a tabela abaixo é descritiva, não normativa pro template:
+
+```toml
+# [memory] — three LLM-judge governance detectors, all default ON.
+# Setting a key to `false` DISABLES the corresponding detector for
+# this project. Disabling does NOT delete past events or proposals;
+# it only stops the scheduler from dispatching new ones.
+
+[memory]
+verify_semantic_llm = false   # S11: post-write semantic verification
+conflict_detect_llm = false   # S13: cross-memory conflict detection
+override_detect_llm = false   # S3: repeated-override threshold detector
+
+# [critique] — write-time self-critique. Default mode = off.
+# Setting `mode` to a non-`off` value ACTIVATES critique with the
+# remaining fields. 'on_writes' fires only on edits; 'always' fires
+# on every assistant turn. Model + prompt_version are illustrative —
+# check `src/critique/config-loader.ts` for the current canonical
+# defaults before adopting verbatim.
+
+[critique]
+mode = "on_writes"            # off | on_writes | always
+threshold = 0.65              # 0..1; severity threshold to surface
+model = "anthropic/claude-haiku-4-5"
+prompt_version = "v1"
+```
+
+Seções futuras (`[providers]`, `[telemetry]`, …) entram aqui pelo mesmo padrão: **schema reference aqui no spec, scaffold mantém-se slim**. Schema-creep no `[…]` reference é aceitável (custo: linhas de spec); schema-creep nos defaults em código requer PR contra esta seção primeiro.
 
 ### 2.2 Composição (Unix philosophy)
 

@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — slim the scaffolded `config.toml` to a spec-pointer
+
+In-flight regression in the unified-init slice surfaced during review of the post-work entry below. The rich 30-line `config.toml` template that `agent init` shipped (per the earlier §2.1.1 schema) **looked like inline documentation but was a false promise**: `/memory governance enable|disable verify|conflict|override|all` rewrites the file via `Bun.TOML.parse → mutate → emitTomlDoc` (`src/cli/slash/commands/memory.ts:3118-3181`), and Bun's TOML parser does not preserve comments. The first slash-command toggle would silently delete every line of the scaffolded inline doc — exactly when the operator first acted on the file they had just learned to read.
+
+**Fix.** Slim the scaffolded `config.toml` to a 13-line spec-pointer header. Discovery moves from the file to `AGENTIC_CLI.md §2.1.1`, which now splits explicitly into:
+
+1. **Scaffold literal** — the exact 13-line slim header that `agent init` writes. The spec block here matches the renderer byte-for-byte (pinned by the snapshot/contains tests).
+2. **Schema reference** — a separate code block listing every available toggle (`[memory]` 3 detectors, `[critique]` 4 keys) with example values, marked as descriptive (not what's in the file).
+
+**Behavioral promise the slim scaffold can keep:** the scaffolded file's comments inform the operator (a) where the schema lives (spec link inline), (b) that the file is empty by design, (c) that `/memory governance` round-trips and loses comments — so the operator decides BEFORE a toggle whether to keep hand-edits inline. The slash-command path's existing parse-emit round-trip stays untouched.
+
+**Alternatives considered and rejected:**
+
+- **Refactor slash command to text-splice the `[memory]` block** instead of round-tripping. Would preserve comments at the cost of reverting the deliberate robustness call documented at `src/cli/slash/commands/memory.ts:3118-3134` (round-trip handles multi-line strings, BOM, `\r\n`, quoted keys, nested-lookalikes inside strings — text-splice fails on each).
+- **Sidecar `config.example.toml`** that ships rich docs and `config.toml` stays empty. Two files for one purpose; operator confusion likely.
+- **Accept the loss + document it inline.** Self-defeating: the warning would itself be a comment, deleted by the first slash toggle.
+
+The slim scaffold buys back the discovery layer at the cost of one extra click (operator → spec) when learning the schema. The cost surfaces at first use; the prior design's cost surfaced silently at FIRST WRITE, which is a worse failure mode.
+
+**Tests rewritten:** `tests/cli/init-config-template.test.ts` drops the per-section/per-key `toContain` assertions (those would couple the test to inline schema content the slim scaffold deliberately omits) and adds `toContain('comments NOT preserved')` to pin the round-trip warning. `tests/cli/init.test.ts` config-step assertions adapted: `[memory]`/`[critique]` checks dropped in favor of empty-TOML-parse + spec-ref-presence. 186 tests pass across affected files; typecheck + lint clean.
+
 ## [2026-05-19] feat(cli) — unified `agent init` scaffolding (post-work)
 
 Closes the pre-work entry below. Two commits on `feat/init-unified-scaffold`:

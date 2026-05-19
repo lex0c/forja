@@ -1,55 +1,37 @@
 // Template for `.agent/config.toml` written by `agent init`.
 // Spec: AGENTIC_CLI.md §2.1.1.
 //
-// Posture: every key is commented out. The scaffolded file is a no-op
-// until the operator uncomments a value. Real defaults live in loader
-// code (currently `src/critique/config-loader.ts`); the template is
-// documentation that becomes config when edited.
+// Posture: the scaffolded file is a slim spec-pointer, NOT inline
+// documentation. The operator opens the file, sees where the schema
+// lives, and edits from there. Rich per-toggle documentation lives
+// in AGENTIC_CLI.md §2.1.1 (schema reference) — not in this string.
 //
-// Why scaffold a file that does nothing on its own?
+// Why slim? `/memory governance enable|disable` rewrites this file
+// via TOML round-trip (parse → mutate → emit), and `Bun.TOML.parse`
+// does not preserve comments. If we shipped a richly-commented
+// scaffold, the first slash-command toggle would silently delete
+// every line of inline documentation. The operator would lose
+// discovery exactly when they first acted on the file. Slim
+// scaffold avoids the false promise: the docs live in the spec
+// where comments do not get rewritten by the toggle path.
 //
-//   1. Discovery — the operator opens `.agent/config.toml` and sees
-//      every available toggle with a short explanation, instead of
-//      grepping the source to learn the schema.
-//   2. Tracked surface — the file lives in version control, so
-//      enabling a toggle for the team becomes a diffable PR rather
-//      than a configuration ritual whispered over Slack.
-//
-// Schema-creep in this template is acceptable (cost: token bloat in
-// the operator's editor). Schema-creep in the loader's default
-// behavior requires a PR against `AGENTIC_CLI.md §2.1.1` first.
+// Adding values to this scaffold (e.g., as defaults for new
+// installs) requires a PR against AGENTIC_CLI.md §2.1.1 first —
+// the spec lists the literal scaffold AND the schema reference.
 
 export const renderInitConfigTemplate =
-  (): string => `# .agent/config.toml — Forja per-project config (auto-scaffolded; safe to edit).
+  (): string => `# .agent/config.toml — Forja per-project config (safe to edit).
 #
-# Spec: AGENTIC_CLI.md §2.1.1 (this schema) + §8 (hierarchy).
+# Schema: AGENTIC_CLI.md §2.1.1.
 # Resolution order: enterprise → user (~/.config/agent/config.toml) →
 # project (this file) → session (CLI flag).
 #
-# All keys below are commented out. Defaults live in code; this file
-# is documentation. Uncomment a key to override that default for
-# this project.
-
-# [memory] — three LLM-judge governance detectors, all default ON.
-# Uncommenting a key DISABLES the corresponding detector for this
-# project. Disabling does NOT delete past events or proposals; it
-# only stops the scheduler from dispatching new ones.
+# This file is empty by design. Add a [memory] or [critique] section
+# to override loader defaults for this project. See the spec for the
+# full toggle list; defaults live in code (src/critique/config-loader.ts).
 #
-# [memory]
-# verify_semantic_llm = false   # S11: post-write semantic verification
-# conflict_detect_llm = false   # S13: cross-memory conflict detection
-# override_detect_llm = false   # S3: repeated-override threshold detector
-
-# [critique] — write-time self-critique. Default mode = off.
-# Uncommenting the block below ACTIVATES critique with the example
-# values shown. 'on_writes' fires only on edits; 'always' fires on
-# every assistant turn. Model + prompt_version below are illustrative;
-# check src/critique/config-loader.ts for the current canonical
-# defaults before adopting verbatim.
-#
-# [critique]
-# mode = "on_writes"            # off | on_writes | always
-# threshold = 0.65              # 0..1; severity threshold to surface
-# model = "anthropic/claude-haiku-4-5"
-# prompt_version = "v1"
+# Note: \`/memory governance enable|disable\` rewrites this file and
+# normalizes formatting (comments NOT preserved). Hand-edits to
+# inactive sections survive; comments do not. Keep notes in the
+# spec or your team's docs, not inline here.
 `;
