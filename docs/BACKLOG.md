@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] hardening(config) — full audit of config↔runtime divergence for budget/critique knobs
+
+Self-prompted audit after the `max_step_stall_ms = 0` fix: systematic check of every operator-tunable numeric field in `[budget]` and `[critique]` against its runtime consumer, looking for the same shape of bug (validator forbids what the runtime supports). Results:
+
+| Field | Status | Notes |
+|---|---|---|
+| `max_steps`, `max_wall_clock_ms` | ✓ correct | `min: 1` guards footgun ("operator typed 0 expecting unlimited gets aborted-on-turn-1") |
+| `max_step_stall_ms` | ✓ fixed in prior commit | runtime `<= 0` disables; validator now `min: 0` |
+| `max_cost_usd` | ⚠ divergence documented | runtime 3-state (absent/undefined/number); TOML can't express undefined; **workaround**: `max_cost_usd = 999999999` (functionally no-cap) or session-only `/budget cost off`; we deliberately do NOT add a `-1` sentinel or `disable_cost_cap = true` flag (typed-system anti-pattern for a niche case with working workarounds) |
+| `compaction_threshold` | ✓ correct | runtime: `usagePct >= threshold`; endpoints 0 (always compact) and 1 (effectively disable, math-naturally) are both legitimate; range `[0, 1]` matches |
+| `compaction_preserve_tail` | ✓ correct | runtime: 0 still preserves trailing assistant+tool_result pair (`harness/types.ts:474`); `min: 0` is intentional, marked inline |
+| `[critique].max_overhead_ms` | ✓ correct | runtime `watchdogMs > 0` arms timer (`critique/engine.ts:167`) — 0 disables; validator `>= 0` already matches |
+| `[critique].mode` / `.threshold` | ✓ correct | enum + bounded float, no hidden states |
+| `[memory]` toggles | ✓ correct | booleans, no states beyond true/false |
+| `[providers].model` | ✓ correct | registry lookup, no states |
+
+**Defense-in-depth pins added:**
+
+- `tests/critique/config-loader.test.ts` — `compaction_threshold = 0` accepted (lower endpoint); `compaction_threshold = 1` accepted (upper endpoint, effective-disable); `[critique].max_overhead_ms = 0` accepted (runtime opt-out, sibling pin to `max_step_stall_ms = 0`). All three guard against a future contributor accidentally tightening to an open interval (`(0, 1)`) or `min: 1` and silently breaking documented disable semantics.
+
+**Spec update** (`AGENTIC_CLI.md §2.1.1`) — `max_cost_usd` table row now flags the opt-out gap explicitly with workaround pointers, so an operator who needs persistent "no cap" finds the answer in the spec instead of grepping source.
+
+Net: 3 new tests (defense), 1 spec table-row clarification. No code changes — the audit confirmed the remaining 11 fields are correctly bounded. The `max_cost_usd` divergence is documented and accepted, not fixed, because the workaround paths exist and adding a sentinel would clutter schema for a niche case.
+
 ## [2026-05-19] fix(config) — `[budget].max_step_stall_ms = 0` accepted (matches runtime opt-out)
 
 `BUDGET_INT_KEYS` in `src/critique/config-loader.ts` had `min: 1` for `max_step_stall_ms`. The runtime contract (`src/harness/abortable.ts:38, :68`) explicitly uses `stallMs <= 0` as the "disable per-step watchdog" sentinel — `stallWatchdog` yields the source verbatim with no timer. An operator running long steady-streaming provider calls who set `max_step_stall_ms = 0` in `.agent/config.toml` to opt out got a "out of range [1, 3600000]" warning and the default 90s watchdog silently stayed in effect. The validator forbade what the harness supports — `config !== runtime` divergence.

@@ -376,6 +376,33 @@ max_overhead_ms = "fast"
     }
   });
 
+  test('max_overhead_ms = 0 accepted (runtime opt-out for the critique watchdog)', async () => {
+    // Sibling pin to `[budget].max_step_stall_ms = 0`. The critique
+    // engine's `buildAbortableStream` arms the watchdog only when
+    // `watchdogMs > 0` (`src/critique/engine.ts:167`) — 0 disables
+    // the per-call latency cap entirely, matching the harness's
+    // `stallMs <= 0` semantic. Operator running a slow critic
+    // model legitimately needs this. Pinned so a future tightening
+    // to `min: 1` cannot silently break the documented opt-out.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+max_overhead_ms = 0
+`,
+      );
+      const reg = stubRegistry([]);
+      const result = loadCritiqueConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.maxOverheadMs).toBe(0);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('non-string prompt_version emits a warning', async () => {
     const cwd = makeTempCwd();
     try {
@@ -1097,6 +1124,50 @@ compaction_threshold = 0.65
       );
       const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
       expect(result.config.compactionThreshold).toBe(0.65);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('compaction_threshold = 0 accepted (compact every step, lower endpoint)', () => {
+    // Endpoint pin: a future tightening to (0, 1) open interval
+    // would forbid the legitimate "always compact" sentinel — the
+    // runtime treats `usagePct >= 0` as always true.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_threshold = 0
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionThreshold).toBe(0);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('compaction_threshold = 1 accepted (effectively disable, upper endpoint)', () => {
+    // Endpoint pin: `usagePct >= 1` never fires in practice
+    // (context-window math doesn't reach exactly 100%), so 1.0 is
+    // the natural "disable compaction" sentinel.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_threshold = 1
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionThreshold).toBe(1);
       expect(result.warnings).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });

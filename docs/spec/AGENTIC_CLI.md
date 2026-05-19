@@ -251,7 +251,7 @@ max_overhead_ms = 5000
 |---|---|---|---|
 | `[providers]` | `model` | string | Fully-qualified id da entry no `createDefaultRegistry()`. Pin per-project pra CI / team não esquecer `--model`. |
 | `[budget]` | `max_steps` | int | Runaway-loop backstop (cost é o engagement gate). |
-| `[budget]` | `max_cost_usd` | float | Hard cap em USD; harness aborta logo após cruzar. Omitir a chave em sessão via `/budget cost off` (não persistido). |
+| `[budget]` | `max_cost_usd` | float `≥0` | Hard cap em USD; harness aborta logo após cruzar. **Opt-out persistente não-expressável em config.toml.** O runtime distingue 3 estados (`RunBudget.maxCostUsd` em `harness/types.ts:478`): chave ausente → default $5, valor `undefined` → opt-out (sem cap), valor número → esse cap. TOML não tem `null`/`undefined`, então config só consegue produzir os 2 primeiros via "absent" ou um número. Pra opt-out persistente, workaround é `max_cost_usd = 999999999` (functionally no-cap); pra session-only, `/budget cost off`. Não adicionamos `-1` sentinel ou `disable_cost_cap = true` porque o caso é niche + os workarounds funcionam. |
 | `[budget]` | `max_wall_clock_ms` | int | Cap de wall-clock da sessão inteira. |
 | `[budget]` | `max_step_stall_ms` | int `≥0` | Watchdog per-step; aborta o step se o provider stream silenciar tantos ms. `0` desliga o watchdog inteiro (runtime: `stallMs <= 0` em `harness/abortable.ts:68` yields source verbatim sem timer) — útil pra providers steady-streaming de long-running steps. |
 | `[budget]` | `compaction_threshold` | float `[0,1]` | Fração do context-window onde compactação dispara. |
