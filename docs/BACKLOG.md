@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] hardening(memory + cli + permissions) — Post-Phase-2 review round 3 (9 commits)
+
+Third pass of code review over the post-S3 memory governance, plus one finding outside memory in `src/permissions/protected_paths.ts` (XDG_RUNTIME_DIR socket carve-out). All landed as individual commits on `feat/memory-governance-llm` for atomic review:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `5daed95` | fix | memory | pass ctx.sessionId to recordOverrideSignal in memory-write modal branches |
+| `a5d4b6d` | docs | todo | defer scheduler abstraction refactor + cursor persistence |
+| `4231cd5` | fix | memory | bound override scheduler cursor + evidence fetch to threshold window |
+| `6762a9b` | fix | memory | blacklist failed conflict pairs in-session to break retry loop |
+| `3bfba73` | fix | memory | preserve untouched detector keys when toggling at project scope |
+| `ed6989a` | fix | cli | pipe json into recap bootstrap to suppress governance banner |
+| `3ac479c` | fix | cli | render actual scopes in subagent shadow warning |
+| `c21a279` | fix | memory | skip conflict dispatch when pair member disappeared from registry |
+| `d22a143` | fix | permissions | re-deny XDG_RUNTIME_DIR socket subpaths inside /run/user carve-out |
+
+**Themes:**
+
+- **Silent budget-leak windows in default-on detectors.** Three commits close paths where an LLM-judge detector silently drained API budget without producing the signal the operator expected. `5daed95` fixed memory-write modal rejections silently no-op'ing the S3 override signal (bootstrap-built registry has no constructor sessionId; `recordOverrideSignal` early-returned without the explicit `auditSessionId` arg). `4231cd5` fixed the override scheduler initializing cursor at epoch (drained 90d retained rows before reaching fresh threshold-tripping events) AND fetching events outside the threshold window into the LLM judge's prompt + persisted evidence. `6762a9b` fixed the conflict scheduler looping on malformed/spawn_failed pairs (dispatcher returned before writing the attempt row, scheduler retried the same failing pair on every poll until cap latch).
+
+- **Precedence / scope misattribution.** Two commits close paths where the slash command surface lied about resolved state. `3bfba73` fixed the toggle materializing all three detector keys as `true` defaults when only one was patched (silently shadowed user-config opt-outs via project precedence). `3ac479c` fixed the subagent shadow warning hardcoding `(user)` and `(project)` labels — the PROTECTED_BUILTIN_NAMES path produces shadows with `shadowed.scope = 'builtin'`, so the labels mis-stated the security warning's subject.
+
+- **Edge cases in concurrent / TOCTOU paths.** `c21a279` fixed the conflict dispatcher silently dispatching against a stale snapshot when `registry.peek` returned non-present for either pair member — the operator deleted a memory between scheduler peek and dispatch, but the LLM judge still ran and landed a quarantine proposal for the gone memory. Mirror of the S3 `target_gone` path now wired through the conflict scheduler.
+
+- **NDJSON pollution.** `ed6989a` fixed the recap CLI path not propagating `--json` into the bootstrap, so `agent recap --json` first-boot consumers saw the governance banner pollute their stream (the main run path already piped json through; the recap branch was missed).
+
+- **Permissions surface mis-narrowing (off-memory).** `d22a143` was the one finding outside the memory subsystem. `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` re-admitted ALL paths under `/run/user/<uid>`, including ssh-agent / gpg-agent sockets, user dbus, container engines, Wayland, etc. — exactly the IPC surface the `/run` deny tier was meant to block. Carve-out narrowed via a `XDG_RUNTIME_SOCKET_SEGMENTS` denylist matching the first segment after the uid directory; regular files under `$XDG_RUNTIME_DIR/<app>/` still pass.
+
+- **Architectural follow-up captured.** `a5d4b6d` deferred two refactoring items to `docs/TODO.md` (the third-round review pass made the abstraction debt visible — several fixes in this slate had to land identical edits across S11/S13/S3 schedulers): (a) extract a `createDetectorScheduler<TCandidate>` factory to collapse the ~1466 LOC three-way duplication, (b) persist scheduler cursor across process restarts so the first poll doesn't re-scan retained tables from epoch. Each entry includes a pull-in signal so the refactor doesn't land prematurely.
+
+**Verification posture.** Most fixes include a `git stash` pre-fix repro confirmation in their commit message — the test pin was checked to fail with the buggy code, prove the fix changes behavior, then validated under post-fix. This pattern surfaces over commit `4231cd5`, `6762a9b`, `3bfba73`, `3ac479c`, `c21a279`, `d22a143`. Two fixes (`5daed95`, `ed6989a`) ship without the stash repro: `5daed95`'s new test is a strict superset of the existing source-gate pin and inspects an additional field; `ed6989a` is a one-line wiring fix where the existing bootstrap-level test (line 134 of `bootstrap-memory-defaults.test.ts`) already pins the `json=true → no banner` contract.
+
+**Test deltas.** Suite went from ~8809 → ~8855 across the 9 commits (~46 new test cases dominated by `protected_paths.test.ts` +20 and the various per-fix regression pins). Typecheck + lint clean throughout. All fixes localized to their subsystem — no cross-cutting refactors. The architectural debt those cross-cutting paths surface is tracked in `docs/TODO.md` (entries from `a5d4b6d`).
+
+**Production-readiness shift.** Round 2 closed the eval gap + the highest-severity silent-failure paths. Round 3 closes the long-tail of "subtle silent-failure windows" — operator-visible bugs that the eval suite didn't catch because they were observable only under specific operator workflows (custom config layers, plan mode + recap, manual disable+reenable cycles, sibling-deletion race). After this round there are no known operator-visible silent-failure windows in the default-on detector paths. The memory subsystem's "production-ready for the LLM-judge governance flow" claim from round 2's BACKLOG entry holds; this round hardens the surface around it.
+
 ## [2026-05-18] hardening(memory + harness) — Post-Phase-2 review round 2 (12 commits)
 
 Second pass of code review over the post-S3 memory governance + the eval suite landed in this same day. Findings split between substrate gaps (bugs that affect operator-facing behavior), one fuzz-target flake, and one missing surface (compile-mode builtin distribution). All twelve landed as individual commits on `feat/memory-governance-llm` for atomic review:
