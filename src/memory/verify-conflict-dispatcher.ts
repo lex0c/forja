@@ -100,7 +100,7 @@ export interface DispatchConflictVerifyInput {
 export type ConflictDispatchOutcome =
   | {
       kind: 'skipped';
-      reason: 'injection_detected' | 'dedup_hit' | 'stale_snapshot' | 'same_pair';
+      reason: 'injection_detected' | 'dedup_hit' | 'stale_snapshot' | 'same_pair' | 'target_gone';
     }
   | {
       kind: 'malformed';
@@ -233,24 +233,39 @@ export const dispatchConflictVerify = async (
   }
 
   // (1a) TOCTOU re-read for BOTH bodies. The scheduler captured
-  // each at peek time; the operator may have edited either between
-  // then and now. Refuse the dispatch if either drifted.
+  // each at peek time; between then and now the operator may have
+  // edited either body (→ stale_snapshot) OR deleted / corrupted
+  // either memory entirely (→ target_gone). Pre-fix the
+  // non-present cases (missing / malformed / unknown) silently fell
+  // through and dispatch proceeded with the captured snapshot —
+  // burning an LLM call and landing a quarantine proposal targeting
+  // a memory the operator already removed. Mirror of the S3
+  // verify-override target_gone path.
   let workingA = input.pair.a.file;
   let workingB = input.pair.b.file;
   if (input.registry !== undefined) {
     const repeekA = input.registry.peek(input.pair.a.name, { scope: input.pair.a.scope });
-    const repeekB = input.registry.peek(input.pair.b.name, { scope: input.pair.b.scope });
     if (repeekA.kind === 'present') {
       if (serializeMemoryFile(input.pair.a.file) !== serializeMemoryFile(repeekA.file)) {
         return { kind: 'skipped', reason: 'stale_snapshot' };
       }
       workingA = repeekA.file;
+    } else {
+      // 'missing' / 'malformed' / 'unknown' — pair member no longer
+      // re-readable from the registry. The next poll re-evaluates
+      // against the fresh registry state; if the memory really is
+      // gone, the upstream sibling gate will exclude it before this
+      // dispatcher is even invoked.
+      return { kind: 'skipped', reason: 'target_gone' };
     }
+    const repeekB = input.registry.peek(input.pair.b.name, { scope: input.pair.b.scope });
     if (repeekB.kind === 'present') {
       if (serializeMemoryFile(input.pair.b.file) !== serializeMemoryFile(repeekB.file)) {
         return { kind: 'skipped', reason: 'stale_snapshot' };
       }
       workingB = repeekB.file;
+    } else {
+      return { kind: 'skipped', reason: 'target_gone' };
     }
   }
 

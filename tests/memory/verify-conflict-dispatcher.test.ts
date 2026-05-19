@@ -446,3 +446,127 @@ describe('dispatchConflictVerify — atomic persistence (H3)', () => {
     expect(listProposals(db)).toHaveLength(0);
   });
 });
+
+describe('dispatchConflictVerify — pair member disappeared (post-review)', () => {
+  // Pre-fix: when registry.peek returned non-present (memory deleted,
+  // malformed, unknown) for either pair member, the if-branch was
+  // skipped silently and dispatch continued with the captured
+  // snapshot — burning an LLM call + landing a governance proposal
+  // for a memory the operator already removed.
+  //
+  // Post-fix: the else branches return {kind:'skipped',
+  // reason:'target_gone'} mirroring the S3 override dispatcher.
+  // No spawn, no attempt row, no proposal — operator's deletion
+  // is honored.
+
+  // Stub registry where each name maps to an override (forced kind)
+  // or to a present result with the EXACT same file the caller
+  // passed in via `pair.X.file`. Echoing the same file is critical:
+  // returning a different body would trigger `stale_snapshot`
+  // before reaching the other side's peek.
+  const stubRegistry = (
+    presentByName: Record<string, { file: unknown }>,
+    overrides: Record<string, { kind: string; error?: string }> = {},
+  ) =>
+    ({
+      peek: (name: string, opts: { scope?: string }) => {
+        const key = `${opts.scope ?? 'project_local'}/${name}`;
+        if (overrides[key] !== undefined) {
+          return { ...overrides[key], scope: opts.scope };
+        }
+        const present = presentByName[name];
+        if (present !== undefined) {
+          return { kind: 'present', scope: opts.scope, file: present.file };
+        }
+        return { kind: 'unknown' };
+      },
+    }) as never;
+
+  test('peek for A returns missing → skipped: target_gone (no spawn, no proposal)', async () => {
+    const a = makeMember('alpha', 'auth via JWT', { source: 'user_explicit' });
+    const b = makeMember('beta', 'auth via OAuth', { source: 'inferred' });
+    let spawnCalled = false;
+    const spawnFn = (async () => {
+      spawnCalled = true;
+      return makeResult();
+    }) as never;
+    const registry = stubRegistry(
+      // beta present with the same file the dispatcher will receive
+      { beta: { file: b.file } },
+      // alpha peek forced to missing
+      { 'project_local/alpha': { kind: 'missing' } },
+    );
+    const outcome = await dispatchConflictVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      pair: { a, b },
+      registry,
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
+    expect(spawnCalled).toBe(false);
+    expect(listRecentConflictAttempts(db)).toHaveLength(0);
+    expect(listProposals(db)).toHaveLength(0);
+  });
+
+  test('peek for B returns malformed → skipped: target_gone (no spawn)', async () => {
+    const a = makeMember('alpha', 'auth via JWT', { source: 'user_explicit' });
+    const b = makeMember('beta', 'auth via OAuth', { source: 'inferred' });
+    let spawnCalled = false;
+    const spawnFn = (async () => {
+      spawnCalled = true;
+      return makeResult();
+    }) as never;
+    const registry = stubRegistry(
+      // alpha present with the same file (would otherwise trigger stale_snapshot first)
+      { alpha: { file: a.file } },
+      // beta peek forced to malformed
+      { 'project_local/beta': { kind: 'malformed', error: 'bad frontmatter' } },
+    );
+    const outcome = await dispatchConflictVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      pair: { a, b },
+      registry,
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
+    expect(spawnCalled).toBe(false);
+  });
+
+  test('peek for A returns unknown → skipped: target_gone', async () => {
+    const a = makeMember('alpha', 'auth via JWT', { source: 'user_explicit' });
+    const b = makeMember('beta', 'auth via OAuth', { source: 'inferred' });
+    const spawnFn = (async () => makeResult()) as never;
+    const registry = stubRegistry(
+      { beta: { file: b.file } },
+      { 'project_local/alpha': { kind: 'unknown' } },
+    );
+    const outcome = await dispatchConflictVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      pair: { a, b },
+      registry,
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
+  });
+});

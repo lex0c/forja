@@ -489,7 +489,11 @@ export const createConflictDetectorScheduler = (
 
         if (outcome.kind === 'skipped') {
           if (outcome.reason === 'dedup_hit') continue; // try next sibling
-          if (outcome.reason === 'injection_detected' || outcome.reason === 'stale_snapshot') {
+          if (
+            outcome.reason === 'injection_detected' ||
+            outcome.reason === 'stale_snapshot' ||
+            outcome.reason === 'target_gone'
+          ) {
             stderr(
               `memory: verify_conflict_skipped: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.memoryName)} vs ${sanitizeOneLineForDisplay(sibling.name)}: ${outcome.reason}\n`,
             );
@@ -499,9 +503,13 @@ export const createConflictDetectorScheduler = (
               // this event below.
               staleSeen = true;
             }
-            // Injection / stale_snapshot for this pair shouldn't
-            // block dispatch against OTHER siblings — those are
-            // independent bodies. Continue to the next sibling.
+            // Injection / stale_snapshot / target_gone for this
+            // pair shouldn't block dispatch against OTHER siblings
+            // — those are independent bodies. Continue to the next
+            // sibling. (target_gone implies one of the pair members
+            // disappeared between scheduler peek and dispatch; the
+            // upstream sibling gate on subsequent polls will exclude
+            // the absent memo before re-invocation.)
             continue;
           }
           continue;
