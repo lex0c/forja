@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { loadRetentionConfig } from '../audit/config-loader.ts';
 import {
   type Broker,
   type SandboxRunner,
@@ -63,6 +64,7 @@ import {
   MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
   pruneVerifyAttempts,
 } from '../storage/repos/memory-verify-attempts.ts';
+import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
@@ -248,6 +250,20 @@ export interface BootstrapResult {
   // a hard abort.
   providersConfigWarnings: readonly string[];
   budgetConfigWarnings: readonly string[];
+  // Warnings from the audit / retention config loader
+  // (`.agent/config.toml [audit]` and `[audit.retention]`). Loader
+  // degrades to defaults on bad values rather than aborting boot —
+  // without this surface, an operator who typed
+  // `[audit.retention].context_pins = "ninety"` (string instead
+  // of integer days) would silently keep the 90-day default, OR
+  // an operator who typed `[audit].run_gc_on_stp = true` (typo)
+  // would silently NOT enable the Stop-hook gc trigger. Both
+  // are deletion-policy decisions; running with unintended
+  // retention windows is operationally risky in a way that
+  // demands the same diagnostic visibility as the other config
+  // loaders. CLI driver renders these on stderr alongside the
+  // memory / hook / critique / providers / budget warnings.
+  auditConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -393,6 +409,22 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // detectors resolved to ON via DEFAULT (no layer explicitly named
   // the field, no CLI override).
   const memoryLoaded = loadMemoryConfig({ cwd: projectConfigCwd });
+  // [audit] config — picks up `run_gc_on_stop` + `[audit.retention]`
+  // windows. Threaded into HarnessConfig.auditRetention so the
+  // session-end loop knows whether to fire the built-in gc trigger
+  // (AGENTIC_CLI §2.1.3 Stop hook integration). Loader degrades to
+  // defaults on misconfig; warnings surface via the same stderr
+  // banner machinery as the other config loaders.
+  const auditLoaded = loadRetentionConfig({ cwd: projectConfigCwd });
+  // Wire the resolved recap_cache TTL into the cache writer's
+  // effective default. Without this, operators who set
+  // `[audit.retention].recap_cache = "5m"` (or any non-default
+  // value) see the config parsed + surfaced in `gc --json` output
+  // but the actual writes from /recap + auto-display still use
+  // the 1h hardcoded default — silently ineffective config.
+  // Single-call wire here keeps the threading out of every cache
+  // writer's call signature.
+  setRecapCacheTtlOverride(auditLoaded.config.recap_cache_ttl_ms);
 
   // First-run banner. Fires once per machine when:
   //   (a) both detectors resolve to ON,
@@ -1231,6 +1263,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(critiqueLoaded.critiqueProvider !== null
       ? { critiqueProvider: critiqueLoaded.critiqueProvider }
       : {}),
+    // [audit] config thread-through. Empty `[audit]` block resolves
+    // to DEFAULT_RETENTION (all defaults, runGcOnStop=false), which
+    // is identical to NOT setting auditRetention at all — both
+    // shapes leave the session-end gc trigger off. We pass the
+    // resolved config regardless so the loop has the retention
+    // windows ready if/when the operator flips run_gc_on_stop.
+    auditRetention: auditLoaded.config,
     // Budget resolution: project/user [budget] config layers merged
     // first (per-key, project winning over user via loader's own
     // merge), then CLI input.budget on top. Harness applies
@@ -1321,6 +1360,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,
+    auditConfigWarnings: auditLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

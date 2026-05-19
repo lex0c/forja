@@ -253,6 +253,37 @@ describe('appendEvictionEvent: insert + defaults', () => {
     );
   });
 
+  test('evidence_json secrets are redacted with <REDACTED:secret> placeholder', () => {
+    // Pins the scrubString → redactSecrets contract (memory/scanner.ts
+    // semantic, NOT sanitize/secrets.ts). Pre-Phase-2, eviction-events
+    // imported via memory/index.ts which re-exports from scanner.ts;
+    // Phase 2's circular-import fix briefly switched the import to
+    // sanitize/secrets.ts (which produces `<redacted:<name>>` instead),
+    // silently changing the format of every audit row's evidence_json.
+    // Fix went back to scanner.ts (direct import, no circular).
+    // This test catches any future regression in that direction.
+    // Use motivo 'irrelevant' (validator requires usage_count +
+    // sample_size). Inject a secret-shape string into a free-form
+    // field that the scrubber walks recursively.
+    const evidence = JSON.stringify({
+      usage_count: 0,
+      sample_size: 20,
+      note: 'leaked AKIA1234567890ABCDEF in user-supplied text',
+    });
+    const e = appendEvictionEvent(
+      db,
+      validInput({
+        evidenceJson: evidence,
+      }),
+    );
+    // The AWS access-key shape (AKIA + 16 hex) matches scanner.ts
+    // SECRET_PATTERNS; output uses the uniform placeholder, not the
+    // per-pattern format.
+    expect(e.evidenceJson).toContain('<REDACTED:secret>');
+    expect(e.evidenceJson).not.toContain('AKIA1234567890ABCDEF');
+    expect(e.evidenceJson).not.toContain('<redacted:'); // sanitize/ format must NOT leak in
+  });
+
   test('throws IllegalTransitionError for illegal state move', () => {
     expect(() =>
       appendEvictionEvent(

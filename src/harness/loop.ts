@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { runGc } from '../audit/gc.ts';
 import { type BgManager, createBgManager } from '../bg/index.ts';
 import {
   type CheckpointManager,
@@ -705,6 +706,36 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           steps: result.steps,
         },
       });
+    }
+    // Built-in gc-on-Stop trigger (AGENTIC_CLI.md §2.1.3 Stop hook
+    // integration). Operator opted in via `[audit] run_gc_on_stop =
+    // true` in config.toml. Synchronous: session-end awaits gc
+    // completion so that "when the agent command returns, hygiene
+    // is done" holds. Errors land in stderr but never propagate —
+    // gc drift is not a task failure, and aborting session-end
+    // because of cleanup hygiene would confuse the operator.
+    // Reuses `config.db` (already open + migrated by the harness's
+    // own bootstrap); no second openDb cycle.
+    //
+    // Runs AFTER operator-declared Stop hooks so an operator hook
+    // that needed the pre-gc state (e.g., backup) sees the DB
+    // untouched. A future `PostGc` event would cover hooks that
+    // need the post-gc state — out of scope for this slice.
+    if (config.auditRetention?.runGcOnStop === true) {
+      try {
+        const report = runGc({
+          db: config.db,
+          config: config.auditRetention,
+          nowMs: Date.now(),
+          dryRun: false,
+        });
+        for (const e of report.errors) {
+          process.stderr.write(`forja gc-on-Stop: ${e.table}: ${e.reason}\n`);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`forja gc-on-Stop: unexpected error: ${msg}\n`);
+      }
     }
     // Drain any fire-and-forget chains still in flight
     // (PostToolUse from the last tool of the run, Notification

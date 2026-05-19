@@ -307,3 +307,35 @@ export const markBgProcessAsKilled = (db: DB, id: string): boolean => {
     .run(now, id);
   return Number(result.changes) > 0;
 };
+
+// ─── pruneBgProcesses ──────────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2).
+// Default retention 30d on `spawned_at`. Cutoff EXCLUSIVE.
+//
+// **`status = 'running'` rows are NEVER deleted**, regardless of
+// age. A bg process that's been running for 31 days is still a
+// live referent — the operator may have a long-lived dev server,
+// a notebook kernel, or a background daemon spawned via the bg
+// system. Deleting the row would orphan the OS-level process from
+// any tracking and break `markBgProcessAsKilled` / status queries.
+//
+// Even after gc, the row stays until either (a) the process exits
+// naturally (then `status` flips to 'exited'/'killed'/'failed' and
+// next gc eats it once `spawned_at` is old enough) or (b) the
+// operator explicitly kills + reaps. This is intentional: gc is
+// hygiene for DEAD state, not a process management surface.
+export const pruneBgProcesses = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneBgProcesses: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db
+    .query(
+      `DELETE FROM background_processes
+       WHERE spawned_at < ? AND status != 'running'`,
+    )
+    .run(olderThanMs);
+  return Number(result.changes);
+};

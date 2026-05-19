@@ -715,6 +715,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     hookWarnings,
     critiqueWarnings,
     memoryConfigWarnings,
+    auditConfigWarnings,
   } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
@@ -756,6 +757,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // "false"` and got default-on detectors billing LLM-judge work).
   for (const w of memoryConfigWarnings) {
     errSink(`forja: memory config: ${w}\n`);
+  }
+  // [audit] / [audit.retention] config warnings — deletion policy
+  // is operationally riskier than the other config surfaces.
+  // An operator who typed a string for a day field, an invalid TTL
+  // for recap_cache, or a typo for `run_gc_on_stop` would otherwise
+  // silently run with default retention windows or the wrong Stop-
+  // hook behavior. REPL-boot stderr is the diagnostic surface so
+  // long-running interactive sessions aren't blind to misconfig.
+  for (const w of auditConfigWarnings) {
+    errSink(`forja: audit config: ${w}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision

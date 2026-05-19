@@ -412,3 +412,30 @@ export const createContextPinsStore = (db: DB): ContextPinsStore => ({
 });
 
 export { PERSISTED_COLUMNS };
+
+// ─── pruneContextPins ──────────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2,
+// CONTEXT_TUNING §12.4). Default retention 90d on `created_at`.
+// Cutoff EXCLUSIVE — a row at exactly `olderThanMs` is KEPT.
+//
+// Distinct from the per-pin `expires_at` short-circuit in the read
+// path (`getActivePinsBySession` filters on `expires_at`): this
+// sweep handles the table-level retention regardless of per-pin
+// TTL. A pin with `expires_at = NULL` (lives until session end)
+// still ages out by `created_at` once it crosses the table
+// retention window — otherwise long-lived sessions would
+// accumulate unbounded pinned context.
+//
+// FK CASCADE with `sessions` already drops pins when the parent
+// session is purged; this sweep covers pins on still-active
+// sessions that are older than retention.
+export const pruneContextPins = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneContextPins: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM context_pins WHERE created_at < ?').run(olderThanMs);
+  return Number(result.changes);
+};

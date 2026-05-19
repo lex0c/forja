@@ -2,6 +2,13 @@
 // enough that adding `commander` would be more code than this. Anything
 // not a recognized flag is collected as the prompt (joined by spaces).
 
+// Import from gc-tables.ts (zero-imports module) instead of
+// audit/gc.ts. The orchestrator pulls the entire storage/memory
+// graph at module load; args.ts is loaded by --help / --version
+// / every entrypoint, so depending on the runtime there makes
+// lightweight commands fragile to unrelated runtime deps.
+// See src/audit/gc-tables.ts header for the rationale.
+import { GC_TABLES } from '../audit/gc-tables.ts';
 import type { ForceEligibleStep, InitStep } from './init.ts';
 
 export interface ParsedArgs {
@@ -289,6 +296,21 @@ export interface ParsedArgs {
   // + sandbox setup + next-steps menu into a guided intro. Idempotent
   // — running it later as a "checkup" is fine.
   welcome?: true;
+  // `agent purge` — §2.1.2 project-scope reset. Filesystem-only
+  // (removes everything under <repoRoot>/.agent/); never touches the
+  // global DB or user-layer configs. Two-phase: bare invocation is
+  // dry-run (prints scope + audit-writability + literal force
+  // command); `--force` executes after writing a purge_events audit
+  // row. `--no-audit` is the escape hatch for emergencies where the
+  // global DB is unwriteable but the operator still needs the FS
+  // reset — purge proceeds without leaving a forensic row.
+  purge?: { force: boolean; json: boolean; noAudit: boolean };
+  // `agent gc` — §2.1.3 retention sweep age-based across the
+  // global DB. Phase 1 covers four low-sensitivity tables
+  // (recap_cache, retrieval_trace, context_pins, bg_processes).
+  // Bare invocation is dry-run (prints counts); --force executes.
+  // --table=X restricts to a single table; repeatable.
+  gc?: { force: boolean; json: boolean; tables: string[] };
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
@@ -928,6 +950,167 @@ const KNOWN_PERMISSION_VERBS = [
   'calibration-export',
 ] as const;
 
+// `agent purge [--force] [--json] [--no-audit]` — project-scope FS
+// reset (AGENTIC_CLI.md §2.1.2). Mirrors the doctor / sandbox shape
+// (positional verb is the first token; sub-flags follow). Mutually
+// exclusive with every other run mode by virtue of consuming argv[0]
+// before parseArgs reaches the prompt-collection loop.
+//
+// Flags:
+//   --force     — execute the purge (without it, dry-run only).
+//   --json      — NDJSON output on stdout (works in both modes).
+//   --no-audit  — allow --force even if the global DB is unwriteable.
+//                 Escape hatch for emergencies; documented in §2.1.2.
+//                 Ignored (warning printed) in dry-run mode.
+const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'purge') return null;
+  let force = false;
+  let json = false;
+  let noAudit = false;
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--force') {
+      force = true;
+      continue;
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    if (token === '--no-audit') {
+      noAudit = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent purge: unknown flag '${token}' (accepted: --force, --json, --no-audit, --help)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      purge: { force, json, noAudit },
+    },
+  };
+};
+
+// `agent gc [--force] [--json] [--table=X]` — retention sweep
+// age-based on the global DB (AGENTIC_CLI.md §2.1.3). Mirrors the
+// purge/doctor shape (positional verb first). Mutually exclusive
+// with every other run mode.
+//
+// Flags:
+//   --force     — execute the sweep (without it, dry-run only).
+//   --json      — NDJSON output on stdout (works in both modes).
+//   --table=X   — restrict to one table; repeatable. Accepted
+//                 values are DERIVED from `GC_TABLES` in
+//                 `src/audit/gc.ts` (union of Phase 1 + Phase 2 +
+//                 future phases) — single source of truth so
+//                 adding a new sweep target widens the parser
+//                 automatically. Drift between the parser's
+//                 accept-set and the orchestrator's switch is
+//                 impossible by construction.
+const KNOWN_GC_TABLES: ReadonlySet<string> = new Set(GC_TABLES);
+
+const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'gc') return null;
+  let force = false;
+  let json = false;
+  const tables: string[] = [];
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--force') {
+      force = true;
+      continue;
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    if (token.startsWith('--table=')) {
+      const value = token.slice('--table='.length);
+      if (value.length === 0) {
+        return {
+          ok: false,
+          message: `--table= requires a value (one of ${[...KNOWN_GC_TABLES].join(', ')})`,
+        };
+      }
+      if (!KNOWN_GC_TABLES.has(value)) {
+        return {
+          ok: false,
+          message: `agent gc: --table='${value}' is not a recognized gc table (valid: ${[...KNOWN_GC_TABLES].join(', ')})`,
+        };
+      }
+      // Dedupe so `--table=X --table=X` runs once. Order preserved
+      // for deterministic output across invocations.
+      if (!tables.includes(value)) tables.push(value);
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent gc: unknown flag '${token}' (accepted: --force, --json, --table=<name>, --help)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      gc: { force, json, tables },
+    },
+  };
+};
+
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
   if (argv.length === 1) {
@@ -1314,6 +1497,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
   if (sandboxParsed !== null) return sandboxParsed;
   const welcomeParsed = parseWelcomeSubcommand(argv);
   if (welcomeParsed !== null) return welcomeParsed;
+  const purgeParsed = parsePurgeSubcommand(argv);
+  if (purgeParsed !== null) return purgeParsed;
+  const gcParsed = parseGcSubcommand(argv);
+  if (gcParsed !== null) return gcParsed;
   const permissionParsed = parsePermissionSubcommand(argv);
   if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {

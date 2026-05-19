@@ -31,7 +31,19 @@
 //     but no derived-audit caveats.
 
 import type { SQLQueryBindings } from 'bun:sqlite';
-import { redactSecrets } from '../../memory/index.ts';
+// Direct import from memory/scanner.ts (the definition site)
+// instead of via memory/index.ts — memory/index.ts pulls in the
+// full transitions/lifecycle/governance chain which re-imports
+// this file (eviction-events), creating a TDZ hazard when a tight
+// consumer (e.g., audit/gc.ts → prune helper) pulls eviction-events
+// early in the module graph. Scanner.ts itself has ZERO imports
+// (pure module), so this import path has no back-edge. We
+// deliberately do NOT use sanitize/secrets.ts (a different
+// redactor with `<redacted:<name>>` output format) — that would
+// silently change the redaction format of every eviction_events
+// row's evidence_json. The scanner's `<REDACTED:secret>`
+// placeholder is the semantic this file has always used.
+import { redactSecrets } from '../../memory/scanner.ts';
 import { scrubFreeformText } from '../../telemetry/scrubbing.ts';
 import type { DB } from '../db.ts';
 
@@ -1121,6 +1133,26 @@ export const countEvictionEvents = (db: DB): number => {
     n: number;
   };
   return row.n;
+};
+
+// ─── pruneEvictionEvents ───────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// §1.2). Default retention 365d on `recorded_at`. Cutoff EXCLUSIVE.
+//
+// Cross-substrate lifecycle audit (memory/policy/candidate/slot_item
+// transitions: proposed→active→quarantined→invalidated→evicted→purged).
+// No FK chain (parent_id refers to another row in same table for
+// state graphs but isn't cryptographically chained), so age-based
+// DELETE is safe — partial deletion just truncates older history.
+export const pruneEvictionEvents = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneEvictionEvents: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM eviction_events WHERE recorded_at < ?').run(olderThanMs);
+  return Number(result.changes);
 };
 
 export { LEGAL_TRANSITIONS, PERSISTED_COLUMNS };

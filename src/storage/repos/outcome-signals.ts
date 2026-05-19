@@ -126,4 +126,35 @@ export const countOutcomeSignals = (db: DB): number => {
   return row.n;
 };
 
+// ─── pruneExpiredOutcomeSignals ────────────────────────────────────────
+//
+// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// §1.2.1). Unlike most prune helpers, outcome_signals uses an
+// absolute TTL column (`ttl_expires_at`, populated at INSERT via
+// per-`signal_kind` defaults from DEFAULT_SIGNAL_TTL_DAYS) rather
+// than an age-from-now cutoff.
+//
+// `nowMs` is the comparison point. The sweep removes rows where the
+// per-row TTL has passed. Boundary `<=` (INCLUSIVE on equality) —
+// a row whose TTL lands exactly on `nowMs` is treated as elapsed.
+// This matches the recap_cache sister-sweep (`purgeExpiredRecapCache`
+// also uses `<=`); operator observing both tables in the same gc
+// run sees consistent boundary semantics. Distinct from the
+// age-based prunes which use `<` because age + cutoff comparison
+// is naturally "anything strictly older".
+//
+// Operator who wants `signal_kind`-specific TTL overrides at config
+// level (e.g., shorter window for `tool_error`) doesn't have that
+// yet — Phase 2 honors what's already in the DB; per-kind override
+// is a future ergonomic.
+export const pruneExpiredOutcomeSignals = (db: DB, nowMs: number): number => {
+  if (!Number.isFinite(nowMs) || nowMs <= 0) {
+    throw new Error(
+      `pruneExpiredOutcomeSignals: nowMs must be a positive finite number (got ${nowMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM outcome_signals WHERE ttl_expires_at <= ?').run(nowMs);
+  return Number(result.changes);
+};
+
 export { PERSISTED_COLUMNS };

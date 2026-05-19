@@ -120,6 +120,7 @@ describe('init → bootstrap eval', () => {
       budgetConfigWarnings,
       memoryConfigWarnings,
       critiqueWarnings,
+      auditConfigWarnings,
       permissionState,
     } = await bootstrap({
       prompt: 'eval probe',
@@ -162,6 +163,9 @@ describe('init → bootstrap eval', () => {
       expect(budgetConfigWarnings).toEqual([]);
       expect(memoryConfigWarnings).toEqual([]);
       expect(critiqueWarnings).toEqual([]);
+      // [audit] / [audit.retention] not scaffolded by init — loader
+      // returns defaults silently with no warnings.
+      expect(auditConfigWarnings).toEqual([]);
     } finally {
       db.close();
     }

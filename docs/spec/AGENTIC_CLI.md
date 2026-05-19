@@ -209,6 +209,8 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **Replay** | `agent --replay <id>` | re-executa sessão (debug/eval) |
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
 | **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
+| **Purge** | `agent purge [--force] [--json] [--no-audit]` | reset filesystem-only do projeto inicializado: apaga **todo o conteúdo de `<repoRoot>/.agent/`** (configs + memory + bg logs + playbooks operator-edited). Banco global (`sessions.db`, `~/.config/agent/**`) **nunca tocado** — audit chain, sessions e memory_events para este `cwd` permanecem queryáveis (`agent --list-sessions --project <cwd>`). Sem `--force` é dry-run: imprime escopo + comando literal pra executar. Marker obrigatório: pelo menos 1 dos 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`) presente em `.agent/`. Symlinks recusados (não seguidos). Detalhe completo em §2.1.2. |
+| **Gc** | `agent gc [--force] [--json] [--table=X]` | retention sweep age-based no DB global (`sessions.db`). Apaga rows mais antigas que `[audit.retention]` (`AUDIT.md §1.2`) tabela por tabela. Sem `--force` é dry-run: imprime contagens "would delete". `--table=X` restringe a uma tabela; repetível. **Phase 1** cobre só tabelas low-sensitivity sem chain integrity (`recap_cache`, `retrieval_trace`, `context_pins`, `bg_processes`); audit-cascade tables e `approvals_log` ficam em fases seguintes. Cross-project por design (age-based, não cwd-based). Detalhe completo em §2.1.3. |
 
 #### 2.1.1 `config.toml` — scaffold com valores ativos + schema reference
 
@@ -266,6 +268,258 @@ max_overhead_ms = 5000
 | `[critique]` | `prompt_version` (opcional) | string | Pin de versão do prompt (`KNOWN_CRITIQUE_PROMPT_VERSIONS`). |
 
 Seções futuras (`[telemetry]`, …) entram pelo mesmo padrão: defaults canônicos em código, scaffold materializa valores ativos, schema reference aqui descreve significado. Schema-creep no scaffold é custo aceitável (operador vê mais linhas no arquivo); schema-creep nos defaults em código requer PR contra esta seção primeiro.
+
+#### 2.1.2 `agent purge` — filesystem reset com audit append-only
+
+`agent purge` reverte o efeito de `agent init` (mais todo runtime acumulado em `<repoRoot>/.agent/`) deixando o projeto **como se Forja nunca tivesse rodado nele do ponto de vista do filesystem**. Banco global e user-layer configs ficam intocados — o audit chain do install permanece íntegro.
+
+**Escopo de remoção.** Tudo sob `<repoRoot>/.agent/`:
+
+| Categoria | Conteúdo |
+|---|---|
+| Configs do `init` | `permissions.yaml`, `config.toml`, `.gitignore`, `agents/*.md` (canonical + operator-added) |
+| Configs do operador | `hooks.toml`, `no-history` marker |
+| Memory (FS source-of-truth) | `memory/shared/**`, `memory/local/**`, `memory/{shared,local}/.tombstones/**` |
+| Runtime state | `bg/`, `bg/subagents/<id>/`, qualquer `*.log`, `traces/`, `checkpoints/`, `sessions.db*` (se o projeto sobrescreveu o path default — o gitignore default reserva o nome) |
+| Qualquer outro arquivo | Tudo que estiver dentro de `.agent/` |
+
+**Escopo preservado (NÃO tocado, garantido):**
+
+- `~/.local/share/forja/sessions.db` (+ `-shm`, `-wal`) — DB global multi-projeto. Sessões, `approvals_log`, `memory_events`, `hook_runs`, `checkpoints`, `outcomes`, `policies`, `eviction_events` referentes ao `cwd` purgado **continuam queryáveis** (`agent --list-sessions --project <cwd>`, `agent permission verify`, etc.). Stale-references (rows que apontam pra um `.agent/` que não existe mais) são inofensivas — o loader de memória lê dos `.md` files (vazios pós-purge), não reconstrói do event log.
+- `~/.config/agent/**` (user layer: `permissions.yaml`, `config.toml`, `hooks.toml`, `agents/`, `memory/`).
+- `~/.local/share/forja/install_id` — identidade do install. Manter preserva o genesis do audit chain (`SECURITY_GUIDELINE.md §10`).
+- `/etc/agent/**` (enterprise layer).
+
+**Por que filesystem-only e não sweep DB por `cwd`.** A alternativa rejeitada — fazer `DELETE` nas tabelas globais onde `cwd = <repoRoot>` — teria três custos: (a) rastrear todas as FKs e tabelas que ganham coluna `cwd` no futuro vira load-bearing forever; (b) apagaria justamente o `approvals_log` e o `memory_events` que constituem o audit-trail do projeto; (c) violaria o princípio 1.1.3 (append-only everywhere). Filesystem-only entrega "zerar visualmente" e preserva trilha forense — escolha de design alinhada com "talvez manter audit" do operator-facing UX.
+
+**Init marker (gate obrigatório).** O comando recusa execução a menos que `<repoRoot>/.agent/` exista E contenha **pelo menos um** dos quatro artefatos canônicos do `init`:
+
+- `<repoRoot>/.agent/permissions.yaml`
+- `<repoRoot>/.agent/config.toml`
+- `<repoRoot>/.agent/agents/` (diretório)
+- `<repoRoot>/.agent/.gitignore`
+
+Sem nenhum deles, exit code 1 com mensagem `purge: <repoRoot>/.agent/ has no init markers — run 'agent init' first or remove .agent/ manually if you didn't initialize this project`. Catches:
+
+1. Operador digita `agent purge` em `$HOME` por engano (não há `.agent/` lá).
+2. Operador opera em projeto que tem `.agent/` por outras razões (planted by another tool) — sem marker, recusamos por segurança.
+3. Operador parcialmente apagou o `.agent/` à mão mas ainda tem evidência de `init` — aceitamos (marker permissivo, qualquer um dos quatro basta).
+
+**Defesa contra symlinks.** ANTES de entrar em `.agent/`, fazemos `lstat`. Se for symlink, recusamos com `purge: <repoRoot>/.agent/ is a symlink — refusing to follow. Remove the link manually if intended`. Justificativa: `ln -s ~/shared-state .agent` faria o purge devastar `~/shared-state` se seguíssemos. Dentro do walker, cada entry também passa por `lstat` — symlink entries são `unlink`ados (o link em si), nunca seguidos. Subdirs reais são recursionados.
+
+**Dois modos: dry-run (default) e `--force`.**
+
+`agent purge` (sem flags) é **dry-run obrigatório**: nenhuma operação destrutiva, nenhum write no DB. Output:
+
+```
+forja purge — DRY RUN (nothing will be modified)
+
+Project root: /repo
+Scope:        /repo/.agent/
+
+Will remove:
+  /repo/.agent/permissions.yaml                          1.2 KB
+  /repo/.agent/config.toml                                432 B
+  /repo/.agent/.gitignore                                  87 B   [operator-owned — confirm before --force]
+  /repo/.agent/hooks.toml                                 215 B
+  /repo/.agent/agents/                              10 files, 24.3 KB
+  /repo/.agent/memory/local/                         3 files, 1.8 KB
+  /repo/.agent/memory/shared/                        7 files, 14.1 KB
+  /repo/.agent/bg/                                  12 files, 412 KB
+Total: 38 files, 4 directories, 454.0 KB
+
+Preserved (will NOT be touched):
+  ~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)
+  ~/.config/agent/**                  (user-layer config + memory)
+  ~/.local/share/forja/install_id     (install identity; audit chain genesis)
+
+Audit will be recorded in purge_events at: ~/.local/share/forja/sessions.db
+
+To execute:
+  agent purge --force
+```
+
+`agent purge --force` executa de fato. **Ordem é load-bearing**: abre + migra DB → escreve audit row em `purge_events` → walks `.agent/` removendo tudo → resumo final. Se o DB estiver inacessível (read-only FS, EACCES no parent dir, lock conflict), `--force` aborta com `purge: cannot write audit row to DB (<reason>); use --no-audit to bypass`. `--no-audit` é a escape hatch para emergências (host comprometido, DB corrompido) — purge prossegue sem deixar registro; usado raramente, documentado.
+
+**Schema do audit row** (`purge_events` em `AUDIT.md §1`):
+
+| Campo | Tipo | Conteúdo |
+|---|---|---|
+| `id` | INTEGER (PK auto) | seq local |
+| `ts` | INTEGER (epoch ms) | quando o purge foi confirmado |
+| `install_id` | TEXT | identidade do install (de `~/.local/share/forja/install_id`) |
+| `cwd` | TEXT | `repoRoot` resolvido (canônico, post-`git rev-parse --show-toplevel`) |
+| `artifacts_present_json` | TEXT (JSON array, sorted) | lista de paths absolutos enumerados pré-purge |
+| `bytes_present` | INTEGER | total de bytes pré-purge (best-effort; soma `lstat.size` de cada arquivo). **Snapshot, não pós-remoção** — race onde outra ferramenta adiciona/remove arquivos entre snapshot e walker produz divergência. |
+| `files_present` | INTEGER | contagem de arquivos pré-purge (symlinks contam como files) |
+| `dirs_present` | INTEGER | contagem de subdiretórios pré-purge — **NÃO inclui o `.agent/` root**, só os filhos |
+| `forja_version` | TEXT | `VERSION` no momento do purge |
+
+**Semântica "_present" vs realidade pós-remove.** Os campos `*_present` capturam o snapshot que o operador confirmou ao rodar `--force` (mesmo que o walker do `--force` veja um número diferente devido a race). O audit row é o "plano confirmado", não o "after-action report". A realidade pós-remove aparece no `forceReport.removed` (stdout/JSON output) mas não persiste — quem precisa de evidência forensic do remove real lê o stdout/log do operador.
+
+Retention: 365d (par com `approvals_log`); sem hash chain (purge é evento operacional, não decisão de policy — chain seria over-engineering). Append-only por contrato (sem UPDATE/DELETE no repo).
+
+**`--json` mode.** NDJSON em ambos os modos. Dry-run emite um único objeto `{"mode":"dry-run","repoRoot":"...","scope":"...","entries":[...],"totals":{...},"audit":{"writable":true,"db_path":"..."},"command":"agent purge --force"}`. Force-mode emite o mesmo shape + `{"mode":"force","audit_id":N,"removed":{...}}` após a operação. Pure stdout (princípio §2.2).
+
+**Re-init após purge.** `agent init` no diretório purgado funciona idempotentemente porque é pure-FS — re-cria os 4 artefatos. A próxima session boota normalmente; usa o mesmo `install_id` (audit chain continua), encontra `shared_corpus_trust` row stale para o scope-root (re-prompt automático — corretamente, já que corpus mudou de "operator-confirmed" pra vazio), e cria nova `sessions` row apontando para o mesmo `cwd`. Trade-off honesto: o DB acumula rastro arqueológico das sessões pré-purge, que é exatamente o "manter audit" desejado.
+
+**Fora de escopo:**
+
+- **DB cleanup por `cwd`.** Vide rationale "Por que filesystem-only" acima. Caso compliance futuro exija privacy purge real (GDPR-style), entra como flow separado em `SECURITY_GUIDELINE.md`.
+- **Backup automático antes do purge.** Dry-run já dá ao operador chance de revisar. Adicionar `tar.gz` numa temp dir cria nova superfície (onde mora? quem limpa?) sem ganho proporcional.
+- **Slash `/purge`.** Verbo é setup-adjacent (mutuamente exclusivo com session ativa — purga o bootstrap que a session lê). Mesmo posture de `init`, `doctor`, `welcome`.
+- **`agent purge log` reader.** Repo expõe `listPurgeEventsByCwd` para um futuro slice; verbo não ships hoje (sem consumidor concreto pedindo).
+
+#### 2.1.3 `agent gc` — retention sweep age-based
+
+`agent gc` é o verbo operator-facing que materializa o contrato declarado em `AUDIT.md §1.2`: cada tabela append-only tem um TTL (`[audit.retention]` em `config.toml`), e rows que ultrapassam o TTL são apagadas. Cron-friendly (`agent gc --force --json` lê limpo em log parser); built-in trigger no `Stop` hook via flag `[audit] run_gc_on_stop = true` (default false).
+
+**Cross-project por design.** Diferente do `agent purge` (per-cwd), o GC é **age-based**: opera no DB global inteiro, todas as projects, todas as sessions. O critério é "row mais velha que retention", não "row deste projeto". Não há flag `--project` — quem precisa de filtro por projeto usa a peça separada (vacuum-per-project, fora do roadmap atual).
+
+**Dois modos (espelho de `agent purge`):**
+
+`agent gc` (sem `--force`) é **dry-run**: imprime, por tabela, "would delete N rows older than YYYY-MM-DD HH:MM". Zero mutação no DB. Operator confirma o impacto antes de rodar de fato.
+
+`agent gc --force` executa o sweep. Por tabela: conta antes, deleta, retorna `(beforeCount, deletedCount)`. Não há rotação de chain nem backup automático — todas as tabelas cobertas no Phase 1 são chain-free (audit-cascade tables e `approvals_log` ficam para fases futuras).
+
+**Flags:**
+
+- `--force` — executa (default: dry-run).
+- `--json` — saída NDJSON em ambos os modos (uma linha).
+- `--table=X` — restringe a uma tabela; repetível (`--table=recap_cache --table=bg_processes`). Sem o flag, todas as tabelas cobertas (Phase 1 + Phase 2 = 10 tabelas) são processadas.
+
+**Tabelas cobertas (Phase 1 + 2 = 10):**
+
+*Phase 1 — low-sensitivity, sem chain integrity:*
+
+| Tabela | Coluna age | TTL default | Notas |
+|---|---|---|---|
+| `recap_cache` | `expires_at` (TTL absoluto, populado no INSERT) | 1h (per-row, já no INSERT) | Sweep apaga `expires_at <= now()`. Read path já evicta on miss; sweep é backstop. |
+| `retrieval_trace` | `created_at` | 90d | Cascade FK com `sessions`; sweep é cold-path quando session permanece. |
+| `context_pins` | `created_at` | 90d | Per-pin `expires_at` já curto-circuita no read; sweep cobre rows pré-cascade + retention. |
+| `bg_processes` | `spawned_at` | 30d | **AND `status != 'running'`** — bg processes ativos NUNCA apagados independente da idade. |
+
+*Phase 2 — audit-cascade tables (FK SET NULL ou CASCADE com `sessions`):*
+
+| Tabela | Coluna age | TTL default | Notas |
+|---|---|---|---|
+| `memory_events` | `created_at` | 365d | Lifecycle audit. FK SET NULL com sessions — sobrevivem cleanup independente. |
+| `hook_runs` | `created_at` | 90d | Per-event hook execution. FK SET NULL. |
+| `failure_events` | `created_at` | 365d | Per-session chain hash. **Trade-off documentado abaixo.** |
+| `eviction_events` | `recorded_at` | 365d | Cross-substrate lifecycle. |
+| `outcomes` | `recorded_at` | 90d | Cross-substrate operational outcomes. FK CASCADE com sessions. |
+| `outcome_signals` | `ttl_expires_at` (per-row, populado no INSERT) | "per-kind" (365d/730d per `signal_kind`) | **TTL-based, NOT age-based.** Sweep apaga `ttl_expires_at < now()` mirroring recap_cache. |
+
+**`failure_events` chain trade-off (Phase 2 design):** o sweep é age-based per-row (`DELETE WHERE created_at < cutoff`). Para uma session com eventos 1-5 e cutoff que pega os 3 primeiros, rows 1-3 vão pra storage-livre; rows 4-5 ficam com `prev_chain_hash` apontando pra row inexistente. Chain forensic per-session vira parcial. **Aceitamos por duas razões:** (a) chain de `failure_events` é best-effort forensic, não tem invariante criptográfico como `approvals_log`; (b) Phase 4 (sessions cascade) vai whole-session-delete, restaurando semantic limpa. Operator que precisa de chain íntegra define `failure_events` com retention muito alto (ex: `failure_events = 99999` ~ forever; `"forever"` literal não implementado em Phase 2).
+
+**`outcome_signals` config (`"per-kind"` sentinel):** o spec AUDIT §1.2 mostra `outcome_signals = "per-kind"`. Aceitamos:
+- `outcome_signals = "per-kind"` — honra TTL per-row já populado no INSERT (default).
+- `outcome_signals = true` — alias para `"per-kind"` (sweep habilitado).
+- `outcome_signals = false` — skip sweep (TTL per-row continua mas gc não força DELETE).
+- Outras strings → warning + fallback para enabled.
+
+Override per-`signal_kind` no config (ex: `[audit.retention.outcome_signals] tool_error = 30`) NÃO suportado em Phase 2 — defaults `DEFAULT_SIGNAL_TTL_DAYS` (em código) determinam o TTL persistido. Future ergonomic.
+
+**Tabelas ainda fora (deferidas):**
+
+- **Phase 3 (hash-chained):** `approvals_log`. Age-based DELETE quebra `permission verify`. Requer wire de `chain-rotation` (migration 035 + verb `agent permission rotate-chain`) num trigger age-based: rotaciona segmento arquivado, depois apaga. Slice dedicado.
+- **Phase 4 (sessions + cascade):** `sessions`. Quando uma session é gc'd, FK CASCADE drop ~12 tabelas dependentes. Blast radius maior; revisão dedicada.
+- **Phase 5a — flag operacional:** `--reclaim-space` (roda SQLite `VACUUM` pós-delete pra liberar disco; lock global). **Stop hook integration (5b) shippou** — vide subsection seguinte.
+
+##### Built-in no `Stop` hook (shipped)
+
+Operator declara `[audit] run_gc_on_stop = true` no `config.toml` (user OU project layer). Default `false` — opt-in. Quando true, o harness chama `runGc({force: true, ...})` automaticamente ao final de cada session, depois do `dispatchHooks Stop` retornar.
+
+```toml
+# ~/.config/agent/config.toml  OU  <cwd>/.agent/config.toml
+
+[audit]
+run_gc_on_stop = true          # gc roda ao final de cada session (default: false)
+
+[audit.retention]
+retrieval_trace = 30           # opera com as mesmas retention windows do verbo
+```
+
+**Semântica:**
+
+- **Síncrono.** Session-end aguarda gc terminar. Latency operator-visível mas determinístico: quando o `agent` command retorna, hygiene já completou. Phase 1 sweeps são rápidos (4 tabelas, SELECT COUNT + DELETE em índices simples). DB grande pode somar segundos; aceitável pelo trade-off de não ter daemon (alinhado com §1.1.2 no-daemon discipline).
+- **Reusa o DB handle aberto pelo harness.** Sem novo `openDb` + `migrate` — sessão já tem DB aberto e migrado. Custo é apenas as queries de count + delete.
+- **Erros vão pro stderr, NÃO abortam session-end.** Falha do gc é hygiene drift, não falha de tarefa. Session exit code reflete o outcome da task; gc errors são forensic noise pro CI log capturar.
+- **Boolean merge respeita `false` explícito.** Project=`false` sobrepõe user=`true`. O operator que QUER desabilitar em um projeto específico (apesar de ter habilitado globalmente) consegue.
+
+**Quando usar:**
+
+- Workflows curtos de uma session (CI runner, batch task) — gc-on-Stop garante limpeza per-job sem cron.
+- Operator que NÃO quer mexer no crontab — flag única, hygiene automática.
+
+**Quando NÃO usar:**
+
+- Sessions interativas longas — gc no final adiciona latency operator-visível antes do prompt retornar.
+- DB muito grande (>1GB) — gc Phase 1 ainda é rápido, mas Phase 2/3 (quando landar) podem fazer sweeps mais pesados. Operator pode quer manter cron user-side com janela noturna.
+- Pipelines onde session-end latency importa (e.g., agent invocado em script com hot-loop). Use cron user-side.
+
+**Composição com hooks operator-declarados:** o built-in roda DEPOIS do `dispatchHooks Stop`. Operator hook que precisa do estado pré-gc (ex: backup) lê o DB intocado; operator hook que precisa do estado pós-gc não tem suporte (built-in é o último side-effect antes do `db.close()`). Esse caso futuro entraria como `PostGc` event, fora do escopo Phase 5.
+
+**Output do dry-run (human):**
+
+```
+forja gc — DRY RUN (nothing will be modified)
+
+Config source: <path>/config.toml (or "defaults" if no override)
+
+Tables (Phase 1):
+  recap_cache         512 rows total   384 would delete (TTL: 1h via expires_at)
+  retrieval_trace   12450 rows total  9821 would delete (older than 90d, cutoff 2026-02-18)
+  context_pins        128 rows total    47 would delete (older than 90d, cutoff 2026-02-18)
+  bg_processes        233 rows total   189 would delete (older than 30d, cutoff 2026-04-19; 3 protected as running)
+
+To execute:
+  agent gc --force
+```
+
+**`--json` shape:**
+
+```json
+{"mode":"dry-run","config":{"recap_cache_ttl_ms":3600000,"retrieval_trace_days":90,...},"tables":[{"table":"recap_cache","beforeCount":512,"wouldDeleteCount":384,"cutoffMs":...},...],"command":"agent gc --force"}
+```
+
+E em force:
+
+```json
+{"mode":"force","tables":[{"table":"recap_cache","beforeCount":512,"deletedCount":384,"cutoffMs":...},...]}
+```
+
+**Config layering** (mirrors critique/budget):
+
+- User: `~/.config/agent/config.toml` `[audit.retention]`
+- Project: `<cwd>/.agent/config.toml` `[audit.retention]`
+- Project overrides user (per-key); ausência de chave herda do default canônico (`AUDIT.md §1.2`).
+
+**Defaults (DEFAULT_RETENTION; replicate AUDIT §1.2):**
+
+```toml
+[audit.retention]
+# Phase 1:
+recap_cache     = "1h"     # TTL absoluto via expires_at
+retrieval_trace = 90       # dias
+context_pins    = 90       # dias
+bg_processes    = 30       # dias
+# Phase 2:
+memory_events    = 365     # dias
+hook_runs        = 90      # dias
+failure_events   = 365     # dias (chain trade-off documentado)
+eviction_events  = 365     # dias
+outcomes         = 90      # dias
+outcome_signals  = "per-kind"  # honra TTL per-row (signal_kind-specific)
+# Phase 3/4 tables aceitas no schema mas ignoradas pelo executor atual.
+```
+
+**O que NÃO faz** (cross-ref pra evitar mal-entendido):
+
+- **Não toca audit chain.** `approvals_log`, `purge_events`, `prompt_versions` (forever) ficam intactos. Phase 3 ou futuro slice cuidam.
+- **Não é per-project.** Operator querendo "limpar dados do projeto X" usa `agent purge` (FS reset; DB rows ficam) ou aguarda vacuum-per-project (não no roadmap).
+- **Não libera disco do arquivo.** DELETE marca rows como livres mas SQLite só recompacta o arquivo via `VACUUM`. Phase 5 adiciona `--reclaim-space`.
+- **Não é privacy purge (GDPR-style).** Compliance purge é flow separado em `SECURITY_GUIDELINE.md`. GC é hygiene operacional, não prova de irrecuperabilidade.
 
 ### 2.2 Composição (Unix philosophy)
 

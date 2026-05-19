@@ -1,12 +1,14 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   DEFAULT_RECAP_CACHE_TTL_MS,
   canonicalScopeHash,
+  getEffectiveRecapCacheTtlMs,
   purgeExpiredRecapCache,
   readRecapCache,
   recapMiniCacheKey,
+  setRecapCacheTtlOverride,
   writeRecapCache,
 } from '../../src/storage/repos/recap-cache.ts';
 
@@ -345,5 +347,67 @@ describe('recap_cache repo', () => {
     expect(removed).toBe(1);
     expect(readRecapCache(db, { scopeHash: 'live', now: 500 })).not.toBeNull();
     expect(readRecapCache(db, { scopeHash: 'dead', now: 500 })).toBeNull();
+  });
+});
+
+describe('setRecapCacheTtlOverride — config-driven TTL wiring', () => {
+  // Operator-reported bug: [audit.retention].recap_cache parsed +
+  // surfaced but never wired to the write path. Operators setting
+  // a non-default TTL saw it ignored — writes still used the
+  // hardcoded 1h default.
+  // Fix: module-level effective default + bootstrap setter. Pin
+  // both the override applies AND the reset restores baseline.
+
+  afterEach(() => {
+    // Reset so override doesn't leak across tests (module-level state).
+    setRecapCacheTtlOverride(undefined);
+  });
+
+  test('baseline: getEffectiveRecapCacheTtlMs returns DEFAULT', () => {
+    expect(getEffectiveRecapCacheTtlMs()).toBe(DEFAULT_RECAP_CACHE_TTL_MS);
+  });
+
+  test('override changes the value used by writeRecapCache (no explicit ttlMs)', () => {
+    setRecapCacheTtlOverride(5 * 60 * 1000); // 5 minutes
+    expect(getEffectiveRecapCacheTtlMs()).toBe(5 * 60 * 1000);
+
+    const generatedAt = 1_000_000;
+    const entry = writeRecapCache(db, {
+      scopeHash: 'override-test',
+      renderer: 'pr',
+      promptVersion: 'v1',
+      output: 'x',
+      // NO ttlMs — should pick up the override.
+      generatedAt,
+      costUsd: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+    });
+    // Load-bearing: expires_at = generatedAt + override (5m), not
+    // the canonical 1h default.
+    expect(entry.expiresAt).toBe(generatedAt + 5 * 60 * 1000);
+  });
+
+  test('explicit ttlMs still wins over the override (per-call escape)', () => {
+    setRecapCacheTtlOverride(5 * 60 * 1000); // 5m
+    const generatedAt = 2_000_000;
+    const entry = writeRecapCache(db, {
+      scopeHash: 'explicit-ttl',
+      renderer: 'pr',
+      promptVersion: 'v1',
+      output: 'x',
+      ttlMs: 30_000, // 30s — should override the override
+      generatedAt,
+      costUsd: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+    });
+    expect(entry.expiresAt).toBe(generatedAt + 30_000);
+  });
+
+  test('setRecapCacheTtlOverride(undefined) reverts to DEFAULT', () => {
+    setRecapCacheTtlOverride(5 * 60 * 1000);
+    setRecapCacheTtlOverride(undefined);
+    expect(getEffectiveRecapCacheTtlMs()).toBe(DEFAULT_RECAP_CACHE_TTL_MS);
   });
 });

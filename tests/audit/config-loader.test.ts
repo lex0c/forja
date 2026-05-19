@@ -1,0 +1,388 @@
+// [audit.retention] config loader tests. Pins the per-key
+// validation, the project-overrides-user layering, the silent
+// acceptance of Phase 2+ keys for forward compat, and the typo
+// warning for unknown keys.
+
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  DEFAULT_RETENTION,
+  loadRetentionConfig,
+  parseDays,
+  parseTtlMs,
+} from '../../src/audit/config-loader.ts';
+
+let workdir: string;
+let userPath: string;
+let projectPath: string;
+
+beforeEach(() => {
+  workdir = mkdtempSync(join(tmpdir(), 'forja-gc-config-'));
+  userPath = join(workdir, 'user.toml');
+  projectPath = join(workdir, 'project.toml');
+});
+
+afterEach(() => {
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+describe('parseTtlMs', () => {
+  test('accepts "1h" → 3600000ms', () => {
+    expect(parseTtlMs('1h')).toBe(3_600_000);
+  });
+  test('accepts "30m" → 1800000ms', () => {
+    expect(parseTtlMs('30m')).toBe(1_800_000);
+  });
+  test('accepts "5s" → 5000ms', () => {
+    expect(parseTtlMs('5s')).toBe(5000);
+  });
+  test('accepts "500ms" → 500ms', () => {
+    expect(parseTtlMs('500ms')).toBe(500);
+  });
+  test('accepts positive integer (raw ms)', () => {
+    expect(parseTtlMs(60000)).toBe(60000);
+  });
+  test('rejects zero / negative / non-integer numbers', () => {
+    expect(parseTtlMs(0)).toBeNull();
+    expect(parseTtlMs(-1)).toBeNull();
+    expect(parseTtlMs(1.5)).toBeNull();
+    expect(parseTtlMs(Number.NaN)).toBeNull();
+  });
+  test('rejects float duration strings ("1.5h")', () => {
+    expect(parseTtlMs('1.5h')).toBeNull();
+  });
+  test('rejects unknown units', () => {
+    expect(parseTtlMs('1d')).toBeNull();
+    expect(parseTtlMs('1y')).toBeNull();
+  });
+  test('rejects bare numbers as strings', () => {
+    expect(parseTtlMs('60')).toBeNull();
+  });
+});
+
+describe('parseDays', () => {
+  test('accepts positive integers', () => {
+    expect(parseDays(90)).toBe(90);
+    expect(parseDays(1)).toBe(1);
+  });
+  test('rejects zero / negative / float / non-number', () => {
+    expect(parseDays(0)).toBeNull();
+    expect(parseDays(-1)).toBeNull();
+    expect(parseDays(90.5)).toBeNull();
+    expect(parseDays('90')).toBeNull();
+  });
+});
+
+describe('loadRetentionConfig', () => {
+  test('returns DEFAULT_RETENTION when no files exist', () => {
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath: null });
+    expect(r.config).toEqual(DEFAULT_RETENTION);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('user layer overrides defaults', () => {
+    writeFileSync(userPath, '[audit.retention]\nretrieval_trace = 30\nrecap_cache = "5m"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath: null });
+    expect(r.config.retrieval_trace_days).toBe(30);
+    expect(r.config.recap_cache_ttl_ms).toBe(5 * 60 * 1000);
+    // Untouched keys fall through to defaults.
+    expect(r.config.context_pins_days).toBe(DEFAULT_RETENTION.context_pins_days);
+    expect(r.config.bg_processes_days).toBe(DEFAULT_RETENTION.bg_processes_days);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('project layer overrides user (per-key)', () => {
+    writeFileSync(userPath, '[audit.retention]\nretrieval_trace = 30\ncontext_pins = 60\n');
+    writeFileSync(projectPath, '[audit.retention]\nretrieval_trace = 7\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    // retrieval_trace: project wins (7), even though user set 30.
+    expect(r.config.retrieval_trace_days).toBe(7);
+    // context_pins: only user set it → user wins.
+    expect(r.config.context_pins_days).toBe(60);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('warns on unknown retention key', () => {
+    writeFileSync(
+      projectPath,
+      '[audit.retention]\nretreival_trace = 30\n', // typo
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('retreival_trace'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('not a known retention key'))).toBe(true);
+    // Misconfig doesn't break loader — defaults fill in.
+    expect(r.config.retrieval_trace_days).toBe(DEFAULT_RETENTION.retrieval_trace_days);
+  });
+
+  test('accepts Phase 2+ keys silently (forward compat)', () => {
+    writeFileSync(projectPath, '[audit.retention]\napprovals_log = 365\nmemory_events = 365\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    // No warnings: both keys are in KNOWN_SCHEMA_KEYS.
+    expect(r.warnings).toEqual([]);
+    // No effect on Phase 1 config either.
+    expect(r.config).toEqual(DEFAULT_RETENTION);
+  });
+
+  test('warns on invalid value type but falls back to default', () => {
+    writeFileSync(
+      projectPath,
+      '[audit.retention]\nretrieval_trace = "ninety"\nbg_processes = -1\n',
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('retrieval_trace'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('bg_processes'))).toBe(true);
+    expect(r.config.retrieval_trace_days).toBe(DEFAULT_RETENTION.retrieval_trace_days);
+    expect(r.config.bg_processes_days).toBe(DEFAULT_RETENTION.bg_processes_days);
+  });
+
+  test('handles [audit] without [audit.retention] subsection', () => {
+    // Uses a known [audit] key (run_gc_on_stop) so the typo guard
+    // doesn't fire — the test's purpose is to confirm the loader
+    // doesn't trip when the retention subsection is absent, not to
+    // pin typo behavior (covered separately).
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config).toEqual(DEFAULT_RETENTION);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('warns on [audit.retention] that is not a table', () => {
+    writeFileSync(projectPath, '[audit]\nretention = "broken"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('must be a table'))).toBe(true);
+    expect(r.config).toEqual(DEFAULT_RETENTION);
+  });
+
+  test('TOML parse error warns and falls back', () => {
+    // Triple-bracket header is unambiguously malformed TOML.
+    writeFileSync(projectPath, '[[[broken\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.toLowerCase().includes('parse'))).toBe(true);
+    expect(r.config).toEqual(DEFAULT_RETENTION);
+  });
+
+  test('sources reflect file EXISTENCE — present files return the path', () => {
+    writeFileSync(userPath, '[audit.retention]\ncontext_pins = 10\n');
+    writeFileSync(projectPath, '[audit.retention]\nretrieval_trace = 1\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.sources.user).toBe(userPath);
+    expect(r.sources.project).toBe(projectPath);
+  });
+
+  test('sources are null when paths resolve but the files do NOT exist', () => {
+    // Both paths are valid strings but no file was written. Resolver
+    // helpers always return a path string when XDG is set, but the
+    // renderer should NOT claim a non-existent file is the active
+    // source — that would mislead the operator into thinking their
+    // config is being honored when in fact defaults are used.
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.sources.user).toBeNull();
+    expect(r.sources.project).toBeNull();
+  });
+
+  test('mixed: project file exists, user file does not → only project source returned', () => {
+    writeFileSync(projectPath, '[audit.retention]\nbg_processes = 7\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.sources.user).toBeNull();
+    expect(r.sources.project).toBe(projectPath);
+  });
+});
+
+describe('loadRetentionConfig — [audit].run_gc_on_stop (Phase 5 Stop hook trigger)', () => {
+  test('defaults to false when absent', () => {
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath: null });
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('user layer can enable it', () => {
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath: null });
+    expect(r.config.runGcOnStop).toBe(true);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('project layer can enable it', () => {
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+  });
+
+  test('project false EXPLICITLY overrides user true (the ?? trap)', () => {
+    // Boolean merge needs `!== undefined` instead of nullish-coalescing
+    // because `false ?? true` would silently flip to true. This test
+    // pins the explicit-false-wins semantic so a future refactor that
+    // accidentally regresses to `??` lands the failure here.
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = true\n');
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('project true overrides user false (symmetric)', () => {
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = false\n');
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+  });
+
+  test('user value used when project file has no [audit] section', () => {
+    writeFileSync(userPath, '[audit]\nrun_gc_on_stop = true\n');
+    writeFileSync(projectPath, '[audit.retention]\nretrieval_trace = 30\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+    // Retention still picks up project's override too.
+    expect(r.config.retrieval_trace_days).toBe(30);
+  });
+
+  test('warns on non-boolean and falls back', () => {
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stop = "yes"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('run_gc_on_stop'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('must be a boolean'))).toBe(true);
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('coexists with [audit.retention] in the same project file', () => {
+    writeFileSync(
+      projectPath,
+      '[audit]\nrun_gc_on_stop = true\n\n[audit.retention]\nbg_processes = 7\n',
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.runGcOnStop).toBe(true);
+    expect(r.config.bg_processes_days).toBe(7);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('typo at [audit].xxx surfaces a warning (symmetric with [audit.retention] guard)', () => {
+    // Operator who learned to expect typo guards from [audit.retention]
+    // would be surprised if [audit].run_gc_on_stp = true silently
+    // dropped. Both sections now warn on unknown keys.
+    writeFileSync(projectPath, '[audit]\nrun_gc_on_stp = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('run_gc_on_stp'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('not a known audit key'))).toBe(true);
+    // Misconfig doesn't break the loader — defaults fill in.
+    expect(r.config.runGcOnStop).toBe(false);
+  });
+
+  test('known [audit] keys do NOT warn', () => {
+    // Polarity check: `retention` and `run_gc_on_stop` are both in
+    // KNOWN_AUDIT_KEYS, so a file using both produces zero warnings.
+    writeFileSync(
+      projectPath,
+      '[audit]\nrun_gc_on_stop = false\n\n[audit.retention]\nretrieval_trace = 60\n',
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings).toEqual([]);
+  });
+});
+
+describe('loadRetentionConfig — Phase 2 keys', () => {
+  test('5 day-based fields parse + override per-key', () => {
+    writeFileSync(
+      projectPath,
+      `[audit.retention]
+memory_events = 30
+hook_runs = 7
+failure_events = 14
+eviction_events = 60
+outcomes = 5
+`,
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.memory_events_days).toBe(30);
+    expect(r.config.hook_runs_days).toBe(7);
+    expect(r.config.failure_events_days).toBe(14);
+    expect(r.config.eviction_events_days).toBe(60);
+    expect(r.config.outcomes_days).toBe(5);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals accepts "per-kind" sentinel (spec literal)', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = "per-kind"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(true);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals accepts boolean true', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(true);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals accepts boolean false (skip sweep)', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(false);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals rejects other strings with warning', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = "all"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('outcome_signals'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('boolean'))).toBe(true);
+    // Falls back to default (enabled).
+    expect(r.config.outcomeSignalsEnabled).toBe(true);
+  });
+
+  test('outcomeSignalsEnabled merge respects explicit false (the ?? trap)', () => {
+    writeFileSync(userPath, '[audit.retention]\noutcome_signals = true\n');
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(false);
+  });
+
+  test('day-based field rejects non-integer with warning', () => {
+    writeFileSync(projectPath, '[audit.retention]\nmemory_events = "thirty"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('memory_events'))).toBe(true);
+    expect(r.config.memory_events_days).toBe(365); // default
+  });
+});
+
+describe('loadRetentionConfig — Phase 3 keys (purge_events)', () => {
+  test('default is 365d (matches AUDIT.md §1.2 + migration 066 comment)', () => {
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath: null });
+    expect(r.config.purge_events_days).toBe(365);
+  });
+
+  test('project layer overrides default', () => {
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = 30\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.purge_events_days).toBe(30);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('user layer overrides default; project overrides user', () => {
+    writeFileSync(userPath, '[audit.retention]\npurge_events = 90\n');
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = 7\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.purge_events_days).toBe(7);
+  });
+
+  test('rejects non-integer / non-positive with warning + default fallback', () => {
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = "lots"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('purge_events'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('positive integer'))).toBe(true);
+    expect(r.config.purge_events_days).toBe(DEFAULT_RETENTION.purge_events_days);
+  });
+
+  test('purge_events key does NOT warn (was previously in Phase 3+ forward-compat list — now validated + applied)', () => {
+    // Regression pin for the operator-reported "inert retention key"
+    // bug. Pre-fix, `purge_events` lived in KNOWN_SCHEMA_KEYS but
+    // only as forward-compat (no parseDays, no merge, no GC table).
+    // The fix moved it to validated + applied. This test ensures
+    // the key produces no warning AND its value lands in the
+    // resolved config (proving validation ran).
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = 180\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings).toEqual([]);
+    expect(r.config.purge_events_days).toBe(180);
+  });
+});

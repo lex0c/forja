@@ -57,6 +57,7 @@ Lista canônica das **28 tabelas de audit**, com escopo, retention, sensitivity,
 | `feature_flags_active` | flags ativas per-sessão (ver §1.6) | 90d (cascade com sessions) | low | nenhuma |
 | `traces` (NDJSON) | OTEL spans | 90d | medium | redact attrs |
 | `redaction_events` | NEW — audit de redactions | 365d | low | nenhuma (sem o conteúdo redacted) |
+| `purge_events` | invocações de `agent purge --force` (`AGENTIC_CLI.md §2.1.2`); install-scoped, project-keyed | 365d | low | nenhuma (paths já fora do projeto purgado, apenas metadata de FS) |
 
 ### 1.1 Sensitivity levels
 
@@ -102,6 +103,7 @@ memory_events = 365
 recap_cache = "1h"            # TTL especial
 pending_decisions = 7
 prompt_versions = "forever"   # nunca limpar; rastreabilidade load-bearing
+purge_events = 365            # AGENTIC_CLI §2.1.2 (par com approvals_log)
 ```
 
 Cleanup via cron user-side (`agent gc`) ou hook `Stop` (configurable).

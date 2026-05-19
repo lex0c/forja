@@ -1078,6 +1078,15 @@ export interface HarnessConfig {
   // to the pre-slice-156 blanket /tmp allow). Tools that read this
   // and find undefined just omit the tmpdir option to maybeWrap.
   sandboxTmpdir?: string;
+  // Audit retention config (AUDIT.md §1.2). When `runGcOnStop` is
+  // true, the loop calls `runGc({force: true, ...})` at session end
+  // after the operator's Stop hooks fire — built-in retention sweep
+  // without crontab wiring (AGENTIC_CLI §2.1.3 "Stop hook
+  // integration"). Optional so existing call sites (subagent
+  // runtime, unit tests that don't care about session-end gc) keep
+  // working without populating it; default-undefined skips the
+  // built-in trigger entirely (same as `runGcOnStop = false`).
+  auditRetention?: import('../audit/config-loader.ts').RetentionConfig;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

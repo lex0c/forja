@@ -2,6 +2,1196 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — gate generic mid-walk "audit row was already written" message on actual write
+
+Operator-reported follow-up to commit `22d17e9` (TOCTOU abort fix). That fix correctly gated the TOCTOU branch's audit message on `!options.noAudit && audit.writable`, but the SIBLING generic-error branch (for non-TOCTOU mid-walk failures like EBUSY, EACCES, ENOSPC) was left with the pre-existing unconditional line: `"(audit row was already written; the project is in a partial state)"`. Under `--no-audit` no probe + insert happens — the line claimed a row that never existed, sending incident-response investigators chasing a nonexistent DB entry during recovery from a real FS failure.
+
+**Concrete scenario:**
+
+```
+$ agent purge --force --no-audit
+forja purge: FS removal failed mid-walk: EBUSY: resource busy or locked
+  (audit row was already written; the project is in a partial state)   ← LIE
+```
+
+The operator running an incident-recovery purge (DB might be broken — exactly why `--no-audit` exists) gets pointed at a nonexistent forensic trail. They open the DB, run `SELECT * FROM purge_events WHERE cwd = ?`, find no row, waste minutes wondering whether the audit subsystem itself silently failed.
+
+**Fix.** Mirror the TOCTOU branch's gating discipline in the generic branch:
+
+1. **`src/cli/purge.ts`** — generic catch branch now:
+    - Splits the message into two lines: `"The project is in a partial state"` (always) and `"Audit row was already written (id=...)"` (gated).
+    - Gates the audit line on `!noAudit && audit.writable` (same predicate the TOCTOU branch uses).
+    - Renders the actual `auditId` for correlation, matching the TOCTOU branch's `(id=...)` format. Operator can grep purge_events by id directly instead of guessing.
+
+2. **`src/cli/purge.ts`** — added `_verifierForTest?: (path: string, preStat: Stats) => boolean` to `RunPurgeOptions`. Pure test seam, symmetric with the existing `dbPath` / `now` options. Threaded into `removeTree(agentDir, options._verifierForTest ? {verifier: options._verifierForTest} : {})`. Lets tests inject a throwing verifier to exercise the generic catch branch deterministically — no platform-dependent chmod tricks.
+
+3. **Tests** — 44/44 in `tests/cli/purge.test.ts` (was 42, +2 new pins in `runPurge — generic mid-walk failure: audit message gated on actual write`):
+    - **`--no-audit` + generic walker throw**: stderr contains `FS removal failed mid-walk`, contains `The project is in a partial state`, but does NOT contain `Audit row was already written` (either casing).
+    - **`--force` audit-on + generic walker throw**: stderr contains the audit line with a numeric id matching `/Audit row was already written \(id=\d+\)/`; the DB actually has the row (queried via `listPurgeEventsByCwd`) so the message isn't bluffing.
+
+**Why the test seam is its own line item.** A test that triggers a generic mid-walk failure WITHOUT a seam would have to either (a) chmod a directory non-writable to provoke `unlinkSync` to throw — platform-dependent, requires non-root test user, brittle on CI; or (b) use a FUSE / overlay FS to simulate EBUSY — even more brittle. The seam is consistent with the existing pragma "RunPurgeOptions already has test-only optionals (`dbPath`, `now`)", costs one optional field, and isolates the failure mode under test.
+
+**Symmetry now between the two catch branches:**
+
+| Branch | Audit-gated line predicate | id rendered? | Partial state line |
+|---|---|---|---|
+| TOCTOU (commit `22d17e9`) | `!options.noAudit && audit.writable` | yes, `(id=N)` | partial counts |
+| Generic (this fix) | `!noAudit && audit.writable` | yes, `(id=N)` | "The project is in a partial state" |
+
+**Verification:**
+- 44/44 tests in `tests/cli/purge.test.ts` (+2 new pins)
+- typecheck + lint clean
+
+**Pre-existing operator state.** Anyone who hit a generic mid-walk failure under `--no-audit` between commit `22d17e9` and this fix saw the false "audit row was already written" line. No FS damage; just misdirected investigation. The DB has no row for the failed purge attempt (correct behavior under `--no-audit`); re-running `agent purge --dry-run` shows the current state.
+
+## [2026-05-19] fix(cli) — propagate `[audit]` / `[audit.retention]` config warnings through bootstrap
+
+Operator-reported bug. `loadRetentionConfig()` already produced warning strings for invalid `[audit]` and `[audit.retention]` values (mirroring the memory/providers/budget loaders), but the bootstrap path consumed only `auditLoaded.config` and dropped `auditLoaded.warnings` on the floor. `BootstrapResult` had no field carrying them, so `run.ts` and `repl.ts` — the two renderers that iterate every other loader's warning array onto stderr — had no surface to read. Retention misconfigs silently fell back to defaults during normal agent/REPL runs.
+
+**Why this is operationally riskier than memory / providers / budget misconfigs.** Retention controls **deletion**. An operator who typed:
+
+- `[audit.retention].context_pins = "ninety"` (string instead of int days) silently kept the 90-day default — but might have intended 365 to preserve cross-session pins longer for a long-running migration project.
+- `[audit.retention].bg_processes = -1` silently kept the 30-day default — but might have intended a far longer window for a project with year-spanning experiments.
+- `[audit].run_gc_on_stp = true` (typo: missing 'o') silently left the Stop-hook gc trigger disabled — but might have intended to enable automatic sweep at session end.
+- `[audit.retention].recap_cache = "not-a-duration"` silently kept the 1h default — operator might have intended `"5m"` for tight freshness.
+
+In all four cases the operator's intent was UNDONE silently, while gc continued to act on the unintended retention windows. With memory/providers/budget misconfigs, the worst-case silent fallback is wasted LLM cost or model substitution — irritating but recoverable. With retention misconfigs, the silent fallback governs row deletion. Different blast radius warrants identical (or stricter) diagnostic surface.
+
+**Fix.** Follow the established memory-warnings propagation pattern verbatim:
+
+1. **`src/cli/bootstrap.ts`** — added `auditConfigWarnings: readonly string[]` field to `BootstrapResult` interface with a comment documenting why the deletion-policy framing matters more than the sibling loaders' warnings. Added `auditConfigWarnings: auditLoaded.warnings` to the returned object alongside the existing memory/providers/budget wiring.
+
+2. **`src/cli/run.ts`** — destructured `auditConfigWarnings`; added a `for (const w of auditConfigWarnings) errSink('forja: audit config: ${w}\n')` loop adjacent to the existing budget-warnings loop (same JSON-mode gating, same `forja: <subsystem> config: ${w}` format).
+
+3. **`src/cli/repl.ts`** — destructured `auditConfigWarnings`; added the same `for-loop` after the existing `memoryConfigWarnings` iteration. (REPL renders memory + critique + hook warnings; pre-existing asymmetry omits providers/budget; audit is added explicitly because of the deletion-policy framing — out-of-scope to extend the providers/budget gap here.)
+
+4. **Tests** — 172/172 across 5 files:
+    - `tests/cli/bootstrap-memory-defaults.test.ts`: new `bootstrap — auditConfigWarnings propagation` describe with 3 pins — (a) malformed `[audit.retention]` values produce ≥ 3 warnings AND fall back to defaults verified by reading `result.config.auditRetention.*`; (b) typo at `[audit].*` sibling level produces a "not a known audit key" warning AND `runGcOnStop` stays false; (c) clean config produces `[]` (no false positives).
+    - `tests/cli/init-eval.test.ts`: scaffold expectation pin — `auditConfigWarnings` is `[]` after `agent init` (init doesn't scaffold `[audit]`, so loader returns defaults silently).
+    - `tests/cli/repl-history.test.ts`: 2 mock `BootstrapResult` instances updated with `auditConfigWarnings: [] as readonly string[]`.
+    - `tests/cli/repl.test.ts`: 1 mock updated.
+    - `tests/audit/config-loader.test.ts`: no changes needed — loader already produced warnings; the bug was purely a bootstrap wiring gap.
+
+**Verification:** 172/172 across the 5 impacted test files; typecheck + lint clean.
+
+**Pre-existing operator state.** Installs that ran with any misconfigured `[audit]` / `[audit.retention]` block before this fix would have seen silent default fallback for all of them. To audit your install, re-run with `bun run dev <prompt>` (or `agent` once built) — every previously-silent warning will now surface on stderr with the `forja: audit config:` prefix. If a warning appears, fix the TOML and the intended retention/Stop-hook behavior takes effect on the next boot.
+
+## [2026-05-19] fix(cli) — `agent purge --force` aborts (exit 1) on TOCTOU detection
+
+Operator-reported bug. The TOCTOU defense in `walkRemove` previously only emitted a stderr line and `return`-ed from the current frame when `verifySamePostReaddir` reported a concurrent FS swap. That sub-frame return cleanly fell off the call stack: if the failure was at the ROOT `.agent/` directory (which is `removeTree`'s entrypoint), the function returned `{files: 0, dirs: 0, bytes: 0}`, `runPurge` built a `ForceReport` with `removed: {0, 0, 0}`, and rendered SUCCESS (exit 0) — silently violating `--force` semantics. Operators saw "purge succeeded" but the project state was unchanged after a concurrent FS swap/race.
+
+**Failure shape:**
+
+| TOCTOU location | Pre-fix outcome | Operator-visible signal |
+|---|---|---|
+| Root `.agent/` (first lstat→readdir) | exit 0 + "purge succeeded, removed: 0 files / 0 dirs / 0 B" | stderr line about "refusing to descend" + bogus success |
+| Mid-tree (child dir) | exit 1, but with `FS removal failed mid-walk: ENOTEMPTY` — because rmdir on the parent failed when the failing-child subtree was still there | Generic message; operator can't tell it was a TOCTOU race vs. perm error vs. EBUSY |
+
+The first case is the silent --force violation. The second case still exits 1 but via a confusing path (rmdir-failure cascading up) with the wrong root cause in the message.
+
+**Fix.** Throw discipline replaces stderr+return:
+
+1. **`src/cli/purge.ts`** — new `class PurgeToctouError extends Error` carrying `path: string` + `partial: {files, dirs, bytes}` (the running counts at the moment of abort). Exported so the catch block can `instanceof`-check.
+
+2. **`src/cli/purge.ts`** — `walkRemove` now `throw new PurgeToctouError(path, {files, dirs, bytes})` instead of `process.stderr.write(...) + return`. The throw propagates through the parent's for-loop (skipping the parent's `rmdirSync`), through `removeTree`, into `runPurge`'s try/catch. Same propagation regardless of where in the tree the TOCTOU triggers — root vs. mid-tree differ only in the captured partial counts, not in the abort signal.
+
+3. **`src/cli/purge.ts`** — `removeTree` signature accepts an optional `RemoveTreeOptions.verifier` (defaults to the real `verifySamePostReaddir`). Pure test seam: production omits it; tests inject a constant-false verifier to exercise the abort path without simulating racy FS scheduling. `removeTree` and `PurgeToctouError` both `export`-ed (the former was previously module-internal).
+
+4. **`src/cli/purge.ts`** — `runPurge` catch block discriminates `PurgeToctouError` from generic mid-walk failures:
+    - Renders the exact path that failed (operator can investigate directly)
+    - Branches on partial counts: "Partial state: N files / M dirs / B removed before the abort" vs. "No files were removed (TOCTOU detected before any removal)"
+    - Notes whether the audit row was already written (important because audit lands BEFORE `removeTree`)
+    - Concludes with "INVESTIGATE: another process modified the filesystem during the walk. Identify and stop it before retrying purge."
+    - All paths return exit 1.
+
+5. **Tests** — 4 new pins in `tests/cli/purge.test.ts` (`removeTree — TOCTOU abort throws PurgeToctouError`):
+    - **Root-level TOCTOU**: `removeTree(root, {verifier: () => false})` throws with `partial = {0,0,0}` AND every file in the tree still exists (the regression pin for the reported bug).
+    - **Mid-tree TOCTOU**: verifier fails only on `sub/`; throws with `path === sub`; both `sub/` and root parent still exist (rmdir cascade prevented).
+    - **Default verifier happy path**: omitting the override produces the real wiring — tree removed normally with correct counts.
+    - **Partial counts shape**: when failure follows file removals, `partial.{files,dirs,bytes}` are numeric and `>= 0` (structural, since readdir order is FS-dependent and exact counts can't be predicted).
+
+**Why throw instead of fixing the silent-return semantic.** Two reasons:
+- The signal needs to survive arbitrary stack depth. A "fatal flag tracked in the closure" approach would work but requires every recursion frame to re-check the flag after each child returns; throw is shorter and matches how the rest of the codebase signals "abandon this entire operation."
+- Mid-tree TOCTOU previously bubbled up through `rmdir` failure with the wrong error class. The throw discipline gives the catch a typed signal it can branch on cleanly.
+
+**Why no stderr write from the walker any more.** Single source of truth: `runPurge` now owns the message format with the partial-state nuance. A future caller of `removeTree` (none today) inherits the contract "catch `PurgeToctouError` and render".
+
+**Verification:**
+- 42/42 tests in `tests/cli/purge.test.ts` (was 38, +4 new TOCTOU abort pins)
+- typecheck + lint clean
+
+**Pre-existing operator state.** Installs that hit a root-level TOCTOU race between the previous fix and this one would have seen exit 0 + zero-removal "success" output. The audit row was still written, so `agent --list-sessions` and the purge_events ledger would record an inflated "I purged at <ts>" claim against a project that's actually still intact. Affected operators should re-run `agent purge --dry-run` on suspect projects to see what's still there. No corruption — the FS is genuinely intact.
+
+## [2026-05-19] feat(audit) — gc Phase 3 wires `purge_events` retention (inert key bug)
+
+Operator-reported gap. The purge subsystem migration (066-purge-events.ts:87) declared "Retention 365d (par with approvals_log, per AUDIT.md §1.2). No UPDATE surface, no DELETE outside the retention sweep" — and `[audit.retention].purge_events` was accepted by config parsing as a forward-compat key — but no sweep path existed. The retention key was inert: an operator setting `purge_events = 30` got the warning-free acceptance of validated input plus the silent no-op of forward-compat input. Worst of both worlds.
+
+**Consequences.**
+
+- `purge_events` rows grow unbounded across the install lifetime. Each `agent purge --force` adds 1 row (`bytes_present`, `files_present`, `dirs_present`, plus JSON artifact list). Heavy users with frequent purges accumulate without ever triggering the documented 365d sweep.
+- The documented retention behavior in AUDIT.md §1.2 + the migration comment didn't hold: operators reading either source assumed the sweep was wired, but it wasn't.
+- `agent gc --table=purge_events` would have rejected (unknown table) — no way to even manually sweep through the CLI.
+- The "inert key" pattern was operator-visible only by reading source: typing the key in TOML produced no warning, no effect, no signal of either acceptance or rejection.
+
+**Fix.** Wire `purge_events` end-to-end through the gc subsystem as the first inhabitant of a new "Phase 3" category:
+
+1. **`src/audit/gc-tables.ts`** — added `PHASE_3_TABLES = ['purge_events'] as const` with comment defining the category: "standalone audit ledgers. Append-only, no FK chain, install-scoped, no hash chain." Distinct from Phase 2 (FK-cascade with sessions) and distinct from the still-deferred approvals_log (hash-chained, needs rotation-aware sweep). `GC_TABLES` union widened to include Phase 3.
+
+2. **`src/storage/repos/purge-events.ts`** — added `prunePurgeEvents(db, cutoffMs)`: `DELETE FROM purge_events WHERE ts < ?`. Strict-`<` boundary matches every other age-based prune helper (retrieval_trace, context_pins, memory_events, hook_runs, failure_events, eviction_events, outcomes) so operators see consistent semantics across a single gc run. Module header updated to call out this single legitimate mutation exception to append-only.
+
+3. **`src/audit/gc.ts`** — added `purge_events` case to all three exhaustive switches (`computeCutoffForTable`, `countWouldDelete`, `sweepOne`). Imported `prunePurgeEvents`. Re-exported `PHASE_3_TABLES` + `Phase3Table` type for consumers that want the phase split.
+
+4. **`src/audit/config-loader.ts`** — added `purge_events_days: 365` to `DEFAULT_RETENTION` (matching AUDIT.md + migration 066 header), added `purge_events_days: number` to `RetentionConfig`, moved `purge_events` from "Phase 3+ accepted, ignored" to "Phase 3 validated + applied" in `KNOWN_SCHEMA_KEYS`, added `parseDays` block for `r.purge_events`, added safe-`??` number merge for `purge_events_days`.
+
+5. **Tests** — 107/107 across 5 files:
+    - `tests/storage/purge-events.test.ts`: whitelist test extended to include `prunePurgeEvents` with explicit comment defining the append-only exception; 5 new prune semantics pins (strict `<` boundary, equal-cutoff preserved, idempotent, empty-table, install-wide scope).
+    - `tests/audit/gc.test.ts`: `TIGHT_CONFIG.purge_events_days = 1`; table count assertions 10 → 11 (and 9 → 10 with outcome_signals disabled); co-fixture integration test seeds + verifies purge_events sweep through orchestrator.
+    - `tests/audit/config-loader.test.ts`: new `Phase 3 keys (purge_events)` describe block — default, override, layer merge, invalid fallback, regression pin for "key was previously inert".
+    - `tests/cli/gc.test.ts`: table count 10 → 11.
+    - `tests/cli/args-gc.test.ts`: drift-guard pin that `--table=purge_events` is accepted by the parser (derives automatically from the GC_TABLES widening).
+
+**Design choices.**
+
+- **Whitelist test stays, doesn't get bypassed.** The append-only contract test at `tests/storage/purge-events.test.ts` previously enforced ONLY `[insertPurgeEvent, listPurgeEventsByCwd]`. Instead of deleting it (which would lose the drift signal for future regressions) or moving the prune to a separate module (would be the only outlier among 9 sister prune functions that all live in their repo files), I extended the whitelist to include `prunePurgeEvents` with an explicit comment carving out the retention-only exception. Any per-row DELETE / UPDATE added later still trips the test.
+
+- **Phase 3, not Phase 2.** Phase 2's comment explicitly defines it as "audit-cascade tables (FK SET NULL or CASCADE with sessions)". purge_events has no FK to sessions (it fires outside any session, attribution via `install_id` instead). Forcing it into Phase 2 would weaken that category's semantic. Phase 3's new comment ("standalone audit ledgers. Append-only, no FK chain, install-scoped") fits exactly, and approvals_log is the natural next inhabitant once a chain-aware sweep is built.
+
+- **Schema key order in `KNOWN_SCHEMA_KEYS` reordered to reflect new validation status.** `purge_events` moved out of the "accepted, ignored" block into a new "Phase 3 (validated + applied)" block. The remaining "Phase 4+" entries (`sessions`, `messages`, `approvals`, `approvals_log`, `policies`, `pending_decisions`, `prompt_versions`, `default_days`) stay forward-compat — none of those have an active sweep path yet.
+
+**Pre-existing operator state.** Installs that ran `agent purge --force` since migration 066 landed will have accumulated `purge_events` rows that were never swept. The first `agent gc --force` after this fix lands will retroactively delete any rows older than 365d. Operators expecting no rows to disappear should set a temporary larger retention before running gc, OR run `agent gc --table=purge_events` in dry-run first to see the projected delete count.
+
+## [2026-05-19] fix(cli) — `agent gc` dry-run discriminates ENOENT from other stat errors
+
+Operator-reported follow-up to commit `7c5cd95`. The ENOENT-vs-real-failure fix used `existsSync(dbPath)` to discriminate, but `existsSync` swallows ALL stat errors and returns `false` for ENOENT, EACCES, ENOTDIR, ELOOP, ENAMETOOLONG equally. The discrimination was only HALF right: real ENOENT (file truly absent) downgraded to exit 0 — but so did EACCES (parent perm denied), ENOTDIR (parent isn't a directory), and other path-resolution errors. Same silent-masking bug the prior fix was meant to close.
+
+**Concrete failure modes** the prior fix still hid:
+
+| Scenario | `existsSync` | Pre-fix outcome | Should be |
+|---|---|---|---|
+| File truly absent (ENOENT) | false | exit 0 + "fresh install" | exit 0 ✓ |
+| Parent dir is a file (ENOTDIR) | false | exit 0 + "fresh install" silently | exit 1 |
+| Parent perm denied (EACCES) | false | exit 0 + "fresh install" silently | exit 1 |
+| Symlink cycle (ELOOP) | false | exit 0 + "fresh install" silently | exit 1 |
+| Path too long (ENAMETOOLONG) | false | exit 0 + "fresh install" silently | exit 1 |
+
+Cron jobs and CI scripts running `agent gc --json` against misconfigured paths would see "all good, 0 rows to sweep" instead of the actual operational failure.
+
+**Fix.** Replace `existsSync` with `lstatSync` + explicit `err.code === 'ENOENT'` check. Three discriminated cases:
+
+```ts
+let trulyAbsent = false;
+let preCheckError: string | null = null;
+try {
+  lstatSync(dbPath);
+  // exists — openDb failure below is real
+} catch (e) {
+  const code = (e as NodeJS.ErrnoException).code;
+  if (code === 'ENOENT') {
+    trulyAbsent = true;
+  } else {
+    // Non-ENOENT: real path-resolution failure
+    preCheckError = e instanceof Error ? e.message : String(e);
+  }
+}
+if (preCheckError !== null) {
+  err(`forja gc: cannot inspect DB path ${dbPath}: ${preCheckError}\n`);
+  return 1;
+}
+// ... openDb + ENOENT-aware fallback as before
+```
+
+Only true ENOENT downgrades to fresh-install. Everything else surfaces as real failure with exit 1 + descriptive stderr.
+
+**Test.** 1 new pin in `tests/cli/gc.test.ts`:
+- `dry-run on ENOTDIR parent (path-resolution error) exits 1, NOT fresh-install` — blocker scenario (parent is a regular file). Pre-fix silently treated as fresh-install; post-fix surfaces with `cannot inspect DB path` + exit 1 + stdout empty.
+
+The previously-existing ENOENT pin still passes (true missing file path).
+
+**Verification:**
+- 20/20 gc CLI tests pass (was 19, +1 new pin)
+- 84/84 across gc + args-gc + audit
+- typecheck + lint clean
+
+**Pre-existing operator state.** Operators with broken paths (ENOTDIR, EACCES) running gc dry-run before this fix would have silently seen "fresh install" reports. After this fix, the real failure surfaces; recovery is fixing the path or perms.
+
+## [2026-05-19] fix(cli + audit) — decouple `args.ts` from gc runtime graph
+
+Operator-reported bug. The gc Phase 2 refactor (`4ee6de0`) replaced `args.ts`'s import of `PHASE_1_TABLES` (4-element array) with `GC_TABLES` from `audit/gc.ts`. But `audit/gc.ts` is the orchestrator — it imports every gc-covered table's prune helper, which transitively pulls the entire storage/memory graph (e.g., `eviction-events.ts` → `memory/scanner.ts`).
+
+**Concrete failure mode.** `src/cli/args.ts` is loaded by EVERY agent invocation — `agent`, `agent --help`, `agent --version`, `agent <prompt>`. After the refactor, that means the storage repos chain is also loaded at module-graph-resolution time for ALL of those. If any deep dep is unavailable (broken native binding, partial install, missing peer dep, FS issue during install), even `agent --help` fails before reaching the dispatcher. The CLI's lazy-import posture in `cli/index.ts` (runtime handlers like `run.ts`, `purge.ts`, `gc.ts` are all `await import(...)`-loaded INSIDE `main()`) becomes fragile because args.ts pre-loads what those handlers were supposed to defer.
+
+The original `PHASE_1_TABLES` import worked because the symbol was already in args.ts's own subsystem (we kept the source of truth in audit/gc.ts but did NOT pull storage repos eagerly). The Phase 2 commit "fixed" the drift-guard by deriving from `GC_TABLES`, but the cure brought a worse coupling.
+
+**Fix.** New zero-imports module `src/audit/gc-tables.ts` owns the table-name constants + types:
+```ts
+// ZERO IMPORTS. Adding any import here re-introduces the coupling.
+export const PHASE_1_TABLES = [...] as const;
+export const PHASE_2_TABLES = [...] as const;
+export const GC_TABLES = [...PHASE_1_TABLES, ...PHASE_2_TABLES] as const;
+export type GcTable = (typeof GC_TABLES)[number];
+// + Phase1Table, Phase2Table types
+```
+
+- `cli/args.ts` imports `GC_TABLES` from `audit/gc-tables.ts` — pulls only the pure data.
+- `audit/gc.ts` re-exports the same symbols from `gc-tables.ts` (backward compat for existing consumers like cli/gc.ts, tests).
+- `cli/gc.ts` migrated to import table data from `gc-tables.ts` directly, runtime symbols (`runGc`, type `GcReport`) still from `audit/gc.ts`. Consistency cleanup; not strictly necessary since cli/gc.ts is lazy-loaded.
+
+Single-source-of-truth preserved — `gc-tables.ts` is the canonical list, audit/gc.ts re-exports.
+
+**Tests.** 3 new pins in `tests/cli/args-gc.test.ts` describe `parseArgs — independence from gc runtime`:
+- **NEG**: `args.ts does NOT statically import from audit/gc.ts (heavy graph)` — regex check on source content. Catches regression where someone "consolidates" the import back to `audit/gc.ts`.
+- **POS**: `args.ts DOES import from audit/gc-tables.ts (zero-imports module)` — the table list must come from somewhere; pinning the right somewhere preserves drift-guard.
+- **LOAD-BEARING**: `gc-tables.ts has ZERO imports` — if anyone adds even a type-only import to this module, args.ts inherits the coupling and lightweight commands become fragile again.
+
+Static source checks (not runtime). Simulating "storage dep missing" at runtime is hard; the file-content regex catches the regression at its root cause.
+
+**Verification:**
+- 16/16 args-gc tests pass (was 13, +3 new pins)
+- 238/238 across args + args-gc + audit + gc CLI
+- typecheck + lint clean
+- Smoke E2E: `agent --version` → `0.0.0`; `agent --help` → usage banner. Both load cleanly without dragging storage/memory chain.
+
+**Pre-existing operator state.** Operators with broken storage deps (rare but reported by partial-install scenarios) couldn't even run `agent --help` before this fix to diagnose. After this fix, lightweight commands work regardless of storage state, restoring the CLI's "help/version always work" contract.
+
+## [2026-05-19] fix(storage + bootstrap) — wire `[audit.retention].recap_cache` into write path
+
+Operator-reported bug. The Phase 2 gc commit (`4ee6de0`) parsed `[audit.retention].recap_cache` from config.toml and surfaced it in `gc --json` output, but never wired it into the cache writer. Operators who shortened/extended the TTL (e.g., `recap_cache = "5m"`) saw the gc dry-run report the new value AND the gc sweep honor it (`expires_at <= now` is unchanged regardless of TTL) — but **the writes themselves still used the 1h hardcoded `DEFAULT_RECAP_CACHE_TTL_MS`**. So `expires_at = generatedAt + 1h` in every row, regardless of config. Config silently ineffective.
+
+**Why the gc sweep alone doesn't help.** gc sweeps rows where `expires_at <= now`. If writer puts 1h into `expires_at`, gc waits 1h to delete. Operator wanting 5m TTL gets 1h lifetime. Operator wanting 24h TTL gets 1h lifetime + nothing in the data path tells them why.
+
+**Threading challenge.** `writeRecapCache` has 3 callers (`/recap` slash + `recap_mini` cache + `auto-display` at session end) reached via different code paths (REPL ctx, harness loop). Plumbing the audit config through every call signature would be invasive.
+
+**Fix.** Module-level effective default in `storage/repos/recap-cache.ts` with a single setter:
+```ts
+let effectiveDefaultTtlMs: number = DEFAULT_RECAP_CACHE_TTL_MS;
+
+export const setRecapCacheTtlOverride = (ttlMs: number | undefined): void => {
+  effectiveDefaultTtlMs = ttlMs ?? DEFAULT_RECAP_CACHE_TTL_MS;
+};
+
+// in writeRecapCache:
+const ttlMs = input.ttlMs ?? effectiveDefaultTtlMs;
+```
+
+Bootstrap calls `setRecapCacheTtlOverride(auditLoaded.config.recap_cache_ttl_ms)` right after `loadRetentionConfig`. Single-call wiring; no churn in N callers. Per-call `ttlMs` (passed explicitly) still wins — the override only fires when callers are silent on TTL (current state for all 3 callers).
+
+**Trade-off honest.** Module-level mutable state isn't ideal but matches the existing pattern (`DEFAULT_BUDGET`, `DEFAULT_CRITIQUE_CONFIG` etc. are global constants that could be similarly setter-driven for runtime override). Alternatives considered:
+- Thread config through every caller signature — would touch 4 files including the harness loop's auto-display call, recap.ts (×2), and ctx type. Higher LOC, more invasive.
+- Per-write injection via a context object — would require operator ctx wiring through harness internals. Out of scope.
+
+The setter approach is the minimum-invasive fix; tests reset the override in `afterEach` to avoid state leaking across the suite.
+
+**Tests.** 4 new pins in `tests/storage/recap-cache.test.ts` describe `setRecapCacheTtlOverride — config-driven TTL wiring`:
+- `baseline: getEffectiveRecapCacheTtlMs returns DEFAULT` — initial state pin.
+- `override changes the value used by writeRecapCache (no explicit ttlMs)` — load-bearing: setter at 5m + write without explicit ttl → `expires_at = generatedAt + 5m`, NOT the 1h default.
+- `explicit ttlMs still wins over the override (per-call escape)` — per-call escape hatch preserved.
+- `setRecapCacheTtlOverride(undefined) reverts to DEFAULT` — reset semantic for tests + operators who remove the config key.
+
+**Verification:**
+- 20/20 recap-cache tests pass (was 16, +4 new)
+- 116/116 across recap-cache + bootstrap + audit
+- typecheck + lint clean (Biome auto-fix for one formatting nit in bootstrap)
+
+**Pre-existing operator state.** Operators who set non-default `recap_cache` config before this fix had their setting silently ignored — writes used 1h regardless. After this fix, the next bootstrap (any agent command) picks up the config and subsequent writes honor it. Pre-existing rows in `recap_cache` already have their `expires_at` written under the old (1h) regime; they survive until the existing TTL elapses. Operator who wants the new TTL to apply retroactively can `agent gc --force --table=recap_cache` (which uses the canonical `<=` sweep predicate; doesn't depend on the config TTL).
+
+## [2026-05-19] fix(cli) — `agent purge` TOCTOU verifier checks `dev` alongside `ino`
+
+Operator-reported security follow-up to commit `75779ce` (TOCTOU symlink race fix). The `verifySamePostReaddir` detector compared only `stAfter.ino === preStat.ino` to confirm directory identity after `readdirSync`. Inode numbers are **only unique per filesystem** — a cross-device swap (adversary mounting a crafted FS at the path with a directory whose ino collides with the original) would pass the check and let the walker recurse into the swapped tree.
+
+**Attack shape.** Adversary with mount privileges (or via FUSE / user namespaces in some configurations) mounts a tmpfs / crafted ext4 at the dir's path between `lstatSync` and `readdirSync`. Crafts the directory inode value to match the original (trivial: SQLite/tmpfs let you control ino at creation in some cases, or just try until you hit a collision — small ino space). The post-readdir re-stat returns the SAME ino — verifier passes. Walker recurses into the mount's contents — deletes files outside `.agent/`.
+
+Real-world feasibility: requires mount rights OR FUSE setup. Lower than the basic symlink race but still within the operator's threat model (multi-user host, container escape recovery, hostile sysadmin scenarios).
+
+**Fix.** Add `stAfter.dev === preStat.dev` to the identity check:
+
+```ts
+return (
+  stAfter.isDirectory() &&
+  !stAfter.isSymbolicLink() &&
+  stAfter.ino === preStat.ino &&
+  stAfter.dev === preStat.dev    // <- new
+);
+```
+
+The `dev + ino` pair is the kernel-level unique identifier across all mounts. Together they pin "this is the same filesystem object" — a swap that changes either field is detected.
+
+**Tests.** 1 new pin in `tests/cli/purge.test.ts` describe `verifySamePostReaddir — TOCTOU race detector`:
+- `returns false when dev differs (cross-device swap with same ino)` — forge a `Stats` object with same `ino` as the real one but `dev: realStat.dev + 1`. Verifier's post-stat (real `lstatSync`) returns the actual dev; if it compared only ino, would return true. Asserts false.
+
+Real cross-device mount isn't feasible in a unit test (needs root + loop device or FUSE). Forged Stats is the cleanest way to pin the dev check is actually consulted.
+
+**Residual race window unchanged.** The post-readdir-to-walkRemove window still exists (microseconds; documented in prior fix entry). Cross-device swap during THAT window remains the residual theoretical risk.
+
+**Verification:**
+- 38/38 purge tests pass (was 37, +1 new pin)
+- 49/49 across purge + args-purge
+- typecheck + lint clean
+
+**Pre-existing operator state.** Same as the original TOCTOU fix — only triggers under concurrent FS modification by a malicious local process with mount rights. Normal single-process workflows were never affected. This fix tightens the identity check; an adversary winning the residual post-stat race remains the only theoretical hole, deferred until exploit reported.
+
+## [2026-05-19] fix(cli) — `agent gc` distinguishes missing DB from real failures in dry-run
+
+Operator-reported bug. The dry-run readonly-open fix (commit `706b344`) collapsed ALL open failures into "fresh install case" — empty report, exit 0, stderr warning. Concrete consequence: a corrupted DB, perm-denied DB, locked DB, or integrity-check failure would surface as "all good, 0 rows to sweep" to scripts/cron jobs, masking real operational failures.
+
+**Concrete failure mode.** Operator's `~/.local/share/forja/sessions.db` is corrupted (cosmic ray, torn page after kernel crash, hostile FS write). Cron job runs `agent gc --json` nightly. Pre-fix:
+```
+{"mode":"dry-run","tables":[],"errors":[],"command":"agent gc --force"}
+```
+Exit 0. Cron silently thinks hygiene is healthy. Operator never notices the DB is broken until something else (a normal `agent` session) hits the corruption.
+
+Post-fix:
+```
+forja gc: DB at /path/sessions.db exists but cannot be opened in dry-run: file is not a database
+```
+Exit 1. Stdout empty. Cron alerts.
+
+**Fix.** Pre-check `existsSync(dbPath)` BEFORE `openDb(dbPath, { readonly: true })`. On open failure:
+- `dbExistedBeforeOpen === false` → legitimate fresh-install case. Empty report + helpful "Run X to create + migrate" pointer + exit 0.
+- `dbExistedBeforeOpen === true` → real failure. Surface stderr + exit 1. No empty report — pretending to have row counts would mask the failure.
+
+Stderr messages distinguish:
+- Fresh install: `"DB not yet created at <path> (fresh install — no rows to sweep). Run <forceCommand> to create + migrate."`
+- Real failure: `"DB at <path> exists but cannot be opened in dry-run: <reason>"`
+
+**existsSync race.** Theoretical: file could be created/removed between `existsSync` and `openDb`. Cases:
+- `exists=true, openDb succeeds` → normal path
+- `exists=true, openDb fails` → real failure (rare race where file vanished mid-call is treated as failure; fine, vanished mid-call is itself unusual)
+- `exists=false, openDb succeeds` → file appeared (concurrent process); proceed normally
+- `exists=false, openDb fails` → fresh install path
+
+All four cases produce sane behavior.
+
+**Tests.** 1 new + 1 rewritten in `tests/cli/gc.test.ts` describe `runGcCli — DB inaccessible`:
+- **NEW**: `dry-run on EXISTING but unopenable DB: exit 1 + surface error` — load-bearing. Writes corrupt content to a valid-looking path (`writeFileSync(dbPath, 'NOT A SQLITE DATABASE')`), verifies SQLite throws on open, asserts exit 1 + `stderr contains "exists but cannot be opened"` + `stdout is empty`.
+- **Rewritten**: `dry-run on missing DB file: exit 0 + fresh-install message` — replaces the previous "DB inaccessible" test that used a blocker path (parent-is-a-file). With the new discrimination, blocker scenario actually triggers fresh-install path (file absent, even if path is patho-invalid); the test now uses an explicitly-missing path and asserts the fresh-install message contains "fresh install".
+
+**Verification:**
+- 19/19 gc CLI tests pass (was 18, +1 new + 1 rewritten net)
+- 80/80 across gc + audit
+- typecheck + lint clean
+- Smoke E2E: corrupt sessions.db at real `defaultDbPath()` path → `exit 1` + stderr "file is not a database"; missing path → `exit 0` + fresh-install message.
+
+**Pre-existing operator state.** Operators with corrupted DBs who relied on cron-driven `agent gc --json` checks may have missed the corruption. The fix surfaces it on next run; recovery is the same as any DB corruption (restore from backup, rotate via `agent permission rotate-chain`, or `rm` and start fresh if no audit history is needed). No automated migration — this fix CATCHES the regression, doesn't repair existing damage.
+
+## [2026-05-19] fix(cli) — `agent purge` TOCTOU symlink race in removeTree
+
+Operator-reported **security** bug. The purge walker's symlink defense was load-bearing for the "won't delete files outside `.agent/`" contract in spec §2.1.2, but had a TOCTOU window that defeated it under concurrent FS mutation.
+
+**The race:**
+
+```
+t0: lstatSync(path)        → directory D, inode X
+t1: ADVERSARY swaps        → path is now a symlink S → /home/important/
+t2: readdirSync(path)      → follows symlink → lists /home/important/'s entries
+t3: walkRemove(child)      → recurses into /home/important/<child>
+... deletes files outside .agent/
+```
+
+The top-of-walk symlink check on `<repoRoot>/.agent/` itself didn't help — the race was per-directory inside the walk, on every recursive descent. Any concurrent process with FS write access to a path inside `.agent/` could exploit it during the narrow window between `lstatSync` and `readdirSync`.
+
+Real-world attack feasibility: low (requires concurrent access + tight timing + write rights inside `.agent/`), but the spec promised the symlink defense was absolute; this was a documented contract violation, not just a theoretical risk.
+
+**Fix.** New exported helper `verifySamePostReaddir(path, preStat): boolean` — re-runs `lstatSync` AFTER `readdirSync` and verifies the path still points at the same inode of a real directory. If the post-stat shows a symlink, a different inode, a non-directory, or vanished — return false and the walker refuses to recurse.
+
+```ts
+if (st.isDirectory()) {
+  let entries: string[];
+  try { entries = readdirSync(path); } catch { entries = []; }
+  if (!verifySamePostReaddir(path, st)) {
+    process.stderr.write(
+      `forja purge: refusing to descend into ${path} — concurrent FS modification detected (lstat/readdir TOCTOU); aborting subtree\n`,
+    );
+    return;
+  }
+  for (const name of entries) walkRemove(join(path, name));
+  rmdirSync(path);
+  ...
+}
+```
+
+**Residual race window (documented, not closed).** Adversary can still swap between the post-readdir re-stat and the per-child `walkRemove` call. That window is microseconds between two FS syscalls in the same process — much narrower and harder to exploit than the pre-fix window. Fully race-free walking requires fd-based directory iteration (`opendir` over an `O_NOFOLLOW` fd), which Node's public `fs` API doesn't cleanly expose. Would need OS-level primitives or Bun-specific extensions; deferred unless a real exploit attempt is reported.
+
+**Tests.** 5 new pins in `tests/cli/purge.test.ts` describe `verifySamePostReaddir — TOCTOU race detector`. Functional (not mocked-race) — construct the post-race state directly and verify the detector reports the mismatch:
+- Same dir across calls → true (baseline).
+- Dir replaced by symlink → false (the motivating attack).
+- Dir recreated with different inode → false.
+- Path vanished entirely → false.
+- Path replaced by regular file → false.
+
+Race scheduling can't be reproduced deterministically without flaky timing tests; the unit tests pin the detector function itself, which is the load-bearing piece.
+
+**Verification:**
+- 37/37 purge tests pass (was 32, +5 new pins)
+- 48/48 across purge + args-purge
+- typecheck + lint clean
+
+**Pre-existing operator state.** No automated recovery — the bug only triggers under concurrent FS modification by a malicious local process. Operators in normal single-process workflows were never affected. The fix shrinks the attack window; an adversary winning the residual race is the remaining theoretical risk, deferred per above.
+
+## [2026-05-19] fix(cli) — `agent purge` dry-run suggestion preserves `--no-audit`
+
+Operator-safety bug, same shape as the recent gc `--table` scope fix. Dry-run output (both human "To execute:" line AND JSON `command` field) was hardcoded to `agent purge --force`, regardless of whether the operator passed `--no-audit`.
+
+**Concrete failure mode (motivating scenario).** Operator hits a DB corruption / fresh install / recovery situation where the global `sessions.db` is unwritable. They:
+1. Run `agent purge --no-audit` to inspect what would be removed.
+2. Dry-run shows scope + suggests `agent purge --force`.
+3. Copy-paste the suggestion.
+4. Force run hits the audit gate (DB unwritable, no `--no-audit` to bypass) → aborts with "cannot write audit row to DB; pass --no-audit to bypass".
+5. Operator now stuck in a loop: they have to manually remember the flag they originally used.
+
+The `--no-audit` flag exists exactly for the emergency case where the DB is broken. Suggesting a command that won't work in that case turns the dry-run into a trap — the operator can't execute the previewed plan.
+
+**Fix.** Build the suggested command dynamically:
+```ts
+const command = noAudit ? 'agent purge --force --no-audit' : 'agent purge --force';
+```
+Passed into the `DryRunReport.command` field, surfaces in both the human "To execute:" line and JSON output. Force-mode JSON still omits `command` (no follow-up to suggest).
+
+Mirrors the gc Phase 2 `buildForceCommand(tables)` fix — same principle (suggested command must echo operator's flags so copy-paste is executable).
+
+**Tests.** 4 new pins in `tests/cli/purge.test.ts` describe `runPurge — dry-run suggestion preserves --no-audit`:
+- `no --no-audit → "agent purge --force" (baseline)` — bare suggestion still works.
+- `--no-audit set → suggestion preserves the flag` — JSON output check.
+- `human output echoes --no-audit suggestion` — includes negative polarity assertion (`stdout NOT matching /agent purge --force\n/` to catch regression).
+- `--no-audit + unwritable DB → suggestion still executable` — the motivating scenario itself: probe-skipped + blocker dbPath, suggestion still includes `--no-audit` so copy-paste actually works.
+
+**Verification:**
+- 32/32 purge tests pass (was 28, +4 new pins)
+- 43/43 across purge + args-purge
+- typecheck + lint clean
+- Smoke E2E: `agent purge --no-audit` in fresh tempdir with valid `.agent/` → "To execute:" footer shows `agent purge --force --no-audit`.
+
+**Pre-existing operator state.** Operators who copy-pasted the bare suggestion from a `--no-audit` dry-run before this fix may have hit the audit gate and either aborted (no data lost — just frustrating) or manually added `--no-audit` on retry. No automated recovery needed.
+
+## [2026-05-19] fix(cli) — `agent gc` dry-run suggestion preserves `--table` scope
+
+Operator-safety bug. Dry-run output (both human "To execute: agent gc --force" line AND JSON `command` field) was hardcoded to `agent gc --force` — no `--table=X` flags echoed back.
+
+**Concrete failure mode.** Operator:
+1. Runs `agent gc --table=memory_events` to inspect ONLY one table's deletion impact.
+2. Reads dry-run output, sees "To execute: agent gc --force".
+3. Copy-pastes that line into the shell.
+4. Force run sweeps ALL 10 covered tables, deleting data outside the inspected scope.
+
+The dry-run's purpose is to let the operator validate impact before committing. Losing the scope in the suggestion turns the dry-run into a trap.
+
+**Fix.** New `buildForceCommand(tables: ReadonlyArray<string>): string` helper:
+- Empty `tables` → `'agent gc --force'`
+- Non-empty → `'agent gc --force --table=X --table=Y'` (each filter explicitly echoed)
+
+Applied to all 5 hardcoded sites in `cli/gc.ts`:
+1. `renderHumanDryRun` final "To execute" line
+2. JSON `command` field on the normal dry-run path
+3. JSON `command` field on the DB-unreadable empty-report path
+4. stderr "run X to create + migrate the DB" warning on the DB-unreadable path
+5. `cmd` variable in the JSON force-vs-dry-run branch
+
+`renderHumanDryRun` now takes the command as a parameter (was hardcoded inside). All call sites updated.
+
+Force-mode JSON still omits `command` entirely (no follow-up to suggest).
+
+**Tests.** 6 new pins in `tests/cli/gc.test.ts` describe `runGcCli — suggested force command preserves scope`:
+- `no --table → "agent gc --force" (unscoped)` — baseline still works.
+- `single --table → preserved in suggestion`
+- `multiple --table → all preserved, order maintained`
+- `human output echoes scoped command` — includes negative polarity assertion (`stdout NOT matching /agent gc --force\n/` to catch regression to bare suggestion).
+- `force mode JSON omits command (no follow-up to suggest)`
+- `DB-unreadable dry-run path also preserves scope` — covers the empty-report emergency path, easy regression spot.
+
+**Verification:**
+- 18/18 gc CLI tests pass (was 12, +6 new pins)
+- 79/79 across gc CLI + args-gc + audit/
+- typecheck + lint clean
+- Smoke E2E: `agent gc --table=context_pins --table=bg_processes` in fresh tempdir → output echoes `agent gc --force --table=context_pins --table=bg_processes` in both stderr warning AND suggestion footer.
+
+**Pre-existing operator state.** Operators who copy-pasted the bare suggestion from a scoped dry-run before this fix may have swept tables outside their intended scope. No automated recovery — the deletions are by-table-retention-windows, idempotent on re-run; operator who wanted narrower scope can re-establish their config and let normal retention rebuild the dataset over time (or restore from backup if available).
+
+## [2026-05-19] fix(cli) — `agent purge --no-audit` skips DB probe entirely
+
+Third operator-reported bug on the `--no-audit` escape hatch in two commits. Sequence:
+
+1. **First fix (`0747faf`)**: `--no-audit` only honored as an error bypass — healthy DB still wrote a row. Made `--no-audit` the PRIMARY gate so the write was correctly skipped.
+2. **This fix**: even after gating the WRITE, the PROBE (`openDb + migrate`) still ran first. So `agent purge --force --no-audit` on a fresh install CREATED `~/.local/share/forja/sessions.db` and applied 66 migrations to it before the noAudit check fired. Operator opted out of audit logging and still got DB side effects.
+
+The escape hatch is meant for emergencies — DB corrupted, fresh install where the global DB shouldn't exist yet, recovery scenarios where any DB touch is risky. Probing first defeats the entire purpose.
+
+**Fix.** Three-way gate on the probe selection:
+```ts
+const audit = noAudit
+  ? { writable: false, dbPath, reason: 'skipped (--no-audit; DB not probed)' }
+  : force
+    ? probeAuditWritabilityMutating(dbPath)
+    : probeAuditWritabilityNonMutating(dbPath);
+```
+
+When `--no-audit` is set, the probe is bypassed entirely. The `audit` object is synthesized with `writable: false` and a reason field describing the opt-out. No `openDb`, no `migrate`, no file creation, no chmod, no sidecars — zero DB-side effects.
+
+Stderr message unified to a single line regardless of force/dry-run + DB state when opt-out is in play:
+```
+forja purge: --no-audit set; audit row skipped (DB not probed)
+```
+
+(Operator who explicitly opted out of audit logging knows the DB state wasn't queried.)
+
+**JSON output semantic change.** `audit.writable: false` now signals BOTH "DB broken" AND "opt-out". Operator scripting that needs to distinguish reads `audit.reason`:
+- `'skipped (--no-audit; DB not probed)'` — opt-out (no DB touch)
+- `'<ENOENT/EACCES message>'` — actual probe failure
+
+Tests in this commit pin both signal paths.
+
+**Tests.** 1 new + 2 updated in `tests/cli/purge.test.ts`:
+- **NEW**: `--force --no-audit on a FRESH install does not create sessions.db` — load-bearing. With non-existent dbPath, FS purge happens but `existsSync(freshDb) === false` after.
+- **Updated**: `--force --no-audit on a HEALTHY DB skips both probe and audit row` — now expects the uniform stderr message + `auditWritable: false` (NOT true as before, because probe never ran).
+- **Updated**: `--force --no-audit JSON output reflects no audit row and skipped probe` — `auditId: null` + `auditWritable: false`.
+- **Updated**: `--force --no-audit proceeds even when DB is unwriteable` — same uniform stderr message expectation.
+
+**Verification:**
+- 28/28 purge tests pass (was 27, +1 new pin)
+- 51/51 across purge + args-purge + purge-events repo
+- typecheck + lint clean
+- Smoke E2E: `agent purge --force --no-audit` with non-existent `XDG_DATA_HOME` → FS purge happens, **no DB created**.
+
+**Pre-existing operator state.** Operators who ran `agent purge --force --no-audit` on a fresh install before this fix have an unwanted `~/.local/share/forja/sessions.db` (created by the probe, migrated, but with no rows). Remove via `rm ~/.local/share/forja/sessions.db*` if not used for real session activity.
+
+## [2026-05-19] fix(cli) — `agent gc` dry-run uses readonly DB open (no file/sidecar creation)
+
+Operator-reported bug. The dry-run path still called `openDb(dbPath)` before the force check — and `openDb` without `{readonly: true}` does substantial mutation:
+
+- `mkdirSync(parent, recursive)` — creates parent directory
+- `Database(path, { create: true })` — creates the `.db` file
+- `PRAGMA journal_mode = WAL` — creates `-shm` + `-wal` sidecar files
+- `PRAGMA busy_timeout = 5000` — sets DB-level setting
+- `chmodSync(path, 0o600)` + `chmodSync(parent, 0o700)` — tightens perms
+
+All of that ran in dry-run, despite the `forja gc — DRY RUN (nothing will be modified)` header. Same shape as the recent purge dry-run fix and the gc Phase 1 C1 fix (migrate-in-dry-run). Caught by operator running `agent gc` on a fresh install — got an unexpected `sessions.db` materialized.
+
+**Fix.** `openDb` already supports `{ readonly: true }` (slice 125 for doctor's chain check). In readonly mode it: skips mkdir, skips `create: true` (open throws SQLITE_CANTOPEN on missing file), skips WAL pragma, skips chmod. Pure no-mutation read path.
+
+Split the gc handler's DB open into two branches:
+- **Force**: `openDb(dbPath)` + `migrate(db)` — current behavior; operator opted into mutation.
+- **Dry-run**: `openDb(dbPath, { readonly: true })`. ENOENT on missing file is caught + reported gracefully: stderr "DB not readable in dry-run", exit 0, empty report. Fresh-install operator running `agent gc --json` gets `{tables: [], errors: []}` instead of a crash.
+
+**Force-mode behavior on broken DB unchanged.** Operator who explicitly opted into mutation still gets exit 1 with "cannot open DB" message — they need to know.
+
+**Tests.** 4 new/updated in `tests/cli/gc.test.ts`:
+- `dry-run does NOT create DB file or sidecars on a fresh path` — load-bearing. Checks `existsSync(freshDb) === false`, plus `-shm` and `-wal` also absent.
+- `dry-run on existing DB does NOT add sidecars or migrate` — confirms schema integrity (no `_migrations` table created).
+- `dry-run reports empty + warning, exit 0 (fresh-install-friendly)` — replaces the old "DB inaccessible → exit 1" test which assumed the broken pre-fix behavior.
+- `--force still exit 1 when DB cannot be opened (write path)` — companion: force-mode still hard-fails on broken DB.
+
+**Verification:**
+- 12/12 gc CLI tests pass (was 9, +3 net; one test rewritten)
+- 96/96 across gc + audit + gc-prunes
+- typecheck + lint clean
+- Smoke E2E: `agent gc` with `XDG_DATA_HOME` pointing at fresh tempdir → `ls $XDG_DATA_HOME/` returns empty after dry-run; **no DB or sidecar files created**.
+
+**Cosmetic side-fix.** Found a leftover "Tables (Phase 1):" header in `renderHumanDryRun` (Phase 2 commit's `replace_all` had missed this one). Changed to "Tables:" matching the force-mode header.
+
+**Pre-existing operator state.** Operators who ran `agent gc` (dry-run) before this fix on a fresh install have an unwanted `~/.local/share/forja/sessions.db` + `-shm` + `-wal`. Remove via `rm ~/.local/share/forja/sessions.db*` if not yet used for real session activity.
+
+## [2026-05-19] fix(cli) — `agent gc` resolves repo root before loading config
+
+Operator-reported bug. `runGcCli` was passing the raw process `cwd` directly to `loadRetentionConfig`. The loader resolves `<cwd>/.agent/config.toml`, so an operator running `agent gc` from a subdirectory (e.g., `<repo>/src/`) read `<repo>/src/.agent/config.toml` (non-existent) and silently fell back to `DEFAULT_RETENTION`. In `--force` mode that pruned rows using default retention windows instead of the operator's configured policy — data-retention regression.
+
+The same handler did the right thing for the FS purge verb (`purge.ts:482 const repoRoot = resolveRepoRoot(cwd)`) and bootstrap already resolves for the harness's call chain (`bootstrap.ts:327 const projectConfigCwd = resolveRepoRoot(cwd)`). Only `cli/gc.ts` missed the resolution — caught by the operator.
+
+**Fix.** Import `resolveRepoRoot` from `memory/paths.ts`; compute `projectConfigCwd = resolveRepoRoot(cwd)` before `loadRetentionConfig({ cwd: projectConfigCwd })`. Mirrors the bootstrap pattern exactly. `git rev-parse --show-toplevel` walks back from any subdir; outside-git invocations preserve the cwd as the project anchor (same fallback the resolver has always had).
+
+**Test.** New pin in `tests/cli/gc.test.ts` "runGcCli — repoRoot resolution":
+- `git init` the tempdir
+- write `<cwd>/.agent/config.toml` with `retrieval_trace = 7` (distinctive override)
+- create `<cwd>/src/` subdir and invoke `runGcCli({ cwd: subdir })`
+- assert `config.retrieval_trace_days === 7` (the override, NOT the 90d default)
+- assert `configSources.project` points at the repo-root config path
+
+Skips gracefully if `git` is unavailable (sandboxed CI) — same posture as the purge equivalent test.
+
+**Verification:**
+- 9/9 gc CLI tests pass (+1 new pin)
+- 80/80 across gc + audit + gc-prunes
+- typecheck + lint clean
+
+**Pre-existing operator state.** Operators who ran `agent gc --force` from a subdirectory before this fix used default retention windows instead of their configured policy. Two cases:
+- Defaults were SHORTER than their config (e.g., config wanted 365d for `memory_events`, default applied = 365d — same) → no impact.
+- Defaults were LONGER than their config → rows that should have been deleted survived. Re-run `agent gc --force` from the repo root (or anywhere now post-fix) to apply the correct windows.
+
+No automated cleanup path — rare case + idempotent verb, operator just re-runs.
+
+## [2026-05-19] fix(cli) — `agent purge --no-audit` honors opt-out on healthy DB
+
+Operator-reported bug. `--no-audit` was treated as an error bypass only — when the DB was writable, the audit row was written regardless of the flag. So `agent purge --force --no-audit` on a healthy DB still recorded a `purge_events` row, contradicting the documented "opt out of audit logging" intent.
+
+The pre-fix branching was:
+```ts
+if (!audit.writable && !noAudit) abort();
+if (audit.writable) writeAuditRow();   // <- always writes when writable
+else /* noAudit must be true */ skip();
+```
+
+`--no-audit` semantic was: "if DB fails, bypass". Operator expected: "always skip, regardless of DB state".
+
+**Fix.** `--no-audit` is now the PRIMARY gate:
+```ts
+if (noAudit) {
+  skip(/* document why: opt-out OR unreachable */);
+} else {
+  if (!audit.writable) abort();
+  writeAuditRow();
+}
+```
+
+Error messages distinguish the two cases:
+- DB writable + opt-out → `--no-audit set; skipping audit row (db writable but opt-out honored)`
+- DB unreachable + opt-out → `--no-audit set; skipping audit row (db unreachable: <reason>)`
+
+So an operator reviewing stderr knows whether they intentionally opted out OR whether the DB was broken AND they bypassed.
+
+**Tests.** Two new pins in `tests/cli/purge.test.ts`:
+- `--force --no-audit on a HEALTHY DB skips the audit row` — load-bearing. Verifies no `purge_events` row lands when operator opts out + DB is fine.
+- `--force --no-audit JSON output reflects no audit row` — `auditId: null`, `auditWritable: true`. Operator scripting can distinguish "opted out" from "DB failed" via the two fields.
+
+**Verification:**
+- 27/27 purge tests pass (was 25, +2 new pins)
+- 50/50 across purge + args-purge + purge-events repo
+- typecheck + lint clean
+
+**Pre-existing operator state.** Operators who ran `agent purge --force --no-audit` before this fix on a healthy DB have spurious `purge_events` rows recorded. They can leave them (forensic noise, harmless) or DELETE explicitly via SQL — no automated cleanup path provided (rare case, doesn't justify a verb).
+
+## [2026-05-19] fix(cli) — `agent purge` dry-run no longer mutates DB schema
+
+Operator-reported bug. `agent purge` (without `--force`) was calling `probeAuditWritability`, which in turn called `openDb(dbPath)` + `migrate(db)` before the dry-run early return. Consequences:
+
+- **Created** `~/.local/share/forja/sessions.db` if absent (the openDb side effect on first call).
+- **Applied** any pending migrations to an existing DB.
+
+Both violate the dry-run contract literally promised by the output header: `forja purge — DRY RUN (nothing will be modified)`. Operator inspecting purge scope ended up with mutated global state they didn't ask for.
+
+Same shape as the gc Phase 1 review fix C1 (`migrate` in dry-run) — I applied the fix there and forgot the homologous path in `purge.ts`. Caught now by the operator.
+
+**Fix.** Split `probeAuditWritability` into two:
+- `probeAuditWritabilityMutating(dbPath)` — current behavior (open + migrate). Used ONLY by `--force` path where the audit row write needs the schema in place anyway.
+- `probeAuditWritabilityNonMutating(dbPath)` — pure FS check via `fs.access(dirname(dbPath), W_OK)` + `existsSync(dbPath)`. Used by dry-run. Never opens, never migrates.
+
+Trade-off in the non-mutating probe: a chmod 0444 DB file with writable parent reports `writable=true` here but fails at `--force` write. Acceptable — the real failure surfaces with a clear message at force time, and dry-run's "no mutation" invariant is load-bearing.
+
+**Tests.** Two new pins in `tests/cli/purge.test.ts`:
+- `dry-run does NOT create the DB file` — load-bearing assertion. Pre-fix this test would fail because `openDb` materialized the file at dry-run time.
+- `dry-run does NOT apply migrations to a pre-existing DB` — companion case. Creates an empty SQLite file via `openDb` (no schema), runs dry-run, verifies `_migrations` table still doesn't exist after.
+
+**Verification:**
+- 25/25 purge tests pass (was 23, +2 new pins)
+- typecheck + lint clean
+- Smoke E2E: `agent purge` in tempdir with XDG_DATA_HOME isolated → `ls $XDG_DATA_HOME/` empty after dry-run, **no DB created**.
+
+**Pre-existing operator state.** Operators who hit this bug AND ran `agent purge` (without --force) before the fix have a `~/.local/share/forja/sessions.db` with unwanted state. If they want it removed: `rm ~/.local/share/forja/sessions.db*`. No data migration needed — fresh DB on next bootstrap.
+
+## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (post-work)
+
+Closes the pre-work entry below. Single branch `feat/purge-command`. Brings the gc roadmap from "Phase 1 + Stop hook shipped" to "Phase 1 + 2 + Stop hook shipped" — `agent gc` now covers 10 tables, the ones that grow fastest in normal use (memory_events, hook_runs, failure_events, eviction_events, outcomes, outcome_signals).
+
+**Round-of-review fixes that landed BEFORE commit** (self-review caught 3 issues — 1 critical, 2 quality):
+
+- **C1 (critical, caught during code review) — `redactSecrets` semantic preserved.** The first draft of the circular-import fix in `eviction-events.ts` switched from `import { redactSecrets } from '../../memory/index.ts'` to `import { redactSecrets } from '../../sanitize/secrets.ts'`. But `memory/index.ts` re-exports from `memory/scanner.ts` (not from `sanitize/secrets.ts`), and the two implementations produce different output formats: scanner uses uniform `<REDACTED:secret>` placeholder; sanitize uses per-pattern `<redacted:<name>>` + special `KEY=value` handling. The swap would have silently changed the format of every `eviction_events.evidence_json` row in production — tests passed because fixtures didn't exercise secret strings. Fix: switch to direct import from `memory/scanner.ts` (the definition site; zero imports → no circular risk; semantic original preserved). New T3 test pins `<REDACTED:secret>` format to catch any future regression.
+- **C2 — outcome_signals TTL boundary standardized to `<=` (sister-symmetric with recap_cache).** First draft used `<` (EXCLUSIVE on equality) "for consistency with age-based prunes". But the two TTL-based tables (`recap_cache` and `outcome_signals`) sit next to each other in the gc report, and divergent boundaries would mean a row with TTL exactly = nowMs lives in one table but dies in the other. Operator observing both in a single run sees inconsistent semantics. Fix: standardized to `<=` (INCLUSIVE). Documented the split rationale in `gc.ts` comments: TTL-based tables use `<=` (sister-symmetric); age-based use `<` (natural for "strictly older than retention window").
+- **T1 — Phase 1 + Phase 2 orchestrator integration test.** Per-helper tests in `gc-prunes.test.ts` pin each prune function in isolation, and the existing orchestrator test seeded only Phase 1 fixtures (Phase 2 tables appeared as `beforeCount: 0`). No coverage of "Phase 2 rows real-deletado through the orchestrator's switch wiring". Added a single comprehensive test that seeds one old + one fresh row in each of the 10 tables, runs `runGc --force` once, and verifies all 10 deleted-counts and that fresh rows survive. Catches regression where someone forgets to wire a Phase 2 table into `sweepOne`.
+
+Deferred review items: M2 (`default_days` silently swallow), M4 (padEnd(18) breaks on long Phase 3+ names), S1-3 (dead exports + heading wording + spec doc gap for boolean alias). None blocking.
+
+**Tables shipped this slice (6):**
+
+| Tabela | Default | Predicate | Edge case |
+|---|---|---|---|
+| `memory_events` | 365d | `created_at < cutoff` | FK SET NULL com sessions — survives session cleanup independently. |
+| `hook_runs` | 90d | `created_at < cutoff` | FK SET NULL. Grows with hook activity. |
+| `failure_events` | 365d | `created_at < cutoff` | **Chain trade-off documented:** per-row DELETE breaks per-session chain integrity for partially-deleted sessions. Accepted because the chain is best-effort forensic (not verifiable like approvals_log) and Phase 4 will whole-session-delete. |
+| `eviction_events` | 365d | `recorded_at < cutoff` | No chain integrity — clean DELETE. |
+| `outcomes` | 90d | `recorded_at < cutoff` | FK CASCADE com sessions. |
+| `outcome_signals` | "per-kind" | `ttl_expires_at < nowMs` | **TTL-based** (not age-based), per-row TTL populated at INSERT via `DEFAULT_SIGNAL_TTL_DAYS`. Operator can disable sweep via `outcome_signals = false`. |
+
+**Decisions that survived in-flight review:**
+
+- **No archive table.** Earlier `failure_events.ts` comment mentioned operating "on a copy under `failure_events_archived`" — an unimplemented spec note, not a hard requirement. Phase 2 ships DELETE-direct; archive-before-delete is a future slice if compliance asks.
+- **failure_events chain trade-off accepted, not engineered around.** Half-measures (delete leaves but keep roots) would leave the chain equally broken with more code complexity. Documented in the prune helper header + spec §2.1.3 + this entry. Operator who needs intact chain sets `failure_events_days` very high.
+- **outcome_signals config: `"per-kind"` string + boolean alias.** Spec AUDIT §1.2 shows `outcome_signals = "per-kind"` literal — we accept that string (honor per-row TTL) plus `true` (alias) and `false` (skip sweep). Other strings warn and fall back to enabled.
+- **Boolean merge for `outcomeSignalsEnabled` mirrors `runGcOnStop`** — `!== undefined` check (not `??`) so explicit `false` wins over user `true`. Pinned by dedicated test.
+- **No new migration.** All 6 tables already have the timestamp columns. Phase 2 is pure code (loader + helpers + orchestrator switches).
+- **`PHASE_1_TABLES` + `PHASE_2_TABLES` + `GC_TABLES` (union).** Keeps phase boundaries visible for spec / docs reference; `GC_TABLES` is what runtime uses. `args.ts` switched its `KNOWN_GC_TABLES` derivation from `PHASE_1_TABLES` to `GC_TABLES` so new tables widen the parser automatically.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1.3` — "tables cobertas" table expanded to 10 (Phase 1 + Phase 2 split visually). Added subsection covering the failure_events chain trade-off + outcome_signals `"per-kind"` config sentinel. Updated DEFAULT_RETENTION TOML snippet to include the 6 new keys. Updated "tabelas ainda fora" to remove Phase 2 references, keeping Phase 3 (approvals_log), Phase 4 (sessions cascade), and Phase 5a (--reclaim-space).
+- `AUDIT.md §1.2` already prescribed all retention defaults — no edit needed.
+
+**Round-of-implementation fixes (caught + fixed before commit):**
+
+- **Circular import TDZ via `memory/index.ts`.** Initial draft had `audit/gc.ts` → `eviction-events.ts` → `memory/index.ts` (for `redactSecrets`) → memory transition chain that re-imports `eviction-events.ts`. Created `Cannot access 'MOTIVOS' before initialization` errors when CLI handler test pulled the chain early. Fix: switch `eviction-events.ts` to import `redactSecrets` directly from `sanitize/secrets.ts` (the actual definition site), bypassing the memory subsystem's big-bang re-export and breaking the cycle.
+- **Test NOW too small for Phase 2 defaults.** `tests/cli/gc.test.ts` used `NOW = 100 * DAY_MS`, but Phase 2 defaults reach 365d. `cutoff = NOW - 365 * DAY_MS = -265 * DAY_MS` was negative → prune helpers rejected with "non-positive olderThanMs". Production uses `Date.now()` (~50 years in ms) where this never happens; test fixture bumped to `NOW = 1000 * DAY_MS`.
+
+**Code deltas (8 files modified, 0 new):**
+
+- `src/storage/repos/memory-events.ts` — `pruneMemoryEvents`
+- `src/storage/repos/hook-runs.ts` — `pruneHookRuns`
+- `src/storage/repos/failure-events.ts` — `pruneFailureEvents` + chain trade-off comment
+- `src/storage/repos/eviction-events.ts` — `pruneEvictionEvents` + circular import fix
+- `src/storage/repos/outcomes.ts` — `pruneOutcomes`
+- `src/storage/repos/outcome-signals.ts` — `pruneExpiredOutcomeSignals` (TTL-based)
+- `src/audit/config-loader.ts` — `RetentionConfig` extended with 6 fields + `DEFAULT_RETENTION` updated + parser blocks for 6 new keys + `outcome_signals` special handler (boolean / "per-kind" / warn-other) + boolean merge for `outcomeSignalsEnabled`
+- `src/audit/gc.ts` — `PHASE_2_TABLES` + `GC_TABLES` union + `GcTable` type + switches in `computeCutoffForTable` / `countWouldDelete` / `sweepOne` + `isTableEnabled` for outcome_signals skip
+- `src/cli/args.ts` — `KNOWN_GC_TABLES` derives from `GC_TABLES` instead of `PHASE_1_TABLES`; error message reworded
+- `src/cli/gc.ts` — imports updated; "Tables (Phase 1):" → "Tables:" headers
+
+**Test deltas (3 files extended, 20 new test cases):**
+
+- `tests/storage/gc-prunes.test.ts` — 12 new cases across 6 prune helpers (per-helper: cutoff EXCLUSIVE + non-positive rejection; outcome_signals also pinning TTL boundary).
+- `tests/audit/gc.test.ts` — TIGHT_CONFIG extended with 6 new fields; existing `tables.length === 4` updated to 10; new describe block for `outcomeSignalsEnabled=false` skip path.
+- `tests/audit/config-loader.test.ts` — 7 new cases covering Phase 2 keys: 5 day-based fields parse together, outcome_signals accepts "per-kind"/true/false/rejects-other-strings, false-merge-respect trap, type-rejection warning + default fallback.
+- `tests/cli/gc.test.ts` — `NOW` bumped to realistic value; `tables.length` expectation 4 → 10; CLI message expectation updated.
+- `tests/cli/args-gc.test.ts` — error message expectation updated ("not a Phase 1 table" → "not a recognized gc table").
+
+**Verification:**
+- `bun run typecheck`: clean
+- `bun run lint`: clean (928 files; Biome auto-fix for one formatting nit in audit/gc.ts)
+- 91/91 gc tests pass (was 71, +20 new)
+- 136 adjacent tests pass (bootstrap, eviction-events, outcomes)
+- Smoke E2E: `agent gc` in isolated tmpdir lists all 10 tables in error path (DB empty, no migrations applied — expected); pending-migration warning fires correctly (C1 fix from prior slice still working).
+
+**Items NOT addressed** (logged for follow-up):
+
+- Phase 3 (`approvals_log` via chain-rotation) — biggest remaining gap.
+- Phase 4 (`sessions` + FK cascade) — depends on Phase 3 design decisions.
+- Phase 5a (`--reclaim-space` SQLite VACUUM).
+- Per-`signal_kind` config override for outcome_signals. Today operator can disable the sweep entirely OR honor per-row TTL; can't say "tool_error TTL = 30d instead of 365d default" via config — would need a nested `[audit.retention.outcome_signals]` block. Future ergonomic.
+
+**Production-readiness shift.** Before: even with Phase 1 + cron + Stop hook, the tables that grow fastest in real use (memory_events, hook_runs, outcome_signals) accumulated indefinitely. After: 10 of the 14 audit tables are swept automatically with operator-set retention windows. Remaining 4 (approvals_log, sessions + cascade, prompt_versions, policies — last two are "forever" by design) need Phase 3/4 for the chain-aware tables and Phase 4 for sessions, but the operator-visible gap is mostly closed.
+
+## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (pre-work plan)
+
+Phase 1 (4 low-sensitivity tables) shipped, plus Stop hook built-in (`run_gc_on_stop`). This slice ships Phase 2 — the 6 audit-cascade tables that grow fastest in real usage (every tool call → `outcome_signals`; every failure → `failure_events`; every memory op → `memory_events`). Without Phase 2, the "archaeological trail" still dominates the DB even with Phase 1 + cron + Stop hook enabled.
+
+**Tables covered (6):**
+
+| Tabela | Coluna age | Default | Notes |
+|---|---|---|---|
+| `memory_events` | `created_at` | 365d | Lifecycle audit (created/edited/deleted/read/promoted/demoted). FK SET NULL com sessions — survive session cleanup independently. |
+| `hook_runs` | `created_at` | 90d | Per-event hook execution. FK SET NULL com sessions. |
+| `failure_events` | `created_at` | 365d | Per-session chain hash. **Trade-off:** sweep individual rows breaks the per-session chain integrity for partially-deleted sessions. Documented in spec — chain hash em failure_events é "best-effort forensic", não verifiable como `approvals_log`. |
+| `eviction_events` | `recorded_at` | 365d | Cross-substrate lifecycle (proposed→active→evicted→purged). |
+| `outcomes` | `recorded_at` | 90d | Cross-substrate operational outcomes (tier 1-5). FK CASCADE com sessions — cleaned by Phase 4 cascade too. |
+| `outcome_signals` | `ttl_expires_at` | "per-kind" | **TTL-based, NOT age-based.** Per-row TTL populated at INSERT via `signal_kind`-specific defaults (DEFAULT_SIGNAL_TTL_DAYS — 365d/730d). Sweep is `DELETE WHERE ttl_expires_at < nowMs`, mirroring recap_cache pattern. |
+
+**Decisions confirmed up front:**
+
+- **Age-based DELETE for 5 tables; TTL-based for `outcome_signals`.** Mirrors the Phase 1 pattern: most tables sweep by age, the TTL-rich ones (recap_cache, outcome_signals) sweep by per-row expiry.
+- **No archive table.** Earlier failure_events comment mentions "operates on a copy under `failure_events_archived`" — that's an unimplemented spec note, not a hard requirement. Phase 2 ships DELETE-direct; archive-before-delete is a future slice if compliance asks for it.
+- **`failure_events` chain trade-off accepted, documented.** Sweep DELETEs individual rows. For a session with 5 failure events (1-5) and 3 of them sweep-eligible, rows 1-3 are deleted; rows 4-5 remain with `prev_chain_hash` pointing at a non-existent row. Per-session forensic chain becomes partial. Two reasons we accept: (a) failure_events chain is best-effort forensic (no cryptographic invariant like `approvals_log`); (b) Phase 4 (sessions cascade) will whole-session-delete, restoring cleaner semantics. Operator who needs intact failure chain can set `failure_events_days` very high.
+- **`outcome_signals` config: `"per-kind"` sentinel + boolean alias.** Spec AUDIT §1.2 shows `outcome_signals = "per-kind"` literal. We accept that string (honor per-row TTL) plus boolean `true` (alias = enabled) and `false` (skip sweep entirely). Other strings → warning + fallback to enabled.
+- **No new migration.** All 6 tables already have the timestamp columns. Phase 2 is pure code (loader + helpers + orchestrator switches).
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1.3` — move 6 tables from Phase 2 deferred to shipped. Expand the "tables covered" block to 10. Add subsection for `failure_events` chain trade-off and `outcome_signals` TTL semantics. Re-state "what's still deferred" (Phase 3 approvals_log, Phase 4 sessions cascade, Phase 5a --reclaim-space).
+
+**Phase 1 — Storage layer.**
+
+- `src/storage/repos/memory-events.ts` — `pruneMemoryEvents(db, olderThanMs): number`.
+- `src/storage/repos/hook-runs.ts` — `pruneHookRuns(db, olderThanMs): number`.
+- `src/storage/repos/failure-events.ts` — `pruneFailureEvents(db, olderThanMs): number` + comment block explaining the chain trade-off.
+- `src/storage/repos/eviction-events.ts` — `pruneEvictionEvents(db, olderThanMs): number`.
+- `src/storage/repos/outcomes.ts` — `pruneOutcomes(db, olderThanMs): number`.
+- `src/storage/repos/outcome-signals.ts` — `pruneExpiredOutcomeSignals(db, nowMs): number` (TTL-based, mirrors `purgeExpiredRecapCache`).
+
+Each mirrors the `pruneVerifyAttempts` shape; input validation `olderThanMs > 0` (or `nowMs > 0` for TTL-based).
+
+**Phase 2 — Config + orchestrator.**
+
+- `src/audit/config-loader.ts` — extend `RetentionConfig` with 5 new day-based fields + `outcomeSignalsEnabled: boolean`. Parser handles `[audit.retention].{memory_events,hook_runs,failure_events,eviction_events,outcomes,outcome_signals}`. `outcome_signals` accepts boolean (true/false) OR the string `"per-kind"` (alias for `true`). Per-key merge respects explicit false. Update `DEFAULT_RETENTION` to match AUDIT §1.2.
+- `src/audit/gc.ts` — rename `PHASE_1_TABLES` → `GC_TABLES` (or add `PHASE_2_TABLES` + union). Extend switches in `computeCutoffForTable`, `countWouldDelete`, `sweepOne` for 6 new tables. `outcome_signals` skip path when disabled.
+- `src/cli/args.ts` — `KNOWN_GC_TABLES` derives from extended set (already wired via `PHASE_1_TABLES` source-of-truth).
+
+**Phase 3 — Tests.**
+
+- `tests/storage/gc-prunes.test.ts` — extend with 6 new describe blocks. For each: cutoff EXCLUSIVE for age-based, TTL-based for outcome_signals, input validation.
+- `tests/audit/gc.test.ts` — extend orchestrator test fixture to seed all 10 tables; verify per-table report. Add test for `outcome_signals` disabled (sweep skipped).
+- `tests/audit/config-loader.test.ts` — extend with 6 new key cases + `outcome_signals` string/boolean variants.
+
+**Items NOT addressed** (still deferred):
+
+- Phase 3 (`approvals_log` via chain-rotation).
+- Phase 4 (`sessions` + FK cascade).
+- Phase 5a (`--reclaim-space`).
+- Per-`signal_kind` override in config (`[audit.retention.outcome_signals] tool_error = 30`). Spec mentions DEFAULT_SIGNAL_TTL_DAYS map — Phase 2 honors what's already in the DB (per-row TTL set at INSERT). Override path is a future ergonomic.
+- Archive-then-delete for failure_events. Deferred until compliance asks.
+
+Same branch `feat/purge-command`. Post-work entry follows once code + tests land.
+
+## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (post-work)
+
+Closes the pre-work entry below. Phase 5 piece of the gc roadmap that shipped (the other Phase 5 piece, `--reclaim-space`, still deferred). Single branch `feat/purge-command`.
+
+**Round-of-review fixes that landed BEFORE this commit** (self-review caught 2 issues):
+
+- **M1 — dynamic import on hot path eliminated.** First draft used `await import('../audit/gc.ts')` inside the session-end branch. The deps of `audit/gc.ts` (storage repos) are already pulled by the harness via memory/retrieval paths, so lazy loading saved nothing and just added a `await` on the hot session-end path. Fix moves to static `import { runGc } from '../audit/gc.ts'` at the top of `loop.ts`. Branch body is now sync.
+- **M2 + T2 — asymmetric typo guard fixed.** The loader caught typos in `[audit.retention].*` (`retreival_trace = 90` → warning) but stayed silent on typos in `[audit].*` (`run_gc_on_stp = true` would silently drop). Operator who learned the typo-guard pattern in retention would be surprised. Fix adds `KNOWN_AUDIT_KEYS = new Set(['run_gc_on_stop', 'retention'])` + the same iterate-and-warn loop applied to `auditTable`. Two new test cases pin: typo warns (negative polarity) AND known keys don't warn (positive polarity).
+
+**Outcome.** `[audit] run_gc_on_stop = true` in `config.toml` turns on a built-in retention sweep at every session-end. Harness runs `runGc({force: true, ...})` synchronously after the operator-declared Stop hooks fire. Default off — opt-in. Cron-free hygiene for operators who don't want crontab wiring.
+
+**Operator surface** (full config example for clarity):
+
+```toml
+# ~/.config/agent/config.toml  OR  <cwd>/.agent/config.toml
+
+[audit]
+run_gc_on_stop = true            # default: false (opt-in)
+
+[audit.retention]
+recap_cache    = "1h"             # already shipped in the gc Phase 1 slice
+retrieval_trace = 90
+context_pins   = 90
+bg_processes   = 30
+```
+
+**Decisions that survived in-flight review:**
+
+- **Config flag, not always-on.** Default `false` so existing operators see zero behavior change. Operator who wants automatic hygiene opts in with one line.
+- **Synchronous execution.** Session-end awaits gc completion. Aligns with the no-daemon discipline (§1.1.2 — no background workers). Phase 1 sweeps are fast (4 tables, simple DELETEs); won't dominate session-end latency in typical DBs.
+- **Errors → stderr, never abort.** A failed gc sweep is hygiene drift, not a task failure. Session exit code reflects the task outcome; gc errors land in stderr for CI log capture.
+- **Reuse harness's DB handle.** Session already has DB open + migrated; no second `openDb` / `migrate` cycle. Pass through to `runGc({db, ...})` directly. Cleaner and faster.
+- **Runs AFTER operator-declared Stop hooks.** Operator hook that needs the pre-gc state (e.g., backup, export) sees the DB untouched. Future `PostGc` event (out of scope) would cover the symmetric case.
+- **Boolean merge needs `!== undefined`, not `??`.** `false ?? user_true` evaluates to `user_true` — silent footgun. The project's explicit `false` MUST override user's `true` (operator wants gc-on-Stop disabled in this specific project despite the user-wide default). Pinned by a dedicated test ("the ?? trap").
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1.3` — Phase 5 entry split: `--reclaim-space` stays deferred; "Stop hook integration" moved to `(shipped)` with a new subsection covering the flag, sync semantics, error handling, when-to-use / when-NOT-to-use, and composition with operator-declared Stop hooks.
+
+**Code deltas (5 files modified):**
+
+- `src/audit/config-loader.ts` — `RetentionConfig` ganha `runGcOnStop: boolean`; `DEFAULT_RETENTION.runGcOnStop = false`; parser handles `[audit].run_gc_on_stop` (boolean, sibling of `[audit.retention]`); merge respects explicit `false` via `!== undefined` comparison.
+- `src/harness/types.ts` — `HarnessConfig.auditRetention?: RetentionConfig` (optional; existing call sites without audit concerns leave it undefined and the loop skips the gc trigger entirely).
+- `src/harness/loop.ts` — after `dispatchHooks Stop`, check `config.auditRetention?.runGcOnStop === true`; if true, run gc synchronously with try/catch; surface per-table errors and unexpected throws to stderr.
+- `src/cli/bootstrap.ts` — calls `loadRetentionConfig({cwd: projectConfigCwd})` (mirrors the existing critique/budget/memory loader pattern), threads `auditLoaded.config` into `HarnessConfig.auditRetention`.
+- `tests/audit/config-loader.test.ts` — 8 new cases pinning `runGcOnStop`: defaults, user/project enables, **explicit project `false` wins over user `true`** (the `??` trap), symmetric (project `true` wins over user `false`), user-only path when project has only retention, non-boolean rejection, coexistence with `[audit.retention]` in the same file.
+
+**Verification:**
+- `bun run typecheck`: clean
+- `bun run lint`: clean (928 files; Biome auto-fix for one formatting nit in bootstrap)
+- 69/69 gc tests pass (was 61, +8 from `runGcOnStop`)
+- 250 adjacent-file tests pass (bootstrap, args, index, init, harness budget-defaults, harness output-tokens)
+
+**Items NOT addressed** (logged for follow-up):
+
+- Operator-visible "gc ran" output at session end. Today gc-on-Stop is silent unless it errors. Could emit "gc swept N rows" alongside the terse line; deferred as UX polish.
+- gc failure telemetry. Errors go to stderr (forensic) but no `outcome_signals` / `failure_events` row. Phase 3 (approvals_log) likely revisits — gc becomes audit-relevant.
+- Full session-lifecycle integration test. The harness loop is hard to exercise in isolation; current coverage relies on the unit tests for `runGc` itself + the trivial branch in `loop.ts` (one boolean check + one call). Low risk per the diff size.
+
+**Production-readiness shift.** Before this slice: operator wanting automatic hygiene had to set up cron (`crontab -e`). After: one config line + zero infra. The gc roadmap's most-asked-for piece (Stop hook integration) now ships; the remaining Phase 5 piece (`--reclaim-space`) is a niche need that can wait for a concrete request.
+
+## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (pre-work plan)
+
+The gc Phase 1 entry below deferred "Stop hook integration" to Phase 5. This slice ships exactly that piece — operator declares `[audit] run_gc_on_stop = true` in `config.toml`, and the harness automatically runs `gc --force` at the end of every session. Cron-friendly hygiene without the operator wiring crontab.
+
+**Scope (decisions confirmed up front):**
+
+- **Activation via config flag** (not always-on, not doc-only). Default `false` — opt-in. The flag lives in `[audit]` (sibling of `[audit.retention]`), not nested inside retention, because it's an operational toggle, not a TTL.
+- **Synchronous execution.** Session-end awaits gc completion. Operator-visible latency but deterministic ("when the command returns, hygiene is done"). Phase 1 sweeps are fast (4 tables, SELECT COUNT + DELETE on simple indexes); won't dominate runtime in typical DBs. Aligns with the no-daemon discipline (§1.1.2) — no background workers spawned.
+- **Errors land on stderr, do NOT abort session-end.** A failed gc sweep is hygiene drift, not a task failure. Session exit code reflects task outcome; gc errors are forensic noise the operator captures in CI logs.
+- **Reuses existing DB handle from the harness.** No new openDb / migrate cycle — the session already has the DB open and migrated. Pass through to `runGc({db, force: true, config: retention, ...})`.
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1.3` — remove "Stop hook integration" from the Phase 5 deferred list, add it to "shipped". Document the flag, sync semantics, error handling, default-off rationale. Cross-reference `§10.1` (Stop event) for operator hooks that want different/additional behavior on top.
+
+**Phase 1 — Loader extension.**
+
+- `src/audit/config-loader.ts` — `RetentionConfig` ganha `runGcOnStop: boolean`. Loader parses `[audit].run_gc_on_stop` (boolean, defaults to false). Merge respects explicit `false` (project=`false` overrides user=`true`); the `??` operator doesn't work for booleans — needs `!== undefined` check.
+
+**Phase 2 — Bootstrap + harness wiring.**
+
+- `src/cli/bootstrap.ts` — calls `loadRetentionConfig({cwd})` (already does today for `agent gc`); threads the resolved `RetentionConfig` into the `HarnessConfig` shape.
+- `src/harness/types.ts:HarnessConfig` — new `auditRetention?: RetentionConfig` field. Optional so existing call sites (tests, subagent runtime) don't need to populate it when they have no audit concerns.
+- `src/harness/loop.ts:~700` — after `dispatchHooks Stop` returns, check `config.auditRetention?.runGcOnStop === true`. If true, call `runGc({db, config: auditRetention, nowMs: Date.now(), dryRun: false})` synchronously inside a try/catch. Errors → stderr via existing `process.stderr.write` (matches the pattern used for outcome_signals emit failures on the same code path).
+
+**Phase 3 — Tests.**
+
+- `tests/audit/config-loader.test.ts` — new `[audit] run_gc_on_stop` cases: parses true/false, rejects non-boolean, false-respecting merge (project=`false` wins over user=`true`).
+- Integration-style test (light-touch): the harness loop is hard to test in isolation, so we pin the behavior via a focused unit on the "would-run" decision — given `auditRetention.runGcOnStop === true`, the path is taken; given false/undefined, it isn't. Full session-lifecycle test deferred to existing harness coverage (which will incidentally exercise the false path on every other test).
+
+**Items NOT addressed** (logged for follow-up):
+
+- **Stop hook integration test for ALL phase-1 tables in a real session lifecycle.** Hard to set up (needs real session, real seed data, real wall-clock for `Date.now`). Existing `tests/audit/gc.test.ts` covers `runGc` directly; the wiring is one boolean check + one call — low risk per the diff size.
+- **Operator-visible "gc ran" output at session end.** Today, gc-on-Stop is silent unless it errors. Emitting "gc swept N rows" at session end would be helpful but pollutes the terse-line / recap output operator already sees. Future UX polish.
+- **Failure detection telemetry.** gc errors go to stderr (forensic), but no `outcome_signals` / `failure_events` row records them. Phase 3 of gc (approvals_log) will likely revisit this — gc itself becomes an audit-relevant operation.
+
+Same branch `feat/purge-command`. Post-work entry follows once code + tests land.
+
+## [2026-05-19] feat(cli + audit) — `agent gc` Phase 1 (post-work)
+
+Closes the pre-work entry below. Single branch `feat/purge-command` (gc shares the branch with purge — both are operator-fired DB / FS lifecycle verbs that compose).
+
+**Round-of-review fixes that landed BEFORE the first gc commit** (self-review caught 3 issues):
+
+- **C1 — `migrate(db)` in dry-run violated the "dry-run mutates nothing" contract.** Initial draft called `migrate(db)` unconditionally inside `runGcCli`. Any pending migration would have applied silently on a dry-run, mutating the schema before the operator opted into anything destructive. Fix split the path: `--force` calls `migrate(db)` (idempotent, expected); dry-run calls the new read-only `countPendingMigrations(db)` helper (exported from `src/storage/migrate.ts`) and emits a stderr warning if any migrations are pending — schema stays untouched. Dry-run hash-mismatch on already-applied migrations is the one trade-off we accept (surfaces on the next real `migrate` call); documented in the helper header.
+- **C2 — `KNOWN_GC_TABLES` (args.ts) duplicated `PHASE_1_TABLES` (audit/gc.ts).** Same drift bug shape as the purge `INIT_MARKERS` ↔ `DEFAULT_STEPS` review-round catch — two manually-synced lists for the same set. Phase 2 would have required editing both files in lockstep without a drift-guard. Fix derives `KNOWN_GC_TABLES = new Set(PHASE_1_TABLES)` directly in `args.ts`; single source of truth in the audit module. Drift is impossible by construction; no separate drift-guard test needed.
+- **C3 — `configSources` returned resolved paths even when the underlying file did not exist.** The renderer would emit "Config source: /tmp/foo/.agent/config.toml (project overrides …)" even when no such file was on disk — defaults were quietly in effect. Misleading for operators trying to trace surprising deletes back to a misconfig. Fix gates `sources.user` / `sources.project` on `existsSync`; renderer's existing fallback ("Config source: defaults") finally fires correctly. Two new test cases pin both polarities (file present → path returned; file absent → null).
+
+The review also flagged lower-priority items deferred for follow-up: asymmetric `tables: []` vs `tables: undefined` semantics in the orchestrator (M1), `default_days` silently ignored (M2), no `gc_events` audit row (M3 — Phase 3 concern when approvals_log lands), `padEnd(18)` breaks on long Phase 2 names (M4), JSON dry-run/force shape divergence (M5). Logged but not blocking — they don't affect Phase 1 correctness.
+
+**Outcome.** New top-level verb `agent gc [--force] [--json] [--table=X]` materializes the retention contract declared in `AUDIT.md §1.2`. Bare invocation is dry-run (counts "would delete" per table); `--force` executes the sweep; `--table=X` restricts to one of the Phase 1 tables (repeatable). Cross-project by design (age-based, not cwd-based), composes with cron and the future `Stop` hook.
+
+**Phase 1 tables shipped (4):**
+
+- `recap_cache` — sweep reuses existing `purgeExpiredRecapCache` (RECAP §8.3). TTL via per-row `expires_at`. Sweep boundary is `<= nowMs` (inclusive, matches read-path eviction).
+- `retrieval_trace` — 90d default on `created_at`. EXCLUSIVE cutoff.
+- `context_pins` — 90d default on `created_at`. EXCLUSIVE cutoff. Per-pin `expires_at` short-circuit in the read path is untouched.
+- `bg_processes` — 30d default on `spawned_at`, AND status filter `status != 'running'`. **Live bg processes are NEVER deleted regardless of age** — deleting their row would orphan the OS-level process from tracking.
+
+**Outside Phase 1 (explicitly deferred):**
+
+- Phase 2 (audit-cascade tables: `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`) — each has per-table edge cases (per-row TTL by `signal_kind`, per-session chain hash).
+- Phase 3 (`approvals_log`) — hash-chained; requires wiring `chain-rotation` (migration 035) into an age-based trigger.
+- Phase 4 (`sessions` + FK cascade) — bigger blast radius.
+- Phase 5 (`--reclaim-space` + `Stop` hook).
+
+**Decisions that survived in-flight review:**
+
+- **Reuse `purgeExpiredRecapCache` (semantic `<=`) instead of shipping a parallel `pruneExpiredRecapCache` (semantic `<`).** The existing helper is what the read-path eviction also calls; a divergent boundary in the gc helper would mean two paths could disagree on whether a row with `expires_at == nowMs` is fresh. Loop-fix during dev — first draft created the duplicate, code review caught it before commit.
+- **Errors are per-table best-effort.** A single table failing (FK violation, lock conflict, whatever) does NOT abort the orchestrator — the report carries `errors[]` and the CLI exits code 2 (vs 0 for clean, 1 for hard failure). This keeps a single broken table from blocking hygiene on the other three.
+- **`--no-audit` does NOT exist** (contrast with `agent purge`). GC IS the audit hygiene — there's no row to skip.
+- **Phase 2+ retention keys silently accepted.** Operators following `AUDIT.md §1.2` already write `approvals_log = 365` etc. in their config; warning "unknown key" for spec-compliant keys would noise the dry-run. Phase 2 wiring activates them at runtime without re-touching the loader.
+- **Typo guard via `KNOWN_SCHEMA_KEYS` set.** Wrong but well-intentioned (`retreival_trace = 90`) surfaces a warning so the operator catches the misconfig before running `--force`.
+- **Dedicated `src/audit/` subsystem dir.** Loader + orchestrator live here. CLI handler stays in `src/cli/gc.ts` for visibility / discoverability. Keeps the boundary clean for Phase 2/3 expansion.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1` — `Gc` row added to the modes table.
+- `AGENTIC_CLI.md §2.1.3` (new) — phase-1 scope (4 tables), dry-run vs `--force`, `--table=X`, `--json` shape, "Phase 1 tables covered" table, "tables fora do Phase 1" with explicit deferral pointers, config layering (mirrors `[critique]` / `[budget]`), DEFAULT_RETENTION matching AUDIT §1.2, "o que NÃO faz" (cross-refs purge, vacuum-per-project, privacy GDPR).
+- `AUDIT.md §1.2` already prescribed `agent gc` and the retention defaults — no edit needed.
+
+**Code deltas (8 files):**
+
+- `src/storage/repos/{retrieval-trace,context-pins,bg-processes}.ts` — 3 new prune helpers (`pruneRetrievalTrace`, `pruneContextPins`, `pruneBgProcesses`). `recap-cache.ts` reused as-is (`purgeExpiredRecapCache` already existed).
+- `src/audit/config-loader.ts` — `loadRetentionConfig`, `parseTtlMs`, `parseDays`, `DEFAULT_RETENTION`. Mirrors critique loader shape; warnings surface typos.
+- `src/audit/gc.ts` — `runGc` orchestrator. Returns `{tables: TableReport[], errors: TableError[], mode, nowMs, config}`.
+- `src/cli/gc.ts` — `runGcCli`. Resolves config, opens DB, calls orchestrator, renders human or JSON.
+- `src/cli/args.ts` — `parseGcSubcommand` + `ParsedArgs.gc` field. `--table=X` validated against `KNOWN_GC_TABLES` so typos fail at parse time.
+- `src/cli/index.ts` — lazy-import branch for `args.gc`; exempts from first-boot nudge and prompt requirement.
+
+**Test deltas (5 files, 59 new tests):**
+
+- `tests/cli/args-gc.test.ts` (13) — parser shapes: bare, each flag in isolation, combinations, `--table` repeatable + dedupe + invalid + empty, unknown flag, help, prefix-not-fuzzy.
+- `tests/storage/gc-prunes.test.ts` (10) — per-helper pins: `purgeExpiredRecapCache` boundary, cutoff EXCLUSIVE for the 3 day-based prunes, **bg_processes never deletes running rows regardless of age**, input validation rejects non-positive ms.
+- `tests/audit/config-loader.test.ts` (23) — `parseTtlMs` accepts h/m/s/ms + bare ms, rejects floats/unknown units/bare-string-numbers; `parseDays` rejects floats / non-numbers; loader: defaults, user-overrides, project-overrides-user per-key, unknown-key typo warning, Phase 2+ keys silent, invalid value falls back, TOML parse error, `[audit]` without `.retention`, `[audit.retention]` not-a-table; **C3 pins**: sources reflect file existence (present → path, absent → null, mixed user/project case).
+- `tests/audit/gc.test.ts` (5) — orchestrator: dry-run reports + idempotency, force happy path + running-bg protected even at 100d age, `--tables` filter restricts, empty filter is "none" (caller signaled nothing), input validation.
+- `tests/cli/gc.test.ts` (10) — CLI end-to-end: dry-run human + JSON shapes, `--table` filter, `--force` JSON has no `command` field, config provenance (`.agent/config.toml` overrides default), warnings surface on stderr, DB inaccessible returns exit 1.
+
+**Verification:**
+- `bun run typecheck`: clean
+- `bun run lint`: clean (928 files; Biome auto-fix + manual template-literal cleanup)
+- All 59 new tests pass; 338 adjacent-file tests (args, init, index, doctor, db, recap-cache, context-pins, bg-processes) still pass.
+
+**Production-readiness shift.** Before: operator's DB accumulated rows indefinitely; `AUDIT.md §1.2` prescribed the cleanup but no verb materialized it. After: `agent gc` is cron-ready (clean exit codes, NDJSON), composes with `--table=X` for surgical runs, has typo-guarded config, and respects the safety invariant that live bg processes can't be evicted by age. Phase 2/3 (audit-cascade + approvals_log) build on the same skeleton without re-litigating the operator surface.
+
+## [2026-05-19] feat(cli + audit) — `agent gc` Phase 1 (pre-work plan)
+
+`AUDIT.md §1.2` has prescribed `agent gc` as the retention-sweep verb since v1 of the audit spec ("Cleanup via cron user-side (`agent gc`) or hook `Stop` (configurable)"). It has remained unimplemented — every audit table accumulates rows indefinitely on the operator's DB. Five repos already have `pruneXxx(db, olderThanMs)` helpers (`memory-verify-attempts`, `memory-conflict-attempts`, `memory-verify-override-attempts`, `memory-override-events`, `memory-provenance`) called from boot-time GC paths, proving the pattern works — but the operator-facing CLI verb that consolidates retention across the whole schema doesn't exist.
+
+This slice ships **Phase 1** of `agent gc`: the verb itself + config loader + sweeps for the **four lowest-sensitivity tables** that have ZERO chain integrity concerns:
+
+- `recap_cache` — TTL via `expires_at`; sweep removes rows where `expires_at < now()`. Already documented (`AUDIT §1.2` "1h TTL"). Read path already evicts on miss; sweep is the cron-driven backstop.
+- `retrieval_trace` — 90d via `created_at` (`AUDIT §1.2` + `RETRIEVAL §10.1`). Cascade-detaches from sessions; standalone sweep is the cold-path backstop.
+- `context_pins` — 90d via `created_at` (`AUDIT §1.2` + `CONTEXT_TUNING §12.4`). Per-pin `expires_at` already short-circuits in the read path; table sweep handles pre-cascade rows + retention.
+- `bg_processes` — 30d via `spawned_at` AND `status != 'running'` (`AUDIT §1.2`). Refuses to delete live background processes regardless of age.
+
+**Deliberately deferred:**
+
+- **`approvals_log`** (Phase 3) — hash-chained; age-based deletion breaks `permission verify`. Requires wiring `chain-rotation` (migration 035 + verb `agent permission rotate-chain`) into an age-based trigger: rotate first, then delete archived rows. Dedicated slice.
+- **Audit tables non-chained but with FK cascades to `sessions`** (Phase 2): `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`. Each has per-table semantics (`outcome_signals.ttl_expires_at` is per-row per-`signal_kind`; `failure_events` carries a per-session chain hash). Worth their own slice for the per-table edge-case review.
+- **`sessions` + cascade** (Phase 4) — when a session is gc'd, FK CASCADE drops ~12 dependent tables. Bigger blast radius, deserves dedicated review.
+- **`--reclaim-space`** (Phase 5) — runs SQLite `VACUUM` after delete to reclaim disk. Lock-global operation, opt-in flag, ships separately.
+- **`Stop` hook integration** (Phase 5) — run gc at session end. Operationally desirable but composable later via existing hook system.
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1` — add `Gc` row to the modes table.
+- `AGENTIC_CLI.md §2.1.3` (new) — phase-1 scope (the 4 tables), config (`[audit.retention]` already defined in AUDIT §1.2), dry-run vs `--force`, `--table=X` filter, `--json` shape, what's out (with explicit deferral pointers to phase 2/3/4/5).
+- `AUDIT.md §1.2` already covers retention defaults — no edit needed.
+
+**Phase 1 — Storage layer.**
+
+- `src/storage/repos/recap-cache.ts` — add `pruneExpiredRecapCache(db, nowMs): number` (`DELETE WHERE expires_at < ?`).
+- `src/storage/repos/retrieval-trace.ts` — add `pruneRetrievalTrace(db, olderThanMs): number` (`DELETE WHERE created_at < ?`).
+- `src/storage/repos/context-pins.ts` — add `pruneContextPins(db, olderThanMs): number` (`DELETE WHERE created_at < ?`).
+- `src/storage/repos/bg-processes.ts` — add `pruneBgProcesses(db, olderThanMs): number` (`DELETE WHERE spawned_at < ? AND status != 'running'`).
+
+Each mirrors the `pruneVerifyAttempts` shape — INSERT-time validation (`olderThanMs > 0`), returns `Number(result.changes)`, no UPDATE/DELETE leakage.
+
+**Phase 2 — Audit subsystem.** New directory `src/audit/`:
+
+- `src/audit/config-loader.ts` — `loadRetentionConfig({cwd})` reads `[audit.retention]` from user → project layers (mirrors critique loader pattern). Returns typed `RetentionConfig` with day-counts + the recap_cache TTL. Defaults from a `DEFAULT_RETENTION` constant matching `AUDIT §1.2`.
+- `src/audit/gc.ts` — `runGc({db, now, config, dryRun, tables?})` orchestrator. For each enabled table: counts-only when `dryRun`, deletes when `!dryRun`. Returns `{ tables: Array<{ table, beforeCount, deletedCount, cutoffMs }> }`.
+
+**Phase 3 — CLI.**
+
+- `src/cli/args.ts` — `parseGcSubcommand`. Flags: `--force` (execute; default dry-run), `--json`, `--table=X` (restrict to one table, repeatable). Mutually exclusive with other verbs.
+- `src/cli/index.ts` — lazy-import branch for `args.gc`; exempt from first-boot nudge and prompt requirement.
+- `src/cli/gc.ts` — `runGcCli({cwd, force, json, tables, out, err, dbPath?})`. Opens DB, loads config, calls `audit/gc.ts:runGc`, renders human or JSON output.
+
+**Phase 4 — Tests.**
+
+- `tests/cli/args-gc.test.ts` — parser shapes (flags, combinations, unknown flag, --table=X, --table=X --table=Y).
+- `tests/storage/recap-cache-prune.test.ts`, `tests/storage/retrieval-trace-prune.test.ts`, `tests/storage/context-pins-prune.test.ts`, `tests/storage/bg-processes-prune.test.ts` — per-helper pins (cutoff exclusive, row count return, running-bg-protected).
+- `tests/audit/config-loader.test.ts` — defaults, user layer, project layer override, invalid values fall back to defaults with warning.
+- `tests/audit/gc.test.ts` — orchestrator: dry-run vs force, --table filter, idempotency (second run = 0 deleted), config-driven cutoffs honored.
+- `tests/cli/gc.test.ts` — end-to-end via CLI handler: human render, JSON shape, --force happy path, --table=X filter.
+
+**Items NOT addressed** (Phase 2/3/4/5 work; tracked above):
+
+- Audit-cascade tables (Phase 2): `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`.
+- `approvals_log` rotation-aware sweep (Phase 3).
+- `sessions` + FK CASCADE (Phase 4).
+- `--reclaim-space` (Phase 5).
+- `Stop` hook integration (Phase 5).
+
+Post-work entry follows once code + tests land. Same branch `feat/purge-command` — operator-fired retention sweep is the natural sibling to `agent purge` (the per-project FS reset), and the user asked to keep both in flight on this branch.
+
+## [2026-05-19] feat(cli) — `agent purge` project-scope reset (post-work)
+
+Closes the pre-work entry below. Single branch `feat/purge-command`; spec landed before code.
+
+**Round-of-review fixes that landed BEFORE the first commit** (self-review caught 5 issues):
+
+- **B1 — schema rename `*_removed` → `*_present`.** Initial design named the audit columns `bytes_removed`, `files_removed`, `dirs_removed`. But the audit row is written BEFORE the FS walker (load-bearing ordering), so the values are a PRE-purge snapshot, not an after-action report. A race where another process adds/removes files between snapshot and walker produces real-removal counts that diverge from the row. Renaming to `*_present` makes the snapshot semantics explicit and reflects what the row actually captures: "the operator-confirmed plan at confirmation time". The realized counts surface in `forceReport.removed` (stdout/JSON) but don't persist — log capture is the after-action evidence.
+- **B2 — walker push-after-stat ordering.** `paths.push(abs)` ran before `lstat` in both walk loops. If an entry vanished between `readdir` and `lstat` (concurrent process, race), `paths` would list it but totals wouldn't count it. The persisted `artifacts_present_json` would then mention paths that contributed zero to `bytes_present` — confusing forensic readers. Fix: push only after stat succeeds.
+- **D3 — drift-guard `INIT_MARKERS` ↔ `init.DEFAULT_STEPS`.** The two arrays live in different files (purge.ts and init.ts) without a structural link. A future init step (`hooks` for example) would scaffold a 5th artifact that purge wouldn't recognize as an init marker — projects scaffolded post-extension would refuse `agent purge`. New `tests/cli/purge.test.ts` drift-guard block uses an explicit `STEP_TO_MARKER` map (typed against the readonly `INIT_MARKERS` tuple so typos fail at compile time) + two paired assertions ("every step has a marker" + "every marker maps to a step"). Failure surfaces in CI, not in operator surprise.
+- **T1 — purge from a subdir resolves repoRoot.** Tests covered the canonical case (`cwd === repoRoot`) but never exercised `resolveRepoRoot` itself. New test `git init`s the tempdir, runs purge from `<repo>/src/`, verifies `<repo>/.agent/` (not `<repo>/src/.agent/`) is removed AND the audit row's `cwd` field carries the resolved repoRoot. Skips with a warning if `git` is unavailable (sandboxed CI) rather than mis-passing.
+- **T6 — walker/removeTree parity invariants.** The audit-row snapshot vs real-removal divergence (rationale for B1) needed a positive control: when nothing changes mid-purge, what's the expected relationship? New test asserts `files` and `bytes` match exactly between dry-run output and force-mode output; `dirs` differs by exactly 1 (removeTree counts `.agent/` root; walker does not). Catches future regressions where someone accidentally makes the walker include the root or the remove walker forget it.
+
+The self-review also surfaced lower-priority items deferred for follow-up: JSON shape divergence between dry-run and force-mode (D1), canonical-JSON-vs-stable-sorted-JSON wording (D2), PRESERVED_PATHS using literal `~/...` instead of resolved paths (D4), `--no-audit` silently ignored in dry-run (D6). Documented in the BACKLOG follow-up notes; tracked but not blocking.
+
+**Outcome.** New top-level verb `agent purge [--force] [--json] [--no-audit]` resets a Forja-initialized project to "as if it never ran here" from the filesystem perspective. Dry-run (bare invocation) prints scope + per-category sizes + preserved-state list + audit writability + the literal `agent purge --force` command to execute. `--force` writes one append-only `purge_events` row to the global DB, then walks `<repoRoot>/.agent/` with `lstat` (never following symlinks) and removes everything. The global DB and `~/.config/agent/**` are untouched by design — sessions / approvals_log / memory_events for the cwd remain queryable via `agent --list-sessions --project <cwd>` after the purge.
+
+**Operator-visible end-to-end** (smoke against a fixture):
+
+```
+$ agent purge
+forja purge — DRY RUN (nothing will be modified)
+Project root: /tmp/forja-purge-smoke
+Scope:        /tmp/forja-purge-smoke/.agent/
+Will remove:
+  /tmp/forja-purge-smoke/.agent/.gitignore         12 B   [operator-owned — confirm before --force]
+  /tmp/forja-purge-smoke/.agent/agents/            1 files, 9 B
+  /tmp/forja-purge-smoke/.agent/bg/                1 files, 4 B
+  /tmp/forja-purge-smoke/.agent/config.toml        9 B
+  /tmp/forja-purge-smoke/.agent/memory/            1 files, 7 B
+  /tmp/forja-purge-smoke/.agent/permissions.yaml   11 B
+Total: 6 files, 4 directories, 52 B
+Preserved (will NOT be touched):
+  ~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)
+  ~/.config/agent/**                  (user-layer config + memory)
+  ~/.local/share/forja/install_id     (install identity; audit chain genesis)
+Audit will be recorded in purge_events at: /home/lex/.local/share/forja/sessions.db
+To execute:
+  agent purge --force
+```
+
+**Decisions that survived in-flight review:**
+
+- **Filesystem-only scope is load-bearing.** Considered + rejected: a parallel sweep of the global DB by cwd. Rationale: cross-substrate FK tracking would be load-bearing forever; the audit-chain rows for this project are exactly the "manter audit" intent the operator confirmed; stale references (DB rows naming a purged `.agent/`) are inert (memory loader reads `.md` files, not memory_events; trust-corpus rows trigger re-prompt on next session — desired). Documented as out-of-scope in `AGENTIC_CLI.md §2.1.2`.
+- **Init marker is permissive (any one of four).** Catches "purge in $HOME by accident" and "purge against a foreign .agent/ planted by another tool" without surprising operators who manually pruned three of the four. Markers list (`permissions.yaml`, `.gitignore`, `config.toml`, `agents/`) is the same set the init orchestrator writes. Failure message names the four explicitly so the operator can debug without grepping source.
+- **`.gitignore` is purged with the rest, but flagged in the dry-run.** Operator-owned semantics from `MEMORY.md §2.5` protect against `init --force` clobbering hand edits, not against the operator's explicit reset verb. Dry-run renders `[operator-owned — confirm before --force]` alongside the size so a deliberate edit doesn't disappear silently.
+- **Audit row before any FS mutation.** `--force` opens + migrates the DB, computes the install identity (`ensureInstallId`), and inserts the `purge_events` row BEFORE entering the removal walker. If the DB is unwriteable, `--force` aborts (`cannot write audit row to DB`) unless `--no-audit` is explicit. `--no-audit` is the escape hatch for emergencies (compromised host, corrupted DB) — purge proceeds without leaving a forensic row; stderr warns explicitly so CI logs capture the bypass.
+- **Symlink defense is `lstat`-only, top-down.** `lstat` on `<repoRoot>/.agent/` itself refuses if it's a link (operator's choice to share state from elsewhere is respected). Inside the walker, `lstat` per entry: symlink entries are `unlinkSync`'d (the link, not the target) and never recursed into. Tested directly with a `--force` that leaves an external symlink target intact post-purge.
+- **No hash chain on `purge_events`.** Considered + rejected. Purge is an operational event, not a policy decision with replay semantics; a chain would complicate the schema for no concrete threat-model gain. `approvals_log` keeps its chain (decisions are replayable); `purge_events` lives parallel as a lightweight install-scoped reset log.
+- **Dedicated table over reusing `approvals_log` / `failure_events`.** approvals_log requires a `session_id` (purge fires outside any session); failure_events is semantic-mismatched (purge is a successful operator action). Dedicated `purge_events` mirrors the established pattern (memory_events, hook_runs, eviction_events, outcomes — one concern per table, append-only).
+
+**Items deliberately NOT addressed** (each documented in spec §2.1.2 + pre-work entry):
+
+- DB cleanup by cwd. Privacy-purge / GDPR flow is a separate `SECURITY_GUIDELINE.md` concern; this verb does not impersonate it.
+- Backup before purge. Two-phase confirmation already lets the operator inspect output and copy what matters; FS-noisy tar.gz dropouts create a new "where does it live, who cleans it?" surface for no clear win.
+- Slash `/purge`. Verb is setup-adjacent (mutually exclusive with active session — it purges the bootstrap the session reads from). Same posture as `init`, `doctor`, `welcome`.
+- `agent purge log` reader. `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; no concrete consumer asked for the verb today.
+
+**Edge cases pinned by tests:**
+
+- Symlink target outside `.agent/` survives a purge that crosses the link.
+- Purge then re-init then purge again — both rows land in `purge_events` for the same cwd; install_id stable across both (genesis preserved).
+- DB unwriteable + `--no-audit` set: FS removal happens, stderr warns, audit skipped. Without `--no-audit`: FS untouched, exit 1.
+- Empty `.agent/` (only marker is a 0-byte `.gitignore`): handled correctly (1 file, 0 bytes).
+- Walker sorts paths into the canonical JSON for `artifacts_present_json` so two enumerations of the same tree produce byte-stable rows (forensic comparability).
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1` — `Purge` row added to the modes table with one-line semantics.
+- `AGENTIC_CLI.md §2.1.2` (new) — scope of removal (table), preserved state (list), filesystem-only rationale, init-marker gate, symlink defense, dry-run vs `--force`, audit row schema, `--json` shape, re-init guarantee, out-of-scope items.
+- `AUDIT.md §1` — `purge_events` added to the canonical 28-table list with retention 365d, low sensitivity, no redaction.
+- `AUDIT.md §1.2` — `purge_events = 365` added to the configurable retention block.
+
+**Code deltas:**
+
+- `src/storage/migrations/066-purge-events.ts` — new migration (CREATE TABLE + `(cwd, ts)` index, CHECK constraints on ts > 0 and counts >= 0). Columns are `*_present` (snapshot pré-purge), not `*_removed` — naming reflects the load-bearing ordering (audit-first, FS-after) where the snapshot captured at confirmation may diverge from the eventual real-removal under racing FS edits.
+- `src/storage/migrations/index.ts` — registers migration 066.
+- `src/storage/repos/purge-events.ts` — `insertPurgeEvent` + `listPurgeEventsByCwd`. Append-only by contract; no UPDATE/DELETE surface (pinned by an export-allow-list test).
+- `src/cli/args.ts` — `parsePurgeSubcommand` + `purge?: { force, json, noAudit }` on `ParsedArgs` + dispatch wiring.
+- `src/cli/index.ts` — lazy-import branch for `args.purge`; exempts from first-boot nudge and prompt requirement.
+- `src/cli/purge.ts` — `runPurge` (init-marker gate, symlink defense, walker, dry-run renderer, force path with audit-first ordering, `--json` serializers).
+
+**Test deltas:**
+
+- `tests/cli/args-purge.test.ts` — 10 parser cases (bare, each flag in isolation, combinations, order-irrelevance, unknown-flag rejection, help, prefix-not-fuzzy).
+- `tests/storage/purge-events.test.ts` — 12 cases across migration schema, CHECK constraints, insert round-trip, list filter + ordering + limit, append-only export allow-list.
+- `tests/cli/purge.test.ts` — 18 handler cases: init-marker gate (5 sub-cases), symlink defense (refusal + non-following), dry-run output (4 sub-cases: no-mutation, human render, gitignore flag, JSON shape, empty edge), `--force` happy path (3 sub-cases: removal + audit row + sorted-json + re-init), `--no-audit` escape hatch (abort vs bypass), repoRoot resolution from subdir (T1), walker/removeTree parity invariants (T6), and drift-guard pairing `INIT_MARKERS` ↔ `init.DEFAULT_STEPS` (D3, 3 sub-cases).
+
+46 new tests pass; typecheck + lint clean across the 920-file Biome scan. Tests of the files I touched (`tests/cli/args.test.ts`, `tests/cli/init.test.ts`, `tests/cli/index.test.ts`, `tests/cli/doctor.test.ts`, `tests/cli/welcome.test.ts`, `tests/storage/db.test.ts`, `tests/storage/migrate.test.ts`) — 280 tests, 0 fail.
+
+**Production-readiness shift.** Before: an operator evaluating Forja on a project and wanting to back out had only `rm -rf .agent/` — no audit, no symlink defense, no marker check, full apex risk (`rm -rf` typo destroys parent tree; symlinked `.agent/` obliterates shared state). After: `agent purge` is first-class, two-phase, audited, symlink-safe, marker-gated, and idempotent with `agent init` (re-init after purge re-scaffolds cleanly because init is pure-FS and the DB is preserved). The "what survives in the global DB" contract is in the spec and surfaced in every dry-run.
+
+## [2026-05-19] feat(cli) — `agent purge` project-scope reset (pre-work plan)
+
+A first-time operator who wants to evaluate Forja on a project, then back out — or who wants to restart with clean state after a botched session — has no first-class undo. `agent init` creates `<repoRoot>/.agent/` with permissions, config, gitignore, and 10 canonical playbooks; subsequent sessions accumulate memory (`memory/{shared,local}/`), background-process logs (`bg/`), and operator-edited artifacts. There is no `agent <verb>` that takes a project-initialized directory and returns it to "as if Forja never ran here". Operators today have to `rm -rf .agent/` manually, which leaves no audit trace and exposes them to apex risk (`rm -rf` typo destroys parent tree; following a symlink obliterates `~`-shared corpus).
+
+This slice adds `agent purge` — operator-fired, two-phase (dry-run then `--force`), filesystem-scoped to `<repoRoot>/.agent/`, audited via a new append-only `purge_events` table on the global DB. The dry-run shows what will be removed plus the literal command to execute. `--force` writes the audit row first, then walks the tree with `lstat` (refuses to follow symlinks out of the purge root). DB-global state is preserved by design: sessions, approvals_log, memory_events for this cwd remain queryable forever via `agent --list-sessions --project <cwd>` — the user's "talvez manter audit" intuition translates to "filesystem-only purge, DB untouched, audit-chain integrity preserved naturally".
+
+**Scope (decisions confirmed up front):**
+
+- **Filesystem-only.** Purge restricted to `<repoRoot>/.agent/`. The global `sessions.db` and `~/.config/agent/**` are never touched — every audit chain row referencing this cwd survives. Alternative considered (sweep DB by cwd) rejected: cross-substrate FK tracking would be load-bearing forever and would erase exactly the audit the user said to keep.
+- **Init marker required.** Refuse unless `<repoRoot>/.agent/` exists AND contains at least one of the 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`). Catches "operator typed `agent purge` in $HOME by accident" and "operator opened a project not initialized by Forja". Permissive enough to recover from a partial init (operator who deleted `permissions.yaml` manually but still has the rest).
+- **`.gitignore` deleted with the rest.** Operator-owned semantics from `MEMORY.md §2.5` exist to protect against `init --force` clobbering hand edits, not against explicit operator-fired purge. Dry-run output flags it with a warning line so the operator confirms.
+- **Append-only audit row before any FS mutation.** New `purge_events` table (`id, ts, install_id, cwd, artifacts_present_json, bytes_removed, files_removed, dirs_removed, forja_version`). DB inaccessibility aborts `--force` unless `--no-audit` is explicit; dry-run downgrades to a warning.
+- **Symlink defense.** `lstat` on `<repoRoot>/.agent/` BEFORE entering it — if it's a symlink, refuse and instruct the operator to `rm` the link manually (we will not follow). Inside the walker, `lstat` every entry; for symlink entries, unlink the link itself without traversing.
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1` — add `Purge` row to the modes table.
+- `AGENTIC_CLI.md §2.1.2` (new subsection) — scope, init-marker gate, dry-run vs `--force`, audit row contract, symlink defense, "what survives in the global DB" explainer (`agent --list-sessions --project <cwd>` after purge).
+- `AUDIT.md §1` — add `purge_events` row to the canonical 28-table list with retention 365d, low sensitivity, no redaction.
+
+**Phase 1 — Storage layer.**
+
+- `src/storage/migrations/066-purge-events.ts` — `CREATE TABLE purge_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL CHECK > 0, install_id TEXT NOT NULL, cwd TEXT NOT NULL, artifacts_present_json TEXT NOT NULL, bytes_present INTEGER NOT NULL CHECK >= 0, files_present INTEGER NOT NULL CHECK >= 0, dirs_present INTEGER NOT NULL CHECK >= 0, forja_version TEXT NOT NULL)` + `(cwd, ts)` index for cwd-scoped queries. Append-only by convention; no UPDATE/DELETE in repo. Note: columns are `*_present` (snapshot pré-purge), not `*_removed`, since the audit row is written before the FS walker — see post-work entry for the load-bearing rationale.
+- `src/storage/repos/purge-events.ts` — `insertPurgeEvent(db, row)` returning the assigned id; `listPurgeEventsByCwd(db, cwd, limit?)` for forensic / future `agent purge log` slice.
+
+**Phase 2 — CLI parser.** `src/cli/args.ts` — `parsePurgeSubcommand` matching the `init`/`doctor` shape (subcommand verb stops prompt collection). Flags: `--force` (execute), `--json` (NDJSON output for both modes), `--no-audit` (allow `--force` even if DB unwriteable; documented as escape hatch for emergencies). Mutually exclusive with all other verbs. Update `parseArgs` dispatch sequence.
+
+**Phase 3 — Handler.** `src/cli/purge.ts:runPurge` —
+1. Resolve `repoRoot` via `resolveRepoRoot(cwd)` (memory/paths.ts).
+2. `lstat` `<repoRoot>/.agent/`; refuse if symlink or missing.
+3. Check init marker (any of the 4 canonical artifacts present).
+4. Walk `.agent/` with `lstat` per entry; collect paths + bytes + counts; never follow symlinks out.
+5. Open + migrate DB; check writability. Dry-run: print warning if unwriteable. `--force`: abort unless `--no-audit`.
+6. If `!force`: print info block, scope (grouped by category), explicit `.gitignore` warning, literal `agent purge --force` command, exit 0.
+7. If `force`: write audit row → atomic-ish FS removal (rm -rf semantics but symlink-safe) → summary line. Exit 0.
+
+**Phase 4 — Dispatcher.** `src/cli/index.ts` — lazy-import branch for `args.purge`. Add to `inSetupFlow` exemption (first-boot nudge suppressed) and to `promptOptional` predicate.
+
+**Phase 5 — Tests.** `tests/cli/args-purge.test.ts` (parser shapes, flag combinations, mutual exclusivity); `tests/storage/migrations/066-purge-events.test.ts` (CREATE + CHECK constraints + index); `tests/storage/repos/purge-events.test.ts` (insert + list + append-only contract); `tests/cli/purge.test.ts` (missing marker rejection, symlink rejection, dry-run output shape, `--force` happy path, audit row written before FS touch, DB-unwriteable behavior with and without `--no-audit`, JSON shape both modes).
+
+**Items deliberately out of scope:**
+
+- **DB cleanup by cwd.** Would require tracking every table that joins via `cwd` or via FK to `sessions(cwd=)` — load-bearing forever. The user explicitly said "manter audit"; deferred indefinitely until a concrete compliance ask names a row that must disappear.
+- **Backup before purge.** Operator with two-phase confirmation already has the chance to inspect output and copy what they want. Adding tar-gzball to a temp dir is FS-noisy and creates another surface (where does the backup live? who cleans it up?). Skip for v1.
+- **Slash `/purge`.** Purge is a setup-adjacent verb (mutually exclusive with an active session — purges the project bootstrap that the running session reads from). No slash counterpart; same posture as `init`, `doctor`, `welcome`.
+- **`agent purge log` reader.** `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; doesn't ship as a verb today (no concrete consumer requested it).
+
+Post-work entry will follow once code + tests land. Single branch `feat/purge-command`; spec commits first, code commits after — per-subsystem branch strategy.
+
 ## [2026-05-19] refactor(config) — centralize agent-path resolvers, closes latent Windows gap
 
 Audit of `src/*/paths.ts` files revealed the XDG / HOME / Windows APPDATA / PROGRAMDATA dance was duplicated across four subsystems (`permissions`, `hooks`, `config.toml` consumers, `install_id`). Worse: the implementations had drifted in completeness.
