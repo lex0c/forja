@@ -2,6 +2,60 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent gc` dry-run discriminates ENOENT from other stat errors
+
+Operator-reported follow-up to commit `7c5cd95`. The ENOENT-vs-real-failure fix used `existsSync(dbPath)` to discriminate, but `existsSync` swallows ALL stat errors and returns `false` for ENOENT, EACCES, ENOTDIR, ELOOP, ENAMETOOLONG equally. The discrimination was only HALF right: real ENOENT (file truly absent) downgraded to exit 0 — but so did EACCES (parent perm denied), ENOTDIR (parent isn't a directory), and other path-resolution errors. Same silent-masking bug the prior fix was meant to close.
+
+**Concrete failure modes** the prior fix still hid:
+
+| Scenario | `existsSync` | Pre-fix outcome | Should be |
+|---|---|---|---|
+| File truly absent (ENOENT) | false | exit 0 + "fresh install" | exit 0 ✓ |
+| Parent dir is a file (ENOTDIR) | false | exit 0 + "fresh install" silently | exit 1 |
+| Parent perm denied (EACCES) | false | exit 0 + "fresh install" silently | exit 1 |
+| Symlink cycle (ELOOP) | false | exit 0 + "fresh install" silently | exit 1 |
+| Path too long (ENAMETOOLONG) | false | exit 0 + "fresh install" silently | exit 1 |
+
+Cron jobs and CI scripts running `agent gc --json` against misconfigured paths would see "all good, 0 rows to sweep" instead of the actual operational failure.
+
+**Fix.** Replace `existsSync` with `lstatSync` + explicit `err.code === 'ENOENT'` check. Three discriminated cases:
+
+```ts
+let trulyAbsent = false;
+let preCheckError: string | null = null;
+try {
+  lstatSync(dbPath);
+  // exists — openDb failure below is real
+} catch (e) {
+  const code = (e as NodeJS.ErrnoException).code;
+  if (code === 'ENOENT') {
+    trulyAbsent = true;
+  } else {
+    // Non-ENOENT: real path-resolution failure
+    preCheckError = e instanceof Error ? e.message : String(e);
+  }
+}
+if (preCheckError !== null) {
+  err(`forja gc: cannot inspect DB path ${dbPath}: ${preCheckError}\n`);
+  return 1;
+}
+// ... openDb + ENOENT-aware fallback as before
+```
+
+Only true ENOENT downgrades to fresh-install. Everything else surfaces as real failure with exit 1 + descriptive stderr.
+
+**Test.** 1 new pin in `tests/cli/gc.test.ts`:
+- `dry-run on ENOTDIR parent (path-resolution error) exits 1, NOT fresh-install` — blocker scenario (parent is a regular file). Pre-fix silently treated as fresh-install; post-fix surfaces with `cannot inspect DB path` + exit 1 + stdout empty.
+
+The previously-existing ENOENT pin still passes (true missing file path).
+
+**Verification:**
+- 20/20 gc CLI tests pass (was 19, +1 new pin)
+- 84/84 across gc + args-gc + audit
+- typecheck + lint clean
+
+**Pre-existing operator state.** Operators with broken paths (ENOTDIR, EACCES) running gc dry-run before this fix would have silently seen "fresh install" reports. After this fix, the real failure surfaces; recovery is fixing the path or perms.
+
 ## [2026-05-19] fix(cli + audit) — decouple `args.ts` from gc runtime graph
 
 Operator-reported bug. The gc Phase 2 refactor (`4ee6de0`) replaced `args.ts`'s import of `PHASE_1_TABLES` (4-element array) with `GC_TABLES` from `audit/gc.ts`. But `audit/gc.ts` is the orchestrator — it imports every gc-covered table's prune helper, which transitively pulls the entire storage/memory graph (e.g., `eviction-events.ts` → `memory/scanner.ts`).

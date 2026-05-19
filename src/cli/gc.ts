@@ -12,7 +12,7 @@
 //     is no "audit row" to skip.
 //   - Cross-project by design (the cutoffs are age-based).
 
-import { existsSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
 // Table constants from the zero-imports module so the import
 // graph stays narrow even if a future call site imports cli/gc.ts
@@ -211,44 +211,66 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
         // PRAGMAs + chmod'd — silently mutating operator state
         // despite the "DRY RUN" header. Same shape as the purge
         // dry-run bug; fixed there + missed here.
-        // Pre-check file existence to distinguish the two open-fail
+        // Pre-check file state to distinguish three open-fail
         // shapes:
-        //   - File absent → fresh-install case. Legitimate "no rows
-        //     to sweep yet"; downgrade to empty report + exit 0.
-        //     Operator just installed Forja and ran `agent gc` before
-        //     any session created the DB.
-        //   - File present but open fails → real operational failure
-        //     (corruption, perm denied, integrity_check refusal,
-        //     locked by other process). MUST surface with non-zero
-        //     exit so cron jobs / CI scripts notice and operators
-        //     get a clear signal rather than a misleading "all good,
-        //     0 rows swept" report.
+        //   - File truly absent (ENOENT) → fresh-install case.
+        //     Legitimate "no rows to sweep yet"; downgrade to empty
+        //     report + exit 0. Operator just installed Forja and
+        //     ran `agent gc` before any session created the DB.
+        //   - File present but openDb fails → real operational
+        //     failure (corruption, perm denied on file,
+        //     integrity_check refusal, locked by other process).
+        //     Exit 1 so scripts notice.
+        //   - Parent dir issues (EACCES, ENOTDIR, ELOOP) → ALSO
+        //     real failure. The file might or might not exist; we
+        //     can't tell because the path can't be resolved. Don't
+        //     pretend it's a fresh-install just because we couldn't
+        //     prove the file is there.
         //
-        // existsSync race: file could be created/removed between
-        // this check and openDb. Cases:
-        //   - exists=true, openDb succeeds → normal path
-        //   - exists=true, openDb fails → real failure (rare race
-        //     where file vanished is treated as failure; that's
-        //     fine — vanished mid-call is itself unusual)
-        //   - exists=false, openDb succeeds → file appeared (some
-        //     other process created it); we proceed normally
-        //   - exists=false, openDb fails → fresh install path
-        const dbExistedBeforeOpen = existsSync(dbPath);
+        // Why lstatSync (not existsSync): existsSync swallows ALL
+        // stat errors and returns false. So `existsSync === false`
+        // covers ENOENT (file absent), EACCES (parent perm denied),
+        // ENOTDIR (parent isn't a dir), ELOOP (symlink cycle),
+        // ENAMETOOLONG, etc. Downgrading all of those to "fresh
+        // install" silently hides real operational failures from
+        // cron jobs and operators. lstatSync surfaces the error
+        // code so we can discriminate ENOENT specifically.
+        let trulyAbsent = false;
+        let preCheckError: string | null = null;
+        try {
+          lstatSync(dbPath);
+          // File exists. openDb failure below is a real failure.
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code === 'ENOENT') {
+            trulyAbsent = true;
+          } else {
+            // Non-ENOENT stat error — path inaccessible OR
+            // mis-configured. Treat as real failure regardless of
+            // what openDb does next; the operator's storage path
+            // is broken and they need to know.
+            preCheckError = e instanceof Error ? e.message : String(e);
+          }
+        }
+        if (preCheckError !== null) {
+          err(`forja gc: cannot inspect DB path ${dbPath}: ${preCheckError}\n`);
+          return 1;
+        }
         try {
           db = openDb(dbPath, { readonly: true });
         } catch (e) {
           const reason = e instanceof Error ? e.message : String(e);
-          if (dbExistedBeforeOpen) {
-            // File exists but unopenable: real failure. Surface with
-            // exit 1 so scripts notice. Don't render an "empty
-            // report" because we DON'T know if there are rows —
-            // pretending we do would mask the failure.
+          if (!trulyAbsent) {
+            // File exists but unopenable: real failure. Surface
+            // with exit 1 so scripts notice. Don't render an
+            // "empty report" because we DON'T know if there are
+            // rows — pretending we do would mask the failure.
             err(`forja gc: DB at ${dbPath} exists but cannot be opened in dry-run: ${reason}\n`);
             return 1;
           }
-          // File absent: legitimate fresh-install case. Empty report
-          // + exit 0 + helpful pointer to the force command that
-          // would create it.
+          // File truly absent (ENOENT confirmed by lstat above):
+          // fresh-install case. Empty report + exit 0 + helpful
+          // pointer to the force command that would create it.
           const forceCommand = buildForceCommand(tables);
           err(
             `forja gc: DB not yet created at ${dbPath} (fresh install — no rows to sweep). Run \`${forceCommand}\` to create + migrate.\n`,

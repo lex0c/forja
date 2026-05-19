@@ -306,6 +306,35 @@ describe('runGcCli — DB inaccessible', () => {
     expect(outBuf.join('')).toBe('');
   });
 
+  test('dry-run on ENOTDIR parent (path-resolution error) exits 1, NOT fresh-install', async () => {
+    // Operator-reported follow-up: pre-fix used existsSync which
+    // returns false for ENOENT, EACCES, ENOTDIR, ELOOP equally.
+    // A blocker scenario (parent is a regular file, not a dir)
+    // would lstatSync the path and get ENOTDIR — but existsSync
+    // collapsed that to "file absent → fresh install", silently
+    // masking a real path-resolution failure from automation.
+    // Post-fix: lstatSync surfaces err.code; only ENOENT means
+    // "truly absent". ENOTDIR (and EACCES, ELOOP, etc.) → exit 1.
+    const blocker = join(xdgHome, 'blocker');
+    writeFileSync(blocker, 'not-a-dir');
+    const ENOTDIRPath = join(blocker, 'sub', 'db.sqlite');
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: false,
+      tables: [],
+      out,
+      err,
+      dbPath: ENOTDIRPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(1);
+    expect(errBuf.join('')).toContain('cannot inspect DB path');
+    // stdout empty — no empty-report fabrication that would hide
+    // the failure from cron / CI.
+    expect(outBuf.join('')).toBe('');
+  });
+
   test('--force still exit 1 when DB cannot be opened (write path)', async () => {
     // Force mode must surface real errors — operator opted in to
     // mutation, so a broken DB is a stop-the-world failure, not
