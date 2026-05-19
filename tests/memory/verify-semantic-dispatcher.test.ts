@@ -557,7 +557,13 @@ describe('dispatchSemanticVerify — F11 stale_snapshot re-read', () => {
     expect(listProposals(db)).toHaveLength(0);
   });
 
-  test('re-peek returns missing → fallthrough with original snapshot (no abort)', async () => {
+  test('re-peek returns unknown (memo deleted) → skipped(target_gone), no attempt, no proposal', async () => {
+    // Post-review fix: pre-fix this branch silently fell through
+    // with the captured snapshot and dispatch ran against bytes the
+    // operator already removed — burning an LLM call + landing a
+    // memory_verify_attempts row (and possibly a quarantine
+    // proposal) for a memory that no longer existed. Mirror of the
+    // S13 conflict + S3 override dispatchers' target_gone path.
     seedActiveFile('foo', 'body');
     const roots: ScopeRoots = {
       user: join(workdir, 'user'),
@@ -566,10 +572,15 @@ describe('dispatchSemanticVerify — F11 stale_snapshot re-read', () => {
     };
     const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
     const file = parseMemoryFile(readFileSync(join(roots.projectLocal, 'foo.md'), 'utf-8'));
-    // Delete the file + reset the index so re-peek returns missing/unknown.
+    // Delete the file + reset the index so re-peek returns unknown.
     rmSync(join(roots.projectLocal, 'foo.md'));
     writeFileSync(join(roots.projectLocal, 'MEMORY.md'), '# Memory index\n');
     registry.reload();
+    let spawnCalled = false;
+    const spawnFn = (async () => {
+      spawnCalled = true;
+      return makeResult();
+    }) as never;
     const outcome = await dispatchSemanticVerify({
       db,
       definition: fakeDefinition,
@@ -580,10 +591,53 @@ describe('dispatchSemanticVerify — F11 stale_snapshot re-read', () => {
       permissionEngine: fakePermissionEngine,
       memory: { scope: 'project_local', name: 'foo', file },
       registry,
-      spawnSubagentFn: makeFakeSpawn(makeResult()),
+      spawnSubagentFn: spawnFn,
     });
-    // Fallthrough uses the original snapshot — dispatch proceeds.
-    expect(outcome.kind).toBe('completed');
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
+    expect(spawnCalled).toBe(false);
+    expect(listRecentAttempts(db)).toHaveLength(0);
+    expect(listProposals(db)).toHaveLength(0);
+  });
+
+  test('re-peek returns missing (file gone but index intact) → skipped(target_gone)', async () => {
+    // Index still references foo.md but the file itself was
+    // removed → peek returns 'missing'. Same target_gone outcome
+    // as the unknown case: don't pretend the memo is still
+    // verifiable.
+    seedActiveFile('foo', 'body');
+    const roots: ScopeRoots = {
+      user: join(workdir, 'user'),
+      projectShared: join(workdir, 'shared'),
+      projectLocal: join(workdir, 'local'),
+    };
+    const registry = createMemoryRegistry({ roots, db, sessionId, cwd: workdir });
+    const file = parseMemoryFile(readFileSync(join(roots.projectLocal, 'foo.md'), 'utf-8'));
+    // Remove the body file, keep the index entry pointing at it.
+    rmSync(join(roots.projectLocal, 'foo.md'));
+    registry.reload();
+    let spawnCalled = false;
+    const spawnFn = (async () => {
+      spawnCalled = true;
+      return makeResult();
+    }) as never;
+    const outcome = await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file },
+      registry,
+      spawnSubagentFn: spawnFn,
+    });
+    expect(outcome.kind).toBe('skipped');
+    if (outcome.kind === 'skipped') expect(outcome.reason).toBe('target_gone');
+    expect(spawnCalled).toBe(false);
+    expect(listRecentAttempts(db)).toHaveLength(0);
+    expect(listProposals(db)).toHaveLength(0);
   });
 });
 

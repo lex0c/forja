@@ -437,12 +437,17 @@ export const createSemanticVerifyScheduler = (
       if (outcome.kind === 'skipped') {
         // No LLM cost incurred — try next candidate without bumping
         // the dispatch counter. injection_detected / dedup_hit /
-        // stale_snapshot are legitimate skips. F17: emit
-        // verify_skipped on the injection / stale_snapshot paths so
-        // the operator opted into --memory-verify-llm can see WHY
-        // the judge never fires on a memory they expected to be
-        // verified. dedup_hit is silent (expected, cached).
-        if (outcome.reason === 'injection_detected' || outcome.reason === 'stale_snapshot') {
+        // stale_snapshot / target_gone are legitimate skips. F17:
+        // emit verify_skipped on the injection / stale_snapshot /
+        // target_gone paths so the operator opted into
+        // --memory-verify-llm can see WHY the judge never fires on
+        // a memory they expected to be verified. dedup_hit is silent
+        // (expected, cached).
+        if (
+          outcome.reason === 'injection_detected' ||
+          outcome.reason === 'stale_snapshot' ||
+          outcome.reason === 'target_gone'
+        ) {
           stderr(
             `memory: verify_skipped: ${sanitizeOneLineForDisplay(cand.scope)}/${sanitizeOneLineForDisplay(cand.name)}: ${outcome.reason}\n`,
           );

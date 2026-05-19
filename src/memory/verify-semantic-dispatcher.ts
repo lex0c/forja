@@ -130,7 +130,7 @@ export interface DispatchSemanticVerifyInput {
 export type DispatchOutcome =
   | {
       kind: 'skipped';
-      reason: 'injection_detected' | 'dedup_hit' | 'stale_snapshot';
+      reason: 'injection_detected' | 'dedup_hit' | 'stale_snapshot' | 'target_gone';
       priorAttempt?: MemoryVerifyAttemptRow;
     }
   | {
@@ -261,12 +261,19 @@ export const dispatchSemanticVerify = async (
         return { kind: 'skipped', reason: 'stale_snapshot' };
       }
       workingFile = repeek.file;
+    } else {
+      // 'missing' / 'malformed' / 'unknown' — memory no longer
+      // re-readable from the registry. Pre-fix this branch fell
+      // through with the captured snapshot and dispatch ran
+      // against bytes the operator already removed/corrupted,
+      // burning an LLM call + landing a memory_verify_attempts
+      // row (and possibly a quarantine proposal) for a memory
+      // that no longer exists. Mirror of the S13 conflict +
+      // S3 override dispatchers' target_gone path. The next
+      // poll's type/state gate filters the absent memo before
+      // re-invocation.
+      return { kind: 'skipped', reason: 'target_gone' };
     }
-    // peek.kind !== 'present' (missing/malformed/unknown): fall
-    // through with the originally-passed snapshot. The dispatcher's
-    // existing hash + lookup steps still run; if the body genuinely
-    // vanished, the next poll will skip the candidate via the
-    // type-gate / peek=missing path.
   }
 
   // (1b) Injection pre-check — keep adversarial bytes out of the
