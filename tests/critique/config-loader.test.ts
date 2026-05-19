@@ -1103,6 +1103,54 @@ compaction_threshold = 0.65
     }
   });
 
+  test('max_step_stall_ms = 0 accepted (runtime opt-out for the per-step watchdog)', () => {
+    // Runtime contract (`src/harness/abortable.ts:68`): `stallMs
+    // <= 0` disables the per-step watchdog entirely — yields the
+    // source verbatim with no timer. Operators running long
+    // steady-streaming provider calls legitimately need to opt
+    // out. The validator's min must match the runtime semantic;
+    // otherwise config can't express what the engine supports.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_step_stall_ms = 0
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxStepStallMs).toBe(0);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('max_steps = 0 still rejected (no documented disable semantic)', () => {
+    // Sibling pin: max_steps and max_wall_clock_ms keep min=1 since
+    // 0 there means "abort immediately", not "no cap". Operator who
+    // types 0 expecting "unlimited" gets a warning, not a session
+    // that aborts on turn 1.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_steps = 0
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxSteps).toBeUndefined();
+      expect(result.warnings[0]).toContain('out of range');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('out-of-range values warn and ignore (max_cost_usd = -1)', () => {
     const cwd = makeTempCwd();
     try {

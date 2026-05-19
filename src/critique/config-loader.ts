@@ -622,6 +622,19 @@ interface PartialBudgetLayer extends BudgetConfigKeys {}
 //     of 90s is what catches genuine hangs.
 //   compaction_preserve_tail: 1000 — preserving more than 1k
 //     turns verbatim defeats the purpose of compaction.
+//
+// Min values differ per key by documented disable semantics:
+//   - max_step_stall_ms: 0 is the runtime "disable watchdog"
+//     sentinel (`src/harness/abortable.ts:68` — `stallMs <= 0`
+//     yields the source verbatim with no timer). Operators with
+//     long-running steady-streaming providers legitimately need
+//     this. Min=1 would force `runtime !== config` divergence.
+//   - compaction_preserve_tail: 0 is the "aggressive compaction"
+//     mode (drop everything except the system prompt).
+//   - max_steps / max_wall_clock_ms: 0 means "abort immediately",
+//     not "no cap" — no documented opt-out semantic, so min=1
+//     guards against a footgun where the operator types 0
+//     expecting "no limit".
 const BUDGET_INT_KEYS: ReadonlyArray<{
   snake: string;
   camel: keyof BudgetConfigKeys;
@@ -630,10 +643,12 @@ const BUDGET_INT_KEYS: ReadonlyArray<{
 }> = [
   { snake: 'max_steps', camel: 'maxSteps', min: 1, max: 1_000_000 },
   { snake: 'max_wall_clock_ms', camel: 'maxWallClockMs', min: 1, max: 24 * 60 * 60 * 1000 },
-  { snake: 'max_step_stall_ms', camel: 'maxStepStallMs', min: 1, max: 60 * 60 * 1000 },
-  // compactionPreserveTail = 0 is intentional (aggressive
-  // compaction: drop everything except the system prompt) — the
-  // min is 0, not 1.
+  // min=0: `stallMs <= 0` disables the per-step watchdog in
+  // `harness/abortable.ts` (runtime contract). Without min=0,
+  // config could not express the documented opt-out.
+  { snake: 'max_step_stall_ms', camel: 'maxStepStallMs', min: 0, max: 60 * 60 * 1000 },
+  // min=0: aggressive compaction — drop everything except the
+  // system prompt.
   { snake: 'compaction_preserve_tail', camel: 'compactionPreserveTail', min: 0, max: 1000 },
 ];
 

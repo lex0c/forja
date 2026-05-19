@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(config) — `[budget].max_step_stall_ms = 0` accepted (matches runtime opt-out)
+
+`BUDGET_INT_KEYS` in `src/critique/config-loader.ts` had `min: 1` for `max_step_stall_ms`. The runtime contract (`src/harness/abortable.ts:38, :68`) explicitly uses `stallMs <= 0` as the "disable per-step watchdog" sentinel — `stallWatchdog` yields the source verbatim with no timer. An operator running long steady-streaming provider calls who set `max_step_stall_ms = 0` in `.agent/config.toml` to opt out got a "out of range [1, 3600000]" warning and the default 90s watchdog silently stayed in effect. The validator forbade what the harness supports — `config !== runtime` divergence.
+
+Fix: `min: 0` for `max_step_stall_ms` only. `max_steps` and `max_wall_clock_ms` keep `min: 1` because `0` for those means "abort immediately" (no documented disable semantic) — guarding against a footgun where the operator types `0` expecting "no limit".
+
+Inline comment in `BUDGET_INT_KEYS` rewritten to spell out the per-key disable semantic. Spec `AGENTIC_CLI.md §2.1.1` schema reference table updated to flag `max_step_stall_ms: int ≥0` with the disable behavior. Test pin: `max_step_stall_ms = 0 accepted (runtime opt-out)` + sibling pin `max_steps = 0 still rejected`.
+
 ## [2026-05-19] hardening(cli) — three init robustness follow-ups (atomic writes, mid-loop pin, eval)
 
 Self-review of `agent init` after the rich-scaffold landed surfaced three production-readiness gaps. All three closed here on the same branch.

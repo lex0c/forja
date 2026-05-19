@@ -253,7 +253,7 @@ max_overhead_ms = 5000
 | `[budget]` | `max_steps` | int | Runaway-loop backstop (cost é o engagement gate). |
 | `[budget]` | `max_cost_usd` | float | Hard cap em USD; harness aborta logo após cruzar. Omitir a chave em sessão via `/budget cost off` (não persistido). |
 | `[budget]` | `max_wall_clock_ms` | int | Cap de wall-clock da sessão inteira. |
-| `[budget]` | `max_step_stall_ms` | int | Watchdog per-step; aborta o step se o provider stream silenciar tantos ms. |
+| `[budget]` | `max_step_stall_ms` | int `≥0` | Watchdog per-step; aborta o step se o provider stream silenciar tantos ms. `0` desliga o watchdog inteiro (runtime: `stallMs <= 0` em `harness/abortable.ts:68` yields source verbatim sem timer) — útil pra providers steady-streaming de long-running steps. |
 | `[budget]` | `compaction_threshold` | float `[0,1]` | Fração do context-window onde compactação dispara. |
 | `[budget]` | `compaction_preserve_tail` | int `≥0` | Quantos turns finais ficam literais (sem compactar). 0 = compacta tudo. |
 | `[memory]` | `verify_semantic_llm` | bool | Detector S11 (post-write semantic verification). Default ON. |
