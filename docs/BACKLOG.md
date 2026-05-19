@@ -2,6 +2,146 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(cli) — `agent purge` project-scope reset (post-work)
+
+Closes the pre-work entry below. Single branch `feat/purge-command`; spec landed before code.
+
+**Round-of-review fixes that landed BEFORE the first commit** (self-review caught 5 issues):
+
+- **B1 — schema rename `*_removed` → `*_present`.** Initial design named the audit columns `bytes_removed`, `files_removed`, `dirs_removed`. But the audit row is written BEFORE the FS walker (load-bearing ordering), so the values are a PRE-purge snapshot, not an after-action report. A race where another process adds/removes files between snapshot and walker produces real-removal counts that diverge from the row. Renaming to `*_present` makes the snapshot semantics explicit and reflects what the row actually captures: "the operator-confirmed plan at confirmation time". The realized counts surface in `forceReport.removed` (stdout/JSON) but don't persist — log capture is the after-action evidence.
+- **B2 — walker push-after-stat ordering.** `paths.push(abs)` ran before `lstat` in both walk loops. If an entry vanished between `readdir` and `lstat` (concurrent process, race), `paths` would list it but totals wouldn't count it. The persisted `artifacts_present_json` would then mention paths that contributed zero to `bytes_present` — confusing forensic readers. Fix: push only after stat succeeds.
+- **D3 — drift-guard `INIT_MARKERS` ↔ `init.DEFAULT_STEPS`.** The two arrays live in different files (purge.ts and init.ts) without a structural link. A future init step (`hooks` for example) would scaffold a 5th artifact that purge wouldn't recognize as an init marker — projects scaffolded post-extension would refuse `agent purge`. New `tests/cli/purge.test.ts` drift-guard block uses an explicit `STEP_TO_MARKER` map (typed against the readonly `INIT_MARKERS` tuple so typos fail at compile time) + two paired assertions ("every step has a marker" + "every marker maps to a step"). Failure surfaces in CI, not in operator surprise.
+- **T1 — purge from a subdir resolves repoRoot.** Tests covered the canonical case (`cwd === repoRoot`) but never exercised `resolveRepoRoot` itself. New test `git init`s the tempdir, runs purge from `<repo>/src/`, verifies `<repo>/.agent/` (not `<repo>/src/.agent/`) is removed AND the audit row's `cwd` field carries the resolved repoRoot. Skips with a warning if `git` is unavailable (sandboxed CI) rather than mis-passing.
+- **T6 — walker/removeTree parity invariants.** The audit-row snapshot vs real-removal divergence (rationale for B1) needed a positive control: when nothing changes mid-purge, what's the expected relationship? New test asserts `files` and `bytes` match exactly between dry-run output and force-mode output; `dirs` differs by exactly 1 (removeTree counts `.agent/` root; walker does not). Catches future regressions where someone accidentally makes the walker include the root or the remove walker forget it.
+
+The self-review also surfaced lower-priority items deferred for follow-up: JSON shape divergence between dry-run and force-mode (D1), canonical-JSON-vs-stable-sorted-JSON wording (D2), PRESERVED_PATHS using literal `~/...` instead of resolved paths (D4), `--no-audit` silently ignored in dry-run (D6). Documented in the BACKLOG follow-up notes; tracked but not blocking.
+
+**Outcome.** New top-level verb `agent purge [--force] [--json] [--no-audit]` resets a Forja-initialized project to "as if it never ran here" from the filesystem perspective. Dry-run (bare invocation) prints scope + per-category sizes + preserved-state list + audit writability + the literal `agent purge --force` command to execute. `--force` writes one append-only `purge_events` row to the global DB, then walks `<repoRoot>/.agent/` with `lstat` (never following symlinks) and removes everything. The global DB and `~/.config/agent/**` are untouched by design — sessions / approvals_log / memory_events for the cwd remain queryable via `agent --list-sessions --project <cwd>` after the purge.
+
+**Operator-visible end-to-end** (smoke against a fixture):
+
+```
+$ agent purge
+forja purge — DRY RUN (nothing will be modified)
+Project root: /tmp/forja-purge-smoke
+Scope:        /tmp/forja-purge-smoke/.agent/
+Will remove:
+  /tmp/forja-purge-smoke/.agent/.gitignore         12 B   [operator-owned — confirm before --force]
+  /tmp/forja-purge-smoke/.agent/agents/            1 files, 9 B
+  /tmp/forja-purge-smoke/.agent/bg/                1 files, 4 B
+  /tmp/forja-purge-smoke/.agent/config.toml        9 B
+  /tmp/forja-purge-smoke/.agent/memory/            1 files, 7 B
+  /tmp/forja-purge-smoke/.agent/permissions.yaml   11 B
+Total: 6 files, 4 directories, 52 B
+Preserved (will NOT be touched):
+  ~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)
+  ~/.config/agent/**                  (user-layer config + memory)
+  ~/.local/share/forja/install_id     (install identity; audit chain genesis)
+Audit will be recorded in purge_events at: /home/lex/.local/share/forja/sessions.db
+To execute:
+  agent purge --force
+```
+
+**Decisions that survived in-flight review:**
+
+- **Filesystem-only scope is load-bearing.** Considered + rejected: a parallel sweep of the global DB by cwd. Rationale: cross-substrate FK tracking would be load-bearing forever; the audit-chain rows for this project are exactly the "manter audit" intent the operator confirmed; stale references (DB rows naming a purged `.agent/`) are inert (memory loader reads `.md` files, not memory_events; trust-corpus rows trigger re-prompt on next session — desired). Documented as out-of-scope in `AGENTIC_CLI.md §2.1.2`.
+- **Init marker is permissive (any one of four).** Catches "purge in $HOME by accident" and "purge against a foreign .agent/ planted by another tool" without surprising operators who manually pruned three of the four. Markers list (`permissions.yaml`, `.gitignore`, `config.toml`, `agents/`) is the same set the init orchestrator writes. Failure message names the four explicitly so the operator can debug without grepping source.
+- **`.gitignore` is purged with the rest, but flagged in the dry-run.** Operator-owned semantics from `MEMORY.md §2.5` protect against `init --force` clobbering hand edits, not against the operator's explicit reset verb. Dry-run renders `[operator-owned — confirm before --force]` alongside the size so a deliberate edit doesn't disappear silently.
+- **Audit row before any FS mutation.** `--force` opens + migrates the DB, computes the install identity (`ensureInstallId`), and inserts the `purge_events` row BEFORE entering the removal walker. If the DB is unwriteable, `--force` aborts (`cannot write audit row to DB`) unless `--no-audit` is explicit. `--no-audit` is the escape hatch for emergencies (compromised host, corrupted DB) — purge proceeds without leaving a forensic row; stderr warns explicitly so CI logs capture the bypass.
+- **Symlink defense is `lstat`-only, top-down.** `lstat` on `<repoRoot>/.agent/` itself refuses if it's a link (operator's choice to share state from elsewhere is respected). Inside the walker, `lstat` per entry: symlink entries are `unlinkSync`'d (the link, not the target) and never recursed into. Tested directly with a `--force` that leaves an external symlink target intact post-purge.
+- **No hash chain on `purge_events`.** Considered + rejected. Purge is an operational event, not a policy decision with replay semantics; a chain would complicate the schema for no concrete threat-model gain. `approvals_log` keeps its chain (decisions are replayable); `purge_events` lives parallel as a lightweight install-scoped reset log.
+- **Dedicated table over reusing `approvals_log` / `failure_events`.** approvals_log requires a `session_id` (purge fires outside any session); failure_events is semantic-mismatched (purge is a successful operator action). Dedicated `purge_events` mirrors the established pattern (memory_events, hook_runs, eviction_events, outcomes — one concern per table, append-only).
+
+**Items deliberately NOT addressed** (each documented in spec §2.1.2 + pre-work entry):
+
+- DB cleanup by cwd. Privacy-purge / GDPR flow is a separate `SECURITY_GUIDELINE.md` concern; this verb does not impersonate it.
+- Backup before purge. Two-phase confirmation already lets the operator inspect output and copy what matters; FS-noisy tar.gz dropouts create a new "where does it live, who cleans it?" surface for no clear win.
+- Slash `/purge`. Verb is setup-adjacent (mutually exclusive with active session — it purges the bootstrap the session reads from). Same posture as `init`, `doctor`, `welcome`.
+- `agent purge log` reader. `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; no concrete consumer asked for the verb today.
+
+**Edge cases pinned by tests:**
+
+- Symlink target outside `.agent/` survives a purge that crosses the link.
+- Purge then re-init then purge again — both rows land in `purge_events` for the same cwd; install_id stable across both (genesis preserved).
+- DB unwriteable + `--no-audit` set: FS removal happens, stderr warns, audit skipped. Without `--no-audit`: FS untouched, exit 1.
+- Empty `.agent/` (only marker is a 0-byte `.gitignore`): handled correctly (1 file, 0 bytes).
+- Walker sorts paths into the canonical JSON for `artifacts_present_json` so two enumerations of the same tree produce byte-stable rows (forensic comparability).
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1` — `Purge` row added to the modes table with one-line semantics.
+- `AGENTIC_CLI.md §2.1.2` (new) — scope of removal (table), preserved state (list), filesystem-only rationale, init-marker gate, symlink defense, dry-run vs `--force`, audit row schema, `--json` shape, re-init guarantee, out-of-scope items.
+- `AUDIT.md §1` — `purge_events` added to the canonical 28-table list with retention 365d, low sensitivity, no redaction.
+- `AUDIT.md §1.2` — `purge_events = 365` added to the configurable retention block.
+
+**Code deltas:**
+
+- `src/storage/migrations/066-purge-events.ts` — new migration (CREATE TABLE + `(cwd, ts)` index, CHECK constraints on ts > 0 and counts >= 0). Columns are `*_present` (snapshot pré-purge), not `*_removed` — naming reflects the load-bearing ordering (audit-first, FS-after) where the snapshot captured at confirmation may diverge from the eventual real-removal under racing FS edits.
+- `src/storage/migrations/index.ts` — registers migration 066.
+- `src/storage/repos/purge-events.ts` — `insertPurgeEvent` + `listPurgeEventsByCwd`. Append-only by contract; no UPDATE/DELETE surface (pinned by an export-allow-list test).
+- `src/cli/args.ts` — `parsePurgeSubcommand` + `purge?: { force, json, noAudit }` on `ParsedArgs` + dispatch wiring.
+- `src/cli/index.ts` — lazy-import branch for `args.purge`; exempts from first-boot nudge and prompt requirement.
+- `src/cli/purge.ts` — `runPurge` (init-marker gate, symlink defense, walker, dry-run renderer, force path with audit-first ordering, `--json` serializers).
+
+**Test deltas:**
+
+- `tests/cli/args-purge.test.ts` — 10 parser cases (bare, each flag in isolation, combinations, order-irrelevance, unknown-flag rejection, help, prefix-not-fuzzy).
+- `tests/storage/purge-events.test.ts` — 12 cases across migration schema, CHECK constraints, insert round-trip, list filter + ordering + limit, append-only export allow-list.
+- `tests/cli/purge.test.ts` — 18 handler cases: init-marker gate (5 sub-cases), symlink defense (refusal + non-following), dry-run output (4 sub-cases: no-mutation, human render, gitignore flag, JSON shape, empty edge), `--force` happy path (3 sub-cases: removal + audit row + sorted-json + re-init), `--no-audit` escape hatch (abort vs bypass), repoRoot resolution from subdir (T1), walker/removeTree parity invariants (T6), and drift-guard pairing `INIT_MARKERS` ↔ `init.DEFAULT_STEPS` (D3, 3 sub-cases).
+
+46 new tests pass; typecheck + lint clean across the 920-file Biome scan. Tests of the files I touched (`tests/cli/args.test.ts`, `tests/cli/init.test.ts`, `tests/cli/index.test.ts`, `tests/cli/doctor.test.ts`, `tests/cli/welcome.test.ts`, `tests/storage/db.test.ts`, `tests/storage/migrate.test.ts`) — 280 tests, 0 fail.
+
+**Production-readiness shift.** Before: an operator evaluating Forja on a project and wanting to back out had only `rm -rf .agent/` — no audit, no symlink defense, no marker check, full apex risk (`rm -rf` typo destroys parent tree; symlinked `.agent/` obliterates shared state). After: `agent purge` is first-class, two-phase, audited, symlink-safe, marker-gated, and idempotent with `agent init` (re-init after purge re-scaffolds cleanly because init is pure-FS and the DB is preserved). The "what survives in the global DB" contract is in the spec and surfaced in every dry-run.
+
+## [2026-05-19] feat(cli) — `agent purge` project-scope reset (pre-work plan)
+
+A first-time operator who wants to evaluate Forja on a project, then back out — or who wants to restart with clean state after a botched session — has no first-class undo. `agent init` creates `<repoRoot>/.agent/` with permissions, config, gitignore, and 10 canonical playbooks; subsequent sessions accumulate memory (`memory/{shared,local}/`), background-process logs (`bg/`), and operator-edited artifacts. There is no `agent <verb>` that takes a project-initialized directory and returns it to "as if Forja never ran here". Operators today have to `rm -rf .agent/` manually, which leaves no audit trace and exposes them to apex risk (`rm -rf` typo destroys parent tree; following a symlink obliterates `~`-shared corpus).
+
+This slice adds `agent purge` — operator-fired, two-phase (dry-run then `--force`), filesystem-scoped to `<repoRoot>/.agent/`, audited via a new append-only `purge_events` table on the global DB. The dry-run shows what will be removed plus the literal command to execute. `--force` writes the audit row first, then walks the tree with `lstat` (refuses to follow symlinks out of the purge root). DB-global state is preserved by design: sessions, approvals_log, memory_events for this cwd remain queryable forever via `agent --list-sessions --project <cwd>` — the user's "talvez manter audit" intuition translates to "filesystem-only purge, DB untouched, audit-chain integrity preserved naturally".
+
+**Scope (decisions confirmed up front):**
+
+- **Filesystem-only.** Purge restricted to `<repoRoot>/.agent/`. The global `sessions.db` and `~/.config/agent/**` are never touched — every audit chain row referencing this cwd survives. Alternative considered (sweep DB by cwd) rejected: cross-substrate FK tracking would be load-bearing forever and would erase exactly the audit the user said to keep.
+- **Init marker required.** Refuse unless `<repoRoot>/.agent/` exists AND contains at least one of the 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`). Catches "operator typed `agent purge` in $HOME by accident" and "operator opened a project not initialized by Forja". Permissive enough to recover from a partial init (operator who deleted `permissions.yaml` manually but still has the rest).
+- **`.gitignore` deleted with the rest.** Operator-owned semantics from `MEMORY.md §2.5` exist to protect against `init --force` clobbering hand edits, not against explicit operator-fired purge. Dry-run output flags it with a warning line so the operator confirms.
+- **Append-only audit row before any FS mutation.** New `purge_events` table (`id, ts, install_id, cwd, artifacts_present_json, bytes_removed, files_removed, dirs_removed, forja_version`). DB inaccessibility aborts `--force` unless `--no-audit` is explicit; dry-run downgrades to a warning.
+- **Symlink defense.** `lstat` on `<repoRoot>/.agent/` BEFORE entering it — if it's a symlink, refuse and instruct the operator to `rm` the link manually (we will not follow). Inside the walker, `lstat` every entry; for symlink entries, unlink the link itself without traversing.
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1` — add `Purge` row to the modes table.
+- `AGENTIC_CLI.md §2.1.2` (new subsection) — scope, init-marker gate, dry-run vs `--force`, audit row contract, symlink defense, "what survives in the global DB" explainer (`agent --list-sessions --project <cwd>` after purge).
+- `AUDIT.md §1` — add `purge_events` row to the canonical 28-table list with retention 365d, low sensitivity, no redaction.
+
+**Phase 1 — Storage layer.**
+
+- `src/storage/migrations/066-purge-events.ts` — `CREATE TABLE purge_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL CHECK > 0, install_id TEXT NOT NULL, cwd TEXT NOT NULL, artifacts_present_json TEXT NOT NULL, bytes_present INTEGER NOT NULL CHECK >= 0, files_present INTEGER NOT NULL CHECK >= 0, dirs_present INTEGER NOT NULL CHECK >= 0, forja_version TEXT NOT NULL)` + `(cwd, ts)` index for cwd-scoped queries. Append-only by convention; no UPDATE/DELETE in repo. Note: columns are `*_present` (snapshot pré-purge), not `*_removed`, since the audit row is written before the FS walker — see post-work entry for the load-bearing rationale.
+- `src/storage/repos/purge-events.ts` — `insertPurgeEvent(db, row)` returning the assigned id; `listPurgeEventsByCwd(db, cwd, limit?)` for forensic / future `agent purge log` slice.
+
+**Phase 2 — CLI parser.** `src/cli/args.ts` — `parsePurgeSubcommand` matching the `init`/`doctor` shape (subcommand verb stops prompt collection). Flags: `--force` (execute), `--json` (NDJSON output for both modes), `--no-audit` (allow `--force` even if DB unwriteable; documented as escape hatch for emergencies). Mutually exclusive with all other verbs. Update `parseArgs` dispatch sequence.
+
+**Phase 3 — Handler.** `src/cli/purge.ts:runPurge` —
+1. Resolve `repoRoot` via `resolveRepoRoot(cwd)` (memory/paths.ts).
+2. `lstat` `<repoRoot>/.agent/`; refuse if symlink or missing.
+3. Check init marker (any of the 4 canonical artifacts present).
+4. Walk `.agent/` with `lstat` per entry; collect paths + bytes + counts; never follow symlinks out.
+5. Open + migrate DB; check writability. Dry-run: print warning if unwriteable. `--force`: abort unless `--no-audit`.
+6. If `!force`: print info block, scope (grouped by category), explicit `.gitignore` warning, literal `agent purge --force` command, exit 0.
+7. If `force`: write audit row → atomic-ish FS removal (rm -rf semantics but symlink-safe) → summary line. Exit 0.
+
+**Phase 4 — Dispatcher.** `src/cli/index.ts` — lazy-import branch for `args.purge`. Add to `inSetupFlow` exemption (first-boot nudge suppressed) and to `promptOptional` predicate.
+
+**Phase 5 — Tests.** `tests/cli/args-purge.test.ts` (parser shapes, flag combinations, mutual exclusivity); `tests/storage/migrations/066-purge-events.test.ts` (CREATE + CHECK constraints + index); `tests/storage/repos/purge-events.test.ts` (insert + list + append-only contract); `tests/cli/purge.test.ts` (missing marker rejection, symlink rejection, dry-run output shape, `--force` happy path, audit row written before FS touch, DB-unwriteable behavior with and without `--no-audit`, JSON shape both modes).
+
+**Items deliberately out of scope:**
+
+- **DB cleanup by cwd.** Would require tracking every table that joins via `cwd` or via FK to `sessions(cwd=)` — load-bearing forever. The user explicitly said "manter audit"; deferred indefinitely until a concrete compliance ask names a row that must disappear.
+- **Backup before purge.** Operator with two-phase confirmation already has the chance to inspect output and copy what they want. Adding tar-gzball to a temp dir is FS-noisy and creates another surface (where does the backup live? who cleans it up?). Skip for v1.
+- **Slash `/purge`.** Purge is a setup-adjacent verb (mutually exclusive with an active session — purges the project bootstrap that the running session reads from). No slash counterpart; same posture as `init`, `doctor`, `welcome`.
+- **`agent purge log` reader.** `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; doesn't ship as a verb today (no concrete consumer requested it).
+
+Post-work entry will follow once code + tests land. Single branch `feat/purge-command`; spec commits first, code commits after — per-subsystem branch strategy.
+
 ## [2026-05-19] refactor(config) — centralize agent-path resolvers, closes latent Windows gap
 
 Audit of `src/*/paths.ts` files revealed the XDG / HOME / Windows APPDATA / PROGRAMDATA dance was duplicated across four subsystems (`permissions`, `hooks`, `config.toml` consumers, `install_id`). Worse: the implementations had drifted in completeness.

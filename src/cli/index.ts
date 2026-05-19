@@ -32,7 +32,10 @@ const main = async (): Promise<number> => {
   // consumers; one-shot per install (install_id gets created by the
   // next normal bootstrap and the nudge stops firing).
   const inSetupFlow =
-    args.welcome === true || args.doctor !== undefined || args.sandbox !== undefined;
+    args.welcome === true ||
+    args.doctor !== undefined ||
+    args.sandbox !== undefined ||
+    args.purge !== undefined;
   if (!inSetupFlow) {
     const { isFirstBoot } = await import('../permissions/install_id.ts');
     if (isFirstBoot()) {
@@ -62,6 +65,26 @@ const main = async (): Promise<number> => {
     if (args.init.only !== undefined) initOptions.only = args.init.only;
     if (args.init.force !== undefined) initOptions.force = args.init.force;
     return runInit(initOptions);
+  }
+
+  // `agent purge [--force] [--json] [--no-audit]` — §2.1.2
+  // project-scope FS reset. Pure-FS in the dry-run path; the
+  // force path also writes one append-only audit row to the
+  // global DB. Lazy import: pulling `./purge.ts` brings in
+  // storage + install_id, so we keep the help/version/etc.
+  // branches above immune to those deps failing to load. Like
+  // `init`, this verb is mutually exclusive with every other
+  // run mode (the parser rejected combos at parseArgs time).
+  if (args.purge !== undefined) {
+    const { runPurge } = await import('./purge.ts');
+    return runPurge({
+      cwd: process.cwd(),
+      force: args.purge.force,
+      json: args.purge.json,
+      noAudit: args.purge.noAudit,
+      out: (s) => process.stdout.write(s),
+      err: (s) => process.stderr.write(s),
+    });
   }
 
   // Subagent-child mode. The parent process
@@ -155,7 +178,11 @@ const main = async (): Promise<number> => {
     // hit before the run.ts dispatcher could route the verb, so
     // `agent permission verify --json` produced "--json requires
     // a prompt" instead of the chain integrity report.
-    args.permission !== undefined;
+    args.permission !== undefined ||
+    // `agent purge` (§2.1.2) — operator-fired FS reset. Lifecycle
+    // mode: no prompt, no provider, no REPL. Same exemption shape
+    // as init/doctor/sandbox/permission.
+    args.purge !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

@@ -209,6 +209,7 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **Replay** | `agent --replay <id>` | re-executa sessão (debug/eval) |
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
 | **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
+| **Purge** | `agent purge [--force] [--json] [--no-audit]` | reset filesystem-only do projeto inicializado: apaga **todo o conteúdo de `<repoRoot>/.agent/`** (configs + memory + bg logs + playbooks operator-edited). Banco global (`sessions.db`, `~/.config/agent/**`) **nunca tocado** — audit chain, sessions e memory_events para este `cwd` permanecem queryáveis (`agent --list-sessions --project <cwd>`). Sem `--force` é dry-run: imprime escopo + comando literal pra executar. Marker obrigatório: pelo menos 1 dos 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`) presente em `.agent/`. Symlinks recusados (não seguidos). Detalhe completo em §2.1.2. |
 
 #### 2.1.1 `config.toml` — scaffold com valores ativos + schema reference
 
@@ -266,6 +267,107 @@ max_overhead_ms = 5000
 | `[critique]` | `prompt_version` (opcional) | string | Pin de versão do prompt (`KNOWN_CRITIQUE_PROMPT_VERSIONS`). |
 
 Seções futuras (`[telemetry]`, …) entram pelo mesmo padrão: defaults canônicos em código, scaffold materializa valores ativos, schema reference aqui descreve significado. Schema-creep no scaffold é custo aceitável (operador vê mais linhas no arquivo); schema-creep nos defaults em código requer PR contra esta seção primeiro.
+
+#### 2.1.2 `agent purge` — filesystem reset com audit append-only
+
+`agent purge` reverte o efeito de `agent init` (mais todo runtime acumulado em `<repoRoot>/.agent/`) deixando o projeto **como se Forja nunca tivesse rodado nele do ponto de vista do filesystem**. Banco global e user-layer configs ficam intocados — o audit chain do install permanece íntegro.
+
+**Escopo de remoção.** Tudo sob `<repoRoot>/.agent/`:
+
+| Categoria | Conteúdo |
+|---|---|
+| Configs do `init` | `permissions.yaml`, `config.toml`, `.gitignore`, `agents/*.md` (canonical + operator-added) |
+| Configs do operador | `hooks.toml`, `no-history` marker |
+| Memory (FS source-of-truth) | `memory/shared/**`, `memory/local/**`, `memory/{shared,local}/.tombstones/**` |
+| Runtime state | `bg/`, `bg/subagents/<id>/`, qualquer `*.log`, `traces/`, `checkpoints/`, `sessions.db*` (se o projeto sobrescreveu o path default — o gitignore default reserva o nome) |
+| Qualquer outro arquivo | Tudo que estiver dentro de `.agent/` |
+
+**Escopo preservado (NÃO tocado, garantido):**
+
+- `~/.local/share/forja/sessions.db` (+ `-shm`, `-wal`) — DB global multi-projeto. Sessões, `approvals_log`, `memory_events`, `hook_runs`, `checkpoints`, `outcomes`, `policies`, `eviction_events` referentes ao `cwd` purgado **continuam queryáveis** (`agent --list-sessions --project <cwd>`, `agent permission verify`, etc.). Stale-references (rows que apontam pra um `.agent/` que não existe mais) são inofensivas — o loader de memória lê dos `.md` files (vazios pós-purge), não reconstrói do event log.
+- `~/.config/agent/**` (user layer: `permissions.yaml`, `config.toml`, `hooks.toml`, `agents/`, `memory/`).
+- `~/.local/share/forja/install_id` — identidade do install. Manter preserva o genesis do audit chain (`SECURITY_GUIDELINE.md §10`).
+- `/etc/agent/**` (enterprise layer).
+
+**Por que filesystem-only e não sweep DB por `cwd`.** A alternativa rejeitada — fazer `DELETE` nas tabelas globais onde `cwd = <repoRoot>` — teria três custos: (a) rastrear todas as FKs e tabelas que ganham coluna `cwd` no futuro vira load-bearing forever; (b) apagaria justamente o `approvals_log` e o `memory_events` que constituem o audit-trail do projeto; (c) violaria o princípio 1.1.3 (append-only everywhere). Filesystem-only entrega "zerar visualmente" e preserva trilha forense — escolha de design alinhada com "talvez manter audit" do operator-facing UX.
+
+**Init marker (gate obrigatório).** O comando recusa execução a menos que `<repoRoot>/.agent/` exista E contenha **pelo menos um** dos quatro artefatos canônicos do `init`:
+
+- `<repoRoot>/.agent/permissions.yaml`
+- `<repoRoot>/.agent/config.toml`
+- `<repoRoot>/.agent/agents/` (diretório)
+- `<repoRoot>/.agent/.gitignore`
+
+Sem nenhum deles, exit code 1 com mensagem `purge: <repoRoot>/.agent/ has no init markers — run 'agent init' first or remove .agent/ manually if you didn't initialize this project`. Catches:
+
+1. Operador digita `agent purge` em `$HOME` por engano (não há `.agent/` lá).
+2. Operador opera em projeto que tem `.agent/` por outras razões (planted by another tool) — sem marker, recusamos por segurança.
+3. Operador parcialmente apagou o `.agent/` à mão mas ainda tem evidência de `init` — aceitamos (marker permissivo, qualquer um dos quatro basta).
+
+**Defesa contra symlinks.** ANTES de entrar em `.agent/`, fazemos `lstat`. Se for symlink, recusamos com `purge: <repoRoot>/.agent/ is a symlink — refusing to follow. Remove the link manually if intended`. Justificativa: `ln -s ~/shared-state .agent` faria o purge devastar `~/shared-state` se seguíssemos. Dentro do walker, cada entry também passa por `lstat` — symlink entries são `unlink`ados (o link em si), nunca seguidos. Subdirs reais são recursionados.
+
+**Dois modos: dry-run (default) e `--force`.**
+
+`agent purge` (sem flags) é **dry-run obrigatório**: nenhuma operação destrutiva, nenhum write no DB. Output:
+
+```
+forja purge — DRY RUN (nothing will be modified)
+
+Project root: /repo
+Scope:        /repo/.agent/
+
+Will remove:
+  /repo/.agent/permissions.yaml                          1.2 KB
+  /repo/.agent/config.toml                                432 B
+  /repo/.agent/.gitignore                                  87 B   [operator-owned — confirm before --force]
+  /repo/.agent/hooks.toml                                 215 B
+  /repo/.agent/agents/                              10 files, 24.3 KB
+  /repo/.agent/memory/local/                         3 files, 1.8 KB
+  /repo/.agent/memory/shared/                        7 files, 14.1 KB
+  /repo/.agent/bg/                                  12 files, 412 KB
+Total: 38 files, 4 directories, 454.0 KB
+
+Preserved (will NOT be touched):
+  ~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)
+  ~/.config/agent/**                  (user-layer config + memory)
+  ~/.local/share/forja/install_id     (install identity; audit chain genesis)
+
+Audit will be recorded in purge_events at: ~/.local/share/forja/sessions.db
+
+To execute:
+  agent purge --force
+```
+
+`agent purge --force` executa de fato. **Ordem é load-bearing**: abre + migra DB → escreve audit row em `purge_events` → walks `.agent/` removendo tudo → resumo final. Se o DB estiver inacessível (read-only FS, EACCES no parent dir, lock conflict), `--force` aborta com `purge: cannot write audit row to DB (<reason>); use --no-audit to bypass`. `--no-audit` é a escape hatch para emergências (host comprometido, DB corrompido) — purge prossegue sem deixar registro; usado raramente, documentado.
+
+**Schema do audit row** (`purge_events` em `AUDIT.md §1`):
+
+| Campo | Tipo | Conteúdo |
+|---|---|---|
+| `id` | INTEGER (PK auto) | seq local |
+| `ts` | INTEGER (epoch ms) | quando o purge foi confirmado |
+| `install_id` | TEXT | identidade do install (de `~/.local/share/forja/install_id`) |
+| `cwd` | TEXT | `repoRoot` resolvido (canônico, post-`git rev-parse --show-toplevel`) |
+| `artifacts_present_json` | TEXT (JSON array, sorted) | lista de paths absolutos enumerados pré-purge |
+| `bytes_present` | INTEGER | total de bytes pré-purge (best-effort; soma `lstat.size` de cada arquivo). **Snapshot, não pós-remoção** — race onde outra ferramenta adiciona/remove arquivos entre snapshot e walker produz divergência. |
+| `files_present` | INTEGER | contagem de arquivos pré-purge (symlinks contam como files) |
+| `dirs_present` | INTEGER | contagem de subdiretórios pré-purge — **NÃO inclui o `.agent/` root**, só os filhos |
+| `forja_version` | TEXT | `VERSION` no momento do purge |
+
+**Semântica "_present" vs realidade pós-remove.** Os campos `*_present` capturam o snapshot que o operador confirmou ao rodar `--force` (mesmo que o walker do `--force` veja um número diferente devido a race). O audit row é o "plano confirmado", não o "after-action report". A realidade pós-remove aparece no `forceReport.removed` (stdout/JSON output) mas não persiste — quem precisa de evidência forensic do remove real lê o stdout/log do operador.
+
+Retention: 365d (par com `approvals_log`); sem hash chain (purge é evento operacional, não decisão de policy — chain seria over-engineering). Append-only por contrato (sem UPDATE/DELETE no repo).
+
+**`--json` mode.** NDJSON em ambos os modos. Dry-run emite um único objeto `{"mode":"dry-run","repoRoot":"...","scope":"...","entries":[...],"totals":{...},"audit":{"writable":true,"db_path":"..."},"command":"agent purge --force"}`. Force-mode emite o mesmo shape + `{"mode":"force","audit_id":N,"removed":{...}}` após a operação. Pure stdout (princípio §2.2).
+
+**Re-init após purge.** `agent init` no diretório purgado funciona idempotentemente porque é pure-FS — re-cria os 4 artefatos. A próxima session boota normalmente; usa o mesmo `install_id` (audit chain continua), encontra `shared_corpus_trust` row stale para o scope-root (re-prompt automático — corretamente, já que corpus mudou de "operator-confirmed" pra vazio), e cria nova `sessions` row apontando para o mesmo `cwd`. Trade-off honesto: o DB acumula rastro arqueológico das sessões pré-purge, que é exatamente o "manter audit" desejado.
+
+**Fora de escopo:**
+
+- **DB cleanup por `cwd`.** Vide rationale "Por que filesystem-only" acima. Caso compliance futuro exija privacy purge real (GDPR-style), entra como flow separado em `SECURITY_GUIDELINE.md`.
+- **Backup automático antes do purge.** Dry-run já dá ao operador chance de revisar. Adicionar `tar.gz` numa temp dir cria nova superfície (onde mora? quem limpa?) sem ganho proporcional.
+- **Slash `/purge`.** Verbo é setup-adjacent (mutuamente exclusivo com session ativa — purga o bootstrap que a session lê). Mesmo posture de `init`, `doctor`, `welcome`.
+- **`agent purge log` reader.** Repo expõe `listPurgeEventsByCwd` para um futuro slice; verbo não ships hoje (sem consumidor concreto pedindo).
 
 ### 2.2 Composição (Unix philosophy)
 

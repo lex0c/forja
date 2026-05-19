@@ -289,6 +289,15 @@ export interface ParsedArgs {
   // + sandbox setup + next-steps menu into a guided intro. Idempotent
   // — running it later as a "checkup" is fine.
   welcome?: true;
+  // `agent purge` — §2.1.2 project-scope reset. Filesystem-only
+  // (removes everything under <repoRoot>/.agent/); never touches the
+  // global DB or user-layer configs. Two-phase: bare invocation is
+  // dry-run (prints scope + audit-writability + literal force
+  // command); `--force` executes after writing a purge_events audit
+  // row. `--no-audit` is the escape hatch for emergencies where the
+  // global DB is unwriteable but the operator still needs the FS
+  // reset — purge proceeds without leaving a forensic row.
+  purge?: { force: boolean; json: boolean; noAudit: boolean };
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
@@ -928,6 +937,76 @@ const KNOWN_PERMISSION_VERBS = [
   'calibration-export',
 ] as const;
 
+// `agent purge [--force] [--json] [--no-audit]` — project-scope FS
+// reset (AGENTIC_CLI.md §2.1.2). Mirrors the doctor / sandbox shape
+// (positional verb is the first token; sub-flags follow). Mutually
+// exclusive with every other run mode by virtue of consuming argv[0]
+// before parseArgs reaches the prompt-collection loop.
+//
+// Flags:
+//   --force     — execute the purge (without it, dry-run only).
+//   --json      — NDJSON output on stdout (works in both modes).
+//   --no-audit  — allow --force even if the global DB is unwriteable.
+//                 Escape hatch for emergencies; documented in §2.1.2.
+//                 Ignored (warning printed) in dry-run mode.
+const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'purge') return null;
+  let force = false;
+  let json = false;
+  let noAudit = false;
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--force') {
+      force = true;
+      continue;
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    if (token === '--no-audit') {
+      noAudit = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent purge: unknown flag '${token}' (accepted: --force, --json, --no-audit, --help)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      purge: { force, json, noAudit },
+    },
+  };
+};
+
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
   if (argv.length === 1) {
@@ -1314,6 +1393,8 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
   if (sandboxParsed !== null) return sandboxParsed;
   const welcomeParsed = parseWelcomeSubcommand(argv);
   if (welcomeParsed !== null) return welcomeParsed;
+  const purgeParsed = parsePurgeSubcommand(argv);
+  if (purgeParsed !== null) return purgeParsed;
   const permissionParsed = parsePermissionSubcommand(argv);
   if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
