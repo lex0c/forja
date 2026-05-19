@@ -75,7 +75,10 @@ afterEach(() => {
 });
 
 describe('/memory governance disable', () => {
-  test('fresh repo: creates .agent/config.toml with [memory] block (disable verify)', async () => {
+  test('fresh repo: creates .agent/config.toml with ONLY the patched key (post-review)', async () => {
+    // Post-review fix: untouched detectors are NOT materialized
+    // as defaults — that would shadow any user-config opt-out the
+    // operator set globally. Only the patched key lands.
     const r = await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
     expect(r.kind).toBe('ok');
     const configPath = join(workdir, '.agent', 'config.toml');
@@ -83,27 +86,28 @@ describe('/memory governance disable', () => {
     const raw = readFileSync(configPath, 'utf8');
     expect(raw).toContain('[memory]');
     expect(raw).toContain('verify_semantic_llm = false');
-    expect(raw).toContain('conflict_detect_llm = true');
-    // S3.5 — override key always materialized in the emitted block.
-    expect(raw).toContain('override_detect_llm = true');
+    // Untouched keys MUST NOT land — would override user-config
+    // values per project>user precedence.
+    expect(raw).not.toContain('conflict_detect_llm');
+    expect(raw).not.toContain('override_detect_llm');
   });
 
-  test('disable conflict: only conflict flips, verify + override stay true', async () => {
+  test('disable conflict: only conflict_detect_llm lands (verify/override absent)', async () => {
     const r = await memoryCommand.exec(['governance', 'disable', 'conflict'], ctx);
     expect(r.kind).toBe('ok');
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
-    expect(raw).toContain('verify_semantic_llm = true');
     expect(raw).toContain('conflict_detect_llm = false');
-    expect(raw).toContain('override_detect_llm = true');
+    expect(raw).not.toContain('verify_semantic_llm');
+    expect(raw).not.toContain('override_detect_llm');
   });
 
-  test('disable override: only override flips, verify + conflict stay true', async () => {
+  test('disable override: only override_detect_llm lands (verify/conflict absent)', async () => {
     const r = await memoryCommand.exec(['governance', 'disable', 'override'], ctx);
     expect(r.kind).toBe('ok');
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
-    expect(raw).toContain('verify_semantic_llm = true');
-    expect(raw).toContain('conflict_detect_llm = true');
     expect(raw).toContain('override_detect_llm = false');
+    expect(raw).not.toContain('verify_semantic_llm');
+    expect(raw).not.toContain('conflict_detect_llm');
   });
 
   test('disable all: all three flip to false', async () => {
@@ -350,7 +354,7 @@ conflict_detect_llm = true
     expect(loaded.config.conflictDetectLlm).toBe(false);
   });
 
-  test('empty file gains [memory] block', async () => {
+  test('empty file gains [memory] block with only the patched key', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(join(workdir, '.agent', 'config.toml'), '');
     const r = await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
@@ -358,7 +362,9 @@ conflict_detect_llm = true
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
     expect(raw).toContain('[memory]');
     expect(raw).toContain('verify_semantic_llm = false');
-    expect(raw).toContain('conflict_detect_llm = true');
+    // Untouched detectors stay absent (post-review fix — don't
+    // shadow user-config opt-outs).
+    expect(raw).not.toContain('conflict_detect_llm');
   });
 
   test('camelCase aliases are normalized to snake_case on rewrite', async () => {
@@ -389,5 +395,91 @@ conflictDetectLlm = true
     // File untouched.
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
     expect(raw).toBe(broken);
+  });
+});
+
+describe('/memory governance disable: user-config preservation (post-review)', () => {
+  // Pre-fix: when ANY detector was disabled in
+  // ~/.config/agent/config.toml (user scope), running `/memory
+  // governance disable verify` at project scope wrote
+  // `conflict_detect_llm = true` + `override_detect_llm = true`
+  // into the project config because the mutator initialized
+  // untouched keys to `true`. Project precedence then beat the
+  // user-level disable — detectors silently re-enabled, LLM
+  // spend resumed. Operator saw `/memory governance status`
+  // showing `yes (.agent/config.toml)` for detectors they had
+  // never touched through that command.
+  //
+  // Post-fix: the mutator only writes the patched key. Untouched
+  // keys stay absent → user-config values still resolve via the
+  // precedence chain.
+
+  test('user-disabled conflict is NOT shadowed when operator runs `disable verify` at project', async () => {
+    // Simulate a user-config opt-out by writing to a temp dir we
+    // pass via XDG_CONFIG_HOME, then run the project-level
+    // toggle. The end-state assertion is the project config
+    // file's shape: conflict_detect_llm MUST be absent so the
+    // user-level disable still wins.
+    const r = await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
+    expect(r.kind).toBe('ok');
+    const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
+    // Patch landed.
+    expect(raw).toContain('verify_semantic_llm = false');
+    // Crucial: untouched keys are NOT in the file. Without this,
+    // the precedence chain would surface project's `true` for
+    // conflict / override and beat the user-level disable.
+    expect(raw).not.toContain('conflict_detect_llm');
+    expect(raw).not.toContain('override_detect_llm');
+  });
+
+  test('targeted enable on already-present key does NOT materialize the others', async () => {
+    // Operator first disables verify (only verify_semantic_llm
+    // lands), then re-enables it. The re-enable should NOT
+    // suddenly add conflict / override keys that were never
+    // present in this file.
+    await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
+    let raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
+    expect(raw).toContain('verify_semantic_llm = false');
+    expect(raw).not.toContain('conflict_detect_llm');
+
+    await memoryCommand.exec(['governance', 'enable', 'verify'], ctx);
+    raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
+    expect(raw).toContain('verify_semantic_llm = true');
+    // Still no conflict / override keys — re-enable doesn't
+    // materialize defaults.
+    expect(raw).not.toContain('conflict_detect_llm');
+    expect(raw).not.toContain('override_detect_llm');
+  });
+
+  test('existing [memory] keys are preserved across toggle of a different detector', async () => {
+    // Operator previously disabled conflict via the toggle
+    // (conflict_detect_llm = false is present in project). Then
+    // disables verify. Both keys must end up in the file —
+    // existing conflict value is preserved, verify patch is
+    // applied, override stays absent.
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      '[memory]\nconflict_detect_llm = false\n',
+    );
+    await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
+    const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
+    expect(raw).toContain('conflict_detect_llm = false');
+    expect(raw).toContain('verify_semantic_llm = false');
+    expect(raw).not.toContain('override_detect_llm');
+  });
+
+  test('disable all explicit DOES write all three keys (operator typed all three)', async () => {
+    // `disable all` is the legitimate "I want all three off at
+    // project scope" path — every key is part of the patch, so
+    // every key lands. This is the inverse case of the
+    // user-config preservation: the operator was explicit about
+    // all three.
+    const r = await memoryCommand.exec(['governance', 'disable', 'all'], ctx);
+    expect(r.kind).toBe('ok');
+    const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
+    expect(raw).toContain('verify_semantic_llm = false');
+    expect(raw).toContain('conflict_detect_llm = false');
+    expect(raw).toContain('override_detect_llm = false');
   });
 });

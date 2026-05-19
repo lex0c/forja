@@ -3216,33 +3216,49 @@ const mutateMemoryConfig = (params: {
     }
   }
 
-  // Resolve current [memory] values (accepting camelCase aliases
-  // the loader honors), then apply patches.
-  let verify = true;
-  let conflict = true;
-  let override = true;
+  // Build the new [memory] block: preserve existing values for keys
+  // NOT in the patch, apply the patch on top. Crucially, untouched
+  // keys that were ABSENT from the project file STAY ABSENT —
+  // materializing them as `true` would write project-level overrides
+  // that silently shadow user-config opt-outs. E.g., if the operator
+  // disabled conflict_detect_llm globally in ~/.config/agent/config
+  // .toml and now runs `/memory governance disable verify`, the
+  // pre-fix code wrote `conflict_detect_llm = true` to the project
+  // config, which then beats the user-level disable per precedence.
+  // The detector silently re-enabled despite the operator never
+  // touching it through this command.
+  const memBlock: Record<string, boolean> = {};
   const existing = doc.memory;
   if (existing !== null && typeof existing === 'object' && !Array.isArray(existing)) {
     const m = existing as Record<string, unknown>;
+    // Accept camelCase aliases the loader honors; re-emit canonical
+    // snake_case below (camelCase aliases dropped on rewrite per
+    // §11.4 doc).
     const v = m.verify_semantic_llm ?? m.verifySemanticLlm;
     const c = m.conflict_detect_llm ?? m.conflictDetectLlm;
     const o = m.override_detect_llm ?? m.overrideDetectLlm;
-    if (typeof v === 'boolean') verify = v;
-    if (typeof c === 'boolean') conflict = c;
-    if (typeof o === 'boolean') override = o;
+    if (typeof v === 'boolean') memBlock.verify_semantic_llm = v;
+    if (typeof c === 'boolean') memBlock.conflict_detect_llm = c;
+    if (typeof o === 'boolean') memBlock.override_detect_llm = o;
   }
-  if (patches.verifySemanticLlm !== undefined) verify = patches.verifySemanticLlm;
-  if (patches.conflictDetectLlm !== undefined) conflict = patches.conflictDetectLlm;
-  if (patches.overrideDetectLlm !== undefined) override = patches.overrideDetectLlm;
+  if (patches.verifySemanticLlm !== undefined) {
+    memBlock.verify_semantic_llm = patches.verifySemanticLlm;
+  }
+  if (patches.conflictDetectLlm !== undefined) {
+    memBlock.conflict_detect_llm = patches.conflictDetectLlm;
+  }
+  if (patches.overrideDetectLlm !== undefined) {
+    memBlock.override_detect_llm = patches.overrideDetectLlm;
+  }
 
-  // Always re-emit the [memory] block with canonical snake_case
-  // keys (per MEMORY.md §11.x). Drop any camelCase aliases that
-  // were present — the emitted snake_case forms are authoritative.
-  doc.memory = {
-    verify_semantic_llm: verify,
-    conflict_detect_llm: conflict,
-    override_detect_llm: override,
-  };
+  if (Object.keys(memBlock).length === 0) {
+    // Patch was a no-op (programmer error) AND there was no prior
+    // [memory] block; drop the doc-level key so we don't emit an
+    // empty section.
+    delete doc.memory;
+  } else {
+    doc.memory = memBlock;
+  }
 
   const outRaw = emitTomlDoc(doc);
 
