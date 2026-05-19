@@ -41,6 +41,7 @@ import type { PermissionEngine } from './engine.ts';
 import type { LockConflict, ResolveOptions } from './hierarchy.ts';
 import { type ReloadPolicyResult, resolvePolicy } from './index.ts';
 import { enterprisePolicyPath, projectPolicyPath, userPolicyPath } from './paths.ts';
+import { mergeTrustedHosts } from './risk-score.ts';
 
 export interface PolicyWatcher {
   close(): void;
@@ -157,7 +158,25 @@ export const watchAndReload = (options: WatchAndReloadOptions): PolicyWatcher =>
       // audit row's `source.layer` and `/perms why` output would
       // point at the construction-time hierarchy — wrong after
       // the first YAML edit that moves a section between layers.
-      const result = options.engine.reloadPolicy(resolved.policy, resolved.provenance);
+      //
+      // Compute the freshly-merged `trustedHosts` list from the
+      // new policy and forward too. Without this, an operator who
+      // edits `fetch_url.trusted_hosts` (adds an internal CDN,
+      // removes a no-longer-trusted host) sees the policy hash
+      // advance but the risk-scorer keeps using the construction-
+      // time list until process restart — `untrusted_egress`
+      // would silently fire (or fail to fire) against the OLD set.
+      // Same `mergeTrustedHosts(DEFAULT_TRUSTED_HOSTS, policy.tools
+      // .fetch_url?.trusted_hosts ?? [])` idiom bootstrap-engine
+      // uses for the construction-time wire.
+      const newTrustedHosts = mergeTrustedHosts(
+        resolved.policy.tools.fetch_url?.trusted_hosts ?? [],
+      );
+      const result = options.engine.reloadPolicy(
+        resolved.policy,
+        resolved.provenance,
+        newTrustedHosts,
+      );
       if (result.ok) {
         options.onReload?.(result);
       } else {

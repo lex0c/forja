@@ -41,7 +41,7 @@ import {
 } from './hierarchy.ts';
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
-import { DEFAULT_TRUSTED_HOSTS } from './risk-score.ts';
+import { mergeTrustedHosts } from './risk-score.ts';
 import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
 import { type SealStore, factoryForSealMode } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
@@ -167,24 +167,15 @@ export interface PreflightInput {
 }
 
 // Validate install_id + policy WITHOUT opening any SQLite handle.
-// Merge policy-supplied trusted hosts with the hardcoded default
-// list. Additive set-union: policy entries that duplicate a default
-// host produce one entry, not two (the engine iterates this list
-// per fetch — keep it tight). When the policy supplies nothing,
-// return the default array unchanged so callers can use it as a
-// sentinel (e.g., engine.test.ts compares against DEFAULT_TRUSTED_HOSTS
-// by reference equality in some paths).
-//
-// Exported so tests pin the structural invariant directly — a
-// behavioral test alone can't distinguish "list inflated with
-// duplicates" from "list is correct" because both produce identical
-// allow/deny decisions in the engine. Subagent bootstrap path in
-// `cli/subagent-child.ts` ALSO consumes this helper so parent and
-// child stay in sync.
-export const mergeTrustedHosts = (policyTrustedHosts: readonly string[]): readonly string[] => {
-  if (policyTrustedHosts.length === 0) return DEFAULT_TRUSTED_HOSTS;
-  return Array.from(new Set([...DEFAULT_TRUSTED_HOSTS, ...policyTrustedHosts]));
-};
+// `mergeTrustedHosts` moved to `risk-score.ts` (where
+// `DEFAULT_TRUSTED_HOSTS` lives) so engine.ts and policy-watcher.ts
+// can also import it for the hot-reload path without crossing
+// layering boundaries (engine.ts is the lower-level module;
+// importing from bootstrap-engine here would invert the dependency
+// direction). Re-exported here for backward-compat with existing
+// import sites (`cli/subagent-child.ts`, the bootstrap-engine.test
+// pins for the merge invariant).
+export { mergeTrustedHosts } from './risk-score.ts';
 
 // Throws on the two boot-blocking failures (install_id discovery,
 // malformed policy) so the CLI driver can fail the boot before any

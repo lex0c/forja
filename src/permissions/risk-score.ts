@@ -276,6 +276,24 @@ export const DEFAULT_TRUSTED_HOSTS: readonly string[] = [
   'crates.io',
 ];
 
+// Merge policy-supplied trusted hosts with the hardcoded default
+// list. Additive set-union: policy entries that duplicate a default
+// host produce one entry, not two (the engine iterates this list
+// per fetch — keep it tight). When the policy supplies nothing,
+// return the default array unchanged so callers can use it as a
+// sentinel (e.g., engine.ts compares against DEFAULT_TRUSTED_HOSTS
+// by reference equality in some paths).
+//
+// Lives here in risk-score.ts (alongside DEFAULT_TRUSTED_HOSTS) so
+// every consumer that needs the merge — bootstrap-engine (initial
+// construction), subagent-child (parent's policy snapshot), engine
+// (hot reload via reloadPolicy), policy-watcher (file-change
+// reload) — can import without crossing layering boundaries.
+export const mergeTrustedHosts = (policyTrustedHosts: readonly string[]): readonly string[] => {
+  if (policyTrustedHosts.length === 0) return DEFAULT_TRUSTED_HOSTS;
+  return Array.from(new Set([...DEFAULT_TRUSTED_HOSTS, ...policyTrustedHosts]));
+};
+
 // Default MCP-tool detector. Tools surface as
 // `mcp__<server>__<tool>` from the MCP loader. The detector is
 // caller-overridable; this default is the fallback when no

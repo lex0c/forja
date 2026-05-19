@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(permissions) — recompute trustedHosts on policy hot-reload
+
+`engine.ts:1277` captured `trustedHosts` as a closure-const at engine construction. `reloadPolicy` was swapping policy / policyHash / mode / provenance correctly, but the risk-score input kept using the construction-time list. Operator edits to `<repo>/.agent/permissions.yaml` adding an internal CDN to `fetch_url.trusted_hosts` (or removing a no-longer-trusted host) saw the policy hash advance, `source.layer` updated, audit row reflected the swap — but `untrusted_egress` continued firing (or failing to fire) against the OLD set until process restart. `config != runtime` divergence on the hot-reload path.
+
+**Fix shape — minimum-invasive:**
+
+- **`mergeTrustedHosts` relocated to `risk-score.ts`** (alongside `DEFAULT_TRUSTED_HOSTS`). Co-locates the merge with the data it operates on, and unblocks `engine.ts` / `policy-watcher.ts` from importing it without crossing layering boundaries (engine.ts is the lower-level module; importing from bootstrap-engine would invert the dependency direction). `bootstrap-engine.ts` re-exports for backward-compat with the existing import sites (`cli/subagent-child.ts`, `tests/permissions/bootstrap-engine.test.ts`).
+- **Engine: `trustedHosts` const → mutable cell.** Same swap pattern the engine already uses for `policy`, `policyHash`, `mode`, `provenance` (each a `let` rebound by `reloadPolicy`).
+- **`reloadPolicy` signature extended with optional `newTrustedHosts`.** When provided, the cell is swapped; when omitted (test-only callers that never reload), construction-time value preserved — backward-compat for callers that don't know about hot-reload semantics.
+- **`policy-watcher.ts` computes and forwards.** After re-resolving the hierarchy, the watcher calls `mergeTrustedHosts(resolved.policy.tools.fetch_url?.trusted_hosts ?? [])` and threads as the third arg to `engine.reloadPolicy`. Same idiom `bootstrap-engine.ts` uses at construction.
+
+**Tests:**
+
+- `engine.test.ts` — two pins. (a) construction with `['only.example.com']`, check it's silent; check `plus.example.com` flagged. reload with `['plus.example.com']` via the new 3rd arg. Check polarities flip: `only.example.com` now flagged, `plus.example.com` now silent. (b) reload WITHOUT the 3rd arg leaves the construction-time list intact (backward-compat pin).
+- `policy-watcher.test.ts` — spy on `engine.reloadPolicy` to capture the args the watcher passes. Trigger a YAML edit declaring `trusted_hosts: ["internal.cdn.example.com"]`. Verify the spy received a 3rd arg containing both the default hosts (`github.com`) AND the policy-supplied host (`internal.cdn.example.com`).
+
+296 tests pass across the three affected permission test files; typecheck + lint clean.
+
+**Why not derive at check time:** considered making the engine recompute trustedHosts from `policy.tools.fetch_url?.trusted_hosts` on every check call (no caching). Rejected because: (a) every `permissionCheck` would re-walk the merge + dedup, which is mechanically cheap but conceptually re-doing work the construction handshake already did; (b) callers that pass a CUSTOM `trustedHosts` baseline at construction (e.g., tests doing `trustedHosts: []` for lockdown) would lose that intent on the first reload, since the engine would always re-merge from `DEFAULT_TRUSTED_HOSTS`. The "watcher forwards explicit value" shape preserves caller intent and keeps the merge work amortized to one per reload.
+
 ## [2026-05-19] hardening(config) — full audit of config↔runtime divergence for budget/critique knobs
 
 Self-prompted audit after the `max_step_stall_ms = 0` fix: systematic check of every operator-tunable numeric field in `[budget]` and `[critique]` against its runtime consumer, looking for the same shape of bug (validator forbids what the runtime supports). Results:
