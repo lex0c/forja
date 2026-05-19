@@ -209,14 +209,37 @@ const SELECT_ALL = `
 // dispatcher's context payload ("here are the operator's last N
 // override events for this memory") and the operator-facing
 // /memory governance status surface (S3.6).
+//
+// Optional `sinceMs` adds an inclusive lower bound on `created_at`
+// (`created_at >= sinceMs`). The dispatcher MUST use the same
+// window cutoff as `countOverridesInWindow` (typically
+// `nowMs - MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS`) so the judge
+// only sees events that contributed to the threshold trip — pre-
+// fix, stale rows OUTSIDE the threshold window could leak into
+// the prompt + persisted evidence, letting the judge quarantine a
+// memory based partly on operator behavior the threshold gate
+// already discarded. Status / forensics callers omit `sinceMs`
+// to see the unbounded recent tail.
 export const listRecentOverridesForMemory = (
   db: DB,
   scope: MemoryScope,
   name: string,
   limit = 20,
+  sinceMs?: number,
 ): MemoryOverrideEventRow[] => {
   if (!VALID_SCOPES.has(scope)) {
     throw new Error(`listRecentOverridesForMemory: invalid scope '${scope}'`);
+  }
+  if (sinceMs !== undefined) {
+    const rows = db
+      .query<RawOverrideRow, [string, string, number, number]>(
+        `${SELECT_ALL}
+          WHERE memory_scope = ? AND memory_name = ? AND created_at >= ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?`,
+      )
+      .all(scope, name, sinceMs, limit);
+    return rows.map(fromRow);
   }
   const rows = db
     .query<RawOverrideRow, [string, string, number]>(

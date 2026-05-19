@@ -277,6 +277,64 @@ describe('listRecentOverridesForMemory', () => {
     }
     expect(listRecentOverridesForMemory(db, 'project_local', 'foo', 2).length).toBe(2);
   });
+
+  test('optional sinceMs lower-bounds the result to events at-or-after cutoff (post-review)', () => {
+    // S3 dispatcher must scope the LLM judge's view to the same
+    // threshold window `countOverridesInWindow` uses. The 5th
+    // optional argument lets the caller pin that cutoff so stale
+    // rows outside the window don't leak into the prompt /
+    // persisted evidence. Inclusive lower bound by design (mirror
+    // of countOverridesInWindow's `>= cutoff`).
+    const now = 2_000_000_000_000;
+    const window = 24 * 60 * 60 * 1000;
+    const cutoff = now - window;
+    const fresh = recordOverrideEvent(db, {
+      sessionId,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      signal: 'memory_write_rejected',
+      createdAt: now,
+    });
+    const boundary = recordOverrideEvent(db, {
+      sessionId,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      signal: 'memory_write_rejected',
+      createdAt: cutoff, // exactly the cutoff — inclusive lower bound admits it
+    });
+    recordOverrideEvent(db, {
+      sessionId,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      signal: 'memory_write_rejected',
+      createdAt: cutoff - 1, // 1ms before cutoff — must be excluded
+    });
+    const rows = listRecentOverridesForMemory(db, 'project_local', 'foo', 20, cutoff);
+    expect(rows.length).toBe(2);
+    expect(rows[0]?.id).toBe(fresh.id);
+    expect(rows[1]?.id).toBe(boundary.id);
+  });
+
+  test('omitting sinceMs preserves the legacy unbounded surface (forensics / status)', () => {
+    const now = 2_000_000_000_000;
+    const window = 24 * 60 * 60 * 1000;
+    recordOverrideEvent(db, {
+      sessionId,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      signal: 'memory_write_rejected',
+      createdAt: now,
+    });
+    recordOverrideEvent(db, {
+      sessionId,
+      memoryScope: 'project_local',
+      memoryName: 'foo',
+      signal: 'memory_write_rejected',
+      createdAt: now - window - 10_000, // stale
+    });
+    // No sinceMs → both rows surface (forensics / governance status).
+    expect(listRecentOverridesForMemory(db, 'project_local', 'foo').length).toBe(2);
+  });
 });
 
 describe('listOverrideEventsSince — scheduler cursor', () => {

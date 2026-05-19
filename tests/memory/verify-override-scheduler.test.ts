@@ -254,6 +254,111 @@ describe('scheduler — threshold gate', () => {
     await sched.poll();
     expect(sched.getCounters().dispatched).toBe(1);
   });
+
+  test('cursor inits at window cutoff so 90d-retained noise does NOT delay fresh threshold trips (post-review)', async () => {
+    // Pre-fix: cursor=(0,'') made the first poll fetch the
+    // OLDEST retained events first (LIMIT 50). With 90d retention
+    // + maxEventsPerPoll=50, a session with >50 retained-but-out-
+    // of-window events would drain irrelevant historical batches
+    // for many step boundaries before reaching the fresh events
+    // that actually crossed the 24h threshold. Short sessions
+    // never ran verify-override at all.
+    //
+    // Post-fix: lazy-init cursor to `nowFn() - thresholdWindowMs`.
+    // First poll's source query skips everything older than the
+    // window — events that wouldn't count via
+    // `countOverridesInWindow` anyway. Fresh threshold-tripping
+    // events surface on the first poll.
+    const now = 5_000_000_000_000;
+    const window = MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS;
+    seedMemoryFile(roots.projectLocal, 'foo', 'project');
+    // 60 ancient retained events (older than the threshold
+    // window, but inside the 90d retention) on a memory that
+    // never crossed threshold this session. Pre-fix: they
+    // occupy the first 50-row batch, draining poll budget.
+    const ancientTimes: number[] = [];
+    for (let i = 0; i < 60; i++) {
+      ancientTimes.push(now - window - i * 1000 - 1);
+    }
+    seedOverrides('project_local', 'old-noise', ancientTimes);
+    // 3 fresh events on the actual target memory — inside the
+    // window, threshold trips.
+    seedOverrides('project_local', 'foo', [now - 1000, now - 500, now]);
+    const sched = buildScheduler({ now: () => now });
+    await sched.poll();
+    // First poll dispatched against the threshold-tripping memory,
+    // not the old noise. Pre-fix this assertion fails: dispatched=0.
+    expect(sched.getCounters().dispatched).toBe(1);
+  });
+
+  test('dispatcher receives only in-window override events as evidence (post-review)', async () => {
+    // Pre-fix: `listRecentOverridesForMemory(db, scope, name, 10)`
+    // had no time bound — the LLM judge received up to 10 most-
+    // recent events regardless of age, even though the threshold
+    // gate above evaluated only events within the 24h window. The
+    // judge could quarantine a memory based partly on stale
+    // operator behavior the threshold gate had already discarded;
+    // the persisted proposal's `evidence.override_event_ids`
+    // carried the same stale rows. Post-fix: fetch passes
+    // `sinceMs = nowFn() - window`, matching the cutoff
+    // `countOverridesInWindow` used.
+    //
+    // We pin via the persisted proposal's
+    // evidence.override_event_ids — the dispatcher writes this
+    // verbatim from the fetched event list, so we get a clean
+    // assertion surface without spying on internal prompt
+    // composition.
+    const now = 5_000_000_000_000;
+    const window = MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS;
+    seedMemoryFile(roots.projectLocal, 'foo', 'project');
+    // 3 fresh (threshold trips) + 4 stale (outside window).
+    const freshTimes = [now - 1000, now - 500, now];
+    const staleTimes = [
+      now - window - 1000,
+      now - window - 5000,
+      now - window - 10_000,
+      now - window - 20_000,
+    ];
+    seedOverrides('project_local', 'foo', [...freshTimes, ...staleTimes]);
+    // Capture which event ids belong to which window for the
+    // post-dispatch assertion.
+    const { listRecentOverridesForMemory } = await import(
+      '../../src/storage/repos/memory-override-events.ts'
+    );
+    const allEvents = listRecentOverridesForMemory(db, 'project_local', 'foo', 50);
+    const freshIds = new Set(allEvents.filter((e) => e.createdAt >= now - window).map((e) => e.id));
+    const staleIds = new Set(allEvents.filter((e) => e.createdAt < now - window).map((e) => e.id));
+
+    // misguiding=true verdict so the dispatcher lands a proposal.
+    const misguidingTrueSpawn = (async (): Promise<RunSubagentResult> => ({
+      output:
+        'misguiding: true\nconfidence: 0.9\nrule_extracted: "the rule"\noverride_pattern_observed: "pattern observed"\nsuggested_motivo: conflict\n',
+      sessionId: childSessionId,
+      status: 'done',
+      reason: 'done',
+      costUsd: 0.05,
+      steps: 1,
+      durationMs: 100,
+    })) as never;
+    const sched = buildScheduler({ now: () => now, spawnSubagentFn: misguidingTrueSpawn });
+    await sched.poll();
+    expect(sched.getCounters().dispatched).toBe(1);
+
+    const { listProposals } = await import('../../src/storage/repos/memory-governance.ts');
+    const proposals = listProposals(db);
+    expect(proposals).toHaveLength(1);
+    const evidenceIds = (proposals[0]?.evidence as { override_event_ids?: string[] })
+      ?.override_event_ids;
+    expect(evidenceIds).toBeDefined();
+    if (evidenceIds === undefined) return;
+    // Post-fix: only fresh events feed the judge + persist on the
+    // proposal's evidence. Pre-fix this would include staleIds.
+    for (const id of evidenceIds) {
+      expect(staleIds.has(id)).toBe(false);
+      expect(freshIds.has(id)).toBe(true);
+    }
+    expect(evidenceIds.length).toBe(freshIds.size);
+  });
 });
 
 describe('scheduler — type / trust / state gates (defense in depth)', () => {

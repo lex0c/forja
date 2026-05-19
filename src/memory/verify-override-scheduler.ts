@@ -129,8 +129,20 @@ export const createOverrideVerifyScheduler = (
   let stopped = false;
   // Cursor tuple. Same shape as verify-semantic's cursor — protects
   // against same-ms inserts losing intervening siblings on next poll.
+  //
+  // Initial value `(0, '')` is a sentinel meaning "uninitialized";
+  // first `poll()` rewrites to `(nowFn() - thresholdWindowMs, '')`
+  // so the scheduler doesn't drain 90d-retained historical rows
+  // before reaching anything that could trip the window-bounded
+  // threshold. Events older than the window can't count via
+  // `countOverridesInWindow` anyway — paying N peeks + N threshold
+  // checks for them was pure waste. Pre-fix, short CLI sessions
+  // could finish before the cursor drained enough old rows to
+  // reach fresh threshold-tripping events. Lazy init (not
+  // construction-time) keeps `now` honoring the test-seam clock.
   let cursorAt = 0;
   let cursorId = '';
+  let cursorInitialized = false;
   const counters: OverrideVerifySchedulerCounters = {
     dispatched: 0,
     costUsdSpent: 0,
@@ -171,6 +183,14 @@ export const createOverrideVerifyScheduler = (
     if (counters.capExhausted !== null) return;
 
     counters.lastPolledAt = nowFn();
+
+    // Lazy cursor init — anchor at the window cutoff so old retained
+    // rows (90d) don't burn poll budget. See cursorAt declaration
+    // comment for rationale.
+    if (!cursorInitialized) {
+      cursorAt = nowFn() - thresholdWindowMs;
+      cursorInitialized = true;
+    }
 
     let events: MemoryOverrideEventRow[];
     try {
@@ -306,14 +326,23 @@ export const createOverrideVerifyScheduler = (
         continue;
       }
 
-      // (4) Pull the override events the judge will see. The
-      // dispatcher takes the per-memory event list as input; the
-      // poll's batch may be a subset (cursor cut off older events).
-      // Use listRecentOverridesForMemory to get the threshold-window
-      // snapshot.
+      // (4) Pull the override events the judge will see, bounded by
+      // the SAME threshold window cutoff used by countOverridesInWindow
+      // above. Pre-fix the fetch was unbounded ("10 most recent
+      // regardless of age") and stale rows OUTSIDE the threshold
+      // window leaked into the prompt + persisted proposal evidence,
+      // letting the judge quarantine a memory based partly on
+      // operator behavior the threshold gate had already discarded.
+      // Symmetric cutoff = `nowFn() - thresholdWindowMs`.
       let overrideEvents: MemoryOverrideEventRow[];
       try {
-        overrideEvents = listRecentOverridesForMemory(deps.db, cand.scope, cand.name, 10);
+        overrideEvents = listRecentOverridesForMemory(
+          deps.db,
+          cand.scope,
+          cand.name,
+          10,
+          nowFn() - thresholdWindowMs,
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         stderr(`memory: verify_override_events_fetch_failed: ${displayErr(msg)}\n`);
