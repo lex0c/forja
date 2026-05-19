@@ -246,6 +246,67 @@ describe('runPurge — dry-run output', () => {
     }
   });
 
+  test('dry-run does NOT create the DB file (load-bearing — see bug report)', async () => {
+    // Pre-fix-commit bug: probeAuditWritability called migrate(db)
+    // unconditionally, which made openDb create the sessions.db
+    // file even on dry-run. That violated the "DRY RUN (nothing
+    // will be modified)" contract — operator inspecting purge
+    // scope ended up with a fresh global DB they didn't ask for.
+    // Pin the fix: dry-run uses probeAuditWritabilityNonMutating
+    // which only checks FS access, never opens.
+    seedMinimal();
+    // dbPath points at a path that doesn't exist yet.
+    expect(existsSync(dbPath)).toBe(false);
+    const code = await runPurge({
+      cwd,
+      force: false,
+      json: false,
+      noAudit: false,
+      out,
+      err,
+      dbPath,
+    });
+    expect(code).toBe(0);
+    // The load-bearing assertion: NO DB file was created.
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  test('dry-run does NOT apply migrations to a pre-existing DB', async () => {
+    // Companion to the prior test: when the DB already exists but
+    // is partially migrated (or in some other intermediate state),
+    // dry-run must NOT trigger migrate() — that would mutate the
+    // schema before --force.
+    seedMinimal();
+    // Create a minimal DB file via raw SQLite — NO migrations applied.
+    const db = openDb(dbPath);
+    // Confirm empty schema (no _migrations table).
+    const before = db
+      .query("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = '_migrations'")
+      .get() as { n: number };
+    expect(before.n).toBe(0);
+    db.close();
+
+    const code = await runPurge({
+      cwd,
+      force: false,
+      json: false,
+      noAudit: false,
+      out,
+      err,
+      dbPath,
+    });
+    expect(code).toBe(0);
+
+    // After dry-run, schema STILL untouched — no _migrations table,
+    // no purge_events table, no anything.
+    const dbAfter = openDb(dbPath);
+    const after = dbAfter
+      .query("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = '_migrations'")
+      .get() as { n: number };
+    expect(after.n).toBe(0);
+    dbAfter.close();
+  });
+
   test('human output lists scope, categories, totals, preserved, command', async () => {
     seedMinimal();
     writeFile('.agent/agents/foo.md', '---\nname: foo\n---\nbody');
@@ -491,6 +552,60 @@ describe('runPurge — --no-audit escape hatch', () => {
     expect(existsSync(join(cwd, '.agent'))).toBe(false);
     // stderr explains the bypass.
     expect(errBuf.join('')).toContain('skipping audit row');
+  });
+
+  test('--force --no-audit on a HEALTHY DB skips the audit row (opt-out is primary)', async () => {
+    // Operator-reported bug: pre-fix, --no-audit was only honored
+    // as an error bypass — when the DB was writable, the audit row
+    // was written anyway, contradicting the documented "opt out of
+    // audit logging" intent. Fix: --no-audit is the PRIMARY gate;
+    // writable DB doesn't override the opt-out.
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: true,
+      json: false,
+      noAudit: true,
+      out,
+      err,
+      dbPath, // healthy, writable path
+    });
+    expect(code).toBe(0);
+    // FS removal happened.
+    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    // stderr confirms opt-out honored (not "unreachable").
+    expect(errBuf.join('')).toContain('skipping audit row');
+    expect(errBuf.join('')).toContain('writable but opt-out honored');
+    // The load-bearing assertion: NO purge_events row landed even
+    // though the DB was perfectly writable.
+    const db = openDb(dbPath);
+    migrate(db);
+    expect(listPurgeEventsByCwd(db, cwd)).toEqual([]);
+    db.close();
+  });
+
+  test('--force --no-audit JSON output reflects no audit row', async () => {
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: true,
+      json: true,
+      noAudit: true,
+      out,
+      err,
+      dbPath,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as {
+      mode: string;
+      auditId: number | null;
+      auditWritable: boolean;
+    };
+    expect(parsed.mode).toBe('force');
+    // auditId is null because we opted out, NOT because the DB
+    // failed. auditWritable still reports true (the DB IS writable).
+    expect(parsed.auditId).toBeNull();
+    expect(parsed.auditWritable).toBe(true);
   });
 });
 

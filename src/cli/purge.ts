@@ -32,8 +32,17 @@
 //      --force aborts unless --no-audit is explicit (escape hatch
 //      for emergencies with the FS reset still possible).
 
-import { type Stats, existsSync, lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  type Stats,
+  accessSync,
+  existsSync,
+  constants as fsConstants,
+  lstatSync,
+  readdirSync,
+  rmdirSync,
+  unlinkSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
 import { migrate, openDb } from '../storage/index.ts';
@@ -304,13 +313,18 @@ const removeTree = (target: string): { files: number; dirs: number; bytes: numbe
 };
 
 // Check whether the global DB is writable for audit. Production
-// path: open + migrate + close. Migrate is idempotent (a 64-rev
-// chain on first install, a no-op on subsequent runs). A throw at
-// open / migrate is the signal that audit cannot proceed.
+// (--force) path: open + migrate + close. Migrate is idempotent
+// (a 64-rev chain on first install, a no-op on subsequent runs).
+// A throw at open / migrate is the signal that audit cannot
+// proceed.
 //
 // We deliberately do NOT keep the DB open here — the caller may
-// not need it (dry-run, --no-audit). Keep the open scope tight.
-const probeAuditWritability = (dbPath: string): AuditWritability => {
+// not need it (--no-audit). Keep the open scope tight.
+//
+// MUTATING: this probe opens (creating the DB file if absent) and
+// runs migrate. ONLY use on the --force path. Dry-run must call
+// `probeAuditWritabilityNonMutating` below instead.
+const probeAuditWritabilityMutating = (dbPath: string): AuditWritability => {
   let db: DB | null = null;
   try {
     db = openDb(dbPath);
@@ -328,6 +342,53 @@ const probeAuditWritability = (dbPath: string): AuditWritability => {
       }
     }
   }
+};
+
+// Non-mutating writability probe for the dry-run path. Critical
+// invariant: `agent purge` (without --force) must NEVER create the
+// DB file, mutate its schema, or apply migrations. The dry-run
+// header literally promises "nothing will be modified" — any DB
+// side-effect violates that contract.
+//
+// Strategy: check existence + parent directory writability via
+// fs.access (W_OK). When the DB file already exists, we assume it
+// was writable last time (the actual write attempt during --force
+// surfaces real failures). When the file doesn't exist yet, we
+// check the parent dir is writable so --force can create it.
+//
+// Trade-off: a chmod 0444 DB file with a writable parent reports
+// writable=true here but fails at --force. Acceptable — the
+// real failure surfaces with a clear message at force time, and
+// dry-run avoiding the mutation is the load-bearing property.
+const probeAuditWritabilityNonMutating = (dbPath: string): AuditWritability => {
+  if (existsSync(dbPath)) {
+    // DB exists. Probe parent writability as a soft signal — a
+    // tightened parent dir (rare) would be the most likely
+    // reason the next write fails.
+    try {
+      accessSync(dirname(dbPath), fsConstants.W_OK);
+      return { writable: true, dbPath };
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      return { writable: false, dbPath, reason };
+    }
+  }
+  // DB doesn't exist yet — --force will create it. Need writable
+  // parent (or grandparent reachable via openDb's mkdir-on-create).
+  const parent = dirname(dbPath);
+  if (existsSync(parent)) {
+    try {
+      accessSync(parent, fsConstants.W_OK);
+      return { writable: true, dbPath };
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      return { writable: false, dbPath, reason };
+    }
+  }
+  // Parent doesn't exist. --force's openDb path will mkdir
+  // recursively; assume writable unless we can prove otherwise.
+  // The actual mkdir-then-open at force time surfaces failures.
+  return { writable: true, dbPath };
 };
 
 const renderHumanDryRun = (report: DryRunReport, out: (s: string) => void): void => {
@@ -468,10 +529,17 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // (render) and force (compare against actual removal).
   const walk = walkAgentDir(agentDir);
 
-  // Probe DB writability. Dry-run uses the answer to warn; force
-  // uses it to decide whether to abort.
+  // Probe DB writability. CRITICAL: dry-run must use the
+  // non-mutating probe — opening + migrating the DB in a "DRY
+  // RUN (nothing will be modified)" path would create the global
+  // sessions.db file (or apply pending migrations to an existing
+  // one) before the operator opts in. Force path uses the
+  // mutating probe (open + migrate) because the audit row write
+  // requires the schema in place anyway.
   const dbPath = options.dbPath ?? defaultDbPath();
-  const audit = probeAuditWritability(dbPath);
+  const audit = force
+    ? probeAuditWritabilityMutating(dbPath)
+    : probeAuditWritabilityNonMutating(dbPath);
 
   // ────────────────────────────────────────────────────────────
   // Dry-run path
@@ -499,17 +567,31 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Force path
   // ────────────────────────────────────────────────────────────
 
-  // Audit gate. If the operator opted out via --no-audit, we
-  // proceed without a row but warn loudly so it shows up in
-  // captured stderr (CI logs, troubleshooting).
+  // Audit gate. `--no-audit` is the PRIMARY opt-out — when set,
+  // we skip the audit-row write entirely regardless of DB
+  // writability. Pre-fix, this branch only fired when the DB was
+  // unwritable, meaning `agent purge --force --no-audit` on a
+  // healthy DB still wrote a row (operator-reported bug:
+  // contradicts the documented "opt out of audit logging" intent).
+  //
+  // Default path (no --no-audit): we MUST write the audit row.
+  // If the DB is unwritable, abort before any FS removal so the
+  // operator either fixes the DB or explicitly opts out via
+  // --no-audit. If the write itself fails (race between probe and
+  // insert), same abort posture — never silently remove without
+  // the forensic trail.
   let auditId: number | null = null;
-  if (!audit.writable && !noAudit) {
+  if (noAudit) {
     err(
-      `forja purge: cannot write audit row to DB (${audit.reason ?? 'unknown'}); pass --no-audit to bypass\n`,
+      `forja purge: --no-audit set; skipping audit row (db ${audit.writable ? 'writable but opt-out honored' : `unreachable: ${audit.reason ?? 'unknown'}`})\n`,
     );
-    return 1;
-  }
-  if (audit.writable) {
+  } else {
+    if (!audit.writable) {
+      err(
+        `forja purge: cannot write audit row to DB (${audit.reason ?? 'unknown'}); pass --no-audit to bypass\n`,
+      );
+      return 1;
+    }
     try {
       auditId = writeAuditRow({
         dbPath,
@@ -520,20 +602,9 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
       });
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      if (noAudit) {
-        err(
-          `forja purge: audit write failed (${reason}); proceeding because --no-audit was passed\n`,
-        );
-      } else {
-        err(`forja purge: audit write failed (${reason}); aborting before FS removal\n`);
-        return 1;
-      }
+      err(`forja purge: audit write failed (${reason}); aborting before FS removal\n`);
+      return 1;
     }
-  } else {
-    // noAudit must be true (verified above) — proceed without row.
-    err(
-      `forja purge: --no-audit set; skipping audit row (db reason: ${audit.reason ?? 'unknown'})\n`,
-    );
   }
 
   // Atomic-ish FS removal. We remove the contents of `.agent/`

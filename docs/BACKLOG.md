@@ -2,6 +2,74 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent purge --no-audit` honors opt-out on healthy DB
+
+Operator-reported bug. `--no-audit` was treated as an error bypass only — when the DB was writable, the audit row was written regardless of the flag. So `agent purge --force --no-audit` on a healthy DB still recorded a `purge_events` row, contradicting the documented "opt out of audit logging" intent.
+
+The pre-fix branching was:
+```ts
+if (!audit.writable && !noAudit) abort();
+if (audit.writable) writeAuditRow();   // <- always writes when writable
+else /* noAudit must be true */ skip();
+```
+
+`--no-audit` semantic was: "if DB fails, bypass". Operator expected: "always skip, regardless of DB state".
+
+**Fix.** `--no-audit` is now the PRIMARY gate:
+```ts
+if (noAudit) {
+  skip(/* document why: opt-out OR unreachable */);
+} else {
+  if (!audit.writable) abort();
+  writeAuditRow();
+}
+```
+
+Error messages distinguish the two cases:
+- DB writable + opt-out → `--no-audit set; skipping audit row (db writable but opt-out honored)`
+- DB unreachable + opt-out → `--no-audit set; skipping audit row (db unreachable: <reason>)`
+
+So an operator reviewing stderr knows whether they intentionally opted out OR whether the DB was broken AND they bypassed.
+
+**Tests.** Two new pins in `tests/cli/purge.test.ts`:
+- `--force --no-audit on a HEALTHY DB skips the audit row` — load-bearing. Verifies no `purge_events` row lands when operator opts out + DB is fine.
+- `--force --no-audit JSON output reflects no audit row` — `auditId: null`, `auditWritable: true`. Operator scripting can distinguish "opted out" from "DB failed" via the two fields.
+
+**Verification:**
+- 27/27 purge tests pass (was 25, +2 new pins)
+- 50/50 across purge + args-purge + purge-events repo
+- typecheck + lint clean
+
+**Pre-existing operator state.** Operators who ran `agent purge --force --no-audit` before this fix on a healthy DB have spurious `purge_events` rows recorded. They can leave them (forensic noise, harmless) or DELETE explicitly via SQL — no automated cleanup path provided (rare case, doesn't justify a verb).
+
+## [2026-05-19] fix(cli) — `agent purge` dry-run no longer mutates DB schema
+
+Operator-reported bug. `agent purge` (without `--force`) was calling `probeAuditWritability`, which in turn called `openDb(dbPath)` + `migrate(db)` before the dry-run early return. Consequences:
+
+- **Created** `~/.local/share/forja/sessions.db` if absent (the openDb side effect on first call).
+- **Applied** any pending migrations to an existing DB.
+
+Both violate the dry-run contract literally promised by the output header: `forja purge — DRY RUN (nothing will be modified)`. Operator inspecting purge scope ended up with mutated global state they didn't ask for.
+
+Same shape as the gc Phase 1 review fix C1 (`migrate` in dry-run) — I applied the fix there and forgot the homologous path in `purge.ts`. Caught now by the operator.
+
+**Fix.** Split `probeAuditWritability` into two:
+- `probeAuditWritabilityMutating(dbPath)` — current behavior (open + migrate). Used ONLY by `--force` path where the audit row write needs the schema in place anyway.
+- `probeAuditWritabilityNonMutating(dbPath)` — pure FS check via `fs.access(dirname(dbPath), W_OK)` + `existsSync(dbPath)`. Used by dry-run. Never opens, never migrates.
+
+Trade-off in the non-mutating probe: a chmod 0444 DB file with writable parent reports `writable=true` here but fails at `--force` write. Acceptable — the real failure surfaces with a clear message at force time, and dry-run's "no mutation" invariant is load-bearing.
+
+**Tests.** Two new pins in `tests/cli/purge.test.ts`:
+- `dry-run does NOT create the DB file` — load-bearing assertion. Pre-fix this test would fail because `openDb` materialized the file at dry-run time.
+- `dry-run does NOT apply migrations to a pre-existing DB` — companion case. Creates an empty SQLite file via `openDb` (no schema), runs dry-run, verifies `_migrations` table still doesn't exist after.
+
+**Verification:**
+- 25/25 purge tests pass (was 23, +2 new pins)
+- typecheck + lint clean
+- Smoke E2E: `agent purge` in tempdir with XDG_DATA_HOME isolated → `ls $XDG_DATA_HOME/` empty after dry-run, **no DB created**.
+
+**Pre-existing operator state.** Operators who hit this bug AND ran `agent purge` (without --force) before the fix have a `~/.local/share/forja/sessions.db` with unwanted state. If they want it removed: `rm ~/.local/share/forja/sessions.db*`. No data migration needed — fresh DB on next bootstrap.
+
 ## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (post-work)
 
 Closes the pre-work entry below. Single branch `feat/purge-command`. Brings the gc roadmap from "Phase 1 + Stop hook shipped" to "Phase 1 + 2 + Stop hook shipped" — `agent gc` now covers 10 tables, the ones that grow fastest in normal use (memory_events, hook_runs, failure_events, eviction_events, outcomes, outcome_signals).
