@@ -159,28 +159,52 @@ describe('buildResumeContext — decisions section', () => {
 });
 
 describe('buildResumeContext — pins', () => {
-  test('pins are always rendered (never truncated)', () => {
+  test('pins are always rendered (never truncated) with kind tag', () => {
     const result = buildResumeContext({
       intermediate: baseIntermediate({
         pinnedContext: [
-          { kind: 'invariant', text: 'never write to /etc', createdBy: 'operator' },
-          { kind: 'reminder', text: 'tests live under tests/', createdBy: 'operator' },
+          { kind: 'invariant', text: 'never write to /etc', createdBy: 'user' },
+          { kind: 'reminder', text: 'tests live under tests/', createdBy: 'user' },
         ],
       }),
       previousStatus: 'interrupted',
       resumedAt: RESUMED_AT,
     });
     expect(result.pinCount).toBe(2);
-    expect(result.text).toContain('  - never write to /etc');
-    expect(result.text).toContain('  - tests live under tests/');
+    expect(result.text).toContain('  - [invariant] never write to /etc');
+    expect(result.text).toContain('  - [reminder] tests live under tests/');
+  });
+
+  test('pins from the pin_context tool get a (model) suffix', () => {
+    // createdBy === 'model_proposed_user_approved' marks pins that
+    // came through the tool path (operator approved a model
+    // proposal via the modal). Operator-direct pins (/pin) get
+    // no suffix to keep the common case quiet.
+    const result = buildResumeContext({
+      intermediate: baseIntermediate({
+        pinnedContext: [
+          { kind: 'constraint', text: 'operator pin', createdBy: 'user' },
+          {
+            kind: 'workflow',
+            text: 'model-proposed pin',
+            createdBy: 'model_proposed_user_approved',
+          },
+        ],
+      }),
+      previousStatus: 'interrupted',
+      resumedAt: RESUMED_AT,
+    });
+    expect(result.text).toContain('  - [constraint] operator pin');
+    expect(result.text).not.toContain('  - [constraint] operator pin (model)');
+    expect(result.text).toContain('  - [workflow] model-proposed pin (model)');
   });
 
   test('pins survive an aggressive truncation budget', () => {
     const result = buildResumeContext({
       intermediate: baseIntermediate({
         pinnedContext: [
-          { kind: 'invariant', text: 'pin-one', createdBy: 'operator' },
-          { kind: 'reminder', text: 'pin-two', createdBy: 'operator' },
+          { kind: 'invariant', text: 'pin-one', createdBy: 'user' },
+          { kind: 'reminder', text: 'pin-two', createdBy: 'user' },
         ],
         decisions: Array.from({ length: 5 }, (_, i) => ({
           stepId: `step-${i}`,

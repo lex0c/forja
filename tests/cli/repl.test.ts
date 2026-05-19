@@ -122,6 +122,7 @@ const makeBootstrapStub = (
     subagents: { byName: new Map(), shadows: [] } as unknown as BootstrapResult['subagents'],
     hookWarnings: [],
     critiqueWarnings: [],
+    memoryConfigWarnings: [] as readonly string[],
     permissionState: 'ready',
     permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
     installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },
@@ -3747,5 +3748,185 @@ describe('repl — Alt+R recap terse (RECAP §3.3)', () => {
     await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+});
+
+describe('REPL shared-trust probe stderr summaries (S5 hardening)', () => {
+  test('revoked outcome surfaces recovery hint (CRIT/F3)', async () => {
+    // Wrap makeBootstrapStub to attach a synthetic
+    // sharedTrustProbe result. The REPL's stderr summary runs
+    // unconditionally after bootstrap, so we don't need to feed
+    // any stdin — just boot + EOF.
+    const baseStub = makeBootstrapStub();
+    const stub: BootstrapResult = {
+      ...baseStub,
+      sharedTrustProbe: {
+        kind: 'revoked',
+        invalidated: [
+          { scope: 'project_shared', name: 'a' },
+          { scope: 'project_shared', name: 'b' },
+        ],
+        failed: [],
+      },
+    };
+    let stderr = '';
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04'); // EOF closes REPL.
+    await promise;
+    // Summary line + recovery hint MUST be present.
+    expect(stderr).toContain('shared memory trust revoked');
+    expect(stderr).toContain('2 shared memories invalidated');
+    expect(stderr).toContain('recovery: edit the `.md` frontmatter');
+    expect(stderr).toContain('7 days');
+  });
+
+  test('deferred outcome surfaces cause-specific stderr line (D1)', async () => {
+    // The post-D1 stderr branch distinguishes modal_cancel from
+    // tocttou_during_prompt. Both cases get a clear hint about
+    // what happens next.
+    const baseStub = makeBootstrapStub();
+    const stub: BootstrapResult = {
+      ...baseStub,
+      sharedTrustProbe: { kind: 'deferred', cause: 'tocttou_during_prompt', hash: 'x' },
+    };
+    let stderr = '';
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+    expect(stderr).toContain('deferred');
+    expect(stderr).toContain('TOCTOU');
+    expect(stderr).toContain('investigate concurrent writers');
+  });
+});
+
+describe('REPL — subagent shadow render uses actual scopes (post-review)', () => {
+  // Pre-fix: render hardcoded `(user) ... (project)` labels. With
+  // PROTECTED_BUILTIN_NAMES, a user-scope file that shadows an
+  // embedded verify-* subagent lands as `shadowed.scope = 'builtin'`
+  // + `winning.scope = 'user'`. Hardcoded labels mislabeled the
+  // security warning as a generic cross-scope shadow, undermining
+  // the protection signal that drove the alert.
+  //
+  // Post-fix: render interpolates `${shadow.shadowed.scope}` and
+  // `${shadow.winning.scope}` directly. This test pins both the
+  // happy path (user shadowed by project) and the protected-builtin
+  // case (builtin shadowed by user) to exercise the new template.
+
+  test('protected-builtin shadow renders (builtin) + (user) — not hardcoded labels', async () => {
+    const stub = makeBootstrapStub();
+    // Inject a shadow record matching the shape load.ts emits for
+    // a PROTECTED_BUILTIN_NAMES entry replaced by a user-scope
+    // file. Both sides need the SubagentDefinition fields the
+    // renderer reads (name, sourcePath, scope).
+    const builtinDef = {
+      name: 'verify-semantic',
+      scope: 'builtin',
+      sourcePath: '<embedded>/verify-semantic.md',
+      description: '',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: '',
+      isolation: 'none',
+      sourceSha256: '0'.repeat(64),
+    };
+    const userDef = {
+      ...builtinDef,
+      scope: 'user',
+      sourcePath: '/home/op/.config/agent/agents/verify-semantic.md',
+    };
+    (stub.subagents as { shadows: unknown[] }).shadows = [
+      { name: 'verify-semantic', shadowed: builtinDef, winning: userDef },
+    ];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    let stderr = '';
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+    // Message must label the embedded definition as 'builtin' and
+    // the override as 'user' — the actual scopes from the records.
+    expect(stderr).toContain('<embedded>/verify-semantic.md (builtin)');
+    expect(stderr).toContain('verify-semantic.md (user)');
+    // Pre-fix would have rendered '(user) is shadowed by ... (project)'.
+    expect(stderr).not.toContain('(project)');
+  });
+
+  test('cross-scope user-shadowed-by-project still renders the actual scopes', async () => {
+    // Negative case: pre-fix hardcoded labels happened to be
+    // correct for this scenario. Post-fix the template must still
+    // produce the same output via interpolation.
+    const stub = makeBootstrapStub();
+    const userDef = {
+      name: 'helper',
+      scope: 'user',
+      sourcePath: '/home/op/.config/agent/agents/helper.md',
+      description: '',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: '',
+      isolation: 'none',
+      sourceSha256: '0'.repeat(64),
+    };
+    const projectDef = {
+      ...userDef,
+      scope: 'project',
+      sourcePath: '/repo/.agent/agents/helper.md',
+    };
+    (stub.subagents as { shadows: unknown[] }).shadows = [
+      { name: 'helper', shadowed: userDef, winning: projectDef },
+    ];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    let stderr = '';
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+    expect(stderr).toContain('/home/op/.config/agent/agents/helper.md (user)');
+    expect(stderr).toContain('/repo/.agent/agents/helper.md (project)');
+    expect(stderr).not.toContain('(builtin)');
   });
 });

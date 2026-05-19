@@ -3,7 +3,390 @@
 Items intentionally left for later milestones, with the deferral
 rationale and a "pull-in" signal so we know when to revisit.
 
+The first section ("ACTIVE") is different — it tracks work in flight
+on a named branch with slices and tasks. When a slice closes, its
+artifacts move to `docs/BACKLOG.md` and the entry here is trimmed.
+
 ---
+
+# ACTIVE — `feat/memory-lifecycle-detectors`
+
+**Branch off `feat/retrieval`.** Goal: close the four automatic detectors spec'd in `docs/spec/MEMORY.md §6.5.2` and `docs/spec/EVICTION.md §5.1` — `verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked` — plus the upstream infrastructure they depend on. Production-ready: substrate + detectors + operator surfaces + audit + tests + docs.
+
+Order matters: Slice 1 (provenance) is foundational for Slices 2 and 3. Slice 6 (penalty + visual flag) is independent.
+
+## Slice 0 — Operator escape hatch + audit baselines
+
+Land the manual paths before the auto-detectors so the pipeline is end-to-end testable and operators have a way to drive transitions explicitly.
+
+| Task | Status | Description |
+|---|---|---|
+| **T0.1** | ✅ done | `/memory quarantine <name> --motivo <kind> --evidence "…"` slash command — invokes `transitionMemoryState` with the operator's motivo. Accepts every spec motivo (`conflict`, `shift`, `security`, `low_roi`, `irrelevant`). |
+| **T0.2** | ✅ done | `/memory list` rendering — `[QUARANTINED] / [INVALIDATED] / [PROPOSED] / [EXPIRED <date>]` prefix flags, `(expires <date>)` suffix for future-expiring active entries, `[ORPHAN] / [MALFORMED]` markers for unreadable rows. Spec §6.5.2 motivo+date format deferred (JOIN with eviction_events). |
+| **T0.3** | ✅ done | `/memory audit --trigger <source>` filter — literal match on `details.trigger`, plus semantic shortcuts `operator` (matches `operator_driven`) and `detector` (matches the 4 spec detectors: `verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked`). Lays the forensic path for Slices 2-5. |
+| **T0.4** | ✅ done | Tests landed inline per task (T0.1: 9, T0.2: 7, T0.3: 5 = 21 new tests). `docs/MEMORY.md` §6 table updated with the 3 new surfaces (quarantine verb, list rendering, audit --trigger); §14.5 entry added under "What IS shipped" pointing to the Slice 0 closure. |
+
+**Acceptance:** operator runs `/memory quarantine foo --motivo conflict --evidence "duplicates bar"`, sees foo in `/memory list` with quarantine flag, inspects the row in `/memory audit`. Pipeline tested end-to-end.
+
+## Slice 1 — Memory **exposure** infrastructure · ✅ DONE
+
+Tracks which memory(s) **were visible to the model** at the moment of each tool call. **Not causation** — the model may ignore an exposed memory entirely. Exposure trace is foundational for the failure-correlation surfaces in Slices 2 (`verify_failed` runs against exposed memories) and 3 (`user_override_repeated` counts overrides per exposed memory).
+
+Closed in 9 commits (`719ff0a..dab5d73` on `feat/memory-lifecycle-detectors`). Three emitters (memory_read/eager/retrieve_context), one operator surface (`/memory provenance`), 90d retention sweep, full §11.2 docs. Post-review hardening pass landed bugs/guards/idempotency. See `docs/BACKLOG.md` for the slice closure summary.
+
+## Slice 2 — `verify_failed` detector · 🔁 ROLLED BACK (heuristic removed; substrate only)
+
+Initial S2 shipped a regex-based path-extraction heuristic + `existsSync` verification. Rolled back per policy decision: **"todo o lifecycle de memória um llm-judge decide; sem heurísticas locais sobre texto"**. Regex over prose can't distinguish factual assertion from historical mention ("we moved away from src/old-auth.ts" → heuristic quarantines, but memory was describing history). Same fundamental class of false-positive as S4's textual conflict heuristic.
+
+What survives in V1:
+- The generic `/memory audit --trigger verify_failed` filter (from S0/T0.3) — operator-facing audit surface ready to render `verify_failed` rows when an LLM-judge emits them.
+- The spec-defined trigger NAME `verify_failed` — preserved as the canonical identifier; future LLM-judge emits the same trigger.
+
+What was deleted from the initial S2 attempt:
+- `src/memory/verify/` entire directory (factuality classifier + project verifier + scheduler + types).
+- `tests/memory/verify/` entire directory.
+- Wire-up in `src/harness/loop.ts` (scheduler creation + poll + drain).
+
+T2.1-T2.6 move to Phase 2 / S11 (semantic verify via LLM-judge). S11 framing updates: no longer "fallback over heuristic unknown" — LLM-judge becomes the PRIMARY path for factual contradiction detection. The hierarchy-of-mechanisms argument from spec §1.1.1 still holds in principle, but in this codebase's memory subsystem **the heuristic tier is intentionally empty** because: (a) regex over prose can't reliably distinguish assertion from mention, and (b) the deterministic part (path-existence) only matters AFTER a fragile extraction step that the heuristic gets wrong.
+
+**Acceptance (revised):** zero text-heuristic in memory lifecycle decisions; `verify_failed` trigger name + audit filter preserved as substrate for S11 to populate via LLM-judge proposals.
+
+## Slice 3 — `user_override_repeated` detector
+
+**Boundary:** counter + threshold are DETERMINISTIC (event counts, sliding window math — not text judgment). When the threshold trips, fire an LLM-judge proposal via S8 (NOT auto-quarantine). Operator approves to apply. Aligns with §1.1.4 (confidence ≠ authority) and the "propose-not-mutate" policy.
+
+| Task | Description |
+|---|---|
+| **T3.1** | Override signal detection — three concrete signals: (a) modal `MemoryWrite` rejected on a memory; (b) `permission ask` denied for a tool whose provenance points to this memory; (c) `edit_file` reverted within N turns of write. Each emits a `memory_override_events` row. |
+| **T3.2** | Migration `055-memory-override-events.sql` — `(id, session_id FK, memory_scope, memory_name, signal ENUM, tool_call_id FK NULL, created_at)`. |
+| **T3.3** | Sliding window counter — `countOverridesInWindow(scope, name, windowMs)`. Spec threshold: 3 in 24h. Deterministic counter; no text judgment. |
+| **T3.4** | Threshold-triggered proposal — runs on each new override event; when threshold crosses, dispatch LLM-judge subagent with the override history + the exposed memory body. Subagent returns `{ conflicting: bool, confidence: 0.0-1.0, reasoning, suggested_motivo }`. Emit `memory_governance_proposals` (S8) with the verdict. Operator approves → state-machine transitions to quarantined with `trigger=user_override_repeated, motivo=conflict`. Below confidence threshold → proposal auto-archived. |
+| **T3.5** | Tests covering each signal kind + threshold boundary (3 vs 2 hits) + proposal landing in pending state + operator approval flow. |
+
+**Acceptance:** user rejects 3 tool-call modals in 24h whose provenance traces to memory X → governance proposal lands in pending state for operator review. Operator approves → X transitions to quarantined with full audit trail. Sub-3 hits: no proposal, no signal. The threshold (3 in 24h) is the deterministic gate that COSTS A LLM CALL; below threshold there's zero LLM cost.
+
+## Slice 4 — `conflict_detected` audit substrate · ✅ DONE (substrate only)
+
+Ships **only** the audit substrate. Detector deferred to Phase 2 (LLM-judge — see new Slice S13 below). Initial S4 implementation built a textual heuristic that was rolled back: <5% real-world coverage, false-positive paths on common English words, fundamentally incapable of paraphrase / semantic equivalence detection. The substrate (audit query helper + `/memory conflicts` slash) is forward-compatible with the LLM-judge path and ships now so the operator surface exists when Phase 2 lands.
+
+What landed:
+
+| Task | State | Description |
+|---|---|---|
+| **T4.4** | ✅ done | `/memory conflicts` slash command — lists eviction_events filtered by `trigger='conflict_detected'`, cross-session forensic surface. Renders `<ts> · <kind> · winner=<scope/name> loser=<scope/name> token="<shared>"`. `--limit N` default 50. |
+| Helper | ✅ done | `listEvictionEventsByTrigger(db, trigger, limit)` in `eviction-events.ts` — generic. Backs `/memory conflicts` and any future trigger-filtered slash. |
+| Tests | ✅ done | 4 slash tests pin empty-state hint, row rendering, `--limit` cap, unknown-flag rejection. |
+
+What does NOT ship in S4 V1 (moved to Phase 2 / S13):
+
+- T4.1 (pairwise comparator) — heuristic-coupled; replaced by LLM dispatcher in S13.
+- T4.2 (textual contradiction heuristic) — removed entirely per "no local heuristics over text" decision.
+- T4.3 (resolver) — semantics documented for S13 to implement (provenance tier > recency > scope specificity > body length → deterministic tiebreak).
+- T4.5 (emit `conflict_detected`) — will land in S13 via S8 governance proposal path (propose-not-mutate; operator approves → state machine transitions).
+- T4.6 (heuristic tests) — N/A; S13 will pin LLM-judge behavior with structured-output fixtures.
+
+**Acceptance (revised):** `/memory conflicts` slash shows zero rows pre-S13 (heuristic-free), but the audit surface is ready to render LLM-judge verdicts once S13 lands.
+
+## Slice 5 — `trust_revoked` detector
+
+Mass-quarantines `shared/` memories when operator revokes trust after a hash change.
+
+**Architectural rationale (boundary check against zero-heuristic commitment):** S5 fits within the architectural commitment because:
+- **Detection is deterministic** — SHA-256 hash diff over canonical concat of shared/MEMORY.md + bodies. No prose judgment; the hash either matches or doesn't.
+- **Judgment is operator authority** — the boot modal IS the explicit consent moment (§1.1.4: authorization vem de "operator explicit approval"). System surfaces the change; operator decides.
+- **Bulk transition is justified by the modal's consent** — modal shows the diff preview; operator's revoke choice IS consent for the bulk effect across all shared memories. Per-memory governance proposals would be UX-wrong here: the operator already reviewed and decided in one place. Splitting into N proposals to approve individually would force the same decision N times.
+- **Diff preview shows raw changes** — no summarization, no "looks malicious" classification. Operator reads the diff and forms their own judgment.
+
+| Task | Description |
+|---|---|
+| **T5.1 ✅** | `shared/` content fingerprint — hash over canonical concat of `.agent/memory/shared/MEMORY.md` + every body file (sorted by name). Persisted in `shared_corpus_trust` (migration 055), keyed by absolute scope-root path. SHA-256 with `forja:shared-corpus:v1\n` domain separator and `filename\n<bytes-len>\n<bytes>\n` framing per file. `src/memory/trust-corpus.ts` exports `computeSharedFingerprint`, `getSharedTrust`, `setSharedTrust`, `clearSharedTrust`. 19 substrate tests. |
+| **T5.2 ✅** | Boot-time re-prompt — `src/memory/trust-corpus-probe.ts` orchestrator runs the probe state machine (seeded / unchanged / reconfirmed / revoked / verify_failed). TUI flavor `shared-trust:ask` (`src/tui/events.ts`, `modal-manager.ts`, `state.ts`) renders a corpus inventory preview (file names + byte sizes, capped at 8 visible). Wired into `bootstrap.ts` BETWEEN GC sweeps AND `assembleMemorySection` so the bulk-invalidate landing on disk takes effect in this very boot's system prompt. REPL boot (`src/cli/repl.ts`) passes the modal callback + pre-subscribes stdin so the modal can receive input during bootstrap. 8 probe tests + 5 bootstrap integration tests. |
+| **T5.3 ✅** | On operator revoke → emit `trust_revoked` for every `state=active` shared memory; transition all to `invalidated` with `motivo=security` (NOT `quarantined` — per EVICTION.md §4.1, `active → quarantined` admits only `conflict`/`low_roi`; `active → invalidated` is the canonical target for security events). Already-quarantined shared memories are left alone (`quarantined → invalidated` admits only `shift`). The modal interaction IS the authorization — no governance proposal layer for the bulk transition. Also added: `src/cli/memory-prompt.ts` filters `state === 'invalidated'` from the eager-load section so the revocation removes invalidated memories from THIS session's system prompt (rather than requiring restart). |
+| **T5.4 ✅** | `/memory trust status` shows trust state + last hash + last re-confirm timestamp. Read-only inspector in `src/cli/slash/commands/memory.ts:handleTrust`. Renders four states: `never confirmed`, `in sync`, `DIVERGED` (upper-cased for visual weight), `VERIFY FAILED`. Hashes truncated to first 12 hex chars + ellipsis; inventory line reports file count + total bytes (counts MEMORY.md alongside body files since the fingerprint hashes both). Strict args validation refuses unknown subcommands AND extra args after `status`. 6 slash tests. |
+| **T5.5 ✅** | Coverage strengthening: (a) reconfirmed path asserts ZERO eviction events emitted + memory stays active (regression guard against the bulk path accidentally running on the 'yes' branch); (b) `verify_failed` path covered via `chmod 000` on the shared root (skipped under root since unix perms are bypassed); (c) bootstrap-layer `unchanged` integration test verifies no modal fires and the trust row's timestamp is not bumped. |
+
+**Acceptance:** operator `git pull`s a commit that adds 2 new shared memories; next session boot re-prompts; if declined, the new + existing shared memories enter `quarantined`.
+
+## Slice 6 — Quarantine penalty ranking + visual flag (EVICTION §9.7)
+
+Walk back the H1+H6 hard-filter (commit `949fadf`) to spec'd behavior: quarantined memories stay visible, with penalty + visual flag.
+
+| Task | Description |
+|---|---|
+| **T6.1** | Retrieval memory view — include `quarantined` in candidate pool with ranking penalty (multiply final score by 0.3). Update view's `registry.list({ states: ['active', 'quarantined'] })`. |
+| **T6.2** | Visual flag in eager-load — `cli/memory-prompt.ts` renders quarantined entries with `[memory: quarantined — <reason> <date>]` per spec §6.5.2. |
+| **T6.3** | `/memory list` shows the same flag (already partial in T0.2; verify integration). |
+| **T6.4** | Tests: quarantined memory appears in retrieval candidates but ranks below active sibling; visual flag renders in eager-load. |
+
+**Acceptance:** quarantined memories visible to operator and model with penalty + tag. Operator decides whether to restore or delete.
+
+## Slice 7 — Docs + E2E smoke
+
+| Task | Description |
+|---|---|
+| **T7.1 ✅** | `docs/MEMORY.md §14` update — removed §14.3 "Trust boundary" (shipped via S5), renumbered §14.4 → §14.3 / §14.5 → §14.4, and rewrote the "What IS shipped" entry to break out S5 (`trust_revoked` detector full impl) + S6 (quarantine penalty + visual flag) as separate bullets; the substrate-only roster shrinks from 4 to 3 detectors (`verify_failed`, `user_override_repeated`, `conflict_detected`). Updated TODO cross-refs (lines 219, 273). |
+| **T7.2 ⊘** | Skipped per operator decision (2026-05-16). No spec ambiguity surfaced during Phase 1; the only mismatch (initial draft of S5 targeted `active → quarantined` instead of `active → invalidated`) was a TODO error caught by the spec, not the other way around. |
+| **T7.3 ✅** | E2E smoke — single test in `tests/cli/slash/memory.test.ts`. The original framing (contradicting memories → `conflict_detected`) is dead since the detector is Phase 2 / S13; pivoted to the operator-driven surfaces that ARE wired in Phase 1: write two project_local memories, quarantine one (assert `[QUARANTINED — motivo/trigger date]` visual flag in `/memory list` AND quarantine row in `/memory audit --trigger operator`), delete the other (state-machine route to `.tombstones/`, no entry in list), restore from tombstone (back to active, no flag). Full audit chain queried via `/memory audit --limit 50`. |
+| **T7.4 ✅** | `docs/BACKLOG.md` Phase 1 closure entry summarizing shipped slices (S0/S1/S5/S6/S7 ✅, S2/S4 substrate-only) and the Phase 2 cluster handoff (S8 → S3 → S11 → S13). |
+
+---
+
+# Phase 2 — LLM-judge governance (proposed branch: `feat/memory-governance-llm`)
+
+Heuristic family (Slices 0-7) covers the operations where ground truth is unambiguous (path-existence, override-counts, hash divergence). Phase 2 adds the LLM-judge layer for operations where heuristics can't reach: **semantic drift, paraphrase contradiction, consolidation candidate detection**.
+
+Design constraints carried forward from the heuristic-vs-LLM analysis:
+
+- **Propose-not-mutate.** LLM subagent NEVER writes/mutates memory directly. It emits structured proposals; a deterministic validator + operator approval flow drives the actual state transition.
+- **Heuristic-first, LLM-fallback.** Slice 2 heuristic stays as-is; LLM only runs over the `unknown` subset where the heuristic couldn't conclude. ~30% of memories produce heuristic verdicts; the remaining ~70% are LLM's domain.
+- **Injection-aware by construction.** Memory bodies are operator-edited and some are marked `trust: untrusted`. Every body that enters the subagent's window passes through `scanForInjection` first; system prompt explicitly frames input as adversarial; output is JSON-schema-validated (not free text) so prose injections can't shape the response.
+- **Confidence decay.** Pending proposals expire after 30 days. A stale proposal that didn't get reviewed loses authority — automation that auto-applied based on month-old confidence would be drift, not governance.
+- **Multi-source evidence.** Proposals carry not just LLM verdict but: provenance lineage, retrieval stats, outcome correlation. Never trust embedding/body content as sole evidence.
+
+## Slice 8 — Memory governance proposal substrate · ✅ DONE
+
+Foundational table + repo + approval flow. No LLM yet — this is the deterministic spine the subagent (Slice 11) lands its findings on. Shipped on `feat/memory-governance-llm`.
+
+| Task | State | Description |
+|---|---|---|
+| **T8.1** | ✅ done | Migration `056-memory-governance-proposals.ts` (migration 055 was already taken by `shared-corpus-trust` in Phase 1 — landed at 056 instead). Tables `memory_governance_proposals` (parent) + `memory_governance_proposal_keys` (FK CASCADE auxiliary index for `listProposalsForMemory`). Schema covers all six kinds in CHECK (forward-compat for deferred kinds); UNIQUE partial index on `proposal_fingerprint WHERE status='pending'`; secondary indexes for status + session listings; `source_memory_snapshots` JSON column captures `{scope, name, content_hash}[]` at proposal creation. |
+| **T8.2** | ✅ done | Repo `src/storage/repos/memory-governance.ts`. `recordProposal` validates kinds/scopes/snapshot bijection/confidence, computes fingerprint, INSERTs parent + key rows in one transaction, catches UNIQUE-constraint failures and returns the existing pending row's id with `deduped: true`. `listProposals` / `listPendingProposals` / `listProposalsForMemory` / `listPendingProposalsForMemory` (JOIN-backed) / `getProposalById` / `decideProposal` / `expirePendingProposals`. Re-exported from `src/storage/index.ts`. Helper `computeProposalFingerprint` exposed for tests + apply path. |
+| **T8.3** | ✅ done | Apply path in `src/memory/governance.ts:applyProposal`. Five sequential gates: existence + status, confidence (default 0.7; NULL bypasses), kind support (quarantine + restore only in V1), single-memory only for supported kinds, staleness (drift wins over state_change). On state-machine refusal, mapped per-kind reason. `actor: 'user'`, motivo defaulted per kind (overridable via `target_payload`), trigger derived from `proposed_by` (`subagent:verify-semantic` → `verify_failed`, etc.). Same-state transitions reject with `system:state_change` (memory already in target state). |
+| **T8.4** | ✅ done | TTL sweep wired in `bootstrap.ts` after `pruneMemoryProvenance`. Constant `GOVERNANCE_PROPOSAL_TTL_MS = 30d` exported. Best-effort: AUDIT DRIFT stderr on failure, never aborts boot. Cutoff exclusive (matches `pruneMemoryProvenance` semantics). |
+| **T8.5+T8.5b** | ✅ done | Slash dispatcher in `src/cli/slash/commands/memory.ts:handleGovernance`. Five subcommands: `list` (with `--status` / `--limit` validation), `show` (renders full proposal detail), `approve` (modal confirm for ≥3 memories; surfaces apply-path rejection reason), `reject` (with optional `--reason`), `audit` (lineage via `listMemoryEventsByName` filter by scope + post-proposal timestamps). Strict arg validation: unknown flags refused, missing ids refused, extra positional args refused. |
+| **T8.6** | ✅ done | 67 new tests: 27 in `tests/storage/memory-governance.test.ts` (repo + schema CHECK + FK CASCADE), 16 in `tests/memory/governance.test.ts` (apply-path e2e with real FS fixtures), 24 in `tests/cli/slash/memory.test.ts` (governance subcommands). Full suite: 8379 pass / 0 fail / 10 skip. |
+| **T8.7** | ✅ done | `docs/MEMORY.md §11.3` documents the substrate, the six kinds, the five apply-path gates, the TTL sweep, the operator surface, and what proposals do NOT do. §11 (tables) extended from 3 to 4 tables. §14.4 "What IS shipped" lists the new slice. |
+
+**Acceptance met:** operator runs `/memory governance list` and sees pending proposals. `approve <id>` applies via `transitionMemoryState`; row status flips to `applied`, `decided_at` + `decided_by` set, `eviction_events` row carries `proposal_id` trace field. Pending proposals expire silently after 30d via boot sweep. No memory state mutates without explicit approval — every transition driven by S8 carries an `operator:slash` (or equivalent) `decided_by` on the proposal AND an `actor='user'` on the eviction_events row.
+
+## Slice 11 — Semantic verify_failed (LLM-judge primary path) · ✅ DONE
+
+THE detector for factual contradiction in memory subsystem. Shipped on `feat/memory-governance-llm`. S2's heuristic was rolled back; LLM-judge is the only path. Routes factual memories (`type: project` or `reference`) through a sandboxed subagent that does semantic verification with FS tools (read_file, grep, memory_read).
+
+**Cost-bounded:** opt-in flag (`--memory-verify-llm` or policy), per-session dispatch cap + cost cap, content-hash + recency dedup so unchanged memories don't re-trigger. The cost discipline that S2's heuristic-first layering provided is now provided by these guardrails instead.
+
+| Task | Description |
+|---|---|
+| **T11.1** | Subagent definition `src/subagents/builtin/verify-semantic.md` (or `.agent/subagents/`, TBD per project convention) — system prompt frames input as adversarial, requires JSON output, enumerates allowed tools (read_file, grep, memory_read — read-only set). Output schema: `{verdict: "passed"|"contradicted"|"inconclusive", confidence: 0.0-1.0, claim_extracted: string, ground_truth_observed: string, evidence_paths: string[]}`. |
+| **T11.2** | Injection pre-check — `scanForInjection(memory.body)` runs BEFORE the body enters the subagent's input. Flagged bodies skip semantic verification entirely; emit `verify_skipped` stderr line. The trust filter's intent (untrusted bodies out of model windows) extends to governance subagent windows. |
+| **T11.3** | Scheduler dispatch — extend `createVerifyScheduler` so when the project heuristic returns `unknown`, the scheduler enqueues a SECONDARY task that dispatches the semantic subagent. Gated on `config.memorySemanticVerify === true` (opt-in flag in `HarnessConfig`, default false) so operators consciously enable LLM cost. **Pre-dispatch dedup guard:** before enqueueing, check `listProposalsForMemory(scope, name)` with `status='pending'` AND `kind='quarantine'`. If a pending proposal already exists for this memory, skip dispatch — avoids paying LLM cost to generate a proposal that would collide with the existing pending row anyway (T8.2's fingerprint UNIQUE index would refuse the INSERT). |
+| **T11.4** | Subagent runner integration — uses existing `task_async` infrastructure: subagent spawn carries its own sandbox profile (no fs.write, no bash, no network beyond tool whitelist), depth gate, cost budget. Reuses `subagent_runs` audit table for prompt_hash + model_id + structured_output capture. |
+| **T11.5** | Structured output validator — JSON schema on the subagent's return. Malformed output → discard, log `verify_semantic_malformed` stderr. The validator is the same shape as the runtime's existing `outputSchema` enforcement for `task` results. |
+| **T11.6** | Emit as `memory_governance_proposals` (S8) — kind=quarantine, source_memory_keys=[{scope, name}], confidence=`output.confidence`, evidence=`{verdict, claim_extracted, ground_truth_observed, evidence_paths, subagent_run_id, prompt_hash}`. proposed_by=`subagent:verify-semantic`. |
+| **T11.7** | Confidence threshold gate — proposals with `confidence < 0.7` auto-archived (status=rejected, decided_by=`system:low_confidence`). Above threshold lands as pending for operator review. Constant `SEMANTIC_VERIFY_MIN_CONFIDENCE` exported and tunable. |
+| **T11.8** | Operator opt-in surface — bootstrap CLI flag `--memory-verify-llm` OR policy `[memory.verify].llm = true`. Default off. Surfaced in `/memory governance status` (new subcommand) showing whether LLM-judge is active for this session. |
+| **T11.9** | Per-session cost + dispatch caps — `MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION` (default 10) + `MEMORY_VERIFY_SEMANTIC_MAX_COST_USD` (default 0.50). Scheduler refuses dispatch beyond cap; logs `memory: verify_semantic_budget_exhausted` stderr line so operator sees the throttle. Constants exported and tunable via policy. Without caps, opt-in operator can see surprise bills when memory corpus grows. |
+| **T11.10** | `last_semantic_verify_at` dedup — `memory_verify_attempts(id, scope, name, content_hash, verdict, confidence, model_id, prompt_hash, attempted_at)` table. Scheduler skips re-dispatch when `(content_hash unchanged AND attempted_at > now - 7d AND verdict ∈ {passed, inconclusive})`. Cross-session memo so an opt-in operator doesn't pay LLM cost every boot for memories the subagent just judged unchanged. Contradicted verdicts always re-dispatch (high-stakes; want re-confirmation). |
+| **T11.11** | Tests + acceptance — fixture: project memory `"we use JWT for auth"` in tmpdir whose code shows OAuth-only patterns. Heuristic returns `unknown` (no path claim) → semantic dispatched → subagent reads files → returns `contradicted` with `confidence: 0.85` → proposal lands in `pending` → operator approves → memory quarantined with paired `memory_events` + `eviction_events` rows. Additional pin: cost cap fires when synthetic budget of $0.01 is set + 11 dispatches attempted (11th refused). Additional pin: dedup table skips re-dispatch when content_hash unchanged + same-day attempt exists. |
+
+**Acceptance:** with opt-in enabled, a semantic-only contradicted memory generates a pending proposal within one turn of being exposed. Operator approves via slash; memory transitions to `quarantined` with full audit trail (eviction_events + governance_proposal + subagent_runs all cross-linkable by ids). With opt-in disabled, no LLM call fires and no proposal lands (default-zero-cost preserved).
+
+**What S11 does NOT do (deferred):**
+- Consolidation (N similar memories → 1) — that's Slice 10 (not in scope here; subagent infrastructure of S11 is the building block but the consolidation prompt + flow is its own slice).
+- Conflict detection between memories (pairwise) — Slice 13 below (V1 of S4 shipped audit substrate only; the LLM-judge conflict detector lands here).
+- Drift detection across time (memory written 90 days ago, codebase migrated) — would need cross-session subagent that doesn't exist today. Future infrastructure.
+
+## Slice 13 — LLM-judge `conflict_detected` detector · ✅ DONE
+
+Replaces the heuristic textual matcher that S4 attempted and rolled back. The audit substrate (`/memory conflicts` slash + `listEvictionEventsByTrigger` repo helper) shipped in S4 V1; S13 wires the actual detection pipeline through S8's governance proposal substrate + S11's subagent infrastructure.
+
+Why deferred to Phase 2 alongside S11:
+
+- Heuristic textual conflict detection has unacceptable coverage on real-world prose (operator-authored memories rarely contain literal antonym + token-identical assertions). Empirical analysis during S4 V1 attempt showed <5% real-conflict coverage with non-zero false-positive surface on common English words.
+- LLM-judge is the only path with realistic recall on paraphrase, semantic equivalence, and cross-clause contradictions.
+- Direct auto-quarantine from a non-deterministic LLM verdict violates §1.1.4 (confidence ≠ authority). The propose-not-mutate path via S8 is the architecturally correct integration.
+
+| Task | Description |
+|---|---|
+| **T13.1** | Subagent definition `verify-conflict.md` — analogous to S11's `verify-semantic.md`. System prompt frames input as adversarial pair (two operator-edited memory bodies); requires structured JSON output `{ conflicting: bool, conflict_kind: string, confidence: 0.0-1.0, evidence: { shared_concept: string, polarity_a: string, polarity_b: string } }`. Tool whitelist: `memory_read` only (the subagent already has both bodies in input). |
+| **T13.2** | Pair-selection scheduler — at step boundary, polls `memory_events` for `action='created' | 'updated'` rows. For each unique (session, scope, name), pairs the written memory against active/quarantined siblings in the same scope (intra-scope only; T4.6 carries forward). **BM25 prefilter (avoid O(N²) explosion):** before dispatching pairwise LLM calls, run the just-written memory's body as a BM25 query against the same-scope sibling corpus (reuse `src/retrieval/views/memory.ts:createMemoryView` with `loadBodies: true`). Take top-K siblings (K=5 default, exported constant `CONFLICT_PREFILTER_K`). LLM-judge fires ONLY on those K pairs. For N=200 siblings, this caps LLM dispatch at 5 instead of 199 (40× cost reduction in worst case). Rationale: BM25 surface-token overlap is necessary-but-not-sufficient for semantic conflict — if zero token overlap, semantic conflict is implausibly rare; if some overlap, LLM-judge is worth the call. K=5 is the cheap-confident bound; tunable via policy. |
+| **T13.3** | Injection pre-check + scanForInjection on BOTH bodies before invocation. Pair-level invocation means TWO potentially adversarial bodies enter the judge's window simultaneously; the system prompt must explicitly frame BOTH as adversarial input. |
+| **T13.4** | Per-pair cost cap + dedupe. Reuse S11's `MAX_DISPATCHES_PER_SESSION = 10` + `MAX_COST_USD = 0.50` budgeting. Dedupe via `memory_verify_attempts` extension OR new `memory_conflict_attempts` keyed by `(session, scope-a/name-a, scope-b/name-b, content_hash_a, content_hash_b)`. |
+| **T13.5** | Resolver implementation (carrying forward from S4 V1 design): provenance tier (`user_explicit > inferred > imported`) → recency → scope specificity → body length tiebreak → deterministic tiebreak (a wins). Pure function, LLM-agnostic. |
+| **T13.6** | Emit governance proposal via S8 — kind=quarantine, source_memory_keys=[winner, loser], evidence=`{ winner_id, loser_id, conflict_kind, confidence, shared_concept, polarity_a, polarity_b, subagent_run_id, prompt_hash }`. Confidence below threshold (`SEMANTIC_CONFLICT_MIN_CONFIDENCE = 0.7`) auto-archives as rejected. Above threshold lands pending for operator review. |
+| **T13.7** | Operator opt-in surface — `--memory-conflict-llm` flag OR policy `[memory.conflict].llm = true`. Default off. Surfaced via `/memory governance status`. |
+| **T13.8** | Tests — fixture: pair of memories with semantic-only contradiction (e.g., `"use JWT for auth"` + `"the auth flow uses OAuth"`). Subagent verdict `conflicting: true, confidence: 0.85` → proposal lands pending → operator approves → loser quarantines with paired audit. False-positive avoidance pin: pair without semantic conflict → `conflicting: false` → no proposal. |
+
+**Acceptance:** with opt-in enabled, writing a memory that semantically contradicts an existing same-scope sibling generates a pending governance proposal within one turn. Operator approves → loser transitions to `quarantined` with full audit (eviction_events + governance_proposal + subagent_runs cross-linkable). With opt-in disabled, no LLM call fires.
+
+---
+
+## Out of scope (deliberate)
+
+- **`distribution_shift` / `source_removed` detectors** — listed in EVICTION §5.1 but tied to startup probes for external sources. Tracked separately as "reference dereference probe".
+- **Compaction × quarantine cross-lifecycle** (EVICTION §9.7) — context-tuning subsystem's responsibility, not memory's.
+- **`roi_below_threshold` detector** — depends on loop frio aggregation (FEEDBACK_ADAPTATION §3.2); listed in `docs/MEMORY.md §14.3`.
+
+## Deferred — actionable but parked
+
+### Extract `createDetectorScheduler<TCandidate>` abstraction
+
+**Status:** the three LLM-judge governance detector schedulers (`src/memory/verify-semantic-scheduler.ts` 505 LOC, `verify-conflict-scheduler.ts` 540 LOC, `verify-override-scheduler.ts` 421 LOC = ~1466 LOC total) are ~80% structurally identical: cursor tuple `(createdAt, id)` + `advanceTo` helper, cap-check with worst-case headroom (`costUsdSpent + worst > maxCost`), exposures fetch + dedup loop, type/trust/state filter, pending-proposal short-circuit, dispatcher invocation, post-shutdown bail (G6), counters + `capExhausted` field, `sharedScopeOffline` derivation, forward-flag boilerplate (`...(deps.signal !== undefined ? { signal: deps.signal } : {})` × 8). What actually differs per detector: source query (`listSessionExposuresSince` vs `listMemoryEventsSince` vs `listOverrideEventsSince`), candidate shape (single memory / pair / memory + events), dispatcher function.
+
+**Problem:** every cross-cutting fix touches all three files — the post-Phase-2 review round 2 (2026-05-18) had several commits that each had to land identical edits 3×: plan-mode gate (`fa9d80a`), `governanceDrift` mirror, registry sessionId. Easy-to-miss-one-site drift risk that already burned operator-facing surface (S3's `auditSessionId` omission survived two rounds of review before landing as commit `5daed95`). Adding a fourth detector (e.g., the deferred `edit_reverted` signal collector for S3.2) means another 400+ LOC of mostly-copy-paste.
+
+**Fix shape:** extract a generic `createDetectorScheduler<TCandidate, TOutcome>({ pollSource, candidateBuilder, eligibilityFilter, dispatcher, ... })` factory in `src/memory/detector-scheduler.ts`. Each detector becomes ~80 LOC of adapter wiring (source query + candidate shape + dispatcher reference). Shared core handles cursor, cap, dedup, filter, dispatch wrap, shutdown, counters. Estimated reduction: 1466 → ~600 LOC (~60% cut). Cross-cutting fix surface drops from 3 sites to 1.
+
+Companion: extract `isFactualMemoryEligible(file): boolean` to share the type/trust/state filter between the scheduler's pre-flight gate AND the dispatcher's TOCTOU re-peek. Today the two implementations can drift (and a new state filter added to one would silently skip the other).
+
+Companion: extract `pickDefined(obj, keys)` (or use `lodash.pickBy(obj, isDefined)`) to replace the 30+ `...(deps.X !== undefined ? { X: deps.X } : {})` lines per scheduler with a single `pickDefined(deps, FORWARD_KEYS)`.
+
+**Pull-in signal:** (a) a fourth detector lands (signal `edit_reverted` for S3, or any new governance LLM-judge), OR (b) a fifth round-of-fixes hits the "had to edit all three schedulers" pattern. Either is a real signal the abstraction is overdue.
+
+**Risk:** harder to grep "everything about verify-semantic" in one file. Mitigated by keeping each adapter file focused on detector-specific shape + a single import from the shared core. The shared core's documentation needs to be load-bearing — operators tracking detector behavior shouldn't have to jump between two files for the common path.
+
+**Spec reference:** none — pure internal refactor, no contract change. The detector outputs + audit chain shape stay identical.
+
+### Persist scheduler cursor across process restarts
+
+**Status:** each scheduler keeps its `(createdAt, id)` cursor in a closure variable. Initial value `(0, 0)` means the first poll after every process restart re-scans the entire source table from epoch. The attempts dedup cache (`memory_verify_attempts` etc.) prevents re-dispatch, so correctness is fine; only perf is at stake.
+
+**Problem:** with 90d retention + heavy use, the source tables (`memory_provenance`, `memory_events`, `memory_override_events`) grow to thousands of rows. Every boot pays O(N) scan + N peek + N pending-proposal lookups before the cursor advances past the historical bulk. Latency at boot, not at steady state.
+
+**Fix shape:** add a tiny `poll_cursors` kv table (PK: `(detector_name, parent_session_id)`, columns: `cursor_at INTEGER`, `cursor_id TEXT`, `updated_at INTEGER`). Persist on `advanceTo`; load on scheduler construction. Or land per-session in `sessions` table as a JSON blob. Either way the boot path skips historical noise.
+
+**Pull-in signal:** boot-time scheduler scan starts showing up in performance traces (today probably <50ms, hard to notice).
+
+**Spec reference:** none — internal optimization.
+
+### Sync `task` subagent under cap-watchdog
+
+**Status:** the cap watchdog in `runAgent` (`src/harness/loop.ts`) listens to `cost_update` IPC events per active subagent and fires `subagentHandleStore.cancelAll('cap_watchdog')` when cumulative live spend crosses `budget.maxCostUsd`. The store walks its `records` map.
+
+**Problem:** sync `task` / `task_sync` spawns flow through `spawnSubagentImpl` WITHOUT a `handleId`, so no record is created in the store. A long-running sync subagent that overshoots its declared estimate mid-execution does NOT get cancelled by the watchdog; it runs to completion, charging `cumulativeChildCostUsd` after the fact. The hard cap may be exceeded by up to one sync child's actual cost.
+
+**Fix shape:** either (a) plumb sync spawns through the store with an implicit `cap=1` slot so the watchdog reaches them, OR (b) attach a passive cost-update observer to sync runs that drives the same `cancelAll` logic. Both require deciding how sync's awaiting parent handles a watchdog-driven cancel (the parent is blocked on `await runSubagent`; cancellation needs to flow back through the abort signal already wired).
+
+**Pull-in signal:** an operator reports a sync subagent overshooting `budget.maxCostUsd` by a non-trivial margin. Today's worst case is bounded by `definition.budget.maxCostUsd` (which the load gate already validates is finite + positive); ergonomic operators see the overage in their session totals but not at runtime.
+
+**Spec reference:** `ORCHESTRATION.md §3.5` (in-flight cap enforcement) — currently silent on sync vs. async asymmetry; spec amendment should land alongside the fix.
+
+## Dependency graph
+
+```
+Phase 1 — substrate + audit family (NO text heuristics — policy decision)
+  S0 (escape hatch)              →  ✅ done
+  S1 (provenance)                →  ✅ done, blocks S3/S11/S13
+  S2 (verify_failed substrate)   →  🔁 rolled back; audit-only via /memory audit --trigger
+  S6 (penalty)                   →  ✅ done
+  S4 (conflict audit substrate)  →  ✅ done (substrate only)
+  S5 (trust_revoked)             →  hash check + operator modal (no heuristic — deterministic)
+  S3 (override counter)          →  threshold counter + LLM-judge proposal (deterministic gate, LLM verdict)
+  S7 (docs+smoke)                →  last (after S0..S6)
+
+Phase 2 — LLM-judge governance (`feat/memory-governance-llm`)
+  S8  (proposal substrate)        →  ✅ done, unblocks S3/S11/S13
+  S11 (LLM-judge verify_failed)   →  ✅ done, PRIMARY detector for factual drift
+  S13 (LLM-judge conflict)        →  depends on S8 + S4 audit substrate (uses S11 subagent infra)
+  S10 (consolidation subagent)    →  depends on S8, deferred
+  S12 (confidence separation)     →  independent, deferred
+```
+
+Recommended order: **S0 ✅ → S1 ✅ → S2 🔁 → S6 ✅ → S4 ✅ → S5 ✅ → S7 ✅ → S8 ✅ → S11 ✅ → S3 / S13** (Phase 2 remainder; can ship in any order on top of S8 + S11's subagent infra).
+
+Architectural commitment: zero text-heuristic for memory lifecycle decisions in this codebase. All prose judgment defers to LLM-judge via S8 governance proposals (propose-not-mutate; operator approves). Deterministic substrate (state machine, audit, frontmatter, hashing, expiry, scope precedence) stays.
+
+Phase 2 ideally lands on a separate branch (`feat/memory-governance-llm`) since the LLM-judge family introduces a different risk surface (injection, cost, non-determinism) and merging Phase 1 first keeps the heuristic baseline shippable independently.
+
+## Tracking
+
+Each task lands as one or more commits on the active branch. Each slice closes with a `feat(memory): slice N done` entry in `docs/BACKLOG.md` summarizing the slice's commits. Phase 1 final consolidation at S7; Phase 2 begins on a new branch after that lands.
+
+---
+
+# DEFERRED — items intentionally left for later
+
+## LLM-judge detector caps: push notification when latched (MEMORY.md §12.5.5)
+
+**Status:** noted during the post-Slice-Q architecture review (2026-05-18). Companion to TODO entry "Aggregate observability for memory-governance detectors" below — both close the loop on the default-ON detector posture.
+
+**What it is:** the verify-semantic + verify-conflict schedulers hold per-session counters (`dispatched`, `costUsdSpent`) with caps (`MAX_DISPATCHES_PER_SESSION = 10`, `MAX_COST_USD = 0.5`). When either cap latches, the scheduler:
+
+1. Sets `counters.capExhausted = 'dispatch' | 'cost'`.
+2. Writes one stderr line.
+3. Returns early on subsequent ticks for the rest of the session.
+
+The stderr line scrolls off; the `capExhausted` state is only readable via `/memory governance status` (pull). An operator in a long session can lose visibility on the fact that the detector silently stopped running — exactly the kind of "default-ON that silently degrades" failure mode the Slice Q first-boot banner was designed to prevent.
+
+**Why deferred:** ergonomics, not correctness. Cap-latch is rare in normal use ($0.50 / 10 dispatches is enough headroom for typical sessions); ship the visible-pull surface first and let real operator feedback drive the push surface.
+
+**Where it would land:**
+
+- `src/memory/verify-semantic-scheduler.ts` + `src/memory/verify-conflict-scheduler.ts` — when the cap first latches, emit a TUI bus event (e.g. `governance:cap_exhausted` payload `{detector: 'verify_semantic'|'verify_conflict', cap: 'dispatch'|'cost', counters}`) once per scheduler instance (latch-edge, not every tick).
+- `src/cli/slash/commands/memory.ts` — bare `/memory` summary line surfaces a `(governance: 1 detector capped — see /memory governance status)` suffix when any scheduler is capped in the current session.
+- Alternative surface: inline notification (existing `addInlineNote` / similar) on the first `/memory <anything>` after the latch — operators typing memory slash commands are the ones who'd act on the signal.
+
+Decision when pulled: push (event-driven, visible immediately) vs lazy (next operator query). Edge case: a session that hits the cap and never types another `/memory ...` would still miss the lazy surface — push is safer for the default-ON posture.
+
+**Pull-in signal:** any of: (a) operator-reported incident where a detector stopped running and the operator only noticed via `/memory governance status` later; (b) telemetry shows non-trivial fraction of sessions reach cap; (c) the post-Slice-Q "is the default ON actually producing useful proposals?" review (the companion observability entry below) makes cap visibility a prerequisite.
+
+**Cost when pulled:** small (~50 lines + tests). The TUI bus already exists; the scheduler already tracks `capExhausted`. Mostly wiring.
+
+## Aggregate observability for memory-governance detectors (MEMORY.md §12.5)
+
+**Status:** noted during the post-Slice-Q architecture review (2026-05-18). Companion to the "caps push notification" entry above.
+
+**What it is:** `/memory metrics` covers the eviction pipeline (motivo distribution, restore rate, quarantine dwell, block counts). No analog exists for the LLM-judge detectors. Questions like:
+
+- "What's the detector's true-positive rate? How many `contradicted`/`conflicting` verdicts landed as proposals, and how many of those did operators approve?"
+- "Which memories generate the most quarantine proposals?" (signals: noisy memory, ambient drift in the repo around a stable memory, detector false-positive bias)
+- "What's the cumulative dollar cost per session window?" (mid-flight visibility into the `MAX_COST_USD` cap)
+- "Which memories have never been exposed?" (the inverse of proposals — memories that aren't earning their slot in eager-load)
+
+…require manual SQL joins across `memory_verify_attempts` + `memory_conflict_attempts` + `memory_governance_proposals` + `memory_events` + `memory_provenance`. Operator-side this is fragile. The pull-in is exactly when defaults flipped ON (Slice Q): "are these detectors helping or making noise?" stops being theoretical.
+
+**Why deferred:** scoped out of Slice Q (Slice Q was about inverting the default + opt-out surface, not new observability). The substrate to compute these metrics already exists — only the rendering + slash surface is missing.
+
+**Where it would land:**
+
+- `src/cli/slash/commands/memory.ts` — new subcommand `/memory detector metrics [--days N]` aggregating:
+  - **Per-detector** (S11 verify-semantic / S13 verify-conflict):
+    - dispatches in window (total, by verdict — passed/contradicted/inconclusive for S11, compatible/conflicting for S13)
+    - proposals emitted (verdicts that crossed `confidence >= threshold`)
+    - sub-threshold auto-archived count (the silent drop path)
+    - approval rate of emitted proposals (approved / (approved + rejected + expired); pending excluded)
+    - cumulative cost / mean cost per dispatch
+    - dedup-cache hit rate (cache hits / total attempts)
+  - **Memory ranking**: top N memories by proposal count (cross-detector); top N memories with zero exposures over the window.
+- `src/storage/repos/memory-governance.ts` (or sibling) — aggregator queries returning typed structs. Pure SELECT; no schema changes.
+- `tests/cli/slash/memory.test.ts` + repo tests pinning the aggregates against seeded fixtures.
+
+**Pull-in signal:** any of: (a) first operator who hits "is verify_semantic actually finding bugs?" and runs out of patience with raw SQL; (b) `MAX_COST_USD` cap latches in real use and the post-mortem needs "where did the money go?"; (c) tuning the confidence threshold needs sub-threshold-drop visibility to choose between 0.6 and 0.8.
+
+**Cost when pulled:** medium. ~150-200 lines of SQL + rendering + tests. The harder design question is what the table shape should be — operator-facing aggregates need a clear narrative ("here's whether the detector is helping you"), not just "here are the numbers".
+
+## Memory quarantine flag enrichment: motivo + date (MEMORY.md §6.5.2)
+
+**Status:** noted during Slice 0 (T0.2) and Slice 6 (T6.2) implementation. Same deferral shape on two surfaces.
+
+**What it is:** spec §6.5.2 formats the quarantine flag as `[memory: quarantined — <motivo> <YYYY-MM-DD>]` — e.g., `[memory: quarantined — conflict 2026-04-15]`. Both the `/memory list` slash command (T0.2) and the eager-load section in `cli/memory-prompt.ts` (T6.2) ship the minimal `[memory: quarantined]` flag today without the motivo + date enrichment.
+
+**Why deferred:** motivo + date live in `eviction_events`, NOT in the memory frontmatter. Enriching the flag requires a JOIN against `eviction_events` (specifically the latest applied `quarantined` event for that `(scope, name)` pair via `getLastQuarantineEvent`). Two call sites means two JOIN points; both should land together when the enrichment is wired so the format stays consistent across surfaces.
+
+**Where it would land:**
+
+- `src/cli/slash/commands/memory.ts` — `handleList` already peeks per-listing for state rendering (T0.2). Extend to call `getLastQuarantineEvent(db, 'memory', name, scope)` for each quarantined entry; format `[QUARANTINED motivo YYYY-MM-DD]`.
+- `src/cli/memory-prompt.ts` — `assembleMemorySection` already peeks for trust filter; extend to lookup the same quarantine event; format `[memory: quarantined — motivo YYYY-MM-DD]` per spec.
+
+**Pull-in signal:** operator request OR detector volume crosses threshold where "which memory is quarantined for which reason" becomes opaque from the bare flag. Estimate: ~10 quarantined memories per install. Below that, the bare flag + `/memory audit` lookup is enough.
+
+**Cost when pulled:** ~1 disk-cached SQL query per quarantined entry per render. For a session with N quarantined (likely < 5), negligible.
+
+## Memory trust filter on `retrieve_context` slot (AGENTIC_CLI §1.1.5)
+
+**Status:** acknowledged gap pre-S6; widened by S6 (quarantined memories now reach the slot, but no trust filter).
+
+**What it is:** the retrieval memory view (`src/retrieval/views/memory.ts`) filters by `states: ['active', 'quarantined']` + `includeExpired: false` but does NOT filter by `trust`. An operator-marked `trust: untrusted` memory reaches the retrieve_context slot unimpeded — eager-load filters it out (§7.2.2), but retrieval doesn't.
+
+**Why deferred:** the gap predates S6 (active untrusted memories already reached retrieval); S6 expanded it to include quarantined untrusted memories. Fixing it requires deciding the contract: hard-filter (mirror eager-load), include with marker, or operator-policy opt-in. Decision is design work, not just code work.
+
+**Where it would land:**
+
+- `src/retrieval/views/memory.ts:114-118` — add `trustFilter` option to the `registry.list()` call, OR a post-list filter on `listing.peek.frontmatter.trust`.
+- Decide: trust=untrusted hard-filtered? Surface with `[memory: untrusted]` reason marker? Operator opt-in via `policy.retrieval.allow_untrusted = false` default?
+- `tests/retrieval/memory-view.test.ts` — pin the chosen contract.
+
+**Pull-in signal:** any of: (a) detector quality measurement reveals untrusted bodies systematically degrading retrieval relevance; (b) security review flags the surface explicitly; (c) operator-reported incident where untrusted body content shaped a model decision.
 
 ## Monotonic seq tiebreaker on the remaining time-ordered tables
 

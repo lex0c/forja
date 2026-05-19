@@ -2,6 +2,3327 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-18] hardening(memory + cli + permissions) — Post-Phase-2 review round 3 (9 commits)
+
+Third pass of code review over the post-S3 memory governance, plus one finding outside memory in `src/permissions/protected_paths.ts` (XDG_RUNTIME_DIR socket carve-out). All landed as individual commits on `feat/memory-governance-llm` for atomic review:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `5daed95` | fix | memory | pass ctx.sessionId to recordOverrideSignal in memory-write modal branches |
+| `a5d4b6d` | docs | todo | defer scheduler abstraction refactor + cursor persistence |
+| `4231cd5` | fix | memory | bound override scheduler cursor + evidence fetch to threshold window |
+| `6762a9b` | fix | memory | blacklist failed conflict pairs in-session to break retry loop |
+| `3bfba73` | fix | memory | preserve untouched detector keys when toggling at project scope |
+| `ed6989a` | fix | cli | pipe json into recap bootstrap to suppress governance banner |
+| `3ac479c` | fix | cli | render actual scopes in subagent shadow warning |
+| `c21a279` | fix | memory | skip conflict dispatch when pair member disappeared from registry |
+| `d22a143` | fix | permissions | re-deny XDG_RUNTIME_DIR socket subpaths inside /run/user carve-out |
+
+**Themes:**
+
+- **Silent budget-leak windows in default-on detectors.** Three commits close paths where an LLM-judge detector silently drained API budget without producing the signal the operator expected. `5daed95` fixed memory-write modal rejections silently no-op'ing the S3 override signal (bootstrap-built registry has no constructor sessionId; `recordOverrideSignal` early-returned without the explicit `auditSessionId` arg). `4231cd5` fixed the override scheduler initializing cursor at epoch (drained 90d retained rows before reaching fresh threshold-tripping events) AND fetching events outside the threshold window into the LLM judge's prompt + persisted evidence. `6762a9b` fixed the conflict scheduler looping on malformed/spawn_failed pairs (dispatcher returned before writing the attempt row, scheduler retried the same failing pair on every poll until cap latch).
+
+- **Precedence / scope misattribution.** Two commits close paths where the slash command surface lied about resolved state. `3bfba73` fixed the toggle materializing all three detector keys as `true` defaults when only one was patched (silently shadowed user-config opt-outs via project precedence). `3ac479c` fixed the subagent shadow warning hardcoding `(user)` and `(project)` labels — the PROTECTED_BUILTIN_NAMES path produces shadows with `shadowed.scope = 'builtin'`, so the labels mis-stated the security warning's subject.
+
+- **Edge cases in concurrent / TOCTOU paths.** `c21a279` fixed the conflict dispatcher silently dispatching against a stale snapshot when `registry.peek` returned non-present for either pair member — the operator deleted a memory between scheduler peek and dispatch, but the LLM judge still ran and landed a quarantine proposal for the gone memory. Mirror of the S3 `target_gone` path now wired through the conflict scheduler.
+
+- **NDJSON pollution.** `ed6989a` fixed the recap CLI path not propagating `--json` into the bootstrap, so `agent recap --json` first-boot consumers saw the governance banner pollute their stream (the main run path already piped json through; the recap branch was missed).
+
+- **Permissions surface mis-narrowing (off-memory).** `d22a143` was the one finding outside the memory subsystem. `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` re-admitted ALL paths under `/run/user/<uid>`, including ssh-agent / gpg-agent sockets, user dbus, container engines, Wayland, etc. — exactly the IPC surface the `/run` deny tier was meant to block. Carve-out narrowed via a `XDG_RUNTIME_SOCKET_SEGMENTS` denylist matching the first segment after the uid directory; regular files under `$XDG_RUNTIME_DIR/<app>/` still pass.
+
+- **Architectural follow-up captured.** `a5d4b6d` deferred two refactoring items to `docs/TODO.md` (the third-round review pass made the abstraction debt visible — several fixes in this slate had to land identical edits across S11/S13/S3 schedulers): (a) extract a `createDetectorScheduler<TCandidate>` factory to collapse the ~1466 LOC three-way duplication, (b) persist scheduler cursor across process restarts so the first poll doesn't re-scan retained tables from epoch. Each entry includes a pull-in signal so the refactor doesn't land prematurely.
+
+**Verification posture.** Most fixes include a `git stash` pre-fix repro confirmation in their commit message — the test pin was checked to fail with the buggy code, prove the fix changes behavior, then validated under post-fix. This pattern surfaces over commit `4231cd5`, `6762a9b`, `3bfba73`, `3ac479c`, `c21a279`, `d22a143`. Two fixes (`5daed95`, `ed6989a`) ship without the stash repro: `5daed95`'s new test is a strict superset of the existing source-gate pin and inspects an additional field; `ed6989a` is a one-line wiring fix where the existing bootstrap-level test (line 134 of `bootstrap-memory-defaults.test.ts`) already pins the `json=true → no banner` contract.
+
+**Test deltas.** Suite went from ~8809 → ~8855 across the 9 commits (~46 new test cases dominated by `protected_paths.test.ts` +20 and the various per-fix regression pins). Typecheck + lint clean throughout. All fixes localized to their subsystem — no cross-cutting refactors. The architectural debt those cross-cutting paths surface is tracked in `docs/TODO.md` (entries from `a5d4b6d`).
+
+**Production-readiness shift.** Round 2 closed the eval gap + the highest-severity silent-failure paths. Round 3 closes the long-tail of "subtle silent-failure windows" — operator-visible bugs that the eval suite didn't catch because they were observable only under specific operator workflows (custom config layers, plan mode + recap, manual disable+reenable cycles, sibling-deletion race). After this round there are no known operator-visible silent-failure windows in the default-on detector paths. The memory subsystem's "production-ready for the LLM-judge governance flow" claim from round 2's BACKLOG entry holds; this round hardens the surface around it.
+
+## [2026-05-18] hardening(memory + harness) — Post-Phase-2 review round 2 (12 commits)
+
+Second pass of code review over the post-S3 memory governance + the eval suite landed in this same day. Findings split between substrate gaps (bugs that affect operator-facing behavior), one fuzz-target flake, and one missing surface (compile-mode builtin distribution). All twelve landed as individual commits on `feat/memory-governance-llm` for atomic review:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `179021a` | eval | memory | governance-flow deterministic fixture suite (8 cases) |
+| `2dfb08a` | eval | smoke | force serial reads on compaction-triggers fixture |
+| `0b8d8e2` | fix | subagents | embed builtin definitions for `bun build --compile` |
+| `57f19bb` | fix | fuzz | amortize migrations in chain target (5371ms → 298ms; kills timeout flake) |
+| `7cbf1d7` | fix | memory | surface decideProposal race in applyProposal via `governanceDrift` |
+| `7f66cba` | fix | memory | SELECT `deferred_until` + `defer_count` in memory-scoped proposal queries |
+| `c12bccd` | fix | harness | attribute `permission_denied` to session exposures, not denied tool call |
+| `312a755` | fix | memory | gate `memory_write_rejected` override signal on `source=inferred` |
+| `73c75fb` | fix | memory | emit save-guidance header even when no memories exist |
+| `ed77024` | fix | memory | apply governance toggle to live `ctx.baseConfig`, not just config file |
+| `993e83a` | fix | memory | propagate config-loader warnings through `BootstrapResult` to stderr |
+| `fa9d80a` | fix | harness | gate memory governance schedulers on `planMode=false` |
+
+**Themes:**
+
+- **Default-on detectors leak budget if any safety gate is missing.** Three of the fixes (`fa9d80a` plan-mode, `c12bccd` permission_denied attribution, `312a755` source=inferred) close paths where a default-on LLM-judge detector could fire (or fail to fire) against the operator's intent — burning API tokens + landing governance writes in read-only sessions, mis-attributing signals to memories that didn't drive the operator's action, or counting the operator's own corrections against unrelated memories. All silent-failure shapes pre-fix.
+- **Live state mutation matters.** Two commits address "the operator changed something but the next turn doesn't see it" gaps: `ed77024` (toggle didn't touch `ctx.baseConfig`) and `993e83a` (malformed `[memory]` TOML silently fell back to defaults with no diagnostic). Both contradict the slash command's "effect at next turn boundary" promise.
+- **Distribution mode bit-rot.** `0b8d8e2` and `57f19bb` are non-memory but tied: the compiled binary silently lost LLM-judge detectors because `import.meta.dir` doesn't enumerate under `/$bunfs/`, and the chain fuzz target's 200-iteration headline test sat right at the bun:test 5s timeout because migration count grew past what the original "~10ms/iter" comment assumed.
+- **API contract honesty.** `7cbf1d7` and `7f66cba` close two narrow contract gaps: `applyProposal` returning `applied` even when the post-transition stamp raced (memory mutated but the row credits someone else), and `listProposalsForMemory` returning rows with `undefined` instead of `null` for `deferredUntil` (consumers doing `!== null` saw "deferred" everywhere).
+- **First-session UX.** `73c75fb` flips the prior "no memories → no header" gate (which optimized for tokens) to "always render the header" because fresh sessions are exactly when the model is most likely to propose bad inferred saves and needs the save criteria + DO-NOT-save list in context.
+
+**Eval coverage.** First commit shipped the `evals/memory/` deterministic fixture suite (8 fixtures covering all three detectors + all three operator decisions + two defense gates F8/F11). Closes the eval gap flagged by the original Phase-2 review under CLAUDE.md principle 4.
+
+**Test deltas.** Suite went from 8787 → 8809 across the 12 commits (+22 tests, dominated by the eval suite at +8 and the rollback/race/regression pins). Typecheck + lint clean throughout. Smoke 9/10 (`04-grep-search` real-LLM variance is pre-existing, tracked separately).
+
+**Production-readiness shift.** Before this round: subsystem was "shipped per spec" but had eval gap + several silent-failure surfaces. After: eval-covered for the governance flow, no known silent-failure paths in the default-on detectors, slash toggle has live-mutation semantic, compiled binaries actually carry the built-in subagents. The phase-2 fixes are no longer load-bearing on follow-up work.
+
+## [2026-05-18] eval(memory) — governance-flow deterministic fixture suite (8 cases)
+
+Closes the eval gap flagged during the post-Phase-2 audit: per `CLAUDE.md` principle 4 ("Eval is load-bearing — a subsystem without eval doesn't ship"), the memory subsystem had 8787 unit tests but zero eval coverage. `evals/regression/` + `evals/smoke/` carried 53 YAML cases across file IO / bash / hooks / compaction / plan-mode — none touching memory, governance, or any LLM-judge detector. By the project's own bar the subsystem was not production-ready despite the surface looking complete.
+
+This slice ships an `evals/memory/` fixture suite mirroring the deterministic pattern from `evals/critique/`: TS modules export pinned subagent verdicts; a `bun test` runner (`tests/memory/eval-fixtures.test.ts`) drives real dispatchers + real governance apply path + real state machine + real audit pair against those verdicts. Each fixture exercises the propose-not-mutate narrative END-TO-END — dispatcher → proposal → operator decision → state transition → file rewrite → audit pair — and fails if any wire between those layers silently breaks. No API cost; runs in CI.
+
+**8 fixtures cover:**
+
+| # | Path | Pins |
+|---|---|---|
+| 01 | s11-contradicted-approve-quarantine | S11 happy path → approve → memory quarantined with `verify_failed` trigger; rewrites frontmatter; audit pair lands |
+| 02 | s11-contradicted-low-conf-auto-reject | Sub-threshold (0.5) contradicted verdict → proposal auto-rejects with `system:low_confidence` inside the dispatcher's txn; no operator action; memory stays active |
+| 03 | s13-conflict-approve-quarantine-loser | S13 conflicting pair (`user_explicit` vs `inferred`) → resolver picks loser → approve → only loser transitions (multi-memory carve-out via `target_payload.target_key`) |
+| 04 | s3-override-approve-quarantine | S3 threshold (3 override events in 24h) + misguiding verdict → approve → memory quarantined with `user_override_repeated` trigger |
+| 05 | s11-operator-reject | S11 happy path through dispatcher → operator `decideProposal` → status=rejected, memory stays active, no audit transition |
+| 06 | s11-operator-defer | S11 happy path → operator `deferProposal(14d)` → proposal pending with `deferred_until` extended; memory state unchanged |
+| 11 | s11-hallucination-guard | F8 defense: contradicted verdict cites nonexistent `evidence_paths` → dispatcher refuses as `malformed` BEFORE recording any attempt; no proposal, no dedup cache poison |
+| 12 | s11-stale-snapshot-toctou | F11 defense: memory body changed between scheduler peek and dispatch → dispatcher refuses with `stale_snapshot` after content-hash compare against fresh registry peek |
+
+**Runner extensions** (`tests/memory/eval-fixtures.test.ts`):
+
+- 3 dispatcher branches (S11 / S13 / S3) with detector-specific seeding (pair-with for S13, override-events count for S3, repo-files for hallucination guard satisfaction).
+- 3 operator decision branches: `applyProposal` (approve), `decideProposal` (reject), `deferProposal` (defer with additionalDays).
+- `expected.dispatcherOutcome` defaults to `'completed'` but accepts `skipped`/`malformed`/`spawn_failed`; `dispatcherReasonContains` pins the EXACT refusal path.
+- Registry built AFTER seedMemoryFile + repoFiles so fixture 12's TOCTOU narrative works (snapshot=v1, on-disk=v2, F11 detects via fresh peek).
+- MEMORY.md index appends rather than overwrites so multi-memory fixtures (S13 pair) don't lose siblings.
+- Detector-specific attempt-count helpers (`listRecentAttempts` / `listRecentConflictAttempts` / `listRecentOverrideAttempts`) route to the right repo.
+
+**Explicitly out of scope** (different surfaces; unit-tested or deferred for separate eval suites): trust revocation cascade (bootstrap-level orchestration), scope precedence dedup (pure registry behavior, covered in `tests/memory/registry.test.ts`), eager-load with trigger (system-prompt assembly via `assembleMemorySection`), headless `memory_write` rejection (CLI flag wiring).
+
+**Smoke-side restoration.** While running smoke evals to confirm baseline, `08-compaction-triggers.yaml` was found failing for a reason unrelated to memory: modern Claude default to batching parallel reads in a single assistant turn, which kept `messages.length` below the compaction gate's `preserveTail + 3` boundary check (`src/harness/loop.ts:3733`). The fixture's `compaction_triggered` assertion gave false-negative coverage of compaction LLM path because the eval ended before the boundary was crossed. Fix in a separate commit (`eval(smoke): ...`): prompt rewritten to force strictly-serial reads ("one read per assistant turn, acknowledge each in text before next"), `maxSteps` 10→14, `maxCostUsd` $0.10→$0.20. Single-case re-run confirms compaction LLM fires (`pass 21881ms $0.18`, steps=4).
+
+**Slice closure metrics.** +2 commits on `feat/memory-governance-llm`; +8 eval fixtures + 1 runner (~430 LOC eval + 270 LOC runner); +1 smoke YAML restoration. Suite 8787 → 8794+ (the eval fixtures are part of `bun test` — they ship as +8 deterministic test cases). Smoke suite 8/10 → 9/10 after compaction restore (the remaining `04-grep-search` failure is real-LLM variance on a specific `output_contains` assertion, tracked separately as an in-place flake).
+
+## [2026-05-18] hardening(memory) — Phase-2 follow-on review: atomic S11+S13 persist, S3 retention sweeps, spec catch-up
+
+Follow-on code-review pass over the post-S3 codebase surfaced three actionable findings — one critical (C1), one drift (C2), one high-severity reliability hole (H3). All three landed in one commit on `feat/memory-governance-llm`.
+
+**H3 — atomic persistence on S11/S13 dispatchers.** Pre-fix mirrored the verify-override bug that an earlier review pass already closed: `recordAttempt` lands first, `recordProposal` lands second; if proposal write throws (FK violation, disk-full, malformed payload), the attempt row stays but no operator-visible proposal exists — the 7d cooldown dedup gates future polls without producing any surface. `src/memory/verify-semantic-dispatcher.ts` and `src/memory/verify-conflict-dispatcher.ts` now wrap `recordAttempt + recordProposal + decideProposal` in `withTransaction`. F18 FK retry (concurrent subagent_runs purge → INSERT throws FOREIGN KEY → retry with `subagent_run_session_id=null`) stays inside the txn so the retry stays atomic with the proposal. Two new test pins (one per dispatcher) force a FK failure via a ghost `parentSessionId` (non-existent session) and assert `outcome.kind === 'spawn_failed'` + `listRecentAttempts/listRecentConflictAttempts` zero + `listProposals` zero, proving the rollback. Existing F18 retry test's db Proxy was breaking on `withTransaction` because bun:sqlite's native `Database.transaction` accesses private fields on `this` that a Proxy doesn't expose; fix delegates the `transaction` property to the real db inside the Proxy so the closure body still runs against the proxied query path. +2 tests.
+
+**C1 — bootstrap retention sweeps for S3 tables.** `pruneOverrideEvents` and `pruneOverrideAttempts` are exported by their repos with documented 90d windows, but bootstrap was missing the callers. Without the sweeps `memory_override_events` and `memory_verify_override_attempts` grew unbounded across sessions. Two new try/catch blocks in `src/cli/bootstrap.ts` mirror the existing S11/S13 sweeps: best-effort, `AUDIT DRIFT` to stderr on failure, do not abort boot. Operator guide `docs/MEMORY.md §1` updated to list all 9 boot sweeps that actually run (the prior list named only 4; missed 5 including the pre-existing `gcStaleInvalidatedMemories`, `pruneVerifyAttempts`, `pruneConflictAttempts`, plus the two new S3 sweeps).
+
+**C2 — spec catches up with S3 detector.** `docs/spec/MEMORY.md §6.6` and `docs/spec/AGENTIC_CLI.md §5.4.1` were written when only S11 and S13 existed; S3 shipped without amending them, so the "two detectors" framing in the spec contradicted the "three detectors" reality in code + operator docs. Both updated to "Três detectores LLM-judge", with: new trigger-table row (`user_override_repeated | threshold counter (3 events em 24h) | S3`), `--memory-override-llm` / `--no-memory-override-llm` flag entries, `override_detect_llm` config key, `verify-override.md` subagent definition, `MEMORY_VERIFY_OVERRIDE_MAX_COST_USD` cost cap, and a "Threshold-first em S3" note explaining why S3 is gated on a deterministic counter (`countOverridesInWindow`) BEFORE the LLM dispatch — below-threshold polls cost zero.
+
+**Slice closure.** +1 commit on `feat/memory-governance-llm`; 7 files modified (~390 insertions, ~220 deletions); suite 8765+ → 8787 (+2 new rollback test pins); typecheck + lint clean. No production behavior change beyond the three findings — H3 closes a silent-failure window, C1 closes a disk-growth window, C2 is doc-only.
+
+## [2026-05-18] feat(memory) — S3 verify-override LLM-judge detector (4th of the 4 spec'd detectors)
+
+Closes the 4-detector quartet from `docs/spec/MEMORY.md §6.5.2`. The deterministic threshold gate (3 operator overrides in 24h per memory) feeds an isolated LLM-judge subagent that decides whether the memory is plausibly driving the rejection pattern, emits a `pending` quarantine proposal through the S8 governance substrate, and lets the operator approve / reject / defer via the existing slash surface. The other three detectors (`verify_failed` / S11, `conflict_detected` / S13, `trust_revoked`) already shipped; S3 lands the closing piece with the same architectural posture (propose-not-mutate, scheduler-at-step-boundary, capability envelope intersected, cooldown-based dedup, capped session budget).
+
+Six commits delivered across the slice, all on `feat/memory-governance-llm`:
+
+**S3.1 — Substrate (commit 15565e2).** Migration 064 `memory_override_events` (3 signal kinds: `memory_write_rejected`, `permission_denied`, `edit_reverted`; FK SET NULL on session + tool_call) + repo with `recordOverrideEvent`, `countOverridesInWindow` (sliding-window counter for threshold), `listOverrideEventsSince` (cursor poll for scheduler), `listRecentOverridesForMemory` (forensics + LLM-judge context), `pruneOverrideEvents` (90d retention sweep). Constants: `MEMORY_OVERRIDE_THRESHOLD_COUNT = 3`, `MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS = 24h` matching spec §6.5.2. +20 tests.
+
+**S3.2 + S3.3 scaffolding (commit 18d2743).** Signal collectors wire `memory_override_events` from operator actions: `MemoryRegistry.recordOverrideSignal({signal, toolCallId?, details?, excludeScopes?})` looks up factual exposures via `memory_provenance` (toolCallId-scoped or session-recent), filters to type ∈ {project, reference} ∧ trust ≠ untrusted ∧ state = active, caps fan-out at MAX_OVERRIDE_ATTRIBUTION_DEPTH=5, emits one row per attributed memory. Hooked into `src/tools/builtin/memory-write.ts` (modal + user-scope modal rejects on operator `'no'`) and `src/harness/invoke-tool.ts` (the `confirm_no` async path where the operator explicitly denied a permission ask). S5 fail-closed posture: wrapper merges its `excluded` set with caller-supplied scopes before delegating to base (HIGH bug fixed pre-commit during code review). Scaffolding for S3.3: `src/memory/verify-override.ts` (constants + types: misguiding bool, confidence, rule_extracted, override_pattern_observed, suggested_motivo ∈ {conflict, shift, low_roi}), `src/subagents/builtin/verify-override.md` (empty tools[], cap 8 steps / $0.08, anti-injection guidance), `PROTECTED_BUILTIN_NAMES` extended, governance trigger map `subagent:verify-override → user_override_repeated`. +14 tests in registry.test.ts.
+
+**S3.3 dispatcher (commit 274d789).** Migration 065 `memory_verify_override_attempts` (content-hash + suggested_motivo + boolean misguiding stored as INTEGER 0/1) + repo with `recordOverrideAttempt`, `lookupRecentOverrideAttempt` (cooldown-gated), `listRecentOverrideAttempts` (status surface), `pruneOverrideAttempts`. Dispatcher `src/memory/verify-override-dispatcher.ts` mirrors verify-semantic: empty_events guard → TOCTOU re-read → scan → 24h cooldown dedup → spawn → validate (hallucination guard for misguiding=true without rule/pattern) → record attempt (FK retry on subagent_runs purge) → governance proposal (pending for high-conf, auto-rejected with `system:low_confidence` for low-conf, no proposal for misguiding=false). +26 tests.
+
+**S3.4 scheduler + harness (commit 202af9a).** `src/memory/verify-override-scheduler.ts` mirror of verify-semantic-scheduler with threshold gate substituted for type-only gate. Per poll: pull events since cursor (createdAt, id), dedup by (scope, name) preserving first-sight, check threshold via `countOverridesInWindow`, run defense-in-depth filters, pending-proposal short-circuit, one dispatch per poll. Harness loop wires construction (gated on memoryOverrideDetect + memoryRegistry + verify-override definition + non-subagent context), step-boundary tick (awaited), finally-block shutdown. Capability envelope intersected via the same `parseCapability` / `intersectCapabilities` shape as S11/S13. `HarnessConfig.memoryOverrideDetect?: boolean` + `memoryOverrideDetectSource` provenance. +21 tests.
+
+**S3.5 opt-out wiring (commit 74fedc3).** `MemoryConfigKeys.overrideDetectLlm`, `DEFAULT_MEMORY_CONFIG.overrideDetectLlm = true` (default ON, joining the S11/S13 posture from Slice Q). `parseMemoryLayer` accepts `override_detect_llm` (snake, canonical) + `overrideDetectLlm` (camelCase, accepted), warns on dual-key. Bootstrap: `BootstrapInput.memoryOverrideDetect`, banner gate extended to require `overrideFromDefault`, banner text updated to `(verify=on, conflict=on, override=on)` + `verify|conflict|override|all`, HarnessConfig populated with source provenance. CLI: `args.memoryOverrideLlm` + `--memory-override-llm` / `--no-memory-override-llm` flags + mutex + F12 mirror. Slash: `parseDetectorTarget` accepts `'override'` and `'all'` covers all three. `mutateMemoryConfig` writes `override_detect_llm` to the canonical block alongside the other two keys; reads accept both casings. +18 tests (config-loader 4, args 5, slash toggle 5 new + 4 adjusted existing).
+
+**S3.6 status surface + docs (this commit).** `/memory governance status` renders a third block `verify-override (S3 / LLM-judge):` with enabled state + source label (all 8 source × enabled combinations covered in the test matrix), caps, cooldown, recent attempts (most-recent first, showing misguiding/noise verdict + confidence + motivo + memory key + model id). docs/MEMORY.md §11.4 updated: "all three detectors" framing, config block shape includes `override_detect_llm`, slash commands list includes `override` target, first-boot banner advisory mentions all three. §12.5 "LLM-judge detector pipeline" table extended to three columns. §14.4 "What IS shipped" gains the canonical S3 entry replacing the prior "substrate-only" line. +9 tests in the source-label render matrix (8 source × enabled combos + 1 "renders all three blocks unconditionally").
+
+**Architectural posture.** All four detectors (S11 + S13 + S3 + trust_revoked) wired with the same shape:
+
+- **Propose-not-mutate** — every detector emits to `memory_governance_proposals`; only `applyProposal` calls `transitionMemoryState`; only after the operator approves through `/memory governance approve` does memory state change.
+- **Default ON with three-layer opt-out** — CLI flag > project config (`.agent/config.toml [memory]`) > user config (`~/.config/agent/config.toml [memory]`) > hardcoded default. First-boot stderr banner once, then silent.
+- **Cost-bounded** — per-session dispatch + cost caps (10 dispatches / $0.50) per detector with per-dispatch headroom check. Cap-latch is sticky (`capExhausted` field on `getCounters()`); follow-up TODO entry tracks "push notification when latched" since today the cap-latch state is pull-only via `/memory governance status`.
+- **Isolated subagents** — `parentApprovalId: null`, new session id, capability envelope intersected with parent's, structured output schema validated before any persisted side effects. `PROTECTED_BUILTIN_NAMES` surfaces project/user shadows in the loader so a malicious override doesn't silently widen the tools[] envelope.
+- **Cooldown / dedup substrate** — each detector has its own attempts table (memory_verify_attempts / memory_conflict_attempts / memory_verify_override_attempts) keyed on `content_hash`; rebuild on operator edit; 7d window for verify-semantic + verify-conflict (high-stakes verdicts re-dispatch), 24h cooldown for verify-override (both verdicts dedup because the pending-proposal gate upstream prevents queue duplicates).
+- **Audit chain** — `/memory governance audit <id>` surfaces proposal + linked memory_events. Both LLM-judge spawn paths populate `subagent_runs.session_id` linked from the attempts table; the alternative-chain bypass (audit-chain through attempts table instead of via `parent_approval_id`) documented in §14.4 "Audit-chain bypass" stays consistent across all three.
+
+**Slice closure metrics.** +6 commits (S3.1 through S3.6); +~3500 lines of code + ~3000 lines of tests; suite count 8649 → 8765+ (+~120 new tests across the slice, the rest of the diff is test infrastructure that re-fired across other suites). Zero regressions outside the pre-existing `chainFuzzTarget` host-load flake. Lint + typecheck clean throughout.
+
+## [2026-05-18] hardening(memory) — Slice Q post-review (5 CRIT + 14 HIGH + MEDs)
+
+Three parallel reviewers on the Slice Q diff surfaced 5 CRIT + 14 HIGH + ~16 MED findings — banner UX, mutator robustness, doc/code drift, status-render coverage. All criticals + highs + bug-class meds closed in this pass (R1-R8) BEFORE the Slice Q commit lands; suite stays green at every step.
+
+**R1 — Spec + operator-doc anchor.** Added `docs/spec/AGENTIC_CLI.md §5.4.1` declaring `[memory]` config block (snake_case + camelCase aliases, precedence table, 2 config layers — no enterprise yet) and `docs/spec/MEMORY.md §6.6` "Detectores LLM-judge — default ON, opt-out via slash + config". Promoted operator-guide `docs/MEMORY.md §11.4` from `####` subsection to top-level peer of §11.3, removed PT-BR fragments, added spec cross-references, documented the `~/.local/share/forja/.governance-banner-shown` marker file.
+
+**R2 (B-CRIT-3 + A-M5) — first-boot banner suppression.** Banner now respects `--json` mode (NDJSON consumers expect predictable stderr) AND a per-machine marker at `~/.local/share/forja/.governance-banner-shown`. `BootstrapInput.governanceBannerMarkerDir?: string | null` for test injection (`null` disables marker entirely, useful for CI determinism). Default location uses `homedir()`. Errors writing marker degrade silently to "emit anyway" (better than suppressing a banner the operator never saw).
+
+**R3 (A-H1/2/3 + A-M1/4) — `mutateMemoryConfig` round-trip.** Pre-fix was text-level extract-and-replace of the `[memory]` block via section-header regex; defeated by multi-line basic strings (embedded `[memory]` lookalike), quoted-key tables, whitespace inside `[ memory ]`, BOM, CRLF, and `lastIndexOf('/')` on Windows. Refactored to `Bun.TOML.parse(raw) → mutate object → emit canonical` via a 40-line TOML emitter handling scalars + flat tables (exhaustive for `.agent/config.toml`'s schema; extends naturally if a future subsystem adds nested tables). Trade-off (lose comments + original whitespace) documented in code. `dirname()` for Windows compat; require() hoisted to top-level imports.
+
+**R4 (C-CRIT-1 + C-CRIT-2) — bootstrap end-to-end tests.** New `tests/cli/bootstrap-memory-defaults.test.ts` (+8 tests): fresh-repo defaults ON via source=`'default'`, first-boot banner emits with marker creation, second-boot stays silent (marker gate), `--json` suppresses banner without writing marker, explicit CLI override bumps source to `'cli'`, project/user config sets `'project-config'`/`'user-config'` source, project wins over user when both touch verify, marker dir=null disables marker (banner re-fires every boot).
+
+**R5 (C-H4) — source-label render matrix.** New describe block in `tests/cli/slash/memory.test.ts` (+16 tests) pinning all 16 distinct enabled/source label strings (8 verify × 8 conflict). Found and fixed a real bug along the way: `handleGovernanceStatus` was early-returning when verify had no recorded attempts or the read failed, suppressing the entire S13 block. Now both blocks always render; recent-attempts is the only conditional within each block.
+
+**R6 (B-M1 + B-H2) — language policy fix + dual-key warning.** PT-BR fragments in `src/cli/args.ts:1730-1732` ("polariades / precisam refusar a combinação / estendido") rewritten in English per project policy. Stale "Default off" comments on `memoryVerifyLlm` / `memoryConflictLlm` fields updated to reflect Slice Q inversion. `config-loader.parseMemoryLayer` now emits a warning when BOTH spellings of the same field appear in `[memory]` (snake wins, camel silently ignored pre-fix → operator confusion). +2 tests in `tests/critique/config-loader.test.ts` (dual-key warning fires; single-spelling stays quiet).
+
+**R7 — test-gap rollup.** Slice Q + R3-R6 added robustness coverage that subsumed the originally-tracked minor gaps (multi-line string in `[critique]`, whitespace-inside-brackets, CRLF round-trip, empty-file gain `[memory]`, camelCase→snake_case normalization on rewrite, malformed-TOML refuses write). +6 tests in `tests/cli/slash/memory-governance-toggle.test.ts`.
+
+**R8 (A-M6 + B-H5) — banner emit-both decision comment.** Documented in `src/cli/bootstrap.ts` the deliberate choice to emit ONE banner gated on BOTH detectors-from-default (instead of per-detector banners): an operator who config-touched EITHER field has signaled awareness of the subsystem; emitting half-of-a-per-detector banner on subsequent boots would be noise. Counter-argument noted + rejected with trade-off rationale.
+
+**Test footprint:** +42 new tests across 4 files. Suite: **8649 pass / 0 fail / 10 skip** (was 8617 pre-hardening). `bun run typecheck` + `bun run lint` clean.
+
+## [2026-05-18] feat(memory) — Slice Q: invert S11+S13 LLM-judge default to ON; opt-out via slash + per-project config
+
+Operator decision: the two LLM-judge detectors (`verify_failed` / S11, `conflict_detected` / S13) inverted from default OFF to default ON. Cost not a limitation; coverage is. Opt-out via slash command persisted per-project — mirroring the `[critique]` precedent in `.agent/config.toml`.
+
+**Resolved precedence chain** (boot-time, first-match wins):
+
+1. CLI flag explicit (`--memory-verify-llm` / `--no-memory-verify-llm` ditto for conflict). Session-only.
+2. Project config `.agent/config.toml [memory] verify_semantic_llm = false`.
+3. User config `~/.config/agent/config.toml [memory] verify_semantic_llm = false`.
+4. **Default ON** (the new default).
+
+Shipped (Q1-Q7):
+
+- **Q1**: spec + doc edits. `docs/MEMORY.md §11.4` (Detector opt-out & per-project config) precedence table. §14.4 audit-chain-bypass extended to cover both detectors. Lines 976/980 inverted from "Opt-in via" to "Default ON; opt-out via".
+- **Q2**: `loadMemoryConfig` in `src/critique/config-loader.ts` reusing `userConfigPath` / `projectConfigPath` / fail-soft warnings. Returns `{config, userHadField, projectHadField, warnings, paths}` — provenance signals drive banner suppression. snake_case + camelCase aliases.
+- **Q3**: bootstrap integration. `HarnessConfig.memorySemanticVerify`/`memoryConflictDetect` (still optional in type for fixture compat); `HarnessConfig.memorySemanticVerifySource`/`memoryConflictDetectSource` provenance fields. Boot banner: when BOTH resolve to ON via default + CLI absent → single stderr line `memory: governance LLM detectors enabled by default ... Disable: /memory governance disable verify|conflict|all`. Subagent context naturally suppresses (subagent-child has its own boot path).
+- **Q4**: CLI `--no-memory-verify-llm` / `--no-memory-conflict-llm` siblings. Mutual-exclusion guard: `--x` + `--no-x` in same argv → parse error. F12 mirror extended to refuse either polarity in subagent context. `run.ts` propagates both `true` and `false` (semantic: `undefined` = no CLI override).
+- **Q5**: `/memory governance enable|disable verify|conflict|all` slash subcommands. Text-level `[memory]` block extract-and-replace (preserves `[critique]` + comments). Atomic tmp+rename. Creates `.agent/` + file if absent. Replaces in-place when block exists (no duplicate).
+- **Q6**: harness loop comments updated (linhas 1074, 1082) reflect new opt-out path; stderr messages dropped flag-specific suffixes since the flag is now optional.
+- **Q7**: `/memory governance status` enabled-state strings use source provenance: `yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, etc.
+
+**Test footprint:** +24 across 3 files.
+
+- `tests/critique/config-loader.test.ts` (+8): defaults, project override, camelCase aliases, type errors, malformed TOML in user, user+project merge precedence.
+- `tests/cli/args.test.ts` (+7): `--no-*` parse, undefined-when-omitted, mutex `--x + --no-x`, F12 mirror for `--no-*`.
+- `tests/cli/slash/memory-governance-toggle.test.ts` (+10): fresh repo creates, disable verify/conflict/all, preserves existing `[critique]` verbatim, replaces in-place, round-trip via loadMemoryConfig, invalid target, extra positional, missing target, enable reverses doubly-disabled.
+
+Suite: **8617 pass / 0 fail / 10 skip** (+24 vs Slice Q baseline of 8593).
+
+**Migration risk mitigated by banner:** operator com config explicit ou CLI flag não é afetado (suprime). Operator que upgradar com nada explícito vê 1 linha no boot apontando para slash de disable.
+
+**Deferred (tracked):**
+
+- Bootstrap-level integration test (`tests/cli/bootstrap-memory-defaults.test.ts` proposto no plano) — Q2/Q3/Q5 cobrem as 3 camadas separately + round-trip. End-to-end seria mais defensivo mas complex de fixturizar; deferred.
+- `/memory governance status` source label tests — Q5 toggle tests cobrem o lado oposto (write); read-side label is rendered text, deferred.
+- Harness loop sanity test sobre scheduler creation via config path — same gap as S11's "4 branches deferred"; symmetric.
+
+## [2026-05-18] hardening(memory) — S13 post-review (3 CRIT + 11 HIGH + MEDs + test gaps)
+
+Three parallel reviewers (correctness, spec/architecture, test quality) on the S13 slice surfaced findings spread across the slice. All criticals + highs closed in this pass (P1-P10) BEFORE the S13 commit landed; the slice ships shippable.
+
+**Critical fixes:**
+
+- **P1+P2+P3 (B-CRIT-1) — multi-memory quarantine carve-out.** Pre-fix dispatcher emitted `sourceMemoryKeys=[winner, loser]` (2 elements) into the S8 governance substrate. Apply path gate #4 in `governance.ts:390` rejected EVERY S13 proposal with `system:multi_memory_unsupported` (single-memory-only contract pinned in `tests/memory/governance.test.ts:226`). T13.8 acceptance "operator approves → loser quarantines" was literally unattainable. Fixed via path (b) — spec PR + apply-path widening:
+  - MEMORY.md §11.3: `target_payload.target_key={scope,name}` schema added; gate #4 admits multi-memory quarantine WHEN target_key designates which entry transitions AND that key appears in source_memory_keys.
+  - `governance.ts`: gate #4 widened; new `system:invalid_target_key` rejection for target_key not matching any source key; source resolution uses target_key when present, else `sourceMemoryKeys[0]`.
+  - Dispatcher uses `targetPayload: {target_key: {scope, name}}` for the loser.
+  - +3 tests in `governance.test.ts` pinning: multi-memory quarantine + valid target_key applies (only loser transitions, winner untouched); target_key not in source_keys → `invalid_target_key`; restore + multi-memory still rejected (carve-out is quarantine-only).
+
+- **P4 (B-CRIT-2) — pre-dispatch pending-proposal gate.** Pre-fix S13 lacked the gate S11 has (verify-semantic-scheduler:341-358). Combined with `conflicting` verdicts ALWAYS re-dispatching (cache miss by design) and the at-most-one-per-poll cursor-stationary semantic, the same pair re-fired every step boundary until cost cap latched. Operator paid up to $0.50 to land 1 pending proposal. Now: `listPendingProposalsForMemory` for both written + each top-K sibling; quarantine-kind pending → skip. New scheduler test pins.
+
+- **C-CRIT-1/2/3 — test gaps mirrored from S11.** Spawn error path (sync throw + non-done status); F18 FK retry (would be `recordConflictAttempt`'s `FOREIGN KEY constraint` regex); F11 TOCTOU re-read on either body. New tests in dispatcher + scheduler suites.
+
+**High fixes:**
+
+- **P5 (A-HIGH-1) — sub-threshold dedup destroys valid pending proposal.** Bug present in BOTH dispatchers (S11 + S13): when `recordProposal` silently dedups against an existing pending row, `decideProposal(rejected, system:low_confidence)` fires unconditionally if the CURRENT confidence is sub-threshold — flipping the prior high-confidence proposal to rejected. Fix: `if (confidence < threshold && !proposalResult.deduped) decideProposal(...)`. Same guard applied to S11 dispatcher. Test pins the high→low sequence; pending stays pending with original confidence.
+
+- **P6 (A-HIGH-2) — `stale_snapshot` was advancing cursor (G5 regression).** When all top-K pairs returned `stale_snapshot` (just-written body drifted between scheduler peek and dispatcher re-peek), `!dispatchedThisPoll` fell through to `advanceTo` — write event lost forever, fresh body never re-evaluated. Mirror of G5 from S11. Track `staleSeen` across the for-loop, skip advance when set.
+
+- **P7 (C-HIGH 1-6) — test gaps closed.** G6 shutdown-during-await guard (scheduler `if (stopped) return` post-await); dispatch cap latch + stderr; F3 cost cap headroom misconfig (maxCostUsd < SUBAGENT_MAX); same-millisecond cursor tuple; pending-proposal gate; sharedScopeOffline negative case. +6 scheduler tests.
+
+**Med fixes:**
+
+- **P8 (A-MED-2) — quarantined siblings excluded from candidate pool.** Pre-fix `states: ['active', 'quarantined']` admitted quarantined siblings into the pair-judge pool. Resolver could pick quarantined as winner via stronger provenance, generating quarantine proposal against an active memory based on a quarantined memo's "authority". Now `states: ['active']` — semantically sound: quarantined memos are already flagged.
+
+- **P8 (C-MED-1) — CLI flag parse tests.** 4 new tests in `tests/cli/args.test.ts`: `--memory-conflict-llm` parses, defaults undefined, rejected with `--subagent-session-id`, coexists with `--memory-verify-llm`.
+
+- **P9 (B-HIGH-3) — audit-chain bypass doc updated for S13.** §14.4 paragraph now covers BOTH verify-semantic AND verify-conflict; cross-references `memory_conflict_attempts.subagent_run_session_id` chain.
+
+- **P9 (B-MED-1) — §14.4 detector roster updated.** S13 moved from "substrate-only" deferred to shipped, with full posture summary; TODO.md S13 marked ✅ DONE.
+
+**Test footprint:** +18 across 4 files.
+
+- `tests/memory/governance.test.ts` (+3): multi-memory quarantine + target_key applies; invalid target_key rejects; restore multi-memory still rejected.
+- `tests/memory/verify-conflict-dispatcher.test.ts` (+3): spawn throw, status≠done, sub-threshold dedup guard.
+- `tests/memory/verify-conflict-scheduler.test.ts` (+6): dispatch cap latch, cost headroom misconfig, G6 shutdown-during-await, same-ms cursor tuple, pending-proposal gate skip, sharedScopeOffline negative.
+- `tests/cli/args.test.ts` (+4): CLI flag tests (parse, default, conflict, coexist).
+- Pre-existing dispatcher test: `targetPayload` shape pin updated to `{target_key: {...}}`.
+
+Full suite: **8593 pass / 0 fail / 10 skip** (+16 vs S13 baseline of 8577).
+
+**Falsely-positive review findings (documented):**
+
+- "S13 has no end-to-end test" (B-HIGH-1) — partially closed by the multi-memory governance tests in `governance.test.ts` (apply-path proved end-to-end). Full harness loop → scheduler → dispatcher → governance integration test remains deferred (same gap as S11; tracked).
+- "Migration 061 CHECK cross-column idiom novel" (B-MED-2) — confirmed; idiom is intentional defense-in-depth, comment justifies it. Kept.
+
+**Deferred (tracked):**
+
+- Loop wire-up 5 branches tests (C-HIGH-6) — same gap as S11's "4 branches deferred"; closing requires bootstrap mock harness, scheduled with the S11 carry-over.
+- Governance status S13 block render test (C-MED-2) — render code is simple, would be cheap; deferred to keep this round bounded.
+- BM25 `tokenize` ASCII-only unicode degradation (A-MED-6) — documented (PT-BR memo bodies lose accent tokens; CJK-only bodies produce empty tokens → BM25 hit zero, scheduler advances cursor silently). Real fix requires unicode-aware tokenizer touch in retrieval pipeline (out of scope).
+
+## [2026-05-18] feat(memory) — S13 LLM-judge `conflict_detected` detector
+
+Third slice of Phase 2 on `feat/memory-governance-llm`. Closes the last remaining auto-detector listed in `docs/MEMORY.md §14.4` substrate-only roster. Replaces the heuristic textual matcher that S4 attempted and rolled back: pair of operator-authored memos goes to an LLM judge, structured verdict → S8 governance proposal → operator approves → loser quarantines via the state machine.
+
+**Auto-trigger, opt-in.** `--memory-conflict-llm` defaults off (zero LLM cost in default sessions). When the operator opts in, the harness loop runs a conflict scheduler tick at each step boundary, polling `memory_events` for `action='created'|'edited'` and dispatching AT MOST ONE pair verification per poll through the gate sequence below.
+
+Shipped (T13.1 → T13.8):
+
+- **`verify-conflict.md` subagent** (`src/subagents/builtin/verify-conflict.md`). Pair-judge: takes TWO operator-authored memory bodies, emits `{conflicting, conflict_kind, confidence, evidence: {shared_concept, polarity_a, polarity_b}}`. Tool whitelist: `memory_read` only (bodies already in input). `capabilities: []` (pure-LLM — memory_read is misc category and resolves to no capability footprint). 6 steps / $0.06 budget. Listed in `PROTECTED_BUILTIN_NAMES` so project / user shadows surface loudly.
+
+- **BM25 pair-selection scheduler** (`src/memory/verify-conflict-scheduler.ts`). Polls `memory_events` for write actions since last poll's cursor, builds BM25 index over same-scope sibling bodies, takes top-K (`CONFLICT_PREFILTER_K = 5`). Caps LLM dispatch at K — for a scope with N=200 siblings the worst case is 5 calls per just-written, a 40× cost reduction over O(N) pairwise. Cursor uses `(createdAt, id)` tuple (mirror the S11 fix); same-ms event bursts don't drop siblings. `at-most-one-dispatch-per-poll` semantic: cursor stays past the just-written event until all its top-K pairs are dedup-hit OR LLM-verified.
+
+- **Per-pair dispatcher** (`src/memory/verify-conflict-dispatcher.ts`). Per-pair contract: TOCTOU re-read both bodies → scanForInjection on BOTH → canonicalize pair → dedup lookup → spawn → validate output → resolveConflictWinner → recordConflictAttempt → recordProposal (S8). Mirrors verify-semantic-dispatcher in shape; pair-shape differences: injection scan fires twice (either body trips), prompt frames BOTH bodies as adversarial between paired delimiters, dedup keyed on canonical pair tuple.
+
+- **Deterministic resolver** (`src/memory/conflict-resolver.ts`). Pure function `resolveConflictWinner(a, b)` with tiebreak chain: provenance (`user_explicit > inferred > imported`) → recency (newer mtime wins) → scope specificity (`project_local > user > project_shared`) → body length (longer wins) → lexicographic name. Returns `{winner, loser, tier}` so the governance proposal's evidence payload records WHICH tier decided. LLM-agnostic — the audit trail can be replayed without the LLM ever firing again.
+
+- **Migration 061 `memory_conflict_attempts`** (`src/storage/migrations/061-memory-conflict-attempts.ts`). Cross-session pair-keyed dedup cache. Schema: `(scope_a/name_a/content_hash_a, scope_b/name_b/content_hash_b, verdict, conflict_kind, confidence, model_id, prompt_hash, subagent_run_session_id, attempted_at)`. CHECK constraint enforces canonical pair order at SQL level (`scope_a/name_a < scope_b/name_b`); the repo's `canonicalizePair` helper does the sort up front. Dedup window 7d for `compatible` verdicts (mirror S11); `conflicting` always re-dispatches. 90d retention.
+
+- **Repo + canonicalization** (`src/storage/repos/memory-conflict-attempts.ts`). `canonicalizePair`, `recordConflictAttempt`, `lookupRecentConflictAttempt`, `listRecentConflictAttempts`, `pruneConflictAttempts`. Pair canonicalization is exposed AND enforced at SQL CHECK level — a caller that bypasses the helper hits a constraint error instead of silently inserting a duplicate row.
+
+- **Governance proposal emission**. Reuses S8 `recordProposal` with `kind='quarantine'`, `targetPayload={scope, name}` for the loser, `sourceMemoryKeys=[winner, loser]`, evidence rich with `{verdict, conflict_kind, confidence, shared_concept, polarity_a, polarity_b, winner_scope/name, loser_scope/name, resolver_tier, prompt_hash, subagent_run_session_id, model_id}`. Confidence below `SEMANTIC_CONFLICT_MIN_CONFIDENCE = 0.7` auto-archives as `rejected` with `decidedBy='system:low_confidence'` — same posture as S11. `triggerForProposal` already maps `'subagent:verify-conflict' → 'conflict_detected'` (was pre-stitched in `src/memory/governance.ts`).
+
+- **CLI flag + harness wire** (`--memory-conflict-llm`). parseArgs accepts the presence-only flag; F12 mirror refuses combination with `--subagent-session-id` (top-level only). Harness loop creates the scheduler when (a) `memoryConflictDetect=true`, (b) `subagentDepth===0`, (c) `subagentRegistry !== undefined`, (d) `verify-conflict` definition loaded, (e) `memoryRegistry !== undefined`. Capabilities sealed via intersection (`parent ∩ declared`); excess logs `verify_conflict_envelope_narrowed` to stderr. Independent counters from S11 (`MEMORY_VERIFY_CONFLICT_MAX_DISPATCHES_PER_SESSION = 10`, `MEMORY_VERIFY_CONFLICT_MAX_COST_USD = 0.5`).
+
+- **`/memory governance status`** renders S13 block alongside S11: enabled state + caps + recent attempts. Each recent attempt shows verdict, confidence, pair, conflict_kind, model.
+
+- **Bootstrap pruneConflictAttempts** wired alongside `pruneVerifyAttempts`. Same 90d retention sweep posture.
+
+**Tests:** +29 across 4 files.
+
+- `tests/memory/conflict-resolver.test.ts` (+13): one test per tier + chained tier-ordering invariants. Pins the deterministic tiebreak as a contract — a refactor that flips a tier order fails loud.
+- `tests/storage/memory-conflict-attempts.test.ts` (+14): canonicalizePair, recordConflictAttempt happy paths + rejection of non-canonical pairs (repo + SQL CHECK), lookup with verdict + window semantics, content_hash drift busting dedup, pruneConflictAttempts.
+- `tests/memory/verify-conflict-dispatcher.test.ts` (+10): injection scan on either body, same-pair short-circuit, dedup cache hit, conflicting+high-confidence proposal landed, sub-threshold auto-reject, compatible attempt-only, malformed output paths.
+- `tests/memory/verify-conflict-scheduler.test.ts` (+5): definition undefined no-op, happy path (write event + sibling → dispatch), BM25 prefilter cap (disjoint siblings never reach LLM), cost cap latches `capExhausted='cost'`, sharedScopeOffline forwarded from session-wide exclude list.
+
+Full suite: **8577 pass / 0 fail / 10 skip** (+44 vs S13 baseline of 8533).
+
+**What S13 does NOT do (deferred):**
+
+- E2e integration tests through the harness loop (CLI → bootstrap → real scheduler → real subagent spawn → governance proposal). Same gap as S11's hardening backlog; tracked there.
+- Cross-scope pairing. Intra-scope only by design — pairing a user-global preference against a project-local fact conflates concept layers and the resolver's scope-specificity tier already handles cross-scope precedence. A future detector that wants cross-scope can compose this one differently.
+- Multi-element merge proposals (`source_memory_keys.length > 2`). S8 substrate admits the shape; S13's resolver is strictly pair-based. Listed in MEMORY.md §14 as "consolidate" detector — a separate slice if/when needed.
+
+**Operator surface ready.** With `--memory-conflict-llm` set, writing a memo that semantically contradicts an existing same-scope sibling generates a pending governance proposal within one turn. `/memory governance status` shows the verdict; `/memory governance approve <id>` quarantines the loser; `/memory audit --trigger conflict_detected` cross-references the eviction event back through the proposal's evidence payload.
+
+## [2026-05-17] fix(permissions) — carve out `/run/media` and `/run/user` from the deny tier
+
+Caught by an operator running Forja from `/run/media/lex/<volume>/Workspaces/forja/` (a workspace on an external drive mounted by udisks2 — Manjaro / Arch / Debian / Ubuntu / Fedora default). Every tool call against any file in the workspace failed instantly:
+
+```
+Denied in 45ms
+└─ path is in protected zone (deny tier): /run/media/.../forja/.gitignore
+```
+
+No modal, no confirm escape hatch — the engine emitted a categorical deny because the cwd happened to start with `/run`, which is in `SYSTEM_DENY_ROOTS`. The original intent of that deny prefix is to block reads/writes against privileged-daemon sockets (`/run/dbus/system_bus_socket`, `/run/postgresql/.s.PGSQL.5432`, `/run/docker.sock`); refusing every file under `/run/media/<user>/<volume>` is a false-positive that makes Forja unusable on external-drive workspaces. Same shape for `/run/user/<uid>/` (XDG_RUNTIME_DIR — per-user runtime tmpfs that applications legitimately write to all day).
+
+**Fix:** added `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` to `protected_paths.ts`. The deny classifier now skips the deny verdict when the absolute path starts with either prefix; everything outside those prefixes (the original `/run/postgresql/...`, `/run/dbus/...`, `/run/systemd/...` shapes) still hard-denies. Carve-outs are explicit and minimal — anything new under `/run` that operators legitimately need would land here.
+
+**Tests:** +9 in `tests/permissions/protected_paths.test.ts` — 5 carve-out cases (workspace paths under `/run/media/<user>/...`, XDG runtime dir under `/run/user/<uid>/...`) classify as `null`; 4 privileged-daemon socket cases stay `deny`. Pins both halves so a future "simplify the exception list" regression fails loud either way.
+
+Full suite: **8529 pass / 0 fail / 10 skip**.
+
+**Investigation note:** the operator-visible symptom looked like a missing modal ("modal ask nao aparece. pode ser bug"). Turned out the modal was never going to fire — the deny was decided categorically before the modal layer was reachable. Documenting because the same shape ("missing modal") can hide either a missing wire OR an upstream categorical deny that pre-empts the modal entirely.
+
+## [2026-05-17] fix(storage) — revert migration 058 edit + add migration 059 (append-only discipline)
+
+Caught at install time by an operator running the newly-built binary against an existing `~/.local/share/forja/sessions.db`: migration 058 had been edited in the previous commit (4dade9c) to add a TEMP-table snapshot/restore around the table rebuild — a "fix" for the FK-pointer severing bug that itself violated CLAUDE.md's "Append-only everywhere" hard rule. Result: hash mismatch on next startup (`applied hash: dcbfd31… current hash: d0b932…`) and a refuse-to-proceed from `migrate.ts` — the migration guard correctly refused to silently re-run an altered migration, but the binary was unusable.
+
+**Fix:**
+
+- **Reverted `058-subagent-runs-scope-builtin-and-approval.ts` SQL** to its original shape (the one already in the operator's DB). Hash now matches `dcbfd31…` again. Comment block updated to document the original FK-severing bug + lesson learned: "migration edits to a landed file break every existing install; the fix MUST live in a new migration."
+- **Created `059-memory-verify-attempts-fk-discipline.ts`.** Adds `provenance_drift_at INTEGER` column to `memory_verify_attempts` so forensic readers can discriminate "pointer was always NULL" from "pointer was severed by 058's drop on date X". Migration body is intentionally minimal; the load-bearing content is the comment block, which codifies the FK preservation pattern (TEMP table snapshot + restore around the drop) as a binding rule for any future migration that rebuilds `subagent_runs` or any table referenced via `ON DELETE SET NULL`.
+- **Pre-058 FK pointers are unrecoverable.** SQLite's `ON DELETE SET NULL` writes NULL irreversibly; the original `session_id` values aren't preserved anywhere correlatable. Operators can still cross-correlate by timestamp via `attempted_at` against `subagent_runs.captured_at`. New rows INSERTed after 058 ran always have intact pointers; the data loss is bounded to rows that existed at the moment of the migration.
+
+**Test update:** `tests/storage/migrate.test.ts` test pinning the wrong claim ("058 preserves the pointer") replaced by one that pins the actual behavior ("058 severs the pre-existing pointer — documented audit drift"). A future reviewer who thinks they can "fix" 058 by editing the SQL hits this test failure loud. Added a second test pinning that 059 lands the `provenance_drift_at` column shape.
+
+**Validated:** smoke script simulating "operator with 058 already applied" + the current MIGRATIONS array — second migrate pass applies only `059` (one row), 058 is correctly skipped via hash match, schema lands intact.
+
+Full suite: **8520 pass / 0 fail / 10 skip** (+1 vs R1-R7 baseline of 8519, the new 059 column test).
+
+**Lesson logged for future rounds:** any "small SQL fix" to a landed migration is a load-bearing breach of the append-only invariant. The bypass route is always: revert + new migration. Smoke-test against an existing DB BEFORE commit when a migration changes shape.
+
+## [2026-05-17] hardening(harness+subagents) — loop ↔ subagent flow review pass (R1–R7)
+
+Third multi-reviewer pass on `feat/memory-governance-llm`, this time focused on the harness loop ↔ subagent runtime boundary (not S11 specifically). Three parallel agents (correctness/robustness, spec/architecture, test quality) surfaced 7 CRIT, 10 HIGH, ~15 MED, ~12 LOW findings clustered in 8 themes. All criticals + highs + actionable meds closed in this pass; remaining items deferred with explicit notes in `docs/TODO.md`.
+
+**Critical fixes:**
+
+- **R1 — hard signal threading + IPC enable for verify dispatch.** Pre-fix the dispatcher accepted only `softStopSignal`; the harness's combined hard abort (Ctrl-C×2 + wall-clock) was unreachable. Ctrl-C-twice during poll hung the loop until the verify subagent's own 10-min wall-clock self-killed. ALSO pre-fix the spawn omitted `ipc: true`, leaving the cooperative interrupt branch in `waitForChild` as dead code (`handle.ipc?.send` was no-op). Symmetric with the task-tool spawn path (loop.ts:1516) which already wired both. Now: `signal` and `ipc: true` thread through `SemanticVerifySchedulerDeps` → `DispatchSemanticVerifyInput` → `runSubagent`.
+
+- **R2 — capability sealing for verify child.** The most-grave finding. R2's first round threaded `effectiveCapabilities()` into the verify spawn, but what got passed was the parent's FULL envelope verbatim — `verify-semantic.md` had no `capabilities` frontmatter field and the loader didn't expose one, so the audit row recorded "verify child ran under parent's full envelope" when the operator's intent was a read-only fact-checker. Exactly the gap migration 040 closed, reintroduced through the scheduler path. Today's blast radius was bounded by the read-only tools whitelist, but a future tools-widening would have silently inherited the full envelope. Now: `SubagentDefinition.capabilities?: string[]` added to types + loader (with full parseCapability round-trip validation), `verify-semantic.md` declares `capabilities: []` (pure-LLM — the spec-prescribed shape for read-only fact-checkers), and the scheduler creation site uses `intersectCapabilities(parent, declared)` mirroring the task-tool path. Loader test bundle (+8) pins parse/reject behavior; load.test.ts pin re-pins `verify-semantic.md` declares `capabilities: []` so a regression that strips it would fail.
+
+- **R3 — migrations 058 (scope='builtin' + parent_approval_id).** Two distinct audit-chain gaps fixed in one table rebuild.
+  - **Scope CHECK widening.** The `subagent_runs.scope` CHECK admitted only `('user','project')`; every builtin spawn was mapped to `'user'` via a runtime hack (`runtime.ts:543`) — forensic queries that filter "shipped vs. operator-authored" returned the same scope for both, contradicting AUDIT.md §0 ("substrato de audit nunca muta retroativamente"). Migration 058 rebuilds the table with `('user','project','builtin')`; the runtime mapping is removed and `definition.scope` lands directly. Pre-058 sessions are unrecoverable (recorded `'user'`), but new dispatches are honest.
+  - **`parent_approval_id` FK column.** PERMISSION_ENGINE.md §10.2 prescribes a one-hop FK from `subagent_runs` back to the `approvals` row that authorized the spawn. Pre-058 the chain was multi-hop via `messages.tool_call_id` → `tool_calls.id` → `approvals.tool_call_id`, fragile under retention sweeps. Migration 058 adds `parent_approval_id TEXT REFERENCES approvals(id) ON DELETE SET NULL`; wired end-to-end through `ToolContext.approvalId` (populated in `invoke-tool.ts` after the allow approval lands) → `SpawnSubagentArgs.parentApprovalId` → `runSubagent.parentApprovalId` → `insertSubagentRun.parentApprovalId`. Verify-scheduler dispatches intentionally bypass this chain (no `tool_call` exists for them); documented in MEMORY.md as an intentional dual-chain with forensics via `memory_verify_attempts.subagent_run_session_id`. A future amendment may land a synthetic approval row (requires `approvals.decided_by` CHECK widening — separate migration).
+  - **FK preservation during table rebuild.** `migrate.ts` wraps each migration in a transaction; SQLite ignores `PRAGMA foreign_keys=OFF` inside one (silent no-op per docs). So the rebuild's `DROP TABLE subagent_runs` fired `ON DELETE SET NULL` on `memory_verify_attempts.subagent_run_session_id` for every referring row — silently severing the forensic chain from the dedup cache to the audit row that the migration was supposed to STRENGTHEN. Caught via a manual smoke test before commit. Migration now snapshots the (mva.id, mva.subagent_run_session_id) tuples into a TEMP table BEFORE the drop and restores them via UPDATE after the rename. New `tests/storage/migrate.test.ts` test pins both halves (FK link preserved + `PRAGMA foreign_key_check` empty).
+
+**High fixes:**
+
+- **R4 — IPC `cost_update` payload validation.** `IPC.md §7` ("mensagens do filho NÃO são confiáveis") demanded boundary validation; the parent's reservation tracker + cap watchdog were consuming `delta`/`cumulative` with `typeof number` only. A malformed child could trip cancelAll or grow the reservation silently. Now rejects non-finite values and negatives at the boundary (loop.ts:1424); rejected updates stderr-log with the offending values for forensics.
+
+- **R4 — `console.error` → `process.stderr.write` in cost-progress persist catch.** `console.error` violates the hard rule "stdout is pure, stderr is for logs" from CLAUDE.md — Bun sometimes routes it to stdout under specific conditions. Routed explicitly to `process.stderr.write` to keep `--json` NDJSON stdout clean.
+
+- **R6 — runtime defense for `--memory-verify-llm` in subagent context.** `parseArgs` already refuses the combination at boot (F12), but a programmatic caller / future code path that constructs `HarnessConfig` directly could still set the flag with `subagentDepth > 0`. Pre-fix the scheduler block silently skipped construction; now stderr-logs `verify_semantic_disabled: cannot run inside a subagent context` so the misconfiguration surfaces.
+
+- **R6 — scheduler creation guard on `memoryRegistry !== undefined`.** Pre-fix the cast `as MemoryRegistry` would land `undefined` into the scheduler; every poll TypeError'd on `registry.peek(...)` and the outer catch swallowed it silently each step. Now refuses construction loudly when registry is missing — mirror of the verify-def absent path.
+
+- **R6 — `cleanupOnFail` surfaces non-clean cleanup outcomes.** Pre-fix `cleanupWorktree(...).catch(() => undefined)` swallowed both success and failure. A cleanup that removed the worktree dir but failed on `git branch -D <agent>` left a stale branch with no logged signal — the operator's branch list grew silently. Now the catch logs to stderr with the failure message; the throw is still swallowed (cleanup remains best-effort) but the breadcrumb is preserved.
+
+- **R6 — forward `planMode` + `spawnChildProcess` test seam to verify scheduler.** Asymmetric with the task-tool spawn path (loop.ts:1535-1558). For `planMode`: today's `verify-semantic.md` whitelist is all read-only so the gap isn't disparable, but a future widening would silently bypass plan-mode write refusal via the verify path. For `spawnChildProcess`: tests wiring a fake subprocess factory saw verify dispatches hit real `Bun.spawn`, a source of CI flakiness. Both threaded through the scheduler + dispatcher + into `runSubagent`.
+
+**Med fixes:**
+
+- **R5 — `recordProvenance` per-row independence pinned.** Existing test covered ONE bad scope not aborting the run; new test pins the stronger invariant: `(good, bad, good)` triple — both goods land even though the middle one throws. A refactor moving the try/catch outside the for-of loop would silently break the backfill on first error; the new test fails immediately.
+
+- **R6 — `existsSync` try/catch in evidence path guard.** `existsSync` can throw on EACCES/ELOOP/EMFILE; the dispatcher's outer catch would have surfaced that as `verify_semantic_dispatch_failed` and skipped the attempt-row INSERT, silently disabling dedup for the affected memory. Now caught locally and treated as "not found" — the verdict still rolls up as contradicted-but-malformed and the cache lands for next-time short-circuit.
+
+**Test footprint:** +16 tests across 5 files.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+3): R1 signal threading (present / absent / IPC always-true).
+- `tests/subagents/load.test.ts` (+8): R2 capabilities loader (absent vs `[]` vs canonical vs reject paths × 6 + verify-semantic.md pin).
+- `tests/storage/subagent-runs.test.ts` (+3): R3 migration 058 widened scope + parentApprovalId round-trip + omitted-id NULL.
+- `tests/storage/migrate.test.ts` (+1): R3 FK preservation through the migration 058 table rebuild (snapshot + restore proves the chain survives DROP TABLE under FK ON).
+- `tests/harness/invoke-tool.test.ts` (+1): R3 e2e — `ctx.approvalId` populated from the allow approval row id at execute time.
+- `tests/tools/task.test.ts` (+2): R3 e2e — `ctx.approvalId` forwarded as `SpawnSubagentArgs.parentApprovalId`; absent-id omitted.
+- `tests/harness/loop.test.ts` (+1): R5 recordProvenance per-row independence (sandwich pattern).
+- `tests/tools/_helpers.ts`: makeCtx now forwards `approvalId` override.
+
+Full suite: **8519 pass / 0 fail / 10 skip** (+20 vs. second-hardening baseline of 8499).
+
+**Falsely-positive review findings (documented):**
+
+- "Hard-abort signal not threaded" (A-CRIT-1) ⇒ confirmed; closed by R1.
+- "Scheduler poll throws caught but in-flight state inconsistent" (A-HIGH-3) ⇒ confirmed at the registry-missing path; closed by R6 (loud refusal at construction time).
+- "Loop skips effective-capabilities derivation in subagent context" (HIGH-1 spec) ⇒ confirmed silent; closed by R6 stderr.
+- "Audit row records scope='user' for builtin" (B-CRIT-2) ⇒ confirmed; closed by R3 migration 058.
+- "`subagent_runs` lacks `parent_approval_id`" (B-HIGH-4) ⇒ confirmed; closed by R3 migration 058.
+- "Verify spawns bypass approval-chain" (B-HIGH-6) ⇒ confirmed; intentionally documented as bypass in MEMORY.md §11.x (forensics via `memory_verify_attempts.subagent_run_session_id`).
+- "wallClockTimer leak on guardedFinish throw" (A-HIGH-2) ⇒ self-demoted by reviewer during pass — `clearTimeout` is first line of `finish()`.
+
+**Deferred (tracked):**
+
+- **NaN/Infinity child cost guard test** (C-HIGH-1). The guard at loop.ts:1648 exists and is correct; pinning it via test requires either runtime injection of a fake child terminal envelope (deep wiring) or extraction of the guard into a testable surface. Deferred — guard is small, defense-in-depth, and any future refactor would have to consciously remove it.
+- **`dispatchChain` sync-throw in `dispatchHooks` catch** (C-HIGH-4). The catch correctly returns `null` (fail-open per CONTRACTS.md §10 line 1057); pinning requires a mock dispatcher that sync-throws. Low risk because `dispatchChain` is async and the implementation surface is small.
+- **Critique-aborted `recordCritiqueRun` persistence assert** (C-HIGH-5). The catch + recordCritiqueRun-before-rethrow pattern is in place; pinning requires a fake critique provider that aborts mid-stream.
+- **Scheduler wire-up 4 branches end-to-end** (C-CRIT-1, carry-over from second hardening). Two branches are now covered by R5 + new construction tests; the 4 named branches (missing-def / subagent-child / shutdown-after-throw / poll-throws) remain partially covered.
+- **`task` synchronous cap-watchdog** (A-MED-3). Sync `task` spawns bypass the `subagentHandleStore`, so cap watchdog doesn't pre-empt overage. Documented in `docs/TODO.md` "Deferred — actionable but parked" with the fix shape + pull-in signal. Worst case bounded by `definition.budget.maxCostUsd` validation.
+- **`validate.ts` capabilities_declared check** (B-MED-1). Whitelist guard checks `metadata.writes` but not `metadata.capabilities_declared` — a typo in playbook tools[] doesn't fail at load. Engine still gates at evaluation; current behavior is "deferred load-time error to first invocation". Smaller surface, low priority.
+- **`cost_soft_cap_warn` semantic confusion** (B-MED-4). Spec says the warn fires on CHILD playbook cap; loop emits on PARENT session cap. Two conflated signals. Spec-PR-first to clarify; code change minor once spec is amended.
+
+## [2026-05-17] hardening(memory) — S11 LLM-judge second post-review pass (critical + high + med + test gaps)
+
+Second multi-reviewer pass on S11 (three parallel agents: correctness/robustness, spec/architecture, test quality) surfaced 27+ new findings after the first hardening round landed. All closed in this pass (G1–G12).
+
+**Critical fixes:**
+
+- **G1 — directory-boundary path-traversal fix.** F8's `evidence_paths` guard checked `resolved.startsWith(cwd)` — `/repo` would admit `/repository-malicious/...` as a sibling whose absolute path shares the prefix but isn't actually under cwd. Switched to the directory-boundary check `resolved === cwd || resolved.startsWith(cwd + sep)`. Also rejects absolute paths up front via `isAbsolute(p)` before resolution. Test pins the sibling-directory case (`/repo-x`) as `malformed` against a dispatcher whose cwd is `/repo`.
+
+- **G2 — wire `effectiveCapabilities` into scheduler/dispatcher.** F9 threaded `effectiveCapabilities` through the dispatcher's input shape but the harness loop wire-up never populated it — the child's PERMISSION_ENGINE §10.1 envelope was empty (sealed audit row carried `[]`), and any subagent gate that consults the envelope's intersection silently degraded. Now derives from `config.permissionEngine.effectiveCapabilities()` with `deriveParentCapabilities(policy())` fallback for engines that pre-date the §10.1 method. `Capability` is nominal-branded; cast through `as unknown as readonly string[]` matches the dispatcher's transport shape.
+
+**High fixes:**
+
+- **G3 — scheduler skips `trust: untrusted` memories.** The shadow-domain `untrusted` trust attestation (MEMORY.md §17 — `trust: untrusted` files can be peeked but never load into context) was honored by the eager-loader path but the verify scheduler's peek-and-dispatch path bypassed it: an `untrusted` memory could be sent to the LLM judge as the BODY of a prompt, exfiltrating its content through the verification request. Added the filter at peek time AFTER the state/exclude checks; cursor advances past skipped candidates so they're not re-considered each poll.
+
+- **G4 — verify-semantic.md flagged as "not a playbook".** PLAYBOOKS.md §1.x requires playbook outputs to include `summary`, `assumptions`, `not_checked`. Verify-semantic intentionally omits these (the verdict + claim_extracted + ground_truth_observed + evidence_paths shape IS the output, no narrative summary is useful). Added a "Not a playbook" header to the .md explaining the omission so the next reviewer doesn't try to "fix" it.
+
+- **G5 — `stale_snapshot` doesn't advance cursor.** F11's TOCTOU re-read returned `{kind: 'skipped', reason: 'stale_snapshot'}` but the scheduler unconditionally advanced the cursor on every skip. A memory whose body was edited between peek and dispatch would NEVER be re-considered after the stale skip — the fresh body sat behind the advanced cursor. Now the scheduler advances only when `outcome.reason !== 'stale_snapshot'`; the next poll re-evaluates against the fresh body.
+
+- **G6 — scheduler counters guarded after shutdown.** The `dispatched++` and `costUsdSpent += ...` mutations happened AFTER the `await dispatchSemanticVerify(...)` resolved. If `shutdown()` was called mid-await (operator Ctrl-C between spawn and resolution), the counters mutated for a dispatch the scheduler had no business making. Added a `stopped` check immediately after the await before any counter mutation; the in-flight result is dropped silently (operator stopped, intent is clear).
+
+- **G7 — `PROTECTED_BUILTINS` source of truth.** F7's protected set lived inline in `src/subagents/load.ts`. Moved to `src/subagents/builtin/index.ts` as the canonical export — same module that owns the ship-dir resolution. Both the loader and any future shadow-precedence consumer import from one place; harder to drift.
+
+- **G8 — doc fixes.** MEMORY.md §14.4 didn't mention the loud shadow surfacing for protected builtins; updated. TODO.md added a "Deferred — actionable but parked" section with the compile-safe builtin distribution entry from F6 (with the operator-facing `verify_semantic_disabled` diagnostic that limits blast radius until a real fix lands).
+
+- **G9 — bump sanitize max for error surfaces.** F14's `sanitizeOneLineForDisplay` defaulted to a 256-char cap that truncated useful error context (SQLite paths + stack frames). Added `ERR_MAX_CHARS = 1024` + `displayErr()` helper used at all error-surface call sites; memory names + model_ids stay at the default 256.
+
+**Med fixes:**
+
+- **G10 — small cleanups.**
+  - Dropped dead `SEMANTIC_VERIFY_ELIGIBLE_SCOPES` constant (never read after F2 moved the scope filter into the harness loop's exclude set).
+  - Dispatcher's `evidenceEssence` now uses `canonicalJsonStringify` (exported from `memory-governance`) instead of `JSON.stringify` — matches the canonical serializer the rest of the governance substrate uses, so the same evidence shape always produces the same string regardless of key insertion order.
+  - Shadow chain in `load.ts` now emits both rows when a project shadow shadows a user shadow of a protected builtin (pre-fix only the project→builtin edge surfaced; the user→builtin edge was hidden behind it).
+
+**Test footprint:** +15 tests across four files.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+6): G1 sibling-directory path-traversal rejection, F11 TOCTOU re-read trio (registry-missing fallback / body-changed / fresh-body), F18 FK-race retry, F9 context-fields forwarding.
+- `tests/memory/verify-semantic-scheduler.test.ts` (+6): G3 trust:untrusted skip, F15 state filter widened to invalidated + evicted, F3 cost cap headroom edge case, F14 stderr ANSI sanitization, G6 shutdown-during-await counter discipline.
+- `tests/cli/slash/memory.test.ts` (+3): F16 absent "or set policy" hint, recent-attempts rendering, read-failed surface.
+- `tests/subagents/load.test.ts`: system prompt phrase pinning for the protected-builtin shadow rows.
+
+Full suite: **8499 pass / 0 fail / 10 skip** (+15 vs first-hardening baseline of 8484).
+
+**Falsely-positive review findings (documented):**
+
+- "FK race fallback loses forensic detail" — confirmed acceptable trade-off; the cache value matters more for the next dispatch than the run pointer.
+- "G2 capability cast loses brand safety" — confirmed; the dispatcher's transport shape is intentionally string-based (it's a forwarded payload, not a gate decision surface).
+
+**Deferred (tracked):**
+
+- Compile-safe builtin distribution (F6 carry-over) — TODO.md entry now explicit.
+- Harness loop scheduler wiring tests (4 branches: missing-definition, subagent-child, shutdown-after-throw, poll-throws).
+- Bootstrap `pruneVerifyAttempts` wiring tests.
+- End-to-end harness→scheduler→dispatcher→governance integration test.
+
+## [2026-05-17] hardening(memory) — S11 LLM-judge post-review (critical + high + med + test gaps)
+
+Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 18 findings on S11 after the slice landed. All 18 closed in this pass.
+
+**Critical fixes:**
+
+- **F1 — ship `verify-semantic.md`.** The `.md` definition that the entire S11 detector depends on was missing from disk — the file `Write` call earlier in the session silently failed (extraneous params on the tool invocation). `loadSubagents` never found the definition; harness emitted `verify_semantic_disabled` on every opt-in boot. Feature was a silent no-op in production. Wrote the file (90 lines, 5.3KB) + smoke test that `loadSubagents` resolves the canonical shape (`scope: 'builtin'`, tools whitelist, budget caps).
+
+- **F2 — scheduler honors `memoryExcludeScopes`.** Pre-fix, the scheduler received the unwrapped `config.memoryRegistry` and peeked + dispatched `project_shared` bodies even when the bootstrap's S5 shared-corpus trust probe had marked the scope offline. Direct security regression — fail-open path bypassing the trust gate. Added `memoryExcludeScopes` to scheduler deps; filtered candidates at the dedupe stage (cheap string check, no peek for excluded scopes); threaded `config.memoryExcludeScopes` through the harness loop. Cursor still advances past excluded candidates so they're not re-considered (trust verdict for the session is stable).
+
+- **F3 — cost cap per-dispatch headroom.** Cap was checked BEFORE dispatch with cost added AFTER — a single expensive dispatch could blow the session budget by an arbitrary overage. Added headroom check: `counters.costUsdSpent + SEMANTIC_VERIFY_SUBAGENT_MAX_COST_USD > maxCost` latches the cap. The subagent's declared budget (0.10 USD) is the worst case under spec; a dispatch that respects its declared budget always fits.
+
+- **F4 — fix intra-poll dedupe out-of-order.** Cenário `(foo @1000, bar @2000, foo @3000)`: pre-fix tracking `seen.set(key, max(prior, createdAt))` advanced cursor to `foo`'s latest sighting (3000) after dispatch, dropping `bar @2000` forever. Switched to `Set<string>` (first-sight only) and advance cursor only past the dispatched candidate's first createdAt — `foo @3000` re-emits next poll (where it dedup-hits cheaply in the dispatcher) but `bar @2000` survives.
+
+- **F5 — sub-threshold contradicted records auto-rejected proposal.** TODO T11.7 was explicit: sub-threshold contradicted verdicts auto-archive as `status=rejected, decidedBy=system:low_confidence`. Pre-fix only recorded an attempt; operator forensic via `/memory governance list --status rejected` was blind. Now records the proposal with the full evidence shape, then immediately decides it as `rejected` with the threshold gate in the `decided_reason`.
+
+**High fixes:**
+
+- **F6 — builtin loader compile-safe (documented).** `import.meta.dir` in `bun build --compile` resolves to a virtual `/$bunfs/` path that `readdirSync` cannot enumerate — built-ins effectively lost in compile mode. Documented the limitation in `src/subagents/paths.ts` header. Operator-facing surface (the existing `verify_semantic_disabled` stderr line in the harness loop) flags the gap loudly when opt-in is set without a resolvable definition. Compile-safe distribution via TS const embedding deferred — tracked as a follow-up since a real fix needs Bun text imports / asset embedding investigation.
+
+- **F7 — shadow guard for protected builtins.** Pre-fix, project-scope `.agent/agents/verify-semantic.md` silently replaced the safe built-in — a malicious repo opting an operator into bash/write_file tools the moment they enable `--memory-verify-llm`. Added a `PROTECTED_BUILTINS` set (`verify-semantic` for now). User AND project shadows of protected builtins ALWAYS surface in the `shadows` array — the existing CLI surface emits these on boot so the operator sees the override. Unprotected built-ins keep the silent-override semantic.
+
+- **F8 — hallucination guard verifies `evidence_paths` exist.** Pre-fix only checked `paths.length > 0`; a clever subagent emitting `evidence_paths: ['fake/file.ts']` satisfied the guard and quarantined real memories on the operator's auto-rejected path. Added `fs.existsSync(join(cwd, p))` per path with absolute-path rejection and `cwd` boundary check (refuses path traversal). Contradicted verdict with any bogus path → `malformed`.
+
+- **F9 — thread `runSubagent` context fields.** Pre-fix dispatcher omitted `softStopSignal`, `cwdTrusted`, `sharedScopeOffline`, `hooksSnapshot`, `effectiveCapabilities` when calling `runSubagent` — operator Ctrl-C didn't interrupt the spawn, trust-gated tools degraded, S5 fail-closed posture was lost, hooks drift window opened. Added fields to scheduler deps + dispatcher input; threaded from `config.softStopSignal` / `config.isCwdTrusted` / `config.hooks` in the harness loop wire-up. `sharedScopeOffline` mirrored from `memoryExcludeScopes` per-candidate.
+
+- **F10 — wire `pruneVerifyAttempts` at boot.** Pre-fix the retention sweep was exported but never called; `memory_verify_attempts` would grow unbounded. Mirrored the existing `pruneMemoryProvenance` sweep in `bootstrap.ts` with the same AUDIT DRIFT stderr posture.
+
+- **F11 — TOCTOU body re-read inside dispatcher.** Operator edit between scheduler peek and dispatcher hash left a stale snapshot — `scanForInjection` + content hash + attempts row landed against bytes whose underlying file no longer existed. Added optional `registry` to `DispatchSemanticVerifyInput`; when present, the dispatcher re-peeks BEFORE scan and refuses the dispatch with `{kind: 'skipped', reason: 'stale_snapshot'}` if the canonical serialization diverged. Scheduler always passes registry. Next poll re-evaluates against the fresh body.
+
+- **F12 — refuse `--memory-verify-llm` in subagent context.** Pre-fix, the flag was accepted unconditionally; a `.envrc`-injected flag in a subagent-child invocation would silently be a no-op (the harness loop's `subagentDepth > 0` guard prevents scheduler creation but doesn't surface to the operator). Now `parseArgs` rejects the combination at the args layer — same discipline `--subagent-shared-scope-offline` already had.
+
+**Med fixes:**
+
+- **F13 — `peek=malformed` emits stderr.** Pre-fix the scheduler silently skipped memories whose frontmatter was corrupt. Now emits `memory: verify_semantic_peek_malformed` so the operator sees the corruption signal.
+
+- **F14 — sanitize scheduler/dispatcher stderr.** Memory names + model_ids + error strings could embed ANSI escapes that repaint the operator's terminal (same shape S8 review caught for other surfaces). All six `stderr(...)` call sites now route through `sanitizeOneLineForDisplay`; the harness loop's `verify_semantic_poll_unhandled` line goes through `redactSecrets`.
+
+- **F15 — state filter in scheduler.** Already-`quarantined` / `invalidated` / `evicted` memories were re-verified on every step, wasting LLM budget on outcomes the lifecycle had already decided. Now skipped with cursor advance.
+
+- **F16 — strip unimplemented policy hint.** `/memory governance status` said "no (default; pass --memory-verify-llm or set policy)" but `[memory.verify].llm` policy was never parsed. Stripped the misleading "or set policy" — opt-in is CLI-flag only in V1.
+
+- **F17 — `verify_skipped` stderr line.** TODO T11.2 promised it; pre-fix silent. Now emits `memory: verify_skipped: <scope>/<name>: injection_detected | stale_snapshot` so opt-in operators see WHY the judge never fires on a memory they expected verified.
+
+- **F18 — `recordAttempt` FK race protection.** Concurrent session purge could delete the child's `subagent_runs` row between `runSubagent` returning and the attempt INSERT — the FK threw `SQLITE_CONSTRAINT_FOREIGNKEY`. Now caught + retried with `subagentRunSessionId: null` so the dedup cache entry still lands (forensic detail about the run is lost, but the cache value matters more for the next dispatch).
+
+**Test footprint:** +15 tests across four files.
+
+- `tests/memory/verify-semantic-scheduler.test.ts` (+5): F2 excluded-scope skip, F4 out-of-order dedupe regression, F13 peek=malformed stderr, F15 quarantined skip, F17 verify_skipped emission.
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+2): F8 non-existent path → malformed, F8 absolute path → malformed.
+- `tests/subagents/load.test.ts` (+5 in new `loadSubagents (S11 builtin scope)` describe): builtin loads from real ship dir, builtinDir=null disables, project shadow of protected builtin surfaces, user shadow of protected builtin surfaces, user shadow of unprotected builtin stays silent.
+- `tests/cli/args.test.ts` (+3): `--memory-verify-llm` parses, defaults undefined, F12 conflict with `--subagent-session-id` rejected.
+
+Plus the pre-existing dispatcher / scheduler / repo test files updated where the new behavior changed assertions (the F5 sub-threshold test re-pinned to expect a `rejected` proposal landed, F3 cost cap test arithmetic adjusted for the headroom-aware threshold).
+
+Full suite: **8484 pass / 0 fail / 10 skip** (+15 vs S11 baseline of 8469, +62 vs S8 baseline of 8422).
+
+**Falsely-positive review findings (documented for posterity):**
+
+- "Parallel-poll race within one session" — confirmed not possible (loop single-threaded + await sequential).
+- "Cost cap when result.costUsd === 0 allows infinite dispatches" — dispatch counter increments regardless, so dispatch cap bounds zero-cost loops.
+
+**Deferred (tracked):**
+
+- Compile-safe builtin distribution via TS const embedding (F6 partial). Today's loader works in dev mode; compiled binaries need either Bun text imports or an embedded-definition fallback. The runtime-side surface emits a loud `verify_semantic_disabled` stderr when opt-in is set without a resolvable definition.
+
+## [2026-05-17] feat(memory) — S11 LLM-judge `verify_failed` detector
+
+Second slice of Phase 2 on `feat/memory-governance-llm`. The S2 heuristic was rolled back months ago; until S11, `verify_failed` lived as a trigger name + audit filter with no detector behind it. This slice ships the actual detection pipeline: a sandboxed subagent reads the repository and decides whether each exposed factual memory still agrees with the code.
+
+**Auto-trigger, opt-in.** `--memory-verify-llm` defaults off (zero LLM cost in default-driver sessions). When the operator opts in, the harness loop runs a scheduler tick at each step boundary — polls `memory_provenance` for newly-exposed `type: project` / `reference` memories, dispatches AT MOST ONE verification per poll through the gate sequence below.
+
+Shipped (T11.1 → T11.13):
+
+- **Migration 057** `memory_verify_attempts` (`src/storage/migrations/057-memory-verify-attempts.ts`). Content-addressed cross-session dedup cache. Schema: `(scope, name, content_hash, verdict, confidence, model_id, prompt_hash, subagent_run_session_id, attempted_at)`. Verdict CHECK + confidence CHECK + indexes for `(scope, name, content_hash, attempted_at DESC)` dedup queries and `(attempted_at)` retention. FK `subagent_run_session_id → subagent_runs(session_id) ON DELETE SET NULL` (subagent_runs PKs on session_id, not on a separate id column — initial draft used the wrong column and broke every FK test until corrected mid-slice).
+
+- **Repo `memory-verify-attempts.ts`.** `recordAttempt` validates the input shape (scope, verdict, confidence range, non-empty model/prompt hashes); `lookupRecentAttempt` enforces the dedup semantic — `contradicted` ALWAYS re-dispatches (high-stakes; cheap re-confirmation), `passed` / `inconclusive` dedup for 7d (`SEMANTIC_VERIFY_DEDUP_WINDOW_MS`); `listRecentAttempts` for `/memory governance status`; `pruneVerifyAttempts` for the 90d retention sweep.
+
+- **HarnessConfig flag + CLI plumbing.** `memorySemanticVerify?: boolean` on `HarnessConfig` (default off; subagent children don't inherit — top-level only, avoids recursive verification). `--memory-verify-llm` argv flag in `args.ts`, threaded through `bootstrap.ts` into the config.
+
+- **Tunables in `src/memory/verify-semantic.ts`.** `SEMANTIC_VERIFY_MIN_CONFIDENCE = 0.7`, `MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION = 10`, `MEMORY_VERIFY_SEMANTIC_MAX_COST_USD = 0.50`, `SEMANTIC_VERIFY_ELIGIBLE_TYPES = ['project', 'reference']`. Constants live in a substrate module so `/memory governance status`, tests, and policy all share one import surface.
+
+- **Built-in subagent loader.** New `src/subagents/builtin/` directory + `loadBuiltinSubagents` flow inside `loadSubagents`. Precedence: project > user > builtin (user/project override built-ins SILENTLY — the shadow surfacing pattern reserved for user/project conflicts where the operator authored both). `SubagentScope` extended to include `'builtin'`; the storage-side `subagent_runs.scope` CHECK still constrains `('user','project')`, so `runtime.ts` maps `'builtin' → 'user'` when inserting the audit row (documented as inherited drift; widening the CHECK is a separate migration).
+
+- **`verify-semantic.md` definition** (`src/subagents/builtin/verify-semantic.md`). Tools: `read_file`, `grep`, `glob`, `memory_read` (read-only — no writes, no bash). Output schema: `{verdict, confidence, claim_extracted, ground_truth_observed, evidence_paths}`. Budget: `max_steps: 15, max_cost_usd: 0.10`. System prompt frames the memory body as adversarial input, requires honest calibration of confidence, and rejects contradicted verdicts that omit evidence_paths (hallucination guard).
+
+- **Dispatcher core** (`src/memory/verify-semantic-dispatcher.ts`). Five-step per-memory orchestrator: (1) `scanForInjection` short-circuits BEFORE the spawn (hostile bytes never reach the judge); (2) `lookupRecentAttempt` short-circuits BEFORE the spawn (content-addressed dedup); (3) `runSubagent` with the verify-semantic definition; (4) `parseOutputAsObject` + JSON-schema validation (verdict enum / confidence range / contradicted-requires-evidence_paths); (5) `recordAttempt` always (suppresses re-dispatch within the dedup window), AND only when `verdict === 'contradicted' AND confidence >= SEMANTIC_VERIFY_MIN_CONFIDENCE` does it emit a `quarantine` governance proposal via S8 (with stable evidence-essence so two contradictions collide on the partial UNIQUE fingerprint).
+
+- **Scheduler** (`src/memory/verify-semantic-scheduler.ts`). Created once per top-level session when opt-in is set AND the verify-semantic definition resolved. `poll()` queries `listSessionExposuresSince(cursorAt)`, dedups by (scope, name), and walks candidates applying the gate sequence: cost / dispatch cap latch (`capExhausted`), type gate (only project / reference), pending-proposal short-circuit (skips memories with an active quarantine proposal — saves the LLM cost since the fingerprint UNIQUE index would refuse the INSERT anyway), then dispatch. ONE real dispatch per poll (single-shot keeps the per-step LLM cost predictable). Cursor advances incrementally per consumed candidate so unprocessed siblings survive into the next poll; counters.lastPolledAt always advances per poll attempt regardless.
+
+- **Wire-up in `src/harness/loop.ts`.** Scheduler instance declared in the outer try scope, constructed once after `sessionId` resolves, polled at end of each step iteration (after compaction's cost cap check; before next iteration's signal/cap checks), shutdown in the outer finally. Subagent children skip creation (`config.subagentDepth ?? 0 === 0` guard) — no recursive verification, no scheduler ticks inside the verify-semantic child itself.
+
+- **`/memory governance status` subcommand** (`src/cli/slash/commands/memory.ts:handleGovernanceStatus`). Read-only inspector: shows enabled state, configured caps, dedup window, last 10 attempts cross-session (model + verdict + confidence + scope/name). The slash can't reach the live scheduler instance, so counters come from `listRecentAttempts` — operator reconstructs "what the verifier has been doing" from substrate, not in-memory state.
+
+- **Provenance helper** `listSessionExposuresSince` (`src/storage/repos/memory-provenance.ts`). Cross-session exposures since a timestamp cutoff; the scheduler's primary query.
+
+- **Subagent storage scope mapping.** `runtime.ts:insertSubagentRun` maps `definition.scope === 'builtin' → 'user'` so the migration-012 CHECK constraint (`scope IN ('user','project')`) doesn't reject built-in subagent rows. Documented as inherited drift; widening the CHECK is a separate spec amendment.
+
+**Test footprint:** +47 tests across three new files + one extension.
+
+- `tests/storage/memory-verify-attempts.test.ts` (+21): repo validation, DB CHECK bypass coverage (verdict / confidence / attempted_at), dedup semantics (contradicted always re-dispatches, window boundary exclusive, content_hash discrimination, windowMs override), `listRecentAttempts` ordering + limit, `pruneVerifyAttempts` cutoff semantics.
+
+- `tests/memory/verify-semantic-dispatcher.test.ts` (+10): injection pre-check short-circuits BEFORE spawn, dedup cache hit short-circuits BEFORE spawn, malformed YAML / hallucination guard / spawn_failed mapping, `runSubagent` throws → spawn_failed, passed verdict = attempt only, contradicted high-confidence = attempt + proposal, contradicted low-confidence = attempt only, two contradicted dispatches collapse to one pending proposal via fingerprint dedup.
+
+- `tests/memory/verify-semantic-scheduler.test.ts` (+13): undefined definition / shutdown / no exposures no-op, type gate (user/feedback rejected, project/reference accepted), pending-quarantine-proposal short-circuit, one dispatch per poll with two eligible memories, intra-poll dedupe by (scope, name), dispatch cap fires + latches, cost cap fires + latches, lastPolledAt advances per poll.
+
+- `tests/cli/slash/memory.test.ts` (+3): `/memory governance status` disabled by default + caps rendering + empty hint, enabled state, unexpected arg refused.
+
+Full suite: **8469 pass / 0 fail / 10 skip** (+47 vs S8 baseline of 8422).
+
+**What S11 does NOT do (deferred):**
+
+- **Consolidation** (N similar memories → 1). Subagent infrastructure built here is the building block for Slice 10; the consolidation prompt + flow lands separately.
+- **Conflict detection between memories** (pairwise). Slice 13 — different subagent (`verify-conflict.md`), pair-selection scheduler with BM25 prefilter to avoid O(N²) dispatch.
+- **Drift detection across time** (memory written 90 days ago, codebase migrated since). Requires cross-session subagent infrastructure that doesn't exist today.
+
+## [2026-05-17] hardening(memory) — S8 governance post-review (critical + medium + test gaps)
+
+Three parallel reviewers (correctness/robustness, spec/architecture, test quality) surfaced 12 real findings on S8 after the initial slice landed. All closed in this pass.
+
+**Critical fixes (would bite in production):**
+
+- **F1 — nested transaction safety.** `recordProposal` opened BEGIN/COMMIT manually. Inside another `withTransaction`, the nested BEGIN throws and the catch's ROLLBACK unwinds the OUTER transaction. Replaced with `withTransaction(db, fn)` which uses bun:sqlite's SAVEPOINT shape — nests safely. Test: a recordProposal inside withTransaction now leaves an unrelated outer-txn UPDATE committed.
+
+- **F4 — `rejectProposal` race-aware.** Apply path's error branches called `rejectProposal` but ignored its boolean return. A proposal flipped between `getProposalById` and `transitionMemoryState` (e.g. by the TTL sweep) would silently no-op the rejection UPDATE while the caller returned `outcome: 'rejected'` — pure drift between result and persisted state. Introduced `concludeRejection` helper that checks the return; on no-op, re-reads and surfaces `outcome: 'already_decided'` with the actual `currentStatus` / `decidedBy`. All 10 rejection call sites converted. Test: pre-decide a row to `'expired'` (race simulation) then trigger an error branch; result now correctly says `already_decided`, currentStatus=expired, decidedBy=`system:ttl`.
+
+- **F5 — `audit_drift` posture reworked.** Previous shape left the proposal pending hoping a retry would land — but the retry hits the staleness gate (the frontmatter rewrite mutated the canonical bytes) and auto-rejects forever as `system:stale_evidence`. Permanent dead row. Correct posture: the memory IS in the target state on disk, so the proposal IS applied from the operator's perspective. Mark `applied` with `decidedReason` flagging the missing audit row, emit `memory: AUDIT DRIFT` stderr alert with the proposal id, synthesize sentinel `evictionEventId = audit-drift:<proposalId>` so callers can grep this prefix to distinguish from real eviction rows.
+
+- **F3 — `restore` reads from `.tombstones/`.** Apply path's staleness gate called `registry.read` which only looks at the scope root; for evicted source the body lives in `.tombstones/`. Every restore-from-evicted proposal auto-rejected as `system:stale_evidence` — `restore` kind was mechanically broken. Added tombstone fallback gated on `kind === 'restore'` via `findLatestTombstone` + `parseMemoryFile`. The other kinds (quarantine etc.) keep the strict scope-root semantics. Quarantined→active restore (body still at scope root) was the only path that happened to work pre-fix and is unchanged. Spec divergence (`MEMORY.md §6.5.5` says restore→`proposed`, not `active`) replicates inherited drift from `/memory restore` slash and is flagged for a separate spec-PR-first cleanup.
+
+**Medium fixes:**
+
+- **F2 — canonical `evidenceEssence` default.** Old default `JSON.stringify(input.evidence)` is JS-key-order-dependent (insertion order); two detectors emitting equivalent evidence in different field orders would compute different fingerprints and the silent-dedup gate would never fire. Added recursive `canonicalJsonStringify` (sorts object keys, preserves array order) as the new default. Test: two proposals with the same fields in different orders now dedup correctly.
+
+- **F6 — `target_payload.motivo` / `target_payload.trigger` validation.** Both fields reached `transitionMemoryState` unvalidated. `motivoForKind` cast unknown strings to `EvictionMotivo` and surfaced as `illegal_transition` later (less informative). `trigger` accepted arbitrary strings into the TEXT column that has no CHECK — a malicious detector could poison the audit trail with ANSI escapes, oversize strings, control chars. Both helpers now return `ResolvedMotivo` / `ResolvedTrigger` discriminated unions; invalid override → `concludeRejection` with `system:invalid_evidence`. Trigger regex: `[A-Za-z0-9_-]{1,64}`. Motivo: against the `MOTIVOS` Set.
+
+- **F7 — staleness gate uses `peek` (not `read`).** Pre-fix every apply attempt — including auto-rejected ones — emitted `memory_events action=read` + a `memory_provenance` row for every source memory. Audit / detector-quality queries would over-count "model saw this memory" by the rejection rate. Switched to `registry.peek` since the staleness check is internal verification, not a model-visible read.
+
+- **F8 — slash output sanitization.** Operator-supplied `--reason` and DB-sourced `proposed_by` / `decidedReason` / `decidedBy` were echoed verbatim to scrollback. Hostile detector embedding ANSI in `proposed_by` (or operator passing `--reason $'\x1b[2J'`) could repaint the trust modal / clear the operator's terminal. Added `displayGov` helper wrapping `sanitizeOneLineForDisplay` over every dynamic external string in `formatProposalLine`, `renderProposalDetail`, and the 4 handler error/note surfaces. Audit row keeps the original bytes (forensic value); only display is sanitized.
+
+- **F9 — removed dead bulk modal.** The `>= 3 memories → modal confirm` branch in `handleGovernanceApprove` is unreachable: the apply path's single-memory gate (V1) rejects multi-memory proposals before the modal would fire. Removed the dead code, left a comment for re-introduction when `merge`/`consolidate` apply primitives ship. Doc §11.3 updated.
+
+- **F10 — audit lineage extended with provenance.** `/memory governance audit <id>` only read `memory_events`; TODO T8.5b promised 4-table lineage. Added `listGlobalProvenanceForMemory` lookup per source memory, surfaced as a separate `exposures (N):` section. `eviction_events` JOIN via `evidence_json LIKE` deferred (fragile against JSON serialization; needs a dedicated index for it to be hot-path safe).
+
+**Test footprint:** +43 tests across the three S8 test files.
+
+- `tests/storage/memory-governance.test.ts` (+14): DB-level CHECK bypass (kind / status / decided_at); FK SET NULL on session purge; empty `proposedBy`; non-positive `createdAt`; invalid memory scope; duplicate-key UNIQUE constraint at the keys table; PRIMARY KEY collision with caller-supplied id; `listProposals` null-session filter; `listPendingProposalsForMemory` scope isolation; nested-transaction safety (F1); key-order-stable default essence (F2); pinned fingerprint hex for canonical input.
+
+- `tests/memory/governance.test.ts` (+15): confidence at exactly threshold; `confidenceThreshold` override (loose + strict); restore from tombstone with real `active→quarantined→evicted` chain via same-chain bypass; restore with no tombstone exists; `blocked_by_hook` mapping; `blocked_by_protection` documented (apply path's `actor='user'` bypasses protection by spec — pinning the architectural decision); invalid `motivo` override; invalid `trigger` override with ANSI; `target_payload.trigger` override propagation; unknown `proposedBy` prefix fallback to `operator_driven`; `buildEvidence` ordering pins detector evidence can't spoof the operator-driven trace markers; race-aware reject path (F4); peek-not-read (F7); audit_drift posture sentinel (F5).
+
+- `tests/cli/slash/memory.test.ts` (+14): approve/reject/audit arg-validation (missing id, too-many args, unknown id); `--reason` without value; ANSI sanitization in proposed_by via raw INSERT (F8); ANSI sanitization in operator `--reason` (F8); ANSI sanitization in id arg (F8); approve rejection reasons coverage (`stale_evidence`, `unimplemented_kind`, `multi_memory_unsupported`); audit lineage surfaces `memory_provenance` entries (F10).
+
+Full suite: 8422 pass / 0 fail / 10 skip (+43 vs the S8 baseline of 8379).
+
+**Falsely positive review findings (documented for posterity):**
+
+- "Same-state pseudo-transition leaves drift between governance + eviction substrates" — by spec, `trigger_fired_no_action` rows in `eviction_events` are exactly the "we tried but didn't move state" audit signal. Pairing with a `rejected` governance row is two substrates honestly auditing two different aspects.
+- "Trust untrusted cwd lost between detector and apply" — concerns Phase 2 / S11 (subagent injection surface), not S8 substrate.
+
+## [2026-05-17] feat(memory) — S8 governance proposal substrate (Phase 2 opens)
+
+First slice of Phase 2 (`feat/memory-governance-llm`, branched off `feat/memory` after the Phase 1 merge). Lands the propose-not-mutate substrate every LLM-judge detector (S11 verify_failed, S13 conflict_detected) and the deterministic counter (S3 user_override_repeated) will hang off of. Zero LLM cost in S8 itself — this is the spine, not a detector.
+
+Shipped (T8.1 → T8.7):
+
+- **Migration 056** (renumbered from the TODO's draft 055 — that slot was already taken by `shared-corpus-trust` in Phase 1). Parent `memory_governance_proposals` with all six kinds in CHECK (`quarantine`, `restore`, `demote`, `merge`, `consolidate`, `expire`), UNIQUE partial index on `proposal_fingerprint WHERE status='pending'` for silent dedup, `source_memory_snapshots` JSON for the staleness gate. Auxiliary `memory_governance_proposal_keys` (FK CASCADE) is the per-memory index that backs `listProposalsForMemory` without JSON LIKE'ing into the parent column.
+
+- **Repo `src/storage/repos/memory-governance.ts`.** `recordProposal` validates kinds/scopes/snapshot bijection/confidence in `[0,1]`, computes the fingerprint (`SHA-256(kind, sorted source keys, evidence_essence)`), INSERTs parent + keys in one transaction, catches `SQLITE_CONSTRAINT` from the partial UNIQUE and returns the existing pending row's id with `deduped: true`. Listings (`listProposals`, `listPendingProposals`, `listProposalsForMemory`, `listPendingProposalsForMemory`) all take explicit limits; the JOIN-backed memory lookups serve the S11 pre-dispatch dedup guard cheaply. `decideProposal` is `status='pending'` gated + idempotent; `expirePendingProposals` is the bulk TTL sweep.
+
+- **Apply path `src/memory/governance.ts:applyProposal`.** Five sequential gates: existence + status, confidence (`DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD = 0.7`; NULL bypasses for operator/deterministic proposals), kind support (V1 implements `quarantine` + `restore`; other kinds reject with `system:unimplemented_kind`), single-memory only (multi-memory keys reserved for `merge` / `consolidate`), staleness (every snapshot must match the current `hashMemoryContent(serializeMemoryFile(file))`; drift wins over state_change in the rejection reason — if the operator edited the body since the proposal, the decision is "evidence stale" not "state changed"). After the gates pass, `transitionMemoryState` runs with `actor: 'user'` (operator approval IS the user action), motivo defaulted per kind (`quarantine → conflict`, `restore → shift`; `target_payload.motivo` overrides), trigger derived from `proposed_by` (`subagent:verify-semantic` → `verify_failed`, etc.) with `target_payload.trigger` override, and an evidence payload carrying `_operator_driven`, `proposal_id`, `proposed_by`, `proposal_fingerprint`, and `detector_evidence`. State-machine refusals (illegal_transition, blocked_by_protection, blocked_by_hook, invalid_evidence) all map to a rejection on the proposal with the matching reason; `io_error` and `audit_drift` leave the proposal pending so a retry can land cleanly.
+
+- **TTL sweep** wired in `bootstrap.ts` between `pruneMemoryProvenance` and the shared-corpus trust probe. Default `GOVERNANCE_PROPOSAL_TTL_MS = 30d`; sweep updates `status='expired'` with `decided_by='system:ttl'`. Best-effort with `AUDIT DRIFT` stderr on failure, same posture as the provenance sweep.
+
+- **Slash `/memory governance`** with five subcommands: `list [--status <s>] [--limit N]`, `show <id>`, `approve <id>` (modal confirm when affecting ≥3 memories), `reject <id> [--reason "..."]`, `audit <id>` (proposal detail + lineage from `memory_events` filtered by source scope/name + post-proposal timestamp). Strict arg validation refuses unknown flags / missing ids / extra positionals.
+
+- **`docs/MEMORY.md` §11.3** documents the substrate end-to-end: why a separate table (mutable status semantic doesn't fit append-only audit), the six kinds + what V1 actually executes, schema fields, the five apply-path gates, TTL semantics, operator surface, and what proposals deliberately do NOT do (mutate state without approval, bypass the state machine, replace direct `/memory quarantine` flows). §11 (tables) extended from 3 to 4. §14.4 "What IS shipped" lists the new slice and how it slots in front of S11/S13.
+
+- **TODO**: Slice 8 marked ✅ done with task-level state; dependency graph + recommended order updated; migration number correction noted (055 → 056).
+
+Test footprint: 67 new tests across three files — 27 (`tests/storage/memory-governance.test.ts`) cover the repo + schema CHECK + FK CASCADE; 16 (`tests/memory/governance.test.ts`) cover the apply path end-to-end with real FS fixtures (pre-flight gates each exercised; happy quarantine path asserts on-disk frontmatter mutation + paired eviction_events row + trace fields; restore happy path; same-state pseudo-transition rejected as state_change; hook fires when wired; `target_payload.motivo` override); 24 (`tests/cli/slash/memory.test.ts`) cover the five subcommands + arg validation + dispatcher errors.
+
+Full suite: 8379 pass / 0 fail / 10 skip (+84 vs the Phase 1 baseline of 8295).
+
+Phase 2 remainder (S3, S11, S13) can ship in any order on top of S8; LLM-judge slices add the injection-aware subagent infrastructure on top of the foundation that landed here.
+
+## [2026-05-17] fix(memory) — Filter excluded scopes before applying search limit
+
+Review observation: `createScopeFilteredRegistry.search` post-filtered hits AFTER `base.search` returned. The base loop enforces `limit` while iterating in precedence order (`project_local` > `project_shared` > `user`); when `project_shared` was excluded and `limit` was small (e.g., 1), the shared match was picked first, filled the cap, and stopped the loop before any allowed-scope sibling was considered. The wrapper then dropped the shared hit and returned `[]` — silently losing the permitted memory. Same precedence-fallback bug pattern the previous `ListOptions.excludeScopes` fix addressed for `list`, just on the search surface.
+
+Fix: add `excludeScopes?: readonly MemoryScope[]` to `SearchOptions`. The registry's search filters candidates by it at candidate-build time (alongside the existing `scope` restriction), BEFORE the iteration loop. The wrapper's `search` now merges its own `excludeScopes` into the option and delegates without any post-filter. Precedence-fallback is restored: the limit walks only over allowed scopes.
+
+Audit-trail impact: the deferred `auditRead` / `auditExposure` emission in the base loop only ever sees the surviving candidates, so the audit row count tracks "what the model actually saw" the same way it did before. Pinned-excluded-scope short-circuit at the wrapper layer stays — a caller asking `search('x', { scope: 'project_shared' })` against a wrapper that excludes `project_shared` still gets `[]` immediately, no base call.
+
+Regression test (`tests/memory/registry.test.ts`): two memories named `fortress`, one in `project_shared` and one in `user`. With no exclusion, `base.search('fortress', { limit: 1 })` returns `project_shared/fortress` (pins the precondition). With `createScopeFilteredRegistry(base, ['project_shared'])` and the same `limit: 1`, the wrapped search MUST surface `user/fortress`. Pre-fix this returned `[]`.
+
+Tests: 8314 pass (+1), 10 skip, 0 fail.
+
+## [2026-05-17] fix(harness) — Enforce shared-scope block on all memory tools
+
+Review observation: when `memoryExcludeScopes` was set (shared trust probe → `verify_failed` / `deferred` / `revoked`), the harness wired `retrieve_context` against the exclusion correctly but exposed the **unfiltered** `memoryRegistry` to `memory_list` / `memory_read` / `memory_search` via `ctx.memoryRegistry`. The model could call those tools and enumerate / read `project_shared` bodies the operator had marked offline — direct bypass of the trust gate the eager-load and retrieval surfaces already respect. Test harness pinning the shared-scope exclusion existed for retrieval and eager-load, but the per-tool surface was unprotected.
+
+Fix: introduce `createScopeFilteredRegistry(base, excludeScopes)` in `src/memory/registry.ts` — a thin wrapper around `MemoryRegistry` that filters every read-side method (`list` / `lookup` / `read` / `peek` / `search` / `count`). Write-side methods (`write`, `recordEvent`, `reload`) pass through; this fix scopes to reads (the bypass the review flagged). Wire it in `src/harness/loop.ts`: when `memoryExcludeScopes` is non-empty, wrap once per run before exposing as `ctx.memoryRegistry`. The retrieval runner builds against the same wrapped registry for surface symmetry, with the explicit `memoryExcludeScopes` still threaded as defense-in-depth.
+
+Wrapper semantics, picked to mirror the existing fail-closed contract:
+- `list({ scope: excluded })` → `[]`. Caller pinned a forbidden scope.
+- `list({})` → routes `excludeScopes` into the native `ListOptions.excludeScopes` so the filter runs BEFORE `deduplicateByName` (preserves the precedence-fallback the previous review fix established — a higher-precedence shadow in an excluded scope no longer suppresses an eligible lower-precedence sibling).
+- `lookup` / `read` / `peek` with `opts.scope`: excluded → `null` / `{ kind: 'unknown' }`; allowed → delegate.
+- `lookup` / `read` / `peek` without `opts.scope`: walk `SCOPE_ORDER` (local > shared > user), skip excluded scopes, return the first hit. Audit emission only fires on `present` (same contract as base), so the wrapper doesn't multiply audit rows.
+- `search` filters hits in excluded scopes; pinned excluded scope short-circuits to `[]`.
+- `count` reflects the filtered view so boot banner / footer tray show the model-effective count.
+
+Empty `excludeScopes` is a degenerate no-op: the wrapper short-circuits to the base registry (reference equality), so unprotected sessions pay zero overhead. The subagent path inherits the wrapping for free because subagent boots re-enter the same harness wiring.
+
+Regression tests:
+- `tests/memory/registry.test.ts` — eight new tests under `createScopeFilteredRegistry`: list dedup-fallback after exclusion, list pinned-excluded → `[]`, read SCOPE_ORDER fallback, read pinned-excluded → `unknown`, search filters hits, peek matches read, empty-exclusion short-circuit (reference equality), count reflects filtered view.
+- `tests/harness/loop.test.ts` — two e2e tests via `runAgent`: (1) with `memoryExcludeScopes: ['project_shared']` and an `ATTACKER_PAYLOAD` body in shared, a synthetic capture tool grabs `ctx.memoryRegistry` and proves all six surfaces (`list({})`, `list({ deduplicateByName: true })`, `read`, `peek`, `search` default + pinned + deep) refuse the shared content. (2) without exclusion, `ctx.memoryRegistry` is the unwrapped base — pinning the conditional so future regressions wrapping unconditionally fail loudly.
+
+Tests: 8313 pass (+10), 10 skip, 0 fail.
+
+## [2026-05-17] fix(memory) — Loader rejects symlinked .md files (trust-attestation symmetry)
+
+Review observation (S5 trust gate): `listSharedCorpusFiles` in `trust-corpus.ts` lstat-rejects symlinks — symlinked `.md` files are excluded from both the shared-corpus fingerprint AND the modal inventory. But `readMemoryByName` and `loadScopeIndex` in `loader.ts` use plain `readFileSync(path, …)`, which follows symlinks. A malicious repo could ship `project_shared/MEMORY.md` referencing `evil.md` where `evil.md` is a symlink to any out-of-scope file the agent UID can read (`~/.ssh/id_rsa`, host config, neighboring project secrets). The fingerprint stays unchanged across boots because the symlink was already excluded from it, so no trust re-prompt fires, while the model silently sees target bytes in eager-load or retrieval. Same threat with a symlinked `MEMORY.md` itself: the attacker swaps which bodies the loader picks up under a stable trust hash.
+
+Fix: add a `checkRegularFile(path)` helper to `loader.ts` that lstats before any read. Both `loadScopeIndex` (MEMORY.md) and `readMemoryByName` (body files) gate on it — symlinks return `kind: 'malformed'` with a security-policy message; non-regular files (directories named `foo.md/`, fifos, sockets) return the same kind with a "not a regular file" message. The substrate's symlink policy is now uniform: modal sees what the model sees, no asymmetric bypass.
+
+Trust-row stays at the existing fingerprint (excludes symlinks); operator-facing surfaces (`/memory list`, `/memory show`) render the malformed entry with the policy message so an operator who intentionally placed a symlink sees a clear "refused" signal rather than silent dropping.
+
+Side note: the existing trust-corpus header on `listSharedCorpusFiles` claimed the rejection prevented leakage "into the eager-load section downstream" — that claim was wrong pre-fix because the eager-load went through this loader. With the mirror in place the comment becomes accurate.
+
+Regression tests:
+- `tests/memory/loader.test.ts` — three new cases: symlinked MEMORY.md → malformed with "symlink" in the message; symlinked body → malformed AND the attacker payload string is provably absent from the result (proof the bytes never enter process memory beyond the lstat); directory named `foo.md` → malformed with "regular" in the message.
+- `tests/cli/memory-prompt.test.ts` — end-to-end: `project_shared/MEMORY.md` is a real file referencing a symlinked body whose target contains `ATTACKER_PAYLOAD`; assert the rendered section does NOT contain those bytes. Pre-fix this would have surfaced them under a stable trust hash.
+
+Tests: 8303 pass (+4), 10 skip, 0 fail.
+
+## [2026-05-17] fix(memory) — Emit search provenance only for returned hits
+
+Review observation: `registry.search` emitted `auditRead` + `auditExposure` inline for every deep-mode body match. The `memory_search` tool intentionally over-fetches (`limit + 1`) to detect truncation and then drops the extra row before returning to the model. That meant at least one body the model never saw still got a `memory_events` `read` row + a `memory_provenance` row with surface=`memory_read`. Detectors that treat provenance as "visible to model" evidence (Slice 3 exposure-frequency / user_override_repeated) got inflated counts; `/memory provenance --tool` showed a phantom exposure operators couldn't reconcile against the search result they ran.
+
+Fix: add an optional `auditLimit` to `SearchOptions`. Defaults to `opts.limit` — every returned hit audits, which is correct for callers that don't over-fetch. The registry's deep loop now appends body matches into a `pendingDeepAudits` queue (capturing `{ listing, fileResult, hitIndex }`) instead of auditing inline; after the loop, only queue entries with `hitIndex < auditLimit` emit. `memory_search` passes `auditLimit: limit, limit: limit + 1` so the over-fetch sentinel stays purely a truncation signal — no audit event, no provenance row.
+
+The body still reads from disk during the loop (the snippet match needs it), but the bytes stay in process memory and never reach the model when the hit is dropped. That's not an exposure under MEMORY.md §11.2's contract.
+
+Regression tests:
+- `tests/memory/registry.test.ts` — `auditLimit caps deep-body emit while limit governs the returned slice`: seeds 5 deep-matchable memories, asks `limit: 4, auditLimit: 3`. Asserts 4 hits returned AND exactly 3 read events across the registry. Pre-fix would have been 4.
+- `tests/tools/memory-search.test.ts` — `deep over-fetch does NOT emit exposure for the dropped sentinel row`: 5 deep-matchable memories, tool called with `limit: 3`. Asserts `result.hits.length === 3`, `truncated: true`, exactly 3 `read` rows and 3 `memory_provenance` rows linked to the tool_call (all surface=`memory_read`). Pre-fix would have surfaced 4 of each.
+
+Tests: 8299 pass (+2), 10 skip, 0 fail.
+
+## [2026-05-17] fix(memory) — Silent-seed when shared corpus has zero files
+
+Review observation: the probe's first-visit branch treated only `presentedHash === EMPTY_CORPUS_HASH` as "empty corpus, silent-seed". `computeSharedFingerprint` returns that sentinel **only** when the shared/ directory is absent (ENOENT). If the directory exists but contains zero `.md` files (operator made `mkdir .agent/memory/shared` via init script / template but never put files there), the fingerprint hashes only the domain separator — a distinct, non-sentinel value. The probe fell into the first-visit modal path over an empty inventory. Worst case: the operator hits Esc / timeout / signal during that modal, the probe returns `deferred(modal_cancel)`, and the shared scope stays offline for the entire session for a corpus that was literally empty.
+
+Fix: move `enumerateCorpus(input.sharedRoot)` to the top of the first-visit branch and silent-seed when `firstVisitCorpus.length === 0`. Both filesystem states (absent dir → listing.kind!=='present' → empty array; present-but-empty dir → listing.kind==='present', files: []) collapse to the same empty inventory through this gate — one check, no extra IO over the original path. The redundant `EMPTY_CORPUS_HASH` import on the probe goes away; the constant stays exported from `trust-corpus.ts` because it's still the documented sentinel returned by the fingerprint.
+
+Updated the FLOW comment + `ProbeSharedTrustResult.seeded` docstring to reflect "zero `.md` files (directory absent OR present-but-empty)" instead of "no files at all" / "seeded with EMPTY_CORPUS_HASH" (the latter was wrong post-fix — present-empty seeds with the actual fingerprint, not the sentinel).
+
+Bootstrap stays unchanged: the probe-result branching (verify_failed / deferred / revoked → offline) catches the new seeded outcome correctly (not offline). The no-probe fallback (`storedTrust === null` → offline) handles the very first headless boot; subsequent boots after any interactive probe land in the `unchanged` branch as expected.
+
+Regression test (`tests/memory/trust-corpus-probe.test.ts`): `mkdir`-create the shared/ directory but write no `.md` files, run the probe with `stored === null`, assert `kind === 'seeded'`, `modalCalls === 0`, trust row stamped with the current fingerprint (distinct from EMPTY_CORPUS_HASH). The existing absent-dir test's comment was tightened to reflect the new contract.
+
+Tests: 8297 pass (+1), 10 skip, 0 fail.
+
+## [2026-05-17] fix(slash) — Enforce --limit for tool/retrieval provenance queries
+
+Review observation: `/memory provenance` parsed `--limit` (default 50) but only honored it on the name mode (`listProvenanceByName` / `listGlobalProvenanceByName` took the limit). The `--tool` and `--retrieval` paths called `listProvenanceForToolCall` and `listExposuresInRetrieval` with no limit parameter — the SQL had no `LIMIT` clause, and every row matching the tool_call_id or retrieval_query_id rendered. For a high-volume session (many memory_read / retrieve_context exposures during one turn, or a retrieval over a large corpus) the slash flooded the terminal with hundreds of lines. Behavior contradicted the flag contract; operators expected `--limit` to cap uniformly.
+
+Fix: append an optional `limit = 50` parameter to both repo functions (matching `listProvenanceByName` / `listProvenanceForMemory` signature shape) and a `LIMIT ?` in the SQL. Thread `flags.limit` through the two call sites in `slash/commands/memory.ts`. Other callers (tests, retrieve-context spec) don't pass a limit and pick up the default — no behavior change there.
+
+Repo-level regression tests in `tests/storage/memory-provenance.test.ts`: for each of `listProvenanceForToolCall` and `listExposuresInRetrieval`, seed 60 rows, assert the default returns exactly 50 and an explicit `limit: 5` returns 5.
+
+Slash-level regression tests in `tests/cli/slash/memory.test.ts`: `provenance --tool <id> --limit 3` over 8 seeded rows returns header + 3 = 4 notes; same shape for `--retrieval`. Pre-fix both would have returned header + all 8 = 9 notes.
+
+Tests: 8296 pass (+4), 10 skip, 0 fail.
+
+## [2026-05-17] fix(harness) — Gate eager provenance on full inventory, not any row
+
+Review observation: the resume guard in `harness/loop.ts` asked `hasEagerProvenance(db, sessionId)` — "does ANY eager row exist for this session?" — and skipped the entire emit if it returned true. Combined with the best-effort per-row write (try/catch around `recordProvenance`, AUDIT-DRIFT stderr on failure), a transient `SQLITE_BUSY` or other write failure mid-loop could leave the session in a partial state: one or more rows landed, the rest didn't. The next resume saw "some rows exist, skip", and the missing exposures stayed missing forever — even after the DB recovered. The provenance accuracy that whole T1.4 emit was added to provide gets silently broken for that session's lifetime.
+
+Fix: replace `hasEagerProvenance` with `getEagerProvenanceKeys(db, sessionId)`, which returns the SET of `${scope}/${name}` keys already recorded as eager for this session. The loop iterates `eagerExposures` and skips only the keys already present — missing keys backfill on the next resume. Same indexed scan as the old probe (`idx_memory_provenance_session_scope_name_created`), so cost is unchanged.
+
+Read-failure posture stays defensive: if the lookup itself throws (unusual — SELECTs don't ordinarily contend with the WAL writer lock), the loop logs to stderr as AUDIT DRIFT and falls through with an empty set, treating every exposure as missing. The downside is duplicate inserts when ALL rows were actually present (schema has no UNIQUE constraint), accepted as the lesser cost than an unhandled throw out of startup.
+
+Audit: `hasEagerProvenance` had no other callers — its sole user was the loop's emit gate. Dropped from the repo surface.
+
+Regression tests:
+- `tests/storage/memory-provenance.test.ts` — `getEagerProvenanceKeys` describe block (5 tests): empty session, per-call surfaces excluded from keyset, scope/name composite keying (same `foo` in two scopes is two entries), partial-write resume keyset shape, session-scoped isolation.
+- `tests/harness/loop.test.ts` — kept the existing per-key idempotency test (renamed + commentary updated). New `eager emit resumes partial writes` test: seed ONE of two exposures pre-loop, run the loop with both supplied, assert the pre-existing row stays unduplicated AND the missing one backfills. Pre-fix the second assertion would fail (the missing row stays 0).
+
+Tests: 8292 pass (+2), 10 skip, 0 fail.
+
+## [2026-05-17] fix(retrieval) — Filter excludeScopes before deduplicating in memory view
+
+Review observation: `createMemoryView` called `registry.list({ deduplicateByName: true, … })` and then filtered `excludeScopes` in JS on the result. That order silently broke the precedence-fallback contract documented in `registry.ts` ("ORDER MATTERS: this runs BEFORE the dedupe-by-name pass"). When a fail-closed session ran with `excludeScopes: ['project_shared']`, dedup picked `project_shared/foo` (precedence local > shared > user) AND suppressed `user/foo`; the post-dedup JS filter then removed `project_shared/foo`, leaving NO `foo` candidate at all. The model lost a trusted body it should still have been able to retrieve.
+
+Fix: plumb `excludeScopes` into `ListOptions` so the registry filters BEFORE both the state/expires peek and the dedup pass. The view drops its JS-side post-filter and passes `excludeScopes` directly into `registry.list(...)`. The registry already had a comment block on the dedup ordering invariant — the new `excludeScopes` filter slots in next to the `scope` restrictor at the top of `list()` so dedup operates only over allowed scopes.
+
+Audit: `assembleMemorySection` (eager-load path) already filters BEFORE its dedupe-by-iteration loop (per H2-rob comment block), so no change needed there. Other `deduplicateByName: true` callers (`/memory list` slash, REPL banner count, status display) don't use exclude semantics and stay unchanged.
+
+Regression tests in `tests/retrieval/memory-view.test.ts`:
+- shared→user precedence fallback (the production case): `project_shared/foo` + `user/foo` + `excludeScopes: ['project_shared']` must surface `user/foo`. Pre-fix returned `[]`. Includes the baseline-without-exclusion assertion that pins the precondition (dedup IS hiding `user/foo` absent any filter), so the test fails for the right reason if the bug returns.
+- local→shared symmetric case: `project_local/bar` + `project_shared/bar` + `excludeScopes: ['project_local']` must surface `project_shared/bar`. Covers the other direction of the precedence ladder.
+
+Tests: 8290 pass (+2), 10 skip, 0 fail.
+
+## [2026-05-17] fix(memory) — Catch BEGIN IMMEDIATE lock failures in purge sweep
+
+Review observation: `gcPurgeExpiredTombstones` called `db.exec('BEGIN IMMEDIATE')` at the top of each per-row TOCTOU transaction with no surrounding error handler. SQLite raises `SQLITE_BUSY` when another writer holds RESERVED — a concurrent boot, an in-flight `/memory restore`, an ongoing slash mutation. The throw escaped the helper, aborting bootstrap entirely. That violates the spec contract documented in `cli/bootstrap.ts` (one bad row mustn't gate the session — failures funnel through `result.failures`, stderr summarizes them, the next boot retries).
+
+Fix: wrap `BEGIN IMMEDIATE` in a try/catch. On any throw, push the row into `failures` with a `BEGIN IMMEDIATE failed: <reason>` line and `continue` to the next row. The paired `finally` ROLLBACK is now also guarded — a poisoned connection state (e.g., COMMIT half-succeeded and we threw later) used to surface its own throw from inside the finally, which would have escaped past the loop boundary in the same way the unhandled BEGIN did. The next loop iteration's BEGIN is the recovery point; anything semantically meaningful for the failed row is already in `failures`.
+
+Regression test: seed two due-for-purge tombstones, wrap the DB in a Proxy that throws `SQLITE_BUSY` on the FIRST `BEGIN IMMEDIATE` and passes every subsequent exec through unchanged (models a transient writer-lock collision that clears by the time the loop reaches the next row). Asserts the sweep returns normally, `failures` carries the first row with a `SQLITE_BUSY`-bearing reason, and `purged` carries the second row — proving the loop survives one BEGIN failure and processes subsequent rows. The Proxy is careful to bind non-overridden methods to the real `Database` instance because `bun:sqlite` uses private fields (`#`).
+
+Tests: 8288 pass (+1), 10 skip, 0 fail.
+
+## [2026-05-17] fix(storage) — Push invalidation batch filter into SQL
+
+Review observation: `getLastInvalidationEventsBatch` ran `SELECT object_id, object_scope, MAX(recorded_at) … GROUP BY object_id, object_scope` with only a `substrate` filter and then trimmed the result in JS via a `wanted` Set. On a long-lived database that meant boot-time `gcStaleInvalidatedMemories` did work proportional to TOTAL historical invalidation rows for the memory substrate, not the handful of currently-invalidated bodies being inspected. The original P1/F2 batching collapsed N round-trips into one, but the one query it left behind still scaled with history.
+
+Fix: push the per-object filter into SQL via row-value IN — `WHERE substrate = ? AND (object_id, object_scope) IN ((?, ?), …)`. The clause builds with one tuple per requested object, parameters bind in order, and the JS-side `wanted` filter is gone (correctness still holds — only requested rows are returned). Row-value IN is supported in SQLite ≥3.15 (2016) and Bun bundles 3.45+; smoke-checked against `bun:sqlite` before landing.
+
+Index usage stays correct: `idx_evict_obj(substrate, object_id)` is hit per IN tuple, then `object_scope` + `to_state` + `outcome` filter at the leaf. Cost now scales with the requested key count, not historical row count.
+
+Regression tests: six new tests under `getLastInvalidationEventsBatch` — basic batch correctness, scope isolation for same id across scopes, empty-objects short-circuit, the **scoping** test (seed 50 unrelated invalidations + 2 requested, assert map.size === 2 and none of the noise leaks), outcome/to_state filter (an applied + a blocked_by_protection + a quarantine row at the same key — only the applied invalidation surfaces), and substrate isolation across memory/policy.
+
+Tests: 8287 pass (+6), 10 skip, 0 fail.
+
+## [2026-05-17] fix(memory) — Sanitize corpus filenames before stderr emission
+
+Review observation: the trust probe's `dumpInventoryToStderr` (S5 IMP/F5) wrote `corpusFiles[i].name` and `sharedRoot` straight through `warn()` to stderr, and `bulkInvalidateShared` did the same with `listing.name` + `reason`. The modal-renderer path passes those strings through `sanitizeOneLineForDisplay` (stripping ANSI escapes and collapsing `\r\n\t` to spaces), but the stderr surface didn't — so a poisoned repo shipping a `.md` file whose name embeds ESC sequences, literal newlines, or carriage returns could inject terminal control bytes into the operator's trust-review output. Concrete attacks: clear-screen + cursor-move to repaint the modal prose, fake an additional inventory line so a malicious entry looks benign, or split a single warn line into two with a forged second line.
+
+Fix: thread `sanitizeOneLineForDisplay` through every operator-facing string the probe emits via `warn`. Three call sites covered — the header (`sharedRoot`), the per-file inventory line (`f.name`), and both bulk-invalidate failure paths (`listing.name` + `reason`). Picks up the same helper the modal reducer uses (`sanitize/ansi.ts`), so the stderr surface stays at parity with the in-TUI surface and a future tightening of the sanitizer benefits both.
+
+Regression test (T1b): creates a `.md` file whose filename embeds `[31m`, a literal newline, and a tab; pre-probe drifts so the drift modal fires; cancels the modal. Asserts the per-file warn line contains the legible portions (`tampered`, `fake-line`, `here`) — operator can still spot the suspicious filename — but is single-line with no ESC / LF / CR / TAB bytes, and the same constraint holds for every warn line emitted (header included).
+
+Tests: 8281 pass (+1 T1b), 10 skip, 0 fail.
+
+## [2026-05-17] fix(memory) — Rehash bytes on the trust-confirm path (reverts F1 fast-path)
+
+Review observation: `verifyConfirmedHash` short-circuited via `recomputeSharedFingerprintIfStale` when every file's `(size, mtimeMs)` matched the pre-modal snapshot. The header on `CorpusSnapshot` claimed this was security-neutral, but the threat model was wrong: an attacker who can write to disk can `utimes(2)` mtime back to the snapshot's value, and a same-second rewrite is naturally invisible on filesystems with coarse mtime granularity (FAT/exFAT, some network FS). In both cases a same-size content swap during the modal window would pass through as unchanged, and the probe would stamp `shared_corpus_trust` on bytes the operator never saw — the exact TOCTOU window `verifyConfirmedHash` is supposed to close.
+
+Fix: drop the fast path. `verifyConfirmedHash` now always re-hashes the corpus from bytes via `computeSharedFingerprint`. The pre-modal and post-modal computations both read every body; the second read is the same cost as the first (~<1ms at spec-bounded sizes per §5.4) and runs at most once per probe.
+
+Cleanup: removed the now-dead `recomputeSharedFingerprintIfStale` helper, the `computeSharedFingerprintWithSnapshot` variant, and the `CorpusSnapshot`/`CorpusFileStat` types. They existed solely to back the fast path; keeping them as exported but unused surface is an attractive nuisance that invites the same regression to be re-introduced elsewhere.
+
+Regression test (T8b): writes body X, captures its stat; pre-probe writes a different body of the same size; inside the modal swaps to a third same-size body and `utimesSync`-restores atime+mtime to the captured stat. A stat-only fast-path would see `(size, mtime)` unchanged and stamp; bytes-on-confirm detects drift, returns `deferred(tocttou_during_prompt)`, leaves the trust row pinned to the old hash + original timestamp. T8 commentary updated to drop the fast-path references.
+
+Side cleanup: ran `biome check --write` on `tests/memory/lifecycle.test.ts` to absorb formatting drift from `b5cf7be`. Pure mechanical reformat, no logic change.
+
+Tests: 8280 pass (+1 vs prior baseline of 8279), 10 skip, 0 fail.
+
+## [2026-05-17] hardening(memory) — Third-round review (architecture + performance + test quality) closed
+
+Three more parallel reviewers (architecture quality, performance & boot-time cost, test coverage gaps) surfaced 18 issues after the second round. All 18 closed.
+
+Architecture cleanup (D1/D2/DRY1/DRY2/N1):
+
+- **D1**: REPL now surfaces the `deferred` outcome's `cause` (`modal_cancel` vs `tocttou_during_prompt`) in stderr — operator-load-bearing distinction that was previously consumed only by tests.
+- **D2**: Shrunk `ProbeSharedTrustResult` to drop `oldHash`/`newHash`/`mode` on `reconfirmed`/`revoked`. The fields were synthetic / not load-bearing in production; durable forensic detail lives in `memory_events`, `eviction_events`, `shared_corpus_trust`. Tests updated to read from those.
+- **DRY1**: `SharedTrustModalMode` alias now imported at 3 prior inline sites (events.ts, modal-manager.ts, bootstrap.ts) — single source of truth.
+- **DRY2**: Extracted `auditAttribution(input)` helper in `bulkInvalidateShared`; 3× repeated conditional spreads collapse to one call site.
+- **N1**: Added WHY one-liners at the array↔boolean serialization boundaries (bootstrap.ts, loop.ts, subagent-child.ts) documenting why `excludeScopes: MemoryScope[]` and `sharedScopeOffline: boolean` are intentional shape divergence — boolean serializes cleanly across the subagent IPC boundary.
+
+Performance (F1/F2/F3, F6 deferred):
+
+- **F2**: `getLastInvalidationEvent` N+1 collapsed to a single batch SELECT (`getLastInvalidationEventsBatch`) grouped by `(object_id, object_scope)`. Drops boot cost from O(N queries) to O(1) for a corpus with N invalidated memories.
+- **F1**: Introduced `CorpusSnapshot = { hash, files: { name, size, mtimeMs }[] }` + `computeSharedFingerprintWithSnapshot` + `recomputeSharedFingerprintIfStale`. Probe captures snapshot once, threads through `verifyConfirmedHash`; fast-path skips re-reading bodies when (size, mtime) tuples unchanged. Falls back to full re-fingerprint on any deviation — no security weakening. Drops post-modal-yes path from 2× corpus reads to 1× read + N stats.
+- **F3+F4**: Extended `MemoryListing` with optional `file?: MemoryFile` populated alongside `state?` when the state filter triggered a peek. `gcStaleInvalidatedMemories` reads `listing.file.frontmatter.source` instead of re-peeking. Eliminated 1 of the 2 reads per invalidated body at boot (bulk-invalidate's per-iter peek stays for M3 concurrent-defense).
+- **F6**: mtime fast-path for headless deferred — documented in `bootstrap.ts` why: ROI is low (~5-10ms per boot), implementation needs migration 056 + per-file mtime persist (root-dir mtime misses body edits). Revisit when telemetry justifies the schema change.
+
+Test gaps (T1/T2/T3/T4/T5/T6/T8/T15a/T15b):
+
+- **T1**: F5 stderr inventory dump now pinned by tests — header + per-file lines + empty-corpus path.
+- **T2**: F3 recovery hint stderr pinned via repl.test.ts (synthesized `sharedTrustProbe: revoked` in stub bootstrap).
+- **T3**: Subagent inheritance E2E test in `tests/subagents/e2e.test.ts` — parent's `sharedScopeOffline: true` propagates through spawn factory → runSubagentChild → assembleMemorySection; captured child's `systemPrompt` does NOT contain shared body.
+- **T4**: gcStaleInvalidatedMemories failure paths — illegal_transition path (frontmatter manually flipped post-seed → filter excludes, accept), io_error path (chmod 000 on `.tombstones/` → failures array populated with correct reason).
+- **T5**: Sweep scope coverage — seeds invalidated memories in user + project_local + project_shared; asserts all three end up in `result.evicted`.
+- **T6**: Bulk-invalidate transition io_error — chmod 0o500 on scope dir (read+exec, no write) so registry.list peek works but transitionMemoryState's frontmatter rewrite fails. Asserts `result.failed` populated + `refused` audit row landed.
+- **T8**: TOCTOU sibling test — same-body modal path returns `reconfirmed` (proves `verifyConfirmedHash` distinguishes drift from non-drift).
+- **T15a/b**: First-visit + cancel and first-visit + yes + TOCTOU state-machine matrix gaps filled.
+
+Tests: 8275 pass (+12 vs pre-rodada-3), 0 fail.
+
+## [2026-05-17] hardening(memory) — Second-round review (operational + cross-subsystem + spec) closed
+
+Three parallel reviewers (operational flow, subsystem boundaries, spec adherence) found 12 more issues after P0/P1. All 12 closed in this pass — eight critical (would break daily operator flow or skip the security gate elsewhere in the system), four important.
+
+Critical fixes:
+
+- **V1 invalidated retention sweep.** Trust_revoked produced `invalidated` rows that stayed on disk forever — no GC progressed them to `evicted` despite the 7-day window mandated by EVICTION.md §7.1 + MEMORY.md §6.5.6. Added `gcStaleInvalidatedMemories` in `src/memory/lifecycle.ts` (mirrors `gcExpiredMemories`/`gcPurgeExpiredTombstones`) wired into bootstrap right after the existing sweeps. `motivo: 'shift', trigger: 'expired_at', actor: 'startup_probe'`. Orphans (frontmatter `state: invalidated` without a matching audit row) surface to stderr without being touched. 5 lifecycle tests.
+
+- **F2 perpetual first-visit prompt.** Operator declining the first-visit modal left the trust row null + files on disk → next boot re-enumerated the same `.md` files → first-visit modal fired again, forever. Fix: both first-visit AND drift revoke paths now stamp the trust row with the POST-invalidate hash (after `bulkInvalidateShared` mutated each frontmatter). Subsequent boots see `unchanged` → no modal. The invalidated frontmatter is the durable decline marker; the trust row records "we know about this state".
+
+- **F3 recovery path.** LEGAL_TRANSITIONS forbids `invalidated → active`, so `/memory restore` can't bring back a revoked corpus. Surfaced the manual recovery path (edit frontmatter + re-add to MEMORY.md, then `/memory trust accept`) in the modal preview AND the post-revoke stderr summary. Stronger fix (spec PR for the state-machine extension) deferred.
+
+- **H1 boot-time hook fire (deferred).** Bulk-invalidate transitions don't fire the Eviction hook because the probe runs pre-session. Documented as deliberate alignment with `gcExpiredMemories` precedent — boot-time consistency actions skip hooks per the existing pattern. If/when the spec demands hook fires for detector-driven boot actions, that's a separate spec PR.
+
+- **H2 retrieval excludeScopes.** `retrieve_context` tool bypassed the eager-load fail-closed gate. Added `excludeScopes` to `MemoryViewDeps` and threaded `memoryExcludeScopes` through `HarnessConfig` → `buildRetrievalRunner` → `createMemoryView`. Eager-load and retrieval now mirror each other on the trust posture. 2 view tests.
+
+- **H3 subagent inherits parent's trust verdict.** Child constructed its own MemoryRegistry + assembleMemorySection without knowing the parent revoked / verify_failed. Added `sharedScopeOffline` to the spawn-factory opts, args parser (`--subagent-shared-scope-offline`), subagent-child opts, runtime input, and harness loop's spawnSubagent closure. Child mirrors parent's eager-load AND retrieval exclusion.
+
+- **H4 plan mode skip.** `--plan` is read-only per AGENTIC_CLI.md §5; a 'no' answer was running destructive bulk-invalidate writes. Gate widened to `input.askSharedTrust !== undefined && isCwdTrusted && input.plan !== true`. Test pins it.
+
+- **F4+M4 headless fail-closed.** When `askSharedTrust` is omitted (CI, `agent run`, plan mode) OR cwd is untrusted, the probe is skipped — but the eager-load gate previously fired only on probe results. Now `sharedScopeOffline` is computed defensively: when the probe is skipped, the bootstrap reads the stored trust row + computes the current hash; only `stored !== null && stored.lastConfirmedHash === currentHash` lets the shared scope load. Untrusted cwd → always excluded. 3 bootstrap tests.
+
+Important fixes:
+
+- **F1+V2 status copy.** Post-revoke (or post-`/memory trust forget`), trust row is null + corpus non-empty. Old copy said "never confirmed (silently seed)" — wrong on both halves. New branch: `currentHash === EMPTY_CORPUS_HASH` → `silently seed`, else `NOT TRUSTED · corpus has content but no trust row (next boot will fire the first-visit modal)`. Two slash tests.
+
+- **M3 audit row for silent skip.** `bulkInvalidateShared` re-peeks state per memory; if state ≠ active (concurrent revoke, /memory delete race), the skip was silent. Now emits a `refused` memory_events row with `details.stage='trust_revoked_bulk', reason='state_changed_concurrently'`. Test uses a proxy registry to force the race deterministically.
+
+- **F5 modal inventory stderr dump.** Modal preview caps at 8 files; operator with >8 changed files had no way to inspect the rest without canceling (deferred + re-prompt next boot). Probe now emits the FULL inventory to stderr via `warn` before opening the modal — operator can switch terminals and `ls`/`cat` while the modal sits.
+
+- **F6 /memory trust accept + forget slash subcommands.** Operator stranded in `deferred` purgatory (cancel/timeout) had no slash to exit without restart. `/memory trust accept` re-fingerprints + stamps the row (operator's slash IS explicit consent). `/memory trust forget` clears the trust row without touching memory state on disk → next boot prompts as first-visit. 5 slash tests.
+
+Architecture footprint:
+- `src/cli/bootstrap.ts`: `sharedScopeOffline` lifted out of try-block; headless fail-closed branch added; `gcStaleInvalidatedMemories` wired between purge sweep and probe; `memoryExcludeScopes` plumbed into HarnessConfig.
+- `src/memory/trust-corpus-probe.ts`: post-revoke `setSharedTrust` replaces `clearSharedTrust`; M3 audit row on skip path; F5 stderr inventory dump; H1 deferral documented in header.
+- `src/memory/lifecycle.ts`: new `gcStaleInvalidatedMemories` sweep + `getLastInvalidationEvent` repo helper.
+- `src/harness/types.ts` + `src/harness/loop.ts`: `memoryExcludeScopes` on config + runner wiring; parent-to-child sharedScopeOffline forwarding.
+- `src/subagents/spawn-factory.ts` + `src/cli/args.ts` + `src/cli/subagent-child.ts` + `src/cli/index.ts` + `src/subagents/runtime.ts`: `--subagent-shared-scope-offline` flag end-to-end.
+- `src/retrieval/views/memory.ts` + `src/retrieval/runner.ts`: `excludeScopes` on `MemoryViewDeps` + `memoryExcludeScopes` on runner deps.
+- `src/cli/slash/commands/memory.ts`: `/memory trust accept` + `forget`; status copy branched.
+- `src/cli/repl.ts`: post-revoke recovery hint in stderr.
+- `src/tui/state.ts`: recovery prose in both first-visit and drift modal previews.
+
+Tests: 8263 pass (+20 vs pre-rodada-2), 0 fail.
+
+## [2026-05-17] hardening(memory) — Phase 1 P0/P1 code-review findings closed (S5 trust_revoked)
+
+Three parallel agents (robustness / reliability / security) reviewed the Phase 1 S5 work and surfaced 5 P0 + 10 P1 issues. All 15 closed in this pass.
+
+P0 (critical, would have shipped with bypasses):
+
+- **F1 Modal preview ANSI injection.** Attacker-controlled `.agent/memory/shared/` filenames flowed verbatim into the trust modal — a name like `\x1b[2J\x1b[H<fake>.md` lets the attacker repaint the entire trust gate UI. Fix: `state.ts` runs `sanitizeOneLineForDisplay` on every filename AND on `event.path` before rendering. Test in `tests/tui/state.test.ts` covers ANSI escapes, CR/LF/TAB, and path-level injection.
+- **F2 First-visit silent seed.** Pre-S5-hardening, the probe silently stamped any first-visit hash. A poisoned `git clone` with cwd already trusted + pre-populated shared/ → eager-load attacker's content with zero operator consent. Fix: distinguish `EMPTY_CORPUS_HASH` (safe to silent-seed) from non-empty corpus (must prompt in first-visit mode). New `SharedTrustModalMode = 'first-visit' | 'drift'` plumbed through the modal event + reducer + bootstrap callback.
+- **F3 TOCTOU between fingerprint compute and modal answer.** Modal can sit open for minutes; attacker could swap corpus during deliberation and operator's "yes" would stamp the unsesen new hash. Fix: re-compute fingerprint AFTER 'yes'; if it differs from the originally-presented hash, return `{ kind: 'deferred', cause: 'tocttou_during_prompt' }`.
+- **H1-rob Atomic revoke ordering.** Prior order (clear-trust → bulk-invalidate) had a crash-window where surviving active memories silently re-loaded next boot because the re-seed of the trust row at current hash would never fire a re-prompt. Fix: bulk-invalidate FIRST, clear trust row AFTER. Crash mid-bulk leaves the trust row pinned to OLD hash → next boot recomputes, sees divergence, re-prompts; surviving actives get a second chance.
+- **H2-rob Fail-closed on `verify_failed`.** Bootstrap previously ran `assembleMemorySection` unconditionally after the probe; `verify_failed` left the previously-loadable shared bodies visible to the model. Fix: extend `assembleMemorySection` with `excludeScopes?: MemoryScope[]`; bootstrap excludes `project_shared` on any non-confirmed probe outcome (`verify_failed`, `deferred`, OR `revoked`). The latter also closes F7 by hard-excluding quarantined-shared survivors of revoke.
+
+P1 (medium):
+
+- **F4 Symlink rejection.** Extracted `listSharedCorpusFiles` in `trust-corpus.ts` as the single source of truth for "what's in the corpus"; uses `lstatSync` and refuses symlinks. The fingerprint, modal preview, AND `/memory trust status` slash all consume the same helper — no more drift between three inline implementations. Closes exfil channel (symlinked `.md` body → `/etc/passwd` bytes in trust hash + eager prompt).
+- **F5 Full SHA-256 in `/memory trust status`.** 12-hex truncation = 48 bits = forgeable by ~16M brute force. Slash now prints full 64-char hashes. Tests updated to require the full hash AND assert no truncation ellipsis.
+- **F6 SIGINT during pre-bootstrap.** Raw mode converts Ctrl+C to `\x03`; with empty focus stack the byte was silently consumed → operator lost the abort hatch during slow boots. Fix: push a low-priority `preBootstrapCtrlCHandler` that re-raises SIGINT on Ctrl+C and returns false otherwise; modal handlers stack on top normally.
+- **F7 Quarantined-shared survival.** Subsumed by H2-rob — `excludeScopes: ['project_shared']` fires for `revoked` outcomes too, dropping quarantined survivors from THIS session's eager-load. The on-disk state stays `quarantined` (state machine doesn't admit `quarantined → invalidated` via `security`); operator can `/memory delete` for hard removal.
+- **M3-rob Concurrent boots / already-invalidated.** Second process hit `illegal_transition` against memories the first invalidated. Fix: re-peek state in `bulkInvalidateShared` per listing immediately before transition; skip silently if no longer `active`.
+- **M4-rob Cancel vs explicit no.** 'cancel' (Esc / timeout / signal) now returns `{ kind: 'deferred', cause: 'modal_cancel' }` — trust row pinned to OLD hash, no bulk action. Only explicit "No, revoke" triggers destructive bulk.
+- **H2-rel `actor: 'startup_probe'`.** Bulk-invalidate transitions now attribute to `startup_probe` (boot-time consistency sweep) instead of `user` (operator command). `motivo: security` already bypasses cooldown/TTL gates so functional behavior is unchanged; the audit attribution is the fix.
+- **M1-rel Per-failure audit row.** Non-applied `transitionMemoryState` results (illegal_transition, invalid_evidence, thrown errors) now emit a `refused` memory_events row in addition to the in-memory `failed` array — `/memory audit` can surface "why didn't this memory get invalidated" forensically.
+- **M2-rel Reducer test coverage.** New `shared-trust:ask reducer` describe in `tests/tui/state.test.ts` covers 8 cases: mode-specific prose + options + title, conservative default selectedIndex, F1 sanitization, overflow caption, empty-corpus prose.
+- **H1-rel cwd threading test.** Bulk-invalidate's threading of `input.cwd` through to `memory_events.cwd` now has an explicit assertion in the probe test suite.
+
+Net delta:
+
+- 16 probe tests (state machine + selectivity + verify_failed + hardening sub-describe)
+- 24 substrate tests (added symlink-rejection coverage + listing helper contract)
+- 8 reducer tests (new describe)
+- 3 memory-prompt excludeScopes tests
+- 2 bootstrap integration tests added/updated for first-visit modal + adjusted seeded test for empty-corpus-only path
+
+Architectural footprint:
+- `src/memory/trust-corpus.ts`: new `listSharedCorpusFiles` helper + `CorpusListing` type + exported `EMPTY_CORPUS_HASH`. Substrate is the single source of truth for corpus enumeration.
+- `src/memory/trust-corpus-probe.ts`: state machine grew `'deferred'` outcome with two causes (`modal_cancel`, `tocttou_during_prompt`); `'reconfirmed'` and `'revoked'` results carry `mode: 'first-visit' | 'drift'`.
+- `src/tui/events.ts` / `src/tui/modal-manager.ts`: `mode` field added to `SharedTrustAskEvent` / `SharedTrustAskArgs`.
+- `src/tui/state.ts`: reducer adapts prose + options per mode; sanitizes every operator-untrusted string.
+- `src/cli/memory-prompt.ts`: `excludeScopes?: MemoryScope[]` added; applied as the first filter pass.
+- `src/cli/bootstrap.ts`: scope-offline computation drives `excludeScopes` for `verify_failed | deferred | revoked` outcomes.
+- `src/cli/repl.ts`: pre-bootstrap focus handler preserves Ctrl+C as SIGINT.
+
+## [2026-05-16] docs+test(memory) — S7 Phase 1 closure (docs/MEMORY.md §14 refresh + E2E smoke)
+
+Phase 1 of the memory lifecycle detectors line closes here. S7 was scoped as docs + E2E smoke; the substantive work was reconciling `docs/MEMORY.md §14` with what actually shipped and replacing the original (now-impossible) E2E smoke premise with one anchored on the operator surfaces.
+
+Changes:
+
+- **`docs/MEMORY.md §14`** — removed §14.3 "Trust boundary" (S5 shipped the hash-based re-trust); renumbered §14.4 → §14.3 (Adaptation cross-cut) and §14.5 → §14.4 (What IS shipped). The "What IS shipped" entry was rewritten so S5 (`trust_revoked` detector, full impl) and S6 (quarantine penalty + visual flag) each get their own bullet describing what landed and where. The substrate-only roster shrinks from 4 to 3 detectors (`verify_failed`, `user_override_repeated`, `conflict_detected`).
+- **`docs/TODO.md`** — fixed cross-refs to the renumbered §14 sections (lines 219, 273). S3 marked for Phase 2 (re-grouped with S8 governance proposals + S11 + S13 in the LLM-judge cluster) since its trip-handler depends on S8.
+- **`tests/cli/slash/memory.test.ts`** — new E2E smoke (`memory lifecycle E2E smoke (S7/T7.3 — Phase 1 closure)`) covering two parallel memories in one session: 'flagger' exercises the quarantine + visual flag + audit path (Slices 0+6), 'roundtrip' exercises the delete (state-machine route to `.tombstones/`) + restore (tombstone → active) round-trip (Slice 0 lifecycle primitives). The split is required because `/memory delete` on a quarantined source falls through to `removeMemory` (legacy, no tombstone) per `confirmAndDelete` in `src/cli/slash/commands/memory.ts` — only an active source takes the state-machine route. The smoke was originally framed around `conflict_detected` per the TODO; pivoted to operator-driven flows since the detector is Phase 2 / S13.
+- **T7.2 skipped** by operator decision: the spec was consistent; the only mismatch (initial S5 TODO drafted `active → quarantined`) was a planning error that the spec already contradicted in §6.5.2 + EVICTION.md §4.1.
+
+Phase 1 final scope shipped:
+- **S0** ✅ Operator escape hatch (`/memory quarantine`, list rendering, audit --trigger filter)
+- **S1** ✅ Memory exposure infrastructure (provenance trail, 3 emitters, 90d retention)
+- **S2** 🔁 Substrate-only (verify_failed trigger name + audit filter; detector deferred to Phase 2 S11)
+- **S4** ✅ Substrate-only (`/memory conflicts` slash + listEvictionEventsByTrigger; detector deferred to Phase 2 S13)
+- **S5** ✅ `trust_revoked` detector (full impl: substrate + boot probe + modal + bulk-invalidate + `/memory trust status` slash inspector + coverage strengthening)
+- **S6** ✅ Quarantine penalty + visual flag (retrieval ranking + assembleMemorySection inline marker)
+- **S7** ✅ Docs + E2E smoke (this entry)
+
+Phase 2 (LLM-judge governance) carries:
+- **S8** governance proposal substrate (required by S3, S11, S13)
+- **S3** `user_override_repeated` detector (counter + S8-mediated proposal flow)
+- **S11** semantic `verify_failed` via LLM-judge (replaces the rolled-back regex heuristic)
+- **S13** `conflict_detected` via LLM-judge (replaces the rolled-back textual heuristic)
+
+Architectural commitment carried forward to Phase 2: zero text-heuristic for memory lifecycle decisions; deterministic substrate (counters, hashes, state machine, audit) + LLM-judge for prose judgment, never auto-mutating — proposals only, operator approves.
+
+## [2026-05-16] test(memory) — S5/T5.5 coverage strengthening; Slice 5 closed
+
+Three targeted assertions that close the `trust_revoked` slice:
+
+- **Reconfirm path emits zero eviction events.** Strengthens the reconfirmed test to assert `SELECT COUNT(*) FROM eviction_events == 0` AND the memory's frontmatter state on disk stays active. Guards against a future regression where the bulk-invalidate path accidentally runs on the 'yes' branch — the existing `kind === 'reconfirmed'` assertion wouldn't catch that since the result kind is set before the transitions fire.
+- **verify_failed path covered.** New test under `probeSharedTrust — verify_failed (T5.5)` simulates an unreadable corpus via `chmod 000` and asserts the probe returns `{ kind: 'verify_failed', sharedRoot }` AND no modal fires. Skipped under root since unix perms are bypassed (uid 0 false-negative). Restores perms in `finally` so tmpdir cleanup doesn't EACCES.
+- **Bootstrap-layer `unchanged` smoke.** New integration test in `tests/cli/bootstrap.test.ts` exercises the in-sync path through real bootstrap: no modal, probe returns `unchanged`, trust row's timestamp is not re-stamped.
+
+Slice 5 (`trust_revoked` detector) is functionally complete: substrate (T5.1), probe + modal + bulk-invalidate (T5.2+T5.3), `/memory trust status` slash inspector (T5.4), coverage strengthening (T5.5). All five sub-tasks ✅.
+
+## [2026-05-16] feat(memory) — S5/T5.4 `/memory trust status` slash inspector
+
+Read-only operator surface for the shared-corpus trust state, closing the gap between "the agent computed a hash and stored it somewhere" and "the operator can see what the agent believes about this corpus without restarting".
+
+Added:
+
+- `src/cli/slash/commands/memory.ts:handleTrust` — branches on `getSharedTrust` × `computeSharedFingerprint` to render one of four states: `never confirmed` (substrate seeded silently on next boot), `in sync` with timestamp + truncated hash, `DIVERGED` with both hash prefixes + a hint that the next boot will fire the modal, `VERIFY FAILED` when fs reads are blocked. Hash truncation (first 12 hex chars + `…`) keeps the output scannable; the operator who needs the full hash can query the DB directly. Inventory line reports the same file set the fingerprint hashes (including MEMORY.md).
+- Strict argument validation. Bare `/memory trust` errors with a subcommand hint; unknown subcommands are rejected; extra args after `status` are also refused so a future `/memory trust forget <path>` doesn't accidentally absorb operator typos.
+- 6 slash tests covering all four states + the three argument-validation paths.
+
+T5.5 (additional "hash unchanged + verify_failed integration" tests) is the only remaining S5 work; the slice is functionally complete.
+
+## [2026-05-16] feat(memory) — S5/T5.2+T5.3 trust_revoked detector wired end-to-end
+
+Builds on T5.1's substrate. The probe now fires inside `bootstrap`, the operator gets a modal-driven re-confirmation when the shared corpus drifted, and revocation bulk-invalidates the affected memories — taking effect in the SAME boot's system prompt rather than requiring a restart.
+
+Added:
+
+- `src/memory/trust-corpus-probe.ts` — boot orchestrator. State machine: `seeded` (no prior row → silent stamp), `unchanged` (no-op), `reconfirmed` (modal yes → re-stamp), `revoked` (modal no/cancel → clear row + bulk transition `active → invalidated` with motivo `security`, trigger `trust_revoked`), `verify_failed` (fs error). Already-quarantined shared memories are left alone since `quarantined → invalidated` admits only `shift` per EVICTION.md §4.1.
+- TUI plumbing for a new modal flavor `shared-trust:ask`. `SharedTrustAskEvent` carries the corpus inventory; the reducer renders a preview block with up to 8 file rows (`name — bytes`) + an explicit "and N more" suffix. Layout mirrors the `trust:ask` flavor with verbs adapted to "Yes, I trust the updated corpus" / "No, revoke trust"; conservative-default (D65) lands on revoke.
+- `BootstrapInput.askSharedTrust` callback and `BootstrapResult.sharedTrustProbe`. Bootstrap calls the probe between the memory GC sweeps and `assembleMemorySection` so the bulk-invalidate is reflected in this boot's prompt. Gated on `isCwdTrusted` — the probe is skipped (alongside undefined-callback) without preexisting cwd consent.
+- `src/cli/repl.ts` wires `modalManager.askSharedTrust` into bootstrap with a 5-minute timeout matching the cwd-trust modal, and pre-subscribes stdin before bootstrap so the modal can receive input even on the previously-trusted path. Renders summary lines on `reconfirmed` / `revoked` / `verify_failed` so the operator sees the action's effect echoed back.
+- `src/cli/memory-prompt.ts` filters `frontmatter.state === 'invalidated'` from the eager-load section. Quarantined memories continue rendering with the `[memory: quarantined]` flag (Slice 6 unchanged); only `invalidated` is excluded.
+- Tests: 8 probe state-machine + selectivity tests, 5 bootstrap integration tests (skip-when-no-callback, skip-when-cwd-untrusted, seed, revoke E2E, "invalidated memory excluded from THIS turn's prompt"), 3 memory-prompt lifecycle-filter tests.
+
+Known limitation (documented in `bootstrap.ts` block comment): a memory auto-evicted by `gcExpiredMemories` between sessions shifts the corpus hash and prompts a false-positive re-confirm next boot. Rare in practice — operator-curated shared/ memories almost never carry `expires:` frontmatter.
+
+Full suite (8210 tests across 349 files) green.
+
+## [2026-05-16] feat(memory) — S5/T5.1 shared-corpus trust substrate (`trust_revoked` detector, phase 1)
+
+Substrate for the `trust_revoked` lifecycle detector. Deterministic-only — fits the zero-text-heuristic commitment because detection is pure hash diff (no prose judgment) and the operator modal is the authority for the revoke decision.
+
+Added:
+
+- `src/storage/migrations/055-shared-corpus-trust.ts` — `shared_corpus_trust(scope_root TEXT PK, last_confirmed_hash TEXT NOT NULL, last_confirmed_at INTEGER NOT NULL CHECK > 0)`. Absence-of-row is the canonical "never confirmed" state.
+- `src/memory/trust-corpus.ts` — `computeSharedFingerprint(sharedRoot)` returns a SHA-256 hex over the canonical concat of every `.md` file at the corpus root (lexicographic sort, length-prefixed framing, `forja:shared-corpus:v1` domain separator). Excludes `.tombstones/` and any subdirectory. Distinguishes "no corpus" (sentinel hash) from "empty corpus" (hashes the domain separator alone) from genuine read failure (returns `null` — caller fail-closes). Repo helpers: `getSharedTrust`, `setSharedTrust` (upsert), `clearSharedTrust`.
+- `tests/memory/trust-corpus.test.ts` — 19 tests covering canonicalization (order-independence, length-prefix anti-collision, present-vs-absent file disambiguation), corpus filter (non-`.md` junk, `.tombstones/`, subdirs, `mistake.md/` directories), and repo round-trip (upsert semantics, multi-scope isolation, CHECK constraint).
+
+T5.2 (boot modal flow) and T5.3 (bulk transition on revoke) are NOT in this slice. They depend on either extending `modal-manager.ts` with a `shared-trust:ask` type OR threading a diff-preview through `askTrust`. Substrate is forward-compatible with either approach.
+
+952 storage + memory tests still green.
+
+## [2026-05-16] fix(memory) — S2 heuristic rolled back; LLM-judge becomes the only prose-judgment path
+
+Policy decision applied: **"todo o lifecycle de memória um llm-judge decide; sem heurísticas locais sobre texto"**. The S2 verify_failed heuristic (regex path extraction + `existsSync`) shipped initially and was removed for the same reason S4's textual conflict heuristic was: regex over prose cannot reliably distinguish factual assertion from historical/cautionary mention. The deterministic part (`existsSync`) is fine; the heuristic part (extracting "this memory ASSERTS path X exists" from prose) isn't. Without the extraction, the FS check has nothing to verify.
+
+Deleted:
+
+- `src/memory/verify/` (4 files: factuality classifier, project verifier, scheduler, MemoryVerifier interface types) — ~250 lines of implementation.
+- `tests/memory/verify/` (3 files: factuality, project-verifier, scheduler) — ~600 lines of tests.
+- Wire-up in `src/harness/loop.ts` (scheduler creation, poll, drain) — ~50 lines.
+
+Preserved as substrate-only:
+
+- The `verify_failed` trigger name + `/memory audit --trigger verify_failed` filter (from S0/T0.3). The audit surface is generic across triggers; it will render `verify_failed` rows when S11's LLM-judge emits them.
+- The `memory_provenance` exposure trail (S1) — foundational for S11's "what should I verify?" pool.
+
+Doc updates:
+
+- `docs/TODO.md`: cleaned up duplicate S2 entry; S2 marked `🔁 rolled back`; S11 reframed from "fallback over heuristic unknown" to "PRIMARY LLM-judge path"; S3 framing made explicit about the boundary (deterministic counter + threshold, LLM-judge proposal when threshold trips, propose-not-mutate via S8); dependency graph + recommended order updated.
+- `docs/MEMORY.md §14.5`: detector family entry updated to reflect substrate-only Phase 1 + LLM-judge Phase 2.
+
+Architectural commitment now documented across BACKLOG + TODO: **zero text-heuristic for memory lifecycle decisions in this codebase**. Deterministic substrate stays (state machine, audit, frontmatter, hashing, expiry, scope precedence, file existence). Numerical ranking dials stay (QUARANTINED_PENALTY=0.3, BM25 weights, retrieval caps). Threshold counters (S3 override count, S5 hash divergence) stay deterministic but trigger LLM-judge proposals via S8 when they trip — no auto-mutation. The boundary is sharp: anything that judges PROSE about memory content goes to LLM; anything that counts or compares structured values stays local.
+
+
+
+## [2026-05-16] feat(memory) — verify_failed detector (S2)
+
+Auto-quarantines factual memories whose path claims contradict the active repo. Bolts onto Slice 1's `memory_provenance` substrate: the scheduler scans the trail at each step boundary, enqueues verification for each unique (session, scope, name), and runs verifiers fire-and-forget. A `contradicted` verdict drives `transitionMemoryState` with `motivo=conflict + trigger=verify_failed + actor=loop_cold`.
+
+The slice deliberately ships a **narrow, high-bar heuristic**. False-positive auto-quarantines erode operator trust in every detector — so the verifier:
+
+- Extracts ONLY paths under known top-level prefixes (`src/ tests/ docs/ evals/ examples/ scripts/`).
+- Refuses paths with `..` traversal or `\` (Windows-style) — a malicious memory body can't make the verifier touch `/etc/passwd`.
+- Returns `unknown` (not `contradicted`) whenever the body has no extractable claim. Most memories ship without verifiable patterns; the long tail stays silent.
+- Logs `verify_unknown` to stderr for forensic visibility without state change.
+
+What v1 does NOT do, by design:
+
+- **Export resolution** — a claim like "src/foo.ts exports validateToken" gets the path checked but NOT the export. Pattern 2 (export+symbol grep) is a future extension if real corpora show it would catch drift the path-existence heuristic misses.
+- **Semantic equivalence** — "auth lives in the user-service" vs "src/auth/" is paraphrase, not literal. Out of scope until/unless an opt-in LLM-judge path lands.
+- **LLM-as-judge** — the verifier injection surface is real (memory bodies are operator-edited; some are marked `trust: untrusted`). Putting them in a judge model's window reopens exactly what the trust filter closes. Documented as a future opt-in flag (`memory.verify.llm = true`) with structured-output + scanForInjection pre-check; not built here.
+
+State machine motivo handling (semantic stretch): EVICTION.md §4.1 admits only `conflict + low_roi` for `active→quarantined`. MEMORY.md §6.5.2 lists verify_failed under motivo `shift`, but `shift` is admitted only for `active→shadow` / `active→invalidated`. Resolution: use `motivo: 'conflict'` (admitted) with `evidence: { failures: 1, claim, expected, observed, verifier_id }` — the `failures: number` branch of the `conflict` schema is satisfied; the auxiliary fields carry the actual forensic detail. The `trigger: 'verify_failed'` field carries detector identity for `/memory audit --trigger verify_failed`. Follow-up issue: amend EVICTION.md to admit `shift` for `active→quarantined`, OR introduce a dedicated `factual_drift` motivo.
+
+Scheduling architecture:
+
+- **Provenance-driven, not per-site enqueue.** The harness calls `pollAndEnqueue()` once per step boundary; the scheduler scans memory_provenance for unique (scope, name) and enqueues. This keeps the integration to ONE site in loop.ts instead of 6 (registry.auditExposure, retrieval runner, memory_read tool, memory_search tool, eager block, retrieve_context tool).
+- **Fire-and-forget.** The model's turn doesn't block on verifier work. `drain()` at the outer finally gives in-flight tasks a 2000ms grace window before shutdown — a hung verifier can't stall session close.
+- **Dedupe in memory.** Same (session, scope, name) verifies once per session; cross-session re-verification fires naturally on the next boot's poll.
+- **Non-fatal failures everywhere.** Verifier throws, peek not-present, state machine refusal — all stderr-log and continue. Verification is observability, not correctness.
+
+Tests: 28 new across `factuality.test.ts` (4 — pure classifier), `project-verifier.test.ts` (13 — extractor + verify), `scheduler.test.ts` (11 — passed/contradicted/unknown verdicts, type gating, idempotency, drain timeout, failure isolation). Acceptance from TODO.md is met for path-mention claims; export-pattern verification is deferred with rationale.
+
+## [2026-05-16] feat(memory) — Slice 4: conflict audit substrate (detector deferred to Phase 2)
+
+Ships ONLY the audit substrate for conflict-detected eviction events. The textual heuristic detector built during initial S4 implementation was deliberately rolled back: empirical analysis showed it would cover <5% of real conflicts in operator-authored memory bodies (narrow vocab pattern matches require literal token collision on identical verb-object pairs — extremely rare in prose) while introducing false-positive paths on common English words (`bash`, `commit`, `test`, `push`, `merge`).
+
+The decision: **no local text heuristic. The conflict detector is LLM-judge only.** Phase 2 / S11-aligned slice will deliver the actual decision pipeline, emitting governance proposals through S8's substrate. V1 ships only what's substrate-agnostic and forward-compatible with the LLM-judge path:
+
+- **`listEvictionEventsByTrigger(db, trigger, limit)`** — generic repo helper in `eviction-events.ts`. Backs any future detector slash surface that filters by trigger (S5/T5.4 `/memory trust status`, future `/memory overrides` if Slice 3 lands).
+- **`/memory conflicts` slash command** — reads audit rows where `trigger='conflict_detected'` and renders `<ts> · <kind> · winner=<scope/name> loser=<scope/name> token="<shared>"`. Cross-session forensic surface. Agnostic of what emits the trigger (heuristic or LLM-judge both work). `--limit N` (default 50). 4 tests pin: empty-state hint, row rendering, --limit cap, unknown-flag rejection.
+
+Deleted from initial S4 attempt:
+
+- `src/memory/conflict/` (4 files: detector, types, resolver, scheduler) — heuristic-coupled and not forward-compatible with the LLM-judge propose-not-mutate path. Auto-mutating state from a heuristic verdict violates §1.1.4 (confidence ≠ authority) more sharply than verify_failed did.
+- `tests/memory/conflict/` (3 files) — exercised the heuristic specifically.
+- Wire-up in `src/harness/loop.ts` for the conflict scheduler.
+
+Decisions carried forward to the future Phase 2 slice (recorded in TODO.md):
+
+- Resolver ordering per `EVICTION.md §6.3`: provenance tier (`user_explicit > inferred > imported`) → recency → scope specificity → body length tiebreak → deterministic tiebreak.
+- Evidence schema: `{ winner_id, loser_id, conflict_kind, shared_concept?, confidence?, resolver_reason }` satisfies `conflict` motivo's `winner_id/loser_id/conflict_kind` triple directly (no semantic stretch like S2's `failures: 1`). Field name `shared_concept` (not the rolled-back heuristic's `shared_token`) is canonical — the slash + S13 producer agree on the LLM-judge vocabulary up front.
+- Actor `loop_cold`, trigger `conflict_detected` for state-machine + audit.
+- Propose-not-mutate: LLM emits `memory_governance_proposals` (S8), operator approves → `transitionMemoryState`. No direct state mutation from LLM verdict.
+
+Honest acceptance reframing: S4 V1 ships **audit substrate ready to receive a detector**, not a detector itself. The TODO acceptance criterion "writing a contradicting memory triggers detection" moves to Phase 2 alongside S8 + S11.
+
+## [2026-05-16] feat(memory) — Slice 6: quarantine penalty + visual flag (EVICTION §9.7)
+
+Walks back the H1+H6 hard-filter on quarantined memories. Per spec EVICTION §9.7 + MEMORY.md §6.5.2, quarantined entries stay visible to model + operator with a ranking penalty + visual flag. Pre-S6 the retrieval memory view dropped quarantined entries entirely (state=active hard-filter); post-S6 they surface with `bootstrapScore × 0.3` and a `(quarantined ×0.3)` reason marker for forensics.
+
+The substrate change: `MemoryListing` gained an optional `state?: MemoryState` field, populated inline by `registry.list()` when the existing peek-for-filtering runs (i.e., when `opts.states` or `opts.includeExpired === false` triggers a frontmatter read). Memory view consumes the field without re-peeking. Other call sites that don't pass a filter get `state: undefined` — explicit opt-in path, no perf regression.
+
+Penalty rationale: 0.3 means a quarantined memory needs ~3.3× the raw match score to tie an active sibling. Suppresses in routine queries; lets overwhelming matches still surface. Quarantine flag is "questionable, not forbidden" — hard-filter would mimic deletion semantics and break operator forensics queries ("did the model see X when it produced Y?"). The constant is `export`ed so tests can pin the exact value — a silent change to 0.25 / 0.5 would shift behavior while passing relative-ordering tests.
+
+Eager-load visual flag: `cli/memory-prompt.ts` renders quarantined entries inline as `- [<scope>] <name> [memory: quarantined] — <hook>`. Motivo + date enrichment (`[memory: quarantined — conflict 2026-04-15]` per spec) is deferred — same shape as T0.2's `/memory list` deferral. The two deferrals are consolidated as one entry in TODO.md's DEFERRED section so the next contributor wires both surfaces together when JOIN-with-eviction-events lands.
+
+Injection surface widening note: AGENTIC_CLI §1.1.5 already documents that retrieve_context lacks a dedicated trust filter (MEMORY.md §14.3). Pre-S6 the state filter `['active']` indirectly excluded the quarantined-untrusted vector; post-S6 it doesn't. S6 doesn't violate the ledger (the gap is acknowledged), but it widens the set of model-facing bodies. Closing the gap is tracked as a separate DEFERRED entry pending a contract decision (hard-filter / marker / operator opt-in).
+
+Post-review fixes (round 2 of agents, 6 items applied):
+- F1: comment in memory view references §1.1.5 widening explicitly.
+- F2: constant `QUARANTINED_PENALTY` exported, pinned by test.
+- F3: motivo+date deferral consolidated as single DEFERRED entry.
+- F4: race-window note in registry.list comment (list-time state, downstream re-peeks may differ — by design).
+- F5: render-order test uses regex (not toContain) so a future reorder of `[scope] [flag] name` vs `[scope] name [flag]` breaks the pin.
+- F6: dedupe + quarantined local shadow + active shared sibling pinned (most-specific scope wins post-filter; semantic change vs pre-S6 explicitly tested).
+
+Tests: 5 new in memory-view.test.ts (single-quarantined surface, ranks-below-active, constant pin, dedupe-shadow interaction, plus retained `invalidated/proposed/evicted still filtered`); 4 new in memory-prompt.test.ts (flag inline, active no flag, default state no flag, mix); 1 rewritten (H1 regression → S6 spec'd behavior).
+
+## [2026-05-16] fix(memory) — Slice 1 post-review hardening
+
+Round of code review delegated to three Explore agents (robustness, reliability, coverage). Four real bugs + three hardening gaps + handful of test pins surfaced. Applied:
+
+**Real bugs:**
+- `positionInCorpus < 0` was accepted silently — off-by-one in the runner would land garbage forensics. Added repo guard: `surface='retrieve_context'` now requires `positionInCorpus >= 0`. Pinned with a negative-value throw test.
+- AUDIT DRIFT message format diverged between sites — bootstrap sweep was `forja: memory_provenance sweep failed at boot (...)` while every other site uses `memory: AUDIT DRIFT: failed to <action>...`. Unified to the latter so operators can grep one signal.
+- `redactSecrets` was missing on two of the new AUDIT DRIFT lines (`runner.ts` retrieve_context emit, `loop.ts` eager emit). SQLite errors can echo bound parameter values from operator-edited memory bodies — accidental tokens would surface unredacted on stderr. Added the call to both sites (and to the bootstrap sweep line) so the four memory emit sites and the boot sweep are now uniform.
+- Eager emit on session resume would duplicate rows. The harness loop's eager-emit block ran in BOTH the `createSession` branch and the `preassignedSessionId` branch; schema has no UNIQUE constraint, so each resume piled more `(session, memory, eager)` rows on top. New `hasEagerProvenance(db, sessionId)` probe gates the emit — returns true if any eager row exists for the session, so resume skips while subagent first boot (preassignedSessionId with no rows yet) still emits.
+
+**Hardening:**
+- `createdAt <= 0` was accepted silently — a broken-clock mock or miscomputed timestamp would corrupt `created_at >= cutoff` window queries 60 days later. Repo guard now refuses `<= 0`.
+- Empty-string `toolCallId` would coerce-pass `ctx.toolCallId !== undefined` in the three forwarding tools (`memory_read`, `memory_search`, `retrieve_context`), reach the registry, and FK-fail every INSERT silently as AUDIT DRIFT. No caller produces `''` today but the guard is cheap defense against future entrypoint bugs. Strengthened to `typeof string && length > 0`.
+
+**Tests added** (+9): negative `positionInCorpus`, `createdAt` zero + negative, `hasEagerProvenance` probe (4 cases — empty session, per-call-only, eager-present, session scoping), B4 idempotency end-to-end via `runAgent` (pre-existing eager row blocks resume re-emit), empty-string `toolCallId` doesn't emit provenance, multi-session `listGlobalProvenanceByName` cross-cut against 3 sessions.
+
+**Deferred** (low ROI):
+- Hash-failure fallback in `toEagerExposure` — defensive 4-line `catch { return null }` around `serializeMemoryFile`+`hashMemoryContent`. Hard to exercise without mocking; the runtime path is shaped so the catch never fires on well-formed inputs.
+- Per-entry isolation test in `emitRetrievalProvenance` — `parseMemoryNodeId` is private and the malformed-nodeId path returns null gracefully without throwing; the catch block protects against `recordProvenance` throws which the integration test already covers (via FK violation).
+
+**Post-cascade semantic of `retrieval_query_id`:** documented in the schema header and repo guard comment. The agent flagged it as "invariant violation post-cascade"; on closer look it's a design decision (INSERT-time strong invariant + graceful nullable post-cascade so retrieval-trace GC doesn't orphan exposure history). Updated comments to make the split explicit so a future contributor doesn't misread the `recordProvenance` guard as a runtime invariant.
+
+8164 pass / 0 fail · typecheck + lint clean.
+
+## [2026-05-16] feat(memory) — provenance docs + end-to-end integration test (S1/T1.8)
+
+Closes Slice 1 of `feat/memory-lifecycle-detectors`. Two artifacts:
+
+`docs/MEMORY.md §11.2` — operator-facing canonical doc for the exposure trail. Documents what the schema claims and (more importantly) what it does NOT claim: not causation, not "use", not replay completeness. Three surfaces (`eager` / `memory_read` / `retrieve_context`) tabulated with their `tool_call_id` + `retrieval_query_id` + `position_in_corpus` invariants. The repo-layer guards (`surface` / `memoryScope` enums, retrieval-grouping invariant, per-surface `tool_call_id` nullability) and the privacy-by-default query convention are documented so a future contributor can read the schema header in `migrations/054-memory-provenance.ts` plus this section and reproduce the contract without spelunking the repo. The `/memory provenance` operator surface (three modes), the 90d retention sweep, and the AUDIT DRIFT failure posture all get short sections. The cross-table reconciliation matrix at the end tells operators which of the three audit tables (`memory_events`, `retrieval_trace`, `memory_provenance`) to query for which question. §11 intro corrected from "two tables" to "three"; §14.5 "What IS shipped" gains a Slice 1 closure entry.
+
+`tests/memory/provenance-trail.test.ts` — cross-cut integration test exercising all three emitters against a real memory/registry/db substrate within one session, asserting `memory_provenance` carries the complete picture. Seven tests pin the contract end-to-end:
+
+- All three surfaces land for the same memory; per-surface `tool_call_id` / `retrieval_query_id` invariants hold simultaneously.
+- Content hash is stable across `memory_read` and `retrieve_context` for an unchanged file (catches future canonical-form divergence between the two paths).
+- Eager dedupe — one row per `(session, memory)` is the emit-site convention; schema doesn't enforce it but the inventory layer's contract is the line of defense.
+- `retrieve_context` exposures group by `retrieval_query_id` with position-ordered listing (monotone non-decreasing).
+- Session scoping regression — by-name and by-(scope,name) refuse cross-session reads silently; only the explicit `listGlobal*` helpers see across.
+- Retention sweep uses the shipped `MEMORY_PROVENANCE_RETENTION_MS` constant directly, verifying the boundary direction end-to-end against the same value the bootstrap path uses.
+- Operator-by-tool-call query surfaces per-call surfaces only — eager rows (which have `toolCallId=NULL` by construction) MUST NOT leak into "what did THIS tool_call expose?" forensic queries.
+
+The unit tests across T1.1-T1.7 already pin each emitter and helper in isolation; this file is the cross-cut. If a future refactor breaks the schema/repo/registry/runner contract in a way each unit test happens to miss but the operator forensic surface would notice, that gap surfaces here.
+
+Slice 1 acceptance per `docs/TODO.md`: every memory exposed to the model leaves a `memory_provenance` row carrying enough state (content_hash, state_at_exposure, retrieval grouping, position) to support honest replay later; operator queries by memory, by tool call, by retrieval batch — all session-scoped by default. ✓
+
+## [2026-05-16] feat(memory) — boot-time provenance retention sweep (S1/T1.7)
+
+90-day retention for `memory_provenance` rows. Exposure rows are a forensic substrate: useful within the first few weeks for "what was visible when X happened" queries, but value decays fast and the table grows monotonically (every tool call that exposes a memory adds a row). Without a sweep, millions of rows accumulate across long-lived installs — slows operator queries, bloats disk, and eventually requires manual SQL pruning.
+
+The sweep mirrors the existing memory-lifecycle GC pattern in bootstrap:
+
+- `MEMORY_PROVENANCE_RETENTION_MS` exported from `memory-provenance.ts` (90 days). Constant lives next to the prune query so a future tuning PR has one place to change.
+- Bootstrap fires `pruneMemoryProvenance(db, Date.now() - RETENTION_MS)` right after the existing `gcExpiredMemories` + `gcPurgeExpiredTombstones` sweeps. Same try/catch posture: a sweep failure logs to stderr but MUST NOT abort boot. Worst case: the failed sweep retries next boot — provenance is observability, not correctness.
+- The cutoff is EXCLUSIVE (`created_at < olderThanMs`) — a row at exactly the cutoff is KEPT. Callers can treat the value as the inclusive lower-bound of the retention window. The boundary case is pinned in `memory-provenance.test.ts` from T1.2.
+
+The 90d default is conservative for now; if real install data shows it's too short (operators wanting to forensic-trace beyond a quarter), the constant becomes a candidate for the operator-policy surface. Until then, hard-coding keeps the boot path simple.
+
+Test: one integration test in `bootstrap.test.ts` seeds two provenance rows directly into the DB before calling `bootstrap()` — one well past retention (cutoff − 1 day past the window) and one inside (1s old). After boot, the old row is gone and the fresh row survives. Verifies wiring + cutoff direction end-to-end.
+
+## [2026-05-16] feat(memory) — /memory provenance operator surface (S1/T1.6)
+
+First operator-facing read of the provenance trail. The `/memory provenance` subcommand reads `memory_provenance` rows and answers three forensic questions, picked via mutually-exclusive modes:
+
+- `/memory provenance <name>` — every exposure of this memory in the current session (default). Cross-scope: matches `user/role` AND `project_local/role` when both share the name. `--all` opts out of the session scope for cross-session forensic queries.
+- `/memory provenance --tool <id>` — every memory exposed during one tool call. Session-scoped (tool_call ids are session-scoped; cross-session would surface unrelated calls under the same prefix).
+- `/memory provenance --retrieval <qid>` — grouped view of one `retrieve_context` call. Ordered by `position_in_corpus ASC` so the rendering reflects the slot's ranking (top hit first).
+
+Mutual exclusion enforced at parse time: mixing modes is a usage error (the underlying queries answer different questions). `--all` only applies to the name lookup — combining with `--tool` / `--retrieval` is refused with a hint. `--limit N` (default 50) caps the rendered batch across every mode.
+
+Two new repo helpers shipped to support the name-mode queries:
+
+- `listProvenanceByName(db, sessionId, name, limit)` — session-scoped, cross-scope. Mirrors `listMemoryEventsByName`'s shape (the operator doesn't always know the scope; the memory may have been deleted but provenance still lives in the table).
+- `listGlobalProvenanceByName(db, name, limit)` — cross-session, cross-scope. Explicitly named (matches the existing `listGlobalProvenanceForMemory` privacy-by-default convention) so a caller writing session-scoped queries can't accidentally reach for it.
+
+Output format is one compact row per exposure: `timestamp · surface · scope/name · tc-prefix · state · hash-prefix` plus `retrieval=<qid-prefix> #<pos>` when surface is `retrieve_context`. `tc=eager---` flags the eager-load rows (where `tool_call_id` is NULL by construction); hash truncated to 8 chars matches the existing session/tool prefix convention. Zero-result rows in name mode include a hint pointing at `--all` so the operator doesn't confuse "no rows in this session" with "no rows anywhere".
+
+Tests: 11 new in `tests/cli/slash/memory.test.ts` (validation + each mode + cross-session fall-through + position ordering + limit cap + no-session refusal for `--tool`); 4 new in `tests/storage/memory-provenance.test.ts` covering the two new helpers (cross-scope match, session-scoping, limit, cross-session aggregate). Pin: mutual exclusion errors, the position-order rendering for the retrieval mode, the `tc=eager---` shape for eager rows.
+
+## [2026-05-16] feat(memory) — retrieve_context provenance emitter (S1/T1.5)
+
+Third emitter on the provenance trail. Every `contextSlot.included` entry whose `view === 'memory'` now produces a `memory_provenance` row with `surface='retrieve_context'`, linking the exposure to BOTH the retrieval batch (via `retrieval_query_id` referencing `retrieval_trace.id`) AND the originating tool_call. `position_in_corpus` pins the slot rank — 0 = top hit — so operator forensics can ask "the memory was exposed but ranked 18th, maybe the model didn't attend to it".
+
+The wiring:
+
+- `RetrieveFn` signature gained an optional third `opts: { toolCallId? }` arg. The `retrieve_context` tool reads `ctx.toolCallId` (populated by `invoke-tool.ts` post-`createToolCall`) and forwards it; test contexts that bypass the harness pass undefined and the runner skips the emit cleanly (mirror of memory_read's posture).
+- Emit happens in `runner.ts`, AFTER `runRetrieval` returns and AFTER `createRetrievalTrace` succeeds — gated on `result.queryId.length > 0` so a persist-failed retrieval (queryId='') doesn't try to FK-link a non-existent trace row. The repo invariant requires non-null `retrievalQueryId` for `surface='retrieve_context'`, so skipping is the only correct path when the parent trace didn't persist.
+- The runner parses `entry.nodeId` (`memory:<scope>/<name>` per `views/memory.ts`) back into `(scope, name)` and `peek`s the memory file for the hash + state snapshot. Peek doesn't fire an audit `read` event (the registry's `peek` is the no-audit form by design) — the model already saw the bytes via the retrieval slot, the provenance row captures THAT exposure, not a second redundant `read` audit.
+- Per-entry `try`/`catch` isolates failures: malformed nodeId, missing memory file (operator deleted between rank and emit), FK violation — none abort the loop or the retrieval call. Audit drift hits stderr; the slot the model received already happened.
+- Session-view entries in `contextSlot.included` are filtered out: provenance is memory-specific. Session messages are already in `messages` table; conflating them into `memory_provenance` would invent a memory exposure that never happened.
+
+Tests: 5 new in `tests/tools/retrieve-context.test.ts`. Pin: one row per memory entry in `slot.included`, `position_in_corpus` matches index in the slot (verified by `listExposuresInRetrieval` which orders ASC), hash + state captured (state pinned to 'active' since the memory view filters non-active memories before they reach the slot — documented in the test comment), absent `toolCallId` ⇒ zero rows, session-view entries don't pollute `memory_provenance`.
+
+## [2026-05-16] feat(memory) — eager-load provenance emitter (S1/T1.4)
+
+Second emitter on the provenance trail. Eager-loaded memories — the names + descriptions the model sees in the system prompt before any tool call fires — now produce one `memory_provenance` row per `(session, memory)` at session start. Surface is `eager` and `tool_call_id` is NULL by construction (the exposure precedes any tool call).
+
+The challenge: assembly happens at CLI boot (`bootstrap.ts`), but the session id doesn't exist until the harness loop calls `createSession`. The schema needs both — the session FK is non-nullable and FK CASCADE means the row must reference a real session row. Solution: capture an inventory at assembly time (`AssembleMemorySectionResult.eagerLoaded`), thread it through `HarnessConfig.eagerExposures`, emit in the loop right after `createSession`.
+
+The inventory is frozen at assembly, not at emit. An operator who rewrites a memory file between boot and session-start would otherwise drift the hash / state from "what landed in the prompt" to "what's on disk now", defeating the replay-fidelity contract. The hash is computed from `serializeMemoryFile` (the canonical writer), so memories the system wrote round-trip exactly; hand-edits with different whitespace hash differently, which IS the drift signal.
+
+Architectural decisions worth tracking:
+
+- `EagerExposure` lives in `src/memory/types.ts`, NOT `src/cli/memory-prompt.ts`, so `src/harness/types.ts` can carry it via `HarnessConfig.eagerExposures` without dragging a `cli/` dependency into the harness layer.
+- The emit is best-effort with `process.stderr.write` "AUDIT DRIFT" on failure — mirrors the registry's `auditRead` / `auditExposure` discipline (provenance is observability, not correctness; a DB throw must NOT abort session bring-up). Bad inventory rows (e.g., invalid scope passing through the inventory layer) get logged and skipped; following rows still emit.
+- Subagent boot uses the same plumbing: `subagent-child.ts` lifts the inventory out of the conditional `wantsMemory` block via `let eagerExposures: readonly EagerExposure[] = []`, then forwards it identically. Each subagent session emits its own eager-load trail under its own session id.
+- Dedupe by name applies to the inventory same way it applies to the rendered text — one row per name even when multiple scopes shadow it. Spec semantic is "once per (session, memory)"; the most-specific scope wins.
+
+Uncertainty path preserved: when `peek` returns missing / malformed, the index entry STILL ships in the eager section ("uncertainty → include" per existing module header). The corresponding inventory row has `memoryContentHash: null` and defaults `memoryStateAtExposure: 'active'`. The provenance row still emits — the operator-visible index line surfaced even when the body was unreadable, and the audit trail captures that.
+
+Tests: 10 new (6 in `memory-prompt.test.ts` covering inventory population for trusted / untrusted / dedupe / empty / uncertainty / hash determinism; 4 in `loop.test.ts` covering the emit happy path / empty array / absent field / audit-drift fault tolerance). Tests verify: surface='eager' + toolCallId=NULL invariant, hash + state round-trip through the emit, session-scoped via the new createSession's id, audit-drift posture continues to emit good rows after a bad one threw.
+
+## [2026-05-16] feat(memory) — exposure provenance: schema + repo + memory_read emitter (S1/T1.1-T1.3)
+
+Slice 1 of the memory lifecycle detectors plan. Records EXPOSURES — moments where a memory's bytes were visible to the model — for the `memory_read` and `memory_search --deep` paths. Foundational for Slice 2 (`verify_failed`) and Slice 3 (`user_override_repeated`) detectors which layer correlation analysis on top of this lower-bound trace.
+
+Schema (migration `054-memory-provenance`):
+- `memory_provenance` table with surface enum (`eager` / `memory_read` / `retrieve_context`), `memory_content_hash` (SHA-256 of canonical serialization), `memory_state_at_exposure` (frontmatter state snapshot), `retrieval_query_id` + `position_in_corpus` for grouping retrieve_context exposures.
+- FK CASCADE on `session_id` + `tool_call_id`; SET NULL on `retrieval_query_id` so retrieval-trace GC doesn't orphan provenance.
+- 4 indices including session-led composite `(session_id, memory_scope, memory_name, created_at DESC, id DESC)` for the canonical "history of memory X in this session" query, and partial indices on the FK columns.
+- Schema header documents what the table does NOT claim (causation, use, replay completeness) so future readers don't conflate exposure with attention.
+
+Repo (`memory-provenance.ts`):
+- `recordProvenance` enforces surface enum, memoryScope enum, retrieval-grouping invariant (`retrieve_context` requires both fields; other surfaces require neither), and toolCallId nullability per surface (eager=null, per-call=non-null).
+- Every list/count helper REQUIRES sessionId — same fix shape as commit `55ba11a`'s `listRetrievalTracesByWorkflow` (privacy-by-default). Cross-session aggregation only reachable via the explicitly-named `listGlobalProvenanceForMemory`.
+- `hashMemoryContent` documents the canonical input form (`${frontmatter}\n\n${body}`) and the throw-vs-swallow semantics so callers know to wrap in try/catch (the column is nullable precisely so hash glitches don't block exposure recording).
+- `pruneMemoryProvenance` GC sweep for the 90d TTL planned in T1.7.
+
+Wire-up:
+- `MemoryRegistry.read` and `search(deep)` emit `memory_provenance` rows alongside the existing `memory_events` audit row. New `auditExposure` helper next to `auditRead` mirrors the same best-effort posture: a DB failure does NOT propagate (body load already succeeded; tool contract honored). Stderr "AUDIT DRIFT" line on failure for operator visibility.
+- `ToolContext.toolCallId` optional, populated by `invoke-tool.ts` right after `createToolCall`. `memory_read` and `memory_search` forward it to the registry as `auditToolCallId`. Test contexts that bypass the harness simply emit no provenance row — degrades cleanly.
+- Hash computed from `serializeMemoryFile` (the canonical writer); a system-written memory round-trips through hash exactly. Operator hand-edits with different whitespace will hash differently — that drift IS the signal.
+
+T1.4 (eager-load), T1.5 (retrieve_context), T1.6 (slash surfaces), T1.7 (TTL+GC), T1.8 (docs+integration) still pending. The schema is forward-compatible with all three remaining emitter paths.
+
+Tests: 38 new (19 repo unit tests, 8 registry integration tests, 11 schema/invariant/cascade pins). Pin: surface-enum validation, scope-enum validation, retrieval-grouping invariant, toolCallId nullability, FK CASCADE for session + tool_calls, hash round-trip, state snapshot survival, cutoff boundaries (inclusive in `countExposuresInWindow`, exclusive in `pruneMemoryProvenance`), SHA-256 algorithm pinned to RFC 6234 empty-string canonical, search-deep emission parity, audit-drift resilience.
+
+## [2026-05-16] fix(retrieval/runner) — preserve caller-supplied memory view when loadBodies is requested
+
+`buildRetrievalRunner` exposes a `views` slot on its deps (documented for tests / fixtures / alternative-scoring wireup). When `input.loadBodies === true`, the runner unconditionally replaced `viewsForCall.memory` with a fresh default `createMemoryView({ registry, loadBodies: true })` — discarding whatever custom view the caller had injected. A test asserting that its sentinel memory view ran, or a fixture stubbing memory behavior for a specific corpus, would silently get the default view's behavior instead. Same for any future custom wireup with alternative limits / scoring / filters.
+
+Fix: track `callerSuppliedViews = deps.views !== undefined` at runner build time. The `loadBodies` override now runs only when views were default-wired. Callers who supply their own views and want loadBodies-on can construct their custom view with `createMemoryView({ ..., loadBodies: true })` themselves — the API is already there, the runner just shouldn't substitute behind their back.
+
+Test in `tests/tools/retrieve-context.test.ts`: build a runner with a sentinel memory view that returns a recognizable candidate and counts calls; invoke with `loadBodies: true`; assert sentinel ran once AND the sentinel's candidate appears in `stats.candidatesRaw`. Pre-fix this test would have shown 0 sentinel calls (the default view replaced it) and a different candidate count.
+
+## [2026-05-16] fix(tools/retrieve-context) — return tool.aborted (not retrieval.internal_error) for mid-flight cancellation
+
+The pre-call abort check at `execute()` entry correctly returns `tool.aborted` (retryable=true), but the catch block around `await ctx.retrieveContext(...)` mapped EVERY thrown error to `retrieval.internal_error` with `retryable: false`. When the signal flipped AFTER entry — during validation, during the await on the runner, or while a subprocess view was in-flight — the runner threw `retrieval aborted before <stage>` (pipeline check, commit `4935fef`) or `retrieval aborted mid-flight` (runner late check) and the catch misclassified it as a hard internal failure. Callers lost the standard `tool.aborted` semantic and could either retry forever (the standard retry-on-abort pattern doesn't fire because retryable=false) or surface the wrong failure reason to the operator.
+
+Fix: catch inspects `ctx.signal.aborted` and maps cancellation to `tool.aborted` (retryable=true) when true; genuine errors keep `retrieval.internal_error` (retryable=false) when the signal stayed un-aborted. The signal state at catch time is the canonical witness — `ctx.signal.aborted` is true iff a cancellation request landed before the catch executed.
+
+Two tests in `tests/tools/retrieve-context.test.ts`:
+- Mid-flight abort: runner aborts the controller and throws — assert `tool.aborted` with `retryable: true` and message containing "aborted during retrieval".
+- Counterpart: real failure (e.g., `disk full`) with un-aborted signal stays `retrieval.internal_error` with `retryable: false` — confirms the fix didn't over-classify hard failures as abortable.
+
+## [2026-05-16] fix(memory/registry) — apply state/expiry filter before deduplicating by name
+
+`registry.list()` deduplicated by name BEFORE evaluating `states` / `includeExpired`. A higher-precedence shadow (e.g. `project_local/foo`) that was quarantined / invalidated / evicted / expired would win the precedence walk, then get dropped by the frontmatter filter — silently suppressing a lower-precedence ELIGIBLE sibling (`project_shared/foo` or `user/foo`) that should have surfaced. The retrieval memory view, which calls `list({ deduplicateByName: true, states: ['active'] })`, ended up with zero candidates for that name even when a valid active version existed in another scope.
+
+Fix: swap the order. State / expires filter runs FIRST, then dedupe-by-name operates over the eligible set only. Comment block above the filter now spells out the order invariant so a future refactor doesn't reintroduce the bug. The `scope` filter still runs at the head (scope mismatch is the cheapest filter and gates everything that follows).
+
+Three regression tests in `tests/memory/registry.test.ts`:
+- Local quarantined + shared active + user active → result is shared (precedence among eligible).
+- All shadows ineligible (local quarantined + shared evicted) → name absent from result.
+- Same precedence-aware filtering for `expires`: local stale + shared fresh → shared surfaces.
+
+## [2026-05-16] fix(memory/registry) — parseExpiresEndOfDayMs rejected legitimate month-end expiries
+
+`parseExpiresEndOfDayMs` validated dates by computing `Date.UTC(year, month - 1, day + 1, …)` and requiring the resulting `getUTCMonth()` to still equal `month - 1`. That check intended to catch overflow inputs like `2026-02-31` (which JS rolls to 2026-03-03), but it ALSO rejected every legitimate last-day-of-month: `2026-01-31`'s "next day" naturally crosses into February, so the month check failed and the function returned null. With null returned, `isExpired` treated the memory as non-expiring and `list({ includeExpired: false })` quietly kept the entry visible past its expiry.
+
+Fix: two-step parse. Validate the date itself first (build `Date.UTC(year, month - 1, day, …)` WITHOUT incrementing) and verify all three fields round-trip — that's what catches `2026-02-31` honestly. Then compute end-of-day as `startOfDayMs + MS_PER_DAY`; ms addition crosses month / year boundaries correctly because epoch ms is independent of the calendar structure.
+
+Tests added in `tests/memory/registry.test.ts`:
+- `2026-01-31` + `2026-12-31` both stay valid mid-day on expiry, expire at next-day 00:00 UTC, and Dec 31 correctly rolls into the next year (Jan 1 2027 00:00 → expired).
+- `2024-02-29` (leap day) valid through the day, expires at Mar 1 00:00 UTC.
+- `2026-02-31` (numerically invalid) is treated as non-expiring (defensive — the frontmatter validator's regex only checks YYYY-MM-DD format; the date parser refusing here means the operator's `/memory audit` surface shows the bad entry rather than the model getting surprise eviction).
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — percentileOf used floor, not ceil/-1 (off-by-one inflated tail)
+
+`percentileOf` was documented as nearest-rank but computed `Math.floor(p * N)`, which at common boundaries returns the NEXT higher element. Worst case: N=20, p=0.95 — `floor(19) = 19` returned the MAX sample instead of index 18 (the actual 19th-rank value, per `⌈p · N⌉ − 1`). The inflated values made `/agent retrieval metrics` overstate p50/p95 stage latencies: a real tail regression was indistinguishable from the always-pinned-at-max output.
+
+Fix: `Math.max(0, Math.min(N - 1, Math.ceil(p * N) - 1))`. The `max(0, …)` guards p=0 / N=1 from producing a -1 index after the ceil/-1 step. Existing tests that asserted the floor-inflated values were corrected to match the standard nearest-rank semantics (p=0.5 over 10 samples is now 4, not 5). New regression test exercises N=20 with p=0.5 / 0.95 / 1.0 to pin the user-reported scenario.
+
+Source: comment block in the function now documents the formula explicitly so a future "simplification" doesn't reintroduce the floor variant.
+
+## [2026-05-16] docs(memory) — reframe scanner as tripwire, not injection defense
+
+The `INJECTION_PHRASES` list in `src/memory/scanner.ts` (`"ignore previous instructions"`, `"you are now"`, etc.) is trivially burlable — any other language, paraphrase, or structural injection defeats it. The pre-existing code comment admitted it ("raise the cost of the obvious vector, not stop a human red team") but the module header, `docs/MEMORY.md §8.1`, and `docs/spec/MEMORY.md §7.3` framed the scanner as "injection defense", overpromising what it delivers.
+
+Reframe is doc/comment-only — no runtime behavior changes.
+
+**`src/memory/scanner.ts`** — module header expanded to spell out the honest split:
+- `scanForSecrets` + `redactSecrets` ARE the honest half (credential shapes are language-agnostic).
+- `scanForInjection` is a tripwire for English script-kiddie copy-paste; its value is the `refused` audit row + defense-in-depth alongside the modal, NOT a semantic injection blocker.
+- Comment above `INJECTION_PHRASES` documents why the list stays short on purpose (translations inflate false positives without moving the threat needle).
+- Comment above `scanForInjection` notes the symbol kept its name for backwards compatibility but the module header reframes what "injection" means.
+
+**`docs/MEMORY.md §8.1`** — rewritten as "Scanner — tripwire, not defense", explicitly listing what the tripwire CAN'T catch (other languages, paraphrase, structural). New §8.1.1 lists the load-bearing layers (modal, source attribution, trust boundary, scope isolation, eager-load filter, audit chain) so an operator reading the security story knows the scanner is layer 0, not the answer.
+
+**`docs/MEMORY.md §13.1` threat table** — Scanner row annotated as "tripwire only" with a pointer to §8.1.
+
+**`docs/spec/MEMORY.md §7.3`** — retitled "Tripwire de phrases óbvias + secret detection" (was "Detecção heurística de injection"). Body restructured into (a) tripwire-with-caveats and (b) honest secret detection. PT-BR preserved per spec convention.
+
+No symbol rename: `scanForInjection` has 8 call sites; the cost of renaming outweighs the clarity gain when the header already reframes. A future rename to `scanWriteTripwire` is noted in the function's comment if call sites are touched for another reason.
+
+No new tests — scanner runtime is unchanged; existing 29 tests still pass.
+
+## [2026-05-16] chore(retrieval+cli) — memory-flow review M round 2 (txn, traceMissing, scope verbose, polish)
+
+Closes the residual robustness findings from the memory-flow code review.
+
+**M1** — `src/retrieval/views/session.ts` did three sequential SQLite reads (messages, tool_calls, failure_events) without a transaction. A new row inserted between reads would leave the corpus with a tool_call whose parent message exists in the DB but not in `messageById`, surfacing a row through the projection's "unknown session source" fallback. Wrapped the three reads in `withTransaction` (DEFERRED — WAL readers don't block writers; the BEGIN's snapshot is stable through COMMIT for every read inside).
+
+**M3** — `src/retrieval/compression.ts createCompressionResolver`'s `warnedViews: Set<string>` is closure-scoped per resolver, which is built once per session-runner. Two concurrent `retrieve_context` calls share it. Behavior is intentional (dedupe stderr warnings across calls of the same session) but the coupling was implicit. Comment added documenting it so a future load-bearing use of the Set knows to revisit the scope decision.
+
+**M4** — Trace persist failure in `runRetrieval` sets `queryId = ''` and logs stderr, but callers had no structured signal that the audit surface had a gap. Added `traceMissing: boolean` to `RetrievalResult` and `RetrieveContextOutput.stats`; mirrors `queryId === ''` so the model / tool consumer can branch (`if (stats.traceMissing) { ... }`) without parsing the empty-string convention. 2 new tests in `tests/retrieval/pipeline.test.ts` covering the failure path (close DB before call) and the happy path.
+
+**M5** — `/agent retrieval replay <id>` previously emitted `memory/memory:project_local/auth · level=full · cost=42t` — the scope was inside the nodeId but visually buried. Added `--verbose-scope` flag that hoists scope into its own column (`memory[project_local]/auth · level=full · cost=42t`) and appends a footer noting the precedence order (`project_local > project_shared > user`). Flag is opt-in so the default output stays narrow. Two new tests pin the flag's render and unknown-flag rejection.
+
+**M6** — Abort signal mid-pipeline correctly throws (commit `4935fef`), but tests didn't assert that NO retrieval_trace row persists in that case. Spec §10.1 mandates "one row end-of-pipeline"; the assertion was missing the upper bound. Added `expect(countRetrievalTraces(db)).toBe(0)` after the existing abort-between-stages test.
+
+No behavior changes the operator would notice except the new `--verbose-scope` flag and the new `traceMissing` field. All previous tests still pass; 5 new tests land alongside.
+
+## [2026-05-16] docs(memory+retrieval) — formalize audit split + retrieval_trace immutability policy (review H4+H5)
+
+H4 and H5 from the memory-flow code review are accepted as a policy decision rather than a code change. The split between `memory_events` (operator-driven, explicit memory operations) and `retrieval_trace.context_slot_json.included[]` (model-facing retrieval deliveries) is the established surface, and `retrieval_trace` bodies stay frozen after the originating memory is evicted/purged. The deliberate-not-accidental nature was implicit in the implementation; this entry promotes it to documented policy.
+
+Three doc updates land in the same commit:
+
+- `docs/MEMORY.md §11.1` — new subsection "Audit split with `retrieval_trace`" tabulating which surface answers which audit question. Calls out that `/memory audit` and `/agent retrieval audit` are complementary, not redundant: an operator asking "what did the model see of memory X" needs both surfaces. Documents why retrieval-internal paths (`peek` for BM25 corpus and compression fallback) are excluded from `memory_events`.
+- `docs/MEMORY.md §13.3` — new "Audit immutability on `retrieval_trace`" subsection (renumbered the original §13.3 load-bearing rule to §13.4). Three reasons listed: replay determinism, audit honesty, subsystem decoupling. Names the escape hatch (session purge via FK CASCADE) and a possible future targeted-purge command if a concrete use case appears.
+- `docs/spec/RETRIEVAL.md §10.4` — mirror of MEMORY §13.3 in PT-BR for the architect's spec, linked back to MEMORY.md §11.1 for the cross-table story.
+
+Two code comments add the same policy reference to the load-bearing sites:
+
+- `src/memory/lifecycle.ts` module header — documents that eviction / purge paths do NOT touch `retrieval_trace` and cites MEMORY.md §13.3.
+- `src/storage/migrations/053-retrieval-trace.ts` schema header — documents `context_slot_json.included[].content` as frozen-on-eviction and cites the policy in both spec docs.
+
+No code-behavior change. No new tests — the absence of a hook from `lifecycle` to `retrieval_trace` is the policy; the docs make it explicit. The `feat/retrieval` review's H4 (audit story gap) and H5 (eviction-doesn't-scrub-trace) are closed as deliberate trade-offs rather than open bugs.
+
+## [2026-05-16] fix(retrieval/views/memory) — scope-pin peek in BM25 corpus build (review H3)
+
+`src/retrieval/views/memory.ts:111` called `deps.registry.peek(l.name)` without a `{ scope }` option. The iterated listing already carries the post-dedupe winning scope (`l.scope`); the lookup re-walked precedence. Today's behavior was usually correct via precedence, but inconsistent with the compression resolver (compression.ts:163, scope-pinned) and a registry-state change mid-call (scope migration, rename, eviction in another scope) could land the wrong body in the BM25 corpus.
+
+One-line fix: `deps.registry.peek(l.name, { scope: l.scope })`. Pins the body load to the same scope the listing represents.
+
+Test: seed `project_shared/auth` and `project_local/auth` with bodies containing distinctive tokens (`castle` vs `fortress`); query a token that only exists in the local body; verify the local candidate ranks (proving the corpus indexed the local body, not the shared one).
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — session-scope check on UUID fast-path (review H2)
+
+`resolveTraceId` in `/agent retrieval replay` previously checked the active session ONLY for prefix scans; the full-UUID fast path (`prefix.length === 36`) called `getRetrievalTrace(db, prefix)` directly and returned whatever the lookup found. `getRetrievalTrace` is a primary-key lookup by design (no session scoping). An operator with a UUID from any session — their own past session, a teammate's session on the same DB, a leaked log line — could replay that session's full trace, including the raw context_slot bodies.
+
+Fix: after `getRetrievalTrace` returns, compare `row.sessionId !== currentSessionId()` and refuse with the same not-found shape used for genuinely missing UUIDs. Same wording means the error doesn't double as an oracle for "this UUID exists but belongs to another session" — an operator probing cross-session can't distinguish the two failure modes.
+
+Test in `tests/cli/slash/agent-retrieval.test.ts`: seed a trace in a foreign session with a recognizable `queryText`, switch to the default session, call replay with the foreign UUID, assert the error path triggers AND that the foreign `queryText` doesn't leak through the message.
+
+## [2026-05-16] fix(memory+retrieval) — lifecycle state + expires filter at the list boundary (review H1+H6)
+
+`registry.list()` previously returned every listing regardless of frontmatter `state` or `expires`. The retrieval memory view consumed `list({ deduplicateByName: true })` directly, so any memory the operator had quarantined / invalidated / proposed / evicted / purged — or a memory past its `expires` date between boot-time GC sweeps — surfaced to the model as a BM25 candidate and could end up in the context slot.
+
+Added two opt-in filters to `ListOptions`:
+
+- `states?: readonly MemoryState[]` — restrict to listings whose current frontmatter state is in the allow-list (`absent` ≡ `active`).
+- `includeExpired?: boolean` (default undefined ≡ no filter; pass `false` to exclude past-expiry).
+- `nowMs?: number` — injectable reference for `expires` evaluation; defaults to `Date.now()`.
+
+Cost: one file read per surviving listing when either filter fires (frontmatter lives in the .md, not in the cached index snapshot). Tolerable at the dozens-of-memories scale the spec assumes. A future cache layer can promote `state` / `expires` into the snapshot if N grows.
+
+`src/retrieval/views/memory.ts` now passes `states: ['active'], includeExpired: false` so the model-facing surface never sees a non-active or stale memory. Other callers (operator-facing `/memory list`, audit surfaces, boot-banner count, slash commands) keep their broad view — defaults unchanged.
+
+Helper: `parseExpiresEndOfDayMs` reads the spec-shaped `YYYY-MM-DD` string and returns the start of the *next* day UTC, so `expires: 2026-05-15` is valid through any time of 2026-05-15 and expired starting 2026-05-16 00:00 UTC (matches operator intuition: "expires today" = "valid through today"). Malformed dates (only reachable via hand-edited files; the writer's validator refuses them) are treated as non-expiring — but the same hand-edit makes the file `malformed` to the parser, which the state filter excludes anyway, so the model never sees it.
+
+Tests: 6 new in `tests/memory/registry.test.ts` covering states allow-list, orphaned listings (missing body files), past-expiry exclusion, the end-of-day boundary, combined filter composition, and the malformed-frontmatter defense-in-depth case. 3 new in `tests/retrieval/memory-view.test.ts` (quarantined / invalidated+proposed batch / expired) plus two existing tests (`loadBodies degrades silently when…`) flipped to assert that orphaned/malformed memories are now filtered out of the candidate pool — that's the safer policy, the model shouldn't be ranking memories the operator can't trust.
+
+## [2026-05-16] chore(retrieval+cli) — L polish pass closing the feat/retrieval review
+
+Closes the remaining low-severity findings from the review with mostly cosmetic / defensive touches; no behavioral changes that an operator would notice except the days-label cleanup.
+
+- **L1** — `src/retrieval/ranking.ts` temporal signal guard now explicitly checks `halfLife > 0` alongside `Number.isFinite(halfLife)`. Today every `HALF_LIFE_MS_BY_VIEW` entry is positive or `Infinity`, so the guard is dead code; the explicit check documents the invariant for future config additions.
+
+- **L2** — extracted `percentileOf` from `handleMetrics`/`buildMetricsLines` as an exported helper so n=1, p=0, p=1 boundaries and array-immutability can be pinned by direct unit tests (5 new tests in `tests/cli/slash/agent-retrieval.test.ts`).
+
+- **L3** — `padEnd(16)` literal (used for workflow column alignment in both the audit summary line and the workflows table) replaced by a named `WORKFLOW_PAD = 16` constant with a comment naming `precedent_lookup` (16 chars) as the longest current enum entry. Bumping the value is the explicit checklist when adding a longer workflow name.
+
+- **L4** — `days.toFixed(1)` in the metrics header (`last 30.0d`) replaced by plain `${days}` (`last 30d`). `--days` is parsed via `Number.parseInt`, so the trailing `.0` was a no-op visual that suggested non-integer support which doesn't exist. The `effectiveDays` value in the `capReached` warning stays decimal because it's a genuine ms → days division.
+
+- **L5** — `if (count === 0) continue` dead code removed from the Shannon entropy loop; `viewCounts` is populated via `set(view, (get(view) ?? 0) + 1)` so every entry is ≥ 1.
+
+- **L6** — explicit migration idempotency test in `tests/storage/retrieval-trace.test.ts` — re-runs `migrate()` after seeding a trace, asserts the row count is unchanged, the trace still round-trips, and both canonical indices are still present.
+
+## [2026-05-16] fix(retrieval) — validate session node ids at projection (review M8)
+
+`src/retrieval/views/session.ts` was doing `hit.id.slice('session:message:'.length)` and trusting the result. A malformed id matching the prefix but truncated (e.g. `session:message:` with no UUID after) would silently slice to `""`, the Map miss would fall through to a generic "unknown session source" reason, and the BM25 invariant breach would go unnoticed.
+
+Extracted the parsers `parseMemoryNodeId` and `parseSessionNodeId` (originally inline in `compression.ts`) into a shared `src/retrieval/node-ids.ts` module so both call sites enforce the same invariants:
+
+- prefix correct (`memory:` / `session:`)
+- kind ∈ canonical enum (memory scope ∈ {`user`, `project_shared`, `project_local`}; session kind ∈ {`message`, `tool_call`, `failure`})
+- non-empty after-prefix segments
+
+Compression imports from the shared module; session view's projection now parses first and branches on `kind`. Malformed ids emit a stderr line ("BM25 emitted malformed node id … this is a view-internal bug") with a tagged fallback reason; valid-id-but-missing-row fall-through carries a kind-aware reason so the trace distinguishes the two failure shapes.
+
+Tests: 12 new in `tests/retrieval/node-ids.test.ts` exercising both parsers (canonical + every malformed shape: missing prefix, empty kind / scope, empty id / name, unknown enum value, case-sensitivity, colon-in-id preservation). 1 invariant test in `tests/retrieval/session-view.test.ts` documents the deletion-mid-flight stability case.
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — coverage closures + formatPercent clamp (review M5+M6+M7)
+
+Closes three coverage findings from the `feat/retrieval` review.
+
+**M5** — `formatPercent` computed `(ratio * 100).toFixed(1) + '%'` without checking the input range. Callers' invariants (`evictionRate = skipped / ranked`, `budgetUtilization = used / budget`) keep the ratio in `[0, 1]`, but a future regression upstream would render misleading `-50.0%` / `150.0%` instead of flagging the corruption. Added `Number.isFinite(ratio) && ratio >= 0 && ratio <= 1` guard rendering `?` otherwise. Exported for direct test coverage; mirrors the `formatDurationMs` posture from M2.
+
+**M6** — adequate coverage already exists: `describe('buildRetrievalRunner — end-to-end')` in `tests/tools/retrieve-context.test.ts` exercises the runner produced by `buildRetrievalRunner` against real corpora (6 tests covering ranked + compressed slot, views filter, loadBodies, default budget, pre-aborted signal, trace persistence). The bootstrap test asserts the tool is registered. The actual `ctx.retrieveContext = buildRetrievalRunner(...)` assignment in `src/harness/loop.ts:2566` is a single visible line — adding a separate integration test that wraps the entire harness loop just to re-assert that line was a poor risk/value trade. No code change.
+
+**M7** — the `capReached` warning render in `handleMetrics` had no slash-level test (the repo-level test from commit `49be554` covers `listRetrievalTracesSinceMs` itself, not the operator-visible warning string). Extracted the pure-render section as `buildMetricsLines({ traces, capReached, hardCap, days, nowMs })` — `handleMetrics` becomes a thin wrapper that pulls traces and delegates the rendering. The exported helper takes pre-computed inputs so a test can drive `capReached: true` with a 2-row fixture instead of seeding 10k+ rows. 3 new tests: warning surfaces with the right hardCap + "oldest kept ≈ Nd ago" computation, warning absent when `capReached=false`, canonical body intact regardless. `formatPercent` unit coverage adds 3 more tests (in-range, out-of-range, NaN/Infinity).
+
+## [2026-05-16] fix(retrieval+storage+cli) — honest error surfaces for corrupted JSON / negative timings / unknown views (review M1+M2+M3)
+
+Three small fixes that turn silent fallbacks into auditable ones.
+
+**M1** — `src/storage/repos/retrieval-trace.ts fromRow` swallowed `JSON.parse` failures and returned `[]` / empty shapes with zero indication that a row's JSON column was corrupt. Direct DB tampering, mid-write crashes, and migration anomalies all became invisible. The parse helper now takes the column name and logs to stderr (`forja retrieval_trace: row <id> <col> JSON parse failed (<msg>); returning empty fallback`) before falling back to the structural-valid shape. Read still completes; corruption is now traceable.
+
+**M2** — `formatDurationMs` in `src/cli/slash/commands/agent-retrieval.ts` accepted any `number` and would happily render `-123ms` from a corrupted `timings_json`. Added a `Number.isFinite(ms) && ms >= 0` guard that renders `?` for malformed values — the operator sees a flag-shaped output instead of a value that looks like a real (but impossible) timeline measurement. Exported the function for direct unit coverage.
+
+**M3** — `createCompressionResolver` returned `null` for any view it didn't recognize. A migration that adds a view without wiring the resolver would silently drop candidates; the operator would see "missing from slot" without learning the cause. Now logs once per unknown view (closure-scoped `warnedViews` Set deduplicates spam) and continues with `null` so the greedy loop tracks the skip honestly.
+
+Tests: 4 new across `tests/cli/slash/agent-retrieval.test.ts` (formatDurationMs unit suite covering negative / NaN / Infinity / boundary), `tests/retrieval/compression.test.ts` (unknown-view stderr capture + one-warning-per-view invariant), `tests/storage/retrieval-trace.test.ts` (corrupted JSON column logs `id` + column name and returns fallback).
+
+## [2026-05-16] fix(cli/slash/agent-retrieval) — prefix scan reaches the full session history (review H7)
+
+`resolveTraceId` in `src/cli/slash/commands/agent-retrieval.ts` previously called `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then matched the prefix in memory. A session with more than 100 retrieval traces dropped any prefix whose match lived beyond the freshest 100 — the operator got "no trace id matches" indistinguishable from a genuinely wrong prefix, with no hint that the issue was scan depth.
+
+Fix: switch to `listRetrievalTracesSinceMs(ctx.db, sessionId, 0, PREFIX_SCAN_HARD_CAP=10_000)`. Same shape the metrics path uses (also 10k cap, also returns `capReached`). 10k is comfortably above any realistic interactive session and below pathological eval harness logs that would risk memory pressure. When `capReached` is true AND the prefix doesn't match in the returned 10k, the error message explicitly names the cap and points to the full-UUID escape hatch ("older traces may exist — pass the full 36-char id to look beyond") so the operator can distinguish "wrong prefix" from "right prefix, beyond the scan window".
+
+Tests: 1 new in `tests/cli/slash/agent-retrieval.test.ts` — seeds 150 filler traces (more than the old 100 cap) plus a target whose `created_at` is older than every filler, then resolves via the prefix; verifies the replay returns the target instead of "no match". Covers the original silent-miss exactly.
+
+## [2026-05-16] fix(storage/retrieval-trace) — deterministic ordering + session-scoped workflow lookup (review H5+H6)
+
+Two findings on the trace repo.
+
+**H5** — every list query in `src/storage/repos/retrieval-trace.ts` sorted by `created_at DESC` only. Two traces landing in the same millisecond (concurrent inserts under eval harness load, or just clock granularity) came back in undefined order, flaking pagination and short-id resolution. Added `, id DESC` as the secondary key to `listRetrievalTracesBySession`, `listRetrievalTracesSinceMs`, and `listRetrievalTracesByWorkflow`. Matches the pattern in `failure-events.ts:93`.
+
+**H6** — `listRetrievalTracesByWorkflow(db, workflow, limit)` filtered only by `workflow = ?`, spanning every session in the DB. A caller assuming session-scope (operator running "show me review-workflow traces in this session") would leak traces from other sessions on the same DB — multi-tenant or shared-machine setups especially. The function had no production callers (only the test), so signature became `(db, sessionId, workflow, limit)` with `sessionId` required. A future cross-session aggregation surface would need a different function whose name and signature acknowledge the scope.
+
+Tests: 1 new tiebreaker test in `listRetrievalTracesBySession` (three rows pinned to the same `created_at`, verifies stable `id DESC` order and replay-stability). 1 new cross-session leak test in `listRetrievalTracesByWorkflow` (seeds 2 sessions, asserts only the active session's row comes back). Existing tests adapted to the new `sessionId` parameter.
+
+## [2026-05-16] fix(tools+telemetry) — cap retrieve_context query length + strip terminal-attack control chars in scrub (review H2+H3)
+
+Closed two `feat/retrieval` review findings, both at the input/output boundary.
+
+**H2** — `src/tools/builtin/retrieve-context.ts` validated `query.trim().length === 0` but not an upper bound. A 1GB query string would otherwise be accepted, tokenized by every view's BM25, persisted into `retrieval_trace.query_text`, and stored verbatim in audit logs — audit-storage DoS through a single tool call. Added `MAX_QUERY_LENGTH = 10_000` chars (well above any real natural-language query, hard refuses pathological inputs). Schema declares `maxLength` so providers that respect schema-side bounds can refuse client-side too.
+
+**H3** — `src/telemetry/scrubbing.ts scrubFreeformText` redacted paths/hosts but left C0/C1 control characters intact. A trace whose `query_text` or `reason` field carried `\x1b[2J` (clear screen), `\x1b[31m` (color), `\x07` (bell), or any other ANSI/OSC escape would manipulate the operator's terminal when surfaced via `/agent retrieval audit`, `/agent retrieval replay`, `/agent policy …`, or any other forensic surface interpolating scrubbed text into stdout. Same surface exists in `worker.crashed.stderr` and `state.transition.reason` — every consumer of `scrubFreeformText` benefits.
+
+Strip range: full C0 (0x00-0x1F) MINUS TAB / LF / CR, plus DEL (0x7F) and C1 (0x80-0x9F). TAB / LF / CR preserved because legitimate multi-line consumers (stack traces in `worker.crashed.stderr`, multi-paragraph reasons) need them, and plain whitespace isn't an attack vector. Stripping runs BEFORE path/host sweeps so an attacker can't smuggle a path past PATH_REGEX_POSIX via an ESC-prefixed token (`\x1b/home/x` — pre-strip the leading `\x1b` breaks the word boundary; post-strip the path emerges and gets redacted).
+
+Tests: 2 new in `tests/tools/retrieve-context.test.ts` (refuse at MAX+1, accept at exactly MAX); 5 new in `tests/telemetry/scrubbing.test.ts` (ANSI SGR strip, OSC/BEL/NUL/DEL strip, C1 strip, whitespace controls preserved, smuggle-via-ESC defended, ordinary text passthrough). Existing `worker.crashed.stderr` test for newline preservation still passes — exactly the case the whitespace-preserve carveout was designed for.
+
+## [2026-05-15] fix(retrieval) — plumb AbortSignal through pipeline + guard estimateTokens NaN/Infinity (review H1+H4)
+
+Closed two high findings from the `feat/retrieval` review.
+
+**H1** — `runner.ts:80-127` checked abort at entry/exit but `runRetrieval()` never received the signal. v1 views are synchronous, but workspace (4.4) will spawn ripgrep; without the signal reaching the pipeline, in-flight subprocesses won't cancel when the operator presses Ctrl+C. Added optional `signal?: AbortSignal` to `PipelineDeps`; `ViewSearch.search` now takes an optional second arg so views can propagate cancellation into their own IO. Sync views (memory + session) accept the parameter and ignore it — comment in each view documents why. Pipeline does a coarse `checkAborted` between every stage (search → expand → rank → compress) and throws `retrieval aborted before <stage>` so the operator/test can pinpoint the boundary. Runner now forwards `signal` to the pipeline.
+
+**H4** — `compression.ts compressGreedy` trusted whatever cost the per-view resolver returned. Slice 4.9 will wire provider-specific token counters via the `estimateTokens` hook; a buggy counter returning `NaN` / `Infinity` / negative would corrupt the greedy comparison (`NaN <= remaining` is `false`, silently skipping the level; placed `Infinity` underflows `remaining`). Added a guard: invalid `costTokens` treated identically to a `null` resolution (fall through to the next level) plus a stderr log naming the candidate / level / bad value. Validation lives in `compressGreedy` (not in resolvers) so every resolver — including future ones — is protected uniformly.
+
+Tests: 4 new in `tests/retrieval/pipeline.test.ts` covering pre-abort short-circuit, abort flipped between stages, signal forwarded to each view's search call, and the no-signal happy path. 2 new in `tests/retrieval/compression.test.ts` covering fall-through when some levels return invalid costs and full skip when all levels are invalid.
+
+## [2026-05-15] fix(cli/slash/agent-retrieval) — compute metrics over the full requested window
+
+`/agent retrieval metrics [--days N]` was loading `listRetrievalTracesBySession(db, sessionId, MAX_AUDIT_LIMIT=100)` and then filtering the result in-memory by `t.createdAt >= cutoffMs`. Once a session held more than 100 traces in the requested window, SQL handed back the freshest 100 (sorted by `created_at DESC`) and every row passed the post-filter — so utilization, eviction rate, diversity, and latency were silently computed from a truncated end-of-period sample. The header line printed "last 30.0d (100 traces)" with no signal that older traces in the window had been excluded.
+
+Fix in `src/storage/repos/retrieval-trace.ts`: new `listRetrievalTracesSinceMs(db, sessionId, cutoffMs, hardCap = 10_000)` filters by window SQL-side and returns `{ rows, capReached, hardCap }`. SQL fetches `hardCap + 1` to disambiguate "fits exactly" from "fits with leftovers" — one cheap extra row beats a separate `COUNT(*)`. The hard cap is defense against pathological sessions (eval harnesses logging tens of thousands of retrieval calls), not a marketing default — 10k is well above any realistic interactive session.
+
+`handleMetrics` consumes the new helper and surfaces `capReached` as an explicit `warning: sample capped at <N> traces (oldest kept ≈ Xd ago); metrics reflect the freshest N only — older traces in the requested Yd window are excluded` line under the header. When the cap doesn't bite (the overwhelming common case), the output is unchanged.
+
+Tests: 4 new in `tests/storage/retrieval-trace.test.ts` covering the helper directly — window scoping (excludes rows before cutoff), session scoping (other sessions excluded), `capReached=true` with surfaces-the-freshest semantics, and the boundary case where row-count equals `hardCap` exactly (must report `capReached=false`).
+
+## [2026-05-15] fix(retrieval) — stop emitting synthetic `memory_events action=read` from retrieval-internal paths (compression + BM25 indexing)
+
+Two retrieval-internal paths were calling `registry.read` and minting `memory_events action=read` rows for content the model never actually saw. Both swapped to `registry.peek` (same scope precedence + discriminated outcome, no `auditRead` side effect). Policy now spelled out in both call sites: `memory_events action=read` stays reserved for explicit `memory_read` tool calls (model asking by name); retrieval-pipeline visibility lives in `retrieval_trace` (included nodeIds + skipped trail).
+
+- `src/retrieval/compression.ts` `memoryResolver` — `compressGreedy` probes up to four levels per candidate (`full → outline → summary → ref`); a single ranked memory could fire 1–3 audit-read rows before placement, and a candidate skipped after probing every body level fired up to 3 reads for nothing the model saw.
+- `src/retrieval/views/memory.ts` BM25 corpus build (`loadBodies=true`) — read EVERY listed memory's body just to compute term frequencies for ranking; only top-K became candidates and only included slot entries reached the model. Worst case in the indexing path: one audit-read row per indexed memory per query.
+
+Regression tests in `tests/retrieval/compression.test.ts` and `tests/retrieval/memory-view.test.ts` each assert zero `memory_events action=read` rows after the respective retrieval pass. Compression test exercises both outcomes (placed + skipped) in one go; memory-view test indexes 5 memories with a query that hits none, isolating the indexing path as the only possible audit source.
+
+## [2026-05-15] feat(retrieval) — Phase 4 kickoff (RETRIEVAL.md v1)
+
+**In progress.** New branch `feat/retrieval` starts implementing `docs/spec/RETRIEVAL.md` v1 — the pipeline `query → candidates → expansion → ranking → compression → context slot`. Decisions agreed up front:
+
+- **Workspace view via filesystem + ripgrep**, not CODE_INDEX. The auto-memory entry "não vamos implementar code index" stays in force; workspace falls back to ripgrep + filename match. Loses caller/reference structural edges; covers symbol find / grep / file outline.
+- **Insertion via a model-facing `retrieve_context` tool**, not auto-fire on step start. Aligns with spec §1.2 ("retrieval is tool, not driver") and lets eval measure per-call value.
+- Slices declared up front (4.1 foundation; 4.2 memory view; 4.3 session view; 4.4 workspace view; 4.5 expansion; 4.6 ranking; 4.7 compression; 4.8 trace; 4.9 integration). v1 ships no embedding, no usage signal, no cross-view auto-edges (per spec §12.1).
+
+### 4.1 — Foundation
+
+Types + new `retrieval_trace` table + pipeline skeleton. No views or rankers yet — these are stubs returning empty results. Establishes the public shape so 4.2+ slot into the skeleton without churn. M1 (selective scrub at the repo layer — reason fields redacted, slot content kept raw) and M2 (single `context_slot_json` column) fixed in the same commit per code review.
+
+### 4.2 — Memory view + BM25 utility
+
+`src/retrieval/bm25.ts` ships a hand-rolled BM25 (~80 lines, no deps). Tokenizer is lowercase + non-alphanumeric split — lexical-first per spec §0 principle 2. Constants k1=1.5, b=0.75 (textbook defaults). Deterministic tiebreaker on equal scores (id ASC) so trace replays are stable.
+
+`src/retrieval/views/memory.ts` implements `ViewSearch` for the memory view. Field weighting: title × 3, description × 2, body × 1 (body opt-in via `loadBodies` because each is a disk read). Uses dedup-by-name listings so local-over-shared overrides surface as one candidate, not two. Node id format `memory:<scope>/<name>` mirrors the cross-store disambiguation pattern. Reason strings get scrubbed at the repo trace layer (slice 4.1 selective scrub).
+
+What's NOT in 4.2 (deferred to spec-correct slices): temporal decay (30d half-life in §4.3 lives at the ranking signal layer, not bootstrap), tag matching (frontmatter `tags:` not on `IndexEntry` today — comment in the view module documents this for the future).
+
+### 4.8 — Trace surfaces (`/agent retrieval`)
+
+Operator-facing forensic for the retrieval pipeline (spec §10). No pipeline mutation — pure reads off `retrieval_trace`. Closes the v1 surface: 4.9 wired the tool the model calls; 4.8 wires the slash command the operator inspects.
+
+`src/cli/slash/commands/agent-retrieval.ts` exports `handleRetrievalSub(ctx, args)`, routed from the existing `/agent` command (now accepts both `policy` and `retrieval` subnamespaces).
+
+Subcommands:
+
+- `/agent retrieval` — summary (trace count in current session, distribution by workflow).
+- `/agent retrieval audit [--limit N]` — newest-first list. Default limit 10, cap 100. Each line: short id · workflow · age · included/skipped counts · total latency · query preview.
+- `/agent retrieval replay <id>` — full per-stage dump for one trace. Accepts the 8-char short id (resolved against the session's traces; ambiguity refused with the colliding shortIds). Renders: query metadata, timings per stage, raw candidates with reason + bootstrap, ranked candidates with signal breakdown (`str=… lex=… sem=… tmp=… use=… goal=…`), included slot entries with level + cost, skipped trail with `would_cost` + reason.
+- `/agent retrieval metrics [--days N]` — aggregates §10.2: `budget_utilization_mean`, `eviction_rate` (skipped/ranked ratio), `diversity` (Shannon entropy of view distribution, normalized to [0,1]), latency `p50/p95` per stage, view distribution (slot inclusions per view). Default window 30d, cap 365d. Uses `ctx.now` so test fixtures with pinned clocks behave deterministically (same pattern `/memory metrics` uses).
+- `/agent retrieval workflows` — prints the `WORKFLOW_WEIGHTS` table with each workflow's six-signal split. Doubles as a debugging surface — the operator sees exactly why `debug` weights temporal heavily vs `refactor` weighting structural.
+
+`/agent` root description updated to reflect both subnamespaces; the previous "only 'policy' is implemented" copy is gone.
+
+Tests: 19 new in `tests/cli/slash/agent-retrieval.test.ts` covering router rejection of unknown subnamespace + subcommand, summary (empty / populated with workflow counts), audit (empty / newest-first ordering / --limit cap / invalid --limit / unknown flag), replay (missing id / full dump shape / short-id prefix resolution / skipped rendering / unknown id), metrics (empty window / aggregates surface / --days window / invalid --days), workflows (table coverage + column headers).
+
+### 4.9 — Integration (retrieve_context tool)
+
+Pipeline finally encosta no operador. The subsystem is now reachable from the model's tool surface — every other slice (4.1 through 4.7) was internal plumbing leading here.
+
+`src/retrieval/runner.ts` exports `buildRetrievalRunner({ db, sessionId, memoryRegistry, defaultBudgetTokens?, views? })` — produces a `RetrieveFn` the harness wires into `ToolContext.retrieveContext`. Builds session-scoped views (memory + session) once per session, plus a compression resolver bound to both substrates. Per-call: filters views per the input's allow-list, swaps in a body-loading memory view when `loadBodies: true`, translates the operator/model input shape into the canonical `RetrievalQuery`, and shapes the result with stats (`candidatesRaw`, `candidatesRanked`, `included`, `skipped`, `budgetUsedTokens`, `budgetRemainingTokens`).
+
+`src/tools/builtin/retrieve-context.ts` defines the model-facing tool. Thin by design — validates args (workflow / queryType / budgetTokens / views / loadBodies all checked against the canonical enums + range bounds; views de-duplicated; query must be a non-empty string), refuses with `retrieval.unavailable` when the harness didn't wire a runner, refuses with `tool.aborted` on a pre-call abort signal, and surfaces runner-thrown errors as `retrieval.internal_error` instead of propagating. Metadata: `category: 'misc'`, `writes: false`, `idempotent: true`, `planSafe: true`, `parallel_safe: true`. Cap: budget ∈ [1, 100000], views ≤ 3 entries.
+
+`src/harness/loop.ts` wires `retrieveContext` into `ToolContext` when `config.memoryRegistry` is present (db is always available — the harness can't run without it). Headless / SDK runs without memory get a clean `retrieval.unavailable` error per spec §15.7 degradation.
+
+`ToolContext.retrieveContext?: RetrieveFn` is the new optional field (same pattern as `memoryRegistry`, `confirmMemoryWrite`, etc.). Imports add `RetrieveFn` from `../retrieval/index.ts`.
+
+`BUILTIN_TOOLS` ordering puts `retrieve_context` next to the read-only memory tools — operator scanning `agent --list-tools` finds them clustered by purpose.
+
+Tests: 19 new in `tests/tools/retrieve-context.test.ts` covering tool validation (missing runner / non-string query / empty query / unknown workflow / unknown queryType / budget out of bounds / non-integer budget / invalid views entries / empty views / loadBodies type / duplicate de-dup / aborted signal / runner-thrown errors) plus 5 runner end-to-end (ranked + compressed output for real query, views filter restriction, loadBodies surfaces body-only matches, defaultBudgetTokens respected, retrieval_trace row persisted per call). Bootstrap test list updated to include `retrieve_context`.
+
+### 4.7 — Compression
+
+Replaces the `ref-only` skeleton stub (slice 4.1) with the full §6 hierarchy + greedy budget allocator.
+
+`src/retrieval/compression.ts` exports two layers:
+
+1. **`createCompressionResolver({ registry, db, estimateTokens? })`** — per-view content materializer. Given a `(candidate, level)` pair, returns `{ content, costTokens }` from the underlying substrate or `null` when the row no longer exists (deletion between rank and compress) / the view is deferred (workspace returns null at every level until 4.4).
+
+   - **memory view**: `full` = frontmatter header + full body; `outline` = name + description + first 5 body lines; `summary` = `frontmatter.description`; `ref` = `memory:<scope>/<name>` projection (no I/O — works even when the file is missing).
+   - **session view**: `message` / `tool_call` / `failure` each have all four levels. `full` for tool_call includes input + output (output is unbounded but greedy can demote to outline when needed); `failure_event` `full` carries the payload_json. New `getFailureEvent(db, id)` helper added to the repo (the existing surface only had list helpers).
+
+2. **`compressGreedy({ ranked, query, resolver })`** — implements spec §6.2 verbatim. For each ranked candidate tries `full → outline → summary → ref` until a level fits; tracks the cheapest-unfit cost for the skipped trail so the operator hint reads `"cheapest level (ref) costs 5t > remaining 2t"` instead of bare "skipped".
+
+Token cost: `Math.ceil(content.length / 4)` heuristic, with minimum 1 to keep empty-content slots structurally honest. Slice 4.9 (integration) wires provider-specific `countTokens` via the optional `estimateTokens` dep.
+
+Pipeline integration: `PipelineDeps` gains an optional `compressionResolver` field. When provided, the pipeline runs `compressGreedy` against it as the default compress stage. Explicit `deps.compress` still wins (for tests). When neither is set, the slice-4.1 ref-only stub remains as the fallback so skeleton-shape tests don't need substrate.
+
+Tests: 15 new in `tests/retrieval/compression.test.ts` covering per-view resolver shape (memory + session + workspace-null), cost-ordering invariant (`ref ≤ summary ≤ outline ≤ full`), missing-row fallback to null, malformed nodeId guards, greedy budget cases (top-K full / tail degrades / exact fit / zero budget / skipped trail with wouldCostTokens / resolver that always returns null), and an end-to-end with the real resolver against memory + session corpora.
+
+### 4.6 — Ranking (out of declared order)
+
+Slice 4.4 (workspace via ripgrep) and 4.5 (expansion) were deferred — workspace without CODE_INDEX collapses to a ripgrep wrapper that duplicates existing grep/glob tools and produces no structural edges; expansion without edges has nothing to traverse. The remaining v1 value sits in honest ranking + compression + integration, so the slice order shifts: 4.6 → 4.7 → 4.9, with 4.4/4.5 picked up when (or if) CODE_INDEX returns.
+
+`src/retrieval/ranking.ts` ships `rankCandidates({ candidates, query, now? })` implementing the spec §5.1 six-signal fusion with §5.2 workflow-specific weights. Module-load guard throws if any workflow's weights don't sum to 1.0 (within float epsilon) — a misspelled weight in the table can't drift scores silently.
+
+Signal calibration:
+
+- **structural**: `1 / pathLength` — placeholder until expansion ships; v1 paths are single-element so it lands at 1.0 across the board. The weight stays in the table so workflows can already declare their structural preference; the substrate flips on when expansion does.
+- **lexical**: BM25 score normalized by the batch max. Per-batch normalization keeps the signal bounded to [0, 1] even though BM25 itself is unbounded.
+- **semantic**: 0 (spec §0 principle 2 — embedding opt-in, not v1).
+- **temporal**: exponential decay against the view's half-life — session 1h, memory 30d, workspace ∞ (no decay). Candidates without `createdAt` get a neutral 1.0 (workspace by design; memory listings today because mtime isn't on the shape).
+- **usage**: 0 (citation history table not implemented).
+- **goalAlignment**: 0 (CONTEXT_TUNING §1.6 canonical goal form not implemented).
+
+`Candidate.createdAt` is now an optional field on the type. Session view populates it from `message.createdAt` / `tool_call.created_at` / `failure.created_at` so the decay math has substrate to chew on. Memory view leaves it undefined (registry doesn't expose mtime today).
+
+Pipeline default rank passes from the zero-filled stub (slice 4.1) to `rankCandidates` real. Custom rank callbacks still override via `deps.rank`. Sort is finalScore DESC with nodeId ASC tiebreak — same trace-stability discipline BM25 uses.
+
+### 4.3 — Session view
+
+`src/retrieval/views/session.ts` projects the implicit session graph (RETRIEVAL §15.1 calls these "structures that ARE edges") onto a BM25 corpus. Three sources contribute one candidate per row:
+
+- **Messages** (`messages.content`) — Anthropic-shaped content blocks get text extracted; plain strings flow through unchanged. Role weighting: user × 3 (operator goal carries identifying signal), assistant × 1, tool × 1.
+- **Tool calls** (`tool_calls.tool_name` + `input`) — joined via `message_id → messages.session_id`. Tool name × 3 (more identifying than the JSON-stringified input). Output is intentionally NOT in the corpus — unbounded sizes (megabytes of stdout) would dominate without producing useful signal; slice 4.7 resolves outputs at `full` level for selected candidates only.
+- **Failure events** (`failure_events.code` + `classe` + `recovery_action` + `payload_json`) — code/classe/recovery × 3, payload × 1.
+
+Node ids: `session:message:<id>`, `session:tool_call:<id>`, `session:failure:<id>` — scoped so the trace makes the substrate visible.
+
+Temporal decay (§4.3 half-life 1h) is INTENTIONALLY NOT applied at bootstrap. The "recência boost" from spec §3.2 manifests in the ranking signal_temporal weight (slice 4.6) which is heaviest for the debug workflow. The trace records undecayed BM25 scores so eval replay can re-rank against truth without unwinding the decay.
+
+## [2026-05-15] fix(feedback,memory,storage) — Phase 3.7 review batch (14 findings closed)
+
+**Done.** Closes the comprehensive code-review punch list for the `feat/memory` branch (32 commits across multiple phases). Findings span Critical (1), High (3), Medium (7), Low (3) severity; all closed in five tightly-scoped slices on the same branch.
+
+### 3.7a — Security: outcomes evidence scrub + unknown-tool FK guard
+
+C1: `outcomes.evidence_json` lands operator-typed payloads (error messages, tool input fragments) which could carry secrets or PII. Mirrored the eviction-events two-pass scrub (telemetry redactor + secret-pattern redactor) onto `createOutcome`. Recursive walk handles arrays + nested objects + cycle guard via WeakSet. Malformed JSON falls through to a `_scrubbed_invalid_json` marker so the row still persists for forensic anchoring.
+
+M7: `invokeTool` returns `toolCallId=''` when the tool is unknown (no `tool_calls` row was created). The emitter's INSERT then tripped the FK constraint and the catch stderr-logged per dispatch — operator saw "forja outcomes: emit failed" noise on every unknown-tool attempt. Early-return guard on empty toolCallId silences this.
+
+### 3.7b — Multi-scope outcome emission
+
+H1: `emitToolCallOutcome` hardcoded `scope_kind='session'` — repo/user/language policies never accumulated evidence. Fix: emitter accepts `scopeChain?: BuiltScopeChain` and resolves to `scope_kind='repo'` (scopeId=chain.repo) when detected; falls back to session when chain absent or `repo='unknown'`. Loop.ts wires the chain via `buildScopeChain({ sessionId, repoCwd: config.cwd })`. Per-repo policies now accumulate evidence for the loop frio.
+
+### 3.7c — Concurrency hardening (TOCTOU + bash parser quotes)
+
+H2: `gcPurgeExpiredTombstones` sweep computed the candidate set, then walked each row through recency-check + `transitionMemoryState`. A concurrent `/memory restore` interleaved between the recency check and the transition would let the sweep purge a tombstone that had just been resurrected (audit drift). Fix: each per-row sequence runs inside `BEGIN IMMEDIATE` / `COMMIT` with `try/finally ROLLBACK` so the recency check + transition are atomic against a concurrent restore writer.
+
+H3: `bash-parser`'s env-prefix regex `[A-Za-z_][A-Za-z0-9_]*=\S+\s+` greedily consumed through quoted values with spaces — `FOO="a b" grep` matched `FOO="a ` and left `b" grep` in rest, producing a wrong binary detection (`b`). Split into name+value captures and bail when value contains `["'`\\]`. Five new tests cover double-quoted / single-quoted / no-space-but-quoted / escaped-space / backtick env values.
+
+### 3.7d — Loop frio refinements + same-state evidence validation
+
+`findSuperiorContradiction` recency window (90d): a long-dormant `active` policy at a more-specific scope with zero outcome flow at its own `(signature, scope, scope_id)` for 90+ days loses contradiction veto over divergent proposals at less-specific scopes. Policy stays active and dispatchable; what decays is its AUTHORITY TO CONTRADICT. Spec §7.2 preserved — we don't decay the policy itself, only the right to block re-learning when the world has clearly moved on. EXISTS subquery joins outcomes; no schema changes. Three tests (fresh-superior-blocks / stale-superior-doesn't-block / 30d-inside-window-still-blocks).
+
+Same-state evidence marker gate: `eviction_events` repo previously skipped shape validation entirely for non-applied outcomes (`trigger_fired_no_action`, `blocked_by_protection`, `blocked_by_hook`). Now requires a STRUCTURAL marker without enforcing the full motivo shape:
+
+- `blocked_by_protection` / `blocked_by_hook`: `blocked_by` column non-empty (names the specific guard).
+- `trigger_fired_no_action`: evidence has either `trigger_source: string` OR `_operator_driven: true`.
+
+`transitionMemoryState`'s same-state path auto-injects `trigger_source = input.trigger` into the evidence so existing callers don't need to thread the marker explicitly. Caller-supplied `trigger_source` (rare override) still wins via spread order. Five new tests cover marker present / marker absent / `_operator_driven` bypass / blocked_by_protection without column / blocked_by_hook with column.
+
+### 3.7e — Polish + doc + missing branch tests
+
+L2: hoist the prepared `Statement` outside the 5-iteration loop in `resolveActivePolicy`. bun:sqlite caches by SQL string internally so savings are marginal; the hoist is primarily a clarity signal that the statement is parametric across the chain.
+
+L1 + M5: inline doc for CI clamping in `bayesian.ts` (why `Math.max(0, ...) / Math.min(1, ...)` over Wilson-style) + structured doc for the `ACTORS` enum in `eviction-events.ts` (each role's meaning + the `actor='user'` protection-gate bypass contract).
+
+L3: branch coverage for `kind: 'no_observations'` (loop-frio with 12 all-partial outcomes pass the accumulation gate but produce zero success/failure data → posterior null) and `kind: 'io_error'` (transitions same-state path with a closed db).
+
+### Test impact
+
+Suite went from 7793 → 7795 pass (10 skip, 0 fail) — added scrub/guard/scope-chain/parser-quotes/recency/marker/branch tests; updated fixtures in eviction-events / memory-lifecycle / loop-frio for the new marker contract and recency window. typecheck + biome lint clean. `.gitignore` now ignores `.claude/`.
+
+## [2026-05-15] fix(feedback) — Phase 3.6 gap-closing batch (7 follow-ups from Phase 3 review)
+
+**Done.** Closes 7 follow-up gaps declared across Phase 3 — high-relevance items that affect code already in production. Bundled in one slice because the changes are tightly coupled (audit table feeds operator forensics for the rewrites just landed; scope enrichment unblocks user/language policies; contradiction check + transactional bracket + ordering + self-alias filter are all loop frio surface refinements).
+
+### 3.6a — dispatch_rewrites audit table
+
+Phase 3.5b shipped the rewrite behavior but the only audit trail was a stderr line — non-queryable, lost on log rotation. New `dispatch_rewrites` table (migration 051) captures: `tool_call_id`, `session_id` (both FK CASCADE), `policy_id` (no FK; survives policy invalidation), `action_signature`, `original_command`, `rewritten_command`, `matched_scope`, `recorded_at`. Three indices for the common forensic queries. Loop.ts INSERTs on every successful rewrite; failure stderr-logs but lets the rewrite proceed (behavior change still happens, only the forensic surface degrades). 10 tests cover CRUD + CASCADE semantics + policy_id-no-FK.
+
+### 3.6b — Scope chain enrichment
+
+Phase 3.5b hardcoded `user: 'global'`, `language: 'unknown'`, and used `config.cwd` literal (no normalization). Three small fixes:
+
+- `normalizeRepoScope`: `path.resolve` + strip trailing slash. Symlinks NOT resolved (operator might use intentional symlinks; calling `realpath` would surprise them).
+- `detectUserScope`: `os.userInfo().username` → `process.env.USER` fallback → `host:<hostname>` last resort → `'unknown'`.
+- `detectLanguageScope`: probe repo root for marker files (package.json → typescript; pyproject.toml/setup.py → python; Cargo.toml → rust; go.mod → go; pom.xml/build.gradle → java; build.gradle.kts → kotlin; Gemfile → ruby; composer.json → php; else `'unknown'`). Order encodes operator-bias for polyglot repos.
+
+`buildScopeChain` convenience wraps all three. Loop.ts now calls this instead of the inline hardcoded chain. 23 tests.
+
+### 3.6c — `noContradictionWithSuperior` real check
+
+Phase 3.4 deferred this — the loop frio passed `true` by default. Now implemented as a SQL query: for a proposed policy at (scope_kind, signature, action_json), walk MORE-SPECIFIC scopes (per resolver precedence: session > repo > user > language > global) and check whether any has `state='active'` with the SAME signature but DIFFERENT action_json. If yes, the proposal would never apply at dispatch (the higher scope always wins); refuse via `gate_refused` with a specific reason. Same `action_json` at higher tier is REDUNDANT (subsumed), not contradicting — allowed. 4 tests cover the contradicting + redundant + session-no-superior + proposed-doesn't-trip paths.
+
+### 3.6d — Outcome emitter post-rewrite resonance
+
+After dispatch rewrites `grep foo → ripgrep foo`, the outcome emitter previously derived L1 from the rewritten command — `ripgrep` isn't in `KNOWN_BASH_ALIASES`, so NO L1 row landed. The policy's signature went dark immediately after promotion; loop frio couldn't measure post-promotion effectiveness. Fix: `EmitOutcomeInput.appliedL1Signature?: string` lets the caller pin the signature; loop.ts threads `rewrite.appliedSignature` when the rewrite manifested. 2 tests cover the override path.
+
+### 3.6e — Transactional bracket on `runLoopFrio`
+
+Two concurrent `runLoopFrio` invocations could both see "no existing policy" and both INSERT duplicate `proposed` rows for the same `(action_signature, scope)`. Refactored per-tuple work into `processTriggeredTuple` and wrapped each iteration in `BEGIN IMMEDIATE` / `COMMIT` (or `ROLLBACK` on throw). SQLite's RESERVED lock blocks concurrent writers; when the second one proceeds, the duplicate guard SEES the just-inserted row and skips. All 18 existing tests still pass (refactor preserves single-threaded semantics).
+
+### 3.6f — Stable ordering in `resolvePolicyId` ambiguity
+
+When operator passes a short-prefix that matches multiple policies, the error message enumerates the first 5 matches. The order reflected state-group iteration + per-state recorded_at — non-reproducible across runs. Fix: sort matches by `id` before slicing. One-line change.
+
+### 3.6g — Self-alias filter on proposer
+
+Loop frio proposer produced no-op proposals for self-alias signatures (`alias:sed:sed`, etc. — present in the curated table for telemetry). Operator saw useless `/agent policy list` entries. New `kind: 'self_alias_no_op'` SignatureResult variant filters at the proposer (after `parseActionSignature`, before `createPolicy`). 1 test.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings (after biome auto-fix)
+- `bun test` 7774 pass / 10 skip / 0 fail (+40 from the batch)
+
+### Deferred (declared throughout Phase 3, not closed in this batch)
+
+- TOML-loaded priors + aliases (operator override config files)
+- Persisted "última análise" timestamp per signature (today the duplicate guard handles re-runs)
+- Distribution shift detector (§7.3)
+- L2/L3/L4 proposers
+- Trigger-driven invocation (session-end auto loop frio)
+- Cross-scope auto-promotion (per §6.2 explicitly NOT auto)
+- Spec amendments (MEMORY §6.5.5, EVICTION §4.1 to admit user_purge/expired motivos)
+- `/agent rewrites list` slash to surface dispatch_rewrites via operator UI
+
+## [2026-05-15] feat(feedback,harness) — L1 alias dispatch rewrite (Phase 3.5b — closes FEEDBACK_ADAPTATION L1 loop)
+
+**Done.** First behavior-changing slice of FEEDBACK_ADAPTATION. The L1 adaptation loop closes end-to-end: bash dispatches produce alias outcomes (3.5a) → loop frio aggregates + proposes policies (3.4) → operator promotes via `/agent policy promote` → THIS SLICE consults the resolver at dispatch time and rewrites the bash command before the permission engine + tool exec see it.
+
+Adaptation now manifests in behavior. The spec §0.6 anti-pattern ("adapt on N=1") stays structurally prevented by the loop frio's `n >= 10` gate; the rewrite trusts that gate.
+
+### Pipeline shape (Phase 3 L1 closure)
+
+```
+bash dispatch                   (model issues `grep foo src/`)
+  │
+  ▼
+maybeRewriteBashCommand         (3.5b — THIS SLICE)
+  ├─ extract leading binary     (3.5a parser)
+  ├─ lookup alias table         (3.5a)
+  ├─ resolveActivePolicy        (3.3 scope chain walk)
+  └─ rewriteCommandBinary       (3.5a parser, splice)
+  │
+  ▼
+permission engine + invokeTool  (sees REWRITTEN command)
+  │
+  ▼
+finishToolCall + outcome emit   (3.2 + 3.5a — alias signature lands)
+  │
+  ▼
+loop frio (3.4 aggregator)      operator review → /agent policy invalidate if degraded
+```
+
+### Design decisions
+
+- **Rewrite happens BEFORE permission engine.** The engine sees the effective command. Audit rows reflect what actually ran. Trade-off: an operator who scans permission logs sees `ripgrep -r foo` not `grep -r foo` — distinct from the model's INTENT. The pre-rewrite command is preserved on stderr via `forja adaptation: rewrote bash command via policy <id> (<signature>, scope=<level>)`; future slice can fold this into a structured audit_timeline event.
+
+- **`target` validated as a bare binary name** (`^[A-Za-z_][A-Za-z0-9_+.-]*$`). Critical because the permission engine sees the REWRITTEN command — without this validator, a poisoned `action_json: {target: '; rm -rf /'}` (hostile DB import, future TOML collaborator, drift on a shared install) would splice shell metacharacters into the command and bypass the entire allow-list. `isValidBinaryReplacement` refuses paths (`/usr/bin/rg`), whitespace (`rg foo`), shell metas (`;`, `&`, `|`, `<`, `>`, `$`, backtick, quotes, newline). Validator failure emits a stderr signal so operators notice tamper attempts on first occurrence.
+
+- **`rewriteCommandBinary` and `extractLeadingBinary` share a single internal scanner.** Earlier shape duplicated the prefix walk between extract + rewrite, with subtle offset-tracking bugs (`( cd /tmp && grep foo )` interior whitespace, `FOO=1 cd /tmp && grep` env-before-cd). Refactored to a single `findLeadingBinary` returning `{binary, start, end}`; both callers consume the same result. Drift-proof.
+
+- **Parens-wrapped commands now bail uniformly.** Previously the parser tried to handle `(cd /tmp && grep foo)` but produced corrupted output on interior whitespace. The bug was security-relevant — the corrupted output could bypass the engine. The refactor refuses parens; operators using subshell wrappers get the generic `flag:bash:default:default` outcome and no rewrite. Pragmatic trade-off vs the prior unsafe attempt at parens handling.
+
+- **Self-alias short-circuit moved up.** When the known-aliases table entry has `from === to` (cat/awk/sed in the curated set), the resolver query is skipped entirely — 3 of 5 entries gain a per-call DB roundtrip avoidance.
+
+- **Scope chain built from harness state.** `session: sessionId`, `repo: config.cwd` (literal path for now — hashing deferred), `user: 'global'` (no per-user differentiation yet), `language: 'unknown'` (no fingerprint detector yet). Minimum-viable; richer scope detection lands in a later slice without changing the resolver contract.
+
+- **Self-alias guard.** If `target === alias.from` (e.g., promoted `alias:sed:sed`), the rewrite is skipped — no string splice for a no-op. Loop frio's proposer may emit self-aliases for tally purposes; this guard ensures they don't pollute dispatch behavior even when accidentally promoted.
+
+- **Defensive parsing of `action_json`.** Missing field, malformed JSON, non-string target — all skip the rewrite silently. The policy row stays valid (the table accepts opaque TEXT per the 3.3 contract); the rewrite is just a no-op in those edge cases.
+
+- **Returns un-rewritten on parser bail.** When `extractLeadingBinary` returns null (quoted commands, pipes, exotic shapes), the rewrite is skipped. Conservative — false positives would silently mutate commands the operator typed exactly as intended.
+
+### Files added/modified
+
+| File | Change |
+|---|---|
+| `src/feedback/bash-parser.ts` | New `rewriteCommandBinary(command, newBinary)` — splices the leading-binary token preserving everything else. |
+| `src/feedback/dispatch-rewrite.ts` (new) | `maybeRewriteBashCommand(db, command, chain)` — resolver consultation + alias lookup + splice + structured result for audit. |
+| `src/harness/loop.ts` | Wire `maybeRewriteBashCommand` BEFORE `invokeTool` in the per-tool dispatch closure. When rewritten, mutates `tu.input.command` and stderr-logs the rewrite for operator visibility. |
+| `tests/feedback/dispatch-rewrite.test.ts` (new) | 26 tests covering: `rewriteCommandBinary` (env, cd, paths, multi-cd, multi-env, args-with-same-name, parens-bail, security-target-refused) + `maybeRewriteBashCommand` (active policy applies; proposed doesn't; missing policy; unknown binary; self-alias guard; global vs more-specific scope; malformed action_json; missing target field; unparseable command; SECURITY: target with shell metas refused — 9 probe targets; SECURITY: target with path prefix refused). |
+| `tests/feedback/bash-parser.test.ts` | Updated parens-around-cd test: now expects null (bail) rather than parsing the interior — matches the refactored security-tightening contract. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7734 pass / 10 skip / 0 fail (+26 from the slice, including post-review security probes)
+
+### Phase 3 closure — what shipped, what's deferred
+
+**Phase 3 (FEEDBACK_ADAPTATION L1 closure) — 6 slices:**
+
+| Slice | What | Status |
+|---|---|---|
+| 3.1 | outcomes table + action_signature schema | ✅ |
+| 3.2 | Loop quente outcome emitter wired into harness | ✅ |
+| 3.3 | policies table + scope resolver | ✅ |
+| 3.4 | Loop frio L1 pipeline + /agent policy slash | ✅ |
+| 3.5a | Bash parser emits L1 alias outcomes | ✅ |
+| 3.5b | L1 alias dispatch rewrite (first manifestação) | ✅ |
+
+**End-to-end L1 loop is live.** Operator can: see `flag:<tool>:default:default` + `alias:<bin>:<bin>` outcomes accumulate; fire `/agent policy run` to invoke loop frio; review proposals via `/agent policy list proposed`; promote with `/agent policy promote`; observe dispatch rewriting via stderr; invalidate degraded policies via `/agent policy invalidate`.
+
+**Deferred to future slices (declared throughout Phase 3):**
+
+- **Scope detection enrichment**: repo-hash, per-user id, language detection.
+- **TOML-loaded priors + aliases** (operator override).
+- **Per-signature "última análise" timestamp** persistence (today the duplicate guard handles re-runs).
+- **Distribution shift detector** (§7.3).
+- **L2/L3/L4 proposers** (per-tool flag detector; recipe template matcher; classifier-driven strategy detector).
+- **Trigger-driven invocation** (session-end auto loop frio, instead of operator-fired `/agent policy run`).
+- **Cross-scope auto-promotion** (per §6.2 explicitly NOT auto).
+- **`noContradictionWithSuperior` real check** (deferred from 3.4).
+- **Audit timeline `policy_changed` events** + structured rewrite audit (today stderr).
+- **Self-alias filter on proposer surface**.
+- **Cross-tool comparison signals** (grep success rate vs rg success rate when both have outcomes).
+- **Transactional bracket on `runLoopFrio`** (race guard for concurrent runs).
+
+**Aggregate verification across Phase 3:** typecheck clean, lint 0 errors, full suite 7728 pass / 10 skip / 0 fail.
+
+## [2026-05-15] feat(feedback) — bash parser emits L1 alias outcomes (Phase 3.5a)
+
+**Done.** The producer side of L1 alias adaptation. Without it, the loop frio's L1 proposer has nothing to aggregate — the existing outcome emitter writes only `flag:<tool_name>:default:default` for every dispatch. This slice adds a minimum-viable bash command parser + a curated known-aliases table, so when the model invokes `bash {command: "grep foo"}` the emitter ALSO writes an `alias:grep:ripgrep` outcome alongside the generic `flag:bash:default:default` row.
+
+The loop frio (3.4) can now propose L1 policies once enough alias outcomes accumulate per (scope, signature). 3.5b will wire dispatch consultation so promoted policies actually rewrite tool calls.
+
+### Design decisions
+
+- **Curated known-aliases table, not learned.** The adaptation direction (`grep → ripgrep`, `find → fd`) is Forja-opinionated. Inferring "which alternative to propose" from outcome data alone needs an alias-discovery subsystem that's out of scope here. Today's table covers grep/find/cat/awk/sed; the first two have real alternatives (rg, fd), the last three are self-aliases (no broadly-recommended swap, but we still capture per-binary tally for future telemetry). Future slice loads from TOML for operator-curated additions.
+
+- **Minimum-viable parser, conservative on shell magic.** Handles plain commands, env prefixes (`FOO=1 grep`), `cd && command` walks, parens-wrapped subshells, leading whitespace, and absolute / relative path binaries (`/usr/bin/grep`, `./grep`). Bails on quotes, pipes/redirections that appear BEFORE the binary, backticks, function calls, control structures. Conservative rationale: false positives pollute the loop frio's outcome stream and produce wrong adaptation proposals; false negatives just leave a stat unrecorded.
+
+- **L1 outcome emitted ALONGSIDE the generic flag outcome.** Two rows per bash dispatch when the leading binary matches the table. Same evidence shape, same success/failure derivation, different action_signatures. The flag signature continues to feed per-tool reliability tracking; the alias signature feeds adaptation. Coexistence is intentional — they index different surfaces.
+
+- **Self-aliases (sed → sed, awk → awk) included.** Captures per-binary tally without proposing change. Loop frio's L1 proposer WOULD construct `actionJson = {target: 'sed'}` for these — operator sees a "promote alias:sed:sed → use sed" no-op proposal, which they wouldn't promote. Future slice can filter self-aliases out of the proposer surface; today the duplicate-guard + operator review covers it.
+
+- **Conservative on the binary alphabet for path-stripping.** `/usr/bin/grep` → `grep`. But the post-strip name can't START with `.` (rules out `.config` as a "binary" if a degenerate path made it through). Empty / `.` / `./` / `/` tokens return null.
+
+### Files added/modified
+
+| File | Purpose |
+|---|---|
+| `src/feedback/bash-aliases.ts` (new) | Curated `KNOWN_BASH_ALIASES` table + `lookupBashAlias` O(1) helper. |
+| `src/feedback/bash-parser.ts` (new) | `extractLeadingBinary(command)` — handles env prefixes, cd walks, parens, path stripping. |
+| `src/feedback/outcome-emitter.ts` | New optional `toolInput` field. Multi-row emit: generic `flag:bash:default:default` PLUS `alias:<from>:<to>` when applicable. Best-effort per-row (one failure doesn't block the other). |
+| `src/harness/loop.ts` | Pass `toolInput: tu.input` to the emitter at the bash dispatch site. |
+| `tests/feedback/bash-parser.test.ts` (new) | 24 tests covering plain commands, env prefixes, cd walks, paths, real-world shapes (git/npm/bun/find), and null bail cases. |
+| `tests/feedback/outcome-emitter.test.ts` | 5 new tests: bash + known alias → 2 rows; bash + unknown → 1 row; cd-prefixed alias detection; non-bash + bash-shaped input → no L1; failure surfaces on both rows. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7708 pass / 10 skip / 0 fail (+29 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.5b — L1 alias dispatch** (next + final slice for L1 closure): tool-dispatch consults `resolveActivePolicy`; if an active L1 alias policy matches, rewrite the tool call before invocation.
+- **TOML-loaded aliases**: operator-curated table; spec §5.2 example uses YAML for priors, same shape for aliases. Future slice.
+- **Self-alias filter on proposer**: skip `from === to` signatures so operators don't see no-op proposals.
+- **Cross-tool comparison signals**: when both `grep` and `rg` have outcomes in the same scope, compute a "ripgrep would have been faster N% of the time" signal that informs the loop frio's adoption decision beyond pure grep success rate.
+- **Per-command-flag detection** (L2): bash commands with specific flag combinations (`grep -E` vs `grep -P`) might prefer different alternatives. Out of scope here.
+
+## [2026-05-15] feat(feedback,cli) — loop frio L1 pipeline + /agent policy slash (Phase 3.4)
+
+**Done.** Complete L1 adaptation pipeline for FEEDBACK_ADAPTATION: priors → Bayesian aggregator → accumulation trigger → L1 alias proposer → orchestrator → operator slash. The loop closes for `alias:<from>:<to>` action_signatures. Outcomes from 3.2 feed the aggregator; proposed policies populate the table from 3.3; operators inspect via `/agent policy list` and promote via `/agent policy promote`. NO behavior change yet — dispatch-time rewriting is 3.5.
+
+### Pipeline shape
+
+```
+findAccumulatedSignatures(N≥10)    →  triggered (action_signature, scope) tuples
+  for each L1 tuple:
+    listOutcomesByActionSignature  →  full history (not just window)
+    posteriorFromOutcomes(prior)   →  {mean, ci_low, ci_high, n}
+    passesPromotionGate            →  ci_low > 0.7 AND n >= 10 AND stable
+    findExistingPolicy             →  skip when non-terminal policy exists
+    createPolicy(state='proposed') →  ready for operator review
+```
+
+### Design decisions
+
+- **Priors per level per §5.2**: L1 `Beta(2,1)` optimistic (simple aliases usually work), L2 `Beta(1,1)` uniform, L3 `Beta(1,1)` uniform, L4 `Beta(1,2)` pessimistic (strategies fail more than they appear to — protects against premature enthusiasm from a noisy classifier). Foreign-vocabulary signatures fall through to the uniform default. Future slice loads from TOML config; this slice uses hardcoded defaults so the canonical priors ship in code without an external file dependency.
+
+- **Normal approximation on the Beta posterior** for the 95% CI. Mathematically defensible when n ≥ 10 (the promotion gate threshold). Alternatives — Wilson score interval, exact incomplete-beta-inverse — were considered. Normal approx is the simplest math + smallest code; exact Beta quantile would be ~50× the code without measurable accuracy gain at the gate boundary. Documented in code as a swap-in point.
+
+- **`partial` and `ambiguous` outcomes EXCLUDED from the binomial.** Spec §5 frames the posterior as `P(success | this action_signature in this scope)`; ambiguous outcomes contaminate that signal. They feed a different surface (per-tier evidence schema, future slice). Today they're tallied but ignored for the posterior.
+
+- **Promotion gate: `ci_low > 0.7 AND n >= 10 AND distribution_stable AND no_contradiction_with_superior`** per §5.3. `noContradictionWithSuperior` defaults to true (caller verifies); `distribution_stable` defaults to true until §7.3 detector ships. Gate refusal lands as `kind: 'gate_refused'` with explicit reason string.
+
+- **Accumulation trigger is window-based** (`sinceMs` parameter). Per-signature "última análise" timestamp persistence would prevent re-processing the same outcomes; out of scope here because the loop frio is idempotent (existing `proposed` policy short-circuits re-proposal via the duplicate guard).
+
+- **L1 alias proposer only.** L2 flag adaptation needs per-tool flag detectors that don't ship today (bash parser, etc.). L3 recipe and L4 strategy need their own evidence pipelines + classifier infrastructure. Per spec §4.1, "Adaptação só age em L1-L2 por default. L3 requer N alto e validação humana. L4 requer opt-in explícito." Shipping L1 first is the canonical entry point.
+
+- **Duplicate guard checks for non-terminal states** (proposed/active/shadow/quarantined). Terminal `invalidated` policies do NOT block re-proposal per spec §4.2 ("re-promoção começa de `proposed` novo, com nova evidence"). Tests pin this.
+
+- **`/agent policy run` is operator-triggered.** No scheduler in this slice — operators fire the loop frio manually via the slash. Future slice can add a per-session trigger or background timer; the runner contract is stable.
+
+- **Short-id prefix matching in `/agent policy promote/invalidate/history`.** Same UX pattern as `git`. The 8-char abbreviation from `list` output is enough for unique resolution in practice; the resolver refuses on ambiguity with an explanation. Full UUID also works.
+
+### Files added/modified
+
+| File | Purpose |
+|---|---|
+| `src/feedback/priors.ts` (new) | Per-level Beta priors + `getPriorForSignature` lookup. |
+| `src/feedback/bayesian.ts` (new) | `tallyOutcomes`, `posteriorFromCounts`, `posteriorFromOutcomes`, `passesPromotionGate` + `Z_95` constant. |
+| `src/feedback/accumulation.ts` (new) | `findAccumulatedSignatures` — SQL GROUP BY signature+scope with `HAVING count >= N`. Default minN=10. |
+| `src/feedback/loop-frio.ts` (new) | `runLoopFrio` orchestrator + `SignatureResult` discriminated union (`proposed | gate_refused | duplicate_proposed | level_not_implemented | no_observations`). |
+| `src/cli/slash/commands/agent-policy.ts` (new) | `/agent policy` slash with 6 subcommands: summary, list, promote, invalidate, history, run. |
+| `src/cli/slash/index.ts` | Register `agentPolicyCommand` in `createBuiltinRegistry`. |
+| `tests/feedback/bayesian.test.ts` (new) | 17 tests covering tallying, posterior math (CI bounds clamped, tight-vs-loose-CI), gate (4 refusal reasons), priors lookup. |
+| `tests/feedback/loop-frio.test.ts` (new) | 9 tests: proposed when gate passes; refused when ci_low too low / n < 10 / unstable; skip non-L1; duplicate guard (non-terminal blocks, terminal doesn't); cross-scope independence; scope filter; motivo content. |
+| `tests/cli/slash/agent-policy.test.ts` (new) | 16 tests: summary, list (grouped + filtered), promote (full id + short prefix + illegal + ambiguous + missing), invalidate, history, run, error paths. |
+| `tests/cli/slash/dispatch.test.ts` | Builtin count bumped 16 → 17. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings (after biome auto-fix)
+- `bun test` 7675 pass / 10 skip / 0 fail (+42 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.5 — L1 alias dispatch** (next + final slice for L1 closure): tool-dispatch consults `resolveActivePolicy`; if an active L1 alias policy matches, rewrite the tool call before invocation. Loop closes end-to-end.
+- **TOML-loaded priors**: spec §5.2 YAML example would let operators override per `action_signature` pattern. Future slice.
+- **Persisted "última análise" timestamp**: per-signature watermark so the accumulation trigger only counts NEW outcomes since the last loop frio run. Today the runner is idempotent via duplicate guard, so this is optimization not correctness.
+- **Distribution shift detector** (§7.3): when scope unstable, all proposals are refused. Today `distributionStable` defaults to true.
+- **L2/L3/L4 proposers**: per-tool flag detector for L2; recipe template matcher for L3; classifier-driven strategy detector for L4 (gated, opt-in).
+- **Trigger-driven invocation**: today operators fire the loop frio manually via `/agent policy run`. Future slice can add session-end automatic invocation or per-N-outcomes timer.
+- **Cross-scope promotion** (e.g., 9/10 in repo X → user-scope promotion): per §6.2 explicitly NOT auto.
+
+## [2026-05-15] feat(storage,feedback) — policies table + scope resolver (Phase 3.3)
+
+**Done.** Schema + state machine + scope-aware lookup for adaptation policies. The loop frio (3.4) writes proposed/active rows; the tool dispatcher (3.5) reads via the resolver at decision time. No callers wire either yet — pure infrastructure.
+
+Policies are the COMMIT-LIKE artifact of the adaptation pipeline. Each row says: "for action_signature X in scope Y, do Z instead of the default". The loop frio aggregates outcomes, fits a Beta posterior, and emits proposals (`state='proposed'`). Operators promote via `/agent policy promote` (`state='active'`). Distribution shift detector (§7.3, future) moves active rows to `shadow` or `quarantined`.
+
+### Design decisions
+
+- **5-state machine**: `proposed | active | shadow | quarantined | invalidated`. Per AGENTIC_CLI §11 + FEEDBACK_ADAPTATION §7.1. `invalidated` is terminal — re-promotion starts fresh per spec §4.2 "begins from `proposed` novo, com nova evidence". Bypasses the same-state pseudo-transition pattern that eviction_events uses; policy state changes are commit-like, not probe events.
+
+- **`isLegalPolicyTransition` + `IllegalPolicyTransitionError`** mirror the eviction state machine shape — `transitionPolicy(db, id, toState)` validates via the helper and throws on refusal. Same defense-in-depth pattern.
+
+- **`transitionPolicy` UPDATES rather than INSERTs.** Trade-off vs eviction_events (which append-only INSERTs per transition): policies are commit-like artifacts; the chain of WHO promoted/invalidated them lives in `audit_timeline` (future), not in repeated policy rows. `parent_id` captures DERIVATION (e.g., a repo policy promoted from a session policy), not state transitions.
+
+- **`action_json` is opaque TEXT at the repo layer.** Per-level shapes (L1 `{target}`, L2 `{flag, value}`, L3 `{recipe_id}`, L4 `{strategy_id}`) are emitter contracts; the repo just stores. Future slice can add per-level validation analogous to eviction evidence schemas if needed.
+
+- **`ci_low` + `ci_high` + `n` for Bayesian state.** Populated by the loop frio aggregator (3.4) — 95% credibility interval bounds from the Beta posterior + sample size. NULL for cold-start defaults + manually-curated policies. Promotion gate (§5.3) reads these.
+
+- **Scope resolver walks 5 levels in order**: `session → repo → user → language → global`. Each level queries independently; cross-level JOIN is forbidden per §6.1 ("Policy é declarada em um único escopo. Não há 'policy global com override per-repo'"). Most-recent-wins within a level (operator-edited policies override loop-frio-proposed ones at the same scope).
+
+- **`ScopeChain` shape carries 4 values + implicit global.** Caller (harness) computes `session` (current session id), `repo` (hash of repo root), `user` (stable user id), `language` (primary language id from workspace detector). Global is literal `'global'` per spec §6 — shipped defaults. The 4-value chain avoids threading 5 args through every consumer.
+
+- **`desiredStates` defaults to `['active']`.** Callers wanting shadow-mode policies (logged-but-not-applied per §7.3 distribution shift) pass `['active', 'shadow']`. The future distribution shift detector emits this expanded read when scope is unstable.
+
+- **Indices per spec read paths**: `(action_signature, scope_kind, scope_id, state)` for resolver hot path; `(state, recorded_at)` for `/agent policy list --pending` style queries; `(parent_id)` for history walks.
+
+- **Coexistence with `policy_archive`** (PERMISSION_ENGINE §6.2) declared in code. The two tables share the noun "policy" but record different audit dimensions: `policy_archive` is permission-policy YAML snapshots; `policies` is adaptation policies (action_signature → action). No dual-write.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/050-policies.ts` | Migration: `policies` table + 3 indices. |
+| `src/storage/migrations/index.ts` | Register migration 050. |
+| `src/storage/repos/policies.ts` | State machine helper + `createPolicy` + `transitionPolicy` + read queries (`getPolicy`, `listPoliciesByActionSignature`, `listPoliciesByState`, `listPolicyHistory`, `countPolicies`). |
+| `src/feedback/scope-resolver.ts` | `resolveActivePolicy(db, actionSignature, chain, desiredStates?)` walks the scope chain returning the first match. |
+| `tests/storage/policies.test.ts` | 17 tests: state machine (legal/illegal transitions, terminal invalidated, same-state refused); create + CHECK violations; transitionPolicy success/failure paths; list helpers; parent-chain history. |
+| `tests/feedback/scope-resolver.test.ts` | 8 tests: none on empty; most-specific wins; fall-through session→repo→user→language→global; ignores non-active states; desiredStates override (shadow); most-recent-wins within a level; signature mismatch returns none. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings (after biome auto-fix on the new SQL row-shape cast)
+- `bun test` 7633 pass / 10 skip / 0 fail (+27 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.4 — Loop frio MVP** (next slice): accumulation trigger + Bayesian aggregator + L1 alias proposer + promotion gate + `/agent policy list` + `/agent policy promote` slash.
+- **3.5 — L1 alias dispatch**: first manifestação — tool dispatch consults resolver.
+- **`audit_timeline`** for policy_changed events: deferred until the audit timeline subsystem lands. For now, `policies.motivo` + `recorded_at` are the forensic record.
+- **Distribution shift detector** (§7.3): triggers `active → shadow` transitions. Out of scope until fingerprint computation ships.
+- **Per-level `action_json` validation**: analogous to EVICTION §6.1 evidence gates. Future slice.
+
+## [2026-05-15] feat(harness,feedback) — loop quente outcome emitter (Phase 3.2)
+
+**Done.** Wires the FEEDBACK_ADAPTATION loop quente (§3.1) into the harness tool-dispatch path. Every finished tool call now produces an `outcomes` row capturing `(action_signature, tier, result)` keyed to the operator's session. No behavior change yet — pure data capture. The loop frio aggregator (3.4) will read these rows.
+
+The emitter coexists with the existing `outcome_signals` write at the same dispatch site (loop.ts:2642-2664, signal_kind='tool_error'). Per AUDIT.md §1.1.1's no-dual-write contract, the two emissions record different audit dimensions: `outcome_signals` feeds the permission engine's calibration (PERMISSION_ENGINE §6.3.2); `outcomes` feeds the adaptation engine.
+
+### Design decisions
+
+- **Generic `flag:<tool_name>:default:default` action_signature.** A baseline that captures "this tool was used; did it succeed?" Future slices refine: a bash command parser will emit `alias:<bin>:<bin>` for known L1 aliases (grep, rg, find); per-tool flag detectors will emit `flag:bash:cwd_arg:preferred` style L2 signatures. The generic shape captures every dispatch without requiring per-tool integration up front; downstream aggregators that want to focus on specific levels filter via `levelOf`.
+
+- **Tier 1 only for now.** §2.1's tier ordering says "tier 1 disponível ⇒ usa tier 1". Every tool dispatch produces a deterministic outcome from the status (done/error) — that's tier 1 by definition. Tier 3 (humano explícito via permission denial) and Tier 2 (estrutural via diff stats) require cross-table joins or downstream detectors that don't ship in this slice; deferred to 3.3.
+
+- **Denied calls skipped.** Per the coexistence contract: when the permission engine denies a call before execution, the decision IS the signal — there's no body outcome to record. The emitter checks `denied === true` and returns false without writing. The permission outcome lives in `outcome_signals` already; double-writing would violate the no-dual-write rule.
+
+- **`scope_kind: 'session'` for every row.** The scope resolver (3.3) will compute the active scope per dispatch (session → repo → user → language → global). For now, every outcome lands at session granularity — coarsest aggregation, but unambiguous. When 3.3 ships, this becomes `scope_kind = resolveScope(...)`.
+
+- **Best-effort emission.** A failure to INSERT the outcome stderr-logs and returns false. The loop continues. Adaptation data loss is preferable to crashing the operator's session — same defensive pattern the existing `outcome_signals` emission uses.
+
+- **`evidence_json` carries `tool_name`, `duration_ms`, `failed?`, `error_message?`.** Minimum shape that supports forensic queries ("which bash invocations failed in this scope?") without bloating storage. The per-tier evidence schema (analogous to EVICTION §6.1) is a future surface; for now the shape is permissive.
+
+- **New `src/feedback/` directory.** Distinct from `src/outcomes/` which owns the PERMISSION_ENGINE outcome_signals subsystem. The two subsystems share the broad concept ("outcome") but live in different audit dimensions; keeping them in separate directories avoids file-grep confusion.
+
+### Files added/modified
+
+| File | Change |
+|---|---|
+| `src/feedback/outcome-emitter.ts` (new) | `emitToolCallOutcome(db, input)` — best-effort INSERT; skips denied paths; tier 1 + generic signature. |
+| `src/harness/loop.ts` | Wire emitter right after the outcome_signals tool_error block in the per-tool dispatch closure. Same dispatch site, distinct emission. |
+| `tests/feedback/outcome-emitter.test.ts` (new) | 5 tests: success → tier 1 success row; failure → tier 1 failure with error_message; denied → skip; action_signature reflects tool name; FK violation → stderr log + return false. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7606 pass / 10 skip / 0 fail (+5 from the slice)
+
+### Deferred / follow-ups declared
+
+- **Bash command parser for L1 aliases**: emit `alias:<bin>:<bin>` for known L1 aliases (grep, rg, find, awk) when bash command parses cleanly. Out of scope here.
+- **Tier 3 link via approvals_log**: when a permission decision later flips a tool's policy, the operator-approved/refused signal becomes the tier-3 outcome. Requires the loop frio to join outcomes + approvals_log; deferred.
+- **scope_kind=repo via repo-hash detector**: needs `repoRoot` threaded through dispatch + hashed identifier. Lands in 3.3 alongside the scope resolver.
+- **3.3 — `policies` table + scope resolver**: next slice.
+
+## [2026-05-15] feat(storage) — outcomes table + action_signature schema (Phase 3.1 — opens FEEDBACK_ADAPTATION)
+
+**Done.** Foundation for the FEEDBACK_ADAPTATION subsystem. Ships the canonical `outcomes` table (FEEDBACK_ADAPTATION §3.1 + AUDIT.md §1) and the `action_signature` parser/serializer for the four levels declared in §4.2 (L1 alias, L2 flag, L3 recipe, L4 strategy). Pure infrastructure — no producers, no consumers. The loop quente detector (3.2) starts writing rows; the loop frio aggregator (3.4) starts reading.
+
+This is the LARGEST greenfield subsystem in the project today (the post-Phase-1 gap analysis reported "Zero subsections of FEEDBACK_ADAPTATION.md are implemented as a feedback-adaptation subsystem"). Phase 3 closes that by building the layers incrementally — schema first, then capture, then policies, then aggregator, then first behavior manifestation.
+
+### Design decisions
+
+- **`id` is TEXT PRIMARY KEY (UUID), not INTEGER as spec §3.1 declares.** Every other audit-shaped repo in this project (memory_events, eviction_events, outcome_signals) uses TEXT UUIDs — globally-unique IDs survive cross-install DB copies and test fixture swaps. Conformance with project pattern overrides the spec letter (an anglicization-class adaptation).
+
+- **`tool_call_id` is TEXT, not INTEGER.** Same rationale — `tool_calls.id` is already TEXT (001-initial.ts), so the FK type must match.
+
+- **`session_id` CASCADE, not SET NULL.** Distinct from memory_events / eviction_events which use SET NULL because their forensic intent outlives sessions. Outcomes are per-session operational signals that feed loop frio, which re-aggregates from survivors — purging with the session is the right choice.
+
+- **`evidence_json` nullable, no validation at the repo layer.** The per-tier evidence shape is the emitter's responsibility. Future slices may add a per-tier schema validator analogous to `eviction_events` §6.1 evidence gates, but the current contract is permissive — Tier 1 might carry exit code + stderr, Tier 3 might carry approval seq + actor, etc. AUDIT.md §1 marks the column medium-sensitivity with required redaction; the emitter scrubs before passing.
+
+- **`action_signature` parser is strict on field alphabet.** Lowercase + digits + hyphen + underscore matches memory name validation — keeps the signature hashable, JOIN-safe, and immune to per-emitter quirks. Colons are reserved as the level/field separator. `serializeActionSignature` throws `InvalidActionSignatureError` on bad input (emitter bug, caller-side); `parseActionSignature` returns `null` for foreign vocabularies (the storage layer accepts any string; downstream consumers treat null as "opaque / skip").
+
+- **`levelOf` is the cheap prefix-only check** for query layers that want to filter L1/L2 without full parse. Does NOT validate field content — that's the parser's job. Loop frio uses `levelOf` to gate "adapt L1/L2 only by default" (§4.1).
+
+- **Indices per §3.1**: `(action_signature, scope_kind, scope_id)` for the loop frio aggregator's primary read; `(session_id, recorded_at)` for session-scoped cross-cuts; `(recorded_at)` for time-windowed sweeps.
+
+- **Repo shape mirrors memory_events / eviction_events**: PERSISTED_COLUMNS + valuesForInsert + SELECT_ALL + fromRow. Same idiom across audit-shaped repos keeps reading them predictable.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/049-outcomes.ts` | Migration: `outcomes` table + 3 indices per §3.1. |
+| `src/storage/migrations/index.ts` | Register migration 049. |
+| `src/storage/repos/action-signature.ts` | Parser + serializer + `levelOf` helper + `InvalidActionSignatureError`. |
+| `src/storage/repos/outcomes.ts` | `createOutcome` + `listOutcomesByActionSignature` + `countOutcomesByActionSignature` (accumulation trigger gate) + `listOutcomesBySession` + `getLatestOutcomeForSignature` + `countOutcomes` (health check). |
+| `tests/storage/action-signature.test.ts` | 14 tests: serialize all 4 levels; parse round-trip; reject uppercase/empty/colons; null for unknown prefix / wrong field count / invalid chars; levelOf prefix detection. |
+| `tests/storage/outcomes.test.ts` | 17 tests: create + CHECK violations (tier/result/scope_kind); CASCADE on session purge; listByActionSignature with scope + sinceMs + limit; count with sinceMs; listBySession ordering; getLatest. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7601 pass / 10 skip / 0 fail (+31 from the slice)
+
+### Deferred / follow-ups declared
+
+- **3.2 — Outcome detector** (loop quente write): post-tool-dispatch hook in harness/loop.ts emits outcomes for tier-1 signals available now (exit code, tool_error, outcome_signals). Tiers 2-3 wait for diff-stat detectors + approvals integration.
+- **3.3 — `policies` table + scope resolver**: parallel to outcomes but for the proposed/active adaptation policies.
+- **3.4 — Loop frio MVP**: accumulation trigger + Beta posterior + L1 alias proposer.
+- **3.5 — L1 alias dispatch** (first manifestação): closes the loop end-to-end.
+- **Per-tier evidence validation**: like EVICTION §6.1, future slice can add schema validation per (tier, result) tuple. Out of scope here.
+- **Recap surface for adaptation activity**: when loop frio lands, surface `policy_changed` events in `/recap`.
+
+## [2026-05-15] fix(memory,storage) — post-Phase-2 review batch (C1+C2+H1+H2+M3+M4+M5)
+
+**Done.** Six corrections from the post-Phase-2 multi-agent review. Bundled in one slice because the changes are tightly coupled (C1 introduces a new result discriminant; M5 tests the new discriminant; H1+H2 are alignment fixes; M3+M4 are polish).
+
+### Critical fixes
+
+- **C2 — GC purge sweep recency check filters by `outcome='applied'`** (`src/storage/repos/eviction-events.ts` + `src/memory/lifecycle.ts`). Earlier shape used `getLastEvictionForObject` which returns the latest row regardless of outcome. A cold-loop detector probing an evicted memory and emitting `trigger_fired_no_action` (same-state pseudo-transition with outcome != 'applied') would produce a later row than the eviction; the sweep's `latest.id !== row.id` check would skip the purge candidate forever and storage would grow unbounded. New helper `getLastAppliedEvictionForObject` filters to `outcome = 'applied'` — only real state changes mask purge candidates. Test added: trigger_fired_no_action between eviction and sweep does NOT mask the candidate.
+
+- **C1 — Pre-flight evidence validation refuses BEFORE applyTransition** (`src/memory/transitions.ts` + `src/storage/repos/eviction-events.ts`). Earlier shape validated evidence shape INSIDE `appendEvictionEvent`, which runs at stage 5 — AFTER `applyTransition` already moved the body to `.tombstones/` and dropped the index entry. A caller passing malformed evidence with outcome='applied' produced a real `audit_drift` (disk moved, no audit row). New `preflightValidateEvidence` helper runs at stage 2b in `transitionMemoryState` (after isLegalTransition, before applyTransition). Failures land as `kind: 'invalid_evidence'` — distinct from `illegal_transition` (state machine refused the from/to/motivo tuple) because the refusal is in the operator-provided payload. Repo-side validation stays as defense-in-depth. Slash `mapTransitionFailure` handles the new kind with operator-facing copy. M5 (test coverage) ships in the same slice — three tests cover the discriminant: refusal preserves disk state and emits no eviction_events row; well-formed evidence proceeds; operator-driven marker bypasses pre-flight.
+
+### High fixes
+
+- **H1 — Cooldown null fallback docstring aligned with code** (`src/storage/repos/memory-events.ts:182-194`). Earlier docstring claimed "over-protect" but code skipped the gate on null (under-protect). Updated the docstring to document the actual behavior + rationale: legacy registry pickups (pre-1.3, no `created` audit row) would otherwise be permanently un-evictable since age never elapses; operator override via `actor: 'user'` still works for those rows; newly-created memories land `created` rows alongside the write. Test added covering the legacy-fallback path.
+
+- **H2 — Stale audit shape references cleaned up** (`src/cli/bootstrap.ts:524-541` + `src/cli/slash/commands/memory.ts:276-300`). Bootstrap comment updated to describe the new 2-step state-machine path (quarantined + evicted memory_events rows instead of single 'expired'). `/memory audit` renderer extended with a new branch covering `evicted`/`quarantined`/`restored`/`purged`/`invalidated` actions (renders `[motivo/trigger]` detail); legacy `expired` branch preserved for old DB rows.
+
+### Medium fixes
+
+- **M3 — `checkProtectionGates` short-circuits when toState is not eviction-shaped.** Early return when `toState` is not `quarantined`/`evicted`/`purged` — restore (`evicted → active`, `quarantined → active`), admission (`proposed → active`), and shadow transitions skip gate evaluation entirely. Cosmetic but tightens the contract: gate code expresses its scope explicitly instead of relying on inner predicates short-circuiting.
+
+- **M4 — Hardcoded `'_operator_driven'` string replaced with `OPERATOR_DRIVEN_EVIDENCE_MARKER` constant.** Both call sites (`gcExpiredMemories` in lifecycle.ts; `deleteViaTransition` + `handleRestore` in slash) now import the constant and use computed-key syntax `{ [OPERATOR_DRIVEN_EVIDENCE_MARKER]: true, ... }`. Single rename point if the marker shape evolves.
+
+- **M5 — Pre-flight evidence validation tests.** Shipped alongside C1 (see above).
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/eviction-events.ts` | New `getLastAppliedEvictionForObject` query (C2). New `preflightValidateEvidence` helper + `PreflightEvidenceResult` type (C1). |
+| `src/memory/lifecycle.ts` | GC sweep uses `getLastAppliedEvictionForObject` (C2). Evidence uses `OPERATOR_DRIVEN_EVIDENCE_MARKER` constant (M4). |
+| `src/memory/transitions.ts` | New stage 2b: pre-flight evidence validation (C1). New `invalid_evidence` result discriminant. `checkProtectionGates` early-returns when toState isn't eviction-shaped (M3). Stale tiebreaker comment removed. |
+| `src/cli/slash/commands/memory.ts` | `mapTransitionFailure` covers `invalid_evidence` (C1). Slash audit renderer covers state-machine actions (H2). Evidence uses constant (M4). |
+| `src/cli/bootstrap.ts` | Comment updated to reflect post-2.2 audit shape (H2). |
+| `src/storage/repos/memory-events.ts` | Docstring aligned with code behavior for null fallback (H1). |
+| `tests/memory/transitions.test.ts` | 3 invalid_evidence tests (C1+M5). 1 legacy-fallback cooldown test (H1). Hook block tests updated to pass valid evidence so pre-flight doesn't short-circuit them. |
+| `tests/memory/lifecycle.test.ts` | 1 test covering probe-trigger-doesn't-mask-purge (C2). Reason-string assertion updated. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7570 pass / 10 skip / 0 fail (+5 from the batch)
+
+### Notes
+
+- Comment about M1 from the review (quarantineStats self-join double-pair risk on theoretical same-state quarantine entries) deemed schema-prevented and not worth a SQL defense.
+- Comment about M2 (non-active /memory delete legacy path operator copy) is a UX nit; deliberate behavior, deferred.
+
+## [2026-05-15] feat(storage,cli) — eviction metrics aggregator + /memory metrics slash (Phase 2.7 — closes Phase 2)
+
+**Done.** Final slice of Phase 2 — closes the EVICTION substrate=memory loop end-to-end. EVICTION §11 declares 10 metrics; this slice ships the 7 the memory substrate alone can produce. The other 3 (`cascade.dependents_orphaned`, `roi.bottom_decile_residency`, `decay.misfire`) need missing subsystems (loop frio re-evaluation; Memory ROI tracking; the decay subsystem). All metrics are read-only aggregators over `eviction_events`; no new producers — just SQL over the rows Phases 1.2–2.6 produced.
+
+**Shipped metrics:**
+
+1. **`eviction.rate_by_motivo`** — distribution by motivo over window
+2. **`eviction.restore_rate`** — % of evictions that came back via restore
+3. **`eviction.purge_irreversible_count`** — `*→purged` rows that bypassed `evicted` (the §4.1 skip-evicted path; should only fire with `user_purge`/`security`)
+4. **`quarantine.dwell_time`** — avg ms in quarantine before exit (excludes same-chain pairs)
+5. **`quarantine.escape_rate`** — % of quarantined that came back to active
+6. **`protection.cooldown_blocks`** — `blocked_by_protection` count, broken down by protection
+7. **`hook.eviction_blocks`** — `blocked_by_hook` count, broken down by hook spec ref
+
+**Deferred:**
+- `cascade.dependents_orphaned` — needs loop frio re-evaluation events
+- `roi.bottom_decile_residency` — needs Memory ROI tracking + citation tracking
+- `decay.misfire` — needs decay subsystem (EVICTION §8)
+
+### Design decisions
+
+- **Same-chain filter in `quarantineStats`.** The dwell SQL excludes pairs where the exit event shares `(actor, trigger)` with the quarantine event — same rule as the protection gate. Without this, `gcExpiredMemories`'s `active→quarantined→evicted` pipeline (same actor/trigger on both steps, only 1ms apart) would dominate the avg dwell with near-zero values, masking real quarantine periods. Filtering matches the operational meaning of the metric: how long does quarantine REALLY hold things in review?
+
+- **Earliest exit, not most-recent.** When a memory was quarantined then restored then re-quarantined within the window, the dwell is from the FIRST quarantine to the FIRST exit (correlated subquery on `MIN(recorded_at)`). The re-quarantine starts a new dwell period; counting it alongside the first would double-count.
+
+- **`evictionMetricsSnapshot` is the single-call surface.** `/memory metrics` calls one function and gets all 7 metrics for the same (nowMs, windowMs). Lets the slash output reflect a consistent window across every line — without the wrapper, callers could drift on the lookback definition between metrics.
+
+- **Per-metric breakdown structures.** `MotivoCount`, `RestoreRate`, `PurgeIrreversible`, `QuarantineStats`, `ProtectionBlocks`, `HookBlocks` are exported as distinct interface shapes. Future dashboard consumers (recap, web UI) read the structured snapshot; the slash output uses string formatting for the terminal.
+
+- **`/memory metrics --days N` operator-facing surface.** Default window is 30d (matches MEMORY's tombstone retention; a metric over the same window that produces it is intuitive). Operators can narrow (e.g., `--days 7` for weekly review, `--days 1` for alert-shape monitoring).
+
+- **Window filter is on `recorded_at`, not on object lifetime.** A memory evicted 5 days ago shows up in a `--days 7` window even if it was created years earlier. The metric measures recent activity, not recent objects.
+
+- **Substrate filter is hardcoded to `'memory'`.** Other substrates (policy, candidate, slot_item) will own their own metric modules when they ship. A single cross-substrate metric query would mix retention windows (memory 30d / policy 14d / etc.) and produce noisy outputs.
+
+- **Snapshot reuses each individual function** rather than denormalizing the SQL. Slightly more queries (7 vs 1 monster join), but each metric is independently testable + reusable from a future dashboard or recap caller. Performance is acceptable at the scale eviction_events grows to (365d retention with thousands of objects = O(1M) rows worst case; 7 indexed queries are sub-millisecond).
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/repos/eviction-metrics.ts` | 7 aggregator functions + `evictionMetricsSnapshot` combined surface. Each function takes `(db, nowMs, windowMs)` so callers control the lookback uniformly. |
+| `src/cli/slash/commands/memory.ts` | `handleMetrics` + `/memory metrics` dispatch case. `--days N` flag (default 30). Output formatted as scrollback lines, one metric per line. |
+| `tests/storage/eviction-metrics.test.ts` | 11 tests covering each function — windowing, motivo grouping, same-chain dwell exclusion, ratio math, breakdown structures, combined snapshot. |
+| `tests/cli/slash/memory.test.ts` | 4 slash-side tests: happy path output mentions every metric line; `--days N` customizes window; rejects non-positive `--days`; rejects unknown flags. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7565 pass / 10 skip / 0 fail (+15 from the slice)
+- `bun test tests/storage/eviction-metrics.test.ts` 11 pass
+
+### Phase 2 closure — what shipped, what's deferred
+
+**Phase 2 (EVICTION memory-substrate completion) — 7 slices closed:**
+
+| Slice | What | Status |
+|---|---|---|
+| 2.1 | Wire Eviction hook into /memory delete + /memory restore | ✅ |
+| 2.2 | Route gcExpiredMemories through transitionMemoryState | ✅ |
+| 2.3 | GC sweep evicted → purged | ✅ |
+| 2.4 | Evidence gate per-motivo schema validation | ✅ |
+| 2.5 | Protection gates (user_explicit cooldown + quarantine min TTL) | ✅ |
+| 2.6 | Cascading detector (memory × memory) | ✅ |
+| 2.7 | Metrics aggregator + /memory metrics slash | ✅ |
+
+**EVICTION.md compliance for the memory substrate:** every section that DOESN'T depend on missing subsystems (policy, candidate, slot_item; context engine for pinned items; FEEDBACK_ADAPTATION for re-promotion gate; CODE_INDEX for symbol cascade) is implemented. The remaining gaps are structurally blocked on other subsystem implementation, not on EVICTION-side work.
+
+**Aggregate verification across Phase 2:** typecheck clean, lint 0 errors, full suite 7565 pass / 10 skip / 0 fail.
+
+### Deferred follow-ups across Phase 2
+
+- **Substrate fan-out**: policy, candidate, slot_item substrates need their own transition pipelines + GC sweeps + protection gates + metrics. Each waits on its owner subsystem to land.
+- **Decay subsystem (§8)** — half-life weighting for retrieval / context (not eviction). Zero implementation today.
+- **Automated triggers (§5.1)** — 11 of 12 triggers fire only manually. Loop frio + verify-before-act + distribution shift detector would close this.
+- **Spec amendments** declared throughout: admit `user_purge` / `expired` motivos on `active → quarantined` / `quarantined → evicted` (eliminates `_operator_driven` marker workaround); align MEMORY §6.5.5 with EVICTION §4.1 (restore goes to `active`, not `proposed`).
+- **Reconciliation slice** — recover from `audit_drift` outcomes by replaying disk state. Mentioned in Phase 1.3 review; out of scope through Phase 2.
+
+## [2026-05-15] feat(memory) — cascading detector (memory × memory) (Phase 2.6)
+
+**Done.** EVICTION §6.4 declares cascade detection: when an object is evicted, OTHER objects that reference it may become stale. The spec is explicit that EVICTION does NOT auto-cascade — instead the dependents are RECORDED in `eviction_events.dependents_json` so the future loop frio (re-evaluation slice, not yet built) can process them with fresh evidence. This slice owns the memory × memory detector — the column has been on the schema since Phase 1.2; this is the first producer.
+
+### What's detected (in scope)
+
+- **`[[memory-name]]` wiki-style references** in another memory's body. Operator-authored syntax for cross-memory linking.
+- **`[link text](memory-name.md)` markdown links** to a memory file by bare name. Excludes fully-qualified paths (`./mem.md`, `/abs/mem.md`, `http://...`) — those don't unambiguously target a sibling memory.
+
+### What's deferred (declared spec dependents, depend on missing subsystems)
+
+- **Policy P → memory M** (no FEEDBACK_ADAPTATION substrate)
+- **Memory M → CODE_INDEX symbol S** (no code index)
+- **Slot item I → memory M** (no context engine)
+
+### Design decisions
+
+- **Cross-scope detection.** A `user`-scope memory referencing `[[project_local_name]]` IS detected because matching is by name. Operators who scope-shadow a name intentionally accept that the dependent reference might resolve to either version; the detector flags both, the future loop frio decides.
+
+- **Self-reference skipped.** A memory whose body references its own name (`mem` body contains `[[mem]]`) is NOT listed as a dependent of itself. Matches operator expectations — a self-cycle isn't a cross-memory dependency.
+
+- **Dedupe per (scope, name).** A body that references the target via BOTH `[[mem]]` and `[link](mem.md)` produces ONE entry in the dependents list. The `refKind` carries the precedence (wiki > md_link, alphabetical, deterministic) — the forensic surface is "this memory referenced the evicted one", not "via which mechanism".
+
+- **Detection runs BEFORE applyTransition for `*→evicted` paths.** The registry's in-memory snapshot is what we walk; running detection AFTER would still work (the function explicitly skips the evicted memory) but ordering before keeps the registry view consistent with the audit row's claim. `dependentsJson` is `null` when no dependents found (NOT empty array) — distinguishing "checked, none found" from "didn't check" requires a separate field; spec doesn't ask for it.
+
+- **Only fires for `*→evicted` transitions.** Restore (`evicted → active`), quarantine (`active → quarantined`), invalidated (`active → invalidated`), and purge (`evicted → purged`) don't carry cascade semantics per §6.4. The spec language is explicit: "Eviction de objeto X pode ter dependentes" — the transition INTO terminal-ish states is when cascade matters.
+
+- **Bare-name matcher constraints.** The regexes capture lowercase alphanumeric + hyphen + underscore tokens (matching memory name validation in `frontmatter.ts`). Mixed-case `[[Mem]]` doesn't match `mem` — operators using non-canonical case in references must adopt the canonical form for cascade detection to fire. This is structurally consistent with memory name validation (names are forced to lowercase).
+
+- **No `dependents.test.ts` integration with the slash flow.** Tests cover the detector unit and one transitionMemoryState integration test (dependents land in eviction_events when ref exists; null when no refs). Slash-side tests would just exercise the same code path through more layers — moved to a follow-up.
+
+### Files added/modified
+
+| File | Change |
+|---|---|
+| `src/memory/dependents.ts` | New module. `detectMemoryDependents(registry, evictedScope, evictedName)` walks registry, looks for wiki + md_link refs to the target, returns `{scope, name, refKind}[]` deduped per object. |
+| `src/memory/index.ts` | Barrel re-export of `detectMemoryDependents` + `MemoryDependent` type. |
+| `src/memory/transitions.ts` | New stage 4a: detect dependents before applyTransition when `toState === 'evicted'`. `dependentsJson` passed through to `appendEvictionEvent`. |
+| `tests/memory/dependents.test.ts` | 9 new tests: wiki ref detection, md_link ref detection, self-reference skipped, no dependents → empty, cross-scope detection, dedupe wiki+md_link, multiple distinct dependents, ignore unrelated wiki refs, ignore fully-qualified md links. |
+| `tests/memory/transitions.test.ts` | 2 new integration tests: dependents_json populates on `*→evicted` when refs exist; dependents_json is null when no refs. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7550 pass / 10 skip / 0 fail (+11 from the slice)
+- `bun test tests/memory/dependents.test.ts` 9 pass
+
+### Deferred / follow-ups declared
+
+- **Slash `/memory dependents <name>`** — operator surface to inspect "what memories reference this one?" without evicting first. Would consume `detectMemoryDependents` directly. Out of scope here.
+- **Cascade pass in loop frio** — when the loop frio adaptation engine ships (FEEDBACK_ADAPTATION), the consumer side reads `eviction_events.dependents_json` and re-evaluates each dependent against the new (post-eviction) world state.
+- **Policy / code-index / slot-item detectors** — when those substrates land.
+- **2.7 — Metrics aggregator** (next + final slice of Phase 2: read-only aggregators over eviction_events for /memory metrics + recap).
+
+## [2026-05-15] feat(memory) — protection gates: user_explicit cooldown + quarantine min TTL (Phase 2.5)
+
+**Done.** Two of the four protection gates EVICTION §6.2 declares — the two that don't require missing subsystems. `transitionMemoryState` now consults `checkProtectionGates` between state-machine validation and hook fire; blocked transitions produce a `blocked_by_protection` eviction_events row + a paired `memory_events` refused row with `stage='eviction_protection'` and the protection name. A new result discriminant `kind: 'blocked_by_protection'` surfaces the protection + reason to callers.
+
+### Implemented gates
+
+1. **`user_explicit` cooldown** (§6.2 line 240). Memory with `source: user_explicit` created within the last 72h can't be evicted via `low_roi` or `irrelevant` motivos by automated actors (loop_cold, compaction, startup_probe, hook). Premise: operator just authored it; sample size is insufficient for automated ROI/usage gates. Memory creation timestamp comes from the earliest `memory_events` row with `action='created'` for the (scope, name) pair.
+
+2. **Quarantine min TTL** (§6.2 line 242). `quarantined → evicted` is blocked unless the memory has been in quarantine for > 7d. Premise: the future re-promotion gate (1.3.c2 verify-before-act, when it ships) needs dwell time to gather evidence; a faster eviction bypasses the gate.
+
+### Bypass rules
+
+- **`actor: 'user'` ALWAYS bypasses both gates.** Operator-typed `/memory delete` or `/memory restore` is an explicit override.
+- **Motivos `user_purge` and `security` bypass cooldown.** Spec §6.2 explicitly lists `low_roi` / `irrelevant` as the cooldown-protected motivos; security-purge is a deliberate operator/hook action that can't wait.
+- **Motivos `user_purge` and `security` bypass quarantine TTL.** A security-driven eviction can't wait for the dwell window to expire.
+- **Same-chain bypass for quarantine TTL.** When the quarantine event was emitted by the same `(actor, trigger)` tuple as the current eviction attempt, the two transitions are one decision and TTL doesn't apply. Example: `gcExpiredMemories`'s `active→quarantined→evicted` runs both steps with `actor='startup_probe'` + `trigger='expired_at'`; the TTL gate protects against DIFFERENT automated processes fast-evicting quarantined memories, not decomposed pipelines from the same source.
+
+### Deferred gates (declared in spec §6.2, can't ship until subsystems land)
+
+- **Pinned items** — needs context engine slot pinning (CONTEXT_TUNING §12.4 producer; no consumer today).
+- **Active session-scope policy** — needs FEEDBACK_ADAPTATION subsystem (zero implementation as of this entry).
+
+### Design decisions
+
+- **Gate fires AFTER state-machine validation but BEFORE hook fire.** State machine refuses illegal transitions (typo motivo, wrong from/to pair) at the structural layer. Protection is the next gate — structural transitions that violate operator-side invariants (cooldown, TTL). Hook is the policy layer on top. This order means a hook can override protection (operator-deployed hook that allows fast-evict in a debug context) — but the audit trail records both the protection check AND the hook decision.
+
+- **`blocked_by_protection` outcome lands its own eviction_events row.** The row carries `to_state = fromState` (no state change), `outcome = 'blocked_by_protection'`, `blocked_by = '<protection_name>'`. Matches the existing `blocked_by_hook` shape so forensic queries pivot uniformly.
+
+- **`memory_events` refused row with `stage='eviction_protection'`** — distinct from `stage='eviction_hook'` (1.2.b hook block) and `stage='lifecycle_gc'` (legacy `removeMemory` failure). Operators investigating "why did this delete fail?" can filter by stage to find the protection that blocked.
+
+- **Audit-friendly reason strings.** Both gate reasons include the gauge value ("created 24h ago; 72h cooldown not yet elapsed", "quarantined 2d ago by loop_cold/verify_failed; 7d min TTL not yet elapsed"). Operators can read the row directly and understand what would un-block it without consulting docs.
+
+- **`getEarliestMemoryCreatedAt(db, scope, name)` returns null on missing row.** A memory pre-dating the audit table (legacy registry pickups) has no `created` event. The gate skips when null — generous fallback. Counterargument: over-protect (refuse without evidence). We picked under-protect because the legacy-registry case is a one-time data gap; refusing forever would block real operations.
+
+- **`getLastQuarantineEvent` returns the full row, not just the timestamp.** Same-chain detection needs `actor` + `trigger`. The earlier shape (`getLastQuarantineAt` returning just `recordedAt`) was insufficient — replaced before the slice landed.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/memory-events.ts` | New `getEarliestMemoryCreatedAt(db, scope, name)` query — fetches the earliest `created` row for the (scope, name) pair. |
+| `src/storage/repos/eviction-events.ts` | New `getLastQuarantineEvent(db, substrate, objectId)` query — most-recent applied `to_state='quarantined'` row, returning the full event for actor/trigger comparison. |
+| `src/memory/transitions.ts` | New `checkProtectionGates` helper (between stage 2 validation and stage 3 hook fire). New `blocked_by_protection` result discriminant. `USER_EXPLICIT_COOLDOWN_MS = 72h` + `QUARANTINE_MIN_TTL_MS = 7d` constants. Bypass rules: `actor=user`, `motivo=user_purge`, `motivo=security`, same-chain `(actor, trigger)` for TTL. |
+| `src/cli/slash/commands/memory.ts` | `mapTransitionFailure` handles the new `blocked_by_protection` kind — operator copy includes protection name + reason. |
+| `tests/memory/transitions.test.ts` | 6 new tests: cooldown blocks within 72h; cooldown bypassed after 72h; actor=user bypasses cooldown; security motivo bypasses cooldown; quarantine TTL blocks different-chain eviction; quarantine TTL bypassed for same-chain (boot GC pipeline). Uses `createMemoryEvent` directly to inject `created` rows with controlled `createdAt`. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7539 pass / 10 skip / 0 fail (+6 from the slice)
+- `bun test tests/memory/transitions.test.ts` 19 pass
+
+### Deferred / follow-ups declared
+
+- **Configurable thresholds.** Today `USER_EXPLICIT_COOLDOWN_MS` and `QUARANTINE_MIN_TTL_MS` are constants. Operator override via env / TOML config would be ergonomic for power users (e.g. shorter cooldown in a fast-iteration debug repo). Spec lists "default 7d" / "72h" — the defaults are right; configurability is polish.
+- **Pinned items + session-scope policy gates** — depend on missing subsystems (declared throughout).
+- **2.6 — Cascading detector** (next slice: detect dependents of an evicted memory and populate `eviction_events.dependents_json`).
+
+## [2026-05-15] feat(storage) — evidence_json schema validation per motivo (Phase 2.4)
+
+**Done.** Closes the §6.1 evidence contract — `appendEvictionEvent` now validates the per-motivo evidence shape declared in EVICTION.md. Each motivo has a canonical evidence schema (e.g. `low_roi`: `{tokens_consumed, load_bearing_count, ratio}`; `shift`: `{shift_score}`; `irrelevant`: `{usage_count, sample_size}`); rows with missing or wrong-type fields are refused at INSERT time via `InvalidEvictionInputError`. Forensic queries that consume `evidence_json->>'$.<field>'` can now rely on the field being present + correctly-typed.
+
+### Design decisions
+
+- **Structural validation, not threshold validation.** The repo verifies SHAPE (required fields present, types correct) — NOT the upstream threshold gates (§6.1: `usage_rate=0 over N=20` for irrelevant; `shift_score>0.3` for shift; ROI threshold for low_roi). Threshold checks are the upstream owner's responsibility — the detector that observed `usage_count === 0 over N=20 queries` constructs the evidence AFTER passing its own gate. The repo trusts that contract; its job is to ensure the structure is correct so forensic queries don't have to defend against missing-field surprises.
+
+- **`oneOf` semantics for `conflict`.** Spec §6.1 admits two shapes — pair-detected `{winner_id, loser_id, conflict_kind}` OR failure-burst `{failures}`. The validator's `oneOf` array lets either pass; both shapes coexist as `conflict` evidence depending on the upstream detector (conflict resolver vs failure aggregator).
+
+- **`_operator_driven: true` marker bypasses required-field checks.** Operator paths (`/memory delete`, `/memory restore`, `gcExpiredMemories`) use closest-fit motivos that don't represent the real semantics — `/memory delete` uses `low_roi` because the state machine doesn't admit `user_purge` on `active → quarantined` (declared spec follow-up). The marker tells the validator "this is a closest-fit; the real evidence is the operator command, recorded in the trigger field instead". Forensic consumers filtering for "real" ROI-driven evictions exclude these rows via `evidence_json->>'$._operator_driven' IS NULL`. Without the marker, operator paths would have to fake degenerate ROI values (`tokens_consumed: 0, load_bearing_count: 0, ratio: 0`), which would pollute genuine ROI analytics.
+
+- **Validation runs only when outcome === 'applied'.** Outcomes that don't represent a real transition (`blocked_by_hook`, `blocked_by_protection`, `trigger_fired_no_action`) record the attempted gate, not the substrate's evidence. The evidence on those rows is owner-specific bookkeeping (the hook spec ref, the protection name, the trigger source) — would fail structural checks for the proposed motivo. Skipping validation on non-applied outcomes preserves their existing shape contracts.
+
+- **Malformed JSON bypasses validation, falls through to scrub.** When `JSON.parse(evidenceJson)` fails, the validator skips and `scrubEvidenceJson` replaces the payload with a `_scrubbed_invalid_json` marker so the row still persists. The validator's job is shape conformance per §6.1, not JSON parse correctness — those are separate concerns. A future writer that passes raw text by mistake gets the audit row + the warning marker; no INSERT failure.
+
+- **Per-motivo schemas exported as `EVIDENCE_SCHEMAS` constant.** Downstream consumers (the future loop frio adaptation engine, dashboards) can read the schemas to know which fields to expect. Single source of truth — adding a new motivo requires updating the schema map alongside the enum.
+
+- **`OPERATOR_DRIVEN_EVIDENCE_MARKER` exported as named constant.** Callers in `/memory delete`, `/memory restore`, `gcExpiredMemories` import + use this string instead of stringly-coding `'_operator_driven'`. Single rename point if the marker's shape evolves.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/eviction-events.ts` | New `EVIDENCE_SCHEMAS` map (per-motivo `oneOf` required-field sets). New `validateEvidenceShape` validator. `appendEvictionEvent` calls validator when outcome === 'applied' and JSON parses. New `OPERATOR_DRIVEN_EVIDENCE_MARKER` export. |
+| `src/cli/slash/commands/memory.ts` | `deleteViaTransition` + `handleRestore` pass `evidence: { _operator_driven: true, source }` so the closest-fit motivos pass validation. |
+| `src/memory/lifecycle.ts` | `gcExpiredMemories` passes `evidence: { _operator_driven: true, expires }` for the boot GC. `gcPurgeExpiredTombstones` passes structurally-valid `expired` evidence (`{expires: ISO}` derived from purgeAt + forensic anchors). |
+| `tests/storage/eviction-events.test.ts` | New `validInput()` defaults to a per-motivo `MIN_EVIDENCE_FOR_MOTIVO` so existing tests pass without per-test ceremony. 7 new tests covering: refusal on missing fields (low_roi, shift); accept both conflict shapes; operator-driven marker bypass; refuse non-object root; skip validation for non-applied outcomes. 3 redaction tests updated to use `motivo: 'user_purge'` (any-shape) so they isolate the scrub concern. |
+| `tests/memory/transitions.test.ts` | New `validEvidence(motivo)` helper. All `transitionMemoryState` call sites that produce `applied` outcomes thread proper evidence (low_roi, conflict, irrelevant, expired shapes). |
+| `tests/memory/lifecycle.test.ts` | Test `gcPurgeExpiredTombstones > skips rows with newer eviction event` uses operator-driven marker on the test's manual restore call. Test `non-memory substrate candidates are ignored` passes valid conflict + low_roi shapes on the policy-substrate fixture inserts. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7533 pass / 10 skip / 0 fail (+7 from the slice's new validator tests)
+- `bun test tests/storage/eviction-events.test.ts` 51 pass
+
+### Deferred / follow-ups declared
+
+- **Spec EVICTION §4.1 amendment** — admit `user_purge` motivo on `active → quarantined`/`quarantined → evicted`; admit `expired` motivo on the same transitions. Would obviate the `_operator_driven` marker for `/memory delete` and `gcExpiredMemories`. Spec PR, not code.
+- **Threshold gating in the validator** — today the validator checks SHAPE only. A future slice could add THRESHOLD checks (e.g. `low_roi` requires `sample_size >= 30`); when threshold isn't met, the row outcome becomes `trigger_fired_no_action` instead of `applied`, per §6.1's "evidência abaixo do gate ⇒ trigger_fired_no_action". Requires the upstream detectors to provide `sample_size` consistently — out of scope here because no automated detectors exist yet.
+- **2.5 — Protection gates** (next slice — user_explicit cooldown 72h + quarantine min TTL).
+
+## [2026-05-15] feat(memory) — GC sweep evicted → purged (Phase 2.3)
+
+**Done.** Materializes the retention window EVICTION §7.1 declares. Phase 2.2 routed `gcExpiredMemories` through the state machine, producing `evicted` rows with `purgeAt = now + 30d`. Phase 1.3.c1 already wired the `evicted → purged` transition into `transitionMemoryState`. The piece missing: a sweep that reads `listEvictedDueForPurge` and calls the transition for each due tombstone. Without it, tombstones accumulated forever — every memory ever evicted lived on disk until the operator manually nuked `.tombstones/`.
+
+This slice ships `gcPurgeExpiredTombstones(db, registry, roots, opts)` and wires it into bootstrap right after `gcExpiredMemories`. Same boot now both expires fresh `expires:` memories AND purges tombstones whose 30d window ran out. Forensic queries (`getLastEvictionForObject`, eviction metrics, `eviction.purge_irreversible_count`) finally have non-trivial purge data.
+
+### Design decisions
+
+- **N+1 recency check via `getLastEvictionForObject`.** `listEvictedDueForPurge` returns ALL rows with `to_state='evicted' AND purge_at <= now` — including stale rows for objects that were restored after the eviction. Without a recency check, the sweep would attempt to purge based on an eviction event that's no longer authoritative. For each candidate, the sweep queries the latest eviction event for `(substrate, objectId)` and skips if the candidate row isn't latest. Tracked separately in `result.skipped` (expected control flow, no stderr) versus `result.failures` (operator surfacing).
+
+- **Substrate filter is inline.** The query is substrate-agnostic; this sweep filters to `substrate === 'memory'`. Future policy/candidate/slot_item substrates will run their own sweeps over the same query with their own filters. A single cross-substrate sweep would have a circular-import problem (each owner's transitionMemoryState equivalent isn't a generic API).
+
+- **`motivo: 'expired'` IS legal on `evicted → purged`** (per EVICTION §4.1 — admits `expired, user_purge, security`). Different from the `gcExpiredMemories` path which had to use `low_roi` as a closest-fit. This sweep is the one place where `expired` lands as motivo in production.
+
+- **`evidence_json` carries the original eviction row id + purge_at.** Operators investigating purges (forensic audit, eviction.purge_irreversible_count anomalies) can trace back from the purge row to the eviction that triggered the retention window. Without the link, a `purged` row by itself doesn't say "why did this disappear?".
+
+- **`MemoryScope` enum validation on `objectScope`.** The eviction_events `object_scope` column is free TEXT (the spec EVICTION §10.1 calls for it — different substrates use different scope vocabularies). For memory, only `user | project_shared | project_local` are valid; the sweep validates before calling transitionMemoryState. A row with `object_scope = 'global'` from a future substrate that piped through the wrong substrate value would land in `failures`, not crash.
+
+- **Bootstrap call site lives AFTER `gcExpiredMemories`.** Ordering rationale: a memory whose `expires:` field hits today gets evicted by gcExpiredMemories (new tombstone, purge_at = today + 30d, not due). On a future boot 31+ days later, gcExpiredMemories finds no new expirations (the memory is already gone), but the purge sweep finds the now-overdue tombstone and finalizes it. Two-phase scheme matches the spec lifecycle.
+
+- **Sweep failure surfacing.** `stderr.write` line per failure, mirroring the pre-existing `gcExpiredMemories` failure path in bootstrap. The audit trail (eviction_events) records the failed transition internally via `audit_drift` or `io_error`; stderr surfaces the live signal.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/lifecycle.ts` | New `gcPurgeExpiredTombstones` async helper + `GcPurgeOptions`, `PurgedTombstone`, `GcPurgeResult` types. `MEMORY_SCOPES` const + `isMemoryScope` validator. Lazy import of `eviction-events.ts` repo to avoid circular-import friction. |
+| `src/memory/index.ts` | Barrel re-exports the new function + types. |
+| `src/cli/bootstrap.ts` | After `gcExpiredMemories`, call `gcPurgeExpiredTombstones` with `auditCwd`. Each `result.failures[]` lands a stderr line. |
+| `tests/memory/lifecycle.test.ts` | 4 new tests covering the sweep: purges tombstones past the window; leaves tombstones inside the window alone; skips rows whose object has a newer eviction event (restore-then-re-evict); non-memory substrate candidates are filtered out before scope validation. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7526 pass / 10 skip / 0 fail (+4 from the slice)
+- `bun test tests/memory/lifecycle.test.ts` 30 pass
+
+### Deferred / follow-ups declared
+
+- **Per-substrate retention.** Today the sweep runs only for memory; policy substrate (EVICTION §7.1: 14d retention) and the future invalidated → evicted window (7d) need their own sweeps when they ship.
+- **REPL re-sweep timer.** Today the sweep runs at boot only. A long-lived REPL (multi-day session) won't see new tombstones materialize purged until restart. A periodic timer (24h) could close this — out of scope here.
+- **2.4 — Evidence gate per-motivo schema validation** (next slice — closes the §6.1 contract).
+
+## [2026-05-15] fix(memory) — route gcExpiredMemories through transitionMemoryState (Phase 2.2)
+
+**Done.** Closes the silent-GC violation of EVICTION §0.9. Pre-1.3, `gcExpiredMemories` (the boot-time sweep that materializes the `expires:` frontmatter field) deleted memories via `removeMemory` and emitted a single `memory_events action='expired'` row — zero `eviction_events` rows, so downstream forensic queries (`getLastEvictionForObject`, GC sweep, trigger-thrashing detector) were blind to expirations. With the state machine landed in Phase 1.2 and `transitionMemoryState` shipping in 1.3, the GC path now flows through the canonical 2-step transition (active→quarantined→evicted) like `/memory delete` does — the eviction trail is uniform across operator-driven and time-driven deletions.
+
+### Design decisions
+
+- **2-step transition with motivo `low_roi` + trigger `expired_at`.** Same trade-off `/memory delete` made for `user_purge`: spec EVICTION §4.1 `LEGAL_TRANSITIONS` only admits `expired` motivo on `evicted → purged`, so the `active → quarantined → evicted` path uses the closest state-machine-legal label (`low_roi`). The TRIGGER field carries the real semantics (`expired_at`), so audit consumers filter by trigger when distinguishing "operator delete" from "expiry GC". Follow-up declared: spec EVICTION §4.1 may grow `expired` motivo on the active→quarantined and quarantined→evicted transitions to clean this attribution.
+
+- **Body moves to `.tombstones/`, NOT deleted.** Same mechanism `/memory delete` uses — `transitionMemoryState({toState:'evicted'})` renames the body file rather than unlinking. Operators can `/memory restore <name>` an expired memory within the 30d retention window. Earlier shape (`removeMemory`) wiped the body permanently — an `expires:` typo (e.g. `2024-01-01` instead of `2027-01-01`) was unrecoverable.
+
+- **`purgeAt = now + 30d` on the evicted row.** Matches MEMORY tombstone retention from EVICTION §7.1. The future GC sweep (2.3 — next slice) materializes `evicted → purged` once `purgeAt <= now`. Without this, GC'd memories would tombstone forever like the pre-fix `/memory delete` did.
+
+- **`actor: 'startup_probe'`** — canonical bootstrap-time origin per EVICTION §5.1.
+
+- **Per-memory `now` counter** keeps monotonic recorded_at + tombstone ts values across the per-memory 2-step pipeline. Without this, two back-to-back expirations on Date.now()-ms granularity could collide on `recorded_at` and tombstone filename (the M2 collision check would bump tombstone ts but recorded_at tiebreaker would still depend on rowid M3).
+
+- **Async signature.** `transitionMemoryState` is async (hook fire is async). `gcExpiredMemories` becomes async too. The single caller (`bootstrap`) is already async, so awaiting is free.
+
+- **Breaking change to the audit shape.** The `memory_events action='expired'` row is no longer emitted by the boot GC — replaced by the canonical 2-step (`quarantined` + `evicted`). The 'expired' action label stays in the `MemoryEventAction` enum for future callers (e.g. a manual `/memory expire` slash, or an operator's audit replay tool), but the production GC stops emitting it. Existing tests updated accordingly.
+
+- **Failure path simplifies.** Earlier shape audited a `refused` row with `stage='lifecycle_gc'` on `removeMemory` failure. New path: `transitionMemoryState` already emits the appropriate audit (`blocked_by_hook` lands a refused memory_events row; `io_error` and `audit_drift` are surfaced to the caller). The local helper `gcFailureReason` translates the result kind into an operator-facing reason string for the `result.failures` field, matching the bootstrap caller's contract.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/lifecycle.ts` | `gcExpiredMemories` becomes async, takes `db: DB` as first param. Replaces `removeMemory` with two sequential `transitionMemoryState` calls (active→quarantined, quarantined→evicted) per expired memory. Local `gcFailureReason` helper translates non-applied results. `MEMORY_TOMBSTONE_RETENTION_MS = 30d` constant. |
+| `src/cli/bootstrap.ts` | Single call site updated: `await gcExpiredMemories(db, memoryRegistry, memoryRoots, { auditCwd: cwd })`. |
+| `tests/memory/lifecycle.test.ts` | 6 tests rewritten to expect tombstone-based behavior: body moves to `.tombstones/`, audit pair (quarantined + evicted), eviction_events.last row has trigger='expired_at' + actor='startup_probe' + purgeAt set, evidence preserves the operator's `expires:` date. Failure test asserts `result.failures[0].reason` contains the step name ('active→quarantined') instead of probing memory_events. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7522 pass / 10 skip / 0 fail (unchanged total — 6 tests rewritten, no net add)
+- `bun test tests/memory/lifecycle.test.ts` 26 pass
+
+### Deferred / follow-ups declared
+
+- **2.3 — GC sweep `evicted → purged`** (next slice — the producer of expired tombstones now ships, so the consumer can land).
+- **Spec EVICTION §4.1** — admit `expired` motivo on `active → quarantined` and `quarantined → evicted`. Audit consumers filtering by motivo would then catch expiries; today they need to filter by `trigger='expired_at'`.
+
+## [2026-05-15] feat(cli) — wire Eviction hook into /memory delete + /memory restore (Phase 2.1)
+
+**Done.** First slice of the "complete EVICTION" sequence. The Eviction hook chain has been a defined surface since Phase 1.2 (schema, matcher, payload type, dispatcher), but neither `/memory delete` nor `/memory restore` actually fired it — `transitionMemoryState` accepts `fireHook?` and the slash callers had it unset, so a security policy that needed to gate operator-driven evictions was inert. This slice plumbs the dispatcher from REPL → SlashContext → both slash flows.
+
+The plumbing mirrors the harness loop's `dispatchHooks` wrapper at `src/harness/loop.ts:532` — same hooks list (`baseConfig.hooks`), same kill-switch short-circuit, same session-id-null safety. The slash-side wrapper has an additional concern: it can fire before a turn has started (`lastSessionId === null`), so the sessionId guard is conjunctive (`!== null && length > 0`).
+
+### Design decisions
+
+- **Hook fires at both `active → quarantined` AND `quarantined → evicted` steps of `/memory delete`.** The 2-step canonical path goes through `transitionMemoryState` twice; each call evaluates the hook with its own payload (different `fromState`/`toState`). A hook that wants to allow quarantine but refuse final eviction can match on `to_state=evicted`. A hook that wants to refuse any operator-driven delete blocks the first transition and the second never fires.
+
+- **Refused row's `toState` collapses to `fromState`.** When a hook blocks an `evicted → active` restore, the eviction_events row records `fromState=evicted, toState=evicted` — the proposed transition's target is captured separately in `memory_events.details.proposed_to_state`. This is the same shape Phase 1.3.c1 settled for blocked-by-hook outcomes: the row reflects what HAPPENED on disk (no state change), not what was attempted.
+
+- **Wrapper catches dispatcher exceptions and stderr-logs.** Same defensive pattern the harness loop uses — a buggy hook (or a bug in the dispatcher itself) shouldn't crash the slash command surface. Failure modes are still observable via the stderr line; the slash result reads as "no hook configured" because returning null falls through transitionMemoryState's empty path.
+
+- **`disableAllHooks` short-circuits at the wrapper, not at the dispatcher.** Same defense-in-depth: the dispatcher honors the flag too (it's load-bearing for slice 181's kill switch), but short-circuiting at the wrapper avoids the wrapper-promise + cleanup churn. The slash caller never sees a half-spawned dispatcher in the disabled path.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/types.ts` | Added optional `dispatchHooks?: (payload) => Promise<HookChainResult \| null>` to `SlashContext`. Hook + chain result imports. |
+| `src/cli/repl.ts` | Built `slashDispatchHooks` wrapper using the REPL's `baseConfig.hooks`, db, and `lastSessionId`. Threaded into `SlashContext`. Tightened the `lastSessionId.length > 0` guard for null-safety (it's typed `string \| null`). |
+| `src/cli/slash/commands/memory.ts` | `deleteViaTransition` + `handleRestore` thread `fireHook: ctx.dispatchHooks` when defined. Each call lands as-is — transitionMemoryState already gates on `sessionId != null` internally. |
+| `tests/cli/slash/memory.test.ts` | 3 new tests: hook block on `/memory delete` keeps body and emits refused audit; hook block on `/memory restore` keeps tombstone in place; non-blocking hook on delete proceeds normally. Stub `stubBlockingDispatcher(message)` helper. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7522 pass / 10 skip / 0 fail (+3 from the slice)
+- `bun test tests/cli/slash/memory.test.ts` 73 pass
+
+### Deferred / follow-ups declared
+
+- **Subagent runtime + REPL `slashDispatchHooks` sharing.** Today the REPL has one wrapper and the harness loop has another, both calling `dispatchChain` against `baseConfig.hooks`. A future slice could lift the wrapper out (shared helper) — out of scope here because the two callers' contexts differ enough (harness has `sessionId` per-turn, REPL has `lastSessionId` from closure).
+- **2.2 — Route `gcExpiredMemories` through transitionMemoryState** (next slice — kills the silent-GC violation of EVICTION §0.9).
+- **2.3 — GC sweep `evicted → purged`** (next slice — materializes the retention window the slice landed via `purgeAt` 30d).
+
+## [2026-05-15] fix(memory) — post-1.3 review batch: retention, atomicity, audit drift, ambiguity
+
+**Done.** Addresses every finding from the post-1.3 multi-agent review across the five Phase 1.3 commits. Twelve corrections in one slice because they're tightly coupled (state-machine validator change cascades into same-state semantics; routing-flag cleanup reshapes the slash callers; retention enforcement requires both `purgeAt` propagation and the `now()` threading). Splitting would create churn without smaller blast radius.
+
+### Critical fixes
+
+- **C1 — purge_at is now set on operator deletes (30d retention).** `deleteViaTransition` computes `purgeAt = ctx.now() + 30 * 24h` and threads it to the `quarantined → evicted` transition. Without this, every evicted row landed with `purge_at=NULL` and `listEvictedDueForPurge` filtered them out — the future GC sweep would have seen nothing and tombstones would accumulate without bound past spec EVICTION §7.1's 30-day window. Constant `MEMORY_TOMBSTONE_RETENTION_MS` lives in the slash module; future per-substrate / per-scope retention can override.
+
+- **C2 — cross-scope tombstone restore now refuses on ambiguity.** `findTombstoneInAnyScope` returns a discriminated `found | none | ambiguous` result; `/memory restore <name>` (without `--scope`) errors when two scopes hold tombstones for the same name, naming the scopes and the disambiguation syntax. Earlier shape silently picked precedence order — restoring `local/X` when the operator may have meant `shared/X` would have overwritten the wrong scope's body without any visible audit attribution.
+
+- **C3 — restore is idempotent against partial-failure retry.** The `evicted → active` branch now checks `existsSync(scopeRootBody)` BEFORE reading the tombstone. If the body already exists (prior restore landed step 1 but crashed before tombstone removal), the operator-edited body is treated as authoritative — tombstone content is NOT overwritten on retry. The frontmatter `state` field is still stripped on finalize so the canonical "no state field" shape lands. Eliminates the "second restore silently overwrites operator edits" data-loss surface.
+
+### High-severity fixes
+
+- **H1 — restore strips `state` field consistently across both source branches.** `quarantined → active` previously called `writeFrontmatterState(target='active')` which wrote an explicit `state: active` to the file (the `else` branch of writeFrontmatterState fires when source had any explicit state). Now both restore paths (`evicted → active` and `quarantined → active`) strip the field on finalize, matching the spec convention "absence === active" symmetrically.
+
+- **H2 — same-state pseudo-transitions validate motivo.** `isLegalTransition(from, from, motivo)` previously returned `ok` for any motivo. Now it requires the motivo to be admitted by at least one real transition out of `from`. Forensic queries can no longer record `from=active to=active motivo=expired` (no transition out of active admits `expired`), which would have implied a substrate trigger that doesn't exist. Defense-in-depth at validator level; the DB CHECK still gates the column enum.
+
+- **H3 — audit_drift discriminant on TransitionMemoryStateResult.** The `eviction_events` INSERT failing AFTER `applyTransition` succeeded now returns `kind: 'audit_drift'` with the `tombstonePath` reference, NOT `kind: 'io_error'`. The slash's `mapTransitionFailure` renders a distinct copy ("disk transition completed but eviction_events insert failed (body at …)"), so an operator no longer sees "delete failed" when the file actually moved. Reconciliation slice (declared follow-up) will replay these drifted rows from disk shape.
+
+- **H4 — `confirmAndDelete` routing flag is explicit.** The earlier shape used `currentState: MemoryState` as a routing flag, passing fake values (`'invalidated'` for malformed/missing entries) purely to force the legacy branch. New shape: `route: 'state-machine' | 'legacy'`. The two malformed/missing call sites now pass `'legacy'` explicitly; the happy path computes the route from `peek.file.frontmatter.state ?? 'active'`. A future refactor reading the field will no longer mis-branch on the fake state.
+
+- **H5 — `ctx.now()` threads through to transitionMemoryState.** Both `deleteViaTransition` (2 calls) and `handleRestore` now pass `now: ctx.now` to `transitionMemoryState`. The `multiple tombstones same name` test was using `setTimeout(5)` as a workaround for `Date.now()` ms granularity; now uses a `nowCounter` and is fully deterministic. Production paths still receive `Date.now`-shaped values from the REPL's default ctx.
+
+- **H6 — new test coverage.** Seven new tests covering the surfaces that previously had none:
+  - `cross-scope tombstones with same name refuse without --scope` (C2 happy + sad path)
+  - `idempotent restore: body already at scope root preserves operator edits` (C3)
+  - `purge_at is set on the evicted eviction_events row (30d window)` (C1)
+  - `listEvictableInWindow surfaces the freshly-evicted row` (C1 GC observability)
+  - `blocked_by_hook on evicted → active: tombstone stays put, refused audit` (restore-path hook block)
+  - `quarantined → active: strips state field, keeps index entry, emits restored audit` (H1 + the missing restore-from-quarantine path)
+  - `moveToTombstone: collision: same-ts eviction bumps ts +1 to avoid overwrite` (M2)
+  - Same-state motivo validation tests in `eviction-events.test.ts` (H2)
+
+### Medium-severity fixes
+
+- **M1 — `findLatestTombstone` cached at the entry of `transitionMemoryState`.** The earlier shape called it twice (once in stage 1 to detect `fromState='evicted'`, again in stage 4 for the restore/purge file mutation). `applyTransition` now takes the result as a `cachedTombstone` parameter — single readdir per transition. Race window between the two calls (concurrent eviction in `.tombstones/`) closed.
+
+- **M2 — `moveToTombstone` bumps `ts +1` on collision.** Two evictions in the same millisecond previously collided on `<name>.<unix_ms>.md` and POSIX `renameSync` silently overwrote the older tombstone. New shape: `while (existsSync(dest)) ts += 1`. Bounded loop — terminates in 0–2 iterations under realistic load.
+
+- **M3 — `rowid` is the monotonic tiebreaker on `getLastEvictionForObject` and `listEvictableInWindow` / `listEvictedDueForPurge`.** Earlier queries used `ORDER BY recorded_at DESC, id DESC` where `id` is a random UUID v4 — same-ms rows returned in non-deterministic order. SQLite's hidden `rowid` is monotonic on INSERT for this rowid table (TEXT PRIMARY KEY, append-only, no DELETEs); ordering by it gives deterministic insertion order tiebreaks without a migration. Documented in the query comments.
+
+- **M4 — `atomicWrite` uses `crypto.randomUUID()` for tmp suffix.** Uniform with `appendEvictionEvent` + `memory_events.id` generation. The earlier `process.pid + Math.random()` shape was theoretical (pid wrap + Math.random seed collision on fork) but unnecessary divergence.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/eviction-events.ts` | H2 — `isLegalTransition` same-state branch validates motivo against admitted set of transitions out of `from`. M3 — query tiebreaker switched to `rowid`. |
+| `src/memory/tombstones.ts` | M2 — `moveToTombstone` collision-check loop. |
+| `src/memory/transitions.ts` | C3 — restore idempotency via `existsSync(bodyPath)` check. H1 — `quarantined → active` strips state field. H3 — `audit_drift` result kind. M1 — `cachedTombstone` threaded through `applyTransition`. M4 — `crypto.randomUUID()` in atomicWrite. |
+| `src/cli/slash/commands/memory.ts` | C1 — `purgeAt` 30d window in `deleteViaTransition`. C2 — `findTombstoneInAnyScope` returns discriminated `found \| none \| ambiguous`; restore refuses on ambiguity. H4 — `confirmAndDelete` takes `route: 'state-machine' \| 'legacy'`. H5 — `ctx.now` threaded to `transitionMemoryState`. H3 — `mapTransitionFailure` renders audit_drift. Unused `MemoryState` import dropped. |
+| `tests/storage/eviction-events.test.ts` | H2 — same-state motivo validation tests (admitted + refused + 'any'-motivo). |
+| `tests/memory/tombstones.test.ts` | M2 — collision-check test. |
+| `tests/memory/transitions.test.ts` | New: blocked_by_hook on restore path; quarantined → active strips state field. |
+| `tests/cli/slash/memory.test.ts` | New: cross-scope ambiguity refuse; idempotent restore preserves operator edits; purgeAt 30d window; listEvictableInWindow surfaces row. Updated: `multiple tombstones same name` no longer uses `setTimeout`. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7519 pass / 10 skip / 0 fail (+7 from the slice's new tests; prior was 7512)
+- `bun test tests/memory/transitions.test.ts` 13 pass (+2 new)
+- `bun test tests/cli/slash/memory.test.ts` 71 pass (+5 new)
+- `bun test tests/memory/tombstones.test.ts` 31 pass (+1 new)
+- `bun test tests/storage/eviction-events.test.ts` 44 pass (+1 new)
+
+### Follow-ups declared (not addressed here)
+
+- **Atomicity beyond restore idempotency.** The `active → evicted` direction still has partial-failure surfaces (frontmatter written + rename succeeded + index removal failed). Full reconciliation needs a journal/transaction log slice — out of scope here. Restore-side idempotency (C3) covers the operator-visible recovery path; the evicted-side surfaces produce orphaned state that needs the journal to recover.
+- **Spec MEMORY §6.5.5 vs EVICTION §4.1.** Still declared: spec PR to align "restore goes to `active`" with the state machine.
+- **Spec EVICTION §4.1 — admit `motivo='user_purge'` on `active → evicted`.** Would drop the 2-step intermediate that `/memory delete` runs through. Audit consumers filtering by `motivo='low_roi'` would stop catching operator-initiated deletes.
+
+## [2026-05-15] feat(cli/memory) — /memory restore slash + re-admission (Phase 1.3.d)
+
+**Done.** Operator-facing inverse of `/memory delete`. `/memory restore <name> [scope]` looks up the latest tombstone for `name`, shows a modal preview with the captured body, and on confirmation transitions the memory from `evicted → active` — body copies back to the scope root, frontmatter strips `state: 'evicted'`, tombstone is consumed, and the paired audit (`eviction_events` `evicted→active` + `memory_events action='restored'`) lands.
+
+This closes Phase 1.3 of the memory/context evolution: the lifecycle (`active → quarantined → evicted → active`) is now end-to-end exercisable from the slash surface, and any eviction (operator-driven via `/memory delete`, or future automated triggers) is reversible until the retention window of `.tombstones/` expires.
+
+### Design decisions
+
+- **Restore target is `active` (state-machine canonical).** Spec MEMORY §6.5.5 names `proposed` as the restore target, but the canonical state machine in EVICTION §4.1 (1.2.a `LEGAL_TRANSITIONS`) only admits `evicted → active`. Routing through `proposed` would require an additional re-admission gate that doesn't exist yet — and the operator's *intent* on `/memory restore` is "I want this entry back the way it was", not "I want a fresh review". Treating restore as direct re-activation matches that intent. Follow-up declared: spec MEMORY §6.5.5 should be amended to read `active` so the docs stop contradicting the state machine. The slash code carries a comment pointing at this inconsistency.
+
+- **Modal preview shows the captured body.** Restoration is rare and operator-confirmed; showing the body content (first ~20 lines) lets the operator verify "yes, this is the entry I meant" before committing to re-admission. Mirrors the preview pattern `/memory delete` already uses.
+
+- **Cross-scope tombstone lookup by default.** With no scope arg, `findTombstoneInAnyScope` walks `project_local → project_shared → user` and restores whichever scope holds the latest matching tombstone. Operators usually remember the *name* they evicted, not which scope held it. Explicit scope arg (`/memory restore mem local`) narrows the lookup — if the tombstone isn't in that scope, error rather than fall back, so the operator's mental model stays consistent.
+
+- **Modal `'restore'` action joins the existing union.** `MemoryActionAskArgs.action` / `MemoryActionAskEvent.action` grow a `'restore'` variant alongside `'delete' | 'promote'`. UI rendering on the TUI side can branch on the action label to show appropriate copy ("Restore from tombstone?" vs. "Delete this memory?"). Modal API stays uniform across lifecycle actions.
+
+- **Latest-wins on same-name tombstones.** Two evictions of the same name produce two tombstones (`<name>.<unix_ms_1>.md`, `<name>.<unix_ms_2>.md`). `findLatestTombstone` picks the highest `ts` — restore takes the most recent version. Operators rarely care about earlier evicted versions; if they do, they can grep `.tombstones/` directly. No multi-version selector slash.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/commands/memory.ts` | `restore` subcommand: arg parse → scope resolve → `findLatestTombstone` (per-scope or cross-scope) → modal confirm with body preview → `transitionMemoryState({ toState: 'active', motivo: 'irrelevant', trigger: 'manual', actor: 'user' })`. `findTombstoneInAnyScope` helper. Import order normalized for Biome. |
+| `src/tui/events.ts` | `MemoryActionAskEvent.action` extended with `'restore'`. |
+| `src/tui/modal-manager.ts` | `MemoryActionAskArgs.action` extended with `'restore'`. |
+| `tests/cli/slash/memory.test.ts` | 7 tests: confirm yes (body restored, tombstone consumed, restored audit), preview content, confirm no, missing name, no tombstone, strict scope pinning, invalid scope arg, latest-wins on duplicates. |
+
+### Deferred / follow-ups declared
+
+- **Spec MEMORY §6.5.5** — change restore target from `proposed` to `active` to match the state machine. Spec PR, not code.
+- **Re-admission gate** — if the project later wants restored memories to land in `proposed` (with explicit operator promotion), introduce a `restored_via: 'gate' | 'direct'` distinction. Out of scope here.
+- **Cross-scope restore disambiguation** — currently silent: first scope with a matching tombstone wins. A future slice could surface "found in scope X, also exists in Y — confirm scope" if operator confusion materializes.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/cli/slash/memory.test.ts` 66 pass / 0 fail (was 58 pre-slice; +7 new + 1 implicit from preview path)
+
+## [2026-05-15] feat(cli/memory) — /memory delete uses transitionMemoryState (Phase 1.3.c3)
+
+**Done.** First production caller of `transitionMemoryState` (1.3.c1). When the operator runs `/memory delete <name>` on an `active` memory, the slash now routes through the state machine instead of calling the legacy `removeMemory` primitive — the body moves into `.tombstones/` (restorable later via `/memory restore`, 1.3.d), and the audit pair (`eviction_events` + `memory_events`) lands. Memories in other states (malformed body, missing file) keep the legacy code path because tombstone semantics don't apply.
+
+Also fixes a latent flake surfaced during the stability check: `transitionMemoryState` now propagates the optional `input.now()` to the `recordedAt` field of every `eviction_events` row it writes (previously only the tombstone filename ts was overridable). Without this, two back-to-back transitions in a test fixture (or in production within the same ms) could collide on `recorded_at`, and the `id DESC` tiebreaker in `getLastEvictionForObject` is non-deterministic (UUID v4 is random). The transitions.test.ts `evicted → purged` test flaked ~1/4 runs before the fix; deterministic after.
+
+### Design decisions
+
+- **Two-step transition for the active path.** The state machine forbids `active → evicted` direct (1.2.a `LEGAL_TRANSITIONS` from spec EVICTION §4.1 — only `active → quarantined → evicted` is canonical). `/memory delete` does both transitions in sequence with `motivo: 'low_roi'` + `trigger: 'user_purge'`. The motivo is the closest state-machine-legal label for operator-driven deletion; the trigger correctly attributes the source. Audit row pair shows the 2-step flow — operator-visible via `/memory audit`. Follow-up declared in this entry: spec EVICTION §4.1 may eventually grow an explicit `user_purge` motivo on `active → evicted` so the 2-step intermediate disappears, but that's a spec PR; current code lives within the canonical state machine.
+
+- **Non-active states keep the legacy removeMemory path.** Three reasons: (1) volume is tiny — operators rarely `/memory delete` malformed entries; (2) the legacy path is well-tested; (3) tombstone semantics don't apply to corrupted/missing files (no body to move). Future slice can route `quarantined`/`invalidated`/`evicted` deletions through `transitionMemoryState` too if a need surfaces.
+
+- **Operator-facing message keeps the verb "deleted".** Lead with "deleted ${scope}/${name}" so the copy stays recognizable across the refactor; the parenthetical "(moved to .tombstones/; restorable via /memory restore until retention window expires)" explains the new mechanism without making the operator parse state-machine vocabulary.
+
+- **`mapTransitionFailure` helper centralizes the result-discriminant → SlashResult mapping.** Each `transitionMemoryState` failure mode (`unknown`, `illegal_transition`, `blocked_by_hook`, `io_error`) gets a specific error message; the prefix (`/memory delete (active→quarantined)`) attributes the failing sub-step.
+
+- **`recordedAt` propagation in `transitionMemoryState`.** When `input.now()` is set, the helper passes the same value to every `appendEvictionEvent` call (applied-row, blocked-by-hook row, trigger-fired-no-action row). Without an override, falls back to `Date.now()` inside the repo. Documented in code as a follow-up: a `seq INTEGER AUTOINCREMENT` column on `eviction_events` would give a deterministic tiebreaker without requiring callers to manage timestamps; out of scope for this slice.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/commands/memory.ts` | `confirmAndDelete` now takes `currentState`; routes through `deleteViaTransition` (new helper) when `currentState === 'active'`; falls through to legacy `removeMemory` otherwise. Each `handleDelete` caller passes the frontmatter state (default `active`, falls to `invalidated` for malformed/missing entries). New `mapTransitionFailure` helper centralizes SlashResult mapping. Imports `MemoryState` and `transitionMemoryState`. |
+| `src/memory/transitions.ts` | Derives `recordedAt` from `input.now()` (when supplied) and forwards to every `appendEvictionEvent` call site (applied, blocked_by_hook, trigger_fired_no_action). |
+| `tests/cli/slash/memory.test.ts` | Updates 2 existing `/memory delete` tests for the new tombstone-based behavior: asserts body moves to `.tombstones/`, asserts `evicted` + `quarantined` actions in memory_events (not `deleted`), asserts notes mention "deleted ... .tombstones". |
+| `tests/memory/transitions.test.ts` | Adds `now: () => 2_000` to the second transition in the `evicted → purged` test for deterministic ordering. |
+
+### Deferred / follow-ups declared
+
+- **1.3.d** — `/memory restore <name>` slash + re-admission gate (the operator-facing inverse of this slice).
+- **Spec EVICTION §4.1 PR** — extend `active → evicted` to admit `motivo: 'user_purge'`, dropping the 2-step intermediate. Operator audit would then show one event per delete instead of two.
+- **`eviction_events.seq` column** — monotonic tiebreaker for `getLastEvictionForObject`. Would close the latent flake without requiring callers to thread `now()` through every call. Needs a migration; out of scope here.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/transitions.test.ts` 11 pass / 0 fail across 3 stability runs (was flaky ~1/4 pre-fix)
+- `bun test tests/cli/slash/memory.test.ts` 58 pass / 0 fail
+- `bun test` 7503 pass / 10 skip / 0 fail (unchanged total — 2 tests rewritten, no net add)
+
+## [2026-05-15] feat(memory) — transitionMemoryState helper (Phase 1.3.c1)
+
+**Done.** Memory's owner of the eviction contract from Phase 1.2. One async function (`transitionMemoryState`) orchestrates a lifecycle transition end-to-end across the file, the index, the `eviction_events` table, and the `memory_events` table — emitted as a paired audit so forensic queries can answer "what changed and why" from either surface. No caller wires it yet — verify-before-act (1.3.c2) and `/memory delete` (1.3.c3) follow.
+
+Also includes migration 048 (memory_events.action CHECK enum expanded), which the Phase 0 stitching declared in the spec vocabulary but never landed at SQL level. Same rebuild pattern migrations 044/047 use (SQLite doesn't ALTER CHECK).
+
+### Pipeline (5 stages, each independently failing)
+
+1. **Read current state.** Body file via `readMemoryByName`; if missing, fall back to `.tombstones/` (the lifecycle target). `fromState` is derived from the frontmatter `state` field (default `active`) or the tombstone (`evicted`).
+2. **Validate transition.** `isLegalTransition(from, to, motivo)` from the 1.2.a state machine. Refusal returns `kind: 'illegal_transition'` with structured reason.
+3. **Fire Eviction hook if wired.** Payload uses the `EvictionEventData` shape (1.2.b). Blocking hook produces `outcome: 'blocked_by_hook'` audit row + `memory_events action='refused'` row; no file/index change.
+4. **Apply transition.** Per (from, to) tuple — `active→quarantined` mutates frontmatter, `*→evicted` mutates frontmatter then renames into `.tombstones/` + removes index entry, `evicted→active` (restore) reads tombstone, copies back, removes tombstone, re-inserts index, `evicted→purged` removes tombstone, etc. File mutations are atomic via temp+rename mirroring `lifecycle.ts`.
+5. **Persist audit pair.** `eviction_events` with `outcome: 'applied'` (or `trigger_fired_no_action` for same-state pseudo-transitions); `memory_events` with the matching lifecycle action (`quarantined`, `evicted`, `invalidated`, `restored`, `purged`, `created`, `refused`).
+
+### Design decisions
+
+- **Helper is async** because the hook fire is async. Other code paths in `src/memory/` stay sync; only this new surface is async. Pattern matches `memory_write` tool.
+- **State machine is the source of truth.** Transitions not in `LEGAL_TRANSITIONS` (from 1.2.a) are refused — even when spec MEMORY §6.5 might suggest a direct path (e.g. `active → evicted` for `/memory delete`). Callers do 2-step transitions through `quarantined`. The state machine wins; spec EVICTION.md §4.1 is canonical.
+- **Same-state transitions record `trigger_fired_no_action`.** A trigger that fires but doesn't advance state (verify-before-act called on an already-quarantined memory) lands as a no-action audit row so trigger thrashing is observable downstream (1.2.a's `detectTriggerThrashing` query).
+- **File state precedes audit write.** If the audit INSERT fails after a successful file/index mutation, the helper returns `kind: 'io_error'` — surfacing drift without rolling back disk state (which would itself be racy). Future reconciliation slice replays from disk shape.
+- **Tombstone frontmatter has `state: 'evicted'`.** Eviction writes the frontmatter first, then renames body→tombstone, so the tombstone file accurately reflects the state it represents. Restore reads the tombstone, strips the state field (default `active`), writes body back, removes tombstone.
+- **Hook payload skipped when `fireHook` unwired.** Same pattern memory_write uses for `confirmMemoryWrite` — headless / test contexts don't need to construct a no-op hook callback.
+- **`evidence_json` redaction is delegated.** `appendEvictionEvent` (the 1.2.a repo, post-1.2 review) runs the scrub on the way in; this layer just JSON-serializes the input `evidence` Record.
+
+### Migration 048
+
+`memory_events.action` CHECK pre-Phase-0 only admitted the 9 original actions (`proposed`, `created`, `edited`, `deleted`, `read`, `refused`, `promoted`, `demoted`, `expired`). Phase 0 added five lifecycle actions to the spec (`quarantined`, `invalidated`, `evicted`, `restored`, `purged`) but never expanded the SQL CHECK — same gap C1 of the post-1.2 review fixed for `hook_runs.event = 'Eviction'`. Without 048, every `transitionMemoryState` would fail-and-stderr through `registry.recordEvent`'s catch-and-log, dropping audit silently. The TS union (`MemoryEventAction` in `src/storage/repos/memory-events.ts`) is updated in lockstep.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/memory/transitions.ts` | Public surface: `transitionMemoryState` async helper + `TransitionMemoryStateInput` / `TransitionMemoryStateResult` types |
+| `src/storage/migrations/048-memory-events-lifecycle-actions.ts` | Rebuild `memory_events` with the expanded `action` CHECK enum |
+| `tests/memory/transitions.test.ts` | 11 tests: active→quarantined, active→evicted illegal, quarantined→evicted, evicted→active restore, evicted→purged, illegal motivo, unknown memory, same-state pseudo, hook blocks, evidence redaction |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/index.ts` | Barrel re-export of `transitionMemoryState` + types |
+| `src/storage/repos/memory-events.ts` | Add 5 lifecycle values to `MemoryEventAction` union |
+| `src/storage/migrations/index.ts` | Register migration 048 |
+
+### Deferred
+
+- **1.3.c2** — Wire verify-before-act detector → `active → quarantined` (motivo=shift, trigger=verify_failed).
+- **1.3.c3** — Wire `/memory delete` slash → 2-step `active → quarantined → evicted`. Note: state machine rejects direct `active → evicted`. Spec EVICTION §4.1 may eventually warrant a `user_purge` motivo on the direct path (follow-up; would require spec PR).
+- **1.3.d** — `/memory restore <name>` slash + re-admission flow.
+- **GC sweep** — `agent gc` calls `listExpiredTombstones` + transition `evicted → purged` per scope retention window.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/transitions.test.ts` 11 pass / 0 fail
+- `bun test` 7503 pass / 10 skip / 0 fail (+11 from 1.3.b baseline 7492)
+
+## [2026-05-15] feat(memory) — .tombstones/ paths + lifecycle helpers (Phase 1.3.b)
+
+**Done.** Second slice of memory lifecycle. Adds the `.tombstones/` storage layer per `MEMORY.md` §6.5: a per-scope sub-directory under the scope root that holds evicted body files renamed `<name>.<unix_ms>.md`. Path helpers in `paths.ts`; I/O helpers (move, list, find latest, list expired, remove) in a new `tombstones.ts`. No consumer yet — eviction transition that calls `moveToTombstone` is 1.3.c.
+
+### Design decisions
+
+- **Filename `<name>.<unix_ms>.md`** preserves the ability to evict the same name multiple times across a session (after a restore-then-evict cycle). `Date.now()` typically advances per call; the tombstone path embeds the timestamp so two evictions in the same ms generate distinct paths only if the caller injects different `now()` values (tests do; production calls Date.now once per eviction so the boundary is moot). Each tombstone carries its ts in the filename so an operator/audit query can disambiguate without consulting `eviction_events`.
+
+- **`parseTombstoneFilename` is the inverse — strict regex.** Returns `null` for anything that doesn't match `^[a-z0-9][a-z0-9_-]*\.\d+\.md$`. Listing code uses the null return as a filter so operator-dropped junk (READMEs, plain `.md` files, `.txt`) in `.tombstones/` doesn't trip queries.
+
+- **`tombstonePath` re-validates the name** through the same `validateName` the main `memoryFilePath` uses. Defense-in-depth: a future regression in the name validator (or a caller bypassing the repo via cast) still can't escape the sandbox root. The `ScopeError` thrown matches the main memory path's contract — callers handling sandbox errors don't need a new branch.
+
+- **Per-scope isolation** (validated by test): tombstones in `user` don't appear under `project_shared` listings. Each scope's `.tombstones/` is independent — eviction never crosses scope boundaries.
+
+- **Sync I/O** matches the rest of `src/memory/` (writer, lifecycle). Tombstone churn is low (one rename per eviction, one readdir per restore/GC) so async would add complexity without payoff.
+
+- **`listExpiredTombstones` boundary is strict (`>`).** Age `===` retention does NOT trip the expiry filter — the operator can still restore exactly at the limit. Mirrors the strict-comparison gate the future GC sweep will apply.
+
+- **`removeFromTombstones` is idempotent** (returns `false` for missing files). The GC sweep may re-run after partial failures; making it idempotent keeps the contract simple.
+
+- **`moveToTombstone` propagates ENOENT** when the source body file doesn't exist. This surfaces caller bugs (trying to evict a memory that was already evicted) instead of silently no-op'ing.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/memory/tombstones.ts` | I/O helpers: `moveToTombstone`, `listTombstones`, `findLatestTombstone`, `listExpiredTombstones`, `removeFromTombstones` + `TombstoneEntry`, `MoveToTombstoneOptions`, `MoveToTombstoneResult` types |
+| `tests/memory/tombstones.test.ts` | 32 tests across 7 describe blocks: tombstonesDir (3), tombstonePath (3), parseTombstoneFilename (7), moveToTombstone (4), findLatestTombstone (4), listTombstones (4), listExpiredTombstones (3), removeFromTombstones (3), sandbox edge (1) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/paths.ts` | Add `tombstonesDir`, `tombstonePath` (sandbox-validated), `parseTombstoneFilename` |
+| `src/memory/index.ts` | Re-export the new path helpers + the tombstones barrel |
+
+### Deferred to subsequent slices
+
+- **1.3.c** — `transitionMemoryState` that calls `moveToTombstone` as part of `active → evicted` flow, plus `eviction_events` + `memory_events` emission and `Eviction` hook firing.
+- **1.3.d** — `/memory restore <name>` that reads `findLatestTombstone` and copies the body back into the scope root as `proposed`.
+- **GC sweep** — `agent gc` would call `listExpiredTombstones` per scope and `removeFromTombstones` for each expired entry. Lives outside the memory subsystem (cross-cutting concern); the helpers are ready when the sweep lands.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/tombstones.test.ts` 32 pass / 0 fail
+- `bun test` 7492 pass / 10 skip / 0 fail (+32 from 1.3.a baseline 7460)
+
+## [2026-05-15] feat(memory) — frontmatter `state` field (Phase 1.3.a)
+
+**Done.** First slice of memory lifecycle integration (`MEMORY.md` §3.1.1). Adds the optional `state` field to the frontmatter and the canonical `MemoryState` type — the 6-state subset of EVICTION §3 (omitting `shadow`, which overlaps with the existing `trust: untrusted` semantics per the Phase 0 stitching decision). Pure persistence layer; no consumer wires the field yet.
+
+### Why this slice ships alone
+
+Frontmatter is the smallest atomic step toward the lifecycle: changing it without integrating eviction transitions yet (1.3.c) means the field round-trips cleanly today, and future slices add semantics without touching the parser/writer. Same discipline 1.1.a used for `context_pins` (storage layer alone before tool/slash/recap).
+
+### Design decisions
+
+- **Subset declared as `MEMORY_STATES` const** (`proposed`, `active`, `quarantined`, `invalidated`, `evicted`, `purged`). Exported from `src/memory/types.ts` + re-exported from the barrel. The exact six-element list lives in one place; future slices (1.3.b–d, and any external owner integration) read from the const rather than duplicating the union literal.
+- **Absence preserves on round-trip** — a memory written without `state` doesn't get a serialized `state: active`. Same convention as the existing `trust` field. Operator-edited files with the field omitted stay omitted; the read-side default (`active` per spec §3.1.1) is decided at consumption time, not at persistence.
+- **Canonical serialization order: state appears LAST** — after `name`, `description`, `type`, `source`, `expires`, `trust`, `triggers`. The order keeps the most-recently-added optional field at the bottom of the YAML so older operator-eye scans of frontmatter don't get visually disrupted.
+- **Unknown-field rejection updated** — the existing parser rejects unknown fields as a defense against silent data loss on round-trip. `state` is added to the `known` set; future fields will require the same explicit addition.
+- **Validator is structural, not transitional.** This slice validates that `state` is one of the six values; it does NOT validate transitions (that's the eviction state machine from 1.2.a, called by future owners via `isLegalTransition`). Same separation of concerns as `MemorySource` validation (parser rejects unknown values; doesn't enforce promotion rules).
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/types.ts` | Add `MEMORY_STATES` const + `MemoryState` type; add `state?: MemoryState` to `MemoryFrontmatter` |
+| `src/memory/frontmatter.ts` | Import + use `MEMORY_STATES`/`MemoryState`; add `VALID_STATES` + `validateState`; wire into `validateFrontmatter` (parse + reject unknown); wire into `serializeMemoryFile` (last position in canonical order); update `known` set so the unknown-field rejection includes `state` |
+| `src/memory/index.ts` | Re-export `MEMORY_STATES` const + `MemoryState` type from barrel |
+| `tests/memory/frontmatter.test.ts` | +11 tests in new `state field` describe: parses each of 6 states (test.each), absence preserves undefined, rejects unknown value, serializer canonical order (state after triggers), serializer omits when absent, round-trip parse→serialize→parse preserves the field |
+
+### Deferred to subsequent slices
+
+- **1.3.b** — `.tombstones/` storage paths + lifecycle helpers (moveToTombstone, findLatestTombstone, retention sweep).
+- **1.3.c** — `transitionMemoryState` helper: validates via EVICTION's state machine, fires `Eviction` hook, persists `eviction_events` + `memory_events`, updates frontmatter `state`. Wires verify-before-act → `active→quarantined`; `/memory delete` → `active→evicted`. First real consumer of the 1.2 contract.
+- **1.3.d** — `/memory restore <name>` + re-admission gate (`evicted→proposed`).
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/frontmatter.test.ts` 48 pass / 0 fail
+- `bun test` 7460 pass / 10 skip / 0 fail (+11 from post-1.2 baseline 7449)
+
+## [2026-05-15] fix(eviction) — post-1.2 review pack (C1+C2+H1+H2+H3+M2+M3+M4+L3)
+
+**Done.** Single pack endereçando o review da Fase 1.2. Dois críticos (audit drift + leak), três highs (tool-matcher silenciado + table scan + test gaps), e cinco medium/low (throw em vez de coerce, cross-event matcher test, type reuse, comment cleanup, timestamp boundary test).
+
+### Critical fixes
+
+**C1 — migration 047 expande `hook_runs.event` CHECK incluindo `'Eviction'`.** Eu havia errado no BACKLOG 1.2.b: a coluna *é* enum-constrained no SQL, não só no TS. Sem essa migration, `fireHook({event:'Eviction'})` causaria `CHECK constraint failed` em todo INSERT e o dispatcher escreveria "AUDIT DRIFT" no stderr — zero audit rows persistidos. Migration 047 faz table rebuild (mesmo pattern de 044 PostToolUseFailure) + recreate dos 2 indices. Test regression: raw INSERT de `event='Eviction'` agora passa.
+
+**C2 — `evidence_json` agora passa por scrub antes do INSERT.** AUDIT.md §1 declara `eviction_events.evidence_json` como medium-sensitivity com redaction obrigatória. O repo escrevia verbatim. Agora:
+- `scrubEvidenceJson(raw)` parse → walk recursivo via `scrubStringsRecursive` → re-serialize. Malformed JSON cai em `{ _scrubbed_invalid_json: "..." }` (scrubed) preservando o sinal de payload não-parseável.
+- Cada string passa por dupla camada: `scrubFreeformText` (paths/hosts/URLs/IPs/SSH refs do telemetry/scrubbing) E `redactSecrets` (credenciais AWS/GitHub/Anthropic/OpenAI/Slack/JWT do memory/scanner).
+- `redactSecrets` é nova: subset substitutivo do `scanForSecrets` (que rejeita). Idempotente (`<REDACTED:secret>` não casa nenhum pattern), global flag aplica em todas as ocorrências por string.
+- Cycle guard via `WeakSet` simétrico com `scrubFailurePayload` (back-references não estouram a pilha).
+
+### High fixes
+
+**H1 — `specMatches` ignora `tool` matcher em events não-tool-shaped.** Antes, um Eviction spec com `matcher = { tool = "...", substrate = "memory" }` (operator misconfig) era silenciado: o dispatcher via `toolName=null` e retornava false. Agora a regra é "tool matcher só narra em events tool-shaped" (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`); para outros eventos é no-op preservando a chain. Para tool-shaped events sem `toolName` (caller bug) o comportamento original sobrevive (retorna false).
+
+**H2 — partial index `idx_evict_thrash` cobre `detectTriggerThrashing`.** EXPLAIN antes mostrava `SCAN eviction_events USING INDEX idx_evict_obj` + `USE TEMP B-TREE FOR GROUP BY`. Índice partial `(substrate, object_id, trigger, recorded_at) WHERE outcome='trigger_fired_no_action'` cobre a query exatamente — partial WHERE mantém o índice pequeno (só rows thrash entram).
+
+**H3 — round-trip tests para `parent_id` e `dependents_json`.** Antes só assertava null no default; nenhum teste exercitava não-null. Cobertos agora: parent linking (audit chain) e cascade detection list.
+
+### Medium / Low fixes
+
+**M2 — `purgeAt` THROW quando `toState !== 'evicted'`.** Antes coerção silenciosa pra null; test que pinava o comportamento removido + nova classe `InvalidEvictionInputError` (estrutural, distinta de `IllegalTransitionError` que cobre apenas state-machine refusal).
+
+**M3 — test cross-event matcher fields ignored.** Hook PostToolUse com `matcher = { substrate: 'memory' }` (operator nonsense) ainda roda — eviction matcher é no-op em payloads não-Eviction. Simétrico com H1.
+
+**M4 — `EvictionEventData` importa types de `eviction-events.ts`.** Eliminado o duplo literal-union em `hooks/types.ts`; adicionar um estado/motivo novo no repo agora flui automaticamente.
+
+**L3 — comment explicando `sinceMs=0` boundary em `detectTriggerThrashing` test.** Fragile coupling entre fixture timestamps e operator agora documentada.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/047-eviction-hook-runs.ts` | (C1) Rebuild `hook_runs` adding `'Eviction'` to event CHECK + (H2) partial `idx_evict_thrash` |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/index.ts` | Register migration 047 |
+| `src/storage/repos/eviction-events.ts` | (C2) `scrubEvidenceJson` + `scrubStringsRecursive` + `scrubString` helpers; (M2) throw `InvalidEvictionInputError` instead of silent coerce; (M2) new error class export |
+| `src/memory/scanner.ts` | (C2) New `redactSecrets` (substitutive subset of `scanForSecrets`) |
+| `src/memory/index.ts` | Re-export `redactSecrets` |
+| `src/hooks/dispatcher-matching.ts` | (H1) Tool matcher is no-op on non-tool-shaped events; new `TOOL_SHAPED_EVENTS` const |
+| `src/hooks/types.ts` | (M4) Import EvictionState/Substrate/Motivo/Actor from eviction-events.ts; `EvictionEventData` uses them instead of duplicate literals |
+| `tests/storage/eviction-events.test.ts` | (M2) Replace coerce-test with throw-test + null-allowed test; (H3) parent_id + dependents_json round-trips; (L4) purge_at===now boundary; (C2) 3 redaction tests; (L3) comment on sinceMs semantics |
+| `tests/hooks/eviction-matching.test.ts` | (C1) hook_runs raw INSERT regression test; (H1) tool matcher on Eviction silently ignored test; (M3) eviction matcher fields on tool event silently ignored test |
+| `tests/memory/scanner.test.ts` | 4 tests for redactSecrets (single, multiple, idempotent, no-op on clean) |
+
+### Findings deliberately NOT addressed
+
+- **M1 (trigger CHECK enum)** — risk accepted as writer-layer const + tests pinning trigger names. Adding CHECK would force an ALTER on every new trigger landing; trade-off declined for now. Documented in this entry.
+- **L1 (migration comment claims redaction will rot)** — moot: the claim is now factual.
+- **L2 (slice numbers in pre-existing hooks comments)** — outside this slice's scope (slice 181 comments live in code I didn't write).
+- **Low boundary test #1 (purge_at===now)** — addressed inline as the "L4" boundary test.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7449 pass / 10 skip / 0 fail (+14 from 1.2.b baseline 7435: +4 redactSecrets + +3 eviction-matching + +7 eviction-events redaction/round-trip/throw/boundary)
+
+## [2026-05-14] feat(hooks/eviction) — Eviction event + matcher (Phase 1.2.b)
+
+**Done.** Second slice of the eviction skeleton (`EVICTION.md` §10.3). Lands the `Eviction` hook event in the dispatcher pipeline with five new matcher fields (`substrate` / `motivo` / `fromState` / `toState` / `actor`), `EvictionEventData` payload shape, blocking semantics, and TOML config parsing — including snake_case → camelCase conversion that mirrors the existing `tool` matcher's discipline.
+
+This slice ships the **hook contract**, not its callers. Owners (memory, policy, retrieval, compaction) will call `fireHook({ event: 'Eviction', ... })` before `appendEvictionEvent` once their lifecycle integration lands. A hook that returns exit 1 refuses the proposed transition; the owner records `outcome: 'blocked_by_hook'` with `blocked_by` carrying the spec source. The `blocked_by_hook` value was already in the migration 046 CHECK enum (added in 1.2.a foresight) so this slice required no schema change.
+
+### Design decisions
+
+- **Eviction is in `BLOCKING_EVENTS`.** Same exit-code semantics as `MemoryWrite` / `PreToolUse` / `PreCompact`: exit 0 = allow, exit 1 = block silent, exit 2 = block with stdout-as-reason, `failClosed: true` makes timeouts/errors block too. Owner inspects `HookChainResult.blockedBy` to discriminate.
+- **Five new matcher fields share the `HookMatcher` interface, not a per-event variant.** Keeps a single config parser path and a single dispatcher API. The matcher is conjunctive — every supplied field must match the corresponding `payload.data` field for the hook to run. Empty matcher means "any Eviction payload" (mirrors the `tool` matcher's behavior).
+- **TOML uses snake_case (`from_state`, `to_state`); TS exposes camelCase (`fromState`, `toState`).** Mapping happens in the config parser, identical to how every other Forja TS/TOML boundary works. Operators write what reads naturally in TOML; the rest of the codebase stays consistent with the EvictionEvent shape from 1.2.a.
+- **No wildcards on the new matcher fields.** Substrate/motivo/state/actor are closed enums in migration 046's CHECK constraints; a `*` matcher would be undefined against an enum. Only `tool` keeps glob semantics because tool names are a free namespace (canonical + MCP `mcp:<server>:<tool>` form).
+- **`hook_runs.event` type was bumped in lockstep.** `src/storage/repos/hook-runs.ts` carries a parallel `HookRunsEvent` union — adding `'Eviction'` there at the same time closes the typecheck loop. A future ALTER on the underlying table isn't needed (the column is `TEXT`, not enum-constrained at SQL level).
+
+### Owner integration (deferred)
+
+The contract is fully callable today but unused — owners that propose eviction transitions will fire the hook and inspect the result in their own slices. Memory lifecycle (Phase 1.3) is the first concrete owner; retrieval/policy/compaction wire when their subsystems land. Pattern:
+
+```ts
+const chain = await ctx.fireHook?.({
+  schema: 'v1',
+  event: 'Eviction',
+  sessionId,
+  data: { substrate, objectId, fromState, toState, motivo, actor, ... },
+});
+if (chain?.blockedBy !== null) {
+  appendEvictionEvent(db, { ..., outcome: 'blocked_by_hook', blockedBy: `${layer}:${path}#${idx}` });
+  return /* refuse */;
+}
+appendEvictionEvent(db, { ..., outcome: 'applied' });
+```
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/hooks/types.ts` | Add `'Eviction'` to `HookEvent` union + `BLOCKING_EVENTS`; expand `HookMatcher` with 5 new optional fields; add `EvictionEventData` interface + variant in `HookEventPayload` |
+| `src/hooks/config.ts` | Add `'Eviction'` to `VALID_EVENTS`; expand matcher parser to read `substrate`/`motivo`/`from_state`/`to_state`/`actor` from TOML and map to camelCase; change `let matcher` to `const matcher` (assigning fields, not reassigning) |
+| `src/hooks/dispatcher-matching.ts` | Add `evictionMatcherMatches` (conjunctive per-field exact-string check); call it from `matchesPayload` when `event === 'Eviction'` |
+| `src/hooks/index.ts` | Re-export `EvictionEventData` |
+| `src/storage/repos/hook-runs.ts` | Add `'Eviction'` to `HookRunsEvent` union so audit-write paths typecheck |
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `tests/hooks/eviction-matching.test.ts` | 12 tests on `matchesPayload`: BLOCKING_EVENTS membership, empty matcher passes, per-field admit/reject (×5 fields), conjunction (×2 + a full 5-field shape), event isolation (eviction matcher doesn't leak to tool events; tool matcher doesn't match eviction payload) |
+
+### Files modified (tests)
+
+| File | Change |
+|---|---|
+| `tests/hooks/config.test.ts` | +5 tests: Eviction event accepted; all 5 matcher fields parse (snake_case → camelCase); empty string rejected; non-string rejected; unknown field ignored (forward-compat) |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/hooks/` 170 pass / 0 fail
+- `bun test` 7435 pass / 10 skip / 0 fail (+17 from 1.2.a baseline 7418: +12 matching + +5 config)
+
+### Phase 1.2 — closing summary
+
+Two commits ship the eviction skeleton end-to-end of contract:
+
+| Slice | Commit | What |
+|---|---|---|
+| 1.2.a — storage + state machine | `618c3de` | Table, validator, transition API, queries |
+| 1.2.b — hook event + matcher | (this commit) | `Eviction` event in the dispatcher, 5 new matcher fields, TOML config + matching contract |
+
+What's now possible:
+- Any owner can `fireHook({ event: 'Eviction', ... })` and inspect `HookChainResult.blockedBy` before persisting.
+- Operators can declare TOML rules like `event = "Eviction", matcher = { motivo = "security", to_state = "purged" }` and the dispatcher routes only matching transitions to that hook.
+- `appendEvictionEvent` validates the state-machine transition and persists with the right `outcome` based on the hook chain's verdict.
+
+What's not yet wired (intentional):
+- No owner is calling `fireHook` for Eviction yet. Memory lifecycle (Phase 1.3) is the first concrete consumer.
+- No dispatcher integration test runs an actual `Eviction` hook subprocess end-to-end — the matching contract is covered, the spawn path inherits from `MemoryWrite`'s coverage (same blocking-event class). A full e2e test pairs naturally with the first owner slice.
+
+## [2026-05-14] feat(storage/eviction-events) — schema + state machine + transition API (Phase 1.2.a)
+
+**Done.** First slice of the eviction skeleton (`EVICTION.md`). Lands the canonical `eviction_events` table (announced in Phase 0 AUDIT §1 as audit row 24), the typed state machine for the four substrates (memory / policy / candidate / slot_item) with 7 states and 8 motivos, the transition API (`appendEvictionEvent` validates before INSERT), and the three canonical queries from EVICTION §10.2 (`getLastEvictionForObject`, `listEvictableInWindow`, `detectTriggerThrashing`).
+
+This slice ships the **contract**, not the consumers. Memory entries, policies, retrieval candidates, and slot items will adopt it incrementally — 1.3 wires memory, future slices wire the rest.
+
+### Schema decisions (deviations from spec §10.1)
+
+The spec uses INTEGER PRIMARY KEY; this migration uses TEXT (UUID v4) to match the Forja convention (`memory_events`, `failure_events`, `outcome_signals`). `parent_id` follows suit. `session_id` is nullable with `FK ON DELETE SET NULL` (memory_events pattern) so a session purge preserves forensics — eviction events can fire outside any session (startup probe, GC, hook-driven security purge), and a session purge MUST NOT cascade-delete its audit history.
+
+CHECK constraints close five enums (`substrate`, `from_state`/`to_state`, `motivo`, `outcome`, `actor`); `trigger` stays free TEXT because the 12-element vocabulary will grow as substrates ship (compaction adds `token_pressure`/`turn_threshold` per §9.3; future detectors add more). Writer-layer const set keeps the value space tight without an ALTER per addition.
+
+`blocked_by_hook` is the 1.2.b wiring outcome — added to the CHECK list up front so the hook landing doesn't need a follow-up ALTER.
+
+### State machine
+
+`LEGAL_TRANSITIONS` is a `Record<from, Record<to, motivo[] | 'any'>>` map encoding EVICTION §4.1's table verbatim. Same-state transitions (from === to) are always allowed at the type level — they encode `trigger_fired_no_action` / `blocked_by_*` outcomes where the trigger fired but state didn't change. The validator handles that branch before consulting the table.
+
+`'any'` motivo marks unrestricted pairs (admission gate `proposed → active`, restore `evicted → active`, etc.). The `* → purged` row from §4.1 is encoded explicitly per from-state instead of a wildcard so a future state addition has to be considered (no silent inheritance into purged).
+
+`purged` is terminal: no outgoing transitions. Forensic data (eviction_events metadata) is what survives.
+
+### Transition API
+
+`appendEvictionEvent(db, input)` runs `isLegalTransition` first (throws `IllegalTransitionError` with structured fields), then INSERTs. Defense-in-depth: a future caller bypassing the helper still can't INSERT a typo state thanks to the CHECK constraints. Same TS + DB layering 1.1.a's `context_pins` uses.
+
+`purgeAt` is silently coerced to `null` when `toState !== 'evicted'` (caller-bug guard documented in the comment: callers may forward state from a prior row that had it set).
+
+### Three canonical queries
+
+- `getLastEvictionForObject(substrate, objectId)` — current state + why it landed there, backed by `idx_evict_obj`.
+- `listEvictableInWindow(nowMs)` — restorable evicted rows (purge_at > now), backed by partial index `idx_evict_purge`.
+- `listEvictedDueForPurge(nowMs)` — GC sweep input (purge_at <= now), same index. Pair with the previous: a row sits in one or the other based on `now`.
+- `detectTriggerThrashing(sinceMs, minCount)` — diagnostic surface for misconfigured thresholds / flapping signals (GROUP BY substrate/object_id/trigger HAVING count >= minCount).
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/046-eviction-events.ts` | Table + CHECK on the 5 closed enums + 3 indices (object, state, partial purge) |
+| `src/storage/repos/eviction-events.ts` | Public surface: 5 enum constants, `LEGAL_TRANSITIONS` map, `isLegalTransition` pure validator, `IllegalTransitionError` class, `appendEvictionEvent`, 5 canonical queries |
+| `tests/storage/eviction-events.test.ts` | 36 tests across 7 describe blocks: isLegalTransition (10), appendEvictionEvent insert + defaults (8), DB-level CHECK defense-in-depth (5), FK semantics (2), getLastEvictionForObject (3), listEvictableInWindow + listEvictedDueForPurge (3), detectTriggerThrashing (4) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/index.ts` | Import + register `migration046EvictionEvents` |
+
+### Deferred (1.2.b + later slices)
+
+- **1.2.b** — `Eviction` hook event integration. EVICTION §10.3 specifies a blocking hook chain with matchers on `substrate`/`motivo`/`from_state`/`to_state`/`actor`. Lands separately so the table + state machine can be reviewed without the hook plumbing in the same diff.
+- **Owner integration** — memory entries don't yet emit eviction events (1.3 wires the lifecycle); policies / retrieval / context-tuning compaction wire when their subsystems land. The contract is callable today; nothing is calling it.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/storage/eviction-events.test.ts` 36 pass / 0 fail
+- `bun test` 7418 pass / 10 skip / 0 fail (+36 from post-review C baseline 7382)
+
+## [2026-05-14] chore(pin) — medium/low cleanup pack (post-review C)
+
+**Done.** Bundles the four medium/low code-review findings into one commit so the working tree closes the post-review cycle cleanly. None of these are correctness fixes; they're contract-tightening + test-gap closures that make future reviewers (and the BACKLOG audit trail) faster.
+
+### 1. Render `[kind]` and `(model)` suffix in `[resume_context]` pinned-context block
+
+The renderer was discarding `kind` and `createdBy` entirely (line was `  - ${p.text}`). The review flagged this as making `RecapPinnedContext.createdBy` a dead field at the literal point of consumption — which weakened the case for keeping it in the recap intermediate.
+
+New format:
+- Operator-direct pin: `  - [constraint] API pública não muda`
+- Model-proposed (approved) pin: `  - [workflow] rodar pnpm fmt (model)`
+
+The `[kind]` tag matches the `/pin --list` vocabulary so an operator who pinned it recognizes the line immediately. The `(model)` suffix appears only for `createdBy === 'model_proposed_user_approved'` to keep operator-direct pins (the common case) quiet in the resume block.
+
+### 2. Correct misleading index comment in migration 045
+
+Original comment claimed `idx_context_pins_session_active` covers `getActivePinsBySession`'s NULL-sort behavior — but `EXPLAIN QUERY PLAN` shows the hot read uses the simple `idx_context_pins_session` index (the composite isn't covering because the SELECT pulls every column). The composite's real value is on `countActivePinsBySession`, which IS covered. Rewrote the comment to declare both indices' actual roles so a future maintainer reading the migration doesn't waste time deciding "which one is the hot read?"
+
+### 3. Drop dead `<= 0` branch in `/pin --list` rendering
+
+`formatActivePin` had a defensive `if (remainingMs <= 0) expiresNote = ' (expired)'` branch. The branch is unreachable: `handleList` calls `getActivePinsBySession(store, sessionId, t)` and `formatActivePin(p, t)` with the SAME `t`, so a pin where `expires_at == t` was already filtered out by the strict `> now` predicate. Dropped the branch; replaced the "clock skew" comment with the actual invariant (same `now`).
+
+### 4. Test gaps closed in `tests/storage/context-pins.test.ts`
+
+- `createPin` with an explicit `id` (the replay/import path documented but never exercised by tests).
+- `createPin` with a duplicate `id` — pins the current contract that the repo does NOT wrap the SQLite PRIMARY KEY violation in a structured error. If a future replay-tool slice needs structured errors, the test will surface the regression instead of silently changing replay semantics.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/recap/resume-context.ts` | New `[kind] text (model)?` rendering in the Pinned context block; comment explains the suffix rule |
+| `src/storage/migrations/045-context-pins.ts` | Index comment rewritten to declare the actual role of each index (simple = full-row reads; composite = counts) |
+| `src/cli/slash/commands/pin.ts` | `formatActivePin`: drop the unreachable `<= 0` branch; comment notes the same-`now` invariant |
+| `tests/recap/resume-context.test.ts` | Update the existing 2 pin tests to the new format; +1 new test pinning the `(model)` suffix discriminator |
+| `tests/storage/context-pins.test.ts` | +2 tests for `createPin` `id` override path and duplicate-id throw |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7382 pass / 10 skip / 0 fail (+3 from post-review B baseline 7379: +1 resume-context, +2 storage)
+
+### Post-review closing summary
+
+Three commits address the code review on Phase 1.1:
+
+| Severity | Finding | Commit |
+|---|---|---|
+| High #1 | `pin_context` tool ships dead in production | `c84cecc` |
+| High #2 | `/pin` slash lacked the secret scanner | `710cd29` |
+| Medium #3,4 + Low #6,7,11 | rendering / comments / dead branch / test gaps | (this commit) |
+
+Findings deliberately NOT addressed:
+- **Medium #5** (`ContextPinsStore` location) — the review itself recommended "leave as-is; revisit if 1.1.e adds eviction logic". Trade-off accepted.
+- **Low #8** (off wording on `--remove --kind`), **#9** (`unknown` cast in `valuesForInsert`), **#10** (`sourceStepId` always-string in tool path) — cosmetic nitpicks where the engineering cost outweighs the readability gain.
+
+## [2026-05-14] sec(cli/pin) — secret-only scan on /pin slash (post-review B)
+
+**Done.** Code-review finding High #2: the `/pin` slash skipped `scanForInjection` entirely, leaving a real gap — a copy-paste from a log line containing `sk-ant-...` or `AKIA...` would land literal in `context_pins.text` and re-inject on every goal/resume per spec §12.4.4. Memory's equivalent surface (`/memory promote shared`) already runs `scanForPromotion`; the pin slash was asymmetric.
+
+### Design choice: secret-only, not full injection
+
+The tool path (`pin_context`) runs the full `scanForInjection` per spec §12.4 discipline (model-proposed content gets the strict treatment). The slash path is operator-typed — blocking injection phrases there would be friction (a `/pin "ignore previous instructions"` may be a legitimate operator note about a failure mode the model just hit), but credential leaks have no defensible "operator meant it" reading.
+
+New `scanForSecrets` in `src/memory/scanner.ts` is a strict subset of `scanForInjection` — same `SECRET_PATTERNS` regex set, same `'secret pattern matched'` reason class, skips the `INJECTION_PHRASES` loop. The error message in `/pin` deliberately omits the matched credential ("rotate the secret and retry without it") so the operator doesn't double-paste it into the error trace.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/memory/scanner.ts` | Add `scanForSecrets(text): ScanResult` — exports the secret-pattern check without the injection-phrase pass; reuses the existing `SECRET_PATTERNS` array and `ScanResult` shape |
+| `src/memory/index.ts` | Re-export `scanForSecrets` next to `scanForInjection` / `scanForPromotion` |
+| `src/cli/slash/commands/pin.ts` | Import `scanForSecrets`; call it in `handleCreate` before `store.createPin`; refuse with a hint that intentionally omits the matched pattern; comment explains the asymmetry vs the tool path |
+| `tests/memory/scanner.test.ts` | +5 tests: clean text passes, secret patterns match, reason vocabulary, injection phrases are NOT rejected (the load-bearing distinction), bare prefix without tail passes |
+| `tests/cli/slash/pin.test.ts` | +4 tests: credential rejection (AKIA + sk-ant- shapes), error message does NOT echo the credential, injection phrases ARE accepted on the slash path |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/memory/scanner.test.ts tests/cli/slash/pin.test.ts` 56 pass / 0 fail
+- `bun test` 7379 pass / 10 skip / 0 fail (+9 from post-review A baseline 7370)
+
+## [2026-05-14] chore(tools/pin-context) — omit from BUILTIN_TOOLS while modal wiring is pending (post-review A)
+
+**Done.** Code-review finding High #1: the `pin_context` tool was registered in `BUILTIN_TOOLS` despite `confirmPinContext` not being wired through the REPL — every model invocation would return `pin.headless_mode`, wasting a turn on a proposal that always errors. Filter the tool out of the default registry until the modal-manager wiring lands (deferred UI slice noted in 1.1.b/c).
+
+The export stays so the tool's own test suite (`tests/tools/pin-context.test.ts`) still exercises the contract end-to-end and the harness can re-add to `BUILTIN_TOOLS` in a one-line patch when `ModalManager.askPinContext` + bus event + renderer arrive. Comment in `src/tools/builtin/index.ts` documents the omission rationale and the un-omit recipe.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/index.ts` | Drop the value-import of `pinContextTool` (re-export stays). Remove from `BUILTIN_TOOLS` array. Add comment block explaining the omission and the re-add recipe. |
+| `tests/cli/bootstrap.test.ts` | Drop `'pin_context'` from the alphabetical builtin-tool list assertion. |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test` 7370 pass / 10 skip / 0 fail (unchanged — `pin-context.test.ts` exercises the export directly so the suite is untouched)
+
+## [2026-05-14] feat(recap/pinned-context) — populate from context_pins on resume (Phase 1.1.d)
+
+**Done.** Final slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Closes the loop end-to-end: pins persisted in 1.1.a, surfaced by 1.1.b (model tool) and 1.1.c (operator slash), now show up in `[resume_context]` on `/resume` per §12.4.3.
+
+### What was missing before
+
+The renderer and event surface were already wired:
+- `RecapIntermediate.pinnedContext: RecapPinnedContext[]` field (src/recap/types.ts:69 — `{kind, text, createdBy}`)
+- `resume-context.ts:162` renders pins as `Pinned context (always-include):` block
+- `HarnessEvent.resume_rehydrated` has a `pinCount` field
+
+Only the projection itself was hardcoded to `pinnedContext: []`. This slice replaces that with a real read from the `context_pins` table.
+
+### Implementation
+
+Single helper `collectPinnedContext(db, bundles, now)` reads `getActivePinsBySession` (1.1.a) for every session in scope and maps each pin to the `RecapPinnedContext` shape. `bundles` is already sorted by `session.startedAt` ASC (the projection does this earlier for timeline consistency); within a session, pins return in `created_at ASC` (the repo's natural ordering). The concatenated list reads as a natural pin timeline across sessions.
+
+### Key decisions
+
+- **Shape collapse to `(kind, text, createdBy)` only.** The recap surface drops `id`, `sessionId`, `expiresAt`, `sourceStepId` — the renderer doesn't need them, and exposing them would couple the recap envelope to the storage schema. Auto-rehydrate just re-injects the literal pin text; downstream consumers (JSON forensics) can join back to `context_pins` via the session id already in the recap if they need the wider shape.
+- **`options.now` parameterizes expiry filtering.** Projection already defaults `now` to `Date.now()`; the new helper forwards it to `getActivePinsBySession`. Tests inject fixed timestamps to pin the expiry boundary without flakiness.
+- **Cross-session aggregation comes for free.** Auto-rehydrate's primary consumer is `session_current` scope (one session resumed), so the multi-session branch matters most for `day`/`range` recap renderings — which now show pins from every covered session in chronological order. No code path needed special-casing; the loop over `bundles` is the same regardless of scope.
+- **The renderer's truncation protection stays load-bearing.** `resume-context.ts` already guarantees pins are never truncated when `decisions[]` / `todos[]` exceed the budget (CONTEXT_TUNING §12.4.4); this slice just feeds it real data.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/recap/projection.ts` | Imports `getActivePinsBySession` and `RecapPinnedContext`; adds `collectPinnedContext` helper above `projectRecap`; replaces `pinnedContext: []` with `pinnedContext: collectPinnedContext(db, bundles, now)` |
+| `tests/recap/projection.test.ts` | +4 tests in the existing `projectRecap` describe block: empty session, populates with active pins, filters expired pins via `options.now`, aggregates across sessions in chronological order |
+
+### Fase 1.1 — closing summary
+
+Four commits ship the pinned context primitive end-to-end. Each commit was independently validated (typecheck + lint + full suite) and the working tree was clean after every step:
+
+| Slice | Commit | Net |
+|---|---|---|
+| 1.1.a — storage layer (schema, repo, validation) | `4497f0d` | +786 |
+| 1.1.b — `pin_context` tool (operator-confirmed model surface) | `5da7cdb` | +624 |
+| 1.1.c — `/pin` slash + harness/REPL wiring | `a7b77f4` | +735 / −3 |
+| 1.1.d — recap projection populates `pinnedContext[]` | (this commit) | +159 / −2 |
+
+What pinned context now does in production:
+- Operator pins via `/pin "<text>"` (sync, no modal). Tool surface `pin_context` exists but defers persistence until a `confirmPinContext` modal callback is wired in the REPL — that lands in a separate UI slice when other modal additions warrant the surface.
+- Pins persist to `context_pins` (cascade with sessions, 90d retention per AUDIT §1).
+- Cap of 10 per session enforced atomically inside the repo.
+- On `/resume`, auto-rehydrate's `[resume_context]` block re-injects every active pin literally, never truncated. The `resume_rehydrated` event reports `pinCount` so the renderer can show "🔄 Resumed from <status> — N decisions, M pins, K todos rehydrated".
+
+What's still deferred (per the Phase 0 plan):
+- **Goal re-injection** (CONTEXT_TUNING §10). Subsystem ahead of the current harness; pins ride the same channel when it lands.
+- **Post-compaction re-injection.** `src/harness/compaction.ts` still has the "No pinned context (M3+)" TODO. Pins are not currently re-injected after compaction in-session — they survive `/resume` (audit-rehydrate path), not mid-session compaction.
+- **`confirmPinContext` modal-manager wiring.** New `ModalManager.askPinContext` + bus event + renderer. Waiting on a UI slice with batched modal additions; the tool path returns `pin.headless_mode` cleanly in the interim.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/recap/projection.test.ts` 52 pass / 0 fail
+- `bun test` 7370 pass / 10 skip / 0 fail (+4 from 1.1.c baseline 7366)
+
+## [2026-05-14] feat(cli/pin) — /pin slash command + harness/REPL wiring (Phase 1.1.c)
+
+**Done.** Third slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the operator-facing surface (`/pin <text>` / `/pin --list` / `/pin --remove <id>`) plus the harness/REPL wiring that brings 1.1.a's persistence and 1.1.b's tool surface into production paths. Direct user action — `/pin` writes WITHOUT a confirmation modal because the operator typed the text themselves. The model-proposed equivalent (`pin_context` tool, 1.1.b) is still the only path that uses the modal.
+
+### Split contract: who originates
+
+`created_by` is the discriminator. The two surfaces share the underlying `context_pins` table:
+
+| Surface | `created_by` value | `sourceStepId` |
+|---|---|---|
+| `/pin` (operator typed) | `'user'` | `null` |
+| `pin_context` tool (model proposed → modal confirmed) | `'model_proposed_user_approved'` | `ctx.stepId` |
+
+Recap (1.1.d) reads both shapes and can answer "did the operator pin this, or did the model propose it via approval?" without extra metadata.
+
+### Subcommand behavior
+
+- **`/pin <text...> [--kind X] [--expires-in DUR]`**: creates a pin. All non-flag positional tokens join with `' '` to recover multi-word text (the shared slash parser doesn't support quoted args, same convention as `/memory show <name>`). Flag order flexible — `--kind` and `--expires-in` can appear before, between, or after text tokens. Success line: `pinned <short-id> [<kind>] (N/10 active): <text>`.
+- **`/pin --list`**: active pins for the current session. Header `pins (N/10):`; per-line shows short id, kind, text, and a humanized "expires in Xm/h/d" when applicable. Expired pins are filtered (matches `getActivePinsBySession` semantics from 1.1.a) so the operator sees what's actually re-injected.
+- **`/pin --remove <id>`**: drops the pin. Idempotent shape — unknown id returns a clear `no pin with id '<id>'` error rather than silently no-op.
+- **`/pin --help` / `/pin`** (no args): prints usage block.
+
+### Key implementation decisions
+
+- **Mode flags are mutually exclusive AND incompatible with create flags.** `/pin --list extra` errors out as "positional text not allowed with --list" rather than silently ignoring `extra`. Catches typos that would otherwise behave surprisingly. `--kind` paired with a mode flag is also rejected — operator probably meant `--remove`.
+- **No-session gate.** Pins are session-scoped (`session_id NOT NULL` in the migration); `/pin` errors with "no active session yet — submit a prompt first" rather than letting the FK constraint surface as an opaque SQLite error. Same gate `/memory show` uses, with a clearer hint pointing at the resolution.
+- **Cap reporting cites the cap directly.** Error message is `cap reached (10/10); remove one first via /pin --remove <id>` — turns the failure into an actionable next step instead of a bare "cap exceeded".
+- **Default `--help` when no args.** `/pin` without arguments returns usage notes (success-shaped) rather than an error. Operators discovering the command get the contract; explicit create mode with empty text still errors ("missing text") so a programmer typo doesn't disguise itself as help.
+- **One `ContextPinsStore` instance for the REPL lifetime.** Constructed once at REPL boot from `db`, threaded into both the `SlashContext` (so `/pin` reads/writes) and each turn's `HarnessConfig.contextPinsStore` (so the `pin_context` tool reads/writes through `ToolContext`). Both surfaces share the table — single source of truth.
+- **Modal-manager wiring for `confirmPinContext` deferred.** The tool's `pin.headless_mode` path still fires in production because no `confirmPinContext` callback is wired in the REPL yet — that needs new event types in the bus + modal renderer (memory-write-shaped surface). Lands in a separate UI slice; `/pin` works fully without it because the slash command is direct-user.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/commands/pin.ts` | The slash command: parsing (mode + flags + positional text), create/list/remove handlers, expiry rendering, cap-aware error messages |
+| `tests/cli/slash/pin.test.ts` | 27 tests across 6 describe blocks: create happy path (6) + --list (4) + --remove (3) + validation/mutual-exclusivity (10) + cap/unwired (3) + headless variants |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/cli/slash/index.ts` | Imports `pinCommand` and inserts it in `builtinsWithoutHelp` between `memoryCommand` and `hooksCommand` |
+| `src/cli/slash/types.ts` | Adds `contextPinsStore?: ContextPinsStore` to `SlashContext` (so `/pin` can dispatch without reaching into raw queries) |
+| `src/harness/types.ts` | Adds `contextPinsStore?: ContextPinsStore` to `HarnessConfig`; imports the type next to `MemoryRegistry` |
+| `src/harness/loop.ts` | Threads `config.contextPinsStore` into the `ToolContext` conditional-spread block, mirroring `memoryRegistry` |
+| `src/cli/repl.ts` | Imports `createContextPinsStore`, instantiates one store from `db` at REPL boot, passes the same instance into `slashCtx` AND each `startTurn`'s `HarnessConfig` so both surfaces share the table |
+| `tests/cli/slash/dispatch.test.ts` | Updates the builtin-list snapshot: 15 → 16, inserts `'pin'` between `'memory'` and `'hooks'`; corresponding help-output line count 18 → 19 |
+
+### Deferred
+
+- **`confirmPinContext` callback in REPL (modal manager wiring).** Requires `askPinContext` on `ModalManager`, new `pin:ask` event in the bus, and renderer support. Tool surface (1.1.b) already declares `pin.headless_mode` for the unwired case; production runs return that cleanly. Lands in a UI slice when other modal additions warrant the surface.
+- **1.1.d — recap projection populating `pinnedContext[]`.** Schema and renderer already exist (`src/recap/types.ts:69`, `src/recap/resume-context.ts:162`); only the projection needs to read `context_pins` for the session.
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/cli/slash/pin.test.ts` 27 pass / 0 fail
+- `bun test` 7366 pass / 10 skip / 0 fail (+27 from 1.1.b baseline 7339, +2 dispatch snapshot updates restored)
+
+## [2026-05-14] feat(tools/pin-context) — operator-confirmed model surface for pinned context (Phase 1.1.b)
+
+**Done.** Second slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the model-facing tool — `pin_context(text, kind?, expires_in?)` — that opens a confirmation modal idêntico ao memory_write. The model never persists a pin without operator approval; this gate is what turns a model proposal into the persistent state 1.1.a's repo can carry.
+
+### Pipeline mirrors memory_write's discipline
+
+Each gate is independent so audit shows exactly where a proposal died:
+
+1. Plumbing checks — aborted? store wired?
+2. Schema/shape — text non-empty + ≤ 500 chars, kind in enum, expires_in parses (delegates to `parseDuration`).
+3. Injection scanner — re-uses `scanForInjection` from the memory subsystem. Pin text is short (≤ 500 chars) so false-positive cost is trivial; the upside is closing a vector where a model proposes `"ignore previous instructions"` and the operator habit-confirms. Audit trail records the block; the hint to the model intentionally omits the matched pattern (mirror of memory_write §7.3 reasoning — surfacing it would teach a future prompt how to bypass).
+4. Headless rejection — when `confirmPinContext` is unwired (CI, one-shot, subagent), refuse with `pin.headless_mode`. Same shape as memory_write §5.1.6.
+5. Modal confirm — operator decides. `yes` persists; `no` and `cancel` return distinct rejected reasons so the model can echo the right thing back.
+6. Persist via `store.createPin`. The cap of 10 (PIN_CAP) is enforced atomically inside the repo (1.1.a); surfaces here as `PinCapExceededError` → mapped to `pin.cap_exceeded` tool error with `details: { currentCount, cap, sessionId }` so the model can recommend `/pin --remove`.
+
+### Key implementation decisions
+
+- **`created_by` hard-wired to `'model_proposed_user_approved'` on this surface.** The `user` value belongs to `/pin` (1.1.c) where the operator types the text directly. Splitting the axis across the two surfaces lets recap/audit answer "did the model propose this, or did the operator pin it themselves?" without extra metadata.
+- **`sourceStepId` populated from `ctx.stepId`** so the recap projection (1.1.d) can answer "which step led to this pin?" without digging through the message timeline.
+- **`writes: true, escapesCwd: true, requiresOperatorConfirm: true, planSafe omitted`.** Pin persists to `sessions.db` (outside the worktree → escapesCwd), goes through a modal (→ requiresOperatorConfirm), and is the wrong phase during planning (→ planSafe omitted = default-block in plan mode).
+- **Rejected outcome returned as success-shaped, not ToolError.** Operator decline is a structured answer to a proposal, not a failure mode. Same convention as memory_write — the model sees the rejected outcome and can echo the rationale back.
+- **Headless = harness without `confirmPinContext` wired.** Subagent contexts inherit this naturally (no IPC modal pipe), same as memory_write. The subagent validator's `requiresOperatorConfirm` gate (declared in `ToolMetadata`) is what excludes the tool from subagent whitelists at config time.
+- **No hook chain (yet).** memory_write fires the blocking `MemoryWrite` hook event; pin_context could mirror that pattern but the use-case is thinner (operator already confirmed; policy-driven hook is overkill for a session-scoped marker). Deferred until a concrete need surfaces.
+- **No trust gate (§7.2.1 of MEMORY).** Pins are per-session by spec (§12.4.1) — cross-session pins violate the memory contract. An untrusted cwd doesn't change the pin's blast radius (it dies with the session anyway).
+
+### Wiring deferred to 1.1.c
+
+`ContextPinsStore` factory exists and `ToolContext.contextPinsStore` / `confirmPinContext` fields are declared, but the **harness wiring** (loop.ts instantiating the store, REPL wiring `confirmPinContext` to the modal manager) is deferred to 1.1.c so it lands alongside the `/pin` slash command — both consumers wired together. In the interim, production runs of `pin_context` return `pin.store_unavailable` cleanly; tests construct the store directly through `makeCtx` overrides.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/tools/builtin/pin-context.ts` | The tool: input schema, validation, injection scanner pass, headless gate, modal confirm, persist via store with cap-error mapping |
+| `tests/tools/pin-context.test.ts` | 18 tests across 7 describe blocks: happy path (3) + decline/cancel (2) + headless/unwired (3) + input validation (5) + injection scanner (2) + cap enforcement (1) + metadata (2) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/repos/context-pins.ts` | Added `ContextPinsStore` interface + `createContextPinsStore` factory (wraps the db handle so tools/slash don't reach into raw queries) |
+| `src/tools/types.ts` | Added `contextPinsStore?: ContextPinsStore` and `confirmPinContext?: (req: { text, kind, expiresAt }) => Promise<'yes' \| 'no' \| 'cancel'>` to `ToolContext`; imported `PinKind` for the request shape |
+| `src/tools/builtin/index.ts` | Imported + exported `pinContextTool` (with input/output types); inserted in `BUILTIN_TOOLS` between `memoryWriteTool` and the bash group (write-tools section) |
+| `tests/tools/_helpers.ts` | Extended `makeCtx` with conditional spreads for `contextPinsStore` and `confirmPinContext` overrides, mirroring the existing memoryRegistry/confirmMemoryWrite pattern |
+| `tests/cli/bootstrap.test.ts` | Added `'pin_context'` to the alphabetical builtin-tool list assertion |
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/tools/pin-context.test.ts` 18 pass / 0 fail
+- `bun test` 7339 pass / 10 skip / 0 fail (+18 from baseline 7321; +1 bootstrap-list assertion updated, same total count)
+
+## [2026-05-14] feat(storage/context-pins) — schema + repo + validation (Phase 1.1.a)
+
+**Done.** First implementation slice of the pinned context primitive (`CONTEXT_TUNING.md §12.4`). Lands the persistence contract — table, repo, validation, duration parser — without yet wiring it to a tool / slash / projection (those are 1.1.b–d). Pinned context is the primitive that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate; without persistence there's nothing for downstream consumers to read.
+
+`context_pins` is the canonical home announced in Phase 0 (AUDIT §1 row, retention 90d, cascade with sessions). This slice materializes that row.
+
+### Key implementation decisions
+
+- **Cap of 10 pins per session enforced in code, not via CHECK.** SQLite CHECK can't reference COUNT subqueries. `createPin` uses `withImmediateTransaction` so a count + insert sequence runs under the writer lock — two concurrent `createPin` calls from the slash command and the model-proposed tool path can't both pass a 9-pin check and land an 11th row. Surfaces as `PinCapExceededError` (structured class with `sessionId/currentCount/cap` fields) so UI can render a specific message instead of parsing a generic SQLite error string.
+- **Cap counts ALL pins including expired ones.** Matches spec literal "10 pins per session". Operator must remove explicitly — alternative ("silently allow creation after expiry") would hide resource pressure and surprise the user when an expired pin briefly resurfaces. Test pins this behavior so a future refactor can't drift.
+- **CASCADE on `sessions(id)`, not SET NULL.** Pin without a session is meaningless (per-session by design, §12.4.1 forbids cross-session pins). Contrasts with `memory_events` (SET NULL, audit rows carry standalone value). AUDIT §1 declared this retention behavior; the migration matches.
+- **Validation layered: TS first, SQL CHECK as defense-in-depth.** Repo `validateInput` catches kind/created_by enum violations, empty text, > 500 chars, non-positive `expires_at` — and throws structured `InvalidPinError` with `field` hint. SQL CHECK rejects the same shapes for any future caller that bypasses the repo (import script, replay tool). Tests cover both paths.
+- **Duration parser is repo-local, not a shared util.** `parseDuration("30m"|"2h"|"1d") → ms` is the only place in the codebase that parses durations this way; promoting to a shared helper would invent shared surface area for one call site. Rejects compound forms (`1h30m`), fractional (`1.5h`), zero, negative, > 365d ceiling. Throws `InvalidDurationError extends InvalidPinError` so the slash/tool layers can surface a field-level error to the UI without re-implementing the check.
+- **`UNIT_MS` typed `as const` + literal union narrow** rather than `Record<string, number>` + non-null assertions. Biome rejects `!` non-null assertions; the narrow makes the code total at the type level instead of trusting a regex contract that compiles to a runtime cast.
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/storage/migrations/045-context-pins.ts` | Table + indices (id PK, session_id FK CASCADE, text CHECK length ≤ 500, kind/created_by CHECK enums, expires_at nullable, source_step_id nullable); two indices on session_id alone and (session_id, expires_at) for active-pin filtering |
+| `src/storage/repos/context-pins.ts` | Public surface: `createPin` / `getPin` / `listPinsBySession` / `getActivePinsBySession` / `countActivePinsBySession` / `removePin`; structured errors `PinCapExceededError` / `InvalidPinError` / `InvalidDurationError`; `parseDuration` helper; constants `PIN_CAP=10`, `PIN_TEXT_MAX_LENGTH=500`, `PIN_KINDS`, `PIN_CREATED_BY` |
+| `tests/storage/context-pins.test.ts` | 33 tests across 6 describe blocks: create+read, cap enforcement (per-session + freed-after-remove + includes-expired + error fields), active filtering (boundary inclusive/exclusive semantics), TS-level validation, DB CHECK defense-in-depth, CASCADE + removePin, parseDuration (units, trim, compound rejection, ceiling) |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/index.ts` | Import + register `migration045ContextPins` |
+
+### Deferred (next slices)
+
+- **1.1.b** — `pin_context` tool with operator-confirmed modal (template: `tools/builtin/memory-write.ts`)
+- **1.1.c** — `/pin` slash command parser + dispatcher
+- **1.1.d** — populate `RecapIntermediate.pinnedContext[]` from `context_pins` in the recap projection so the already-wired `resume-context.ts:162` rendering picks it up
+
+Goal re-injection and post-compaction injection remain deferred per the Phase 0 plan — both wait on subsystems not yet implemented (goal stack in harness loop; compaction maturity past the "No pinned context (M3+)" TODO already in `src/harness/compaction.ts`).
+
+### Verification
+
+- `bun run typecheck` clean
+- `bun run lint` 0 errors 0 warnings
+- `bun test tests/storage/context-pins.test.ts` 33 pass / 0 fail
+- `bun test` 7321 pass / 10 skip / 0 fail (+33 from baseline 7288)
+
+## [2026-05-14] spec(memory/context) — stitch RETRIEVAL/FEEDBACK_ADAPTATION/EVICTION into existing docs (Phase 0)
+
+**Done.** Three new spec docs landed in `docs/spec/` (`RETRIEVAL.md`, `FEEDBACK_ADAPTATION.md`, `EVICTION.md`) covering context selection pipeline, harness-side adaptation loops, and typed lifecycle/eviction governance. They referenced sections in `AUDIT.md`, `MEMORY.md`, `CONTEXT_TUNING.md`, and `AGENTIC_CLI.md` that didn't yet have the corresponding hooks, leaving the architecture as three islands.
+
+This is the **non-code Phase 0**: weave the three new specs into the existing surface so schemas, lifecycle, and indices are coherent. No source-tree changes; spec-only. Phase 1 (implementation of pinned context + eviction skeleton + memory lifecycle) is gated on this stitching.
+
+Six incremental sub-steps, each with explicit user approval before applying:
+
+- **0.1 — AUDIT §1 schema canon.** Table count 23 → 28: added `outcomes` (FEEDBACK generalist, tier 1-5), `eviction_events`, `policies` (forever retention), `retrieval_trace`, `context_pins` (canonical home for the schema declared in CONTEXT_TUNING §12.4.2). New §1.1.1 declares the `outcome_signals` × `outcomes` coexistence rule (no dual-write; permission-engine emits to `outcome_signals`, generalist callers emit to `outcomes`). TOML retention block updated.
+- **0.2 — FEEDBACK_ADAPTATION §3.1 cross-ref.** Blockquote at top of §3.1 anchoring the `outcomes` table scope and linking back to AUDIT §1.1.1 and PERMISSION_ENGINE §6.3.2. Reinforces "no dual-write" and JOIN-explicit pattern.
+- **0.3 — MEMORY lifecycle.** New §3.1.1 introduces optional `state` field on the frontmatter (subset of EVICTION §3: `proposed | active | quarantined | invalidated | evicted | purged`; `shadow` deliberately excluded — semantic overlap with `trust: untrusted`). New §6.5 with 7 sub-subsections covers admission gate, `active → quarantined`, `quarantined → evicted`, retention windows per sub-scope, restore semantics, `invalidated` corner case, and irreversible purge. `.tombstones/` directories added to §2.1 (user scope) and §2.2 (project scope, with the explicit call-out that shared tombstones are versioned in git while local ones cascade-ignore). §5.3 `action` enum extended with state-transition values; new paragraph documents the paired emission (`memory_events` + `eviction_events`).
+- **0.4 — CONTEXT_TUNING §12.4 consistency.** Header cross-refs extended to AUDIT §1 (audit-table canon) and EVICTION §6.2 / §9.5 (absolute protection gate). §12.4.2 gains an audit-table note. §12.4.4 first guarantee ("Nunca elididos") now explicitly cites EVICTION §6.2 and §9.5.
+- **0.5 — AGENTIC_CLI index + Context Engine overview.** §0.1 docs index gets three new rows positioned thematically: `EVICTION.md` (after AUDIT), `RETRIEVAL.md` (after CONTEXT_TUNING), `FEEDBACK_ADAPTATION.md` (after FEATURE_FLAGS). §6 overview gains a "Driver de seleção" blockquote (WHAT vs HOW split: RETRIEVAL decides what enters context; CONTEXT_TUNING formats what already entered). The Compaction sub-section gets a closing paragraph declaring "Compaction = retrieval re-query with smaller budget" and cross-refs RETRIEVAL §15.5, EVICTION §9, CONTEXT_TUNING §12.4, and the ORCHESTRATION §4.6 fallback.
+- **0.6 — Cross-doc consistency pass.** Scripted validation across all numbered refs in the three new specs (and the 26 refs introduced during 0.1-0.5). Found two broken refs — both `§0.N` shapes pointing at items inside the numbered "Princípios" list rather than real subsections (`RETRIEVAL §0` cited `CODE_INDEX.md §0.8`; `EVICTION §0` cited `RETRIEVAL.md §0.10`). Rewrote both to `§0 princípio N` so the link target is unambiguous. Final pass: zero broken refs.
+
+### Key architectural decisions captured in the stitching
+
+- **`outcome_signals` and `outcomes` coexist.** Kept the two tables separate (reversing an earlier consideration to unify). `outcome_signals` stays derived-audit (hash-chained via `approvals_log.seq`) and scoped to permission-engine calibration; `outcomes` is generalist (tier 1-5, `action_signature` L1-L4) for the FEEDBACK adaptation loops. Coexistence rule lives in AUDIT §1.1.1.
+- **Memory state in the frontmatter, not in a separate table.** Keeps memory files self-contained, auditable via `cat`/`vim`/`git diff`, and consistent with MEMORY §0 principle 9 (markdown, not vector). Audit goes through `memory_events` (action enum extended) plus `eviction_events` (cross-substrate); they're emitted as a pair on every transition.
+- **Shared tombstones are versioned in git, local tombstones cascade-ignore.** Surfaces eviction history cross-team for shared memory (restorable via `git checkout` even past the retention window); preserves per-dev privacy for local. Mirrors the existing `shared` vs `local` split in §2.2.
+- **Phase 1 scope frozen as conservative v1.** Pinned context + eviction skeleton + full memory lifecycle. RETRIEVAL v1 (no embedding) and FEEDBACK_ADAPTATION v1 (L1-L2 only) deferred to the next wave so the foundation can settle first.
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `docs/spec/AUDIT.md` | §1 table +5 rows; new §1.1.1 (`outcome_signals` × `outcomes` coexistence); §1.2 TOML retention extended |
+| `docs/spec/FEEDBACK_ADAPTATION.md` | §3.1 scope blockquote with cross-refs to AUDIT §1.1.1 and PERMISSION_ENGINE §6.3.2 |
+| `docs/spec/MEMORY.md` | §3.1 frontmatter + new §3.1.1; §2.1/§2.2 `.tombstones/` paths; §5.3 action enum extended + paired-event note; new §6.5 with 7 sub-subsections |
+| `docs/spec/CONTEXT_TUNING.md` | §12.4 header cross-refs; §12.4.2 audit-table note; §12.4.4 first guarantee re-anchored on EVICTION §6.2/§9.5 |
+| `docs/spec/AGENTIC_CLI.md` | §0.1 index +3 rows; §6 overview blockquote + Compaction integration paragraph |
+| `docs/spec/RETRIEVAL.md` | §0 princípio 2: broken ref `CODE_INDEX.md §0.8` → `CODE_INDEX.md §0 princípio 8` |
+| `docs/spec/EVICTION.md` | §0 princípio 5: broken ref `RETRIEVAL.md §0.10` → `RETRIEVAL.md §0 princípio 10` |
+
+### Verification
+
+- Cross-doc ref audit: scripted check of every numbered ref in the three new specs and every cross-ref added during 0.1-0.5. Final count: 0 broken refs.
+- File-existence check across all markdown links: 100% resolved.
+- No code, no test impact: spec-only change. `bun test` / `bun run typecheck` / `bun run lint` not relevant for this entry.
+
 ## [2026-05-14] fix(bg/manager) — honor documented `maxLogBytes: 0` unbounded sentinel
 
 **Done.** `SpawnInput.maxLogBytes` doc said: "use 0 to disable the cap — file grows unbounded, same as pre-cap behavior." The runtime validator rejected `0` with `bg spawn: maxLogBytes must be >= 1024 or Infinity` because `0 < 1024`. Internal/tooling callers following the interface docs hit a hard error on the documented unbounded shape.

@@ -42,6 +42,27 @@ import { migration041FailureEvents } from './041-failure-events.ts';
 import { migration042OutcomeSignals } from './042-outcome-signals.ts';
 import { migration043BgBytesDropped } from './043-bg-bytes-dropped.ts';
 import { migration044HookRunsPostToolUseFailure } from './044-hook-runs-post-tool-use-failure.ts';
+import { migration045ContextPins } from './045-context-pins.ts';
+import { migration046EvictionEvents } from './046-eviction-events.ts';
+import { migration047EvictionHookRuns } from './047-eviction-hook-runs.ts';
+import { migration048MemoryEventsLifecycleActions } from './048-memory-events-lifecycle-actions.ts';
+import { migration049Outcomes } from './049-outcomes.ts';
+import { migration050Policies } from './050-policies.ts';
+import { migration051DispatchRewrites } from './051-dispatch-rewrites.ts';
+import { migration052EvictionThrashingScope } from './052-eviction-thrashing-scope.ts';
+import { migration053RetrievalTrace } from './053-retrieval-trace.ts';
+import { migration054MemoryProvenance } from './054-memory-provenance.ts';
+import { migration055SharedCorpusTrust } from './055-shared-corpus-trust.ts';
+import { migration056MemoryGovernanceProposals } from './056-memory-governance-proposals.ts';
+import { migration057MemoryVerifyAttempts } from './057-memory-verify-attempts.ts';
+import { migration058SubagentRunsScopeBuiltinAndApproval } from './058-subagent-runs-scope-builtin-and-approval.ts';
+import { migration059MemoryVerifyAttemptsFkDiscipline } from './059-memory-verify-attempts-fk-discipline.ts';
+import { migration060MemoryVerifyAttemptsBackfillDrift } from './060-memory-verify-attempts-backfill-drift.ts';
+import { migration061MemoryConflictAttempts } from './061-memory-conflict-attempts.ts';
+import { migration062MemoryGovernanceProposalsDefer } from './062-memory-governance-proposals-defer.ts';
+import { migration063MemoryEventsDeferredAction } from './063-memory-events-deferred-action.ts';
+import { migration064MemoryOverrideEvents } from './064-memory-override-events.ts';
+import { migration065MemoryVerifyOverrideAttempts } from './065-memory-verify-override-attempts.ts';
 
 export interface Migration {
   id: number;
@@ -94,4 +115,25 @@ export const MIGRATIONS: readonly Migration[] = [
   migration042OutcomeSignals,
   migration043BgBytesDropped,
   migration044HookRunsPostToolUseFailure,
+  migration045ContextPins,
+  migration046EvictionEvents,
+  migration047EvictionHookRuns,
+  migration048MemoryEventsLifecycleActions,
+  migration049Outcomes,
+  migration050Policies,
+  migration051DispatchRewrites,
+  migration052EvictionThrashingScope,
+  migration053RetrievalTrace,
+  migration054MemoryProvenance,
+  migration055SharedCorpusTrust,
+  migration056MemoryGovernanceProposals,
+  migration057MemoryVerifyAttempts,
+  migration058SubagentRunsScopeBuiltinAndApproval,
+  migration059MemoryVerifyAttemptsFkDiscipline,
+  migration060MemoryVerifyAttemptsBackfillDrift,
+  migration061MemoryConflictAttempts,
+  migration062MemoryGovernanceProposalsDefer,
+  migration063MemoryEventsDeferredAction,
+  migration064MemoryOverrideEvents,
+  migration065MemoryVerifyOverrideAttempts,
 ];

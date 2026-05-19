@@ -206,6 +206,12 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       name: args.subagent,
       prompt: args.prompt,
       declaredCapabilities,
+      // Migration 058: forward the approval id that authorized this
+      // tool call so the spawned child's audit row links back to it
+      // (PERMISSION_ENGINE.md §10.2). Spread keeps the field absent
+      // when ctx.approvalId isn't populated (test contexts that
+      // construct ToolContext without invoke-tool).
+      ...(ctx.approvalId !== undefined ? { parentApprovalId: ctx.approvalId } : {}),
     });
     // Audit: the synchronous task family hits the dispatcher
     // first (no pre-flight check), so the three refusal kinds

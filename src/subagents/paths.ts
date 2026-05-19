@@ -46,3 +46,16 @@ export const userAgentsDir = (
 
 export const projectAgentsDir = (cwd: string): string =>
   pathMod(process.platform).join(cwd, '.agent', 'agents');
+
+// Built-in subagent definitions ship inside the binary at
+// `src/subagents/builtin/`. Returned as an absolute path computed at
+// module-load time via `import.meta.dir`. Dev runs (`bun run dev`)
+// resolve to the source path directly and the loader reads from
+// disk. Compiled binaries (`bun build --compile`) instead surface a
+// virtual `/$bunfs/...` path that `readdirSync` cannot enumerate —
+// the loader detects the empty filesystem result and falls back to
+// `EMBEDDED_BUILTINS` (Bun text imports inlined at compile time, see
+// `./builtin/index.ts`). The fallback ONLY triggers for the default
+// path so a custom `builtinDir` passed to `loadSubagents` keeps its
+// fixture semantics (zero builtins stays zero).
+export const BUILTIN_AGENTS_DIR = pathMod(process.platform).join(import.meta.dir, 'builtin');

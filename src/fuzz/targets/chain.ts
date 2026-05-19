@@ -27,6 +27,16 @@
 // at the tail, may leave the chain verifiably intact. The
 // invariant is structural (no throw + valid shape), not "always
 // returns ok:false".
+//
+// Performance note: the migration set grew from ~50 rows when this
+// target shipped to 60+ today, and `openMemoryDb + migrate` now
+// costs ~25ms per call — i.e. ~5s for 200 iterations, right at
+// the bun:test default timeout. To keep the 200-iteration headline
+// invariant feasible under the default budget, the target lazily
+// memos one shared in-memory DB across iterations and truncates
+// `approvals_log` between runs. Migrations run exactly once per
+// module-load instead of 200 times. Net per-iteration cost drops
+// to ~1ms; the seed→tamper→verify path is otherwise identical.
 
 import { createSqliteSink, ensureInstallId } from '../../permissions/index.ts';
 import { type DB, MIGRATIONS, migrate, openMemoryDb } from '../../storage/index.ts';
@@ -183,8 +193,13 @@ export const chainFuzzTarget: FuzzTarget<ChainFuzzInput> = {
   format: (input) =>
     `rowCount=${input.rowCount} tamperKind=${input.tamperKind} rowIndex=${input.rowIndex} fieldIndex=${input.fieldIndex} payload=${JSON.stringify(input.payload)}`,
   run: (input) => {
-    const db = openMemoryDb();
-    migrate(db, MIGRATIONS);
+    const db = getSharedDb();
+    // Truncate between iterations — the migration cost is paid
+    // once; each iteration just rewrites the rows it cares about.
+    // `approvals_log` is the only table the seedChain path
+    // populates, so clearing it is enough; other tables stay
+    // untouched verbatim.
+    db.run('DELETE FROM approvals_log');
     const { sink } = seedChain(db, input.rowCount);
     applyTamper(db, input);
     // verifyChain MUST NOT throw — wrap in try/catch so the
@@ -199,4 +214,19 @@ export const chainFuzzTarget: FuzzTarget<ChainFuzzInput> = {
       throw new Error(`verifyChain returned malformed result: ${JSON.stringify(result)}`);
     }
   },
+};
+
+// Lazily memoized in-memory DB. Reused across all chain fuzz
+// iterations to amortize the migration cost (see file header). The
+// `approvals_log` truncate inside `run()` resets the per-iteration
+// state so the seed→tamper→verify shape stays equivalent to opening
+// a fresh DB each time. Lives for the lifetime of the module — the
+// bun:test process exits between runs, so no cross-test leakage.
+let sharedDb: DB | null = null;
+const getSharedDb = (): DB => {
+  if (sharedDb !== null) return sharedDb;
+  const db = openMemoryDb();
+  migrate(db, MIGRATIONS);
+  sharedDb = db;
+  return db;
 };

@@ -71,6 +71,73 @@ export interface ProtectedClassifyInput {
 // some embedded) still have a real `/var/run`.
 const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev', '/run', '/var/run'];
 
+// Carve-outs from the deny prefixes above. Two real user-facing
+// paths live under `/run` on modern Linux:
+//   - `/run/media/<user>/<volume>` — mount points for removable
+//     media (udisks2, the default mount surface on Debian / Ubuntu /
+//     Arch / Manjaro / Fedora etc.). An operator can legitimately
+//     have their working repo on an external drive; everything
+//     under this prefix is a regular filesystem they own.
+//   - `/run/user/<uid>` — XDG_RUNTIME_DIR. Per-user runtime state
+//     (often a tmpfs scoped to the login session). Standard target
+//     for application config, IPC, and ephemeral caches; users
+//     write here all day. NOT the same as the system-wide sockets
+//     in /run/dbus, /run/systemd, etc.
+// Refusing deny for paths starting with these prefixes preserves
+// the original threat coverage (privileged daemon sockets stay
+// blocked) without false-positiving user workspaces.
+const SYSTEM_DENY_EXCEPTIONS: readonly string[] = ['/run/media', '/run/user'];
+
+// Subpath names inside /run/user/<uid> that contain user-scoped IPC
+// sockets and credential-adjacent endpoints. The /run/user carve-out
+// above re-admits arbitrary file reads/writes for the XDG_RUNTIME_DIR
+// case (legitimate operator workflows store per-session config/cache
+// there), but THESE subpaths are exactly the surface the /run deny
+// tier was added to block: ssh-agent / gpg-agent sockets, the user
+// dbus bus, container engines, Wayland, etc. Re-denying them inside
+// the carve-out preserves the legitimate use case (regular files
+// under $XDG_RUNTIME_DIR/<app>/) while keeping the agent off the
+// privileged-IPC attack surface. Pattern: an exact segment match
+// against the FIRST path segment after `/run/user/<uid>/`.
+const XDG_RUNTIME_SOCKET_SEGMENTS: readonly string[] = [
+  'bus', // user dbus socket (modern systemd)
+  'dbus-1', // dbus internals
+  'dbus-session', // legacy dbus session bus file
+  'gnupg', // S.gpg-agent, S.gpg-agent.ssh, S.scdaemon, S.dirmngr
+  'keyring', // gnome-keyring sockets (ssh, control)
+  'podman', // podman.sock + libpod runtime
+  'docker.sock', // docker socket if rootless docker stored here
+  'pulse', // pulseaudio native socket
+  'pipewire-0', // pipewire socket
+  'pipewire-0-manager', // pipewire manager
+  'systemd', // user systemd manager (notify, units, etc.)
+];
+
+// Matches a top-level Wayland display socket file at
+// /run/user/<uid>/wayland-<N> (`wayland-0`, `wayland-0.lock`, etc.).
+const WAYLAND_SOCKET_RE = /^wayland-\d+/;
+
+// Returns true when absPath is a `/run/user/<uid>/<sensitive>...`
+// IPC endpoint that the carve-out should NOT re-admit. Anchors on
+// the first segment after the uid directory; allows any other
+// subpath through (the legitimate XDG_RUNTIME_DIR file workflow).
+const isXdgRuntimeSensitive = (absPath: string): boolean => {
+  const prefix = '/run/user/';
+  if (!absPath.startsWith(prefix)) return false;
+  const rest = absPath.slice(prefix.length);
+  const uidEnd = rest.indexOf('/');
+  if (uidEnd === -1) return false;
+  const uid = rest.slice(0, uidEnd);
+  if (uid.length === 0 || !/^\d+$/.test(uid)) return false;
+  const afterUid = rest.slice(uidEnd + 1);
+  if (afterUid.length === 0) return false;
+  const nextSegEnd = afterUid.indexOf('/');
+  const nextSeg = nextSegEnd === -1 ? afterUid : afterUid.slice(0, nextSegEnd);
+  if (XDG_RUNTIME_SOCKET_SEGMENTS.includes(nextSeg)) return true;
+  if (WAYLAND_SOCKET_RE.test(nextSeg)) return true;
+  return false;
+};
+
 // Tilde-rooted files that escalate on write. Each entry is
 // resolved against the operator's `$HOME` at classification time.
 // Lists canonical shell rc files plus the agent's own config
@@ -233,9 +300,28 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
   const { absPath, op, home, cwd } = input;
 
   // Tier `deny` — applies to reads and writes alike. SYSTEM_DENY_ROOTS
-  // is a constant (no per-call resolve needed).
+  // is a constant (no per-call resolve needed). Exceptions list
+  // covers user-facing carve-outs inside /run (see comment on
+  // SYSTEM_DENY_EXCEPTIONS): /run/media/<user> for removable media
+  // mount points, /run/user/<uid> for XDG_RUNTIME_DIR.
   for (const root of SYSTEM_DENY_ROOTS) {
-    if (startsWithSegment(absPath, root)) return 'deny';
+    if (!startsWithSegment(absPath, root)) continue;
+    let excepted = false;
+    for (const ex of SYSTEM_DENY_EXCEPTIONS) {
+      if (startsWithSegment(absPath, ex)) {
+        excepted = true;
+        break;
+      }
+    }
+    if (excepted) {
+      // Re-deny known XDG_RUNTIME_DIR socket/IPC subpaths even when
+      // the broader /run/user carve-out matched — those are exactly
+      // the user-scoped IPC surface the /run deny tier was meant to
+      // block (ssh-agent, gpg-agent, user dbus, podman, Wayland, …).
+      if (isXdgRuntimeSensitive(absPath)) return 'deny';
+      continue;
+    }
+    return 'deny';
   }
 
   // Tier `escalate` — only writes/deletes are upgraded. Reads pass

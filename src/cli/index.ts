@@ -91,6 +91,11 @@ const main = async (): Promise<number> => {
       // (worktree paths are never on the trust list, so a
       // re-resolve would default-deny every worktree subagent).
       ...(args.subagentCwdTrusted === true ? { cwdTrusted: true } : {}),
+      // S5 CRIT/H3: shared-corpus trust verdict from parent. Set
+      // when the parent's probe returned non-confirmed; child
+      // mirrors the fail-closed posture on eager-load AND
+      // retrieve_context.
+      ...(args.subagentSharedScopeOffline === true ? { sharedScopeOffline: true } : {}),
       // Per-subagent bg log directory. Threaded across by the
       // parent so background-process tools work for the child
       // without colliding with the parent's bg state.

@@ -11,7 +11,11 @@ import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
 import { monitorTool } from './monitor.ts';
+// pinContextTool is re-exported (line ~52) but intentionally not
+// imported here — see the BUILTIN_TOOLS comment for why it is
+// omitted from the default registry.
 import { readFileTool } from './read-file.ts';
+import { retrieveContextTool } from './retrieve-context.ts';
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
@@ -48,9 +52,12 @@ export type {
 export { memoryWriteTool } from './memory-write.ts';
 export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { monitorTool } from './monitor.ts';
+export { pinContextTool } from './pin-context.ts';
+export type { PinContextInput, PinContextOutput } from './pin-context.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
+export { retrieveContextTool } from './retrieve-context.ts';
 export { taskTool, taskSyncTool } from './task.ts';
 export type { TaskInput, TaskOutput } from './task.ts';
 export { taskAsyncTool } from './task-async.ts';
@@ -75,6 +82,16 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // read-only (audit logs are internal); memory_write sits with the
 // other write tools because it persists to disk and is gated by
 // plan mode + operator confirm modal.
+//
+// pinContextTool is intentionally OMITTED from BUILTIN_TOOLS while
+// the `confirmPinContext` modal callback is not yet wired through
+// the REPL (ModalManager.askPinContext + bus event + renderer are
+// the deferred UI slice noted in the Phase 1.1.b/c BACKLOG entries).
+// Without the callback, every invocation returns `pin.headless_mode`
+// — surfacing the tool to the model would waste a turn proposing
+// something that always errors. The export below is preserved so the
+// tool test suite still exercises the contract and the harness can
+// re-add to BUILTIN_TOOLS in one line when the modal lands.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
@@ -82,6 +99,7 @@ export const BUILTIN_TOOLS = [
   memoryListTool,
   memoryReadTool,
   memorySearchTool,
+  retrieveContextTool,
   waitForTool,
   monitorTool,
   todoWriteTool,

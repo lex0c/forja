@@ -60,14 +60,25 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
     ? { recordGateDecision: overrides.recordGateDecision }
     : {}),
   ...(overrides.memoryRegistry !== undefined ? { memoryRegistry: overrides.memoryRegistry } : {}),
+  ...(overrides.retrieveContext !== undefined
+    ? { retrieveContext: overrides.retrieveContext }
+    : {}),
   ...(overrides.confirmMemoryWrite !== undefined
     ? { confirmMemoryWrite: overrides.confirmMemoryWrite }
     : {}),
   ...(overrides.confirmMemoryUserScope !== undefined
     ? { confirmMemoryUserScope: overrides.confirmMemoryUserScope }
     : {}),
+  ...(overrides.contextPinsStore !== undefined
+    ? { contextPinsStore: overrides.contextPinsStore }
+    : {}),
+  ...(overrides.confirmPinContext !== undefined
+    ? { confirmPinContext: overrides.confirmPinContext }
+    : {}),
   ...(overrides.emitWarn !== undefined ? { emitWarn: overrides.emitWarn } : {}),
   ...(overrides.fireHook !== undefined ? { fireHook: overrides.fireHook } : {}),
   ...(overrides.sandboxProfile !== undefined ? { sandboxProfile: overrides.sandboxProfile } : {}),
+  ...(overrides.toolCallId !== undefined ? { toolCallId: overrides.toolCallId } : {}),
+  ...(overrides.approvalId !== undefined ? { approvalId: overrides.approvalId } : {}),
   broker: overrides.broker ?? defaultBroker(),
 });

@@ -12,8 +12,10 @@
 // `bus.emit` calls across every command.
 
 import type { HarnessConfig } from '../../harness/index.ts';
+import type { HookChainResult, HookEventPayload } from '../../hooks/types.ts';
 import type { ModelRegistry } from '../../providers/registry.ts';
 import type { DB } from '../../storage/index.ts';
+import type { ContextPinsStore } from '../../storage/repos/context-pins.ts';
 import type { RunSubagentResult } from '../../subagents/index.ts';
 import type { Bus } from '../../tui/bus.ts';
 import type { ModalManager } from '../../tui/modal-manager.ts';
@@ -42,9 +44,13 @@ export interface PlaybookDispatchInput {
 export type PlaybookDispatcher = (input: PlaybookDispatchInput) => Promise<RunSubagentResult>;
 
 export interface SlashContext {
-  // Read-only snapshot of the harness config the REPL bootstrapped
-  // with. Commands read model id, plan flag, budget caps from here.
-  // Mutation commands (future slice) will need a different shape.
+  // Shared mutable harness-config handle the REPL bootstrapped
+  // with. Commands read model id, plan flag, budget caps from
+  // here. Mutation commands (`/model`, `/memory governance
+  // enable|disable`) update fields IN PLACE; the next `startTurn`
+  // reads the updated value via its spread copy. Current in-flight
+  // turn is unaffected — its config was already snapshot at turn
+  // start.
   baseConfig: HarnessConfig;
   // Persistent DB handle for commands that read history (/sessions).
   db: DB;
@@ -147,6 +153,25 @@ export interface SlashContext {
   // surface a clear "dispatch unavailable" error rather than
   // crashing or silently no-opping.
   runPlaybook?: PlaybookDispatcher;
+  // Pinned context store (CONTEXT_TUNING.md §12.4). Wrap of the
+  // db handle so /pin doesn't reach into raw context_pins queries.
+  // REPL constructs once at boot via createContextPinsStore(db);
+  // tests inject a degenerate one. Absent ⇒ /pin surfaces
+  // "store unavailable" cleanly. Same shape as the
+  // contextPinsStore field on ToolContext (pin_context tool reads
+  // through there); the SlashContext copy is what /pin uses
+  // because slash commands don't run inside a ToolContext.
+  contextPinsStore?: ContextPinsStore;
+  // Hook dispatcher (AGENTIC_CLI.md §10.3 + EVICTION.md §10.3).
+  // Wraps `dispatchChain` against the REPL-resolved hooks. Slash
+  // commands that emit hook events (today: /memory delete + /memory
+  // restore via the Eviction event) thread this into the
+  // transitionMemoryState `fireHook` field. Absent in headless /
+  // test contexts that don't load hooks.toml; transitions then
+  // skip the hook gate entirely (same path as the harness loop's
+  // empty-chain short-circuit). Null return mirrors that path so
+  // call sites don't branch on the discriminator.
+  dispatchHooks?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

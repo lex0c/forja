@@ -8,6 +8,7 @@ import {
   createInProcessBroker,
   createSpawnBroker,
 } from '../broker/index.ts';
+import { loadMemoryConfig } from '../critique/config-loader.ts';
 import { loadCritiqueConfig } from '../critique/index.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
@@ -18,12 +19,18 @@ import {
   resolveHookShell,
 } from '../hooks/index.ts';
 import {
+  computeSharedFingerprint,
   createMemoryRegistry,
   evaluateBootTriggers,
   gcExpiredMemories,
+  gcPurgeExpiredTombstones,
+  gcStaleInvalidatedMemories,
+  getSharedTrust,
+  probeSharedTrust,
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
+import type { ProbeSharedTrustResult } from '../memory/index.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type LockConflict,
@@ -38,7 +45,20 @@ import {
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { scrubEnv } from '../sanitize/index.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import {
+  GOVERNANCE_PROPOSAL_TTL_MS,
+  expirePendingProposals,
+} from '../storage/repos/memory-governance.ts';
+import {
+  MEMORY_PROVENANCE_RETENTION_MS,
+  pruneMemoryProvenance,
+} from '../storage/repos/memory-provenance.ts';
+import {
+  MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
+  pruneVerifyAttempts,
+} from '../storage/repos/memory-verify-attempts.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
@@ -125,6 +145,52 @@ export interface BootstrapInput {
   // binary mode is currently unsupported — bootstrap throws a
   // clear error when the worker source isn't on disk.
   brokerMode?: 'in-process' | 'spawn';
+  // S11 opt-in for the LLM-judge semantic verifier (MEMORY.md §11.x).
+  // Default false; threaded straight through to HarnessConfig.
+  // memorySemanticVerify. The CLI run.ts surfaces this from
+  // `args.memoryVerifyLlm`; programmatic callers (tests) pass it
+  // directly.
+  memorySemanticVerify?: boolean;
+  // S13 opt-in for the LLM-judge conflict detector. Independent of
+  // memorySemanticVerify. CLI surfaces from `args.memoryConflictLlm`.
+  memoryConflictDetect?: boolean;
+  // S3 opt-in for the LLM-judge override detector. Independent of
+  // memorySemanticVerify + memoryConflictDetect. CLI surfaces from
+  // `args.memoryOverrideLlm` (S3.5 follow-up wires the flag).
+  memoryOverrideDetect?: boolean;
+  // Slice Q — suppress operator-facing stderr banners when the CLI
+  // is producing structured NDJSON. The boot banner for the default-
+  // ON governance detectors fires when both resolve via default;
+  // setting this to `true` suppresses it unconditionally, mirroring
+  // the existing "stderr is for logs" stack rule (CLAUDE.md). When
+  // omitted, the banner emits per its own gating logic.
+  json?: boolean;
+  // Slice Q — directory for the first-boot banner marker
+  // (~/.local/share/forja/.governance-banner-shown by default).
+  // The banner is suppressed once the marker exists. Tests pass an
+  // isolated tmp dir to avoid polluting the operator's real state.
+  // `null` disables the marker entirely (banner fires every boot
+  // when other gates pass — useful for CI environments that scrape
+  // first-boot output deterministically).
+  governanceBannerMarkerDir?: string | null;
+  // Shared-corpus trust modal callback (MEMORY.md §6.5.2
+  // `trust_revoked` detector, S5/T5.2). Fired by `probeSharedTrust`
+  // when the operator previously confirmed trust for this scope-
+  // root but the corpus' SHA-256 has since diverged. Caller (REPL
+  // boot) wraps `modalManager.askSharedTrust` in a thin adapter.
+  // When undefined, the probe is SKIPPED entirely — bootstrap
+  // doesn't seed, doesn't prompt, doesn't bulk-invalidate. Use
+  // case: tests / headless invocations that don't have a TUI and
+  // shouldn't be silently auto-accepting drifted corpora. Production
+  // REPL always passes the modal callback; an explicit
+  // `() => Promise.resolve('yes')` is the way to opt into "auto-
+  // accept" semantics with an audit trail (the probe records the
+  // reconfirmed transition with a real timestamp).
+  askSharedTrust?: (args: {
+    path: string;
+    mode: import('../memory/index.ts').SharedTrustModalMode;
+    corpusFiles: readonly { name: string; bytes: number }[];
+  }) => Promise<'yes' | 'no' | 'cancel'>;
 }
 
 export interface BootstrapResult {
@@ -157,6 +223,15 @@ export interface BootstrapResult {
   // a bad value degrades to defaults rather than aborting boot.
   // Empty in the happy path.
   critiqueWarnings: readonly string[];
+  // Warnings from the memory governance config loader
+  // (`.agent/config.toml [memory]` keys). Loader degrades to
+  // defaults (currently default-ON) on bad values rather than
+  // aborting boot — without this surface, an operator who writes
+  // `verify_semantic_llm = "false"` (string instead of boolean)
+  // would silently keep the default-on detector running and pay
+  // the LLM-judge cost without diagnostic. CLI driver renders
+  // these on stderr alongside the hook + critique warnings.
+  memoryConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -174,6 +249,17 @@ export interface BootstrapResult {
   // to the active audit chain. The CLI surfaces this in
   // diagnostics so operators can correlate logs across machines.
   installIdentity: import('../permissions/index.ts').InstallIdentity;
+  // Outcome of the shared-corpus trust probe (S5/T5.2). Undefined
+  // when:
+  //   - `askSharedTrust` was not supplied (headless / tests), or
+  //   - the cwd was not trusted at boot (operator must first
+  //     confirm cwd trust before shared-trust kicks in), or
+  //   - bootstrap aborted before the memory subsystem finished
+  //     initializing (rare — try-block early throw).
+  // Present in the production REPL path. Callers render warnings on
+  // `revoked` and may surface a count on `reconfirmed` so the
+  // operator sees the trust action they just took echoed back.
+  sharedTrustProbe?: import('../memory/trust-corpus-probe.ts').ProbeSharedTrustResult;
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -238,7 +324,118 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // is non-fatal by design (a malformed [critique] block degrades
   // to defaults, not a hard exit). The warnings array is exposed
   // on BootstrapResult for the CLI driver to print.
-  const critiqueLoaded = loadCritiqueConfig({ cwd, registry });
+  //
+  // BOTH loaders take cwd → `.agent/config.toml` at that dir. The
+  // canonical project config lives at `<repo-root>/.agent/config
+  // .toml`, NOT under the operator's invocation cwd. When `agent`
+  // is launched from a subdirectory (the common case), passing raw
+  // cwd would miss the repo-rooted file entirely — the operator
+  // would set `verify_semantic_llm = false` at `<repo>/.agent/
+  // config.toml` and bootstrap would still resolve detectors via
+  // default + spend LLM budget. Resolve repo root ONCE up here and
+  // reuse below for the memory scope-roots construction; falls
+  // back to cwd when not in a git repo, matching the historical
+  // "config lives where the operator invoked from" behavior for
+  // non-repo workflows.
+  const projectConfigCwd = resolveRepoRoot(cwd);
+  const critiqueLoaded = loadCritiqueConfig({ cwd: projectConfigCwd, registry });
+
+  // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
+  // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
+  // pair as [critique]; project field wins. `userHadField` /
+  // `projectHadField` per-field provenance signals drive the
+  // first-run banner emission below: banner fires ONLY when both
+  // detectors resolved to ON via DEFAULT (no layer explicitly named
+  // the field, no CLI override).
+  const memoryLoaded = loadMemoryConfig({ cwd: projectConfigCwd });
+
+  // First-run banner. Fires once per machine when:
+  //   (a) both detectors resolve to ON,
+  //   (b) the resolution came from the hardcoded default (no config
+  //       layer touched the field, no CLI override),
+  //   (c) we're not in `--json` mode (stack rule: NDJSON consumers
+  //       expect predictable stderr; one-line banner pollutes
+  //       structured log capture),
+  //   (d) the per-machine marker file doesn't exist yet (or marker
+  //       was disabled via input.governanceBannerMarkerDir=null).
+  //
+  // subagent-child.ts has its own boot path; this function is only
+  // reached by top-level operator runs, so the banner is naturally
+  // suppressed for subagents.
+  //
+  // Design decision — emit ONE banner covering both detectors,
+  // suppress when ANY layer touched EITHER field (not per-detector
+  // independent banners):
+  //   - Rationale: an operator who already wrote `[memory]
+  //     verify_semantic_llm = false` is signaling awareness of the
+  //     memory governance subsystem. Emitting the conflict-half of
+  //     a per-detector banner on their next boot would be noise
+  //     ("we know, we configured it").
+  //   - Counter-argument (rejected): a per-detector banner would
+  //     warn when only ONE detector is silently on. We accept that
+  //     trade-off: configured operators read `/memory governance
+  //     status` (Slice Q surfaces source-labels there); unconfigured
+  //     operators get the canonical single-line advisory once.
+  //   - Edge: if an operator config-disables only one field, the
+  //     banner suppresses entirely — even though the OTHER field
+  //     came from default. This is intentional. The status command
+  //     and docs/MEMORY.md §11.4 cover the operator's information
+  //     path from that point on.
+  const verifyFromDefault =
+    input.memorySemanticVerify === undefined &&
+    !memoryLoaded.projectHadField.verifySemanticLlm &&
+    !memoryLoaded.userHadField.verifySemanticLlm;
+  const conflictFromDefault =
+    input.memoryConflictDetect === undefined &&
+    !memoryLoaded.projectHadField.conflictDetectLlm &&
+    !memoryLoaded.userHadField.conflictDetectLlm;
+  const overrideFromDefault =
+    input.memoryOverrideDetect === undefined &&
+    !memoryLoaded.projectHadField.overrideDetectLlm &&
+    !memoryLoaded.userHadField.overrideDetectLlm;
+  const resolvedVerify = input.memorySemanticVerify ?? memoryLoaded.config.verifySemanticLlm;
+  const resolvedConflict = input.memoryConflictDetect ?? memoryLoaded.config.conflictDetectLlm;
+  const resolvedOverride = input.memoryOverrideDetect ?? memoryLoaded.config.overrideDetectLlm;
+  const shouldShowBanner =
+    verifyFromDefault &&
+    conflictFromDefault &&
+    overrideFromDefault &&
+    resolvedVerify &&
+    resolvedConflict &&
+    resolvedOverride &&
+    input.json !== true;
+  if (shouldShowBanner) {
+    // Per-machine marker: when input.governanceBannerMarkerDir is
+    // explicitly null the marker is disabled (banner re-emits every
+    // boot — useful for CI / determinism). Otherwise default to
+    // `~/.local/share/forja/`. mkdirSync+writeFile errors degrade
+    // silently to "no marker, emit anyway" — better than refusing
+    // the banner on a wonky filesystem.
+    const markerDir =
+      input.governanceBannerMarkerDir === undefined
+        ? join(homedir(), '.local', 'share', 'forja')
+        : input.governanceBannerMarkerDir;
+    let markerExists = false;
+    if (markerDir !== null) {
+      try {
+        const markerFs = await import('node:fs');
+        const markerPath = join(markerDir, '.governance-banner-shown');
+        markerExists = markerFs.existsSync(markerPath);
+        if (!markerExists) {
+          markerFs.mkdirSync(markerDir, { recursive: true });
+          markerFs.writeFileSync(markerPath, `${Date.now()}\n`);
+        }
+      } catch {
+        // Best-effort. If we can't write the marker, banner fires —
+        // worse to suppress when the operator never saw it.
+      }
+    }
+    if (!markerExists) {
+      process.stderr.write(
+        'memory: governance LLM detectors enabled by default (verify=on, conflict=on, override=on). Disable: /memory governance disable verify|conflict|override|all\n',
+      );
+    }
+  }
 
   const toolRegistry = createToolRegistry();
   registerBuiltinTools(toolRegistry);
@@ -414,6 +611,24 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
+  // Eager-load inventory (MEMORY.md §11.2). Lifted out of the
+  // try-block so the post-try HarnessConfig builder can read it;
+  // empty array survives the no-memory path without conditional
+  // spread on the consumer side.
+  let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
+  // Whether the shared scope is offline for THIS session — drives
+  // both the eager-load section's `excludeScopes` AND the retrieval
+  // runner's `memoryExcludeScopes` (S5 CRIT/H2). Lifted out of the
+  // try-block so the post-try HarnessConfig builder can pass it
+  // straight into the config without re-deriving from
+  // `sharedTrustProbe`.
+  let sharedScopeOffline = false;
+  // Probe outcome (S5/T5.2). Lifted out of the try-block for the
+  // same reason as `eagerExposures` — present on BootstrapResult
+  // for the CLI driver to render warnings, absent on the early-
+  // throw path so callers can distinguish "probe skipped" from
+  // "probe ran and decided X".
+  let sharedTrustProbe: ProbeSharedTrustResult | undefined;
   try {
     // Resolve the effective system prompt. Layers stack here in
     // precedence order (most-specific to most-generic). Each
@@ -516,34 +731,215 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // `.git` / `package.json` / `tsconfig.json` etc. Memories
     // tagged with those triggers got filtered out even though
     // the same session loaded the project memory containing them.
-    // Single `repoRoot` value keeps the two consumers aligned.
-    const repoRoot = resolveRepoRoot(cwd);
+    // Single `repoRoot` value keeps the three consumers
+    // aligned: critique/memory config loader (hoisted above),
+    // memory scope roots, and the trigger-probe section below.
+    const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
-    // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-removes
-    // memories whose `expires:` field is on or before today. Each
-    // removal emits a `memory_events` row with `action: 'expired'`
-    // so the operator can audit "what disappeared and when". We
-    // run this BEFORE assembling the eager prompt section so the
-    // model never sees stale entries that vanish mid-session. The
-    // session id isn't known yet (the harness loop creates it
+    // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-evicts
+    // memories whose `expires:` field is on or before today through
+    // the canonical state machine — Phase 2.2 routed this path
+    // through transitionMemoryState, so each expiry lands TWO
+    // memory_events rows (action='quarantined' then action='evicted')
+    // plus the paired eviction_events trail with motivo='low_roi'
+    // (closest-fit per the spec follow-up) and trigger='expired_at'.
+    // The body moves into `.tombstones/`; operators can `/memory
+    // restore` an unintended expiry within the retention window.
+    // We run this BEFORE assembling the eager prompt section so
+    // the model never sees stale entries that vanish mid-session.
+    // The session id isn't known yet (the harness loop creates it
     // later), so the audit rows here land with sessionId NULL —
     // the lifecycle GC is conceptually a session-bootstrap event,
     // not a per-session-conversation one. cwd is forwarded so
     // `/memory audit` can group GC events by working directory.
     //
-    // Failures (sandbox / io / unknown) get a `refused` audit row
-    // with stage='lifecycle_gc' AND a stderr line so the operator
-    // sees them in two places: the persistent audit table (for
-    // forensic review) and the live stderr stream (for "something
-    // unusual happened on this boot"). A bootstrap-blocking
-    // failure would be wrong — one bad memory shouldn't gate the
-    // session — but silently dropping the failure is worse.
-    const gcResult = gcExpiredMemories(memoryRegistry, memoryRoots, { auditCwd: cwd });
+    // Failures surface in `gcResult.failures` with a translated
+    // reason string (transitionMemoryState's discriminated outcomes
+    // → operator-facing message), plus a stderr line per failure
+    // so the operator sees them live without consulting the audit
+    // table. A bootstrap-blocking failure would be wrong — one
+    // bad memory shouldn't gate the session — but silently
+    // dropping the failure is worse.
+    const gcResult = await gcExpiredMemories(db, memoryRegistry, memoryRoots, { auditCwd: cwd });
     for (const failure of gcResult.failures) {
       process.stderr.write(
         `forja: memory gc: failed to expire ${failure.memory.scope}/${failure.memory.name} (expires ${failure.memory.expires}): ${failure.reason}\n`,
       );
+    }
+    // Purge sweep — materializes evicted → purged for tombstones
+    // whose retention window expired (EVICTION §7.1). Runs after
+    // gcExpiredMemories so this same boot can purge an entry that
+    // was just expired in a prior boot whose retention has now
+    // run out, AND so any concurrent boot-time evictions land
+    // their `evicted` row before this sweep iterates. Failures
+    // surface to stderr like expiration failures.
+    const purgeResult = await gcPurgeExpiredTombstones(db, memoryRegistry, memoryRoots, {
+      auditCwd: cwd,
+    });
+    for (const failure of purgeResult.failures) {
+      process.stderr.write(
+        `forja: memory gc: failed to purge eviction_event ${failure.evictionEventId}: ${failure.reason}\n`,
+      );
+    }
+    // Stale-invalidated sweep (S5 CRIT/V1, EVICTION.md §7.1 +
+    // MEMORY.md §6.5.6 7-day window). Trust_revoked produces
+    // `invalidated` rows in bulk; without this sweep they
+    // accumulate on disk forever. Each memory whose invalidation
+    // event is older than 7 days transitions to `evicted` with
+    // motivo='shift' (the only motivo §4.1 admits for
+    // invalidated→evicted), trigger='expired_at',
+    // actor='startup_probe'. Failures and orphans surface to
+    // stderr like the other sweeps.
+    const staleResult = await gcStaleInvalidatedMemories(db, memoryRegistry, memoryRoots, {
+      auditCwd: cwd,
+    });
+    for (const failure of staleResult.failures) {
+      process.stderr.write(
+        `forja: memory gc: failed to evict stale invalidated ${failure.memory.scope}/${failure.memory.name}: ${failure.reason}\n`,
+      );
+    }
+    for (const orphan of staleResult.orphans) {
+      process.stderr.write(
+        `forja: memory gc: orphan invalidated frontmatter without audit row at ${orphan.scope}/${orphan.name}\n`,
+      );
+    }
+    // Provenance sweep (MEMORY.md §11.2, S1/T1.7). Drops
+    // exposure rows older than the retention window. Best-
+    // effort: a DB failure here MUST NOT abort boot — provenance
+    // is observability, not correctness, and a one-off failed
+    // sweep just delays cleanup by one boot. Stderr surfaces the
+    // cause for the operator without gating the session.
+    try {
+      pruneMemoryProvenance(db, Date.now() - MEMORY_PROVENANCE_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Match the AUDIT DRIFT shape every other memory site uses
+      // (registry.ts auditRead/auditExposure, loop.ts eager emit,
+      // runner.ts retrieve_context emit) so operators can grep
+      // 'memory: AUDIT DRIFT' for every drift signal. redactSecrets
+      // because SQLite errors may echo bound params.
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to record retention sweep at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // Governance proposal TTL sweep (MEMORY.md §11.3, S8/T8.4).
+    // Pending proposals older than 30d auto-expire — a proposal
+    // that didn't get reviewed in that window has lost authority
+    // (underlying memory + detector context likely drifted).
+    // Detectors re-emit if the finding still holds. Best-effort
+    // same as the provenance sweep: a DB failure does not abort
+    // boot — operator-facing governance surfaces will fall back to
+    // surfacing stale rows until the next successful sweep.
+    try {
+      expirePendingProposals(db, { ttlMs: GOVERNANCE_PROPOSAL_TTL_MS });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to expire pending governance proposals at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // S11 verify-attempts retention sweep (MEMORY.md §11.x, S11/T11.10).
+    // Content-addressed dedup cache; rows older than 90d are dropped
+    // (the content_hash has almost certainly drifted past that point
+    // and the value of suppressing re-dispatch becomes negative).
+    // Best-effort same as the sister sweeps above.
+    try {
+      pruneVerifyAttempts(db, Date.now() - MEMORY_VERIFY_ATTEMPTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_verify_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // S13 conflict-attempts retention sweep. Same shape as
+    // verify-attempts; independent table (memory_conflict_attempts).
+    try {
+      const { pruneConflictAttempts, MEMORY_CONFLICT_ATTEMPTS_RETENTION_MS } = await import(
+        '../storage/repos/memory-conflict-attempts.ts'
+      );
+      pruneConflictAttempts(db, Date.now() - MEMORY_CONFLICT_ATTEMPTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_conflict_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // S3 override-events retention sweep (post-Phase-2 review C1).
+    // Signal collector populates this table on every modal-reject /
+    // permission-deny; without the sweep the table grows unbounded
+    // and the threshold counter's `countOverridesInWindow` query
+    // slows over time. 90d retention matches memory_provenance —
+    // the override events feed the threshold which feeds proposals;
+    // symmetric retention keeps the audit JOIN valid for that window.
+    try {
+      const { pruneOverrideEvents, MEMORY_OVERRIDE_EVENTS_RETENTION_MS } = await import(
+        '../storage/repos/memory-override-events.ts'
+      );
+      pruneOverrideEvents(db, Date.now() - MEMORY_OVERRIDE_EVENTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_override_events at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // S3 override-attempts retention sweep (post-Phase-2 review C1).
+    // Companion to verify-attempts + conflict-attempts; rows older
+    // than 90d are content-addressed-stale and the cooldown semantic
+    // breaks down past that horizon.
+    try {
+      const { pruneOverrideAttempts, MEMORY_VERIFY_OVERRIDE_ATTEMPTS_RETENTION_MS } = await import(
+        '../storage/repos/memory-verify-override-attempts.ts'
+      );
+      pruneOverrideAttempts(db, Date.now() - MEMORY_VERIFY_OVERRIDE_ATTEMPTS_RETENTION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `memory: AUDIT DRIFT: failed to prune memory_verify_override_attempts at boot (will retry next boot): ${redactSecrets(msg)}\n`,
+      );
+    }
+    // Shared-corpus trust probe (S5/T5.2, MEMORY.md §6.5.2
+    // `trust_revoked` detector). Runs ONLY when:
+    //   - the operator supplied a callback (no TUI ⇒ no consent
+    //     pathway; the headless eager-load gate covers fail-closed
+    //     downstream by computing the hash separately),
+    //   - the cwd is trusted at boot (without cwd trust, the
+    //     operator hasn't consented to operate in this directory,
+    //     so prompting them about its shared corpus is premature),
+    //   - we are NOT in `--plan` mode. Plan mode is the read-only
+    //     profile (AGENTIC_CLI §5); a 'no' answer would trigger
+    //     bulk-invalidate writes (.tombstones/, eviction_events,
+    //     memory_events, clearSharedTrust) that violate the no-
+    //     writes contract. We skip the probe in plan; the
+    //     downstream fail-closed gate still excludes the scope
+    //     when the stored hash diverges, so the model doesn't load
+    //     unattested content even when no modal fired.
+    //
+    // Placement intent: AFTER the GC sweeps (an active shared
+    // memory just auto-evicted by `gcExpiredMemories` would shift
+    // the hash, prompting unnecessarily — accepted as a documented
+    // false-positive given how rarely operators set `expires:` on
+    // shared memories) and BEFORE `assembleMemorySection` so the
+    // bulk-invalidate path on revoke keeps the invalidated
+    // memories out of THIS session's system prompt (otherwise the
+    // operator would need to restart for the revocation to take
+    // effect).
+    if (input.askSharedTrust !== undefined && isCwdTrusted && input.plan !== true) {
+      sharedTrustProbe = await probeSharedTrust({
+        db,
+        registry: memoryRegistry,
+        roots: memoryRoots,
+        sharedRoot: memoryRoots.projectShared,
+        askSharedTrust: input.askSharedTrust,
+        sessionId: null,
+        cwd,
+        warn: (msg) => {
+          // Same shape used elsewhere in this try block (memory
+          // GC failures, provenance sweep failures). Operator
+          // greps stderr for any boot-time warning surface.
+          process.stderr.write(`forja: shared-corpus trust: ${msg}\n`);
+        },
+      });
     }
     // Boot-time trigger context (spec §4.3). evaluateBootTriggers
     // probes the REPO ROOT for well-known files (.git, .env,
@@ -585,11 +981,98 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       isRepoRootTrusted,
     });
     resolvedSystemPrompt = composeWithProjectPointer(resolvedSystemPrompt, projectPointer.text);
+    // S5 fail-closed eager-load gating. The project_shared scope
+    // is eligible for the eager-load section ONLY when the trust
+    // probe established confidence in the corpus' current state.
+    // Three outcomes block the scope:
+    //
+    //   - 'verify_failed' (P0/H2-rob): substrate couldn't read the
+    //     corpus. System has no idea what's on disk; surfacing
+    //     previously-snapshotted bodies would be fail-open against
+    //     an attacker who EACCES'd the directory.
+    //   - 'deferred' (P0/F3 + P1/M4-rob): modal was cancelled (Esc,
+    //     timeout) OR a TOCTOU drift was detected after the
+    //     operator's 'yes'. Either way, operator hasn't confirmed
+    //     the current state.
+    //   - 'revoked' (P1/F7): operator just said "I don't trust this
+    //     corpus". The probe's bulk-invalidate cleared every ACTIVE
+    //     shared memory, but quarantined-shared memories cannot
+    //     transition to `invalidated` via motivo `security` (state
+    //     machine admits only `shift` for that edge per
+    //     EVICTION.md §4.1). Hard-excluding the whole scope at
+    //     eager-load drops those survivors out of the model's
+    //     window for THIS session — the operator can `/memory
+    //     delete` for hard removal across boots.
+    //
+    // 'seeded', 'unchanged', 'reconfirmed' all pass — those are
+    // the states where the trust row pins a hash that matches what
+    // the model is about to see.
+    //
+    // CRIT/F4+M4 hardening: headless callers (no askSharedTrust)
+    // and untrusted-cwd boots used to skip the gate entirely
+    // (fail-OPEN). They now fail-CLOSED by default: the scope
+    // loads ONLY when the stored trust row's hash matches the
+    // current corpus fingerprint (the post-decision unchanged
+    // state). This means:
+    //   - Headless `agent run` against a corpus that's drifted
+    //     since the operator's last interactive confirm: scope
+    //     excluded, no model exposure to unattested content. The
+    //     operator must run the interactive REPL to re-confirm.
+    //   - Untrusted cwd (operator declined cwd-trust): scope
+    //     excluded; aligns with the spec's "trust is per-project"
+    //     stance — no shared corpus without project trust.
+    //   - Plan mode (probe skipped per H4): same headless logic
+    //     applies; plan mode reads but doesn't bulk-invalidate.
+    // Why `sharedScopeOffline` is a boolean while downstream callers
+    // consume `excludeScopes: readonly MemoryScope[]`: the boolean
+    // shape serializes cleanly across the subagent IPC boundary
+    // (`--subagent-shared-scope-offline` flag, no list parsing), and
+    // S5's only excluded scope is `project_shared` — generality
+    // beyond that would be wasted today. Internal consumers of the
+    // boolean re-derive `excludeScopes: ['project_shared']` at the
+    // call site (see `bootstrap.ts:835`, `subagent-child.ts`, harness
+    // `loop.ts:1420`). The array shape stays for the
+    // `assembleMemorySection` / `createMemoryView` APIs that may
+    // grow more scopes (e.g., a future quarantine sweep that wants
+    // to gate `user` independently).
+    sharedScopeOffline = (() => {
+      if (sharedTrustProbe !== undefined) {
+        return (
+          sharedTrustProbe.kind === 'verify_failed' ||
+          sharedTrustProbe.kind === 'deferred' ||
+          sharedTrustProbe.kind === 'revoked'
+        );
+      }
+      // No probe ran. Decide based on whether the corpus state
+      // matches what the operator last confirmed. Fail-closed on
+      // any unknown / mismatch.
+      //
+      // P1/F6 cost note (deferred): a CI run that boots N times
+      // against an unchanged corpus pays one full `.agent/memory/
+      // shared/` read per boot just to compute the hash that will
+      // match. A proper mtime fast-path would persist per-file
+      // (size, mtime) tuples alongside the trust row and skip the
+      // hash on stat-match — but a directory-mtime fast-path
+      // misses body-content edits (root mtime doesn't change on
+      // body writes), and a full per-file mtime persist requires
+      // a migration + a snapshot column. Cost-benefit: ~5-10ms
+      // per boot for a 100-file × 5KB corpus, dwarfed by Bun init
+      // + SQLite migration. Skipped for now; revisit if telemetry
+      // surfaces hot-path impact.
+      if (!isCwdTrusted) return true;
+      const currentHash = computeSharedFingerprint(memoryRoots.projectShared);
+      if (currentHash === null) return true; // unreadable corpus
+      const storedTrust = getSharedTrust(db, memoryRoots.projectShared);
+      if (storedTrust === null) return true; // never confirmed
+      return storedTrust.lastConfirmedHash !== currentHash; // drift
+    })();
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
+      ...(sharedScopeOffline ? { excludeScopes: ['project_shared'] as const } : {}),
     });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
+    eagerExposures = memorySection.eagerLoaded;
 
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Resolved inside
     // the same try-block as memory so any throw — TOML parse
@@ -675,6 +1158,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
     memoryRegistry,
+    // S5 CRIT/H2: thread the scope-offline decision down so the
+    // retrieval runner mirrors the eager-load posture. Empty
+    // array when scope is online — the harness loop's
+    // BuildRetrievalRunnerDeps spread treats empty as no-op.
+    ...(sharedScopeOffline ? { memoryExcludeScopes: ['project_shared'] as const } : {}),
+    // Eager-load provenance (MEMORY.md §11.2, S1/T1.4). Frozen
+    // here at assembly time; loop emits one provenance row per
+    // entry right after createSession. Empty array passes
+    // through cleanly when the registry produced no memories or
+    // every memory was filtered out (no harm in passing through).
+    eagerExposures,
     isCwdTrusted,
     // Hooks resolved at boot (spec AGENTIC_CLI.md §10). When the
     // list is empty (no config files exist) we still pass the
@@ -695,6 +1189,37 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
+    // Slice Q — resolved state (always boolean, never undefined).
+    // Precedence: CLI explicit > project config > user config > default ON.
+    // memorySemanticVerifySource carries provenance for /memory
+    // governance status rendering + first-run banner suppression.
+    memorySemanticVerify: input.memorySemanticVerify ?? memoryLoaded.config.verifySemanticLlm,
+    memorySemanticVerifySource:
+      input.memorySemanticVerify !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.verifySemanticLlm
+          ? 'project-config'
+          : memoryLoaded.userHadField.verifySemanticLlm
+            ? 'user-config'
+            : 'default',
+    memoryConflictDetect: input.memoryConflictDetect ?? memoryLoaded.config.conflictDetectLlm,
+    memoryConflictDetectSource:
+      input.memoryConflictDetect !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.conflictDetectLlm
+          ? 'project-config'
+          : memoryLoaded.userHadField.conflictDetectLlm
+            ? 'user-config'
+            : 'default',
+    memoryOverrideDetect: input.memoryOverrideDetect ?? memoryLoaded.config.overrideDetectLlm,
+    memoryOverrideDetectSource:
+      input.memoryOverrideDetect !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.overrideDetectLlm
+          ? 'project-config'
+          : memoryLoaded.userHadField.overrideDetectLlm
+            ? 'user-config'
+            : 'default',
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.resumeFromSessionId !== undefined
@@ -734,12 +1259,14 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     subagents,
     hookWarnings: resolvedHooks.warnings,
     critiqueWarnings: critiqueLoaded.warnings,
+    memoryConfigWarnings: memoryLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }
       : {}),
     permissionChain: permResult.chain,
     installIdentity: permResult.identity,
+    ...(sharedTrustProbe !== undefined ? { sharedTrustProbe } : {}),
   };
 };
 

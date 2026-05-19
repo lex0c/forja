@@ -28,6 +28,23 @@ export type MemoryTrust = 'trusted' | 'untrusted';
 // `MemoryType`, not a scope — it can live in any of the three.
 export type MemoryScope = 'user' | 'project_shared' | 'project_local';
 
+// Lifecycle states per spec §3.1.1 — declared subset of EVICTION
+// §3's 7-state vocabulary. Memory omits `shadow`: the trust
+// field already encodes "loaded but not vinculante" semantics
+// for the memory case (see §6.5 rationale and Phase 0 stitching).
+// Absence of the field in frontmatter equates to `active`; the
+// parser/writer round-trip preserves the field exactly as it
+// appears (no canonicalization to `active` on read).
+export const MEMORY_STATES = [
+  'proposed',
+  'active',
+  'quarantined',
+  'invalidated',
+  'evicted',
+  'purged',
+] as const;
+export type MemoryState = (typeof MEMORY_STATES)[number];
+
 // Parsed frontmatter block. All optional fields preserve their
 // absence on round-trip — `trust` omitted on input means `trust`
 // omitted on output, NOT a serialized `trust: trusted`. The
@@ -46,6 +63,13 @@ export interface MemoryFrontmatter {
   // Optional auto-injection tags (spec §4.3). 5.1 just preserves
   // these on round-trip; the eager-injection logic lives in 5.2.
   triggers?: string[];
+  // Optional lifecycle state per spec §3.1.1. Absence equates to
+  // `active`; the parser/writer preserve absence on round-trip
+  // (a memory written without `state` doesn't get a serialized
+  // `state: active`). Transitions are managed via the eviction
+  // contract (EVICTION.md §4); this field is the persisted
+  // snapshot the next session reads.
+  state?: MemoryState;
 }
 
 // A single memory file: frontmatter + raw markdown body. The
@@ -66,4 +90,28 @@ export interface IndexEntry {
   title: string;
   href: string;
   hook: string;
+}
+
+// Frozen snapshot of one eager-loaded memory at system-prompt
+// assembly time. Produced by `assembleMemorySection`, consumed by
+// the harness loop right after createSession (the first moment a
+// sessionId exists to link against). Hash + state are pinned at
+// assembly, not at emit, because the operator may rewrite a file
+// between boot and session start — the spec semantic is "the
+// bytes the model saw at boot", and that's the moment to freeze.
+//
+// Lives in `memory/types.ts` (not `cli/memory-prompt.ts`) so the
+// harness can carry it through HarnessConfig.eagerExposures
+// without dragging a `cli/`-layer dependency into the harness.
+export interface EagerExposure {
+  scope: MemoryScope;
+  name: string;
+  // SHA-256 hex of the canonical serialization at assembly time.
+  // Null when hashing failed (best-effort; mirrors the schema's
+  // nullable column).
+  memoryContentHash: string | null;
+  // frontmatter.state at assembly time; defaults to 'active' when
+  // absent. The MemoryState string is stored as TEXT in the DB so
+  // schema-level forward compat works without a CHECK migration.
+  memoryStateAtExposure: string;
 }

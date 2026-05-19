@@ -2176,3 +2176,171 @@ describe('state immutability', () => {
     expect(after).toBe(snapshot);
   });
 });
+
+describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
+  // Helpers to drive the reducer with a minimal `shared-trust:ask`
+  // event. The flavor's full contract: title, options, preview
+  // shape, conservative default, sanitization of attacker-
+  // influenced strings.
+  const sharedTrustEvent = (overrides: {
+    mode: 'first-visit' | 'drift';
+    path?: string;
+    corpusFiles?: readonly { name: string; bytes: number }[];
+  }): UIEvent => ({
+    type: 'shared-trust:ask',
+    ts: 1,
+    promptId: 'p1',
+    path: overrides.path ?? '/repo/.agent/memory/shared',
+    mode: overrides.mode,
+    corpusFiles: overrides.corpusFiles ?? [{ name: 'alpha.md', bytes: 42 }],
+  });
+
+  test('drift mode renders the drift-specific prose and revoke option', () => {
+    const initial = createInitialState();
+    const r = applyEvent(initial, sharedTrustEvent({ mode: 'drift' }));
+    const modal = r.state.modal;
+    expect(modal).not.toBeNull();
+    if (modal === null) return;
+    expect(modal.flavor).toBe('shared-trust');
+    expect(modal.title).toBe('Shared memory trust:');
+    // Drift-mode prose mentions "changed since you last confirmed".
+    const previewText = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(previewText).toContain('changed since you last confirmed trust');
+    expect(previewText).not.toContain('have not yet confirmed');
+    // Options: yes + revoke (drift labels).
+    expect(modal.options.map((o) => o.label)).toEqual([
+      'Yes, I trust the updated corpus',
+      'No, revoke trust',
+    ]);
+  });
+
+  test('first-visit mode renders distinct prose + title + option label', () => {
+    const initial = createInitialState();
+    const r = applyEvent(initial, sharedTrustEvent({ mode: 'first-visit' }));
+    const modal = r.state.modal;
+    expect(modal).not.toBeNull();
+    if (modal === null) return;
+    expect(modal.title).toBe('Shared memory trust (first visit):');
+    const previewText = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(previewText).toContain('have not yet confirmed');
+    expect(previewText).not.toContain('changed since you last confirmed');
+    expect(modal.options.map((o) => o.label)).toEqual([
+      'Yes, I trust this shared corpus',
+      'No, do not load',
+    ]);
+  });
+
+  test('conservative default selectedIndex points at the "no" option (D65)', () => {
+    // Operator hitting Enter without reading must NOT default to
+    // trust — that would be the unsafe fail-mode. A regression
+    // flipping selectedIndex to 0 in either mode would silently
+    // turn the trust gate into a rubber-stamp.
+    const initial = createInitialState();
+    for (const mode of ['first-visit', 'drift'] as const) {
+      const r = applyEvent(initial, sharedTrustEvent({ mode }));
+      const modal = r.state.modal;
+      if (modal === null) throw new Error('expected modal');
+      expect(modal.selectedIndex).toBe(modal.options.length - 1);
+      expect(modal.options[modal.selectedIndex]?.value).toBe('no');
+    }
+  });
+
+  test('P0/F1: ANSI escapes in corpus filenames are stripped', () => {
+    // Attacker plants a `.md` file whose name contains terminal
+    // control bytes: `\x1b[2J\x1b[H` clears the screen and homes
+    // the cursor, `\x1bc` resets the terminal. Without
+    // sanitization the renderer would emit these verbatim and
+    // give the attacker control over what the operator sees in
+    // the trust modal.
+    const evil = '\x1b[2J\x1b[H\x1b]0;PWNED\x07evil.md';
+    const initial = createInitialState();
+    const r = applyEvent(
+      initial,
+      sharedTrustEvent({
+        mode: 'drift',
+        corpusFiles: [{ name: evil, bytes: 7 }],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const previewText = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(previewText).not.toContain('\x1b');
+    expect(previewText).not.toContain('\x07');
+    // The visible portion of the filename survives.
+    expect(previewText).toContain('evil.md');
+  });
+
+  test('P0/F1: CR/LF/TAB in filenames are collapsed to spaces', () => {
+    // Multi-line filename would break the bounded preview layout
+    // and let an attacker push other rows off-screen or pretend
+    // their filename "spans" multiple inventory lines.
+    const evil = 'line1\nline2\tline3\rline4.md';
+    const initial = createInitialState();
+    const r = applyEvent(
+      initial,
+      sharedTrustEvent({
+        mode: 'drift',
+        corpusFiles: [{ name: evil, bytes: 1 }],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    // The flag chars must be gone from the FILE LINE specifically
+    // (the modal still uses \n between rows; we check the row
+    // containing 'line1' has no embedded newline/tab/cr).
+    const fileLine = modal.preview
+      .map((p) => (typeof p === 'string' ? p : p.text))
+      .find((s) => s.includes('line1'));
+    expect(fileLine).toBeDefined();
+    if (fileLine !== undefined) {
+      expect(fileLine).not.toContain('\n');
+      expect(fileLine).not.toContain('\r');
+      expect(fileLine).not.toContain('\t');
+    }
+  });
+
+  test('P0/F1: malicious bytes in path are also stripped', () => {
+    // Defense-in-depth. `event.path` is operator-derived today,
+    // but a future producer that threads attacker-influenced data
+    // through the path field shouldn't repaint the modal.
+    const initial = createInitialState();
+    const r = applyEvent(
+      initial,
+      sharedTrustEvent({
+        mode: 'drift',
+        path: '\x1b[31mfake\x1b[0m/.agent/memory/shared',
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const previewText = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(previewText).not.toContain('\x1b');
+  });
+
+  test('overflow truncation: > 8 files surfaces "(N more)" suffix', () => {
+    const corpusFiles = Array.from({ length: 12 }, (_, i) => ({
+      name: `mem-${String(i).padStart(2, '0')}.md`,
+      bytes: 100,
+    }));
+    const initial = createInitialState();
+    const r = applyEvent(initial, sharedTrustEvent({ mode: 'drift', corpusFiles }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const previewText = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    // First 8 surface in the inventory; the 4 overflow names DON'T.
+    for (let i = 0; i < 8; i++) {
+      expect(previewText).toContain(`mem-${String(i).padStart(2, '0')}.md`);
+    }
+    expect(previewText).toContain('and 4 more files not shown');
+    expect(previewText).not.toContain('mem-08.md');
+  });
+
+  test('empty corpus inventory surfaces the explicit "(currently empty)" line', () => {
+    const initial = createInitialState();
+    const r = applyEvent(initial, sharedTrustEvent({ mode: 'drift', corpusFiles: [] }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const previewText = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(previewText).toContain('(the corpus is currently empty)');
+  });
+});

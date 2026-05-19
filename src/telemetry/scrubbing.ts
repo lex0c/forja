@@ -153,6 +153,27 @@ const GIT_SSH_REGEX = /\b[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+/g;
 // avoid matching `version.bumped.to:something`.
 const DOMAIN_PORT_REGEX = /\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:\d{1,5}\b/g;
 
+// Terminal-attack control characters. Stripped from every free-
+// form text the scrubber processes so a reason field carrying
+// `\x1b[2J` (clear screen), `\x1b[31m` (color), `\x07` (bell), or
+// any other ANSI/OSC sequence can't manipulate the operator's
+// terminal when surfaced via `/agent retrieval audit` / `replay`,
+// `/agent policy …`, or any other forensic surface that
+// interpolates scrubbed text directly into stdout. Removing the
+// leading `\x1b` neutralizes the whole escape sequence — `[2J`
+// without ESC is just three literal characters.
+//
+// Range: full C0 (0x00-0x1F) MINUS TAB (0x09) / LF (0x0A) / CR
+// (0x0D), plus DEL (0x7F) and C1 (0x80-0x9F). We preserve TAB / LF
+// / CR because legitimate multi-line consumers (stack traces in
+// `worker.crashed.stderr`, multi-paragraph reasons) need them; an
+// attacker can't manipulate the terminal with plain whitespace.
+// Path/host sweeps run AFTER stripping so an attacker can't
+// smuggle a path through an ESC-prefixed token (e.g., `\x1b/home/x`
+// would look like a non-path to the posix regex before stripping).
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters IS the point — this is a security scrub.
+const CONTROL_CHARS_REGEX = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g;
+
 export interface ScrubOptions {
   // Redact path scopes in capability strings + path-shaped
   // substrings in reason fields. Default true.
@@ -179,7 +200,11 @@ const scrubCapability = (cap: string, opts: Required<ScrubOptions>): string => {
 };
 
 const scrubReason = (text: string, opts: Required<ScrubOptions>): string => {
-  let scrubbed = text;
+  // Strip control chars before any other redaction so neither the
+  // path/host regex nor the operator's terminal can be tricked by
+  // an ESC-prefixed token. See CONTROL_CHARS_REGEX header for the
+  // threat model.
+  let scrubbed = text.replace(CONTROL_CHARS_REGEX, '');
   if (opts.redactPaths) {
     // Apply each path shape independently. Order matters when
     // patterns can overlap: URLs (matched below under redactHosts)

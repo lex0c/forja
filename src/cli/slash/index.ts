@@ -6,6 +6,7 @@
 // owns the lookup-and-execute path.
 
 import type { SubagentSet } from '../../subagents/index.ts';
+import { agentPolicyCommand } from './commands/agent-policy.ts';
 import { budgetCommand } from './commands/budget.ts';
 import { clearCommand } from './commands/clear.ts';
 import { costCommand } from './commands/cost.ts';
@@ -16,6 +17,7 @@ import { hooksCommand } from './commands/hooks.ts';
 import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
+import { pinCommand } from './commands/pin.ts';
 import { planCommand } from './commands/plan.ts';
 import { buildPlaybookSlashCommands } from './commands/playbook.ts';
 import { quitCommand } from './commands/quit.ts';
@@ -62,7 +64,9 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     permsCommand,
     historyCommand,
     memoryCommand,
+    pinCommand,
     hooksCommand,
+    agentPolicyCommand,
   ];
   const playbookCommands =
     subagents !== undefined ? buildPlaybookSlashCommands(subagents.byName.values()) : [];

@@ -1,3 +1,10 @@
+import type {
+  EvictionActor,
+  EvictionMotivo,
+  EvictionState,
+  EvictionSubstrate,
+} from '../storage/repos/eviction-events.ts';
+
 // Type vocabulary for the hooks subsystem (spec AGENTIC_CLI.md
 // §10 + CONTRACTS.md §3 / §10).
 //
@@ -37,15 +44,22 @@ export type HookEvent =
   | 'Notification'
   | 'PreCheckpoint'
   | 'MemoryWrite'
+  | 'Eviction'
   | 'Stop';
 
 // Events the dispatcher waits on before resuming the originating
 // flow. Mirror of the "Pode bloquear?" column in spec §10.1.
+//
+// Eviction is blocking per EVICTION.md §10.3: a hook that returns
+// exit 1 refuses the proposed transition. The owner that proposed
+// the transition records `outcome = 'blocked_by_hook'` in
+// eviction_events instead of `applied`.
 export const BLOCKING_EVENTS: ReadonlySet<HookEvent> = new Set([
   'UserPromptSubmit',
   'PreToolUse',
   'PreCompact',
   'MemoryWrite',
+  'Eviction',
 ]);
 
 // Hierarchy layer for a hook spec. Lower-priority layers cannot
@@ -55,19 +69,31 @@ export const BLOCKING_EVENTS: ReadonlySet<HookEvent> = new Set([
 // project per spec §10 line 1042-1045.
 export type HookLayer = 'enterprise' | 'user' | 'project';
 
-// Matcher: filter that limits when a hook fires. Today only the
-// `tool` field is honored (matches `event.data.tool` for
-// PreToolUse / PostToolUse). Other matcher fields can land later
-// without changing the dispatcher contract — unknown fields are
-// ignored (forward-compat for newer config files on older
-// binaries).
+// Matcher: filter that limits when a hook fires.
 //
-// Matching semantics: the matcher is a glob string per spec §10.2
-// line 987 (`matcher = { tool = "write_file" }`). We support
-// exact-string match and `*` wildcard suffix (`bash*`) — the
-// permissions matcher uses the same scheme (`permissions/match.ts`).
+// `tool` matches `event.data.tool.name` on tool-shaped events
+// (PreToolUse / PostToolUse / PostToolUseFailure). Exact-string
+// match plus `*` wildcard suffix (`bash*` matches `bash` and
+// `bash_background`) — same scheme as `permissions/match.ts`.
+//
+// The remaining fields (`substrate`, `motivo`, `fromState`,
+// `toState`, `actor`) are Eviction-event matchers per
+// EVICTION.md §10.3. Each is an EXACT-string match against the
+// corresponding field of `event.data`. TOML uses snake_case
+// (`from_state`, `to_state`); the config parser converts.
+//
+// Unknown matcher fields are ignored (forward-compat for newer
+// config files on older binaries). Per-event semantics: a
+// matcher field only narrows when the event has the
+// corresponding payload field; on other events the field is
+// ignored and the hook still runs (subject to other filters).
 export interface HookMatcher {
   tool?: string;
+  substrate?: string;
+  motivo?: string;
+  fromState?: string;
+  toState?: string;
+  actor?: string;
 }
 
 // One hook entry from the resolved config, after hierarchy merge.
@@ -185,6 +211,7 @@ export type HookEventPayload =
   | { schema: 'v1'; event: 'Notification'; sessionId: string; data: NotificationData }
   | { schema: 'v1'; event: 'PreCheckpoint'; sessionId: string; data: PreCheckpointData }
   | { schema: 'v1'; event: 'MemoryWrite'; sessionId: string; data: MemoryWriteData }
+  | { schema: 'v1'; event: 'Eviction'; sessionId: string; data: EvictionEventData }
   | { schema: 'v1'; event: 'Stop'; sessionId: string; data: StopData };
 
 export interface SessionStartData {
@@ -228,6 +255,31 @@ export interface MemoryWriteData {
   name: string;
   source: 'user_explicit' | 'inferred' | 'imported';
   body: string;
+}
+
+// Eviction event payload per EVICTION.md §10.3. Owner that
+// proposed the transition fires this BEFORE persisting the row
+// to eviction_events; if the hook chain blocks, the owner
+// records `outcome: 'blocked_by_hook'` with `blocked_by` set to
+// the spec source (`<layer>:<sourcePath>#<entryIndex>`).
+//
+// Types are imported from the eviction_events repo so adding a
+// new state/motivo/etc. there flows automatically into the hook
+// payload shape — no parallel literal unions to keep in sync.
+export interface EvictionEventData {
+  substrate: EvictionSubstrate;
+  objectId: string;
+  objectScope: string;
+  fromState: EvictionState;
+  toState: EvictionState;
+  trigger: string;
+  motivo: EvictionMotivo;
+  actor: EvictionActor;
+  // The same JSON the row will persist in `evidence_json`. Hook
+  // commands can inspect it via stdin (the dispatcher passes the
+  // full payload as-is) — useful for security-policy hooks that
+  // need more than substrate/motivo to decide.
+  evidenceJson: string;
 }
 export interface StopData {
   durationMs: number;

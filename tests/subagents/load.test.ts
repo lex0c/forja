@@ -1241,6 +1241,7 @@ describe('loadSubagents (directory discovery)', () => {
       cwd: workspace,
       userDir: join(workspace, 'no-user'),
       projectDir: join(workspace, 'no-project'),
+      builtinDir: null,
     });
     expect(set.byName.size).toBe(0);
     expect(set.shadows).toEqual([]);
@@ -1261,7 +1262,7 @@ describe('loadSubagents (directory discovery)', () => {
         'User-only review.',
       ),
     );
-    const set = loadSubagents({ cwd: workspace, userDir, projectDir });
+    const set = loadSubagents({ cwd: workspace, userDir, projectDir, builtinDir: null });
     expect(set.byName.size).toBe(2);
     expect(set.byName.get('explore')?.scope).toBe('project');
     expect(set.byName.get('explore')?.description).toBe('Project override.');
@@ -1288,7 +1289,12 @@ describe('loadSubagents (directory discovery)', () => {
     writeFile(join(dir, 'README.txt'), 'noise');
     mkdirSync(join(dir, 'nested-dir'), { recursive: true });
     writeFile(join(dir, 'nested-dir', 'inside.md'), VALID);
-    const set = loadSubagents({ cwd: workspace, userDir: dir, projectDir: null });
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: dir,
+      projectDir: null,
+      builtinDir: null,
+    });
     expect(set.byName.size).toBe(1);
     expect(set.byName.get('explore')?.sourcePath).toBe(join(dir, 'explore.md'));
   });
@@ -1296,8 +1302,191 @@ describe('loadSubagents (directory discovery)', () => {
   test('userDir=null disables the user scope entirely', () => {
     const projectDir = join(workspace, '.agent', 'agents');
     writeFile(join(projectDir, 'explore.md'), VALID);
-    const set = loadSubagents({ cwd: workspace, userDir: null, projectDir });
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: null,
+      projectDir,
+      builtinDir: null,
+    });
     expect(set.byName.get('explore')?.scope).toBe('project');
     expect(set.shadows).toEqual([]);
+  });
+});
+
+// ── post-S11 review (F1 + F7): built-in scope loading ────────────
+
+describe('playbook surface — capabilities (R2)', () => {
+  // The capabilities frontmatter field lets a playbook author declare
+  // its PERMISSION_ENGINE §10.1 ask. The loader validates each entry
+  // via parseCapability and rejects malformed ones at load time
+  // (source-aware error) rather than letting them surface as a
+  // confusing `subagent_escalation` envelope mid-run. Absence ⇒
+  // legacy behavior (parent's full envelope verbatim). Empty array
+  // is meaningful: pure-LLM run.
+
+  const withCaps = (yaml: string) => `---
+name: t
+description: t
+tools: [read_file]
+budget:
+  max_steps: 5
+  max_cost_usd: 0.1
+${yaml}
+---
+body`;
+
+  test('absent ⇒ undefined (legacy fallback)', () => {
+    const def = loadSubagentFromString(VALID, 'user', '/fake/t.md');
+    expect(def.capabilities).toBeUndefined();
+  });
+
+  test('empty array ⇒ [] (pure-LLM, distinct from absent)', () => {
+    const def = loadSubagentFromString(withCaps('capabilities: []'), 'user', '/fake/t.md');
+    expect(def.capabilities).toEqual([]);
+  });
+
+  test('canonical entries round-trip through parse + format', () => {
+    const def = loadSubagentFromString(
+      withCaps('capabilities:\n  - read-fs:src/**\n  - exec:shell'),
+      'user',
+      '/fake/t.md',
+    );
+    expect(def.capabilities).toEqual(['read-fs:src/**', 'exec:shell']);
+  });
+
+  test('rejects non-array', () => {
+    expect(() =>
+      loadSubagentFromString(withCaps("capabilities: 'read-fs:**'"), 'user', '/f.md'),
+    ).toThrow(/'capabilities' must be an array/);
+  });
+
+  test('rejects non-string entry', () => {
+    expect(() => loadSubagentFromString(withCaps('capabilities: [42]'), 'user', '/f.md')).toThrow(
+      /'capabilities\[0\]' must be a string/,
+    );
+  });
+
+  test('rejects empty entry', () => {
+    expect(() => loadSubagentFromString(withCaps('capabilities: [""]'), 'user', '/f.md')).toThrow(
+      /'capabilities\[0\]' must be a non-empty/,
+    );
+  });
+
+  test('rejects whitespace-padded entry', () => {
+    expect(() =>
+      loadSubagentFromString(withCaps('capabilities: ["read-fs:** "]'), 'user', '/f.md'),
+    ).toThrow(/leading or trailing whitespace/);
+  });
+
+  test('rejects malformed capability', () => {
+    expect(() =>
+      loadSubagentFromString(withCaps('capabilities: ["bogus-kind:x"]'), 'user', '/f.md'),
+    ).toThrow(/not a valid capability/);
+  });
+
+  test('rejects duplicate canonical form', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withCaps('capabilities:\n  - read-fs:src/**\n  - read-fs:src/**'),
+        'user',
+        '/f.md',
+      ),
+    ).toThrow(/'capabilities' lists 'read-fs:src\/\*\*' twice/);
+  });
+});
+
+describe('loadSubagents (S11 builtin scope)', () => {
+  test('verify-semantic builtin loads from the real ship dir', () => {
+    // Uses the production BUILTIN_AGENTS_DIR. Pinned to catch
+    // regressions where the file moves / renames / gets removed.
+    const set = loadSubagents({ cwd: workspace, userDir: null, projectDir: null });
+    const def = set.byName.get('verify-semantic');
+    expect(def).toBeDefined();
+    expect(def?.scope).toBe('builtin');
+    expect(def?.tools).toEqual(['read_file', 'grep', 'glob', 'memory_read']);
+    expect(def?.budget.maxSteps).toBe(15);
+    expect(def?.budget.maxCostUsd).toBeCloseTo(0.1);
+    expect(def?.isolation).toBe('none');
+    expect(set.shadows).toEqual([]);
+    // G11: pin two load-bearing safety phrases from the system
+    // prompt — the dispatcher's runtime guards (injection + path
+    // existence) assume the model was told to treat the body as
+    // adversarial and to refuse phantom citations. A silent refactor
+    // that strips either should fail this test.
+    expect(def?.systemPrompt).toContain('adversarial');
+    expect(def?.systemPrompt).toContain('Phantom citations');
+    // R2 + follow-up: verify-semantic declares the MINIMUM
+    // capabilities its read_file / grep / glob tools need.
+    // `read-fs:**` lets the verifier inspect any file the operator's
+    // parent envelope allows; the intersection narrows that to the
+    // parent's actual read-fs grants. A regression that dropped
+    // the declaration (or re-set it to `[]`) would either re-grant
+    // the parent's full envelope (audit drift) or — worse — refuse
+    // every read_file the verifier needs ("subagent capability
+    // outside declared envelope") and turn the fact-checker into
+    // a hallucination engine.
+    expect(def?.capabilities).toEqual(['read-fs:**']);
+  });
+
+  test('builtinDir=null disables the scope entirely', () => {
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: null,
+      projectDir: null,
+      builtinDir: null,
+    });
+    expect(set.byName.size).toBe(0);
+  });
+
+  test('project shadow of a protected builtin (verify-semantic) surfaces a shadow row', () => {
+    const projectDir = join(workspace, '.agent', 'agents');
+    writeFile(
+      join(projectDir, 'verify-semantic.md'),
+      VALID.replace('name: explore', 'name: verify-semantic').replace(
+        'Read-only codebase exploration.',
+        'malicious override.',
+      ),
+    );
+    const set = loadSubagents({
+      cwd: workspace,
+      userDir: null,
+      projectDir,
+    });
+    // Project wins by precedence.
+    expect(set.byName.get('verify-semantic')?.scope).toBe('project');
+    // Shadow surfaces (loud) — operator sees it on boot.
+    expect(set.shadows.some((s) => s.name === 'verify-semantic')).toBe(true);
+    const shadow = set.shadows.find((s) => s.name === 'verify-semantic');
+    expect(shadow?.shadowed.scope).toBe('builtin');
+    expect(shadow?.winning.scope).toBe('project');
+  });
+
+  test('user shadow of a protected builtin (verify-semantic) also surfaces', () => {
+    const userDir = join(workspace, 'user-agents');
+    writeFile(
+      join(userDir, 'verify-semantic.md'),
+      VALID.replace('name: explore', 'name: verify-semantic'),
+    );
+    const set = loadSubagents({ cwd: workspace, userDir, projectDir: null });
+    expect(set.byName.get('verify-semantic')?.scope).toBe('user');
+    expect(set.shadows.some((s) => s.name === 'verify-semantic')).toBe(true);
+  });
+
+  test('user shadow of an UNprotected builtin stays silent', () => {
+    // Synthesize an "unprotected" builtin by loading from a custom
+    // builtinDir; user override should not appear in shadows[].
+    const builtinDir = join(workspace, 'fake-builtin');
+    writeFile(join(builtinDir, 'helper.md'), VALID.replace('name: explore', 'name: helper'));
+    const userDir = join(workspace, 'user-agents');
+    writeFile(
+      join(userDir, 'helper.md'),
+      VALID.replace('name: explore', 'name: helper').replace(
+        'Read-only codebase exploration.',
+        'user override.',
+      ),
+    );
+    const set = loadSubagents({ cwd: workspace, userDir, projectDir: null, builtinDir });
+    expect(set.byName.get('helper')?.scope).toBe('user');
+    expect(set.shadows.some((s) => s.name === 'helper')).toBe(false);
   });
 });

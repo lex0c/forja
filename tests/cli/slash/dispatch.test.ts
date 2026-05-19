@@ -153,7 +153,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 15 builtins when no subagents provided', () => {
+  test('contains all 17 builtins when no subagents provided', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -171,7 +171,9 @@ describe('createBuiltinRegistry', () => {
       'perms',
       'history',
       'memory',
+      'pin',
       'hooks',
+      'agent',
     ]);
   });
 
@@ -182,8 +184,8 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 15 commands → header + 15 rows + blank + emergency-exit footer = 18.
-    expect(result.notes?.length).toBe(18);
+    // 17 commands → header + 17 rows + blank + emergency-exit footer = 20.
+    expect(result.notes?.length).toBe(20);
   });
 
   test('appends playbook slash commands when a SubagentSet is provided', () => {

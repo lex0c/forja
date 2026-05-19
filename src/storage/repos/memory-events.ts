@@ -20,7 +20,21 @@ export type MemoryEventAction =
   | 'refused'
   | 'promoted'
   | 'demoted'
-  | 'expired';
+  | 'expired'
+  // Phase 0 stitching (MEMORY.md §5.3 + EVICTION.md §3) added
+  // five lifecycle actions. Migration 048 expanded the CHECK
+  // constraint to admit them; this union mirrors the schema.
+  | 'quarantined'
+  | 'invalidated'
+  | 'evicted'
+  | 'restored'
+  | 'purged'
+  // Migration 063: governance proposal expiry-extension audit
+  // (`/memory governance defer <id> <days>`). One row per defer
+  // attributed to the memory the proposal would transition on
+  // approve (target_key when multi-memory, else
+  // sourceMemoryKeys[0]).
+  | 'deferred';
 export type MemoryEventSource = 'user_explicit' | 'inferred' | 'imported';
 
 export interface MemoryEvent {
@@ -168,6 +182,41 @@ export const listRecentMemoryEvents = (db: DB, limit = 50): MemoryEvent[] => {
     )
     .all(limit);
   return rows.map(fromRow);
+};
+
+// Earliest `created` event timestamp for a memory in a scope,
+// or null when no `created` row exists. Used by the user_explicit
+// cooldown protection gate (EVICTION §6.2) to determine when a
+// manually-created memory was first observed by the audit chain
+// — so the gate can refuse `low_roi` / `irrelevant` evictions in
+// the first 72h after creation.
+//
+// Falls back to NULL when the memory pre-dates the audit table
+// (legacy registry pickups created before MEMORY §3.1.1's
+// `created` event landed in the schema). The protection gate
+// treats null as "age unknown" and SKIPS the cooldown — under-
+// protect rather than over-protect. Rationale: a legacy memory
+// with no `created` row would otherwise be permanently blocked
+// from eviction by any cooldown-protected motivo, since age
+// never elapses. The operator override (`actor: 'user'` via
+// `/memory delete`) still works for those rows, and any newly-
+// created memory (post-1.3) lands a `created` row alongside the
+// write so the gate fires correctly.
+export const getEarliestMemoryCreatedAt = (
+  db: DB,
+  scope: string,
+  memoryName: string,
+): number | null => {
+  const row = db
+    .query<{ created_at: number }, [string, string]>(
+      `SELECT created_at
+         FROM memory_events
+        WHERE scope = ? AND memory_name = ? AND action = 'created'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    )
+    .get(scope, memoryName);
+  return row !== null ? row.created_at : null;
 };
 
 // History of one memory across its full lifetime. Ordered most-

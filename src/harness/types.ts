@@ -7,11 +7,12 @@ import type {
 } from '../critique/index.ts';
 import type { FailureEventSink } from '../failures/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
-import type { MemoryRegistry } from '../memory/index.ts';
+import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
 import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
+import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
@@ -816,6 +817,75 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // S5 CRIT/H2 hardening. Scopes that must be excluded from
+  // retrieval (`retrieve_context` tool) for this session. Mirrors
+  // the eager-load exclusion the bootstrap applies to
+  // `assembleMemorySection` when the shared-corpus trust probe
+  // returned a non-confirmed outcome (verify_failed / deferred /
+  // revoked). Without this, the model could fetch project_shared
+  // bodies via retrieve_context even though the system prompt
+  // already excluded them — partial fail-closed. Absent / empty
+  // = no exclusion.
+  memoryExcludeScopes?: ReadonlyArray<import('../memory/index.ts').MemoryScope>;
+  // S11 LLM-judge semantic verifier (MEMORY.md §11.x / Phase 2).
+  // DEFAULT ON since Slice Q (post-S13). When true: every step
+  // boundary polls memory_provenance for newly-exposed factual
+  // memories (type=project / reference) and dispatches the
+  // verify-semantic subagent (gated by cost / dispatch caps + the
+  // memory_verify_attempts dedup table). Opt-out:
+  //   - `/memory governance disable verify` (per-project, persisted
+  //     in `.agent/config.toml [memory] verify_semantic_llm = false`)
+  //   - `--no-memory-verify-llm` (session-only)
+  // Optional in the type so test fixtures + programmatic callers
+  // that don't model memory governance can omit the field (loop.ts
+  // treats undefined as "off"); CLI bootstrap ALWAYS sets it
+  // explicitly post-Slice-Q.
+  memorySemanticVerify?: boolean;
+  // Source provenance for /memory governance status rendering + the
+  // first-run banner suppression. Boot resolves which layer
+  // produced `memorySemanticVerify`'s value. Optional because
+  // legacy fixtures don't populate it.
+  memorySemanticVerifySource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // S13 LLM-judge conflict detector (MEMORY.md §11.x / Phase 2).
+  // DEFAULT ON since Slice Q. Mirror of memorySemanticVerify
+  // optionality.
+  memoryConflictDetect?: boolean;
+  memoryConflictDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // S3 LLM-judge override detector (MEMORY.md §11.x / Phase 2, spec
+  // §6.5.2). When true: every step boundary polls
+  // memory_override_events for memories whose override counter
+  // tripped the threshold (3 events in 24h) and dispatches the
+  // verify-override subagent (gated by cost / dispatch caps + the
+  // memory_verify_override_attempts cooldown). Opt-out via slash +
+  // config will mirror S11/S13 (S3.5 follow-up adds the loader
+  // + CLI flag + slash subcommand). Optional in type so callers
+  // pre-S3.5 omit (loop treats undefined as "off").
+  memoryOverrideDetect?: boolean;
+  memoryOverrideDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
+  // Inventory of memories that landed in the eager-load section
+  // of the system prompt (MEMORY.md §11.2 — provenance, surface
+  // 'eager'). Populated by the CLI bootstrap from
+  // assembleMemorySection. The harness loop emits one
+  // memory_provenance row per entry right after createSession —
+  // that's the first moment a sessionId exists to link against
+  // (eager loading happens BEFORE the session is created, so the
+  // record has to be deferred). Absent / empty ⇒ no eager
+  // exposures (headless tests, registries with no memories).
+  //
+  // The inventory pins hash + state-at-exposure at boot, NOT at
+  // emit time — the operator may rewrite a file between assembly
+  // and session start. The spec semantic is "the bytes the model
+  // saw at boot", which freezes at assembly.
+  eagerExposures?: readonly EagerExposure[];
+  // Pinned context store (CONTEXT_TUNING.md §12.4). When set, the
+  // harness threads it through ToolContext so the pin_context tool
+  // can dispatch. Absent ⇒ pin_context surfaces `pin.store_
+  // unavailable` cleanly. Same shape as memoryRegistry above: the
+  // REPL constructs once at boot via createContextPinsStore(db)
+  // and hands it through. The /pin slash command consumes the
+  // SAME store instance via SlashContext.contextPinsStore — both
+  // surfaces share the underlying table.
+  contextPinsStore?: ContextPinsStore;
   // Async hook the harness calls when the permission engine returns
   // a `confirm` decision. Caller resolves true to allow the call
   // (recorded as confirm_yes) or false to deny (confirm_no). When

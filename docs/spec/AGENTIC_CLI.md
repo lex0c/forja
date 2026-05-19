@@ -36,10 +36,12 @@ Este documento (`AGENTIC_CLI.md`) é a spec arquitetural de alto nível. Detalhe
 | [`FAILURE_MODES.md`](./FAILURE_MODES.md) | Catálogo de falhas com playbook de recovery, audit, mensagens-template | Ao implementar tratamento de erro, ou triagem de incidente |
 | [`SECURITY_GUIDELINE.md`](./SECURITY_GUIDELINE.md) | Threat model STRIDE, trust boundaries, attack vectors, defense layers, secret handling, supply chain, signing, disclosure process | Antes de implementar qualquer feature com side effect; ao revisar PR de segurança; pré-release |
 | [`AUDIT.md`](./AUDIT.md) | Append-only convention, timeline unificada, PII redaction antes-de-persistir, hash chain (tamper-evident), forensics bundle format, `agent audit` CLI, schema versioning, GDPR hooks | Ao implementar audit/forensics; ao definir retention; ao adicionar tabela de audit nova |
+| [`EVICTION.md`](./EVICTION.md) | Lifecycle e despejo tipado cross-substrato (memory, policy, candidate, slot item) — 7 estados canônicos, state machine, gates de evidência + proteção, tombstones com retention window, decay × eviction separados, compaction como eviction efêmera | Ao implementar lifecycle de qualquer substrato persistente; ao auditar "por que isso sumiu?"; antes de adicionar mecanismo de "esquecimento" |
 | [`PROVIDERS.md`](./PROVIDERS.md) | Catálogo de providers, capabilities matrix, quirks documentados, recomendações por workflow, eval multi-model strategy | Ao adicionar provider novo, ou ao escolher provider pra workflow específico |
 | [`LOCAL_MODELS.md`](./LOCAL_MODELS.md) | Hardware detection, model lifecycle, tool calling adapters, constrained generation, embeddings strategy, prompt template dialects, setup/bootstrap, remote Ollama, failure modes locais, privacy verifiable | Ao rodar com Ollama/llama.cpp; pra detalhamento operacional além do PROVIDERS.md |
 | [`TOKEN_TUNING.md`](./TOKEN_TUNING.md) | Sampling params (temperature, top_p, top_k, penalties, seed), output budget per call, stop sequences, reasoning effort, multi-sample, truncation strategies, tokenizer accuracy, per-workflow defaults, eval-driven tuning | Ao definir sampling em playbook novo; ao adicionar provider; ao tunar workflow com eval |
 | [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) | Shape do prompt: system prompt architecture, layout + cache breakpoints, memory loading, tool palette, few-shot strategy, format choices, attention positioning, per-step shaping, goal re-injection, repo map injection, selective inclusion, per-workflow recipes | Ao desenhar/tunar contexto de prompt; pareceria com TOKEN_TUNING (tuning de generation) |
+| [`RETRIEVAL.md`](./RETRIEVAL.md) | Pipeline `query → candidates → expansion → ranking → compression → context slot` em três views (workspace, session, memory). Decide **WHAT** entra no contexto dado um goal. Ranking auditável (lexical/estrutural primeiro, embedding opt-in v2), expansion bounded, trace obrigatório | Ao decidir o que entra no contexto; antes de propor "memória infinita" ou RAG; ao integrar compaction = retrieval re-query |
 | [`PERFORMANCE.md`](./PERFORMANCE.md) | SLOs, budgets de latência, custo por tarefa, regression strategy | Ao otimizar hot path, ou definir threshold de regressão em CI |
 | [`UI.md`](./UI.md) | Modelo inline, event bus, render funcional, componentes (tool card, modais, status line), paleta/glyphs/microcopy, headless `--json`, fallbacks. Sem framework. | Ao implementar qualquer parte da TUI ou definir microcopy de erro |
 | [`RECAP.md`](./RECAP.md) | Vista projetada de sessões (PR/changelog/slack/etc), source-of-truth determinística + LLM renderer | Ao implementar `/recap`, ou gerar artefato a partir de sessão |
@@ -49,6 +51,7 @@ Este documento (`AGENTIC_CLI.md`) é a spec arquitetural de alto nível. Detalhe
 | [`CODE_INDEX.md`](./CODE_INDEX.md) | Subsistema de indexação de código — schema SQLite (symbols/references/imports), pipeline (initial scan + incremental + FS watcher opt-in), API queryable, multi-language tree-sitter, integração com repo map, tools simbólicas candidatas, invalidação, privacy | Ao implementar code index; ao adicionar tool simbólica nova; ao tunar repo map ou estratégia de retrieval |
 | [`CODE_GENERATION.md`](./CODE_GENERATION.md) | Pipeline canônico de geração — generate → format → lint → test → checkpoint → accept; modos de strictness; integração com playbooks; per-language config; audit footprint; anti-patterns | Ao implementar PostToolUse hooks de generation; ao definir strict mode em playbook; ao debugar pipeline failure |
 | [`FEATURE_FLAGS.md`](./FEATURE_FLAGS.md) | Governance mínima de flags — categorias (CLI/config/slash/state), lifecycle (experimental→staged→stable→deprecated), inventário canônico, audit (`feature_flags_active`), discovery (`agent --list-flags`, `/flags`), eval integration, anti-patterns | Ao introduzir flag nova; ao promover/depreciar; ao auditar bypass flags em CI |
+| [`FEEDBACK_ADAPTATION.md`](./FEEDBACK_ADAPTATION.md) | Aprendizado operacional harness-side — dois loops (quente per-action / frio per-trigger), tiers de feedback (1-5), unidade adaptável (L1 alias → L4 strategy), calibração bayesiana com prior, invalidação > decay, escopo hierárquico (session → repo → user → language → global). Modelo nunca é notificado da adaptação | Ao propor "agent que aprende"; ao calibrar policies de permission/retrieval/context; antes de adicionar LLM-as-judge |
 
 Spec arquitetural sem esses docs é descrição de uma implementação. **Com** esses docs vira protocolo que múltiplas implementações respeitam.
 
@@ -80,7 +83,114 @@ Spec arquitetural sem esses docs é descrição de uma implementação. **Com** 
 
 ---
 
-## 2. Terminal-first (o que isso significa, na prática)
+## 1.1 Invariantes operacionais
+
+Corolários operacionais dos princípios §1, escritos como regras verificáveis. Cada invariante existe porque um foot-gun recorrente em sistemas similares justifica documentá-lo explicitamente. Próximas slices devem citar o invariante violado quando propuserem exceção.
+
+### 1.1.1 Verifier hierarchy doctrine
+
+**Regra:** *Use o mecanismo mais barato que resolve o problema. Saltar níveis é foot-gun por default.*
+
+Pilha de verificação por custo (latência típica, custo USD por chamada):
+
+| Mecanismo | Latência | $ / chamada | Domínio |
+|---|---|---|---|
+| `stat` / `existsSync` | ~0.001 ms | $0 | Exact lookup (path-existence, file-shape) |
+| `grep` / regex | ~10 ms | $0 | Pattern search em texto conhecido |
+| SQLite indexed query | ~1 ms | $0 | Structured lookup em audit / state |
+| Embedding similarity | ~50 ms | ~$0.0001 | Semantic clustering, near-dup detection |
+| LLM call (Haiku-class) | ~1000 ms | ~$0.001 | Semantic judgment, paraphrase, single-doc reasoning |
+| LLM call (Sonnet-class) | ~2000 ms | ~$0.005 | Complex multi-step reasoning, multi-source synthesis |
+| LLM subagent (multi-tool) | ~30000 ms | ~$0.05 | Exploratory analysis, governance proposal generation |
+
+**Aplicação:**
+
+- Slice nova que precisa de verificação DEVE escolher o nível mais baixo que cobre o caso documentado e **justificar por que não usou o anterior**.
+- "LLM cobre tudo" é arquitetura cara + lenta + não-determinística sem ganho. Usar LLM em path-existence é gasto desnecessário de ~5-6 ordens de grandeza.
+- "Heurística sempre" é frágil em domínios semânticos. Quando o caso documentado envolve paráfrase, equivalência conceitual ou síntese — LLM é apropriado.
+- Hybrid stack: heurística pega o cheap path, retorna `unknown` no resto; LLM como fallback opt-in sobre o `unknown` set. Custo escala com complexidade real, não com volume.
+
+**Pull-in signal para overrider:** dados empíricos mostrando que o nível inferior tem false-negative rate intolerável para o caso de uso. Sem dados, ficar no nível barato.
+
+**Excepção subsistema-específica documentada — memory:** o memory subsystem do Forja optou deliberadamente por **zero text-heuristic** para decisões de lifecycle (S2 verify_failed e S4 conflict_detected ambas tentaram extratores regex sobre prose e foram revertidas — análise empírica mostrou que distinguir "memória afirma X" de "memória menciona X em contexto histórico" requer compreensão semântica que regex não entrega). A doutrina geral acima continua válida (use o mais barato que resolve), mas no memory subsystem **a camada heurística é intencionalmente vazia** para essa classe de decisão: todo julgamento sobre prose vai para LLM-judge via S8 governance proposals (`MEMORY.md §11.3`). Substrato determinístico (state machine, audit, frontmatter, hashing, expiry, scope precedence, file existence checks) e dials numéricos (BM25 weights, quarantine penalty) ficam — não são "judgment over prose".
+
+### 1.1.2 No-daemon discipline
+
+**Regra:** *Forja é per-CLI-invocation. Não há processo de longa duração entre sessões. Cross-session work acontece em boot sweeps, não em background.*
+
+**Aplicação:**
+
+- Sweeps de retenção (eviction tombstone purge, provenance prune, governance proposal expire) rodam **at boot**, com janela documentada (90d / 30d) — não em timer/cron interno.
+- Detectores e governance que precisam de "monitoramento contínuo" devem ser reformulados como "verificação at boot" ou "verificação at step boundary" dentro da sessão.
+- Subagents existem e correm async, mas dentro do escopo de **uma sessão** (`task_async` handle store é drenado no outer finally do `runAgent`).
+- Cron / scheduled work cross-session é responsabilidade do operator (cron + `agent` invocation), não do binário.
+
+**Por que:** processo background introduz classe inteira de bugs (zombie processes, db lock contention, signal handling em ambientes restritivos, recovery após crash) que a infra atual não modela. Inverter essa decisão requer projetar lifecycle de processo separado, IPC entre instâncias, lock files, etc. — escopo de subsistema novo.
+
+**Pull-in signal:** caso de uso documentado que **não pode** ser modelado como boot sweep ou step-boundary. Hoje nenhum existe.
+
+### 1.1.3 Append-only everywhere
+
+**Regra:** *Substrato de audit nunca muta retroativamente. Tudo que parece mutação é INSERT de nova row + ponteiro pro estado anterior.*
+
+**Aplicação:**
+
+- `memory_events`, `eviction_events`, `memory_provenance`, `memory_governance_proposals`: tabelas append-only. UPDATE permitido apenas em campos de status discriminantes (e.g., `governance_proposals.status: pending → applied/rejected/expired`), nunca rewrite de payload.
+- Mutações lógicas (state transition, memory rewrite) viram audit-row + paired transition-row. O histórico do conteúdo vive em commit history do filesystem + tombstones; o histórico do estado vive em eviction_events parent-chain.
+- Sweeps de retenção são a **única** operação DELETE permitida nesses substratos, com janela explícita documentada em constante exportada.
+- Migration que adicionar campo NOVO em audit table é OK; migration que reescreve rows existentes (backfill que não seja idempotente sobre `created_at`) **requer justificativa documentada**.
+
+**Por que:** replay forense + audit reconciliation + detector quality measurement dependem de imutabilidade. Uma rewrite silenciosa quebra a premissa que faz audit valer mais que log.
+
+### 1.1.4 Confidence ≠ authority
+
+**Regra:** *Scores de confidence guiam ranking e decay — nunca authorization. Authorization vem de: (a) operator explicit approval, (b) deterministic state-machine validation, (c) heuristic com zero false-positive shape.*
+
+**Aplicação:**
+
+- `memory_governance_proposals.confidence` é input para ordenação na UI e para gate de "auto-archive abaixo de threshold". **Nunca** input para "auto-apply acima de threshold".
+- Truth confidence em frontmatter (proposta em S12) impacta retrieval ranking, **não** auto-mutation.
+- "Auto-apply at confidence > 0.95" é refused by design — confidence é estimativa probabilística do modelo sobre si mesmo, não autorização para alterar estado persistente.
+- Apply path SEMPRE requer evento de authorization explícito (operator approval row, state machine `applied` outcome).
+
+**Por que:** confiar em confidence para auto-aplicar cria caminho de **recursive epistemic corruption**: memória ruim → LLM gera proposal high-confidence → auto-apply → estado degrada → futura geração de proposals piora. Separar confidence de authority quebra o loop.
+
+**Pull-in signal:** apenas se um detector tiver false-positive rate empiricamente medido em **zero** em corpus suficientemente grande — e mesmo assim, com kill-switch operacional.
+
+### 1.1.5 Injection surface ledger
+
+**Regra:** *Toda superfície onde bytes de memory body podem entrar em janela de modelo é listada explicitamente. Adicionar nova superfície requer: (a) entrada nesta lista, (b) revisão do trust filter, (c) `scanForInjection` pre-check.*
+
+**Superfícies hoje:**
+
+1. **Eager system prompt** (boot). Filtered: `frontmatter.trust === 'untrusted'` exclui o body do prompt. Index entry (name + description) ainda surface.
+2. **`memory_read` tool response** (per-call). Full body returned ao modelo via tool result. Trust marker propagated em `out.trust`; renderer surface "[memory: untrusted]" warn no terminal.
+3. **`retrieve_context` slot** (per-call). Full body em `level='full'`, comprimido em `outline/summary/ref`. Inclusão é gateada pelo compression resolver; não tem trust filter dedicado hoje (gap conhecido — `MEMORY.md §14.3`).
+4. **Governance subagent input** (planejado em S11). Bodies passam por `scanForInjection` pre-check; system prompt enquadra input como adversarial; output JSON-schema-validated.
+
+**Aplicação:**
+
+- PR que adicionar nova superfície (ex.: novo tool que retorna memory body, novo subagent que lê memory) DEVE adicionar entrada nesta lista. PR review check.
+- Trust filter (`frontmatter.trust === 'untrusted'` rejection) é o gate canônico — futuras superfícies devem usar a mesma helper, não reimplementar.
+- `scanForInjection` é o pre-check canônico para LLM-consumer surfaces — futuras superfícies LLM devem chamar antes de emitir bytes no prompt.
+
+**Por que:** memory bodies são operator-edited e alguns são imported (FEEDBACK_ADAPTATION cross-cut). Tratá-los como input não-adversarial em qualquer superfície reabre o vetor que o trust filter existe para fechar. Sem ledger central, próximo developer adiciona a 5ª superfície sem perceber que está bypassando uma camada de defesa.
+
+### 1.1.6 Proposal staleness check
+
+**Regra:** *Toda governance proposal carrega snapshot do estado das memórias referenciadas no momento da criação. Apply path verifica os snapshots contra estado CURRENT antes da transição; mismatch = `rejected`, não `applied`.*
+
+**Aplicação:**
+
+- Qualquer proposal que cite uma ou mais memórias por `(scope, name)` (governance proposals, eviction proposals, consolidation proposals — toda família `memory_governance_proposals` da §11.3) DEVE persistir `source_memory_snapshots: { scope, name, content_hash }[]` no momento da criação.
+- O apply path computa `hashMemoryContent(serializeMemoryFile(current_file))` para cada memória citada e compara com o snapshot. Qualquer mismatch → status='rejected', `decided_by='system:stale_evidence'`, reason inclui qual memória drifou.
+- O check roda ANTES da verificação de state (memory has changed state since proposal) — drift de conteúdo é o sinal mais informativo para o operator ("a memória mudou desde que eu propus isso" é mais útil que "memória já não está active").
+- **Caso especial — memória citada não existe mais** (deletada entre proposal creation e approval): `readMemoryByName` retorna `missing`/`unknown` → rejection com `decided_by='system:memory_gone'`, distinto de `system:stale_evidence`. Os dois são UX semanticamente diferentes pro operator (memória "editada" vs memória "sumiu"); rejection reason carrega a distinção pra slash render.
+- **Caso especial — proposal sem source_memory_keys** (e.g., hipotético `kind='create'` propondo memória nova): `source_memory_snapshots` é array vazio; o check passa por vacuidade (nada pra comparar) e o apply path prossegue para validação de state + transição normal.
+
+**Por que:** propose-not-mutate (§1.1.4) tem latência entre criação e aprovação. Sem snapshot check, o operator aprova hoje uma proposal cuja evidência reflete o estado de N dias atrás — pior caso, autoriza mutação contra body completamente diferente do que a evidência da proposal cita. O snapshot fecha o gap: o invariante operacional é "approval ratifica evidência no contexto em que foi gerada; se contexto drifou, evidência expira".
+
+**Pull-in signal para overrider:** nenhum — esse é defesa estrutural barata (1 hash extra por proposal, 1 comparison no apply). Sem custo significativo, sem trade-off operacional.
 
 A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal portada pra terminal. Aqui não.
 
@@ -576,11 +686,38 @@ Eval específico em `evals/critique/`:
 
 Sem eval, critic vira ruído (warnings constantes que user aprende a ignorar).
 
+### 5.4.1 Memory governance detectors (per-project opt-out)
+
+Os três detectores LLM-judge do memory subsystem (`verify_failed` em [`MEMORY.md`](./MEMORY.md) §11, `conflict_detected` em §11, `user_override_repeated` em §11) são **default ON** por default. Operator faz opt-out via `.agent/config.toml`:
+
+```toml
+# ~/.config/agent/config.toml ou .agent/config.toml
+[memory]
+verify_semantic_llm = false        # desliga S11 verify_failed (default true)
+conflict_detect_llm = false        # desliga S13 conflict_detected (default true)
+override_detect_llm = false        # desliga S3 user_override_repeated (default true)
+```
+
+**Precedência** (first-match wins):
+
+1. **CLI flag** explicit — `--memory-verify-llm` / `--no-memory-verify-llm` (idem `--memory-conflict-llm` e `--memory-override-llm`). Session-only override; ignora config.
+2. **Project config** — `<cwd>/.agent/config.toml [memory]`. Per-projeto, versionado pelo time.
+3. **User config** — `~/.config/agent/config.toml [memory]`. Per-user, cross-project.
+4. **Default ON** — hardcoded em `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG`.
+
+**Layers (2):** user + project. Sem enterprise layer ainda — mirror do `[critique]` block; spec amenda quando regulated environment surfacar. Snake_case canonical; camelCase aliases aceitos (mesma posture de `[critique]`).
+
+**Slash:** `/memory governance enable | disable verify|conflict|override|all` escreve `.agent/config.toml [memory]`. `all` cobre os três detectores. Efeito vale a partir do próximo turn boundary (snapshot semantic).
+
+**First-boot advisory:** quando OS TRÊS detectores resolvem ON via default (nenhum layer setou, nenhuma CLI flag, marker em `~/.local/share/forja/.governance-banner-shown` ausente), boot emite uma linha stderr `memory: governance LLM detectors enabled by default (verify=on, conflict=on, override=on). Disable: /memory governance disable verify|conflict|override|all`. Suppressed em `--json` mode, subagent context, e após primeira sessão (marker em `~/.local/share/forja/`).
+
 ---
 
 ## 6. Context Engine
 
 > **Detalhamento operacional:** [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) — system prompt architecture, layout + cache breakpoints, memory loading, tool palette, few-shot strategy, format choices, attention positioning, per-step shaping, goal re-injection mechanics, repo map injection, selective inclusion, per-workflow recipes. Esta seção é overview.
+>
+> **Driver de seleção:** [`RETRIEVAL.md`](./RETRIEVAL.md) decide **WHAT** entra no contexto dado um goal (pipeline `candidates → expansion → ranking → compression`); CONTEXT_TUNING decide **HOW** formatar o que já entrou. Sem retrieval declarado, "memória infinita"/RAG vira cargo cult ([`ANTI_PATTERNS.md §2.2`](./ANTI_PATTERNS.md)).
 
 Estrutura do prompt **fixa, ordem importa, cache breakpoints conscientes**:
 
@@ -610,6 +747,8 @@ Estratégia em camadas:
 Compaction é uma chamada LLM separada — modelo configurado em `compaction.model`, **não vendor-locked**. Default por profile: `autonomous` usa modelo cheap-but-capable do mesmo provider (Haiku se Anthropic, gpt-4o-mini se OpenAI, etc); `orchestrated` usa o backend local; `hybrid` é declarado em config. Prompt versionado, **testada por eval**. Sem isso degrada silenciosamente.
 
 Em profile `orchestrated`, compaction usa modelo do próprio backend (não Haiku) com prompt mais agressivo e schema fixo (`goal`, `decisions`, `files_touched`, `errors`).
+
+**Compaction = retrieval re-query com budget menor.** Critério de "o que fica" delega ao [`RETRIEVAL.md §15.5`](./RETRIEVAL.md) — re-rank dos candidatos do contexto atual com `budget' < budget`; o que cai fora do top-K vira candidato a eviction efêmera ([`EVICTION.md §9`](./EVICTION.md)). Pinned items são gate absoluto ([`CONTEXT_TUNING.md §12.4`](./CONTEXT_TUNING.md)). Fallback determinístico (`drop_oldest`) preservado em [`ORCHESTRATION.md §4.6`](./ORCHESTRATION.md) quando retrieval indisponível.
 
 ### Repo Map (essencial em `orchestrated`, opcional em `autonomous`)
 

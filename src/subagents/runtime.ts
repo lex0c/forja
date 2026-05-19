@@ -231,6 +231,13 @@ export interface RunSubagentInput {
   // `config.isCwdTrusted` so the in-flight run propagates the
   // verdict it's already operating under.
   cwdTrusted?: boolean;
+  // S5 CRIT/H3: forwarded from the parent's bootstrap when the
+  // shared-corpus trust probe returned a non-confirmed outcome
+  // (verify_failed / deferred / revoked). The child's harness
+  // mirrors the fail-closed posture on both `assembleMemorySection`
+  // (eager-load) and `retrieve_context` (tool surface). Absence =
+  // false (parent confirmed OR no probe ran).
+  sharedScopeOffline?: boolean;
   depth?: number;
   worktreeRootDir?: string;
   // Test seam: inject a fake subprocess factory. Production
@@ -320,6 +327,14 @@ export interface RunSubagentInput {
   //   - `['cap', ...]` — narrowed envelope. Sealed verbatim;
   //     child gates each resolved cap via cwd-aware coverage.
   effectiveCapabilities?: readonly string[];
+  // Migration 058 — id of the `approvals` row that authorized this
+  // spawn (PERMISSION_ENGINE.md §10.2). Sealed into
+  // `subagent_runs.parent_approval_id` so the audit chain stays
+  // one-hop. Optional because (a) test fixtures construct
+  // RunSubagentInput without an approval, (b) the verify-semantic
+  // scheduler bypasses the approval path entirely (forensics route
+  // via memory_verify_attempts.subagent_run_session_id).
+  parentApprovalId?: string;
   // Permission proxy callback (spec docs/spec/IPC.md §7,
   // permission:ask / permission:answer slice). When the child's
   // engine returns a `confirm` verdict, the child bridge
@@ -500,9 +515,21 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // is what the operator reads.
   const cleanupOnFail = async (): Promise<void> => {
     if (worktreeHandle !== undefined) {
-      await cleanupWorktree({ handle: worktreeHandle, parentCwd: input.cwd }).catch(
-        () => undefined,
-      );
+      // R6 — pre-fix the catch swallowed both success and failure
+      // outcomes silently. A cleanupWorktree that succeeded on dir
+      // removal but failed on `git branch -D <agent>` left a stale
+      // branch in git with no logged signal; operator perception
+      // was "agent worked fine" while the branch list grew. Surface
+      // failure paths on stderr (cleanup is best-effort; we still
+      // swallow the throw, but the operator gets the breadcrumb).
+      try {
+        await cleanupWorktree({ handle: worktreeHandle, parentCwd: input.cwd });
+      } catch (cleanupErr) {
+        const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+        process.stderr.write(
+          `subagent ${childSession.id}: cleanupWorktree threw during failure cleanup: ${msg}\n`,
+        );
+      }
     }
     // Best-effort finalize. Swallow errors — the row may have
     // been finalized concurrently by an outer purge, or
@@ -524,7 +551,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     insertSubagentRun(input.db, {
       sessionId: childSession.id,
       name: definition.name,
+      // The storage schema (migration 012) constrains scope to
+      // Migration 058 widened the CHECK to include 'builtin', so
+      // the row now records the true provenance ('user'/'project'/
+      // 'builtin') directly. Forensic queries can filter shipped
+      // vs. operator-authored without cross-referencing the
+      // in-process registry. Pre-058 sessions recorded 'user' for
+      // builtin definitions; that drift is unrecoverable for old
+      // rows but new dispatches are honest.
       scope: definition.scope,
+      ...(input.parentApprovalId !== undefined ? { parentApprovalId: input.parentApprovalId } : {}),
       sourcePath: definition.sourcePath,
       sourceSha256: definition.sourceSha256,
       systemPrompt: definition.systemPrompt,
@@ -696,6 +732,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.planMode === true ? { planMode: true } : {}),
       ...(input.cwdTrusted === true ? { cwdTrusted: true } : {}),
+      ...(input.sharedScopeOffline === true ? { sharedScopeOffline: true } : {}),
       // Forward the IPC opt-in. The default spawn factory
       // converts this into pipe streams + the `--ipc=<n>` argv
       // flag; injected fakes can either build their own channel

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { FrontmatterError, parseMemoryFile } from './frontmatter.ts';
 import { type ParsedIndex, parseIndex } from './index-file.ts';
@@ -43,17 +43,87 @@ export type ScopeIndexResult =
 const isEnoent = (err: unknown): boolean =>
   typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === 'ENOENT';
 
+// Refuse symlinks and non-regular files BEFORE readFileSync. Two
+// reasons share this gate:
+//
+//   1. Trust attestation symmetry (S5 review). The shared-corpus
+//      fingerprint (`listSharedCorpusFiles` in trust-corpus.ts)
+//      already lstat-rejects symlinks: a symlinked `.md` is
+//      excluded from the hash AND the trust modal inventory.
+//      Without this loader-side mirror, the eager-load /
+//      retrieval surfaces would `readFileSync(path)` and follow
+//      the symlink — feeding target bytes to the model under a
+//      trust hash that pretended the file didn't exist. A
+//      malicious repo could ship `MEMORY.md` referencing
+//      `evil.md` where `evil.md` is a symlink to `~/.ssh/id_rsa`
+//      (or any out-of-scope file): the fingerprint stays
+//      unchanged across boots ("no re-prompt needed") while the
+//      target's bytes leak into the model's context. Closing the
+//      symmetry at the loader makes the substrate's symlink
+//      policy uniform — modal sees the same set the model sees.
+//
+//   2. Non-regular file rejection (defense-in-depth). A
+//      directory named `foo.md/`, a fifo, a socket, a device
+//      node — `readFileSync` either returns junk or blocks
+//      indefinitely. Surface as malformed so operators can spot
+//      it via `/memory list` rather than discovering it via a
+//      hung boot.
+//
+// Outcomes from the pre-read regular-file check.
+type RegularFileCheck =
+  | { kind: 'ok' }
+  | { kind: 'not_found' }
+  | { kind: 'symlink' }
+  | { kind: 'non_regular' };
+
+const checkRegularFile = (path: string): RegularFileCheck => {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(path);
+  } catch (err) {
+    if (isEnoent(err)) return { kind: 'not_found' };
+    throw err;
+  }
+  if (stat.isSymbolicLink()) return { kind: 'symlink' };
+  if (!stat.isFile()) return { kind: 'non_regular' };
+  return { kind: 'ok' };
+};
+
+const SYMLINK_REFUSE_MESSAGE =
+  'memory file is a symlink — refused by security policy ' +
+  '(shared-corpus trust attestation requires regular files; ' +
+  'materialize a real file at this path)';
+
+const NON_REGULAR_REFUSE_MESSAGE =
+  'memory file is not a regular file (got directory, fifo, socket, or device node)';
+
 // Read MEMORY.md for one scope. Returns 'absent' when either the
 // scope root directory or the file itself does not exist — both
 // states indicate "no memories declared via index here", which is
 // indistinguishable from the operator's perspective. Other fs errors
 // (EACCES, EIO) propagate; they're real problems, not scope state.
+//
+// SECURITY (S5 review): refuse symlinked MEMORY.md. The shared-
+// corpus fingerprint excludes symlinks from its hash, so a symlinked
+// index would let an attacker swap which bodies eager-load reads
+// (point MEMORY.md at any out-of-scope file containing
+// markdown-link syntax) while leaving the trust hash unchanged.
+// Same loader-level mirror as `readMemoryByName` below; see that
+// helper's header for the full threat-model.
 export const loadScopeIndex = (roots: ScopeRoots, scope: MemoryScope): ScopeIndexResult => {
   const path = indexFilePath(roots, scope);
+  const fileCheck = checkRegularFile(path);
+  if (fileCheck.kind === 'not_found') return { kind: 'absent' };
+  if (fileCheck.kind === 'symlink') return { kind: 'malformed', error: SYMLINK_REFUSE_MESSAGE };
+  if (fileCheck.kind === 'non_regular') {
+    return { kind: 'malformed', error: NON_REGULAR_REFUSE_MESSAGE };
+  }
   let raw: string;
   try {
     raw = readFileSync(path, 'utf-8');
   } catch (err) {
+    // checkRegularFile already absorbed ENOENT; remaining throws
+    // are real fs errors (EACCES, EIO) we surface unchanged.
     if (isEnoent(err)) return { kind: 'absent' };
     throw err;
   }
@@ -81,6 +151,20 @@ export type MemoryFileResult =
 // through `memoryFilePath`, which validates and re-applies the
 // sandbox check — callers can pass arbitrary user-supplied names
 // without re-validating.
+//
+// SECURITY (S5 review): refuse symlinks and non-regular files
+// BEFORE readFileSync. The shared-corpus trust attestation excludes
+// symlinks from the fingerprint at `listSharedCorpusFiles` — but
+// without this loader-side mirror, the eager-load and retrieval
+// paths would still follow them via `readFileSync(path)` and feed
+// target bytes to the model. A malicious repo could ship MEMORY.md
+// referencing a symlinked body whose target is an out-of-scope
+// file (e.g., `~/.ssh/id_rsa` or any host file readable by the
+// agent's UID); the fingerprint would stay unchanged across boots
+// because the symlinked body was excluded from it, so no trust
+// re-prompt fires, while the model silently sees the target's
+// content. Mirroring the rejection at the loader closes the
+// asymmetry and makes the substrate's symlink policy uniform.
 export const readMemoryByName = (
   roots: ScopeRoots,
   scope: MemoryScope,
@@ -91,6 +175,12 @@ export const readMemoryByName = (
   // we propagate the FrontmatterError / ScopeError unchanged so the
   // tool surface (5.2.b) can map it to a clean tool error.
   const path = memoryFilePath(roots, scope, name);
+  const fileCheck = checkRegularFile(path);
+  if (fileCheck.kind === 'not_found') return { kind: 'missing' };
+  if (fileCheck.kind === 'symlink') return { kind: 'malformed', error: SYMLINK_REFUSE_MESSAGE };
+  if (fileCheck.kind === 'non_regular') {
+    return { kind: 'malformed', error: NON_REGULAR_REFUSE_MESSAGE };
+  }
   let raw: string;
   try {
     raw = readFileSync(path, 'utf-8');

@@ -188,6 +188,93 @@ export type {
 } from './repos/memory-events.ts';
 
 export {
+  DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD,
+  GOVERNANCE_PROPOSAL_KINDS,
+  GOVERNANCE_PROPOSAL_STATUSES,
+  GOVERNANCE_PROPOSAL_TTL_MS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS,
+  MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  canonicalJsonStringify,
+  computeProposalFingerprint,
+  decideProposal,
+  deferProposal,
+  expirePendingProposals,
+  getProposalById,
+  listPendingProposals,
+  listPendingProposalsForMemory,
+  listProposals,
+  listProposalsForMemory,
+  recordProposal,
+} from './repos/memory-governance.ts';
+export type {
+  DecideProposalInput,
+  DeferProposalInput,
+  DeferProposalResult,
+  ExpirePendingProposalsInput,
+  ListProposalsOptions,
+  MemoryGovernanceProposalKind,
+  MemoryGovernanceProposalRow,
+  MemoryGovernanceProposalStatus,
+  MemoryKey,
+  MemorySnapshot,
+  RecordProposalInput,
+  RecordProposalResult,
+} from './repos/memory-governance.ts';
+
+export {
+  listRecentSessionExposures,
+  listSessionExposuresSince,
+} from './repos/memory-provenance.ts';
+
+export {
+  MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
+  SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
+  SEMANTIC_VERIFY_VERDICTS,
+  listRecentAttempts,
+  lookupRecentAttempt,
+  pruneVerifyAttempts,
+  recordAttempt,
+} from './repos/memory-verify-attempts.ts';
+export type {
+  MemoryVerifyAttemptRow,
+  RecordAttemptInput,
+  SemanticVerifyVerdict,
+} from './repos/memory-verify-attempts.ts';
+
+export {
+  MEMORY_OVERRIDE_EVENTS_RETENTION_MS,
+  MEMORY_OVERRIDE_THRESHOLD_COUNT,
+  MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
+  OVERRIDE_SIGNALS,
+  countOverridesInWindow,
+  listOverrideEventsSince,
+  listRecentOverridesForMemory,
+  pruneOverrideEvents,
+  recordOverrideEvent,
+} from './repos/memory-override-events.ts';
+export type {
+  MemoryOverrideEventRow,
+  OverrideSignal,
+  RecordOverrideEventInput,
+  RecordOverrideEventResult,
+} from './repos/memory-override-events.ts';
+
+export {
+  MEMORY_VERIFY_OVERRIDE_ATTEMPTS_RETENTION_MS,
+  OVERRIDE_SUGGESTED_MOTIVOS,
+  listRecentOverrideAttempts,
+  lookupRecentOverrideAttempt,
+  pruneOverrideAttempts,
+  recordOverrideAttempt,
+} from './repos/memory-verify-override-attempts.ts';
+export type {
+  MemoryVerifyOverrideAttemptRow,
+  OverrideSuggestedMotivo,
+  RecordOverrideAttemptInput,
+} from './repos/memory-verify-override-attempts.ts';
+
+export {
   createHookRun,
   listHookRunsByEvent,
   listHookRunsBySession,

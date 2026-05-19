@@ -334,6 +334,100 @@ describe('resolveHookConfig — locking semantics', () => {
   });
 });
 
+describe('resolveHookConfig — Eviction event + matcher fields', () => {
+  test('Eviction is accepted as a valid event', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `
+        [[hooks]]
+        event = "Eviction"
+        command = "audit-eviction.sh"
+      `,
+    );
+    const result = resolveHookConfig({ enterprise: null, user: null, project: prj });
+    expect(result.warnings).toEqual([]);
+    expect(result.hooks[0]?.event).toBe('Eviction');
+  });
+
+  test('parses substrate / motivo / from_state / to_state / actor matcher fields', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `
+        [[hooks]]
+        event = "Eviction"
+        command = "security-audit.sh"
+        matcher = { substrate = "memory", motivo = "security", from_state = "active", to_state = "purged", actor = "hook" }
+      `,
+    );
+    const result = resolveHookConfig({ enterprise: null, user: null, project: prj });
+    expect(result.warnings).toEqual([]);
+    const h = result.hooks[0];
+    if (h === undefined) throw new Error('missing hook');
+    expect(h.matcher.substrate).toBe('memory');
+    expect(h.matcher.motivo).toBe('security');
+    expect(h.matcher.fromState).toBe('active'); // snake_case → camelCase
+    expect(h.matcher.toState).toBe('purged');
+    expect(h.matcher.actor).toBe('hook');
+  });
+
+  test('rejects empty-string matcher fields', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `
+        [[hooks]]
+        event = "Eviction"
+        command = "x"
+        matcher = { substrate = "" }
+      `,
+    );
+    const result = resolveHookConfig({ enterprise: null, user: null, project: prj });
+    expect(result.hooks).toHaveLength(0);
+    expect(result.warnings[0]?.kind).toBe('invalid_entry');
+    expect(result.warnings[0]?.message).toContain('matcher.substrate');
+  });
+
+  test('rejects non-string matcher fields', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `
+        [[hooks]]
+        event = "Eviction"
+        command = "x"
+        matcher = { motivo = 42 }
+      `,
+    );
+    const result = resolveHookConfig({ enterprise: null, user: null, project: prj });
+    expect(result.hooks).toHaveLength(0);
+    expect(result.warnings[0]?.kind).toBe('invalid_entry');
+    expect(result.warnings[0]?.message).toContain('matcher.motivo');
+  });
+
+  test('unknown matcher fields are silently ignored (forward-compat)', () => {
+    const tmp = makeTmp();
+    const prj = join(tmp, 'hooks.toml');
+    writeToml(
+      prj,
+      `
+        [[hooks]]
+        event = "Eviction"
+        command = "x"
+        matcher = { substrate = "memory", future_field = "any" }
+      `,
+    );
+    const result = resolveHookConfig({ enterprise: null, user: null, project: prj });
+    expect(result.warnings).toEqual([]);
+    expect(result.hooks[0]?.matcher.substrate).toBe('memory');
+  });
+});
+
 describe('resolveHookConfig — slice 181', () => {
   test('PostToolUseFailure is a valid event', () => {
     const tmp = makeTmp();

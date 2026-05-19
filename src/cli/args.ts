@@ -162,6 +162,38 @@ export interface ParsedArgs {
   // `session.cwd` would also default false. Carrying the
   // parent's verdict explicitly is the only correct option.
   subagentCwdTrusted?: boolean;
+  // Internal: forwarded shared-corpus trust verdict
+  // (S5 CRIT/H3). True ⇒ parent's bootstrap shared-trust probe
+  // returned a non-confirmed outcome (verify_failed / deferred /
+  // revoked); child must mirror the fail-closed posture by
+  // excluding project_shared from BOTH eager-load AND retrieval.
+  // Absence = false (parent's probe confirmed OR didn't run, in
+  // which case the child also doesn't run its own probe — the
+  // memory subsystem is already set up for the parent's scope).
+  subagentSharedScopeOffline?: boolean;
+  // S11 session-only override (MEMORY.md §11.x). Enables/disables
+  // the LLM-judge semantic verifier: at each step boundary the
+  // scheduler polls memory_provenance for newly-exposed factual
+  // memories and dispatches the verify-semantic subagent (gated by
+  // cost/dispatch caps + dedup table). Slice Q inverted the
+  // default to ON; persistent opt-out belongs in `.agent/config.
+  // toml [memory]` or `~/.config/agent/config.toml`. CLI flags
+  // (`--memory-verify-llm` / `--no-memory-verify-llm`) are session-
+  // only overrides that win over config. `undefined` means "no CLI
+  // override; honor config" — explicit boolean values are forwarded
+  // to bootstrap which records the source as `'cli'`.
+  memoryVerifyLlm?: boolean;
+  // S13 session-only override for the LLM-judge conflict detector.
+  // Independent of memoryVerifyLlm — operator may enable either,
+  // both, or neither. Same top-level-only constraint (subagent
+  // children don't run their own scheduler). Same default-ON +
+  // config-opt-out posture as memoryVerifyLlm (Slice Q).
+  memoryConflictLlm?: boolean;
+  // S3 session-only override for the LLM-judge override detector.
+  // Independent of memoryVerifyLlm + memoryConflictLlm. Same
+  // top-level-only constraint and config-opt-out posture as the
+  // other two detectors (S3.5 wiring).
+  memoryOverrideLlm?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -1499,6 +1531,57 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.subagentCwdTrusted = true;
         i += 1;
         break;
+      case '--subagent-shared-scope-offline':
+        // Presence-only flag (S5 CRIT/H3). Set when the parent's
+        // shared-corpus trust probe returned a non-confirmed
+        // outcome (verify_failed / deferred / revoked). The child
+        // mirrors the parent's fail-closed posture: eager-load AND
+        // retrieval exclude project_shared. Without forwarding,
+        // the child would re-read disk via its own
+        // assembleMemorySection and surface bodies the parent
+        // specifically gated.
+        args.subagentSharedScopeOffline = true;
+        i += 1;
+        break;
+      case '--memory-verify-llm':
+        // S11 LLM-judge semantic verifier — session-only override-ON.
+        // Default ON since Slice Q (post-S13); this flag stays for
+        // scripts that want explicit opt-in even when project
+        // config disabled. Cost + dispatch caps in
+        // MEMORY_VERIFY_SEMANTIC_MAX_* throttle the spend.
+        args.memoryVerifyLlm = true;
+        i += 1;
+        break;
+      case '--no-memory-verify-llm':
+        // S11 LLM-judge — session-only override-OFF. Disables S11
+        // for THIS session regardless of config layer. Persistent
+        // disable: `/memory governance disable verify`.
+        args.memoryVerifyLlm = false;
+        i += 1;
+        break;
+      case '--memory-conflict-llm':
+        // S13 LLM-judge conflict detector — session-only override-ON.
+        // Mirror of --memory-verify-llm; independent flag (operator
+        // can enable one and disable the other).
+        args.memoryConflictLlm = true;
+        i += 1;
+        break;
+      case '--no-memory-conflict-llm':
+        // S13 LLM-judge — session-only override-OFF.
+        args.memoryConflictLlm = false;
+        i += 1;
+        break;
+      case '--memory-override-llm':
+        // S3 LLM-judge override detector — session-only override-ON.
+        // Mirror of --memory-verify-llm + --memory-conflict-llm.
+        args.memoryOverrideLlm = true;
+        i += 1;
+        break;
+      case '--no-memory-override-llm':
+        // S3 LLM-judge — session-only override-OFF.
+        args.memoryOverrideLlm = false;
+        i += 1;
+        break;
       case '--subagent-temperature': {
         const value = argv[i + 1];
         if (value === undefined) {
@@ -1644,6 +1727,57 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     return {
       ok: false,
       message: '--ipc is an internal flag and requires --subagent-session-id',
+    };
+  }
+  // Slice Q — mutual exclusion: `--memory-verify-llm` and
+  // `--no-memory-verify-llm` in the same argv silently last-wins
+  // through the switch above, which masks an operator's typo. We
+  // refuse both polarities being present at parse time. Same for
+  // the conflict pair.
+  const seen = new Set(argv);
+  if (seen.has('--memory-verify-llm') && seen.has('--no-memory-verify-llm')) {
+    return {
+      ok: false,
+      message: '--memory-verify-llm and --no-memory-verify-llm are mutually exclusive',
+    };
+  }
+  if (seen.has('--memory-conflict-llm') && seen.has('--no-memory-conflict-llm')) {
+    return {
+      ok: false,
+      message: '--memory-conflict-llm and --no-memory-conflict-llm are mutually exclusive',
+    };
+  }
+  if (seen.has('--memory-override-llm') && seen.has('--no-memory-override-llm')) {
+    return {
+      ok: false,
+      message: '--memory-override-llm and --no-memory-override-llm are mutually exclusive',
+    };
+  }
+  // S11/S13 — top-level-only flags (verify scheduler + conflict
+  // scheduler never run in subagent context). Both polarities
+  // (--memory-verify-llm and --no-memory-verify-llm) must refuse
+  // the combination with --subagent-session-id. F12 mirror extended
+  // for Slice Q. The check fires on either explicit polarity
+  // (undefined = no CLI override, not rejected).
+  if (args.memoryVerifyLlm !== undefined && args.subagentSessionId !== undefined) {
+    return {
+      ok: false,
+      message:
+        '--memory-verify-llm / --no-memory-verify-llm are top-level flags and conflict with --subagent-session-id (subagent children do not run the verify scheduler)',
+    };
+  }
+  if (args.memoryConflictLlm !== undefined && args.subagentSessionId !== undefined) {
+    return {
+      ok: false,
+      message:
+        '--memory-conflict-llm / --no-memory-conflict-llm are top-level flags and conflict with --subagent-session-id (subagent children do not run the conflict scheduler)',
+    };
+  }
+  if (args.memoryOverrideLlm !== undefined && args.subagentSessionId !== undefined) {
+    return {
+      ok: false,
+      message:
+        '--memory-override-llm / --no-memory-override-llm are top-level flags and conflict with --subagent-session-id (subagent children do not run the override scheduler)',
     };
   }
   return { ok: true, args };

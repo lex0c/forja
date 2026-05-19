@@ -95,6 +95,14 @@ export const getLastFailureEventBySession = (
   return row;
 };
 
+// One-shot fetch by id. Used by the retrieval compression layer
+// to resolve a failure-event candidate's body when ranking
+// elects it for the context slot. Returns null on miss.
+export const getFailureEvent = (db: DB, id: string): FailureEventRow | null => {
+  const row = db.query(`${SELECT_ALL} WHERE id = ?`).get(id) as FailureEventRow | null;
+  return row;
+};
+
 // Full chain in append order (created_at ASC, id ASC tiebreak).
 // Used by verifyChain to walk hashes for a session. Bounded by
 // per-session retention; typical session has 0-3 failure events.

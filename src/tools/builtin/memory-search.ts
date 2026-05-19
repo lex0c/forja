@@ -144,6 +144,14 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
     // if we get back `limit+1`, we know there's at least one more
     // match. The reported `hits` is sliced to `limit`.
     //
+    // `auditLimit: limit` constrains body-match audit/provenance
+    // emission to the rows actually returned to the model. Without
+    // this cap, the over-fetched sentinel (the +1 row used only as
+    // a "is there more?" signal) would still emit a `read` event +
+    // memory_provenance row, inflating exposure counts and skewing
+    // detectors that treat provenance as "visible to model"
+    // evidence.
+    //
     // Forward ctx.sessionId / ctx.cwd as audit overrides. The
     // deep branch emits `read` events for body-match hits; without
     // per-call attribution these would land with session_id NULL
@@ -153,8 +161,18 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
       ...(scopeCheck !== null ? { scope: scopeCheck } : {}),
       ...(args.deep === true ? { deep: true } : {}),
       limit: limit + 1,
+      auditLimit: limit,
       auditSessionId: ctx.sessionId,
       auditCwd: ctx.cwd,
+      // Body-match hits in the deep branch read the file, which
+      // is an EXPOSURE per MEMORY.md §11.2 — same accountability
+      // as a memory_read tool call. Forwarding ctx.toolCallId so
+      // the provenance row links back to the search call.
+      // Stronger than `!== undefined`: empty string would
+      // coerce-pass and FK-fail silently. See memory-read.ts.
+      ...(typeof ctx.toolCallId === 'string' && ctx.toolCallId.length > 0
+        ? { auditToolCallId: ctx.toolCallId }
+        : {}),
     });
 
     const truncated = raw.length > limit;

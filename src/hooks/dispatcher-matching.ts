@@ -26,17 +26,63 @@ const getIfGlob = (pattern: string): Glob => {
 // Shared by `matchesPayload` and the public `filterMatchingHooks`
 // — keeping the rule in one place prevents drift between the
 // two call sites.
+// Events that carry a tool name in their payload. Tool matcher
+// only narrows for these; on non-tool-shaped events (Eviction,
+// MemoryWrite, etc.) the field is a no-op rather than a deny.
+const TOOL_SHAPED_EVENTS: ReadonlySet<HookEvent> = new Set([
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+]);
+
 const specMatches = (spec: HookSpec, event: HookEvent, toolName: string | null): boolean => {
   if (spec.event !== event) return false;
   const toolMatcher = spec.matcher.tool;
   if (toolMatcher === undefined) return true;
-  // Tool matcher only meaningful when a tool name is in scope.
-  // Non-tool events pass `null` and never match.
+  // Tool matcher is a no-op on non-tool-shaped events. Without
+  // this branch, an Eviction-event spec that ALSO sets
+  // `matcher.tool = "..."` (operator misconfiguration: tool
+  // matcher is meaningless on a non-tool payload) would suppress
+  // the hook silently. Preserving the original "tool matcher
+  // requires toolName when the event IS tool-shaped" gate
+  // (returns false if the caller forgot to supply one) keeps
+  // the existing dispatcher contract for PreToolUse etc.
+  if (!TOOL_SHAPED_EVENTS.has(event)) return true;
   if (toolName === null) return false;
   if (toolMatcher.endsWith('*')) {
     return toolName.startsWith(toolMatcher.slice(0, -1));
   }
   return toolName === toolMatcher;
+};
+
+// Eviction-event matcher per EVICTION.md §10.3. Each field is an
+// EXACT string match against the corresponding payload key. A
+// hook is admitted only when EVERY supplied field matches —
+// matcher fields conjunct, not disjunct.
+//
+// Same semantics as the tool matcher: supplying no field passes
+// any payload (the matcher is fully open); supplying one or more
+// narrows the conjunctive intersection. Wildcards are NOT
+// honored here (motivo/state/actor are closed enums in the
+// repo's CHECK constraints — a `*` matcher would be undefined
+// against an enum).
+const evictionMatcherMatches = (
+  spec: HookSpec,
+  data: {
+    substrate: string;
+    motivo: string;
+    fromState: string;
+    toState: string;
+    actor: string;
+  },
+): boolean => {
+  const m = spec.matcher;
+  if (m.substrate !== undefined && m.substrate !== data.substrate) return false;
+  if (m.motivo !== undefined && m.motivo !== data.motivo) return false;
+  if (m.fromState !== undefined && m.fromState !== data.fromState) return false;
+  if (m.toState !== undefined && m.toState !== data.toState) return false;
+  if (m.actor !== undefined && m.actor !== data.actor) return false;
+  return true;
 };
 
 // Extract the tool name from a payload, if it's a tool-shaped
@@ -153,6 +199,7 @@ const ifFilterMatches = (spec: HookSpec, payload: HookEventPayload): boolean => 
 
 export const matchesPayload = (spec: HookSpec, payload: HookEventPayload): boolean => {
   if (!specMatches(spec, payload.event, toolNameFromPayload(payload))) return false;
+  if (payload.event === 'Eviction' && !evictionMatcherMatches(spec, payload.data)) return false;
   return ifFilterMatches(spec, payload);
 };
 

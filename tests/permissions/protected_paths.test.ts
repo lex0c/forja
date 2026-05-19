@@ -31,6 +31,76 @@ describe('classifyProtectedPath — system deny tier', () => {
       classifyProtectedPath({ absPath: '/systemd-something', op: 'read', home: HOME, cwd: CWD }),
     ).toBeNull();
   });
+
+  // Carve-outs from the /run deny prefix. Real user-facing paths
+  // live under /run on modern Linux: removable media mount points
+  // (udisks2 default surface) and XDG_RUNTIME_DIR (per-user
+  // tmpfs). Pre-fix every read or write under either prefix
+  // landed as deny tier, including operators with their workspace
+  // on an external drive (e.g. /run/media/<user>/<volume>/repo)
+  // — the .gitignore in such a repo was deny-tier protected and
+  // every edit was refused with no modal escape hatch.
+  test.each([
+    // Removable media — udisks2 mounts at /run/media/<user>/<volume>.
+    ['/run/media/lex/disk/Workspaces/forja/.gitignore', 'read'],
+    ['/run/media/lex/disk/Workspaces/forja/.gitignore', 'write'],
+    ['/run/media/alice/usb/notes.md', 'write'],
+    // Regular files under XDG_RUNTIME_DIR — apps drop per-session
+    // config/cache here. These should pass the engine's normal
+    // allow/confirm/deny chain (not pre-emptively deny-tier).
+    ['/run/user/1000/myapp/cache.json', 'write'],
+    ['/run/user/1000/forja/lockfile', 'read'],
+  ] as const)('%s (op=%s) → null (user-owned carve-out under /run)', (absPath, op) => {
+    expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBeNull();
+  });
+
+  test.each([
+    ['/run/postgresql/.s.PGSQL.5432', 'read'],
+    ['/run/dbus/system_bus_socket', 'write'],
+    ['/run/systemd/private', 'write'],
+    ['/var/run/docker.sock', 'write'],
+  ] as const)('%s (op=%s) → deny (privileged daemon socket, NOT in carve-out)', (absPath, op) => {
+    expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBe('deny');
+  });
+
+  // Post-review: the /run/user carve-out used to re-admit EVERY
+  // path under XDG_RUNTIME_DIR, including the user-scoped IPC
+  // sockets the /run deny tier was specifically meant to block.
+  // Narrow the carve-out: regular files pass (test above), but
+  // ssh-agent, gpg-agent, user dbus, podman, Wayland, etc. stay
+  // denied.
+  test.each([
+    // gnupg sockets: S.gpg-agent, S.gpg-agent.ssh, S.scdaemon, S.dirmngr
+    ['/run/user/1000/gnupg/S.gpg-agent', 'read'],
+    ['/run/user/1000/gnupg/S.gpg-agent.ssh', 'write'],
+    ['/run/user/1000/gnupg/S.scdaemon', 'read'],
+    // gnome-keyring (incl. SSH agent surrogate)
+    ['/run/user/1000/keyring/ssh', 'read'],
+    ['/run/user/1000/keyring/control', 'write'],
+    // User dbus (modern systemd) + legacy / internal variants
+    ['/run/user/1000/bus', 'read'],
+    ['/run/user/1000/dbus-1/session', 'read'],
+    ['/run/user/1000/dbus-session', 'read'],
+    // Container daemons
+    ['/run/user/1000/podman/podman.sock', 'write'],
+    ['/run/user/1000/docker.sock', 'write'],
+    // Wayland display sockets (top-level files, not subdirs)
+    ['/run/user/1000/wayland-0', 'write'],
+    ['/run/user/1000/wayland-0.lock', 'read'],
+    ['/run/user/1000/wayland-1', 'read'],
+    // PulseAudio + PipeWire
+    ['/run/user/1000/pulse/native', 'read'],
+    ['/run/user/1000/pipewire-0', 'write'],
+    ['/run/user/1000/pipewire-0-manager', 'write'],
+    // User systemd manager (notify socket, runtime units, etc.)
+    ['/run/user/1000/systemd/notify', 'write'],
+    ['/run/user/1000/systemd/units/.timer', 'read'],
+  ] as const)(
+    '%s (op=%s) → deny (XDG_RUNTIME_DIR IPC endpoint stays blocked under carve-out)',
+    (absPath, op) => {
+      expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBe('deny');
+    },
+  );
 });
 
 describe('classifyProtectedPath — escalate tier (writes only)', () => {

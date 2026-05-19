@@ -329,6 +329,43 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
         auditSessionId: ctx.sessionId,
         auditCwd: ctx.cwd,
       });
+      // S3 signal (a): operator explicitly declined an inferred
+      // memory write. Attribute to the factual memories that were
+      // recently exposed in this session — those are the candidates
+      // whose presence in context could have led the model to
+      // propose the rejected write. Cancellations (esc/timeout) are
+      // excluded: spec language is "user rejeitou", an esc-cancel
+      // is ambiguous (could be accidental, modal timeout). Best-
+      // effort: helper itself catches throws.
+      //
+      // Source gate: only `inferred` writes count as override
+      // signals. `user_explicit` means the operator themselves
+      // asked to save and then declined/corrected — that's a
+      // user changing their mind about their OWN proposal, not
+      // a model misalignment. Attributing it to recently-loaded
+      // factual memories would surface false positives that could
+      // wrongly trip the S3 quarantine flow against unrelated
+      // memories. `imported` shares the same "not model-inferred"
+      // posture and is excluded for the same reason.
+      if (answer === 'no' && source === 'inferred') {
+        registry.recordOverrideSignal({
+          signal: 'memory_write_rejected',
+          details: {
+            proposed_scope: scope,
+            proposed_name: args.name,
+            proposed_source: source,
+            modal_stage: 'modal',
+          },
+          // bootstrap creates memoryRegistry without a constructor
+          // sessionId (the harness loop creates the session later);
+          // recordOverrideSignal no-ops when both ctor sessionId
+          // and auditSessionId are missing, so the signal silently
+          // drops and S3 threshold never trips. Pass ctx.sessionId
+          // here (and on the user_scope_modal branch below) to keep
+          // parity with every other audit call in this file.
+          auditSessionId: ctx.sessionId,
+        });
+      }
       return {
         outcome: 'rejected',
         scope,
@@ -388,6 +425,28 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
           auditSessionId: ctx.sessionId,
           auditCwd: ctx.cwd,
         });
+        // S3 signal (a): same attribution as the first modal. User-
+        // scope rejection is structurally the same operator action
+        // ("don't persist this proposal") — the second modal is just
+        // extra friction for user-scope, not a different signal.
+        // Same source gate as the first modal: only `inferred`
+        // counts as override signal; `user_explicit` is the user
+        // changing their mind about their own request.
+        if (scopeAnswer === 'no' && source === 'inferred') {
+          registry.recordOverrideSignal({
+            signal: 'memory_write_rejected',
+            details: {
+              proposed_scope: scope,
+              proposed_name: args.name,
+              proposed_source: source,
+              modal_stage: 'user_scope_modal',
+            },
+            // Same auditSessionId rationale as the first modal
+            // branch above — bootstrap-built registry has no
+            // constructor sessionId.
+            auditSessionId: ctx.sessionId,
+          });
+        }
         return {
           outcome: 'rejected',
           scope,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assembleMemorySection, composeSystemPrompt } from '../../src/cli/memory-prompt.ts';
@@ -32,7 +32,7 @@ const writeIndex = (dir: string, body: string): void => {
 const writeBody = (
   dir: string,
   name: string,
-  fmExtras: { trust?: string; type?: string; source?: string } = {},
+  fmExtras: { trust?: string; type?: string; source?: string; state?: string } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -42,6 +42,7 @@ const writeBody = (
     `source: ${fmExtras.source ?? 'user_explicit'}`,
   ];
   if (fmExtras.trust !== undefined) lines.push(`trust: ${fmExtras.trust}`);
+  if (fmExtras.state !== undefined) lines.push(`state: ${fmExtras.state}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
 };
 
@@ -53,12 +54,24 @@ afterEach(() => {
 });
 
 describe('assembleMemorySection', () => {
-  test('returns empty string and zero count when no memories exist', () => {
+  test('renders header-only block with zero count when no memories exist', () => {
+    // Post-review fix: save-criteria + 4-type semantics + DO-NOT-save
+    // list are load-bearing on FRESH sessions (the moment the model
+    // is most likely to propose a bad inferred save). Pre-fix this
+    // returned text === '' and the model saw only the tool
+    // description's one-liner; now the full header always renders.
     const repo = makeTmp();
     const registry = createMemoryRegistry({ roots: makeRoots(repo) });
     const result = assembleMemorySection({ registry });
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).toContain('memory_write when');
+    expect(result.text).toContain('Do NOT save');
     expect(result.entryCount).toBe(0);
+    // No index lines when there are no entries — the bullet list
+    // is what differs between empty + populated states.
+    expect(result.text).not.toContain('- [');
+    // eagerLoaded stays empty because no memories actually shipped.
+    expect(result.eagerLoaded).toHaveLength(0);
   });
 
   test('renders entries with scope prefix', () => {
@@ -94,14 +107,20 @@ describe('assembleMemorySection', () => {
     expect(text.toLowerCase()).toContain('drift');
   });
 
-  test('verify-before-act guidance does NOT render when the memory section is empty', () => {
-    // No memories → no section, hence no guidance. Avoids
-    // wasting tokens on a verification rule with nothing to
-    // verify.
+  test('verify-before-act guidance renders even when no memories exist (post-review)', () => {
+    // Inverted from the prior "empty → no guidance" pin. The
+    // verification rule + save criteria are MORE useful on empty
+    // states (model has no precedent to imitate), so we accept the
+    // ~250-token cost in exchange for consistent guidance across
+    // every session.
     const repo = makeTmp();
     const registry = createMemoryRegistry({ roots: makeRoots(repo) });
-    const result = assembleMemorySection({ registry });
-    expect(result.text).toBe('');
+    const text = assembleMemorySection({ registry }).text;
+    expect(text).toContain('FACTUAL');
+    expect(text).toContain('PREFERENCE');
+    expect(text).toContain('grep');
+    expect(text).toContain('read_file');
+    expect(text.toLowerCase()).toContain('drift');
   });
 
   test('orders entries by scope precedence (local > shared > user)', () => {
@@ -132,6 +151,41 @@ describe('assembleMemorySection', () => {
     expect(result.text).toContain('[project_local] commit-style — local version');
     expect(result.text).not.toContain('shared version');
     expect(result.text).not.toContain('user version');
+  });
+
+  test('S5 review: symlinked .md body does NOT leak target content into the section', () => {
+    // End-to-end trust-attestation regression. Trust-corpus already
+    // excludes symlinks from the fingerprint and modal inventory;
+    // the loader-side mirror (loader.ts) closes the asymmetry so a
+    // shared MEMORY.md referencing a symlinked body can't feed
+    // target bytes into the model under a stable trust hash.
+    //
+    // Setup: project_shared/MEMORY.md is a regular file referencing
+    // `evil.md`. `evil.md` is a symlink whose target contains
+    // recognizable bytes ("ATTACKER_PAYLOAD"). assembleMemorySection
+    // must NOT surface those bytes — the body is refused at load
+    // time as malformed; uncertainty-include keeps the entry visible
+    // in the listing but the body content stays out of the section
+    // (peek returns malformed, which the assembler treats the same
+    // way as a missing body: skip rendering rather than emit it).
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Evil](evil.md) — fortress\n');
+    const targetPath = join(repo, 'attacker-secret.md');
+    writeFileSync(
+      targetPath,
+      '---\nname: evil\ndescription: stolen\ntype: feedback\nsource: user_explicit\n---\n\nATTACKER_PAYLOAD\n',
+    );
+    symlinkSync(targetPath, join(roots.projectShared, 'evil.md'));
+
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // The attacker-controlled bytes MUST NOT appear in the rendered
+    // section. Pre-fix the loader followed the symlink and the body
+    // would have rendered normally; the trust hash never re-prompts
+    // because the symlink was already excluded from the hash.
+    expect(result.text).not.toContain('ATTACKER_PAYLOAD');
   });
 });
 
@@ -164,7 +218,7 @@ describe('assembleMemorySection — trust filter (spec §7.2.2)', () => {
     expect(result.text).toContain('pref');
   });
 
-  test('returns empty section when every entry is untrusted', () => {
+  test('returns header-only section when every entry is untrusted', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [Only](only.md) — h\n');
@@ -172,7 +226,10 @@ describe('assembleMemorySection — trust filter (spec §7.2.2)', () => {
     const registry = createMemoryRegistry({ roots });
     const result = assembleMemorySection({ registry });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    // Filter dropped everything → no index lines, but the save-
+    // guidance header still renders (post-review behavior).
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('uncertain peek (missing body) defaults to INCLUDE the index entry', () => {
@@ -240,7 +297,8 @@ describe('assembleMemorySection — trust filter (spec §7.2.2)', () => {
     const registry = createMemoryRegistry({ roots });
     const result = assembleMemorySection({ registry });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('peek call does NOT emit memory_events read rows (no audit)', async () => {
@@ -283,6 +341,108 @@ describe('composeSystemPrompt', () => {
   test('appends memory after base with blank line separator', () => {
     const out = composeSystemPrompt('You are an agent.', '# Memory\n- entry');
     expect(out).toBe('You are an agent.\n\n# Memory\n- entry');
+  });
+});
+
+describe('assembleMemorySection — lifecycle state filter (spec MEMORY.md §6)', () => {
+  test('invalidated memory is excluded from the section', () => {
+    // S5 trust_revoked: every active shared memory becomes
+    // `invalidated` when operator revokes corpus trust. The boot
+    // probe persists that state to disk; THIS layer is what keeps
+    // it out of the system prompt for the rest of the session.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Live](live.md) — h\n- [Zombie](zombie.md) — h\n');
+    writeBody(roots.projectShared, 'live');
+    writeBody(roots.projectShared, 'zombie', { state: 'invalidated' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('live');
+    expect(result.text).not.toContain('zombie');
+  });
+
+  test('quarantined memory stays in the section with the [memory: quarantined] flag (S6)', () => {
+    // Lifecycle-state filter is targeted: ONLY `invalidated` is
+    // excluded. Quarantined memories remain visible with the flag
+    // per S6/T6.2 so the model sees the cautionary marker inline.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Q](q.md) — h\n');
+    writeBody(roots.projectShared, 'q', { state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('[memory: quarantined]');
+  });
+
+  test('active memory (default frontmatter state) is included unchanged', () => {
+    // Ensures the new filter is a no-op for the common case —
+    // memories without an explicit `state:` are treated as active
+    // by the registry/peek layer, and active memories ship.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Live](live.md) — h\n');
+    writeBody(roots.projectShared, 'live'); // no state marker
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('live');
+    expect(result.text).not.toContain('[memory:');
+  });
+});
+
+describe('assembleMemorySection — excludeScopes (S5 P0/H2-rob fail-closed)', () => {
+  test('drops every listing in an excluded scope before per-entry filters', () => {
+    // Scenario: shared-trust probe returned verify_failed.
+    // assembleMemorySection MUST exclude project_shared entirely;
+    // even otherwise-loadable shared memories don't surface.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Shared](shared.md) — h\n');
+    writeBody(roots.projectShared, 'shared');
+    writeIndex(roots.projectLocal, '- [Local](local.md) — h\n');
+    writeBody(roots.projectLocal, 'local');
+    writeIndex(roots.user, '- [User](user.md) — h\n');
+    writeBody(roots.user, 'user', { type: 'user' });
+    const registry = createMemoryRegistry({ roots });
+
+    const result = assembleMemorySection({ registry, excludeScopes: ['project_shared'] });
+    expect(result.entryCount).toBe(2);
+    expect(result.text).toContain('local');
+    expect(result.text).toContain('user');
+    expect(result.text).not.toContain('shared');
+  });
+
+  test('excluded scope also drops missing-body "uncertain peek" entries (fail-closed)', () => {
+    // Index entry without a body file normally falls into the
+    // "uncertain peek → include" branch (resilience: don't lose
+    // operator visibility just because the body went missing). But
+    // when the scope is hard-excluded, the bootstrap intent is "we
+    // don't know what's there, so surface NOTHING". The fail-
+    // closed exclusion must beat the resilience path.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Ghost](ghost.md) — body absent\n');
+    // No writeBody for ghost — peek returns 'missing'.
+    const registry = createMemoryRegistry({ roots });
+
+    const result = assembleMemorySection({ registry, excludeScopes: ['project_shared'] });
+    expect(result.entryCount).toBe(0);
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
+  });
+
+  test('empty excludeScopes list is a no-op (no behavior change)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Shared](shared.md) — h\n');
+    writeBody(roots.projectShared, 'shared');
+    const registry = createMemoryRegistry({ roots });
+
+    const result = assembleMemorySection({ registry, excludeScopes: [] });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('shared');
   });
 });
 
@@ -353,7 +513,8 @@ describe('assembleMemorySection — boot trigger filter (spec §4.3)', () => {
     // boot context has no `git` trigger
     const result = assembleMemorySection({ registry, bootContext: makeCtx('env') });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
   });
 
   test('operator-defined runtime tag (no well-known): unconditional load (rule 2)', () => {
@@ -541,7 +702,7 @@ describe('assembleMemorySection — memory_filter (slice 9)', () => {
     expect(result.text).not.toContain('— h\n- [project_local] c');
   });
 
-  test('no entry matches → empty section', () => {
+  test('no entry matches → header-only section (no index lines)', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
     writeIndex(roots.projectLocal, '- [A](a.md) — h\n');
@@ -549,6 +710,185 @@ describe('assembleMemorySection — memory_filter (slice 9)', () => {
     const registry = createMemoryRegistry({ roots });
     const result = assembleMemorySection({ registry, memoryFilter: ['nonexistent'] });
     expect(result.entryCount).toBe(0);
-    expect(result.text).toBe('');
+    expect(result.text).toContain('# Memory');
+    expect(result.text).not.toContain('- [');
+  });
+});
+
+describe('assembleMemorySection — quarantined visual flag (S6/T6.2)', () => {
+  // Quarantined memories ship in the eager-load section with a
+  // `[memory: quarantined]` marker between scope tag and
+  // description. Spec MEMORY.md §6.5.2; motivo + date enrichment
+  // is deferred (would require JOIN against eviction_events,
+  // matches T0.2's deferral on the slash side).
+  const writeBodyWithStateAlias = (dir: string, name: string, state: string | undefined): void => {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      `name: ${name}`,
+      `description: hook for ${name}`,
+      'type: feedback',
+      'source: user_explicit',
+    ];
+    if (state !== undefined) lines.push(`state: ${state}`);
+    writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
+  };
+
+  test('quarantined memory renders [memory: quarantined] flag inline', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Bad](bad.md) — questionable hook\n');
+    writeBodyWithStateAlias(roots.user, 'bad', 'quarantined');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // Regex pin (not toContain) so a future refactor that
+    // reordered to `[user] [memory: quarantined] bad — …` or
+    // `[user] bad — [memory: quarantined] …` would break this
+    // test. The spec order is `<scope> <name> [memory:
+    // quarantined] — <hook>`; we lock the line shape exactly.
+    expect(result.text).toMatch(/^- \[user\] bad \[memory: quarantined\] — questionable hook$/m);
+    expect(result.entryCount).toBe(1);
+  });
+
+  test('active memory does NOT carry the quarantined flag', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Good](good.md) — fine hook\n');
+    writeBodyWithStateAlias(roots.user, 'good', 'active');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] good — fine hook');
+    expect(result.text).not.toContain('[memory: quarantined]');
+  });
+
+  test('memory without explicit state (defaults to active) shows no flag', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Default](default.md) — no state set\n');
+    writeBodyWithStateAlias(roots.user, 'default', undefined);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] default — no state set');
+    expect(result.text).not.toContain('[memory: quarantined]');
+  });
+
+  test('mix of active + quarantined: only quarantined entries get the flag', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h1\n- [B](b.md) — h2\n');
+    writeBodyWithStateAlias(roots.user, 'a', 'active');
+    writeBodyWithStateAlias(roots.user, 'b', 'quarantined');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] a — h1');
+    expect(result.text).toContain('[user] b [memory: quarantined] — h2');
+    expect(result.text).not.toContain('[user] a [memory: quarantined]');
+  });
+});
+
+describe('assembleMemorySection — eagerLoaded inventory (S1/T1.4)', () => {
+  // Helper specifically for these tests: write a body with a
+  // specific state. Avoids leaking state-aware setup into every
+  // suite above.
+  const writeBodyWithState = (
+    dir: string,
+    name: string,
+    state: string | undefined,
+    trust: string | undefined,
+  ): void => {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      `name: ${name}`,
+      `description: hook for ${name}`,
+      'type: feedback',
+      'source: user_explicit',
+    ];
+    if (state !== undefined) lines.push(`state: ${state}`);
+    if (trust !== undefined) lines.push(`trust: ${trust}`);
+    writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
+  };
+
+  test('every rendered entry appears in eagerLoaded with hash + state', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBodyWithState(roots.user, 'a', undefined, undefined); // defaults active
+    writeBodyWithState(roots.user, 'b', 'quarantined', undefined);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(2);
+    expect(result.eagerLoaded).toHaveLength(2);
+    const aEntry = result.eagerLoaded.find((e) => e.name === 'a');
+    expect(aEntry?.scope).toBe('user');
+    expect(aEntry?.memoryStateAtExposure).toBe('active');
+    expect(aEntry?.memoryContentHash).toMatch(/^[0-9a-f]{64}$/);
+    const bEntry = result.eagerLoaded.find((e) => e.name === 'b');
+    expect(bEntry?.memoryStateAtExposure).toBe('quarantined');
+  });
+
+  test('untrusted entries are excluded from eagerLoaded', () => {
+    // Same filter that drops the entry from `text` MUST drop it
+    // from `eagerLoaded` — keeping it would emit a provenance row
+    // for a memory the model never saw.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBodyWithState(roots.user, 'a', undefined, undefined);
+    writeBodyWithState(roots.user, 'b', undefined, 'untrusted');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.eagerLoaded.map((e) => e.name)).toEqual(['a']);
+  });
+
+  test('dedupe by name applies to eagerLoaded too (one row per name)', () => {
+    // Spec: "once per (session, memory)". Two scopes with the
+    // same name MUST produce only one eager row — the most-
+    // specific scope wins.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Same](same.md) — local\n');
+    writeIndex(roots.user, '- [Same](same.md) — user\n');
+    writeBodyWithState(roots.projectLocal, 'same', undefined, undefined);
+    writeBodyWithState(roots.user, 'same', undefined, undefined);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(1);
+    expect(result.eagerLoaded).toHaveLength(1);
+    expect(result.eagerLoaded[0]?.scope).toBe('project_local');
+  });
+
+  test('empty registry produces empty eagerLoaded', () => {
+    const repo = makeTmp();
+    const registry = createMemoryRegistry({ roots: makeRoots(repo) });
+    const result = assembleMemorySection({ registry });
+    expect(result.eagerLoaded).toEqual([]);
+  });
+
+  test('peek-uncertainty entry (missing body) still appears with null hash', () => {
+    // Index references a body that doesn't exist. The eager section
+    // includes it (uncertainty → include); the provenance row must
+    // emit too — with NULL hash and the default 'active' state —
+    // so the audit trail records that the operator-visible index
+    // line DID surface, even when the body was unreadable.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Ghost](ghost.md) — phantom\n');
+    // No body file written.
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.eagerLoaded).toHaveLength(1);
+    expect(result.eagerLoaded[0]?.name).toBe('ghost');
+    expect(result.eagerLoaded[0]?.memoryContentHash).toBeNull();
+    expect(result.eagerLoaded[0]?.memoryStateAtExposure).toBe('active');
+  });
+
+  test('hash is deterministic across two calls on unchanged file', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n');
+    writeBodyWithState(roots.user, 'a', undefined, undefined);
+    const registry = createMemoryRegistry({ roots });
+    const r1 = assembleMemorySection({ registry });
+    const r2 = assembleMemorySection({ registry });
+    expect(r1.eagerLoaded[0]?.memoryContentHash).toBe(r2.eagerLoaded[0]?.memoryContentHash);
   });
 });

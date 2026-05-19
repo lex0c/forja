@@ -10,6 +10,8 @@ import type {
   ToolArgs,
 } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { RetrieveFn } from '../retrieval/index.ts';
+import type { ContextPinsStore, PinKind } from '../storage/repos/context-pins.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
@@ -139,6 +141,25 @@ export interface ToolContext {
   cwd: string;
   sessionId: string;
   stepId: string;
+  // The active tool_call row's id, populated by the harness in
+  // `invoke-tool.ts` right after `createToolCall`. Tools that emit
+  // per-call audit rows (currently only memory_read / memory_search
+  // for the provenance trail in MEMORY.md §11.2) thread this into
+  // the registry so each exposure links back to its causal call.
+  // Optional because test contexts and legacy entrypoints
+  // construct ToolContext without going through the harness loop —
+  // those callers get no provenance row, which mirrors how
+  // bgManager / todoStore degrade cleanly when absent.
+  toolCallId?: string;
+  // Migration 058 — id of the `approvals` row that admitted this
+  // tool call. Populated by invoke-tool after `recordApproval` lands
+  // the allow row. Only tools that spawn subagents (`task` family)
+  // read this — it threads through SpawnSubagentArgs into
+  // `subagent_runs.parent_approval_id` so the audit chain is
+  // one-hop instead of multi-hop via messages/tool_calls.
+  // Optional because test contexts construct ToolContext without
+  // going through invoke-tool.
+  approvalId?: string;
   permissions: PermissionsView;
   // §6.5 sandbox profile the engine planner chose for THIS call.
   // Populated by `invoke-tool.ts` from `decision.sandboxProfile`
@@ -281,6 +302,13 @@ export interface ToolContext {
   // logged to memory_events at the registry layer; the tool just
   // dispatches.
   memoryRegistry?: MemoryRegistry;
+  // Retrieval subsystem runner (spec RETRIEVAL.md §15.4). Set by
+  // the harness when both memoryRegistry AND db are wired — the
+  // pipeline needs both for its view + compression-resolver
+  // dependencies. Absent in headless callers that didn't wire
+  // either. The `retrieve_context` tool surfaces a clean
+  // `retrieval.unavailable` error when this is undefined.
+  retrieveContext?: RetrieveFn;
   // Modal confirm hook for the `memory_write` tool (MEMORY.md §5.1).
   // Set by the harness when `HarnessConfig.confirmMemoryWrite` is
   // wired. Absent in headless / non-interactive runs — the
@@ -301,6 +329,26 @@ export interface ToolContext {
   confirmMemoryUserScope?: (req: {
     name: string;
     body: string;
+  }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Pinned context store (CONTEXT_TUNING.md §12.4). Set by the
+  // harness when context_pins persistence is wired (default in
+  // production REPL; off in degenerate test contexts). The
+  // pin_context tool and `/pin` slash command consume this; tools
+  // surface a clean error when absent rather than dereferencing
+  // undefined. Persistent — backed by SQLite, not an in-memory
+  // map — so pins survive `/resume` per §12.4.4.
+  contextPinsStore?: ContextPinsStore;
+  // Modal confirm hook for the `pin_context` tool (§12.4.1 —
+  // "modelo pode propor pin (vai a awaiting_user para confirmação
+  // modal, idêntico a memory writes)"). Same shape as
+  // `confirmMemoryWrite`: REPL wires it through the modal manager,
+  // headless leaves it unset. Absent ⇒ the pin_context tool
+  // refuses with `pin.headless_mode` (matches the memory_write
+  // headless path).
+  confirmPinContext?: (req: {
+    text: string;
+    kind: PinKind;
+    expiresAt: number | null;
   }) => Promise<'yes' | 'no' | 'cancel'>;
   // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
   // §9.1). Required so any future tool that needs trust info gets
@@ -367,6 +415,14 @@ export interface SpawnSubagentArgs {
   prompt: string;
   declaredCapabilities?: readonly string[];
   parentCapabilities?: readonly string[];
+  // Migration 058 — approval row that authorized the parent's task
+  // tool call. Threaded into `subagent_runs.parent_approval_id` so
+  // the audit chain stays one-hop from the run back to the policy
+  // decision. Optional because (a) test fixtures construct
+  // SpawnSubagentArgs without invoke-tool, (b) the verify-semantic
+  // scheduler bypasses the approval path entirely (forensics via
+  // memory_verify_attempts.subagent_run_session_id instead).
+  parentApprovalId?: string;
 }
 
 // Result discriminated by `kind` so the calling tool can map an

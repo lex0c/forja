@@ -18,7 +18,16 @@ import {
   shouldCritique,
   toolPlanHasWrites,
 } from '../critique/index.ts';
+import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
+import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
+import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
+import { resolveRepoRoot } from '../memory/paths.ts';
+import { type MemoryRegistry, createScopeFilteredRegistry } from '../memory/registry.ts';
+import {
+  type SemanticVerifyScheduler,
+  createSemanticVerifyScheduler,
+} from '../memory/verify-semantic-scheduler.ts';
 import {
   deriveParentCapabilities,
   formatCapability,
@@ -39,6 +48,8 @@ import { estimatePromptTokens } from '../providers/tokens.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
+import { buildRetrievalRunner } from '../retrieval/index.ts';
+import { redactSecrets } from '../sanitize/secrets.ts';
 import {
   type CritiqueRunCode,
   type SessionStatus,
@@ -53,6 +64,8 @@ import {
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
+import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
+import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -220,6 +233,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let steps = 0;
   let consecutiveErrors = 0;
   let sessionId = '';
+  // Repo root for scope-chain resolution. `config.cwd` is the
+  // invocation directory; an operator starting the CLI from a
+  // subdirectory of a repo would otherwise see policy / outcome
+  // scope_ids fragment per-subdirectory, so a `repo`-scoped policy
+  // promoted from one folder wouldn't apply when dispatching from
+  // another. `resolveRepoRoot` runs `git rev-parse --show-toplevel`
+  // once per run (cheap — config.cwd is stable across the session
+  // by the resume cwd-mismatch check) and falls back to config.cwd
+  // outside a git checkout. Language detection benefits too:
+  // markers (package.json, Cargo.toml, etc.) live at the repo root,
+  // not in arbitrary subdirectories.
+  const repoRoot = resolveRepoRoot(config.cwd);
   let lastMessageId = '';
   // Session-scoped bg manager. Created lazily after createSession
   // so the manager can record the right session_id on every spawn.
@@ -762,6 +787,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // so they don't mask the run's HarnessResult, and the DB is
   // converged via markRunningAsKilled inside cleanup() regardless of
   // whether the OS kill landed.
+  //
+  // S11 — declared outside the try so the outer finally can call
+  // .shutdown() on it. Constructed inside the try once sessionId is
+  // resolved (the scheduler captures it). Undefined when opt-in is
+  // off / definition unavailable / running as a subagent child.
+  let semanticVerifyScheduler: SemanticVerifyScheduler | undefined;
+  // S13 parallel: conflict-detector scheduler. Same lifecycle posture
+  // (top-level only, optional, declared at outer scope so the finally
+  // block can shutdown() even on early throws).
+  let conflictDetectorScheduler:
+    | import('../memory/verify-conflict-scheduler.ts').ConflictDetectorScheduler
+    | undefined;
+  // S3 — verify-override scheduler. Same lifecycle posture (top-level
+  // only, optional, declared at outer scope so the finally block can
+  // shutdown() even on early throws).
+  let overrideVerifyScheduler:
+    | import('../memory/verify-override-scheduler.ts').OverrideVerifyScheduler
+    | undefined;
   try {
     try {
       // Resume vs new session. In resume mode, the prior session id
@@ -869,6 +912,89 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         sessionId = session.id;
       }
 
+      // Eager-load provenance emit (MEMORY.md §11.2, S1/T1.4).
+      // The CLI bootstrap froze the inventory at system-prompt
+      // assembly time; this is the first moment a sessionId
+      // exists to link the exposures against. One row per
+      // (session, memory) with surface='eager' and
+      // tool_call_id=NULL — eager-load happens BEFORE any tool
+      // call exists, so the FK is intentionally absent.
+      //
+      // Idempotency gate: ask the repo which (scope, name) pairs
+      // are already recorded for this session and emit only the
+      // missing ones. An earlier shape used a coarse "any eager
+      // row exists?" probe (hasEagerProvenance); on resume after
+      // a previous emit that succeeded for SOME exposures then
+      // hit a transient SQLITE_BUSY / write failure, the next
+      // boot saw "some rows exist" and skipped backfill of the
+      // rest, permanently dropping the missing entries from the
+      // provenance trail. Per-key gating restores the contract:
+      // every system-prompt body ends up with a matching eager
+      // row, even across multiple partial resumes.
+      //
+      // Subagent first boots also use preassignedSessionId but
+      // have zero eager rows yet, so they emit normally — the
+      // existing-set is just empty.
+      //
+      // Best-effort: a DB failure here MUST NOT abort startup
+      // (provenance is observability, not correctness — same
+      // posture as registry.auditExposure). Failures land on
+      // stderr as AUDIT DRIFT. A read failure on the lookup
+      // itself (rare — `SELECT` paths don't ordinarily contend
+      // with the WAL writer lock) falls through to the
+      // `existing.has` checks below treating every exposure as
+      // missing, which is safe under "ALL rows exist already"
+      // (next emit duplicates, schema has no UNIQUE so duplicates
+      // accumulate) — accept that cost vs. an unhandled throw
+      // out of startup.
+      if (config.eagerExposures !== undefined && config.eagerExposures.length > 0) {
+        let existing: Set<string>;
+        try {
+          existing = getEagerProvenanceKeys(config.db, sessionId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: AUDIT DRIFT: failed to read eager provenance keys for session ${sessionId}: ${redactSecrets(msg)}\n`,
+          );
+          existing = new Set();
+        }
+        for (const exposure of config.eagerExposures) {
+          if (existing.has(`${exposure.scope}/${exposure.name}`)) continue;
+          try {
+            recordProvenance(config.db, {
+              sessionId,
+              toolCallId: null,
+              memoryScope: exposure.scope,
+              memoryName: exposure.name,
+              surface: 'eager',
+              memoryContentHash: exposure.memoryContentHash,
+              memoryStateAtExposure: exposure.memoryStateAtExposure,
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // Redact — SQLite errors may echo bound parameter
+            // values (the inventory's hash + state). Mirrors
+            // registry.ts AUDIT DRIFT redaction pattern.
+            process.stderr.write(
+              `memory: AUDIT DRIFT: failed to record eager exposure for ${exposure.name} (${exposure.scope}): ${redactSecrets(msg)}\n`,
+            );
+          }
+        }
+      }
+
+      // S2/verify_failed heuristic rolled back per policy:
+      // "todo o lifecycle de memória um llm-judge decide; sem
+      // heurísticas locais sobre texto". The verify scheduler +
+      // ProjectVerifier (regex path extraction + existsSync)
+      // shipped initially and were removed when their value-vs-
+      // false-positive analysis revealed the same fundamental
+      // limitation as S4's text heuristic: regex over prose
+      // can't distinguish assertion from historical mention.
+      // S11 (Phase 2 LLM-judge) is the replacement; until that
+      // lands, no verify-cycle runs in-session. The
+      // `verify_failed` trigger name is preserved for S11
+      // emission via the generic /memory audit --trigger filter.
+
       // bg manager creation MUST happen here, after sessionId is
       // resolved — every row insertBgProcess writes carries the
       // session_id FK, so a manager built before createSession would
@@ -933,6 +1059,349 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           },
         });
+      }
+
+      // S11 — semantic-verify scheduler (MEMORY.md §11.x). Created
+      // once per top-level session when the opt-in flag is set AND
+      // the verify-semantic definition is loaded. Top-level only:
+      // subagent children don't run their own scheduler (avoids
+      // recursive verification + their session has no
+      // memory_provenance trail meaningful for the detector).
+      //
+      // The scheduler captures runtime deps that don't exist
+      // outside the loop scope (provider, parentToolRegistry,
+      // permissionEngine), so creation lives here rather than in
+      // bootstrap. Lifecycle: poll() fires at each step boundary
+      // (end of the while(true) below); shutdown() drains in the
+      // outer finally.
+      // semanticVerifyScheduler is declared in the outer scope so
+      // the outer finally can shutdown() it even on early throw.
+      // R6 — runtime defense in depth. `parseArgs` already refuses
+      // `--memory-verify-llm` / `--no-memory-verify-llm` in subagent
+      // context (F12 + Slice Q), but a programmatic caller / future
+      // code path that builds HarnessConfig directly could still set
+      // `memorySemanticVerify` with `subagentDepth > 0`. Stay silent
+      // ⇒ operator wonders why verify never fires. Emit a diagnostic
+      // and continue without wiring the scheduler. Post-Slice-Q the
+      // default is ON; opt-out is `/memory governance disable verify`
+      // (persisted) or `--no-memory-verify-llm` (session-only).
+      if (config.memorySemanticVerify === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_semantic_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // Plan-mode gate (post-review fix): `--plan` declares a read-
+      // only session ("show me what you'd do, don't write"). The
+      // LLM-judge detectors are writes against the governance
+      // substrate — every dispatch lands a `memory_verify_attempts`
+      // row and (on a contradicted verdict) a pending proposal that
+      // mutates `memory_governance_proposals`. Spending LLM budget
+      // and writing audit rows during plan mode contradicts the
+      // operator's "read-only" framing. Refuse scheduler
+      // construction at the top-level gate so poll() never runs
+      // (forwarding `planMode: true` to the dispatcher only gates
+      // the spawn-side, after the attempt row has already landed).
+      if (
+        config.memorySemanticVerify === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_semantic_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      // R6 — guard on memoryRegistry availability. Pre-fix the cast
+      // `as MemoryRegistry` would land `undefined` into the scheduler
+      // and every poll would TypeError on `registry.peek(...)`. The
+      // outer catch swallows the throw silently every step; operator
+      // sees nothing. Now we mirror the verify-def absent path and
+      // refuse construction loudly when registry is missing.
+      if (
+        config.memorySemanticVerify === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
+        config.subagentRegistry !== undefined
+      ) {
+        const verifyDef = config.subagentRegistry.byName.get('verify-semantic');
+        if (verifyDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_semantic_disabled: --memory-verify-llm set but memory registry not wired\n',
+          );
+        } else if (verifyDef !== undefined && config.memoryRegistry !== undefined) {
+          semanticVerifyScheduler = createSemanticVerifyScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: verifyDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            // S5 mirror — when bootstrap excluded scopes via the
+            // shared-corpus trust gate, the scheduler honors the
+            // same posture so the verify-semantic subagent never
+            // sees bodies the operator marked untrusted.
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            // F9 + R1: forward parent-runtime envelope into each
+            // dispatch so the verify child runs under the parent's
+            // resolved verdicts (hard signal, Ctrl-C, trust, hooks,
+            // capabilities) rather than defaults. `signal` is the
+            // combined caller+wall-clock abort; without it the
+            // dispatch hangs until the subagent's own 10-min budget
+            // and operator Ctrl-C×2 cannot interrupt.
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // Plan-mode forwarding intentionally absent: the
+            // construction gate above refuses scheduler creation
+            // entirely when planMode is true, so this branch is
+            // unreachable in plan mode. If the construction gate
+            // is ever weakened, restore the
+            // `config.planMode === true ? { planMode: true } : {}`
+            // forward as defense-in-depth.
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            // PERMISSION_ENGINE.md §10.1: seal the verify subagent's
+            // effective envelope. Mirror the task-tool spawn shape
+            // (loop.ts:1289) — intersect parent's envelope against
+            // the playbook's declared capabilities.
+            //
+            // Pre-R2 the loop passed the parent's FULL envelope
+            // verbatim because verify-semantic.md didn't declare
+            // capabilities and the loader didn't expose the field.
+            // That reintroduced the exact gap migration 040 fixed
+            // (audit row recorded "child ran under parent's full
+            // envelope" when the operator's intent was a read-only
+            // fact-checker).
+            //
+            // The verify-semantic playbook declares `read-fs:**`
+            // (the minimum its read_file / grep / glob whitelist
+            // needs to inspect repo state). The intersection narrows
+            // that to whatever subset of read-fs the parent grants.
+            // An earlier R2 draft used `capabilities: []` (intending
+            // "pure-LLM") — but every read_file call in the child
+            // engine would then have been refused with `subagent
+            // capability outside declared envelope`, degrading the
+            // fact-checker into a hallucination engine. Empty
+            // declared envelope means the child can't call
+            // capability-resolving tools AT ALL; only misc-category
+            // tools survive.
+            //
+            // Excess (declared cap not covered by parent) is logged
+            // as a stderr warning but doesn't refuse the spawn — an
+            // operator who scoped reads to `src/**` should still get
+            // a verifier that can verify `src/**` claims rather than
+            // losing the detector entirely.
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = verifyDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_semantic_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_semantic_disabled: --memory-verify-llm set but verify-semantic definition not loaded\n',
+          );
+        }
+      }
+
+      // S13 — conflict detector scheduler. Same wiring posture as
+      // the verify-semantic scheduler above: top-level only, gated on
+      // memory registry availability, capabilities sealed via
+      // intersect.
+      if (config.memoryConflictDetect === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_conflict_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // Plan-mode gate — mirror of the verify-semantic case above.
+      // Same rationale: scheduler poll writes governance proposals
+      // on contradicted-pair verdicts, which is a write surface.
+      if (
+        config.memoryConflictDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_conflict_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      if (
+        config.memoryConflictDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
+        config.subagentRegistry !== undefined
+      ) {
+        const conflictDef = config.subagentRegistry.byName.get('verify-conflict');
+        if (conflictDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_conflict_disabled: --memory-conflict-llm set but memory registry not wired\n',
+          );
+        } else if (conflictDef !== undefined && config.memoryRegistry !== undefined) {
+          const { createConflictDetectorScheduler } = await import(
+            '../memory/verify-conflict-scheduler.ts'
+          );
+          conflictDetectorScheduler = createConflictDetectorScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: conflictDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // Plan-mode forwarding intentionally absent: construction
+            // gate above refuses scheduler creation when planMode is
+            // true (mirror of verify-semantic).
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = conflictDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_conflict_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_conflict_disabled: --memory-conflict-llm set but verify-conflict definition not loaded\n',
+          );
+        }
+      }
+
+      // S3 — verify-override scheduler. Same wiring posture as
+      // verify-semantic + verify-conflict: top-level only, gated on
+      // memory registry availability, capabilities sealed via
+      // intersect.
+      if (config.memoryOverrideDetect === true && (config.subagentDepth ?? 0) > 0) {
+        process.stderr.write(
+          'memory: verify_override_disabled: cannot run inside a subagent context (refused at runtime)\n',
+        );
+      }
+      // Plan-mode gate — mirror of verify-semantic / verify-conflict.
+      // S3 dispatcher writes memory_verify_override_attempts +
+      // governance proposals on misguiding verdicts; same write-
+      // surface refusal in plan mode.
+      if (
+        config.memoryOverrideDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode === true
+      ) {
+        process.stderr.write(
+          'memory: verify_override_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)\n',
+        );
+      }
+      if (
+        config.memoryOverrideDetect === true &&
+        (config.subagentDepth ?? 0) === 0 &&
+        config.planMode !== true &&
+        config.subagentRegistry !== undefined
+      ) {
+        const overrideDef = config.subagentRegistry.byName.get('verify-override');
+        if (overrideDef !== undefined && config.memoryRegistry === undefined) {
+          process.stderr.write(
+            'memory: verify_override_disabled: memoryOverrideDetect set but memory registry not wired\n',
+          );
+        } else if (overrideDef !== undefined && config.memoryRegistry !== undefined) {
+          const { createOverrideVerifyScheduler } = await import(
+            '../memory/verify-override-scheduler.ts'
+          );
+          overrideVerifyScheduler = createOverrideVerifyScheduler({
+            db: config.db,
+            registry: config.memoryRegistry as MemoryRegistry,
+            definition: overrideDef,
+            parentSessionId: sessionId,
+            cwd: config.cwd,
+            provider: config.provider,
+            parentToolRegistry: config.toolRegistry,
+            permissionEngine: config.permissionEngine,
+            ...(config.memoryExcludeScopes !== undefined
+              ? { memoryExcludeScopes: config.memoryExcludeScopes }
+              : {}),
+            signal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            ...(config.isCwdTrusted !== undefined ? { cwdTrusted: config.isCwdTrusted } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            // Plan-mode forwarding intentionally absent: construction
+            // gate above refuses scheduler creation when planMode is
+            // true (mirror of verify-semantic).
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
+            // Capability envelope intersect — same shape as verify-
+            // semantic / verify-conflict. The verify-override.md
+            // declares EMPTY tools[] so the intersected envelope is
+            // empty too — no capability-resolving tools land in the
+            // child's gate. Mismatch (declared cap not covered by
+            // parent) stderr-logs as a warning; pure-empty declared
+            // → no warning, the loop just hands the child no tools.
+            effectiveCapabilities: ((): readonly string[] => {
+              const declaredRaw = overrideDef.capabilities ?? [];
+              const declared = declaredRaw.map(parseCapability);
+              const parent =
+                config.permissionEngine.effectiveCapabilities() ??
+                deriveParentCapabilities(config.permissionEngine.policy());
+              const { effective, excess } = intersectCapabilities(parent, declared);
+              if (excess.length > 0) {
+                process.stderr.write(
+                  `memory: verify_override_envelope_narrowed: ${excess
+                    .map(formatCapability)
+                    .join(
+                      ', ',
+                    )} not covered by parent envelope; verify may degrade on those reads\n`,
+                );
+              }
+              return effective.map(formatCapability);
+            })(),
+          });
+        } else {
+          process.stderr.write(
+            'memory: verify_override_disabled: memoryOverrideDetect set but verify-override definition not loaded\n',
+          );
+        }
       }
 
       // §13.6 degraded banner emitter (slice 92). One emitter per
@@ -1206,6 +1675,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     e.type === 'subagent_progress' &&
                     e.lastEvent.type === 'cost_update'
                   ) {
+                    // R4 — defensive validation on the IPC boundary.
+                    // IPC.md §7 ("mensagens do filho NÃO são
+                    // confiáveis"): a malformed cost_update (negative
+                    // values, cumulative-regression, NaN) could
+                    // mis-steer the cap watchdog into a false trip
+                    // (cancelAll fires) or — worse — silently grow
+                    // the reservation under the cap. The handle-store's
+                    // monotonic guard catches REGRESSION but accepts
+                    // any non-negative finite value; reject upstream.
+                    const { delta, cumulative } = e.lastEvent;
+                    if (
+                      !Number.isFinite(delta) ||
+                      !Number.isFinite(cumulative) ||
+                      delta < 0 ||
+                      cumulative < 0
+                    ) {
+                      process.stderr.write(
+                        `subagent ${trackerHandleId}: cost_update rejected (delta=${delta}, cumulative=${cumulative})\n`,
+                      );
+                      return;
+                    }
                     trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
                     // Persist the cost-update into the audit
                     // stream (migration 022, audit fix #2). The
@@ -1243,8 +1733,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     } catch (persistErr) {
                       const message =
                         persistErr instanceof Error ? persistErr.message : String(persistErr);
-                      console.error(
-                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}`,
+                      // R4: `console.error` violates the hard rule
+                      // "stdout is pure, stderr is for logs" — Bun
+                      // sometimes interleaves console.error with
+                      // stdout in --json mode despite the underlying
+                      // routing. Route to process.stderr explicitly
+                      // to keep --json's NDJSON stdout clean.
+                      process.stderr.write(
+                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}\n`,
                       );
                     }
                     if (budget.maxCostUsd !== undefined) {
@@ -1314,6 +1810,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             permissionEngine: config.permissionEngine,
             db: config.db,
             cwd: config.cwd,
+            // Migration 058 — back-link the audit row to the approval
+            // that admitted the spawning tool call.
+            ...(args.parentApprovalId !== undefined
+              ? { parentApprovalId: args.parentApprovalId }
+              : {}),
             ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
             // §10.1 effective envelope (slice 95). When the model
@@ -1332,6 +1833,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             subagentRegistry: registry,
             ...(config.planMode === true ? { planMode: true } : {}),
             ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
+            // S5 CRIT/H3: forward shared-scope fail-closed verdict
+            // to the child. Without this, a subagent spawned after
+            // the operator revoked (or after verify_failed) would
+            // re-read disk and surface bodies the parent gated.
+            // Array → boolean translation: the child receives a
+            // single boolean via `--subagent-shared-scope-offline`
+            // (cleaner IPC than serializing an array of scopes);
+            // S5's only excluded scope is `project_shared` so the
+            // collapse is lossless today. If a future detector
+            // gates a different scope, this site widens to encode
+            // the array (and the spawn-factory grows a list flag).
+            ...(config.memoryExcludeScopes?.includes('project_shared')
+              ? { sharedScopeOffline: true }
+              : {}),
             ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
             depth: childDepth,
             // Forward the spawn factory test seam. Production
@@ -2436,6 +2951,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           spawnSubagentClosure = (args) => impl(args);
         }
 
+        // Scope-filtered registry for tool-facing surfaces. When the
+        // shared-corpus trust probe lands a non-confirmed outcome
+        // (verify_failed / deferred / revoked), bootstrap sets
+        // `memoryExcludeScopes: ['project_shared']`; without the
+        // wrapper, the tool context's `memoryRegistry` would still
+        // expose the unfiltered registry to memory_list /
+        // memory_read / memory_search, letting the model enumerate
+        // and read project_shared bodies under a fail-closed trust
+        // state — direct bypass of the trust gate that eager-load
+        // and retrieve_context already respect. Wrap once per run
+        // here so every tool invocation downstream sees the same
+        // filtered view; `retrieveContext` builds against the same
+        // wrapped registry below for surface symmetry.
+        const effectiveMemoryRegistry =
+          config.memoryRegistry !== undefined &&
+          config.memoryExcludeScopes !== undefined &&
+          config.memoryExcludeScopes.length > 0
+            ? createScopeFilteredRegistry(config.memoryRegistry, config.memoryExcludeScopes)
+            : config.memoryRegistry;
+
         const buildCtx = (tu: CollectedToolUse): ToolContext => ({
           signal,
           cwd: config.cwd,
@@ -2537,12 +3072,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               }
             }
           },
-          ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
+          ...(effectiveMemoryRegistry !== undefined
+            ? { memoryRegistry: effectiveMemoryRegistry }
+            : {}),
+          // Retrieval subsystem runner (slice 4.9). Wired when the
+          // memory registry is configured — db is always available
+          // since harness can't run without it. retrieve_context
+          // tool surfaces 'retrieval.unavailable' when this is
+          // absent (headless / SDK runs without memory).
+          //
+          // Uses the same `effectiveMemoryRegistry` the tool ctx
+          // exposes, so the retrieval and direct-tool surfaces stay
+          // at parity on the trust posture (both filter excluded
+          // scopes; one couldn't legitimately bypass the other).
+          // `memoryExcludeScopes` still flows into the retrieval
+          // runner because the retrieval pipeline plumbs it
+          // separately (e.g., into the BM25 view's own filter
+          // path) — defense in depth: even if the wrapper missed
+          // something at some surface, the explicit memoryExcludeScopes
+          // there continues to enforce the same policy.
+          ...(effectiveMemoryRegistry !== undefined
+            ? {
+                retrieveContext: buildRetrievalRunner({
+                  db: config.db,
+                  sessionId,
+                  memoryRegistry: effectiveMemoryRegistry,
+                  ...(config.memoryExcludeScopes !== undefined &&
+                  config.memoryExcludeScopes.length > 0
+                    ? { memoryExcludeScopes: config.memoryExcludeScopes }
+                    : {}),
+                }),
+              }
+            : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }
             : {}),
           ...(config.confirmMemoryUserScope !== undefined
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
+            : {}),
+          ...(config.contextPinsStore !== undefined
+            ? { contextPinsStore: config.contextPinsStore }
             : {}),
           // Trust state — required on ToolContext, optional on
           // HarnessConfig. Default-false at the harness layer is
@@ -2584,6 +3153,76 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const invokeOne = async (
           tu: CollectedToolUse,
         ): Promise<{ toolResult: ProviderToolResultBlock; failed: boolean }> => {
+          // FEEDBACK_ADAPTATION §9.1 dispatch rewrite. When the
+          // model issues a bash command whose leading binary has an
+          // active L1 alias policy in the operator's scope chain,
+          // rewrite before the permission engine + tool dispatch
+          // see the call. CRITICAL: the engine sees the REWRITTEN
+          // command, so target validation (bare-binary name only,
+          // no shell metas) lives inside maybeRewriteBashCommand
+          // — a poisoned action_json with shell injection would
+          // otherwise bypass the allow-list.
+          //
+          // Audit gap (declared follow-up): the pre-rewrite command
+          // is NOT structurally persisted today. tool_calls.input
+          // captures the rewritten value; stderr below captures the
+          // rewrite event. A future slice adds a dispatch_rewrites
+          // audit table linking the policy id to the original
+          // command — operator forensic queries need it. For now
+          // operators trace via /agent policy history <id>.
+          // Tracks the L1 signature that drove a successful rewrite
+          // (null when no rewrite happened). Threaded into the
+          // outcome emitter so the policy's signature keeps
+          // accumulating evidence after promotion — without this,
+          // the post-rewrite command's bash-parser pass would
+          // either pick the rewritten binary (not in alias table)
+          // or nothing, and the policy's effectiveness signal
+          // would go dark immediately after promotion.
+          let appliedL1Signature: string | null = null;
+          // Pending rewrite audit deferred until after invokeTool
+          // creates the tool_calls row. `tu.id` is the provider's
+          // tool_use id; `tool_calls.id` is a separate UUID that
+          // invokeTool generates inside the same call. Persisting
+          // here with tu.id would always hit the FK on
+          // dispatch_rewrites.tool_call_id → tool_calls.id and
+          // fall into the catch path — the behavior change happened
+          // but the structured audit row never landed.
+          let pendingRewriteAudit: {
+            policyId: string;
+            actionSignature: string;
+            originalCommand: string;
+            rewrittenCommand: string;
+            matchedScope: 'global' | 'language' | 'repo' | 'user' | 'session';
+          } | null = null;
+          if (tu.name === 'bash' && typeof tu.input.command === 'string') {
+            const originalCommand = tu.input.command;
+            const rewrite = maybeRewriteBashCommand(
+              config.db,
+              originalCommand,
+              buildScopeChain({ sessionId, repoCwd: repoRoot }),
+            );
+            if (
+              rewrite.rewritten &&
+              rewrite.appliedPolicyId !== null &&
+              rewrite.appliedSignature !== null &&
+              rewrite.matchedScope !== null
+            ) {
+              appliedL1Signature = rewrite.appliedSignature;
+              tu.input = { ...tu.input, command: rewrite.command };
+              pendingRewriteAudit = {
+                policyId: rewrite.appliedPolicyId,
+                actionSignature: rewrite.appliedSignature,
+                originalCommand,
+                rewrittenCommand: rewrite.command,
+                matchedScope: rewrite.matchedScope as
+                  | 'global'
+                  | 'language'
+                  | 'repo'
+                  | 'user'
+                  | 'session',
+              };
+            }
+          }
           safeEmit(config.onEvent, {
             type: 'tool_invoking',
             toolUseId: tu.id,
@@ -2626,6 +3265,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
           });
+          // Persist the dispatch-rewrite audit row now that invokeTool
+          // created the tool_calls row that the FK points at. Skipped
+          // when invokeTool returned an empty toolCallId (unknown
+          // tool — no tool_call row to anchor against). Best-effort:
+          // FK / IO failure stderr-logs and lets the rewrite proceed;
+          // the behavior change already happened on tu.input mutation
+          // upstream, only the forensic surface degrades.
+          if (pendingRewriteAudit !== null && inv.toolCallId !== '') {
+            try {
+              createDispatchRewrite(config.db, {
+                toolCallId: inv.toolCallId,
+                sessionId,
+                policyId: pendingRewriteAudit.policyId,
+                actionSignature: pendingRewriteAudit.actionSignature,
+                originalCommand: pendingRewriteAudit.originalCommand,
+                rewrittenCommand: pendingRewriteAudit.rewrittenCommand,
+                matchedScope: pendingRewriteAudit.matchedScope,
+              });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              process.stderr.write(
+                `forja adaptation: dispatch_rewrites insert failed for tool_call=${inv.toolCallId} (${msg})\n`,
+              );
+            }
+          }
           // Slice 131 wire: when a tool execution fails AFTER
           // permission allowed it (failed=true, denied!=true)
           // AND we have an approval_seq from the decision, emit
@@ -2659,6 +3323,45 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               );
             }
           }
+          // FEEDBACK_ADAPTATION §3.1 loop quente write — emit a
+          // `outcomes` row capturing the (action_signature, tier,
+          // result) tuple for the dispatch. Coexists with the
+          // outcome_signals emission above per AUDIT.md §1.1.1:
+          // the two tables record different audit dimensions and
+          // never dual-write the same fact. The signal_kind=
+          // 'tool_error' block above feeds the permission engine's
+          // calibration; THIS row feeds the loop frio adaptation
+          // engine (3.4). Best-effort — failures stderr but don't
+          // crash. Denied calls are skipped inside the emitter (no
+          // body ran, no action_signature outcome to record).
+          emitToolCallOutcome(config.db, {
+            sessionId,
+            toolCallId: inv.toolCallId,
+            toolName: tu.name,
+            failed: inv.failed,
+            ...(inv.denied === true ? { denied: true } : {}),
+            durationMs: inv.durationMs,
+            ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
+            // Pass tool input so the emitter can derive L1 alias
+            // signatures from bash commands (3.5a). Other tools
+            // ignore the input; only `bash` carries a `command`
+            // field the parser inspects.
+            toolInput: tu.input,
+            // When a dispatch rewrite manifested, pin the L1
+            // signature to the policy's — the post-rewrite
+            // command's leading binary (rg) isn't in the alias
+            // table, so without this override the emitter would
+            // skip the L1 row entirely and the policy would lose
+            // its evidence stream immediately after promotion
+            // (3.6d).
+            ...(appliedL1Signature !== null ? { appliedL1Signature } : {}),
+            // Pass the scope chain so outcomes land at scope=repo
+            // (when detected). Without this, every outcome lands
+            // at scope=session and repo/user/language-scoped
+            // policies never accumulate evidence (3.7b — fixes
+            // H1 from the branch review).
+            scopeChain: buildScopeChain({ sessionId, repoCwd: repoRoot }),
+          });
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state
           // internally. Emits a `sandbox_degraded_active` harness
@@ -3161,11 +3864,94 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             if (overage !== null) return await finish('maxCostUsd', overage);
           }
         }
+
+        // S11/S13/S3 — detector scheduler ticks at step boundary
+        // (MEMORY.md §11.x / T11.9 + T13.x + S3.4). Each scheduler
+        // polls its source surface (memory_provenance / memory_events
+        // / memory_override_events), runs gates, and dispatches AT
+        // MOST one verification before the next provider call.
+        // Awaited (not fire-and-forget) so the dispatch's cost
+        // lands in the session totals before the next iteration's
+        // cost-cap check.
+        //
+        // Cost wiring (post-review fix): each detector's LLM-judge
+        // dispatch is a real billed call but only tracked in
+        // scheduler-local counters until this helper folds the
+        // delta into `cumulativeChildCostUsd`. Pre-fix, a session
+        // at/near `maxCostUsd` could still run verify-* dispatches
+        // because `costCapDetailIfExceeded()` only consults
+        // {totalCostUsd, cumulativeChildCostUsd, reserved} — never
+        // the scheduler counters. With default-on detectors,
+        // operator's hard cap was silently exceeded by the
+        // detector spend. The helper folds delta in + fires a
+        // cost_update event (with the FULL composite cumulative
+        // so the renderer's footer reflects reality) + immediately
+        // checks the cap so a burst that pushes past doesn't wait
+        // for the next top-of-loop check.
+        //
+        // Best-effort: scheduler failures stderr-log here AND
+        // inside the scheduler implementation (defense in depth
+        // against programmer errors that escape the inner catch).
+        const chargeSchedulerThenCheckCap = async (
+          scheduler:
+            | {
+                poll: () => Promise<void>;
+                getCounters: () => { costUsdSpent: number };
+              }
+            | undefined,
+          label: 'verify_semantic' | 'verify_conflict' | 'verify_override',
+        ): Promise<string | null> => {
+          if (scheduler === undefined) return null;
+          const before = scheduler.getCounters().costUsdSpent;
+          try {
+            await scheduler.poll();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`memory: ${label}_poll_unhandled: ${redactSecrets(msg)}\n`);
+          }
+          const after = scheduler.getCounters().costUsdSpent;
+          const delta = after - before;
+          if (delta > 0) {
+            cumulativeChildCostUsd += delta;
+            safeEmit(config.onEvent, {
+              type: 'cost_update',
+              delta,
+              cumulative: priorCostUsd + totalCostUsd + cumulativeChildCostUsd,
+            });
+          }
+          return costCapDetailIfExceeded();
+        };
+
+        const semanticOverage = await chargeSchedulerThenCheckCap(
+          semanticVerifyScheduler,
+          'verify_semantic',
+        );
+        if (semanticOverage !== null) return await finish('maxCostUsd', semanticOverage);
+
+        const conflictOverage = await chargeSchedulerThenCheckCap(
+          conflictDetectorScheduler,
+          'verify_conflict',
+        );
+        if (conflictOverage !== null) return await finish('maxCostUsd', conflictOverage);
+
+        const overrideOverage = await chargeSchedulerThenCheckCap(
+          overrideVerifyScheduler,
+          'verify_override',
+        );
+        if (overrideOverage !== null) return await finish('maxCostUsd', overrideOverage);
       }
     } catch (e) {
       return await guardedFinish(e);
     }
   } finally {
+    // Shut down the semantic-verify scheduler first. Subsequent
+    // poll() calls no-op; any in-flight dispatch from the last
+    // poll already awaited above (the loop awaits per-step), so
+    // nothing remains in flight here. Idempotent — safe to call
+    // even when the scheduler was never created.
+    semanticVerifyScheduler?.shutdown();
+    conflictDetectorScheduler?.shutdown();
+    overrideVerifyScheduler?.shutdown();
     // Drain the lazy retention sweep BEFORE anything else in the
     // finally fires. The caller (cli/run.ts) is allowed to close the
     // DB right after runAgent returns; without this drain the purge

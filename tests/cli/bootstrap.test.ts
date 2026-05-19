@@ -90,6 +90,7 @@ describe('bootstrap', () => {
         'memory_write',
         'monitor',
         'read_file',
+        'retrieve_context',
         'task',
         'task_async',
         'task_await',
@@ -563,13 +564,20 @@ Body.`,
       enterprisePolicyPath: null,
       userPolicyPath: null,
     });
-    // Post-D227: systemPrompt is the parallelism hint alone
-    // when no memory entries and no caller prompt. The hint is
-    // unconditional; only the memory section is gated on
-    // having entries.
+    // Post-review: the memory header ALWAYS renders when the
+    // registry is wired (even with zero entries), so the model
+    // sees the save-criteria + 4-type semantics + DO-NOT-save list
+    // on fresh sessions — exactly when it's most likely to propose
+    // a bad inferred save. The header lands without any index
+    // lines when the registry has zero memories.
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
-    expect(config.systemPrompt).not.toContain('# Memory');
+    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt).toContain('memory_write when');
+    // Header-only: no inventory lines render with zero entries.
+    expect(config.systemPrompt).not.toContain('- [project_local]');
+    expect(config.systemPrompt).not.toContain('- [project_shared]');
+    expect(config.systemPrompt).not.toContain('- [user]');
     // And the registry is still threaded through for tools.
     expect(config.memoryRegistry).toBeDefined();
     expect(config.memoryRegistry?.list()).toEqual([]);
@@ -996,5 +1004,528 @@ Body.`,
       await broker.close();
       db.close();
     });
+  });
+
+  describe('memory_provenance retention sweep at boot (S1/T1.7)', () => {
+    test('prunes rows older than the retention window; keeps recent rows', async () => {
+      // Seed the DB BEFORE bootstrap so the row pre-exists when
+      // the boot sweep runs. Bootstrap re-opens the same dbPath,
+      // runs migrations (idempotent), then fires the sweep.
+      const {
+        MEMORY_PROVENANCE_RETENTION_MS: RETENTION_MS,
+        recordProvenance,
+        listGlobalProvenanceByName,
+      } = await import('../../src/storage/repos/memory-provenance.ts');
+      const { openDb, migrate } = await import('../../src/storage/index.ts');
+      const { createSession } = await import('../../src/storage/repos/sessions.ts');
+
+      const seedDb = openDb(dbPath);
+      migrate(seedDb);
+      const seedSession = createSession(seedDb, { model: 'm', cwd: workdir });
+      const nowMs = Date.now();
+      // Row 1: well past retention — must be swept.
+      recordProvenance(seedDb, {
+        sessionId: seedSession.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'old',
+        surface: 'eager',
+        createdAt: nowMs - RETENTION_MS - 24 * 60 * 60 * 1000,
+      });
+      // Row 2: inside retention window — must survive.
+      recordProvenance(seedDb, {
+        sessionId: seedSession.id,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'fresh',
+        surface: 'eager',
+        createdAt: nowMs - 1000,
+      });
+      seedDb.close();
+
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+      });
+      // Bootstrap doesn't surface the swept count; the assertion
+      // is on the post-sweep state of the table.
+      const oldRows = listGlobalProvenanceByName(db, 'old');
+      const freshRows = listGlobalProvenanceByName(db, 'fresh');
+      expect(oldRows).toEqual([]);
+      expect(freshRows).toHaveLength(1);
+      // Smoke-check the config built normally (sweep didn't poison
+      // anything downstream).
+      expect(config.memoryRegistry).toBeDefined();
+      db.close();
+    });
+  });
+
+  describe('shared-corpus trust probe (S5/T5.2)', () => {
+    // Verify the boot probe wires substrate + callback + bulk-
+    // invalidate end-to-end inside bootstrap. Per-unit assertions
+    // already live in tests/memory/trust-corpus-probe.test.ts; this
+    // suite covers the bootstrap-layer contract: gating on
+    // isCwdTrusted, plumbing the callback, exposing the result.
+
+    const seedFromMain = async (extra?: {
+      seed?: (db: import('../../src/storage/index.ts').DB) => void;
+    }) => {
+      const { openDb, migrate } = await import('../../src/storage/index.ts');
+      const seedDb = openDb(dbPath);
+      migrate(seedDb);
+      extra?.seed?.(seedDb);
+      seedDb.close();
+    };
+
+    test('skipped when no askSharedTrust callback is supplied', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(result.sharedTrustProbe).toBeUndefined();
+      result.db.close();
+    });
+
+    test('skipped when cwd is not trusted (probe requires cwd consent first)', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+
+      let callbackFired = false;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => {
+          callbackFired = true;
+          return 'yes';
+        },
+      });
+      expect(callbackFired).toBe(false);
+      expect(result.sharedTrustProbe).toBeUndefined();
+      result.db.close();
+    });
+
+    test('seeded silently when no shared corpus exists (empty case)', async () => {
+      // P0/F2: silent seed is reserved for the case where there's
+      // nothing to consent to. No `.agent/memory/shared/` directory
+      // at all → EMPTY_CORPUS_HASH → no modal fires.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      let modalCalls = 0;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => {
+          modalCalls++;
+          return 'yes';
+        },
+      });
+      expect(modalCalls).toBe(0);
+      expect(result.sharedTrustProbe?.kind).toBe('seeded');
+      result.db.close();
+    });
+
+    test('first-visit non-empty: modal fires in mode=first-visit (P0/F2)', async () => {
+      // Pre-populated shared/ + cwd already trusted MUST trigger the
+      // first-visit modal. Silent seeding here would let a poisoned
+      // repo's `.agent/memory/shared/` flow into the model on the
+      // very first agent invocation after `git clone`.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      let modalCalls = 0;
+      let receivedMode: 'first-visit' | 'drift' | null = null;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async (args) => {
+          modalCalls++;
+          receivedMode = args.mode;
+          return 'yes';
+        },
+      });
+      expect(modalCalls).toBe(1);
+      expect(receivedMode as 'first-visit' | 'drift' | null).toBe('first-visit');
+      expect(result.sharedTrustProbe?.kind).toBe('reconfirmed');
+      result.db.close();
+    });
+
+    test('revoked: corpus changed after seeding → modal fires, bulk-invalidate runs', async () => {
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      // Pre-seed trust row with the CURRENT hash so the probe sees
+      // a baseline. Without this, the first bootstrap would seed
+      // silently and any drift test would be conflated with the
+      // initial-seed path.
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const baselineHash = computeSharedFingerprint(sharedDir);
+      expect(baselineHash).toBeString();
+      await seedFromMain({
+        seed: (db) => setSharedTrust(db, sharedDir, baselineHash as string, 1000),
+      });
+
+      // Modify the corpus AFTER the trust baseline.
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nTAMPERED\n',
+      );
+
+      let receivedPath: string | null = null;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async (args) => {
+          receivedPath = args.path;
+          return 'no';
+        },
+      });
+      expect(receivedPath as string | null).toBe(sharedDir);
+      expect(result.sharedTrustProbe?.kind).toBe('revoked');
+      if (result.sharedTrustProbe?.kind === 'revoked') {
+        expect(result.sharedTrustProbe.invalidated.map((q) => q.name)).toEqual(['a']);
+        expect(result.sharedTrustProbe.failed).toEqual([]);
+      }
+      // CRIT/F2: trust row stamped at post-invalidate hash so the
+      // next boot doesn't re-prompt (the invalidated frontmatter is
+      // the persistent decline marker). Pre-hardening this was
+      // null; the F2 fix made it the durable post-revoke stamp.
+      const { getSharedTrust } = await import('../../src/memory/trust-corpus.ts');
+      const stored = getSharedTrust(result.db, sharedDir);
+      expect(stored).not.toBeNull();
+      // The stamped hash matches the corpus state AFTER bulk-
+      // invalidate flipped each frontmatter to `state: invalidated`.
+      expect(stored?.lastConfirmedHash).toBe(computeSharedFingerprint(sharedDir) as string);
+      result.db.close();
+    });
+
+    test('revoked: invalidated memory is excluded from the system prompt this turn', async () => {
+      // End-to-end: probe runs BEFORE assembleMemorySection so the
+      // bulk-invalidate landing on disk is reflected in the prompt
+      // built this very boot. Without that ordering the operator
+      // would need to restart to get the memories out of the
+      // system prompt.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [Quokka](quokka.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'quokka.md'),
+        '---\nname: quokka\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const baselineHash = computeSharedFingerprint(sharedDir);
+      await seedFromMain({
+        seed: (db) => setSharedTrust(db, sharedDir, baselineHash as string, 1000),
+      });
+
+      writeFileSync(
+        join(sharedDir, 'quokka.md'),
+        '---\nname: quokka\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nTAMPERED\n',
+      );
+
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => 'no',
+      });
+      expect(result.sharedTrustProbe?.kind).toBe('revoked');
+      // The system prompt was assembled AFTER the bulk-invalidate
+      // landed on disk; the invalidated memory must not appear.
+      expect(result.config.systemPrompt ?? '').not.toContain('quokka');
+      result.db.close();
+    });
+
+    test('unchanged: prior row matches current hash → no modal, probe returns unchanged (T5.5)', async () => {
+      // T5.5 strengthening for the happy path inside bootstrap. The
+      // unit test in tests/memory/trust-corpus-probe.test.ts already
+      // pins this against the probe in isolation; this version
+      // verifies the bootstrap-layer plumbing doesn't somehow
+      // induce a divergence on the in-sync path (e.g., a registry
+      // construction quirk that wrote to the corpus and shifted
+      // its hash).
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'a.md'),
+        '---\nname: a\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const baselineHash = computeSharedFingerprint(sharedDir);
+      await seedFromMain({
+        seed: (db) => setSharedTrust(db, sharedDir, baselineHash as string, 1000),
+      });
+
+      let modalCalls = 0;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => {
+          modalCalls++;
+          return 'no';
+        },
+      });
+      expect(modalCalls).toBe(0);
+      expect(result.sharedTrustProbe?.kind).toBe('unchanged');
+      // The trust row stays put with its original timestamp — no
+      // re-stamp implied by "unchanged".
+      const { getSharedTrust } = await import('../../src/memory/trust-corpus.ts');
+      expect(getSharedTrust(result.db, sharedDir)?.lastConfirmedAtMs).toBe(1000);
+      result.db.close();
+    });
+
+    test('headless without callback: fail-closed when corpus diverged from stored trust (CRIT/F4+M4)', async () => {
+      // Pre-hardening: no askSharedTrust → probe skipped → eager-
+      // load proceeded with whatever was on disk. A CI run against
+      // a corpus that diverged since the operator's last interactive
+      // confirm silently auto-accepted the new content.
+      // Post-hardening: when the probe doesn't run, the bootstrap
+      // computes the hash itself and excludes project_shared
+      // unless stored trust matches.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [X](x.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'x.md'),
+        '---\nname: x\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nOPERATOR_INFLUENCING_BODY\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      // Pre-seed trust at a STALE hash (simulates: operator
+      // confirmed days ago, corpus has since drifted).
+      const { openDb, migrate } = await import('../../src/storage/index.ts');
+      const seedDb = openDb(dbPath);
+      migrate(seedDb);
+      const { setSharedTrust } = await import('../../src/memory/trust-corpus.ts');
+      setSharedTrust(seedDb, sharedDir, 'stale-hash-from-before', 1_000);
+      seedDb.close();
+
+      // Headless boot: no askSharedTrust callback.
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        // intentionally no askSharedTrust
+      });
+      // Probe didn't run → no probe result.
+      expect(result.sharedTrustProbe).toBeUndefined();
+      // BUT the eager-load fail-closed gate kicked in: the shared
+      // body must NOT appear in the system prompt.
+      expect(result.config.systemPrompt ?? '').not.toContain('OPERATOR_INFLUENCING_BODY');
+      // And the retrieval-side gate is also active.
+      expect(result.config.memoryExcludeScopes).toEqual(['project_shared']);
+      result.db.close();
+    });
+
+    test('headless without callback: stored hash matches current → scope loads (CRIT/F4+M4 happy)', async () => {
+      // The companion to the fail-closed case: when there's an
+      // operator-confirmed trust row matching current disk state,
+      // headless callers DO load the scope. Otherwise CI runs
+      // against a well-curated repo would be broken.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [K](kept.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'kept.md'),
+        '---\nname: kept\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nKEPT_BODY\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      const { openDb, migrate } = await import('../../src/storage/index.ts');
+      const { computeSharedFingerprint, setSharedTrust } = await import(
+        '../../src/memory/trust-corpus.ts'
+      );
+      const currentHash = computeSharedFingerprint(sharedDir) as string;
+      const seedDb = openDb(dbPath);
+      migrate(seedDb);
+      setSharedTrust(seedDb, sharedDir, currentHash, 1_000);
+      seedDb.close();
+
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(result.sharedTrustProbe).toBeUndefined();
+      // Stored matches current → scope is online → body in prompt.
+      expect(result.config.systemPrompt ?? '').toContain('kept');
+      expect(result.config.memoryExcludeScopes).toBeUndefined();
+      result.db.close();
+    });
+
+    test('untrusted cwd: shared scope excluded even with empty corpus (CRIT/F4+M4)', async () => {
+      // Spec §9 — trust is per-project. Without cwd-trust, the
+      // shared scope must not load. Probe is also skipped (gated on
+      // isCwdTrusted) and the fail-closed branch fires.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [S](s.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 's.md'),
+        '---\nname: s\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nUNTRUSTED_BODY\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        askSharedTrust: async () => 'yes',
+      });
+      expect(result.sharedTrustProbe).toBeUndefined();
+      expect(result.config.systemPrompt ?? '').not.toContain('UNTRUSTED_BODY');
+      expect(result.config.memoryExcludeScopes).toEqual(['project_shared']);
+      result.db.close();
+    });
+
+    test('plan mode skips the probe entirely (CRIT/H4)', async () => {
+      // --plan is the read-only profile. A 'no' answer in plan mode
+      // would still run bulk-invalidate, writing tombstones,
+      // eviction_events, memory_events — violating the no-writes
+      // contract. The gate must skip the probe before any modal
+      // fires.
+      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      mkdirSync(sharedDir, { recursive: true });
+      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [P](p.md) — h\n');
+      writeFileSync(
+        join(sharedDir, 'p.md'),
+        '---\nname: p\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
+      );
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+
+      let modalCalls = 0;
+      const result = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        plan: true,
+        askSharedTrust: async () => {
+          modalCalls++;
+          return 'no';
+        },
+      });
+      // Probe was NOT called → no modal, no probe result.
+      expect(modalCalls).toBe(0);
+      expect(result.sharedTrustProbe).toBeUndefined();
+      // Plan mode → no checkpoint, no harness writes.
+      expect(result.config.enableCheckpoints).toBe(false);
+      result.db.close();
+    });
+
+    // NOTE: A bootstrap-level integration test for verify_failed
+    // (probe-result kind 'verify_failed' → exclude project_shared
+    // from system prompt) is intentionally NOT here. The natural
+    // way to trigger verify_failed in production is to make the
+    // shared root unreadable (EACCES) — but that ALSO makes the
+    // registry's MEMORY.md read fail BEFORE the probe runs, so
+    // bootstrap throws at registry construction. The probe-layer
+    // unit test (`tests/memory/trust-corpus-probe.test.ts:
+    // 'returns verify_failed when the shared root is unreadable'`)
+    // and the assembleMemorySection unit test
+    // (`tests/cli/memory-prompt.test.ts: 'drops every listing in
+    // an excluded scope ...'`) together cover the two halves; the
+    // bootstrap wiring is a single conditional that fans them out.
   });
 });

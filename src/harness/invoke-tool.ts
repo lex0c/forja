@@ -12,6 +12,7 @@ import {
   withTransaction,
 } from '../storage/index.ts';
 import { linkApprovalToToolCall } from '../storage/repos/approval-call-links.ts';
+import type { Approval } from '../storage/repos/approvals.ts';
 import {
   type Tool,
   type ToolContext,
@@ -350,7 +351,7 @@ export const invokeTool = async (
     // The post-transaction code awaits confirmPermission and then
     // commits a second transaction with the approval + start/finish.
     | { phase: 'confirm_pending'; toolCall: { id: string }; prompt: string }
-    | { phase: 'started'; toolCall: { id: string } };
+    | { phase: 'started'; toolCall: { id: string }; approvalId: string };
 
   const setup = withTransaction(deps.db, (): Setup => {
     const toolCall = createToolCall(deps.db, {
@@ -420,7 +421,7 @@ export const invokeTool = async (
     }
 
     // allow
-    recordApproval(deps.db, {
+    const approval = recordApproval(deps.db, {
       toolCallId: toolCall.id,
       decision: 'allow',
       decidedBy: 'policy',
@@ -435,7 +436,7 @@ export const invokeTool = async (
     // (matches the comment in tool-calls.ts:90). Deferring keeps
     // the lifecycle: pending → denied (hook-blocked) OR
     // pending → running → done/error (normal completion).
-    return { phase: 'started', toolCall };
+    return { phase: 'started', toolCall, approvalId: approval.id };
   });
 
   if (setup.phase === 'denied') {
@@ -471,6 +472,15 @@ export const invokeTool = async (
   // the callback (rare — modal manager normally resolves false on
   // close/timeout) collapses to denied so the run doesn't hang on
   // a stuck pending row.
+  //
+  // Migration 058 — capture the approval row for the `confirm_yes`
+  // branch so its id flows into `ctx.approvalId` like the
+  // policy-allow branch. Without this the audit chain is broken
+  // specifically for user-confirmed task spawns (the recordApproval
+  // result was previously dropped on the floor; ctx.approvalId
+  // would be undefined and subagent_runs.parent_approval_id would
+  // land NULL even though an authoritative approval row existed).
+  let confirmYesApproval: Approval | undefined;
   if (setup.phase === 'confirm_pending') {
     const askUser = deps.confirmPermission;
     if (askUser === undefined) {
@@ -543,6 +553,43 @@ export const invokeTool = async (
           error: 'denied by user',
         });
       });
+      // S3 signal (b): operator denied a permission_ask for this
+      // tool call. Attribute to factual memories exposed in this
+      // session via the registry's session-recent path (no
+      // `toolCallId` argument) — the rejected tool call itself
+      // (bash, edit, write_file, …) does NOT emit memory_provenance
+      // rows, so a per-tool-call lookup would always return zero
+      // and silently drop the signal. The relevant memories were
+      // exposed earlier in the session (eager-load, memory_read,
+      // retrieve_context); recordOverrideSignal's session-recent
+      // path picks them up correctly. The `tool_call_id` is still
+      // preserved in `details` for forensic JOINs against
+      // `tool_calls` (operator can trace WHICH denial triggered
+      // the row even though the attribution is session-scoped).
+      //
+      // The registry helper filters to factual / active / trusted
+      // and caps fan-out at MAX_OVERRIDE_ATTRIBUTION_DEPTH. Best-
+      // effort: catches throws internally. Skipped when
+      // memoryRegistry isn't wired (headless / test contexts).
+      const memReg = deps.ctx.memoryRegistry;
+      if (memReg !== undefined) {
+        try {
+          memReg.recordOverrideSignal({
+            signal: 'permission_denied',
+            details: {
+              tool_name: input.toolName,
+              tool_call_id: callId,
+              prompt: setup.prompt,
+            },
+            auditSessionId: deps.ctx.sessionId,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: override_signal_attribute_failed (permission_denied): ${msg}\n`,
+          );
+        }
+      }
       return {
         // Bare "denied by user" — no engine-prompt suffix because
         // the prompt is why the engine ASKED, not why the user
@@ -562,7 +609,7 @@ export const invokeTool = async (
     // explanatory; engine prompt belongs in the deny path.
     // startToolCall is deferred to the post-PreToolUse step
     // (same rationale as the policy-allow branch above).
-    recordApproval(deps.db, {
+    confirmYesApproval = recordApproval(deps.db, {
       toolCallId: callId,
       decision: 'confirm_yes',
       decidedBy: 'user',
@@ -721,10 +768,30 @@ export const invokeTool = async (
   // consume `ctx.sandboxProfile` to wrap argv via `buildBwrapArgv`.
   // Skipped (undefined) when the planner didn't run for this call —
   // legacy callers / misc category / pre-planner refusals.
-  const ctxForExecute: ToolContext =
-    decision.sandboxProfile === undefined
-      ? deps.ctx
-      : { ...deps.ctx, sandboxProfile: decision.sandboxProfile };
+  // Migration 058: thread approval id into the ctx so spawning tools
+  // (task family) can populate subagent_runs.parent_approval_id and
+  // keep the audit chain one-hop. Two sources of an authoritative
+  // approval row reach this point:
+  //   - Policy-allow path: `setup.phase === 'started'` carries the
+  //     approval id captured inside the setup transaction.
+  //   - Confirm-yes path: `setup.phase === 'confirm_pending'` and
+  //     the user approved above; `confirmYesApproval` carries the
+  //     row recorded post-confirm.
+  // Both are valid lineage anchors for spawning tools; only the
+  // hook-block / deny / confirm-no branches return before this
+  // point and therefore don't reach the execute step at all.
+  const approvalIdForCtx =
+    setup.phase === 'started'
+      ? setup.approvalId
+      : confirmYesApproval !== undefined
+        ? confirmYesApproval.id
+        : undefined;
+  const ctxForExecute: ToolContext = {
+    ...deps.ctx,
+    toolCallId: toolCall.id,
+    ...(approvalIdForCtx !== undefined ? { approvalId: approvalIdForCtx } : {}),
+    ...(decision.sandboxProfile !== undefined ? { sandboxProfile: decision.sandboxProfile } : {}),
+  };
 
   let rawResult: unknown;
   let crashed = false;
