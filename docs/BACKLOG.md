@@ -2,6 +2,40 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] refactor(config) — centralize agent-path resolvers, closes latent Windows gap
+
+Audit of `src/*/paths.ts` files revealed the XDG / HOME / Windows APPDATA / PROGRAMDATA dance was duplicated across four subsystems (`permissions`, `hooks`, `config.toml` consumers, `install_id`). Worse: the implementations had drifted in completeness.
+
+| File | XDG | POSIX HOME/.config | Windows APPDATA | Windows USERPROFILE | Enterprise (POSIX /etc) | Enterprise (Win PROGRAMDATA) |
+|---|---|---|---|---|---|---|
+| `permissions/paths.ts` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `hooks/paths.ts` | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ |
+| `config/paths.ts` (my recent refactor) | ✓ | ✓ | ✗ | ✗ | n/a | n/a |
+
+**Latent bug.** Operator on Windows running `agent` without `XDG_CONFIG_HOME` set: hooks and config.toml user layers were silently unavailable. The implementation returned `null`, the loader treated it as "no user file", and the operator's `~/.config/agent/{hooks.toml,config.toml}` (or platform equivalent) was silently ignored. Only the permissions layer worked correctly because that's the file the lock-conflict story made the team test most thoroughly.
+
+**Consolidation.** New `src/config/agent-paths.ts` owns the shared logic with the most complete (permissions-shape) implementation:
+
+- `agentConfigDir(env?, platform?): string | null` — XDG → Windows APPDATA → Windows USERPROFILE → POSIX HOME → null.
+- `userAgentPath(filename, env?, platform?): string | null` — `agentConfigDir + filename`.
+- `enterpriseAgentPath(filename, env?, platform?): string | null` — `/etc/agent/<filename>` (POSIX) or `<PROGRAMDATA>\agent\<filename>` (Windows), null when env missing.
+- `projectAgentPath(repoRoot, filename, platform?): string` — platform-aware `join(repoRoot, '.agent', filename)`.
+
+Each subsystem's public API stays identical:
+
+- `permissions/paths.ts` keeps `enterprisePolicyPath` / `userPolicyPath` / `installIdPath` / `projectPolicyPath` — delegates to the shared helpers with the `permissions.yaml` / `install_id` filename.
+- `hooks/paths.ts` keeps `enterpriseHooksPath` / `userHooksPath` / `projectHooksPath` / `resolveHookPaths` — delegates with `hooks.toml`.
+- `config/paths.ts` keeps `userConfigPath` / `projectConfigPath` — delegates with `config.toml`. **This commit closes the Windows gap as a side effect** (operator on Windows now gets the user-layer config.toml resolved correctly).
+
+**Tests.** All 84 existing per-subsystem path tests pass unchanged — behavior is preserved (delegation is mechanical). New `tests/config/agent-paths.test.ts` adds 16 cases pinning the shared module directly: XDG precedence, non-absolute XDG rejection (traversal defense), POSIX fallback, **Windows APPDATA / USERPROFILE behavior** (catches regression to the POSIX-only shape that hooks and config.toml had), Windows `null` on stripped env, enterprise POSIX `/etc/agent/`, enterprise Windows PROGRAMDATA, project-path platform-aware join.
+
+What this refactor did NOT touch (deliberately):
+
+- **Loaders / mergers** stay per-subsystem. Formats differ genuinely (TOML for config + hooks, YAML for permissions, markdown frontmatter for memory). Validators are section-specific (field-level types, ranges, regex). The hierarchy/merge semantics differ too — permissions has lock conflicts, hooks runs ALL layers concatenated, config.toml does per-key project>user merge, memory has scope-based precedence. Centralizing the loader would create worse coupling than the duplication.
+- **`memory/paths.ts:userScopeRoot`** stays as-is. Returns a directory (not a file), always succeeds (never null), uses `homedir()` fallback. Different signature shape; consolidation would require generalizing in a way that hurts readability of the memory-specific path semantics. The scope-roots resolver is also more complex (3 scopes: user, project_shared, project_local) than the others' 2-3 layer hierarchy.
+
+Suite delta: 100 path tests pass across the 4 affected files (84 existing + 16 new shared); typecheck + lint clean. ~80 LOC of duplicated env-var plumbing eliminated.
+
 ## [2026-05-19] fix(permissions) — honor host globs in `trusted_hosts`
 
 `risk-score.ts:isUntrustedEgressHost` was checking trust with `trusted.includes(host)` — exact string match — while the sibling `allow_hosts` / `deny_hosts` lists on the SAME `fetch_url` schema use `matcher.ts:matchHost` which honors `*.corp.internal` style patterns. Operator declaring `trusted_hosts: ["*.corp.internal"]` in `.agent/permissions.yaml` saw `foo.corp.internal` continue triggering the `untrusted_egress` risk component despite the policy explicitly trusting the entire `*.corp.internal` subdomain space. Operator-visible divergence within a single policy section.

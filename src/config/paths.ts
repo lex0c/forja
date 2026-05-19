@@ -1,37 +1,22 @@
-// Shared config-file path resolvers for `.agent/config.toml` consumers
-// (currently critique, memory, providers, budget — and any future
-// loader that targets the same per-project TOML).
-//
-// Why this lives in `src/config/` and not next to a specific
-// consumer: with four loaders (and counting) all reading the SAME
-// file via the SAME path resolution, leaving the helpers under
-// `critique/` made the import graph awkward (memory/providers/budget
-// reach into critique's surface for plumbing they don't conceptually
-// own). The cross-consumer re-export from critique/config-loader.ts
-// stays in place for backward-compat with existing import sites.
+// Per-project `.agent/config.toml` path resolvers (currently
+// consumed by critique, memory governance, providers, budget
+// loaders). Path-resolution plumbing centralized in
+// `src/config/agent-paths.ts` so the XDG / HOME / Windows
+// APPDATA / USERPROFILE / PROGRAMDATA dance is shared across
+// every operator-facing artifact (config.toml, permissions.yaml,
+// hooks.toml, install_id). Pre-consolidation this file only
+// handled XDG + POSIX HOME — Windows users without explicit
+// XDG_CONFIG_HOME silently missed the user-layer config.toml.
 
-import { homedir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { projectAgentPath, userAgentPath } from './agent-paths.ts';
 
-// User-layer path. XDG_CONFIG_HOME wins when set + absolute, else
-// `$HOME/.config`. Returns null on a stripped-down env where neither
-// yields a usable absolute path (containers, CI workers with $HOME
-// unset); the loaders treat null as "no user file" and proceed with
-// project-only resolution.
-//
-// Non-absolute XDG_CONFIG_HOME is treated as if unset — a relative
-// value could shadow user files via path traversal (security:
-// `XDG_CONFIG_HOME=../../some/path` should not redirect lookups).
-export const userConfigPath = (env: NodeJS.ProcessEnv = process.env): string | null => {
-  const xdg = env.XDG_CONFIG_HOME;
-  if (xdg !== undefined && xdg.length > 0 && isAbsolute(xdg)) {
-    return join(xdg, 'agent', 'config.toml');
-  }
-  const home = env.HOME ?? homedir();
-  if (home.length === 0 || !isAbsolute(home)) return null;
-  return join(home, '.config', 'agent', 'config.toml');
-};
+// User-layer path for `~/.config/agent/config.toml` (or the
+// platform/XDG equivalent). Returns null on a stripped-down env
+// where no absolute root can be derived; the loaders treat null as
+// "no user file" and proceed with project-only resolution.
+export const userConfigPath = (env: NodeJS.ProcessEnv = process.env): string | null =>
+  userAgentPath('config.toml', env);
 
-// Project-layer path. Always derivable from cwd; loaders treat
+// Project-layer path. Always derivable from cwd; loader treats
 // absent file as empty layer.
-export const projectConfigPath = (cwd: string): string => join(cwd, '.agent', 'config.toml');
+export const projectConfigPath = (cwd: string): string => projectAgentPath(cwd, 'config.toml');
