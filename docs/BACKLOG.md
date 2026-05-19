@@ -2,6 +2,59 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — rich config.toml scaffold supersedes the slim spec-pointer
+
+Reverses the slim-scaffold posture from earlier in the day. Two days ago the analysis was: `/memory governance enable|disable` round-trips `.agent/config.toml` via `Bun.TOML.parse → mutate → emit` and comments don't survive — so shipping a comment-rich scaffold was a false promise. The fix at the time was to ship a minimal header pointing at `AGENTIC_CLI.md §2.1.1` for the schema.
+
+The slim shape addressed the false-promise problem but introduced a new one: an operator who opens `.agent/config.toml` after `init` sees an essentially empty file and has no way to know what budget caps / model / governance toggles are in effect without grepping source. The "single source of truth" intuition surfaced via direct operator question ("can we remove DEFAULT_BUDGET? config should be the only place with values") and the steelman holds: values living in two places (code defaults + config.toml that may or may not declare them) is genuine cognitive overhead.
+
+**New shape.** The scaffold contains **active TOML values for all four operator-tunable sections** (`[providers]`, `[budget]`, `[memory]`, `[critique]`) sourced from the canonical code defaults at scaffold time. No comments anywhere in the file — because comments still die on `/memory governance` round-trip, but values survive. The operator opens `config.toml` and sees the running config literally:
+
+```toml
+[providers]
+model = "anthropic/claude-opus-4-7"
+
+[budget]
+max_steps = 200
+max_cost_usd = 5
+max_wall_clock_ms = 600000
+max_step_stall_ms = 90000
+compaction_threshold = 0.7
+compaction_preserve_tail = 3
+
+[memory]
+verify_semantic_llm = true
+conflict_detect_llm = true
+override_detect_llm = true
+
+[critique]
+mode = "off"
+threshold = 0.85
+max_overhead_ms = 5000
+```
+
+**What stays hardcoded.** `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL` remain in code as a **safety floor**: fresh install before any `init`, programmatic test seams that don't construct a config loader, subagent runs that resolve config through the parent's audit snapshot path. The user's original instinct "remove DEFAULT_BUDGET entirely" was rejected explicitly — a fresh install with no config.toml + no DEFAULT_BUDGET would run with NO step backstop, NO cost cap, NO wall-clock cap. The "fresh install has no caps" failure mode is exactly the runaway-loop scenario `maxSteps: 200` exists to prevent.
+
+**Trade-off accepted: sticky defaults.** An operator who ran `forja init` on version N and then upgrades to version N+1 keeps their scaffolded values from version N until they re-run `agent init --force=config`. This is a real cost — we documented it inline in `src/providers/default-model.ts` and in the BACKLOG. The mitigating factor: bumps to canonical defaults are deliberate per-release moves (not bug fixes), and re-running `init --force=config` is a single, advertised step.
+
+**DEFAULT_MODEL extracted.** Moved from `src/cli/bootstrap.ts:77` (whose transitive closure includes storage, providers, hooks, telemetry) to a tiny dependency-free `src/providers/default-model.ts`. The `agent init` path now imports the model string without pulling in `bootstrap.ts`. `bootstrap.ts` re-exports for backward-compat with consumer code that imports `DEFAULT_MODEL` from there.
+
+**Spec edits** (`docs/spec/AGENTIC_CLI.md §2.1.1`):
+
+- Title changed from "scaffold slim + schema reference" to "scaffold com valores ativos + schema reference".
+- Scaffold-literal block replaced with the new active-values shape.
+- "Por que slim e não rico-com-comentários" reframed to "Sem comentários no scaffold" — the no-comments invariant stays load-bearing, but the active-values story takes precedence.
+- Schema reference converted from inline TOML examples to a markdown table mapping section/key → type → significado. Easier to scan; doesn't tempt the reader to copy-paste the example values (which would lose the "code is source of truth" property).
+- Sticky-defaults trade-off documented explicitly so future operators understand why `init --force=config` is the upgrade path.
+
+**Tests:**
+
+- `tests/cli/init-config-template.test.ts` rewritten (9 cases): parses valid TOML; parses to all-four-sections populated; `[providers].model` matches `DEFAULT_MODEL`; `[budget]` values match `DEFAULT_BUDGET` (six fields); `[memory]` values match `DEFAULT_MEMORY_CONFIG` (three detectors); `[critique]` values match `DEFAULT_CRITIQUE_CONFIG`; scaffold contains NO comments (line-by-line `#`-prefix rejection); `max_cost_usd` omitted when caller passes `undefined` (opt-out semantic); trailing newline.
+- `tests/cli/init.test.ts` config-step assertions updated: drop the `'AGENTIC_CLI.md §2.1.1'`/`'parses to empty'`/`'spec-pointer'` checks; add `parsed.providers/budget/memory/critique` defined checks; add a comment-rejection pin.
+- 147 tests pass across the four affected test files; typecheck + lint clean.
+
+**Production-readiness shift.** Operator UX improves on the "what's actually configured here?" axis — answer is now "open `.agent/config.toml`, that's everything". Cognitive load drops one indirection. The "two sources of truth" residual concern (code default + scaffold value) is real but bounded: `DEFAULT_*` constants are the source of truth for scaffold values, and `init --force=config` re-syncs. The path "delete a line → no cap" still doesn't work (loader falls back to `DEFAULT_BUDGET`); the "no cap" semantic stays slash-only (`/budget cost off`, session-scoped) until a future slice adds an explicit `[budget].disable_cost_cap` or `-1` sentinel — deliberately out of scope for this slice.
+
 ## [2026-05-19] feat(cli + permissions) — three operator-tunable knobs no longer hardcoded
 
 Audit of `src/` for `MAX_*`, `DEFAULT_*` constants and hardcoded model ids surfaced ~17 candidates; 3 had high signal for operator override and no existing per-project path. Cargo-cult risk acknowledged — the remaining 14 (subagent depth, IPC caps, retention windows, harness concurrency caps, …) are safety/protocol/internal-tuning constants and stay in code.

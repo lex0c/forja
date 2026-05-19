@@ -22,8 +22,12 @@
 
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { DEFAULT_MEMORY_CONFIG } from '../critique/config-loader.ts';
+import { DEFAULT_CRITIQUE_CONFIG } from '../critique/types.ts';
+import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { ensureAgentGitignore } from '../memory/gitignore.ts';
 import { projectPolicyPath } from '../permissions/index.ts';
+import { DEFAULT_MODEL } from '../providers/default-model.ts';
 import { projectAgentsDir } from '../subagents/paths.ts';
 import { renderInitConfigTemplate } from './init-config-template.ts';
 import { CANONICAL_PLAYBOOKS, type CanonicalPlaybook } from './init-playbooks/index.ts';
@@ -134,7 +138,19 @@ const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null
   }
   try {
     mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, renderInitConfigTemplate(), { encoding: 'utf8' });
+    // Scaffold sources all four section values from the canonical
+    // code defaults so a re-run with `--force=config` (or a fresh
+    // init after a bump) re-syncs to the current values.
+    writeFileSync(
+      target,
+      renderInitConfigTemplate({
+        model: DEFAULT_MODEL,
+        budget: DEFAULT_BUDGET,
+        memory: DEFAULT_MEMORY_CONFIG,
+        critique: DEFAULT_CRITIQUE_CONFIG,
+      }),
+      { encoding: 'utf8' },
+    );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     err(`forja: failed to write ${target}: ${msg}\n`);

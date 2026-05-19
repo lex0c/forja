@@ -210,83 +210,62 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
 | **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
 
-#### 2.1.1 `config.toml` — scaffold slim + schema reference
+#### 2.1.1 `config.toml` — scaffold com valores ativos + schema reference
 
-`agent init` escreve um `.agent/config.toml` **slim**: apenas um header apontando pra esta seção, sem exemplos inline. Discovery do schema fica aqui, não no arquivo.
+`agent init` escreve `.agent/config.toml` **com valores ativos pra todas as quatro seções operator-tuneáveis** (`[providers]`, `[budget]`, `[memory]`, `[critique]`). Os valores são sourceados dos defaults canônicos em código — operador abre o arquivo e vê literalmente o que está em vigor.
 
-**Scaffold literal** (o que o `init` materializa em `.agent/config.toml`):
+**Sem comentários no scaffold.** O slash `/memory governance enable|disable verify|conflict|override|all` reescreve `config.toml` por round-trip (parse → mutate → emit), e `Bun.TOML.parse` não preserva comments. Um scaffold com comentários **perderia toda a documentação inline na primeira invocação do slash**. Em vez de prometer e quebrar, o scaffold contém só nomes-de-seção e valores — esses sim sobrevivem ao round-trip. Discovery do significado de cada chave fica nesta seção (spec), onde edits não são rewritados.
 
-```toml
-# .agent/config.toml — Forja per-project config (safe to edit).
-#
-# Schema: AGENTIC_CLI.md §2.1.1.
-# Resolution order: enterprise → user (~/.config/agent/config.toml) →
-# project (this file) → session (CLI flag).
-#
-# This file is empty by design. Add a [memory] or [critique] section
-# to override loader defaults for this project. See the spec for the
-# full toggle list; defaults live in code (src/critique/config-loader.ts).
-#
-# Note: `/memory governance enable|disable` rewrites this file and
-# normalizes formatting (comments NOT preserved). Hand-edits to
-# inactive sections survive; comments do not. Keep notes in the
-# spec or your team's docs, not inline here.
-```
+**Por que valores ativos e não documentação comentada.** Antes desta revisão, o scaffold era slim (header apontando pra esta seção, sem seções inline). Operador precisava abrir spec OU `src/...` pra saber qual valor estava ativo. A pegada é: ter valores literais no arquivo dá ao operador imediata visibilidade ("o que está em vigor agora?") sem comprometer nada (`/memory governance` só rewrita valores, e os valores aqui já são os valores reais). Sticky-defaults trade-off aceito: operador que rodou `init` em versão antiga e foi promovido pra versão nova fica com os valores antigos no arquivo até re-rodar `agent init --force=config` — preço justo pela visibilidade single-source.
 
-**Por que slim e não rico-com-comentários.** O slash `/memory governance enable|disable verify|conflict|override|all` reescreve `config.toml` por round-trip (parse → mutate → emit), e `Bun.TOML.parse` não preserva comments. Um scaffold rico em comentários **perderia toda a documentação inline na primeira invocação do slash** — exatamente quando o operador acabou de aprender a usá-lo. Discovery via spec evita essa falsa promessa.
-
-**Schema reference** — o conjunto canônico de toggles que `config.toml` aceita. Defaults reais vivem em código (`src/critique/config-loader.ts`); a tabela abaixo é descritiva, não normativa pro template:
+**Scaffold literal** (o que o `init` materializa em `.agent/config.toml`, com os valores que estão hoje em `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL`):
 
 ```toml
-# [memory] — three LLM-judge governance detectors, all default ON.
-# Setting a key to `false` DISABLES the corresponding detector for
-# this project. Disabling does NOT delete past events or proposals;
-# it only stops the scheduler from dispatching new ones.
-
-[memory]
-verify_semantic_llm = false   # S11: post-write semantic verification
-conflict_detect_llm = false   # S13: cross-memory conflict detection
-override_detect_llm = false   # S3: repeated-override threshold detector
-
-# [critique] — write-time self-critique. Default mode = off.
-# Setting `mode` to a non-`off` value ACTIVATES critique with the
-# remaining fields. 'on_writes' fires only on edits; 'always' fires
-# on every assistant turn. Model + prompt_version are illustrative —
-# check `src/critique/config-loader.ts` for the current canonical
-# defaults before adopting verbatim.
-
-[critique]
-mode = "on_writes"            # off | on_writes | always
-threshold = 0.65              # 0..1; severity threshold to surface
-model = "anthropic/claude-haiku-4-5"
-prompt_version = "v1"
-
-# [providers] — default executor model for this project. Pin here so
-# CI / team members get the same model without remembering the
-# --model flag. Resolution chain: CLI flag (--model) > project
-# [providers].model > user [providers].model > DEFAULT_MODEL in code.
-
 [providers]
-model = "anthropic/claude-opus-4-7"   # any id in createDefaultRegistry()
-
-# [budget] — per-project caps for the harness run budget. Each field
-# is independently overridable; absent fields inherit DEFAULT_BUDGET
-# from `src/harness/types.ts`. Resolution chain mirrors [providers]:
-# CLI flag (--max-steps, --max-cost-usd, ...) > project [budget] >
-# user [budget] > DEFAULT_BUDGET. Useful for CI where strict caps
-# protect cost; useful for high-trust dev branches where steps need
-# to grow past the default 200 backstop.
+model = "anthropic/claude-opus-4-7"
 
 [budget]
-max_steps = 200               # runaway-loop backstop; cost cap is the engagement gate
-max_cost_usd = 5              # hard cap; harness aborts strictly above this value
-max_wall_clock_ms = 600000    # 10 min default
-max_step_stall_ms = 90000     # 90s per-step watchdog
-compaction_threshold = 0.7    # fraction of context-window before compaction fires
-compaction_preserve_tail = 3  # turns of conversation tail kept verbatim during compaction
+max_steps = 200
+max_cost_usd = 5
+max_wall_clock_ms = 600000
+max_step_stall_ms = 90000
+compaction_threshold = 0.7
+compaction_preserve_tail = 3
+
+[memory]
+verify_semantic_llm = true
+conflict_detect_llm = true
+override_detect_llm = true
+
+[critique]
+mode = "off"
+threshold = 0.85
+max_overhead_ms = 5000
 ```
 
-Seções futuras (`[telemetry]`, …) entram aqui pelo mesmo padrão: **schema reference aqui no spec, scaffold mantém-se slim**. Schema-creep no `[…]` reference é aceitável (custo: linhas de spec); schema-creep nos defaults em código requer PR contra esta seção primeiro.
+**Safety floor.** `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL` em código continuam autoritativos como **safety floor**: fresh install antes do `init`, subagent runs sem config-loader na cadeia, testes programáticos. Quando o operador edita um valor no `config.toml`, o per-key merge no bootstrap layer sobreescreve o code-default só pra aquela key; outras keys ainda herdam o floor.
+
+**Schema reference** — semântica de cada toggle (descritivo, não normativo pro scaffold):
+
+| Seção | Chave | Tipo | Significado |
+|---|---|---|---|
+| `[providers]` | `model` | string | Fully-qualified id da entry no `createDefaultRegistry()`. Pin per-project pra CI / team não esquecer `--model`. |
+| `[budget]` | `max_steps` | int | Runaway-loop backstop (cost é o engagement gate). |
+| `[budget]` | `max_cost_usd` | float | Hard cap em USD; harness aborta logo após cruzar. Omitir a chave em sessão via `/budget cost off` (não persistido). |
+| `[budget]` | `max_wall_clock_ms` | int | Cap de wall-clock da sessão inteira. |
+| `[budget]` | `max_step_stall_ms` | int | Watchdog per-step; aborta o step se o provider stream silenciar tantos ms. |
+| `[budget]` | `compaction_threshold` | float `[0,1]` | Fração do context-window onde compactação dispara. |
+| `[budget]` | `compaction_preserve_tail` | int `≥0` | Quantos turns finais ficam literais (sem compactar). 0 = compacta tudo. |
+| `[memory]` | `verify_semantic_llm` | bool | Detector S11 (post-write semantic verification). Default ON. |
+| `[memory]` | `conflict_detect_llm` | bool | Detector S13 (cross-memory conflict). Default ON. |
+| `[memory]` | `override_detect_llm` | bool | Detector S3 (threshold de override). Default ON. |
+| `[critique]` | `mode` | `off`/`on_writes`/`always` | Quando self-critique dispara. |
+| `[critique]` | `threshold` | float `[0,1]` | Severity threshold pra surface issues. |
+| `[critique]` | `max_overhead_ms` | int | Cap de latência adicional do critique pass. |
+| `[critique]` | `model` (opcional) | string | Provider id pra critique (fallback: executor). |
+| `[critique]` | `prompt_version` (opcional) | string | Pin de versão do prompt (`KNOWN_CRITIQUE_PROMPT_VERSIONS`). |
+
+Seções futuras (`[telemetry]`, …) entram pelo mesmo padrão: defaults canônicos em código, scaffold materializa valores ativos, schema reference aqui descreve significado. Schema-creep no scaffold é custo aceitável (operador vê mais linhas no arquivo); schema-creep nos defaults em código requer PR contra esta seção primeiro.
 
 ### 2.2 Composição (Unix philosophy)
 

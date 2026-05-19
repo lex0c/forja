@@ -1,37 +1,83 @@
 // Template for `.agent/config.toml` written by `agent init`.
 // Spec: AGENTIC_CLI.md §2.1.1.
 //
-// Posture: the scaffolded file is a slim spec-pointer, NOT inline
-// documentation. The operator opens the file, sees where the schema
-// lives, and edits from there. Rich per-toggle documentation lives
-// in AGENTIC_CLI.md §2.1.1 (schema reference) — not in this string.
+// Posture: the scaffolded file contains ACTIVE values for every
+// operator-tunable section ([providers], [budget], [memory],
+// [critique]) sourced from the canonical code defaults. Operator
+// opens the file, sees the running values literal in front of them,
+// edits in-place to override.
 //
-// Why slim? `/memory governance enable|disable` rewrites this file
-// via TOML round-trip (parse → mutate → emit), and `Bun.TOML.parse`
-// does not preserve comments. If we shipped a richly-commented
-// scaffold, the first slash-command toggle would silently delete
-// every line of inline documentation. The operator would lose
-// discovery exactly when they first acted on the file. Slim
-// scaffold avoids the false promise: the docs live in the spec
-// where comments do not get rewritten by the toggle path.
+// NO comments are written into the scaffold. Two reasons:
 //
-// Adding values to this scaffold (e.g., as defaults for new
-// installs) requires a PR against AGENTIC_CLI.md §2.1.1 first —
-// the spec lists the literal scaffold AND the schema reference.
+//   1. `/memory governance enable|disable` rewrites the file via
+//      TOML round-trip (parse → mutate → emit), and `Bun.TOML.parse`
+//      does not preserve comments. A richly-commented scaffold would
+//      silently lose every line of inline documentation on the first
+//      slash toggle — operator-visible promise broken at exactly
+//      the moment the operator first acted on the file.
+//   2. With active values present, the file IS its own
+//      documentation: section names and key names ARE the schema.
+//      The full schema reference (with descriptions, valid ranges,
+//      illustrative non-default values) lives in AGENTIC_CLI.md
+//      §2.1.1, where comments don't get rewritten.
+//
+// The code-side DEFAULT_BUDGET / DEFAULT_MEMORY_CONFIG /
+// DEFAULT_CRITIQUE_CONFIG remain authoritative as safety floors
+// (fresh install before init, programmatic test seams, subagent_run
+// contexts that don't carry config). When the operator edits a value
+// in config.toml, the per-key merge in the bootstrap layer overrides
+// the code default for that key only — other keys still inherit
+// the code-side floor.
 
-export const renderInitConfigTemplate =
-  (): string => `# .agent/config.toml — Forja per-project config (safe to edit).
-#
-# Schema: AGENTIC_CLI.md §2.1.1.
-# Resolution order: enterprise → user (~/.config/agent/config.toml) →
-# project (this file) → session (CLI flag).
-#
-# This file is empty by design. Add a [memory] or [critique] section
-# to override loader defaults for this project. See the spec for the
-# full toggle list; defaults live in code (src/critique/config-loader.ts).
-#
-# Note: \`/memory governance enable|disable\` rewrites this file and
-# normalizes formatting (comments NOT preserved). Hand-edits to
-# inactive sections survive; comments do not. Keep notes in the
-# spec or your team's docs, not inline here.
-`;
+import type { MemoryConfigKeys } from '../critique/config-loader.ts';
+import type { CritiqueConfig } from '../critique/types.ts';
+import type { RunBudget } from '../harness/types.ts';
+
+export interface InitConfigDefaults {
+  model: string;
+  budget: RunBudget;
+  memory: MemoryConfigKeys;
+  critique: CritiqueConfig;
+}
+
+// Quote a TOML string value defensively — handles backslash and
+// double-quote in the unlikely case a future model id / mode enum
+// carries one. Values written today (model registry ids, the
+// 'off'|'on_writes'|'always' enum) are safe ASCII, so this is
+// belt-and-suspenders for forward-compat.
+const tomlString = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+export const renderInitConfigTemplate = (defaults: InitConfigDefaults): string => {
+  const { model, budget: b, memory: m, critique: c } = defaults;
+  // maxCostUsd is `number | undefined` — explicit-undefined is
+  // operator opt-out semantics (RunBudget docstring at
+  // harness/types.ts:484). DEFAULT_BUDGET ships it as 5, but
+  // defensively skip the line when the caller hands us undefined
+  // so the scaffold doesn't write `max_cost_usd = undefined` as
+  // literal text.
+  const maxCostLine = b.maxCostUsd !== undefined ? `max_cost_usd = ${b.maxCostUsd}\n` : '';
+  // prompt_version is optional in CritiqueConfig and not set by
+  // DEFAULT_CRITIQUE_CONFIG; only emit when populated.
+  const promptVersionLine =
+    c.promptVersion !== undefined ? `prompt_version = ${tomlString(c.promptVersion)}\n` : '';
+  return `[providers]
+model = ${tomlString(model)}
+
+[budget]
+max_steps = ${b.maxSteps}
+${maxCostLine}max_wall_clock_ms = ${b.maxWallClockMs}
+max_step_stall_ms = ${b.maxStepStallMs}
+compaction_threshold = ${b.compactionThreshold}
+compaction_preserve_tail = ${b.compactionPreserveTail}
+
+[memory]
+verify_semantic_llm = ${m.verifySemanticLlm}
+conflict_detect_llm = ${m.conflictDetectLlm}
+override_detect_llm = ${m.overrideDetectLlm}
+
+[critique]
+mode = ${tomlString(c.mode)}
+threshold = ${c.threshold}
+max_overhead_ms = ${c.maxOverheadMs}
+${promptVersionLine}`;
+};

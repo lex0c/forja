@@ -78,7 +78,13 @@ import { composeWithResponseFormat } from './response-format.ts';
 import { composeWithTaskDiscipline } from './task-discipline.ts';
 import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 
-export const DEFAULT_MODEL = 'anthropic/claude-opus-4-7';
+// Re-export from the dependency-free home so existing import sites
+// keep working. New code should prefer `src/providers/default-model.ts`
+// directly — importing it doesn't drag in this module's full
+// transitive closure (storage, providers, hooks, ...) on lighter
+// paths like `agent init`.
+export { DEFAULT_MODEL } from '../providers/default-model.ts';
+import { DEFAULT_MODEL } from '../providers/default-model.ts';
 
 export interface BootstrapInput {
   prompt: string;

@@ -254,28 +254,37 @@ describe('runInit — config step', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('writes a slim .agent/config.toml pointing at the spec', () => {
+  test('writes .agent/config.toml with active values for all four sections', () => {
     const code = runInit({ cwd, mode: 'strict', only: ['config'], out, err });
     expect(code).toBe(0);
     const target = join(cwd, '.agent', 'config.toml');
     expect(existsSync(target)).toBe(true);
     const body = readFileSync(target, 'utf8');
-    // Slim scaffold posture (AGENTIC_CLI.md §2.1.1): the file ships
-    // as a spec-pointer header. Inline section content would be
-    // deleted by the first `/memory governance` toggle round-trip,
-    // so we explicitly avoid scaffolding what we cannot promise
-    // to preserve. The prose may mention the section names; the
-    // next test pins that no ACTIVE section is rendered.
-    expect(body).toContain('AGENTIC_CLI.md §2.1.1');
+    // Rich-scaffold posture (AGENTIC_CLI.md §2.1.1, post-rewrite):
+    // the file ships with literal values from the code defaults so
+    // the operator opens it and sees the running config in front of
+    // them. Section/value-level pins live in the template's own test
+    // (init-config-template.test.ts); here we just confirm the
+    // orchestrator wired the right renderer and produced parseable
+    // TOML with all four expected sections.
+    const parsed = Bun.TOML.parse(body) as Record<string, unknown>;
+    expect(parsed.providers).toBeDefined();
+    expect(parsed.budget).toBeDefined();
+    expect(parsed.memory).toBeDefined();
+    expect(parsed.critique).toBeDefined();
   });
 
-  test('rendered config is no-op TOML (slim scaffold)', () => {
+  test('scaffolded config contains NO comments (slash round-trip would kill them)', () => {
     runInit({ cwd, mode: 'strict', only: ['config'], out, err });
     const body = readFileSync(join(cwd, '.agent', 'config.toml'), 'utf8');
-    // The orchestrator's contract is "scaffold the slim template";
-    // a deviation here means the template renderer leaked an
-    // active section/value into the file shipped to the operator.
-    expect(Bun.TOML.parse(body)).toEqual({});
+    // `/memory governance enable|disable` rewrites this file via
+    // TOML round-trip and Bun.TOML.parse drops comments. The
+    // scaffold MUST NOT emit any `#`-prefixed line or the file's
+    // initial documentation would silently vanish on the first
+    // governance toggle.
+    for (const line of body.split('\n').filter((l) => l.length > 0)) {
+      expect(line).not.toMatch(/^\s*#/);
+    }
   });
 
   test('skips existing config.toml when not forced', () => {
@@ -305,12 +314,13 @@ describe('runInit — config step', () => {
       err,
     });
     expect(code).toBe(0);
-    // Force overwrites with the slim scaffold — operator's `#
-    // operator edit\n` is gone, replaced by the spec-pointer
-    // header.
+    // Force overwrites — operator's `# operator edit\n` is gone,
+    // replaced by the rich scaffold's [providers] / [budget] /
+    // [memory] / [critique] sections.
     const body = readFileSync(target, 'utf8');
     expect(body).not.toContain('operator edit');
-    expect(body).toContain('AGENTIC_CLI.md §2.1.1');
+    expect(body).toContain('[budget]');
+    expect(body).toContain('[providers]');
   });
 });
 
@@ -557,9 +567,7 @@ describe('runInit — full bundle (default order)', () => {
     });
     // Force-eligible artifacts got rewritten.
     expect(readFileSync(join(cwd, '.agent', 'permissions.yaml'), 'utf8')).toContain('mode: strict');
-    expect(readFileSync(join(cwd, '.agent', 'config.toml'), 'utf8')).toContain(
-      'AGENTIC_CLI.md §2.1.1',
-    );
+    expect(readFileSync(join(cwd, '.agent', 'config.toml'), 'utf8')).toContain('[budget]');
     expect(readFileSync(join(cwd, '.agent', 'agents', 'fixture-a.md'), 'utf8')).toContain(
       'name: fixture-a',
     );
