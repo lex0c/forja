@@ -2,6 +2,52 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent purge --force` aborts (exit 1) on TOCTOU detection
+
+Operator-reported bug. The TOCTOU defense in `walkRemove` previously only emitted a stderr line and `return`-ed from the current frame when `verifySamePostReaddir` reported a concurrent FS swap. That sub-frame return cleanly fell off the call stack: if the failure was at the ROOT `.agent/` directory (which is `removeTree`'s entrypoint), the function returned `{files: 0, dirs: 0, bytes: 0}`, `runPurge` built a `ForceReport` with `removed: {0, 0, 0}`, and rendered SUCCESS (exit 0) — silently violating `--force` semantics. Operators saw "purge succeeded" but the project state was unchanged after a concurrent FS swap/race.
+
+**Failure shape:**
+
+| TOCTOU location | Pre-fix outcome | Operator-visible signal |
+|---|---|---|
+| Root `.agent/` (first lstat→readdir) | exit 0 + "purge succeeded, removed: 0 files / 0 dirs / 0 B" | stderr line about "refusing to descend" + bogus success |
+| Mid-tree (child dir) | exit 1, but with `FS removal failed mid-walk: ENOTEMPTY` — because rmdir on the parent failed when the failing-child subtree was still there | Generic message; operator can't tell it was a TOCTOU race vs. perm error vs. EBUSY |
+
+The first case is the silent --force violation. The second case still exits 1 but via a confusing path (rmdir-failure cascading up) with the wrong root cause in the message.
+
+**Fix.** Throw discipline replaces stderr+return:
+
+1. **`src/cli/purge.ts`** — new `class PurgeToctouError extends Error` carrying `path: string` + `partial: {files, dirs, bytes}` (the running counts at the moment of abort). Exported so the catch block can `instanceof`-check.
+
+2. **`src/cli/purge.ts`** — `walkRemove` now `throw new PurgeToctouError(path, {files, dirs, bytes})` instead of `process.stderr.write(...) + return`. The throw propagates through the parent's for-loop (skipping the parent's `rmdirSync`), through `removeTree`, into `runPurge`'s try/catch. Same propagation regardless of where in the tree the TOCTOU triggers — root vs. mid-tree differ only in the captured partial counts, not in the abort signal.
+
+3. **`src/cli/purge.ts`** — `removeTree` signature accepts an optional `RemoveTreeOptions.verifier` (defaults to the real `verifySamePostReaddir`). Pure test seam: production omits it; tests inject a constant-false verifier to exercise the abort path without simulating racy FS scheduling. `removeTree` and `PurgeToctouError` both `export`-ed (the former was previously module-internal).
+
+4. **`src/cli/purge.ts`** — `runPurge` catch block discriminates `PurgeToctouError` from generic mid-walk failures:
+    - Renders the exact path that failed (operator can investigate directly)
+    - Branches on partial counts: "Partial state: N files / M dirs / B removed before the abort" vs. "No files were removed (TOCTOU detected before any removal)"
+    - Notes whether the audit row was already written (important because audit lands BEFORE `removeTree`)
+    - Concludes with "INVESTIGATE: another process modified the filesystem during the walk. Identify and stop it before retrying purge."
+    - All paths return exit 1.
+
+5. **Tests** — 4 new pins in `tests/cli/purge.test.ts` (`removeTree — TOCTOU abort throws PurgeToctouError`):
+    - **Root-level TOCTOU**: `removeTree(root, {verifier: () => false})` throws with `partial = {0,0,0}` AND every file in the tree still exists (the regression pin for the reported bug).
+    - **Mid-tree TOCTOU**: verifier fails only on `sub/`; throws with `path === sub`; both `sub/` and root parent still exist (rmdir cascade prevented).
+    - **Default verifier happy path**: omitting the override produces the real wiring — tree removed normally with correct counts.
+    - **Partial counts shape**: when failure follows file removals, `partial.{files,dirs,bytes}` are numeric and `>= 0` (structural, since readdir order is FS-dependent and exact counts can't be predicted).
+
+**Why throw instead of fixing the silent-return semantic.** Two reasons:
+- The signal needs to survive arbitrary stack depth. A "fatal flag tracked in the closure" approach would work but requires every recursion frame to re-check the flag after each child returns; throw is shorter and matches how the rest of the codebase signals "abandon this entire operation."
+- Mid-tree TOCTOU previously bubbled up through `rmdir` failure with the wrong error class. The throw discipline gives the catch a typed signal it can branch on cleanly.
+
+**Why no stderr write from the walker any more.** Single source of truth: `runPurge` now owns the message format with the partial-state nuance. A future caller of `removeTree` (none today) inherits the contract "catch `PurgeToctouError` and render".
+
+**Verification:**
+- 42/42 tests in `tests/cli/purge.test.ts` (was 38, +4 new TOCTOU abort pins)
+- typecheck + lint clean
+
+**Pre-existing operator state.** Installs that hit a root-level TOCTOU race between the previous fix and this one would have seen exit 0 + zero-removal "success" output. The audit row was still written, so `agent --list-sessions` and the purge_events ledger would record an inflated "I purged at <ts>" claim against a project that's actually still intact. Affected operators should re-run `agent purge --dry-run` on suspect projects to see what's still there. No corruption — the FS is genuinely intact.
+
 ## [2026-05-19] feat(audit) — gc Phase 3 wires `purge_events` retention (inert key bug)
 
 Operator-reported gap. The purge subsystem migration (066-purge-events.ts:87) declared "Retention 365d (par with approvals_log, per AUDIT.md §1.2). No UPDATE surface, no DELETE outside the retention sweep" — and `[audit.retention].purge_events` was accepted by config parsing as a forward-compat key — but no sweep path existed. The retention key was inert: an operator setting `purge_events = 30` got the warning-free acceptance of validated input plus the silent no-op of forward-compat input. Worst of both worlds.

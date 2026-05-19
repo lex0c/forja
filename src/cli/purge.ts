@@ -307,14 +307,69 @@ export const verifySamePostReaddir = (path: string, preStat: Stats): boolean => 
   );
 };
 
+// Thrown when verifySamePostReaddir reports a concurrent FS swap
+// during the walk. Carries the offending path AND the partial
+// removal counts captured up to the abort point, so runPurge can
+// distinguish the two operational shapes:
+//
+//   - partial == {0,0,0}: TOCTOU triggered before ANY removal (e.g.,
+//     race against the root `.agent/` itself). FS state unchanged.
+//   - partial > 0: TOCTOU triggered mid-walk after some children
+//     were already removed. FS is in a partial state.
+//
+// Operator action differs: in the second case, the project is
+// genuinely half-purged; in the first case, the project is intact
+// but the audit row already landed (because runPurge writes audit
+// BEFORE entering the removal walker).
+//
+// Previously walkRemove only emitted a stderr line and returned —
+// which meant a root-level TOCTOU swallowed the abort signal,
+// removeTree returned {0,0,0}, and runPurge reported success
+// (exit 0) despite removing nothing. That silent-success bug
+// violated --force semantics. The throw discipline here surfaces
+// every TOCTOU detection as a real failure (exit 1) regardless of
+// where in the walk it triggers.
+export class PurgeToctouError extends Error {
+  readonly path: string;
+  readonly partial: { files: number; dirs: number; bytes: number };
+  constructor(path: string, partial: { files: number; dirs: number; bytes: number }) {
+    super(
+      `refusing to descend into ${path} — concurrent FS modification detected (lstat/readdir TOCTOU)`,
+    );
+    this.name = 'PurgeToctouError';
+    this.path = path;
+    this.partial = partial;
+  }
+}
+
+// Options for `removeTree`. The verifier is exposed as an override
+// purely for tests — production omits it and the walker uses the
+// real `verifySamePostReaddir`. A racy TOCTOU can't be reproduced
+// deterministically in a unit test without injection, so this seam
+// lets the abort path be pinned without flaky scheduling.
+export interface RemoveTreeOptions {
+  verifier?: (path: string, preStat: Stats) => boolean;
+}
+
 // Removes a tree rooted at `target`, lstat-aware. Symlinks are
 // unlinked (the link itself, not its target). Real directories are
 // recursed then rmdir'd. Other entries are unlinked.
 //
+// Throws `PurgeToctouError` (which the caller MUST catch and
+// surface as exit 1) when the verifier detects a concurrent FS
+// modification during the walk. See class header for the
+// partial-state semantics.
+//
 // Returns the actually-removed counts so the force path can
 // confirm the dry-run numbers (typically identical; differs only
 // when the FS changes between enumeration and removal).
-const removeTree = (target: string): { files: number; dirs: number; bytes: number } => {
+//
+// Exported for tests; runPurge is the only production caller.
+export const removeTree = (
+  target: string,
+  options: RemoveTreeOptions = {},
+): { files: number; dirs: number; bytes: number } => {
+  const verifier = options.verifier ?? verifySamePostReaddir;
   let files = 0;
   let dirs = 0;
   let bytes = 0;
@@ -340,15 +395,18 @@ const removeTree = (target: string): { files: number; dirs: number; bytes: numbe
       }
       // TOCTOU re-check: confirm the path is still the same real
       // directory we lstat'd above. If a concurrent process swapped
-      // it for a symlink between lstat and readdir, refuse to
-      // recurse — readdirSync follows symlinks, so the entries
-      // listed might belong to an external target. Recursing
-      // would delete files outside .agent/.
-      if (!verifySamePostReaddir(path, st)) {
-        process.stderr.write(
-          `forja purge: refusing to descend into ${path} — concurrent FS modification detected (lstat/readdir TOCTOU); aborting subtree\n`,
-        );
-        return;
+      // it for a symlink between lstat and readdir, ABORT THE
+      // ENTIRE WALK — readdirSync follows symlinks, so the entries
+      // listed might belong to an external target. Recursing would
+      // delete files outside `.agent/`.
+      //
+      // Throw (don't merely return) so the caller sees a real
+      // failure regardless of where in the tree this triggers. The
+      // partial counts captured up to this point let runPurge tell
+      // the operator whether the FS is intact (root abort) or
+      // half-purged (mid-tree abort).
+      if (!verifier(path, st)) {
+        throw new PurgeToctouError(path, { files, dirs, bytes });
       }
       for (const name of entries) walkRemove(join(path, name));
       rmdirSync(path);
@@ -692,6 +750,30 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   try {
     removed = removeTree(agentDir);
   } catch (e) {
+    // TOCTOU aborts get a distinct rendering so the operator
+    // doesn't conflate "another process raced us" with the more
+    // mundane FS errors (EBUSY, EACCES mid-walk). Carries the
+    // partial-state counts so an operator inspecting the project
+    // can compare against the audit row's "what was here" snapshot.
+    if (e instanceof PurgeToctouError) {
+      const auditNote = !options.noAudit && audit.writable;
+      err(`forja purge: ${e.message}; aborting at ${e.path}\n`);
+      const hasPartial = e.partial.files > 0 || e.partial.dirs > 0;
+      if (hasPartial) {
+        err(
+          `  Partial state: ${e.partial.files} file(s) / ${e.partial.dirs} dir(s) / ${formatBytes(e.partial.bytes)} removed before the abort\n`,
+        );
+      } else {
+        err('  No files were removed (TOCTOU detected before any removal)\n');
+      }
+      if (auditNote) {
+        err(`  Audit row was already written (id=${auditId ?? 'unknown'})\n`);
+      }
+      err(
+        '  INVESTIGATE: another process modified the filesystem during the walk. Identify and stop it before retrying purge.\n',
+      );
+      return 1;
+    }
     const reason = e instanceof Error ? e.message : String(e);
     err(`forja purge: FS removal failed mid-walk: ${reason}\n`);
     err('  (audit row was already written; the project is in a partial state)\n');

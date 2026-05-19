@@ -28,7 +28,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_STEPS, type InitStep } from '../../src/cli/init.ts';
-import { INIT_MARKERS, runPurge, verifySamePostReaddir } from '../../src/cli/purge.ts';
+import {
+  INIT_MARKERS,
+  PurgeToctouError,
+  removeTree,
+  runPurge,
+  verifySamePostReaddir,
+} from '../../src/cli/purge.ts';
 import { openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listPurgeEventsByCwd } from '../../src/storage/repos/purge-events.ts';
@@ -892,6 +898,166 @@ describe('verifySamePostReaddir — TOCTOU race detector', () => {
     expect(forgedPreStat.ino).toBe(realStat.ino);
     expect(forgedPreStat.dev).not.toBe(realStat.dev);
     expect(verifySamePostReaddir(realDir, forgedPreStat)).toBe(false);
+  });
+});
+
+describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
+  // Operator-reported bug: when verifySamePostReaddir failed inside
+  // walkRemove, the old code wrote stderr and `return`-ed from the
+  // current frame only. If the failure was at the ROOT (.agent/
+  // itself), removeTree returned {0,0,0} cleanly, runPurge built a
+  // ForceReport with `removed={0,0,0}` and rendered SUCCESS (exit
+  // 0). That silently violated --force semantics — operators saw
+  // "purge succeeded" but nothing was removed and the project was
+  // unchanged after a concurrent FS swap/race.
+  //
+  // The fix throws PurgeToctouError from the walker so the abort
+  // signal survives all the way to runPurge's catch, which renders
+  // exit 1 with explicit partial-state details. The TOCTOU race
+  // itself isn't reproducible deterministically in a unit test
+  // (would require winning a microsecond scheduling race against
+  // the lstat→readdir gap), so removeTree exposes a verifier
+  // override for tests — production omits it and uses the real
+  // verifySamePostReaddir.
+
+  let workdir: string;
+  beforeEach(() => {
+    workdir = mkdtempSync(join(tmpdir(), 'forja-purge-removetree-'));
+  });
+  afterEach(() => {
+    // Best-effort cleanup. Tests deliberately leave partial state;
+    // ignore cleanup errors so a test failure doesn't cascade into
+    // an unrelated rmSync error.
+    try {
+      rmSync(workdir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  test('root-level TOCTOU: throws with partial = {0,0,0}; FS intact', () => {
+    // Simulates the reported bug: verifier returns false on the very
+    // first directory checked (the root). Old code returned {0,0,0}
+    // silently; new code throws.
+    const root = join(workdir, '.agent');
+    mkdirSync(root);
+    writeFileSync(join(root, 'config.toml'), 'data');
+    mkdirSync(join(root, 'agents'));
+    writeFileSync(join(root, 'agents', 'one.md'), 'x');
+
+    const alwaysFail = () => false;
+    let thrown: unknown;
+    try {
+      removeTree(root, { verifier: alwaysFail });
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect(thrown).toBeInstanceOf(PurgeToctouError);
+    const err = thrown as PurgeToctouError;
+    expect(err.path).toBe(root);
+    expect(err.partial).toEqual({ files: 0, dirs: 0, bytes: 0 });
+    // Crucial: NOTHING was removed.
+    expect(existsSync(root)).toBe(true);
+    expect(existsSync(join(root, 'config.toml'))).toBe(true);
+    expect(existsSync(join(root, 'agents', 'one.md'))).toBe(true);
+  });
+
+  test('mid-tree TOCTOU: throws at the failing subtree; offending path + parent still exist', () => {
+    // Verifier passes for the root but fails when descending into
+    // `sub/`. Throw bubbles up through the parent's for-loop;
+    // rmdirSync on the parent never runs. Operator can identify
+    // the exact path via PurgeToctouError.path.
+    const root = join(workdir, '.agent');
+    mkdirSync(root);
+    const sub = join(root, 'sub');
+    mkdirSync(sub);
+    writeFileSync(join(sub, 'child.txt'), 'data');
+
+    const failOnSub = (path: string) => path !== sub;
+    let thrown: unknown;
+    try {
+      removeTree(root, { verifier: failOnSub });
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect(thrown).toBeInstanceOf(PurgeToctouError);
+    const err = thrown as PurgeToctouError;
+    expect(err.path).toBe(sub);
+    // The failing subtree must still exist (we refused to descend).
+    expect(existsSync(sub)).toBe(true);
+    expect(existsSync(join(sub, 'child.txt'))).toBe(true);
+    // The root parent must still exist (rmdirSync after the for-loop
+    // never ran because the for-loop threw).
+    expect(existsSync(root)).toBe(true);
+  });
+
+  test('default verifier (production wiring): happy path removes the tree', () => {
+    // Polarity check — without injecting a failing verifier, the
+    // real verifySamePostReaddir wins on a static tree (no
+    // concurrent modification) and removeTree completes normally.
+    // Pin so a future regression in the default-arg wiring lands
+    // here rather than going unnoticed.
+    const root = join(workdir, '.agent');
+    mkdirSync(root);
+    writeFileSync(join(root, 'a.txt'), 'abc'); // 3 bytes
+    mkdirSync(join(root, 'sub'));
+    writeFileSync(join(root, 'sub', 'b.txt'), 'def'); // 3 bytes
+
+    const result = removeTree(root);
+    expect(result.files).toBe(2);
+    // 2 dirs: `sub` + root
+    expect(result.dirs).toBe(2);
+    expect(result.bytes).toBe(6);
+    expect(existsSync(root)).toBe(false);
+  });
+
+  test('PurgeToctouError carries running counts when failure follows partial removal', () => {
+    // Build a tree where some siblings are removed BEFORE the
+    // verifier rejects the failing dir, so partial counts > 0.
+    // We exploit the fact that walkRemove processes a directory's
+    // entries one-by-one and only checks the verifier when
+    // DESCENDING into a child directory. By placing files
+    // alongside a dir and pointing the failing verifier at the
+    // dir, we get deterministic partial state.
+    const root = join(workdir, '.agent');
+    mkdirSync(root);
+    // Two file entries — each contributes to `files` and `bytes`
+    // BEFORE we ever try to descend into `sub/`.
+    writeFileSync(join(root, 'a.txt'), 'aaa'); // 3 bytes
+    writeFileSync(join(root, 'b.txt'), 'bbbb'); // 4 bytes
+    const sub = join(root, 'sub');
+    mkdirSync(sub);
+    writeFileSync(join(sub, 'inner.txt'), 'x');
+
+    const failOnSub = (path: string) => path !== sub;
+    let thrown: unknown;
+    try {
+      removeTree(root, { verifier: failOnSub });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(PurgeToctouError);
+    const err = thrown as PurgeToctouError;
+    expect(err.path).toBe(sub);
+    // Files are processed in readdir order, which is FS-dependent.
+    // But by the time we try to descend into `sub`, AT LEAST the
+    // sibling files that came before `sub` in the iteration order
+    // were unlinked. We can't predict the order, so we don't assert
+    // an exact count, but we DO assert that the partial counts
+    // reflect actual progress (>= 0 — the type-system guarantee
+    // would be vacuous; the real assertion is structural: partial
+    // is a numeric record, not undefined or {} or missing fields).
+    expect(typeof err.partial.files).toBe('number');
+    expect(typeof err.partial.dirs).toBe('number');
+    expect(typeof err.partial.bytes).toBe('number');
+    expect(err.partial.files).toBeGreaterThanOrEqual(0);
+    expect(err.partial.dirs).toBeGreaterThanOrEqual(0);
+    expect(err.partial.bytes).toBeGreaterThanOrEqual(0);
+    // The failing subtree must still exist.
+    expect(existsSync(sub)).toBe(true);
+    expect(existsSync(join(sub, 'inner.txt'))).toBe(true);
   });
 });
 
