@@ -3865,47 +3865,80 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           }
         }
 
-        // S11 — semantic-verify scheduler tick at step boundary
-        // (MEMORY.md §11.x / T11.9). Polls memory_provenance for new
-        // factual-memory exposures landed during this step and
-        // dispatches AT MOST one verification before the next
-        // provider call. Awaited (not fire-and-forget) so the
-        // dispatch's cost lands in the session totals before the
-        // next iteration's cost-cap check; tests pin the synchronous
-        // outcome. Best-effort: scheduler failures stderr-log inside
-        // its own implementation and never throw out.
-        if (semanticVerifyScheduler !== undefined) {
+        // S11/S13/S3 — detector scheduler ticks at step boundary
+        // (MEMORY.md §11.x / T11.9 + T13.x + S3.4). Each scheduler
+        // polls its source surface (memory_provenance / memory_events
+        // / memory_override_events), runs gates, and dispatches AT
+        // MOST one verification before the next provider call.
+        // Awaited (not fire-and-forget) so the dispatch's cost
+        // lands in the session totals before the next iteration's
+        // cost-cap check.
+        //
+        // Cost wiring (post-review fix): each detector's LLM-judge
+        // dispatch is a real billed call but only tracked in
+        // scheduler-local counters until this helper folds the
+        // delta into `cumulativeChildCostUsd`. Pre-fix, a session
+        // at/near `maxCostUsd` could still run verify-* dispatches
+        // because `costCapDetailIfExceeded()` only consults
+        // {totalCostUsd, cumulativeChildCostUsd, reserved} — never
+        // the scheduler counters. With default-on detectors,
+        // operator's hard cap was silently exceeded by the
+        // detector spend. The helper folds delta in + fires a
+        // cost_update event (with the FULL composite cumulative
+        // so the renderer's footer reflects reality) + immediately
+        // checks the cap so a burst that pushes past doesn't wait
+        // for the next top-of-loop check.
+        //
+        // Best-effort: scheduler failures stderr-log here AND
+        // inside the scheduler implementation (defense in depth
+        // against programmer errors that escape the inner catch).
+        const chargeSchedulerThenCheckCap = async (
+          scheduler:
+            | {
+                poll: () => Promise<void>;
+                getCounters: () => { costUsdSpent: number };
+              }
+            | undefined,
+          label: 'verify_semantic' | 'verify_conflict' | 'verify_override',
+        ): Promise<string | null> => {
+          if (scheduler === undefined) return null;
+          const before = scheduler.getCounters().costUsdSpent;
           try {
-            await semanticVerifyScheduler.poll();
+            await scheduler.poll();
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            process.stderr.write(`memory: verify_semantic_poll_unhandled: ${redactSecrets(msg)}\n`);
+            process.stderr.write(`memory: ${label}_poll_unhandled: ${redactSecrets(msg)}\n`);
           }
-        }
-        // S13 conflict-detector scheduler tick. Independent of the
-        // S11 scheduler — both can be configured; both run per step
-        // boundary; failures stderr-log inside the scheduler and the
-        // catch here is defense-in-depth (programmer errors only).
-        if (conflictDetectorScheduler !== undefined) {
-          try {
-            await conflictDetectorScheduler.poll();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            process.stderr.write(`memory: verify_conflict_poll_unhandled: ${redactSecrets(msg)}\n`);
+          const after = scheduler.getCounters().costUsdSpent;
+          const delta = after - before;
+          if (delta > 0) {
+            cumulativeChildCostUsd += delta;
+            safeEmit(config.onEvent, {
+              type: 'cost_update',
+              delta,
+              cumulative: priorCostUsd + totalCostUsd + cumulativeChildCostUsd,
+            });
           }
-        }
-        // S3 — override-verify scheduler tick. Same posture as the
-        // S11 + S13 schedulers: independent budget, fail-soft, await
-        // so the dispatch cost lands in counters before the next
-        // step's cap check.
-        if (overrideVerifyScheduler !== undefined) {
-          try {
-            await overrideVerifyScheduler.poll();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            process.stderr.write(`memory: verify_override_poll_unhandled: ${redactSecrets(msg)}\n`);
-          }
-        }
+          return costCapDetailIfExceeded();
+        };
+
+        const semanticOverage = await chargeSchedulerThenCheckCap(
+          semanticVerifyScheduler,
+          'verify_semantic',
+        );
+        if (semanticOverage !== null) return await finish('maxCostUsd', semanticOverage);
+
+        const conflictOverage = await chargeSchedulerThenCheckCap(
+          conflictDetectorScheduler,
+          'verify_conflict',
+        );
+        if (conflictOverage !== null) return await finish('maxCostUsd', conflictOverage);
+
+        const overrideOverage = await chargeSchedulerThenCheckCap(
+          overrideVerifyScheduler,
+          'verify_override',
+        );
+        if (overrideOverage !== null) return await finish('maxCostUsd', overrideOverage);
       }
     } catch (e) {
       return await guardedFinish(e);
