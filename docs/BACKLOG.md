@@ -2,6 +2,48 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — gate generic mid-walk "audit row was already written" message on actual write
+
+Operator-reported follow-up to commit `22d17e9` (TOCTOU abort fix). That fix correctly gated the TOCTOU branch's audit message on `!options.noAudit && audit.writable`, but the SIBLING generic-error branch (for non-TOCTOU mid-walk failures like EBUSY, EACCES, ENOSPC) was left with the pre-existing unconditional line: `"(audit row was already written; the project is in a partial state)"`. Under `--no-audit` no probe + insert happens — the line claimed a row that never existed, sending incident-response investigators chasing a nonexistent DB entry during recovery from a real FS failure.
+
+**Concrete scenario:**
+
+```
+$ agent purge --force --no-audit
+forja purge: FS removal failed mid-walk: EBUSY: resource busy or locked
+  (audit row was already written; the project is in a partial state)   ← LIE
+```
+
+The operator running an incident-recovery purge (DB might be broken — exactly why `--no-audit` exists) gets pointed at a nonexistent forensic trail. They open the DB, run `SELECT * FROM purge_events WHERE cwd = ?`, find no row, waste minutes wondering whether the audit subsystem itself silently failed.
+
+**Fix.** Mirror the TOCTOU branch's gating discipline in the generic branch:
+
+1. **`src/cli/purge.ts`** — generic catch branch now:
+    - Splits the message into two lines: `"The project is in a partial state"` (always) and `"Audit row was already written (id=...)"` (gated).
+    - Gates the audit line on `!noAudit && audit.writable` (same predicate the TOCTOU branch uses).
+    - Renders the actual `auditId` for correlation, matching the TOCTOU branch's `(id=...)` format. Operator can grep purge_events by id directly instead of guessing.
+
+2. **`src/cli/purge.ts`** — added `_verifierForTest?: (path: string, preStat: Stats) => boolean` to `RunPurgeOptions`. Pure test seam, symmetric with the existing `dbPath` / `now` options. Threaded into `removeTree(agentDir, options._verifierForTest ? {verifier: options._verifierForTest} : {})`. Lets tests inject a throwing verifier to exercise the generic catch branch deterministically — no platform-dependent chmod tricks.
+
+3. **Tests** — 44/44 in `tests/cli/purge.test.ts` (was 42, +2 new pins in `runPurge — generic mid-walk failure: audit message gated on actual write`):
+    - **`--no-audit` + generic walker throw**: stderr contains `FS removal failed mid-walk`, contains `The project is in a partial state`, but does NOT contain `Audit row was already written` (either casing).
+    - **`--force` audit-on + generic walker throw**: stderr contains the audit line with a numeric id matching `/Audit row was already written \(id=\d+\)/`; the DB actually has the row (queried via `listPurgeEventsByCwd`) so the message isn't bluffing.
+
+**Why the test seam is its own line item.** A test that triggers a generic mid-walk failure WITHOUT a seam would have to either (a) chmod a directory non-writable to provoke `unlinkSync` to throw — platform-dependent, requires non-root test user, brittle on CI; or (b) use a FUSE / overlay FS to simulate EBUSY — even more brittle. The seam is consistent with the existing pragma "RunPurgeOptions already has test-only optionals (`dbPath`, `now`)", costs one optional field, and isolates the failure mode under test.
+
+**Symmetry now between the two catch branches:**
+
+| Branch | Audit-gated line predicate | id rendered? | Partial state line |
+|---|---|---|---|
+| TOCTOU (commit `22d17e9`) | `!options.noAudit && audit.writable` | yes, `(id=N)` | partial counts |
+| Generic (this fix) | `!noAudit && audit.writable` | yes, `(id=N)` | "The project is in a partial state" |
+
+**Verification:**
+- 44/44 tests in `tests/cli/purge.test.ts` (+2 new pins)
+- typecheck + lint clean
+
+**Pre-existing operator state.** Anyone who hit a generic mid-walk failure under `--no-audit` between commit `22d17e9` and this fix saw the false "audit row was already written" line. No FS damage; just misdirected investigation. The DB has no row for the failed purge attempt (correct behavior under `--no-audit`); re-running `agent purge --dry-run` shows the current state.
+
 ## [2026-05-19] fix(cli) — propagate `[audit]` / `[audit.retention]` config warnings through bootstrap
 
 Operator-reported bug. `loadRetentionConfig()` already produced warning strings for invalid `[audit]` and `[audit.retention]` values (mirroring the memory/providers/budget loaders), but the bootstrap path consumed only `auditLoaded.config` and dropped `auditLoaded.warnings` on the floor. `BootstrapResult` had no field carrying them, so `run.ts` and `repl.ts` — the two renderers that iterate every other loader's warning array onto stderr — had no surface to read. Retention misconfigs silently fell back to defaults during normal agent/REPL runs.

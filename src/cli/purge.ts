@@ -106,6 +106,14 @@ export interface RunPurgeOptions {
   // Test seam — fixed timestamp for audit-row ts. Production reads
   // Date.now() at the moment of insert.
   now?: () => number;
+  // Test seam — override the TOCTOU verifier passed to removeTree's
+  // walker. Production omits this and the walker uses the real
+  // verifySamePostReaddir; tests inject a constant-false verifier
+  // (to exercise the PurgeToctouError abort path) or a throwing
+  // verifier (to exercise the generic mid-walk catch branch
+  // without provoking a real FS permission failure). Symmetric
+  // with the dbPath / now seams above.
+  _verifierForTest?: (path: string, preStat: Stats) => boolean;
 }
 
 interface AuditWritability {
@@ -748,7 +756,10 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // them via the project root.
   let removed: { files: number; dirs: number; bytes: number };
   try {
-    removed = removeTree(agentDir);
+    removed = removeTree(
+      agentDir,
+      options._verifierForTest !== undefined ? { verifier: options._verifierForTest } : {},
+    );
   } catch (e) {
     // TOCTOU aborts get a distinct rendering so the operator
     // doesn't conflate "another process raced us" with the more
@@ -774,9 +785,18 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
       );
       return 1;
     }
+    // Generic FS failure (EBUSY, EACCES, ENOSPC mid-walk, etc.).
+    // The audit message is gated on whether a row was actually
+    // written: under --no-audit the probe was skipped entirely
+    // (line ~720) and no row exists, so claiming otherwise would
+    // send incident-response investigators chasing a nonexistent
+    // DB entry. Same gating discipline as the TOCTOU branch above.
     const reason = e instanceof Error ? e.message : String(e);
     err(`forja purge: FS removal failed mid-walk: ${reason}\n`);
-    err('  (audit row was already written; the project is in a partial state)\n');
+    err('  The project is in a partial state\n');
+    if (!noAudit && audit.writable) {
+      err(`  Audit row was already written (id=${auditId ?? 'unknown'})\n`);
+    }
     return 1;
   }
 

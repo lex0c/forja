@@ -1061,6 +1061,89 @@ describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
   });
 });
 
+describe('runPurge — generic mid-walk failure: audit message gated on actual write', () => {
+  // Operator-reported bug: the non-TOCTOU catch branch in runPurge
+  // unconditionally rendered "audit row was already written" — even
+  // when --no-audit was set, where the probe + insert were skipped
+  // entirely. During incident recovery for a mid-walk FS failure
+  // (EBUSY, EACCES, ENOSPC), this sent operators chasing a
+  // nonexistent DB entry.
+  //
+  // Fix: gate the audit line on the same predicate the TOCTOU
+  // branch uses (`!noAudit && audit.writable`), and render the
+  // actual auditId for correlation. These pins cover both halves
+  // of the gate (set and unset) to lock the symmetry.
+  //
+  // Test technique: inject `_verifierForTest` that throws a
+  // generic Error from the walker. The throw bubbles through
+  // `removeTree` and is caught by runPurge as a non-PurgeToctouError
+  // — landing in the generic branch under test. No platform-
+  // dependent chmod tricks needed.
+
+  test('--no-audit + generic walker throw: NO "Audit row" line in stderr', async () => {
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: true,
+      json: false,
+      noAudit: true,
+      out,
+      err,
+      dbPath,
+      _verifierForTest: () => {
+        throw new Error('synthetic mid-walk EBUSY');
+      },
+    });
+    expect(code).toBe(1);
+    const stderr = errBuf.join('');
+    // Generic mid-walk error message present.
+    expect(stderr).toContain('FS removal failed mid-walk');
+    expect(stderr).toContain('synthetic mid-walk EBUSY');
+    expect(stderr).toContain('The project is in a partial state');
+    // Crucial: audit line MUST NOT appear under --no-audit.
+    expect(stderr).not.toContain('Audit row was already written');
+    expect(stderr).not.toContain('audit row was already written'); // both casings
+    // FS state: the .agent dir still exists (walker threw before
+    // completing). We don't assert exact contents because the throw
+    // happens on the root directory check, before any unlink.
+    expect(existsSync(join(cwd, '.agent'))).toBe(true);
+  });
+
+  test('--force (audit ON) + generic walker throw: "Audit row" line WITH id', async () => {
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: true,
+      json: false,
+      noAudit: false,
+      out,
+      err,
+      dbPath,
+      _verifierForTest: () => {
+        throw new Error('synthetic mid-walk EBUSY');
+      },
+    });
+    expect(code).toBe(1);
+    const stderr = errBuf.join('');
+    expect(stderr).toContain('FS removal failed mid-walk');
+    expect(stderr).toContain('synthetic mid-walk EBUSY');
+    expect(stderr).toContain('The project is in a partial state');
+    // Audit line MUST appear with a numeric id (audit row was
+    // written BEFORE removeTree was called).
+    expect(stderr).toMatch(/Audit row was already written \(id=\d+\)/);
+    // Confirm the audit DB actually has the row (the message isn't
+    // bluffing).
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const rows = listPurgeEventsByCwd(db, cwd);
+      expect(rows.length).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe('runPurge — dry-run suggestion preserves --no-audit', () => {
   // Operator-safety bug: dry-run with --no-audit suggested a bare
   // `agent purge --force` command. Copy-pasting in the emergency
