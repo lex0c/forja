@@ -2,6 +2,8 @@
 // enough that adding `commander` would be more code than this. Anything
 // not a recognized flag is collected as the prompt (joined by spaces).
 
+import type { ForceEligibleStep, InitStep } from './init.ts';
+
 export interface ParsedArgs {
   prompt: string;
   json: boolean;
@@ -229,26 +231,32 @@ export interface ParsedArgs {
   // default — present-but-mismatched is a hard refusal at
   // child boot.
   subagentIpcVersion?: number;
-  // `agent init` mode (AGENTIC_CLI §2.1). Scaffolds
-  // `.agent/permissions.yaml` and exits. The first positional
-  // arg `init` triggers it — diverging from the `--<flag>`
-  // convention every other subcommand uses, but matching shell
-  // muscle memory (`git init`, `npm init`, `cargo init`). When
-  // set, the parser stops collecting prompt fragments and
-  // accepts only the init-specific sub-flags (`--force`,
-  // `--mode`, `--playbooks`). Mutually exclusive with --json
-  // (init is operator-facing, not scriptable yet) and every
-  // other run mode; the dispatcher checks.
+  // `agent init` mode (AGENTIC_CLI §2.1). Scaffolds the four
+  // bootstrap artifacts under `.agent/` (permissions.yaml,
+  // .gitignore, config.toml, agents/*.md) and exits. The first
+  // positional arg `init` triggers it — diverging from the
+  // `--<flag>` convention every other subcommand uses, but
+  // matching shell muscle memory (`git init`, `npm init`,
+  // `cargo init`). When set, the parser stops collecting prompt
+  // fragments and accepts only the init-specific sub-flags
+  // (`--mode`, `--only=csv`, `--force[=csv]`). Mutually exclusive
+  // with --json (init is operator-facing, not scriptable yet) and
+  // every other run mode; the dispatcher checks.
   //
-  // `playbooks` switches the handler to the alternate path
-  // (`PLAYBOOKS.md` §14): instead of writing
-  // `.agent/permissions.yaml`, the handler writes the canonical
-  // .md playbooks under `.agent/agents/`. Mode is irrelevant on
-  // that path (mode is a permissions concept) and gets ignored
-  // by the handler. Force still gates overwrites — shared with
-  // the permissions path so the operator does not have to
-  // remember per-flag semantics.
-  init?: { force: boolean; mode: 'strict' | 'acceptEdits'; playbooks: boolean };
+  // `only` restricts the scaffold to a subset of the four steps.
+  // `undefined` means "all four" (the default). `force` follows
+  // the same shape: bare `--force` parses to `'all'` (overwrite
+  // every force-eligible step); `--force=csv` parses to an array
+  // (overwrite only the listed steps). `.gitignore` is never
+  // force-eligible (operator-owned post-creation per MEMORY.md
+  // §2.5) and rejects out of the force-array union; the parser
+  // surfaces the rule with a pointer to the spec when an operator
+  // passes `--force=gitignore`.
+  init?: {
+    mode: 'strict' | 'acceptEdits';
+    only?: ReadonlyArray<InitStep>;
+    force?: 'all' | ReadonlyArray<ForceEligibleStep>;
+  };
   // `agent recap [args]` headless subcommand (RECAP.md §9). Routes
   // to the `runRecapHeadless` handler — same surface as the
   // `/recap` slash but invoked from a non-REPL context (CI, scripts,
@@ -364,11 +372,62 @@ const POSITIVE_INT = /^[1-9][0-9]*$/;
 // through to the main flag-parser. Sub-flags allowed inside the
 // verb's tail are validated here; unknown flags surface a verb-
 // scoped error so the diagnostic points at the right surface.
+// All four steps the orchestrator runs (`init.ts` DEFAULT_STEPS).
+// Duplicated here rather than imported as a runtime value to keep
+// the parser side-effect-free during `--help` paths (init.ts pulls
+// in fs + ensureAgentGitignore + the canonical-playbook bundle).
+const VALID_INIT_STEPS: ReadonlyArray<InitStep> = [
+  'permissions',
+  'gitignore',
+  'config',
+  'playbooks',
+];
+
+// Steps eligible for `--force` / `--force=csv`. `gitignore` is
+// operator-owned after creation per MEMORY.md §2.5 and rejected
+// out of this set; passing `--force=gitignore` surfaces a clear
+// error pointing back to the spec.
+const FORCE_ELIGIBLE_STEPS: ReadonlyArray<ForceEligibleStep> = [
+  'permissions',
+  'config',
+  'playbooks',
+];
+
+const parseCsvSubset = <T extends string>(
+  csv: string,
+  validValues: ReadonlyArray<T>,
+  flagName: string,
+  validList: string,
+): { ok: true; subset: T[] } | { ok: false; message: string } => {
+  const parts = csv.split(',');
+  const seen = new Set<T>();
+  const subset: T[] = [];
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.length === 0) {
+      return { ok: false, message: `${flagName}=${csv}: empty value in csv (valid: ${validList})` };
+    }
+    if (!validValues.includes(trimmed as T)) {
+      return {
+        ok: false,
+        message: `${flagName}=${csv}: '${trimmed}' is not a valid step (valid: ${validList})`,
+      };
+    }
+    // Dedupe — `--only=permissions,permissions` shouldn't run the
+    // step twice. First occurrence wins so a hand-typed CSV
+    // preserves the operator's intended order.
+    if (seen.has(trimmed as T)) continue;
+    seen.add(trimmed as T);
+    subset.push(trimmed as T);
+  }
+  return { ok: true, subset };
+};
+
 const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'init') return null;
-  let force = false;
   let mode: 'strict' | 'acceptEdits' = 'strict';
-  let playbooks = false;
+  let only: InitStep[] | undefined;
+  let force: 'all' | ForceEligibleStep[] | undefined;
   let i = 1;
   while (i < argv.length) {
     const token = argv[i];
@@ -376,20 +435,69 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       i += 1;
       continue;
     }
+    if (token === '--playbooks') {
+      // Legacy flag. Removed in favor of `--only=playbooks` so
+      // `init` always means "scaffold the bootstrap bundle" and
+      // the granular path is named consistently with the other
+      // step selectors. Explicit reject + pointer beats a silent
+      // alias — an operator with muscle memory should learn the
+      // new shape on the first failed invocation.
+      return {
+        ok: false,
+        message: 'init: --playbooks was removed; use --only=playbooks instead',
+      };
+    }
     if (token === '--force') {
-      force = true;
+      force = 'all';
       i += 1;
       continue;
     }
-    if (token === '--playbooks') {
-      // Switches init to the canonical-playbooks path
-      // (`PLAYBOOKS.md` §14). Mutually compatible with --force;
-      // --mode is ignored on this path and silently dropped (the
-      // handler does not consult it). Erroring on the
-      // combination would be operator-hostile — the muscle
-      // memory `agent init --mode strict --playbooks` should
-      // just work.
-      playbooks = true;
+    if (token.startsWith('--force=')) {
+      const value = token.slice('--force='.length);
+      if (value.length === 0) {
+        return {
+          ok: false,
+          message:
+            '--force= requires a value (csv of permissions,config,playbooks) or use --force alone for all',
+        };
+      }
+      // gitignore explicitly rejected — operator-owned after
+      // creation per MEMORY.md §2.5. The error message names
+      // the spec section so the operator can audit the rule.
+      if (value.split(',').some((p) => p.trim() === 'gitignore')) {
+        return {
+          ok: false,
+          message:
+            '--force=gitignore is not allowed: .gitignore is operator-owned after creation (MEMORY.md §2.5). To regenerate, delete the file and re-run init.',
+        };
+      }
+      const parsed = parseCsvSubset(
+        value,
+        FORCE_ELIGIBLE_STEPS,
+        '--force',
+        'permissions, config, playbooks',
+      );
+      if (!parsed.ok) return { ok: false, message: parsed.message };
+      force = parsed.subset;
+      i += 1;
+      continue;
+    }
+    if (token.startsWith('--only=')) {
+      const value = token.slice('--only='.length);
+      if (value.length === 0) {
+        return {
+          ok: false,
+          message: '--only= requires a value (csv of permissions,gitignore,config,playbooks)',
+        };
+      }
+      const parsed = parseCsvSubset(
+        value,
+        VALID_INIT_STEPS,
+        '--only',
+        'permissions, gitignore, config, playbooks',
+      );
+      if (!parsed.ok) return { ok: false, message: parsed.message };
+      only = parsed.subset;
       i += 1;
       continue;
     }
@@ -429,6 +537,13 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
     }
     return { ok: false, message: `init: unknown argument '${token}'` };
   }
+  // Build init descriptor without explicit-undefined keys —
+  // `exactOptionalPropertyTypes` rejects `only: undefined` against
+  // an `only?: T` field, and toEqual({...}) treats `{a: undefined}`
+  // and `{}` as different shapes (a footgun for downstream tests).
+  const initArgs: NonNullable<ParsedArgs['init']> = { mode };
+  if (only !== undefined) initArgs.only = only;
+  if (force !== undefined) initArgs.force = force;
   return {
     ok: true,
     args: {
@@ -441,7 +556,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       includeSubagents: false,
       explainPermissions: false,
       yes: false,
-      init: { force, mode, playbooks },
+      init: initArgs,
     },
   };
 };
@@ -1786,12 +1901,17 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
 export const usage = (): string =>
   [
     'Usage: agent [options] <prompt>',
-    '       agent init [--force] [--mode strict|acceptEdits]',
-    '       agent init --playbooks [--force]',
+    '       agent init [--mode strict|acceptEdits] [--only=csv] [--force[=csv]]',
     '',
     'Subcommands:',
-    '  init                   Scaffold .agent/permissions.yaml (refuse-on-exists; --force overwrites)',
-    '  init --playbooks       Copy the 10 canonical playbooks to .agent/agents/ (skip-if-exists; --force overwrites)',
+    '  init                   Scaffold the .agent/ bootstrap bundle:',
+    '                           permissions.yaml, .gitignore, config.toml, agents/*.md',
+    '                         Each step is idempotent (existing files skipped).',
+    '                         --only=csv    subset to run (permissions,gitignore,config,playbooks)',
+    '                         --force       overwrite all force-eligible steps',
+    '                         --force=csv   overwrite subset (permissions,config,playbooks);',
+    '                                       .gitignore is operator-owned (MEMORY.md §2.5)',
+    '                         --mode        permissions.yaml posture (strict|acceptEdits)',
     '',
     'Options:',
     '  --version, -v          Print version and exit',

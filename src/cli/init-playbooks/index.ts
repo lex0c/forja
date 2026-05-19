@@ -1,8 +1,8 @@
-// Bundled canonical playbooks (`PLAYBOOKS.md` §14). The 10 .md
-// files in this directory are imported as text assets and exposed
-// as a stable array. `agent init --playbooks` writes each entry
-// into `<cwd>/.agent/agents/`, where the loader picks them up at
-// the next REPL boot.
+// Bundled canonical playbooks (`PLAYBOOKS.md` §12 — distribution).
+// The 10 .md files in this directory are imported as text assets
+// and exposed as a stable array. The playbooks step of `agent init`
+// writes each entry into `<cwd>/.agent/agents/`, where the loader
+// picks them up at the next REPL boot.
 //
 // Bun's `with { type: 'text' }` import attribute embeds the file
 // content as a string at build time, so the compiled binary
@@ -35,8 +35,8 @@ export interface CanonicalPlaybook {
   filename: string;
   // Raw frontmatter + body. Ready to be written verbatim — the
   // loader normalizes the YAML at read time, so we do not parse
-  // here. Keeping the source form lets `agent init --playbooks`
-  // produce a byte-for-byte copy authors can edit later.
+  // here. Keeping the source form lets the playbooks step produce
+  // a byte-for-byte copy authors can edit later.
   content: string;
 }
 

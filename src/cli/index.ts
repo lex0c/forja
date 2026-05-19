@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { parseArgs, usage } from './args.ts';
+import type { InitOptions } from './init.ts';
 import { VERSION } from './version.ts';
 
 const main = async (): Promise<number> => {
@@ -41,22 +42,26 @@ const main = async (): Promise<number> => {
     }
   }
 
-  // `agent init` — scaffold .agent/permissions.yaml. Pure
-  // filesystem work, no provider/DB needed; same lazy-import
-  // posture as the other handlers below so a broken provider
-  // dep can't break this. Lands BEFORE the subagent-child
-  // branch because init is mutually exclusive with every
-  // other run mode and the parser already rejected combos.
+  // `agent init` — scaffold the .agent/ bootstrap bundle
+  // (permissions.yaml, .gitignore, config.toml, agents/*.md).
+  // Pure filesystem work, no provider/DB needed; same lazy-import
+  // posture as the other handlers below so a broken provider dep
+  // can't break this. Lands BEFORE the subagent-child branch
+  // because init is mutually exclusive with every other run mode
+  // and the parser already rejected combos.
   if (args.init !== undefined) {
     const { runInit } = await import('./init.ts');
-    return runInit({
+    // Build the options without explicit-undefined keys to satisfy
+    // `exactOptionalPropertyTypes` on `InitOptions.only` / `.force`.
+    const initOptions: InitOptions = {
       cwd: process.cwd(),
-      force: args.init.force,
       mode: args.init.mode,
-      playbooks: args.init.playbooks,
       out: (s) => process.stdout.write(s),
       err: (s) => process.stderr.write(s),
-    });
+    };
+    if (args.init.only !== undefined) initOptions.only = args.init.only;
+    if (args.init.force !== undefined) initOptions.force = args.init.force;
+    return runInit(initOptions);
   }
 
   // Subagent-child mode. The parent process
