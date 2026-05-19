@@ -483,3 +483,40 @@ describe('/memory governance disable: user-config preservation (post-review)', (
     expect(raw).toContain('override_detect_llm = false');
   });
 });
+
+describe('/memory governance disable: repo-root anchoring (post-review)', () => {
+  // Pre-fix: the toggle wrote `<ctx.baseConfig.cwd>/.agent/config
+  // .toml`. When the REPL was launched from a subdir, the file
+  // landed in the subdir but bootstrap reads from the REPO root
+  // (via resolveRepoRoot, fixed in commit 734a262). Process
+  // restart → next bootstrap doesn't see the persisted disable →
+  // detector silently re-enables despite a successful slash
+  // return.
+  //
+  // Post-fix: toggle ALSO resolves repo root before writing, so
+  // both writer + reader anchor on the same file.
+
+  test('REPL launched from repo subdir writes config to repo root, not subdir', async () => {
+    // Set up workdir as a git repo via `git init`. ctx points at a
+    // subdir under it (mimicking `agent` launched from `src/`).
+    const { spawnSync } = await import('node:child_process');
+    spawnSync('git', ['init', '-q', workdir], { stdio: 'ignore' });
+    const subdir = join(workdir, 'src', 'components');
+    mkdirSync(subdir, { recursive: true });
+    // Mutate the ctx baseConfig to point at the subdir as the
+    // active cwd — same shape the REPL passes from an `agent`
+    // invocation in a subdir.
+    (ctx.baseConfig as { cwd: string }).cwd = subdir;
+
+    const r = await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
+    expect(r.kind).toBe('ok');
+
+    // File MUST land at the repo root, NOT the subdir.
+    const repoConfig = join(workdir, '.agent', 'config.toml');
+    const subdirConfig = join(subdir, '.agent', 'config.toml');
+    expect(existsSync(repoConfig)).toBe(true);
+    expect(existsSync(subdirConfig)).toBe(false);
+    const raw = readFileSync(repoConfig, 'utf8');
+    expect(raw).toContain('verify_semantic_llm = false');
+  });
+});

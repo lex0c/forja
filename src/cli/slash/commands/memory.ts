@@ -40,6 +40,7 @@ import {
   moveMemory,
   parseMemoryFile,
   removeMemory,
+  resolveRepoRoot,
   scanForInjection,
   scanForPromotion,
   setSharedTrust,
@@ -3297,7 +3298,18 @@ const handleGovernanceToggle = (
     };
   }
   const path = require('node:path') as typeof import('node:path');
-  const filePath = path.join(ctx.baseConfig.cwd, '.agent', 'config.toml');
+  // Resolve repo root so the toggle writes to `<repo>/.agent/config
+  // .toml` — the SAME file bootstrap reads via
+  // `loadMemoryConfig({ cwd: resolveRepoRoot(cwd) })` (fixed in
+  // commit 734a262). Pre-fix the toggle wrote to
+  // `<invocation-cwd>/.agent/config.toml`; when the REPL was
+  // launched from a subdir, the persisted file landed in the
+  // subdir and the next process start would not see it — the
+  // detector silently re-enabled from repo-root config + defaults
+  // despite a successful slash-command return. Falls back to cwd
+  // when not in a git repo (matches bootstrap's symmetric
+  // fallback).
+  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), '.agent', 'config.toml');
   const patches: Parameters<typeof mutateMemoryConfig>[0]['patches'] = {};
   if (target.verify) patches.verifySemanticLlm = value;
   if (target.conflict) patches.conflictDetectLlm = value;
