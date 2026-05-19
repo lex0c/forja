@@ -2943,6 +2943,32 @@ describe('engine.check — §8 grants (slice 40)', () => {
 });
 
 describe('engine.reloadPolicy — §12.3 hot reload (slice 51)', () => {
+  // Local captureSink + CapturedEmit so the trustedHosts-swap tests
+  // can inspect score_components without depending on the audit
+  // shape defined in other describe blocks (pattern reuse mirrors
+  // existing scoped describes in this file).
+  interface CapturedEmit {
+    decision: 'allow' | 'deny' | 'confirm';
+    score?: number;
+    score_components?: Record<string, number>;
+    reason_chain: ReadonlyArray<{ stage: string; note?: string }>;
+  }
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
+    },
+    snapshot: () => [],
+  });
+
   test('successful swap: returns oldHash + newHash, mode updates', () => {
     const eng = createPermissionEngine(
       policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
@@ -3079,6 +3105,59 @@ describe('engine.reloadPolicy — §12.3 hot reload (slice 51)', () => {
     const noop = eng.reloadPolicy(eng.policy());
     expect(noop.ok).toBe(true);
     if (noop.ok) expect(noop.oldHash).toBe(oldHash);
+  });
+
+  test('reload swaps trustedHosts when newTrustedHosts is supplied', () => {
+    // Pre-fix: trustedHosts was captured as a closure-const at
+    // construction. An operator editing `permissions.yaml` to add
+    // an internal CDN to `fetch_url.trusted_hosts` would see the
+    // policy hash advance but the risk-scorer kept using the
+    // construction-time list — `untrusted_egress` continued firing
+    // until process restart. Now reloadPolicy accepts a third arg
+    // `newTrustedHosts`; the watcher (policy-watcher.ts) computes
+    // `mergeTrustedHosts(newPolicy.tools.fetch_url?.trusted_hosts
+    // ?? [])` and forwards. This test pins the swap behaviorally:
+    // construct with `['only.example.com']`, reload with
+    // `['plus.example.com']`, verify the second host stops
+    // triggering untrusted_egress AND the first host starts
+    // triggering it.
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['curl *'] } } }), {
+      cwd: CWD,
+      audit: captureSink(collected),
+      trustedHosts: ['only.example.com'],
+    });
+    // Before reload: only.example.com silent, plus.example.com flagged.
+    eng.check('bash', 'bash', { command: 'curl https://only.example.com/x' });
+    expect(collected[0]?.score_components?.untrusted_egress).toBeUndefined();
+    eng.check('bash', 'bash', { command: 'curl https://plus.example.com/x' });
+    expect(collected[1]?.score_components?.untrusted_egress).toBeGreaterThan(0);
+    // Reload with the swapped list.
+    const result = eng.reloadPolicy(policy({ tools: { bash: { allow: ['curl *'] } } }), undefined, [
+      'plus.example.com',
+    ]);
+    expect(result.ok).toBe(true);
+    // After reload: only.example.com NOW flagged, plus.example.com silent.
+    eng.check('bash', 'bash', { command: 'curl https://only.example.com/x' });
+    expect(collected[2]?.score_components?.untrusted_egress).toBeGreaterThan(0);
+    eng.check('bash', 'bash', { command: 'curl https://plus.example.com/x' });
+    expect(collected[3]?.score_components?.untrusted_egress).toBeUndefined();
+  });
+
+  test('reload WITHOUT newTrustedHosts preserves construction-time list', () => {
+    // Backward-compat: the third arg is optional. Callers that
+    // never reload (or don't know about the new plumbing) keep
+    // working exactly as before. Pin: reload without the arg
+    // leaves the trusted list untouched.
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['curl *'] } } }), {
+      cwd: CWD,
+      audit: captureSink(collected),
+      trustedHosts: ['internal.corp'],
+    });
+    eng.reloadPolicy(policy({ tools: { bash: { allow: ['curl *'] } } }));
+    eng.check('bash', 'bash', { command: 'curl https://internal.corp/x' });
+    expect(collected[0]?.score_components?.untrusted_egress).toBeUndefined();
   });
 
   test('reload preserves session-allow state', () => {

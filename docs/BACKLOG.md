@@ -2,6 +2,341 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] refactor(config) — centralize agent-path resolvers, closes latent Windows gap
+
+Audit of `src/*/paths.ts` files revealed the XDG / HOME / Windows APPDATA / PROGRAMDATA dance was duplicated across four subsystems (`permissions`, `hooks`, `config.toml` consumers, `install_id`). Worse: the implementations had drifted in completeness.
+
+| File | XDG | POSIX HOME/.config | Windows APPDATA | Windows USERPROFILE | Enterprise (POSIX /etc) | Enterprise (Win PROGRAMDATA) |
+|---|---|---|---|---|---|---|
+| `permissions/paths.ts` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `hooks/paths.ts` | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ |
+| `config/paths.ts` (my recent refactor) | ✓ | ✓ | ✗ | ✗ | n/a | n/a |
+
+**Latent bug.** Operator on Windows running `agent` without `XDG_CONFIG_HOME` set: hooks and config.toml user layers were silently unavailable. The implementation returned `null`, the loader treated it as "no user file", and the operator's `~/.config/agent/{hooks.toml,config.toml}` (or platform equivalent) was silently ignored. Only the permissions layer worked correctly because that's the file the lock-conflict story made the team test most thoroughly.
+
+**Consolidation.** New `src/config/agent-paths.ts` owns the shared logic with the most complete (permissions-shape) implementation:
+
+- `agentConfigDir(env?, platform?): string | null` — XDG → Windows APPDATA → Windows USERPROFILE → POSIX HOME → null.
+- `userAgentPath(filename, env?, platform?): string | null` — `agentConfigDir + filename`.
+- `enterpriseAgentPath(filename, env?, platform?): string | null` — `/etc/agent/<filename>` (POSIX) or `<PROGRAMDATA>\agent\<filename>` (Windows), null when env missing.
+- `projectAgentPath(repoRoot, filename, platform?): string` — platform-aware `join(repoRoot, '.agent', filename)`.
+
+Each subsystem's public API stays identical:
+
+- `permissions/paths.ts` keeps `enterprisePolicyPath` / `userPolicyPath` / `installIdPath` / `projectPolicyPath` — delegates to the shared helpers with the `permissions.yaml` / `install_id` filename.
+- `hooks/paths.ts` keeps `enterpriseHooksPath` / `userHooksPath` / `projectHooksPath` / `resolveHookPaths` — delegates with `hooks.toml`.
+- `config/paths.ts` keeps `userConfigPath` / `projectConfigPath` — delegates with `config.toml`. **This commit closes the Windows gap as a side effect** (operator on Windows now gets the user-layer config.toml resolved correctly).
+
+**Tests.** All 84 existing per-subsystem path tests pass unchanged — behavior is preserved (delegation is mechanical). New `tests/config/agent-paths.test.ts` adds 16 cases pinning the shared module directly: XDG precedence, non-absolute XDG rejection (traversal defense), POSIX fallback, **Windows APPDATA / USERPROFILE behavior** (catches regression to the POSIX-only shape that hooks and config.toml had), Windows `null` on stripped env, enterprise POSIX `/etc/agent/`, enterprise Windows PROGRAMDATA, project-path platform-aware join.
+
+What this refactor did NOT touch (deliberately):
+
+- **Loaders / mergers** stay per-subsystem. Formats differ genuinely (TOML for config + hooks, YAML for permissions, markdown frontmatter for memory). Validators are section-specific (field-level types, ranges, regex). The hierarchy/merge semantics differ too — permissions has lock conflicts, hooks runs ALL layers concatenated, config.toml does per-key project>user merge, memory has scope-based precedence. Centralizing the loader would create worse coupling than the duplication.
+- **`memory/paths.ts:userScopeRoot`** stays as-is. Returns a directory (not a file), always succeeds (never null), uses `homedir()` fallback. Different signature shape; consolidation would require generalizing in a way that hurts readability of the memory-specific path semantics. The scope-roots resolver is also more complex (3 scopes: user, project_shared, project_local) than the others' 2-3 layer hierarchy.
+
+Suite delta: 100 path tests pass across the 4 affected files (84 existing + 16 new shared); typecheck + lint clean. ~80 LOC of duplicated env-var plumbing eliminated.
+
+## [2026-05-19] fix(permissions) — honor host globs in `trusted_hosts`
+
+`risk-score.ts:isUntrustedEgressHost` was checking trust with `trusted.includes(host)` — exact string match — while the sibling `allow_hosts` / `deny_hosts` lists on the SAME `fetch_url` schema use `matcher.ts:matchHost` which honors `*.corp.internal` style patterns. Operator declaring `trusted_hosts: ["*.corp.internal"]` in `.agent/permissions.yaml` saw `foo.corp.internal` continue triggering the `untrusted_egress` risk component despite the policy explicitly trusting the entire `*.corp.internal` subdomain space. Operator-visible divergence within a single policy section.
+
+Fix: replace `trusted.includes(host)` with `for (const pattern of trusted) if (matchHost(pattern, host)) return false` — reuse the existing host matcher. Exact strings still match exactly (`github.com` → `github.com`); globs now match consistently with the rest of the section.
+
+Considered the alternative (reject patterns in `trusted_hosts` as unsupported with a validator warning). Rejected: schema schizophrenia ("why does this list support globs but that one doesn't?") would be more confusing than just making the semantics uniform. The fix mirrors the matcher allow/deny already use, no new mental model.
+
+**Tests** (`tests/permissions/risk-score.test.ts`):
+
+- Glob pattern in trusted_hosts silences subdomain matches (`*.corp.internal` makes `foo.corp.internal` silent).
+- Multiple subdomain depths covered (`api.foo.corp.internal` also silent under `*.corp.internal`) — points at matchHost's own pinned behavior rather than re-specifying it.
+- Non-match still flagged (polarity check: pattern is a narrow trust, not a free pass).
+- Exact-string pattern still works (`github.com` literal) — backward-compat with `DEFAULT_TRUSTED_HOSTS` which is all exact strings.
+
+**Spec** (`AGENTIC_CLI.md §8`): `trusted_hosts` description gained a paragraph documenting that patterns are honored via `matchHost` — same semantic as `allow_hosts`/`deny_hosts`. `FetchPolicy.trusted_hosts` type docstring updated for symmetry.
+
+57 risk-score tests pass; typecheck + lint clean.
+
+## [2026-05-19] fix(permissions) — recompute trustedHosts on policy hot-reload
+
+`engine.ts:1277` captured `trustedHosts` as a closure-const at engine construction. `reloadPolicy` was swapping policy / policyHash / mode / provenance correctly, but the risk-score input kept using the construction-time list. Operator edits to `<repo>/.agent/permissions.yaml` adding an internal CDN to `fetch_url.trusted_hosts` (or removing a no-longer-trusted host) saw the policy hash advance, `source.layer` updated, audit row reflected the swap — but `untrusted_egress` continued firing (or failing to fire) against the OLD set until process restart. `config != runtime` divergence on the hot-reload path.
+
+**Fix shape — minimum-invasive:**
+
+- **`mergeTrustedHosts` relocated to `risk-score.ts`** (alongside `DEFAULT_TRUSTED_HOSTS`). Co-locates the merge with the data it operates on, and unblocks `engine.ts` / `policy-watcher.ts` from importing it without crossing layering boundaries (engine.ts is the lower-level module; importing from bootstrap-engine would invert the dependency direction). `bootstrap-engine.ts` re-exports for backward-compat with the existing import sites (`cli/subagent-child.ts`, `tests/permissions/bootstrap-engine.test.ts`).
+- **Engine: `trustedHosts` const → mutable cell.** Same swap pattern the engine already uses for `policy`, `policyHash`, `mode`, `provenance` (each a `let` rebound by `reloadPolicy`).
+- **`reloadPolicy` signature extended with optional `newTrustedHosts`.** When provided, the cell is swapped; when omitted (test-only callers that never reload), construction-time value preserved — backward-compat for callers that don't know about hot-reload semantics.
+- **`policy-watcher.ts` computes and forwards.** After re-resolving the hierarchy, the watcher calls `mergeTrustedHosts(resolved.policy.tools.fetch_url?.trusted_hosts ?? [])` and threads as the third arg to `engine.reloadPolicy`. Same idiom `bootstrap-engine.ts` uses at construction.
+
+**Tests:**
+
+- `engine.test.ts` — two pins. (a) construction with `['only.example.com']`, check it's silent; check `plus.example.com` flagged. reload with `['plus.example.com']` via the new 3rd arg. Check polarities flip: `only.example.com` now flagged, `plus.example.com` now silent. (b) reload WITHOUT the 3rd arg leaves the construction-time list intact (backward-compat pin).
+- `policy-watcher.test.ts` — spy on `engine.reloadPolicy` to capture the args the watcher passes. Trigger a YAML edit declaring `trusted_hosts: ["internal.cdn.example.com"]`. Verify the spy received a 3rd arg containing both the default hosts (`github.com`) AND the policy-supplied host (`internal.cdn.example.com`).
+
+296 tests pass across the three affected permission test files; typecheck + lint clean.
+
+**Why not derive at check time:** considered making the engine recompute trustedHosts from `policy.tools.fetch_url?.trusted_hosts` on every check call (no caching). Rejected because: (a) every `permissionCheck` would re-walk the merge + dedup, which is mechanically cheap but conceptually re-doing work the construction handshake already did; (b) callers that pass a CUSTOM `trustedHosts` baseline at construction (e.g., tests doing `trustedHosts: []` for lockdown) would lose that intent on the first reload, since the engine would always re-merge from `DEFAULT_TRUSTED_HOSTS`. The "watcher forwards explicit value" shape preserves caller intent and keeps the merge work amortized to one per reload.
+
+## [2026-05-19] hardening(config) — full audit of config↔runtime divergence for budget/critique knobs
+
+Self-prompted audit after the `max_step_stall_ms = 0` fix: systematic check of every operator-tunable numeric field in `[budget]` and `[critique]` against its runtime consumer, looking for the same shape of bug (validator forbids what the runtime supports). Results:
+
+| Field | Status | Notes |
+|---|---|---|
+| `max_steps`, `max_wall_clock_ms` | ✓ correct | `min: 1` guards footgun ("operator typed 0 expecting unlimited gets aborted-on-turn-1") |
+| `max_step_stall_ms` | ✓ fixed in prior commit | runtime `<= 0` disables; validator now `min: 0` |
+| `max_cost_usd` | ⚠ divergence documented | runtime 3-state (absent/undefined/number); TOML can't express undefined; **workaround**: `max_cost_usd = 999999999` (functionally no-cap) or session-only `/budget cost off`; we deliberately do NOT add a `-1` sentinel or `disable_cost_cap = true` flag (typed-system anti-pattern for a niche case with working workarounds) |
+| `compaction_threshold` | ✓ correct | runtime: `usagePct >= threshold`; endpoints 0 (always compact) and 1 (effectively disable, math-naturally) are both legitimate; range `[0, 1]` matches |
+| `compaction_preserve_tail` | ✓ correct | runtime: 0 still preserves trailing assistant+tool_result pair (`harness/types.ts:474`); `min: 0` is intentional, marked inline |
+| `[critique].max_overhead_ms` | ✓ correct | runtime `watchdogMs > 0` arms timer (`critique/engine.ts:167`) — 0 disables; validator `>= 0` already matches |
+| `[critique].mode` / `.threshold` | ✓ correct | enum + bounded float, no hidden states |
+| `[memory]` toggles | ✓ correct | booleans, no states beyond true/false |
+| `[providers].model` | ✓ correct | registry lookup, no states |
+
+**Defense-in-depth pins added:**
+
+- `tests/critique/config-loader.test.ts` — `compaction_threshold = 0` accepted (lower endpoint); `compaction_threshold = 1` accepted (upper endpoint, effective-disable); `[critique].max_overhead_ms = 0` accepted (runtime opt-out, sibling pin to `max_step_stall_ms = 0`). All three guard against a future contributor accidentally tightening to an open interval (`(0, 1)`) or `min: 1` and silently breaking documented disable semantics.
+
+**Spec update** (`AGENTIC_CLI.md §2.1.1`) — `max_cost_usd` table row now flags the opt-out gap explicitly with workaround pointers, so an operator who needs persistent "no cap" finds the answer in the spec instead of grepping source.
+
+Net: 3 new tests (defense), 1 spec table-row clarification. No code changes — the audit confirmed the remaining 11 fields are correctly bounded. The `max_cost_usd` divergence is documented and accepted, not fixed, because the workaround paths exist and adding a sentinel would clutter schema for a niche case.
+
+## [2026-05-19] fix(config) — `[budget].max_step_stall_ms = 0` accepted (matches runtime opt-out)
+
+`BUDGET_INT_KEYS` in `src/critique/config-loader.ts` had `min: 1` for `max_step_stall_ms`. The runtime contract (`src/harness/abortable.ts:38, :68`) explicitly uses `stallMs <= 0` as the "disable per-step watchdog" sentinel — `stallWatchdog` yields the source verbatim with no timer. An operator running long steady-streaming provider calls who set `max_step_stall_ms = 0` in `.agent/config.toml` to opt out got a "out of range [1, 3600000]" warning and the default 90s watchdog silently stayed in effect. The validator forbade what the harness supports — `config !== runtime` divergence.
+
+Fix: `min: 0` for `max_step_stall_ms` only. `max_steps` and `max_wall_clock_ms` keep `min: 1` because `0` for those means "abort immediately" (no documented disable semantic) — guarding against a footgun where the operator types `0` expecting "no limit".
+
+Inline comment in `BUDGET_INT_KEYS` rewritten to spell out the per-key disable semantic. Spec `AGENTIC_CLI.md §2.1.1` schema reference table updated to flag `max_step_stall_ms: int ≥0` with the disable behavior. Test pin: `max_step_stall_ms = 0 accepted (runtime opt-out)` + sibling pin `max_steps = 0 still rejected`.
+
+## [2026-05-19] hardening(cli) — three init robustness follow-ups (atomic writes, mid-loop pin, eval)
+
+Self-review of `agent init` after the rich-scaffold landed surfaced three production-readiness gaps. All three closed here on the same branch.
+
+**1. Atomic temp+rename for the three non-gitignore writers.** `scaffoldPermissions`, `scaffoldConfig`, `scaffoldPlaybooks` were calling bare `writeFileSync`. A process killed mid-write leaves a partial target file — `permissions.yaml` truncated at byte 500 refuses parse on next boot (engine → refusing), `config.toml` partial fails TOML.parse (loader fail-soft warns, defaults kick in — silent semantic drift), playbook `.md` truncated breaks the subagent loader on read.
+
+The gitignore writer was already atomic via `ensureAgentGitignore` (`wx` create-or-fail flag). New `atomicWrite(target, content)` helper in `init.ts` mirrors the temp+rename idiom from `cli/slash/commands/memory.ts:3268-3271` (`mutateMemoryConfig`): write `<target>.tmp-<pid>-<ts>` first, then `renameSync` into place. The rename is a single filesystem syscall, atomic on POSIX/NTFS for same-volume renames. On write or rename failure, best-effort `unlinkSync(tmp)` cleans up the temp before re-raising; inner unlink errors are swallowed so the operator's diagnostic surfaces the original write failure, not a secondary unlink-of-nonexistent.
+
+**2. Mid-loop failure pin for `scaffoldPlaybooks`.** Prior test coverage exercised the step-boundary failure (sentinel file at `.agent/agents` → mkdirSync ENOTDIR) but not within-loop. Inject scenario added: fixture with four entries where entry 3's `filename` points at a non-existent subdir (`missing-subdir/bad.md`). writeFileSync fails with ENOENT; the scaffolder early-returns. Pins assert: entries 1+2 wrote to final paths, entry 3 has no file (atomicWrite cleaned up its temp on write-throw), entry 4 was never attempted, stderr carries the diagnostic, no `.tmp-PID-TS` orphans linger anywhere in `.agent/agents/`. A refactor that loses the early-return (continuing past a single write failure) would silently turn this into "entries 1+2+4 wrote, error printed for 3" — caught here.
+
+**3. End-to-end eval — `evals/init/` + `tests/cli/init-eval.test.ts`.** Per `CLAUDE.md` principle 4 ("eval is load-bearing — a subsystem without eval doesn't ship"). Pre-eval, init's unit tests covered the scaffolder's outputs, and bootstrap's unit tests covered the loader's inputs, but no test pinned the **cross-subsystem handshake**: init writes the files; bootstrap reads them; the values flow through every loader correctly. Three scenarios:
+
+| # | Scenario | Pins |
+|---|---|---|
+| 1 | Default init (all 4 steps) → bootstrap | `permissionState === 'ready'`; `modelId === DEFAULT_MODEL`; `config.budget.maxSteps === DEFAULT_BUDGET.maxSteps`; memory + critique + providers warnings all empty |
+| 2 | `--only=permissions,config` (partial scaffold) → bootstrap | Boots to ready even without `.agent/agents/`; `[providers].model` still drives modelId resolution |
+| 3 | Re-run idempotency | Second init prints "skipped"; permissions / config / gitignore / playbook content byte-for-byte unchanged; bootstrap still reaches ready against the unchanged scaffold |
+
+What the eval catches: schema drift between renderer and parser (init emits a key the loader's `BUDGET_INT_KEYS` doesn't recognize); path drift between `projectPolicyPath` / `projectAgentsDir` and bootstrap's read sites; value drift between scaffold and code defaults; partial-scaffold compatibility regression. What it doesn't: LLM behavior under the scaffolded model (covered by `tests/providers/*`), multi-operator concurrency (TOCTOU window narrowed by atomic-write but not eliminated), compiled-binary asset bundling (covered elsewhere). README at `evals/init/README.md`.
+
+**Test deltas:**
+
+- `tests/cli/init.test.ts`: +2 cases (atomic-write orphan check, mid-loop failure pin). 27 pass.
+- `tests/cli/init-eval.test.ts`: new file, 3 cases. 3 pass.
+- `tests/cli/init-config-template.test.ts`: unchanged (template tests aren't affected by the atomic-write or eval additions). 9 pass.
+
+Suite delta: 152 tests pass across 5 affected files; typecheck + lint clean.
+
+**Production-readiness shift.** Before: known partial-write window on crash, mid-loop failure behavior untested, cross-subsystem handshake unpinned. After: writes atomic at the filesystem layer (orphan temp possible, partial target impossible), mid-loop semantic pinned by deliberate failure injection, init↔bootstrap cross-wire pinned end-to-end. The three follow-ups identified in the post-rich-scaffold review are now closed.
+
+## [2026-05-19] fix(cli) — rich config.toml scaffold supersedes the slim spec-pointer
+
+Reverses the slim-scaffold posture from earlier in the day. Two days ago the analysis was: `/memory governance enable|disable` round-trips `.agent/config.toml` via `Bun.TOML.parse → mutate → emit` and comments don't survive — so shipping a comment-rich scaffold was a false promise. The fix at the time was to ship a minimal header pointing at `AGENTIC_CLI.md §2.1.1` for the schema.
+
+The slim shape addressed the false-promise problem but introduced a new one: an operator who opens `.agent/config.toml` after `init` sees an essentially empty file and has no way to know what budget caps / model / governance toggles are in effect without grepping source. The "single source of truth" intuition surfaced via direct operator question ("can we remove DEFAULT_BUDGET? config should be the only place with values") and the steelman holds: values living in two places (code defaults + config.toml that may or may not declare them) is genuine cognitive overhead.
+
+**New shape.** The scaffold contains **active TOML values for all four operator-tunable sections** (`[providers]`, `[budget]`, `[memory]`, `[critique]`) sourced from the canonical code defaults at scaffold time. No comments anywhere in the file — because comments still die on `/memory governance` round-trip, but values survive. The operator opens `config.toml` and sees the running config literally:
+
+```toml
+[providers]
+model = "anthropic/claude-opus-4-7"
+
+[budget]
+max_steps = 200
+max_cost_usd = 5
+max_wall_clock_ms = 600000
+max_step_stall_ms = 90000
+compaction_threshold = 0.7
+compaction_preserve_tail = 3
+
+[memory]
+verify_semantic_llm = true
+conflict_detect_llm = true
+override_detect_llm = true
+
+[critique]
+mode = "off"
+threshold = 0.85
+max_overhead_ms = 5000
+```
+
+**What stays hardcoded.** `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL` remain in code as a **safety floor**: fresh install before any `init`, programmatic test seams that don't construct a config loader, subagent runs that resolve config through the parent's audit snapshot path. The user's original instinct "remove DEFAULT_BUDGET entirely" was rejected explicitly — a fresh install with no config.toml + no DEFAULT_BUDGET would run with NO step backstop, NO cost cap, NO wall-clock cap. The "fresh install has no caps" failure mode is exactly the runaway-loop scenario `maxSteps: 200` exists to prevent.
+
+**Trade-off accepted: sticky defaults.** An operator who ran `forja init` on version N and then upgrades to version N+1 keeps their scaffolded values from version N until they re-run `agent init --force=config`. This is a real cost — we documented it inline in `src/providers/default-model.ts` and in the BACKLOG. The mitigating factor: bumps to canonical defaults are deliberate per-release moves (not bug fixes), and re-running `init --force=config` is a single, advertised step.
+
+**DEFAULT_MODEL extracted.** Moved from `src/cli/bootstrap.ts:77` (whose transitive closure includes storage, providers, hooks, telemetry) to a tiny dependency-free `src/providers/default-model.ts`. The `agent init` path now imports the model string without pulling in `bootstrap.ts`. `bootstrap.ts` re-exports for backward-compat with consumer code that imports `DEFAULT_MODEL` from there.
+
+**Spec edits** (`docs/spec/AGENTIC_CLI.md §2.1.1`):
+
+- Title changed from "scaffold slim + schema reference" to "scaffold com valores ativos + schema reference".
+- Scaffold-literal block replaced with the new active-values shape.
+- "Por que slim e não rico-com-comentários" reframed to "Sem comentários no scaffold" — the no-comments invariant stays load-bearing, but the active-values story takes precedence.
+- Schema reference converted from inline TOML examples to a markdown table mapping section/key → type → significado. Easier to scan; doesn't tempt the reader to copy-paste the example values (which would lose the "code is source of truth" property).
+- Sticky-defaults trade-off documented explicitly so future operators understand why `init --force=config` is the upgrade path.
+
+**Tests:**
+
+- `tests/cli/init-config-template.test.ts` rewritten (9 cases): parses valid TOML; parses to all-four-sections populated; `[providers].model` matches `DEFAULT_MODEL`; `[budget]` values match `DEFAULT_BUDGET` (six fields); `[memory]` values match `DEFAULT_MEMORY_CONFIG` (three detectors); `[critique]` values match `DEFAULT_CRITIQUE_CONFIG`; scaffold contains NO comments (line-by-line `#`-prefix rejection); `max_cost_usd` omitted when caller passes `undefined` (opt-out semantic); trailing newline.
+- `tests/cli/init.test.ts` config-step assertions updated: drop the `'AGENTIC_CLI.md §2.1.1'`/`'parses to empty'`/`'spec-pointer'` checks; add `parsed.providers/budget/memory/critique` defined checks; add a comment-rejection pin.
+- 147 tests pass across the four affected test files; typecheck + lint clean.
+
+**Production-readiness shift.** Operator UX improves on the "what's actually configured here?" axis — answer is now "open `.agent/config.toml`, that's everything". Cognitive load drops one indirection. The "two sources of truth" residual concern (code default + scaffold value) is real but bounded: `DEFAULT_*` constants are the source of truth for scaffold values, and `init --force=config` re-syncs. The path "delete a line → no cap" still doesn't work (loader falls back to `DEFAULT_BUDGET`); the "no cap" semantic stays slash-only (`/budget cost off`, session-scoped) until a future slice adds an explicit `[budget].disable_cost_cap` or `-1` sentinel — deliberately out of scope for this slice.
+
+## [2026-05-19] feat(cli + permissions) — three operator-tunable knobs no longer hardcoded
+
+Audit of `src/` for `MAX_*`, `DEFAULT_*` constants and hardcoded model ids surfaced ~17 candidates; 3 had high signal for operator override and no existing per-project path. Cargo-cult risk acknowledged — the remaining 14 (subagent depth, IPC caps, retention windows, harness concurrency caps, …) are safety/protocol/internal-tuning constants and stay in code.
+
+**Knob 1 — `[providers] model` in `.agent/config.toml`.** Pin executor model per-project. Resolution chain: CLI flag `--model` > project `[providers].model` > user `[providers].model` > `DEFAULT_MODEL` (`anthropic/claude-opus-4-7`). Unknown model id in config → warning + fall back to default (matches `[critique].model` posture). Surfaced via new `loadProvidersConfig` mirroring the existing critique/memory loader shape. Bootstrap reorder: `projectConfigCwd` resolved EARLY so providers loader runs before `modelId` resolution.
+
+**Knob 2 — `[budget]` section in `.agent/config.toml`.** Six keys exposed (`max_steps`, `max_cost_usd`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_threshold`, `compaction_preserve_tail`). Per-key merge: project overrides user, CLI `input.budget` overrides both; absent fields inherit `DEFAULT_BUDGET` from `src/harness/types.ts` (harness applies the final merge). Per-key validators reject non-finite numbers, non-integers in integer fields, out-of-range values; fail-soft (warning + ignore the offending field, not the whole layer). camelCase aliases accepted for copy-paste from harness API docs.
+
+**Knob 3 — `tools.fetch_url.trusted_hosts` in `permissions.yaml`.** Additive over `DEFAULT_TRUSTED_HOSTS` (`risk-score.ts` — github + 5 public registries). Hosts listed in policy do NOT trigger the `untrusted_egress` risk-score feature for this project — useful for internal CDNs, GitHub Enterprise, or any endpoint outside the public default. NOT an allowlist (deny_hosts still wins). Bootstrap merges policy-supplied entries with the default list (dedupe via `Array.from(new Set(...))` so a policy that re-lists `github.com` doesn't inflate the iteration set). Init template scaffolds an empty `trusted_hosts: []` block with explanatory comment.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1.1` — schema reference extended with `[providers]` and `[budget]` example blocks. Resolution-chain comment makes precedence explicit.
+- `AGENTIC_CLI.md §8` — `web_fetch` policy example shows `trusted_hosts: ["github.com", ...]` alongside `deny_hosts`; new paragraph clarifies additive-over-default semantics and the "NOT an allowlist" rule.
+
+**Warnings surface** — bootstrap returns two new arrays on `BootstrapResult`: `providersConfigWarnings` and `budgetConfigWarnings`. `src/cli/run.ts` prints them on stderr alongside the existing critique + memory warnings (non-JSON mode only). Operator who typos a model id or budget number sees the diagnostic instead of silently running with defaults.
+
+**Items audited and deliberately NOT promoted to config:**
+
+- `MAX_SUBAGENT_DEPTH = 4`, `MAX_CONCURRENT_TOOL_CALLS_CAP = 16`, `MAX_CONCURRENT_SUBAGENTS_CAP = 8` — safety caps; tunable is a footgun.
+- `MEMORY_OVERRIDE_THRESHOLD_COUNT = 3` / `_WINDOW_MS = 24h` — S3 detector calibration; mutating per-project breaks reproducibility of governance decisions across repos.
+- `MAX_CACHE_BREAKPOINTS_PER_REQUEST = 4` — Anthropic API limit, not a knob.
+- `MEMORY_*_RETENTION_MS = 90d` (verify/conflict/override attempts + provenance) — retention policy; varying per-project creates audit-trail inconsistency.
+- `MAX_RESUME_MESSAGES = 500`, `MAX_PLAYBOOK_TABLE_ROWS = 12`, `DEFAULT_HOOK_TIMEOUT_MS = 5000`, `DEFAULT_RECAP_CACHE_TTL_MS = 1h`, `TOOL_BATCH_COALESCE_THRESHOLD = 3` — internal presentation/operational tuning; no high-signal per-project case yet.
+- `DEFAULT_SCORE_CONFIRM_THRESHOLD = 0.4` (permission risk-score modal trigger) — medium signal but the right home is `permissions.yaml` not `config.toml`; deferred so the permissions schema doesn't grow two unrelated changes in the same PR.
+- `DEFAULT_RETENTION_DAYS = 30` (checkpoints) — medium signal; deferred as a separate slice (touches retention storage path).
+- `MEMORY_VERIFY_*_MAX_COST_USD = 0.5` — advanced-user knob; low frequency; if demand surfaces, add under `[memory]` later.
+
+**Tests:**
+
+- `tests/critique/config-loader.test.ts` extended with 6 `loadProvidersConfig` tests (empty layer, project read, unknown model → warning, non-string → warning, empty string → warning, project-overrides-user, non-table → warning) + 9 `loadBudgetConfig` tests (empty, full read, integer validation, float validation, out-of-range cost, out-of-range threshold, non-number → warning, camelCase aliases, project-overrides-user, non-table → warning).
+- `tests/permissions/config.test.ts` extended: `trusted_hosts` parse + string-array validator rejection.
+- `tests/permissions/bootstrap-engine.test.ts` extended: behavioral pin verifying policy-supplied `trusted_hosts` merges additive over `DEFAULT_TRUSTED_HOSTS` — internal host silent, `github.com` still silent (default preserved), unlisted external host flagged via `untrusted_egress` risk component.
+- Test-side `BootstrapResult` fixtures (`tests/cli/repl.test.ts`, `tests/cli/repl-history.test.ts`) updated to include the new warning arrays.
+
+**In-flight review findings addressed before commit:**
+
+- **#1 — Subagent child trustedHosts merge** (bug). `src/cli/subagent-child.ts:668` was calling `createPermissionEngine` without `trustedHosts`, so a subagent fetching the same internal CDN as the parent run would surface `untrusted_egress` on the risk-score side while the parent treated the host as silent — operator-visible parent/child divergence on identical URLs. Fixed by mirroring the merge via the new `mergeTrustedHosts` helper (exported from `bootstrap-engine.ts` so the subagent path doesn't duplicate the dedup logic).
+- **#2 — Budget loader double-declaration warning.** `[critique]` / `[memory]` loaders emit "declares both X and Y; snake_case wins" when an operator writes both spellings; budget loader did the silent snake-wins fallback. Now matches the convention — operator who declares both `max_steps = 200` AND `maxSteps = 300` sees the diagnostic and knows which value won.
+- **#3 — `mergeTrustedHosts` extracted + direct unit tests.** The dedup invariant (policy that re-lists `github.com` does NOT inflate the array) was previously buried inside `bootstrapPermissionEngine` and only behaviorally testable; a refactor to plain concat would have passed the behavioral test but doubled the engine's per-fetch iteration set silently. Now a separate function with structural tests (`empty → default by reference`, `extends with new host`, `dedupes default overlap`, `dedupes policy-internal duplicates`).
+- **#4 — Comment cleanup after bootstrap reorder.** When `projectConfigCwd = resolveRepoRoot(cwd)` moved up to feed the providers loader, the long explanatory comment stayed at the old location and read like the resolution happened there. Comment now lives next to the actual resolveRepoRoot call.
+- **#5 — `ProvidersConfigKeys` shape consistency.** Changed from `{model: string | null}` to `{model?: string}` to match `BudgetConfigKeys` and `CritiqueConfig.promptVersion` — the `?? DEFAULT_MODEL` consumer doesn't care which sentinel; the optional shape is the established convention.
+- **#6 — Preserve `input.budget !== undefined` semantic.** Bootstrap budget guard reverted to the original "guard on caller intent, not merged-object-emptiness". A caller that passes `input.budget = {}` (explicit empty marker) flows through unchanged; only "no config AND no CLI" suppresses the field entirely.
+- **#7 — Verified `--explain-permissions --json` surfaces `trusted_hosts`.** The JSON output path `writeJson` does `JSON.stringify(policy)` directly — TypeScript types + runtime object shape carry the new field through reflection. No code change needed.
+- **#8 / #9 — Documented `BUDGET_INT_KEYS` / `BUDGET_FLOAT_KEYS` max-range rationale.** Inline comments explain why each ceiling is "sanity-typo guard" and not "tight cap"; `compaction_preserve_tail: { min: 0 }` is intentional (aggressive compaction, drop everything except system prompt) and marked.
+- **#10 — Extracted shared config plumbing into `src/config/`.** Honors the TODO from `critique/config-loader.ts:310` ("when a third config consumer surfaces, split into `src/config/loader.ts`"). The third + fourth consumers landed in this slice; ~120 LOC of duplicated file-read-and-parse-section boilerplate collapsed into `src/config/section.ts` (`loadTomlSection`, a discriminated-union return type for absent / no-section / invalid / found). Path helpers (`userConfigPath`, `projectConfigPath`) moved to `src/config/paths.ts` and re-exported from `critique/config-loader.ts` for backward-compat with existing import sites.
+
+Suite delta: 206 pass across 4 affected files (config-loader +15, permissions/config +1, bootstrap-engine +1, init unchanged). Typecheck + lint clean.
+
+**Production-readiness shift.** Before: operator pinning a model per-project required `--model anthropic/...` on every invocation; CI runs needing stricter caps required flag-passing every time; teams with internal CDN endpoints had no operator path to dampen the `untrusted_egress` risk component for their hosts. After: all three are diff-tracked, team-reviewable per-project config. The cargo-cult risk acknowledged inline in BACKLOG — the audit deliberately stops short of promoting safety/protocol caps to operator-tunable territory.
+
+## [2026-05-19] fix(cli) — slim the scaffolded `config.toml` to a spec-pointer
+
+In-flight regression in the unified-init slice surfaced during review of the post-work entry below. The rich 30-line `config.toml` template that `agent init` shipped (per the earlier §2.1.1 schema) **looked like inline documentation but was a false promise**: `/memory governance enable|disable verify|conflict|override|all` rewrites the file via `Bun.TOML.parse → mutate → emitTomlDoc` (`src/cli/slash/commands/memory.ts:3118-3181`), and Bun's TOML parser does not preserve comments. The first slash-command toggle would silently delete every line of the scaffolded inline doc — exactly when the operator first acted on the file they had just learned to read.
+
+**Fix.** Slim the scaffolded `config.toml` to a 13-line spec-pointer header. Discovery moves from the file to `AGENTIC_CLI.md §2.1.1`, which now splits explicitly into:
+
+1. **Scaffold literal** — the exact 13-line slim header that `agent init` writes. The spec block here matches the renderer byte-for-byte (pinned by the snapshot/contains tests).
+2. **Schema reference** — a separate code block listing every available toggle (`[memory]` 3 detectors, `[critique]` 4 keys) with example values, marked as descriptive (not what's in the file).
+
+**Behavioral promise the slim scaffold can keep:** the scaffolded file's comments inform the operator (a) where the schema lives (spec link inline), (b) that the file is empty by design, (c) that `/memory governance` round-trips and loses comments — so the operator decides BEFORE a toggle whether to keep hand-edits inline. The slash-command path's existing parse-emit round-trip stays untouched.
+
+**Alternatives considered and rejected:**
+
+- **Refactor slash command to text-splice the `[memory]` block** instead of round-tripping. Would preserve comments at the cost of reverting the deliberate robustness call documented at `src/cli/slash/commands/memory.ts:3118-3134` (round-trip handles multi-line strings, BOM, `\r\n`, quoted keys, nested-lookalikes inside strings — text-splice fails on each).
+- **Sidecar `config.example.toml`** that ships rich docs and `config.toml` stays empty. Two files for one purpose; operator confusion likely.
+- **Accept the loss + document it inline.** Self-defeating: the warning would itself be a comment, deleted by the first slash toggle.
+
+The slim scaffold buys back the discovery layer at the cost of one extra click (operator → spec) when learning the schema. The cost surfaces at first use; the prior design's cost surfaced silently at FIRST WRITE, which is a worse failure mode.
+
+**Tests rewritten:** `tests/cli/init-config-template.test.ts` drops the per-section/per-key `toContain` assertions (those would couple the test to inline schema content the slim scaffold deliberately omits) and adds `toContain('comments NOT preserved')` to pin the round-trip warning. `tests/cli/init.test.ts` config-step assertions adapted: `[memory]`/`[critique]` checks dropped in favor of empty-TOML-parse + spec-ref-presence. 186 tests pass across affected files; typecheck + lint clean.
+
+## [2026-05-19] feat(cli) — unified `agent init` scaffolding (post-work)
+
+Closes the pre-work entry below. Two commits on `feat/init-unified-scaffold`:
+
+| Commit | Class | Subsystem | One-liner |
+|---|---|---|---|
+| `47080c5` | docs | spec | widen `agent init` to scaffold the four bootstrap artifacts |
+| `4bca315` | feat | cli | unify `agent init` scaffold across four bootstrap artifacts |
+
+**Outcome.** One `agent init` invocation now writes all four `.agent/` artifacts (`permissions.yaml`, `.gitignore`, `config.toml`, 10 canonical playbooks) instead of the prior two-invocation dance (`init` then `init --playbooks`). Each step is idempotent (skip-if-exists), so re-runs after partial failure or after `git pull` are safe and operator hand-edits survive. The operator-facing surface gained `--only=csv` (subset selection) and `--force[=csv]` (bare = `'all'`; CSV = subset of force-eligible steps), and lost `--playbooks` (legacy flag explicitly rejected with a pointer to `--only=playbooks`).
+
+**Decisions that survived the in-flight review:**
+
+- **`--playbooks` is a clean break, not a deprecated alias.** Parser surfaces a single-line error pointing at `--only=playbooks`. Rationale: no shipped binary depends on the old shape, the spec was already moving, and silent aliasing teaches the wrong shape long-term.
+- **`.gitignore` is excluded from the force-eligible set at the type level.** `ForceEligibleStep = Exclude<InitStep, 'gitignore'>`. The runtime parser additionally rejects `--force=gitignore` with a pointer to `MEMORY.md §2.5` — defense in depth for an operator who bypasses TS via headless invocation. Regeneration path is "delete the file and re-run init" (the file's own scaffold step is naturally idempotent and will re-create on absence).
+- **`config.toml` scaffold is no-op until edited.** Every key commented; defaults live in the loader (`src/critique/config-loader.ts`). Wording landed in the round-of-review pass: `[memory]` describes uncommenting as DISABLING detectors (default ON inversion), `[critique]` describes uncommenting as ACTIVATING critique (default OFF). Same idiom ("uncomment to take effect"), opposite polarities — surfaced explicitly so an operator skimming the file doesn't misread the direction.
+- **No rollback on partial failure.** Mirrors the existing `runInitPlaybooks` posture. Exit 1, surviving writes stay, re-run with `--force=<failed-step>` after fixing. Justification: rollback would either delete operator-edited surviving files (bad) or distinguish "we wrote this" from "this was already here" (state-tracking complexity unjustified for a one-shot CLI).
+- **Two-source-of-truth for the step list** (`DEFAULT_STEPS` in `init.ts`, `VALID_INIT_STEPS` in `args.ts`). Trade-off: lazy-import posture preserved (args parser doesn't pull fs + the playbook asset bundle on the `--help` path) at the cost of a manual sync. A new drift-guard test (`tests/cli/args.test.ts` — "parser accepts every step that the orchestrator runs") pins parity through behavior so a future `'hooks'` step lands the test failure before the operator sees "unknown step".
+
+**Round-of-review fixes that landed before commit:**
+
+- `parseCsvSubset` deduplicates — `--only=permissions,permissions` runs the step once, first occurrence wins (preserves operator-intended order). Pinned by `tests/cli/args.test.ts — --only deduplicates repeated entries`.
+- `config.toml` template comment block was previously ambiguous about default polarity; now explicitly states uncommenting `[memory]` disables (default ON) while uncommenting `[critique]` activates (default off). The `model` / `prompt_version` example values flag themselves as illustrative with a pointer to the canonical loader for current defaults.
+- Drift-guard test added.
+
+**Items flagged in review and intentionally NOT addressed:**
+
+- **TOCTOU between `existsSync` and `writeFileSync` in `scaffoldPermissions` / `scaffoldConfig`.** `ensureAgentGitignore` uses `wx` (atomic create-or-fail); the other two use the check-then-write pattern. Fixing would require either splitting the force path from the create path (two writeFileSync calls per step) or switching to `wx`-then-`w`-fallback. Mitigation: operators don't run two `agent init` concurrently; concern is theoretical for the use case. Documented inline.
+- **`--force=all` rejected with "valid: permissions, config, playbooks" instead of being a synonym for bare `--force`.** Operator with muscle memory may try `--force=all` expecting it to work. Trade-off: special-casing `all` adds a parser branch + spec wording exception. Leaving as-is; the error message is clear.
+- **`scaffoldPermissions` and `scaffoldConfig` have near-identical 60-line bodies.** Two usages don't amortize a `scaffoldFileTemplate` helper. If a 3rd file-template step lands (`hooks.toml`?), refactor then.
+- **Mid-loop failure inside `scaffoldPlaybooks` not test-covered.** The partial-failure test exercises step-boundary failure (sentinel file at `.agent/agents` → mkdirSync ENOTDIR). Within-step partial failure (e.g., entry 5 of 10 throws on writeFileSync) is harder to inject without mocking fs and isn't covered. Behavior on this path: aggregate summary suppressed (early-return), per-file output already streamed, exit 1, operator re-runs.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1` — `init` table row broadened; new `§2.1.1` defines the scaffolded `config.toml` schema with worked example.
+- `AGENTIC_CLI.md §8` — bootstrap-path paragraph extended; explicit note that `.gitignore` is operator-owned post-creation and rejected from `--force`.
+- `MEMORY.md §2.5` — `.gitignore` ownership moved from "first invocation" to "init scaffold step"; idempotency + never-overwrite semantics preserved; regeneration path documented.
+- `PLAYBOOKS.md` — new `§12` documenting bundled distribution (canonical 10 copied to `.agent/agents/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Existing `§12–§15` renumbered to `§13–§16`. Cross-refs in `src/cli/init.ts:3` and `src/cli/init-playbooks/index.ts:1` updated.
+
+**Test deltas.** `tests/cli/init.test.ts` rewritten in 5 describe blocks (permissions / gitignore / config / playbooks / full-bundle); `tests/cli/init-config-template.test.ts` new (6 cases — TOML validity, empty-parse pin, section/key presence, spec ref, trailing newline); `tests/cli/args.test.ts` init describe expanded (15 → 19 cases including `--force` shapes, `--only` shapes, dedup, drift guard, legacy `--playbooks` rejection, `--force=gitignore` rejection). 186 tests pass across the three files; typecheck + lint clean.
+
+**Production-readiness shift.** Before: first-time operator had to run `init` twice (permissions, then `--playbooks`) and still got `.agent/config.toml` only by grepping source. After: one invocation scaffolds the entire bootstrap bundle; `config.toml` documents every available toggle in the file itself; granular re-copy (`--only`) and overwrite (`--force[=csv]`) cover the maintenance flows; idempotent re-runs are safe by default.
+
+## [2026-05-19] feat(cli) — unify `agent init` scaffolding (pre-work plan)
+
+`agent init` today scaffolds exactly one artifact: `.agent/permissions.yaml`. The `--playbooks` flag is mutually exclusive — it instead copies the 10 canonical playbooks under `.agent/agents/`. A first-time operator on a fresh repo therefore has to run `agent init` TWICE (once for permissions, once for playbooks) and still doesn't get `.agent/.gitignore` (auto-generated lazily by the memory subsystem on first session via `ensureAgentGitignore` in `src/memory/gitignore.ts:47`) or `.agent/config.toml` (no scaffolder exists; the file is "optional" but governance toggles + critique config live there and without it the operator can't discover the schema short of grepping the source).
+
+This slice unifies the scaffold: one `agent init` writes all four artifacts — `permissions.yaml`, `.gitignore`, `config.toml`, and the 10 playbooks — each step idempotent (skip-if-exists) so reruns don't clobber operator edits. `--playbooks` is removed; granularity moves to `--only=<csv>` (subset of the four steps) and `--force[=csv]` (overwrite all or a subset).
+
+**Phase 0 — Spec PR (mandatory first per `CLAUDE.md` hard rule "Diverging from the spec requires a PR against the spec first, code after").**
+
+- `AGENTIC_CLI.md §2.1` — broaden `agent init` table row; document `--only=<csv>` and `--force[=csv]`; remove `--playbooks` from the synopsis. Update the bootstrap-path paragraph in §8 (which currently says "`agent init` … generates a baseline `permissions.yaml`") to mention the three additional artifacts.
+- `MEMORY.md §2.5` — move `.gitignore` ownership from "first invocation" to "`agent init` scaffold step". Semantics stay (idempotent; operator-owned after creation; agent never overwrites).
+- `PLAYBOOKS.md` — new §12 documenting bundled distribution via `agent init` (canonical 10 copied to `.agent/agents/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Renumber existing §12–15 to §13–16.
+- New subsection (in `AGENTIC_CLI.md §2.1` or §3) defining the scaffolded `config.toml` schema: `[memory]` (3 governance toggles: `verify_semantic_llm`, `conflict_detect_llm`, `override_detect_llm`) + `[critique]` (`mode`, `threshold`, `model`, `prompt_version`), all entries commented so the file is a no-op until the operator edits.
+
+**Phase 1 — Config template.** New `src/cli/init-config-template.ts` mirroring `init-template.ts`. Header comment + spec ref. `[memory]` and `[critique]` sections with every key commented and a short explanation per key. Snapshot test + `Bun.TOML.parse` validation pinning that the rendered file parses as valid TOML (and that the commented form produces empty parsed sections).
+
+**Phase 2 — Init orchestrator refactor.** Break `src/cli/init.ts` into 4 step functions (`scaffoldPermissions`, `scaffoldGitignore`, `scaffoldConfig`, `scaffoldPlaybooks`), each idempotent, each returning `{ wrote | skipped | overwritten }`. `runInit` walks all 4 (or the filtered subset from `--only`). Final summary line aggregating counts. Exit 1 on any step failure; no rollback (mirrors current `runInitPlaybooks` policy).
+
+**Phase 3 — Args parser.** `src/cli/args.ts`: remove `playbooks: boolean` from `InitArgs`; add `only?: ReadonlyArray<'permissions'|'gitignore'|'config'|'playbooks'>` and `force?: 'all' | ReadonlyArray<'permissions'|'config'|'playbooks'>` (bare `--force` = `'all'`; `--force=csv` = subset; `.gitignore` is not force-able). Reject legacy `--playbooks` with `"--playbooks removed; use --only=playbooks"`. Update help text (lines 1789–1816) + `src/cli/welcome.ts:107`.
+
+**Phase 4 — Tests.** `tests/cli/init.test.ts` extended: full scaffold from empty repo (4 artifacts materialized), idempotent rerun (all skipped), `--only=permissions`, `--only=playbooks,config`, `--force` global vs `--force=permissions`, partial failure (mock fs throw mid-walk → preceding steps stay, subsequent steps don't run, exit 1), legacy `--playbooks` rejection, `--mode acceptEdits` applies only to `permissions.yaml`, `.gitignore` content matches `DEFAULT_AGENT_GITIGNORE`. New `tests/cli/init-config-template.test.ts` (snapshot + `Bun.TOML.parse`).
+
+**Decisions baked in (operator-facing surface):**
+
+- Legacy `--playbooks` removed (no shipped binary depends on the old shape; clean break is simpler than maintaining a deprecation window).
+- `--force` accepts both shapes (`--force` = all; `--force=permissions,config` = subset) for parity with `--only`.
+- `config.toml` posture: every key commented (file is no-op until edited); defaults already live in code, the template is documentation that becomes config when uncommented.
+- `.gitignore` does NOT accept `--force` — idempotent-by-design and operator-owned after creation per `MEMORY.md §2.5`. To regenerate, operator deletes manually then re-runs `init`.
+- No rollback on partial failure (operator re-runs with `--force=<failed-step>` after fixing).
+- Single branch `feat/init-unified-scaffold`; spec commits land first, code commits after — same branch (per-subsystem branch strategy).
+
+Post-work entry will follow once code + tests land.
+
 ## [2026-05-18] hardening(memory + cli + permissions) — Post-Phase-2 review round 3 (9 commits)
 
 Third pass of code review over the post-S3 memory governance, plus one finding outside memory in `src/permissions/protected_paths.ts` (XDG_RUNTIME_DIR socket carve-out). All landed as individual commits on `feat/memory-governance-llm` for atomic review:

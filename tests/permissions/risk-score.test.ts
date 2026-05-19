@@ -146,6 +146,73 @@ describe('computeRiskScore — untrusted_egress', () => {
     );
     expect(r.components.untrusted_egress).toBe(RISK_SCORE_WEIGHTS.untrusted_egress);
   });
+
+  test('glob pattern in trustedHosts silences subdomain matches', () => {
+    // Pre-fix: isUntrustedEgressHost used `trusted.includes(host)`
+    // exact-match, so `trusted_hosts: ["*.corp.internal"]` silently
+    // failed for `foo.corp.internal` even though allow_hosts /
+    // deny_hosts on the SAME schema honored the same glob. Now the
+    // host matcher (matcher.ts:matchHost) is reused — operator-
+    // facing semantic of `trusted_hosts` matches the other host-
+    // list fields on fetch_url.
+    const r = computeRiskScore(
+      baseInput({
+        capabilities: [netEgress('foo.corp.internal')],
+        trustedHosts: ['*.corp.internal'],
+      }),
+    );
+    expect(r.components.untrusted_egress).toBeUndefined();
+  });
+
+  test('glob pattern accepts multiple subdomain depths via matchHost rules', () => {
+    // `*.corp.internal` matches `foo.corp.internal` (1 segment)
+    // AND `api.foo.corp.internal` (2 segments) per matchHost's
+    // shared semantic. The point of this pin isn't to specify the
+    // matcher's depth behavior — that's owned by matcher.ts tests —
+    // but to confirm risk-score CONSULTS the matcher rather than
+    // doing its own shallower compare.
+    const r1 = computeRiskScore(
+      baseInput({
+        capabilities: [netEgress('foo.corp.internal')],
+        trustedHosts: ['*.corp.internal'],
+      }),
+    );
+    const r2 = computeRiskScore(
+      baseInput({
+        capabilities: [netEgress('api.foo.corp.internal')],
+        trustedHosts: ['*.corp.internal'],
+      }),
+    );
+    expect(r1.components.untrusted_egress).toBeUndefined();
+    expect(r2.components.untrusted_egress).toBeUndefined();
+  });
+
+  test('glob pattern in trustedHosts still flags non-matching hosts', () => {
+    // Polarity check: pattern is narrow, not a free pass. A host
+    // outside the trusted glob remains untrusted.
+    const r = computeRiskScore(
+      baseInput({
+        capabilities: [netEgress('evil.example.com')],
+        trustedHosts: ['*.corp.internal'],
+      }),
+    );
+    expect(r.components.untrusted_egress).toBe(RISK_SCORE_WEIGHTS.untrusted_egress);
+  });
+
+  test('exact-string pattern still works (backward-compat with DEFAULT_TRUSTED_HOSTS)', () => {
+    // DEFAULT_TRUSTED_HOSTS is all exact strings (github.com,
+    // registry.npmjs.org, etc.). The matchHost path must still
+    // honor exact patterns identically — a regression here would
+    // make github.com fetches start flagging untrusted_egress on
+    // every fresh install.
+    const r = computeRiskScore(
+      baseInput({
+        capabilities: [netEgress('github.com')],
+        trustedHosts: ['github.com'],
+      }),
+    );
+    expect(r.components.untrusted_egress).toBeUndefined();
+  });
 });
 
 // Slice 147 (review): `exec:arbitrary` had no dedicated score

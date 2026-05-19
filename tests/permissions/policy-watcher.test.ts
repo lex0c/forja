@@ -332,6 +332,52 @@ describe('watchAndReload', () => {
     expect(reloadCalls[0]?.provenanceBash).toBe('project');
   });
 
+  test('forwards merged trustedHosts to engine.reloadPolicy on YAML edit', () => {
+    // Pre-fix: trustedHosts was captured at engine construction
+    // (`engine.ts:1278`) and never re-derived on reload. Operator
+    // edits `fetch_url.trusted_hosts` → policy hash advances and
+    // `source.layer` updates, but the risk-scorer keeps using the
+    // construction-time list. The watcher now computes
+    // `mergeTrustedHosts(newPolicy.tools.fetch_url?.trusted_hosts
+    // ?? [])` and forwards as the 3rd arg of reloadPolicy. This
+    // test pins the wire by spying on the call.
+    const projectFile = join(tmp, '.agent', 'permissions.yaml');
+    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    writeFileSync(
+      projectFile,
+      'defaults:\n  mode: strict\ntools:\n  fetch_url:\n    trusted_hosts:\n      - "internal.cdn.example.com"\n',
+    );
+
+    const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
+    const reloadCalls: Array<{ trustedHosts: readonly string[] | undefined }> = [];
+    const original = eng.reloadPolicy.bind(eng);
+    eng.reloadPolicy = ((newPolicy, newProvenance, newTrustedHosts) => {
+      reloadCalls.push({ trustedHosts: newTrustedHosts });
+      return original(newPolicy, newProvenance, newTrustedHosts);
+    }) as typeof eng.reloadPolicy;
+
+    const fake = makeFakeWatcher();
+    const timer = makeSyncTimer();
+    watchAndReload({
+      engine: eng,
+      resolveOptions: { cwd: tmp, enterprisePath: null, userPath: null },
+      watcher: fake.watcher,
+      setTimer: timer.setTimer,
+      clearTimer: timer.clearTimer,
+    });
+
+    fake.trigger(projectFile);
+    timer.fire();
+    expect(reloadCalls.length).toBe(1);
+    expect(reloadCalls[0]?.trustedHosts).toBeDefined();
+    // Merged list = DEFAULT_TRUSTED_HOSTS (github.com + 5 public
+    // registries) + the policy-supplied internal host. Spot-check
+    // both endpoints rather than exact-length so a future bump to
+    // DEFAULT_TRUSTED_HOSTS doesn't break this pin.
+    expect(reloadCalls[0]?.trustedHosts).toContain('github.com');
+    expect(reloadCalls[0]?.trustedHosts).toContain('internal.cdn.example.com');
+  });
+
   test('successive reloads: each one fires its own callback', () => {
     const projectFile = join(tmp, '.agent', 'permissions.yaml');
     mkdirSync(join(tmp, '.agent'), { recursive: true });

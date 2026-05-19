@@ -208,7 +208,64 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **List sessions** | `agent --list-sessions [opções]` | lista sessões com filtros; JSON-friendly via `--json` |
 | **Replay** | `agent --replay <id>` | re-executa sessão (debug/eval) |
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
-| **Init** | `agent init [--force] [--mode strict\|acceptEdits]` | escreve `.agent/permissions.yaml` com baseline de policy editável; refuse-on-exists sem `--force`. Sem este passo o operador roda em strict default-deny (§8). |
+| **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
+
+#### 2.1.1 `config.toml` — scaffold com valores ativos + schema reference
+
+`agent init` escreve `.agent/config.toml` **com valores ativos pra todas as quatro seções operator-tuneáveis** (`[providers]`, `[budget]`, `[memory]`, `[critique]`). Os valores são sourceados dos defaults canônicos em código — operador abre o arquivo e vê literalmente o que está em vigor.
+
+**Sem comentários no scaffold.** O slash `/memory governance enable|disable verify|conflict|override|all` reescreve `config.toml` por round-trip (parse → mutate → emit), e `Bun.TOML.parse` não preserva comments. Um scaffold com comentários **perderia toda a documentação inline na primeira invocação do slash**. Em vez de prometer e quebrar, o scaffold contém só nomes-de-seção e valores — esses sim sobrevivem ao round-trip. Discovery do significado de cada chave fica nesta seção (spec), onde edits não são rewritados.
+
+**Por que valores ativos e não documentação comentada.** Antes desta revisão, o scaffold era slim (header apontando pra esta seção, sem seções inline). Operador precisava abrir spec OU `src/...` pra saber qual valor estava ativo. A pegada é: ter valores literais no arquivo dá ao operador imediata visibilidade ("o que está em vigor agora?") sem comprometer nada (`/memory governance` só rewrita valores, e os valores aqui já são os valores reais). Sticky-defaults trade-off aceito: operador que rodou `init` em versão antiga e foi promovido pra versão nova fica com os valores antigos no arquivo até re-rodar `agent init --force=config` — preço justo pela visibilidade single-source.
+
+**Scaffold literal** (o que o `init` materializa em `.agent/config.toml`, com os valores que estão hoje em `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL`):
+
+```toml
+[providers]
+model = "anthropic/claude-opus-4-7"
+
+[budget]
+max_steps = 200
+max_cost_usd = 5
+max_wall_clock_ms = 600000
+max_step_stall_ms = 90000
+compaction_threshold = 0.7
+compaction_preserve_tail = 3
+
+[memory]
+verify_semantic_llm = true
+conflict_detect_llm = true
+override_detect_llm = true
+
+[critique]
+mode = "off"
+threshold = 0.85
+max_overhead_ms = 5000
+```
+
+**Safety floor.** `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL` em código continuam autoritativos como **safety floor**: fresh install antes do `init`, subagent runs sem config-loader na cadeia, testes programáticos. Quando o operador edita um valor no `config.toml`, o per-key merge no bootstrap layer sobreescreve o code-default só pra aquela key; outras keys ainda herdam o floor.
+
+**Schema reference** — semântica de cada toggle (descritivo, não normativo pro scaffold):
+
+| Seção | Chave | Tipo | Significado |
+|---|---|---|---|
+| `[providers]` | `model` | string | Fully-qualified id da entry no `createDefaultRegistry()`. Pin per-project pra CI / team não esquecer `--model`. |
+| `[budget]` | `max_steps` | int | Runaway-loop backstop (cost é o engagement gate). |
+| `[budget]` | `max_cost_usd` | float `≥0` | Hard cap em USD; harness aborta logo após cruzar. **Opt-out persistente não-expressável em config.toml.** O runtime distingue 3 estados (`RunBudget.maxCostUsd` em `harness/types.ts:478`): chave ausente → default $5, valor `undefined` → opt-out (sem cap), valor número → esse cap. TOML não tem `null`/`undefined`, então config só consegue produzir os 2 primeiros via "absent" ou um número. Pra opt-out persistente, workaround é `max_cost_usd = 999999999` (functionally no-cap); pra session-only, `/budget cost off`. Não adicionamos `-1` sentinel ou `disable_cost_cap = true` porque o caso é niche + os workarounds funcionam. |
+| `[budget]` | `max_wall_clock_ms` | int | Cap de wall-clock da sessão inteira. |
+| `[budget]` | `max_step_stall_ms` | int `≥0` | Watchdog per-step; aborta o step se o provider stream silenciar tantos ms. `0` desliga o watchdog inteiro (runtime: `stallMs <= 0` em `harness/abortable.ts:68` yields source verbatim sem timer) — útil pra providers steady-streaming de long-running steps. |
+| `[budget]` | `compaction_threshold` | float `[0,1]` | Fração do context-window onde compactação dispara. |
+| `[budget]` | `compaction_preserve_tail` | int `≥0` | Quantos turns finais ficam literais (sem compactar). 0 = compacta tudo. |
+| `[memory]` | `verify_semantic_llm` | bool | Detector S11 (post-write semantic verification). Default ON. |
+| `[memory]` | `conflict_detect_llm` | bool | Detector S13 (cross-memory conflict). Default ON. |
+| `[memory]` | `override_detect_llm` | bool | Detector S3 (threshold de override). Default ON. |
+| `[critique]` | `mode` | `off`/`on_writes`/`always` | Quando self-critique dispara. |
+| `[critique]` | `threshold` | float `[0,1]` | Severity threshold pra surface issues. |
+| `[critique]` | `max_overhead_ms` | int | Cap de latência adicional do critique pass. |
+| `[critique]` | `model` (opcional) | string | Provider id pra critique (fallback: executor). |
+| `[critique]` | `prompt_version` (opcional) | string | Pin de versão do prompt (`KNOWN_CRITIQUE_PROMPT_VERSIONS`). |
+
+Seções futuras (`[telemetry]`, …) entram pelo mesmo padrão: defaults canônicos em código, scaffold materializa valores ativos, schema reference aqui descreve significado. Schema-creep no scaffold é custo aceitável (operador vê mais linhas no arquivo); schema-creep nos defaults em código requer PR contra esta seção primeiro.
 
 ### 2.2 Composição (Unix philosophy)
 
@@ -1033,9 +1090,14 @@ tools:
 
   web_fetch:
     deny_hosts: ["localhost", "127.0.0.1", "169.254.*", "10.*"]
+    trusted_hosts: ["github.com", "raw.githubusercontent.com"]
 ```
 
 Matching é **prefix + glob**, não regex. Regex em política é pé na bola.
+
+`trusted_hosts` (additive sobre `DEFAULT_TRUSTED_HOSTS` em `src/permissions/risk-score.ts`) reduz o risk-score de fetches pra esses hosts — útil pra time que tem CDN interno, GitHub Enterprise, ou outros endpoints conhecidos-bons. NÃO é um allowlist: `deny_hosts` continua tendo precedência (host trusted que também aparece em deny ainda é negado). A lista hardcoded cobre o consensus público (`github.com`, `npmjs.com`, etc.); o per-projeto trusted_hosts é pra a hidden surface de cada repo.
+
+Patterns aceitos via `matcher.ts:matchHost` — mesma semântica de `allow_hosts` / `deny_hosts` no mesmo bloco. `*.corp.internal` silencia subdomínios; `github.com` casa exatamente. Operador escrevendo as três listas do `fetch_url` (allow/deny/trusted) lê pelas mesmas regras.
 
 Modos:
 - `strict` (default) — confirma o que é confirmável, nega o resto.
@@ -1047,6 +1109,8 @@ Hierarquia: **enterprise** (`/etc/agent/`) → **user** (`~/.config/agent/`) →
 Cada decisão vai pra tabela `approvals` (auditoria).
 
 **Bootstrap path.** A engine não inventa allow rules — sem `.agent/permissions.yaml` o projeto roda em strict default-deny e toda gated tool retorna `kind: 'deny'`. O operador escreve o arquivo manualmente OU roda `agent init` (§2.1), que gera um baseline editável: strict mode, allow whitelist conservador (`git status`, `ls`, `rg`), confirm pra ações observáveis (`git push`, `rm`, `*install`), deny pra padrões catastróficos (`rm -rf /*`, `sudo`, `curl|sh`), e protections de path/host óbvias (`.env*`, `.git/`, loopback). O REPL detecta a ausência do arquivo no boot e emite uma linha vermelha apontando pra `agent init` / `/perms` (§17).
+
+Além do `permissions.yaml`, `agent init` scaffolda no mesmo passo três outros artefatos no `.agent/`: o `.gitignore` (template em [`MEMORY.md`](./MEMORY.md) §2.5), o `config.toml` documentando o schema com todas as chaves comentadas (§2.1.1), e os 10 playbooks canônicos sob `agents/` (lista em [`PLAYBOOKS.md`](./PLAYBOOKS.md)). Cada passo é idempotente — re-rodar `init` em repo já parcialmente scaffoldado preenche só o que falta sem tocar nas edições do operador. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks`; `--force` (ou `--force=csv`) sobrescreve. Note que `.gitignore` **não** é aceito em `--force` — é operator-owned após criação (§2.5 do `MEMORY.md`).
 
 ---
 

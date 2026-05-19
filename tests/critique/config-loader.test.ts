@@ -4,8 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_MEMORY_CONFIG,
+  loadBudgetConfig,
   loadCritiqueConfig,
   loadMemoryConfig,
+  loadProvidersConfig,
   projectConfigPath,
   userConfigPath,
 } from '../../src/critique/config-loader.ts';
@@ -369,6 +371,33 @@ max_overhead_ms = "fast"
       // The warning names the actual key the operator typed, not
       // the camelCase alias — matches the operator's mental model.
       expect(result.warnings[0]).toContain('max_overhead_ms=');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('max_overhead_ms = 0 accepted (runtime opt-out for the critique watchdog)', async () => {
+    // Sibling pin to `[budget].max_step_stall_ms = 0`. The critique
+    // engine's `buildAbortableStream` arms the watchdog only when
+    // `watchdogMs > 0` (`src/critique/engine.ts:167`) — 0 disables
+    // the per-call latency cap entirely, matching the harness's
+    // `stallMs <= 0` semantic. Operator running a slow critic
+    // model legitimately needs this. Pinned so a future tightening
+    // to `min: 1` cannot silently break the documented opt-out.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+max_overhead_ms = 0
+`,
+      );
+      const reg = stubRegistry([]);
+      const result = loadCritiqueConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.maxOverheadMs).toBe(0);
+      expect(result.warnings).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -884,6 +913,447 @@ verify_semantic_llm = false
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadProvidersConfig', () => {
+  test('returns null model when no layer declared [providers]', () => {
+    const cwd = makeTempCwd();
+    try {
+      const reg = stubRegistry([]);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBeUndefined();
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('reads [providers].model from project config and validates against the registry', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[providers]
+model = "anthropic/claude-opus-4-7"
+`,
+      );
+      const reg = stubRegistry(['anthropic/claude-opus-4-7']);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBe('anthropic/claude-opus-4-7');
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('unknown model id warns and degrades to null (caller falls back to DEFAULT_MODEL)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[providers]
+model = "anthropic/typo-model"
+`,
+      );
+      const reg = stubRegistry(['anthropic/claude-opus-4-7']);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBeUndefined();
+      expect(result.warnings.length).toBe(1);
+      expect(result.warnings[0]).toContain('not a known model');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-string model warns and ignores', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[providers]
+model = 42
+`,
+      );
+      const reg = stubRegistry(['anthropic/claude-opus-4-7']);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBeUndefined();
+      expect(result.warnings[0]).toContain('must be a string');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('empty model string warns and ignores', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[providers]
+model = ""
+`,
+      );
+      const reg = stubRegistry(['anthropic/claude-opus-4-7']);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBeUndefined();
+      expect(result.warnings[0]).toContain('is empty');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('project overrides user', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-providers-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'agent', 'config.toml'),
+        '[providers]\nmodel = "anthropic/claude-haiku-4-5"\n',
+      );
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        '[providers]\nmodel = "anthropic/claude-opus-4-7"\n',
+      );
+      const reg = stubRegistry(['anthropic/claude-haiku-4-5', 'anthropic/claude-opus-4-7']);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: home } });
+      expect(result.config.model).toBe('anthropic/claude-opus-4-7');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('[providers] not a table warns and degrades', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(join(cwd, '.agent', 'config.toml'), 'providers = "oops"\n');
+      const reg = stubRegistry([]);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBeUndefined();
+      expect(result.warnings[0]).toContain('not a table');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadBudgetConfig', () => {
+  test('returns empty config when no layer declared [budget]', () => {
+    const cwd = makeTempCwd();
+    try {
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config).toEqual({});
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('reads all six [budget] keys from project config', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_steps = 50
+max_cost_usd = 0.5
+max_wall_clock_ms = 60000
+max_step_stall_ms = 30000
+compaction_threshold = 0.8
+compaction_preserve_tail = 5
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config).toEqual({
+        maxSteps: 50,
+        maxCostUsd: 0.5,
+        maxWallClockMs: 60000,
+        maxStepStallMs: 30000,
+        compactionThreshold: 0.8,
+        compactionPreserveTail: 5,
+      });
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('integer fields reject non-integer values', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_steps = 200.5
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxSteps).toBeUndefined();
+      expect(result.warnings[0]).toContain('must be an integer');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('float fields accept decimals (compaction_threshold = 0.65)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_threshold = 0.65
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionThreshold).toBe(0.65);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('compaction_threshold = 0 accepted (compact every step, lower endpoint)', () => {
+    // Endpoint pin: a future tightening to (0, 1) open interval
+    // would forbid the legitimate "always compact" sentinel — the
+    // runtime treats `usagePct >= 0` as always true.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_threshold = 0
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionThreshold).toBe(0);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('compaction_threshold = 1 accepted (effectively disable, upper endpoint)', () => {
+    // Endpoint pin: `usagePct >= 1` never fires in practice
+    // (context-window math doesn't reach exactly 100%), so 1.0 is
+    // the natural "disable compaction" sentinel.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_threshold = 1
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionThreshold).toBe(1);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('max_step_stall_ms = 0 accepted (runtime opt-out for the per-step watchdog)', () => {
+    // Runtime contract (`src/harness/abortable.ts:68`): `stallMs
+    // <= 0` disables the per-step watchdog entirely — yields the
+    // source verbatim with no timer. Operators running long
+    // steady-streaming provider calls legitimately need to opt
+    // out. The validator's min must match the runtime semantic;
+    // otherwise config can't express what the engine supports.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_step_stall_ms = 0
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxStepStallMs).toBe(0);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('max_steps = 0 still rejected (no documented disable semantic)', () => {
+    // Sibling pin: max_steps and max_wall_clock_ms keep min=1 since
+    // 0 there means "abort immediately", not "no cap". Operator who
+    // types 0 expecting "unlimited" gets a warning, not a session
+    // that aborts on turn 1.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_steps = 0
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxSteps).toBeUndefined();
+      expect(result.warnings[0]).toContain('out of range');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('out-of-range values warn and ignore (max_cost_usd = -1)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_cost_usd = -1
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxCostUsd).toBeUndefined();
+      expect(result.warnings[0]).toContain('out of range');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('out-of-range compaction_threshold = 1.5 warns', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_threshold = 1.5
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionThreshold).toBeUndefined();
+      expect(result.warnings[0]).toContain('out of range');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-number value warns (max_steps = "200")', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_steps = "200"
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxSteps).toBeUndefined();
+      expect(result.warnings[0]).toContain('must be a finite number');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('declares both snake_case and camelCase → warning, snake wins', () => {
+    // Mirror of the existing dual-key warning in [critique] /
+    // [memory] loaders. Operator who writes both flavors gets a
+    // diagnostic naming both keys; snake_case is the spec-canonical
+    // form and its value lands.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+max_steps = 100
+maxSteps = 200
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxSteps).toBe(100); // snake wins
+      expect(result.warnings.length).toBe(1);
+      expect(result.warnings[0]).toContain('declares both max_steps and maxSteps');
+      expect(result.warnings[0]).toContain('snake_case wins');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('accepts camelCase aliases (maxSteps, maxCostUsd, ...)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+maxSteps = 75
+maxCostUsd = 1.5
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.maxSteps).toBe(75);
+      expect(result.config.maxCostUsd).toBe(1.5);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('project overrides user per-key (user max_steps=300, project max_cost_usd=2)', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-budget-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(join(home, '.config', 'agent', 'config.toml'), '[budget]\nmax_steps = 300\n');
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(join(cwd, '.agent', 'config.toml'), '[budget]\nmax_cost_usd = 2\n');
+      const result = loadBudgetConfig({ cwd, env: { HOME: home } });
+      // Per-key merge: user's max_steps survives because project
+      // didn't touch it; project's max_cost_usd lands.
+      expect(result.config.maxSteps).toBe(300);
+      expect(result.config.maxCostUsd).toBe(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('[budget] not a table warns', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(join(cwd, '.agent', 'config.toml'), 'budget = 42\n');
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config).toEqual({});
+      expect(result.warnings[0]).toContain('not a table');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 });

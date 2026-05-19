@@ -855,19 +855,96 @@ describe('usage', () => {
 });
 
 describe('parseArgs — init subcommand', () => {
-  test('bare `init` produces strict-mode init descriptor', () => {
+  test('bare `init` produces strict-mode descriptor with no only/force', () => {
     const r = parseArgs(['init']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.args.init).toEqual({ force: false, mode: 'strict', playbooks: false });
+    // No `only`/`force` keys at all — the parser omits them rather
+    // than setting `undefined`, so toEqual({mode:'strict'}) matches
+    // tightly under exactOptionalPropertyTypes.
+    expect(r.args.init).toEqual({ mode: 'strict' });
     expect(r.args.prompt).toBe('');
   });
 
-  test('--force flips the force bit', () => {
+  test("bare --force parses to 'all'", () => {
     const r = parseArgs(['init', '--force']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.args.init?.force).toBe(true);
+    expect(r.args.init?.force).toBe('all');
+  });
+
+  test('--force=permissions parses to a single-element subset', () => {
+    const r = parseArgs(['init', '--force=permissions']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.force).toEqual(['permissions']);
+  });
+
+  test('--force=permissions,config parses to a two-element subset', () => {
+    const r = parseArgs(['init', '--force=permissions,config']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.force).toEqual(['permissions', 'config']);
+  });
+
+  test('--force=gitignore is rejected with a MEMORY.md pointer', () => {
+    // gitignore is operator-owned post-creation per MEMORY.md §2.5;
+    // the parser surfaces the rule so the operator does not have
+    // to discover it by trial and error.
+    const r = parseArgs(['init', '--force=gitignore']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('gitignore');
+    expect(r.message).toContain('MEMORY.md §2.5');
+  });
+
+  test('--force=unknown is rejected with the valid list', () => {
+    const r = parseArgs(['init', '--force=unknown']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('permissions, config, playbooks');
+  });
+
+  test('--force= (empty value) is rejected', () => {
+    const r = parseArgs(['init', '--force=']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--force=');
+  });
+
+  test('--only=permissions parses to a single-element subset', () => {
+    const r = parseArgs(['init', '--only=permissions']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.only).toEqual(['permissions']);
+  });
+
+  test('--only=permissions,config,playbooks parses to the listed order', () => {
+    const r = parseArgs(['init', '--only=permissions,config,playbooks']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.only).toEqual(['permissions', 'config', 'playbooks']);
+  });
+
+  test('--only accepts gitignore (it is force-ineligible, not skip-ineligible)', () => {
+    const r = parseArgs(['init', '--only=gitignore']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.only).toEqual(['gitignore']);
+  });
+
+  test('--only=unknown is rejected with the valid list', () => {
+    const r = parseArgs(['init', '--only=unknown']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('permissions, gitignore, config, playbooks');
+  });
+
+  test('--only= (empty value) is rejected', () => {
+    const r = parseArgs(['init', '--only=']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--only=');
   });
 
   test('--mode acceptEdits is accepted', () => {
@@ -891,36 +968,23 @@ describe('parseArgs — init subcommand', () => {
     expect(r.message).toContain('--mode requires a value');
   });
 
+  test('--playbooks is explicitly rejected with --only=playbooks pointer', () => {
+    // Legacy flag removed; the parser surfaces the new shape so an
+    // operator with muscle memory discovers `--only=playbooks` on
+    // the first invocation rather than ending up with a silently
+    // ignored alias.
+    const r = parseArgs(['init', '--playbooks']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--playbooks was removed');
+    expect(r.message).toContain('--only=playbooks');
+  });
+
   test('unknown init flag is rejected with init scope', () => {
     const r = parseArgs(['init', '--bogus']);
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.message).toContain('init: unknown argument');
-  });
-
-  test('--playbooks switches the init mode flag', () => {
-    const r = parseArgs(['init', '--playbooks']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.init).toEqual({ force: false, mode: 'strict', playbooks: true });
-  });
-
-  test('--playbooks composes with --force', () => {
-    const r = parseArgs(['init', '--playbooks', '--force']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.init).toEqual({ force: true, mode: 'strict', playbooks: true });
-  });
-
-  test('--playbooks ignores the irrelevant --mode flag without erroring', () => {
-    // Mode is a permissions concept; on the playbooks path the
-    // handler does not consult it. Erroring on the combination
-    // would be operator-hostile (`agent init --mode strict
-    // --playbooks` is plausible muscle memory).
-    const r = parseArgs(['init', '--mode', 'acceptEdits', '--playbooks']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.init).toEqual({ force: false, mode: 'acceptEdits', playbooks: true });
   });
 
   test('init only triggers as the FIRST positional', () => {
@@ -939,6 +1003,33 @@ describe('parseArgs — init subcommand', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.args.help).toBe(true);
+  });
+
+  test('parser accepts every step that the orchestrator runs', async () => {
+    // Drift guard: `VALID_INIT_STEPS` in args.ts is duplicated from
+    // `DEFAULT_STEPS` in init.ts (kept separate to preserve the
+    // parser's side-effect-free posture on the --help path —
+    // init.ts pulls in fs + the canonical-playbook bundle). If a
+    // future step lands in init.ts but the parser isn't updated,
+    // this test fails before the operator sees "unknown step".
+    const { DEFAULT_STEPS } = await import('../../src/cli/init.ts');
+    for (const step of DEFAULT_STEPS) {
+      const r = parseArgs(['init', `--only=${step}`]);
+      expect(r.ok).toBe(true);
+      if (!r.ok) continue;
+      expect(r.args.init?.only).toEqual([step]);
+    }
+  });
+
+  test('--only deduplicates repeated entries', () => {
+    // `--only=permissions,permissions` should NOT run the step
+    // twice. First occurrence wins so a hand-typed CSV preserves
+    // operator-intended order. Pinned because the dedupe is a
+    // 3-line silent behavior change in `parseCsvSubset`.
+    const r = parseArgs(['init', '--only=permissions,config,permissions']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.only).toEqual(['permissions', 'config']);
   });
 });
 

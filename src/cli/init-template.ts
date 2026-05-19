@@ -177,4 +177,12 @@ tools:
       - "metadata.google.internal"
       - "metadata.goog"
       - "fd00:ec2::254"
+
+    # Additive over the hardcoded DEFAULT_TRUSTED_HOSTS (github.com
+    # + npm/yarn/pypi/crates registries). Hosts listed here do NOT
+    # trigger the risk-score's untrusted_egress feature for this
+    # project — useful for internal CDNs, GitHub Enterprise, or
+    # other endpoints outside the public default set. NOT an
+    # allowlist: deny_hosts above still wins.
+    trusted_hosts: []
 `;

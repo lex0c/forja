@@ -73,8 +73,10 @@ export const formatFetch = (p: FetchPolicy): string[] => {
   const out: string[] = [];
   const allow = formatRules('allow_hosts', p.allow_hosts);
   const deny = formatRules('deny_hosts', p.deny_hosts);
+  const trusted = formatRules('trusted_hosts', p.trusted_hosts);
   if (allow !== null) out.push(allow);
   if (deny !== null) out.push(deny);
+  if (trusted !== null) out.push(trusted);
   return out;
 };
 

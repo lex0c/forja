@@ -41,6 +41,7 @@ import {
 } from './hierarchy.ts';
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
+import { mergeTrustedHosts } from './risk-score.ts';
 import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
 import { type SealStore, factoryForSealMode } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
@@ -166,6 +167,16 @@ export interface PreflightInput {
 }
 
 // Validate install_id + policy WITHOUT opening any SQLite handle.
+// `mergeTrustedHosts` moved to `risk-score.ts` (where
+// `DEFAULT_TRUSTED_HOSTS` lives) so engine.ts and policy-watcher.ts
+// can also import it for the hot-reload path without crossing
+// layering boundaries (engine.ts is the lower-level module;
+// importing from bootstrap-engine here would invert the dependency
+// direction). Re-exported here for backward-compat with existing
+// import sites (`cli/subagent-child.ts`, the bootstrap-engine.test
+// pins for the merge invariant).
+export { mergeTrustedHosts } from './risk-score.ts';
+
 // Throws on the two boot-blocking failures (install_id discovery,
 // malformed policy) so the CLI driver can fail the boot before any
 // DB file is created. Production bootstrap calls this, then opens
@@ -512,6 +523,16 @@ export const bootstrapPermissionEngine = async (
   // lenient, the bootstrap transitions to `degraded` instead so
   // `check()` keeps running but every would-be allow becomes confirm.
   const sandbox = input.sandbox;
+  // Operator-augmented trusted-hosts list. Additive over
+  // DEFAULT_TRUSTED_HOSTS (`risk-score.ts`) — policy entries do
+  // NOT replace the hardcoded public-registry set; they extend it
+  // with per-project internal hosts (CDN, GitHub Enterprise, etc.).
+  // Empty/absent leaves the engine at the default. See
+  // `mergeTrustedHosts` for the dedup-set-union shape (exported
+  // so tests can pin the structural invariant directly — a
+  // behavioral test alone can't distinguish "extra duplicates
+  // were silently accepted" from "list is correct").
+  const trustedHosts = mergeTrustedHosts(resolveResult.policy.tools.fetch_url?.trusted_hosts ?? []);
   const engine = createPermissionEngine(resolveResult.policy, {
     cwd: input.cwd,
     home,
@@ -519,6 +540,7 @@ export const bootstrapPermissionEngine = async (
     audit: sink,
     sessionId: input.sessionId,
     stateController: controller,
+    trustedHosts,
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
     ...(input.now !== undefined ? { now: input.now } : {}),

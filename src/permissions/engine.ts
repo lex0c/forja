@@ -290,7 +290,22 @@ export interface PermissionEngine {
   // change and forwards the fresh `SectionProvenance` here. Callers
   // without dynamic provenance (tests / one-shot uses) can omit the
   // argument and the engine keeps the construction-time provenance.
-  reloadPolicy(newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult;
+  //
+  // The optional `newTrustedHosts` argument lets the caller swap the
+  // risk-score `trustedHosts` list alongside the policy. Without
+  // this, an operator who edits `fetch_url.trusted_hosts` to add an
+  // internal CDN would see the policy hash change but the risk-
+  // scorer would keep using the construction-time list — same host
+  // continues to trigger `untrusted_egress` until process restart.
+  // The watcher computes `mergeTrustedHosts(newPolicy.tools.fetch_url
+  // ?.trusted_hosts ?? [])` and forwards. Omitting the argument
+  // preserves the construction-time value (test seam — callers that
+  // never reload don't need to know about this plumbing).
+  reloadPolicy(
+    newPolicy: Policy,
+    newProvenance?: SectionProvenance,
+    newTrustedHosts?: readonly string[],
+  ): ReloadPolicyResult;
   // Current state. Bootstrap walks the engine through
   // `init → loading-policy → validating-chain → ready` before
   // exposing it to the harness; runtime can transition between
@@ -1253,7 +1268,13 @@ export const createPermissionEngine = (
   // by health-watcher slices) take effect immediately.
   const stateController =
     options.stateController ?? createStateController({ initial: options.initialState ?? 'ready' });
-  const trustedHosts = options.trustedHosts ?? DEFAULT_TRUSTED_HOSTS;
+  // Mutable so reloadPolicy can swap it alongside policy / hash /
+  // mode. Pre-fix this was a const, which meant a hot-reload that
+  // added or removed `fetch_url.trusted_hosts` entries left the
+  // risk-scorer using the construction-time list — operator edited
+  // YAML, policy hash advanced, but `untrusted_egress` kept firing
+  // (or stopped firing) against the OLD set until process restart.
+  let trustedHosts = options.trustedHosts ?? DEFAULT_TRUSTED_HOSTS;
   const isMcpTool = options.isMcpTool ?? defaultIsMcpTool;
   // Normalize `recentToolErrors` to a getter. The number form is
   // wrapped in a closure capturing the literal value (preserves
@@ -2113,7 +2134,11 @@ export const createPermissionEngine = (
     // present) and either commits the swap or returns a diagnostic.
     // Single-threaded JS means in-flight check() calls run to
     // completion before this fires.
-    reloadPolicy: (newPolicy: Policy, newProvenance?: SectionProvenance): ReloadPolicyResult => {
+    reloadPolicy: (
+      newPolicy: Policy,
+      newProvenance?: SectionProvenance,
+      newTrustedHosts?: readonly string[],
+    ): ReloadPolicyResult => {
       // Refuse the reload when the engine is in `refusing` state.
       // Otherwise the policy-watcher would keep firing reloads on
       // YAML edits after a sealing failure / chain break /
@@ -2160,6 +2185,23 @@ export const createPermissionEngine = (
       // preserves the construction-time provenance — callers that
       // don't know about layered policy attribution stay correct.
       if (newProvenance !== undefined) provenance = newProvenance;
+      // Swap trustedHosts when the caller forwards a fresh list.
+      // The watcher (`policy-watcher.ts`) computes
+      // `mergeTrustedHosts(newPolicy.tools.fetch_url?.trusted_hosts
+      // ?? [])` and passes here. Omitting preserves the
+      // construction-time value (test-only callers that don't care
+      // about hot-reload semantics aren't forced to plumb it).
+      //
+      // Polarity note: `[]` IS swap-eligible (caller's explicit
+      // lockdown intent — "no hosts trusted, every egress flagged").
+      // Only `undefined` preserves construction-time. So a test
+      // caller passing `trustedHosts: []` at construction AND then
+      // calling `reloadPolicy(policy)` (2 args) keeps the lockdown;
+      // calling `reloadPolicy(policy, undefined, [])` (3 args, empty
+      // array) also keeps it. The production watcher never passes
+      // `[]` — `mergeTrustedHosts` returns `DEFAULT_TRUSTED_HOSTS`
+      // (non-empty) when the policy declares no trusted_hosts.
+      if (newTrustedHosts !== undefined) trustedHosts = newTrustedHosts;
       return { ok: true, oldHash, newHash };
     },
   };

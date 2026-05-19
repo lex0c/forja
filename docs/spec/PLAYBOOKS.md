@@ -1846,7 +1846,23 @@ Métrica anti-contrarian-theater: **`implausible_alternative_rate`** = `alternat
 
 ---
 
-## 12. Como adicionar um playbook novo
+## 12. Distribuição inicial via `agent init`
+
+Os 10 playbooks canônicos listados em §2-§11 ficam empacotados no binário e são distribuídos via `agent init` (`AGENTIC_CLI.md §2.1`). Em `init` numa árvore sem `.agent/agents/`, cada playbook é copiado pra lá em formato `.md` — o mesmo formato que o loader de subagents lê depois. O scaffold é **idempotente por arquivo**: passos seguintes pulam playbooks já existentes (operador pode ter editado um), e `--force` (ou `--force=playbooks`) sobrescreve cada `.md` mesmo que tenha mudado.
+
+Granularidade:
+
+- `agent init` — scaffolda os 4 artefatos do bootstrap (`permissions.yaml`, `.gitignore`, `config.toml`, playbooks) numa só invocação.
+- `agent init --only=playbooks` — re-copia só os playbooks (ex: após `git pull` que trouxe versão nova do binário, ou após apagar `.agent/agents/` manualmente).
+- `agent init --force=playbooks` — sobrescreve os 10 mesmo que o operador tenha editado. Use quando quer descartar customizações e voltar ao baseline canônico.
+
+**Customizações continuam disjuntas do scaffold.** Playbooks per-developer ficam em `~/.config/agent/playbooks/`; playbooks per-projeto customizados ficam em `.agent/agents/` mas com nomes que não colidem com os 10 canônicos (o scaffold só toca arquivos cujo `filename` aparece em `src/cli/init-playbooks/index.ts`). Se o operador renomear um canônico (`code-review.md` → `code-review-strict.md`) o original re-aparece no próximo `init` — sintoma esperado; o scaffold não rastreia renames.
+
+**Distribuição vs. discovery.** A discovery de playbook (system prompt injetado, listagem via `/`) lê de `~/.config/agent/playbooks/` + `.agent/agents/` independente de quem escreveu — `agent init` é só o mecanismo que coloca os 10 canônicos no diretório certo na primeira vez. Operador que prefere bootstrap manual pode pular o `--only=playbooks` e copiar à mão.
+
+---
+
+## 13. Como adicionar um playbook novo
 
 1. Criar `~/.config/agent/playbooks/<name>.md` com frontmatter completo.
 2. Definir output schema com `summary` + `assumptions` + `not_checked` (mínimo).
@@ -1860,7 +1876,7 @@ Sem (5)-(6), o playbook regride silenciosamente quando o prompt do system mudar.
 
 ---
 
-## 13. Anti-patterns comuns (não cometa)
+## 14. Anti-patterns comuns (não cometa)
 
 | Anti-pattern | Por que é ruim |
 |---|---|
@@ -1876,7 +1892,7 @@ Sem (5)-(6), o playbook regride silenciosamente quando o prompt do system mudar.
 
 ---
 
-## 14. Playbooks futuros (candidatos)
+## 15. Playbooks futuros (candidatos)
 
 Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 10** — acima do teto. Decisão deliberada; gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar (deprecar `pair-coding`/`architect` é trivial — não existem; deprecar um dos 10 ativos exige PR de remoção).
 
@@ -1896,7 +1912,7 @@ Princípio: cada playbook novo só entra se **eval mostra que modo normal falha*
 
 ---
 
-## 15. Insight final
+## 16. Insight final
 
 Playbook bem feito não ensina o modelo a pensar — **restringe** o que ele pode fazer e **estrutura** o que ele deve devolver. O resto é o modelo já fazendo o trabalho dele.
 

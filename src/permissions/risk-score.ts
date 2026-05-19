@@ -21,7 +21,7 @@
 
 import type { Capability } from './capabilities.ts';
 import type { Confidence } from './grant-types.ts';
-import { containsShellInjection } from './matcher.ts';
+import { containsShellInjection, matchHost } from './matcher.ts';
 import type { EngineState } from './state-machine.ts';
 
 // Same domain as `ApprovalLogConfidence` in
@@ -128,9 +128,23 @@ const isUntrustedEgressHost = (host: string | null, trusted: readonly string[]):
   // Wildcard egress is counted under `wildcard_scope` instead of
   // `untrusted_egress` — same shape, different penalty.
   if (host === '*') return false;
-  // Plain string match; trust list is small (under 20 entries
-  // typical) so linear scan is fine.
-  return !trusted.includes(host);
+  // Use the same host matcher `allow_hosts` / `deny_hosts` use
+  // (`matcher.ts:matchHost`) so `trusted_hosts: ["*.corp.internal"]`
+  // silences subdomains consistently with the rest of the
+  // fetch_url policy schema. Pre-fix this was `trusted.includes(host)`
+  // — exact string compare — and operator-declared patterns
+  // silently failed to take effect, flagging
+  // `foo.corp.internal` as untrusted even though the policy
+  // explicitly trusted `*.corp.internal`.
+  //
+  // Trust list is small (typical < 20 entries); the regex cache
+  // inside matchHost compiles each pattern once and reuses on
+  // subsequent calls, so per-check cost is O(n) regex-test which
+  // is well within risk-score's existing budget.
+  for (const pattern of trusted) {
+    if (matchHost(pattern, host)) return false;
+  }
+  return true;
 };
 
 // Threshold at which the `recent_errors` feature fires: three
@@ -275,6 +289,24 @@ export const DEFAULT_TRUSTED_HOSTS: readonly string[] = [
   'pypi.org',
   'crates.io',
 ];
+
+// Merge policy-supplied trusted hosts with the hardcoded default
+// list. Additive set-union: policy entries that duplicate a default
+// host produce one entry, not two (the engine iterates this list
+// per fetch — keep it tight). When the policy supplies nothing,
+// return the default array unchanged so callers can use it as a
+// sentinel (e.g., engine.ts compares against DEFAULT_TRUSTED_HOSTS
+// by reference equality in some paths).
+//
+// Lives here in risk-score.ts (alongside DEFAULT_TRUSTED_HOSTS) so
+// every consumer that needs the merge — bootstrap-engine (initial
+// construction), subagent-child (parent's policy snapshot), engine
+// (hot reload via reloadPolicy), policy-watcher (file-change
+// reload) — can import without crossing layering boundaries.
+export const mergeTrustedHosts = (policyTrustedHosts: readonly string[]): readonly string[] => {
+  if (policyTrustedHosts.length === 0) return DEFAULT_TRUSTED_HOSTS;
+  return Array.from(new Set([...DEFAULT_TRUSTED_HOSTS, ...policyTrustedHosts]));
+};
 
 // Default MCP-tool detector. Tools surface as
 // `mcp__<server>__<tool>` from the MCP loader. The detector is

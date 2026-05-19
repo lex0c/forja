@@ -200,8 +200,8 @@ const validateFetchPolicy = (raw: unknown, toolName: string): void => {
     throw new Error(`policy: ${toolName} must be an object`);
   }
   const r = raw as Record<string, unknown>;
-  rejectUnknownKeys(r, ['allow_hosts', 'deny_hosts', 'locked'], toolName);
-  for (const key of ['allow_hosts', 'deny_hosts']) {
+  rejectUnknownKeys(r, ['allow_hosts', 'deny_hosts', 'trusted_hosts', 'locked'], toolName);
+  for (const key of ['allow_hosts', 'deny_hosts', 'trusted_hosts']) {
     if (r[key] !== undefined && !isStringArray(r[key])) {
       throw new Error(`policy: ${toolName}.${key} must be a string array`);
     }

@@ -1,6 +1,3 @@
-import { homedir } from 'node:os';
-import { isAbsolute, join, win32 as winPath } from 'node:path';
-
 // Hook config file discovery (spec AGENTIC_CLI.md §10.2).
 //
 // Three layers, looked up at boot in execution-priority order
@@ -9,8 +6,10 @@ import { isAbsolute, join, win32 as winPath } from 'node:path';
 //      `%PROGRAMDATA%\agent\hooks.toml` (Windows). Locked rules
 //      live here.
 //   2. user:       `~/.config/agent/hooks.toml` per XDG_CONFIG_HOME
-//      convention. Mirrors `userScopeRoot` in
-//      `src/memory/paths.ts`.
+//      convention. Now ALSO honors Windows APPDATA / USERPROFILE
+//      via the shared agent-paths helper — pre-consolidation this
+//      file only handled POSIX, leaving Windows users without
+//      XDG_CONFIG_HOME silently missing the user layer.
 //   3. project:    `<repo>/.agent/hooks.toml`. Tracked by git
 //      (operator decides what to commit; locked-shared semantics
 //      land if/when team-shared trust storage matures).
@@ -23,7 +22,10 @@ import { isAbsolute, join, win32 as winPath } from 'node:path';
 // (`isAbsolute`) before use. A user setting
 // `XDG_CONFIG_HOME=../etc` would otherwise let a project file
 // shadow the enterprise layer. The same defense lives in
-// `memory/paths.ts:userScopeRoot`.
+// `memory/paths.ts:userScopeRoot`. Plumbing centralized in
+// `src/config/agent-paths.ts` post-consolidation.
+
+import { enterpriseAgentPath, projectAgentPath, userAgentPath } from '../config/agent-paths.ts';
 
 export interface HookConfigPaths {
   enterprise: string | null;
@@ -39,52 +41,22 @@ export interface HookConfigPaths {
 export const enterpriseHooksPath = (
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-): string | null => {
-  if (platform === 'win32') {
-    const programData = env.PROGRAMDATA;
-    // Use win32 path semantics for the absoluteness check —
-    // when the test runtime is POSIX, `path.isAbsolute` rejects
-    // `C:\\ProgramData` (no `/` prefix) but it IS a valid
-    // absolute Windows path. The platform arg already gates
-    // the branch so reaching here means we WANT win32 rules.
-    if (programData === undefined || programData.length === 0 || !winPath.isAbsolute(programData)) {
-      return null;
-    }
-    // Same reason for `winPath.join` — keeps backslash
-    // separators when building on a POSIX test runtime that
-    // simulates Windows paths.
-    return winPath.join(programData, 'agent', 'hooks.toml');
-  }
-  return '/etc/agent/hooks.toml';
-};
+): string | null => enterpriseAgentPath('hooks.toml', env, platform);
 
-// User-layer path. Mirrors `memory/paths.ts:userScopeRoot` —
-// honor `XDG_CONFIG_HOME` when set + absolute, fall back to
-// `$HOME/.config`. Spec uses `~/.config/agent/hooks.toml`
-// literally; this implementation respects XDG so dotfile
-// managers / portable installs work.
-//
-// The `env` arg is the canonical source for HOME — using
-// `os.homedir()` would ignore the parameter (it reads
-// process.env at call time, not the passed-in dict), breaking
-// tests that inject a fixture env. Falls back to homedir() only
-// when env.HOME is missing AND XDG is missing (which on a
-// real machine means we're on a stripped-down environment with
-// no usual home; null is the right marker).
-export const userHooksPath = (env: NodeJS.ProcessEnv = process.env): string | null => {
-  const xdg = env.XDG_CONFIG_HOME;
-  if (xdg !== undefined && xdg.length > 0 && isAbsolute(xdg)) {
-    return join(xdg, 'agent', 'hooks.toml');
-  }
-  const home = env.HOME ?? homedir();
-  if (home.length === 0 || !isAbsolute(home)) return null;
-  return join(home, '.config', 'agent', 'hooks.toml');
-};
+// User-layer path. Honors XDG_CONFIG_HOME first, then
+// platform-specific roots (Windows APPDATA / USERPROFILE; POSIX
+// HOME/.config). Returns null on a stripped-down env where no
+// absolute root can be derived — caller treats null as "user
+// layer unavailable" rather than producing a relative path that
+// would resolve against cwd (path-traversal defense documented
+// in `agent-paths.ts:agentConfigDir`).
+export const userHooksPath = (env: NodeJS.ProcessEnv = process.env): string | null =>
+  userAgentPath('hooks.toml', env);
 
 // Project-layer path. Always derivable from the repo root; the
 // loader treats absent file as empty layer.
 export const projectHooksPath = (repoRoot: string): string =>
-  join(repoRoot, '.agent', 'hooks.toml');
+  projectAgentPath(repoRoot, 'hooks.toml');
 
 // Resolve all three layer paths for a session. `repoRoot` is the
 // caller's responsibility to compute (typically via

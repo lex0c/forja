@@ -8,13 +8,28 @@ describe('parsePolicy', () => {
       tools: {
         bash: { allow: ['git status'], confirm: ['git push *'], deny: ['rm -rf *'] },
         write_file: { allow_paths: ['src/**'], deny_paths: ['**/.env*'] },
-        fetch_url: { allow_hosts: ['*.public.com'] },
+        fetch_url: {
+          allow_hosts: ['*.public.com'],
+          trusted_hosts: ['internal.cdn.example.com'],
+        },
       },
     });
     expect(p.defaults.mode).toBe('acceptEdits');
     expect(p.tools.bash?.allow).toEqual(['git status']);
     expect(p.tools.write_file?.deny_paths).toEqual(['**/.env*']);
     expect(p.tools.fetch_url?.allow_hosts).toEqual(['*.public.com']);
+    expect(p.tools.fetch_url?.trusted_hosts).toEqual(['internal.cdn.example.com']);
+  });
+
+  test('fetch_url.trusted_hosts must be a string array', () => {
+    // Mirror of the existing allow_hosts / deny_hosts validator.
+    // A non-array value is operator typo (e.g. forgot the YAML
+    // dash) and should fail load, not silently degrade.
+    expect(() =>
+      parsePolicy({
+        tools: { fetch_url: { trusted_hosts: 'github.com' as unknown as string[] } },
+      }),
+    ).toThrow(/trusted_hosts must be a string array/);
   });
 
   test('preserves mode-omitted as undefined (engine/resolver applies the default downstream)', () => {
