@@ -35,7 +35,8 @@ const main = async (): Promise<number> => {
     args.welcome === true ||
     args.doctor !== undefined ||
     args.sandbox !== undefined ||
-    args.purge !== undefined;
+    args.purge !== undefined ||
+    args.gc !== undefined;
   if (!inSetupFlow) {
     const { isFirstBoot } = await import('../permissions/install_id.ts');
     if (isFirstBoot()) {
@@ -82,6 +83,22 @@ const main = async (): Promise<number> => {
       force: args.purge.force,
       json: args.purge.json,
       noAudit: args.purge.noAudit,
+      out: (s) => process.stdout.write(s),
+      err: (s) => process.stderr.write(s),
+    });
+  }
+
+  // `agent gc [--force] [--json] [--table=X]` — §2.1.3 retention
+  // sweep age-based on the global DB. Phase 1 covers 4 tables.
+  // Lazy-import shape mirrors purge: keeps help/version/etc.
+  // immune to storage / audit-config dependency failures.
+  if (args.gc !== undefined) {
+    const { runGcCli } = await import('./gc.ts');
+    return runGcCli({
+      cwd: process.cwd(),
+      force: args.gc.force,
+      json: args.gc.json,
+      tables: args.gc.tables,
       out: (s) => process.stdout.write(s),
       err: (s) => process.stderr.write(s),
     });
@@ -182,7 +199,10 @@ const main = async (): Promise<number> => {
     // `agent purge` (§2.1.2) — operator-fired FS reset. Lifecycle
     // mode: no prompt, no provider, no REPL. Same exemption shape
     // as init/doctor/sandbox/permission.
-    args.purge !== undefined;
+    args.purge !== undefined ||
+    // `agent gc` (§2.1.3) — retention sweep. Lifecycle mode; no
+    // prompt, no provider, no REPL.
+    args.gc !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

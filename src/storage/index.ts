@@ -10,7 +10,7 @@ export { StorageJsonError } from './json-safe.ts';
 
 export { defaultDataDir, defaultDbPath } from './paths.ts';
 
-export { migrate } from './migrate.ts';
+export { countPendingMigrations, migrate } from './migrate.ts';
 export type { MigrateResult } from './migrate.ts';
 export type { Migration } from './migrations/index.ts';
 export { MIGRATIONS } from './migrations/index.ts';

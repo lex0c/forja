@@ -33,6 +33,35 @@ export interface MigrateResult {
   skipped: string[];
 }
 
+// Read-only check: how many registered migrations have NOT been
+// applied to this DB? Used by code paths that want to know about
+// pending migrations WITHOUT applying them (e.g., `agent gc`
+// dry-run, which must not mutate schema).
+//
+// Returns the count of migrations whose `id` is missing from
+// `_migrations`. Does NOT detect hash mismatches on already-applied
+// migrations — that's the integrity check that lives inside
+// `migrate` itself and only runs when the operator opts in. For
+// dry-run we accept the trade-off: hash drift surfaces on the next
+// real `migrate` call (or any other command that calls migrate
+// during bootstrap).
+export const countPendingMigrations = (
+  db: DB,
+  migrations: readonly Migration[] = MIGRATIONS,
+): number => {
+  const tblExists = db
+    .query<{ n: number }, []>(
+      "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = '_migrations'",
+    )
+    .get() as { n: number } | null;
+  if (tblExists === null || tblExists.n === 0) return migrations.length;
+  const appliedIds = (db.query('SELECT id FROM _migrations').all() as Array<{ id: number }>).map(
+    (r) => r.id,
+  );
+  const appliedSet = new Set(appliedIds);
+  return migrations.filter((m) => !appliedSet.has(m.id)).length;
+};
+
 export const migrate = (db: DB, migrations: readonly Migration[] = MIGRATIONS): MigrateResult => {
   ensureMigrationsTable(db);
   const appliedRows = db

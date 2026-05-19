@@ -210,6 +210,7 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
 | **Init** | `agent init [--force[=csv]] [--mode strict\|acceptEdits] [--only=csv]` | scaffolda o bundle inicial em `.agent/` — `permissions.yaml`, `.gitignore`, `config.toml`, e os 10 playbooks canônicos sob `agents/`. Cada passo é idempotente (skip-if-exists); `--force` (bare = `all`; `--force=csv` = subset entre `permissions`, `config`, `playbooks`) sobrescreve. `--only=csv` restringe o scaffold a um subconjunto entre `permissions`, `gitignore`, `config`, `playbooks` (default: todos). Sem este passo o operador roda em strict default-deny (§8). Schema do `config.toml` scaffoldado em §2.1.1. |
 | **Purge** | `agent purge [--force] [--json] [--no-audit]` | reset filesystem-only do projeto inicializado: apaga **todo o conteúdo de `<repoRoot>/.agent/`** (configs + memory + bg logs + playbooks operator-edited). Banco global (`sessions.db`, `~/.config/agent/**`) **nunca tocado** — audit chain, sessions e memory_events para este `cwd` permanecem queryáveis (`agent --list-sessions --project <cwd>`). Sem `--force` é dry-run: imprime escopo + comando literal pra executar. Marker obrigatório: pelo menos 1 dos 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`) presente em `.agent/`. Symlinks recusados (não seguidos). Detalhe completo em §2.1.2. |
+| **Gc** | `agent gc [--force] [--json] [--table=X]` | retention sweep age-based no DB global (`sessions.db`). Apaga rows mais antigas que `[audit.retention]` (`AUDIT.md §1.2`) tabela por tabela. Sem `--force` é dry-run: imprime contagens "would delete". `--table=X` restringe a uma tabela; repetível. **Phase 1** cobre só tabelas low-sensitivity sem chain integrity (`recap_cache`, `retrieval_trace`, `context_pins`, `bg_processes`); audit-cascade tables e `approvals_log` ficam em fases seguintes. Cross-project por design (age-based, não cwd-based). Detalhe completo em §2.1.3. |
 
 #### 2.1.1 `config.toml` — scaffold com valores ativos + schema reference
 
@@ -368,6 +369,93 @@ Retention: 365d (par com `approvals_log`); sem hash chain (purge é evento opera
 - **Backup automático antes do purge.** Dry-run já dá ao operador chance de revisar. Adicionar `tar.gz` numa temp dir cria nova superfície (onde mora? quem limpa?) sem ganho proporcional.
 - **Slash `/purge`.** Verbo é setup-adjacent (mutuamente exclusivo com session ativa — purga o bootstrap que a session lê). Mesmo posture de `init`, `doctor`, `welcome`.
 - **`agent purge log` reader.** Repo expõe `listPurgeEventsByCwd` para um futuro slice; verbo não ships hoje (sem consumidor concreto pedindo).
+
+#### 2.1.3 `agent gc` — retention sweep age-based
+
+`agent gc` é o verbo operator-facing que materializa o contrato declarado em `AUDIT.md §1.2`: cada tabela append-only tem um TTL (`[audit.retention]` em `config.toml`), e rows que ultrapassam o TTL são apagadas. Cron-friendly (`agent gc --force --json` lê limpo em log parser); composeable com `Stop` hook (operacional, Phase 5).
+
+**Cross-project por design.** Diferente do `agent purge` (per-cwd), o GC é **age-based**: opera no DB global inteiro, todas as projects, todas as sessions. O critério é "row mais velha que retention", não "row deste projeto". Não há flag `--project` — quem precisa de filtro por projeto usa a peça separada (vacuum-per-project, fora do roadmap atual).
+
+**Dois modos (espelho de `agent purge`):**
+
+`agent gc` (sem `--force`) é **dry-run**: imprime, por tabela, "would delete N rows older than YYYY-MM-DD HH:MM". Zero mutação no DB. Operator confirma o impacto antes de rodar de fato.
+
+`agent gc --force` executa o sweep. Por tabela: conta antes, deleta, retorna `(beforeCount, deletedCount)`. Não há rotação de chain nem backup automático — todas as tabelas cobertas no Phase 1 são chain-free (audit-cascade tables e `approvals_log` ficam para fases futuras).
+
+**Flags:**
+
+- `--force` — executa (default: dry-run).
+- `--json` — saída NDJSON em ambos os modos (uma linha).
+- `--table=X` — restringe a uma tabela; repetível (`--table=recap_cache --table=bg_processes`). Sem o flag, todas as tabelas Phase 1 são processadas.
+
+**Phase 1 — tabelas cobertas (4):**
+
+| Tabela | Coluna age | TTL default | Notas |
+|---|---|---|---|
+| `recap_cache` | `expires_at` (TTL absoluto, populado no INSERT) | 1h (per-row, já no INSERT) | Sweep apaga `expires_at < now()`. Read path já evicta on miss; sweep é backstop. |
+| `retrieval_trace` | `created_at` | 90d | Cascade FK com `sessions`; sweep é cold-path quando session permanece. |
+| `context_pins` | `created_at` | 90d | Per-pin `expires_at` já curto-circuita no read; sweep cobre rows pré-cascade + retention. |
+| `bg_processes` | `spawned_at` | 30d | **AND `status != 'running'`** — bg processes ativos NUNCA apagados independente da idade. |
+
+**Tabelas fora do Phase 1 (deferidas):**
+
+- **Phase 2 (audit-cascade tables, FK CASCADE com `sessions`):** `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`. Cada uma tem semantic edge case (`outcome_signals.ttl_expires_at` per-row per-`signal_kind`; `failure_events` tem chain hash per-session). Slice dedicado.
+- **Phase 3 (hash-chained):** `approvals_log`. Age-based DELETE quebra `permission verify`. Requer wire de `chain-rotation` (migration 035 + verb `agent permission rotate-chain`) num trigger age-based: rotaciona segmento arquivado, depois apaga. Slice dedicado.
+- **Phase 4 (sessions + cascade):** `sessions`. Quando uma session é gc'd, FK CASCADE drop ~12 tabelas dependentes. Blast radius maior; revisão dedicada.
+- **Phase 5 — flags operacionais:** `--reclaim-space` (roda SQLite `VACUUM` pós-delete pra liberar disco; lock global), integração com `Stop` hook (cron-via-session-end).
+
+**Output do dry-run (human):**
+
+```
+forja gc — DRY RUN (nothing will be modified)
+
+Config source: <path>/config.toml (or "defaults" if no override)
+
+Tables (Phase 1):
+  recap_cache         512 rows total   384 would delete (TTL: 1h via expires_at)
+  retrieval_trace   12450 rows total  9821 would delete (older than 90d, cutoff 2026-02-18)
+  context_pins        128 rows total    47 would delete (older than 90d, cutoff 2026-02-18)
+  bg_processes        233 rows total   189 would delete (older than 30d, cutoff 2026-04-19; 3 protected as running)
+
+To execute:
+  agent gc --force
+```
+
+**`--json` shape:**
+
+```json
+{"mode":"dry-run","config":{"recap_cache_ttl_ms":3600000,"retrieval_trace_days":90,...},"tables":[{"table":"recap_cache","beforeCount":512,"wouldDeleteCount":384,"cutoffMs":...},...],"command":"agent gc --force"}
+```
+
+E em force:
+
+```json
+{"mode":"force","tables":[{"table":"recap_cache","beforeCount":512,"deletedCount":384,"cutoffMs":...},...]}
+```
+
+**Config layering** (mirrors critique/budget):
+
+- User: `~/.config/agent/config.toml` `[audit.retention]`
+- Project: `<cwd>/.agent/config.toml` `[audit.retention]`
+- Project overrides user (per-key); ausência de chave herda do default canônico (`AUDIT.md §1.2`).
+
+**Defaults (DEFAULT_RETENTION; replicate AUDIT §1.2):**
+
+```toml
+[audit.retention]
+recap_cache    = "1h"     # TTL absoluto via expires_at
+retrieval_trace = 90      # dias
+context_pins    = 90      # dias
+bg_processes    = 30      # dias
+# Phase 2/3/4 tables aceitas no schema mas ignoradas pelo executor Phase 1.
+```
+
+**O que NÃO faz** (cross-ref pra evitar mal-entendido):
+
+- **Não toca audit chain.** `approvals_log`, `purge_events`, `prompt_versions` (forever) ficam intactos. Phase 3 ou futuro slice cuidam.
+- **Não é per-project.** Operator querendo "limpar dados do projeto X" usa `agent purge` (FS reset; DB rows ficam) ou aguarda vacuum-per-project (não no roadmap).
+- **Não libera disco do arquivo.** DELETE marca rows como livres mas SQLite só recompacta o arquivo via `VACUUM`. Phase 5 adiciona `--reclaim-space`.
+- **Não é privacy purge (GDPR-style).** Compliance purge é flow separado em `SECURITY_GUIDELINE.md`. GC é hygiene operacional, não prova de irrecuperabilidade.
 
 ### 2.2 Composição (Unix philosophy)
 

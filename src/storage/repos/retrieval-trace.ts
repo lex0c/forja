@@ -337,3 +337,26 @@ export const countRetrievalTraces = (db: DB): number => {
   };
   return row.n;
 };
+
+// ─── pruneRetrievalTrace ───────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2,
+// RETRIEVAL §10.1). Default retention 90d on `created_at`. Cutoff
+// EXCLUSIVE — a row at exactly `olderThanMs` is KEPT (matches
+// pruneVerifyAttempts and the other prune helpers).
+//
+// Standalone sweep is the cold-path backstop: FK CASCADE with
+// `sessions` already drops traces when the parent session is
+// purged, so most traces leave via cascade. This sweep covers the
+// case where the session survives but the traces should be aged
+// out (e.g., long-lived workflow sessions accumulating traces
+// across many queries).
+export const pruneRetrievalTrace = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneRetrievalTrace: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM retrieval_trace WHERE created_at < ?').run(olderThanMs);
+  return Number(result.changes);
+};
