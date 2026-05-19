@@ -369,3 +369,131 @@ verify_semantic_llm = false
     }
   });
 });
+
+describe('bootstrap — auditConfigWarnings propagation', () => {
+  // Operator-reported bug: loadRetentionConfig produces warning
+  // strings for invalid [audit] / [audit.retention] values, but
+  // bootstrap previously consumed only `auditLoaded.config` and
+  // dropped `auditLoaded.warnings` on the floor — no field on
+  // BootstrapResult carried them. The CLI driver (run.ts) and
+  // REPL (repl.ts) renderers had no surface to iterate.
+  //
+  // Operators typing `[audit.retention].context_pins = "ninety"`
+  // (string instead of int) would silently keep the 90-day
+  // default. Operators typing `[audit].run_gc_on_stp = true`
+  // (typo) would silently NOT enable the Stop-hook gc trigger.
+  // Both are deletion-policy decisions; running with unintended
+  // retention windows or unintended sweep timing is operationally
+  // riskier than the other config loaders' fallback behavior.
+  //
+  // Fix: BootstrapResult.auditConfigWarnings carries the same
+  // strings; run.ts + repl.ts iterate them with the
+  // `forja: audit config: ...` prefix. These pins lock the
+  // propagation so a future refactor that drops the wire (or
+  // re-orders the bootstrap return) lands the failure here.
+
+  test('malformed [audit.retention] value surfaces in BootstrapResult.auditConfigWarnings + falls back to defaults', async () => {
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      [
+        '[audit.retention]',
+        'context_pins = "ninety"', // string instead of int days
+        'bg_processes = -1', // non-positive
+        'recap_cache = "not-a-duration"', // unparseable TTL string
+      ].join('\n'),
+    );
+    const result = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      governanceBannerMarkerDir: markerDir,
+    });
+    try {
+      // Each bad value produced a warning, and the field surface
+      // carries all three.
+      expect(result.auditConfigWarnings.length).toBeGreaterThanOrEqual(3);
+      const joined = result.auditConfigWarnings.join('\n');
+      expect(joined).toContain('context_pins');
+      expect(joined).toContain('bg_processes');
+      expect(joined).toContain('recap_cache');
+      // Bad values fell back to defaults — the operator's intended
+      // override did NOT take effect. Without the warnings being
+      // propagated, the operator would be silently running with
+      // unintended retention windows.
+      expect(result.config.auditRetention?.context_pins_days).toBe(90);
+      expect(result.config.auditRetention?.bg_processes_days).toBe(30);
+      expect(result.config.auditRetention?.recap_cache_ttl_ms).toBe(60 * 60 * 1000);
+    } finally {
+      result.db.close();
+    }
+  });
+
+  test('typo under [audit].* (sibling of [audit.retention]) surfaces a warning', async () => {
+    // Operator typed `run_gc_on_stp` (missing 'o') — the typo
+    // guard in parseLayer should fire AND the actual flag should
+    // default to false (Stop-hook gc trigger remains off).
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      '[audit]\nrun_gc_on_stp = true\n', // typo: missing the second 'o'
+    );
+    const result = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      governanceBannerMarkerDir: markerDir,
+    });
+    try {
+      expect(result.auditConfigWarnings.length).toBeGreaterThan(0);
+      const joined = result.auditConfigWarnings.join('\n');
+      expect(joined).toContain('run_gc_on_stp');
+      expect(joined).toContain('not a known audit key');
+      // The intended toggle did NOT take effect — runGcOnStop is
+      // still its default (false). The warning is the operator's
+      // only signal that the Stop-hook gc trigger they thought
+      // they enabled is actually not enabled.
+      expect(result.config.auditRetention?.runGcOnStop).toBe(false);
+    } finally {
+      result.db.close();
+    }
+  });
+
+  test('clean [audit] config produces an empty auditConfigWarnings array (no false positives)', async () => {
+    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.agent', 'config.toml'),
+      [
+        '[audit]',
+        'run_gc_on_stop = true',
+        '',
+        '[audit.retention]',
+        'context_pins = 30',
+        'recap_cache = "5m"',
+      ].join('\n'),
+    );
+    const result = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      governanceBannerMarkerDir: markerDir,
+    });
+    try {
+      expect(result.auditConfigWarnings).toEqual([]);
+      expect(result.config.auditRetention?.runGcOnStop).toBe(true);
+      expect(result.config.auditRetention?.context_pins_days).toBe(30);
+      expect(result.config.auditRetention?.recap_cache_ttl_ms).toBe(5 * 60 * 1000);
+    } finally {
+      result.db.close();
+    }
+  });
+});

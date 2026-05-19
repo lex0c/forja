@@ -721,6 +721,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       memoryConfigWarnings,
       providersConfigWarnings,
       budgetConfigWarnings,
+      auditConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -835,6 +836,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       // or out-of-range value shouldn't disappear silently.
       for (const w of budgetConfigWarnings) {
         errSink(`forja: budget config: ${w}\n`);
+      }
+      // [audit] / [audit.retention] config warnings — deletion
+      // policy is operationally riskier than the other config
+      // surfaces. An operator who typed a string for a day field,
+      // an invalid TTL for recap_cache, or a typo for
+      // `run_gc_on_stop` would otherwise silently run with default
+      // retention windows or the wrong Stop-hook behavior, with
+      // gc deleting (or NOT deleting) rows they didn't intend.
+      for (const w of auditConfigWarnings) {
+        errSink(`forja: audit config: ${w}\n`);
       }
     }
 

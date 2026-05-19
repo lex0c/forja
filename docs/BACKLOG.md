@@ -2,6 +2,38 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — propagate `[audit]` / `[audit.retention]` config warnings through bootstrap
+
+Operator-reported bug. `loadRetentionConfig()` already produced warning strings for invalid `[audit]` and `[audit.retention]` values (mirroring the memory/providers/budget loaders), but the bootstrap path consumed only `auditLoaded.config` and dropped `auditLoaded.warnings` on the floor. `BootstrapResult` had no field carrying them, so `run.ts` and `repl.ts` — the two renderers that iterate every other loader's warning array onto stderr — had no surface to read. Retention misconfigs silently fell back to defaults during normal agent/REPL runs.
+
+**Why this is operationally riskier than memory / providers / budget misconfigs.** Retention controls **deletion**. An operator who typed:
+
+- `[audit.retention].context_pins = "ninety"` (string instead of int days) silently kept the 90-day default — but might have intended 365 to preserve cross-session pins longer for a long-running migration project.
+- `[audit.retention].bg_processes = -1` silently kept the 30-day default — but might have intended a far longer window for a project with year-spanning experiments.
+- `[audit].run_gc_on_stp = true` (typo: missing 'o') silently left the Stop-hook gc trigger disabled — but might have intended to enable automatic sweep at session end.
+- `[audit.retention].recap_cache = "not-a-duration"` silently kept the 1h default — operator might have intended `"5m"` for tight freshness.
+
+In all four cases the operator's intent was UNDONE silently, while gc continued to act on the unintended retention windows. With memory/providers/budget misconfigs, the worst-case silent fallback is wasted LLM cost or model substitution — irritating but recoverable. With retention misconfigs, the silent fallback governs row deletion. Different blast radius warrants identical (or stricter) diagnostic surface.
+
+**Fix.** Follow the established memory-warnings propagation pattern verbatim:
+
+1. **`src/cli/bootstrap.ts`** — added `auditConfigWarnings: readonly string[]` field to `BootstrapResult` interface with a comment documenting why the deletion-policy framing matters more than the sibling loaders' warnings. Added `auditConfigWarnings: auditLoaded.warnings` to the returned object alongside the existing memory/providers/budget wiring.
+
+2. **`src/cli/run.ts`** — destructured `auditConfigWarnings`; added a `for (const w of auditConfigWarnings) errSink('forja: audit config: ${w}\n')` loop adjacent to the existing budget-warnings loop (same JSON-mode gating, same `forja: <subsystem> config: ${w}` format).
+
+3. **`src/cli/repl.ts`** — destructured `auditConfigWarnings`; added the same `for-loop` after the existing `memoryConfigWarnings` iteration. (REPL renders memory + critique + hook warnings; pre-existing asymmetry omits providers/budget; audit is added explicitly because of the deletion-policy framing — out-of-scope to extend the providers/budget gap here.)
+
+4. **Tests** — 172/172 across 5 files:
+    - `tests/cli/bootstrap-memory-defaults.test.ts`: new `bootstrap — auditConfigWarnings propagation` describe with 3 pins — (a) malformed `[audit.retention]` values produce ≥ 3 warnings AND fall back to defaults verified by reading `result.config.auditRetention.*`; (b) typo at `[audit].*` sibling level produces a "not a known audit key" warning AND `runGcOnStop` stays false; (c) clean config produces `[]` (no false positives).
+    - `tests/cli/init-eval.test.ts`: scaffold expectation pin — `auditConfigWarnings` is `[]` after `agent init` (init doesn't scaffold `[audit]`, so loader returns defaults silently).
+    - `tests/cli/repl-history.test.ts`: 2 mock `BootstrapResult` instances updated with `auditConfigWarnings: [] as readonly string[]`.
+    - `tests/cli/repl.test.ts`: 1 mock updated.
+    - `tests/audit/config-loader.test.ts`: no changes needed — loader already produced warnings; the bug was purely a bootstrap wiring gap.
+
+**Verification:** 172/172 across the 5 impacted test files; typecheck + lint clean.
+
+**Pre-existing operator state.** Installs that ran with any misconfigured `[audit]` / `[audit.retention]` block before this fix would have seen silent default fallback for all of them. To audit your install, re-run with `bun run dev <prompt>` (or `agent` once built) — every previously-silent warning will now surface on stderr with the `forja: audit config:` prefix. If a warning appears, fix the TOML and the intended retention/Stop-hook behavior takes effect on the next boot.
+
 ## [2026-05-19] fix(cli) — `agent purge --force` aborts (exit 1) on TOCTOU detection
 
 Operator-reported bug. The TOCTOU defense in `walkRemove` previously only emitted a stderr line and `return`-ed from the current frame when `verifySamePostReaddir` reported a concurrent FS swap. That sub-frame return cleanly fell off the call stack: if the failure was at the ROOT `.agent/` directory (which is `removeTree`'s entrypoint), the function returned `{files: 0, dirs: 0, bytes: 0}`, `runPurge` built a `ForceReport` with `removed: {0, 0, 0}`, and rendered SUCCESS (exit 0) — silently violating `--force` semantics. Operators saw "purge succeeded" but the project state was unchanged after a concurrent FS swap/race.

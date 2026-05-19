@@ -250,6 +250,20 @@ export interface BootstrapResult {
   // a hard abort.
   providersConfigWarnings: readonly string[];
   budgetConfigWarnings: readonly string[];
+  // Warnings from the audit / retention config loader
+  // (`.agent/config.toml [audit]` and `[audit.retention]`). Loader
+  // degrades to defaults on bad values rather than aborting boot —
+  // without this surface, an operator who typed
+  // `[audit.retention].context_pins = "ninety"` (string instead
+  // of integer days) would silently keep the 90-day default, OR
+  // an operator who typed `[audit].run_gc_on_stp = true` (typo)
+  // would silently NOT enable the Stop-hook gc trigger. Both
+  // are deletion-policy decisions; running with unintended
+  // retention windows is operationally risky in a way that
+  // demands the same diagnostic visibility as the other config
+  // loaders. CLI driver renders these on stderr alongside the
+  // memory / hook / critique / providers / budget warnings.
+  auditConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -1346,6 +1360,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,
+    auditConfigWarnings: auditLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }
