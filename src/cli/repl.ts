@@ -719,9 +719,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
   // Surface the same warnings the one-shot path does. Operators get
   // them once at REPL boot rather than per turn.
+  // Use the ACTUAL scopes from the ShadowedDefinition records
+  // (`shadowed.scope` / `winning.scope`) rather than hardcoded
+  // labels. With PROTECTED_BUILTIN_NAMES, shadows can carry
+  // `shadowed.scope = 'builtin'` for embedded verify-* definitions
+  // replaced by user/project files — hardcoded `(user) ...
+  // (project)` would mislabel a builtin-replacement security
+  // warning as a normal cross-scope shadow. Mirror of run.ts.
   for (const shadow of subagents.shadows) {
     errSink(
-      `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (user) is shadowed by ${shadow.winning.sourcePath} (project)\n`,
+      `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (${shadow.shadowed.scope}) is shadowed by ${shadow.winning.sourcePath} (${shadow.winning.scope})\n`,
     );
   }
   for (const c of lockConflicts) {

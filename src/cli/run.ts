@@ -747,13 +747,23 @@ export const run = async (options: RunOptions): Promise<number> => {
     // ~/.config/agent/agents/<name>.md silently being eclipsed by
     // a project-scope file is the kind of misconfiguration that
     // wastes hours when the author doesn't see it; one warning
-    // per shadow on stderr makes the precedence visible. Gated on
-    // non-JSON mode so NDJSON consumers get a pure stream — the
-    // information is recoverable from the project tree anyway.
+    // per shadow on stderr makes the precedence visible.
+    //
+    // Use the ACTUAL scopes from the ShadowedDefinition records
+    // rather than hardcoded labels. With PROTECTED_BUILTIN_NAMES,
+    // shadows can carry `shadowed.scope = 'builtin'` (the embedded
+    // verify-* definition) and `winning.scope = 'user' | 'project'`
+    // — hardcoding `(user) ... (project)` would mislabel the
+    // builtin-replacement security warning as a normal cross-scope
+    // shadow and undermine the protection signal that drove this
+    // alert.
+    //
+    // Gated on non-JSON mode so NDJSON consumers get a pure stream
+    // — the information is recoverable from the project tree anyway.
     if (!args.json) {
       for (const shadow of subagents.shadows) {
         errSink(
-          `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (user) is shadowed by ${shadow.winning.sourcePath} (project)\n`,
+          `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (${shadow.shadowed.scope}) is shadowed by ${shadow.winning.sourcePath} (${shadow.winning.scope})\n`,
         );
       }
     }
