@@ -260,9 +260,33 @@ mode = "on_writes"            # off | on_writes | always
 threshold = 0.65              # 0..1; severity threshold to surface
 model = "anthropic/claude-haiku-4-5"
 prompt_version = "v1"
+
+# [providers] — default executor model for this project. Pin here so
+# CI / team members get the same model without remembering the
+# --model flag. Resolution chain: CLI flag (--model) > project
+# [providers].model > user [providers].model > DEFAULT_MODEL in code.
+
+[providers]
+model = "anthropic/claude-opus-4-7"   # any id in createDefaultRegistry()
+
+# [budget] — per-project caps for the harness run budget. Each field
+# is independently overridable; absent fields inherit DEFAULT_BUDGET
+# from `src/harness/types.ts`. Resolution chain mirrors [providers]:
+# CLI flag (--max-steps, --max-cost-usd, ...) > project [budget] >
+# user [budget] > DEFAULT_BUDGET. Useful for CI where strict caps
+# protect cost; useful for high-trust dev branches where steps need
+# to grow past the default 200 backstop.
+
+[budget]
+max_steps = 200               # runaway-loop backstop; cost cap is the engagement gate
+max_cost_usd = 5              # hard cap; harness aborts strictly above this value
+max_wall_clock_ms = 600000    # 10 min default
+max_step_stall_ms = 90000     # 90s per-step watchdog
+compaction_threshold = 0.7    # fraction of context-window before compaction fires
+compaction_preserve_tail = 3  # turns of conversation tail kept verbatim during compaction
 ```
 
-Seções futuras (`[providers]`, `[telemetry]`, …) entram aqui pelo mesmo padrão: **schema reference aqui no spec, scaffold mantém-se slim**. Schema-creep no `[…]` reference é aceitável (custo: linhas de spec); schema-creep nos defaults em código requer PR contra esta seção primeiro.
+Seções futuras (`[telemetry]`, …) entram aqui pelo mesmo padrão: **schema reference aqui no spec, scaffold mantém-se slim**. Schema-creep no `[…]` reference é aceitável (custo: linhas de spec); schema-creep nos defaults em código requer PR contra esta seção primeiro.
 
 ### 2.2 Composição (Unix philosophy)
 
@@ -1087,9 +1111,12 @@ tools:
 
   web_fetch:
     deny_hosts: ["localhost", "127.0.0.1", "169.254.*", "10.*"]
+    trusted_hosts: ["github.com", "raw.githubusercontent.com"]
 ```
 
 Matching é **prefix + glob**, não regex. Regex em política é pé na bola.
+
+`trusted_hosts` (additive sobre `DEFAULT_TRUSTED_HOSTS` em `src/permissions/risk-score.ts`) reduz o risk-score de fetches pra esses hosts — útil pra time que tem CDN interno, GitHub Enterprise, ou outros endpoints conhecidos-bons. NÃO é um allowlist: `deny_hosts` continua tendo precedência (host trusted que também aparece em deny ainda é negado). A lista hardcoded cobre o consensus público (`github.com`, `npmjs.com`, etc.); o per-projeto trusted_hosts é pra a hidden surface de cada repo.
 
 Modos:
 - `strict` (default) — confirma o que é confirmável, nega o resto.

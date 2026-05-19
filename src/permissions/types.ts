@@ -35,6 +35,13 @@ export interface PathPolicy {
 export interface FetchPolicy {
   allow_hosts?: readonly string[];
   deny_hosts?: readonly string[];
+  // Additive over `DEFAULT_TRUSTED_HOSTS` in `risk-score.ts`. Hosts
+  // listed here do NOT trigger the `untrusted_egress` risk feature
+  // for this project — useful for internal CDNs, GitHub Enterprise,
+  // or any endpoint outside the hardcoded public-registry default.
+  // NOT an allowlist: `deny_hosts` still wins. Empty/absent leaves
+  // the engine at the default set.
+  trusted_hosts?: readonly string[];
   locked?: boolean;
 }
 

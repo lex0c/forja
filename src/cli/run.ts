@@ -719,6 +719,8 @@ export const run = async (options: RunOptions): Promise<number> => {
       hookWarnings,
       critiqueWarnings,
       memoryConfigWarnings,
+      providersConfigWarnings,
+      budgetConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -820,6 +822,19 @@ export const run = async (options: RunOptions): Promise<number> => {
       // they thought they had opted out of.
       for (const w of memoryConfigWarnings) {
         errSink(`forja: memory config: ${w}\n`);
+      }
+      // [providers] config warnings (`.agent/config.toml
+      // [providers]`). Operator who typos a model id gets stderr
+      // visibility — without it, the bootstrap silently falls back
+      // to DEFAULT_MODEL and the operator wonders why their pinned
+      // model didn't take effect.
+      for (const w of providersConfigWarnings) {
+        errSink(`forja: providers config: ${w}\n`);
+      }
+      // [budget] config warnings — same rationale: a numeric typo
+      // or out-of-range value shouldn't disappear silently.
+      for (const w of budgetConfigWarnings) {
+        errSink(`forja: budget config: ${w}\n`);
       }
     }
 

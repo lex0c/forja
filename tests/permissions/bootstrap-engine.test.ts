@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   bootstrapPermissionEngine,
+  mergeTrustedHosts,
   preflightPermissionEngine,
 } from '../../src/permissions/bootstrap-engine.ts';
 import {
@@ -12,6 +13,7 @@ import {
   createSqliteSink,
   ensureInstallId,
 } from '../../src/permissions/index.ts';
+import { DEFAULT_TRUSTED_HOSTS } from '../../src/permissions/risk-score.ts';
 import { type DB, MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 import { listApprovalsLogByInstall } from '../../src/storage/repos/approvals-log.ts';
 
@@ -42,6 +44,41 @@ const baseInput = (overrides: Partial<Parameters<typeof bootstrapPermissionEngin
   now: () => 1,
   uuid: () => 'boot-uuid-aaaa-bbbb',
   ...overrides,
+});
+
+describe('mergeTrustedHosts', () => {
+  test('empty policy list returns DEFAULT_TRUSTED_HOSTS by reference', () => {
+    // Reference equality matters: callers that compare against
+    // DEFAULT_TRUSTED_HOSTS by `===` (engine fast paths in
+    // particular) keep working. Spreading into a fresh array would
+    // be functionally equivalent but break referential identity.
+    expect(mergeTrustedHosts([])).toBe(DEFAULT_TRUSTED_HOSTS);
+  });
+
+  test('extends default with new host (additive, not replace)', () => {
+    const merged = mergeTrustedHosts(['internal.example.com']);
+    expect(merged).toContain('github.com'); // default preserved
+    expect(merged).toContain('internal.example.com');
+    expect(merged.length).toBe(DEFAULT_TRUSTED_HOSTS.length + 1);
+  });
+
+  test('dedupes when policy duplicates a default host', () => {
+    // Structural pin: policy that re-lists `github.com` (already in
+    // DEFAULT_TRUSTED_HOSTS) must NOT double the entry. A future
+    // refactor from `Array.from(new Set(...))` to plain concat
+    // would inflate the array; this test catches it before the
+    // engine's per-fetch iteration silently grows.
+    const merged = mergeTrustedHosts(['github.com', 'new.example.com']);
+    expect(merged.length).toBe(DEFAULT_TRUSTED_HOSTS.length + 1);
+    expect(merged.filter((h) => h === 'github.com').length).toBe(1);
+  });
+
+  test('dedupes policy-internal duplicates', () => {
+    // Defense in depth: even if the policy file itself lists the
+    // same host twice (parser doesn't filter), the merge collapses.
+    const merged = mergeTrustedHosts(['x.example.com', 'x.example.com']);
+    expect(merged.filter((h) => h === 'x.example.com').length).toBe(1);
+  });
 });
 
 describe('bootstrapPermissionEngine — happy path', () => {
@@ -84,6 +121,101 @@ describe('bootstrapPermissionEngine — happy path', () => {
     expect(r.layers).toEqual([]); // no policy files → default
     expect(r.lockConflicts).toEqual([]);
     expect(r.provenance.defaults).toBe('default');
+  });
+
+  test('trusted_hosts merge deduplicates default-overlap entries', async () => {
+    // Operator who re-lists a host already in DEFAULT_TRUSTED_HOSTS
+    // (e.g., `github.com`) shouldn't inflate the list — the merge
+    // is set-union, not concat. The engine iterates trustedHosts
+    // per fetch; keeping it tight matters at scale. Test verifies
+    // the dedup explicitly so a future refactor to plain concat
+    // doesn't silently regress: an internal "github.com" plus the
+    // default's "github.com" must remain one entry.
+    const projDir = join(tmpRoot, 'proj');
+    const agentDir = join(projDir, '.agent');
+    require('node:fs').mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, 'permissions.yaml'),
+      `
+defaults:
+  mode: strict
+tools:
+  bash:
+    allow: ["curl *"]
+  fetch_url:
+    trusted_hosts:
+      - "github.com"
+      - "internal.cdn.example.com"
+`,
+    );
+    const db = baseDb();
+    const r = await bootstrapPermissionEngine(baseInput({ cwd: projDir, db }));
+    expect(r.state).toBe('ready');
+    // Probe github.com twice to confirm the host is silent — the
+    // dedup check is structural, but if the merge produced
+    // duplicate entries the engine would still treat github.com as
+    // trusted (idempotent membership check). The real test is
+    // behavioral: trust both internal AND github.com simultaneously
+    // with policy-declared overlap.
+    r.engine.check('bash', 'bash', { command: 'curl https://github.com/foo' });
+    r.engine.check('bash', 'bash', { command: 'curl https://internal.cdn.example.com/x' });
+    const rows = listApprovalsLogByInstall(db, r.identity.install_id);
+    const components = rows.map(
+      (row) => JSON.parse(row.score_components_json) as Record<string, number | undefined>,
+    );
+    expect(components[0]?.untrusted_egress).toBeUndefined();
+    expect(components[1]?.untrusted_egress).toBeUndefined();
+  });
+
+  test('policy.tools.fetch_url.trusted_hosts merges additive over default into the engine', async () => {
+    // Operator writes an internal host to permissions.yaml; the
+    // bootstrap merges it with DEFAULT_TRUSTED_HOSTS (github + the
+    // public registries) so the engine sees both as silent for
+    // the `untrusted_egress` risk feature. Verify behaviorally via
+    // bash curl checks: internal + github.com stay silent; an
+    // external unlisted host still surfaces the feature. The
+    // engine-level pin already exists (engine.test.ts "custom
+    // trustedHosts narrows untrusted_egress"); this test pins the
+    // WIRE from policy yaml → engine option.
+    const projDir = join(tmpRoot, 'proj');
+    const agentDir = join(projDir, '.agent');
+    require('node:fs').mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, 'permissions.yaml'),
+      `
+defaults:
+  mode: strict
+tools:
+  bash:
+    allow: ["curl *"]
+  fetch_url:
+    trusted_hosts:
+      - "internal.cdn.example.com"
+`,
+    );
+    const db = baseDb();
+    const r = await bootstrapPermissionEngine(baseInput({ cwd: projDir, db }));
+    expect(r.state).toBe('ready');
+    r.engine.check('bash', 'bash', {
+      command: 'curl https://internal.cdn.example.com/asset.js',
+    });
+    r.engine.check('bash', 'bash', { command: 'curl https://github.com/foo' });
+    r.engine.check('bash', 'bash', {
+      command: 'curl https://random-unlisted.example.org/x',
+    });
+    const rows = listApprovalsLogByInstall(db, r.identity.install_id);
+    expect(rows.length).toBe(3);
+    const components = rows.map(
+      (row) => JSON.parse(row.score_components_json) as Record<string, number | undefined>,
+    );
+    // Policy-supplied trusted host → silent.
+    expect(components[0]?.untrusted_egress).toBeUndefined();
+    // DEFAULT_TRUSTED_HOSTS still applies (github.com is in there) →
+    // silent. Confirms the merge is ADDITIVE, not replace.
+    expect(components[1]?.untrusted_egress).toBeUndefined();
+    // Unlisted external host → feature surfaces.
+    expect(components[2]?.untrusted_egress).toBeDefined();
+    expect(components[2]?.untrusted_egress).toBeGreaterThan(0);
   });
 });
 

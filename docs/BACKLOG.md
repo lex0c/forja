@@ -2,6 +2,57 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(cli + permissions) — three operator-tunable knobs no longer hardcoded
+
+Audit of `src/` for `MAX_*`, `DEFAULT_*` constants and hardcoded model ids surfaced ~17 candidates; 3 had high signal for operator override and no existing per-project path. Cargo-cult risk acknowledged — the remaining 14 (subagent depth, IPC caps, retention windows, harness concurrency caps, …) are safety/protocol/internal-tuning constants and stay in code.
+
+**Knob 1 — `[providers] model` in `.agent/config.toml`.** Pin executor model per-project. Resolution chain: CLI flag `--model` > project `[providers].model` > user `[providers].model` > `DEFAULT_MODEL` (`anthropic/claude-opus-4-7`). Unknown model id in config → warning + fall back to default (matches `[critique].model` posture). Surfaced via new `loadProvidersConfig` mirroring the existing critique/memory loader shape. Bootstrap reorder: `projectConfigCwd` resolved EARLY so providers loader runs before `modelId` resolution.
+
+**Knob 2 — `[budget]` section in `.agent/config.toml`.** Six keys exposed (`max_steps`, `max_cost_usd`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_threshold`, `compaction_preserve_tail`). Per-key merge: project overrides user, CLI `input.budget` overrides both; absent fields inherit `DEFAULT_BUDGET` from `src/harness/types.ts` (harness applies the final merge). Per-key validators reject non-finite numbers, non-integers in integer fields, out-of-range values; fail-soft (warning + ignore the offending field, not the whole layer). camelCase aliases accepted for copy-paste from harness API docs.
+
+**Knob 3 — `tools.fetch_url.trusted_hosts` in `permissions.yaml`.** Additive over `DEFAULT_TRUSTED_HOSTS` (`risk-score.ts` — github + 5 public registries). Hosts listed in policy do NOT trigger the `untrusted_egress` risk-score feature for this project — useful for internal CDNs, GitHub Enterprise, or any endpoint outside the public default. NOT an allowlist (deny_hosts still wins). Bootstrap merges policy-supplied entries with the default list (dedupe via `Array.from(new Set(...))` so a policy that re-lists `github.com` doesn't inflate the iteration set). Init template scaffolds an empty `trusted_hosts: []` block with explanatory comment.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1.1` — schema reference extended with `[providers]` and `[budget]` example blocks. Resolution-chain comment makes precedence explicit.
+- `AGENTIC_CLI.md §8` — `web_fetch` policy example shows `trusted_hosts: ["github.com", ...]` alongside `deny_hosts`; new paragraph clarifies additive-over-default semantics and the "NOT an allowlist" rule.
+
+**Warnings surface** — bootstrap returns two new arrays on `BootstrapResult`: `providersConfigWarnings` and `budgetConfigWarnings`. `src/cli/run.ts` prints them on stderr alongside the existing critique + memory warnings (non-JSON mode only). Operator who typos a model id or budget number sees the diagnostic instead of silently running with defaults.
+
+**Items audited and deliberately NOT promoted to config:**
+
+- `MAX_SUBAGENT_DEPTH = 4`, `MAX_CONCURRENT_TOOL_CALLS_CAP = 16`, `MAX_CONCURRENT_SUBAGENTS_CAP = 8` — safety caps; tunable is a footgun.
+- `MEMORY_OVERRIDE_THRESHOLD_COUNT = 3` / `_WINDOW_MS = 24h` — S3 detector calibration; mutating per-project breaks reproducibility of governance decisions across repos.
+- `MAX_CACHE_BREAKPOINTS_PER_REQUEST = 4` — Anthropic API limit, not a knob.
+- `MEMORY_*_RETENTION_MS = 90d` (verify/conflict/override attempts + provenance) — retention policy; varying per-project creates audit-trail inconsistency.
+- `MAX_RESUME_MESSAGES = 500`, `MAX_PLAYBOOK_TABLE_ROWS = 12`, `DEFAULT_HOOK_TIMEOUT_MS = 5000`, `DEFAULT_RECAP_CACHE_TTL_MS = 1h`, `TOOL_BATCH_COALESCE_THRESHOLD = 3` — internal presentation/operational tuning; no high-signal per-project case yet.
+- `DEFAULT_SCORE_CONFIRM_THRESHOLD = 0.4` (permission risk-score modal trigger) — medium signal but the right home is `permissions.yaml` not `config.toml`; deferred so the permissions schema doesn't grow two unrelated changes in the same PR.
+- `DEFAULT_RETENTION_DAYS = 30` (checkpoints) — medium signal; deferred as a separate slice (touches retention storage path).
+- `MEMORY_VERIFY_*_MAX_COST_USD = 0.5` — advanced-user knob; low frequency; if demand surfaces, add under `[memory]` later.
+
+**Tests:**
+
+- `tests/critique/config-loader.test.ts` extended with 6 `loadProvidersConfig` tests (empty layer, project read, unknown model → warning, non-string → warning, empty string → warning, project-overrides-user, non-table → warning) + 9 `loadBudgetConfig` tests (empty, full read, integer validation, float validation, out-of-range cost, out-of-range threshold, non-number → warning, camelCase aliases, project-overrides-user, non-table → warning).
+- `tests/permissions/config.test.ts` extended: `trusted_hosts` parse + string-array validator rejection.
+- `tests/permissions/bootstrap-engine.test.ts` extended: behavioral pin verifying policy-supplied `trusted_hosts` merges additive over `DEFAULT_TRUSTED_HOSTS` — internal host silent, `github.com` still silent (default preserved), unlisted external host flagged via `untrusted_egress` risk component.
+- Test-side `BootstrapResult` fixtures (`tests/cli/repl.test.ts`, `tests/cli/repl-history.test.ts`) updated to include the new warning arrays.
+
+**In-flight review findings addressed before commit:**
+
+- **#1 — Subagent child trustedHosts merge** (bug). `src/cli/subagent-child.ts:668` was calling `createPermissionEngine` without `trustedHosts`, so a subagent fetching the same internal CDN as the parent run would surface `untrusted_egress` on the risk-score side while the parent treated the host as silent — operator-visible parent/child divergence on identical URLs. Fixed by mirroring the merge via the new `mergeTrustedHosts` helper (exported from `bootstrap-engine.ts` so the subagent path doesn't duplicate the dedup logic).
+- **#2 — Budget loader double-declaration warning.** `[critique]` / `[memory]` loaders emit "declares both X and Y; snake_case wins" when an operator writes both spellings; budget loader did the silent snake-wins fallback. Now matches the convention — operator who declares both `max_steps = 200` AND `maxSteps = 300` sees the diagnostic and knows which value won.
+- **#3 — `mergeTrustedHosts` extracted + direct unit tests.** The dedup invariant (policy that re-lists `github.com` does NOT inflate the array) was previously buried inside `bootstrapPermissionEngine` and only behaviorally testable; a refactor to plain concat would have passed the behavioral test but doubled the engine's per-fetch iteration set silently. Now a separate function with structural tests (`empty → default by reference`, `extends with new host`, `dedupes default overlap`, `dedupes policy-internal duplicates`).
+- **#4 — Comment cleanup after bootstrap reorder.** When `projectConfigCwd = resolveRepoRoot(cwd)` moved up to feed the providers loader, the long explanatory comment stayed at the old location and read like the resolution happened there. Comment now lives next to the actual resolveRepoRoot call.
+- **#5 — `ProvidersConfigKeys` shape consistency.** Changed from `{model: string | null}` to `{model?: string}` to match `BudgetConfigKeys` and `CritiqueConfig.promptVersion` — the `?? DEFAULT_MODEL` consumer doesn't care which sentinel; the optional shape is the established convention.
+- **#6 — Preserve `input.budget !== undefined` semantic.** Bootstrap budget guard reverted to the original "guard on caller intent, not merged-object-emptiness". A caller that passes `input.budget = {}` (explicit empty marker) flows through unchanged; only "no config AND no CLI" suppresses the field entirely.
+- **#7 — Verified `--explain-permissions --json` surfaces `trusted_hosts`.** The JSON output path `writeJson` does `JSON.stringify(policy)` directly — TypeScript types + runtime object shape carry the new field through reflection. No code change needed.
+- **#8 / #9 — Documented `BUDGET_INT_KEYS` / `BUDGET_FLOAT_KEYS` max-range rationale.** Inline comments explain why each ceiling is "sanity-typo guard" and not "tight cap"; `compaction_preserve_tail: { min: 0 }` is intentional (aggressive compaction, drop everything except system prompt) and marked.
+- **#10 — Extracted shared config plumbing into `src/config/`.** Honors the TODO from `critique/config-loader.ts:310` ("when a third config consumer surfaces, split into `src/config/loader.ts`"). The third + fourth consumers landed in this slice; ~120 LOC of duplicated file-read-and-parse-section boilerplate collapsed into `src/config/section.ts` (`loadTomlSection`, a discriminated-union return type for absent / no-section / invalid / found). Path helpers (`userConfigPath`, `projectConfigPath`) moved to `src/config/paths.ts` and re-exported from `critique/config-loader.ts` for backward-compat with existing import sites.
+
+Suite delta: 206 pass across 4 affected files (config-loader +15, permissions/config +1, bootstrap-engine +1, init unchanged). Typecheck + lint clean.
+
+**Production-readiness shift.** Before: operator pinning a model per-project required `--model anthropic/...` on every invocation; CI runs needing stricter caps required flag-passing every time; teams with internal CDN endpoints had no operator path to dampen the `untrusted_egress` risk component for their hosts. After: all three are diff-tracked, team-reviewable per-project config. The cargo-cult risk acknowledged inline in BACKLOG — the audit deliberately stops short of promoting safety/protocol caps to operator-tunable territory.
+
 ## [2026-05-19] fix(cli) — slim the scaffolded `config.toml` to a spec-pointer
 
 In-flight regression in the unified-init slice surfaced during review of the post-work entry below. The rich 30-line `config.toml` template that `agent init` shipped (per the earlier §2.1.1 schema) **looked like inline documentation but was a false promise**: `/memory governance enable|disable verify|conflict|override|all` rewrites the file via `Bun.TOML.parse → mutate → emitTomlDoc` (`src/cli/slash/commands/memory.ts:3118-3181`), and Bun's TOML parser does not preserve comments. The first slash-command toggle would silently delete every line of the scaffolded inline doc — exactly when the operator first acted on the file they had just learned to read.

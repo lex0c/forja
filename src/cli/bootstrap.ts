@@ -8,7 +8,11 @@ import {
   createInProcessBroker,
   createSpawnBroker,
 } from '../broker/index.ts';
-import { loadMemoryConfig } from '../critique/config-loader.ts';
+import {
+  loadBudgetConfig,
+  loadMemoryConfig,
+  loadProvidersConfig,
+} from '../critique/config-loader.ts';
 import { loadCritiqueConfig } from '../critique/index.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
@@ -232,6 +236,12 @@ export interface BootstrapResult {
   // the LLM-judge cost without diagnostic. CLI driver renders
   // these on stderr alongside the hook + critique warnings.
   memoryConfigWarnings: readonly string[];
+  // Warnings from the providers + budget config loaders
+  // (`.agent/config.toml [providers|budget]`). Same fail-soft
+  // posture as the others: bad value → warning + degrade, not
+  // a hard abort.
+  providersConfigWarnings: readonly string[];
+  budgetConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -286,17 +296,39 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // discoverable. Threaded explicitly into both preflight and
   // bootstrap so the engine sees a single resolved home value.
   const home = homedir();
-  const modelId = input.modelId ?? DEFAULT_MODEL;
 
   // Resolve everything that *can throw* before opening the DB, so a
   // policy YAML error or unknown model doesn't leak a SQLite handle
   // (and the WAL files that come with it).
   let provider: Provider;
-  // Build the registry once and share it across both the executor
-  // and the critique-config loader (Slice C). Creating two
+  // Build the registry once and share it across the executor, the
+  // critique-config loader, and the providers-config loader. Creating
   // independent default registries would double the model-table
   // import cost for no benefit.
   const registry = createDefaultRegistry();
+
+  // Resolve project config root EARLY (needed by the providers
+  // loader before model resolution). `resolveRepoRoot` walks up
+  // from cwd looking for a git root and falls back to cwd when
+  // none is found — so `<repo>/.agent/config.toml` resolves the
+  // same way whether the operator invoked from the repo root or
+  // a subdirectory. Without this resolve, a `<repo>/.agent/
+  // config.toml [providers] model = "..."` would be invisible when
+  // the operator ran `agent` from a subdir, and the boot would
+  // silently use DEFAULT_MODEL. Reused below for [critique] /
+  // [memory] / [budget] loaders — same file, same path resolution.
+  const projectConfigCwd = resolveRepoRoot(cwd);
+
+  // [providers] model — pin per-project. Resolution chain:
+  //   CLI flag (input.modelId) > project [providers].model
+  //                            > user    [providers].model
+  //                            > DEFAULT_MODEL.
+  // Unknown ids in the config file degrade to a warning + null
+  // (caller falls back to DEFAULT_MODEL); the CLI override is
+  // strict and throws below if registry.get returns null.
+  const providersLoaded = loadProvidersConfig({ cwd: projectConfigCwd, registry });
+  const modelId = input.modelId ?? providersLoaded.config.model ?? DEFAULT_MODEL;
+
   if (input.providerOverride !== undefined) {
     provider = input.providerOverride;
   } else {
@@ -325,20 +357,27 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // to defaults, not a hard exit). The warnings array is exposed
   // on BootstrapResult for the CLI driver to print.
   //
-  // BOTH loaders take cwd → `.agent/config.toml` at that dir. The
-  // canonical project config lives at `<repo-root>/.agent/config
-  // .toml`, NOT under the operator's invocation cwd. When `agent`
-  // is launched from a subdirectory (the common case), passing raw
-  // cwd would miss the repo-rooted file entirely — the operator
-  // would set `verify_semantic_llm = false` at `<repo>/.agent/
-  // config.toml` and bootstrap would still resolve detectors via
-  // default + spend LLM budget. Resolve repo root ONCE up here and
-  // reuse below for the memory scope-roots construction; falls
-  // back to cwd when not in a git repo, matching the historical
-  // "config lives where the operator invoked from" behavior for
-  // non-repo workflows.
-  const projectConfigCwd = resolveRepoRoot(cwd);
+  // `projectConfigCwd` was resolved above (early in this function —
+  // see the long comment near the providers loader). The same
+  // repo-rooted cwd is reused here so [critique] / [memory] /
+  // [budget] all read the SAME `.agent/config.toml` the providers
+  // loader already consumed. When `agent` is launched from a
+  // subdirectory, raw cwd would miss the repo-rooted file entirely
+  // — the operator would set `verify_semantic_llm = false` at
+  // `<repo>/.agent/config.toml` and bootstrap would still resolve
+  // detectors via default + spend LLM budget. resolveRepoRoot
+  // falls back to cwd when not in a git repo, matching the
+  // historical "config lives where the operator invoked from"
+  // behavior for non-repo workflows. Loader is non-fatal: malformed
+  // sections degrade to defaults, warnings surface on stderr via
+  // BootstrapResult.{critique,memory,providers,budget}Warnings.
   const critiqueLoaded = loadCritiqueConfig({ cwd: projectConfigCwd, registry });
+  // [budget] config — resolves before the harness builds its
+  // RunBudget. Per-key merge: project [budget].max_steps wins
+  // over user, both override DEFAULT_BUDGET in code. CLI flags
+  // (input.budget) win over both layers. Loader degrades to
+  // defaults on bad values rather than aborting boot.
+  const budgetLoaded = loadBudgetConfig({ cwd: projectConfigCwd });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
@@ -1186,7 +1225,21 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(critiqueLoaded.critiqueProvider !== null
       ? { critiqueProvider: critiqueLoaded.critiqueProvider }
       : {}),
-    ...(input.budget !== undefined ? { budget: input.budget } : {}),
+    // Budget resolution: project/user [budget] config layers merged
+    // first (per-key, project winning over user via loader's own
+    // merge), then CLI input.budget on top. Harness applies
+    // DEFAULT_BUDGET as the final fallback when it spreads this
+    // partial into a full RunBudget. The field lands when EITHER
+    // CLI input is present (mirroring pre-config semantic: explicit
+    // `input.budget = {}` flows through as a forwarded empty
+    // marker, in case downstream code distinguishes "absent" vs
+    // "explicitly empty") OR config carries at least one key.
+    ...((): { budget?: Partial<RunBudget> } => {
+      const haveConfig = Object.keys(budgetLoaded.config).length > 0;
+      const haveCli = input.budget !== undefined;
+      if (!haveConfig && !haveCli) return {};
+      return { budget: { ...budgetLoaded.config, ...(input.budget ?? {}) } };
+    })(),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
     // Slice Q — resolved state (always boolean, never undefined).
@@ -1260,6 +1313,8 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     hookWarnings: resolvedHooks.warnings,
     critiqueWarnings: critiqueLoaded.warnings,
     memoryConfigWarnings: memoryLoaded.warnings,
+    providersConfigWarnings: providersLoaded.warnings,
+    budgetConfigWarnings: budgetLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

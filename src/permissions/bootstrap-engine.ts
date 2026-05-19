@@ -41,6 +41,7 @@ import {
 } from './hierarchy.ts';
 import { type InstallIdentity, ensureInstallId } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
+import { DEFAULT_TRUSTED_HOSTS } from './risk-score.ts';
 import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
 import { type SealStore, factoryForSealMode } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
@@ -166,6 +167,25 @@ export interface PreflightInput {
 }
 
 // Validate install_id + policy WITHOUT opening any SQLite handle.
+// Merge policy-supplied trusted hosts with the hardcoded default
+// list. Additive set-union: policy entries that duplicate a default
+// host produce one entry, not two (the engine iterates this list
+// per fetch — keep it tight). When the policy supplies nothing,
+// return the default array unchanged so callers can use it as a
+// sentinel (e.g., engine.test.ts compares against DEFAULT_TRUSTED_HOSTS
+// by reference equality in some paths).
+//
+// Exported so tests pin the structural invariant directly — a
+// behavioral test alone can't distinguish "list inflated with
+// duplicates" from "list is correct" because both produce identical
+// allow/deny decisions in the engine. Subagent bootstrap path in
+// `cli/subagent-child.ts` ALSO consumes this helper so parent and
+// child stay in sync.
+export const mergeTrustedHosts = (policyTrustedHosts: readonly string[]): readonly string[] => {
+  if (policyTrustedHosts.length === 0) return DEFAULT_TRUSTED_HOSTS;
+  return Array.from(new Set([...DEFAULT_TRUSTED_HOSTS, ...policyTrustedHosts]));
+};
+
 // Throws on the two boot-blocking failures (install_id discovery,
 // malformed policy) so the CLI driver can fail the boot before any
 // DB file is created. Production bootstrap calls this, then opens
@@ -512,6 +532,16 @@ export const bootstrapPermissionEngine = async (
   // lenient, the bootstrap transitions to `degraded` instead so
   // `check()` keeps running but every would-be allow becomes confirm.
   const sandbox = input.sandbox;
+  // Operator-augmented trusted-hosts list. Additive over
+  // DEFAULT_TRUSTED_HOSTS (`risk-score.ts`) — policy entries do
+  // NOT replace the hardcoded public-registry set; they extend it
+  // with per-project internal hosts (CDN, GitHub Enterprise, etc.).
+  // Empty/absent leaves the engine at the default. See
+  // `mergeTrustedHosts` for the dedup-set-union shape (exported
+  // so tests can pin the structural invariant directly — a
+  // behavioral test alone can't distinguish "extra duplicates
+  // were silently accepted" from "list is correct").
+  const trustedHosts = mergeTrustedHosts(resolveResult.policy.tools.fetch_url?.trusted_hosts ?? []);
   const engine = createPermissionEngine(resolveResult.policy, {
     cwd: input.cwd,
     home,
@@ -519,6 +549,7 @@ export const bootstrapPermissionEngine = async (
     audit: sink,
     sessionId: input.sessionId,
     stateController: controller,
+    trustedHosts,
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
     ...(input.now !== undefined ? { now: input.now } : {}),

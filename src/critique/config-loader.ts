@@ -12,13 +12,18 @@
 // hooks-style three-layer hierarchy would be overkill. Add it later
 // if a regulated environment needs to lock the mode.
 
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { projectConfigPath, userConfigPath } from '../config/paths.ts';
+import { loadTomlSection } from '../config/section.ts';
 import type { Provider } from '../providers/index.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
 import { KNOWN_CRITIQUE_PROMPT_VERSIONS } from './prompt.ts';
 import { type CritiqueConfig, type CritiqueMode, DEFAULT_CRITIQUE_CONFIG } from './types.ts';
+
+// Re-export shared path helpers so existing import sites (critique/
+// index.ts, tests/critique/config-loader.test.ts, etc.) keep working
+// without churn. New code should prefer importing from
+// `src/config/paths.ts` directly.
+export { projectConfigPath, userConfigPath };
 
 // Resolved config + (optional) critique provider. Bootstrap fans
 // these out into HarnessConfig.critique and HarnessConfig.critiqueProvider.
@@ -44,24 +49,6 @@ export interface LoadedCritiqueConfig {
   warnings: string[];
 }
 
-// User-layer path. Mirrors `userHooksPath` in src/hooks/paths.ts —
-// XDG_CONFIG_HOME wins when set + absolute, else `$HOME/.config`.
-// Returns null on a stripped-down env where neither yields a usable
-// absolute path; the loader treats null as "no user file".
-export const userConfigPath = (env: NodeJS.ProcessEnv = process.env): string | null => {
-  const xdg = env.XDG_CONFIG_HOME;
-  if (xdg !== undefined && xdg.length > 0 && isAbsolute(xdg)) {
-    return join(xdg, 'agent', 'config.toml');
-  }
-  const home = env.HOME ?? homedir();
-  if (home.length === 0 || !isAbsolute(home)) return null;
-  return join(home, '.config', 'agent', 'config.toml');
-};
-
-// Project-layer path. Always derivable from cwd; loader treats
-// absent file as empty layer.
-export const projectConfigPath = (cwd: string): string => join(cwd, '.agent', 'config.toml');
-
 const VALID_MODES: ReadonlySet<string> = new Set(['off', 'on_writes', 'always']);
 
 interface PartialCritiqueLayer {
@@ -80,39 +67,18 @@ interface ParseResult {
 // Parse one TOML file's `[critique]` section into a partial layer
 // object. Robust against absent file (treated as empty), missing
 // section (also empty), and bad values (warning + skip the
-// individual field, not the whole layer).
+// individual field, not the whole layer). Shared file/parse/section
+// plumbing lives in `src/config/section.ts` (`loadTomlSection`).
 const parseLayer = (path: string | null, source: string): ParseResult => {
   const layer: PartialCritiqueLayer = {};
   const warnings: string[] = [];
-  if (path === null) return { layer, warnings };
-  if (!existsSync(path)) return { layer, warnings };
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf8');
-  } catch (err) {
-    warnings.push(
-      `${source} config (${path}) could not be read: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  const section = loadTomlSection(path, 'critique', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
     return { layer, warnings };
   }
-  let parsed: unknown;
-  try {
-    parsed = Bun.TOML.parse(raw);
-  } catch (err) {
-    warnings.push(
-      `${source} config (${path}) TOML parse failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return { layer, warnings };
-  }
-  if (parsed === null || typeof parsed !== 'object') return { layer, warnings };
-  const top = parsed as Record<string, unknown>;
-  const section = top.critique;
-  if (section === undefined) return { layer, warnings };
-  if (section === null || typeof section !== 'object') {
-    warnings.push(`${source} config (${path}): [critique] is not a table`);
-    return { layer, warnings };
-  }
-  const c = section as Record<string, unknown>;
+  const c = section.section;
 
   // Format a value defensively for inclusion in a warning string.
   // JSON.stringify handles objects/arrays/null without throwing on
@@ -372,35 +338,13 @@ const parseMemoryLayer = (
     hadOverrideField: false,
   };
   const warnings: string[] = [];
-  if (path === null) return { layer, warnings };
-  if (!existsSync(path)) return { layer, warnings };
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf8');
-  } catch (err) {
-    warnings.push(
-      `${source} config (${path}) could not be read: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  const section = loadTomlSection(path, 'memory', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
     return { layer, warnings };
   }
-  let parsed: unknown;
-  try {
-    parsed = Bun.TOML.parse(raw);
-  } catch (err) {
-    warnings.push(
-      `${source} config (${path}) TOML parse failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return { layer, warnings };
-  }
-  if (parsed === null || typeof parsed !== 'object') return { layer, warnings };
-  const top = parsed as Record<string, unknown>;
-  const section = top.memory;
-  if (section === undefined) return { layer, warnings };
-  if (section === null || typeof section !== 'object') {
-    warnings.push(`${source} config (${path}): [memory] is not a table`);
-    return { layer, warnings };
-  }
-  const m = section as Record<string, unknown>;
+  const m = section.section;
 
   const fmtBad = (v: unknown): string => {
     try {
@@ -528,4 +472,273 @@ export const loadMemoryConfig = (input: LoadMemoryConfigInput): LoadedMemoryConf
     projectPath,
     warnings,
   };
+};
+
+// ────────────────────────────────────────────────────────────────────
+// PROVIDERS CONFIG (AGENTIC_CLI.md §2.1.1)
+//
+// `[providers] model = "..."` pins the executor model per-project.
+// Resolution chain (bootstrap consumes via `loadProvidersConfig`):
+//
+//   CLI flag (--model)  >  project [providers].model
+//                       >  user    [providers].model
+//                       >  DEFAULT_MODEL (in bootstrap.ts)
+//
+// Unknown model id ⇒ warning + null (the caller falls back to
+// DEFAULT_MODEL). Same fail-soft posture as [critique].model.
+
+export interface ProvidersConfigKeys {
+  // Fully-qualified model id, e.g. "anthropic/claude-opus-4-7".
+  // Absent (rather than `null`) when no layer declared the field —
+  // matches the per-field-optional convention used by
+  // BudgetConfigKeys and CritiqueConfig.promptVersion. Bootstrap
+  // consumes via `?? DEFAULT_MODEL` so both undefined and null
+  // would work, but the optional shape keeps the field shape
+  // consistent across loaders.
+  model?: string;
+}
+
+export interface LoadedProvidersConfig {
+  config: ProvidersConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+interface PartialProvidersLayer {
+  model?: string;
+}
+
+const parseProvidersLayer = (
+  path: string | null,
+  source: string,
+  registry: ModelRegistry,
+): { layer: PartialProvidersLayer; warnings: string[] } => {
+  const layer: PartialProvidersLayer = {};
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'providers', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const p = section.section;
+  if (p.model !== undefined) {
+    if (typeof p.model !== 'string') {
+      warnings.push(
+        `${source} config (${path}): [providers].model must be a string (got ${typeof p.model}); ignoring`,
+      );
+    } else if (p.model.length === 0) {
+      warnings.push(`${source} config (${path}): [providers].model is empty; ignoring`);
+    } else if (registry.get(p.model) === null) {
+      warnings.push(
+        `${source} config (${path}): [providers].model='${p.model}' is not a known model; ignoring. Known: ${registry
+          .list()
+          .map((e) => e.id)
+          .join(', ')}`,
+      );
+    } else {
+      layer.model = p.model;
+    }
+  }
+  return { layer, warnings };
+};
+
+export interface LoadProvidersConfigInput {
+  cwd: string;
+  registry: ModelRegistry;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadProvidersConfig = (input: LoadProvidersConfigInput): LoadedProvidersConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+
+  const userResult = parseProvidersLayer(userPath, 'user', input.registry);
+  const projectResult = parseProvidersLayer(projectPath, 'project', input.registry);
+  const warnings: string[] = [...userResult.warnings, ...projectResult.warnings];
+
+  // Per-field merge — project overrides user. Only one field today
+  // (`model`), but the merge shape stays consistent with the other
+  // loaders so a future `[providers].api_key_env` etc. drops in
+  // without restructuring. Field omitted entirely when no layer
+  // declared it (matches BudgetConfigKeys convention).
+  const config: ProvidersConfigKeys = {};
+  const resolvedModel = projectResult.layer.model ?? userResult.layer.model;
+  if (resolvedModel !== undefined) config.model = resolvedModel;
+
+  return { config, userPath, projectPath, warnings };
+};
+
+// ────────────────────────────────────────────────────────────────────
+// BUDGET CONFIG (AGENTIC_CLI.md §2.1.1)
+//
+// `[budget]` overrides DEFAULT_BUDGET per-project. Resolution chain
+// mirrors [providers]:
+//
+//   CLI flag  >  project [budget].<key>
+//             >  user    [budget].<key>
+//             >  DEFAULT_BUDGET.<key> in src/harness/types.ts
+//
+// Per-key merge — a layer that only sets `max_cost_usd` leaves
+// the other fields to the next layer down. Validators reject
+// out-of-range / wrong-type values with a warning + ignore
+// (same fail-soft posture as [critique] / [memory]).
+
+export interface BudgetConfigKeys {
+  maxSteps?: number;
+  maxCostUsd?: number;
+  maxWallClockMs?: number;
+  maxStepStallMs?: number;
+  compactionThreshold?: number;
+  compactionPreserveTail?: number;
+}
+
+export interface LoadedBudgetConfig {
+  config: BudgetConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+interface PartialBudgetLayer extends BudgetConfigKeys {}
+
+// Integer-valued budget keys with sanity-check ranges.
+//
+// The max values are deliberately permissive — they catch "the
+// operator typed a wildly wrong number" (negative cost, 10x the
+// realistic upper bound) without forbidding legitimate use cases.
+// DEFAULT_BUDGET (in src/harness/types.ts) sits well inside each
+// range. Each ceiling is justified inline:
+//
+//   max_steps: 1M — runaway-loop backstop; a long refactor at 1k
+//     steps is plausible, anything >>1k means the loop never
+//     converges. 1M is "obviously a typo" rather than "tight cap".
+//   max_wall_clock_ms: 24h — overnight CI runs are legitimate;
+//     anything beyond a day is operator error.
+//   max_step_stall_ms: 1h — single step taking >1h to produce
+//     output is "stuck" by any reasonable definition; the default
+//     of 90s is what catches genuine hangs.
+//   compaction_preserve_tail: 1000 — preserving more than 1k
+//     turns verbatim defeats the purpose of compaction.
+const BUDGET_INT_KEYS: ReadonlyArray<{
+  snake: string;
+  camel: keyof BudgetConfigKeys;
+  min: number;
+  max: number;
+}> = [
+  { snake: 'max_steps', camel: 'maxSteps', min: 1, max: 1_000_000 },
+  { snake: 'max_wall_clock_ms', camel: 'maxWallClockMs', min: 1, max: 24 * 60 * 60 * 1000 },
+  { snake: 'max_step_stall_ms', camel: 'maxStepStallMs', min: 1, max: 60 * 60 * 1000 },
+  // compactionPreserveTail = 0 is intentional (aggressive
+  // compaction: drop everything except the system prompt) — the
+  // min is 0, not 1.
+  { snake: 'compaction_preserve_tail', camel: 'compactionPreserveTail', min: 0, max: 1000 },
+];
+
+// Float-valued budget keys. Same sanity-check posture as integers.
+//
+//   max_cost_usd: 1M — pathological-typo guard; real budgets are
+//     orders of magnitude below. min=0 admits "no spend allowed"
+//     as a legitimate lockdown shape (matches the engine's
+//     `> 0` cost-cap semantic in harness/types.ts:491).
+//   compaction_threshold: [0, 1] — fraction of the context window;
+//     out of [0,1] is mathematically meaningless.
+const BUDGET_FLOAT_KEYS: ReadonlyArray<{
+  snake: string;
+  camel: keyof BudgetConfigKeys;
+  min: number;
+  max: number;
+}> = [
+  { snake: 'max_cost_usd', camel: 'maxCostUsd', min: 0, max: 1_000_000 },
+  { snake: 'compaction_threshold', camel: 'compactionThreshold', min: 0, max: 1 },
+];
+
+const parseBudgetLayer = (
+  path: string | null,
+  source: string,
+): { layer: PartialBudgetLayer; warnings: string[] } => {
+  const layer: PartialBudgetLayer = {};
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'budget', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const b = section.section;
+
+  const readNumber = (
+    snake: string,
+    camel: keyof BudgetConfigKeys,
+    min: number,
+    max: number,
+    isInteger: boolean,
+  ): void => {
+    const snakeRaw = b[snake];
+    const camelRaw = b[camel];
+    // Mirror the dual-key warning convention from [critique] /
+    // [memory]: if the operator declares BOTH spellings, snake_case
+    // wins (TOML idiom is snake_case + spec convention) and the
+    // camelCase value is dropped. Surface the conflict so the
+    // operator can audit which value is authoritative.
+    if (snakeRaw !== undefined && camelRaw !== undefined) {
+      warnings.push(
+        `${source} config (${path}): [budget] declares both ${snake} and ${camel}; snake_case wins, camelCase ignored`,
+      );
+    }
+    const v = snakeRaw ?? camelRaw;
+    if (v === undefined) return;
+    const keyUsed = snakeRaw !== undefined ? snake : camel;
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      warnings.push(
+        `${source} config (${path}): [budget].${keyUsed}=${JSON.stringify(v)} must be a finite number; ignoring`,
+      );
+      return;
+    }
+    if (isInteger && !Number.isInteger(v)) {
+      warnings.push(
+        `${source} config (${path}): [budget].${keyUsed}=${v} must be an integer; ignoring`,
+      );
+      return;
+    }
+    if (v < min || v > max) {
+      warnings.push(
+        `${source} config (${path}): [budget].${keyUsed}=${v} out of range [${min}, ${max}]; ignoring`,
+      );
+      return;
+    }
+    (layer as Record<string, number>)[camel] = v;
+  };
+
+  for (const { snake, camel, min, max } of BUDGET_INT_KEYS)
+    readNumber(snake, camel, min, max, true);
+  for (const { snake, camel, min, max } of BUDGET_FLOAT_KEYS)
+    readNumber(snake, camel, min, max, false);
+
+  return { layer, warnings };
+};
+
+export interface LoadBudgetConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadBudgetConfig = (input: LoadBudgetConfigInput): LoadedBudgetConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+
+  const userResult = parseBudgetLayer(userPath, 'user');
+  const projectResult = parseBudgetLayer(projectPath, 'project');
+  const warnings: string[] = [...userResult.warnings, ...projectResult.warnings];
+
+  // Per-key merge — project wins on conflict, undefined leaves the
+  // next layer (or DEFAULT_BUDGET) to fill in. Bootstrap is
+  // responsible for the DEFAULT_BUDGET merge, mirroring how
+  // critique/memory don't pre-merge defaults here.
+  const config: BudgetConfigKeys = { ...userResult.layer, ...projectResult.layer };
+
+  return { config, userPath, projectPath, warnings };
 };

@@ -7,6 +7,7 @@ import {
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
+import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
 import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
@@ -665,6 +666,18 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // bun) instead of vanishing entirely.
     const childTelemetry = createRecordingTelemetrySink();
 
+    // Mirror the parent's trusted-hosts merge so a subagent
+    // fetching the same internal CDN as the parent run sees the
+    // same risk-score posture. The audit.policySnapshot is the
+    // parent's canonical policy committed at spawn and already
+    // carries `tools.fetch_url.trusted_hosts`. Without this wire
+    // the engine here would fall back to DEFAULT_TRUSTED_HOSTS
+    // and surface `untrusted_egress` for the very same host the
+    // parent treated as silent — operator-visible divergence
+    // between parent and child decisions on identical URLs.
+    const childTrustedHosts = mergeTrustedHosts(
+      audit.policySnapshot.tools.fetch_url?.trusted_hosts ?? [],
+    );
     const permissionEngine = createPermissionEngine(audit.policySnapshot, {
       cwd: session.cwd,
       ...(effectiveCapabilitiesParsed !== undefined
@@ -673,6 +686,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       ...(childSink !== undefined ? { audit: childSink } : {}),
       telemetry: childTelemetry,
       sessionId: opts.sessionId,
+      trustedHosts: childTrustedHosts,
     });
 
     // The audit row carries the canonical toolset (`tools_whitelist`)
