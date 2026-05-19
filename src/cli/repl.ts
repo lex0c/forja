@@ -2314,11 +2314,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (k === 'enter') {
         const val = renderer.state().input.value;
         const parsed = parseSlashInput(val);
-        if (parsed === null || parsed.name === '') {
-          // Bare `/` + Enter: nothing to execute. Falling through
-          // would let applyKey emit submit:'/' and dispatch a turn
-          // sending '/' to the model. Clear input + slash mode and
-          // consume the keystroke.
+        // Two paths converge here. (1) Buffer has a typed name
+        // (`/quit`, `/q foo`) — parsed.name is non-empty. (2) Buffer
+        // is bare `/` and the popover is open with a live selection
+        // — operator's intent is "run the highlighted item". The
+        // popover takes precedence in both cases when a selection
+        // exists, because it's the most specific signal of intent
+        // (it tells us which command, regardless of how much the
+        // operator typed). Args, if any, come from the buffer
+        // (selection alone can't carry args).
+        let effectiveName: string | null = null;
+        if (slashState !== null && slashState.selectedIdx >= 0) {
+          const pick = slashState.suggestions[slashState.selectedIdx];
+          if (pick !== undefined) effectiveName = pick.name;
+        }
+        if (effectiveName === null && parsed !== null && parsed.name !== '') {
+          effectiveName = parsed.name;
+        }
+        if (effectiveName === null) {
+          // Bare `/` + Enter with NO selection (zero matches, or
+          // popover already closed): nothing to execute. Falling
+          // through would let applyKey emit submit:'/' and dispatch
+          // a turn sending '/' to the model. Clear input + slash
+          // mode and consume the keystroke.
           bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
           slashOpen = false;
           bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
@@ -2329,17 +2347,22 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // dispatch. The reducer's user:submit branch clears the
         // input — including the unknown-command case, so a typo
         // like `/doesnotexist` doesn't linger in the buffer for
-        // the next Enter to retry. Resolve the typed name through
-        // the registry's case-insensitive matcher so `/Help` lands
-        // on `help` (autocomplete already shows `help`; bug if the
-        // dispatcher disagrees).
-        const resolvedName = resolveCommandName(parsed.name);
-        bus.emit({ type: 'user:submit', ts: now(), text: val });
-        recordHistorySubmit(val);
+        // the next Enter to retry. The echoed text reflects the
+        // RESOLVED command (not the raw prefix) so scrollback +
+        // history match what actually ran. resolveCommandName's
+        // case-insensitive fallback covers exact-name typos
+        // (`/Help` → `help`); the popover selection already
+        // handled the prefix case above.
+        const resolvedName = resolveCommandName(effectiveName);
+        const args = parsed?.args ?? [];
+        const echoText =
+          args.length > 0 ? `/${resolvedName} ${args.join(' ')}` : `/${resolvedName}`;
+        bus.emit({ type: 'user:submit', ts: now(), text: echoText });
+        recordHistorySubmit(echoText);
         bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
         slashOpen = false;
         void dispatchSlash(
-          { name: resolvedName, args: parsed.args },
+          { name: resolvedName, args },
           { registry: slashRegistry, ctx: slashCtx },
         );
         return true;

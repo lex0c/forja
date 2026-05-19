@@ -2,6 +2,81 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(tui) — slash popover moves below input; Enter commits popover selection
+
+Hands-on UX iteration on the slash autocomplete popover. Four operator-visible changes plus one functional fix; spec amendments are pending — see "Spec follow-ups" at the bottom of this entry.
+
+**1. Popover repositioned below the input block.**
+
+The popover used to render above the input rule (`UI.md §5.3`). Operators on this iteration wanted it adjacent to where they're typing — eye doesn't have to jump up. New layout:
+
+```
+─────────────────────────────────  ← rule above input
+> /q                                ← input
+─────────────────────────────────  ← rule below input
+/help        show help              ← popover (col 0)
+/quit        exit
+…
+  • opus · 3/50 · $0.0120           ← footer
+```
+
+- `src/tui/render/compose.ts` — removed the `appendBlock(renderSlashPopover(...))` call between the upper live region and the input rule; added a direct `lines.push(...renderSlashPopover(...))` (no `padFrame`, no blank separator) between the rule below the input and the footer.
+- Introduced `trailingBelowInput(state)` so `composeCursor` knows how many rows sit below the input (base `FOOTER_BLOCK_LINES = 2` + popover line count when open). The cursor still lands on the input row regardless of popover height.
+- `src/tui/render/slash-popover.ts` — exported `slashPopoverLineCount(slash)` so `compose.ts` can compute the offset without re-rendering. Single source of truth between renderer and cursor math.
+
+**2. Popover frame margin removed (rows live at col 0).**
+
+`UI.md §6.3` lists the slash popover as one of the padded elements (2sp left frame margin). New behavior: popover rows are edge-to-edge like the input block, no leading prefix. Made the visual link between input and popover obvious — they read as one continuous typing zone instead of two indented elements.
+
+- `src/tui/render/slash-popover.ts` — removed the internal `  ${cursor}` prefix from suggestion rows, the `(no matches — try /help)` placeholder, and the `(N more — scroll with ↑/↓)` overflow footer. All three now start at col 0.
+
+**3. Cursor glyph removed; selection painted in `accent` (terminal blue).**
+
+The `> ` cursor glyph (same one modal options use) was a redundant signal once the popover sits next to the input. Removed it; selection is conveyed by color alone:
+
+- Selected row: `accent` (SGR 94, bright blue).
+- Unselected rows + placeholder + overflow hint: `secondary` (SGR 90, grey).
+- `color: 'none'` terminals lose the selection cue. Acceptable degradation — the popover already requires a colored terminal to read cleanly. Documented as known degradation for the spec PR.
+
+The `accent` token in `src/tui/term.ts:124-129` is currently reserved for structural chrome (modal top rule); we extended it to popover selection. Spec amendment is pending — see follow-ups.
+
+**4. Footer suppresses beginner hints while popover is open.**
+
+`? for help · \+Enter newline` competed for attention with the autocomplete list. Now suppressed when `state.slash !== null`. `esc to interrupt` still surfaces if a run is in flight. `exitArmed` still takes absolute precedence.
+
+- `src/tui/render/footer.ts` — new branch in `renderFooter` between the `exitArmed` cue and the default-left-column path: when `state.slash !== null`, the left column drops both hints and keeps only the interrupt cue if `isRunning(state)`.
+
+**5. Enter commits the popover selection (functional fix, not just UX).**
+
+Operator-reported bug: navigating to a popover item and pressing Enter did nothing visible. Two distinct root causes:
+
+- **Prefix case (`/q` + Enter):** `src/cli/repl.ts` Enter handler parsed the raw buffer (`q`), `resolveCommandName('q')` returned the raw string (the case-insensitive fallback only catches exact-name matches, not prefixes), and the dispatcher surfaced "unknown command" while `quit` sat visibly selected.
+- **Bare-slash case (`/` + selection + Enter):** the bare-slash early-return branch fired BEFORE the new selection-aware code path, so any selection — default highlight (`help`) or navigated — was ignored. Operator saw a highlighted row but Enter cleared the buffer.
+
+Fix in `src/cli/repl.ts` Enter handler: the popover selection is now the primary signal of intent. If `slashState !== null && selectedIdx >= 0`, the highlighted item's name becomes the `effectiveName`. The parsed buffer name is the fallback. Only when BOTH are absent does the bare-slash clear path fire. Args (if any) still come from the buffer — operator may have typed `/q foo bar` and the args belong to the highlighted command.
+
+The user-submit echo + history record now reflect the RESOLVED command (`/quit`, not `/q`), so scrollback and `↑` history match what actually ran.
+
+**Tests.**
+
+- `tests/tui/render/slash-popover.test.ts` — updated row-shape assertions (no `> ` prefix, no leading spaces); added 4 new tests for `slashPopoverLineCount` (one per render branch + cross-check against actual render length), color assertions on `accent` (selected) and `secondary` (unselected + placeholder + overflow hint).
+- `tests/tui/render/footer.test.ts` — new `slash popover open suppresses help hints` describe block: 4 tests covering hint suppression, right column intact, interrupt cue still surfaces during runs, exitArmed wins precedence over slash.
+- `tests/cli/repl.test.ts` — added 2 regression tests: `prefix /q + Enter (no Tab) executes the highlighted /quit` and `bare / + Down + Enter executes the navigated selection`. Updated the existing `bare / + Enter clears the buffer` test to reflect the new behavior (Enter now dispatches the default-highlighted command; the LLM still never receives `/`).
+
+**Verification.**
+- `bun run typecheck` clean
+- `bun run lint` clean on changed files
+- `bun test tests/tui/render/{slash-popover,compose,footer}.test.ts` → 83/83 pass
+- `bun test tests/cli/repl.test.ts` → 86/86 pass
+
+**Spec follow-ups** (pending, to batch into a single PR once UX is stable):
+
+1. `UI.md §5.3` — popover renders BELOW the input, not above.
+2. `UI.md §6.3` — slash popover leaves the padded-elements list; rows live at col 0 like the input block.
+3. `UI.md §6.4` + `src/tui/term.ts:124-129` comment — `accent` is also valid as a selection cursor (extension of the "structural anchor" scope, not content coloring).
+4. `UI.md §4.10.6` — footer suppresses `? for help · \+Enter newline` while the slash popover is open.
+5. `UI.md §5.4` — Enter on the popover commits the highlighted selection, independent of Tab having been pressed first.
+
 ## [2026-05-19] fix(cli) — gate generic mid-walk "audit row was already written" message on actual write
 
 Operator-reported follow-up to commit `22d17e9` (TOCTOU abort fix). That fix correctly gated the TOCTOU branch's audit message on `!options.noAudit && audit.writable`, but the SIBLING generic-error branch (for non-TOCTOU mid-walk failures like EBUSY, EACCES, ENOSPC) was left with the pre-existing unconditional line: `"(audit row was already written; the project is in a partial state)"`. Under `--no-audit` no probe + insert happens — the line claimed a row that never existed, sending incident-response investigators chasing a nonexistent DB entry during recovery from a real FS failure.

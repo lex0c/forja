@@ -63,6 +63,20 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   let left: string;
   if (state.exitArmed !== null) {
     left = paint(caps, 'warn', 'Press Ctrl-C again to exit');
+  } else if (state.slash !== null) {
+    // Slash popover is open directly below the input. The two
+    // beginner hints (`? for help`, `\+Enter newline`) would compete
+    // for the operator's attention with the autocomplete rows the
+    // popover just printed — and they're irrelevant in this moment
+    // (operator is mid-command, not browsing options). Suppress both
+    // for the duration of the popover. The interrupt cue stays in
+    // case a run is in flight (rare while slash is open, but
+    // possible — esc is still load-bearing then).
+    const leftParts: string[] = [];
+    if (isRunning(state)) {
+      leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+    }
+    left = leftParts.join(sep);
   } else {
     const leftParts = [
       dim(caps, '? for help'),

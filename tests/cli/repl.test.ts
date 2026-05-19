@@ -2398,6 +2398,28 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(0);
   });
 
+  test('prefix /q + Enter (no Tab) executes the highlighted /quit (regression)', async () => {
+    // Without the fix, Enter dispatches the raw buffer (`q`), the
+    // registry lookup fails, and the operator sees "unknown command"
+    // while `quit` sat visibly selected in the popover. The
+    // operator's intent — "run the highlighted item" — wins.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+    });
+    await tick();
+    stdin.feed('/q');
+    await flushFrame();
+    // Popover open with `quit` highlighted (only `q*` match). Enter
+    // commits the selection — exit code 0 proves /quit ran.
+    stdin.feed('\r');
+    expect(await promise).toBe(0);
+  });
+
   test('/Help (mixed case) resolves to /help via case-insensitive lookup', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
@@ -2422,9 +2444,15 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
-  test('bare / + Enter clears the buffer instead of sending "/" to the LLM', async () => {
+  test('bare / + Enter dispatches the default-highlighted command (does NOT send "/" to the LLM)', async () => {
+    // `/` opens the popover with selectedIdx=0 (the first registry
+    // entry, currently `/help`). Enter commits that selection — same
+    // contract as any other prefix. The critical invariant: '/' must
+    // NEVER reach the LLM as a user message, regardless of whether
+    // the dispatcher runs the highlight or no-ops.
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
+    const writes: string[] = [];
     const promise = runRepl({
       args: makeArgs(),
       bootstrapOverride: makeBootstrapStub(),
@@ -2432,16 +2460,45 @@ describe('repl — slash commands integration', () => {
       skipTtyCheck: true,
       skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
     });
     await tick();
     stdin.feed('/');
-    await tick();
+    await flushFrame();
     stdin.feed('\r');
-    await tick();
+    await flushFrame();
     // No turn started — runAgent override never called.
     expect(ra.captured).toHaveLength(0);
+    // The default highlight (help) executed — its scrollback output
+    // is the proof.
+    expect(writes.join('')).toContain('Slash commands:');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+
+  test('bare / + Down + Enter executes the navigated selection (regression)', async () => {
+    // Operator opens the popover with bare `/`, navigates one row
+    // down (off `help`, onto `quit` — registration order), and hits
+    // Enter. Without the fix, the bare-slash early-return branch
+    // ignored the popover selection entirely; the operator saw the
+    // highlighted row but Enter did nothing user-visible.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+    });
+    await tick();
+    stdin.feed('/');
+    await flushFrame();
+    stdin.feed('\x1b[B'); // Down — move highlight from /help to /quit.
+    await flushFrame();
+    stdin.feed('\r'); // Enter — should dispatch /quit, not no-op.
+    expect(await promise).toBe(0);
   });
 
   test('slash mode is closed after typing a non-slash character at the start', async () => {
