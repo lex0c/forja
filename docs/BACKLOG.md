@@ -2,6 +2,44 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(audit) — gc Phase 3 wires `purge_events` retention (inert key bug)
+
+Operator-reported gap. The purge subsystem migration (066-purge-events.ts:87) declared "Retention 365d (par with approvals_log, per AUDIT.md §1.2). No UPDATE surface, no DELETE outside the retention sweep" — and `[audit.retention].purge_events` was accepted by config parsing as a forward-compat key — but no sweep path existed. The retention key was inert: an operator setting `purge_events = 30` got the warning-free acceptance of validated input plus the silent no-op of forward-compat input. Worst of both worlds.
+
+**Consequences.**
+
+- `purge_events` rows grow unbounded across the install lifetime. Each `agent purge --force` adds 1 row (`bytes_present`, `files_present`, `dirs_present`, plus JSON artifact list). Heavy users with frequent purges accumulate without ever triggering the documented 365d sweep.
+- The documented retention behavior in AUDIT.md §1.2 + the migration comment didn't hold: operators reading either source assumed the sweep was wired, but it wasn't.
+- `agent gc --table=purge_events` would have rejected (unknown table) — no way to even manually sweep through the CLI.
+- The "inert key" pattern was operator-visible only by reading source: typing the key in TOML produced no warning, no effect, no signal of either acceptance or rejection.
+
+**Fix.** Wire `purge_events` end-to-end through the gc subsystem as the first inhabitant of a new "Phase 3" category:
+
+1. **`src/audit/gc-tables.ts`** — added `PHASE_3_TABLES = ['purge_events'] as const` with comment defining the category: "standalone audit ledgers. Append-only, no FK chain, install-scoped, no hash chain." Distinct from Phase 2 (FK-cascade with sessions) and distinct from the still-deferred approvals_log (hash-chained, needs rotation-aware sweep). `GC_TABLES` union widened to include Phase 3.
+
+2. **`src/storage/repos/purge-events.ts`** — added `prunePurgeEvents(db, cutoffMs)`: `DELETE FROM purge_events WHERE ts < ?`. Strict-`<` boundary matches every other age-based prune helper (retrieval_trace, context_pins, memory_events, hook_runs, failure_events, eviction_events, outcomes) so operators see consistent semantics across a single gc run. Module header updated to call out this single legitimate mutation exception to append-only.
+
+3. **`src/audit/gc.ts`** — added `purge_events` case to all three exhaustive switches (`computeCutoffForTable`, `countWouldDelete`, `sweepOne`). Imported `prunePurgeEvents`. Re-exported `PHASE_3_TABLES` + `Phase3Table` type for consumers that want the phase split.
+
+4. **`src/audit/config-loader.ts`** — added `purge_events_days: 365` to `DEFAULT_RETENTION` (matching AUDIT.md + migration 066 header), added `purge_events_days: number` to `RetentionConfig`, moved `purge_events` from "Phase 3+ accepted, ignored" to "Phase 3 validated + applied" in `KNOWN_SCHEMA_KEYS`, added `parseDays` block for `r.purge_events`, added safe-`??` number merge for `purge_events_days`.
+
+5. **Tests** — 107/107 across 5 files:
+    - `tests/storage/purge-events.test.ts`: whitelist test extended to include `prunePurgeEvents` with explicit comment defining the append-only exception; 5 new prune semantics pins (strict `<` boundary, equal-cutoff preserved, idempotent, empty-table, install-wide scope).
+    - `tests/audit/gc.test.ts`: `TIGHT_CONFIG.purge_events_days = 1`; table count assertions 10 → 11 (and 9 → 10 with outcome_signals disabled); co-fixture integration test seeds + verifies purge_events sweep through orchestrator.
+    - `tests/audit/config-loader.test.ts`: new `Phase 3 keys (purge_events)` describe block — default, override, layer merge, invalid fallback, regression pin for "key was previously inert".
+    - `tests/cli/gc.test.ts`: table count 10 → 11.
+    - `tests/cli/args-gc.test.ts`: drift-guard pin that `--table=purge_events` is accepted by the parser (derives automatically from the GC_TABLES widening).
+
+**Design choices.**
+
+- **Whitelist test stays, doesn't get bypassed.** The append-only contract test at `tests/storage/purge-events.test.ts` previously enforced ONLY `[insertPurgeEvent, listPurgeEventsByCwd]`. Instead of deleting it (which would lose the drift signal for future regressions) or moving the prune to a separate module (would be the only outlier among 9 sister prune functions that all live in their repo files), I extended the whitelist to include `prunePurgeEvents` with an explicit comment carving out the retention-only exception. Any per-row DELETE / UPDATE added later still trips the test.
+
+- **Phase 3, not Phase 2.** Phase 2's comment explicitly defines it as "audit-cascade tables (FK SET NULL or CASCADE with sessions)". purge_events has no FK to sessions (it fires outside any session, attribution via `install_id` instead). Forcing it into Phase 2 would weaken that category's semantic. Phase 3's new comment ("standalone audit ledgers. Append-only, no FK chain, install-scoped") fits exactly, and approvals_log is the natural next inhabitant once a chain-aware sweep is built.
+
+- **Schema key order in `KNOWN_SCHEMA_KEYS` reordered to reflect new validation status.** `purge_events` moved out of the "accepted, ignored" block into a new "Phase 3 (validated + applied)" block. The remaining "Phase 4+" entries (`sessions`, `messages`, `approvals`, `approvals_log`, `policies`, `pending_decisions`, `prompt_versions`, `default_days`) stay forward-compat — none of those have an active sweep path yet.
+
+**Pre-existing operator state.** Installs that ran `agent purge --force` since migration 066 landed will have accumulated `purge_events` rows that were never swept. The first `agent gc --force` after this fix lands will retroactively delete any rows older than 365d. Operators expecting no rows to disappear should set a temporary larger retention before running gc, OR run `agent gc --table=purge_events` in dry-run first to see the projected delete count.
+
 ## [2026-05-19] fix(cli) — `agent gc` dry-run discriminates ENOENT from other stat errors
 
 Operator-reported follow-up to commit `7c5cd95`. The ENOENT-vs-real-failure fix used `existsSync(dbPath)` to discriminate, but `existsSync` swallows ALL stat errors and returns `false` for ENOENT, EACCES, ENOTDIR, ELOOP, ENAMETOOLONG equally. The discrimination was only HALF right: real ENOENT (file truly absent) downgraded to exit 0 — but so did EACCES (parent perm denied), ENOTDIR (parent isn't a directory), and other path-resolution errors. Same silent-masking bug the prior fix was meant to close.

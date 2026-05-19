@@ -9,6 +9,7 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { insertBgProcess } from '../../src/storage/repos/bg-processes.ts';
 import { createPin } from '../../src/storage/repos/context-pins.ts';
+import { insertPurgeEvent } from '../../src/storage/repos/purge-events.ts';
 import { writeRecapCache } from '../../src/storage/repos/recap-cache.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
@@ -119,6 +120,8 @@ const TIGHT_CONFIG = {
   eviction_events_days: 1,
   outcomes_days: 1,
   outcomeSignalsEnabled: true,
+  // Phase 3 (kept tight at 1 day for symmetry with Phase 1/2):
+  purge_events_days: 1,
   // runGcOnStop is irrelevant to the orchestrator tests — that flag
   // is consumed by the harness loop wiring, not by runGc itself.
   // Set explicitly to satisfy the RetentionConfig type.
@@ -148,10 +151,11 @@ describe('runGc — dry-run', () => {
     });
     expect(report.mode).toBe('dry-run');
     expect(report.errors).toEqual([]);
-    // Phase 1 + Phase 2 = 10 tables (outcomeSignalsEnabled=true).
-    // Seeded fixtures only touch 4 of them; the other 6 report as
-    // empty tables (beforeCount=0, deletedCount=0) but still appear.
-    expect(report.tables.length).toBe(10);
+    // Phase 1 + Phase 2 + Phase 3 = 11 tables (outcomeSignalsEnabled
+    // =true). Seeded fixtures only touch 4 of them; the other 7
+    // report as empty tables (beforeCount=0, deletedCount=0) but
+    // still appear.
+    expect(report.tables.length).toBe(11);
 
     // FS state unchanged: re-run dry-run gets same numbers.
     const second = runGc({ db, config: TIGHT_CONFIG, nowMs, dryRun: true });
@@ -253,19 +257,19 @@ describe('runGc — outcome_signals disabled (Phase 2 skip)', () => {
     const report = runGc({ db, config, nowMs, dryRun: true });
     const tableNames = report.tables.map((t) => t.table);
     expect(tableNames).not.toContain('outcome_signals');
-    // Other 9 tables still processed.
-    expect(report.tables.length).toBe(9);
+    // Other 10 tables still processed (4 Phase 1 + 5 Phase 2 + 1 Phase 3).
+    expect(report.tables.length).toBe(10);
   });
 });
 
-describe('runGc — Phase 1 + Phase 2 co-fixture integration', () => {
-  // Seeds a row in EACH of the 10 covered tables, half old (past
+describe('runGc — Phase 1 + Phase 2 + Phase 3 co-fixture integration', () => {
+  // Seeds a row in EACH of the 11 covered tables, half old (past
   // cutoff) and half fresh, then runs a single --force sweep and
-  // verifies every Phase 2 table actually had its old row deleted
-  // through the orchestrator. The per-helper tests pin each prune
-  // function in isolation; this test pins the orchestrator's
-  // dispatch wiring end-to-end across both phases.
-  test('orchestrator sweeps Phase 1 + Phase 2 rows in a single run', () => {
+  // verifies every table actually had its old row deleted through
+  // the orchestrator. The per-helper tests pin each prune function
+  // in isolation; this test pins the orchestrator's dispatch wiring
+  // end-to-end across all three phases.
+  test('orchestrator sweeps Phase 1 + Phase 2 + Phase 3 rows in a single run', () => {
     const nowMs = 10 * DAY_MS;
     const OLD = nowMs - 2 * DAY_MS;
     const FRESH = nowMs - 1000;
@@ -360,11 +364,33 @@ describe('runGc — Phase 1 + Phase 2 co-fixture integration', () => {
     seedSignal('os-old', nowMs - 1000); // expired
     seedSignal('os-fresh', nowMs + 60_000); // 1min in future
 
-    // Single sweep across all 10 tables.
+    // Phase 3 — purge_events (standalone audit ledger):
+    insertPurgeEvent(db, {
+      ts: OLD,
+      install_id: 'inst-old',
+      cwd: '/p',
+      artifacts_present_json: '[]',
+      bytes_present: 0,
+      files_present: 0,
+      dirs_present: 0,
+      forja_version: '0.0.0',
+    });
+    insertPurgeEvent(db, {
+      ts: FRESH,
+      install_id: 'inst-fresh',
+      cwd: '/p',
+      artifacts_present_json: '[]',
+      bytes_present: 0,
+      files_present: 0,
+      dirs_present: 0,
+      forja_version: '0.0.0',
+    });
+
+    // Single sweep across all 11 tables.
     const report = runGc({ db, config: TIGHT_CONFIG, nowMs, dryRun: false });
     expect(report.mode).toBe('force');
     expect(report.errors).toEqual([]);
-    expect(report.tables.length).toBe(10);
+    expect(report.tables.length).toBe(11);
 
     const byTable = new Map(report.tables.map((t) => [t.table, t]));
 
@@ -382,7 +408,10 @@ describe('runGc — Phase 1 + Phase 2 co-fixture integration', () => {
     expect(byTable.get('outcomes')?.deletedCount).toBe(1);
     expect(byTable.get('outcome_signals')?.deletedCount).toBe(1);
 
-    // Verify "fresh" rows survived (spot-check Phase 2):
+    // Phase 3 expectations — purge_events old row deleted:
+    expect(byTable.get('purge_events')?.deletedCount).toBe(1);
+
+    // Verify "fresh" rows survived (spot-check Phase 2 + Phase 3):
     expect(
       (
         db.query("SELECT COUNT(*) AS n FROM memory_events WHERE id = 'me-fresh'").get() as {
@@ -393,6 +422,15 @@ describe('runGc — Phase 1 + Phase 2 co-fixture integration', () => {
     expect(
       (
         db.query("SELECT COUNT(*) AS n FROM outcome_signals WHERE id = 'os-fresh'").get() as {
+          n: number;
+        }
+      ).n,
+    ).toBe(1);
+    expect(
+      (
+        db
+          .query("SELECT COUNT(*) AS n FROM purge_events WHERE install_id = 'inst-fresh'")
+          .get() as {
           n: number;
         }
       ).n,

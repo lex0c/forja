@@ -117,8 +117,8 @@ describe('runGcCli — dry-run', () => {
     expect(parsed.mode).toBe('dry-run');
     expect(parsed.nowMs).toBe(NOW);
     expect(parsed.config.context_pins_days).toBe(90); // default
-    // Phase 1 + Phase 2 = 10 tables (outcome_signals enabled by default).
-    expect(parsed.tables.length).toBe(10);
+    // Phase 1 + Phase 2 + Phase 3 = 11 tables (outcome_signals enabled by default).
+    expect(parsed.tables.length).toBe(11);
     expect(parsed.command).toBe('agent gc --force');
     // The "old" pin (200d back) is way past 90d default → 1 would-delete.
     const pinTable = parsed.tables.find((t) => t.table === 'context_pins');

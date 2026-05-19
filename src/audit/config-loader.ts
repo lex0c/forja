@@ -53,6 +53,11 @@ export const DEFAULT_RETENTION = {
   // INSERT). The flag here just gates whether gc sweeps the expired
   // rows or leaves them alone. Default true (sweep enabled).
   outcomeSignalsEnabled: true,
+  // Phase 3 (standalone audit ledgers — AUDIT §1.2 default).
+  // 365d matches the migration 066 header comment ("par with
+  // approvals_log") and the AUDIT.md retention table. Without an
+  // active gc path this key was inert; Phase 3 wires the sweep.
+  purge_events_days: 365,
   // Operational:
   runGcOnStop: false,
 } as const;
@@ -70,13 +75,15 @@ export interface RetentionConfig {
   eviction_events_days: number;
   outcomes_days: number;
   outcomeSignalsEnabled: boolean;
+  // Phase 3:
+  purge_events_days: number;
   // Operational:
   runGcOnStop: boolean;
 }
 
-// AUDIT §1.2 schema keys. Phase 1 + Phase 2 (10 tables) are
-// validated + applied; the rest are accepted silently (no runtime
-// effect, forward compat for Phase 3/4). A typo like
+// AUDIT §1.2 schema keys. Phase 1 + Phase 2 + Phase 3 (11 tables)
+// are validated + applied; the rest are accepted silently (no
+// runtime effect, forward compat for Phase 4/5). A typo like
 // `retreival_trace = 90` lands as "unknown key" warning so the
 // operator sees it.
 const KNOWN_SCHEMA_KEYS = new Set([
@@ -92,7 +99,9 @@ const KNOWN_SCHEMA_KEYS = new Set([
   'eviction_events',
   'outcomes',
   'outcome_signals',
-  // Phase 3+ (accepted, ignored at runtime — forward compat):
+  // Phase 3 (validated + applied — standalone audit ledgers):
+  'purge_events',
+  // Phase 4+ (accepted, ignored at runtime — forward compat):
   'default_days',
   'sessions',
   'messages',
@@ -101,7 +110,6 @@ const KNOWN_SCHEMA_KEYS = new Set([
   'policies',
   'pending_decisions',
   'prompt_versions',
-  'purge_events',
 ]);
 
 const PHASE_1_KEYS = new Set(['recap_cache', 'retrieval_trace', 'context_pins', 'bg_processes']);
@@ -344,6 +352,19 @@ const parseLayer = (path: string | null, source: string): ParseResult => {
     }
   }
 
+  // Phase 3 validation. Single day-based field (purge_events). Same
+  // parseDays pattern as Phase 1/2 day fields.
+  if (r.purge_events !== undefined) {
+    const d = parseDays(r.purge_events);
+    if (d === null) {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].purge_events=${fmtBad(r.purge_events)} must be a positive integer (days); ignoring`,
+      );
+    } else {
+      layer.purge_events_days = d;
+    }
+  }
+
   return { layer, warnings };
 };
 
@@ -425,6 +446,11 @@ export const loadRetentionConfig = (input: LoadRetentionInput): LoadedRetentionC
         : userParse.layer.outcomeSignalsEnabled !== undefined
           ? userParse.layer.outcomeSignalsEnabled
           : DEFAULT_RETENTION.outcomeSignalsEnabled,
+    // Phase 3 day-based field — safe `??` merge (number).
+    purge_events_days:
+      projectParse.layer.purge_events_days ??
+      userParse.layer.purge_events_days ??
+      DEFAULT_RETENTION.purge_events_days,
     // Boolean merge needs `!== undefined` instead of `??` because
     // `false ?? user_true` evaluates to `user_true` — the project's
     // explicit `false` would be silently dropped. Operator that

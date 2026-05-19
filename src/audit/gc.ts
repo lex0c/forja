@@ -22,6 +22,7 @@ import { pruneHookRuns } from '../storage/repos/hook-runs.ts';
 import { pruneMemoryEvents } from '../storage/repos/memory-events.ts';
 import { pruneExpiredOutcomeSignals } from '../storage/repos/outcome-signals.ts';
 import { pruneOutcomes } from '../storage/repos/outcomes.ts';
+import { prunePurgeEvents } from '../storage/repos/purge-events.ts';
 // `purgeExpiredRecapCache` predates the gc subsystem (RECAP §8.3
 // inline cleanup). We reuse it rather than ship a parallel
 // `pruneExpiredRecapCache` — the semantic is identical (sweep
@@ -49,9 +50,11 @@ export {
   GC_TABLES,
   PHASE_1_TABLES,
   PHASE_2_TABLES,
+  PHASE_3_TABLES,
   type GcTable,
   type Phase1Table,
   type Phase2Table,
+  type Phase3Table,
 } from './gc-tables.ts';
 import { GC_TABLES, type GcTable } from './gc-tables.ts';
 
@@ -139,6 +142,9 @@ const computeCutoffForTable = (table: GcTable, config: RetentionConfig, nowMs: n
       return nowMs - config.eviction_events_days * DAY_MS;
     case 'outcomes':
       return nowMs - config.outcomes_days * DAY_MS;
+    // Phase 3 — standalone audit ledger (no FK, no chain):
+    case 'purge_events':
+      return nowMs - config.purge_events_days * DAY_MS;
   }
 };
 
@@ -186,6 +192,12 @@ const countWouldDelete = (db: DB, table: GcTable, cutoffMs: number): number => {
       break;
     case 'outcome_signals':
       sql = 'SELECT COUNT(*) AS n FROM outcome_signals WHERE ttl_expires_at <= ?';
+      break;
+    case 'purge_events':
+      // Age-based on `ts` (epoch ms at confirmation time, CHECK > 0
+      // in migration 066). Strict `<` boundary mirrors other
+      // age-based tables; equal-cutoff rows survive.
+      sql = 'SELECT COUNT(*) AS n FROM purge_events WHERE ts < ?';
       break;
   }
   const row = db.query(sql).get(cutoffMs) as { n: number } | null;
@@ -239,6 +251,9 @@ const sweepOne = (
       break;
     case 'outcome_signals':
       deleted = pruneExpiredOutcomeSignals(db, cutoffMs);
+      break;
+    case 'purge_events':
+      deleted = prunePurgeEvents(db, cutoffMs);
       break;
   }
   return { beforeCount, deletedCount: deleted };

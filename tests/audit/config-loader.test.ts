@@ -344,3 +344,45 @@ outcomes = 5
     expect(r.config.memory_events_days).toBe(365); // default
   });
 });
+
+describe('loadRetentionConfig — Phase 3 keys (purge_events)', () => {
+  test('default is 365d (matches AUDIT.md §1.2 + migration 066 comment)', () => {
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath: null });
+    expect(r.config.purge_events_days).toBe(365);
+  });
+
+  test('project layer overrides default', () => {
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = 30\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.purge_events_days).toBe(30);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('user layer overrides default; project overrides user', () => {
+    writeFileSync(userPath, '[audit.retention]\npurge_events = 90\n');
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = 7\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.purge_events_days).toBe(7);
+  });
+
+  test('rejects non-integer / non-positive with warning + default fallback', () => {
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = "lots"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('purge_events'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('positive integer'))).toBe(true);
+    expect(r.config.purge_events_days).toBe(DEFAULT_RETENTION.purge_events_days);
+  });
+
+  test('purge_events key does NOT warn (was previously in Phase 3+ forward-compat list — now validated + applied)', () => {
+    // Regression pin for the operator-reported "inert retention key"
+    // bug. Pre-fix, `purge_events` lived in KNOWN_SCHEMA_KEYS but
+    // only as forward-compat (no parseDays, no merge, no GC table).
+    // The fix moved it to validated + applied. This test ensures
+    // the key produces no warning AND its value lands in the
+    // resolved config (proving validation ran).
+    writeFileSync(projectPath, '[audit.retention]\npurge_events = 180\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings).toEqual([]);
+    expect(r.config.purge_events_days).toBe(180);
+  });
+});

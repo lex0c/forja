@@ -42,11 +42,25 @@ export const PHASE_2_TABLES = [
   'outcome_signals',
 ] as const;
 
+// Phase 3 — standalone audit ledgers. Append-only, no FK chain,
+// install-scoped (not session-scoped), no hash chain. Distinct from
+// Phase 2 because pruning these doesn't have to reason about
+// FK cascade semantics with sessions, and distinct from the
+// hash-chained ledgers (approvals_log) which still need a dedicated
+// rotation-aware sweep before they can be added here.
+//
+// `purge_events` is the first inhabitant: AUDIT.md §1.2 specifies
+// 365d retention, the migration comment (066-purge-events.ts:87)
+// pre-declares "no DELETE outside the retention sweep", but the
+// sweep itself was missing until this phase wired it in.
+export const PHASE_3_TABLES = ['purge_events'] as const;
+
 // Union: every table the orchestrator knows how to sweep.
 // `args.ts` derives `KNOWN_GC_TABLES` from this so a new entry
 // here automatically widens the parser's --table=X accept-set.
-export const GC_TABLES = [...PHASE_1_TABLES, ...PHASE_2_TABLES] as const;
+export const GC_TABLES = [...PHASE_1_TABLES, ...PHASE_2_TABLES, ...PHASE_3_TABLES] as const;
 
 export type Phase1Table = (typeof PHASE_1_TABLES)[number];
 export type Phase2Table = (typeof PHASE_2_TABLES)[number];
+export type Phase3Table = (typeof PHASE_3_TABLES)[number];
 export type GcTable = (typeof GC_TABLES)[number];

@@ -14,7 +14,11 @@ import { describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import * as purgeRepo from '../../src/storage/repos/purge-events.ts';
-import { insertPurgeEvent, listPurgeEventsByCwd } from '../../src/storage/repos/purge-events.ts';
+import {
+  insertPurgeEvent,
+  listPurgeEventsByCwd,
+  prunePurgeEvents,
+} from '../../src/storage/repos/purge-events.ts';
 
 const newDb = (): DB => {
   const db = openMemoryDb();
@@ -285,11 +289,92 @@ describe('listPurgeEventsByCwd', () => {
 });
 
 describe('append-only contract', () => {
-  test('repo exports no UPDATE / DELETE surface', () => {
+  test('repo exports only the operator-visible inserts/reads and the retention-only prune', () => {
     const exports = Object.keys(purgeRepo);
-    // Whitelist what we DO export — drift here is the signal that
-    // someone landed a mutation surface (and should refactor that
-    // intent into a separate retention/admin module per AUDIT spec).
-    expect(exports.sort()).toEqual(['insertPurgeEvent', 'listPurgeEventsByCwd']);
+    // Whitelist what we DO export. From the operator's perspective
+    // this table is append-only — there is NO per-row DELETE/UPDATE
+    // surface, only:
+    //   - insertPurgeEvent: the only writer (called by cli/purge.ts
+    //     after the operator confirms a --force purge).
+    //   - listPurgeEventsByCwd: forensic read for "purge history of
+    //     project X" (called by the future `agent purge log` reader).
+    //   - prunePurgeEvents: retention-only mutation, called ONLY by
+    //     the gc orchestrator (src/audit/gc.ts:sweepOne) with an
+    //     age cutoff. AUDIT.md §1.2 specifies 365d retention; the
+    //     migration 066 header pre-declared this exception ("no
+    //     DELETE outside the retention sweep").
+    // Adding any per-row DELETE/UPDATE here should fail this test
+    // and force a discussion about why the append-only contract
+    // should bend further.
+    expect(exports.sort()).toEqual([
+      'insertPurgeEvent',
+      'listPurgeEventsByCwd',
+      'prunePurgeEvents',
+    ]);
+  });
+});
+
+describe('prunePurgeEvents — retention sweep', () => {
+  const ts = (n: number) => 1_700_000_000_000 + n; // anchor + offset for readability
+  const baseRow = {
+    install_id: 'inst-1',
+    cwd: '/repo',
+    artifacts_present_json: '[]',
+    bytes_present: 0,
+    files_present: 0,
+    dirs_present: 0,
+    forja_version: '0.0.0',
+  } as const;
+
+  test('deletes rows strictly older than cutoffMs', () => {
+    const db = newDb();
+    insertPurgeEvent(db, { ...baseRow, ts: ts(100) }); // old
+    insertPurgeEvent(db, { ...baseRow, ts: ts(200) }); // old
+    insertPurgeEvent(db, { ...baseRow, ts: ts(500) }); // young (after cutoff)
+    const cutoff = ts(300);
+    const deleted = prunePurgeEvents(db, cutoff);
+    expect(deleted).toBe(2);
+    const remaining = listPurgeEventsByCwd(db, '/repo');
+    expect(remaining.length).toBe(1);
+    expect(remaining[0]?.ts).toBe(ts(500));
+  });
+
+  test('preserves rows with ts exactly equal to cutoffMs (strict <)', () => {
+    // Boundary parity with other age-based prunes: equal-cutoff
+    // rows survive. An operator who sets retention to "1 day"
+    // shouldn't see a row that's exactly 24h old vanish on the
+    // boundary tick.
+    const db = newDb();
+    insertPurgeEvent(db, { ...baseRow, ts: ts(100) });
+    const deleted = prunePurgeEvents(db, ts(100));
+    expect(deleted).toBe(0);
+    expect(listPurgeEventsByCwd(db, '/repo').length).toBe(1);
+  });
+
+  test('idempotent: second call deletes nothing', () => {
+    const db = newDb();
+    insertPurgeEvent(db, { ...baseRow, ts: ts(100) });
+    insertPurgeEvent(db, { ...baseRow, ts: ts(200) });
+    const first = prunePurgeEvents(db, ts(300));
+    expect(first).toBe(2);
+    const second = prunePurgeEvents(db, ts(300));
+    expect(second).toBe(0);
+  });
+
+  test('returns 0 on empty table', () => {
+    const db = newDb();
+    expect(prunePurgeEvents(db, ts(1000))).toBe(0);
+  });
+
+  test('deletes across all cwd values (install-scoped, not project-scoped)', () => {
+    // prunePurgeEvents is install-wide hygiene — operator running
+    // `agent gc --force` shouldn't have to enumerate every project's
+    // cwd. Confirm the SQL does not filter by cwd.
+    const db = newDb();
+    insertPurgeEvent(db, { ...baseRow, cwd: '/a', ts: ts(100) });
+    insertPurgeEvent(db, { ...baseRow, cwd: '/b', ts: ts(100) });
+    insertPurgeEvent(db, { ...baseRow, cwd: '/c', ts: ts(100) });
+    const deleted = prunePurgeEvents(db, ts(200));
+    expect(deleted).toBe(3);
   });
 });

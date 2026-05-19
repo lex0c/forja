@@ -1,7 +1,16 @@
-// purge_events repo. Append-only by contract — no UPDATE / DELETE
-// surface here. Retention sweep (365d, per AUDIT.md §1.2) lives in
-// the separate gc path that already handles approvals_log /
-// failure_events; this module only provides INSERT + read primitives.
+// purge_events repo. Append-only from the OPERATOR'S perspective —
+// the only mutation surface exposed here is the retention sweep
+// (365d, per AUDIT.md §1.2), wired into the gc orchestrator
+// (src/audit/gc.ts). No per-row UPDATE / DELETE-by-id ever lands;
+// the contract is "append for writes; sweep by age only for the
+// gc retention path".
+//
+// The append-only test pin in tests/storage/purge-events.test.ts
+// whitelists `prunePurgeEvents` for exactly this reason: it is the
+// single legitimate mutation surface. Any other DELETE/UPDATE
+// addition (per-row delete, status update, etc.) should fail the
+// whitelist test and force a discussion about why the append-only
+// invariant should bend further.
 //
 // Schema in migration 066-purge-events.ts. Distinct from
 // approvals_log (the permission-engine hash-chained ledger) in two
@@ -89,4 +98,29 @@ export const listPurgeEventsByCwd = (db: DB, cwd: string, limit = 50): PurgeEven
   return db
     .query(`${SELECT_ALL} WHERE cwd = ? ORDER BY ts DESC LIMIT ?`)
     .all(cwd, limit) as PurgeEventRow[];
+};
+
+// Retention sweep — the ONLY mutation surface on this table. Deletes
+// rows strictly OLDER than `cutoffMs` (`ts < cutoffMs`), preserving
+// rows with `ts === cutoffMs`. The strict-less-than boundary matches
+// every other age-based prune helper in the gc orchestrator
+// (retrieval_trace, context_pins, memory_events, hook_runs,
+// failure_events, eviction_events, outcomes) — operators observing
+// multiple tables in the same gc run see consistent boundary
+// semantics across the board.
+//
+// Returns the row count from `result.changes`, mirroring the same
+// shape used by sister prune functions. The gc orchestrator
+// (src/audit/gc.ts:sweepOne) consumes this for the force-mode
+// `deletedCount` field.
+//
+// No `> 0` validation on cutoffMs: the orchestrator's runGc input
+// validator rejects non-positive `nowMs` before any per-table call,
+// and every cutoff is derived from `nowMs - days * DAY_MS` where
+// `days >= 1` is enforced by parseDays. Defense-in-depth would mean
+// re-validating here, but the validation lives where the input
+// boundary is (orchestrator), not at every leaf.
+export const prunePurgeEvents = (db: DB, cutoffMs: number): number => {
+  const result = db.query('DELETE FROM purge_events WHERE ts < ?').run(cutoffMs);
+  return Number(result.changes);
 };

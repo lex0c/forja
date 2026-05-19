@@ -75,6 +75,19 @@ describe('parseArgs — gc subcommand', () => {
     expect(r.args.gc?.tables.length).toBe(4);
   });
 
+  test('Phase 3 table name (purge_events) is accepted via --table', () => {
+    // Drift-guard: PHASE_3_TABLES landed in gc-tables.ts with
+    // purge_events as its first inhabitant. The parser derives its
+    // accept-set from GC_TABLES, so this should pass automatically;
+    // if it ever fails, someone partially undid the Phase 3 wiring
+    // (e.g., dropped purge_events from the union without updating
+    // the orchestrator).
+    const r = parseArgs(['gc', '--table=purge_events']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.args.gc?.tables).toEqual(['purge_events']);
+  });
+
   test('--table=<unknown> rejects with helpful message', () => {
     const r = parseArgs(['gc', '--table=approvals_log']);
     expect(r.ok).toBe(false);
