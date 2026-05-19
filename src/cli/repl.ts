@@ -1547,6 +1547,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       await baseConfig.broker.close();
     }
     db.close();
+    // Resume hint. Printed AFTER renderer.close() (no live region to
+    // fight) and AFTER db.close() (any teardown diagnostics that
+    // would also use errSink land first). Gated on a real session
+    // having run — when lastSessionId is null the operator never
+    // started a turn and there is nothing to resume to, so silence
+    // is correct. Goes through errSink (not stdout) because the
+    // line is operator diagnostics, not program output; tests inject
+    // a sink to capture it, and the convention matches the panic
+    // exit message above.
+    if (lastSessionId !== null) {
+      errSink(`\nResume this session with:\nforja --resume ${lastSessionId}\n`);
+    }
     resolveExit();
   };
 

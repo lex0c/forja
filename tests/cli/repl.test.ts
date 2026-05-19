@@ -2420,6 +2420,63 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(0);
   });
 
+  test('exit hint: prints "Resume this session with: forja --resume <id>" after a turn ran', async () => {
+    // Operator-visible cue printed during shutdown so the next boot
+    // can pick up where the previous one left off. Goes through
+    // errSink (operator diagnostics, not program output). Gated on
+    // lastSessionId being non-null — see the next test.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    // One turn so lastSessionId gets populated (`sess-1`).
+    stdin.feed('hi\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    // Quit. Shutdown path runs and the hint should land on errSink.
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+    const all = errs.join('');
+    expect(all).toContain('Resume this session with:');
+    expect(all).toContain('forja --resume sess-1');
+  });
+
+  test('exit hint: silent when no turn ever ran (lastSessionId stays null)', async () => {
+    // Operator opens the REPL and quits without prompting anything —
+    // there is no session to resume to, so the hint must NOT print.
+    // Printing `forja --resume undefined` would actively mislead.
+    const stdin = makeStdin();
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+    const all = errs.join('');
+    expect(all).not.toContain('Resume this session with:');
+    expect(all).not.toContain('--resume');
+  });
+
   test('/Help (mixed case) resolves to /help via case-insensitive lookup', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
