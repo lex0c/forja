@@ -293,4 +293,23 @@ export const countOutcomes = (db: DB): number => {
   return row.n;
 };
 
+// ─── pruneOutcomes ─────────────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// §1.2). Default retention 90d on `recorded_at`. Cutoff EXCLUSIVE.
+//
+// Cross-substrate operational outcomes (tier 1-5 + action_signature
+// + scope_kind). FK CASCADE with sessions — when Phase 4 lands,
+// session deletion will also drop outcomes; this sweep is the
+// independent retention path for outcomes that outlive their session.
+export const pruneOutcomes = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneOutcomes: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM outcomes WHERE recorded_at < ?').run(olderThanMs);
+  return Number(result.changes);
+};
+
 export { PERSISTED_COLUMNS };

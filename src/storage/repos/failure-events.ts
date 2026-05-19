@@ -150,6 +150,38 @@ export const countFailureEvents = (db: DB): number => {
   return row.n;
 };
 
+// ─── pruneFailureEvents ────────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// §1.2). Default retention 365d on `created_at`. Cutoff EXCLUSIVE.
+//
+// **Chain trade-off (documented in spec §2.1.3).** failure_events
+// carries a per-session chain hash (prev_chain_hash → this_chain_hash).
+// Age-based DELETE on individual rows breaks the per-session chain
+// for sessions that survive the sweep with only some events removed:
+// surviving rows will reference prev hashes that no longer exist in
+// the DB. We accept this because:
+//   (a) failure_events chain is best-effort forensic, NOT verifiable
+//       like approvals_log — no `verify` verb walks it.
+//   (b) Phase 4 (sessions FK CASCADE) will whole-session-delete,
+//       restoring cleaner semantics for old sessions.
+//   (c) Operator who needs intact chain integrity can set
+//       `failure_events_days` very high (e.g., 99999 ~= forever;
+//       the literal `"forever"` sentinel is not Phase 2 scope).
+//
+// We deliberately do NOT skip rows here based on chain position —
+// half-measures (delete leaves but keep roots) would leave the
+// chain equally broken with more code complexity.
+export const pruneFailureEvents = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneFailureEvents: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM failure_events WHERE created_at < ?').run(olderThanMs);
+  return Number(result.changes);
+};
+
 // Re-export the persisted column order so the sink's canonical
 // hash payload mirrors the DB's column declaration exactly. Same
 // single-source-of-truth pattern approvals-log.ts uses.

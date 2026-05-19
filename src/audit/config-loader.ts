@@ -38,23 +38,45 @@ import { loadTomlSection } from '../config/section.ts';
 // Lives in `[audit]` (sibling of `[audit.retention]`), not nested,
 // because it's an operational toggle rather than a TTL.
 export const DEFAULT_RETENTION = {
+  // Phase 1 (4 low-sensitivity tables):
   recap_cache_ttl_ms: 60 * 60 * 1000, // 1h
   retrieval_trace_days: 90,
   context_pins_days: 90,
   bg_processes_days: 30,
+  // Phase 2 (6 audit-cascade tables — AUDIT §1.2 defaults):
+  memory_events_days: 365,
+  hook_runs_days: 90,
+  failure_events_days: 365,
+  eviction_events_days: 365,
+  outcomes_days: 90,
+  // outcome_signals uses per-row TTL (ttl_expires_at populated at
+  // INSERT). The flag here just gates whether gc sweeps the expired
+  // rows or leaves them alone. Default true (sweep enabled).
+  outcomeSignalsEnabled: true,
+  // Operational:
   runGcOnStop: false,
 } as const;
 
 export interface RetentionConfig {
+  // Phase 1:
   recap_cache_ttl_ms: number;
   retrieval_trace_days: number;
   context_pins_days: number;
   bg_processes_days: number;
+  // Phase 2:
+  memory_events_days: number;
+  hook_runs_days: number;
+  failure_events_days: number;
+  eviction_events_days: number;
+  outcomes_days: number;
+  outcomeSignalsEnabled: boolean;
+  // Operational:
   runGcOnStop: boolean;
 }
 
-// AUDIT §1.2 schema keys. Phase 1 only validates the 4 below;
-// the rest are accepted silently (no runtime effect). A typo like
+// AUDIT §1.2 schema keys. Phase 1 + Phase 2 (10 tables) are
+// validated + applied; the rest are accepted silently (no runtime
+// effect, forward compat for Phase 3/4). A typo like
 // `retreival_trace = 90` lands as "unknown key" warning so the
 // operator sees it.
 const KNOWN_SCHEMA_KEYS = new Set([
@@ -63,18 +85,20 @@ const KNOWN_SCHEMA_KEYS = new Set([
   'retrieval_trace',
   'context_pins',
   'bg_processes',
-  // Phase 2+ (accepted, ignored at runtime — forward compat):
+  // Phase 2 (validated + applied):
+  'memory_events',
+  'hook_runs',
+  'failure_events',
+  'eviction_events',
+  'outcomes',
+  'outcome_signals',
+  // Phase 3+ (accepted, ignored at runtime — forward compat):
   'default_days',
   'sessions',
   'messages',
   'approvals',
   'approvals_log',
-  'failure_events',
-  'outcome_signals',
-  'outcomes',
-  'eviction_events',
   'policies',
-  'memory_events',
   'pending_decisions',
   'prompt_versions',
   'purge_events',
@@ -250,9 +274,75 @@ const parseLayer = (path: string | null, source: string): ParseResult => {
     }
   }
 
-  // Phase 2+ keys are silently accepted (warning would noise the
-  // operator who's spec-compliant). When phase 2 lands, copy the
-  // per-key block above for each new field.
+  // Phase 2 validation. Five day-based fields (memory_events,
+  // hook_runs, failure_events, eviction_events, outcomes) follow the
+  // same parseDays pattern as Phase 1. outcome_signals is special:
+  // accepts boolean (true/false) OR string `"per-kind"` (alias for
+  // true). Other strings → warning + fallback to default (enabled).
+
+  if (r.memory_events !== undefined) {
+    const d = parseDays(r.memory_events);
+    if (d === null) {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].memory_events=${fmtBad(r.memory_events)} must be a positive integer (days); ignoring`,
+      );
+    } else {
+      layer.memory_events_days = d;
+    }
+  }
+  if (r.hook_runs !== undefined) {
+    const d = parseDays(r.hook_runs);
+    if (d === null) {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].hook_runs=${fmtBad(r.hook_runs)} must be a positive integer (days); ignoring`,
+      );
+    } else {
+      layer.hook_runs_days = d;
+    }
+  }
+  if (r.failure_events !== undefined) {
+    const d = parseDays(r.failure_events);
+    if (d === null) {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].failure_events=${fmtBad(r.failure_events)} must be a positive integer (days); ignoring`,
+      );
+    } else {
+      layer.failure_events_days = d;
+    }
+  }
+  if (r.eviction_events !== undefined) {
+    const d = parseDays(r.eviction_events);
+    if (d === null) {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].eviction_events=${fmtBad(r.eviction_events)} must be a positive integer (days); ignoring`,
+      );
+    } else {
+      layer.eviction_events_days = d;
+    }
+  }
+  if (r.outcomes !== undefined) {
+    const d = parseDays(r.outcomes);
+    if (d === null) {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].outcomes=${fmtBad(r.outcomes)} must be a positive integer (days); ignoring`,
+      );
+    } else {
+      layer.outcomes_days = d;
+    }
+  }
+  if (r.outcome_signals !== undefined) {
+    const v = r.outcome_signals;
+    if (typeof v === 'boolean') {
+      layer.outcomeSignalsEnabled = v;
+    } else if (typeof v === 'string' && v === 'per-kind') {
+      // Spec literal — alias for `true` (honor per-row TTL).
+      layer.outcomeSignalsEnabled = true;
+    } else {
+      warnings.push(
+        `${source} config (${path}): [audit.retention].outcome_signals=${fmtBad(v)} must be a boolean (true|false) or the literal "per-kind"; ignoring`,
+      );
+    }
+  }
 
   return { layer, warnings };
 };
@@ -305,6 +395,36 @@ export const loadRetentionConfig = (input: LoadRetentionInput): LoadedRetentionC
       projectParse.layer.bg_processes_days ??
       userParse.layer.bg_processes_days ??
       DEFAULT_RETENTION.bg_processes_days,
+    // Phase 2 day-based fields use `??` (number merge is safe;
+    // no falsy trap):
+    memory_events_days:
+      projectParse.layer.memory_events_days ??
+      userParse.layer.memory_events_days ??
+      DEFAULT_RETENTION.memory_events_days,
+    hook_runs_days:
+      projectParse.layer.hook_runs_days ??
+      userParse.layer.hook_runs_days ??
+      DEFAULT_RETENTION.hook_runs_days,
+    failure_events_days:
+      projectParse.layer.failure_events_days ??
+      userParse.layer.failure_events_days ??
+      DEFAULT_RETENTION.failure_events_days,
+    eviction_events_days:
+      projectParse.layer.eviction_events_days ??
+      userParse.layer.eviction_events_days ??
+      DEFAULT_RETENTION.eviction_events_days,
+    outcomes_days:
+      projectParse.layer.outcomes_days ??
+      userParse.layer.outcomes_days ??
+      DEFAULT_RETENTION.outcomes_days,
+    // Boolean merge needs `!== undefined` instead of `??` (same
+    // false-respecting reason as runGcOnStop below):
+    outcomeSignalsEnabled:
+      projectParse.layer.outcomeSignalsEnabled !== undefined
+        ? projectParse.layer.outcomeSignalsEnabled
+        : userParse.layer.outcomeSignalsEnabled !== undefined
+          ? userParse.layer.outcomeSignalsEnabled
+          : DEFAULT_RETENTION.outcomeSignalsEnabled,
     // Boolean merge needs `!== undefined` instead of `??` because
     // `false ?? user_true` evaluates to `user_true` — the project's
     // explicit `false` would be silently dropped. Operator that

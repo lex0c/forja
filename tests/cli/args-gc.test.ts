@@ -77,7 +77,7 @@ describe('parseArgs — gc subcommand', () => {
     const r = parseArgs(['gc', '--table=approvals_log']);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
-    expect(r.message).toContain("--table='approvals_log' is not a Phase 1 table");
+    expect(r.message).toContain("--table='approvals_log' is not a recognized gc table");
     expect(r.message).toContain('recap_cache');
   });
 

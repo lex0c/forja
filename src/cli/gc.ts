@@ -13,8 +13,8 @@
 //   - Cross-project by design (the cutoffs are age-based).
 
 import { loadRetentionConfig } from '../audit/config-loader.ts';
-import type { GcReport, Phase1Table, TableReport } from '../audit/gc.ts';
-import { PHASE_1_TABLES, runGc } from '../audit/gc.ts';
+import type { GcReport, GcTable, TableReport } from '../audit/gc.ts';
+import { GC_TABLES, runGc } from '../audit/gc.ts';
 import type { DB } from '../storage/index.ts';
 import { countPendingMigrations, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
@@ -102,7 +102,7 @@ const renderHumanDryRun = (
 
 const renderHumanForce = (report: GcReport, out: (s: string) => void): void => {
   out('forja gc — done\n\n');
-  out('Tables (Phase 1):\n');
+  out('Tables:\n');
   if (report.tables.length === 0) {
     out('  (no tables selected)\n');
   } else {
@@ -152,10 +152,10 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
   // Translate the parser's string[] into the typed enum the
   // orchestrator expects. We trust the parser already filtered to
   // known names; this cast is the boundary translation.
-  const tablesFilter: ReadonlyArray<Phase1Table> | undefined =
+  const tablesFilter: ReadonlyArray<GcTable> | undefined =
     tables.length === 0
       ? undefined
-      : tables.filter((t): t is Phase1Table => (PHASE_1_TABLES as readonly string[]).includes(t));
+      : tables.filter((t): t is GcTable => (GC_TABLES as readonly string[]).includes(t));
 
   let db: DB | null = null;
   try {

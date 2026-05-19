@@ -249,3 +249,22 @@ export const listMemoryEventsByName = (
     .all(memoryName);
   return rows.map(fromRow);
 };
+
+// ─── pruneMemoryEvents ─────────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// §1.2). Default retention 365d on `created_at`. Cutoff EXCLUSIVE.
+//
+// Lifecycle audit (created/edited/deleted/read/promoted/demoted).
+// FK SET NULL with sessions — rows survive session cleanup
+// independently, so the sweep is the only retention pressure on
+// this table until Phase 4 sessions cascade lands.
+export const pruneMemoryEvents = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneMemoryEvents: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM memory_events WHERE created_at < ?').run(olderThanMs);
+  return Number(result.changes);
+};

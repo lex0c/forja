@@ -386,23 +386,45 @@ Retention: 365d (par com `approvals_log`); sem hash chain (purge é evento opera
 
 - `--force` — executa (default: dry-run).
 - `--json` — saída NDJSON em ambos os modos (uma linha).
-- `--table=X` — restringe a uma tabela; repetível (`--table=recap_cache --table=bg_processes`). Sem o flag, todas as tabelas Phase 1 são processadas.
+- `--table=X` — restringe a uma tabela; repetível (`--table=recap_cache --table=bg_processes`). Sem o flag, todas as tabelas cobertas (Phase 1 + Phase 2 = 10 tabelas) são processadas.
 
-**Phase 1 — tabelas cobertas (4):**
+**Tabelas cobertas (Phase 1 + 2 = 10):**
+
+*Phase 1 — low-sensitivity, sem chain integrity:*
 
 | Tabela | Coluna age | TTL default | Notas |
 |---|---|---|---|
-| `recap_cache` | `expires_at` (TTL absoluto, populado no INSERT) | 1h (per-row, já no INSERT) | Sweep apaga `expires_at < now()`. Read path já evicta on miss; sweep é backstop. |
+| `recap_cache` | `expires_at` (TTL absoluto, populado no INSERT) | 1h (per-row, já no INSERT) | Sweep apaga `expires_at <= now()`. Read path já evicta on miss; sweep é backstop. |
 | `retrieval_trace` | `created_at` | 90d | Cascade FK com `sessions`; sweep é cold-path quando session permanece. |
 | `context_pins` | `created_at` | 90d | Per-pin `expires_at` já curto-circuita no read; sweep cobre rows pré-cascade + retention. |
 | `bg_processes` | `spawned_at` | 30d | **AND `status != 'running'`** — bg processes ativos NUNCA apagados independente da idade. |
 
-**Tabelas fora do Phase 1 (deferidas):**
+*Phase 2 — audit-cascade tables (FK SET NULL ou CASCADE com `sessions`):*
 
-- **Phase 2 (audit-cascade tables, FK CASCADE com `sessions`):** `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`. Cada uma tem semantic edge case (`outcome_signals.ttl_expires_at` per-row per-`signal_kind`; `failure_events` tem chain hash per-session). Slice dedicado.
+| Tabela | Coluna age | TTL default | Notas |
+|---|---|---|---|
+| `memory_events` | `created_at` | 365d | Lifecycle audit. FK SET NULL com sessions — sobrevivem cleanup independente. |
+| `hook_runs` | `created_at` | 90d | Per-event hook execution. FK SET NULL. |
+| `failure_events` | `created_at` | 365d | Per-session chain hash. **Trade-off documentado abaixo.** |
+| `eviction_events` | `recorded_at` | 365d | Cross-substrate lifecycle. |
+| `outcomes` | `recorded_at` | 90d | Cross-substrate operational outcomes. FK CASCADE com sessions. |
+| `outcome_signals` | `ttl_expires_at` (per-row, populado no INSERT) | "per-kind" (365d/730d per `signal_kind`) | **TTL-based, NOT age-based.** Sweep apaga `ttl_expires_at < now()` mirroring recap_cache. |
+
+**`failure_events` chain trade-off (Phase 2 design):** o sweep é age-based per-row (`DELETE WHERE created_at < cutoff`). Para uma session com eventos 1-5 e cutoff que pega os 3 primeiros, rows 1-3 vão pra storage-livre; rows 4-5 ficam com `prev_chain_hash` apontando pra row inexistente. Chain forensic per-session vira parcial. **Aceitamos por duas razões:** (a) chain de `failure_events` é best-effort forensic, não tem invariante criptográfico como `approvals_log`; (b) Phase 4 (sessions cascade) vai whole-session-delete, restaurando semantic limpa. Operator que precisa de chain íntegra define `failure_events` com retention muito alto (ex: `failure_events = 99999` ~ forever; `"forever"` literal não implementado em Phase 2).
+
+**`outcome_signals` config (`"per-kind"` sentinel):** o spec AUDIT §1.2 mostra `outcome_signals = "per-kind"`. Aceitamos:
+- `outcome_signals = "per-kind"` — honra TTL per-row já populado no INSERT (default).
+- `outcome_signals = true` — alias para `"per-kind"` (sweep habilitado).
+- `outcome_signals = false` — skip sweep (TTL per-row continua mas gc não força DELETE).
+- Outras strings → warning + fallback para enabled.
+
+Override per-`signal_kind` no config (ex: `[audit.retention.outcome_signals] tool_error = 30`) NÃO suportado em Phase 2 — defaults `DEFAULT_SIGNAL_TTL_DAYS` (em código) determinam o TTL persistido. Future ergonomic.
+
+**Tabelas ainda fora (deferidas):**
+
 - **Phase 3 (hash-chained):** `approvals_log`. Age-based DELETE quebra `permission verify`. Requer wire de `chain-rotation` (migration 035 + verb `agent permission rotate-chain`) num trigger age-based: rotaciona segmento arquivado, depois apaga. Slice dedicado.
 - **Phase 4 (sessions + cascade):** `sessions`. Quando uma session é gc'd, FK CASCADE drop ~12 tabelas dependentes. Blast radius maior; revisão dedicada.
-- **Phase 5 — flags operacionais:** `--reclaim-space` (roda SQLite `VACUUM` pós-delete pra liberar disco; lock global). **Stop hook integration shippou** — vide subsection seguinte.
+- **Phase 5a — flag operacional:** `--reclaim-space` (roda SQLite `VACUUM` pós-delete pra liberar disco; lock global). **Stop hook integration (5b) shippou** — vide subsection seguinte.
 
 ##### Built-in no `Stop` hook (shipped)
 
@@ -477,11 +499,19 @@ E em force:
 
 ```toml
 [audit.retention]
-recap_cache    = "1h"     # TTL absoluto via expires_at
-retrieval_trace = 90      # dias
-context_pins    = 90      # dias
-bg_processes    = 30      # dias
-# Phase 2/3/4 tables aceitas no schema mas ignoradas pelo executor Phase 1.
+# Phase 1:
+recap_cache     = "1h"     # TTL absoluto via expires_at
+retrieval_trace = 90       # dias
+context_pins    = 90       # dias
+bg_processes    = 30       # dias
+# Phase 2:
+memory_events    = 365     # dias
+hook_runs        = 90      # dias
+failure_events   = 365     # dias (chain trade-off documentado)
+eviction_events  = 365     # dias
+outcomes         = 90      # dias
+outcome_signals  = "per-kind"  # honra TTL per-row (signal_kind-specific)
+# Phase 3/4 tables aceitas no schema mas ignoradas pelo executor atual.
 ```
 
 **O que NÃO faz** (cross-ref pra evitar mal-entendido):

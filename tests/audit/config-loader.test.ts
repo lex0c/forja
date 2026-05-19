@@ -278,3 +278,69 @@ describe('loadRetentionConfig — [audit].run_gc_on_stop (Phase 5 Stop hook trig
     expect(r.warnings).toEqual([]);
   });
 });
+
+describe('loadRetentionConfig — Phase 2 keys', () => {
+  test('5 day-based fields parse + override per-key', () => {
+    writeFileSync(
+      projectPath,
+      `[audit.retention]
+memory_events = 30
+hook_runs = 7
+failure_events = 14
+eviction_events = 60
+outcomes = 5
+`,
+    );
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.memory_events_days).toBe(30);
+    expect(r.config.hook_runs_days).toBe(7);
+    expect(r.config.failure_events_days).toBe(14);
+    expect(r.config.eviction_events_days).toBe(60);
+    expect(r.config.outcomes_days).toBe(5);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals accepts "per-kind" sentinel (spec literal)', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = "per-kind"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(true);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals accepts boolean true', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = true\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(true);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals accepts boolean false (skip sweep)', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(false);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('outcome_signals rejects other strings with warning', () => {
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = "all"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('outcome_signals'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('boolean'))).toBe(true);
+    // Falls back to default (enabled).
+    expect(r.config.outcomeSignalsEnabled).toBe(true);
+  });
+
+  test('outcomeSignalsEnabled merge respects explicit false (the ?? trap)', () => {
+    writeFileSync(userPath, '[audit.retention]\noutcome_signals = true\n');
+    writeFileSync(projectPath, '[audit.retention]\noutcome_signals = false\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath, projectPath });
+    expect(r.config.outcomeSignalsEnabled).toBe(false);
+  });
+
+  test('day-based field rejects non-integer with warning', () => {
+    writeFileSync(projectPath, '[audit.retention]\nmemory_events = "thirty"\n');
+    const r = loadRetentionConfig({ cwd: workdir, userPath: null, projectPath });
+    expect(r.warnings.some((w) => w.includes('memory_events'))).toBe(true);
+    expect(r.config.memory_events_days).toBe(365); // default
+  });
+});

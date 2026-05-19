@@ -2,6 +2,145 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (post-work)
+
+Closes the pre-work entry below. Single branch `feat/purge-command`. Brings the gc roadmap from "Phase 1 + Stop hook shipped" to "Phase 1 + 2 + Stop hook shipped" — `agent gc` now covers 10 tables, the ones that grow fastest in normal use (memory_events, hook_runs, failure_events, eviction_events, outcomes, outcome_signals).
+
+**Round-of-review fixes that landed BEFORE commit** (self-review caught 3 issues — 1 critical, 2 quality):
+
+- **C1 (critical, caught during code review) — `redactSecrets` semantic preserved.** The first draft of the circular-import fix in `eviction-events.ts` switched from `import { redactSecrets } from '../../memory/index.ts'` to `import { redactSecrets } from '../../sanitize/secrets.ts'`. But `memory/index.ts` re-exports from `memory/scanner.ts` (not from `sanitize/secrets.ts`), and the two implementations produce different output formats: scanner uses uniform `<REDACTED:secret>` placeholder; sanitize uses per-pattern `<redacted:<name>>` + special `KEY=value` handling. The swap would have silently changed the format of every `eviction_events.evidence_json` row in production — tests passed because fixtures didn't exercise secret strings. Fix: switch to direct import from `memory/scanner.ts` (the definition site; zero imports → no circular risk; semantic original preserved). New T3 test pins `<REDACTED:secret>` format to catch any future regression.
+- **C2 — outcome_signals TTL boundary standardized to `<=` (sister-symmetric with recap_cache).** First draft used `<` (EXCLUSIVE on equality) "for consistency with age-based prunes". But the two TTL-based tables (`recap_cache` and `outcome_signals`) sit next to each other in the gc report, and divergent boundaries would mean a row with TTL exactly = nowMs lives in one table but dies in the other. Operator observing both in a single run sees inconsistent semantics. Fix: standardized to `<=` (INCLUSIVE). Documented the split rationale in `gc.ts` comments: TTL-based tables use `<=` (sister-symmetric); age-based use `<` (natural for "strictly older than retention window").
+- **T1 — Phase 1 + Phase 2 orchestrator integration test.** Per-helper tests in `gc-prunes.test.ts` pin each prune function in isolation, and the existing orchestrator test seeded only Phase 1 fixtures (Phase 2 tables appeared as `beforeCount: 0`). No coverage of "Phase 2 rows real-deletado through the orchestrator's switch wiring". Added a single comprehensive test that seeds one old + one fresh row in each of the 10 tables, runs `runGc --force` once, and verifies all 10 deleted-counts and that fresh rows survive. Catches regression where someone forgets to wire a Phase 2 table into `sweepOne`.
+
+Deferred review items: M2 (`default_days` silently swallow), M4 (padEnd(18) breaks on long Phase 3+ names), S1-3 (dead exports + heading wording + spec doc gap for boolean alias). None blocking.
+
+**Tables shipped this slice (6):**
+
+| Tabela | Default | Predicate | Edge case |
+|---|---|---|---|
+| `memory_events` | 365d | `created_at < cutoff` | FK SET NULL com sessions — survives session cleanup independently. |
+| `hook_runs` | 90d | `created_at < cutoff` | FK SET NULL. Grows with hook activity. |
+| `failure_events` | 365d | `created_at < cutoff` | **Chain trade-off documented:** per-row DELETE breaks per-session chain integrity for partially-deleted sessions. Accepted because the chain is best-effort forensic (not verifiable like approvals_log) and Phase 4 will whole-session-delete. |
+| `eviction_events` | 365d | `recorded_at < cutoff` | No chain integrity — clean DELETE. |
+| `outcomes` | 90d | `recorded_at < cutoff` | FK CASCADE com sessions. |
+| `outcome_signals` | "per-kind" | `ttl_expires_at < nowMs` | **TTL-based** (not age-based), per-row TTL populated at INSERT via `DEFAULT_SIGNAL_TTL_DAYS`. Operator can disable sweep via `outcome_signals = false`. |
+
+**Decisions that survived in-flight review:**
+
+- **No archive table.** Earlier `failure_events.ts` comment mentioned operating "on a copy under `failure_events_archived`" — an unimplemented spec note, not a hard requirement. Phase 2 ships DELETE-direct; archive-before-delete is a future slice if compliance asks.
+- **failure_events chain trade-off accepted, not engineered around.** Half-measures (delete leaves but keep roots) would leave the chain equally broken with more code complexity. Documented in the prune helper header + spec §2.1.3 + this entry. Operator who needs intact chain sets `failure_events_days` very high.
+- **outcome_signals config: `"per-kind"` string + boolean alias.** Spec AUDIT §1.2 shows `outcome_signals = "per-kind"` literal — we accept that string (honor per-row TTL) plus `true` (alias) and `false` (skip sweep). Other strings warn and fall back to enabled.
+- **Boolean merge for `outcomeSignalsEnabled` mirrors `runGcOnStop`** — `!== undefined` check (not `??`) so explicit `false` wins over user `true`. Pinned by dedicated test.
+- **No new migration.** All 6 tables already have the timestamp columns. Phase 2 is pure code (loader + helpers + orchestrator switches).
+- **`PHASE_1_TABLES` + `PHASE_2_TABLES` + `GC_TABLES` (union).** Keeps phase boundaries visible for spec / docs reference; `GC_TABLES` is what runtime uses. `args.ts` switched its `KNOWN_GC_TABLES` derivation from `PHASE_1_TABLES` to `GC_TABLES` so new tables widen the parser automatically.
+
+**Spec edits** (`docs/spec/`):
+
+- `AGENTIC_CLI.md §2.1.3` — "tables cobertas" table expanded to 10 (Phase 1 + Phase 2 split visually). Added subsection covering the failure_events chain trade-off + outcome_signals `"per-kind"` config sentinel. Updated DEFAULT_RETENTION TOML snippet to include the 6 new keys. Updated "tabelas ainda fora" to remove Phase 2 references, keeping Phase 3 (approvals_log), Phase 4 (sessions cascade), and Phase 5a (--reclaim-space).
+- `AUDIT.md §1.2` already prescribed all retention defaults — no edit needed.
+
+**Round-of-implementation fixes (caught + fixed before commit):**
+
+- **Circular import TDZ via `memory/index.ts`.** Initial draft had `audit/gc.ts` → `eviction-events.ts` → `memory/index.ts` (for `redactSecrets`) → memory transition chain that re-imports `eviction-events.ts`. Created `Cannot access 'MOTIVOS' before initialization` errors when CLI handler test pulled the chain early. Fix: switch `eviction-events.ts` to import `redactSecrets` directly from `sanitize/secrets.ts` (the actual definition site), bypassing the memory subsystem's big-bang re-export and breaking the cycle.
+- **Test NOW too small for Phase 2 defaults.** `tests/cli/gc.test.ts` used `NOW = 100 * DAY_MS`, but Phase 2 defaults reach 365d. `cutoff = NOW - 365 * DAY_MS = -265 * DAY_MS` was negative → prune helpers rejected with "non-positive olderThanMs". Production uses `Date.now()` (~50 years in ms) where this never happens; test fixture bumped to `NOW = 1000 * DAY_MS`.
+
+**Code deltas (8 files modified, 0 new):**
+
+- `src/storage/repos/memory-events.ts` — `pruneMemoryEvents`
+- `src/storage/repos/hook-runs.ts` — `pruneHookRuns`
+- `src/storage/repos/failure-events.ts` — `pruneFailureEvents` + chain trade-off comment
+- `src/storage/repos/eviction-events.ts` — `pruneEvictionEvents` + circular import fix
+- `src/storage/repos/outcomes.ts` — `pruneOutcomes`
+- `src/storage/repos/outcome-signals.ts` — `pruneExpiredOutcomeSignals` (TTL-based)
+- `src/audit/config-loader.ts` — `RetentionConfig` extended with 6 fields + `DEFAULT_RETENTION` updated + parser blocks for 6 new keys + `outcome_signals` special handler (boolean / "per-kind" / warn-other) + boolean merge for `outcomeSignalsEnabled`
+- `src/audit/gc.ts` — `PHASE_2_TABLES` + `GC_TABLES` union + `GcTable` type + switches in `computeCutoffForTable` / `countWouldDelete` / `sweepOne` + `isTableEnabled` for outcome_signals skip
+- `src/cli/args.ts` — `KNOWN_GC_TABLES` derives from `GC_TABLES` instead of `PHASE_1_TABLES`; error message reworded
+- `src/cli/gc.ts` — imports updated; "Tables (Phase 1):" → "Tables:" headers
+
+**Test deltas (3 files extended, 20 new test cases):**
+
+- `tests/storage/gc-prunes.test.ts` — 12 new cases across 6 prune helpers (per-helper: cutoff EXCLUSIVE + non-positive rejection; outcome_signals also pinning TTL boundary).
+- `tests/audit/gc.test.ts` — TIGHT_CONFIG extended with 6 new fields; existing `tables.length === 4` updated to 10; new describe block for `outcomeSignalsEnabled=false` skip path.
+- `tests/audit/config-loader.test.ts` — 7 new cases covering Phase 2 keys: 5 day-based fields parse together, outcome_signals accepts "per-kind"/true/false/rejects-other-strings, false-merge-respect trap, type-rejection warning + default fallback.
+- `tests/cli/gc.test.ts` — `NOW` bumped to realistic value; `tables.length` expectation 4 → 10; CLI message expectation updated.
+- `tests/cli/args-gc.test.ts` — error message expectation updated ("not a Phase 1 table" → "not a recognized gc table").
+
+**Verification:**
+- `bun run typecheck`: clean
+- `bun run lint`: clean (928 files; Biome auto-fix for one formatting nit in audit/gc.ts)
+- 91/91 gc tests pass (was 71, +20 new)
+- 136 adjacent tests pass (bootstrap, eviction-events, outcomes)
+- Smoke E2E: `agent gc` in isolated tmpdir lists all 10 tables in error path (DB empty, no migrations applied — expected); pending-migration warning fires correctly (C1 fix from prior slice still working).
+
+**Items NOT addressed** (logged for follow-up):
+
+- Phase 3 (`approvals_log` via chain-rotation) — biggest remaining gap.
+- Phase 4 (`sessions` + FK cascade) — depends on Phase 3 design decisions.
+- Phase 5a (`--reclaim-space` SQLite VACUUM).
+- Per-`signal_kind` config override for outcome_signals. Today operator can disable the sweep entirely OR honor per-row TTL; can't say "tool_error TTL = 30d instead of 365d default" via config — would need a nested `[audit.retention.outcome_signals]` block. Future ergonomic.
+
+**Production-readiness shift.** Before: even with Phase 1 + cron + Stop hook, the tables that grow fastest in real use (memory_events, hook_runs, outcome_signals) accumulated indefinitely. After: 10 of the 14 audit tables are swept automatically with operator-set retention windows. Remaining 4 (approvals_log, sessions + cascade, prompt_versions, policies — last two are "forever" by design) need Phase 3/4 for the chain-aware tables and Phase 4 for sessions, but the operator-visible gap is mostly closed.
+
+## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (pre-work plan)
+
+Phase 1 (4 low-sensitivity tables) shipped, plus Stop hook built-in (`run_gc_on_stop`). This slice ships Phase 2 — the 6 audit-cascade tables that grow fastest in real usage (every tool call → `outcome_signals`; every failure → `failure_events`; every memory op → `memory_events`). Without Phase 2, the "archaeological trail" still dominates the DB even with Phase 1 + cron + Stop hook enabled.
+
+**Tables covered (6):**
+
+| Tabela | Coluna age | Default | Notes |
+|---|---|---|---|
+| `memory_events` | `created_at` | 365d | Lifecycle audit (created/edited/deleted/read/promoted/demoted). FK SET NULL com sessions — survive session cleanup independently. |
+| `hook_runs` | `created_at` | 90d | Per-event hook execution. FK SET NULL com sessions. |
+| `failure_events` | `created_at` | 365d | Per-session chain hash. **Trade-off:** sweep individual rows breaks the per-session chain integrity for partially-deleted sessions. Documented in spec — chain hash em failure_events é "best-effort forensic", não verifiable como `approvals_log`. |
+| `eviction_events` | `recorded_at` | 365d | Cross-substrate lifecycle (proposed→active→evicted→purged). |
+| `outcomes` | `recorded_at` | 90d | Cross-substrate operational outcomes (tier 1-5). FK CASCADE com sessions — cleaned by Phase 4 cascade too. |
+| `outcome_signals` | `ttl_expires_at` | "per-kind" | **TTL-based, NOT age-based.** Per-row TTL populated at INSERT via `signal_kind`-specific defaults (DEFAULT_SIGNAL_TTL_DAYS — 365d/730d). Sweep is `DELETE WHERE ttl_expires_at < nowMs`, mirroring recap_cache pattern. |
+
+**Decisions confirmed up front:**
+
+- **Age-based DELETE for 5 tables; TTL-based for `outcome_signals`.** Mirrors the Phase 1 pattern: most tables sweep by age, the TTL-rich ones (recap_cache, outcome_signals) sweep by per-row expiry.
+- **No archive table.** Earlier failure_events comment mentions "operates on a copy under `failure_events_archived`" — that's an unimplemented spec note, not a hard requirement. Phase 2 ships DELETE-direct; archive-before-delete is a future slice if compliance asks for it.
+- **`failure_events` chain trade-off accepted, documented.** Sweep DELETEs individual rows. For a session with 5 failure events (1-5) and 3 of them sweep-eligible, rows 1-3 are deleted; rows 4-5 remain with `prev_chain_hash` pointing at a non-existent row. Per-session forensic chain becomes partial. Two reasons we accept: (a) failure_events chain is best-effort forensic (no cryptographic invariant like `approvals_log`); (b) Phase 4 (sessions cascade) will whole-session-delete, restoring cleaner semantics. Operator who needs intact failure chain can set `failure_events_days` very high.
+- **`outcome_signals` config: `"per-kind"` sentinel + boolean alias.** Spec AUDIT §1.2 shows `outcome_signals = "per-kind"` literal. We accept that string (honor per-row TTL) plus boolean `true` (alias = enabled) and `false` (skip sweep entirely). Other strings → warning + fallback to enabled.
+- **No new migration.** All 6 tables already have the timestamp columns. Phase 2 is pure code (loader + helpers + orchestrator switches).
+
+**Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
+
+- `AGENTIC_CLI.md §2.1.3` — move 6 tables from Phase 2 deferred to shipped. Expand the "tables covered" block to 10. Add subsection for `failure_events` chain trade-off and `outcome_signals` TTL semantics. Re-state "what's still deferred" (Phase 3 approvals_log, Phase 4 sessions cascade, Phase 5a --reclaim-space).
+
+**Phase 1 — Storage layer.**
+
+- `src/storage/repos/memory-events.ts` — `pruneMemoryEvents(db, olderThanMs): number`.
+- `src/storage/repos/hook-runs.ts` — `pruneHookRuns(db, olderThanMs): number`.
+- `src/storage/repos/failure-events.ts` — `pruneFailureEvents(db, olderThanMs): number` + comment block explaining the chain trade-off.
+- `src/storage/repos/eviction-events.ts` — `pruneEvictionEvents(db, olderThanMs): number`.
+- `src/storage/repos/outcomes.ts` — `pruneOutcomes(db, olderThanMs): number`.
+- `src/storage/repos/outcome-signals.ts` — `pruneExpiredOutcomeSignals(db, nowMs): number` (TTL-based, mirrors `purgeExpiredRecapCache`).
+
+Each mirrors the `pruneVerifyAttempts` shape; input validation `olderThanMs > 0` (or `nowMs > 0` for TTL-based).
+
+**Phase 2 — Config + orchestrator.**
+
+- `src/audit/config-loader.ts` — extend `RetentionConfig` with 5 new day-based fields + `outcomeSignalsEnabled: boolean`. Parser handles `[audit.retention].{memory_events,hook_runs,failure_events,eviction_events,outcomes,outcome_signals}`. `outcome_signals` accepts boolean (true/false) OR the string `"per-kind"` (alias for `true`). Per-key merge respects explicit false. Update `DEFAULT_RETENTION` to match AUDIT §1.2.
+- `src/audit/gc.ts` — rename `PHASE_1_TABLES` → `GC_TABLES` (or add `PHASE_2_TABLES` + union). Extend switches in `computeCutoffForTable`, `countWouldDelete`, `sweepOne` for 6 new tables. `outcome_signals` skip path when disabled.
+- `src/cli/args.ts` — `KNOWN_GC_TABLES` derives from extended set (already wired via `PHASE_1_TABLES` source-of-truth).
+
+**Phase 3 — Tests.**
+
+- `tests/storage/gc-prunes.test.ts` — extend with 6 new describe blocks. For each: cutoff EXCLUSIVE for age-based, TTL-based for outcome_signals, input validation.
+- `tests/audit/gc.test.ts` — extend orchestrator test fixture to seed all 10 tables; verify per-table report. Add test for `outcome_signals` disabled (sweep skipped).
+- `tests/audit/config-loader.test.ts` — extend with 6 new key cases + `outcome_signals` string/boolean variants.
+
+**Items NOT addressed** (still deferred):
+
+- Phase 3 (`approvals_log` via chain-rotation).
+- Phase 4 (`sessions` + FK cascade).
+- Phase 5a (`--reclaim-space`).
+- Per-`signal_kind` override in config (`[audit.retention.outcome_signals] tool_error = 30`). Spec mentions DEFAULT_SIGNAL_TTL_DAYS map — Phase 2 honors what's already in the DB (per-row TTL set at INSERT). Override path is a future ergonomic.
+- Archive-then-delete for failure_events. Deferred until compliance asks.
+
+Same branch `feat/purge-command`. Post-work entry follows once code + tests land.
+
 ## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (post-work)
 
 Closes the pre-work entry below. Phase 5 piece of the gc roadmap that shipped (the other Phase 5 piece, `--reclaim-space`, still deferred). Single branch `feat/purge-command`.

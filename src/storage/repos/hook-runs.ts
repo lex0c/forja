@@ -256,3 +256,22 @@ export const queryHookRuns = (db: DB, opts: HookRunsQuery = {}): HookRun[] => {
     .all(...params);
   return rows.map(fromRow);
 };
+
+// ─── pruneHookRuns ─────────────────────────────────────────────────────
+//
+// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// §1.2). Default retention 90d on `created_at`. Cutoff EXCLUSIVE.
+//
+// Per-event hook execution log. FK SET NULL with sessions — rows
+// survive session cleanup independently. Grows with every hook
+// dispatch; among the fastest-accumulating tables in workflows with
+// rich operator hook chains.
+export const pruneHookRuns = (db: DB, olderThanMs: number): number => {
+  if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+    throw new Error(
+      `pruneHookRuns: olderThanMs must be a positive finite number (got ${olderThanMs})`,
+    );
+  }
+  const result = db.query('DELETE FROM hook_runs WHERE created_at < ?').run(olderThanMs);
+  return Number(result.changes);
+};

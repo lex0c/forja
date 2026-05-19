@@ -2,7 +2,7 @@
 // enough that adding `commander` would be more code than this. Anything
 // not a recognized flag is collected as the prompt (joined by spaces).
 
-import { PHASE_1_TABLES } from '../audit/gc.ts';
+import { GC_TABLES } from '../audit/gc.ts';
 import type { ForceEligibleStep, InitStep } from './init.ts';
 
 export interface ParsedArgs {
@@ -1023,13 +1023,14 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
 //   --force     — execute the sweep (without it, dry-run only).
 //   --json      — NDJSON output on stdout (works in both modes).
 //   --table=X   — restrict to one table; repeatable. Accepted
-//                 values are DERIVED from `PHASE_1_TABLES` in
-//                 `src/audit/gc.ts` — single source of truth so
+//                 values are DERIVED from `GC_TABLES` in
+//                 `src/audit/gc.ts` (union of Phase 1 + Phase 2 +
+//                 future phases) — single source of truth so
 //                 adding a new sweep target widens the parser
 //                 automatically. Drift between the parser's
 //                 accept-set and the orchestrator's switch is
 //                 impossible by construction.
-const KNOWN_GC_TABLES: ReadonlySet<string> = new Set(PHASE_1_TABLES);
+const KNOWN_GC_TABLES: ReadonlySet<string> = new Set(GC_TABLES);
 
 const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'gc') return null;
@@ -1074,7 +1075,7 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
       if (!KNOWN_GC_TABLES.has(value)) {
         return {
           ok: false,
-          message: `agent gc: --table='${value}' is not a Phase 1 table (valid: ${[...KNOWN_GC_TABLES].join(', ')})`,
+          message: `agent gc: --table='${value}' is not a recognized gc table (valid: ${[...KNOWN_GC_TABLES].join(', ')})`,
         };
       }
       // Dedupe so `--table=X --table=X` runs once. Order preserved

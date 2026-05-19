@@ -6,16 +6,22 @@
 // describing what would happen (dry-run) or what happened (force).
 // The CLI handler in `src/cli/gc.ts` consumes this and renders.
 //
-// Phase 1 contract: iterate the four supported tables; for each,
-// count before, optionally delete, count after. Per-table failures
-// are captured in `errors[]` but do NOT abort the orchestrator —
-// gc is best-effort hygiene, and a single broken table shouldn't
-// keep the other three from getting swept. Operator sees the
-// aggregate; the broken one surfaces with reason.
+// Contract: iterate every covered table; for each, count before,
+// optionally delete, count after. Per-table failures are captured
+// in `errors[]` but do NOT abort the orchestrator — gc is
+// best-effort hygiene, and a single broken table shouldn't keep
+// the others from getting swept. Operator sees the aggregate; the
+// broken one surfaces with reason.
 
 import type { DB } from '../storage/db.ts';
 import { pruneBgProcesses } from '../storage/repos/bg-processes.ts';
 import { pruneContextPins } from '../storage/repos/context-pins.ts';
+import { pruneEvictionEvents } from '../storage/repos/eviction-events.ts';
+import { pruneFailureEvents } from '../storage/repos/failure-events.ts';
+import { pruneHookRuns } from '../storage/repos/hook-runs.ts';
+import { pruneMemoryEvents } from '../storage/repos/memory-events.ts';
+import { pruneExpiredOutcomeSignals } from '../storage/repos/outcome-signals.ts';
+import { pruneOutcomes } from '../storage/repos/outcomes.ts';
 // `purgeExpiredRecapCache` predates the gc subsystem (RECAP §8.3
 // inline cleanup). We reuse it rather than ship a parallel
 // `pruneExpiredRecapCache` — the semantic is identical (sweep
@@ -25,10 +31,7 @@ import { purgeExpiredRecapCache } from '../storage/repos/recap-cache.ts';
 import { pruneRetrievalTrace } from '../storage/repos/retrieval-trace.ts';
 import type { RetentionConfig } from './config-loader.ts';
 
-// Phase 1 table names. Adding a table here without wiring the
-// switch in `sweepOne` below is a refactor footgun — the test
-// suite covers parity, but the constant is the source of truth
-// for "what `agent gc` knows about" today.
+// Phase 1 — low-sensitivity tables (no chain integrity).
 export const PHASE_1_TABLES = [
   'recap_cache',
   'retrieval_trace',
@@ -36,10 +39,32 @@ export const PHASE_1_TABLES = [
   'bg_processes',
 ] as const;
 
+// Phase 2 — audit-cascade tables (FK SET NULL or CASCADE with
+// sessions). Each has per-table semantic edge case documented in
+// the corresponding prune helper.
+export const PHASE_2_TABLES = [
+  'memory_events',
+  'hook_runs',
+  'failure_events',
+  'eviction_events',
+  'outcomes',
+  'outcome_signals',
+] as const;
+
+// Union: every table the orchestrator knows how to sweep.
+// `args.ts` derives `KNOWN_GC_TABLES` from this so a new entry
+// here automatically widens the parser's --table=X accept-set.
+// Adding a table without wiring the switches in `sweepOne` /
+// `computeCutoffForTable` / `countWouldDelete` below is a
+// refactor footgun — keep them in lockstep.
+export const GC_TABLES = [...PHASE_1_TABLES, ...PHASE_2_TABLES] as const;
+
 export type Phase1Table = (typeof PHASE_1_TABLES)[number];
+export type Phase2Table = (typeof PHASE_2_TABLES)[number];
+export type GcTable = (typeof GC_TABLES)[number];
 
 export interface TableReport {
-  table: Phase1Table;
+  table: GcTable;
   beforeCount: number;
   // For dry-run, this is "would delete"; for force, this is
   // "actually deleted". Naming is uniform (just `deletedCount`)
@@ -48,17 +73,17 @@ export interface TableReport {
   // twice (read mode + read field), violating "one source of
   // truth per number".
   deletedCount: number;
-  // The cutoff timestamp used for this sweep. For `recap_cache`,
-  // this is `nowMs` (the comparison point for `expires_at`); for
-  // the other three, it's `nowMs - retentionDays * 86_400_000`.
-  // Exposed for forensic / config debugging ("why did 384 rows
-  // get evicted? — because cutoff was X, and 384 rows had ts <
-  // X").
+  // The cutoff timestamp used for this sweep. For TTL-based tables
+  // (`recap_cache`, `outcome_signals`), this is `nowMs` itself
+  // (the comparison point for `expires_at` / `ttl_expires_at`); for
+  // the age-based tables, it's `nowMs - retentionDays * 86_400_000`.
+  // Exposed for forensic / config debugging ("why did 384 rows get
+  // evicted? — because cutoff was X, and 384 rows had ts < X").
   cutoffMs: number;
 }
 
 export interface TableError {
-  table: Phase1Table;
+  table: GcTable;
   reason: string;
 }
 
@@ -69,7 +94,9 @@ export interface GcReport {
   nowMs: number;
   config: RetentionConfig;
   // One entry per table that the orchestrator attempted. Tables
-  // filtered out by `tables?` option don't appear here.
+  // filtered out by `tables?` option don't appear here. Tables
+  // SKIPPED due to config (e.g., outcome_signals with
+  // outcomeSignalsEnabled=false) also don't appear.
   tables: TableReport[];
   // Per-table errors (no aborts). When `errors.length > 0`, the
   // CLI emits non-zero exit + stderr lines summarizing each.
@@ -85,42 +112,56 @@ export interface RunGcInput {
   // can reject before any per-table call (cleaner error surface).
   nowMs: number;
   dryRun: boolean;
-  // Restrict to a subset of Phase 1 tables. Undefined = all four.
+  // Restrict to a subset of GC_TABLES. Undefined = all 10.
   // Unknown table names are caller's bug — orchestrator silently
   // drops them (the CLI parser is the proper place to reject).
-  tables?: ReadonlyArray<Phase1Table>;
+  tables?: ReadonlyArray<GcTable>;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Compute the age cutoff (rows with `ts < cutoffMs` are deletable)
-// for a given retention-in-days. For `recap_cache` we use `nowMs`
-// directly against the per-row `expires_at` — separate code path
-// because the comparison is "TTL elapsed", not "age-based".
-const computeCutoffForTable = (
-  table: Phase1Table,
-  config: RetentionConfig,
-  nowMs: number,
-): number => {
+// for a given retention-in-days. For TTL-based tables we use
+// `nowMs` directly against the per-row TTL column — separate code
+// path because the comparison is "TTL elapsed", not "age-based".
+const computeCutoffForTable = (table: GcTable, config: RetentionConfig, nowMs: number): number => {
   switch (table) {
+    // TTL-based (compare nowMs against per-row column):
     case 'recap_cache':
+    case 'outcome_signals':
       return nowMs;
+    // Age-based (compare cutoff against per-row created/recorded/spawned):
     case 'retrieval_trace':
       return nowMs - config.retrieval_trace_days * DAY_MS;
     case 'context_pins':
       return nowMs - config.context_pins_days * DAY_MS;
     case 'bg_processes':
       return nowMs - config.bg_processes_days * DAY_MS;
+    case 'memory_events':
+      return nowMs - config.memory_events_days * DAY_MS;
+    case 'hook_runs':
+      return nowMs - config.hook_runs_days * DAY_MS;
+    case 'failure_events':
+      return nowMs - config.failure_events_days * DAY_MS;
+    case 'eviction_events':
+      return nowMs - config.eviction_events_days * DAY_MS;
+    case 'outcomes':
+      return nowMs - config.outcomes_days * DAY_MS;
   }
 };
 
 // SELECT COUNT — used for both the pre-delete baseline AND the
-// dry-run "would delete" projection. For `bg_processes`, the
-// dry-run count must exclude `status = 'running'` to match the
-// real delete predicate. For `recap_cache`, the boundary is `<=`
-// to match the read-path eviction inside `purgeExpiredRecapCache`
-// (RECAP §8.3) — a TTL of exactly `nowMs` is considered elapsed.
-const countWouldDelete = (db: DB, table: Phase1Table, cutoffMs: number): number => {
+// dry-run "would delete" projection. Per-table predicate matches
+// the real DELETE predicate exactly:
+//   - bg_processes: excludes status='running' (live processes
+//     never deleted regardless of age).
+//   - recap_cache + outcome_signals: TTL-based with `<=` boundary
+//     (INCLUSIVE on equality — TTL exactly = nowMs is elapsed).
+//     Sister tables share the boundary so operators observing both
+//     in the same gc run see consistent semantics.
+//   - others: age-based with `<` cutoff (EXCLUSIVE — natural for
+//     "strictly older than retention window").
+const countWouldDelete = (db: DB, table: GcTable, cutoffMs: number): number => {
   let sql: string;
   switch (table) {
     case 'recap_cache':
@@ -136,12 +177,30 @@ const countWouldDelete = (db: DB, table: Phase1Table, cutoffMs: number): number 
       sql =
         "SELECT COUNT(*) AS n FROM background_processes WHERE spawned_at < ? AND status != 'running'";
       break;
+    case 'memory_events':
+      sql = 'SELECT COUNT(*) AS n FROM memory_events WHERE created_at < ?';
+      break;
+    case 'hook_runs':
+      sql = 'SELECT COUNT(*) AS n FROM hook_runs WHERE created_at < ?';
+      break;
+    case 'failure_events':
+      sql = 'SELECT COUNT(*) AS n FROM failure_events WHERE created_at < ?';
+      break;
+    case 'eviction_events':
+      sql = 'SELECT COUNT(*) AS n FROM eviction_events WHERE recorded_at < ?';
+      break;
+    case 'outcomes':
+      sql = 'SELECT COUNT(*) AS n FROM outcomes WHERE recorded_at < ?';
+      break;
+    case 'outcome_signals':
+      sql = 'SELECT COUNT(*) AS n FROM outcome_signals WHERE ttl_expires_at <= ?';
+      break;
   }
   const row = db.query(sql).get(cutoffMs) as { n: number } | null;
   return row?.n ?? 0;
 };
 
-const countTotal = (db: DB, table: Phase1Table): number => {
+const countTotal = (db: DB, table: GcTable): number => {
   const tableName = table === 'bg_processes' ? 'background_processes' : table;
   const row = db.query(`SELECT COUNT(*) AS n FROM ${tableName}`).get() as { n: number } | null;
   return row?.n ?? 0;
@@ -149,7 +208,7 @@ const countTotal = (db: DB, table: Phase1Table): number => {
 
 const sweepOne = (
   db: DB,
-  table: Phase1Table,
+  table: GcTable,
   cutoffMs: number,
   dryRun: boolean,
 ): { beforeCount: number; deletedCount: number } => {
@@ -171,19 +230,47 @@ const sweepOne = (
     case 'bg_processes':
       deleted = pruneBgProcesses(db, cutoffMs);
       break;
+    case 'memory_events':
+      deleted = pruneMemoryEvents(db, cutoffMs);
+      break;
+    case 'hook_runs':
+      deleted = pruneHookRuns(db, cutoffMs);
+      break;
+    case 'failure_events':
+      deleted = pruneFailureEvents(db, cutoffMs);
+      break;
+    case 'eviction_events':
+      deleted = pruneEvictionEvents(db, cutoffMs);
+      break;
+    case 'outcomes':
+      deleted = pruneOutcomes(db, cutoffMs);
+      break;
+    case 'outcome_signals':
+      deleted = pruneExpiredOutcomeSignals(db, cutoffMs);
+      break;
   }
   return { beforeCount, deletedCount: deleted };
+};
+
+// Honor config-driven skip: when outcome_signals sweep is disabled,
+// we drop the table from the iteration entirely — the report
+// omits it (not "0 deletes") so the operator sees "this was
+// genuinely not processed".
+const isTableEnabled = (table: GcTable, config: RetentionConfig): boolean => {
+  if (table === 'outcome_signals') return config.outcomeSignalsEnabled;
+  return true;
 };
 
 export const runGc = (input: RunGcInput): GcReport => {
   if (!Number.isFinite(input.nowMs) || input.nowMs <= 0) {
     throw new Error(`runGc: nowMs must be a positive finite number (got ${input.nowMs})`);
   }
-  const tables = input.tables ?? PHASE_1_TABLES;
+  const tables = input.tables ?? GC_TABLES;
   const reports: TableReport[] = [];
   const errors: TableError[] = [];
 
   for (const table of tables) {
+    if (!isTableEnabled(table, input.config)) continue;
     const cutoffMs = computeCutoffForTable(table, input.config, input.nowMs);
     try {
       const { beforeCount, deletedCount } = sweepOne(input.db, table, cutoffMs, input.dryRun);

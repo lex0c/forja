@@ -23,7 +23,13 @@ const out = (s: string) => outBuf.push(s);
 const err = (s: string) => errBuf.push(s);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const NOW = 100 * DAY_MS;
+// Phase 2 added retention windows up to 365d (memory_events,
+// failure_events, eviction_events). NOW must exceed the largest
+// default so the cutoff (NOW - days * DAY_MS) stays positive —
+// prune helpers reject non-positive cutoffs as a guard against
+// nonsense config. Production passes Date.now() (~50 years in ms),
+// so this is purely a test-fixture concern.
+const NOW = 1000 * DAY_MS;
 
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), 'forja-gc-cli-'));
@@ -111,7 +117,8 @@ describe('runGcCli — dry-run', () => {
     expect(parsed.mode).toBe('dry-run');
     expect(parsed.nowMs).toBe(NOW);
     expect(parsed.config.context_pins_days).toBe(90); // default
-    expect(parsed.tables.length).toBe(4);
+    // Phase 1 + Phase 2 = 10 tables (outcome_signals enabled by default).
+    expect(parsed.tables.length).toBe(10);
     expect(parsed.command).toBe('agent gc --force');
     // The "old" pin (200d back) is way past 90d default → 1 would-delete.
     const pinTable = parsed.tables.find((t) => t.table === 'context_pins');
