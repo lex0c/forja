@@ -15,6 +15,7 @@
 import { loadRetentionConfig } from '../audit/config-loader.ts';
 import type { GcReport, GcTable, TableReport } from '../audit/gc.ts';
 import { GC_TABLES, runGc } from '../audit/gc.ts';
+import { resolveRepoRoot } from '../memory/paths.ts';
 import type { DB } from '../storage/index.ts';
 import { countPendingMigrations, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
@@ -75,7 +76,7 @@ const renderHumanDryRun = (
   } else {
     out('Config source: defaults (no user or project config.toml found)\n');
   }
-  out('\nTables (Phase 1):\n');
+  out('\nTables:\n');
   if (report.tables.length === 0) {
     out('  (no tables selected)\n');
   } else {
@@ -144,7 +145,17 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
   // DB. Warnings (typos, bad values) go to stderr but don't block
   // execution — operator gets the diagnostic AND the sweep
   // proceeds with defaults for the bad keys.
-  const loaded = loadRetentionConfig({ cwd });
+  //
+  // resolveRepoRoot is REQUIRED here. `loadRetentionConfig` reads
+  // `<cwd>/.agent/config.toml`; passing the raw process cwd means
+  // an operator running `agent gc` from `<repo>/src/` would read
+  // `<repo>/src/.agent/config.toml` (which doesn't exist), silently
+  // falling back to defaults and pruning rows with the wrong
+  // retention window. Data-retention regression in --force mode.
+  // Bootstrap already does this resolution for the harness's own
+  // call site — same posture here.
+  const projectConfigCwd = resolveRepoRoot(cwd);
+  const loaded = loadRetentionConfig({ cwd: projectConfigCwd });
   for (const w of loaded.warnings) {
     err(`forja gc: ${w}\n`);
   }
@@ -160,14 +171,58 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
   let db: DB | null = null;
   try {
     try {
-      db = openDb(dbPath);
-      // Schema mutation is gated by `--force`. Dry-run MUST NOT
-      // alter the DB; if migrations are pending, we warn loudly
-      // and proceed using the current schema. The next `--force`
-      // (or any bootstrap that calls migrate) will apply them.
       if (force) {
+        // Force path: open RW + migrate. openDb without `readonly`
+        // creates the file if absent, mkdir's parent, sets WAL +
+        // busy_timeout PRAGMAs (creates -shm/-wal sidecars on first
+        // write), and chmod's to 0600. All mutating, but expected
+        // — operator opted into mutation via --force.
+        db = openDb(dbPath);
         migrate(db);
       } else {
+        // Dry-run path: open in `readonly` mode. openDb with
+        // `{readonly: true}` skips mkdir, skips create:true, skips
+        // WAL/busy_timeout pragmas, skips chmod — pure FS-level
+        // no-mutation. If the file doesn't exist, the open throws
+        // (SQLite refuses RO-create); we catch + report gracefully
+        // as "DB not yet created — no rows to sweep" so the dry-run
+        // doesn't crash on fresh installs.
+        //
+        // Pre-fix bug: dry-run called openDb() without readonly,
+        // which CREATED sessions.db + -shm + -wal sidecars + applied
+        // PRAGMAs + chmod'd — silently mutating operator state
+        // despite the "DRY RUN" header. Same shape as the purge
+        // dry-run bug; fixed there + missed here.
+        try {
+          db = openDb(dbPath, { readonly: true });
+        } catch (e) {
+          const reason = e instanceof Error ? e.message : String(e);
+          // SQLITE_CANTOPEN on a non-existent file is the common
+          // case (fresh install, never ran any agent command). All
+          // sweep counts are 0; report cleanly without opening
+          // anything. Other errors (corrupted DB, perm denied) get
+          // the same surface — operator sees the reason in stderr
+          // and the report shows zero rows.
+          err(
+            `forja gc: DB not readable in dry-run (${reason}); reporting empty counts — run \`agent gc --force\` to create + migrate the DB.\n`,
+          );
+          // Synthesize an empty report so the renderer still works.
+          const emptyReport: GcReport = {
+            mode: 'dry-run',
+            nowMs: nowFn(),
+            config: loaded.config,
+            tables: [],
+            errors: [],
+          };
+          if (json) {
+            out(
+              `${JSON.stringify(serializeReport(emptyReport, loaded.sources, 'agent gc --force'))}\n`,
+            );
+          } else {
+            renderHumanDryRun(emptyReport, loaded.sources, out);
+          }
+          return 0;
+        }
         const pending = countPendingMigrations(db);
         if (pending > 0) {
           err(

@@ -2,6 +2,70 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent gc` dry-run uses readonly DB open (no file/sidecar creation)
+
+Operator-reported bug. The dry-run path still called `openDb(dbPath)` before the force check — and `openDb` without `{readonly: true}` does substantial mutation:
+
+- `mkdirSync(parent, recursive)` — creates parent directory
+- `Database(path, { create: true })` — creates the `.db` file
+- `PRAGMA journal_mode = WAL` — creates `-shm` + `-wal` sidecar files
+- `PRAGMA busy_timeout = 5000` — sets DB-level setting
+- `chmodSync(path, 0o600)` + `chmodSync(parent, 0o700)` — tightens perms
+
+All of that ran in dry-run, despite the `forja gc — DRY RUN (nothing will be modified)` header. Same shape as the recent purge dry-run fix and the gc Phase 1 C1 fix (migrate-in-dry-run). Caught by operator running `agent gc` on a fresh install — got an unexpected `sessions.db` materialized.
+
+**Fix.** `openDb` already supports `{ readonly: true }` (slice 125 for doctor's chain check). In readonly mode it: skips mkdir, skips `create: true` (open throws SQLITE_CANTOPEN on missing file), skips WAL pragma, skips chmod. Pure no-mutation read path.
+
+Split the gc handler's DB open into two branches:
+- **Force**: `openDb(dbPath)` + `migrate(db)` — current behavior; operator opted into mutation.
+- **Dry-run**: `openDb(dbPath, { readonly: true })`. ENOENT on missing file is caught + reported gracefully: stderr "DB not readable in dry-run", exit 0, empty report. Fresh-install operator running `agent gc --json` gets `{tables: [], errors: []}` instead of a crash.
+
+**Force-mode behavior on broken DB unchanged.** Operator who explicitly opted into mutation still gets exit 1 with "cannot open DB" message — they need to know.
+
+**Tests.** 4 new/updated in `tests/cli/gc.test.ts`:
+- `dry-run does NOT create DB file or sidecars on a fresh path` — load-bearing. Checks `existsSync(freshDb) === false`, plus `-shm` and `-wal` also absent.
+- `dry-run on existing DB does NOT add sidecars or migrate` — confirms schema integrity (no `_migrations` table created).
+- `dry-run reports empty + warning, exit 0 (fresh-install-friendly)` — replaces the old "DB inaccessible → exit 1" test which assumed the broken pre-fix behavior.
+- `--force still exit 1 when DB cannot be opened (write path)` — companion: force-mode still hard-fails on broken DB.
+
+**Verification:**
+- 12/12 gc CLI tests pass (was 9, +3 net; one test rewritten)
+- 96/96 across gc + audit + gc-prunes
+- typecheck + lint clean
+- Smoke E2E: `agent gc` with `XDG_DATA_HOME` pointing at fresh tempdir → `ls $XDG_DATA_HOME/` returns empty after dry-run; **no DB or sidecar files created**.
+
+**Cosmetic side-fix.** Found a leftover "Tables (Phase 1):" header in `renderHumanDryRun` (Phase 2 commit's `replace_all` had missed this one). Changed to "Tables:" matching the force-mode header.
+
+**Pre-existing operator state.** Operators who ran `agent gc` (dry-run) before this fix on a fresh install have an unwanted `~/.local/share/forja/sessions.db` + `-shm` + `-wal`. Remove via `rm ~/.local/share/forja/sessions.db*` if not yet used for real session activity.
+
+## [2026-05-19] fix(cli) — `agent gc` resolves repo root before loading config
+
+Operator-reported bug. `runGcCli` was passing the raw process `cwd` directly to `loadRetentionConfig`. The loader resolves `<cwd>/.agent/config.toml`, so an operator running `agent gc` from a subdirectory (e.g., `<repo>/src/`) read `<repo>/src/.agent/config.toml` (non-existent) and silently fell back to `DEFAULT_RETENTION`. In `--force` mode that pruned rows using default retention windows instead of the operator's configured policy — data-retention regression.
+
+The same handler did the right thing for the FS purge verb (`purge.ts:482 const repoRoot = resolveRepoRoot(cwd)`) and bootstrap already resolves for the harness's call chain (`bootstrap.ts:327 const projectConfigCwd = resolveRepoRoot(cwd)`). Only `cli/gc.ts` missed the resolution — caught by the operator.
+
+**Fix.** Import `resolveRepoRoot` from `memory/paths.ts`; compute `projectConfigCwd = resolveRepoRoot(cwd)` before `loadRetentionConfig({ cwd: projectConfigCwd })`. Mirrors the bootstrap pattern exactly. `git rev-parse --show-toplevel` walks back from any subdir; outside-git invocations preserve the cwd as the project anchor (same fallback the resolver has always had).
+
+**Test.** New pin in `tests/cli/gc.test.ts` "runGcCli — repoRoot resolution":
+- `git init` the tempdir
+- write `<cwd>/.agent/config.toml` with `retrieval_trace = 7` (distinctive override)
+- create `<cwd>/src/` subdir and invoke `runGcCli({ cwd: subdir })`
+- assert `config.retrieval_trace_days === 7` (the override, NOT the 90d default)
+- assert `configSources.project` points at the repo-root config path
+
+Skips gracefully if `git` is unavailable (sandboxed CI) — same posture as the purge equivalent test.
+
+**Verification:**
+- 9/9 gc CLI tests pass (+1 new pin)
+- 80/80 across gc + audit + gc-prunes
+- typecheck + lint clean
+
+**Pre-existing operator state.** Operators who ran `agent gc --force` from a subdirectory before this fix used default retention windows instead of their configured policy. Two cases:
+- Defaults were SHORTER than their config (e.g., config wanted 365d for `memory_events`, default applied = 365d — same) → no impact.
+- Defaults were LONGER than their config → rows that should have been deleted survived. Re-run `agent gc --force` from the repo root (or anywhere now post-fix) to apply the correct windows.
+
+No automated cleanup path — rare case + idempotent verb, operator just re-runs.
+
 ## [2026-05-19] fix(cli) — `agent purge --no-audit` honors opt-out on healthy DB
 
 Operator-reported bug. `--no-audit` was treated as an error bypass only — when the DB was writable, the audit row was written regardless of the flag. So `agent purge --force --no-audit` on a healthy DB still recorded a `purge_events` row, contradicting the documented "opt out of audit logging" intent.

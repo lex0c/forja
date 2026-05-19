@@ -3,7 +3,7 @@
 // rendering, JSON shape, table filter forwarding, exit codes.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGcCli } from '../../src/cli/gc.ts';
@@ -250,13 +250,47 @@ describe('runGcCli — config provenance', () => {
 });
 
 describe('runGcCli — DB inaccessible', () => {
-  test('reports error and exits 1 when DB cannot be opened', async () => {
+  test('dry-run reports empty + warning, exit 0 (fresh-install-friendly)', async () => {
+    // Post-fix: dry-run uses readonly open. A missing or broken DB
+    // is the common case (operator never ran a force-mode command
+    // yet). We surface the reason on stderr but exit 0 with an
+    // empty report — operator running --json dry-run on fresh
+    // install gets `{tables: [], errors: []}` instead of a crash.
     const blocker = join(xdgHome, 'blocker');
     writeFileSync(blocker, 'not-a-dir');
     const impossibleDb = join(blocker, 'sub', 'db.sqlite');
     const code = await runGcCli({
       cwd,
       force: false,
+      json: true,
+      tables: [],
+      out,
+      err,
+      dbPath: impossibleDb,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    expect(errBuf.join('')).toContain('DB not readable in dry-run');
+    const parsed = JSON.parse(outBuf.join('').trim()) as {
+      mode: string;
+      tables: unknown[];
+      errors: unknown[];
+    };
+    expect(parsed.mode).toBe('dry-run');
+    expect(parsed.tables).toEqual([]);
+    expect(parsed.errors).toEqual([]);
+  });
+
+  test('--force still exit 1 when DB cannot be opened (write path)', async () => {
+    // Force mode must surface real errors — operator opted in to
+    // mutation, so a broken DB is a stop-the-world failure, not
+    // hygiene drift.
+    const blocker = join(xdgHome, 'blocker');
+    writeFileSync(blocker, 'not-a-dir');
+    const impossibleDb = join(blocker, 'sub', 'db.sqlite');
+    const code = await runGcCli({
+      cwd,
+      force: true,
       json: false,
       tables: [],
       out,
@@ -266,5 +300,138 @@ describe('runGcCli — DB inaccessible', () => {
     });
     expect(code).toBe(1);
     expect(errBuf.join('')).toContain('cannot open DB');
+  });
+});
+
+describe('runGcCli — dry-run no-mutation invariant', () => {
+  test('dry-run does NOT create DB file or sidecars on a fresh path', async () => {
+    // Operator-reported bug: openDb without readonly creates the
+    // sessions.db file + -shm + -wal sidecars + applies WAL/
+    // busy_timeout PRAGMAs + chmod 0600. That ran in dry-run
+    // pre-fix, silently mutating operator state despite the
+    // "DRY RUN" header. Fix uses openDb({readonly: true}) which
+    // refuses to create the file.
+    const freshDb = join(xdgHome, 'never-existed.db');
+    expect(existsSync(freshDb)).toBe(false);
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: false,
+      tables: [],
+      out,
+      err,
+      dbPath: freshDb,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    // Load-bearing assertion: NO DB file created.
+    expect(existsSync(freshDb)).toBe(false);
+    // Sidecar files (WAL journal mode) also not created — those
+    // only land if the file is opened RW.
+    expect(existsSync(`${freshDb}-shm`)).toBe(false);
+    expect(existsSync(`${freshDb}-wal`)).toBe(false);
+  });
+
+  test('dry-run on existing DB does NOT add sidecars or migrate', async () => {
+    // Pre-existing DB without WAL sidecars; dry-run should not
+    // create them (WAL pragma is RW-only) nor apply migrations.
+    // The DB has no schema (just an empty file from openDb seed),
+    // so per-table COUNT queries will fail and exit code = 2.
+    // That's expected and orthogonal to the load-bearing
+    // assertion: dry-run MUST NOT mutate the DB schema.
+    const existingDb = join(xdgHome, 'existing.db');
+    // Create a minimal empty DB (raw open + close — applies the
+    // RW path's PRAGMAs which create -shm/-wal sidecars on first
+    // write). Then close.
+    const seed = openDb(existingDb);
+    seed.close();
+    // The seed openDb above sets WAL mode (persisted in DB
+    // header), so subsequent opens — even readonly — may touch
+    // sidecars. That's a SQLite-level behavior, not a gc-handler
+    // mutation. The load-bearing assertion here is SCHEMA
+    // INTEGRITY (no migrate ran), not file-system file inventory
+    // (covered by the prior `fresh path` test where there's no
+    // persisted WAL state to inherit).
+
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: true,
+      tables: [],
+      out,
+      err,
+      dbPath: existingDb,
+      now: () => NOW,
+    });
+    // Per-table errors expected (no tables exist yet); handler
+    // exits 2 when report.errors.length > 0.
+    expect([0, 2]).toContain(code);
+
+    // DB file still there (sanity).
+    expect(existsSync(existingDb)).toBe(true);
+
+    // Load-bearing: no _migrations table — dry-run never called migrate().
+    const dbAfter = openDb(existingDb, { readonly: true, skipIntegrityCheck: true });
+    const migCount = dbAfter
+      .query<{ n: number }, []>(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = '_migrations'",
+      )
+      .get() as { n: number } | null;
+    expect(migCount?.n ?? 0).toBe(0);
+    dbAfter.close();
+  });
+});
+
+describe('runGcCli — repoRoot resolution', () => {
+  test('gc from <repo>/src/ honors <repo>/.agent/config.toml (not subdir defaults)', async () => {
+    // Operator-reported bug: handler passed raw cwd to
+    // loadRetentionConfig, so running from a subdir read
+    // <subdir>/.agent/config.toml (non-existent) and silently used
+    // defaults. In --force mode that pruned rows with the wrong
+    // retention window — data-retention regression.
+    //
+    // git init the tempdir so resolveRepoRoot walks back to it
+    // from the subdir invocation cwd.
+    const gitInit = Bun.spawnSync({
+      cmd: ['git', 'init', '-q', cwd],
+      env: process.env,
+    });
+    if (gitInit.exitCode !== 0) {
+      console.warn('skipping gc subdir-resolve test: git init returned', gitInit.exitCode);
+      return;
+    }
+    // Write project config at REPO ROOT with a distinctive override.
+    const projectConfigDir = join(cwd, '.agent');
+    const projectConfigPath = join(projectConfigDir, 'config.toml');
+    const { mkdirSync: mkdir } = await import('node:fs');
+    mkdir(projectConfigDir, { recursive: true });
+    writeFileSync(projectConfigPath, '[audit.retention]\nretrieval_trace = 7\n');
+
+    // Create subdir, run gc from there.
+    const subdir = join(cwd, 'src');
+    mkdir(subdir, { recursive: true });
+
+    const code = await runGcCli({
+      cwd: subdir, // <-- invocation cwd is the subdir
+      force: false,
+      json: true,
+      tables: ['retrieval_trace'],
+      out,
+      err,
+      dbPath,
+      now: () => NOW,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as {
+      config: { retrieval_trace_days: number };
+      configSources: { project: string | null };
+    };
+    // The load-bearing assertions:
+    //   (a) retrieval_trace_days = 7 (from repo-root config),
+    //       NOT 90 (default).
+    //   (b) configSources.project points at the REPO-ROOT path,
+    //       NOT a subdir path.
+    expect(parsed.config.retrieval_trace_days).toBe(7);
+    expect(parsed.configSources.project).toBe(projectConfigPath);
   });
 });
