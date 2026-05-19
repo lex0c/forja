@@ -451,6 +451,12 @@ export const run = async (options: RunOptions): Promise<number> => {
           prompt: '',
           ...(args.model !== undefined ? { modelId: args.model } : {}),
           signal: options.signal ?? new AbortController().signal,
+          // Pipe --json through so bootstrap's first-boot governance
+          // banner suppresses correctly for `agent recap --json`
+          // consumers. Mirror of the main run path below — the recap
+          // bootstrap was missing this and JSON consumers saw a one-
+          // time stderr line on first boot polluting their stream.
+          json: args.json,
           ...(options.bootstrapOverride ?? {}),
         };
         const result = await bootstrap(bootstrapInput);
