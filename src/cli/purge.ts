@@ -268,6 +268,36 @@ const hasInitMarker = (agentDir: string): boolean => {
   return false;
 };
 
+// TOCTOU defense: between the pre-readdir lstat and the readdir
+// itself, an adversary with concurrent FS access could replace the
+// directory with a symlink to an external path. Because readdirSync
+// follows symlinks, the walker would then list (and subsequently
+// delete) entries from the symlink target — outside `.agent/`,
+// defeating the top-of-walk symlink defense.
+//
+// This helper re-runs lstat AFTER readdir and verifies the path
+// still points at the same inode of a real directory. If not, the
+// caller refuses to recurse into the listed entries.
+//
+// Residual race: adversary can still swap between this re-stat and
+// the per-child walkRemove call. That window is much narrower
+// (microseconds between two FS syscalls in the same process) and
+// requires winning a tight scheduling race; documented but not
+// closed by this fix. A fully race-free walk requires fd-based
+// directory iteration (opendir over an O_NOFOLLOW fd) which Node's
+// public fs API doesn't expose — would need OS-level primitives.
+export const verifySamePostReaddir = (path: string, preStat: Stats): boolean => {
+  let stAfter: Stats;
+  try {
+    stAfter = lstatSync(path);
+  } catch {
+    // Vanished between readdir and this lstat — treat as not-same
+    // (don't recurse into a path that's no longer there).
+    return false;
+  }
+  return stAfter.isDirectory() && !stAfter.isSymbolicLink() && stAfter.ino === preStat.ino;
+};
+
 // Removes a tree rooted at `target`, lstat-aware. Symlinks are
 // unlinked (the link itself, not its target). Real directories are
 // recursed then rmdir'd. Other entries are unlinked.
@@ -298,6 +328,18 @@ const removeTree = (target: string): { files: number; dirs: number; bytes: numbe
         entries = readdirSync(path);
       } catch {
         entries = [];
+      }
+      // TOCTOU re-check: confirm the path is still the same real
+      // directory we lstat'd above. If a concurrent process swapped
+      // it for a symlink between lstat and readdir, refuse to
+      // recurse — readdirSync follows symlinks, so the entries
+      // listed might belong to an external target. Recursing
+      // would delete files outside .agent/.
+      if (!verifySamePostReaddir(path, st)) {
+        process.stderr.write(
+          `forja purge: refusing to descend into ${path} — concurrent FS modification detected (lstat/readdir TOCTOU); aborting subtree\n`,
+        );
+        return;
       }
       for (const name of entries) walkRemove(join(path, name));
       rmdirSync(path);
@@ -559,6 +601,15 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Dry-run path
   // ────────────────────────────────────────────────────────────
   if (!force) {
+    // Build the suggested command, preserving the operator's
+    // --no-audit flag. Without this, an operator who ran
+    // `agent purge --no-audit` (typically because DB is broken
+    // — the exact emergency the flag exists for) would see
+    // "agent purge --force" suggested. Copy-pasting that would
+    // hit the audit gate and abort, blocking the emergency
+    // purge workflow. The suggested command must be directly
+    // executable; preserve scope flags.
+    const command = noAudit ? 'agent purge --force --no-audit' : 'agent purge --force';
     const report: DryRunReport = {
       mode: 'dry-run',
       repoRoot,
@@ -567,7 +618,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
       totals: walk.totals,
       preserved: PRESERVED_PATHS,
       audit,
-      command: 'agent purge --force',
+      command,
     };
     if (json) {
       out(`${JSON.stringify(serializeDryRun(report))}\n`);

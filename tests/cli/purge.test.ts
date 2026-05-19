@@ -15,11 +15,19 @@
 // ~/.config/agent/install_id.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_STEPS, type InitStep } from '../../src/cli/init.ts';
-import { INIT_MARKERS, runPurge } from '../../src/cli/purge.ts';
+import { INIT_MARKERS, runPurge, verifySamePostReaddir } from '../../src/cli/purge.ts';
 import { openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listPurgeEventsByCwd } from '../../src/storage/repos/purge-events.ts';
@@ -787,5 +795,157 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
     for (const step of DEFAULT_STEPS) {
       expect(STEP_TO_MARKER[step]).toBeDefined();
     }
+  });
+});
+
+describe('verifySamePostReaddir — TOCTOU race detector', () => {
+  // Operator-reported security bug: between lstat (confirming a
+  // path is a real directory) and readdirSync (which follows
+  // symlinks), an adversary can swap the directory for a symlink
+  // to an external path. Without the post-readdir re-check, the
+  // walker would recurse into and delete files outside .agent/.
+  //
+  // These pins exercise the detector directly (without simulating
+  // the racy scheduling, which would be flaky). We CONSTRUCT the
+  // race-outcome state — i.e., a path whose post-stat differs from
+  // the pre-stat — and verify the function reports the mismatch.
+
+  let workdir: string;
+  beforeEach(() => {
+    workdir = mkdtempSync(join(tmpdir(), 'forja-purge-toctou-'));
+  });
+  afterEach(() => {
+    rmSync(workdir, { recursive: true, force: true });
+  });
+
+  test('returns true when path is the same real directory across calls', () => {
+    const realDir = join(workdir, 'real');
+    mkdirSync(realDir);
+    const preStat = lstatSync(realDir);
+    expect(verifySamePostReaddir(realDir, preStat)).toBe(true);
+  });
+
+  test('returns false when directory was replaced by a symlink (adversary swap)', () => {
+    const realDir = join(workdir, 'real');
+    mkdirSync(realDir);
+    const preStat = lstatSync(realDir);
+    // Simulate the post-race state: dir is now a symlink to /tmp.
+    rmSync(realDir, { recursive: true, force: true });
+    symlinkSync('/tmp', realDir);
+    expect(verifySamePostReaddir(realDir, preStat)).toBe(false);
+  });
+
+  test('returns false when path was replaced by a different directory (inode change)', () => {
+    const realDir = join(workdir, 'real');
+    mkdirSync(realDir);
+    const preStat = lstatSync(realDir);
+    // Recreate at same path with a different inode.
+    rmSync(realDir, { recursive: true, force: true });
+    mkdirSync(realDir);
+    const postStat = lstatSync(realDir);
+    // Sanity: inodes must differ for the test to be meaningful.
+    expect(postStat.ino).not.toBe(preStat.ino);
+    expect(verifySamePostReaddir(realDir, preStat)).toBe(false);
+  });
+
+  test('returns false when path vanished entirely', () => {
+    const realDir = join(workdir, 'real');
+    mkdirSync(realDir);
+    const preStat = lstatSync(realDir);
+    rmSync(realDir, { recursive: true, force: true });
+    expect(verifySamePostReaddir(realDir, preStat)).toBe(false);
+  });
+
+  test('returns false when path was replaced by a regular file', () => {
+    const realDir = join(workdir, 'real');
+    mkdirSync(realDir);
+    const preStat = lstatSync(realDir);
+    rmSync(realDir, { recursive: true, force: true });
+    writeFileSync(realDir, 'now a file');
+    expect(verifySamePostReaddir(realDir, preStat)).toBe(false);
+  });
+});
+
+describe('runPurge — dry-run suggestion preserves --no-audit', () => {
+  // Operator-safety bug: dry-run with --no-audit suggested a bare
+  // `agent purge --force` command. Copy-pasting in the emergency
+  // case (DB broken — the exact reason --no-audit exists) would
+  // hit the audit gate and abort, blocking the recovery workflow.
+  // Fix: suggested command echoes --no-audit when set.
+
+  test('no --no-audit → "agent purge --force" (baseline)', async () => {
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: false,
+      json: true,
+      noAudit: false,
+      out,
+      err,
+      dbPath,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command: string };
+    expect(parsed.command).toBe('agent purge --force');
+  });
+
+  test('--no-audit set → suggestion preserves the flag', async () => {
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: false,
+      json: true,
+      noAudit: true,
+      out,
+      err,
+      dbPath,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command: string };
+    expect(parsed.command).toBe('agent purge --force --no-audit');
+  });
+
+  test('human output echoes --no-audit suggestion', async () => {
+    seedMinimal();
+    const code = await runPurge({
+      cwd,
+      force: false,
+      json: false,
+      noAudit: true,
+      out,
+      err,
+      dbPath,
+    });
+    expect(code).toBe(0);
+    const stdout = outBuf.join('');
+    expect(stdout).toContain('agent purge --force --no-audit');
+    // Negative polarity: bare suggestion must NOT appear (would
+    // indicate the flag was dropped — exact regression target).
+    expect(stdout).not.toMatch(/agent purge --force\n/);
+  });
+
+  test('--no-audit + unwritable DB → suggestion still executable', async () => {
+    // The motivating scenario: operator sees DB is broken, runs
+    // dry-run with --no-audit to inspect what would be purged,
+    // copy-pastes the suggested command. It MUST work.
+    seedMinimal();
+    const blockerPath = join(xdgHome, 'blocker');
+    writeFileSync(blockerPath, 'not-a-dir');
+    const impossibleDb = join(blockerPath, 'sub', 'db.sqlite');
+    const code = await runPurge({
+      cwd,
+      force: false,
+      json: true,
+      noAudit: true,
+      out,
+      err,
+      dbPath: impossibleDb,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(outBuf.join('').trim()) as { command: string };
+    // The suggestion includes --no-audit even when probe was
+    // skipped — operator who copy-pastes this gets the correct
+    // emergency-recovery command.
+    expect(parsed.command).toBe('agent purge --force --no-audit');
   });
 });

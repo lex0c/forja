@@ -2,6 +2,95 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] fix(cli) — `agent purge` TOCTOU symlink race in removeTree
+
+Operator-reported **security** bug. The purge walker's symlink defense was load-bearing for the "won't delete files outside `.agent/`" contract in spec §2.1.2, but had a TOCTOU window that defeated it under concurrent FS mutation.
+
+**The race:**
+
+```
+t0: lstatSync(path)        → directory D, inode X
+t1: ADVERSARY swaps        → path is now a symlink S → /home/important/
+t2: readdirSync(path)      → follows symlink → lists /home/important/'s entries
+t3: walkRemove(child)      → recurses into /home/important/<child>
+... deletes files outside .agent/
+```
+
+The top-of-walk symlink check on `<repoRoot>/.agent/` itself didn't help — the race was per-directory inside the walk, on every recursive descent. Any concurrent process with FS write access to a path inside `.agent/` could exploit it during the narrow window between `lstatSync` and `readdirSync`.
+
+Real-world attack feasibility: low (requires concurrent access + tight timing + write rights inside `.agent/`), but the spec promised the symlink defense was absolute; this was a documented contract violation, not just a theoretical risk.
+
+**Fix.** New exported helper `verifySamePostReaddir(path, preStat): boolean` — re-runs `lstatSync` AFTER `readdirSync` and verifies the path still points at the same inode of a real directory. If the post-stat shows a symlink, a different inode, a non-directory, or vanished — return false and the walker refuses to recurse.
+
+```ts
+if (st.isDirectory()) {
+  let entries: string[];
+  try { entries = readdirSync(path); } catch { entries = []; }
+  if (!verifySamePostReaddir(path, st)) {
+    process.stderr.write(
+      `forja purge: refusing to descend into ${path} — concurrent FS modification detected (lstat/readdir TOCTOU); aborting subtree\n`,
+    );
+    return;
+  }
+  for (const name of entries) walkRemove(join(path, name));
+  rmdirSync(path);
+  ...
+}
+```
+
+**Residual race window (documented, not closed).** Adversary can still swap between the post-readdir re-stat and the per-child `walkRemove` call. That window is microseconds between two FS syscalls in the same process — much narrower and harder to exploit than the pre-fix window. Fully race-free walking requires fd-based directory iteration (`opendir` over an `O_NOFOLLOW` fd), which Node's public `fs` API doesn't cleanly expose. Would need OS-level primitives or Bun-specific extensions; deferred unless a real exploit attempt is reported.
+
+**Tests.** 5 new pins in `tests/cli/purge.test.ts` describe `verifySamePostReaddir — TOCTOU race detector`. Functional (not mocked-race) — construct the post-race state directly and verify the detector reports the mismatch:
+- Same dir across calls → true (baseline).
+- Dir replaced by symlink → false (the motivating attack).
+- Dir recreated with different inode → false.
+- Path vanished entirely → false.
+- Path replaced by regular file → false.
+
+Race scheduling can't be reproduced deterministically without flaky timing tests; the unit tests pin the detector function itself, which is the load-bearing piece.
+
+**Verification:**
+- 37/37 purge tests pass (was 32, +5 new pins)
+- 48/48 across purge + args-purge
+- typecheck + lint clean
+
+**Pre-existing operator state.** No automated recovery — the bug only triggers under concurrent FS modification by a malicious local process. Operators in normal single-process workflows were never affected. The fix shrinks the attack window; an adversary winning the residual race is the remaining theoretical risk, deferred per above.
+
+## [2026-05-19] fix(cli) — `agent purge` dry-run suggestion preserves `--no-audit`
+
+Operator-safety bug, same shape as the recent gc `--table` scope fix. Dry-run output (both human "To execute:" line AND JSON `command` field) was hardcoded to `agent purge --force`, regardless of whether the operator passed `--no-audit`.
+
+**Concrete failure mode (motivating scenario).** Operator hits a DB corruption / fresh install / recovery situation where the global `sessions.db` is unwritable. They:
+1. Run `agent purge --no-audit` to inspect what would be removed.
+2. Dry-run shows scope + suggests `agent purge --force`.
+3. Copy-paste the suggestion.
+4. Force run hits the audit gate (DB unwritable, no `--no-audit` to bypass) → aborts with "cannot write audit row to DB; pass --no-audit to bypass".
+5. Operator now stuck in a loop: they have to manually remember the flag they originally used.
+
+The `--no-audit` flag exists exactly for the emergency case where the DB is broken. Suggesting a command that won't work in that case turns the dry-run into a trap — the operator can't execute the previewed plan.
+
+**Fix.** Build the suggested command dynamically:
+```ts
+const command = noAudit ? 'agent purge --force --no-audit' : 'agent purge --force';
+```
+Passed into the `DryRunReport.command` field, surfaces in both the human "To execute:" line and JSON output. Force-mode JSON still omits `command` (no follow-up to suggest).
+
+Mirrors the gc Phase 2 `buildForceCommand(tables)` fix — same principle (suggested command must echo operator's flags so copy-paste is executable).
+
+**Tests.** 4 new pins in `tests/cli/purge.test.ts` describe `runPurge — dry-run suggestion preserves --no-audit`:
+- `no --no-audit → "agent purge --force" (baseline)` — bare suggestion still works.
+- `--no-audit set → suggestion preserves the flag` — JSON output check.
+- `human output echoes --no-audit suggestion` — includes negative polarity assertion (`stdout NOT matching /agent purge --force\n/` to catch regression).
+- `--no-audit + unwritable DB → suggestion still executable` — the motivating scenario itself: probe-skipped + blocker dbPath, suggestion still includes `--no-audit` so copy-paste actually works.
+
+**Verification:**
+- 32/32 purge tests pass (was 28, +4 new pins)
+- 43/43 across purge + args-purge
+- typecheck + lint clean
+- Smoke E2E: `agent purge --no-audit` in fresh tempdir with valid `.agent/` → "To execute:" footer shows `agent purge --force --no-audit`.
+
+**Pre-existing operator state.** Operators who copy-pasted the bare suggestion from a `--no-audit` dry-run before this fix may have hit the audit gate and either aborted (no data lost — just frustrating) or manually added `--no-audit` on retry. No automated recovery needed.
+
 ## [2026-05-19] fix(cli) — `agent gc` dry-run suggestion preserves `--table` scope
 
 Operator-safety bug. Dry-run output (both human "To execute: agent gc --force" line AND JSON `command` field) was hardcoded to `agent gc --force` — no `--table=X` flags echoed back.
