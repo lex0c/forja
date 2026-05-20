@@ -129,6 +129,12 @@ export const SGR = {
   // until then.
   accent: `${CSI}94m`,
   bold: `${CSI}1m`,
+  // Text attributes (not colors) for inline Markdown — `emphasis`
+  // and `~~delete~~`. Landed with the markdown-render slice; they
+  // degrade gracefully on terminals that ignore them. UI.md §6
+  // codifies the palette/typography evolution afterwards.
+  italic: `${CSI}3m`,
+  strikethrough: `${CSI}9m`,
   error: `${CSI}31m`,
   warn: `${CSI}33m`,
   success: `${CSI}32m`,

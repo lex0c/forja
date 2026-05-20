@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — markdown rendering slice A: GFM render on the assistant block
+
+The model's prose now renders as GitHub-flavored Markdown in the TUI instead of raw text — output "like Claude Code". The dep (`remark` + `remark-gfm`) and the render both collide with set spec decisions — `AGENTIC_CLI §3` ("deps mínimas: string-width, wrap-ansi"), `§2.6` output design, `UI.md §13`/`§14`; the operator's call was to iterate in code and align the spec afterwards. Roadmap + the deferred slices live in `docs/TODO.md` under "Markdown rendering".
+
+**Render-only, contained.** Markdown is a render concern: the `assistant` `PermanentItem` keeps `text: string` (raw markdown), the reducer is untouched. `formatPermanent`'s `assistant` case stopped doing `text.split('\n')` and delegates to a new `renderMarkdown(src, caps)`.
+
+**`src/tui/render/markdown.ts`** (new) — `remark().use(remarkGfm).parse()` → an `mdast` tree; a recursive walk maps each node onto `term.ts` palette primitives, returning `string[]` (no frame margin — the caller pads). Block: heading (bold), paragraph (word-wrapped via `wrap-ansi`, a dep the TUI already had), bullet / ordered / task list (`•` / `N.` / `[x]` markers, nesting indents, tight — no blank between an item's blocks), code fence (dim, indented two columns, no syntax highlighting), blockquote (`│` prefix), thematic break (rule), GFM table (slice-A fallback: cells joined by a dim separator, no column alignment). Inline: bold, italic, inline code, strikethrough, link (label + dimmed URL). The walk threads an attribute stack rather than nesting `paint()` — a nested `\x1b[0m` would reset the outer attribute (bold lost after an inline-code span inside `**…**`); each leaf run paints itself whole via `paintMulti`.
+
+**`term.ts`** gains `italic` (`CSI 3m`) and `strikethrough` (`CSI 9m`) SGR tokens — Markdown emphasis needs them; text attributes, not colors, degrade gracefully where unsupported.
+
+**Deferred (`docs/TODO.md`):** slice B (streaming — incremental render on `assistant:delta`; until then a streaming turn shows plain text and settles into Markdown at `assistant:end`), slice C (table degradation for narrow terminals), syntax highlighting (fights the `§6.1` palette), and the spec alignment (`UI.md` markdown section + `§6` evolution, `§3` deps, `§13`/`§14` reconciled).
+
+**Tests.** New `markdown.test.ts` (16 — every block + inline element, the GFM-table fallback, word-wrap, ASCII fallback, the colored SGR runs, empty input). `permanent.test.ts` — the trailing-newline test re-pinned: the parser normalizes a trailing `\n` away, so it no longer leaves a spurious empty line. `bun test tests/tui/` 828 green, `tests/cli/` 1822 green; `typecheck` + `lint` clean.
+
 ## [2026-05-20] decision — slice 3 (per-tool token count) dropped
 
 The card roadmap pencilled a token count onto the grouped chip (`[4ms · 330 tokens]`). Exploration ruled it out: the provider reports real token usage only per-turn (`assistant:usage`), never per tool_result, so a per-tool figure could only be a `chars/4` estimate. The project already took the opposite stance — the `assistant-chip` deliberately shows no token count until the real `usage` lands ("show no number when we don't have one"), and `TOKEN_TUNING §8` directs callers to the provider's real `countTokens` where exactness matters. Tool results are code-heavy, the worst case for `chars/4`. A fabricated number that doesn't reconcile with the turn total is worse than none — so the chip stays at `[duration]`. The slice-2 truncation hint already flags an oversized result where it matters. Revisit only if Forja grows real per-message tokenization.

@@ -341,16 +341,16 @@ describe('formatPermanent', () => {
     ).toEqual([]);
   });
 
-  test('assistant with trailing newline emits an explicit empty trailing line', () => {
-    // Documents current behavior: text with a trailing `\n` becomes
-    // [content, ''] after split. Provider streams typically don't end
-    // with a newline; if a future producer does, we may want to filter.
+  test('assistant: a trailing newline does not leave a spurious empty line', () => {
+    // The Markdown renderer normalizes a trailing `\n` — it is not a
+    // line. The pre-markdown `text.split('\n')` left an empty `''`
+    // here; this test pinned that, and now pins its absence.
     expect(
       formatPermanent(
         { kind: 'assistant', text: 'foo\n', durationMs: null, outputTokens: null },
         ascii,
       ),
-    ).toEqual([pad(''), pad('foo'), pad('')]);
+    ).toEqual([pad(''), pad('foo')]);
   });
 
   test('assistant ignores durationMs/outputTokens (chip header removed)', () => {

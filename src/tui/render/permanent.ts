@@ -15,6 +15,7 @@ import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
 import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
+import { renderMarkdown } from './markdown.ts';
 import { visualWidth } from './width.ts';
 
 // Card-head glyph (UI.md §4.10.5). One glyph for all statuses;
@@ -208,8 +209,13 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // tool_use blocks but no prose) used to surface a header-only
       // chip for cost visibility; the footer cost counter and the
       // tool-end chips already cover that signal.
+      //
+      // The prose is GitHub-flavored Markdown — `renderMarkdown`
+      // parses and walks it (`render/markdown.ts`). Streaming still
+      // shows plain text; the block settles into Markdown here, at
+      // turn end.
       if (item.text.length === 0) return [];
-      return ['', ...item.text.split('\n')].map(padFrame);
+      return ['', ...renderMarkdown(item.text, caps)].map(padFrame);
     }
     case 'tool-end': {
       // UI.md §4.10.5 — card head: glyph + status-aware verb + a

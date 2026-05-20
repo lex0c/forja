@@ -296,6 +296,22 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 # DEFERRED — items intentionally left for later
 
+## Markdown rendering — GFM on the assistant block (output "like Claude Code")
+
+**Status:** Fatia A in progress on `feat/ui-improves`; B / C and spec-alignment parked here.
+
+**What it is:** the model's prose (the `assistant` `PermanentItem`) renders as GitHub-flavored Markdown in the TUI instead of raw text. Operator decision: `remark` + `remark-gfm`, iterate in code, align the spec afterwards. Markdown is a *render* concern only — the `PermanentItem` keeps `text: string`, the reducer is untouched; `formatPermanent`'s `assistant` case delegates to a new `renderMarkdown(src, caps)`.
+
+**Slices:**
+
+- **A — static render** (this session): the dep + `src/tui/render/markdown.ts` + the `permanent.ts` wire-up + tests. Subset: heading, paragraph, list (incl. task list), blockquote, code fence, hr, inline (bold / italic / code / strikethrough / link). Streaming still emits plain text; the block settles into Markdown at `assistant:end`.
+- **B — streaming:** incremental render on `assistant:delta` — re-parse of the partial (open fence, half list). Removes the plain→markdown flip.
+- **C — tables:** GFM table with narrow-terminal degradation (stack / collapse).
+
+**Spec alignment (deferred):** `UI.md` gains a markdown-render section + evolved `§6` palette / typography; `AGENTIC_CLI §3` lists `remark` / `remark-gfm` among the TUI deps; `§13` / `§14` reconciled with the new reality. Also the density rule ("every sentence changes what the reader knows or does next") cracked into `response-format.ts` / `CONTEXT_TUNING §1.5`.
+
+**Open decision:** syntax highlighting of code fences — fights the `§6.1` 8-colour palette; parked until the palette question is settled.
+
 ## LLM-judge detector caps: push notification when latched (MEMORY.md §12.5.5)
 
 **Status:** noted during the post-Slice-Q architecture review (2026-05-18). Companion to TODO entry "Aggregate observability for memory-governance detectors" below — both close the loop on the default-ON detector posture.
