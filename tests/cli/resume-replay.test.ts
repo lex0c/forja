@@ -33,7 +33,7 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     const { bus, events } = recordEvents();
     const result = replaySessionMessages(db, 's1', bus);
     expect(events).toEqual([]);
-    expect(result).toEqual({ turns: 0, messagesWalked: 0 });
+    expect(result).toEqual({ turns: 0, messagesWalked: 0, droppedFromHead: 0 });
   });
 
   test('single user → assistant turn emits the expected sequence', () => {
@@ -56,7 +56,7 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     });
     const { bus, events } = recordEvents();
     const result = replaySessionMessages(db, 's1', bus);
-    expect(result).toEqual({ turns: 1, messagesWalked: 2 });
+    expect(result).toEqual({ turns: 1, messagesWalked: 2, droppedFromHead: 0 });
     // Sequence: user:submit → assistant:start → assistant:delta →
     // assistant:end → session:end. Order matters — start before
     // delta before end is what the reducer expects.
@@ -172,22 +172,38 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     expect(result.turns).toBe(1);
   });
 
-  test('tool_result-only user message (no matching tool_use) emits nothing', () => {
+  test('orphan tool_result inside the window emits no tool:end', () => {
     const db = setupSession('s1');
-    // A user message whose only block is a tool_result with no
-    // prior tool_use anywhere in the session — orphan. No
-    // user:submit (not a string prompt), no tool:end (the orphan
-    // result is dropped: emitting tool:end for a card the reducer
-    // never opened would noop at best).
+    // A string prompt opens a safe window head, followed by a user
+    // message whose only block is a tool_result with no prior
+    // tool_use. The orphan tool_result produces no tool:end —
+    // emitting one for a card the reducer never opened would noop
+    // at best. The string prompt + a trailing assistant keep the
+    // window from collapsing (so this isolates orphan-result
+    // handling, not the window cut).
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'kick off',
+      createdAt: 1_000_000,
+    });
     appendMessage(db, {
       sessionId: 's1',
       role: 'user',
       content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }],
-      createdAt: 1_000_000,
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+      createdAt: 1_002_000,
     });
     const { bus, events } = recordEvents();
     replaySessionMessages(db, 's1', bus);
-    expect(events).toEqual([]);
+    expect(events.find((e) => e.type === 'tool:end')).toBeUndefined();
+    // No truncation indicator — the whole (tiny) session fit.
+    expect(events.find((e) => e.type === 'info')).toBeUndefined();
   });
 
   test('multi-turn conversation: each turn produces its own footer', () => {
@@ -817,5 +833,83 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
       'assistant:end',
       'session:end',
     ]);
+  });
+
+  // ── Resume window cap (must match the model's context) ────────
+
+  // Helper: seed a session with `n` independent user→assistant
+  // turns, each 1s apart. Returns the db.
+  const seedTurns = (sessionId: string, n: number) => {
+    const db = setupSession(sessionId);
+    for (let i = 0; i < n; i++) {
+      const base = 1_000_000 + i * 10_000;
+      appendMessage(db, {
+        sessionId,
+        role: 'user',
+        content: `prompt ${i}`,
+        createdAt: base,
+      });
+      appendMessage(db, {
+        sessionId,
+        role: 'assistant',
+        content: [{ type: 'text', text: `reply ${i}` }],
+        createdAt: base + 1_000,
+      });
+    }
+    return db;
+  };
+
+  test('session within the window: no truncation indicator, droppedFromHead 0', () => {
+    const db = seedTurns('s1', 3);
+    const { bus, events } = recordEvents();
+    // fetchLimit 100 >> 6 messages — whole session fits.
+    const result = replaySessionMessages(db, 's1', bus, 100);
+    expect(result.droppedFromHead).toBe(0);
+    expect(events.find((e) => e.type === 'info')).toBeUndefined();
+    expect(result.turns).toBe(3);
+  });
+
+  test('session larger than the fetch window: only the capped tail replays', () => {
+    // 10 turns = 20 messages. fetchLimit 6 → only the most-recent
+    // 6 messages reach the replay. resumeWindowCut may trim the
+    // head further to land on a safe boundary.
+    const db = seedTurns('s1', 10);
+    const { bus, events } = recordEvents();
+    const result = replaySessionMessages(db, 's1', bus, 6);
+    // 20 total, at most 6 walked.
+    expect(result.messagesWalked).toBeLessThanOrEqual(6);
+    expect(result.droppedFromHead).toBeGreaterThan(0);
+    // droppedFromHead + messagesWalked accounts for every row.
+    expect(result.droppedFromHead + result.messagesWalked).toBe(20);
+    // The oldest turns are NOT in the replayed scrollback — the
+    // model never received them, so neither does the operator.
+    const submitted = events
+      .filter((e) => e.type === 'user:submit')
+      .map((e) => (e as { text: string }).text);
+    expect(submitted).not.toContain('prompt 0');
+    expect(submitted).not.toContain('prompt 1');
+    // The most recent turn IS present.
+    expect(submitted).toContain('prompt 9');
+  });
+
+  test('truncation indicator is emitted first, in secondary tone, with the dropped count', () => {
+    const db = seedTurns('s1', 10);
+    const { bus, events } = recordEvents();
+    const result = replaySessionMessages(db, 's1', bus, 6);
+    const first = events[0];
+    expect(first).toMatchObject({ type: 'info', tone: 'secondary' });
+    expect((first as { message: string }).message).toContain(`${result.droppedFromHead} earlier`);
+    expect((first as { message: string }).message).toContain('not in model context');
+  });
+
+  test('truncation count is the exact set of rows outside the window', () => {
+    // 5 turns = 10 messages, fetchLimit 4. The tail query returns
+    // the newest 4; resumeWindowCut may trim further. Whatever the
+    // exact split, dropped + walked must equal the full 10.
+    const db = seedTurns('s1', 5);
+    const { bus } = recordEvents();
+    const result = replaySessionMessages(db, 's1', bus, 4);
+    expect(result.droppedFromHead + result.messagesWalked).toBe(10);
+    expect(result.droppedFromHead).toBe(10 - result.messagesWalked);
   });
 });

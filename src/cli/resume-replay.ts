@@ -38,6 +38,18 @@
 // interleave in the same order the operator saw live (text →
 // tool → text → tool → text within a single assistant message).
 //
+// Resume window — MUST match the model's. The harness does NOT feed
+// the whole persisted log to the model on --resume: it fetches a
+// bounded tail (listMessageTailBySession with MAX_RESUME_MESSAGES +
+// ALIGNMENT_FETCH_MARGIN) and cuts it down to MAX_RESUME_MESSAGES
+// via resumeWindowCut (src/harness/resume.ts). Replaying the FULL
+// log would (a) make REPL boot time + memory scale with total
+// history, and (b) show the operator turns the model can't
+// actually reference — a silent mislead about what the next turn
+// can build on. So replay drives off the exact same capped window
+// and surfaces a truncation indicator when older history was
+// dropped.
+//
 // Content shape. Anthropic content blocks:
 //   - {type: 'text', text: string}
 //   - {type: 'tool_use', id: string, name: string, input: object}
@@ -45,7 +57,8 @@
 // User content is either a plain string (operator prompt) or an
 // array of tool_result blocks (continuation of the prior run).
 
-import { type DB, listMessagesBySession } from '../storage/index.ts';
+import { ALIGNMENT_FETCH_MARGIN, MAX_RESUME_MESSAGES, resumeWindowCut } from '../harness/resume.ts';
+import { type DB, listMessageTailBySession } from '../storage/index.ts';
 import type { Bus } from '../tui/bus.ts';
 import { lookupToolVocab } from '../tui/tool-vocab.ts';
 
@@ -54,9 +67,15 @@ export interface ReplayResult {
   // turn boundary. Mirrors what the bridge anchor announces; the
   // operator's "I typed 3 prompts" maps to this count.
   turns: number;
-  // Number of source messages actually walked. Diagnostic — helps a
-  // future test or operator confirm the replay touched every row.
+  // Number of source messages actually walked (= the size of the
+  // capped resume window). Diagnostic.
   messagesWalked: number;
+  // Messages that exist in the persisted log but fall OUTSIDE the
+  // resume window — older than what the model received as context.
+  // Zero when the whole session fit. The caller can use this to
+  // decide whether to mention truncation; the replay itself already
+  // emits an in-scrollback indicator (see below).
+  droppedFromHead: number;
 }
 
 // Cap for the tool:end summary line. Anthropic tool_results can run
@@ -187,8 +206,49 @@ const indexToolPairs = (
   return { uses, results };
 };
 
-export const replaySessionMessages = (db: DB, sessionId: string, bus: Bus): ReplayResult => {
-  const messages = listMessagesBySession(db, sessionId);
+// Default tail-fetch size — the same value the harness passes to
+// listMessageTailBySession on resume (loop.ts). Exposed as a
+// parameter only so tests can exercise the truncation path with a
+// small session instead of seeding 600+ rows; production always
+// uses this default, keeping replay's window identical to the
+// model's.
+const DEFAULT_FETCH_LIMIT = MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN;
+
+export const replaySessionMessages = (
+  db: DB,
+  sessionId: string,
+  bus: Bus,
+  fetchLimit: number = DEFAULT_FETCH_LIMIT,
+): ReplayResult => {
+  // Fetch the bounded tail, not the whole log — same call shape the
+  // harness uses to build the model's resume context. `totalCount`
+  // is the full persisted size; `tail.messages` is at most
+  // `fetchLimit` of the most-recent rows.
+  const tail = listMessageTailBySession(db, sessionId, fetchLimit);
+  // Apply the SAME head cut the model's context uses, so visual
+  // history and model context are the identical window.
+  const cut = resumeWindowCut(tail.messages);
+  const messages = cut > 0 ? tail.messages.slice(cut) : tail.messages;
+  // Messages outside the window = rows older than the fetched tail
+  // (totalCount minus what the tail query returned) PLUS rows the
+  // alignment cut dropped from the tail's head.
+  const droppedFromHead = tail.totalCount - tail.messages.length + cut;
+
+  // Truncation indicator. When older history was dropped, the
+  // operator must know the scrollback above is partial — and, more
+  // importantly, that the model's context is equally partial, so
+  // the next turn can't reference those dropped turns. Emitted
+  // FIRST so it sits at the top of the replayed block. `secondary`
+  // tone — scaffolding, not content.
+  if (droppedFromHead > 0) {
+    bus.emit({
+      type: 'info',
+      ts: messages[0]?.createdAt ?? 0,
+      tone: 'secondary',
+      message: `— ${droppedFromHead} earlier ${droppedFromHead === 1 ? 'message' : 'messages'} not shown — outside the resume window, not in model context —`,
+    });
+  }
+
   const { uses, results } = indexToolPairs(messages);
   // `runStartTs`: createdAt of the operator-prompt user message
   // that opened the current run. Carried across intermediate
@@ -376,5 +436,5 @@ export const replaySessionMessages = (db: DB, sessionId: string, bus: Bus): Repl
     // the next emission anchors to the latest activity.
     prevCreatedAt = msg.createdAt;
   }
-  return { turns, messagesWalked: messages.length };
+  return { turns, messagesWalked: messages.length, droppedFromHead };
 };
