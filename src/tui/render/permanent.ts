@@ -236,8 +236,10 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
       const headRaw = `${indent}${glyph} ${verb}`;
-      const headTone =
-        item.status === 'error' ? 'error' : item.status === 'denied' ? 'warn' : 'dim';
+      // `denied` takes the `error` tone too — a blocked call didn't
+      // run, which reads as a failure; the verb ('Denied' vs 'Failed')
+      // is what tells the two apart.
+      const headTone = item.status === 'error' || item.status === 'denied' ? 'error' : 'dim';
       // The duration is meta — always `secondary`, never the head's
       // status color (a slow error shouldn't paint its `[Xms]` red).
       const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.durationMs)}]`);
@@ -311,8 +313,10 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
       const headRaw = `${indent}${glyph} ${verb}`;
-      const headTone =
-        item.status === 'error' ? 'error' : item.status === 'denied' ? 'warn' : 'dim';
+      // `denied` takes the `error` tone too — a blocked call didn't
+      // run, which reads as a failure; the verb ('Denied' vs 'Failed')
+      // is what tells the two apart.
+      const headTone = item.status === 'error' || item.status === 'denied' ? 'error' : 'dim';
       const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.totalDurationMs)}]`);
       const head = `${paint(caps, headTone, headRaw)}${metric}`;
       // Same leading-blank rule as tool-end: top-level chips get a

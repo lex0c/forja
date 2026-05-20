@@ -713,6 +713,21 @@ describe('formatPermanent', () => {
       expect(out[1]).toContain(`${CSI}31m`);
     });
 
+    test('denied status applies error palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'denied',
+          durationMs: 1,
+        },
+        colored,
+      );
+      expect(out[1]).toContain(`${CSI}31m`);
+    });
+
     test('done status applies dim palette SGR to chip head when color enabled', () => {
       const out = formatPermanent(
         { kind: 'tool-end', name: 'r', verb: 'Read', subject: null, status: 'done', durationMs: 1 },

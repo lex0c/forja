@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] fix(tui) — denied tool card uses the error tone, not warn
+
+The `tool-end` head painted a `denied` status in `warn` (amber). A denied call never ran — it reads as a failure, not a caution — and `warn` now also carries the new `exit N` marker. The head shares the `error` tone (red) with `error` status; the verb ('Denied' vs 'Failed') is the only distinguisher. `exit N` keeps `warn` — a command that ran but exited non-zero is a genuinely lighter signal.
+
 ## [2026-05-20] feat — the tool card surfaces a command's non-zero exit code
 
 A `bash` that exits non-zero — `npm test` red, a failed build — returns a normal result (`{exit_code, stdout, stderr}`), so the tool call is `status: done` and the card rendered `● Executed`, indistinguishable from a command that succeeded. The failure was invisible in the scrollback unless the model happened to mention it.
