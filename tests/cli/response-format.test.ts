@@ -36,6 +36,12 @@ describe('response-format', () => {
     expect(RESPONSE_FORMAT_PROMPT.toLowerCase()).toContain('recap');
   });
 
+  test('RESPONSE_FORMAT_PROMPT pins the per-sentence density rule', () => {
+    // The principle the one-sentence-answer / no-pad rules derive
+    // from — every sentence must move the reader. Presence rule.
+    expect(RESPONSE_FORMAT_PROMPT).toContain('change what the reader knows');
+  });
+
   test('RESPONSE_FORMAT_PROMPT does NOT carry persona or adjectival tuning', () => {
     // ANTI_PATTERNS.md §1.2 + §1.3: persona ("you are an
     // expert X") and adjectival verbosity ("be concise",

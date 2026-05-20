@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(cli) — per-sentence density rule in the response-surface prompt
+
+`RESPONSE_FORMAT_PROMPT` (`src/cli/response-format.ts`) gains the density principle the operator asked for — *"every sentence should change what the reader knows or does next"* — prepended to the one-sentence-answer / no-pad bullet, framed as the principle those measurable rules derive from. New presence test in `response-format.test.ts`. The matching `CONTEXT_TUNING §1.5` spec line stays parked with the rest of the markdown-render spec alignment (`docs/TODO.md`).
+
 ## [2026-05-20] feat(tui) — markdown rendering slice A: GFM render on the assistant block
 
 The model's prose now renders as GitHub-flavored Markdown in the TUI instead of raw text — output "like Claude Code". The dep (`remark` + `remark-gfm`) and the render both collide with set spec decisions — `AGENTIC_CLI §3` ("deps mínimas: string-width, wrap-ansi"), `§2.6` output design, `UI.md §13`/`§14`; the operator's call was to iterate in code and align the spec afterwards. Roadmap + the deferred slices live in `docs/TODO.md` under "Markdown rendering".
