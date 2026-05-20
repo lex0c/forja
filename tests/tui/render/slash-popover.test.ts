@@ -21,21 +21,75 @@ const slash = (
 ): SlashAutocomplete => ({ suggestions, selectedIdx });
 
 describe('renderSlashPopover', () => {
-  test('renders one row per suggestion starting at col 0 with no cursor glyph', () => {
+  test('colored terminals: every row starts at col 0 with no glyph (color carries selection)', () => {
     const out = renderSlashPopover(
       slash([
         { name: 'help', description: 'show help' },
         { name: 'quit', description: 'exit' },
       ]),
+      colored,
+    );
+    expect(out).toHaveLength(2);
+    // No `>` cursor — selection comes from accent vs secondary
+    // SGR (asserted in the color tests below). Rows live at col 0
+    // — the popover sits below the input block, which is also
+    // edge-to-edge (UI.md §6.3 input-block exception). After
+    // stripping the leading SGR escape, the next char is `/`.
+    expect(out[0]).toMatch(new RegExp(`^${CSI.replace('[', '\\[')}[0-9;]+m/help`));
+    expect(out[1]).toMatch(new RegExp(`^${CSI.replace('[', '\\[')}[0-9;]+m/quit`));
+  });
+
+  test('no-color terminals: selected row gets `> ` glyph; unselected gets `  ` (NO_COLOR fallback)', () => {
+    // Without color, accent vs secondary collapses to plain text
+    // and the operator can't tell which suggestion Enter will
+    // execute. The fallback glyph keeps selection legible — same
+    // shape the modal uses for its option cursor, consistent
+    // affordance across the TUI.
+    const out = renderSlashPopover(
+      slash(
+        [
+          { name: 'help', description: 'show help' },
+          { name: 'quit', description: 'exit' },
+        ],
+        0,
+      ),
       caps,
     );
     expect(out).toHaveLength(2);
-    // No `>` cursor — every row starts with `/name`. Selection is
-    // conveyed by color (accent vs secondary), tested separately.
-    // Rows live at col 0 — the popover sits below the input block,
-    // which is also edge-to-edge (UI.md §6.3 input-block exception).
-    expect(out[0]).toMatch(/^\/help/);
-    expect(out[1]).toMatch(/^\/quit/);
+    expect(out[0]).toMatch(/^> \/help/);
+    // Unselected row uses 2sp so the `/name` column stays aligned
+    // with the selected row's `/name`.
+    expect(out[1]).toMatch(/^ {2}\/quit/);
+  });
+
+  test('no-color terminals: glyph moves with selectedIdx', () => {
+    const out = renderSlashPopover(
+      slash(
+        [
+          { name: 'a', description: 'a' },
+          { name: 'b', description: 'b' },
+          { name: 'c', description: 'c' },
+        ],
+        2,
+      ),
+      caps,
+    );
+    expect(out[0]).toMatch(/^ {2}\/a/);
+    expect(out[1]).toMatch(/^ {2}\/b/);
+    expect(out[2]).toMatch(/^> \/c/);
+  });
+
+  test('colored terminals never carry the glyph (clean col-0 layout)', () => {
+    // Defense against regressing the fallback into "always on" —
+    // the tight col-0 layout is the iteration's chosen UX for
+    // colored terminals.
+    const out = renderSlashPopover(slash([{ name: 'help', description: 'show help' }], 0), colored);
+    // Strip ANSI escapes; the content should start with `/`, not
+    // with `> ` or `  `. Source the CSI literal from term.ts so this
+    // assertion travels with any future CSI prefix change.
+    const ansiStripper = new RegExp(`${CSI.replace('[', '\\[')}[0-9;]*m`, 'g');
+    const stripped = (out[0] ?? '').replace(ansiStripper, '');
+    expect(stripped).toMatch(/^\/help/);
   });
 
   test('names are padded to align descriptions', () => {

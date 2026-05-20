@@ -7,13 +7,26 @@
 // "(no matches)" surfaces when the user typed something with no
 // completions — better than silently hiding the popover.
 //
-// Each row: `/<name>  <description>`. Two-column layout with names
-// padded to the longest visible name so descriptions align. No cursor
-// glyph — selection is conveyed by color alone (color: 'none' loses
-// the cue, acceptable degradation per spec since the slash popover
-// already requires a colored terminal to read cleanly). Rows start at
-// column 0 (no frame margin), matching the input block's edge-to-edge
-// convention.
+// Each row: `/<name>  <description>` (col 0). Two-column layout with
+// names padded to the longest visible name so descriptions align.
+// Rows start at column 0 (no frame margin), matching the input block's
+// edge-to-edge convention.
+//
+// Selection cue.
+// - Colored terminals (caps.color !== 'none'): the selected row paints
+//   in `accent` (SGR 94 = bright blue), unselected in `secondary`
+//   (SGR 90 = grey). No glyph — selection reads cleanly from color
+//   alone, which is what the operator-aligned UX iteration landed on.
+// - Monochrome terminals (caps.color === 'none', e.g. NO_COLOR=1, CI
+//   logs, scripts piping stdout): paint() returns plain text and the
+//   color cue disappears. Without a fallback, selected and unselected
+//   rows look identical — and since Enter now executes the
+//   highlighted suggestion (including destructive ones like /quit),
+//   that ambiguity is operator-visible harm. So we prepend a `>`
+//   glyph to the selected row and a `  ` to others, padded to the
+//   same width so the `/name` column stays aligned. The glyph fallback
+//   only activates in no-color mode — colored terminals keep the
+//   tighter col-0 layout.
 
 import type { SlashAutocomplete } from '../state.ts';
 import { type Capabilities, type SgrToken, paint } from '../term.ts';
@@ -46,13 +59,21 @@ export const renderSlashPopover = (slash: SlashAutocomplete, caps: Capabilities)
   }
   const visible = slash.suggestions.slice(windowStart, windowStart + visibleCount);
   const longest = visible.reduce((max, s) => Math.max(max, s.name.length), 0);
+  // Glyph fallback fires only in no-color terminals — see header
+  // comment. In colored mode the prefix is empty so the popover keeps
+  // the tight col-0 layout the iteration converged on.
+  const useGlyph = caps.color === 'none';
   const lines = visible.map((s, i) => {
     const absoluteIdx = windowStart + i;
+    const isSelected = absoluteIdx === slash.selectedIdx;
     const padded = s.name.padEnd(longest);
-    const token: SgrToken = absoluteIdx === slash.selectedIdx ? 'accent' : 'secondary';
-    return paint(caps, token, `/${padded}  ${s.description}`);
+    const prefix = useGlyph ? (isSelected ? '> ' : '  ') : '';
+    const token: SgrToken = isSelected ? 'accent' : 'secondary';
+    return paint(caps, token, `${prefix}/${padded}  ${s.description}`);
   });
   // Footer hint when the visible slice is a window of a larger list.
+  // No glyph here — the hint isn't a selectable row, so it carries no
+  // "is this selected?" ambiguity even in no-color mode.
   if (total > visibleCount) {
     lines.push(paint(caps, 'secondary', `(${total - visibleCount} more — scroll with ↑/↓)`));
   }
