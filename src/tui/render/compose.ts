@@ -31,7 +31,7 @@ import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderReverseSearch } from './reverse-search.ts';
-import { renderSlashPopover } from './slash-popover.ts';
+import { renderSlashPopover, slashPopoverLineCount } from './slash-popover.ts';
 import { renderSubagentRows } from './subagent-row.ts';
 import { renderThinkingChip } from './thinking-chip.ts';
 import { renderTodoList } from './todo-list.ts';
@@ -48,16 +48,33 @@ const horizontalRule = (caps: Capabilities): string =>
   paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
 
 // Number of lines between the input's last row and the bottom of the
-// live region (the rule below input + the footer line). composeCursor
-// subtracts this so the cursor lands inside the input, not on the
-// footer. Only matters in the no-modal path — when a modal is up,
-// composeCursor returns null and the constant goes unused. Grow
-// alongside any future expansion of the bottom block (multi-line
+// live region in the BASE case (rule below input + the footer line).
+// composeCursor subtracts this so the cursor lands inside the input,
+// not on the footer. Only matters in the no-modal path — when a modal
+// is up, composeCursor returns null and the constant goes unused.
+// Grow alongside any future expansion of the bottom block (multi-line
 // footer, secondary tray under it, etc.).
+//
+// The slash popover renders BETWEEN the rule-below-input and the
+// footer (UI.md §5.3 — popover sits adjacent to the typing zone, no
+// frame margin, no blank separator). When `state.slash !== null`,
+// `trailingBelowInput` adds the popover's line count to this base —
+// composeCursor uses that combined offset to keep the cursor on the
+// input row regardless of how many suggestions are open.
 //
 // Exported so a regression test can guard against drift between the
 // constant and what composeLive actually emits below the input.
 export const FOOTER_BLOCK_LINES = 2;
+
+// How many live-region rows sit BELOW the last input row, accounting
+// for the optional slash popover. Single source of truth shared by the
+// composer (writes that block) and composeCursor (subtracts it to find
+// the input row). If a future element joins the trailing stack, extend
+// here and in composeLive in lockstep.
+const trailingBelowInput = (state: LiveState): number => {
+  const popover = state.slash !== null ? slashPopoverLineCount(state.slash) : 0;
+  return FOOTER_BLOCK_LINES + popover;
+};
 
 // Position the cursor wants to land inside the live region, so the
 // renderer can issue cursor-back escapes after writing. Coordinates
@@ -165,10 +182,11 @@ export const composeCursor = (
     col = caps.cols - 1;
   }
 
-  // Last input row is FOOTER_BLOCK_LINES above the bottom of the
-  // live region; subtract input's own (wrapped) height to get the
-  // first row.
-  const inputStartRow = lineCount - FOOTER_BLOCK_LINES - inputLineCount;
+  // Last input row sits `trailingBelowInput` rows above the bottom of
+  // the live region; subtract input's own (wrapped) height to get the
+  // first row. `trailingBelowInput` covers the base rule+footer plus
+  // the slash popover when it's open.
+  const inputStartRow = lineCount - trailingBelowInput(state) - inputLineCount;
   return {
     row: inputStartRow + visualRowsBefore + subRowInLine,
     col: Math.min(col, Math.max(0, caps.cols - 1)),
@@ -284,19 +302,15 @@ export const composeLive: ComposeLive = (
     lines.push(...renderModal(state.modal, caps));
     return lines;
   }
-  // Slash autocomplete popover sits above the rule, between status
-  // line / tool cards and the bottom anchor. Its line count adds to
-  // the upper region — composeCursor's math (FOOTER_BLOCK_LINES +
-  // inputLines from the bottom) stays correct regardless.
-  if (state.slash !== null) {
-    appendBlock(renderSlashPopover(state.slash, caps));
-  }
-  // Reverse-search overlay (HISTORY.md §2.2). Same slot as slash —
-  // they're mutually exclusive at the producer level (REPL refuses
-  // to open Ctrl+R while slash is active), so this branch and the
-  // one above never fire on the same frame. The input box below
-  // stays visible: operator's draft is preserved untouched while
-  // the overlay is up.
+  // Reverse-search overlay (HISTORY.md §2.2) sits above the input
+  // rule, in the same upper-slot the live chips use. Slash popover
+  // moved below the input (further down in this function); the two
+  // were mutually exclusive at the producer level (REPL refuses to
+  // open Ctrl+R while slash is active), so swapping slash to the
+  // lower slot doesn't create any overlap with reverse-search.
+  // Reverse-search stays above because the operator typed Ctrl+R to
+  // *search* prior submits — visual proximity to scrollback above
+  // matters more than proximity to the input draft below.
   if (state.reverseSearch !== null) {
     appendBlock(renderReverseSearch(state.reverseSearch, caps));
   }
@@ -317,10 +331,21 @@ export const composeLive: ComposeLive = (
   // the operator's draft is visibly preserved-but-secondary.
   lines.push(...renderInput(state.input, caps, { dimmed: state.reverseSearch !== null }));
   lines.push(horizontalRule(caps));
+  // Slash autocomplete popover: rendered DIRECTLY below the input's
+  // bottom rule, no `padFrame` (rows live at col 0 like the input
+  // block above), no blank separator (slash reads as an extension of
+  // the typing zone, not a standalone live-region block). When closed
+  // (`state.slash === null`) the slot collapses entirely and the
+  // footer abuts the rule as before — keeps `FOOTER_BLOCK_LINES`
+  // truthful for the base case. `trailingBelowInput` mirrors this
+  // structure so composeCursor lands the cursor on the right row.
+  if (state.slash !== null) {
+    lines.push(...renderSlashPopover(state.slash, caps));
+  }
   // renderFooter only returns null on modal (handled above); the
   // non-null assert keeps the contract explicit — if a future
-  // renderFooter loosens it, composeCursor's FOOTER_BLOCK_LINES math
-  // would silently drift. Fail loudly here instead.
+  // renderFooter loosens it, composeCursor's row math would silently
+  // drift. Fail loudly here instead.
   const footer = renderFooter(state, caps);
   if (footer === null) throw new Error('composeLive: renderFooter returned null in non-modal path');
   lines.push(footer);

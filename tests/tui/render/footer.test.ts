@@ -383,6 +383,60 @@ describe('renderFooter', () => {
     expect(out).not.toContain('sonnet-4.6');
   });
 
+  describe('slash popover open suppresses help hints', () => {
+    // When the slash popover is open directly below the input, the
+    // footer drops `? for help` and `\+Enter newline` so the operator
+    // isn't reading two competing UI surfaces at once.
+    test('hides both help hints when state.slash is non-null', () => {
+      const s = startedSession();
+      s.slash = {
+        suggestions: [{ name: 'help', description: 'show help' }],
+        selectedIdx: 0,
+      };
+      const out = renderFooter(s, caps);
+      expect(out).not.toContain('? for help');
+      expect(out).not.toContain('\\+Enter newline');
+    });
+
+    test('right column stays intact (model/steps/cost still visible)', () => {
+      const s = startedSession();
+      s.slash = { suggestions: [], selectedIdx: -1 };
+      const out = renderFooter(s, caps);
+      expect(out).toContain('• sonnet-4.6');
+      expect(out).toContain('3/50');
+      expect(out).toContain('$0.0120');
+    });
+
+    test('interrupt cue still surfaces if a run is in flight', () => {
+      const s = startedSession();
+      s.slash = { suggestions: [{ name: 'a', description: '' }], selectedIdx: 0 };
+      const tool: ActiveTool = {
+        toolId: 't1',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: null,
+        startedAt: 0,
+        preview: [],
+      };
+      s.activeTools.set('t1', tool);
+      const out = renderFooter(s, caps);
+      expect(out).toContain('esc to interrupt');
+      expect(out).not.toContain('? for help');
+    });
+
+    test('exitArmed beats slash (gate cue still wins)', () => {
+      // Defense in depth: if the operator somehow has the popover
+      // open AND the exit gate armed (unlikely — typing during slash
+      // resets the gate), the lethal cue still owns the column.
+      const s = startedSession();
+      s.slash = { suggestions: [{ name: 'a', description: '' }], selectedIdx: 0 };
+      s.exitArmed = { at: 1000 };
+      const out = renderFooter(s, caps);
+      expect(out).toContain('Press Ctrl-C again to exit');
+    });
+  });
+
   describe('idle exit-armed cue (UI.md §5.4 + §4.10.6)', () => {
     test('exitArmed swaps left column to "Press Ctrl-C again to exit"', () => {
       const s = startedSession();

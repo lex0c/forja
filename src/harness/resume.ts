@@ -108,7 +108,17 @@ const isSafeHead = (row: Message): boolean => {
   return false;
 };
 
-export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessages => {
+// Compute how many rows to drop from the head of a persisted tail
+// so the kept slice (a) fits MAX_RESUME_MESSAGES and (b) starts at
+// a provider-safe boundary (assistant, or user-with-string — never
+// an orphan user_tool_result). Pure index math, no allocation.
+//
+// Exported so the resume scrollback replay (src/cli/resume-replay.ts)
+// can drive its visual window from the EXACT same cut the model's
+// context uses. If the two diverge, the operator sees turns in
+// scrollback that the model can't actually reference — a silent
+// mislead. Sharing this function keeps them in lockstep.
+export const resumeWindowCut = (rows: Message[]): number => {
   let cut = rows.length > MAX_RESUME_MESSAGES ? rows.length - MAX_RESUME_MESSAGES : 0;
   // Walk forward past unsafe heads (user_tool_result without its
   // matching assistant). If no safe boundary exists in the kept
@@ -120,7 +130,11 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
     if (isSafeHead(candidate)) break;
     cut += 1;
   }
-  const droppedFromHead = cut;
+  return cut;
+};
+
+export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessages => {
+  const droppedFromHead = resumeWindowCut(rows);
 
   const sliced = droppedFromHead > 0 ? rows.slice(droppedFromHead) : rows;
   const out: ProviderMessage[] = [];

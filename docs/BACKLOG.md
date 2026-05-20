@@ -2,6 +2,120 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-19] feat(cli) — interactive `--resume`: open the REPL and replay the prior session
+
+Operator-driven feature. `forja --resume <id|last>` with no follow-up prompt now opens the REPL with the prior conversation rebuilt on screen, instead of failing with `--resume requires a follow-up prompt` (which is still the correct error for the *headless* `--resume` path). Built in phases, each validated hands-on before the next; multiple review rounds hardened the interactive path to parity with the headless one.
+
+**Exit hint (precursor).** `shutdown()` now prints, on every clean REPL exit (`/quit`, `Ctrl+D`, idle `Ctrl+C` double-tap, SIGINT):
+
+```
+Resume this session with:
+forja --resume <lastSessionId>
+```
+
+Gated on `lastSessionId !== null` (an empty-REPL exit prints nothing — `forja --resume undefined` would mislead). Goes through `errSink` (stderr — operator diagnostics convention, matching the panic-exit branch). Panic exit (`Ctrl+\`) is intentionally not covered — it bypasses `shutdown()` by design.
+
+**Phase 1 — gate + context threading.** `cli/index.ts` drops the `args.resume === undefined` clause from the REPL gate, so `--resume` + empty prompt routes to the REPL. `resolveResumeId` split into a DB-aware inner (`resolveResumeIdOnDb`) and the path-based outer — the REPL boot reuses the inner against the already-open DB, sharing the literal-id / `'last'` / subagent-rejection rules with the headless path. The resolved id seeds `lastSessionId` so the first turn threads `resumeFromSessionId` to the harness (the LLM gets the prior conversation). Banner env shows `resumed: <short-id>`.
+
+**Phase 2 — text scrollback replay.** New `src/cli/resume-replay.ts`: `replaySessionMessages` walks persisted messages and emits the UIEvents (`user:submit` / `assistant:start|delta|end` / `session:end`) that rebuild the visual scrollback. Timestamps come from each message's persisted `createdAt`, so the reducer's `durationMs = event.ts - buf.startedAt` math yields the *historical* turn duration, not a 0s placeholder. A bridge info line — `— resumed N prior turns (history above; new turns below) —` — anchors the operator between the replayed history and the empty prompt. Replay is fail-soft: a corrupt content blob is caught, `errSink` warns, the REPL still reaches the prompt (the LLM context is independent of the visual replay).
+
+**Run-boundary footer fix.** The harness persists one assistant message per LLM completion — a tool-using run spans `assistant → user(tool_result) → assistant` across several rows. Replay initially emitted a `session:end` footer per assistant row, producing extra `Cogitated for Xs` markers and a 0ms final block. Fixed with a look-ahead: an assistant row is mid-run when the next message is a `user` row with array content (tool_result); `session:end` fires only at the real run boundary.
+
+**Phase 3 — tool card replay.** Each `tool_use` block + its matching `tool_result` becomes a `tool:start` + `tool:end` pair, painted by the same `tool-vocab` the live adapter uses (subject / `activeVerb` / `finalVerb` / status / `durationMs` proxied from `createdAt` deltas). The block walk interleaves `assistant:delta` and `tool:start` so text and tool cards land in the same order the operator saw live. Orphan `tool_use` (no matching result — run hard-killed mid-tool) emits a real `tool:start` plus a *synthetic* error `tool:end` (`(no result recorded — run interrupted)`) so the card doesn't freeze as "running…". Orphan `tool_result` is dropped.
+
+**`info` secondary tone.** `InfoEvent` / the `info` `PermanentItem` gain an optional `tone` field — default `'plain'` (unchanged), `'secondary'` paints the line in the greyscale meta channel (SGR 90). The resume bridge anchor uses `'secondary'` so it recedes next to the replayed conversation.
+
+**Hardening (review rounds).**
+
+- **Capped resume window.** Replay drove off `listMessagesBySession` (the *whole* log) while the model's `--resume` context is capped (`MAX_RESUME_MESSAGES` via `listMessageTailBySession` + `resumeWindowCut`). On long sessions this scaled REPL boot with total history AND showed turns outside the model's context. Extracted `resumeWindowCut` from `harness/resume.ts` (shared by both paths so they can't drift); replay now fetches the same bounded tail and emits a truncation indicator (`— N earlier messages not shown — outside the resume window, not in model context —`) when older history was dropped.
+- **Broker drain on abort.** The failed-resume early-return closed `db` but not `baseConfig.broker` — a non-default broker mode leaked handles/timers on an invalid resume id. Now mirrors `shutdown()`'s §13.7 order: broker drain before `db.close()`.
+- **Stale subagent handles (Slice 129 parity).** The REPL resume path skipped `settleRunningSubagentHandles`, which the headless path runs — interactively resuming a crashed session left `subagent_handles` stuck in `running` and `task_await` returning `unknown_handle`. Now settles them on resolution, reusing the bootstrap-opened DB.
+- **Cross-cwd leak.** Literal resume ids weren't cwd-scoped; the REPL replays scrollback before runAgent's cwd guard runs, so `forja --resume <foreign-id>` rendered another project's conversation on screen. `resolveResumeIdOnDb` gained an `enforceCwd` flag — the REPL passes `true`, rejecting a foreign-cwd literal at resolution before any replay; the headless path is unchanged.
+
+**Tests.** `tests/cli/resume-replay.test.ts` (new, 23 tests — text/tool replay, run boundaries, orphan handling, window cap + truncation). `tests/cli/repl.test.ts` grew to cover: resume gating (unknown id / `'last'` empty / subagent refused / valid id threads `resumeFromSessionId`), scrollback replay end-to-end, exit hint, broker drain on abort, subagent-handle settle, cross-cwd rejection. `tests/tui/render/permanent.test.ts` +4 for the `info` tone field. All green; `bun run typecheck` + `lint` clean.
+
+**Spec follow-ups** (pending, batch with the slash-popover entry's follow-ups):
+
+1. Interactive `--resume` opening the REPL with a visual scrollback replay — likely a new section under `AGENTIC_CLI` §12 (checkpoints/undo neighbourhood) or a dedicated doc; covers the replay model, the capped window, the truncation indicator, and the headless-vs-interactive split.
+2. `UI.md §6.1` — `info` lines support a `secondary` tone for visual scaffolding (the resume anchor).
+
+## [2026-05-19] feat(tui) — slash popover moves below input; Enter commits popover selection
+
+Hands-on UX iteration on the slash autocomplete popover. Four operator-visible changes plus one functional fix; spec amendments are pending — see "Spec follow-ups" at the bottom of this entry.
+
+**1. Popover repositioned below the input block.**
+
+The popover used to render above the input rule (`UI.md §5.3`). Operators on this iteration wanted it adjacent to where they're typing — eye doesn't have to jump up. New layout:
+
+```
+─────────────────────────────────  ← rule above input
+> /q                                ← input
+─────────────────────────────────  ← rule below input
+/help        show help              ← popover (col 0)
+/quit        exit
+…
+  • opus · 3/50 · $0.0120           ← footer
+```
+
+- `src/tui/render/compose.ts` — removed the `appendBlock(renderSlashPopover(...))` call between the upper live region and the input rule; added a direct `lines.push(...renderSlashPopover(...))` (no `padFrame`, no blank separator) between the rule below the input and the footer.
+- Introduced `trailingBelowInput(state)` so `composeCursor` knows how many rows sit below the input (base `FOOTER_BLOCK_LINES = 2` + popover line count when open). The cursor still lands on the input row regardless of popover height.
+- `src/tui/render/slash-popover.ts` — exported `slashPopoverLineCount(slash)` so `compose.ts` can compute the offset without re-rendering. Single source of truth between renderer and cursor math.
+
+**2. Popover frame margin removed (rows live at col 0).**
+
+`UI.md §6.3` lists the slash popover as one of the padded elements (2sp left frame margin). New behavior: popover rows are edge-to-edge like the input block, no leading prefix. Made the visual link between input and popover obvious — they read as one continuous typing zone instead of two indented elements.
+
+- `src/tui/render/slash-popover.ts` — removed the internal `  ${cursor}` prefix from suggestion rows, the `(no matches — try /help)` placeholder, and the `(N more — scroll with ↑/↓)` overflow footer. All three now start at col 0.
+
+**3. Cursor glyph removed; selection painted in `accent` (terminal blue).**
+
+The `> ` cursor glyph (same one modal options use) was a redundant signal once the popover sits next to the input. Removed it; selection is conveyed by color alone:
+
+- Selected row: `accent` (SGR 94, bright blue).
+- Unselected rows + placeholder + overflow hint: `secondary` (SGR 90, grey).
+- `color: 'none'` terminals lose the selection cue. Acceptable degradation — the popover already requires a colored terminal to read cleanly. Documented as known degradation for the spec PR.
+
+The `accent` token in `src/tui/term.ts:124-129` is currently reserved for structural chrome (modal top rule); we extended it to popover selection. Spec amendment is pending — see follow-ups.
+
+**4. Footer suppresses beginner hints while popover is open.**
+
+`? for help · \+Enter newline` competed for attention with the autocomplete list. Now suppressed when `state.slash !== null`. `esc to interrupt` still surfaces if a run is in flight. `exitArmed` still takes absolute precedence.
+
+- `src/tui/render/footer.ts` — new branch in `renderFooter` between the `exitArmed` cue and the default-left-column path: when `state.slash !== null`, the left column drops both hints and keeps only the interrupt cue if `isRunning(state)`.
+
+**5. Enter commits the popover selection (functional fix, not just UX).**
+
+Operator-reported bug: navigating to a popover item and pressing Enter did nothing visible. Two distinct root causes:
+
+- **Prefix case (`/q` + Enter):** `src/cli/repl.ts` Enter handler parsed the raw buffer (`q`), `resolveCommandName('q')` returned the raw string (the case-insensitive fallback only catches exact-name matches, not prefixes), and the dispatcher surfaced "unknown command" while `quit` sat visibly selected.
+- **Bare-slash case (`/` + selection + Enter):** the bare-slash early-return branch fired BEFORE the new selection-aware code path, so any selection — default highlight (`help`) or navigated — was ignored. Operator saw a highlighted row but Enter cleared the buffer.
+
+Fix in `src/cli/repl.ts` Enter handler: the popover selection is now the primary signal of intent. If `slashState !== null && selectedIdx >= 0`, the highlighted item's name becomes the `effectiveName`. The parsed buffer name is the fallback. Only when BOTH are absent does the bare-slash clear path fire. Args (if any) still come from the buffer — operator may have typed `/q foo bar` and the args belong to the highlighted command.
+
+The user-submit echo + history record now reflect the RESOLVED command (`/quit`, not `/q`), so scrollback and `↑` history match what actually ran.
+
+**Tests.**
+
+- `tests/tui/render/slash-popover.test.ts` — updated row-shape assertions (no `> ` prefix, no leading spaces); added 4 new tests for `slashPopoverLineCount` (one per render branch + cross-check against actual render length), color assertions on `accent` (selected) and `secondary` (unselected + placeholder + overflow hint).
+- `tests/tui/render/footer.test.ts` — new `slash popover open suppresses help hints` describe block: 4 tests covering hint suppression, right column intact, interrupt cue still surfaces during runs, exitArmed wins precedence over slash.
+- `tests/cli/repl.test.ts` — added 2 regression tests: `prefix /q + Enter (no Tab) executes the highlighted /quit` and `bare / + Down + Enter executes the navigated selection`. Updated the existing `bare / + Enter clears the buffer` test to reflect the new behavior (Enter now dispatches the default-highlighted command; the LLM still never receives `/`).
+
+**Verification.**
+- `bun run typecheck` clean
+- `bun run lint` clean on changed files
+- `bun test tests/tui/render/{slash-popover,compose,footer}.test.ts` → 83/83 pass
+- `bun test tests/cli/repl.test.ts` → 86/86 pass
+
+**Follow-up fix — NO_COLOR selection cue.** Review of the cursor-glyph removal flagged that monochrome terminals (`NO_COLOR=1`, CI logs, piped stdout) lose the `accent`-vs-`secondary` selection signal entirely — and since Enter now executes the highlighted suggestion, an operator on such a terminal can't tell which command (incl. destructive ones like `/quit`) will run. Fix: the `>` glyph is reintroduced **only** when `caps.color === 'none'` — colored terminals keep the tight col-0 layout; monochrome terminals get the glyph back as a fallback. `tests/tui/render/slash-popover.test.ts` +4 tests (colored = no glyph, no-color = glyph on selected / 2sp on others, glyph follows selectedIdx, regression guard against glyph in colored mode).
+
+**Spec follow-ups** (pending, to batch into a single PR once UX is stable):
+
+1. `UI.md §5.3` — popover renders BELOW the input, not above.
+2. `UI.md §6.3` — slash popover leaves the padded-elements list; rows live at col 0 like the input block.
+3. `UI.md §6.4` + `src/tui/term.ts:124-129` comment — `accent` is also valid as a selection cursor (extension of the "structural anchor" scope, not content coloring); document the NO_COLOR glyph fallback alongside it.
+4. `UI.md §4.10.6` — footer suppresses `? for help · \+Enter newline` while the slash popover is open.
+5. `UI.md §5.4` — Enter on the popover commits the highlighted selection, independent of Tab having been pressed first.
+
 ## [2026-05-19] fix(cli) — gate generic mid-walk "audit row was already written" message on actual write
 
 Operator-reported follow-up to commit `22d17e9` (TOCTOU abort fix). That fix correctly gated the TOCTOU branch's audit message on `!options.noAudit && audit.writable`, but the SIBLING generic-error branch (for non-TOCTOU mid-walk failures like EBUSY, EACCES, ENOSPC) was left with the pre-existing unconditional line: `"(audit row was already written; the project is in a partial state)"`. Under `--no-audit` no probe + insert happens — the line claimed a row that never existed, sending incident-response investigators chasing a nonexistent DB entry during recovery from a real FS failure.

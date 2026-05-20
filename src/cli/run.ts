@@ -1,5 +1,12 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
-import { defaultDbPath, getSession, listSessions, migrate, openDb } from '../storage/index.ts';
+import {
+  type DB,
+  defaultDbPath,
+  getSession,
+  listSessions,
+  migrate,
+  openDb,
+} from '../storage/index.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
@@ -65,13 +72,81 @@ export const exitCodeFor = (result: HarnessResult): number => {
 // behavior they expect (continue the latest session of THIS
 // project).
 //
-// Literal ids stay unfiltered — if the user typed an id, they
-// know what they want. Cross-cwd literal resume still trips
-// runAgent's cwd guard and surfaces a clean error.
+// Literal ids: by default unfiltered — if the user typed an id in
+// the headless path, they know what they want, and a cross-cwd
+// literal resume still trips runAgent's cwd guard before any work
+// happens. The REPL resume path is different: it REPLAYS the
+// session's persisted scrollback immediately on resolution, well
+// before runAgent's guard runs. An unfiltered cross-cwd literal
+// would render another project's conversation on screen — an
+// information leak. So the REPL passes `enforceCwd: true`, which
+// rejects a literal id whose session belongs to a different cwd
+// at resolution time, before any replay.
 //
 // Lives outside the main `run()` flow because list-sessions and
 // resume both need the same DB-only pre-step before deciding
 // whether to enter the harness path.
+//
+// Inner form takes an open db so callers that already have one
+// (REPL boot) don't open a second connection. The outer form below
+// keeps the legacy "give me a path, I'll open + close" shape that
+// run.ts's pre-bootstrap branch was built on.
+export const resolveResumeIdOnDb = (
+  db: DB,
+  resume: string,
+  cwd: string,
+  enforceCwd = false,
+): { ok: true; id: string } | { ok: false; message: string } => {
+  if (resume === 'last') {
+    // 'last' is already cwd-scoped via the listSessions filter —
+    // it can never resolve to a foreign-cwd session, so the
+    // `enforceCwd` flag is moot for this branch.
+    const sessions = listSessions(db, { limit: 1, cwd });
+    const first = sessions[0];
+    if (first === undefined) {
+      return {
+        ok: false,
+        message: `no sessions found to resume (with 'last') for cwd '${cwd}'`,
+      };
+    }
+    return { ok: true, id: first.id };
+  }
+  // Literal id path. Validate upfront so a typo'd id fails with
+  // a clean errSink message before bootstrap. Without this
+  // pre-check, the throw inside runAgent's init block lands in
+  // guardedFinish and surfaces as an internalError exit (1)
+  // with no diagnostic on stderr — confusing for users.
+  const existing = getSession(db, resume);
+  if (existing === null) {
+    return { ok: false, message: `session ${resume} not found` };
+  }
+  if (existing.isSubagent) {
+    // O5 C-block. Subagent sessions can't be resumed cleanly
+    // because --resume restores messages but NOT the system
+    // prompt or the tools whitelist — the resumed run would
+    // get the parent's full registry and an empty system
+    // prompt, diverging from how the subagent originally ran.
+    // The audit snapshot from migration 012 enables future
+    // re-hydration (O5b in BACKLOG) but the semantics need
+    // proper design (budget conflicts, plan mode, missing
+    // tools). For now we refuse and point at task().
+    return {
+      ok: false,
+      message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
+    };
+  }
+  if (enforceCwd && existing.cwd !== cwd) {
+    // Cross-cwd literal resume under cwd enforcement (REPL path).
+    // Reject BEFORE the caller replays the scrollback — replaying
+    // first would leak another project's conversation on screen.
+    return {
+      ok: false,
+      message: `session ${resume} belongs to a different project (${existing.cwd}); resume it from there`,
+    };
+  }
+  return { ok: true, id: resume };
+};
+
 const resolveResumeId = (
   resume: string,
   dbPath: string,
@@ -80,42 +155,7 @@ const resolveResumeId = (
   const db = openDb(dbPath);
   try {
     migrate(db);
-    if (resume === 'last') {
-      const sessions = listSessions(db, { limit: 1, cwd });
-      const first = sessions[0];
-      if (first === undefined) {
-        return {
-          ok: false,
-          message: `no sessions found to resume (with 'last') for cwd '${cwd}'`,
-        };
-      }
-      return { ok: true, id: first.id };
-    }
-    // Literal id path. Validate upfront so a typo'd id fails with
-    // a clean errSink message before bootstrap. Without this
-    // pre-check, the throw inside runAgent's init block lands in
-    // guardedFinish and surfaces as an internalError exit (1)
-    // with no diagnostic on stderr — confusing for users.
-    const existing = getSession(db, resume);
-    if (existing === null) {
-      return { ok: false, message: `session ${resume} not found` };
-    }
-    if (existing.isSubagent) {
-      // O5 C-block. Subagent sessions can't be resumed cleanly
-      // because --resume restores messages but NOT the system
-      // prompt or the tools whitelist — the resumed run would
-      // get the parent's full registry and an empty system
-      // prompt, diverging from how the subagent originally ran.
-      // The audit snapshot from migration 012 enables future
-      // re-hydration (O5b in BACKLOG) but the semantics need
-      // proper design (budget conflicts, plan mode, missing
-      // tools). For now we refuse and point at task().
-      return {
-        ok: false,
-        message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
-      };
-    }
-    return { ok: true, id: resume };
+    return resolveResumeIdOnDb(db, resume, cwd);
   } finally {
     db.close();
   }

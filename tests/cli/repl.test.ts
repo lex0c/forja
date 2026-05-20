@@ -14,6 +14,10 @@ import { recordCritiqueRun } from '../../src/storage/repos/critique-runs.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { listRecentRecapRuns } from '../../src/storage/repos/recap-runs.ts';
 import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
+import {
+  getSubagentHandle,
+  insertSubagentHandle,
+} from '../../src/storage/repos/subagent-handles.ts';
 import { addTrustedDir, loadTrustedDirs } from '../../src/trust/index.ts';
 
 // Build a ParsedArgs shape with all the flags the REPL inspects set
@@ -91,6 +95,11 @@ interface MakeBootstrapStubOptions {
   // both the boot banner env entry and the footer's `mem N` token.
   // Omit (default 0) to test the omit-on-zero paths.
   memoryCount?: number;
+  // Optional broker stub. When set, it's attached to the bootstrap
+  // config so teardown paths that call `baseConfig.broker.close()`
+  // can be exercised. Production brokers own handles/timers; tests
+  // pass a `close` spy to assert the drain actually happens.
+  broker?: { close: () => Promise<void> };
 }
 
 const makeBootstrapStub = (
@@ -112,6 +121,7 @@ const makeBootstrapStub = (
       capabilities: { context_window: 200000, output_max_tokens: 4096 },
     },
     memoryRegistry: makeStubRegistry(memoryCount),
+    ...(opts.broker !== undefined ? { broker: opts.broker } : {}),
   } as unknown as HarnessConfig;
   return {
     config,
@@ -2398,6 +2408,85 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(0);
   });
 
+  test('prefix /q + Enter (no Tab) executes the highlighted /quit (regression)', async () => {
+    // Without the fix, Enter dispatches the raw buffer (`q`), the
+    // registry lookup fails, and the operator sees "unknown command"
+    // while `quit` sat visibly selected in the popover. The
+    // operator's intent — "run the highlighted item" — wins.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+    });
+    await tick();
+    stdin.feed('/q');
+    await flushFrame();
+    // Popover open with `quit` highlighted (only `q*` match). Enter
+    // commits the selection — exit code 0 proves /quit ran.
+    stdin.feed('\r');
+    expect(await promise).toBe(0);
+  });
+
+  test('exit hint: prints "Resume this session with: forja --resume <id>" after a turn ran', async () => {
+    // Operator-visible cue printed during shutdown so the next boot
+    // can pick up where the previous one left off. Goes through
+    // errSink (operator diagnostics, not program output). Gated on
+    // lastSessionId being non-null — see the next test.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    // One turn so lastSessionId gets populated (`sess-1`).
+    stdin.feed('hi\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    // Quit. Shutdown path runs and the hint should land on errSink.
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+    const all = errs.join('');
+    expect(all).toContain('Resume this session with:');
+    expect(all).toContain('forja --resume sess-1');
+  });
+
+  test('exit hint: silent when no turn ever ran (lastSessionId stays null)', async () => {
+    // Operator opens the REPL and quits without prompting anything —
+    // there is no session to resume to, so the hint must NOT print.
+    // Printing `forja --resume undefined` would actively mislead.
+    const stdin = makeStdin();
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+    const all = errs.join('');
+    expect(all).not.toContain('Resume this session with:');
+    expect(all).not.toContain('--resume');
+  });
+
   test('/Help (mixed case) resolves to /help via case-insensitive lookup', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
@@ -2422,9 +2511,15 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
-  test('bare / + Enter clears the buffer instead of sending "/" to the LLM', async () => {
+  test('bare / + Enter dispatches the default-highlighted command (does NOT send "/" to the LLM)', async () => {
+    // `/` opens the popover with selectedIdx=0 (the first registry
+    // entry, currently `/help`). Enter commits that selection — same
+    // contract as any other prefix. The critical invariant: '/' must
+    // NEVER reach the LLM as a user message, regardless of whether
+    // the dispatcher runs the highlight or no-ops.
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
+    const writes: string[] = [];
     const promise = runRepl({
       args: makeArgs(),
       bootstrapOverride: makeBootstrapStub(),
@@ -2432,16 +2527,45 @@ describe('repl — slash commands integration', () => {
       skipTtyCheck: true,
       skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
     });
     await tick();
     stdin.feed('/');
-    await tick();
+    await flushFrame();
     stdin.feed('\r');
-    await tick();
+    await flushFrame();
     // No turn started — runAgent override never called.
     expect(ra.captured).toHaveLength(0);
+    // The default highlight (help) executed — its scrollback output
+    // is the proof.
+    expect(writes.join('')).toContain('Slash commands:');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+
+  test('bare / + Down + Enter executes the navigated selection (regression)', async () => {
+    // Operator opens the popover with bare `/`, navigates one row
+    // down (off `help`, onto `quit` — registration order), and hits
+    // Enter. Without the fix, the bare-slash early-return branch
+    // ignored the popover selection entirely; the operator saw the
+    // highlighted row but Enter did nothing user-visible.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+    });
+    await tick();
+    stdin.feed('/');
+    await flushFrame();
+    stdin.feed('\x1b[B'); // Down — move highlight from /help to /quit.
+    await flushFrame();
+    stdin.feed('\r'); // Enter — should dispatch /quit, not no-op.
+    expect(await promise).toBe(0);
   });
 
   test('slash mode is closed after typing a non-slash character at the start', async () => {
@@ -3585,6 +3709,649 @@ describe('repl — slash commands integration', () => {
 
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+});
+
+describe('repl — --resume gating + session seed (Phase 1)', () => {
+  // `--resume <id|last>` with empty prompt now routes to the REPL
+  // (cli/index.ts). repl.ts resolves the id against the DB via
+  // resolveResumeIdOnDb and seeds `lastSessionId` so the first turn
+  // threads `resumeFromSessionId` to the harness. Visual scrollback
+  // replay lands in a follow-up slice.
+
+  test('unknown id aborts boot with exit 1 and a clean diagnostic (no TUI flash)', async () => {
+    const stub = makeBootstrapStub();
+    const stdin = makeStdin();
+    const errs: string[] = [];
+    const rendererWrites: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'does-not-exist' }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+      rendererWrite: (s) => {
+        rendererWrites.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('session does-not-exist not found');
+    // No live region drew — the boot aborts BEFORE the renderer
+    // emits any frame. The renderer's pre-bootstrap hook does
+    // write the bracketed-paste enable sequence, so we don't assert
+    // rendererWrites is empty; we assert no session:banner line
+    // (which would only land after the banner emit, well past the
+    // resume gate).
+    expect(rendererWrites.join('')).not.toContain('forja v');
+  });
+
+  test("'last' with no prior sessions aborts boot with cwd-scoped diagnostic", async () => {
+    const stub = makeBootstrapStub();
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'last' }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    const all = errs.join('');
+    expect(all).toContain("no sessions found to resume (with 'last')");
+    // Diagnostic names the cwd so the operator can tell if the
+    // resolver looked at the wrong tree (multi-repo gotcha).
+    expect(all).toContain('/tmp/forja-repl-test');
+  });
+
+  test('subagent session id is refused (parent-only contract)', async () => {
+    const stub = makeBootstrapStub();
+    // is_subagent=true makes the session unresumable per the O5
+    // C-block in resolveResumeIdOnDb.
+    createSession(stub.db, {
+      id: 'sub-sess-1',
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+      isSubagent: true,
+    });
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'sub-sess-1' }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('cannot --resume a subagent session');
+  });
+
+  test('failed resume still drains the broker (no leaked handles on abort)', async () => {
+    // The bad-id abort path returns early, bypassing shutdown().
+    // It must still drain the broker — a non-default broker mode
+    // owns handles/timers that would leak just because the
+    // operator mistyped a resume id. Mirror the §13.7 teardown
+    // order: broker.close() before db.close().
+    let brokerClosed = 0;
+    const stub = makeBootstrapStub({
+      broker: {
+        close: async () => {
+          brokerClosed += 1;
+        },
+      },
+    });
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'no-such-id' }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('session no-such-id not found');
+    // Broker drained exactly once on the abort path.
+    expect(brokerClosed).toBe(1);
+  });
+
+  test('cross-cwd literal resume is rejected before any replay (no scrollback leak)', async () => {
+    // A literal id pointing at a session from a DIFFERENT project
+    // must be refused at resolution time. The REPL replays the
+    // session's scrollback right after resolving — an unfiltered
+    // cross-cwd id would render another project's conversation on
+    // screen before runAgent's (much later) cwd guard fires.
+    const stub = makeBootstrapStub(); // cwd = /tmp/forja-repl-test
+    const foreignId = 'sess-other-project';
+    createSession(stub.db, {
+      id: foreignId,
+      model: 'mock/m',
+      cwd: '/some/other/project',
+    });
+    // Seed the foreign session with a message so a leak would be
+    // observable in the renderer writes.
+    appendMessage(stub.db, {
+      sessionId: foreignId,
+      role: 'user',
+      content: 'SECRET CONVERSATION FROM ANOTHER REPO',
+      createdAt: 1_000_000,
+    });
+    const errs: string[] = [];
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: foreignId }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('belongs to a different project');
+    expect(errs.join('')).toContain('/some/other/project');
+    // The foreign conversation never reached the screen.
+    expect(writes.join('')).not.toContain('SECRET CONVERSATION FROM ANOTHER REPO');
+  });
+
+  test('failed resume settles stale subagent handles (crash recovery, Slice 129)', async () => {
+    // A parent that crashed mid-`task_async` leaves
+    // subagent_handles rows stuck in `running`. The headless
+    // resume path settles them; the REPL resume path must too, or
+    // an interactively-resumed crashed session strands its async
+    // subagents (task_await → unknown_handle). Settle runs once the
+    // id resolves — even though THIS test resumes a valid session
+    // and then quits, the settle pass already fired by then.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-crashed';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // Two handles left `running` by the crashed prior run.
+    insertSubagentHandle(stub.db, {
+      handleId: 'h1',
+      parentSessionId: resumedId,
+      name: 'explore',
+      spawnedAt: 1_000,
+    });
+    insertSubagentHandle(stub.db, {
+      handleId: 'h2',
+      parentSessionId: resumedId,
+      name: 'audit',
+      spawnedAt: 1_001,
+    });
+    const errs: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    // Both handles flipped from running → settled.
+    expect(getSubagentHandle(stub.db, 'h1')?.status).toBe('settled');
+    expect(getSubagentHandle(stub.db, 'h2')?.status).toBe('settled');
+    // The settled payload describes the crash-resume interruption
+    // so a re-await rehydrates a coherent envelope.
+    expect(getSubagentHandle(stub.db, 'h1')?.settledPayload).toMatchObject({
+      status: 'interrupted',
+      reason: 'parent_session_resumed_after_crash',
+    });
+    // Operator sees the count.
+    expect(errs.join('')).toContain('settled 2 subagent handle(s)');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('valid id seeds lastSessionId — first turn threads resumeFromSessionId', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-prior-real';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Fire the first prompt; the harness call should carry the
+    // resumed id (not undefined, which is the fresh-session shape).
+    stdin.feed('continue\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.resumeFromSessionId).toBe(resumedId);
+    // Wrap up cleanly.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('valid id reflected in banner env as `resumed: <short>`', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-abcdef-the-rest-is-padding';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Banner env renders `resumed: <first 8 chars of the id>`.
+    // The short form keeps the banner readable on 80-col terminals
+    // while still letting the operator visually confirm which
+    // session they reopened.
+    const all = writes.join('');
+    expect(all).toContain('resumed');
+    expect(all).toContain(resumedId.slice(0, 8));
+    // Exit cleanly.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: prior turns render into scrollback in chronological order', async () => {
+    // Resume with a pre-populated session — the replay should land
+    // each turn's user text + assistant text into the scrollback
+    // captured via rendererWrite, in seq order. Ordering matters
+    // because the user-text → assistant-text pairing is what makes
+    // the historical conversation readable; out-of-order rows
+    // would surface as "answer before its question" in scrollback.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-with-history';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'first question',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'first answer ABCXYZ' }],
+      createdAt: 1_001_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'second question',
+      createdAt: 1_002_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'second answer DEFGHI' }],
+      createdAt: 1_003_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    // Every text fragment must appear — substring presence first.
+    expect(all).toContain('first question');
+    expect(all).toContain('first answer ABCXYZ');
+    expect(all).toContain('second question');
+    expect(all).toContain('second answer DEFGHI');
+    // Strict chronology by indexOf: turn 1 user → turn 1 assistant
+    // → turn 2 user → turn 2 assistant. A reordered replay (e.g.
+    // walking messages by createdAt descending or grouping by
+    // role) would pass substring checks but fail here.
+    const idxQ1 = all.indexOf('first question');
+    const idxA1 = all.indexOf('first answer ABCXYZ');
+    const idxQ2 = all.indexOf('second question');
+    const idxA2 = all.indexOf('second answer DEFGHI');
+    expect(idxQ1).toBeLessThan(idxA1);
+    expect(idxA1).toBeLessThan(idxQ2);
+    expect(idxQ2).toBeLessThan(idxA2);
+    // Wrap up.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: anchor info line separates history from new turns', async () => {
+    // After the replay drops the historical scrollback, the REPL
+    // emits one info line bridging "everything above is history"
+    // and "everything below is new". Without this anchor, the
+    // operator opening a deep history can mistake the last
+    // assistant text for something they typed today.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-anchor';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'past prompt',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'past reply' }],
+      createdAt: 1_001_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    expect(all).toContain('resumed 1 prior turn');
+    expect(all).toContain('history above; new turns below');
+    // Anchor sits AFTER the last assistant text — guarantees the
+    // bridge reads as the closing line of the historical block.
+    expect(all.indexOf('past reply')).toBeLessThan(all.indexOf('resumed 1 prior turn'));
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: anchor pluralizes correctly for multi-turn history', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-multi-anchor';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // Two turns → "2 prior turns".
+    for (const [u, a, t] of [
+      ['q1', 'a1', 1_000_000],
+      ['q2', 'a2', 1_010_000],
+    ] as const) {
+      appendMessage(stub.db, {
+        sessionId: resumedId,
+        role: 'user',
+        content: u,
+        createdAt: t,
+      });
+      appendMessage(stub.db, {
+        sessionId: resumedId,
+        role: 'assistant',
+        content: [{ type: 'text', text: a }],
+        createdAt: t + 1000,
+      });
+    }
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    expect(writes.join('')).toContain('resumed 2 prior turns');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 3: tool card from a resumed session renders into scrollback', async () => {
+    // End-to-end: a persisted run with a tool_use + tool_result
+    // should replay a tool card visible in the scrollback. Unit
+    // tests cover the raw event stream; this one drives the full
+    // message-store → bus → reducer → renderer pipeline so a
+    // regression in tool-card materialization (batching,
+    // PermanentItem shape) trips here, not just in production.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-tool-history';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'read the config',
+      createdAt: 1_000_000,
+    });
+    // Assistant fires a read_file tool_use. The vocab subject
+    // extractor pulls `input.path`, so the card subject should be
+    // the path string.
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Let me read that.' },
+        {
+          type: 'tool_use',
+          id: 'tu-cfg',
+          name: 'read_file',
+          input: { path: 'config/settings.json' },
+        },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu-cfg', content: '{json body}' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Config looks fine.' }],
+      createdAt: 1_003_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    // Assistant text from both turns lands.
+    expect(all).toContain('Let me read that.');
+    expect(all).toContain('Config looks fine.');
+    // The tool card renders — `read_file`'s finalVerb is "Read
+    // file" (tool-vocab) and the subject is the path. Either the
+    // verb or the path proves the card materialized in scrollback.
+    expect(all).toContain('config/settings.json');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: replay throw is fail-soft (boot survives, errSink warns)', async () => {
+    // Inject a corrupt content blob — parseJsonSafe throws when
+    // fromRow tries to parse it. Replay catches, errSink gets the
+    // diagnostic, and a one-line info anchor explains the missing
+    // scrollback. REPL still reaches the prompt; operator can
+    // still type and the LLM still has the prior context (the
+    // first turn's `resumeFromSessionId` is independent of the
+    // visual replay).
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-corrupt';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // Hand-write a row with invalid JSON content. Bypasses the
+    // appendMessage helper because we WANT the malformed shape.
+    stub.db
+      .query(
+        `INSERT INTO messages (id, session_id, parent_id, role, content, created_at, seq)
+         VALUES ('m1', ?, NULL, 'user', '{bad json', 1000000, 0)`,
+      )
+      .run(resumedId);
+    const errs: string[] = [];
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    expect(errs.join('')).toContain('failed to replay resumed session scrollback');
+    expect(writes.join('')).toContain('scrollback could not be rendered');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: replay precedes the input prompt (chronology = boot then history)', async () => {
+    // Operator-visible ordering invariant: banner → permission
+    // hint (if any) → replayed scrollback → empty `> ` prompt at
+    // the bottom. Replay landing AFTER the prompt would push it
+    // off-screen during the redraw burst.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-order';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'historical line MARKER',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'historical reply MARKER2' }],
+      createdAt: 1_001_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    // The banner's `forja v` appears BEFORE the replayed content
+    // in the write stream. The reverse order would mean replay
+    // ran too early (banner was emitted but not yet drained, or
+    // replay raced ahead).
+    const bannerIdx = all.indexOf('forja v');
+    const historyIdx = all.indexOf('MARKER2');
+    expect(bannerIdx).toBeGreaterThanOrEqual(0);
+    expect(historyIdx).toBeGreaterThan(bannerIdx);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('resume hint at exit prints the SAME id (chain continues across boots)', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-chain-anchor';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    const errs: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+    // The exit hint reuses lastSessionId — when no turn ran in this
+    // boot, the resumed id is still the canonical id to point at.
+    const all = errs.join('');
+    expect(all).toContain('Resume this session with:');
+    expect(all).toContain(`forja --resume ${resumedId}`);
   });
 });
 

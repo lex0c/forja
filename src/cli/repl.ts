@@ -40,6 +40,7 @@ import {
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { listCritiqueRunsBySession } from '../storage/repos/critique-runs.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
+import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
@@ -61,6 +62,8 @@ import {
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
+import { replaySessionMessages } from './resume-replay.ts';
+import { resolveResumeIdOnDb } from './run.ts';
 import {
   type SlashContext,
   createBuiltinRegistry,
@@ -822,6 +825,83 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
   }
 
+  // Resume resolution. `--resume <id|last>` with empty prompt routes
+  // here from `cli/index.ts` (the headless run.ts path stays guarded
+  // by `--resume requires a follow-up prompt`). resolveResumeIdOnDb
+  // shares the literal-id / 'last' / subagent-rejection rules with
+  // the headless code path so the operator sees the same diagnostics
+  // either way. A bad id aborts the REPL boot before the TUI takes
+  // over so the operator's terminal stays clean — entering the live
+  // region only to immediately tear it down would flash an empty
+  // frame and a cursor that briefly disappeared.
+  //
+  // On success, the resolved id seeds `lastSessionId` (declared
+  // below) so the first turn's runAgent gets `resumeFromSessionId`
+  // and the LLM sees the prior conversation. The visual replay of
+  // the prior turns (rebuilding scrollback from persisted messages)
+  // lands in a subsequent slice; this slice closes the gate +
+  // context-threading half of the feature.
+  let resumedSessionId: string | null = null;
+  if (args.resume !== undefined) {
+    // `enforceCwd: true` — the REPL replays the resumed session's
+    // scrollback immediately below, before runAgent's cwd guard
+    // would ever run. A cross-cwd literal id must be rejected HERE
+    // or another project's conversation would render on screen.
+    const resolved = resolveResumeIdOnDb(db, args.resume, baseConfig.cwd, true);
+    if (!resolved.ok) {
+      errSink(`forja: ${resolved.message}\n`);
+      // Mirror the full shutdown teardown order (§13.7): drain the
+      // broker BEFORE closing storage. This early-return path
+      // bypasses `shutdown()` entirely, so without the explicit
+      // drain a non-default broker mode would leak its owned
+      // resources (handles, timers) just because the operator
+      // mistyped a resume id. tearDownPreBootstrap covers the
+      // renderer/stdin side; broker + db close the bootstrap side.
+      tearDownPreBootstrap();
+      if (baseConfig.broker !== undefined) {
+        await baseConfig.broker.close();
+      }
+      db.close();
+      return 1;
+    }
+    resumedSessionId = resolved.id;
+
+    // Slice 129 (R5 P0 crash) parity with the headless resume path
+    // (run.ts): settle any subagent handles left `running` from a
+    // crashed prior run of this session. Without this, a parent
+    // that died mid-`task_async` leaves `subagent_handles.status =
+    // 'running'` forever; post-resume `task_await(handle_id)`
+    // returns `unknown_handle` and the cached child output in
+    // `subagent_outputs` is unreachable. The headless path settled
+    // these; the REPL resume path (this slice's new surface) must
+    // too, or interactively resuming a crashed session silently
+    // strands its async subagents.
+    //
+    // The REPL already holds the bootstrap-opened `db` — no second
+    // connection (run.ts opens its own because it settles BEFORE
+    // bootstrap). Non-fatal: a settle failure shouldn't abort the
+    // resume; surface the diagnostic so the operator knows some
+    // handles MIGHT still be stranded.
+    try {
+      const settled = settleRunningSubagentHandles(db, resolved.id, {
+        status: 'interrupted',
+        reason: 'parent_session_resumed_after_crash',
+        interrupted_at_ms: now(),
+      });
+      if (settled > 0) {
+        errSink(
+          `forja: --resume settled ${settled} subagent handle(s) left running from the previous (crashed) run.\n`,
+        );
+      }
+    } catch (e) {
+      errSink(
+        `forja: --resume could not settle stale subagent handles: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
+      );
+    }
+  }
+
   const project = basename(baseConfig.cwd) || baseConfig.cwd;
 
   // Snapshot the adapter context fresh for every turn. Mutation slash
@@ -885,7 +965,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `onData` / `cancelDrain` / `onModalInterrupt` are all hoisted
   // above the trust prompt — see "Pre-bootstrap stack" earlier in
   // this function.
-  let lastSessionId: string | null = null;
+  // Seeded by `--resume` resolution above (null when the operator
+  // started a fresh REPL). On resume, this id flows through the
+  // first turn's `resumeFromSessionId` so the LLM sees the prior
+  // conversation, and the shutdown hint prints the same id so the
+  // chain can continue across boots.
+  let lastSessionId: string | null = resumedSessionId;
   // Append-only list of session ids tracked across this REPL
   // boot. Pushed on `session_finished` and on playbook subagent
   // completion. /critique aggregates across this list so an
@@ -901,6 +986,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     replSessionIdSet.add(id);
     replSessionIdOrder.push(id);
   };
+  // Seed the tracking list with the resumed id so /critique can
+  // aggregate across both the resumed chain AND new turns added in
+  // this boot. Without this seed, /critique would only see runs
+  // started in the current boot, hiding any prior critique data
+  // tied to the resumed session.
+  if (resumedSessionId !== null) trackReplSessionId(resumedSessionId);
 
   // Synthetic parent session id for slash playbook dispatches that
   // happen BEFORE any normal turn has run. `runSubagent` requires a
@@ -1547,6 +1638,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       await baseConfig.broker.close();
     }
     db.close();
+    // Resume hint. Printed AFTER renderer.close() (no live region to
+    // fight) and AFTER db.close() (any teardown diagnostics that
+    // would also use errSink land first). Gated on a real session
+    // having run — when lastSessionId is null the operator never
+    // started a turn and there is nothing to resume to, so silence
+    // is correct. Goes through errSink (not stdout) because the
+    // line is operator diagnostics, not program output; tests inject
+    // a sink to capture it, and the convention matches the panic
+    // exit message above.
+    if (lastSessionId !== null) {
+      errSink(`\nResume this session with:\nforja --resume ${lastSessionId}\n`);
+    }
     resolveExit();
   };
 
@@ -2314,11 +2417,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (k === 'enter') {
         const val = renderer.state().input.value;
         const parsed = parseSlashInput(val);
-        if (parsed === null || parsed.name === '') {
-          // Bare `/` + Enter: nothing to execute. Falling through
-          // would let applyKey emit submit:'/' and dispatch a turn
-          // sending '/' to the model. Clear input + slash mode and
-          // consume the keystroke.
+        // Two paths converge here. (1) Buffer has a typed name
+        // (`/quit`, `/q foo`) — parsed.name is non-empty. (2) Buffer
+        // is bare `/` and the popover is open with a live selection
+        // — operator's intent is "run the highlighted item". The
+        // popover takes precedence in both cases when a selection
+        // exists, because it's the most specific signal of intent
+        // (it tells us which command, regardless of how much the
+        // operator typed). Args, if any, come from the buffer
+        // (selection alone can't carry args).
+        let effectiveName: string | null = null;
+        if (slashState !== null && slashState.selectedIdx >= 0) {
+          const pick = slashState.suggestions[slashState.selectedIdx];
+          if (pick !== undefined) effectiveName = pick.name;
+        }
+        if (effectiveName === null && parsed !== null && parsed.name !== '') {
+          effectiveName = parsed.name;
+        }
+        if (effectiveName === null) {
+          // Bare `/` + Enter with NO selection (zero matches, or
+          // popover already closed): nothing to execute. Falling
+          // through would let applyKey emit submit:'/' and dispatch
+          // a turn sending '/' to the model. Clear input + slash
+          // mode and consume the keystroke.
           bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
           slashOpen = false;
           bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
@@ -2329,17 +2450,22 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // dispatch. The reducer's user:submit branch clears the
         // input — including the unknown-command case, so a typo
         // like `/doesnotexist` doesn't linger in the buffer for
-        // the next Enter to retry. Resolve the typed name through
-        // the registry's case-insensitive matcher so `/Help` lands
-        // on `help` (autocomplete already shows `help`; bug if the
-        // dispatcher disagrees).
-        const resolvedName = resolveCommandName(parsed.name);
-        bus.emit({ type: 'user:submit', ts: now(), text: val });
-        recordHistorySubmit(val);
+        // the next Enter to retry. The echoed text reflects the
+        // RESOLVED command (not the raw prefix) so scrollback +
+        // history match what actually ran. resolveCommandName's
+        // case-insensitive fallback covers exact-name typos
+        // (`/Help` → `help`); the popover selection already
+        // handled the prefix case above.
+        const resolvedName = resolveCommandName(effectiveName);
+        const args = parsed?.args ?? [];
+        const echoText =
+          args.length > 0 ? `/${resolvedName} ${args.join(' ')}` : `/${resolvedName}`;
+        bus.emit({ type: 'user:submit', ts: now(), text: echoText });
+        recordHistorySubmit(echoText);
         bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
         slashOpen = false;
         void dispatchSlash(
-          { name: resolvedName, args: parsed.args },
+          { name: resolvedName, args },
           { registry: slashRegistry, ctx: slashCtx },
         );
         return true;
@@ -2557,6 +2683,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // capability indicators (rendered as `✓ name` in success palette),
   // `meta` for non-binary key:value (rendered dim).
   const env: SessionBannerEvent['env'] = [];
+  if (resumedSessionId !== null) {
+    // Short id (first 8 chars of the UUID head) — full id is 36
+    // chars and would crowd the banner; the head is unique enough
+    // for visual confirmation and `/list-sessions` shows the full
+    // form for anyone who needs to copy it.
+    env.push({ kind: 'meta', key: 'resumed', value: resumedSessionId.slice(0, 8) });
+  }
   if (subagents.byName.size > 0) {
     env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
   }
@@ -2624,6 +2757,53 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     now,
     warn: (m) => errSink(`forja: ${m}\n`),
   });
+
+  // Replay the prior session's scrollback when --resume seeded a
+  // sessionId. Runs AFTER the banner + permission/history hints so
+  // the operator's eye lands first on the boot context, then on
+  // the historical conversation, then on the empty input prompt.
+  // Replay drops PermanentItems directly into scrollback; the
+  // renderer's incremental frame pipeline handles a burst of
+  // events without flashing. Text-only in this slice — tool cards
+  // pick up in a follow-up.
+  //
+  // Fail-soft: a corrupt content blob (parseJsonSafe throws) or a
+  // DB read failure shouldn't crash the boot. Surface the error
+  // via errSink + an info line in scrollback so the operator
+  // understands why the conversation didn't reappear, then keep
+  // going with an empty scrollback. The LLM still has the prior
+  // context via `resumeFromSessionId`, so the operator can keep
+  // typing — they just lose the visual recap. Better than crashing
+  // them out of a half-drawn REPL.
+  if (resumedSessionId !== null) {
+    try {
+      const replay = replaySessionMessages(db, resumedSessionId, bus);
+      // Anchor between historical scrollback and the empty prompt:
+      // an info line attributing the rows above to the resume and
+      // marking "everything below is new". Without this, an
+      // operator opening a deep history can mistake the last
+      // assistant text for a turn they already typed today.
+      if (replay.turns > 0) {
+        bus.emit({
+          type: 'info',
+          ts: now(),
+          // `secondary` (grey) — the anchor is visual scaffolding
+          // separating history from new turns, not content; it
+          // should recede next to the replayed conversation.
+          tone: 'secondary',
+          message: `— resumed ${replay.turns} prior ${replay.turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
+      errSink(`forja: failed to replay resumed session scrollback — ${msg}\n`);
+      bus.emit({
+        type: 'info',
+        ts: now(),
+        message: `(resumed session ${resumedSessionId.slice(0, 8)} — scrollback could not be rendered; LLM still has the context)`,
+      });
+    }
+  }
 
   // Initial frame: emit one input:update with the empty buffer so the
   // renderer draws the `> ` prompt before the user types. Without
