@@ -845,7 +845,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const resolved = resolveResumeIdOnDb(db, args.resume, baseConfig.cwd);
     if (!resolved.ok) {
       errSink(`forja: ${resolved.message}\n`);
+      // Mirror the full shutdown teardown order (§13.7): drain the
+      // broker BEFORE closing storage. This early-return path
+      // bypasses `shutdown()` entirely, so without the explicit
+      // drain a non-default broker mode would leak its owned
+      // resources (handles, timers) just because the operator
+      // mistyped a resume id. tearDownPreBootstrap covers the
+      // renderer/stdin side; broker + db close the bootstrap side.
       tearDownPreBootstrap();
+      if (baseConfig.broker !== undefined) {
+        await baseConfig.broker.close();
+      }
       db.close();
       return 1;
     }

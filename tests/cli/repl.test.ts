@@ -91,6 +91,11 @@ interface MakeBootstrapStubOptions {
   // both the boot banner env entry and the footer's `mem N` token.
   // Omit (default 0) to test the omit-on-zero paths.
   memoryCount?: number;
+  // Optional broker stub. When set, it's attached to the bootstrap
+  // config so teardown paths that call `baseConfig.broker.close()`
+  // can be exercised. Production brokers own handles/timers; tests
+  // pass a `close` spy to assert the drain actually happens.
+  broker?: { close: () => Promise<void> };
 }
 
 const makeBootstrapStub = (
@@ -112,6 +117,7 @@ const makeBootstrapStub = (
       capabilities: { context_window: 200000, output_max_tokens: 4096 },
     },
     memoryRegistry: makeStubRegistry(memoryCount),
+    ...(opts.broker !== undefined ? { broker: opts.broker } : {}),
   } as unknown as HarnessConfig;
   return {
     config,
@@ -3782,6 +3788,37 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     });
     expect(await promise).toBe(1);
     expect(errs.join('')).toContain('cannot --resume a subagent session');
+  });
+
+  test('failed resume still drains the broker (no leaked handles on abort)', async () => {
+    // The bad-id abort path returns early, bypassing shutdown().
+    // It must still drain the broker — a non-default broker mode
+    // owns handles/timers that would leak just because the
+    // operator mistyped a resume id. Mirror the §13.7 teardown
+    // order: broker.close() before db.close().
+    let brokerClosed = 0;
+    const stub = makeBootstrapStub({
+      broker: {
+        close: async () => {
+          brokerClosed += 1;
+        },
+      },
+    });
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'no-such-id' }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('session no-such-id not found');
+    // Broker drained exactly once on the abort path.
+    expect(brokerClosed).toBe(1);
   });
 
   test('valid id seeds lastSessionId — first turn threads resumeFromSessionId', async () => {
