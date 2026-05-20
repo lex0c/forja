@@ -14,6 +14,10 @@ import { recordCritiqueRun } from '../../src/storage/repos/critique-runs.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { listRecentRecapRuns } from '../../src/storage/repos/recap-runs.ts';
 import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
+import {
+  getSubagentHandle,
+  insertSubagentHandle,
+} from '../../src/storage/repos/subagent-handles.ts';
 import { addTrustedDir, loadTrustedDirs } from '../../src/trust/index.ts';
 
 // Build a ParsedArgs shape with all the flags the REPL inspects set
@@ -3819,6 +3823,62 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     expect(errs.join('')).toContain('session no-such-id not found');
     // Broker drained exactly once on the abort path.
     expect(brokerClosed).toBe(1);
+  });
+
+  test('failed resume settles stale subagent handles (crash recovery, Slice 129)', async () => {
+    // A parent that crashed mid-`task_async` leaves
+    // subagent_handles rows stuck in `running`. The headless
+    // resume path settles them; the REPL resume path must too, or
+    // an interactively-resumed crashed session strands its async
+    // subagents (task_await → unknown_handle). Settle runs once the
+    // id resolves — even though THIS test resumes a valid session
+    // and then quits, the settle pass already fired by then.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-crashed';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // Two handles left `running` by the crashed prior run.
+    insertSubagentHandle(stub.db, {
+      handleId: 'h1',
+      parentSessionId: resumedId,
+      name: 'explore',
+      spawnedAt: 1_000,
+    });
+    insertSubagentHandle(stub.db, {
+      handleId: 'h2',
+      parentSessionId: resumedId,
+      name: 'audit',
+      spawnedAt: 1_001,
+    });
+    const errs: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    // Both handles flipped from running → settled.
+    expect(getSubagentHandle(stub.db, 'h1')?.status).toBe('settled');
+    expect(getSubagentHandle(stub.db, 'h2')?.status).toBe('settled');
+    // The settled payload describes the crash-resume interruption
+    // so a re-await rehydrates a coherent envelope.
+    expect(getSubagentHandle(stub.db, 'h1')?.settledPayload).toMatchObject({
+      status: 'interrupted',
+      reason: 'parent_session_resumed_after_crash',
+    });
+    // Operator sees the count.
+    expect(errs.join('')).toContain('settled 2 subagent handle(s)');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
   });
 
   test('valid id seeds lastSessionId — first turn threads resumeFromSessionId', async () => {

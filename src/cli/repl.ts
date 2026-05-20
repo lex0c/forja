@@ -40,6 +40,7 @@ import {
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { listCritiqueRunsBySession } from '../storage/repos/critique-runs.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
+import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
@@ -860,6 +861,41 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       return 1;
     }
     resumedSessionId = resolved.id;
+
+    // Slice 129 (R5 P0 crash) parity with the headless resume path
+    // (run.ts): settle any subagent handles left `running` from a
+    // crashed prior run of this session. Without this, a parent
+    // that died mid-`task_async` leaves `subagent_handles.status =
+    // 'running'` forever; post-resume `task_await(handle_id)`
+    // returns `unknown_handle` and the cached child output in
+    // `subagent_outputs` is unreachable. The headless path settled
+    // these; the REPL resume path (this slice's new surface) must
+    // too, or interactively resuming a crashed session silently
+    // strands its async subagents.
+    //
+    // The REPL already holds the bootstrap-opened `db` — no second
+    // connection (run.ts opens its own because it settles BEFORE
+    // bootstrap). Non-fatal: a settle failure shouldn't abort the
+    // resume; surface the diagnostic so the operator knows some
+    // handles MIGHT still be stranded.
+    try {
+      const settled = settleRunningSubagentHandles(db, resolved.id, {
+        status: 'interrupted',
+        reason: 'parent_session_resumed_after_crash',
+        interrupted_at_ms: now(),
+      });
+      if (settled > 0) {
+        errSink(
+          `forja: --resume settled ${settled} subagent handle(s) left running from the previous (crashed) run.\n`,
+        );
+      }
+    } catch (e) {
+      errSink(
+        `forja: --resume could not settle stale subagent handles: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
+      );
+    }
   }
 
   const project = basename(baseConfig.cwd) || baseConfig.cwd;
