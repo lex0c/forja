@@ -2737,6 +2737,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         bus.emit({
           type: 'info',
           ts: now(),
+          // `secondary` (grey) — the anchor is visual scaffolding
+          // separating history from new turns, not content; it
+          // should recede next to the replayed conversation.
+          tone: 'secondary',
           message: `— resumed ${replay.turns} prior ${replay.turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
         });
       }

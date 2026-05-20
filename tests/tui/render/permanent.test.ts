@@ -1081,4 +1081,41 @@ describe('formatPermanent', () => {
       expect(out[0]).not.toContain('Done  in');
     });
   });
+
+  describe('info (UI.md §6.1 — plain by default, secondary tone opt-in)', () => {
+    test('default tone: message is plain (no SGR) even when colored', () => {
+      const out = formatPermanent({ kind: 'info', message: 'help text here' }, colored);
+      // [leading blank, message]. The message row carries no SGR —
+      // info isn't an alert; coloring it would collide with warn.
+      expect(out).toHaveLength(2);
+      expect(out[1]).toContain('help text here');
+      expect(out[1]).not.toContain(CSI);
+    });
+
+    test("tone 'plain' is identical to omitting tone", () => {
+      const plain = formatPermanent({ kind: 'info', message: 'x' }, colored);
+      const explicit = formatPermanent({ kind: 'info', message: 'x', tone: 'plain' }, colored);
+      expect(explicit).toEqual(plain);
+    });
+
+    test("tone 'secondary' paints the message in the grey meta channel (SGR 90)", () => {
+      const out = formatPermanent(
+        {
+          kind: 'info',
+          message: '— resumed 2 prior turns (history above; new turns below) —',
+          tone: 'secondary',
+        },
+        colored,
+      );
+      expect(out).toHaveLength(2);
+      expect(out[1]).toContain(`${CSI}90m`);
+      expect(out[1]).toContain('resumed 2 prior turns');
+    });
+
+    test("tone 'secondary' emits no SGR when color is disabled", () => {
+      const out = formatPermanent({ kind: 'info', message: 'anchor', tone: 'secondary' }, ascii);
+      // paint() no-ops under color: 'none' — the line is plain text.
+      expect(out[1]).toBe(pad('anchor'));
+    });
+  });
 });

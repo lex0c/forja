@@ -325,13 +325,20 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', paint(caps, 'error', `error: ${item.message}`)].map(padFrame);
     case 'warn':
       return ['', paint(caps, 'warn', `warn: ${item.message}`)].map(padFrame);
-    case 'info':
-      // Plain — no SGR. Info isn't an alert; coloring it would
-      // collide with the warn channel's "actually pay attention"
-      // signal (lock conflicts, compaction notices, etc.). Same
-      // leading blank as error/warn so consecutive info lines from
-      // different sources don't blob together.
-      return ['', item.message].map(padFrame);
+    case 'info': {
+      // Default (plain — no SGR): info isn't an alert; coloring it
+      // would collide with the warn channel's "actually pay
+      // attention" signal (lock conflicts, compaction notices,
+      // etc.). `tone: 'secondary'` opts a line into the greyscale
+      // meta channel (SGR 90) — for visual scaffolding that should
+      // recede rather than read as content (the `--resume`
+      // history/new-turns anchor). Same leading blank as error/warn
+      // so consecutive info lines from different sources don't blob
+      // together.
+      const body =
+        item.tone === 'secondary' ? paint(caps, 'secondary', item.message) : item.message;
+      return ['', body].map(padFrame);
+    }
     case 'recap-terse': {
       // RECAP §3.3 auto-display: bold "recap:" prefix + the line
       // body in `secondary` (SGR 90 = bright-grey, the same

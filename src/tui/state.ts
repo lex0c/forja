@@ -613,7 +613,7 @@ export type PermanentItem =
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
-  | { kind: 'info'; message: string }
+  | { kind: 'info'; message: string; tone?: 'plain' | 'secondary' }
   | { kind: 'recap-terse'; message: string }
   | {
       // Subagent run terminal summary, emitted from the
@@ -1261,7 +1261,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state, permanent: [{ kind: 'warn', message: event.message }] };
 
     case 'info':
-      return { state, permanent: [{ kind: 'info', message: event.message }] };
+      return {
+        state,
+        permanent: [
+          {
+            kind: 'info',
+            message: event.message,
+            ...(event.tone !== undefined ? { tone: event.tone } : {}),
+          },
+        ],
+      };
 
     case 'recap:terse':
       return { state, permanent: [{ kind: 'recap-terse', message: event.message }] };

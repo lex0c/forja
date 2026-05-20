@@ -667,9 +667,17 @@ export type ReverseSearchCloseEvent = BaseEvent & {
 // in any alarm color. Slash command output (/help, /sessions,
 // /cost, etc.) uses this so the operator doesn't see help text in
 // the same yellow as a lock-conflict warning.
+//
+// `tone` controls the paint: omitted/'plain' renders the message
+// uncolored (the default — see permanent.ts for why info isn't
+// colored like alerts); 'secondary' renders it in the greyscale
+// meta channel (SGR 90), for lines that are visual scaffolding
+// rather than content — e.g. the `--resume` history/new-turns
+// anchor, which should recede, not compete with the conversation.
 export type InfoEvent = BaseEvent & {
   type: 'info';
   message: string;
+  tone?: 'plain' | 'secondary';
 };
 
 // Recap terse line surfaced by RECAP §3.3 auto-display surfaces
