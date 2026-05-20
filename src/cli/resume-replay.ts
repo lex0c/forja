@@ -416,11 +416,26 @@ export const replaySessionMessages = (
       // floating footer with no opening user row would read as
       // a bug.
       if (!isMidRun && runStartTs !== null) {
+        // 'done' vs 'interrupted'. The harness ends a run only
+        // when the model produces a tool-FREE response — a
+        // run-boundary assistant that still carries unresolved
+        // tool_use blocks (orphanToolIds non-empty) never reached
+        // that clean stop: the prior run crashed / was killed
+        // with a tool outstanding (or before its result was
+        // persisted). Emitting reason='done' there would render a
+        // successful "Cogitated for Xs" marker over a dead run —
+        // misrepresenting it as completed and misleading the
+        // operator about what the resumed context holds. Mark it
+        // 'interrupted' so the footer reads "Interrupted after Xs"
+        // instead. The turn still counts toward the anchor: it
+        // IS a turn of history present above the prompt, just an
+        // incomplete one.
+        const runInterrupted = orphanToolIds.length > 0;
         bus.emit({
           type: 'session:end',
           ts: msg.createdAt,
           sessionId,
-          reason: 'done',
+          reason: runInterrupted ? 'interrupted' : 'done',
           durationMs: msg.createdAt - runStartTs,
         });
         turns++;

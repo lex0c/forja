@@ -135,12 +135,13 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     expect(events.find((e) => e.type === 'tool:start')).toMatchObject({ toolId: 'tu1' });
   });
 
-  test('tool-only assistant turn (no text) still emits its tool card + run footer', () => {
-    // An assistant message with only a tool_use and no text. No
-    // assistant:start/end pair (nothing to bracket), but the tool
-    // card replays and the run-boundary footer fires. Here the
-    // tool_use is orphan (no result) so the card closes with the
-    // synthetic error tool:end.
+  test('tool-only assistant turn (no text) emits its tool card + interrupted footer', () => {
+    // An assistant message with only a tool_use and no text, and
+    // no tool_result after it. No assistant:start/end pair
+    // (nothing to bracket), but the tool card replays and the
+    // run-boundary footer fires. The tool_use is orphan → the run
+    // never reached a clean stop, so the footer is 'interrupted',
+    // not 'done'.
     const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',
@@ -167,7 +168,7 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     expect(events[3]).toMatchObject({
       type: 'session:end',
       durationMs: 1000,
-      reason: 'done',
+      reason: 'interrupted',
     });
     expect(result.turns).toBe(1);
   });
@@ -684,7 +685,85 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     expect(toolEndIdx).toBeGreaterThan(endIdx);
     // Text + closing footer still emit.
     expect(events.find((e) => e.type === 'assistant:delta')).toMatchObject({ text: 'starting' });
-    expect(events.find((e) => e.type === 'session:end')).toBeDefined();
+    // The footer reports 'interrupted', not 'done' — the run had an
+    // outstanding tool_use when it died.
+    expect(events.find((e) => e.type === 'session:end')).toMatchObject({
+      reason: 'interrupted',
+    });
+  });
+
+  test('interrupted tail (user → assistant with unresolved tool_use) → interrupted footer', () => {
+    // The reviewer's scenario. A session whose LAST row is an
+    // assistant message carrying a tool_use with no tool_result
+    // after it = the run crashed / was killed waiting on the tool.
+    // The footer must NOT say 'done' — that would render a
+    // successful "Cogitated for Xs" marker over a dead run.
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'analyze the repo',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Starting the analysis...' },
+        { type: 'tool_use', id: 'tu-killed', name: 'bash', input: { command: 'find .' } },
+      ],
+      createdAt: 1_004_000,
+    });
+    // Nothing after — the run died here.
+    const { bus, events } = recordEvents();
+    const result = replaySessionMessages(db, 's1', bus);
+    const end = events.find((e) => e.type === 'session:end');
+    expect(end).toMatchObject({ reason: 'interrupted', durationMs: 4000 });
+    // The turn still counts — it's a turn of history above the
+    // prompt, just an incomplete one.
+    expect(result.turns).toBe(1);
+  });
+
+  test('completed tail (run ends on a tool-free assistant) → done footer', () => {
+    // Contrast with the interrupted case: a run that ends on a
+    // text-only assistant DID reach a clean stop (the harness
+    // ends a run when the model produces a tool-free response).
+    // That footer is legitimately 'done'.
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'analyze the repo',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Looking...' },
+        { type: 'tool_use', id: 'tu1', name: 'bash', input: { command: 'find .' } },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'file list' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Analysis complete.' }],
+      createdAt: 1_005_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const ends = events.filter((e) => e.type === 'session:end');
+    // One footer for the whole run, reason='done' (the run ended
+    // on a tool-free assistant response).
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ reason: 'done', durationMs: 5000 });
   });
 
   test('orphan tool_result (no matching use) is dropped', () => {
