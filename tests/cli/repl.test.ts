@@ -4014,6 +4014,80 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Phase 3: tool card from a resumed session renders into scrollback', async () => {
+    // End-to-end: a persisted run with a tool_use + tool_result
+    // should replay a tool card visible in the scrollback. Unit
+    // tests cover the raw event stream; this one drives the full
+    // message-store → bus → reducer → renderer pipeline so a
+    // regression in tool-card materialization (batching,
+    // PermanentItem shape) trips here, not just in production.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-tool-history';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'read the config',
+      createdAt: 1_000_000,
+    });
+    // Assistant fires a read_file tool_use. The vocab subject
+    // extractor pulls `input.path`, so the card subject should be
+    // the path string.
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Let me read that.' },
+        {
+          type: 'tool_use',
+          id: 'tu-cfg',
+          name: 'read_file',
+          input: { path: 'config/settings.json' },
+        },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu-cfg', content: '{json body}' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Config looks fine.' }],
+      createdAt: 1_003_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    // Assistant text from both turns lands.
+    expect(all).toContain('Let me read that.');
+    expect(all).toContain('Config looks fine.');
+    // The tool card renders — `read_file`'s finalVerb is "Read
+    // file" (tool-vocab) and the subject is the path. Either the
+    // verb or the path proves the card materialized in scrollback.
+    expect(all).toContain('config/settings.json');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('Phase 2: replay throw is fail-soft (boot survives, errSink warns)', async () => {
     // Inject a corrupt content blob — parseJsonSafe throws when
     // fromRow tries to parse it. Replay catches, errSink gets the

@@ -27,7 +27,7 @@ const setupSession = (sessionId: string) => {
   return db;
 };
 
-describe('replaySessionMessages — text-only (Phase 2)', () => {
+describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
   test('empty session emits nothing', () => {
     const db = setupSession('s1');
     const { bus, events } = recordEvents();
@@ -85,7 +85,15 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     });
   });
 
-  test('assistant message with interleaved text blocks joins them with newline', () => {
+  test('interleaved text blocks emit as separate deltas in block order (no \\n join)', () => {
+    // Walker emits one assistant:delta per text block, not a joined
+    // concat. The reducer's pendingAssistant accumulates the deltas
+    // into a single PermanentItem with text = "Looking..." + "Found
+    // it..." (no separator) — matching live streaming behavior where
+    // the model's own whitespace dictates separators. The tool_use
+    // here HAS a matching tool_result so it replays as a real tool
+    // card between the two text deltas; orphan behavior is covered
+    // separately below.
     const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',
@@ -93,9 +101,6 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
       content: 'do something complex',
       createdAt: 1_000_000,
     });
-    // Anthropic emits this shape when the response weaves prose
-    // around tool_use blocks. We skip the tool block (Phase 2) but
-    // keep both text fragments so the prose reads continuously.
     appendMessage(db, {
       id: 'a1',
       sessionId: 's1',
@@ -107,22 +112,35 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
       ],
       createdAt: 1_001_000,
     });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'file body' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'wrap up' }],
+      createdAt: 1_003_000,
+    });
     const { bus, events } = recordEvents();
     replaySessionMessages(db, 's1', bus);
-    const delta = events.find((e) => e.type === 'assistant:delta');
-    expect(delta).toMatchObject({
-      type: 'assistant:delta',
-      text: "Looking...\nFound it, here's the answer.",
-    });
+    // First assistant message's two text blocks land as two deltas.
+    const a1Deltas = events.filter((e) => e.type === 'assistant:delta' && e.messageId === 'a1');
+    expect(a1Deltas).toHaveLength(2);
+    expect(a1Deltas[0]).toMatchObject({ text: 'Looking...' });
+    expect(a1Deltas[1]).toMatchObject({ text: "Found it, here's the answer." });
+    // The tool_use replays as a real card (matching result exists).
+    expect(events.find((e) => e.type === 'tool:start')).toMatchObject({ toolId: 'tu1' });
   });
 
-  test('tool-only assistant turn at run boundary: footer fires even without text', () => {
-    // The live operator saw a user submit, then tool cards, then a
-    // `Cogitated for Xs` footer. We skip the tool cards in this
-    // slice (text-only), but the footer still belongs at the run
-    // boundary — operator's mental model is "this run ended,
-    // here's the timing". Suppressing it would also collapse the
-    // turn count, hiding a real conversation step from the anchor.
+  test('tool-only assistant turn (no text) still emits its tool card + run footer', () => {
+    // An assistant message with only a tool_use and no text. No
+    // assistant:start/end pair (nothing to bracket), but the tool
+    // card replays and the run-boundary footer fires. Here the
+    // tool_use is orphan (no result) so the card closes with the
+    // synthetic error tool:end.
     const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',
@@ -133,15 +151,20 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     appendMessage(db, {
       sessionId: 's1',
       role: 'assistant',
-      content: [{ type: 'tool_use', id: 'tu1', name: 'bash', input: { cmd: 'ls' } }],
+      content: [{ type: 'tool_use', id: 'tu1', name: 'bash', input: { command: 'ls' } }],
       createdAt: 1_001_000,
     });
     const { bus, events } = recordEvents();
     const result = replaySessionMessages(db, 's1', bus);
-    // user:submit + session:end (no assistant row in text-only
-    // mode; tool-replay slice will fill the gap with chip rows).
-    expect(events.map((e) => e.type)).toEqual(['user:submit', 'session:end']);
-    expect(events[1]).toMatchObject({
+    // user:submit → tool:start → tool:end (synthetic) → session:end.
+    // No assistant:start/end — the message carried no text.
+    expect(events.map((e) => e.type)).toEqual([
+      'user:submit',
+      'tool:start',
+      'tool:end',
+      'session:end',
+    ]);
+    expect(events[3]).toMatchObject({
       type: 'session:end',
       durationMs: 1000,
       reason: 'done',
@@ -149,11 +172,13 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     expect(result.turns).toBe(1);
   });
 
-  test('tool_result-only user message (array content) is skipped', () => {
+  test('tool_result-only user message (no matching tool_use) emits nothing', () => {
     const db = setupSession('s1');
-    // User's tool_results message — content is an array of
-    // tool_result blocks, not a string. We render nothing
-    // user-facing for it (Phase 2 leaves tool replay out).
+    // A user message whose only block is a tool_result with no
+    // prior tool_use anywhere in the session — orphan. No
+    // user:submit (not a string prompt), no tool:end (the orphan
+    // result is dropped: emitting tool:end for a card the reducer
+    // never opened would noop at best).
     appendMessage(db, {
       sessionId: 's1',
       role: 'user',
@@ -341,17 +366,43 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     expect(starts[0]).toMatchObject({ messageId: 'a1', ts: 1_000_000 });
     expect(starts[1]).toMatchObject({ messageId: 'a2', ts: 1_002_000 });
 
-    // Order: user → asst1 (3 events) → asst2 (3 events) → session:end.
+    // Order with Phase 3 tool replay:
+    //   user:submit
+    //   assistant:start (a1) → delta(text) → tool:start(tu1) → assistant:end(a1)
+    //   tool:end(tu1)
+    //   assistant:start (a2) → delta(text) → assistant:end(a2)
+    //   session:end
     expect(events.map((e) => e.type)).toEqual([
       'user:submit',
       'assistant:start',
       'assistant:delta',
+      'tool:start',
       'assistant:end',
+      'tool:end',
       'assistant:start',
       'assistant:delta',
       'assistant:end',
       'session:end',
     ]);
+    // Tool pair landed with status=done and a durationMs proxy
+    // sourced from the createdAt gap between the assistant row
+    // emitting the use (a1 at 1_001_000) and the user row carrying
+    // the result (1_002_000).
+    const toolStart = events.find((e) => e.type === 'tool:start');
+    const toolEnd = events.find((e) => e.type === 'tool:end');
+    expect(toolStart).toMatchObject({
+      type: 'tool:start',
+      toolId: 'tu1',
+      name: 'read_file',
+      // read_file's vocab subject extractor pulls `input.path`.
+      subject: 'x',
+    });
+    expect(toolEnd).toMatchObject({
+      type: 'tool:end',
+      toolId: 'tu1',
+      status: 'done',
+      durationMs: 1000,
+    });
   });
 
   test('multi-run with mid-stream tool chain per run: one footer per OPERATOR turn', () => {
@@ -423,5 +474,348 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     expect(ends[0]).toMatchObject({ durationMs: 3000 });
     expect(ends[1]).toMatchObject({ durationMs: 10000 });
     expect(result.turns).toBe(2);
+  });
+
+  // ── Phase 3 specific coverage ─────────────────────────────────
+
+  test('tool subject extraction uses tool-vocab (read_file → input.path)', () => {
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'read it',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'read_file', input: { path: 'src/x.ts' } }],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'file body' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const start = events.find((e) => e.type === 'tool:start');
+    expect(start).toMatchObject({
+      toolId: 'tu1',
+      name: 'read_file',
+      activeVerb: 'Reading file',
+      finalVerb: 'Read file',
+      subject: 'src/x.ts',
+    });
+  });
+
+  test('unknown tool name falls back to generic vocab (Calling X / Called X)', () => {
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'do it',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'made_up_tool', input: {} }],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const start = events.find((e) => e.type === 'tool:start');
+    expect(start).toMatchObject({
+      name: 'made_up_tool',
+      activeVerb: 'Calling made_up_tool',
+      finalVerb: 'Called made_up_tool',
+      // No subject extractor for unknown tools → null.
+      subject: null,
+    });
+  });
+
+  test('tool_result with is_error=true emits status=error', () => {
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'try it',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'bash', input: { command: 'false' } }],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'exit 1', is_error: true }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'oops' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    expect(events.find((e) => e.type === 'tool:end')).toMatchObject({
+      status: 'error',
+      durationMs: 1000,
+    });
+  });
+
+  test('tool_result summary collapses whitespace and truncates at 200 chars', () => {
+    const db = setupSession('s1');
+    const longContent = `${'a'.repeat(300)}\nmore${'b'.repeat(50)}`;
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'do it',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'bash', input: { command: 'cat big' } }],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: longContent }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'ok' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const end = events.find((e) => e.type === 'tool:end');
+    const summary = (end as { summary: string }).summary;
+    expect(summary).toBeDefined();
+    expect(summary.length).toBeLessThanOrEqual(200);
+    // ASCII '...' ellipsis — the summary is content text, not a
+    // renderer glyph, so it must render on every terminal.
+    expect(summary.endsWith('...')).toBe(true);
+    // Whitespace collapsed: no embedded `\n` in the summary.
+    expect(summary).not.toContain('\n');
+  });
+
+  test('orphan tool_use (no matching result) emits tool:start + synthetic error tool:end', () => {
+    // Live: an interrupted run can leave a tool_use without a
+    // tool_result (hard kill / crash before the tool returned).
+    // Dropping it entirely would hide that the tool was attempted;
+    // emitting only tool:start would freeze the card as "running…"
+    // in the live region. So we emit BOTH: a real tool:start, then
+    // a synthetic error tool:end that tells the truth.
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'do it',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'starting' },
+        { type: 'tool_use', id: 'orphan', name: 'bash', input: { command: 'sleep 5' } },
+      ],
+      createdAt: 1_001_000,
+    });
+    // No user(tool_result) follow-up — run was interrupted.
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    expect(events.find((e) => e.type === 'tool:start')).toMatchObject({ toolId: 'orphan' });
+    expect(events.find((e) => e.type === 'tool:end')).toMatchObject({
+      toolId: 'orphan',
+      status: 'error',
+      durationMs: 0,
+      summary: '(no result recorded — run interrupted)',
+    });
+    // The synthetic tool:end lands AFTER assistant:end (the card
+    // closes only once the surrounding text has rendered).
+    const endIdx = events.findIndex((e) => e.type === 'assistant:end');
+    const toolEndIdx = events.findIndex((e) => e.type === 'tool:end');
+    expect(toolEndIdx).toBeGreaterThan(endIdx);
+    // Text + closing footer still emit.
+    expect(events.find((e) => e.type === 'assistant:delta')).toMatchObject({ text: 'starting' });
+    expect(events.find((e) => e.type === 'session:end')).toBeDefined();
+  });
+
+  test('orphan tool_result (no matching use) is dropped', () => {
+    // Defensive against malformed audit shapes (or a partial
+    // import). A tool_result without a known tool_use produces no
+    // tool:end — the reducer's activeTools wouldn't have an entry
+    // to flush anyway, so emitting one would noop on best case
+    // and corrupt on worst.
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'do it',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'I will do it' }],
+      createdAt: 1_001_000,
+    });
+    // Synthetic stray tool_result with no prior tool_use.
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'phantom', content: 'r' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    expect(events.find((e) => e.type === 'tool:end')).toBeUndefined();
+  });
+
+  test('multi-tool turn: one assistant fires N tool_uses, paired with N tool_results', () => {
+    // Assistant emits two tool_uses in one message (parallel
+    // tools); the next user message carries both results. Replay
+    // emits two tool:start in block order + two tool:end in
+    // result-block order, all paired by id.
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'do both',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'doing both' },
+        { type: 'tool_use', id: 'a', name: 'read_file', input: { path: 'x.ts' } },
+        { type: 'tool_use', id: 'b', name: 'read_file', input: { path: 'y.ts' } },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'a', content: 'a body' },
+        { type: 'tool_result', tool_use_id: 'b', content: 'b body' },
+      ],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const starts = events.filter((e) => e.type === 'tool:start');
+    const ends = events.filter((e) => e.type === 'tool:end');
+    expect(starts).toHaveLength(2);
+    expect(ends).toHaveLength(2);
+    expect(starts[0]).toMatchObject({ toolId: 'a', subject: 'x.ts' });
+    expect(starts[1]).toMatchObject({ toolId: 'b', subject: 'y.ts' });
+    expect(ends[0]).toMatchObject({ toolId: 'a', summary: 'a body' });
+    expect(ends[1]).toMatchObject({ toolId: 'b', summary: 'b body' });
+  });
+
+  test('block order preserved: text → tool → text → tool → text within one assistant message', () => {
+    // Live behavior: when an LLM completion weaves prose around
+    // multiple tool calls, the operator sees the text in its
+    // emit order with tool cards interleaved beneath the chip.
+    // Replay must preserve that order (reducer accepts tool:start
+    // while pendingAssistant is open).
+    const db = setupSession('s1');
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'do x then y',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'first ' },
+        { type: 'tool_use', id: 'a', name: 'read_file', input: { path: '1' } },
+        { type: 'text', text: 'middle ' },
+        { type: 'tool_use', id: 'b', name: 'read_file', input: { path: '2' } },
+        { type: 'text', text: 'last' },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'a', content: 'r1' },
+        { type: 'tool_result', tool_use_id: 'b', content: 'r2' },
+      ],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'closing' }],
+      createdAt: 1_003_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    // The 3 text deltas + 2 tool:starts all happen inside the
+    // SAME assistant:start/end pair, in source-block order.
+    expect(events.map((e) => e.type)).toEqual([
+      'user:submit',
+      'assistant:start',
+      'assistant:delta',
+      'tool:start',
+      'assistant:delta',
+      'tool:start',
+      'assistant:delta',
+      'assistant:end',
+      'tool:end',
+      'tool:end',
+      'assistant:start',
+      'assistant:delta',
+      'assistant:end',
+      'session:end',
+    ]);
   });
 });
