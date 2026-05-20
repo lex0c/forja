@@ -392,6 +392,22 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
+    test('non-zero exitCode renders `exit N` on the head', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'npm test',
+          status: 'done',
+          durationMs: 30,
+          exitCode: 1,
+        },
+        unicode,
+      );
+      expect(out[1]).toBe(pad('● Executed  exit 1  [30ms]'));
+    });
+
     test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
       // Slice 2: chips with parentId render under their owner
       // (today: a subagent run). The leading blank that separates

@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat — the tool card surfaces a command's non-zero exit code
+
+A `bash` that exits non-zero — `npm test` red, a failed build — returns a normal result (`{exit_code, stdout, stderr}`), so the tool call is `status: done` and the card rendered `● Executed`, indistinguishable from a command that succeeded. The failure was invisible in the scrollback unless the model happened to mention it.
+
+The card now shows `exit N` for a non-zero exit. The code travels the same path as `outputTruncated`:
+
+- **`invoke-tool.ts`** — `readNonZeroExit` reads `exit_code` structurally; `InvokeToolResult.exitCode?` is set only for a non-zero exit (the tool itself stays `failed: false`).
+- **`harness/types.ts` + `loop.ts`** — `tool_finished` carries `exitCode?`.
+- **`events.ts` + `harness-adapter.ts`** — `tool:end` carries `exitCode?`.
+- **`state.ts`** — the `tool-end` PermanentItem gains `exitCode?`; the `tool:end` reducer treats a non-zero exit like a non-`done` status — it bypasses the coalescing buffer, so a failed command surfaces as its own card instead of vanishing into an "Executed N commands" batch.
+- **`permanent.ts`** — the head shows `exit N`, `warn`-colored: exit ≠ 0 is also the normal "no match" of grep or a failed `test`, so it flags without the red alarm of `error`.
+
+`tool-end-batch` has no `exitCode` — a non-zero exit never coalesces. 3 new tests; `tests/tui/` + `tests/harness/` green.
+
 ## [2026-05-20] feat — tool duration measures execution, not the permission-modal wait
 
 A tool's `durationMs` was timed from the top of `invokeTool` (`start`) — spanning the permission engine, the confirmation modal (the human wait), and the PreToolUse hooks. A `bash` that ran 2s but sat 30s in an approval modal reported `[32s]`: the metric mixed machine time with human-decision time and was not comparable across runs.

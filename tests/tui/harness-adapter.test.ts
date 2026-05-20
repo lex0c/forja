@@ -856,6 +856,38 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.outputTruncated).toBeUndefined();
   });
 
+  test('exitCode on tool_finished carries onto tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+      exitCode: 1,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.exitCode).toBe(1);
+  });
+
+  test('exitCode absent leaves the tool:end field unset', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.exitCode).toBeUndefined();
+  });
+
   test('errorMessage absent on done outcomes leaves summary unset', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({

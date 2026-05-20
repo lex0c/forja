@@ -3299,6 +3299,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.denied === true ? { denied: true } : {}),
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
             ...(inv.outputTruncated === true ? { outputTruncated: true } : {}),
+            ...(inv.exitCode !== undefined ? { exitCode: inv.exitCode } : {}),
           });
           // Persist the dispatch-rewrite audit row now that invokeTool
           // created the tool_calls row that the FK points at. Skipped

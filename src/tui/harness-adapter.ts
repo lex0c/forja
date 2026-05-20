@@ -535,6 +535,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           durationMs: event.durationMs,
           ...(summary !== undefined ? { summary } : {}),
           ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
+          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
         });
         return out;
       }

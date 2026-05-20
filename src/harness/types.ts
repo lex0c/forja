@@ -124,6 +124,11 @@ export type HarnessEvent =
       // Absent for failures (a ToolError carries no `truncated`)
       // and for tools whose output shape has no truncation notion.
       outputTruncated?: boolean;
+      // Non-zero exit code of a command tool (bash). The tool itself
+      // succeeded (`failed: false`); this is the command's own exit.
+      // The TUI shows `exit N` so a failed command doesn't read as a
+      // success. Absent for exit 0 and tools with no exit code.
+      exitCode?: number;
     }
   | {
       type: 'compaction_started';

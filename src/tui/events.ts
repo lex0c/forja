@@ -244,6 +244,10 @@ export type ToolEndEvent = BaseEvent & {
   // `… output truncated` hint on the finished card. Absent on
   // failure / denial and for tools with no truncation notion.
   outputTruncated?: boolean;
+  // Non-zero exit code of a command tool (bash). Present only when
+  // the command exited non-zero; drives the `exit N` marker on the
+  // card. Absent for exit 0 and tools with no exit code.
+  exitCode?: number;
 };
 
 // Permission/trust/memory write/plan review/critique modals.

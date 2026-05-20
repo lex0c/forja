@@ -149,6 +149,12 @@ export interface InvokeToolResult {
   // Absent on failure paths (a ToolError carries no `truncated`) and
   // for tools whose output shape has no truncation flag.
   outputTruncated?: boolean;
+  // Non-zero exit code of a command tool (bash). Present only when
+  // the command ran and exited non-zero — the tool itself did not
+  // fail (`failed` stays false), but the TUI surfaces `exit N` so a
+  // failed command does not read as a success. Absent for exit 0
+  // and for tools with no exit code.
+  exitCode?: number;
 }
 
 // A success result is "truncated" when the tool capped its own
@@ -161,6 +167,18 @@ const readOutputTruncated = (result: unknown): boolean =>
   result !== null &&
   'truncated' in result &&
   (result as Record<string, unknown>).truncated === true;
+
+// A non-zero exit code from a command tool (bash). Read structurally
+// — only some result shapes carry `exit_code`. Returns undefined for
+// a zero exit, for tools with no `exit_code`, and for non-numbers,
+// so the field only travels when there is a non-zero code to show.
+const readNonZeroExit = (result: unknown): number | undefined => {
+  if (typeof result !== 'object' || result === null || !('exit_code' in result)) {
+    return undefined;
+  }
+  const code = (result as Record<string, unknown>).exit_code;
+  return typeof code === 'number' && code !== 0 ? code : undefined;
+};
 
 const buildErrorBlock = (
   toolUseId: string,
@@ -1021,6 +1039,7 @@ export const invokeTool = async (
   if (contextParts.length > 0) {
     content = `${content}${contextParts.join('')}`;
   }
+  const exitCode = readNonZeroExit(result);
   return {
     toolResult: {
       type: 'tool_result',
@@ -1033,5 +1052,6 @@ export const invokeTool = async (
     failed: false,
     decision,
     ...(readOutputTruncated(result) ? { outputTruncated: true } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
   };
 };

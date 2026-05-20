@@ -241,7 +241,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // The duration is meta — always `secondary`, never the head's
       // status color (a slow error shouldn't paint its `[Xms]` red).
       const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.durationMs)}]`);
-      const head = `${paint(caps, headTone, headRaw)}${metric}`;
+      // A non-zero exit code — the command ran but failed on its own
+      // terms. `warn`, not `error`: exit ≠ 0 is also the normal "no
+      // match" of grep or a failed `test`, so it flags, not alarms.
+      const exitMark =
+        item.exitCode !== undefined ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '';
+      const head = `${paint(caps, headTone, headRaw)}${exitMark}${metric}`;
       // Leading blank (UI.md §6.3) — each tool finalization is its
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a

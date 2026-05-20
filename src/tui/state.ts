@@ -577,6 +577,9 @@ export type PermanentItem =
       // True when the tool capped its own output — renderer adds a
       // `… output truncated (ctrl+o to expand)` line under the card.
       outputTruncated?: boolean;
+      // Non-zero exit code of a command tool (bash). Renderer shows
+      // `exit N` on the head so a failed command reads as a failure.
+      exitCode?: number;
     }
   | {
       // Coalesced batch of N consecutive same-name + same-parentId
@@ -1145,7 +1148,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // buffer. That's strictly more honest: operator sees the
       // failure boundary instead of one batch chip with
       // worst-of status.
-      if (event.status !== 'done') {
+      // A non-zero exit code joins the non-`done` bypass: the command
+      // ran fine as a tool call but failed on its own terms, so it
+      // must not vanish into a coalesced "Executed N commands" batch.
+      if (event.status !== 'done' || event.exitCode !== undefined) {
         const flushed = flushPendingToolEndBatch(state);
         const item: PermanentItem = {
           kind: 'tool-end',
@@ -1156,6 +1162,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           durationMs: event.durationMs,
           ...(event.summary !== undefined ? { summary: event.summary } : {}),
           ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
+          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
         };
         return {
           state: { ...flushed.state, activeTools: nextTools },

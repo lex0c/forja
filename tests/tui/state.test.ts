@@ -511,6 +511,26 @@ describe('tool lifecycle', () => {
     expect(result.state.activeTools.size).toBe(0);
   });
 
+  test('tool:end with a non-zero exitCode emits immediately and carries exitCode', () => {
+    // A bash that exited non-zero is status:done but must not coalesce
+    // into a batch — it surfaces as its own card with `exitCode` set.
+    const result = drive([
+      startBash('t1'),
+      { type: 'tool:end', ts: 1500, toolId: 't1', status: 'done', durationMs: 30, exitCode: 1 },
+    ]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 30,
+        exitCode: 1,
+      },
+    ]);
+  });
+
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
       {

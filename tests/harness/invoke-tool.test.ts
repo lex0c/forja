@@ -39,6 +39,16 @@ const truncatedTool: Tool = {
   },
 };
 
+const exitCodeTool: Tool = {
+  name: 'runs',
+  description: 'returns a configurable exit_code',
+  inputSchema: { type: 'object', properties: { code: { type: 'number' } } },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  async execute(args: unknown) {
+    return { stdout: '', stderr: '', exit_code: (args as { code: number }).code };
+  },
+};
+
 const errorReturningTool: Tool = {
   name: 'fails',
   description: 'always returns error',
@@ -194,6 +204,21 @@ describe('invokeTool', () => {
     );
     expect(inv.failed).toBe(true);
     expect(fired).toBe(0);
+  });
+
+  test('exitCode carries a non-zero exit, and is absent for a zero exit', async () => {
+    const deps = buildDeps(exitCodeTool);
+    const fail = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'runs', args: { code: 2 }, messageId },
+      deps,
+    );
+    expect(fail.failed).toBe(false);
+    expect(fail.exitCode).toBe(2);
+    const ok = await invokeTool(
+      { toolUseId: 'tu2', toolName: 'runs', args: { code: 0 }, messageId },
+      deps,
+    );
+    expect(ok.exitCode).toBeUndefined();
   });
 
   // R3 follow-up — same wire for the confirm_yes branch. The bridged
