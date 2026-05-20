@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat — tool duration measures execution, not the permission-modal wait
+
+A tool's `durationMs` was timed from the top of `invokeTool` (`start`) — spanning the permission engine, the confirmation modal (the human wait), and the PreToolUse hooks. A `bash` that ran 2s but sat 30s in an approval modal reported `[32s]`: the metric mixed machine time with human-decision time and was not comparable across runs.
+
+The duration clock now starts at `startToolCall` (post-permission, post-hooks):
+
+- **`invoke-tool.ts`** — captures `execStart` after `startToolCall`; the execution-path `durationMs` is `now − execStart`. The top-of-function `start` still scopes the deny/block early returns. New optional `InvokeToolDeps.onExecutionStart` callback, fired at the same point.
+- **`harness/types.ts` + `loop.ts`** — new `tool_execution_started` HarnessEvent; the loop wires `onExecutionStart` to emit it.
+- **`events.ts` + `harness-adapter.ts`** — `tool:execution-started` UIEvent + its translation.
+- **`state.ts`** — the reducer rebases `ActiveTool.startedAt` to that event, so the live card's `[Xs]` excludes the modal wait too — no live↔permanent jump.
+
+Tests: 5 new (reducer rebase, adapter translate, `onExecutionStart` fires on the allow path / not for an unknown tool). `tests/tui/` + `tests/harness/` green; typecheck + lint clean.
+
 ## [2026-05-20] feat(tui) — shimmer on the live-region verb chips (EXPERIMENTAL)
 
 The verb chips — awaiting / assistant / thinking / critique — carry a shimmer: a highlight slides left-to-right across the verb, `accent` (blue) at the centre, `default` on its neighbours, the chip's base token elsewhere. New `src/tui/render/shimmer.ts` (`renderShimmer`, base-parametrized); the position derives from `now`, so the frame scheduler that already redraws for the spinner animates it.

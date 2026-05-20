@@ -3278,6 +3278,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 : {}),
               fireHook: dispatchHooks,
               signal,
+              onExecutionStart: () => {
+                safeEmit(config.onEvent, { type: 'tool_execution_started', toolUseId: tu.id });
+              },
             },
           );
           if (inv.decision !== null) {

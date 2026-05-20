@@ -91,6 +91,11 @@ export type HarnessEvent =
       toolName: string;
       message: string;
     }
+  // Emitted the instant a tool's body starts executing — after the
+  // permission engine, the modal, and PreToolUse hooks. Lets the TUI
+  // rebase the tool card's clock to exclude the human wait at the
+  // permission modal from the shown duration.
+  | { type: 'tool_execution_started'; toolUseId: string }
   | {
       type: 'tool_finished';
       toolUseId: string;

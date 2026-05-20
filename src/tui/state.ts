@@ -1097,6 +1097,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state: { ...state, activeTools: next }, permanent: [] };
     }
 
+    case 'tool:execution-started': {
+      // Rebase the tool's clock to when its body actually started —
+      // execution begins after the permission engine, the modal, and
+      // PreToolUse hooks. Without this the live card's `[Xs]` would
+      // count the human wait at the permission modal.
+      const tool = state.activeTools.get(event.toolId);
+      if (tool === undefined) return { state, permanent: [] };
+      const next = cloneTools(state.activeTools);
+      next.set(event.toolId, { ...tool, startedAt: event.ts });
+      return { state: { ...state, activeTools: next }, permanent: [] };
+    }
+
     case 'tool:delta': {
       const tool = state.activeTools.get(event.toolId);
       // Delta for an unknown tool: drop. Producer error or out-of-order

@@ -495,6 +495,22 @@ describe('tool lifecycle', () => {
     ]);
   });
 
+  test('tool:execution-started rebases the active tool clock', () => {
+    // startedAt is set at tool:start (pre-permission); when the body
+    // actually begins it is rebased so the live card's [Xs] excludes
+    // the permission-modal wait.
+    const result = drive([
+      startBash('t1'),
+      { type: 'tool:execution-started', ts: 9000, toolId: 't1' },
+    ]);
+    expect(result.state.activeTools.get('t1')?.startedAt).toBe(9000);
+  });
+
+  test('tool:execution-started for an unknown tool is a no-op', () => {
+    const result = drive([{ type: 'tool:execution-started', ts: 9000, toolId: 'ghost' }]);
+    expect(result.state.activeTools.size).toBe(0);
+  });
+
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
       {

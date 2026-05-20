@@ -108,6 +108,12 @@ export interface InvokeToolDeps {
   // capturing sink to assert emission shape without polluting
   // stdout/stderr of the test runner.
   errSink?: (line: string) => void;
+  // Called the instant the tool body starts executing — after the
+  // permission engine, the modal, and PreToolUse hooks (i.e. at
+  // `startToolCall`). The loop wires this to a `tool_execution_started`
+  // event so the TUI rebases the tool card's clock, excluding the
+  // human wait at the permission modal from the shown duration.
+  onExecutionStart?: () => void;
 }
 
 export interface InvokeToolResult {
@@ -778,6 +784,18 @@ export const invokeTool = async (
   // tool_call lifecycle reaches a terminal state via finishToolCall
   // below.
   startToolCall(deps.db, toolCall.id);
+  // The execution clock starts HERE — after permission + hooks — so
+  // the reported duration is the tool's own runtime, not the human
+  // wait at the modal. `start` (top of invokeTool) still scopes the
+  // deny/block paths that never reach execution.
+  const execStart = Date.now();
+  // A notification callback must not break the call: if a future
+  // caller's handler throws, the tool body still runs.
+  try {
+    deps.onExecutionStart?.();
+  } catch {
+    // Swallow — exec-start is a UI signal, not load-bearing.
+  }
 
   // §6.5 wire-up: propagate the planner's chosen sandbox profile
   // (populated by the engine on the Decision) into the tool's
@@ -829,7 +847,7 @@ export const invokeTool = async (
   // invariant 4 requires this layer between tool exec and context.
   const result = sanitizeToolOutput(rawResult);
 
-  const duration = Date.now() - start;
+  const duration = Date.now() - execStart;
 
   // PostToolUse hook chain (spec AGENTIC_CLI.md §10.1, log-only).
   // Fires AFTER tool execution AND AFTER the tool_call row's

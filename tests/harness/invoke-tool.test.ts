@@ -166,6 +166,36 @@ describe('invokeTool', () => {
     expect(inv.outputTruncated).toBeUndefined();
   });
 
+  test('onExecutionStart fires once the tool body runs (allow path)', async () => {
+    let fired = 0;
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'echo', args: { msg: 'hi' }, messageId },
+      {
+        ...buildDeps(okTool),
+        onExecutionStart: () => {
+          fired += 1;
+        },
+      },
+    );
+    expect(inv.failed).toBe(false);
+    expect(fired).toBe(1);
+  });
+
+  test('onExecutionStart does not fire for an unknown tool (no execution)', async () => {
+    let fired = 0;
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'nonexistent', args: {}, messageId },
+      {
+        ...buildDeps(okTool),
+        onExecutionStart: () => {
+          fired += 1;
+        },
+      },
+    );
+    expect(inv.failed).toBe(true);
+    expect(fired).toBe(0);
+  });
+
   // R3 follow-up — same wire for the confirm_yes branch. The bridged
   // confirm path records a separate approval (decidedBy='user',
   // decision='confirm_yes') AFTER the user approves; pre-fix

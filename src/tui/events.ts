@@ -217,6 +217,14 @@ export type ToolStartEvent = BaseEvent & {
   // renderer can read it back at end time without re-deriving.
   parentId?: string;
 };
+// Fired when a tool's body actually starts running — after the
+// permission engine, modal, and PreToolUse hooks. The reducer
+// rebases the active tool's `startedAt` to this event's `ts`, so the
+// card clock measures execution, not the human wait at the modal.
+export type ToolExecutionStartedEvent = BaseEvent & {
+  type: 'tool:execution-started';
+  toolId: string;
+};
 export type ToolDeltaEvent = BaseEvent & {
   type: 'tool:delta';
   toolId: string;
@@ -748,6 +756,7 @@ export type UIEvent =
   | CritiqueStartEvent
   | CritiqueEndEvent
   | ToolStartEvent
+  | ToolExecutionStartedEvent
   | ToolDeltaEvent
   | ToolEndEvent
   | PermissionAskEvent

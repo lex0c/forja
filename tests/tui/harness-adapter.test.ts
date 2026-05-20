@@ -620,6 +620,14 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.subject).toBe('/a');
   });
 
+  test('tool_execution_started → tool:execution-started', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({ type: 'tool_execution_started', toolUseId: 't1' });
+    expect(types(out)).toEqual(['tool:execution-started']);
+    const e = out[0] as Extract<UIEvent, { type: 'tool:execution-started' }>;
+    expect(e.toolId).toBe('t1');
+  });
+
   test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({

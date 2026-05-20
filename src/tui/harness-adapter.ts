@@ -450,6 +450,11 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
+      case 'tool_execution_started': {
+        out.push({ type: 'tool:execution-started', ts, toolId: event.toolUseId });
+        return out;
+      }
+
       case 'tool_decided': {
         const tool = state.tools.get(event.toolUseId);
         if (tool !== undefined) tool.decision = event.decision;
