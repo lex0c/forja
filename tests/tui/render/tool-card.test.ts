@@ -40,12 +40,12 @@ describe('spinnerGlyph', () => {
 });
 
 describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)', () => {
-  test('head line is `<spinner> <activeVerb>… (<elapsed>)`', () => {
+  test('head line is `<spinner> <activeVerb>…  [<elapsed>]`', () => {
     const out = renderToolCardLive(tool(), unicode, 1234);
     // [chip head, sub-content]
     expect(out).toHaveLength(2);
     expect(out[0]).toContain('Executing…');
-    expect(out[0]).toContain('(1.2s)');
+    expect(out[0]).toContain('[1.2s]');
     // Spinner glyph leads the head — the specific frame depends on
     // now (covered in spinnerGlyph tests); here we just check the
     // first char is one of the cycle's frames.
@@ -53,13 +53,13 @@ describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)',
     expect(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']).toContain(firstChar);
   });
 
-  test('elapsed under 1s uses ms units in the parens', () => {
-    expect(renderToolCardLive(tool(), unicode, 850)[0]).toContain('(850ms)');
+  test('elapsed under 1s uses ms units in the bracket', () => {
+    expect(renderToolCardLive(tool(), unicode, 850)[0]).toContain('[850ms]');
   });
 
   test('elapsed clamps to 0s if now < startedAt', () => {
     const t: ActiveTool = { ...tool(), startedAt: 1000 };
-    expect(renderToolCardLive(t, unicode, 500)[0]).toContain('(0s)');
+    expect(renderToolCardLive(t, unicode, 500)[0]).toContain('[0s]');
   });
 
   test('subject renders as sub-content under `└─ ` (Unicode)', () => {

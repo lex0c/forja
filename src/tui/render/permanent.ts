@@ -13,13 +13,16 @@
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
-import { subContentConnector } from './glyphs.ts';
+import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
 import { visualWidth } from './width.ts';
 
-// Final-state chip prefix glyph (UI.md §4.10.5). One glyph for all
-// statuses; status is communicated by the verb ('Failed' vs the
-// per-tool finalVerb) plus color (error / dim).
-const CHIP_FINAL_GLYPH = { unicode: '·', ascii: '*' } as const;
+// Card-head glyph (UI.md §4.10.5). One glyph for all statuses;
+// status is communicated by the verb ('Failed' vs the per-tool
+// finalVerb) plus color (error / denied / dim). The filled `●`
+// landed with the slice-1 card restyle — it gives the head a
+// visible anchor so a stack of cards reads as discrete blocks.
+// ASCII keeps `*`; `●` has no reliable dumb-terminal equivalent.
+const CHIP_FINAL_GLYPH = { unicode: '●', ascii: '*' } as const;
 // Glyph used in place of CHIP_FINAL_GLYPH when a tool-end has a
 // `parentId` — visually marks the chip as nested inside its
 // parent (today: a subagent run). `|_` reads as "branch from
@@ -47,6 +50,19 @@ const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): s
   if (status === 'error') return 'Failed';
   return vocabVerb;
 };
+
+// Chip duration metric: sub-second in `ms`, else one-decimal `s`.
+// Rendered as a trailing `[…]` field on the card head (slice-1 card
+// restyle) — the bracket reads as a telemetry slot, leaving room
+// for the token count and `+N lines` that later slices add.
+const formatChipDuration = (ms: number): string =>
+  ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+
+// Cap on subject rows under a `tool-end-batch` head. Above it the
+// body shows MAX-1 subjects and folds the rest into a `… +N more`
+// tail — a large batch must not bury the scrollback. The body
+// therefore never exceeds MAX_BATCH_SUBJECTS rows.
+const MAX_BATCH_SUBJECTS = 5;
 
 export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
   // Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded
@@ -197,9 +213,9 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', ...item.text.split('\n')].map(padFrame);
     }
     case 'tool-end': {
-      // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
-      // `· <verb> in <duration>` for top-level chips,
-      // `  |_ <verb> in <duration>` for nested chips
+      // UI.md §4.10.5 — card head: glyph + status-aware verb + a
+      // trailing `[duration]` metric field. `● <verb>  [<dur>]` for
+      // top-level chips, `  |_ <verb>  [<dur>]` for nested chips
       // (`item.parentId` set, today: tool fired inside a subagent).
       // Color: dim for done, error palette for failed, warn palette
       // for denied — applied identically regardless of nesting.
@@ -214,11 +230,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // verb" — the indent IS the attribution signal.
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const ms =
-        item.durationMs >= 1000
-          ? `${(item.durationMs / 1000).toFixed(1)}s`
-          : `${item.durationMs}ms`;
-      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
+      const headRaw = `${indent}${glyph} ${verb}  [${formatChipDuration(item.durationMs)}]`;
       const head =
         item.status === 'error'
           ? paint(caps, 'error', headRaw)
@@ -273,12 +285,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return lines.map(padFrame);
     }
     case 'tool-end-batch': {
-      // Coalesced summary of N consecutive same-tool tool-end items
-      // (slice 3). Same chip-shape contract as `tool-end`: status
-      // palette (dim / error / warn), nested glyph + indent when
-      // `parentId` is set. The continuation here lists EACH
-      // child's subject under `|_` instead of the single `└─ subject`
-      // that a non-batched chip emits.
+      // Coalesced summary of N consecutive same-tool tool-end items.
+      // Same card-head contract as `tool-end`: status palette (dim /
+      // error / warn), nested glyph + indent when `parentId` is set.
+      // The body lists each child's subject as a tree — `├─` for the
+      // mid rows, `└─` for the last — capped at MAX_BATCH_SUBJECTS so
+      // a large batch can't bury the scrollback.
       const nested = item.parentId !== undefined;
       const glyph = nested
         ? CHIP_NESTED_GLYPH
@@ -287,11 +299,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           : CHIP_FINAL_GLYPH.ascii;
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const ms =
-        item.totalDurationMs >= 1000
-          ? `${(item.totalDurationMs / 1000).toFixed(1)}s`
-          : `${item.totalDurationMs}ms`;
-      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
+      const headRaw = `${indent}${glyph} ${verb}  [${formatChipDuration(item.totalDurationMs)}]`;
       const head =
         item.status === 'error'
           ? paint(caps, 'error', headRaw)
@@ -301,20 +309,30 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // Same leading-blank rule as tool-end: top-level chips get a
       // separator, nested ones stay tight under their owner.
       const lines = nested ? [head] : ['', head];
-      // Each child's subject as a `|_` continuation. Reuse the
-      // nest glyph for the per-child connector — visually consistent
-      // with slice 2's nested chip glyph and explicitly different
-      // from the `└─ ` subject connector (which marks "this is the
-      // chip's subject", not "this is a sibling child of the chip
-      // above"). Empty subjects are filtered upstream in
-      // flushPendingToolEndBatch — we don't need to skip here.
-      for (const subj of item.subjects) {
-        // Continuation lines indent ONE deeper than the head when
-        // the chip itself is already nested under a subagent —
-        // visual hierarchy reads "subagent > batch summary >
-        // child detail".
-        const childIndent = nested ? `${CHIP_NESTED_INDENT}${CHIP_NESTED_INDENT}` : '  ';
-        lines.push(paint(caps, 'secondary', `${childIndent}${CHIP_NESTED_GLYPH} ${subj}`));
+      // Subject tree under the head. Connectors align at the head's
+      // glyph column (`indent`) — `├─` while the tree is open, `└─`
+      // on the closing row. Over the cap, the body shows
+      // MAX_BATCH_SUBJECTS - 1 subjects and folds the rest into a
+      // `└─ … +N more` tail; the body never exceeds MAX rows. Empty
+      // `subjects` (every child had a null subject, filtered upstream
+      // in flushPendingToolEndBatch) leaves the head standing alone
+      // — the count in the verb carries it.
+      const branch = treeBranchConnector(caps);
+      const last = subContentConnector(caps);
+      const ellipsis = ellipsisGlyph(caps);
+      const overflow = item.subjects.length > MAX_BATCH_SUBJECTS;
+      const visible = item.subjects.slice(
+        0,
+        overflow ? MAX_BATCH_SUBJECTS - 1 : item.subjects.length,
+      );
+      const bodyLines = visible.map((subj, i) => {
+        const isLastRow = !overflow && i === visible.length - 1;
+        return paint(caps, 'secondary', `${indent}${isLastRow ? last : branch}${subj}`);
+      });
+      lines.push(...bodyLines);
+      if (overflow) {
+        const moreN = item.subjects.length - visible.length;
+        lines.push(paint(caps, 'secondary', `${indent}${last}${ellipsis} +${moreN} more`));
       }
       return lines.map(padFrame);
     }
@@ -353,8 +371,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     }
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
-      // tool-end's compact shape: `· task <name> Done <summary> in 1m2s`
-      // for success, `· task <name> <Verb> <summary> in 1m2s` for
+      // tool-end's compact shape: `● task <name> Done <summary> in 1m2s`
+      // for success, `● task <name> <Verb> <summary> in 1m2s` for
       // non-success — Verb is chosen from status + reason so the
       // operator can read the cause at a glance instead of a flat
       // "Failed" that hides whether the cap blew, the user

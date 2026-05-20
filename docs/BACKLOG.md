@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — compact tool cards (slice 1): group from 2, bracket metric, tree connectors
+
+Operator-driven UX iteration. Tool-event scrollback is being redesigned into a denser "card" shape so consecutive operations read as one grouped block instead of a stack of gap-separated chips. Direction (card restyle, full scope) and the exact layout were locked with the operator via mockup *before* touching code — the chip format is pinned across ~30 string-exact render tests, so a blind reshape would mean rewriting them twice.
+
+Sliced; this entry is slice 1 — the visual restyle on data the TUI already has (no new plumbing).
+
+1. **Group from 2.** `TOOL_BATCH_COALESCE_THRESHOLD` 3 → 2 (`state.ts`) — two consecutive same-tool `tool:end` items now coalesce into one `tool-end-batch` card. Two items already pay for the summary: one head + two subject rows (3 lines) replaces two gap-separated chips (6 lines incl. blanks). `error`/`denied` still bypass the buffer — a failure stays its own chip.
+2. **Bracket metric.** Chip duration moves from `in 4ms` to a trailing `  [4ms]` field, in both the live card (`tool-card.ts`) and the final/batch cards (`permanent.ts`). The bracket reads as a telemetry slot — room for the token count (slice 3) and `+N lines` (slice 2) without reflowing the head. New `formatChipDuration` helper shared by `tool-end` and `tool-end-batch`.
+3. **Card glyphs.** Final chip glyph `·` → `●` (ASCII stays `*`); the shared `CHIP_FINAL_GLYPH` also re-skins the `subagent_summary` head, keeping every completed-operation line in scrollback on one glyph. The `tool-end-batch` subject list swaps the ad-hoc 2sp-indented `|_` for canonical tree connectors — `├─` mid rows, `└─` last (`glyphs.ts` gains `treeBranchConnector`) — aligned at the head column. A list over `MAX_BATCH_SUBJECTS` (5) shows 4 subjects then a `└─ … +N more` fold, so a large batch can't bury the scrollback.
+
+**Tests.** `permanent.test.ts` — `tool-end` describe updated for `●` + `[…]`; `tool-end-batch` describe rewritten for the tree + new cases (single-subject `└─`, the `+N more` cap, both sides of the `MAX_BATCH_SUBJECTS` boundary, ASCII overflow tail). `tool-card.test.ts` — live metric `(…)` → `[…]`. `state.test.ts` — the threshold-2 behavior change: the old "1-2 items individual" test split into single→`tool-end` and 2→`tool-end-batch`; the warn-flush and `session:end`-flush tests now expect the coalesced batch. `bun test tests/tui/` 795 green, `tests/cli/` 1822 green; `typecheck` + `lint` clean.
+
+**Review pass.** Self-review of the diff found no bugs; three nits applied — dropped the stale `(slice 3)` label from two `state.test.ts` describes, added the `MAX_BATCH_SUBJECTS + 1` overflow-boundary test, and centralized the ellipsis (`…`/`...`) in `glyphs.ts` as `ellipsisGlyph` rather than inlining the fallback.
+
+Known follow-up — **metric format.** Operation chips now carry three duration formats: tool cards `[5s]`, assistant/thinking chips `(5s)` (`assistant-chip.ts`, `thinking-chip.ts`), and `subagent_summary` `in 5s` (the shared `●` glyph reached it but the metric did not). Out of scope here; wants a deliberate unification pass — likely its own slice.
+
+Slices 2-4 (output `+N lines` + `ctrl+o` hint, per-tool token counter, cross-tool "search phase" grouping) need new plumbing through the harness adapter and land separately. Spec PR (UI.md §4.10.5/§4.10.7 for the bracket metric + card head, §6.2 for the `●` glyph) follows once the card UX stabilizes.
+
 ## [2026-05-19] feat(cli) — interactive `--resume`: open the REPL and replay the prior session
 
 Operator-driven feature. `forja --resume <id|last>` with no follow-up prompt now opens the REPL with the prior conversation rebuilt on screen, instead of failing with `--resume requires a follow-up prompt` (which is still the correct error for the *headless* `--resume` path). Built in phases, each validated hands-on before the next; multiple review rounds hardened the interactive path to parity with the headless one.

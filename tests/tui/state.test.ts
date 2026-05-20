@@ -642,7 +642,7 @@ describe('tool lifecycle', () => {
   });
 });
 
-describe('tool-end batch coalescing (slice 3)', () => {
+describe('tool-end batch coalescing', () => {
   // Helper: build a tool:start + tool:end pair for read_file with
   // a given subject and toolId. Simulates the simplest "model
   // issued read_file" sequence.
@@ -666,7 +666,7 @@ describe('tool-end batch coalescing (slice 3)', () => {
       },
     ] satisfies UIEvent[];
 
-  test('3+ consecutive same-name tool:end items coalesce into a single tool-end-batch', () => {
+  test('3 consecutive same-name tool:end items coalesce into a single tool-end-batch', () => {
     const result = drive([
       ...readPair('t1', 'src/a.ts', 100),
       ...readPair('t2', 'src/b.ts', 200),
@@ -683,13 +683,25 @@ describe('tool-end batch coalescing (slice 3)', () => {
     expect(item.status).toBe('done');
   });
 
-  test('1-2 same-name tool:end items emit individually (no fold below threshold)', () => {
+  test('a single tool:end below the threshold emits as an individual tool-end', () => {
     // The buffer ALWAYS captures, but flush respects the threshold:
-    // 1-2 items unfold back into individual `tool-end` chips so the
-    // operator gets normal per-tool visibility for small batches
-    // without surprise coalescing.
-    const result = drive([...readPair('t1', 'src/a.ts'), ...readPair('t2', 'src/b.ts')]);
-    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end']);
+    // a lone item has nothing to coalesce with and unfolds back to
+    // a normal per-tool `tool-end` chip.
+    const result = drive([...readPair('t1', 'src/a.ts')]);
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end']);
+  });
+
+  test('2 consecutive same-name tool:end items coalesce (threshold is 2)', () => {
+    // Two same-tool runs are the smallest coalescing unit — one
+    // card head + two subject rows beats two gap-separated chips.
+    const result = drive([...readPair('t1', 'src/a.ts', 100), ...readPair('t2', 'src/b.ts', 200)]);
+    expect(result.permanent).toHaveLength(1);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.count).toBe(2);
+    expect(item.totalDurationMs).toBe(300);
+    expect(item.subjects).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(item.verb).toBe('Read 2 files');
   });
 
   test('different tool names do NOT merge across the batch', () => {
@@ -892,9 +904,9 @@ describe('tool-end batch coalescing (slice 3)', () => {
       // Flush trigger: warn (emits a permanent item).
       { type: 'warn', ts: 200, message: 'something' },
     ]);
-    // Order: 2 tool-ends (under threshold so emit individual) +
-    // the warn item. Crucially the tool-ends come FIRST.
-    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end', 'warn']);
+    // Order: the 2 reads coalesce into one tool-end-batch, then the
+    // warn item. Crucially the batch comes FIRST.
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end-batch', 'warn']);
   });
 
   test('batch holds across no-permanent events (status updates do NOT flush)', () => {
@@ -913,7 +925,7 @@ describe('tool-end batch coalescing (slice 3)', () => {
   });
 });
 
-describe('applyEvent wrapper (flush lifecycle, slice 3)', () => {
+describe('applyEvent wrapper (flush lifecycle)', () => {
   // Direct unit tests for the public `applyEvent` wrapper that
   // sits in front of `applyEventInner`. The integration tests in
   // the batch coalescing block exercise this through `drive`,
@@ -1067,15 +1079,14 @@ describe('session boundary handling of pendingToolEndBatch', () => {
   test('session:end flushes the buffer BEFORE the footer (correct chronology)', () => {
     // The session that emitted the tool calls is the one ending,
     // so the buffer's items DO belong in this session's
-    // scrollback — drained before the footer marker.
+    // scrollback — drained before the footer marker. A single
+    // buffered item is below the coalesce threshold, so it drains
+    // as an individual `tool-end`.
     const dirty: LiveState = {
       ...createInitialState(),
       pendingToolEndBatch: {
         name: 'read_file',
-        items: [
-          { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 },
-          { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 20 },
-        ],
+        items: [{ verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 }],
       },
     };
     const r = applyEvent(dirty, {
@@ -1084,9 +1095,7 @@ describe('session boundary handling of pendingToolEndBatch', () => {
       sessionId: 's1',
       reason: 'done',
     });
-    // Two tool-end items (under the threshold of 3, so each
-    // emits individually) come BEFORE the session-footer.
-    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end', 'tool-end', 'session-footer']);
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end', 'session-footer']);
     expect(r.state.pendingToolEndBatch).toBeNull();
   });
 

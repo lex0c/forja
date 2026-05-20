@@ -63,13 +63,14 @@ export interface InputState {
 }
 
 // Threshold below which a pending tool-end batch flushes as
-// individual chips (no visual savings from coalescing 1-2 items).
+// individual chips (a lone tool-end has nothing to coalesce with).
 // At/above the threshold, the batch flushes as a single
-// `tool-end-batch` PermanentItem. Tuned to 3 because that's the
-// smallest count where the operator visibly benefits from the
-// summary chip (Read 3 files reads cleaner than three back-to-back
-// "Read in 0.2s" chips with similar subjects).
-export const TOOL_BATCH_COALESCE_THRESHOLD = 3;
+// `tool-end-batch` PermanentItem. Tuned to 2: two consecutive
+// same-tool runs already pay for the summary — one head + two
+// `├─`/`└─` subject rows (3 lines) replaces two gap-separated
+// chips (blank + head + `└─` each = 6 lines), and the operator
+// reads "Read 2 files" instead of two near-identical chips.
+export const TOOL_BATCH_COALESCE_THRESHOLD = 2;
 
 // Item buffered inside `PendingToolEndBatch.items` — captures
 // what each child child contributed so the flush helper can decide
@@ -577,8 +578,8 @@ export type PermanentItem =
       // Coalesced batch of N consecutive same-name + same-parentId
       // tool-end items, emitted by the reducer when the pending
       // batch flushes with `count >= TOOL_BATCH_COALESCE_THRESHOLD`.
-      // Reads as a single chip "Read 3 files in 0.6s" with the N
-      // subjects as `|_` continuation lines underneath.
+      // Reads as a single card "Read 3 files  [0.6s]" with the N
+      // subjects as a `├─`/`└─` tree underneath.
       kind: 'tool-end-batch';
       // Tool name — single value because the batch only forms across
       // matching names.

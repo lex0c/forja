@@ -38,7 +38,7 @@ const formatElapsed = (ms: number): string => {
 export const renderToolCardLive = (tool: ActiveTool, caps: Capabilities, now: number): string[] => {
   const spinner = spinnerGlyph(caps, now);
   const elapsed = formatElapsed(now - tool.startedAt);
-  const head = paint(caps, 'warn', `${spinner} ${tool.activeVerb}… (${elapsed})`);
+  const head = paint(caps, 'warn', `${spinner} ${tool.activeVerb}…  [${elapsed}]`);
   const lines: string[] = [head];
 
   // Sub-content: subject (per-tool extracted) under the shared
