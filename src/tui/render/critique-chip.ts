@@ -21,6 +21,7 @@
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { formatChipDuration } from './duration.ts';
+import { renderShimmer } from './shimmer.ts';
 import { spinnerGlyph } from './tool-card.ts';
 
 export const renderCritiqueChip = (
@@ -38,5 +39,6 @@ export const renderCritiqueChip = (
     ? 'Reviewing tool plan' // about to mutate — emphasis on the plan
     : 'Reviewing output'; //   text-only end-of-step
   const color = critique.toolPlanWrites ? 'error' : 'warn';
-  return [paint(caps, color, `${spinner} ${label}…  [${elapsed}]`)];
+  const verb = renderShimmer(`${label}…`, caps, now, color);
+  return [`${paint(caps, color, `${spinner} `)}${verb}${paint(caps, color, `  [${elapsed}]`)}`];
 };

@@ -7,10 +7,11 @@
 // hung — usually reaches for Ctrl-C before the step-stall
 // watchdog (90s default) would have caught a real problem.
 //
-// Format mirrors the thinking and assistant chips so the
-// operator's eye reads them as the same family of indicator:
+//   ⠙ Awaiting model…  [12s]
 //
-//   ▸ Awaiting model…  [12s]
+// The label carries the shimmer (`render/shimmer.ts`, EXPERIMENTAL
+// — see the note there); base token `secondary`, like the rest of
+// this chip's resting color.
 //
 // Mutual exclusion: when `thinking` or `pendingAssistant` is
 // set, that chip takes the slot. The compose layer's chip-slot
@@ -20,6 +21,7 @@
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { formatChipDuration } from './duration.ts';
+import { renderShimmer } from './shimmer.ts';
 import { spinnerGlyph } from './tool-card.ts';
 
 export const renderAwaitingChip = (
@@ -27,13 +29,8 @@ export const renderAwaitingChip = (
   caps: Capabilities,
   now: number,
 ): string[] => {
-  const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatChipDuration(now - awaiting.startedAt);
-  // `secondary` palette (SGR 90 bright-black, visibly grey)
-  // rather than `warn` (yellow) so a long wait doesn't read as
-  // an alarm — it's normal for some prompts. The thinking chip
-  // uses warn because extended thinking with a real cost
-  // implication is more notable; awaiting is just "we asked
-  // and we're waiting".
-  return [paint(caps, 'secondary', `${spinner} Awaiting model…  [${elapsed}]`)];
+  const spinner = paint(caps, 'secondary', `${spinnerGlyph(caps, now)} `);
+  const label = renderShimmer('Awaiting model…', caps, now, 'secondary');
+  const elapsed = paint(caps, 'secondary', `  [${formatChipDuration(now - awaiting.startedAt)}]`);
+  return [`${spinner}${label}${elapsed}`];
 };

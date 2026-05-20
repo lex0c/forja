@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — shimmer on the live-region verb chips (EXPERIMENTAL)
+
+The verb chips — awaiting / assistant / thinking / critique — carry a shimmer: a highlight slides left-to-right across the verb, `accent` (blue) at the centre, `default` on its neighbours, the chip's base token elsewhere. New `src/tui/render/shimmer.ts` (`renderShimmer`, base-parametrized); the position derives from `now`, so the frame scheduler that already redraws for the spinner animates it.
+
+Base color per chip: awaiting / assistant / thinking → `secondary` (grey), the uniform "model is working" family (assistant and thinking dropped their old `warn` to join it); critique keeps `error` / `warn` — there the color is the writes-vs-text safety signal, not decoration.
+
+**EXPERIMENTAL** — collides with `UI.md §13` ("Animações. Só spinner. Nada de fade, slide, transition."); the spec is NOT amended (the `shimmer.ts` comment carries the note). If the shimmer stays, `§13` needs a deliberate revision — tracked in `docs/TODO.md`. New `shimmer.test.ts` (4 tests); `critique-chip.test.ts` adjusted (the verb splits per-char under color). `tests/tui/` 830 green.
+
 ## [2026-05-20] feat(tui) — markdown slice C: table grid + stack degradation
 
 `renderTable` (`render/markdown.ts`) replaces the slice-A fallback (cells joined by a separator) with a measured renderer. Columns are measured via `visualWidth` (`string-width`); if the aligned grid — bold header + rule + padded rows — fits the available width it renders the grid, otherwise it degrades to a **stack**: one `header: value` block per data row, fitting any width (a long value wraps). `renderBlock` plumbs `width` into `renderTable`.

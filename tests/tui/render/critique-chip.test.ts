@@ -26,22 +26,32 @@ const critique = (
 
 describe('renderCritiqueChip', () => {
   test('text-only review uses the "Reviewing output" verb and warn palette', () => {
-    const out = renderCritiqueChip(critique({ toolPlanWrites: false }), ansiCaps, 1500);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toContain('Reviewing output');
-    expect(out[0]).toContain('[1.5s]');
+    // Verb under color-none: the shimmer is inert there, so the
+    // label is a contiguous substring (under color it splits
+    // per-char as the highlight slides).
+    const plain = renderCritiqueChip(critique({ toolPlanWrites: false }), caps, 1500);
+    expect(plain).toHaveLength(1);
+    expect(plain[0]).toContain('Reviewing output');
+    expect(plain[0]).toContain('[1.5s]');
+    // Palette under color: the warn token is present.
+    const colored = renderCritiqueChip(critique({ toolPlanWrites: false }), ansiCaps, 1500);
+    expect(colored[0]).toContain('\x1b[33m');
   });
 
-  test('writes-step plan critique uses the "Reviewing tool plan" verb and error palette', () => {
-    const writes = renderCritiqueChip(critique({ toolPlanWrites: true }), ansiCaps, 800);
-    const text = renderCritiqueChip(critique({ toolPlanWrites: false }), ansiCaps, 800);
-    expect(writes[0]).toContain('Reviewing tool plan');
-    expect(text[0]).toContain('Reviewing output');
-    // Distinct ANSI escape sequences (writes uses error/red, text
-    // uses warn/yellow). The exact codes are managed by paint();
-    // we just assert they DIFFER so a future palette tweak doesn't
-    // silently collapse the two flavors.
-    expect(writes[0]).not.toBe(text[0]);
+  test('writes-step plan critique uses "Reviewing tool plan" + error palette', () => {
+    expect(renderCritiqueChip(critique({ toolPlanWrites: true }), caps, 800)[0]).toContain(
+      'Reviewing tool plan',
+    );
+    expect(renderCritiqueChip(critique({ toolPlanWrites: false }), caps, 800)[0]).toContain(
+      'Reviewing output',
+    );
+    // Base palette under color: writes = error/red, text-only = warn/yellow.
+    expect(renderCritiqueChip(critique({ toolPlanWrites: true }), ansiCaps, 800)[0]).toContain(
+      '\x1b[31m',
+    );
+    expect(renderCritiqueChip(critique({ toolPlanWrites: false }), ansiCaps, 800)[0]).toContain(
+      '\x1b[33m',
+    );
   });
 
   test('elapsed renders as ms below 1s, then seconds', () => {

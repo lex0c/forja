@@ -26,6 +26,7 @@
 import type { PendingAssistant } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { formatChipDuration } from './duration.ts';
+import { renderShimmer } from './shimmer.ts';
 import { pickOutputVerb } from './spinner-verbs.ts';
 import { spinnerGlyph } from './tool-card.ts';
 
@@ -45,6 +46,7 @@ export const renderAssistantChip = (
     pending.outputTokens === null
       ? `[${elapsed}]`
       : `[${elapsed} · ${upArrow} ${pending.outputTokens} tokens]`;
-  const verb = pickOutputVerb(pending.messageId);
-  return [paint(caps, 'warn', `${spinner} ${verb}…  ${counter}`)];
+  const verb = renderShimmer(`${pickOutputVerb(pending.messageId)}…`, caps, now, 'secondary');
+  const head = paint(caps, 'secondary', `${spinner} `);
+  return [`${head}${verb}${paint(caps, 'secondary', `  ${counter}`)}`];
 };

@@ -37,6 +37,7 @@
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { formatChipDuration } from './duration.ts';
+import { renderShimmer } from './shimmer.ts';
 import { pickCognitiveVerb } from './spinner-verbs.ts';
 import { spinnerGlyph } from './tool-card.ts';
 
@@ -47,6 +48,7 @@ export const renderThinkingChip = (
 ): string[] => {
   const spinner = spinnerGlyph(caps, now);
   const elapsed = formatChipDuration(now - thinking.startedAt);
-  const verb = pickCognitiveVerb(thinking.messageId);
-  return [paint(caps, 'warn', `${spinner} ${verb}…  [${elapsed}]`)];
+  const verb = renderShimmer(`${pickCognitiveVerb(thinking.messageId)}…`, caps, now, 'secondary');
+  const head = paint(caps, 'secondary', `${spinner} `);
+  return [`${head}${verb}${paint(caps, 'secondary', `  [${elapsed}]`)}`];
 };

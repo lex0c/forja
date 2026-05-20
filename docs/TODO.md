@@ -296,6 +296,14 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 # DEFERRED — items intentionally left for later
 
+## Shimmer on verb chips — §13 alignment (or removal)
+
+**Status:** shipped EXPERIMENTAL — a sliding highlight on the awaiting / assistant / thinking / critique verbs (`render/shimmer.ts`). The module + chip comments mark it experimental; the spec is not amended.
+
+**Decision pending:** it collides with `UI.md §13` ("Animações. Só spinner. Nada de fade, slide, transition."). If the shimmer stays, `§13` gets a deliberate revision — "só spinner" → "spinner + the verb-chip shimmer", keeping the veto on slide / layout transition; and the EXPERIMENTAL markers come out. If it goes, revert the shimmer.
+
+**Pull-in signal:** operator confirms the shimmer stays (or asks to drop it).
+
 ## Markdown code-fence syntax highlighting
 
 **Status:** deferred. Markdown rendering shipped — slice A (static GFM render) + slice C (table grid / stack degradation), spec aligned (`UI.md §4.11`, `§6`, `AGENTIC_CLI §3`, `CONTEXT_TUNING §1.5`); slice B (streaming) was dropped. Full history in `docs/BACKLOG.md`. This is the one piece left open.
