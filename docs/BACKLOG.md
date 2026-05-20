@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] decision — slice 3 (per-tool token count) dropped
+
+The card roadmap pencilled a token count onto the grouped chip (`[4ms · 330 tokens]`). Exploration ruled it out: the provider reports real token usage only per-turn (`assistant:usage`), never per tool_result, so a per-tool figure could only be a `chars/4` estimate. The project already took the opposite stance — the `assistant-chip` deliberately shows no token count until the real `usage` lands ("show no number when we don't have one"), and `TOKEN_TUNING §8` directs callers to the provider's real `countTokens` where exactness matters. Tool results are code-heavy, the worst case for `chars/4`. A fabricated number that doesn't reconcile with the turn total is worse than none — so the chip stays at `[duration]`. The slice-2 truncation hint already flags an oversized result where it matters. Revisit only if Forja grows real per-message tokenization.
+
 ## [2026-05-20] test(harness) — wire the bash parser in invoke-tool.test.ts
 
 The slice-2 review surfaced two `plan mode: planSafe …` tests failing in `tests/harness/invoke-tool.test.ts` — `planSafe` tools refused when they should execute. Root cause was a setup gap, not a production bug: the plan-safe tests use a `bash`-category tool, so they reach `engine.check`, and the bash resolver needs the tree-sitter parser (`initBashParser()`) ready to decompose the command. Production wires that in `bootstrap-engine.ts`; this test file never did — the resolver refused with `parser unavailable` and the engine fell through to strict default-deny. The `planSafe`-blocks test passed only because the plan-mode block short-circuits it before `engine.check` ever runs.
