@@ -72,7 +72,7 @@ describe('renderMarkdown', () => {
 
   test('inline emphasis maps to SGR runs (colored)', () => {
     const out = renderMarkdown('a **b** `c` *d* ~~e~~', colored);
-    expect(out[0]).toBe('a \x1b[1mb\x1b[0m \x1b[90mc\x1b[0m \x1b[3md\x1b[0m \x1b[9me\x1b[0m');
+    expect(out[0]).toBe('a \x1b[1mb\x1b[0m \x1b[94mc\x1b[0m \x1b[3md\x1b[0m \x1b[9me\x1b[0m');
   });
 
   test('inline styling is absent under color: none', () => {

@@ -53,7 +53,11 @@ const renderInline = (
         out += renderInline(node.children, caps, [...active, 'strikethrough']);
         break;
       case 'inlineCode':
-        out += styled(node.value, caps, [...active, 'secondary']);
+        // `accent` (blue): inline code is the prose's most frequent
+        // technical anchor — flags, paths, identifiers — and blue
+        // lifts it off the greyscale. Reuses the chrome token for
+        // now; the §6 alignment revisits accent-vs-own-token.
+        out += styled(node.value, caps, [...active, 'accent']);
         break;
       case 'break':
         out += '\n';
