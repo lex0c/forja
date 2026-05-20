@@ -296,21 +296,15 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 # DEFERRED — items intentionally left for later
 
-## Markdown rendering — GFM on the assistant block (output "like Claude Code")
+## Markdown code-fence syntax highlighting
 
-**Status:** Fatia A + spec-alignment shipped; B dropped; C (tables) parked.
+**Status:** deferred. Markdown rendering shipped — slice A (static GFM render) + slice C (table grid / stack degradation), spec aligned (`UI.md §4.11`, `§6`, `AGENTIC_CLI §3`, `CONTEXT_TUNING §1.5`); slice B (streaming) was dropped. Full history in `docs/BACKLOG.md`. This is the one piece left open.
 
-**What it is:** the model's prose (the `assistant` `PermanentItem`) renders as GitHub-flavored Markdown in the TUI instead of raw text. Operator decision: `remark` + `remark-gfm`, iterate in code, align the spec afterwards. Markdown is a *render* concern only — the `PermanentItem` keeps `text: string`, the reducer is untouched; `formatPermanent`'s `assistant` case delegates to a new `renderMarkdown(src, caps)`.
+**What it is:** code fences in the assistant's prose render `dim`, with no syntax highlighting. Real highlighting needs more colors than the `§6.1` palette allows (8 tokens, "sem 256-color, sem truecolor").
 
-**Slices:**
+**Why deferred:** it is the markdown-render decision that most strains `§6` — either the palette opens (a `§6.1` amendment) or fences stay monochrome. No demand signal, and monochrome `dim` fences are perfectly readable.
 
-- **A — static render:** ✅ shipped — `42c8ba9` (renderer + `permanent.ts` wire-up), `d3191cb` (inline code in accent blue). Full subset + tests in `docs/BACKLOG.md`.
-- **B — streaming:** ❌ dropped — premise was wrong. The live region shows only the assistant progress chip while streaming; the prose is never displayed until `assistant:end`, so there is no plain→markdown flip to remove. Displaying streaming prose would be a new live-region feature against §6.5 — out of scope; operator chose to keep the chip.
-- **C — tables:** GFM table with narrow-terminal degradation (stack / collapse).
-
-**Spec alignment:** ✅ done — `UI.md §4.11` (new markdown-rendering section), `§6` (italic / strikethrough tokens, `accent` re-scoped to inline code), `AGENTIC_CLI §3` (the `remark` deps), `CONTEXT_TUNING §1.5` + the §1.8 canonical prompt (density rule). `UI.md §13`/`§14` reviewed and left as-is — the renderer respects the non-goals (links without OSC 8, fixed palette, static tables) and the inline / no-framework thesis.
-
-**Open decision:** syntax highlighting of code fences — fights the `§6.1` 8-colour palette; parked until the palette question is settled.
+**Pull-in signal:** operator asks for highlighted fences, or `§6.1` is revisited for another reason.
 
 ## LLM-judge detector caps: push notification when latched (MEMORY.md §12.5.5)
 

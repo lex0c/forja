@@ -724,7 +724,7 @@ function renderMarkdown(src: string, caps: Capabilities): string[]
 | code fence | `dim`, indentado 2 colunas, **sem** syntax highlighting |
 | blockquote | prefixo `│` em `secondary` |
 | thematic break | régua `─` |
-| table | Fatia A: células por separador `dim`; degradação pra terminal estreito é Fatia C |
+| table | grade alinhada quando cabe; degrada pra stack (`header: valor` por linha) em terminal estreito |
 
 Inline: `bold` (`**…**`), `italic` (`*…*`), inline code (`accent`), strikethrough (`~~…~~`), link (texto + URL em `dim`). Os atributos se aninham via uma pilha — cada run de texto se pinta inteiro com `paintMulti`, nunca `paint` aninhado (o reset interno apagaria o atributo externo).
 

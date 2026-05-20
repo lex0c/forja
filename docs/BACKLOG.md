@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — markdown slice C: table grid + stack degradation
+
+`renderTable` (`render/markdown.ts`) replaces the slice-A fallback (cells joined by a separator) with a measured renderer. Columns are measured via `visualWidth` (`string-width`); if the aligned grid — bold header + rule + padded rows — fits the available width it renders the grid, otherwise it degrades to a **stack**: one `header: value` block per data row, fitting any width (a long value wraps). `renderBlock` plumbs `width` into `renderTable`.
+
+Tests: the slice-A fallback test replaced by two — aligned grid (fits) and stack degradation (`cols 7` forces it); `markdown.test.ts` 17 green, `tests/tui/` 830 green, typecheck + lint clean. `UI.md §4.11` table line updated; the `docs/TODO.md` markdown entry trimmed to its one remaining follow-up — code-fence syntax highlighting.
+
 ## [2026-05-20] decision — markdown slice B (streaming) dropped
 
 Slice B rested on a wrong premise: that the assistant's prose shows plain while streaming and flips to Markdown at turn end. It does not — the live region shows only the progress chip (`renderAssistantChip`) while streaming; the prose is never displayed until `assistant:end`, where `renderMarkdown` runs once. No flip, so no incremental render to add. The `UI.md §4.11` "Streaming" paragraph (committed in `1f0ad04` with that wrong claim) is corrected to match. Showing streaming prose would be a new live-region feature against `§6.5` (the live region is summary, not detail) — the operator's call was to keep the current chip behavior. Slice A stays complete; slice C (table degradation) stays open.

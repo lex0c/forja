@@ -64,10 +64,26 @@ describe('renderMarkdown', () => {
     expect(renderMarkdown('---', { ...caps, cols: 12 })).toEqual(['──────────']);
   });
 
-  test('GFM table: rows as cells joined by a separator (slice-A fallback)', () => {
-    const md = '| A | B |\n|---|---|\n| 1 | 2 |';
-    expect(renderMarkdown(md, caps)).toEqual(['A · B', '1 · 2']);
-    expect(renderMarkdown(md, ascii)).toEqual(['A | B', '1 | 2']);
+  test('GFM table: aligned grid when it fits', () => {
+    const md = '| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bob | 25 |';
+    expect(renderMarkdown(md, caps)).toEqual([
+      'Name   Age',
+      '──────────',
+      'Alice  30',
+      'Bob    25',
+    ]);
+    expect(renderMarkdown(md, ascii)).toEqual([
+      'Name   Age',
+      '----------',
+      'Alice  30',
+      'Bob    25',
+    ]);
+  });
+
+  test('GFM table: degrades to a stack when it does not fit', () => {
+    // cols 7 → frameWidth 5; the 3-column grid (width 7) does not fit.
+    const md = '| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |';
+    expect(renderMarkdown(md, { ...caps, cols: 7 })).toEqual(['A: 1', 'B: 2', 'C: 3']);
   });
 
   test('inline emphasis maps to SGR runs (colored)', () => {

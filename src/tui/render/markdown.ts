@@ -11,12 +11,13 @@
 // The matching `UI.md` section + §6 evolution land later (see
 // `docs/TODO.md` "Markdown rendering").
 
-import type { List, ListItem, PhrasingContent, RootContent, Table } from 'mdast';
+import type { List, ListItem, PhrasingContent, RootContent, Table, TableRow } from 'mdast';
 import { remark } from 'remark';
 import remarkGfm from 'remark-gfm';
 import wrapAnsi from 'wrap-ansi';
 import { type Capabilities, type SgrToken, paint, paintMulti } from '../term.ts';
 import { frameWidth } from './frame.ts';
+import { visualWidth } from './width.ts';
 
 // Built once — `remark-gfm` registers the table / task-list /
 // strikethrough / autolink extensions on the parser.
@@ -102,15 +103,62 @@ const listMarker = (node: List, item: ListItem, n: number, caps: Capabilities): 
   return caps.unicode ? '• ' : '- ';
 };
 
-// GFM table — slice-A fallback: each row is its cells joined by a dim
-// separator, no column alignment. Narrow-terminal degradation (stack
-// / collapse) is slice C.
-const renderTable = (node: Table, caps: Capabilities, indent: number): string[] => {
+// GFM table. Columns are measured; if the aligned grid fits the
+// available width it renders as a grid (bold header + rule + padded
+// rows), otherwise it degrades to a stack — one `header: value`
+// block per data row, which fits any width (UI.md §4.11).
+const renderTable = (node: Table, caps: Capabilities, width: number, indent: number): string[] => {
   const pad = ' '.repeat(indent);
-  const sep = paint(caps, 'dim', caps.unicode ? ' · ' : ' | ');
-  return node.children.map(
-    (row) => pad + row.children.map((cell) => renderInline(cell.children, caps)).join(sep),
+  const avail = Math.max(1, width - indent);
+  const headerNode = node.children[0];
+  if (headerNode === undefined) return [];
+  const bodyNodes = node.children.slice(1);
+
+  // Render a row's cells with an attribute stack — `active` threads
+  // the style through `renderInline`, so a header cell with inline
+  // markup keeps its style across the markup's own SGR resets (no
+  // `paint` wrapping after the fact).
+  const cellsOf = (row: TableRow, active: readonly SgrToken[]): string[] =>
+    row.children.map((cell) => renderInline(cell.children, caps, active));
+
+  const header = cellsOf(headerNode, []);
+  const body = bodyNodes.map((row) => cellsOf(row, []));
+  const cols = header.length;
+
+  // Column width = the visual max over every row (style-independent).
+  const colWidth = Array.from({ length: cols }, (_, c) =>
+    Math.max(visualWidth(header[c] ?? ''), ...body.map((row) => visualWidth(row[c] ?? ''))),
   );
+  const SEP = '  ';
+  const gridWidth = colWidth.reduce((a, b) => a + b, 0) + SEP.length * Math.max(0, cols - 1);
+
+  const padTo = (text: string, w: number): string =>
+    text + ' '.repeat(Math.max(0, w - visualWidth(text)));
+  // Every column but the last is padded — no trailing margin (§6.3).
+  const gridRow = (cells: string[]): string =>
+    pad + cells.map((cell, c) => (c === cols - 1 ? cell : padTo(cell, colWidth[c] ?? 0))).join(SEP);
+
+  // Grid — the table fits, or has no data rows to stack.
+  if (gridWidth <= avail || body.length === 0) {
+    const out = [gridRow(cellsOf(headerNode, ['bold']))];
+    const ruleGlyph = caps.unicode ? '─' : '-';
+    out.push(pad + paint(caps, 'dim', ruleGlyph.repeat(Math.min(gridWidth, avail))));
+    for (const row of body) out.push(gridRow(row));
+    return out;
+  }
+
+  // Stack — degrade: one `header: value` block per data row; the
+  // label is the column header, dimmed.
+  const labels = cellsOf(headerNode, ['secondary']);
+  const colon = paint(caps, 'secondary', ':');
+  const out: string[] = [];
+  body.forEach((row, i) => {
+    if (i > 0) out.push('');
+    labels.forEach((label, c) => {
+      for (const line of wrapText(`${label}${colon} ${row[c] ?? ''}`, avail)) out.push(pad + line);
+    });
+  });
+  return out;
 };
 
 // A list: each item's content is flow, rendered at `indent +
@@ -174,7 +222,7 @@ const renderBlock = (
     case 'list':
       return renderList(node, caps, width, indent);
     case 'table':
-      return renderTable(node, caps, indent);
+      return renderTable(node, caps, width, indent);
     default:
       // html / definition / footnoteDefinition — render a raw `value`
       // if present (rare in LLM prose), else skip.
