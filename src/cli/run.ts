@@ -72,9 +72,16 @@ export const exitCodeFor = (result: HarnessResult): number => {
 // behavior they expect (continue the latest session of THIS
 // project).
 //
-// Literal ids stay unfiltered — if the user typed an id, they
-// know what they want. Cross-cwd literal resume still trips
-// runAgent's cwd guard and surfaces a clean error.
+// Literal ids: by default unfiltered — if the user typed an id in
+// the headless path, they know what they want, and a cross-cwd
+// literal resume still trips runAgent's cwd guard before any work
+// happens. The REPL resume path is different: it REPLAYS the
+// session's persisted scrollback immediately on resolution, well
+// before runAgent's guard runs. An unfiltered cross-cwd literal
+// would render another project's conversation on screen — an
+// information leak. So the REPL passes `enforceCwd: true`, which
+// rejects a literal id whose session belongs to a different cwd
+// at resolution time, before any replay.
 //
 // Lives outside the main `run()` flow because list-sessions and
 // resume both need the same DB-only pre-step before deciding
@@ -88,8 +95,12 @@ export const resolveResumeIdOnDb = (
   db: DB,
   resume: string,
   cwd: string,
+  enforceCwd = false,
 ): { ok: true; id: string } | { ok: false; message: string } => {
   if (resume === 'last') {
+    // 'last' is already cwd-scoped via the listSessions filter —
+    // it can never resolve to a foreign-cwd session, so the
+    // `enforceCwd` flag is moot for this branch.
     const sessions = listSessions(db, { limit: 1, cwd });
     const first = sessions[0];
     if (first === undefined) {
@@ -122,6 +133,15 @@ export const resolveResumeIdOnDb = (
     return {
       ok: false,
       message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
+    };
+  }
+  if (enforceCwd && existing.cwd !== cwd) {
+    // Cross-cwd literal resume under cwd enforcement (REPL path).
+    // Reject BEFORE the caller replays the scrollback — replaying
+    // first would leak another project's conversation on screen.
+    return {
+      ok: false,
+      message: `session ${resume} belongs to a different project (${existing.cwd}); resume it from there`,
     };
   }
   return { ok: true, id: resume };

@@ -843,7 +843,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // context-threading half of the feature.
   let resumedSessionId: string | null = null;
   if (args.resume !== undefined) {
-    const resolved = resolveResumeIdOnDb(db, args.resume, baseConfig.cwd);
+    // `enforceCwd: true` — the REPL replays the resumed session's
+    // scrollback immediately below, before runAgent's cwd guard
+    // would ever run. A cross-cwd literal id must be rejected HERE
+    // or another project's conversation would render on screen.
+    const resolved = resolveResumeIdOnDb(db, args.resume, baseConfig.cwd, true);
     if (!resolved.ok) {
       errSink(`forja: ${resolved.message}\n`);
       // Mirror the full shutdown teardown order (§13.7): drain the

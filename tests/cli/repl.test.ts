@@ -3825,6 +3825,49 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     expect(brokerClosed).toBe(1);
   });
 
+  test('cross-cwd literal resume is rejected before any replay (no scrollback leak)', async () => {
+    // A literal id pointing at a session from a DIFFERENT project
+    // must be refused at resolution time. The REPL replays the
+    // session's scrollback right after resolving — an unfiltered
+    // cross-cwd id would render another project's conversation on
+    // screen before runAgent's (much later) cwd guard fires.
+    const stub = makeBootstrapStub(); // cwd = /tmp/forja-repl-test
+    const foreignId = 'sess-other-project';
+    createSession(stub.db, {
+      id: foreignId,
+      model: 'mock/m',
+      cwd: '/some/other/project',
+    });
+    // Seed the foreign session with a message so a leak would be
+    // observable in the renderer writes.
+    appendMessage(stub.db, {
+      sessionId: foreignId,
+      role: 'user',
+      content: 'SECRET CONVERSATION FROM ANOTHER REPO',
+      createdAt: 1_000_000,
+    });
+    const errs: string[] = [];
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: foreignId }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('belongs to a different project');
+    expect(errs.join('')).toContain('/some/other/project');
+    // The foreign conversation never reached the screen.
+    expect(writes.join('')).not.toContain('SECRET CONVERSATION FROM ANOTHER REPO');
+  });
+
   test('failed resume settles stale subagent handles (crash recovery, Slice 129)', async () => {
     // A parent that crashed mid-`task_async` leaves
     // subagent_handles rows stuck in `running`. The headless
