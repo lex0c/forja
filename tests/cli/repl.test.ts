@@ -3849,6 +3849,267 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Phase 2: prior turns render into scrollback in chronological order', async () => {
+    // Resume with a pre-populated session — the replay should land
+    // each turn's user text + assistant text into the scrollback
+    // captured via rendererWrite, in seq order. Ordering matters
+    // because the user-text → assistant-text pairing is what makes
+    // the historical conversation readable; out-of-order rows
+    // would surface as "answer before its question" in scrollback.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-with-history';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'first question',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'first answer ABCXYZ' }],
+      createdAt: 1_001_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'second question',
+      createdAt: 1_002_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'second answer DEFGHI' }],
+      createdAt: 1_003_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    // Every text fragment must appear — substring presence first.
+    expect(all).toContain('first question');
+    expect(all).toContain('first answer ABCXYZ');
+    expect(all).toContain('second question');
+    expect(all).toContain('second answer DEFGHI');
+    // Strict chronology by indexOf: turn 1 user → turn 1 assistant
+    // → turn 2 user → turn 2 assistant. A reordered replay (e.g.
+    // walking messages by createdAt descending or grouping by
+    // role) would pass substring checks but fail here.
+    const idxQ1 = all.indexOf('first question');
+    const idxA1 = all.indexOf('first answer ABCXYZ');
+    const idxQ2 = all.indexOf('second question');
+    const idxA2 = all.indexOf('second answer DEFGHI');
+    expect(idxQ1).toBeLessThan(idxA1);
+    expect(idxA1).toBeLessThan(idxQ2);
+    expect(idxQ2).toBeLessThan(idxA2);
+    // Wrap up.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: anchor info line separates history from new turns', async () => {
+    // After the replay drops the historical scrollback, the REPL
+    // emits one info line bridging "everything above is history"
+    // and "everything below is new". Without this anchor, the
+    // operator opening a deep history can mistake the last
+    // assistant text for something they typed today.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-anchor';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'past prompt',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'past reply' }],
+      createdAt: 1_001_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    expect(all).toContain('resumed 1 prior turn');
+    expect(all).toContain('history above; new turns below');
+    // Anchor sits AFTER the last assistant text — guarantees the
+    // bridge reads as the closing line of the historical block.
+    expect(all.indexOf('past reply')).toBeLessThan(all.indexOf('resumed 1 prior turn'));
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: anchor pluralizes correctly for multi-turn history', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-multi-anchor';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // Two turns → "2 prior turns".
+    for (const [u, a, t] of [
+      ['q1', 'a1', 1_000_000],
+      ['q2', 'a2', 1_010_000],
+    ] as const) {
+      appendMessage(stub.db, {
+        sessionId: resumedId,
+        role: 'user',
+        content: u,
+        createdAt: t,
+      });
+      appendMessage(stub.db, {
+        sessionId: resumedId,
+        role: 'assistant',
+        content: [{ type: 'text', text: a }],
+        createdAt: t + 1000,
+      });
+    }
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    expect(writes.join('')).toContain('resumed 2 prior turns');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: replay throw is fail-soft (boot survives, errSink warns)', async () => {
+    // Inject a corrupt content blob — parseJsonSafe throws when
+    // fromRow tries to parse it. Replay catches, errSink gets the
+    // diagnostic, and a one-line info anchor explains the missing
+    // scrollback. REPL still reaches the prompt; operator can
+    // still type and the LLM still has the prior context (the
+    // first turn's `resumeFromSessionId` is independent of the
+    // visual replay).
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-corrupt';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // Hand-write a row with invalid JSON content. Bypasses the
+    // appendMessage helper because we WANT the malformed shape.
+    stub.db
+      .query(
+        `INSERT INTO messages (id, session_id, parent_id, role, content, created_at, seq)
+         VALUES ('m1', ?, NULL, 'user', '{bad json', 1000000, 0)`,
+      )
+      .run(resumedId);
+    const errs: string[] = [];
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    expect(errs.join('')).toContain('failed to replay resumed session scrollback');
+    expect(writes.join('')).toContain('scrollback could not be rendered');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Phase 2: replay precedes the input prompt (chronology = boot then history)', async () => {
+    // Operator-visible ordering invariant: banner → permission
+    // hint (if any) → replayed scrollback → empty `> ` prompt at
+    // the bottom. Replay landing AFTER the prompt would push it
+    // off-screen during the redraw burst.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-order';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'historical line MARKER',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'historical reply MARKER2' }],
+      createdAt: 1_001_000,
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const all = writes.join('');
+    // The banner's `forja v` appears BEFORE the replayed content
+    // in the write stream. The reverse order would mean replay
+    // ran too early (banner was emitted but not yet drained, or
+    // replay raced ahead).
+    const bannerIdx = all.indexOf('forja v');
+    const historyIdx = all.indexOf('MARKER2');
+    expect(bannerIdx).toBeGreaterThanOrEqual(0);
+    expect(historyIdx).toBeGreaterThan(bannerIdx);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('resume hint at exit prints the SAME id (chain continues across boots)', async () => {
     const stub = makeBootstrapStub();
     const resumedId = 'sess-chain-anchor';

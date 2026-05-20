@@ -61,6 +61,7 @@ import {
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
+import { replaySessionMessages } from './resume-replay.ts';
 import { resolveResumeIdOnDb } from './run.ts';
 import {
   type SlashContext,
@@ -2706,6 +2707,49 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     now,
     warn: (m) => errSink(`forja: ${m}\n`),
   });
+
+  // Replay the prior session's scrollback when --resume seeded a
+  // sessionId. Runs AFTER the banner + permission/history hints so
+  // the operator's eye lands first on the boot context, then on
+  // the historical conversation, then on the empty input prompt.
+  // Replay drops PermanentItems directly into scrollback; the
+  // renderer's incremental frame pipeline handles a burst of
+  // events without flashing. Text-only in this slice — tool cards
+  // pick up in a follow-up.
+  //
+  // Fail-soft: a corrupt content blob (parseJsonSafe throws) or a
+  // DB read failure shouldn't crash the boot. Surface the error
+  // via errSink + an info line in scrollback so the operator
+  // understands why the conversation didn't reappear, then keep
+  // going with an empty scrollback. The LLM still has the prior
+  // context via `resumeFromSessionId`, so the operator can keep
+  // typing — they just lose the visual recap. Better than crashing
+  // them out of a half-drawn REPL.
+  if (resumedSessionId !== null) {
+    try {
+      const replay = replaySessionMessages(db, resumedSessionId, bus);
+      // Anchor between historical scrollback and the empty prompt:
+      // an info line attributing the rows above to the resume and
+      // marking "everything below is new". Without this, an
+      // operator opening a deep history can mistake the last
+      // assistant text for a turn they already typed today.
+      if (replay.turns > 0) {
+        bus.emit({
+          type: 'info',
+          ts: now(),
+          message: `— resumed ${replay.turns} prior ${replay.turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
+      errSink(`forja: failed to replay resumed session scrollback — ${msg}\n`);
+      bus.emit({
+        type: 'info',
+        ts: now(),
+        message: `(resumed session ${resumedSessionId.slice(0, 8)} — scrollback could not be rendered; LLM still has the context)`,
+      });
+    }
+  }
 
   // Initial frame: emit one input:update with the empty buffer so the
   // renderer draws the `> ` prompt before the user types. Without
