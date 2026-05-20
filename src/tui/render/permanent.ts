@@ -235,13 +235,13 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // verb" — the indent IS the attribution signal.
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const headRaw = `${indent}${glyph} ${verb}  [${formatChipDuration(item.durationMs)}]`;
-      const head =
-        item.status === 'error'
-          ? paint(caps, 'error', headRaw)
-          : item.status === 'denied'
-            ? paint(caps, 'warn', headRaw)
-            : paint(caps, 'dim', headRaw);
+      const headRaw = `${indent}${glyph} ${verb}`;
+      const headTone =
+        item.status === 'error' ? 'error' : item.status === 'denied' ? 'warn' : 'dim';
+      // The duration is meta — always `secondary`, never the head's
+      // status color (a slow error shouldn't paint its `[Xms]` red).
+      const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.durationMs)}]`);
+      const head = `${paint(caps, headTone, headRaw)}${metric}`;
       // Leading blank (UI.md §6.3) — each tool finalization is its
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
@@ -305,13 +305,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           : CHIP_FINAL_GLYPH.ascii;
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const headRaw = `${indent}${glyph} ${verb}  [${formatChipDuration(item.totalDurationMs)}]`;
-      const head =
-        item.status === 'error'
-          ? paint(caps, 'error', headRaw)
-          : item.status === 'denied'
-            ? paint(caps, 'warn', headRaw)
-            : paint(caps, 'dim', headRaw);
+      const headRaw = `${indent}${glyph} ${verb}`;
+      const headTone =
+        item.status === 'error' ? 'error' : item.status === 'denied' ? 'warn' : 'dim';
+      const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.totalDurationMs)}]`);
+      const head = `${paint(caps, headTone, headRaw)}${metric}`;
       // Same leading-blank rule as tool-end: top-level chips get a
       // separator, nested ones stay tight under their owner.
       const lines = nested ? [head] : ['', head];

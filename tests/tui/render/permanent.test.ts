@@ -471,11 +471,13 @@ describe('formatPermanent', () => {
         },
         colored,
       );
-      // Painted output starts with SGR red (palette 'error'). Just
-      // assert the visible substring — exact escape codes are
-      // verified elsewhere; the load-bearing thing here is that the
-      // glyph is `|_` with the indent under the painted segment.
-      expect(out[0]).toContain('|_ Failed  [5ms]');
+      // The glyph + verb carry the error palette; the `[Xms]` metric
+      // is split into `secondary` (meta, not status), so it is no
+      // longer contiguous with the verb.
+      expect(out[0]).toContain('|_ Failed');
+      expect(out[0]).toContain('[5ms]');
+      expect(out[0]).toContain('\x1b[31m'); // error palette on the head
+      expect(out[0]).toContain('\x1b[90m'); // secondary on the metric
     });
 
     test('done status with no subject emits blank + chip head only', () => {
@@ -874,9 +876,12 @@ describe('formatPermanent', () => {
       );
       // Verb override mirrors the single-chip behavior: error
       // statuses always read "Failed" regardless of the producer's
-      // headline. Operator gets a uniform error verb across single
-      // and batch cards.
-      expect(out[1]).toContain('Failed  [100ms]');
+      // headline. The `[Xms]` metric is split into `secondary` —
+      // meta, not status — so it is not contiguous with the verb.
+      expect(out[1]).toContain('Failed');
+      expect(out[1]).toContain('[100ms]');
+      expect(out[1]).toContain('\x1b[31m'); // error palette on the head
+      expect(out[1]).toContain('\x1b[90m'); // secondary on the metric
     });
 
     test('empty subjects array still emits the head (no orphan tree rows)', () => {
