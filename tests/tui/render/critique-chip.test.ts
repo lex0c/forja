@@ -29,7 +29,7 @@ describe('renderCritiqueChip', () => {
     const out = renderCritiqueChip(critique({ toolPlanWrites: false }), ansiCaps, 1500);
     expect(out).toHaveLength(1);
     expect(out[0]).toContain('Reviewing output');
-    expect(out[0]).toContain('(1.5s)');
+    expect(out[0]).toContain('[1.5s]');
   });
 
   test('writes-step plan critique uses the "Reviewing tool plan" verb and error palette', () => {
@@ -47,12 +47,12 @@ describe('renderCritiqueChip', () => {
   test('elapsed renders as ms below 1s, then seconds', () => {
     const sub = renderCritiqueChip(critique({ startedAt: 0 }), caps, 750);
     const sec = renderCritiqueChip(critique({ startedAt: 0 }), caps, 4200);
-    expect(sub[0]).toContain('(750ms)');
-    expect(sec[0]).toContain('(4.2s)');
+    expect(sub[0]).toContain('[750ms]');
+    expect(sec[0]).toContain('[4.2s]');
   });
 
   test('clock skew (now < startedAt) clamps to 0ms instead of going negative', () => {
     const out = renderCritiqueChip(critique({ startedAt: 5000 }), caps, 4000);
-    expect(out[0]).toContain('(0ms)');
+    expect(out[0]).toContain('[0ms]');
   });
 });

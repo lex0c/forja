@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — unify the operation-chip duration metric
+
+Follow-up from the compact-tool-cards review (entry below). The slice-1 card restyle put the tool card on a bracketed `[5s]` metric, but the review found the live region still mixed three duration shapes — `(5s)` on the assistant / thinking / critique / awaiting chips, `in 5s` on the `subagent_summary` line. A wider look found the rot underneath: **five** near-identical copies of `formatElapsed` (one per chip file) plus three `formatDuration` copies, already drifted (`0s` vs `0ms` clamp; decimal vs integer seconds).
+
+**Canonical formatter.** New `src/tui/render/duration.ts` exports `formatChipDuration` — one source of truth: `< 1s → 850ms`, `< 1min → 8.2s` (one decimal), `≥ 1min → 1m23s` (`2m` when the seconds are zero). Negative input (clock skew) clamps to `0ms`, not `0s`, so a single skew tick doesn't jump the chip between units. The minute branch rounds to tenths *before* branching, so the [59 950, 60 000)ms window goes straight to `1m` instead of flashing `60.0s` for a tick. The `≥ 1min` branch is new — the old per-chip `formatElapsed` had no minute case, so a 2-minute tool rendered `120.0s`.
+
+**Bracket metric.** The assistant / thinking / critique / awaiting chips move from `(Xs)` to `[Xs]`; `subagent_summary` from ` in Xs` to a trailing `  [Xs]`. The tool card (live + final / batch) already carried `[Xs]` from slice 1. Every operation chip now reads the metric identically.
+
+**Out of scope, by design.** The live subagent row (`subagent-row.ts`) is a `·`-separated table line, not a `verb… [metric]` chip — it keeps `· Xs`. The turn-end footer (`Cogitated for X`) is prose. Both keep their own duration shape; neither is an operation chip.
+
+**Tests.** New `duration.test.ts` covers both formatters — every branch, the 60s boundary (incl. the no-double-round case), the skew clamp. `tool-card` / `assistant-chip` / `thinking-chip` / `critique-chip` tests updated for `[…]`; `compose.test.ts` verb-matching regex updated; `permanent.test.ts` `subagent_summary` cases updated (`in Xs` → `[Xs]`, decimal seconds). `bun test tests/tui/` 804 green; `typecheck` + `lint` clean.
+
+**Review pass.** Self-review caught two nits, both applied: (1) the minute branch double-rounded (`tenths`, then `tenths / 10`) — `60 450ms` rendered `1m1s` instead of `1m`; it now rounds raw `ms`. (2) The migration left two identical `formatDuration` copies — the turn-end footer and the live subagent row — consolidated into a second `duration.ts` export, `formatCoarseDuration` (the whole-second form for non-chip surfaces); output unchanged. Duration formatters in the tree drop from nine to two, both in `duration.ts`.
+
 ## [2026-05-20] feat(tui) — compact tool cards (slice 1): group from 2, bracket metric, tree connectors
 
 Operator-driven UX iteration. Tool-event scrollback is being redesigned into a denser "card" shape so consecutive operations read as one grouped block instead of a stack of gap-separated chips. Direction (card restyle, full scope) and the exact layout were locked with the operator via mockup *before* touching code — the chip format is pinned across ~30 string-exact render tests, so a blind reshape would mean rewriting them twice.

@@ -12,6 +12,7 @@
 
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
+import { formatChipDuration, formatCoarseDuration } from './duration.ts';
 import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
 import { visualWidth } from './width.ts';
@@ -51,13 +52,6 @@ const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): s
   return vocabVerb;
 };
 
-// Chip duration metric: sub-second in `ms`, else one-decimal `s`.
-// Rendered as a trailing `[…]` field on the card head (slice-1 card
-// restyle) — the bracket reads as a telemetry slot, leaving room
-// for the token count and `+N lines` that later slices add.
-const formatChipDuration = (ms: number): string =>
-  ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
-
 // Cap on subject rows under a `tool-end-batch` head. Above it the
 // body shows MAX-1 subjects and folds the rest into a `… +N more`
 // tail — a large batch must not bury the scrollback. The body
@@ -96,19 +90,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // surfacing useful info — wall-clock time the model spent on
       // the turn — which the operator likely wants to see anyway.
       const dur = item.durationMs;
-      const formatDuration = (ms: number): string => {
-        if (ms < 1000) return `${ms}ms`;
-        const totalSec = Math.round(ms / 1000);
-        if (totalSec < 60) return `${totalSec}s`;
-        const m = Math.floor(totalSec / 60);
-        const s = totalSec % 60;
-        return s === 0 ? `${m}m` : `${m}m${s}s`;
-      };
-      const tail = dur !== undefined ? ` ${formatDuration(dur)}` : '';
+      const tail = dur !== undefined ? ` ${formatCoarseDuration(dur)}` : '';
       const verb = (() => {
         switch (item.reason) {
           case 'done':
-            return dur !== undefined ? `Cogitated for ${formatDuration(dur)}` : 'Cogitated.';
+            return dur !== undefined ? `Cogitated for ${formatCoarseDuration(dur)}` : 'Cogitated.';
           case 'aborted': {
             const cause = item.abortCause !== undefined ? ` (${item.abortCause})` : '';
             return dur !== undefined ? `Aborted${cause} after${tail}` : `Aborted${cause}.`;
@@ -371,8 +357,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     }
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
-      // tool-end's compact shape: `● task <name> Done <summary> in 1m2s`
-      // for success, `● task <name> <Verb> <summary> in 1m2s` for
+      // tool-end's compact shape: `● task <name> Done <summary>  [1m2s]`
+      // for success, `● task <name> <Verb> <summary>  [1m2s]` for
       // non-success — Verb is chosen from status + reason so the
       // operator can read the cause at a glance instead of a flat
       // "Failed" that hides whether the cap blew, the user
@@ -426,14 +412,6 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         return 'Failed';
       };
       const verb = verbFor(item.status, item.reason, item.costUsd);
-      const formatDuration = (ms: number): string => {
-        if (ms < 1000) return `${ms}ms`;
-        const totalSec = Math.round(ms / 1000);
-        if (totalSec < 60) return `${totalSec}s`;
-        const m = Math.floor(totalSec / 60);
-        const s = totalSec % 60;
-        return s === 0 ? `${m}m` : `${m}m${s}s`;
-      };
       // Truncate the summary so a verbose child doesn't blow out
       // the line — the renderer's frame width is the operator's
       // budget, not the producer's.
@@ -444,7 +422,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           ? `${trimmedSummary.slice(0, maxSummary - 1)}…`
           : trimmedSummary;
       const head = `${glyph} task ${item.name} ${verb}`;
-      const tail = ` in ${formatDuration(item.durationMs)}`;
+      const tail = `  [${formatChipDuration(item.durationMs)}]`;
       const body = summary.length > 0 ? ` ${summary}` : '';
       const line =
         item.status === 'done'

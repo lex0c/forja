@@ -24,16 +24,16 @@ const pending = (overrides: Partial<PendingAssistant> = {}): PendingAssistant =>
   ...overrides,
 });
 
-// Match "<word>… (..." — the chip's verb sits before the elapsed
+// Match "<word>… [..." — the chip's verb sits before the elapsed
 // counter. Used by tests that don't pin a specific verb but do
 // need to assert the chip rendered SOME verb from the pool.
-const verbPattern = /(\w+)…\s*\(/;
+const verbPattern = /(\w+)…\s*\[/;
 
 describe('renderAssistantChip', () => {
   test('no usage event yet → counter is duration only, verb is from the output pool', () => {
     const out = renderAssistantChip(pending({ startedAt: 0 }), caps, 8200);
     expect(out).toHaveLength(1);
-    expect(out[0]).toContain('(8.2s)');
+    expect(out[0]).toContain('[8.2s]');
     const match = out[0]?.match(verbPattern);
     expect(match).not.toBeNull();
     expect(OUTPUT_VERB_POOL).toContain(match?.[1] ?? '');
@@ -46,7 +46,7 @@ describe('renderAssistantChip', () => {
     const out = renderAssistantChip(pending({ startedAt: 0, outputTokens: 234 }), caps, 8200);
     const match = out[0]?.match(verbPattern);
     expect(OUTPUT_VERB_POOL).toContain(match?.[1] ?? '');
-    expect(out[0]).toContain('(8.2s · ↑ 234 tokens)');
+    expect(out[0]).toContain('[8.2s · ↑ 234 tokens]');
   });
 
   test('verb is stable for the same messageId across consecutive renders', () => {
@@ -61,7 +61,7 @@ describe('renderAssistantChip', () => {
 
   test('sub-second elapsed renders in ms', () => {
     const out = renderAssistantChip(pending({ startedAt: 100 }), caps, 450);
-    expect(out[0]).toContain('(350ms)');
+    expect(out[0]).toContain('[350ms]');
   });
 
   test('ASCII fallback uses ^ instead of ↑', () => {
@@ -85,6 +85,6 @@ describe('renderAssistantChip', () => {
     // sub-second positive branch — a single skew tick shouldn't make
     // the counter visually jump units.
     const out = renderAssistantChip(pending({ startedAt: 5000 }), caps, 1000);
-    expect(out[0]).toContain('(0ms)');
+    expect(out[0]).toContain('[0ms]');
   });
 });

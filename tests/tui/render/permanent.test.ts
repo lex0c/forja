@@ -991,7 +991,7 @@ describe('formatPermanent', () => {
       expect(out).toHaveLength(1);
       expect(out[0]).toContain('● task explore Done');
       expect(out[0]).toContain('README at /repo/README.md');
-      expect(out[0]).toContain('5s');
+      expect(out[0]).toContain('[5.0s]');
     });
 
     test('error shape uses Error verb and red SGR when colored', () => {
@@ -1182,7 +1182,7 @@ describe('formatPermanent', () => {
       expect(out).toHaveLength(1);
     });
 
-    test('empty summary produces a clean line without double-space', () => {
+    test('empty summary: metric bracket follows the verb with the standard 2-space gap', () => {
       const out = formatPermanent(
         {
           kind: 'subagent_summary',
@@ -1196,8 +1196,11 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[0]).toContain('Done in 100ms');
-      expect(out[0]).not.toContain('Done  in');
+      // Empty summary → `[100ms]` sits right after the verb with the
+      // card's standard 2-space gap, no triple-space hole where the
+      // summary would otherwise have gone.
+      expect(out[0]).toContain('Done  [100ms]');
+      expect(out[0]).not.toContain('Done   [');
     });
   });
 

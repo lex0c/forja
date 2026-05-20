@@ -3,8 +3,8 @@
 // alongside tool cards while text streams in.
 //
 // Format:
-//   ▸ Forging… (8s · ↑ 234 tokens)        ← usage event arrived
-//   ▸ Tempering… (8s)                     ← no usage yet
+//   ▸ Forging…  [8s · ↑ 234 tokens]        ← usage event arrived
+//   ▸ Tempering…  [8s]                     ← no usage yet
 //
 // Verb is picked from the OUTPUT pool by `pickOutputVerb`, hashed
 // off the assistant message id. Stable for the duration of the
@@ -25,18 +25,9 @@
 
 import type { PendingAssistant } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { formatChipDuration } from './duration.ts';
 import { pickOutputVerb } from './spinner-verbs.ts';
 import { spinnerGlyph } from './tool-card.ts';
-
-const formatElapsed = (ms: number): string => {
-  // Negative clock skew (producer's startedAt > now) clamps to 0 in
-  // ms units, not seconds — keeps the unit consistent with the
-  // sub-second positive branch so a clock-skew tick doesn't visually
-  // jump from "350ms" to "(0s)".
-  if (ms < 0) return '0ms';
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-};
 
 export const renderAssistantChip = (
   pending: PendingAssistant,
@@ -44,7 +35,7 @@ export const renderAssistantChip = (
   now: number,
 ): string[] => {
   const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatElapsed(now - pending.startedAt);
+  const elapsed = formatChipDuration(now - pending.startedAt);
   // ↑ glyph is intentionally Unicode-only with an ASCII fallback to
   // `^` (uplink direction). Spec §4.10.5 calls out `↑` literal as
   // "engineer recognizes as uplink/output direction"; ASCII users
@@ -52,8 +43,8 @@ export const renderAssistantChip = (
   const upArrow = caps.unicode ? '↑' : '^';
   const counter =
     pending.outputTokens === null
-      ? `(${elapsed})`
-      : `(${elapsed} · ${upArrow} ${pending.outputTokens} tokens)`;
+      ? `[${elapsed}]`
+      : `[${elapsed} · ${upArrow} ${pending.outputTokens} tokens]`;
   const verb = pickOutputVerb(pending.messageId);
-  return [paint(caps, 'warn', `${spinner} ${verb}… ${counter}`)];
+  return [paint(caps, 'warn', `${spinner} ${verb}…  ${counter}`)];
 };

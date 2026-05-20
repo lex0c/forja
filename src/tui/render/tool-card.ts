@@ -12,6 +12,7 @@
 
 import type { ActiveTool } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { formatChipDuration } from './duration.ts';
 import { subContentConnector } from './glyphs.ts';
 
 const SPINNER_UNICODE = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
@@ -29,15 +30,9 @@ export const spinnerGlyph = (caps: Capabilities, now: number): string => {
   return SPINNER_ASCII[idx] ?? SPINNER_ASCII[0];
 };
 
-const formatElapsed = (ms: number): string => {
-  if (ms < 0) return '0s';
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-};
-
 export const renderToolCardLive = (tool: ActiveTool, caps: Capabilities, now: number): string[] => {
   const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatElapsed(now - tool.startedAt);
+  const elapsed = formatChipDuration(now - tool.startedAt);
   const head = paint(caps, 'warn', `${spinner} ${tool.activeVerb}…  [${elapsed}]`);
   const lines: string[] = [head];
 

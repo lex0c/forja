@@ -10,7 +10,7 @@
 // Format mirrors the thinking and assistant chips so the
 // operator's eye reads them as the same family of indicator:
 //
-//   ▸ Awaiting model… (12s)
+//   ▸ Awaiting model…  [12s]
 //
 // Mutual exclusion: when `thinking` or `pendingAssistant` is
 // set, that chip takes the slot. The compose layer's chip-slot
@@ -19,16 +19,8 @@
 
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { formatChipDuration } from './duration.ts';
 import { spinnerGlyph } from './tool-card.ts';
-
-const formatElapsed = (ms: number): string => {
-  // Same clamp as thinking-chip / assistant-chip: clock skew
-  // (producer's startedAt > now) clamps to 0 in ms, not seconds,
-  // so a single skew tick doesn't visually jump units.
-  if (ms < 0) return '0ms';
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-};
 
 export const renderAwaitingChip = (
   awaiting: NonNullable<LiveState['awaitingProvider']>,
@@ -36,12 +28,12 @@ export const renderAwaitingChip = (
   now: number,
 ): string[] => {
   const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatElapsed(now - awaiting.startedAt);
+  const elapsed = formatChipDuration(now - awaiting.startedAt);
   // `secondary` palette (SGR 90 bright-black, visibly grey)
   // rather than `warn` (yellow) so a long wait doesn't read as
   // an alarm — it's normal for some prompts. The thinking chip
   // uses warn because extended thinking with a real cost
   // implication is more notable; awaiting is just "we asked
   // and we're waiting".
-  return [paint(caps, 'secondary', `${spinner} Awaiting model… (${elapsed})`)];
+  return [paint(caps, 'secondary', `${spinner} Awaiting model…  [${elapsed}]`)];
 };

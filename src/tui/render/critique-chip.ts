@@ -20,16 +20,8 @@
 
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { formatChipDuration } from './duration.ts';
 import { spinnerGlyph } from './tool-card.ts';
-
-const formatElapsed = (ms: number): string => {
-  // Same clamp as thinking-chip / assistant-chip: clock skew
-  // (producer's startedAt > now) clamps to 0 in ms, not seconds,
-  // so a single skew tick doesn't visually jump units.
-  if (ms < 0) return '0ms';
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-};
 
 export const renderCritiqueChip = (
   critique: NonNullable<LiveState['critique']>,
@@ -37,7 +29,7 @@ export const renderCritiqueChip = (
   now: number,
 ): string[] => {
   const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatElapsed(now - critique.startedAt);
+  const elapsed = formatChipDuration(now - critique.startedAt);
   // Verb is fixed (no spinner-verbs pool) — the critic's role is
   // narrow enough that variation would feel cute rather than
   // informative. "Reviewing" reads as "second pair of eyes", which
@@ -46,5 +38,5 @@ export const renderCritiqueChip = (
     ? 'Reviewing tool plan' // about to mutate — emphasis on the plan
     : 'Reviewing output'; //   text-only end-of-step
   const color = critique.toolPlanWrites ? 'error' : 'warn';
-  return [paint(caps, color, `${spinner} ${label}… (${elapsed})`)];
+  return [paint(caps, color, `${spinner} ${label}…  [${elapsed}]`)];
 };

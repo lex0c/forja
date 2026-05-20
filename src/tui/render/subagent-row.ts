@@ -22,6 +22,7 @@
 // keeps the terminal verdict.
 
 import { type Capabilities, paint } from '../term.ts';
+import { formatCoarseDuration } from './duration.ts';
 
 const ACTIVE_GLYPH = { unicode: '▸', ascii: '>' } as const;
 
@@ -35,15 +36,6 @@ const truncate = (s: string, max: number): string => {
   const trimmed = s.replace(/\s+/g, ' ').trim();
   if (trimmed.length <= max) return trimmed;
   return `${trimmed.slice(0, max - 1)}…`;
-};
-
-const formatDuration = (ms: number): string => {
-  if (ms < 1000) return `${ms}ms`;
-  const totalSec = Math.round(ms / 1000);
-  if (totalSec < 60) return `${totalSec}s`;
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return s === 0 ? `${m}m` : `${m}m${s}s`;
 };
 
 export interface SubagentRowState {
@@ -82,7 +74,7 @@ export const renderSubagentRows = (
       sub.progress.length > 0
         ? truncate(sub.progress, MAX_DETAIL)
         : truncate(`booting · ${sub.goal}`, MAX_DETAIL);
-    const elapsed = formatDuration(Math.max(0, now - sub.startedAt));
+    const elapsed = formatCoarseDuration(Math.max(0, now - sub.startedAt));
     // Cost chip: a 6-cent precision dollar amount when the
     // child has reported any spend. Suppressed at 0 so test
     // fixtures (zero-cost mock providers) and free-tier runs

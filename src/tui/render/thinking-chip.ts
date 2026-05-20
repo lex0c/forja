@@ -18,7 +18,7 @@
 // output pool — see `spinner-verbs.ts` for the full rationale).
 //
 // Format:
-//   ▸ Synthesizing… (8s)
+//   ▸ Synthesizing…  [8s]
 //
 // No token counter. Anthropic's extended thinking emits
 // `thinking_delta` events without a usable per-token signal at
@@ -36,17 +36,9 @@
 
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { formatChipDuration } from './duration.ts';
 import { pickCognitiveVerb } from './spinner-verbs.ts';
 import { spinnerGlyph } from './tool-card.ts';
-
-const formatElapsed = (ms: number): string => {
-  // Same clamp as assistant-chip.ts: clock skew (producer's
-  // startedAt > now) clamps to 0 in ms, not seconds, so a single
-  // skew tick doesn't visually jump units.
-  if (ms < 0) return '0ms';
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-};
 
 export const renderThinkingChip = (
   thinking: NonNullable<LiveState['thinking']>,
@@ -54,7 +46,7 @@ export const renderThinkingChip = (
   now: number,
 ): string[] => {
   const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatElapsed(now - thinking.startedAt);
+  const elapsed = formatChipDuration(now - thinking.startedAt);
   const verb = pickCognitiveVerb(thinking.messageId);
-  return [paint(caps, 'warn', `${spinner} ${verb}… (${elapsed})`)];
+  return [paint(caps, 'warn', `${spinner} ${verb}…  [${elapsed}]`)];
 };

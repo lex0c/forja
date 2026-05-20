@@ -57,9 +57,9 @@ describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)',
     expect(renderToolCardLive(tool(), unicode, 850)[0]).toContain('[850ms]');
   });
 
-  test('elapsed clamps to 0s if now < startedAt', () => {
+  test('elapsed clamps to 0ms if now < startedAt', () => {
     const t: ActiveTool = { ...tool(), startedAt: 1000 };
-    expect(renderToolCardLive(t, unicode, 500)[0]).toContain('[0s]');
+    expect(renderToolCardLive(t, unicode, 500)[0]).toContain('[0ms]');
   });
 
   test('subject renders as sub-content under `└─ ` (Unicode)', () => {
