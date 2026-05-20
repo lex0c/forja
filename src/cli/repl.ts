@@ -61,6 +61,7 @@ import {
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
+import { resolveResumeIdOnDb } from './run.ts';
 import {
   type SlashContext,
   createBuiltinRegistry,
@@ -822,6 +823,34 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
   }
 
+  // Resume resolution. `--resume <id|last>` with empty prompt routes
+  // here from `cli/index.ts` (the headless run.ts path stays guarded
+  // by `--resume requires a follow-up prompt`). resolveResumeIdOnDb
+  // shares the literal-id / 'last' / subagent-rejection rules with
+  // the headless code path so the operator sees the same diagnostics
+  // either way. A bad id aborts the REPL boot before the TUI takes
+  // over so the operator's terminal stays clean — entering the live
+  // region only to immediately tear it down would flash an empty
+  // frame and a cursor that briefly disappeared.
+  //
+  // On success, the resolved id seeds `lastSessionId` (declared
+  // below) so the first turn's runAgent gets `resumeFromSessionId`
+  // and the LLM sees the prior conversation. The visual replay of
+  // the prior turns (rebuilding scrollback from persisted messages)
+  // lands in a subsequent slice; this slice closes the gate +
+  // context-threading half of the feature.
+  let resumedSessionId: string | null = null;
+  if (args.resume !== undefined) {
+    const resolved = resolveResumeIdOnDb(db, args.resume, baseConfig.cwd);
+    if (!resolved.ok) {
+      errSink(`forja: ${resolved.message}\n`);
+      tearDownPreBootstrap();
+      db.close();
+      return 1;
+    }
+    resumedSessionId = resolved.id;
+  }
+
   const project = basename(baseConfig.cwd) || baseConfig.cwd;
 
   // Snapshot the adapter context fresh for every turn. Mutation slash
@@ -885,7 +914,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `onData` / `cancelDrain` / `onModalInterrupt` are all hoisted
   // above the trust prompt — see "Pre-bootstrap stack" earlier in
   // this function.
-  let lastSessionId: string | null = null;
+  // Seeded by `--resume` resolution above (null when the operator
+  // started a fresh REPL). On resume, this id flows through the
+  // first turn's `resumeFromSessionId` so the LLM sees the prior
+  // conversation, and the shutdown hint prints the same id so the
+  // chain can continue across boots.
+  let lastSessionId: string | null = resumedSessionId;
   // Append-only list of session ids tracked across this REPL
   // boot. Pushed on `session_finished` and on playbook subagent
   // completion. /critique aggregates across this list so an
@@ -901,6 +935,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     replSessionIdSet.add(id);
     replSessionIdOrder.push(id);
   };
+  // Seed the tracking list with the resumed id so /critique can
+  // aggregate across both the resumed chain AND new turns added in
+  // this boot. Without this seed, /critique would only see runs
+  // started in the current boot, hiding any prior critique data
+  // tied to the resumed session.
+  if (resumedSessionId !== null) trackReplSessionId(resumedSessionId);
 
   // Synthetic parent session id for slash playbook dispatches that
   // happen BEFORE any normal turn has run. `runSubagent` requires a
@@ -2592,6 +2632,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // capability indicators (rendered as `✓ name` in success palette),
   // `meta` for non-binary key:value (rendered dim).
   const env: SessionBannerEvent['env'] = [];
+  if (resumedSessionId !== null) {
+    // Short id (first 8 chars of the UUID head) — full id is 36
+    // chars and would crowd the banner; the head is unique enough
+    // for visual confirmation and `/list-sessions` shows the full
+    // form for anyone who needs to copy it.
+    env.push({ kind: 'meta', key: 'resumed', value: resumedSessionId.slice(0, 8) });
+  }
   if (subagents.byName.size > 0) {
     env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
   }

@@ -1,5 +1,12 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
-import { defaultDbPath, getSession, listSessions, migrate, openDb } from '../storage/index.ts';
+import {
+  type DB,
+  defaultDbPath,
+  getSession,
+  listSessions,
+  migrate,
+  openDb,
+} from '../storage/index.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
@@ -72,6 +79,54 @@ export const exitCodeFor = (result: HarnessResult): number => {
 // Lives outside the main `run()` flow because list-sessions and
 // resume both need the same DB-only pre-step before deciding
 // whether to enter the harness path.
+//
+// Inner form takes an open db so callers that already have one
+// (REPL boot) don't open a second connection. The outer form below
+// keeps the legacy "give me a path, I'll open + close" shape that
+// run.ts's pre-bootstrap branch was built on.
+export const resolveResumeIdOnDb = (
+  db: DB,
+  resume: string,
+  cwd: string,
+): { ok: true; id: string } | { ok: false; message: string } => {
+  if (resume === 'last') {
+    const sessions = listSessions(db, { limit: 1, cwd });
+    const first = sessions[0];
+    if (first === undefined) {
+      return {
+        ok: false,
+        message: `no sessions found to resume (with 'last') for cwd '${cwd}'`,
+      };
+    }
+    return { ok: true, id: first.id };
+  }
+  // Literal id path. Validate upfront so a typo'd id fails with
+  // a clean errSink message before bootstrap. Without this
+  // pre-check, the throw inside runAgent's init block lands in
+  // guardedFinish and surfaces as an internalError exit (1)
+  // with no diagnostic on stderr — confusing for users.
+  const existing = getSession(db, resume);
+  if (existing === null) {
+    return { ok: false, message: `session ${resume} not found` };
+  }
+  if (existing.isSubagent) {
+    // O5 C-block. Subagent sessions can't be resumed cleanly
+    // because --resume restores messages but NOT the system
+    // prompt or the tools whitelist — the resumed run would
+    // get the parent's full registry and an empty system
+    // prompt, diverging from how the subagent originally ran.
+    // The audit snapshot from migration 012 enables future
+    // re-hydration (O5b in BACKLOG) but the semantics need
+    // proper design (budget conflicts, plan mode, missing
+    // tools). For now we refuse and point at task().
+    return {
+      ok: false,
+      message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
+    };
+  }
+  return { ok: true, id: resume };
+};
+
 const resolveResumeId = (
   resume: string,
   dbPath: string,
@@ -80,42 +135,7 @@ const resolveResumeId = (
   const db = openDb(dbPath);
   try {
     migrate(db);
-    if (resume === 'last') {
-      const sessions = listSessions(db, { limit: 1, cwd });
-      const first = sessions[0];
-      if (first === undefined) {
-        return {
-          ok: false,
-          message: `no sessions found to resume (with 'last') for cwd '${cwd}'`,
-        };
-      }
-      return { ok: true, id: first.id };
-    }
-    // Literal id path. Validate upfront so a typo'd id fails with
-    // a clean errSink message before bootstrap. Without this
-    // pre-check, the throw inside runAgent's init block lands in
-    // guardedFinish and surfaces as an internalError exit (1)
-    // with no diagnostic on stderr — confusing for users.
-    const existing = getSession(db, resume);
-    if (existing === null) {
-      return { ok: false, message: `session ${resume} not found` };
-    }
-    if (existing.isSubagent) {
-      // O5 C-block. Subagent sessions can't be resumed cleanly
-      // because --resume restores messages but NOT the system
-      // prompt or the tools whitelist — the resumed run would
-      // get the parent's full registry and an empty system
-      // prompt, diverging from how the subagent originally ran.
-      // The audit snapshot from migration 012 enables future
-      // re-hydration (O5b in BACKLOG) but the semantics need
-      // proper design (budget conflicts, plan mode, missing
-      // tools). For now we refuse and point at task().
-      return {
-        ok: false,
-        message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
-      };
-    }
-    return { ok: true, id: resume };
+    return resolveResumeIdOnDb(db, resume, cwd);
   } finally {
     db.close();
   }

@@ -164,8 +164,12 @@ const main = async (): Promise<number> => {
   //   - --undo / --checkpoints: DB + git only, no provider call.
   // For everything else, an empty prompt enters the interactive
   // REPL (UI.md §2 — `forja` with no prompt opens the inline TUI).
-  // Resume's empty-prompt check fires inside run() with a more
-  // specific error so the user knows --resume needs a follow-up.
+  // `--resume` with empty prompt now also enters the REPL — the
+  // operator's intent is "reopen the conversation visually and keep
+  // going", not "run one headless turn against the prior session".
+  // run.ts still rejects --resume + empty prompt in the headless
+  // path it owns (--json / piped); that branch is unreachable here
+  // because the REPL gate fires first.
   const promptOptional =
     args.listSessions ||
     args.undo !== undefined ||
@@ -203,7 +207,7 @@ const main = async (): Promise<number> => {
     // `agent gc` (§2.1.3) — retention sweep. Lifecycle mode; no
     // prompt, no provider, no REPL.
     args.gc !== undefined;
-  if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
+  if (args.prompt.length === 0 && !promptOptional) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop
     // that nobody can drive.

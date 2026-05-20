@@ -3702,6 +3702,184 @@ describe('repl — slash commands integration', () => {
   });
 });
 
+describe('repl — --resume gating + session seed (Phase 1)', () => {
+  // `--resume <id|last>` with empty prompt now routes to the REPL
+  // (cli/index.ts). repl.ts resolves the id against the DB via
+  // resolveResumeIdOnDb and seeds `lastSessionId` so the first turn
+  // threads `resumeFromSessionId` to the harness. Visual scrollback
+  // replay lands in a follow-up slice.
+
+  test('unknown id aborts boot with exit 1 and a clean diagnostic (no TUI flash)', async () => {
+    const stub = makeBootstrapStub();
+    const stdin = makeStdin();
+    const errs: string[] = [];
+    const rendererWrites: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'does-not-exist' }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+      rendererWrite: (s) => {
+        rendererWrites.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('session does-not-exist not found');
+    // No live region drew — the boot aborts BEFORE the renderer
+    // emits any frame. The renderer's pre-bootstrap hook does
+    // write the bracketed-paste enable sequence, so we don't assert
+    // rendererWrites is empty; we assert no session:banner line
+    // (which would only land after the banner emit, well past the
+    // resume gate).
+    expect(rendererWrites.join('')).not.toContain('forja v');
+  });
+
+  test("'last' with no prior sessions aborts boot with cwd-scoped diagnostic", async () => {
+    const stub = makeBootstrapStub();
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'last' }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    const all = errs.join('');
+    expect(all).toContain("no sessions found to resume (with 'last')");
+    // Diagnostic names the cwd so the operator can tell if the
+    // resolver looked at the wrong tree (multi-repo gotcha).
+    expect(all).toContain('/tmp/forja-repl-test');
+  });
+
+  test('subagent session id is refused (parent-only contract)', async () => {
+    const stub = makeBootstrapStub();
+    // is_subagent=true makes the session unresumable per the O5
+    // C-block in resolveResumeIdOnDb.
+    createSession(stub.db, {
+      id: 'sub-sess-1',
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+      isSubagent: true,
+    });
+    const errs: string[] = [];
+    const promise = runRepl({
+      args: makeArgs({ resume: 'sub-sess-1' }),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(await promise).toBe(1);
+    expect(errs.join('')).toContain('cannot --resume a subagent session');
+  });
+
+  test('valid id seeds lastSessionId — first turn threads resumeFromSessionId', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-prior-real';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Fire the first prompt; the harness call should carry the
+    // resumed id (not undefined, which is the fresh-session shape).
+    stdin.feed('continue\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.resumeFromSessionId).toBe(resumedId);
+    // Wrap up cleanly.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('valid id reflected in banner env as `resumed: <short>`', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-abcdef-the-rest-is-padding';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Banner env renders `resumed: <first 8 chars of the id>`.
+    // The short form keeps the banner readable on 80-col terminals
+    // while still letting the operator visually confirm which
+    // session they reopened.
+    const all = writes.join('');
+    expect(all).toContain('resumed');
+    expect(all).toContain(resumedId.slice(0, 8));
+    // Exit cleanly.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('resume hint at exit prints the SAME id (chain continues across boots)', async () => {
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-chain-anchor';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    const errs: string[] = [];
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        errs.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+    // The exit hint reuses lastSessionId — when no turn ran in this
+    // boot, the resumed id is still the canonical id to point at.
+    const all = errs.join('');
+    expect(all).toContain('Resume this session with:');
+    expect(all).toContain(`forja --resume ${resumedId}`);
+  });
+});
+
 describe('repl — Alt+R recap terse (RECAP §3.3)', () => {
   test('Alt+R before any session emits a warn, no info line, no audit row', async () => {
     // Spec gate (`lastSessionId === null`): there's nothing to
