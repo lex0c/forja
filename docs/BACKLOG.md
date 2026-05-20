@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] decision — markdown slice B (streaming) dropped
+
+Slice B rested on a wrong premise: that the assistant's prose shows plain while streaming and flips to Markdown at turn end. It does not — the live region shows only the progress chip (`renderAssistantChip`) while streaming; the prose is never displayed until `assistant:end`, where `renderMarkdown` runs once. No flip, so no incremental render to add. The `UI.md §4.11` "Streaming" paragraph (committed in `1f0ad04` with that wrong claim) is corrected to match. Showing streaming prose would be a new live-region feature against `§6.5` (the live region is summary, not detail) — the operator's call was to keep the current chip behavior. Slice A stays complete; slice C (table degradation) stays open.
+
 ## [2026-05-20] docs(spec) — markdown rendering + density rule aligned into the spec
 
 The slice-A markdown work landed code-first (operator's call — iterate, align the spec after); the spec now catches up. `UI.md` gains `§4.11` "Markdown rendering" — the `renderMarkdown` pipeline, the GFM subset, the render-only invariant, the streaming / Fatia-B deferral, and "Markdown does not govern critical layout". `§6` reconciled: `italic` / `strikethrough` tokens in the palette, `accent` re-scoped to also cover inline code, `§6.4` allows the `bold + accent` nesting. `AGENTIC_CLI §3` drops "deps mínimas" and lists `remark` + `remark-gfm`. `CONTEXT_TUNING §1.5` + the §1.8 canonical prompt carry the density line. `§13` / `§14` reviewed, left as-is — the renderer respects the non-goals and the inline / no-framework thesis. All `docs/spec/` edits in PT-BR, per the spec's language.
@@ -24,7 +28,7 @@ The model's prose now renders as GitHub-flavored Markdown in the TUI instead of 
 
 **`term.ts`** gains `italic` (`CSI 3m`) and `strikethrough` (`CSI 9m`) SGR tokens — Markdown emphasis needs them; text attributes, not colors, degrade gracefully where unsupported.
 
-**Deferred (`docs/TODO.md`):** slice B (streaming — incremental render on `assistant:delta`; until then a streaming turn shows plain text and settles into Markdown at `assistant:end`), slice C (table degradation for narrow terminals), syntax highlighting (fights the `§6.1` palette), and the spec alignment (`UI.md` markdown section + `§6` evolution, `§3` deps, `§13`/`§14` reconciled).
+**Deferred (`docs/TODO.md`):** slice B (streaming render — later dropped; see the decision entry above), slice C (table degradation for narrow terminals), syntax highlighting (fights the `§6.1` palette), and the spec alignment (`UI.md` markdown section + `§6` evolution, `§3` deps, `§13`/`§14` reconciled).
 
 **Tests.** New `markdown.test.ts` (16 — every block + inline element, the GFM-table fallback, word-wrap, ASCII fallback, the colored SGR runs, empty input). `permanent.test.ts` — the trailing-newline test re-pinned: the parser normalizes a trailing `\n` away, so it no longer leaves a spurious empty line. `bun test tests/tui/` 828 green, `tests/cli/` 1822 green; `typecheck` + `lint` clean.
 

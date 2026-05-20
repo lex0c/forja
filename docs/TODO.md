@@ -298,14 +298,14 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 ## Markdown rendering — GFM on the assistant block (output "like Claude Code")
 
-**Status:** Fatia A + spec-alignment shipped; B / C parked here.
+**Status:** Fatia A + spec-alignment shipped; B dropped; C (tables) parked.
 
 **What it is:** the model's prose (the `assistant` `PermanentItem`) renders as GitHub-flavored Markdown in the TUI instead of raw text. Operator decision: `remark` + `remark-gfm`, iterate in code, align the spec afterwards. Markdown is a *render* concern only — the `PermanentItem` keeps `text: string`, the reducer is untouched; `formatPermanent`'s `assistant` case delegates to a new `renderMarkdown(src, caps)`.
 
 **Slices:**
 
-- **A — static render:** ✅ shipped — `42c8ba9` (renderer + `permanent.ts` wire-up), `d3191cb` (inline code in accent blue). Full subset + tests in `docs/BACKLOG.md`. Streaming still emits plain text — that is slice B.
-- **B — streaming:** incremental render on `assistant:delta` — re-parse of the partial (open fence, half list). Removes the plain→markdown flip.
+- **A — static render:** ✅ shipped — `42c8ba9` (renderer + `permanent.ts` wire-up), `d3191cb` (inline code in accent blue). Full subset + tests in `docs/BACKLOG.md`.
+- **B — streaming:** ❌ dropped — premise was wrong. The live region shows only the assistant progress chip while streaming; the prose is never displayed until `assistant:end`, so there is no plain→markdown flip to remove. Displaying streaming prose would be a new live-region feature against §6.5 — out of scope; operator chose to keep the chip.
 - **C — tables:** GFM table with narrow-terminal degradation (stack / collapse).
 
 **Spec alignment:** ✅ done — `UI.md §4.11` (new markdown-rendering section), `§6` (italic / strikethrough tokens, `accent` re-scoped to inline code), `AGENTIC_CLI §3` (the `remark` deps), `CONTEXT_TUNING §1.5` + the §1.8 canonical prompt (density rule). `UI.md §13`/`§14` reviewed and left as-is — the renderer respects the non-goals (links without OSC 8, fixed palette, static tables) and the inline / no-framework thesis.

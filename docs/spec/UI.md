@@ -728,7 +728,7 @@ function renderMarkdown(src: string, caps: Capabilities): string[]
 
 Inline: `bold` (`**…**`), `italic` (`*…*`), inline code (`accent`), strikethrough (`~~…~~`), link (texto + URL em `dim`). Os atributos se aninham via uma pilha — cada run de texto se pinta inteiro com `paintMulti`, nunca `paint` aninhado (o reset interno apagaria o atributo externo).
 
-**Streaming.** Durante o streaming (`assistant:delta`) a prosa sai como texto plain; ao fechar o turno (`assistant:end`) o bloco entra no scrollback e assenta como Markdown renderizado. O render incremental durante o stream é deferido (`docs/TODO.md`, Fatia B) — re-parsear Markdown parcial (fence aberto, tabela pela metade) a cada delta é o custo que justifica o adiamento.
+**Streaming.** A prosa não aparece enquanto o turno streama: a região viva mostra só o chip de progresso do assistant (verbo + contador), coerente com §6.5 — a região viva é sumário, não detalhe. O `renderMarkdown` roda uma vez, no `assistant:end`, quando o texto inteiro entra no scrollback já renderizado. Não há render incremental nem flip plain→markdown — a prosa nunca é exibida crua.
 
 **Markdown não rege layout crítico.** Só a prosa do `assistant` passa por `renderMarkdown`. Tool cards (§4.1, §4.10.5), modais (§4.6-§4.9), diffs e o footer continuam componentes nativos com render próprio — Markdown é uma linguagem de *conteúdo*, não o protocolo de runtime da UI.
 
