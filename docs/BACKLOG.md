@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] test(harness) — wire the bash parser in invoke-tool.test.ts
+
+The slice-2 review surfaced two `plan mode: planSafe …` tests failing in `tests/harness/invoke-tool.test.ts` — `planSafe` tools refused when they should execute. Root cause was a setup gap, not a production bug: the plan-safe tests use a `bash`-category tool, so they reach `engine.check`, and the bash resolver needs the tree-sitter parser (`initBashParser()`) ready to decompose the command. Production wires that in `bootstrap-engine.ts`; this test file never did — the resolver refused with `parser unavailable` and the engine fell through to strict default-deny. The `planSafe`-blocks test passed only because the plan-mode block short-circuits it before `engine.check` ever runs.
+
+Fix: `await initBashParser()` in the file's `beforeEach`, mirroring `dispatch-rewrite-audit.test.ts` and the `tests/permissions/` suites. Test-only — no production code touched. `bun test tests/harness/invoke-tool.test.ts` 40 green.
+
 ## [2026-05-20] feat(tui) — compact tool cards (slice 2): output-truncation hint
 
 Slice 2 of the card line. A tool whose result was capped — bash `max_bytes`, grep / glob `max_results`, the read_file window — now shows a `… output truncated (ctrl+o to expand)` line under its finished card, so the operator sees the model's view of the result has more behind it.

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { invokeTool } from '../../src/harness/invoke-tool.ts';
 import type { HookChainResult, HookEventPayload } from '../../src/hooks/index.ts';
+import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
@@ -81,9 +82,14 @@ const policy = (p: Partial<Policy>): Policy => ({
 let db: DB;
 let messageId: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   db = openMemoryDb();
   migrate(db);
+  // The bash resolver needs the tree-sitter parser ready before the
+  // permission engine can decompose a bash command — the plan-mode
+  // tests exercise real `bash` through the engine. Production wires
+  // this in bootstrap; other harness tests mirror it in their setup.
+  await initBashParser();
   const s = createSession(db, { model: 'm', cwd: '/p' });
   messageId = appendMessage(db, { sessionId: s.id, role: 'assistant', content: 'x' }).id;
 });
