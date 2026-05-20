@@ -80,6 +80,7 @@ Global, aplica a todo step:
 ```
 Output formato: prosa concisa OR tool_use estruturado.
 Sem prefácio. Sem disclaimers. Sem "I'll start by...". Aja.
+Cada frase muda o que o leitor sabe ou faz a seguir.
 ```
 
 Em playbook: substituído por output_schema específico.
@@ -130,6 +131,7 @@ Git branch: main
 
 Output formato: prosa concisa OR tool_use estruturado.
 Sem prefácio. Sem disclaimers. Sem "I'll start by...". Aja.
+Cada frase muda o que o leitor sabe ou faz a seguir.
 
 NÃO invente arquivos/funções sem ler/grep.
 NÃO assuma sucesso sem evidência (tool result, test pass).

@@ -298,17 +298,17 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 ## Markdown rendering — GFM on the assistant block (output "like Claude Code")
 
-**Status:** Fatia A done (`42c8ba9`); B / C and spec-alignment parked here.
+**Status:** Fatia A + spec-alignment shipped; B / C parked here.
 
 **What it is:** the model's prose (the `assistant` `PermanentItem`) renders as GitHub-flavored Markdown in the TUI instead of raw text. Operator decision: `remark` + `remark-gfm`, iterate in code, align the spec afterwards. Markdown is a *render* concern only — the `PermanentItem` keeps `text: string`, the reducer is untouched; `formatPermanent`'s `assistant` case delegates to a new `renderMarkdown(src, caps)`.
 
 **Slices:**
 
-- **A — static render** (this session): the dep + `src/tui/render/markdown.ts` + the `permanent.ts` wire-up + tests. Subset: heading, paragraph, list (incl. task list), blockquote, code fence, hr, inline (bold / italic / code / strikethrough / link). Streaming still emits plain text; the block settles into Markdown at `assistant:end`.
+- **A — static render:** ✅ shipped — `42c8ba9` (renderer + `permanent.ts` wire-up), `d3191cb` (inline code in accent blue). Full subset + tests in `docs/BACKLOG.md`. Streaming still emits plain text — that is slice B.
 - **B — streaming:** incremental render on `assistant:delta` — re-parse of the partial (open fence, half list). Removes the plain→markdown flip.
 - **C — tables:** GFM table with narrow-terminal degradation (stack / collapse).
 
-**Spec alignment (deferred):** `UI.md` gains a markdown-render section + evolved `§6` palette / typography; `AGENTIC_CLI §3` lists `remark` / `remark-gfm` among the TUI deps; `§13` / `§14` reconciled with the new reality. The density rule ("every sentence changes what the reader knows or does next") landed in `response-format.ts`; its `CONTEXT_TUNING §1.5` spec line aligns with the rest of this list.
+**Spec alignment:** ✅ done — `UI.md §4.11` (new markdown-rendering section), `§6` (italic / strikethrough tokens, `accent` re-scoped to inline code), `AGENTIC_CLI §3` (the `remark` deps), `CONTEXT_TUNING §1.5` + the §1.8 canonical prompt (density rule). `UI.md §13`/`§14` reviewed and left as-is — the renderer respects the non-goals (links without OSC 8, fixed palette, static tables) and the inline / no-framework thesis.
 
 **Open decision:** syntax highlighting of code fences — fights the `§6.1` 8-colour palette; parked until the palette question is settled.
 

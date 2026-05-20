@@ -2,9 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] docs(spec) — markdown rendering + density rule aligned into the spec
+
+The slice-A markdown work landed code-first (operator's call — iterate, align the spec after); the spec now catches up. `UI.md` gains `§4.11` "Markdown rendering" — the `renderMarkdown` pipeline, the GFM subset, the render-only invariant, the streaming / Fatia-B deferral, and "Markdown does not govern critical layout". `§6` reconciled: `italic` / `strikethrough` tokens in the palette, `accent` re-scoped to also cover inline code, `§6.4` allows the `bold + accent` nesting. `AGENTIC_CLI §3` drops "deps mínimas" and lists `remark` + `remark-gfm`. `CONTEXT_TUNING §1.5` + the §1.8 canonical prompt carry the density line. `§13` / `§14` reviewed, left as-is — the renderer respects the non-goals and the inline / no-framework thesis. All `docs/spec/` edits in PT-BR, per the spec's language.
+
 ## [2026-05-20] feat(cli) — per-sentence density rule in the response-surface prompt
 
 `RESPONSE_FORMAT_PROMPT` (`src/cli/response-format.ts`) gains the density principle the operator asked for — *"every sentence should change what the reader knows or does next"* — prepended to the one-sentence-answer / no-pad bullet, framed as the principle those measurable rules derive from. New presence test in `response-format.test.ts`. The matching `CONTEXT_TUNING §1.5` spec line stays parked with the rest of the markdown-render spec alignment (`docs/TODO.md`).
+
+## [2026-05-20] feat(tui) — inline code rendered in accent blue
+
+`renderMarkdown` paints `inlineCode` spans with the `accent` token (blue, SGR 94) instead of `secondary` (grey). Inline code is the prose's most frequent technical anchor — flags, paths, identifiers — and blue lifts it off the greyscale. Reuses the `accent` token, which `term.ts` reserves for layout chrome (the modal rule today); the `§6` palette alignment revisits accent-vs-own-token. Commit `d3191cb`; `markdown.test.ts` colored-SGR assertion updated.
 
 ## [2026-05-20] feat(tui) — markdown rendering slice A: GFM render on the assistant block
 

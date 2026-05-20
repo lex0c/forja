@@ -702,6 +702,38 @@ Atalhos:
 - **`Why?` explanation** — antiga `[w]` da §4.6. Preview tool-aware já carrega `matched policy rule: ...` quando o tool veio de uma `confirm` decision do engine; explicação adicional fica como expansion futura via `(ctrl+i for risk details)` ou similar.
 - **Outros flavors visuais** (trust, memory-write, plan-review, critique). Compartilham o `ConfirmState` shape de §5.5; layout específico de cada um lands no slice que conectar o producer correspondente.
 
+### 4.11 Markdown rendering (prosa do assistant)
+
+A prosa do assistant — o texto que o modelo produz num turno, renderizado no scrollback como o `assistant` block — chega como **Markdown GitHub-flavored**: o modelo é instruído a formatar assim (`CONTEXT_TUNING §1.5`, bloco `# Response surface`). A TUI renderiza esse Markdown em vez de imprimir o texto cru.
+
+```ts
+function renderMarkdown(src: string, caps: Capabilities): string[]
+```
+
+**Render-only.** Markdown é detalhe de render, não de estado: o `PermanentItem` do `assistant` guarda `text: string` (o Markdown cru), e o reducer e o event bus nunca veem a árvore. `renderMarkdown` é o único ponto onde o texto é parseado e percorrido — chamado pelo render do `assistant` block, uma vez quando o item entra no scrollback.
+
+**Pipeline.** `remark` + `remark-gfm` parseiam pra uma árvore `mdast`; um walk recursivo mapeia cada nó nos primitivos de §6 e devolve `string[]` — linhas sem frame margin, o caller aplica o padding de §6.3.
+
+**Subconjunto suportado (GFM):**
+
+| Bloco | Render |
+|---|---|
+| heading | `bold`, linha em branco antes |
+| paragraph | word-wrap na largura útil (`cols - 2`) |
+| list / ordered / task list | marcador `•` / `N.` / `[x]` + indent; aninhamento indenta |
+| code fence | `dim`, indentado 2 colunas, **sem** syntax highlighting |
+| blockquote | prefixo `│` em `secondary` |
+| thematic break | régua `─` |
+| table | Fatia A: células por separador `dim`; degradação pra terminal estreito é Fatia C |
+
+Inline: `bold` (`**…**`), `italic` (`*…*`), inline code (`accent`), strikethrough (`~~…~~`), link (texto + URL em `dim`). Os atributos se aninham via uma pilha — cada run de texto se pinta inteiro com `paintMulti`, nunca `paint` aninhado (o reset interno apagaria o atributo externo).
+
+**Streaming.** Durante o streaming (`assistant:delta`) a prosa sai como texto plain; ao fechar o turno (`assistant:end`) o bloco entra no scrollback e assenta como Markdown renderizado. O render incremental durante o stream é deferido (`docs/TODO.md`, Fatia B) — re-parsear Markdown parcial (fence aberto, tabela pela metade) a cada delta é o custo que justifica o adiamento.
+
+**Markdown não rege layout crítico.** Só a prosa do `assistant` passa por `renderMarkdown`. Tool cards (§4.1, §4.10.5), modais (§4.6-§4.9), diffs e o footer continuam componentes nativos com render próprio — Markdown é uma linguagem de *conteúdo*, não o protocolo de runtime da UI.
+
+**Não-objetivos do render:** syntax highlighting de code fence (puxaria cores fora da paleta de §6.1 — deferido); OSC 8 hyperlinks (§13); HTML embutido (renderizado como texto literal).
+
 ---
 
 ## 5. Padrões de interação
@@ -944,15 +976,17 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 | `default` | texto normal | (sem escape) |
 | `dim` | meta, hints, separadores (réguas, footer, sub-content `└─`) | `\x1b[2m` (faint) |
 | `secondary` | marker visivelmente grey que precisa se separar do conteúdo primário (turn-end `Cogitated for X`, §3.2) | `\x1b[90m` (bright-black ≈ grey) |
-| `accent` | structural anchors que precisam destacar do greyscale baseline — top rule + título de modal hoje | `\x1b[94m` (bright blue) |
-| `bold` | ênfase, header de modal | `\x1b[1m` |
+| `accent` | structural anchors (top rule + título de modal) e inline code de Markdown na prosa do assistant (§4.11) | `\x1b[94m` (bright blue) |
+| `bold` | ênfase, header de modal, headings de Markdown (§4.11) | `\x1b[1m` |
+| `italic` | ênfase de Markdown (`*…*`) na prosa do assistant (§4.11) | `\x1b[3m` |
+| `strikethrough` | `~~…~~` de Markdown na prosa do assistant (§4.11) | `\x1b[9m` |
 | `error` | mensagens de erro, status falho | `\x1b[31m` |
 | `warn` | avisos, budget 80% | `\x1b[33m` |
 | `success` | pipeline badges (`✓`) e indicadores binários de capability habilitada no banner env (§4.10.9) | `\x1b[32m` |
 
 **Sem cores não-listadas.** Sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. A tabela acima é a paleta inteira. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
 
-**Nota sobre `dim` vs `secondary` vs `accent`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2; matched-rule e hint footer no permission modal). **`accent`** (SGR 94 bright blue) é o token mais saturado da paleta, reservado pra structural chrome — top rule do modal e título do modal hoje. Os três SGRs são cores 16-color (cinza, cinza-bright, blue-bright), parte do baseline universal de qualquer terminal; o `accent` foi pesado contra a regra "sem azul" porque a estrutura do modal precisa de um anchor visual além do dim baseline pra ler como uma decisão deliberada e não como conteúdo de fluxo.
+**Nota sobre `dim` vs `secondary` vs `accent`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2; matched-rule e hint footer no permission modal). **`accent`** (SGR 94 bright blue) é o token mais saturado da paleta. Structural chrome (top rule e título de modal) e — desde o render de Markdown (§4.11) — inline code na prosa do assistant; inline code é a âncora técnica mais frequente da prosa (flags, paths, identificadores) e o azul a separa do greyscale. Os três SGRs são cores 16-color (cinza, cinza-bright, blue-bright), parte do baseline universal de qualquer terminal; o `accent` foi pesado contra a regra "sem azul" porque a estrutura do modal precisa de um anchor visual além do dim baseline pra ler como uma decisão deliberada e não como conteúdo de fluxo.
 
 `NO_COLOR` env var ou `--no-color`: desativa todos os escapes. `CLICOLOR_FORCE=1` ignora `!isTTY` e força cores (útil em log capture).
 
@@ -989,9 +1023,10 @@ Detecção: locale-aware (`LANG`/`LC_ALL` contém `UTF-8`) + check de width via 
 Terminal só tem uma fonte. Hierarquia vem de:
 - `bold` para títulos de modal e ênfase forte (1-2 palavras).
 - `dim` para meta (timestamps, paths secundários, hints).
+- `italic` / `strikethrough` para ênfase e `~~…~~` de Markdown, **restritos à prosa do assistant** (§4.11) — atributos de texto, não cor; degradam em terminais que os ignoram, e não entram em chrome.
 - `default` para tudo o mais.
 
-Combinações proibidas: `bold + dim` (briga visual), `bold + colorido` (exceto `error`).
+Combinações proibidas: `bold + dim` (briga visual), `bold + colorido` — exceto `error`, e exceto a prosa de Markdown, onde um inline code (`accent`) dentro de `**negrito**` produz `bold + accent` legitimamente (§4.11).
 
 ### 6.5 Densidade
 
