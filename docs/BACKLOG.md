@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — compact tool cards (slice 2): output-truncation hint
+
+Slice 2 of the card line. A tool whose result was capped — bash `max_bytes`, grep / glob `max_results`, the read_file window — now shows a `… output truncated (ctrl+o to expand)` line under its finished card, so the operator sees the model's view of the result has more behind it.
+
+The roadmap pencilled this as `+N lines`, but exploring the harness ruled out an exact count: the `tool_result` the model consumes is JSON-stringified (newlines escaped — a line count of it reads `1`), there is no uniform "output text" across tools, and `tool:delta` is never emitted in production. The operator picked the cheaper honest path — surface the `truncated: boolean` every capped tool result already carries, no per-tool line counting.
+
+**Plumbing.** One boolean, `outputTruncated`, rides the layers it must cross: `result.truncated` (read structurally in `invoke-tool.ts` — only some output shapes carry the field) → `InvokeToolResult` → the `tool_finished` HarnessEvent → `loop.ts` emit → `harness-adapter.ts` → the `tool:end` UIEvent → the reducer. The `tool-end` PermanentItem carries it; `PendingToolEndBatchItem` too, and `tool-end-batch` aggregates with `some` — one hint for the group when any child capped.
+
+**Render.** `permanent.ts` gains `truncationHint`: a `secondary` line indented 3 cols under the card body, for `tool-end` and `tool-end-batch` alike. The `ctrl+o` key stays unwired — `UI.md §4.10.5` defers the expansion panel to a later slice; this entry is the hint only.
+
+**Tests.** `permanent.test.ts` (render with / without the flag, ASCII fallback, batch), `state.test.ts` (the flag rides onto `tool-end`, aggregates onto the batch, absent leaves it unset), `harness-adapter.test.ts` (passes through), `invoke-tool.test.ts` (a `truncated: true` result surfaces as `InvokeToolResult.outputTruncated`). `bun test tests/tui/` 813 green; `typecheck` + `lint` clean.
+
+**Pre-existing failure, unrelated.** Running `tests/harness/invoke-tool.test.ts` surfaced two failing `plan mode: planSafe …` tests — `planSafe` tools blocked in plan mode when they should execute. Not slice 2: the diff to `invoke-tool.ts` is three hunks (the `InvokeToolResult` field, the `readOutputTruncated` helper, the success-return spread), none of which touch the plan-mode block (lines 249-338) — and the two tests fail under a `plan mode`-only filter, before any slice-2 test runs. Flagged for a separate fix.
+
 ## [2026-05-20] feat(tui) — unify the operation-chip duration metric
 
 Follow-up from the compact-tool-cards review (entry below). The slice-1 card restyle put the tool card on a bracketed `[5s]` metric, but the review found the live region still mixed three duration shapes — `(5s)` on the assistant / thinking / critique / awaiting chips, `in 5s` on the `subagent_summary` line. A wider look found the rot underneath: **five** near-identical copies of `formatElapsed` (one per chip file) plus three `formatDuration` copies, already drifted (`0s` vs `0ms` clamp; decimal vs integer seconds).

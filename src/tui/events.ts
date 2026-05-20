@@ -231,6 +231,11 @@ export type ToolEndEvent = BaseEvent & {
   // One-line summary the final tool card prints (UI.md §4.1). The
   // producer composes this — it knows the tool semantics.
   summary?: string;
+  // True when the tool capped its own output (bash `max_bytes`,
+  // grep / glob `max_results`, the read_file window). Drives the
+  // `… output truncated` hint on the finished card. Absent on
+  // failure / denial and for tools with no truncation notion.
+  outputTruncated?: boolean;
 };
 
 // Permission/trust/memory write/plan review/critique modals.

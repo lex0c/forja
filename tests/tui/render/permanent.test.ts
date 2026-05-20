@@ -702,6 +702,57 @@ describe('formatPermanent', () => {
       );
       expect(out[1]).toContain(`${CSI}2m`);
     });
+
+    test('outputTruncated appends a `… output truncated` hint under the card', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'cat big.log',
+          status: 'done',
+          durationMs: 50,
+          outputTruncated: true,
+        },
+        unicode,
+      );
+      // blank, head, `└─` subject, hint — the hint indents 3 cols so
+      // it sits under the connector's content.
+      expect(out).toHaveLength(4);
+      expect(out[3]).toBe(pad('   … output truncated (ctrl+o to expand)'));
+    });
+
+    test('no hint line when outputTruncated is absent', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'ls',
+          status: 'done',
+          durationMs: 5,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out.join('\n')).not.toContain('truncated');
+    });
+
+    test('ASCII: the truncation hint uses the ... ellipsis fallback', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'ls',
+          status: 'done',
+          durationMs: 5,
+          outputTruncated: true,
+        },
+        ascii,
+      );
+      expect(out[out.length - 1]).toBe(pad('   ... output truncated (ctrl+o to expand)'));
+    });
   });
 
   // error / warn / info also prepend a leading blank — each is a
@@ -742,6 +793,25 @@ describe('formatPermanent', () => {
         pad('├─ src/b.ts'),
         pad('└─ src/c.ts'),
       ]);
+    });
+
+    test('outputTruncated appends one hint line under the batch body', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 80,
+          subjects: ['a.ts', 'b.ts'],
+          status: 'done',
+          outputTruncated: true,
+        },
+        unicode,
+      );
+      // blank, head, ├─ a, └─ b, then a single hint for the group.
+      expect(out).toHaveLength(5);
+      expect(out[4]).toBe(pad('   … output truncated (ctrl+o to expand)'));
     });
 
     test('single-subject batch closes the tree with └─ on the only row', () => {

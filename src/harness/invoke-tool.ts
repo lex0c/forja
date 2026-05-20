@@ -137,7 +137,24 @@ export interface InvokeToolResult {
   // through `summary` separately). The TUI uses this to show the
   // failure cause on the `└─` connector instead of just the path.
   errorMessage?: string;
+  // True when the successful tool result reported `truncated: true`
+  // — the tool capped its own output. Plumbed to the `tool_finished`
+  // event so the TUI can hint the result has more behind `ctrl+o`.
+  // Absent on failure paths (a ToolError carries no `truncated`) and
+  // for tools whose output shape has no truncation flag.
+  outputTruncated?: boolean;
 }
+
+// A success result is "truncated" when the tool capped its own
+// output (bash `max_bytes`, grep / glob `max_results`, the
+// read_file window). The flag is per-tool — only some output
+// shapes carry it — so this reads it structurally and treats
+// absent / non-boolean as not truncated.
+const readOutputTruncated = (result: unknown): boolean =>
+  typeof result === 'object' &&
+  result !== null &&
+  'truncated' in result &&
+  (result as Record<string, unknown>).truncated === true;
 
 const buildErrorBlock = (
   toolUseId: string,
@@ -997,5 +1014,6 @@ export const invokeTool = async (
     durationMs: duration,
     failed: false,
     decision,
+    ...(readOutputTruncated(result) ? { outputTruncated: true } : {}),
   };
 };

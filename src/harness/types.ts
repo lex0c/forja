@@ -112,6 +112,13 @@ export type HarnessEvent =
       // The TUI uses this on the `└─` connector to surface the
       // cause without forcing the operator to grep audit logs.
       errorMessage?: string;
+      // True when the tool capped its own output (bash `max_bytes`,
+      // grep / glob `max_results`, the read_file window). The TUI
+      // shows a `… output truncated` hint on the finished card so
+      // the operator knows the result has more behind `ctrl+o`.
+      // Absent for failures (a ToolError carries no `truncated`)
+      // and for tools whose output shape has no truncation notion.
+      outputTruncated?: boolean;
     }
   | {
       type: 'compaction_started';

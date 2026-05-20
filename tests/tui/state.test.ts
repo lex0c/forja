@@ -704,6 +704,75 @@ describe('tool-end batch coalescing', () => {
     expect(item.verb).toBe('Read 2 files');
   });
 
+  test('tool:end outputTruncated carries onto an individual tool-end', () => {
+    // A lone truncated tool (below the coalesce threshold) keeps the
+    // flag on the unfolded `tool-end` item.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: 'cat big',
+      },
+      {
+        type: 'tool:end',
+        ts: 50,
+        toolId: 't1',
+        status: 'done',
+        durationMs: 49,
+        outputTruncated: true,
+      },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.outputTruncated).toBe(true);
+  });
+
+  test('a batch aggregates outputTruncated when any child truncated', () => {
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: 'a',
+      },
+      { type: 'tool:end', ts: 2, toolId: 't1', status: 'done', durationMs: 1 },
+      {
+        type: 'tool:start',
+        ts: 3,
+        toolId: 't2',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: 'b',
+      },
+      {
+        type: 'tool:end',
+        ts: 4,
+        toolId: 't2',
+        status: 'done',
+        durationMs: 1,
+        outputTruncated: true,
+      },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.outputTruncated).toBe(true);
+  });
+
+  test('a batch with no truncated child leaves outputTruncated unset', () => {
+    const result = drive([...readPair('t1', 'a'), ...readPair('t2', 'b')]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.outputTruncated).toBeUndefined();
+  });
+
   test('different tool names do NOT merge across the batch', () => {
     // A read followed by a bash followed by a read produces three
     // individual chips, not one cross-tool batch.

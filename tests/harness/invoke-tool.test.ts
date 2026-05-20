@@ -28,6 +28,16 @@ const okTool: Tool = {
   },
 };
 
+const truncatedTool: Tool = {
+  name: 'truncates',
+  description: 'returns a result flagged truncated',
+  inputSchema: { type: 'object' },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  async execute() {
+    return { content: 'capped output', truncated: true };
+  },
+};
+
 const errorReturningTool: Tool = {
   name: 'fails',
   description: 'always returns error',
@@ -128,6 +138,26 @@ describe('invokeTool', () => {
     expect(approvals).toHaveLength(1);
     expect(approvals[0]?.decision).toBe('allow');
     expect(observedApprovalId).toBe(approvals[0]?.id);
+  });
+
+  test('outputTruncated set when the success result reports truncated: true', async () => {
+    const deps = buildDeps(truncatedTool);
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'truncates', args: {}, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(inv.outputTruncated).toBe(true);
+  });
+
+  test('outputTruncated absent when the result carries no truncated flag', async () => {
+    const deps = buildDeps(okTool);
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'echo', args: { msg: 'hi' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(inv.outputTruncated).toBeUndefined();
   });
 
   // R3 follow-up — same wire for the confirm_yes branch. The bridged

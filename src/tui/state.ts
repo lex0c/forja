@@ -84,6 +84,7 @@ export interface PendingToolEndBatchItem {
   status: 'done' | 'error' | 'denied';
   durationMs: number;
   summary?: string;
+  outputTruncated?: boolean;
 }
 
 // Reducer-side buffer for slice 3 (read coalescing). See
@@ -573,6 +574,9 @@ export type PermanentItem =
       // swaps the leading glyph to `|_` so the chip visually
       // belongs to its owner. Absent for top-level tool calls.
       parentId?: string;
+      // True when the tool capped its own output — renderer adds a
+      // `… output truncated (ctrl+o to expand)` line under the card.
+      outputTruncated?: boolean;
     }
   | {
       // Coalesced batch of N consecutive same-name + same-parentId
@@ -611,6 +615,9 @@ export type PermanentItem =
       // tool-end; the field is absent only when all children were
       // top-level.
       parentId?: string;
+      // True when ANY child in the batch capped its output — the
+      // renderer adds one `… output truncated` line for the group.
+      outputTruncated?: boolean;
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
@@ -740,6 +747,7 @@ export const flushPendingToolEndBatch = (
       durationMs: it.durationMs,
       ...(it.summary !== undefined ? { summary: it.summary } : {}),
       ...(batch.parentId !== undefined ? { parentId: batch.parentId } : {}),
+      ...(it.outputTruncated === true ? { outputTruncated: true } : {}),
     }));
     return { state: next, permanent };
   }
@@ -762,6 +770,7 @@ export const flushPendingToolEndBatch = (
     subjects,
     status,
     ...(batch.parentId !== undefined ? { parentId: batch.parentId } : {}),
+    ...(batch.items.some((it) => it.outputTruncated === true) ? { outputTruncated: true } : {}),
   };
   return { state: next, permanent: [summary] };
 };
@@ -1147,6 +1156,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         status: event.status,
         durationMs: event.durationMs,
         ...(event.summary !== undefined ? { summary: event.summary } : {}),
+        ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
       };
       const pending = state.pendingToolEndBatch;
       const matches =

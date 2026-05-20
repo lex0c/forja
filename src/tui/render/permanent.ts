@@ -58,6 +58,19 @@ const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): s
 // therefore never exceeds MAX_BATCH_SUBJECTS rows.
 const MAX_BATCH_SUBJECTS = 5;
 
+// `… output truncated` hint line (slice 2). A tool that capped its
+// own output gets one secondary line under the card body. The
+// `ctrl+o` key stays unwired — UI.md §4.10.5 defers the expansion
+// panel to a later slice; the hint stands on its own until then.
+// Indented 3 cols so it lines up under the `└─ ` connector's
+// content, reading as a footnote of the card rather than a sibling.
+const truncationHint = (caps: Capabilities, indent: string): string =>
+  paint(
+    caps,
+    'secondary',
+    `${indent}   ${ellipsisGlyph(caps)} output truncated (ctrl+o to expand)`,
+  );
+
 export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
   // Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded
   // lines. The `user-submit` reverse bar handles its own padding
@@ -268,6 +281,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       if (subText !== null) {
         lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
       }
+      if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
       return lines.map(padFrame);
     }
     case 'tool-end-batch': {
@@ -320,6 +334,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         const moreN = item.subjects.length - visible.length;
         lines.push(paint(caps, 'secondary', `${indent}${last}${ellipsis} +${moreN} more`));
       }
+      if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
       return lines.map(padFrame);
     }
     case 'error':

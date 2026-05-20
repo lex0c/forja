@@ -816,6 +816,38 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.summary).toBe('ENOENT: no such file or directory');
   });
 
+  test('outputTruncated on tool_finished carries onto tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+      outputTruncated: true,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.outputTruncated).toBe(true);
+  });
+
+  test('outputTruncated absent leaves the tool:end flag unset', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.outputTruncated).toBeUndefined();
+  });
+
   test('errorMessage absent on done outcomes leaves summary unset', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({
