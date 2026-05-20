@@ -116,7 +116,13 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     });
   });
 
-  test('tool-only assistant turn emits nothing (no text → no scrollback row)', () => {
+  test('tool-only assistant turn at run boundary: footer fires even without text', () => {
+    // The live operator saw a user submit, then tool cards, then a
+    // `Cogitated for Xs` footer. We skip the tool cards in this
+    // slice (text-only), but the footer still belongs at the run
+    // boundary — operator's mental model is "this run ended,
+    // here's the timing". Suppressing it would also collapse the
+    // turn count, hiding a real conversation step from the anchor.
     const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',
@@ -132,11 +138,15 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     });
     const { bus, events } = recordEvents();
     const result = replaySessionMessages(db, 's1', bus);
-    // user:submit lands; assistant text path skipped entirely
-    // (no start/delta/end and crucially no orphan session:end
-    // footer floating without content).
-    expect(events.map((e) => e.type)).toEqual(['user:submit']);
-    expect(result.turns).toBe(0);
+    // user:submit + session:end (no assistant row in text-only
+    // mode; tool-replay slice will fill the gap with chip rows).
+    expect(events.map((e) => e.type)).toEqual(['user:submit', 'session:end']);
+    expect(events[1]).toMatchObject({
+      type: 'session:end',
+      durationMs: 1000,
+      reason: 'done',
+    });
+    expect(result.turns).toBe(1);
   });
 
   test('tool_result-only user message (array content) is skipped', () => {
@@ -190,11 +200,13 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     expect(ends[1]).toMatchObject({ durationMs: 1000 });
   });
 
-  test('orphan assistant (no prior user) emits with durationMs=0 and start.ts=assistant.createdAt', () => {
-    const db = setupSession('s1');
+  test('orphan assistant (no prior user) emits the text row but NO session:end footer', () => {
     // Synthetic edge: an assistant message with no preceding user
     // (only happens in pathological histories or test fixtures).
-    // Don't crash; emit the text but with a safe-fallback duration.
+    // Don't crash; emit the text. Don't emit session:end — there
+    // is no user submit above it, so a floating footer would read
+    // as a bug to the operator.
+    const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',
       role: 'assistant',
@@ -202,11 +214,14 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
       createdAt: 1_000_000,
     });
     const { bus, events } = recordEvents();
-    replaySessionMessages(db, 's1', bus);
-    const start = events.find((e) => e.type === 'assistant:start');
-    const end = events.find((e) => e.type === 'session:end');
-    expect(start).toMatchObject({ ts: 1_000_000 });
-    expect(end).toMatchObject({ durationMs: 0 });
+    const result = replaySessionMessages(db, 's1', bus);
+    expect(events.map((e) => e.type)).toEqual([
+      'assistant:start',
+      'assistant:delta',
+      'assistant:end',
+    ]);
+    expect(events.find((e) => e.type === 'assistant:start')).toMatchObject({ ts: 1_000_000 });
+    expect(result.turns).toBe(0);
   });
 
   test('plain-string assistant content (legacy / non-block shape) renders as text', () => {
@@ -234,12 +249,14 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     });
   });
 
-  test('empty assistant text (zero block matches) is treated as tool-only', () => {
+  test('empty assistant text (zero block matches) skips text row but still closes the run', () => {
     // Defensive: an assistant message whose only blocks are
     // `{type: 'text', text: ''}` (provider quirk) should NOT
     // emit a phantom assistant:end with empty text. The reducer
     // would drop the empty case anyway, but we avoid the noise
-    // upstream and skip session:end for it too (no anchor turn).
+    // upstream. Same shape as a tool-only assistant: footer still
+    // fires at the run boundary so the turn count and timing
+    // surface in the anchor.
     const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',
@@ -255,7 +272,156 @@ describe('replaySessionMessages — text-only (Phase 2)', () => {
     });
     const { bus, events } = recordEvents();
     const result = replaySessionMessages(db, 's1', bus);
-    expect(events.map((e) => e.type)).toEqual(['user:submit']);
-    expect(result.turns).toBe(0);
+    expect(events.map((e) => e.type)).toEqual(['user:submit', 'session:end']);
+    expect(result.turns).toBe(1);
+  });
+
+  test('run with mid-stream tool_use → tool_result → final text: ONE footer at the very end', () => {
+    // The bug this slice fixes. The harness persists one assistant
+    // message per LLM completion; a run that uses tools writes
+    // (assistant text+tool_use → user tool_result → assistant
+    // text). The live operator saw ONE `Cogitated for Xs` footer
+    // covering the whole run. Naive per-assistant-row footer
+    // emission would show TWO footers AND collapse the duration
+    // of the second to 0 (no preceding "user submit" to anchor).
+    const db = setupSession('s1');
+    // Original operator prompt at t=1_000_000.
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'read the file and summarize',
+      createdAt: 1_000_000,
+    });
+    // Assistant says "Looking..." and fires a tool_use, at t=1_001_000.
+    appendMessage(db, {
+      id: 'a1',
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Looking...' },
+        { type: 'tool_use', id: 'tu1', name: 'read_file', input: { path: 'x' } },
+      ],
+      createdAt: 1_001_000,
+    });
+    // Tool result lands in a user message with ARRAY content at t=1_002_000.
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'file body' }],
+      createdAt: 1_002_000,
+    });
+    // Final assistant text closes the run at t=1_005_000.
+    appendMessage(db, {
+      id: 'a2',
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Done. Here is the summary.' }],
+      createdAt: 1_005_000,
+    });
+    const { bus, events } = recordEvents();
+    const result = replaySessionMessages(db, 's1', bus);
+
+    // Exactly ONE session:end across the whole run.
+    const ends = events.filter((e) => e.type === 'session:end');
+    expect(ends).toHaveLength(1);
+    // The single footer spans the WHOLE run (operator's prompt
+    // through the final assistant): 1_005_000 - 1_000_000 = 5_000.
+    expect(ends[0]).toMatchObject({ durationMs: 5000, reason: 'done' });
+    // turns reflects user-facing runs, not raw assistant rows.
+    expect(result.turns).toBe(1);
+
+    // Both assistant blocks emit start/delta/end with sensible per-block
+    // timestamps. First block's start anchors to the user prompt
+    // (createdAt 1_000_000), second block's start anchors to the
+    // tool_result user message (createdAt 1_002_000) — neither is
+    // 0, neither is a guess. Reducer math gives each block its
+    // own honest per-completion duration.
+    const starts = events.filter((e) => e.type === 'assistant:start');
+    expect(starts).toHaveLength(2);
+    expect(starts[0]).toMatchObject({ messageId: 'a1', ts: 1_000_000 });
+    expect(starts[1]).toMatchObject({ messageId: 'a2', ts: 1_002_000 });
+
+    // Order: user → asst1 (3 events) → asst2 (3 events) → session:end.
+    expect(events.map((e) => e.type)).toEqual([
+      'user:submit',
+      'assistant:start',
+      'assistant:delta',
+      'assistant:end',
+      'assistant:start',
+      'assistant:delta',
+      'assistant:end',
+      'session:end',
+    ]);
+  });
+
+  test('multi-run with mid-stream tool chain per run: one footer per OPERATOR turn', () => {
+    // Two operator turns, each with its own tool chain. Expect
+    // exactly two footers — not four (one per assistant row) and
+    // not one (collapsed across runs).
+    const db = setupSession('s1');
+    // Run 1: user → asst (text+tool) → user[tool_result] → asst (text).
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'turn 1 prompt',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 't1 intermediate' },
+        { type: 'tool_use', id: 't1tu', name: 'read', input: {} },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't1tu', content: 'r' }],
+      createdAt: 1_002_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 't1 final' }],
+      createdAt: 1_003_000,
+    });
+    // Run 2: user → asst (text+tool) → user[tool_result] → asst (text).
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: 'turn 2 prompt',
+      createdAt: 1_010_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 't2 intermediate' },
+        { type: 'tool_use', id: 't2tu', name: 'bash', input: {} },
+      ],
+      createdAt: 1_011_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't2tu', content: 'r' }],
+      createdAt: 1_012_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 't2 final' }],
+      createdAt: 1_020_000,
+    });
+    const { bus, events } = recordEvents();
+    const result = replaySessionMessages(db, 's1', bus);
+    const ends = events.filter((e) => e.type === 'session:end');
+    expect(ends).toHaveLength(2);
+    // Each footer spans its OWN run's full wall clock.
+    expect(ends[0]).toMatchObject({ durationMs: 3000 });
+    expect(ends[1]).toMatchObject({ durationMs: 10000 });
+    expect(result.turns).toBe(2);
   });
 });

@@ -13,19 +13,32 @@
 // 0 and the footer renders `Cogitated for 0s` — accurate for the
 // replay itself but a lie about the original turn. So we use the
 // persisted `createdAt` of each message: `assistant:start.ts` =
-// the prior user message's createdAt; `assistant:end.ts` and
-// `session:end.ts` = the assistant message's createdAt. Reducer
-// math then yields the real wall-clock duration of the historical
-// turn.
+// the immediately preceding message's createdAt (user submit for
+// the first assistant of a run, tool_result user message for
+// continuations); `assistant:end.ts` = the assistant message's
+// createdAt; `session:end.ts` = the run-final assistant's
+// createdAt. Reducer math then yields the real wall-clock duration
+// of the historical turn at each level (per-block + per-run).
+//
+// Run boundaries vs message boundaries. The harness persists ONE
+// assistant message per LLM completion: a run with tool_use can
+// produce assistant → user(tool_result) → assistant chains across
+// several rows (see src/harness/loop.ts). The live operator saw
+// ONE `Cogitated for Xs` footer at the end of the whole run, not
+// one per assistant row. We mirror that here: `session:end` fires
+// only at the run boundary (= the last assistant message before
+// either end-of-session or a user message with STRING content,
+// i.e. the next operator prompt). A user message with ARRAY
+// content (tool_result) means the run continues — no footer yet.
 //
 // Content shape. The provider (Anthropic) writes assistant content
 // as an array of blocks: `{type: 'text', text}`, `{type: 'tool_use',
 // id, name, input}`, etc. User content is either a plain string
-// (the initial prompt) or an array of `tool_result` blocks (the
-// turn that follows a tool_use). We only need the `text` blocks
-// here; everything else is skipped silently. Future tool-replay
-// slice walks the same content but maps tool_use/tool_result to
-// `tool:start` / `tool:end` events.
+// (the initial prompt or a follow-up operator turn) or an array of
+// `tool_result` blocks (continuation of the prior run). We only
+// need the `text` blocks here; everything else is skipped silently.
+// Future tool-replay slice walks the same content but maps
+// tool_use/tool_result to `tool:start` / `tool:end` events.
 
 import { type DB, listMessagesBySession } from '../storage/index.ts';
 import type { Bus } from '../tui/bus.ts';
@@ -76,77 +89,102 @@ const extractAssistantText = (content: unknown): string | null => {
 
 export const replaySessionMessages = (db: DB, sessionId: string, bus: Bus): ReplayResult => {
   const messages = listMessagesBySession(db, sessionId);
-  // Track the most recent user message's createdAt so the next
-  // assistant emission can compute a real `durationMs`. Cleared
-  // after each assistant turn lands, so a subsequent tool-only
-  // turn doesn't borrow the prior user message's anchor.
-  let lastUserAt: number | null = null;
+  // `runStartTs`: createdAt of the operator-prompt user message
+  // that opened the current run. Carried across intermediate
+  // assistant + tool_result messages so the run's final footer can
+  // span the WHOLE run, not just the last LLM completion. Null
+  // outside of an active run.
+  let runStartTs: number | null = null;
+  // `prevCreatedAt`: createdAt of the immediately preceding message.
+  // Used as the `assistant:start.ts` so per-block `durationMs`
+  // reflects "this LLM completion's wall clock" — which is the
+  // gap between the previous row and this assistant row (the user
+  // prompt for the first assistant; the tool_result user message
+  // for continuations). Mirrors what the renderer showed live, per
+  // assistant block.
+  let prevCreatedAt: number | null = null;
   let turns = 0;
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    // SAFETY: i is bounded by messages.length above; the entry
+    // exists. The non-null assertion is the same shape the rest of
+    // the codebase uses for guarded array access.
+    const msg = messages[i] as (typeof messages)[number];
     if (msg.role === 'user') {
       const text = extractUserText(msg.content);
       if (text !== null) {
+        // Operator prompt opens a new run. Anchor the run start
+        // here so the run-end footer can measure the full wall
+        // clock from prompt to final assistant.
         bus.emit({ type: 'user:submit', ts: msg.createdAt, text });
-        lastUserAt = msg.createdAt;
+        runStartTs = msg.createdAt;
       }
+      // Array content (tool_result continuation) doesn't reset
+      // runStartTs — it's the same run still going. prevCreatedAt
+      // still advances either way so the next assistant's start
+      // timestamp lines up with the most recent activity.
+      prevCreatedAt = msg.createdAt;
       continue;
     }
     if (msg.role === 'assistant') {
       const text = extractAssistantText(msg.content);
-      if (text === null) {
-        // Tool-only turn (no text). The tool-replay slice will
-        // emit tool:start/tool:end here; for now, leave the slot
-        // empty and don't fabricate a session:end footer (a
-        // footer with no preceding assistant block visually
-        // floats and reads as a bug).
-        continue;
+      // Look ahead to decide whether THIS assistant is the run's
+      // last LLM completion or a mid-run continuation. A user
+      // message with ARRAY content means tool_result follow-up —
+      // run continues. Anything else (no next message, or a
+      // user-string operator prompt, or another assistant — which
+      // shouldn't happen but we treat conservatively) closes the
+      // run.
+      const next = messages[i + 1];
+      const isMidRun = next !== undefined && next.role === 'user' && Array.isArray(next.content);
+      // Emit the assistant block when there's text. Tool-only
+      // assistants produce no row in this slice — but they still
+      // count toward the run boundary check above. A future tool-
+      // replay slice will fill in the missing card.
+      if (text !== null) {
+        // start.ts = previous message's createdAt when available.
+        // First assistant in a run: user prompt's createdAt;
+        // continuation: tool_result user message's createdAt;
+        // orphan (no prior): assistant's own createdAt → reducer
+        // yields durationMs=0 per block, safe.
+        const startTs = prevCreatedAt ?? msg.createdAt;
+        bus.emit({ type: 'assistant:start', ts: startTs, messageId: msg.id });
+        bus.emit({
+          type: 'assistant:delta',
+          ts: msg.createdAt,
+          messageId: msg.id,
+          text,
+        });
+        bus.emit({ type: 'assistant:end', ts: msg.createdAt, messageId: msg.id });
       }
-      // Synthesize start → delta → end → session:end. The reducer
-      // collapses delta-driven text into the assistant
-      // PermanentItem; a single delta carrying the whole message
-      // is functionally identical to N small ones from the live
-      // stream (the renderer's frame coalescer batches the live
-      // path anyway).
-      //
-      // start.ts uses the user message's createdAt when we have
-      // one; otherwise the assistant's own createdAt (turn with no
-      // matching prior user). Reducer's durationMs computation
-      // (event.ts - buf.startedAt) yields the wall-clock gap
-      // between user submit and assistant completion in the
-      // first case, and 0 in the orphan case (safe fallback —
-      // reduces to text-only chip).
-      const startTs = lastUserAt ?? msg.createdAt;
-      bus.emit({ type: 'assistant:start', ts: startTs, messageId: msg.id });
-      bus.emit({
-        type: 'assistant:delta',
-        ts: msg.createdAt,
-        messageId: msg.id,
-        text,
-      });
-      bus.emit({ type: 'assistant:end', ts: msg.createdAt, messageId: msg.id });
-      // session:end produces the `Cogitated for Xs` footer
-      // (UI.md §3.2). durationMs comes from the createdAt gap so
-      // the operator sees the historical turn's real timing, not
-      // a 0s placeholder. Reason is fixed as 'done' — the
-      // persisted messages don't record turn-end cause; subsequent
-      // turns existing implies the prior one completed cleanly
-      // enough to take another input.
-      const durationMs = lastUserAt !== null ? msg.createdAt - lastUserAt : 0;
-      bus.emit({
-        type: 'session:end',
-        ts: msg.createdAt,
-        sessionId,
-        reason: 'done',
-        durationMs,
-      });
-      lastUserAt = null;
-      turns++;
+      // session:end fires only at the real run boundary AND only
+      // when this run had a user-facing start (runStartTs !==
+      // null — operator prompt present). The orphan-assistant
+      // edge skips the footer entirely: with no opening user row
+      // in scrollback, a "Cogitated for 0s" footer would float
+      // alone and read as a bug. Reason is 'done' — persisted
+      // messages don't record turn-end cause; the run produced
+      // followups (or ended), so 'done' is the safe default.
+      if (!isMidRun && runStartTs !== null) {
+        bus.emit({
+          type: 'session:end',
+          ts: msg.createdAt,
+          sessionId,
+          reason: 'done',
+          durationMs: msg.createdAt - runStartTs,
+        });
+        turns++;
+        runStartTs = null;
+      }
+      prevCreatedAt = msg.createdAt;
+      continue;
     }
     // role === 'tool': no current producer writes this role; the
     // type is kept on `MessageRole` for forward compat with
     // providers that need a dedicated tool channel. Skip silently
     // so a future migration that starts using it doesn't crash
-    // the replay.
+    // the replay. prevCreatedAt still tracks so the next emission
+    // anchors to the latest activity.
+    prevCreatedAt = msg.createdAt;
   }
   return { turns, messagesWalked: messages.length };
 };
