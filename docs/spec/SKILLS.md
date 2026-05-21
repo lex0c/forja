@@ -430,16 +430,26 @@ Anti-pattern: `description` genérica + body sem ação. Vira ruído eager (~20t
 
 ### v1 (mínimo viável)
 
-- Frontmatter (`name`, `description`) + body em markdown.
-- Scopes: user + project (shared/local).
-- Surface eager, body lazy.
-- `skill.invoke / list / show` como tools.
-- Audit de surfaced/invoked/filtered.
+- Frontmatter (`name`, `description` obrigatórios) + body em markdown.
+- Scopes: user + project (shared/local). `imported` fica pra v2.
+- Surface eager (catálogo no system prompt), body lazy.
+- Tools `skill_invoke` / `skill_list` / `skill_show`.
+- Comando `/skill`: `list` / `show` / `new` / `promote` / `demote` / `delete`.
+- Audit de surfaced / invoked / filtered (tabela `skill_events`).
+- `expires` checado na invocação: warn + invoca mesmo assim + registra (`§5.4`).
+- Catálogo seed instalado por `agent init`.
+
+v1 surfacea `tools` / `requires` no output do `invoke` mas **não** os gateia:
+sem o pré-flight check de `§8`, sem o erro de `requires` ausente de `§5.4` —
+ambos pedem um registry de capabilities de subsistema que não existe em v1.
+Re-invocação sempre reinjeta o body `full`; o dedup `ref` (`§5.3`) é v2.
 
 ### v2
 
 - `imported` scope com import flow + injection scanning.
-- `expires` + decay pruning automático.
+- Decay pruning automático (`§6.4`) + retenção/pruning de `skill_events`.
+- Gating de `tools` / `requires`: pré-flight check (`§8`) e erro structured de `requires` ausente (`§5.4`).
+- Re-invocação com dedup `ref` vs `full` (`§5.3`).
 - `/skill capture` (transforma sessão em skill candidate).
 - `version:` bumping com changelog.
 

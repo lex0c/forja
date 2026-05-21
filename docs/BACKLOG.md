@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] docs(spec) — reconcile SKILLS.md §14 with the v1 implementation
+
+`docs/spec/SKILLS.md §14` (v1 / v2 / v3) brought in line with what slices 1–7 shipped — it was the one factually stale section. The v1 list now names the `/skill` command, the `skill_events` audit table, the `expires` invoke-time warn, and the seed catalog (it previously enumerated only the tools + audit), and states plainly that v1 surfaces `tools` / `requires` without gating them. v2 correspondingly splits the `expires` warn (now v1) from decay pruning, and gains the deferred `tools` / `requires` gating (`§8` pre-flight, `§5.4` requires-error) and the `§5.3` re-invocation `ref` dedup. The design body (`§§0–13`) is untouched — only the v1/v2 staging ledger was stale. Spec edit made on the explicit "atualize docs" request.
+
 ## [2026-05-21] test(skills) — eval coverage
 
 `evals/smoke/11-skill-invoke.yaml` + `12-skill-list.yaml` — the skills subsystem's first eval cases, closing the principle-4 gap (a subsystem without eval doesn't ship). The eval harness runs every case through `bootstrap`, which builds the skill catalog over the case's fixture cwd — so a `setup.files` entry under `.agent/skills/shared/` is picked up with no executor change.
