@@ -138,8 +138,8 @@ const renderTable = (node: Table, caps: Capabilities, width: number, indent: num
   const gridRow = (cells: string[]): string =>
     pad + cells.map((cell, c) => (c === cols - 1 ? cell : padTo(cell, colWidth[c] ?? 0))).join(SEP);
 
-  // Grid — the table fits, or has no data rows to stack.
-  if (gridWidth <= avail || body.length === 0) {
+  // Grid — the aligned table fits the available width.
+  if (gridWidth <= avail) {
     const out = [gridRow(cellsOf(headerNode, ['bold']))];
     const ruleGlyph = caps.unicode ? '─' : '-';
     out.push(pad + paint(caps, 'dim', ruleGlyph.repeat(Math.min(gridWidth, avail))));
@@ -147,11 +147,19 @@ const renderTable = (node: Table, caps: Capabilities, width: number, indent: num
     return out;
   }
 
-  // Stack — degrade: one `header: value` block per data row; the
-  // label is the column header, dimmed.
+  // Stack — degrade to a width-independent layout. A header-only
+  // table (no data rows) lists its column headers one per line; a
+  // table with data rows emits one `header: value` block per row.
+  // Label = the column header, dimmed.
   const labels = cellsOf(headerNode, ['secondary']);
   const colon = paint(caps, 'secondary', ':');
   const out: string[] = [];
+  if (body.length === 0) {
+    for (const label of labels) {
+      for (const line of wrapText(label, avail)) out.push(pad + line);
+    }
+    return out;
+  }
   body.forEach((row, i) => {
     if (i > 0) out.push('');
     labels.forEach((label, c) => {

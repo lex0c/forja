@@ -86,6 +86,17 @@ describe('renderMarkdown', () => {
     expect(renderMarkdown(md, { ...caps, cols: 7 })).toEqual(['A: 1', 'B: 2', 'C: 3']);
   });
 
+  test('GFM table: a fitting header-only table still renders as a grid', () => {
+    expect(renderMarkdown('| A | B |\n|---|---|', caps)).toEqual(['A  B', '────']);
+  });
+
+  test('GFM table: a header-only table that overflows degrades, one header per line', () => {
+    // No data rows, and the header grid (width 12) exceeds the frame —
+    // before the fix this took the grid branch and overflowed the line.
+    const md = '| Name | Status |\n|---|---|';
+    expect(renderMarkdown(md, { ...caps, cols: 9 })).toEqual(['Name', 'Status']);
+  });
+
   test('inline emphasis maps to SGR runs (colored)', () => {
     const out = renderMarkdown('a **b** `c` *d* ~~e~~', colored);
     expect(out[0]).toBe('a \x1b[1mb\x1b[0m \x1b[94mc\x1b[0m \x1b[3md\x1b[0m \x1b[9me\x1b[0m');

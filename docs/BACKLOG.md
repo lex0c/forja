@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(tui) — header-only Markdown table no longer overflows a narrow terminal
+
+A header-only GFM table (no data rows) always took the grid branch — the `|| body.length === 0` bypass skipped the fit check — so a header wider than the frame emitted an over-long line and leaned on terminal soft-wrap, misaligning scrollback. The bypass is gone; an oversized header-only table now degrades like any other. But the stack path's `body.forEach` emits nothing for a header-only table, so removing the bypass alone would have dropped the header entirely — the degrade path gained a dedicated branch: the column headers, one per line, wrapped to width. 2 new `markdown.test.ts` cases.
+
 ## [2026-05-20] fix(tui) — propagate outputTruncated on the non-zero-exit tool-end path
 
 The exit-code slice made a non-zero `exitCode` bypass the coalescing buffer (immediate `tool-end` emission). That branch copied `exitCode` but dropped `outputTruncated` — so a failing command whose output was capped lost the `… output truncated` hint, exactly when partial failing output most needs noticing. The immediate-emission `item` now carries `outputTruncated` too. One new `state.test.ts` case (non-zero exit + truncated → both on the card).
