@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] fix — orphaned tool_use after a mid-round abort bricked the session
+
+A `maxToolErrors` abort on the serial tool path returned from inside the `for (const tu of collected.tool_uses)` loop: the tool_uses after the failing one never got a `tool_result`, and the persisted `user` message answered only the partial set. The provider contract requires every `tool_use` to have a matching `tool_result` in the next message — so from then on every request 400'd ("tool_use ids without tool_result") and the session was unrecoverable.
+
+Two-part fix:
+
+- **Root (`loop.ts`).** The `maxToolErrors` serial bail now synthesizes an `is_error` `tool_result` for every `collected.tool_uses` entry it never reached, before persisting the user message — the history it writes is valid.
+- **Net (`resume.ts`).** `messagesToProviderMessages` gained `repairOrphanedToolUses`: any `tool_use` with no `tool_result` in the following message gets a synthetic one before the history reaches the provider. This recovers already-corrupted sessions and backstops any abort path that still escapes. It runs before the user→user repair, since a synthetic result message can land just before a real prompt.
+
+Tests: 5 new — 4 in `resume.test.ts` (partial answer completed, no answer inserted, orphan-before-prompt bridged, full round untouched) and 1 in `loop.test.ts` (the serial maxToolErrors bail answers every tool_use, asserted against the persisted history).
+
+Known gap: the `signal.aborted` / `softAborted` returns in the same serial loop discard `toolResults` entirely — they orphan too. The net repairs them on resume; fixing their origin (persisting on Ctrl+C) is a separate change. `FAILURE_MODES.md` still has no entry for mid-round abort integrity.
+
+## [2026-05-20] feat(tui) — the live tool card joins the shimmer chip family
+
+The live tool card (`tool-card.ts` — `Executing…`, `Reading file…`) painted its head in flat `warn`. It now matches the awaiting / assistant / thinking chips: the active verb runs the `renderShimmer` sweep, and the spinner + verb + `[elapsed]` all sit in `secondary`. The shimmer — not a loud tone — is what signals the card is live. Still EXPERIMENTAL pending the `UI.md §13` decision.
+
 ## [2026-05-20] fix(tui) — denied tool card uses the error tone, not warn
 
 The `tool-end` head painted a `denied` status in `warn` (amber). A denied call never ran — it reads as a failure, not a caution — and `warn` now also carries the new `exit N` marker. The head shares the `error` tone (red) with `error` status; the verb ('Denied' vs 'Failed') is the only distinguisher. `exit N` keeps `warn` — a command that ran but exited non-zero is a genuinely lighter signal.

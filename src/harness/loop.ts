@@ -3750,13 +3750,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               consecutiveErrors = 0;
             }
             if (consecutiveErrors >= budget.maxToolErrors) {
-              // Persist the partial tool_result message before
-              // bailing so the session history reflects what
-              // actually happened. Mirror it in the in-memory
-              // `messages` array for symmetry with the normal
-              // path; nothing reads it post-bail today, but a
-              // future refactor that does (resume, replay) gets
-              // a consistent view.
+              // The bail returns mid-`for` — the tool_uses after this
+              // one never run. Every tool_use in the assistant turn
+              // must still be answered by a tool_result, or the
+              // persisted history is invalid: the provider 400s on the
+              // next request ("tool_use without tool_result") and the
+              // session is unrecoverable. Synthesize an error result
+              // for each tool_use this round never reached.
+              const answered = new Set(toolResults.map((r) => r.tool_use_id));
+              for (const pending of collected.tool_uses) {
+                if (answered.has(pending.id)) continue;
+                toolResults.push({
+                  type: 'tool_result',
+                  tool_use_id: pending.id,
+                  name: pending.name,
+                  content: 'Tool not executed — run stopped after consecutive tool errors.',
+                  is_error: true,
+                });
+              }
               const partialMsg = appendMessage(config.db, {
                 sessionId,
                 role: 'user',

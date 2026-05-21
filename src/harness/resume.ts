@@ -1,4 +1,9 @@
-import type { ProviderContentBlock, ProviderMessage } from '../providers/index.ts';
+import type {
+  ProviderContentBlock,
+  ProviderMessage,
+  ProviderToolResultBlock,
+  ProviderToolUseBlock,
+} from '../providers/index.ts';
 import type { Message, MessageRole } from '../storage/repos/messages.ts';
 
 // Hard cap on how many persisted messages we reload at resume init.
@@ -52,6 +57,13 @@ export const TRUNCATION_PLACEHOLDER =
 // list.
 export const STRANDED_TURN_PLACEHOLDER =
   '[The previous turn was interrupted before a response was produced. Continuing from this point.]';
+
+// Synthetic tool_result content for a tool_use that an aborted run
+// never answered. Inserted by repairOrphanedToolUses so the replayed
+// history satisfies the provider's "every tool_use needs a
+// tool_result" rule. is_error so the model treats it as a non-result.
+export const ORPHAN_TOOL_RESULT_PLACEHOLDER =
+  '[Tool call interrupted — the run ended before this tool produced a result.]';
 
 // Reconstruct the in-memory ProviderMessage[] from persisted rows.
 // Today the harness only persists role='user' and role='assistant'
@@ -133,6 +145,57 @@ export const resumeWindowCut = (rows: Message[]): number => {
   return cut;
 };
 
+// Every assistant `tool_use` block must be answered by a `tool_result`
+// in the very next message (the provider contract). A run aborted
+// mid-tool-round can persist a history where some tool_use blocks were
+// never answered — the provider then 400s on every subsequent request
+// and the session is unrecoverable. `resumeWindowCut` only guards the
+// HEAD of the slice; this catches orphans anywhere in it. Each orphan
+// gets a synthetic error tool_result so the replayed history is valid.
+const repairOrphanedToolUses = (msgs: ProviderMessage[]): ProviderMessage[] => {
+  const out: ProviderMessage[] = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const curr = msgs[i];
+    if (curr === undefined) continue;
+    out.push(curr);
+    const toolUseIds =
+      curr.role === 'assistant' && Array.isArray(curr.content)
+        ? curr.content
+            .filter((b): b is ProviderToolUseBlock => b.type === 'tool_use')
+            .map((b) => b.id)
+        : [];
+    if (toolUseIds.length === 0) continue;
+    const next = msgs[i + 1];
+    const nextResults =
+      next !== undefined && next.role === 'user' && Array.isArray(next.content)
+        ? next.content
+        : null;
+    const answered = new Set(
+      (nextResults ?? [])
+        .filter((b): b is ProviderToolResultBlock => b.type === 'tool_result')
+        .map((b) => b.tool_use_id),
+    );
+    const orphans = toolUseIds.filter((id) => !answered.has(id));
+    if (orphans.length === 0) continue;
+    const synthetic: ProviderToolResultBlock[] = orphans.map((id) => ({
+      type: 'tool_result',
+      tool_use_id: id,
+      content: ORPHAN_TOOL_RESULT_PLACEHOLDER,
+      is_error: true,
+    }));
+    if (nextResults !== null) {
+      // The next message answers some tool_uses — splice the synthetic
+      // results in front of it and consume it.
+      out.push({ role: 'user', content: [...synthetic, ...nextResults] });
+      i++;
+    } else {
+      // Nothing answers this turn — insert a fresh result message.
+      out.push({ role: 'user', content: synthetic });
+    }
+  }
+  return out;
+};
+
 export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessages => {
   const droppedFromHead = resumeWindowCut(rows);
 
@@ -161,6 +224,12 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
   if (out[0]?.role === 'assistant') {
     out.unshift({ role: 'user', content: TRUNCATION_PLACEHOLDER });
   }
+  // Answer any orphaned tool_use blocks first — a mid-round abort can
+  // persist a tool_use with no tool_result, and one unanswered
+  // tool_use 400s the entire request. This can leave a user→user seam
+  // (a synthetic result message just before a real prompt); the pass
+  // below closes it.
+  const deOrphaned = repairOrphanedToolUses(out);
   // Repair internal user→user gaps. A single stranded resume left
   // a trailing user; the loop patched it once. But repeated
   // aborted resumes accumulate INTERNAL user,user pairs in the
@@ -171,11 +240,11 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
   // (STRANDED_TURN_PLACEHOLDER) — these are all "the model never
   // got to reply" gaps.
   const repaired: ProviderMessage[] = [];
-  for (let i = 0; i < out.length; i++) {
-    const curr = out[i];
+  for (let i = 0; i < deOrphaned.length; i++) {
+    const curr = deOrphaned[i];
     if (curr === undefined) continue;
     repaired.push(curr);
-    const next = out[i + 1];
+    const next = deOrphaned[i + 1];
     if (curr.role === 'user' && next !== undefined && next.role === 'user') {
       repaired.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
     }

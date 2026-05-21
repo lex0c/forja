@@ -2,8 +2,9 @@
 //
 // Tool currently executing renders as the spinner + active verb +
 // elapsed counter, with the subject under a `└─ ` connector. The
-// chip uses the warn palette so it visually pops out of the dim
-// baseline while the operation runs.
+// head sits in the `secondary` tone shared by the live chips
+// (awaiting / assistant / thinking); the shimmer sweep across the
+// verb is what marks the card as live.
 //
 // Final state lives in `formatPermanent` — the chip collapses to
 // dim, gets the per-tool past-tense verb, and joins scrollback.
@@ -14,6 +15,7 @@ import type { ActiveTool } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { formatChipDuration } from './duration.ts';
 import { subContentConnector } from './glyphs.ts';
+import { renderShimmer } from './shimmer.ts';
 
 const SPINNER_UNICODE = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
 const SPINNER_ASCII = ['|', '/', '-', '\\'] as const;
@@ -33,7 +35,13 @@ export const spinnerGlyph = (caps: Capabilities, now: number): string => {
 export const renderToolCardLive = (tool: ActiveTool, caps: Capabilities, now: number): string[] => {
   const spinner = spinnerGlyph(caps, now);
   const elapsed = formatChipDuration(now - tool.startedAt);
-  const head = paint(caps, 'warn', `${spinner} ${tool.activeVerb}…  [${elapsed}]`);
+  // Spinner, shimmer-swept verb, and `[elapsed]` all in `secondary` —
+  // the live tool card reads as one family with the awaiting /
+  // assistant / thinking chips; the sweep, not a loud tone, is what
+  // signals it is running.
+  const verb = renderShimmer(`${tool.activeVerb}…`, caps, now, 'secondary');
+  const metric = paint(caps, 'secondary', `  [${elapsed}]`);
+  const head = `${paint(caps, 'secondary', `${spinner} `)}${verb}${metric}`;
   const lines: string[] = [head];
 
   // Sub-content: subject (per-tool extracted) under the shared
