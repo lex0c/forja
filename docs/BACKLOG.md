@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(skills) — moveSkill rolls back a partial move
+
+`moveSkill` (`src/skills/lifecycle.ts`, behind `/skill promote` / `demote`) copies the source to the destination, then deletes the source — but a `rmSync(source)` failure returned `io_error` while leaving the just-written destination on disk. The skill then existed in BOTH scopes — silently shifting precedence / shadowing — and a retry failed with `already_exists`. The destination write is now rolled back on any post-write failure (`rmSync(target, { force: true })` in the catch), so a failed move mutates nothing. The source read is split into its own try so a read failure is cleanly distinguished from a post-write failure. Regression test forces the source-delete failure with a read-only source directory and asserts the destination was rolled back and the source still resolves.
+
 ## [2026-05-21] docs(spec) — reconcile SKILLS.md §14 with the v1 implementation
 
 `docs/spec/SKILLS.md §14` (v1 / v2 / v3) brought in line with what slices 1–7 shipped — it was the one factually stale section. The v1 list now names the `/skill` command, the `skill_events` audit table, the `expires` invoke-time warn, and the seed catalog (it previously enumerated only the tools + audit), and states plainly that v1 surfaces `tools` / `requires` without gating them. v2 correspondingly splits the `expires` warn (now v1) from decay pruning, and gains the deferred `tools` / `requires` gating (`§8` pre-flight, `§5.4` requires-error) and the `§5.3` re-invocation `ref` dedup. The design body (`§§0–13`) is untouched — only the v1/v2 staging ledger was stale. Spec edit made on the explicit "atualize docs" request.

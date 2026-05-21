@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSkill, createSkillCatalog, deleteSkill, moveSkill } from '../../src/skills/index.ts';
 import { brokenDoc, cleanupTmpDirs, makeRoots, makeTmp, skillDoc, writeSkill } from './_helpers.ts';
@@ -90,6 +90,26 @@ describe('moveSkill', () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe('malformed');
+  });
+
+  test('rolls back the destination when the source delete fails', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectLocal, 'stuck', skillDoc('stuck'));
+    // Read-only source dir makes rmSync(source) fail — unlink needs
+    // write on the parent — exercising the post-write failure path.
+    chmodSync(roots.projectLocal, 0o555);
+    try {
+      const result = moveSkill(roots, 'stuck', 'project_local', 'project_shared');
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toBe('io_error');
+      // A failed move must mutate nothing: the destination is rolled
+      // back, the source still resolves.
+      expect(existsSync(join(roots.projectShared, 'stuck.md'))).toBe(false);
+      expect(existsSync(join(roots.projectLocal, 'stuck.md'))).toBe(true);
+    } finally {
+      chmodSync(roots.projectLocal, 0o755);
+    }
   });
 });
 

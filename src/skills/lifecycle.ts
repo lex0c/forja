@@ -147,15 +147,35 @@ export const moveSkill = (
       message: `scope '${to}' already has a skill named '${name}'`,
     };
   }
+  // Raw re-read, not a re-serialize of the parsed source: a move
+  // copies the operator's file verbatim — re-serializing would
+  // re-canonicalize field order and whitespace.
+  let raw: string;
   try {
-    // Raw re-read, not a re-serialize of the parsed source: a move
-    // copies the operator's file verbatim — re-serializing would
-    // re-canonicalize field order and whitespace.
-    const raw = readFileSync(source.path, 'utf8');
+    raw = readFileSync(source.path, 'utf8');
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'io_error',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+  // Copy-then-delete. Any failure past the destination write may
+  // have left the target file on disk — roll it back so a failed
+  // move mutates nothing. Without the rollback a `rmSync(source)`
+  // failure leaves the skill in BOTH scopes (silently shifting
+  // resolution / shadowing) and a retry fails with `already_exists`.
+  try {
     mkdirSync(dirname(target.path), { recursive: true });
     writeFileSync(target.path, raw, 'utf8');
     rmSync(source.path);
   } catch (err) {
+    try {
+      rmSync(target.path, { force: true });
+    } catch {
+      // Best-effort rollback; the original io_error below is what
+      // the caller acts on.
+    }
     return {
       ok: false,
       reason: 'io_error',
