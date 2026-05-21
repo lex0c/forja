@@ -23,6 +23,7 @@ import { buildPlaybookSlashCommands } from './commands/playbook.ts';
 import { quitCommand } from './commands/quit.ts';
 import { recapCommand } from './commands/recap.ts';
 import { sessionsCommand } from './commands/sessions.ts';
+import { skillCommand } from './commands/skill.ts';
 import { subagentsCommand } from './commands/subagents.ts';
 import { parseSlashInput } from './parse.ts';
 import { type SlashRegistry, createRegistry } from './registry.ts';
@@ -67,6 +68,7 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     pinCommand,
     hooksCommand,
     agentPolicyCommand,
+    skillCommand,
   ];
   const playbookCommands =
     subagents !== undefined ? buildPlaybookSlashCommands(subagents.byName.values()) : [];

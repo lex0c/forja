@@ -2703,6 +2703,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       env.push({ kind: 'meta', key: 'memory', value: String(memoryCount) });
     }
   }
+  // Skills count — the resolved catalog the model sees in its
+  // `# Skills` prompt block. Mirrors `memory` above: skills and
+  // memory are sibling catalogs surfaced to the model, so the
+  // operator gets the same at-a-glance count. Zero omits the entry
+  // per the env-summary "no useful info" rule.
+  if (baseConfig.skillCatalog !== undefined) {
+    const skillCount = baseConfig.skillCatalog.count();
+    if (skillCount > 0) {
+      env.push({ kind: 'meta', key: 'skills', value: String(skillCount) });
+    }
+  }
   // `checkpoints` flag was removed from the banner — operator
   // marked it as not useful. The capability still works (harness
   // creates checkpoints when conditions are met); it just doesn't

@@ -60,6 +60,7 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
     ? { recordGateDecision: overrides.recordGateDecision }
     : {}),
   ...(overrides.memoryRegistry !== undefined ? { memoryRegistry: overrides.memoryRegistry } : {}),
+  ...(overrides.skillCatalog !== undefined ? { skillCatalog: overrides.skillCatalog } : {}),
   ...(overrides.retrieveContext !== undefined
     ? { retrieveContext: overrides.retrieveContext }
     : {}),

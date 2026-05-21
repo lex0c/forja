@@ -19,6 +19,25 @@ export const parseJsonSafe = (raw: string, context: string): unknown => {
   }
 };
 
+// Parse a JSON-object TEXT column defensively: returns null on absent,
+// empty, corrupt, non-object, or array JSON. This is the swallow-and-
+// continue posture the audit / event repos need — a corrupt `details`
+// blob must not crash a listing — distinct from `parseJsonSafe`, which
+// throws `StorageJsonError`. Audit repos historically hand-rolled this
+// per file; new repos should use this shared variant.
+export const parseJsonObject = (raw: string | null): Record<string, unknown> | null => {
+  if (raw === null || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+};
+
 // Canonical JSON: object keys are emitted in lexicographic order at every
 // depth; arrays preserve index order; primitives are stringified the same
 // way `JSON.stringify` would. Two structurally equal values produce the

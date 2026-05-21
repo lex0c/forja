@@ -2,6 +2,173 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(skills) — /skill delete targets multi-word filenames
+
+The slash parser splits on whitespace with no quoting, so `/skill delete Bad Name` reached `handleDelete` as positionals `['Bad', 'Name']` — name `'Bad'`, scope `'Name'` — and could never target `Bad Name.md`, exactly the malformed file `/skill list` surfaces and delete exists to clean up. `handleDelete` now joins all positionals into the name; the optional scope moved from a positional (which a multi-word name made ambiguous) to a `--scope=<user|shared|local>` flag, extracted like `--confirm`. A name with collapsed runs of whitespace still can't be reconstructed — a parser limitation — but a normal single-spaced name works.
+
+## [2026-05-21] feat(tui) — skills count in the boot banner
+
+The boot banner's env block surfaced `subagents` and `memory` counts but not `skills`, even though skills and memory are sibling catalogs both surfaced to the model. `repl.ts` now pushes a `skills: N` meta entry, omitted at zero like `memory` — the operator gets the at-a-glance count the model already had via its `# Skills` prompt block. `repl.test.ts` gains a `skillCount` stub seam plus includes / omits coverage mirroring the memory banner tests.
+
+## [2026-05-21] chore(skills) — trim the seed catalog from 20 to 15
+
+Removed five seed skills judged too niche or role-specific for a catalog installed onto every project: `git-split-commit`, `restrict-proc-hidepid`, `ssh-tunnel`, `diagnose-network`, `python-executable-script`. The remaining 15 stay weighted toward broadly-useful procedures — git recovery / conflict / bisect / rewrite, the debug/test/perf family, forensics, the two Postgres skills, bulk file operations. The `.md` assets and their `CANONICAL_SKILLS` entries are gone, `profile-hotspot`'s dangling `diagnose-network` cross-reference reworded, and the `init-skills` count assertions + `docs/SKILLS.md` updated to 15. The seed still installs into `project_shared` — install location unchanged.
+
+## [2026-05-21] review(skills) — robustness / reliability / coherence pass
+
+Three-agent max-effort review of `21076d6..HEAD` (the eval, the §14 reconciliation, the three lifecycle/command fixes), focused on robustness, reliability, and coherent flow. Findings fixed:
+
+- **Sandbox** (`paths.ts`): `allowAnyName` skipped `validateName` entirely, leaving `isUnderRoot` — a prefix test that blocks a climb-out but not a *descent* — as the sole guard, so `skillFilePath` could resolve `subdir/x` or a separator-bearing name. `allowAnyName` now drops only the kebab FORMAT rule; a single-flat-component check (no `/`, `\`, NUL, `.` / `..`) still runs.
+- **Error reason** (`lifecycle.ts`): a traversal/unsafe name reaching `deleteSkill` reported `scope_unavailable`; now `invalid_name` — the null-root case already returns earlier, so a `ScopeError` at the resolve step is always a bad name. `createSkill` and `deleteSkill` now agree on the reason.
+- **Failed-move signalling** (`lifecycle.ts`): when a `moveSkill` rollback itself failed, the skill was silently left in both scopes. The catch now probes `existsSync` on both paths and, when the copy is stranded, says so in the message so a retry does not blind-walk into `already_exists`. The "mutates nothing" claim softened to "leaves no skill file behind" (a `mkdirSync`'d empty dir can remain).
+- **Reload guard** (`skill.ts`): a post-mutation `catalog.reload()` that threw turned an already-succeeded delete/move/new into a reported crash. `reloadCatalog` swallows a scan fault; the handler notes the in-session catalog is stale instead.
+- **Scope-token consistency** (`skill.ts`): `/skill delete` parsed its scope arg via a map while `promote` / `demote` hard-coded theirs — three subcommands, three parsers. All three now share `parseScopeToken`.
+- Minor: the `moveSkill` / `deleteSkill` `allowAnyName` asymmetry is documented; the `/skill delete` ambiguity prompt punctuation is aligned; the rollback regression test now `skipIf` root (a 0o555 dir does not stop root, so it passed vacuously); added negative coverage for nested/traversal delete names.
+
+Left for a spec decision (not patched): lifecycle mutation (`promote` / `demote` / `delete`) records no `skill_events` row — §6.5 implies a delete trail but §14 v1 audit is `surfaced` / `invoked` / `filtered` only.
+
+## [2026-05-21] fix(skills) — deleteSkill removes a file whose filename is malformed
+
+`deleteSkill` resolved its path through `resolvePath` → `validateName`, which rejects a non-kebab name before any filesystem check. So `/skill delete` could not remove a filtered file whose FILENAME itself is invalid (`Bad Name.md`, `Upper.md`) — even though `/skill list` surfaces those as actionable cleanup targets and `deleteSkill` already deletes a file whose *contents* are malformed. `validateName` conflates two things: the kebab-case FORMAT rule and (incidentally) traversal-blocking; only the format rule is wrong when deleting an already-on-disk file. `skillFilePath` gains an `allowAnyName` option that skips the format gate while the `isUnderRoot` sandbox runs unconditionally; `resolvePath` threads it; `deleteSkill` passes it. A traversal name stays refused — tested.
+
+## [2026-05-21] fix(skills) — /skill delete reaches filtered skills
+
+`/skill delete` resolved its target only through `catalog.lookup` (winners), so a malformed / name-mismatched / shadowed file — which `/skill list` *does* surface via `catalog.filtered()` — could not be removed through the command and needed a manual `rm`. `deleteSkill` itself already deletes a malformed file; only the command's lookup-gating blocked it. `handleDelete` now collects every scope holding a `<name>.md` (the winner plus any filtered copy) and deletes from it; when a name sits in more than one scope it asks for an explicit `/skill delete <name> <user|shared|local>` instead of guessing. The slice-6 review (Agent 2) flagged this as a `[scope]`-arg gap — deferred then as an edge case, closed now.
+
+## [2026-05-21] fix(skills) — moveSkill rolls back a partial move
+
+`moveSkill` (`src/skills/lifecycle.ts`, behind `/skill promote` / `demote`) copies the source to the destination, then deletes the source — but a `rmSync(source)` failure returned `io_error` while leaving the just-written destination on disk. The skill then existed in BOTH scopes — silently shifting precedence / shadowing — and a retry failed with `already_exists`. The destination write is now rolled back on any post-write failure (`rmSync(target, { force: true })` in the catch), so a failed move mutates nothing. The source read is split into its own try so a read failure is cleanly distinguished from a post-write failure. Regression test forces the source-delete failure with a read-only source directory and asserts the destination was rolled back and the source still resolves.
+
+## [2026-05-21] docs(spec) — reconcile SKILLS.md §14 with the v1 implementation
+
+`docs/spec/SKILLS.md §14` (v1 / v2 / v3) brought in line with what slices 1–7 shipped — it was the one factually stale section. The v1 list now names the `/skill` command, the `skill_events` audit table, the `expires` invoke-time warn, and the seed catalog (it previously enumerated only the tools + audit), and states plainly that v1 surfaces `tools` / `requires` without gating them. v2 correspondingly splits the `expires` warn (now v1) from decay pruning, and gains the deferred `tools` / `requires` gating (`§8` pre-flight, `§5.4` requires-error) and the `§5.3` re-invocation `ref` dedup. The design body (`§§0–13`) is untouched — only the v1/v2 staging ledger was stale. Spec edit made on the explicit "atualize docs" request.
+
+## [2026-05-21] test(skills) — eval coverage
+
+`evals/smoke/11-skill-invoke.yaml` + `12-skill-list.yaml` — the skills subsystem's first eval cases, closing the principle-4 gap (a subsystem without eval doesn't ship). The eval harness runs every case through `bootstrap`, which builds the skill catalog over the case's fixture cwd — so a `setup.files` entry under `.agent/skills/shared/` is picked up with no executor change.
+
+- **`11-skill-invoke`** exercises the model-behavior loop end-to-end: a `file-summary` skill is surfaced in the prompt catalog, the model invokes it via `skill_invoke`, and follows the injected body — the body's `PURPOSE:` / `LINECOUNT:` format (a sentinel the model would not emit otherwise) reaching the output proves the body was followed, not just loaded.
+- **`12-skill-list`** proves the `skill_list` tool executes and returns the resolved catalog (both seeded skills named back).
+
+Both land in `evals/smoke/`, so `bun run eval:smoke` exercises them as part of the routine suite rather than orphaning them in an unscripted directory.
+
+## [2026-05-21] docs(skills) — operator guide
+
+`docs/SKILLS.md` — the English operator / implementation reference for the skills subsystem, in the shape of `docs/MEMORY.md` / `docs/HOOKS.md`: what a skill is, the file format + frontmatter table, the three scopes and disk layout, the precedence-resolving catalog, the eager `# Skills` prompt surface, the `skill_invoke` / `skill_list` / `skill_show` tools, the `/skill` lifecycle command, the `skill_events` audit, the `<skill>` trust marker, the seed catalog `agent init` installs, and the v2-deferred scope. The canonical spec stays `docs/spec/SKILLS.md` (PT-BR); this is the operational companion — spec wins on divergence.
+
+## [2026-05-21] feat(skills) — slice 7: seed catalog (agent init installs 20 skills)
+
+The last slice. `agent init` now scaffolds a fifth artifact — the seed skill catalog — so a freshly-initialized project starts with 20 vetted skills.
+
+- The 20 seed skills moved from `docs/spec/skills/` (the architect's draft staging) to `src/cli/init-skills/`, their canonical home — bundled into the binary as `with { type: 'text' }` imports, mirroring `init-playbooks/`. `docs/spec/skills/` is removed: seed content lives in `src/cli/init-*`, never `docs/spec/` (there is no `docs/spec/playbooks/` either). One seed (`profile-hotspot`) shipped a 126-char description — trimmed to 111 so the catalog admits it (the 120-char cap, slice 1).
+- **`src/cli/init-skills/index.ts`** (new) — `CANONICAL_SKILLS`, the bundled array.
+- **`init.ts`** — a `skills` step writes the catalog into `<cwd>/.agent/skills/shared/`. The playbooks + skills copy/skip/force loop is extracted into one `scaffoldAssetDir`; `scaffoldPlaybooks` / `scaffoldSkills` are thin wrappers over it.
+- The new step rippled through the drift-guarded surfaces: `args.ts` (`--only` / `--force` step lists) and `purge.ts` (`INIT_MARKERS` — `.agent/skills/` now gates `agent purge` and is recognized by it). The drift-guard tests pairing those to `DEFAULT_STEPS` caught each omission.
+- `memory/gitignore.ts` — `.agent/.gitignore` now ignores `skills/local/` (spec §2: the local scope is gitignored, like `memory/local/`).
+- Forja's own `.agent/skills/shared/` is populated with the 20 skills — its dev sessions now boot with the catalog surfaced in the prompt.
+
+`tests/cli/init-skills.test.ts` (new) validates every seed parses + `agent init` installs a catalog all 20 resolve into; `init.test.ts` / `purge.test.ts` updated for the fifth step. `typecheck` + `lint` clean; `tests/cli/` + `tests/memory/` green (the one pre-existing `repl.test.ts` banner failure aside).
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort; efficiency confirmed the 20 bundled text assets load only in the `agent init` process, never on a normal `agent` boot — type-only + dynamic-gated import). Fixes folded in: `parseCsvSubset` now derives its `valid: …` hint from the step array it is already passed instead of a hand-maintained string copy — that copy had silently kept the pre-skills list, so `agent init --force=typo` advised a valid set without `skills`; the `--force=` / `--only=` empty-value messages and the `--help` text were corrected the same way. Plus the stale `four`→`five` comments the fifth step left behind.
+
+The skills subsystem (slices 1–7) is feature-complete for v1: storage + scopes, the precedence-resolving catalog, the `skill_events` audit, the `skill_invoke` / `skill_list` / `skill_show` tools, the eager prompt surface, the `/skill` lifecycle command, and the installed seed catalog. `capture` / `import` / the §6.4 decay sweep remain the noted v2 scope.
+
+## [2026-05-21] feat(skills) — slice 6: /skill slash command
+
+The operator surface for the skills lifecycle (spec SKILLS.md §6) — `list` / `show` / `new` / `promote` / `demote` / `delete`. `capture` (turn a session into a skill) and `import` (the `imported` scope) stay v2.
+
+- **`src/skills/lifecycle.ts`** (new) — `createSkill` / `moveSkill` / `deleteSkill`: the disk mutations, each "measure twice" (validate the name, confirm the scope root resolves, probe the target before writing) and returning a discriminated `SkillLifecycleResult` rather than throwing. Lives in the subsystem so the file ops are testable without the REPL. `moveSkill` copy-then-deletes rather than `rename` — the project and user scopes can sit on different filesystems, where `rename` fails with EXDEV; it also refuses to move a malformed source.
+- **`src/cli/slash/commands/skill.ts`** (new) — the `/skill` command, a thin dispatch + presentation layer over the lifecycle module and the catalog. `new` scaffolds into `project_local` (the lowest scope; `promote` moves a vetted one up). After any mutation it `reload()`s the catalog so the live `skill_list` / `skill_invoke` tools see the change within the session.
+- Destructive ops gate on an explicit `--confirm` token, not a modal: `promote user` crosses into the host-global scope and `delete` removes a file, so each first prints what it will do and asks for a re-run. The within-project moves (`promote shared`, `demote local`) are reversible and just report. A new modal flavor would have dragged modal-manager / state / renderer into the slice for no v1 gain — a re-run token is a complete confirmation, and the UX iterates in code (spec PR after it stabilizes).
+
+`tests/skills/lifecycle.test.ts` + `tests/cli/slash/skill.test.ts` (new); `dispatch.test.ts`'s builtin-registry assertions updated for the 18th command.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort; efficiency cleared the `existsSync` TOCTOU checks and the post-mutation `catalog.reload()` as correct for an operator-paced surface, and confirmed `moveSkill`'s validate-then-copy double read is deliberate). Fixes folded in: `/skill delete` of a name that shadows a same-name skill in a lower scope now reports that the shadowed copy is live again (the silent surprise §6.3 argues against); `--confirm` is split from the positionals so it works in any position — a leading `--confirm` previously hijacked the name slot; `applyMove` failures carry the `/skill promote:` / `/skill demote:` prefix the handlers' own errors use; `resolvePath` got a dedicated `ResolvedPath` type so its "path resolved" `ok` does not blur with the lifecycle result's "op done" `ok`. Plus coverage for `scope_unavailable`, a symlinked-source move refusal, the `/skill list` filtered section, and the `--confirm` prompt content.
+
+`typecheck` + `lint` clean; `tests/skills/` + `tests/cli/` green (the one pre-existing `repl.test.ts` banner failure aside).
+
+## [2026-05-21] feat(skills) — slice 5: surface (the subsystem goes live)
+
+The wiring slice — after it the skills subsystem is end-to-end live: the catalog is built at boot, surfaced in the system prompt, the three tools are registered, and surfaced / invoked / filtered are all audited.
+
+- **`cli/skills-prompt.ts`** (new) — `assembleSkillCatalogSection` renders the resolved catalog as a `# Skills` prompt block (name + description + scope per skill, §4.1 "surface eager, body lazy"). A mirror of `memory-prompt.ts:assembleMemorySection` minus the trust / trigger filtering — skills have no per-skill trust field, so the section is `catalog.list()` verbatim, identical to what the `surfaced` audit records. An empty catalog yields an empty string (no section, no scaffolding).
+- **`bootstrap.ts`** — builds `createSkillCatalog({ roots, db })` (same repo-rooted scope resolution as memory; the skills `resolveScopeRoots` is import-aliased to dodge the name clash), composes the catalog section onto the prompt after the memory index, and threads `skillCatalog` into `HarnessConfig`.
+- **`harness/loop.ts`** — after `createSession`, calls `catalog.recordSurface({ sessionId })`: one `surfaced` `skill_events` row per resolved entry and one `filtered` row per dropped file. Mirrors the eager-exposure emit; the session row must exist first for the FK.
+- **`catalog.ts`** — gained `recordSurface` (plus a `filteredDetails` projector mapping the discriminated `FilteredSkill` onto the audit `details` JSON); `recordEvent`'s body is now a shared `emitSkillEvent` closure that both `recordEvent` and `recordSurface` call.
+- **`tools/builtin/index.ts`** — `skill_invoke` / `skill_list` / `skill_show` added to `BUILTIN_TOOLS`; the bootstrap now wires a catalog, so they no longer always-error.
+
+`tests/cli/skills-prompt.test.ts` (new) + a catalog `recordSurface` test; `bootstrap.test.ts`'s tool-list assertion updated for the three new tools.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `recordSurface` gained a per-session idempotency gate — it claimed to mirror the loop's eager-provenance emit but lacked the gate that emit carries because the post-`createSession` region re-runs on resumed and preassigned sessions; without it a resume double-wrote the `surfaced`/`filtered` rows the §3.4.5 surfaced-vs-invoked ratio reads (`skill_events` has no UNIQUE). The boot INSERT burst is now wrapped in one `withTransaction` — dozens of best-effort INSERTs collapse to a single commit. `surfaced` rows carry the frontmatter `version` (symmetry with `invoked`). `assembleSkillCatalogSection` returns a bare `string` — the dropped `entryCount` field had no consumer and `catalog.count()` already provides it. Plus a named `SkillSurfaceAttribution` type and a corrected stale `catalog.ts` header comment.
+
+`typecheck` + `lint` clean; `tests/skills/` + `tests/cli/` + `tests/harness/` — 2214 pass.
+
+Noted, NOT slice 5: running `tests/cli/` surfaced one pre-existing failure — `repl.test.ts` "boot emits welcome banner" — unrelated to skills (a TUI banner-content assertion). Verified still failing at the pre-slice-5 HEAD with the slice stashed away; left for a separate fix.
+
+## [2026-05-21] feat(skills) — slice 4: tools (skill_invoke / skill_list / skill_show)
+
+The model-facing surface (spec SKILLS.md §5) — three tools in `src/tools/builtin/`, plus the harness plumbing to reach the catalog.
+
+- **`skill_invoke`** — resolves a skill (precedence, or a pinned scope), returns the body wrapped in the `<skill name scope>…</skill>` trust marker (§4.2 / §7.2: the model treats the delimited text as a procedure to follow, not as system instruction), and records an `invoked` audit row via `catalog.recordEvent`. A body that itself contains a literal `</skill>` is refused as malformed — it could break out of the marker. `tools` / `requires` / `version` / `expires` from the frontmatter are surfaced in the output; the opaque `args` (§5.2) is echoed back.
+- **`skill_list`** — the resolved catalog as name + description + scope (§5.1), optional scope filter.
+- **`skill_show`** — a skill's raw body for inspection, NO marker and NO audit — §5.1: list / show are read-only. The catalog's `read()` stays pure (no auto-emit) precisely so `skill_show` can load a body without it counting as an invocation; `invoked` is `skill_invoke`'s explicit `recordEvent` call.
+- Shared `_skills.ts` — `validateSkillScope`, `wrapSkillBody`, `SKILL_MARKER_CLOSE`.
+- Wiring: `ToolContext.skillCatalog?` + `HarnessConfig.skillCatalog?` + the loop's `buildCtx` spread. The three tools are exported but deliberately NOT in `BUILTIN_TOOLS` yet — the bootstrap has no catalog to wire until slice 5, and surfacing always-`catalog_unavailable` tools to the model would waste turns (same treatment `pin_context` gets). Slice 5 adds them.
+
+v1 deferral, noted: `skill_invoke` surfaces `tools` / `requires` but does NOT gate on them. The §5.4 `requires`-missing hard error needs a subsystem-capability registry that does not exist; the §8 `tools` pre-flight cannot be a strict tool-name match (the seed catalog declares loose names like `edit`). Both are v2 — alongside the §6.4 decay sweep, the other `expires`-driven v2 piece.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: the byte-identical `skill_invoke` / `skill_show` resolution prelude (catalog check → name/scope validation → `catalog.read` → not_found/missing/malformed mapping, ~40 lines) extracted into `_skills.ts:resolveSkillForTool`; `skill_invoke` now honors §5.4's expired-skill warn (`emitWarn` + an `expired` flag in the audit `details`) rather than only surfacing the date; the `args` input-schema property dropped its `type: 'object'` — §5.2: `args` is opaque and un-validated, and a typed schema would invite the provider to reject a non-object before the tool runs; and `catalog.read` now rejects a file whose `frontmatter.name` differs from the requested name — the `name_mismatch` identity invariant `refresh()` already enforces, which a strict-scope read previously bypassed. Plus coverage for `body_missing`, the malformed path, and unknown-scope rejection.
+
+26 skill-tool tests (`tests/tools/skill-{invoke,list,show}.test.ts`) + a `catalog.read` name-mismatch test; `typecheck` + `lint` clean; `tests/skills/` + the skill-tool suites green (105). The harness wiring is additive — `tests/tools/` + `tests/harness/` were green at build (729).
+
+## [2026-05-21] feat(skills) — slice 3: audit (skill_events)
+
+The audit storage for the subsystem (spec SKILLS.md §0.7, §14; RETRIEVAL.md §3.4.5). Without it there is no trail to tune a skill's `description` against — surfaced-often-but-never-invoked is the signal §3.4.5 names, and that needs the events recorded.
+
+- **Migration `067-skill-events`** — `skill_events` table mirroring `memory_events`: `id` (UUID), `scope` + `action` CHECK-constrained, `skill_name`, nullable `session_id` (FK `ON DELETE SET NULL`), `cwd`, `created_at`, JSON `details`. `action` ∈ `surfaced` / `invoked` / `filtered` (§0.7). No `source` column — skills have no inferred-vs-explicit provenance axis in v1; `scope` is the only provenance. Partial index on `session_id`, composite `(skill_name, created_at DESC)` — the same index pair as `memory_events`.
+- **`src/storage/repos/skill-events.ts`** — `createSkillEvent` + `listSkillEventsBySession` / `listSkillEventsByName` / `listRecentSkillEvents`, re-exported from `storage/index.ts`. Mirrors the `memory-events` repo.
+- **`createSkillCatalog` gains `db?` / `sessionId?` / `cwd?` + `recordEvent`** — best-effort emit (no-op without a db; a DB failure goes to redacted stderr, never throws — an audit miss must not break a turn or the boot path). The catalog's `read()` stays pure: `invoked` is an explicit `recordEvent` call by the (slice-4) `skill_invoke` tool, NOT an auto-emit on body load — `skill_show` reads a body without invoking and must not emit.
+
+The `surfaced` / `invoked` / `filtered` rows are emitted by later slices: `invoked` by the `skill_invoke` tool (slice 4), `surfaced` / `filtered` at boot once the session exists (slice 5). Slice 3 is the storage + emit API those callers use.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: the repo's hand-rolled `parseDetails` was a sixth copy of a `JSON.parse → object|null` swallow helper — replaced by a new shared `parseJsonObject` in `storage/json-safe.ts` (the established storage-JSON home; the five other pre-existing copies are a tracked cross-cutting cleanup, out of scope here). Test coverage closed on the slice's own guarantees: `recordEvent` swallowing a DB failure (the "audit miss must not break a turn" contract — previously only the no-db early-return was covered), the `cwd` attribution fallback, a corrupt-`details` round-trip, and direct `parseJsonObject` unit tests; the catalog `recordEvent` tests moved onto a describe-local `beforeEach`.
+
+`tests/skills/` + `tests/storage/` green (875), `typecheck` + `lint` clean.
+
+Follow-up, NOT slice 3: a retention sweep (`pruneSkillEvents` + `agent gc` wiring) — `skill_events` grows unbounded until then. It is an audit-subsystem change, tracked separately rather than shipped as a dead function here.
+
+## [2026-05-21] feat(skills) — slice 2: catalog
+
+`src/skills/catalog.ts` — `createSkillCatalog` scans every scope at construction (the loader's `scanScope`), resolves name conflicts by precedence (`project_local > project_shared > user`, §3.5), and holds the result as an in-memory snapshot. Mirrors the memory registry minus the index file: skills discover by directory glob, so the catalog IS the index.
+
+One scan, two outputs — `entries` (resolved winners: the §4.1 surface — name + description + scope) and `filtered` (every scanned file that did NOT become an entry, with the reason: `malformed` / `name_mismatch` / `shadowed`). §3.5 mandates resolution be explicit and auditable; `filtered()` is that audit input (slice 3 emits it). A frontmatter `name` ≠ filename mismatch is rejected so `skill_invoke(<filename>)` and `<frontmatter.name>` can never disagree about what exists. A malformed skill in a higher scope does NOT shadow a valid lower one — precedence runs over valid candidates only.
+
+API: `list(scope?)` / `lookup(name)` / `read(name, scope?)` / `filtered()` / `count()` / `reload()`. `read` is lazy — the body is re-read fresh from disk every call (no body cache — same rule the loader and memory registry follow); no scope resolves the winner, an explicit scope reads strictly so a shadowed skill stays reachable. No persistence yet — the surfaced/invoked/filtered audit lands in slice 3.
+
+Fixed a slice-1 gap the catalog scan exposed: a non-kebab-case `.md` filename made `skillFilePath`→`validateName` throw, and the throw escaped `scanScope` and crashed the whole catalog build. `readSkillByName` now catches the invalid-name throw and returns `malformed` — the bad file surfaces as a filtered entry instead of taking the scan down.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `FilteredSkill` is now discriminated by `reason` (`error` / `declaredName` / `shadowedBy: SkillScope`) instead of a flattened `detail: string`, so the slice-3 audit consumer gets typed payloads; `SkillCatalogEntry` / `FilteredSkill` fields are `readonly` (the snapshot was leaking mutable entries via `lookup`); the winners `Map` is kept for O(1) `lookup` / `read` instead of being built then discarded; a regression test pins `read()` of a winner whose file was deleted after the scan. Test fixtures (`makeTmp` / `makeRoots` / `skillDoc` / `writeSkill`) hoisted to `tests/skills/_helpers.ts` — they were copy-pasted across the loader + catalog test files, and every later slice would copy them again. Noted follow-up, NOT slice 2: `SkillScope` ≡ `MemoryScope` and the scope-precedence literal are duplicated across memory / skills / subagents — unifying them is a cross-subsystem refactor, tracked separately.
+
+72 tests in `tests/skills/`; `typecheck` + `lint` clean.
+
+## [2026-05-21] feat(skills) — subsystem kickoff: slice 1 (core storage)
+
+New subsystem (spec `SKILLS.md`): gated, reusable procedures the model invokes when the goal matches — markdown file with frontmatter (`name` + `description`) + a prose body the LLM follows. v1 scope per `SKILLS.md §14`: frontmatter + body, three scopes (user / project_shared / project_local — `imported` is v2), surface eager / body lazy, `skill_invoke|list|show` tools, `surfaced/invoked/filtered` audit. Sliced: (1) core storage, (2) catalog, (3) audit table, (4) tools, (5) prompt surface, (6) `/skill` slash, (7) seed catalog.
+
+`RETRIEVAL.md` gained `§3.4 Skills gating` — the surface/gate mechanism `SKILLS.md` cross-references (the doc previously stopped at §3.3). Section authored by the architect; applied verbatim except one "Claude Code" mention generalized to "CLIs agênticos" per the no-Claude-Code-in-docs rule.
+
+**Slice 1 — `src/skills/{types,frontmatter,paths,loader,index}.ts`.** Pure core storage, no harness coupling:
+
+- `frontmatter.ts` — parse / serialize / validate skill `.md` files. `name` + `description` required (kebab-case name; single-line description hard-capped at the spec's 120 chars); `version` / `trigger_keywords` / `tools` / `requires` / `source` / `created_at` / `updated_at` / `expires` optional. Snake_case field names mirror the YAML keys 1:1 — no case-translation layer. `expires: null` (the seed-catalog idiom) collapses to absent. Unknown fields rejected. Strict `---` fence detection, CRLF normalized, one leading body blank stripped — modeled on `memory/frontmatter.ts`.
+- `paths.ts` — scope roots: user via the shared `config/agent-paths.ts:agentConfigDir` (XDG + Windows `APPDATA`; `null` when no home is derivable, so `SkillScopeRoots.user` is `string | null`), project `.agent/skills/{shared,local}/`. `skillFilePath` validates the name then re-checks the resolved path under the scope root — defense-in-depth, unreachable with the current `NAME_RE`. Repo-root resolution stays the caller's job — no skills→memory coupling.
+- `loader.ts` — glob-based discovery (skills have no `MEMORY.md`-style index): `listSkillNames` / `readSkillByName` / `scanScope`. Symlinked + non-regular `.md` files refused — a skill body is injected into model context, so a symlink could exfiltrate an out-of-scope file.
+
+55 tests in `tests/skills/` (frontmatter / paths / loader); `typecheck` + `lint` clean.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `userScopeRoot` switched to the shared `config/agent-paths.ts:agentConfigDir` — it was a fourth hand-rolled XDG copy that missed Windows user paths, the exact drift `agent-paths.ts` exists to end (a homeless env now yields no user scope rather than a cwd-relative path; this also makes `ScopeError` reachable + tested); a `SKILL_FIELD_ORDER` tuple replaced three hand-synced field lists (interface / unknown-field gate / serializer); plus comment-honesty and coverage fixes (`source: imported` + `version: null` round-trips, null-scope-root paths). Noted follow-up, NOT slice 1: `checkRegularFile` is byte-identical with `memory/loader.ts` — extracting it to a shared `src/lib/` is a cross-subsystem change (migrates memory too), tracked separately. The skills↔memory frontmatter/sandbox helper duplication is deliberate per-subsystem (error-class coupling; signatures already divergent across 5 subsystems) — left as-is.
+
+Deferred, raised when load-bearing: seed-catalog placement (the 20 `docs/spec/skills/` files → `.agent/skills/shared/`?) at slice 7; branch at first commit. `requires:` is parsed and will surface in `skill_show` but gets no hard pre-flight in v1 — no subsystem-capability registry exists; `tools:` will be registry-checked at slice 4.
+
 ## [2026-05-21] feat(tui) — restyle the permission modal preview
 
 Several changes to the permission modal's preview block:

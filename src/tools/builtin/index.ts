@@ -16,6 +16,9 @@ import { monitorTool } from './monitor.ts';
 // omitted from the default registry.
 import { readFileTool } from './read-file.ts';
 import { retrieveContextTool } from './retrieve-context.ts';
+import { skillInvokeTool } from './skill-invoke.ts';
+import { skillListTool } from './skill-list.ts';
+import { skillShowTool } from './skill-show.ts';
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
@@ -58,6 +61,12 @@ export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
 export { retrieveContextTool } from './retrieve-context.ts';
+export { skillInvokeTool } from './skill-invoke.ts';
+export type { SkillInvokeInput, SkillInvokeOutput } from './skill-invoke.ts';
+export { skillListTool } from './skill-list.ts';
+export type { SkillListEntry, SkillListInput, SkillListOutput } from './skill-list.ts';
+export { skillShowTool } from './skill-show.ts';
+export type { SkillShowInput, SkillShowOutput } from './skill-show.ts';
 export { taskTool, taskSyncTool } from './task.ts';
 export type { TaskInput, TaskOutput } from './task.ts';
 export { taskAsyncTool } from './task-async.ts';
@@ -100,6 +109,9 @@ export const BUILTIN_TOOLS = [
   memoryReadTool,
   memorySearchTool,
   retrieveContextTool,
+  skillListTool,
+  skillShowTool,
+  skillInvokeTool,
   waitForTool,
   monitorTool,
   todoWriteTool,

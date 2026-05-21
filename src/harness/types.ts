@@ -11,6 +11,7 @@ import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
 import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
+import type { SkillCatalog } from '../skills/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
@@ -834,6 +835,12 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // Skill catalog (spec SKILLS.md). When set, the harness threads it
+  // through ToolContext so skill_invoke / skill_list / skill_show can
+  // dispatch, and the catalog's recordEvent writes skill_events audit
+  // rows. Absent ⇒ those tools surface a clean tool-error. Built by
+  // the CLI bootstrap; the harness just hands it through.
+  skillCatalog?: SkillCatalog;
   // S5 CRIT/H2 hardening. Scopes that must be excluded from
   // retrieval (`retrieve_context` tool) for this session. Mirrors
   // the eager-load exclusion the bootstrap applies to

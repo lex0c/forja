@@ -902,7 +902,7 @@ describe('parseArgs — init subcommand', () => {
     const r = parseArgs(['init', '--force=unknown']);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.message).toContain('permissions, config, playbooks');
+    expect(r.message).toContain('permissions, config, playbooks, skills');
   });
 
   test('--force= (empty value) is rejected', () => {
@@ -937,7 +937,7 @@ describe('parseArgs — init subcommand', () => {
     const r = parseArgs(['init', '--only=unknown']);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.message).toContain('permissions, gitignore, config, playbooks');
+    expect(r.message).toContain('permissions, gitignore, config, playbooks, skills');
   });
 
   test('--only= (empty value) is rejected', () => {

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
-import { StorageJsonError, canonicalJson } from '../../src/storage/json-safe.ts';
+import { StorageJsonError, canonicalJson, parseJsonObject } from '../../src/storage/json-safe.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { getMessage } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
@@ -34,6 +34,28 @@ describe('storage JSON safety', () => {
       expect(err.context).toContain('messages(msg-1).content');
       expect(err.message).toContain('corrupt JSON');
     }
+  });
+});
+
+describe('parseJsonObject', () => {
+  test('parses a JSON object', () => {
+    expect(parseJsonObject('{"a":1,"b":"x"}')).toEqual({ a: 1, b: 'x' });
+  });
+
+  test('returns null for absent or empty input', () => {
+    expect(parseJsonObject(null)).toBeNull();
+    expect(parseJsonObject('')).toBeNull();
+  });
+
+  test('returns null for corrupt JSON instead of throwing', () => {
+    expect(parseJsonObject('{not valid json')).toBeNull();
+  });
+
+  test('returns null for non-object JSON — arrays and primitives', () => {
+    expect(parseJsonObject('[1,2,3]')).toBeNull();
+    expect(parseJsonObject('42')).toBeNull();
+    expect(parseJsonObject('"a string"')).toBeNull();
+    expect(parseJsonObject('null')).toBeNull();
   });
 });
 

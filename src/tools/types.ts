@@ -11,6 +11,7 @@ import type {
 } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 import type { RetrieveFn } from '../retrieval/index.ts';
+import type { SkillCatalog } from '../skills/index.ts';
 import type { ContextPinsStore, PinKind } from '../storage/repos/context-pins.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
@@ -302,6 +303,13 @@ export interface ToolContext {
   // logged to memory_events at the registry layer; the tool just
   // dispatches.
   memoryRegistry?: MemoryRegistry;
+  // Skill catalog (spec SKILLS.md). Set by the harness when skills
+  // were wired via HarnessConfig.skillCatalog. The skill_invoke /
+  // skill_list / skill_show tools surface a clean error when absent
+  // rather than dereferencing undefined — same pattern as
+  // memoryRegistry. The catalog owns its own audit emit (recordEvent
+  // → skill_events); the tools just dispatch.
+  skillCatalog?: SkillCatalog;
   // Retrieval subsystem runner (spec RETRIEVAL.md §15.4). Set by
   // the harness when both memoryRegistry AND db are wired — the
   // pipeline needs both for its view + compression-resolver

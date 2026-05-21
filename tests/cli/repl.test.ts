@@ -95,6 +95,10 @@ interface MakeBootstrapStubOptions {
   // both the boot banner env entry and the footer's `mem N` token.
   // Omit (default 0) to test the omit-on-zero paths.
   memoryCount?: number;
+  // Resolved skill-catalog count surfaced by `SkillCatalog.count`;
+  // drives the boot banner's skills env entry. Omit (default 0) to
+  // test the omit-on-zero path.
+  skillCount?: number;
   // Optional broker stub. When set, it's attached to the bootstrap
   // config so teardown paths that call `baseConfig.broker.close()`
   // can be exercised. Production brokers own handles/timers; tests
@@ -109,6 +113,7 @@ const makeBootstrapStub = (
     typeof cwdOrOpts === 'string' ? { cwd: cwdOrOpts } : cwdOrOpts;
   const cwd = opts.cwd ?? '/tmp/forja-repl-test';
   const memoryCount = opts.memoryCount ?? 0;
+  const skillCount = opts.skillCount ?? 0;
   const realDb = openMemoryDb();
   migrate(realDb);
   const config = {
@@ -121,6 +126,7 @@ const makeBootstrapStub = (
       capabilities: { context_window: 200000, output_max_tokens: 4096 },
     },
     memoryRegistry: makeStubRegistry(memoryCount),
+    skillCatalog: { count: () => skillCount },
     ...(opts.broker !== undefined ? { broker: opts.broker } : {}),
   } as unknown as HarnessConfig;
   return {
@@ -573,6 +579,48 @@ describe('repl — boot + smoke', () => {
     const all = writes.join('');
     // Zero memories → no env entry; the "memory:" key never appears.
     expect(all).not.toContain('memory:');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('boot banner includes skills env entry when the catalog has entries', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ skillCount: 5 }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    await tick();
+    const all = writes.join('');
+    expect(all).toContain('skills: 5');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('boot banner omits skills env entry when the catalog is empty', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ skillCount: 0 }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    await tick();
+    const all = writes.join('');
+    expect(all).not.toContain('skills:');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

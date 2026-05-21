@@ -97,6 +97,77 @@ Cada view exporta `search(query) → [candidates]`. Pipeline funde resultados (`
 
 Candidato sai com `(node_id, view, bootstrap_score, reason)`. Reason permite trace.
 
+### 3.4 Skills gating (quarto candidato, mecanismo distinto)
+
+Skills não são uma quarta view — não têm grafo, traversal, nem decay temporal. Mas resolvem o mesmo problema upstream: **dado goal atual, que subset de N skills disponíveis merece aparecer no prompt?** Pipeline acima é overkill; ranking estrutural não se aplica (skill não tem `calls`/`imports`).
+
+Mecanismo: **description-based progressive disclosure** (mesmo padrão que CLIs agênticos aplicam a skills/subagents/MCP tools). Não é busca semântica via embedding — é gating via LLM lendo descrições curtas.
+
+#### 3.4.1 Estrutura por skill
+
+```
+---
+name: <slug>
+description: <1 linha, ≤120 chars, optimizada pra LLM decidir relevância>
+trigger_keywords: [opcional, lista]   # pré-filtro lexical barato
+---
+<body — carrega lazy>
+```
+
+`description` é load-bearing. Vago ("ajuda com código") = nunca invocada ou sempre invocada errado. Específica ("renomeia símbolos via tree-sitter respeitando escopo") = gate funciona.
+
+#### 3.4.2 Duas fases
+
+| Fase | Quando | Custo | Saída |
+|---|---|---|---|
+| **Surface** | sempre, no system prompt | `≈ N × 30t` (só nome + description) | catálogo visível |
+| **Load** | quando modelo invoca | corpo da skill | body completo, contexto da turn |
+
+Análogo a `MEMORY §4` (eager index, lazy content). Skill nunca entra `full` antes de invocada — caso contrário N grandes skills inflacionam todo prompt.
+
+#### 3.4.3 Pré-filtro opcional (quando N grande)
+
+Se catálogo passa de ~30 skills (ordem de grandeza, não dogma), surface vira ruidoso. Adicionar pré-filtro lexical antes do surface:
+
+```
+relevant = [s for s in skills if
+  any(kw in goal_text for kw in s.trigger_keywords)
+  or BM25(s.description, goal_text) > threshold]
+```
+
+Pré-filtro é **opt-in** e **lexical** — mesmo princípio de `§0.2`. Embedding sobre descriptions só entra se medir dor.
+
+Skills sem `trigger_keywords` e sem hit BM25 ainda entram via fallback "general" group (sempre surfaceado), pra evitar invisibilidade silenciosa.
+
+#### 3.4.4 Por que não ranquear via grafo
+
+- Skill não tem edge natural pro código (`calls`, `imports`) — forçar isso é cargo cult.
+- Goal-alignment via cosine entre `description` e goal text **é** ranking semântico, e cai na trava de `§0.2` (opt-in v2).
+- Modelo é melhor selecionador que weighted-sum aqui: descrição curta + nome basta pra decisão tool-call-like.
+
+#### 3.4.5 Audit
+
+Mesmo princípio de `§5.3`: registrar quais skills foram **surfaced**, quais foram **invoked**, quais foram **filtered out** no pré-filtro. Permite afinar `description` e `trigger_keywords` com base em miss/false-positive.
+
+```
+{
+  query_id,
+  skills_surfaced:   [name, ...],
+  skills_invoked:    [name, ...],
+  skills_filtered:   [{name, reason: "no kw match"}, ...]
+}
+```
+
+#### 3.4.6 Anti-patterns específicos
+
+| Pattern | Por que dói |
+|---|---|
+| `description` vaga ou genérica | gate quebra; skill nunca invocada ou invocada errado |
+| Carregar body de todas skills eager | infla system prompt linearmente com N |
+| Ranquear skills por cosine vs goal embedding | adiciona infra (embed) pra problema que LLM resolve com 30t de description |
+| Skill como "tudo que pode ser útil às vezes" | catálogo cresce, sinal/ruído degrada, modelo deixa de invocar até as boas |
+| Skills sem audit | impossível afinar descriptions com base em uso real |
+
 ---
 
 ## 4. Expansion (bounded traversal)

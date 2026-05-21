@@ -33,6 +33,30 @@ Body B.`,
   },
 ];
 
+// Synthetic skill fixture — same role as FIXTURE_PLAYBOOKS for the
+// skills step: surgical counts without depending on the 15-entry
+// canonical catalog.
+const FIXTURE_SKILLS = [
+  {
+    filename: 'fixture-skill-a.md',
+    content: `---
+name: fixture-skill-a
+description: Stub skill A
+---
+Body A.
+`,
+  },
+  {
+    filename: 'fixture-skill-b.md',
+    content: `---
+name: fixture-skill-b
+description: Stub skill B
+---
+Body B.
+`,
+  },
+];
+
 describe('runInit — permissions step', () => {
   let cwd: string;
   let outBuf: string[];
@@ -537,11 +561,12 @@ describe('runInit — full bundle (default order)', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('scaffolds all four artifacts on a clean cwd', () => {
+  test('scaffolds all five artifacts on a clean cwd', () => {
     const code = runInit({
       cwd,
       mode: 'strict',
       playbookSource: FIXTURE_PLAYBOOKS,
+      skillSource: FIXTURE_SKILLS,
       out,
       err,
     });
@@ -551,9 +576,11 @@ describe('runInit — full bundle (default order)', () => {
     expect(existsSync(join(cwd, '.agent', 'config.toml'))).toBe(true);
     expect(existsSync(join(cwd, '.agent', 'agents', 'fixture-a.md'))).toBe(true);
     expect(existsSync(join(cwd, '.agent', 'agents', 'fixture-b.md'))).toBe(true);
-    // Aggregate count = 1 perm + 1 gitignore + 1 config + 2 playbooks
-    expect(outBuf.join('')).toContain('5 wrote');
-    expect(outBuf.join('')).toContain('4 steps');
+    expect(existsSync(join(cwd, '.agent', 'skills', 'shared', 'fixture-skill-a.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.agent', 'skills', 'shared', 'fixture-skill-b.md'))).toBe(true);
+    // Aggregate count = 1 perm + 1 gitignore + 1 config + 2 playbooks + 2 skills
+    expect(outBuf.join('')).toContain('7 wrote');
+    expect(outBuf.join('')).toContain('5 steps');
     expect(outBuf.join('')).toContain("review .agent/ and run 'agent'");
   });
 
