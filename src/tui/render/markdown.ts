@@ -68,11 +68,14 @@ const renderInline = (
         break;
       case 'link': {
         // The URL rides inline, dimmed — only when it adds info (an
-        // autolink has label === url). OSC 8 hyperlinks are a UI.md
-        // §13 non-goal.
+        // autolink has label === url). The match is against the RAW
+        // label text, not the styled one: surrounding formatting (a
+        // link inside **…**) adds SGR that would make an equal URL
+        // compare unequal. OSC 8 hyperlinks are a UI.md §13 non-goal.
         const label = renderInline(node.children, caps, active);
+        const rawLabel = renderInline(node.children, { ...caps, color: 'none' }, []);
         out +=
-          node.url !== '' && node.url !== label
+          node.url !== '' && node.url !== rawLabel
             ? `${label} ${styled(`(${node.url})`, caps, [...active, 'dim'])}`
             : label;
         break;

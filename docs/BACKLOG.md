@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(tui) — Markdown autolink no longer duplicates the URL under formatting
+
+The link renderer compared `node.url` against the *styled* label string. Under color, surrounding formatting (a link inside `**…**`) adds SGR to the label, so an autolink — `[https://x.io](https://x.io)` — compared unequal and rendered as `https://x.io (https://x.io)`, duplicating the URL. The comparison now runs against the raw label text (rendered with color off), so the "show the URL only when it adds information" rule holds regardless of formatting. 2 new `markdown.test.ts` cases.
+
 ## [2026-05-21] fix(tui) — subagent tool handling catches up to the top-level path
 
 The subagent tool-event translation (`harness-adapter.ts`, `subagent_progress.lastEvent`) lagged two recent top-level changes:

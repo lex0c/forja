@@ -109,4 +109,16 @@ describe('renderMarkdown', () => {
   test('a link shows the URL dimmed alongside the label', () => {
     expect(renderMarkdown('see [docs](https://x.io)', caps)).toEqual(['see docs (https://x.io)']);
   });
+
+  test('an autolink (label === url) shows the URL once, not duplicated', () => {
+    expect(renderMarkdown('[https://x.io](https://x.io)', caps)).toEqual(['https://x.io']);
+  });
+
+  test('an autolink inside formatting still shows the URL once (raw-label match)', () => {
+    // The label is bold-styled (SGR), the URL is raw — the match must
+    // be on the raw text, or it appends a duplicate ` (url)`.
+    expect(renderMarkdown('**[https://x.io](https://x.io)**', colored)).toEqual([
+      '\x1b[1mhttps://x.io\x1b[0m',
+    ]);
+  });
 });
