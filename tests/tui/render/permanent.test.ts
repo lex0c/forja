@@ -210,14 +210,15 @@ describe('formatPermanent', () => {
       );
     });
 
-    test('applies bold to title, secondary to cwd, success to flags, dim to meta when color enabled', () => {
+    test('applies bold to title, secondary to cwd and to the whole env line', () => {
       const out = formatPermanent(baseBanner, colored);
-      // 0: title (bold), 1: cwd (secondary), 2: env mix
+      // 0: title (bold), 1: cwd (secondary), 2: env (uniformly secondary)
       expect(out[0]).toContain(`${CSI}1m`);
       expect(out[1]).toContain(`${CSI}90m`);
-      // env line: meta entry dim, flag entry success.
-      expect(out[2]).toContain(`${CSI}2m`); // dim runs (meta + separator)
-      expect(out[2]).toContain(`${CSI}32m`); // success run (flag)
+      expect(out[2]).toContain(`${CSI}90m`);
+      // env line carries no success / dim runs — one secondary run.
+      expect(out[2]).not.toContain(`${CSI}32m`);
+      expect(out[2]).not.toContain(`${CSI}2m`);
     });
 
     test('emits no SGR when color disabled', () => {

@@ -137,8 +137,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // UI.md §4.10.9. Three stacked blocks, no blank lines between:
       //   1. title (bold) — `forja v0.0.0`
       //   2. cwd (secondary)
-      //   3. env — mixed: `✓ name` (success) for flags, `key: value` (dim)
-      //      for meta, joined by ` · ` (dim). Omitted when env is empty.
+      //   3. env — `✓ name` (flags) + `key: value` (meta) joined by
+      //      ` · `, the whole line in `secondary`. Omitted when empty.
       // Version is prefixed with `v` (semver convention) regardless of
       // what the producer sent — operators read `v0.0.0` as a version
       // string at a glance, `0.0.0` as ambiguous.
@@ -150,15 +150,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         paint(caps, 'secondary', item.cwd),
       ];
       if (item.env.length > 0) {
-        const dimSep = paint(caps, 'dim', ` ${sep} `);
         const parts = item.env.map((e) => {
           if (e.kind === 'flag') {
             const tail = e.count !== undefined ? ` (${e.count})` : '';
-            return paint(caps, 'success', `${checkGlyph} ${e.name}${tail}`);
+            return `${checkGlyph} ${e.name}${tail}`;
           }
-          return paint(caps, 'dim', `${e.key}: ${e.value}`);
+          return `${e.key}: ${e.value}`;
         });
-        lines.push(parts.join(dimSep));
+        lines.push(paint(caps, 'secondary', parts.join(` ${sep} `)));
       }
       return lines.map(padFrame);
     }

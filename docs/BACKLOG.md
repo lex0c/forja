@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — the init banner's env line renders uniformly secondary
+
+The banner's env line mixed two tones — `success` for flags (`✓ name`) and `dim` for meta (`key: value`). It now renders as a single `secondary` run: the env line reads as one quiet block of boot context, no per-entry color. `permanent.test.ts` palette case updated.
+
 ## [2026-05-20] feat(tui) — trim the init banner to three stacked lines
 
 The session banner had a 2-line identity block (`{model} · {ctx} · max {out}` + cwd) and a blank line between each of its three blocks. The model+limits line is removed (redundant — the footer carries the model — and noisy at boot), and the blank separators are removed too. The banner is now three stacked lines: title (bold), cwd (`secondary`, was `dim`), env. `permanent.test.ts` banner cases updated.
