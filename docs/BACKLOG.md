@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] fix(tui) — propagate outputTruncated on the non-zero-exit tool-end path
+
+The exit-code slice made a non-zero `exitCode` bypass the coalescing buffer (immediate `tool-end` emission). That branch copied `exitCode` but dropped `outputTruncated` — so a failing command whose output was capped lost the `… output truncated` hint, exactly when partial failing output most needs noticing. The immediate-emission `item` now carries `outputTruncated` too. One new `state.test.ts` case (non-zero exit + truncated → both on the card).
+
 ## [2026-05-20] feat(tui) — the init banner's env line renders uniformly secondary
 
 The banner's env line mixed two tones — `success` for flags (`✓ name`) and `dim` for meta (`key: value`). It now renders as a single `secondary` run: the env line reads as one quiet block of boot context, no per-entry color. `permanent.test.ts` palette case updated.

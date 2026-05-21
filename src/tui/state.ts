@@ -1163,6 +1163,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           ...(event.summary !== undefined ? { summary: event.summary } : {}),
           ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
           ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+          ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
         };
         return {
           state: { ...flushed.state, activeTools: nextTools },

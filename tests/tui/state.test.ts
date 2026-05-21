@@ -531,6 +531,35 @@ describe('tool lifecycle', () => {
     ]);
   });
 
+  test('tool:end with a non-zero exitCode carries outputTruncated too', () => {
+    // A failing command whose output was capped — both `exit N` and the
+    // `… output truncated` hint belong on the immediately-emitted card.
+    const result = drive([
+      startBash('t1'),
+      {
+        type: 'tool:end',
+        ts: 1500,
+        toolId: 't1',
+        status: 'done',
+        durationMs: 30,
+        exitCode: 2,
+        outputTruncated: true,
+      },
+    ]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 30,
+        exitCode: 2,
+        outputTruncated: true,
+      },
+    ]);
+  });
+
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
       {
