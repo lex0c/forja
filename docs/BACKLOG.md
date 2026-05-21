@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(harness) — synthetic orphan tool_results keep the tool name
+
+`repairOrphanedToolUses` synthesized `tool_result` blocks carrying `tool_use_id` but not `name`. The Google adapter (`google/index.ts`) correlates `tool_result` to `tool_use` by function name — not id — and throws when `name` is absent, so an interrupted tool round was unrecoverable on resume for Gemini-backed sessions. The synthetic blocks now carry `tool_use.name`, matching every other `tool_result` producer in the harness. `resume.test.ts` repair case asserts the name.
+
 ## [2026-05-21] fix(tui) — header-only Markdown table no longer overflows a narrow terminal
 
 A header-only GFM table (no data rows) always took the grid branch — the `|| body.length === 0` bypass skipped the fit check — so a header wider than the frame emitted an over-long line and leaned on terminal soft-wrap, misaligning scrollback. The bypass is gone; an oversized header-only table now degrades like any other. But the stack path's `body.forEach` emits nothing for a header-only table, so removing the bypass alone would have dropped the header entirely — the degrade path gained a dedicated branch: the column headers, one per line, wrapped to width. 2 new `markdown.test.ts` cases.

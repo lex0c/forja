@@ -78,9 +78,13 @@ describe('messagesToProviderMessages', () => {
     ]);
     const last = r.messages.at(-1);
     expect(last?.role).toBe('user');
-    const blocks = last?.content as { tool_use_id: string; is_error?: boolean }[];
+    const blocks = last?.content as { tool_use_id: string; name?: string; is_error?: boolean }[];
     expect(blocks.map((b) => b.tool_use_id).sort()).toEqual(['A', 'B', 'C']);
-    expect(blocks.find((b) => b.tool_use_id === 'C')?.is_error).toBe(true);
+    const synthetic = blocks.find((b) => b.tool_use_id === 'C');
+    expect(synthetic?.is_error).toBe(true);
+    // The synthetic result carries the tool name — the Google adapter
+    // correlates by function name and throws without it.
+    expect(synthetic?.name).toBe('bash');
   });
 
   test('inserts a tool_result message when an aborted assistant turn has no answer', () => {

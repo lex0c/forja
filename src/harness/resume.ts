@@ -158,13 +158,11 @@ const repairOrphanedToolUses = (msgs: ProviderMessage[]): ProviderMessage[] => {
     const curr = msgs[i];
     if (curr === undefined) continue;
     out.push(curr);
-    const toolUseIds =
+    const toolUses =
       curr.role === 'assistant' && Array.isArray(curr.content)
-        ? curr.content
-            .filter((b): b is ProviderToolUseBlock => b.type === 'tool_use')
-            .map((b) => b.id)
+        ? curr.content.filter((b): b is ProviderToolUseBlock => b.type === 'tool_use')
         : [];
-    if (toolUseIds.length === 0) continue;
+    if (toolUses.length === 0) continue;
     const next = msgs[i + 1];
     const nextResults =
       next !== undefined && next.role === 'user' && Array.isArray(next.content)
@@ -175,11 +173,14 @@ const repairOrphanedToolUses = (msgs: ProviderMessage[]): ProviderMessage[] => {
         .filter((b): b is ProviderToolResultBlock => b.type === 'tool_result')
         .map((b) => b.tool_use_id),
     );
-    const orphans = toolUseIds.filter((id) => !answered.has(id));
+    const orphans = toolUses.filter((tu) => !answered.has(tu.id));
     if (orphans.length === 0) continue;
-    const synthetic: ProviderToolResultBlock[] = orphans.map((id) => ({
+    // `name` is required: the Google adapter correlates tool_result to
+    // tool_use by function name (not id) and throws without it.
+    const synthetic: ProviderToolResultBlock[] = orphans.map((tu) => ({
       type: 'tool_result',
-      tool_use_id: id,
+      tool_use_id: tu.id,
+      name: tu.name,
       content: ORPHAN_TOOL_RESULT_PLACEHOLDER,
       is_error: true,
     }));
