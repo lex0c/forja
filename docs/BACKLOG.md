@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] chore(skills) — trim the seed catalog from 20 to 15
+
+Removed five seed skills judged too niche or role-specific for a catalog installed onto every project: `git-split-commit`, `restrict-proc-hidepid`, `ssh-tunnel`, `diagnose-network`, `python-executable-script`. The remaining 15 stay weighted toward broadly-useful procedures — git recovery / conflict / bisect / rewrite, the debug/test/perf family, forensics, the two Postgres skills, bulk file operations. The `.md` assets and their `CANONICAL_SKILLS` entries are gone, `profile-hotspot`'s dangling `diagnose-network` cross-reference reworded, and the `init-skills` count assertions + `docs/SKILLS.md` updated to 15. The seed still installs into `project_shared` — install location unchanged.
+
 ## [2026-05-21] review(skills) — robustness / reliability / coherence pass
 
 Three-agent max-effort review of `21076d6..HEAD` (the eval, the §14 reconciliation, the three lifecycle/command fixes), focused on robustness, reliability, and coherent flow. Findings fixed:

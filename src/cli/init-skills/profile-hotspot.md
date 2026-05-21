@@ -15,7 +15,7 @@ expires:     null
 
 Goal-shape: "this is slow, find out why", "profile this service", "where is the time going". Use when you need to **locate** a bottleneck before changing code.
 
-Not a use case: optimizing on a hunch with no measurement (that's premature optimization — this skill exists to prevent it); a slowness already known to be in the database (use `pg-heavy-queries`) or the network (use `diagnose-network`).
+Not a use case: optimizing on a hunch with no measurement (that's premature optimization — this skill exists to prevent it); a slowness already known to be in the database (use `pg-heavy-queries`) or the network.
 
 ## Prerequisites
 

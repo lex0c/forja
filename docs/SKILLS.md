@@ -51,7 +51,7 @@ Storage and pure logic live under `src/skills/`; the audit table lives in `src/s
   ▼                      ▼                         ▼                          ▼
 src/tools/builtin/   src/cli/skills-prompt.ts   src/cli/slash/commands/   src/cli/init-skills/
 skill-invoke         assembleSkillCatalog       skill.ts                  CANONICAL_SKILLS
-skill-list           Section — the eager        /skill list/show/new      (20 seed skills,
+skill-list           Section — the eager        /skill list/show/new      (15 seed skills,
 skill-show           `# Skills` prompt block    /promote/demote/delete    installed by `agent init`)
 ```
 
@@ -236,9 +236,9 @@ The model is trained to treat text inside `<skill>…</skill>` as a procedure to
 
 ## 10. The seed catalog
 
-`agent init` scaffolds a fifth artifact (after permissions, gitignore, config, playbooks): the seed skill catalog. The 20 canonical skills are bundled into the binary (`src/cli/init-skills/`, imported as text assets) and written into `<cwd>/.agent/skills/shared/` — the catalog scan picks them up at the next REPL boot.
+`agent init` scaffolds a fifth artifact (after permissions, gitignore, config, playbooks): the seed skill catalog. The 15 canonical skills are bundled into the binary (`src/cli/init-skills/`, imported as text assets) and written into `<cwd>/.agent/skills/shared/` — the catalog scan picks them up at the next REPL boot.
 
-The seed set spans git workflows (`git-bisect-regression`, `git-resolve-conflict`, `git-rewrite-history`, `git-recover-lost-work`, `git-split-commit`), debugging and performance (`debug-failure`, `triage-flaky-test`, `profile-hotspot`, `add-regression-test`), security and forensics (`threat-model-component`, `investigate-suspicious-host`, `acquire-forensic-evidence`, `restrict-proc-hidepid`), databases (`pg-blocked-sessions`, `pg-heavy-queries`), and ops (`diagnose-network`, `ssh-tunnel`, `bulk-edit-files`, `safe-bulk-delete`, `python-executable-script`).
+The seed set spans git workflows (`git-bisect-regression`, `git-resolve-conflict`, `git-rewrite-history`, `git-recover-lost-work`), debugging and performance (`debug-failure`, `triage-flaky-test`, `profile-hotspot`, `add-regression-test`), security and forensics (`threat-model-component`, `investigate-suspicious-host`, `acquire-forensic-evidence`), databases (`pg-blocked-sessions`, `pg-heavy-queries`), and bulk file operations (`bulk-edit-files`, `safe-bulk-delete`).
 
 `agent init --only=skills` re-runs just this step; `--force=skills` overwrites existing files. Each step is skip-if-exists, so a re-run after an operator's hand edits is safe.
 

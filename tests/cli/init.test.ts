@@ -34,7 +34,7 @@ Body B.`,
 ];
 
 // Synthetic skill fixture — same role as FIXTURE_PLAYBOOKS for the
-// skills step: surgical counts without depending on the 20-entry
+// skills step: surgical counts without depending on the 15-entry
 // canonical catalog.
 const FIXTURE_SKILLS = [
   {
