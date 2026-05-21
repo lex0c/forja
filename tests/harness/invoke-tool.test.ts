@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { invokeTool } from '../../src/harness/invoke-tool.ts';
 import type { HookChainResult, HookEventPayload } from '../../src/hooks/index.ts';
+import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
@@ -25,6 +26,26 @@ const okTool: Tool = {
   async execute(args: unknown) {
     const { msg } = args as { msg: string };
     return { echoed: msg };
+  },
+};
+
+const truncatedTool: Tool = {
+  name: 'truncates',
+  description: 'returns a result flagged truncated',
+  inputSchema: { type: 'object' },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  async execute() {
+    return { content: 'capped output', truncated: true };
+  },
+};
+
+const exitCodeTool: Tool = {
+  name: 'runs',
+  description: 'returns a configurable exit_code',
+  inputSchema: { type: 'object', properties: { code: { type: 'number' } } },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  async execute(args: unknown) {
+    return { stdout: '', stderr: '', exit_code: (args as { code: number }).code };
   },
 };
 
@@ -71,9 +92,14 @@ const policy = (p: Partial<Policy>): Policy => ({
 let db: DB;
 let messageId: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   db = openMemoryDb();
   migrate(db);
+  // The bash resolver needs the tree-sitter parser ready before the
+  // permission engine can decompose a bash command — the plan-mode
+  // tests exercise real `bash` through the engine. Production wires
+  // this in bootstrap; other harness tests mirror it in their setup.
+  await initBashParser();
   const s = createSession(db, { model: 'm', cwd: '/p' });
   messageId = appendMessage(db, { sessionId: s.id, role: 'assistant', content: 'x' }).id;
 });
@@ -128,6 +154,71 @@ describe('invokeTool', () => {
     expect(approvals).toHaveLength(1);
     expect(approvals[0]?.decision).toBe('allow');
     expect(observedApprovalId).toBe(approvals[0]?.id);
+  });
+
+  test('outputTruncated set when the success result reports truncated: true', async () => {
+    const deps = buildDeps(truncatedTool);
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'truncates', args: {}, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(inv.outputTruncated).toBe(true);
+  });
+
+  test('outputTruncated absent when the result carries no truncated flag', async () => {
+    const deps = buildDeps(okTool);
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'echo', args: { msg: 'hi' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(inv.outputTruncated).toBeUndefined();
+  });
+
+  test('onExecutionStart fires once the tool body runs (allow path)', async () => {
+    let fired = 0;
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'echo', args: { msg: 'hi' }, messageId },
+      {
+        ...buildDeps(okTool),
+        onExecutionStart: () => {
+          fired += 1;
+        },
+      },
+    );
+    expect(inv.failed).toBe(false);
+    expect(fired).toBe(1);
+  });
+
+  test('onExecutionStart does not fire for an unknown tool (no execution)', async () => {
+    let fired = 0;
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'nonexistent', args: {}, messageId },
+      {
+        ...buildDeps(okTool),
+        onExecutionStart: () => {
+          fired += 1;
+        },
+      },
+    );
+    expect(inv.failed).toBe(true);
+    expect(fired).toBe(0);
+  });
+
+  test('exitCode carries a non-zero exit, and is absent for a zero exit', async () => {
+    const deps = buildDeps(exitCodeTool);
+    const fail = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'runs', args: { code: 2 }, messageId },
+      deps,
+    );
+    expect(fail.failed).toBe(false);
+    expect(fail.exitCode).toBe(2);
+    const ok = await invokeTool(
+      { toolUseId: 'tu2', toolName: 'runs', args: { code: 0 }, messageId },
+      deps,
+    );
+    expect(ok.exitCode).toBeUndefined();
   });
 
   // R3 follow-up — same wire for the confirm_yes branch. The bridged

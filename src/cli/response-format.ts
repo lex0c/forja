@@ -34,7 +34,7 @@ The operator's terminal renders your text as CommonMark in monospace ANSI. Forma
 - Code references use \`file:line\` form (e.g., \`src/auth.ts:42\`) so the renderer can link them.
 - Default to no emojis. The user asks if they want them.
 - Don't preface work with "I will…" or end with a recap of what you just did — the operator sees the diff and the tool calls.
-- When a question is answerable in one sentence, answer in one sentence. Don't pad with headers, bullets, or restated prompts.
+- Every sentence should change what the reader knows or does next. When a question is answerable in one sentence, answer in one sentence. Don't pad with headers, bullets, or restated prompts.
 - Multi-step internal reasoning belongs in tools (\`todo_write\` for plans the operator should see); chat text is for results and decisions, not commentary on the work in flight.`;
 
 // Compose the response-format hint with a downstream prompt.

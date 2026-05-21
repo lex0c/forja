@@ -296,6 +296,24 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 # DEFERRED — items intentionally left for later
 
+## Shimmer on verb chips — §13 alignment (or removal)
+
+**Status:** shipped EXPERIMENTAL — a sliding highlight on the awaiting / assistant / thinking / critique verbs (`render/shimmer.ts`). The module + chip comments mark it experimental; the spec is not amended.
+
+**Decision pending:** it collides with `UI.md §13` ("Animações. Só spinner. Nada de fade, slide, transition."). If the shimmer stays, `§13` gets a deliberate revision — "só spinner" → "spinner + the verb-chip shimmer", keeping the veto on slide / layout transition; and the EXPERIMENTAL markers come out. If it goes, revert the shimmer.
+
+**Pull-in signal:** operator confirms the shimmer stays (or asks to drop it).
+
+## Markdown code-fence syntax highlighting
+
+**Status:** deferred. Markdown rendering shipped — slice A (static GFM render) + slice C (table grid / stack degradation), spec aligned (`UI.md §4.11`, `§6`, `AGENTIC_CLI §3`, `CONTEXT_TUNING §1.5`); slice B (streaming) was dropped. Full history in `docs/BACKLOG.md`. This is the one piece left open.
+
+**What it is:** code fences in the assistant's prose render `dim`, with no syntax highlighting. Real highlighting needs more colors than the `§6.1` palette allows (8 tokens, "sem 256-color, sem truecolor").
+
+**Why deferred:** it is the markdown-render decision that most strains `§6` — either the palette opens (a `§6.1` amendment) or fences stay monochrome. No demand signal, and monochrome `dim` fences are perfectly readable.
+
+**Pull-in signal:** operator asks for highlighted fences, or `§6.1` is revisited for another reason.
+
 ## LLM-judge detector caps: push notification when latched (MEMORY.md §12.5.5)
 
 **Status:** noted during the post-Slice-Q architecture review (2026-05-18). Companion to TODO entry "Aggregate observability for memory-governance detectors" below — both close the loop on the default-ON detector posture.

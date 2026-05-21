@@ -91,6 +91,11 @@ export type HarnessEvent =
       toolName: string;
       message: string;
     }
+  // Emitted the instant a tool's body starts executing — after the
+  // permission engine, the modal, and PreToolUse hooks. Lets the TUI
+  // rebase the tool card's clock to exclude the human wait at the
+  // permission modal from the shown duration.
+  | { type: 'tool_execution_started'; toolUseId: string }
   | {
       type: 'tool_finished';
       toolUseId: string;
@@ -112,6 +117,18 @@ export type HarnessEvent =
       // The TUI uses this on the `└─` connector to surface the
       // cause without forcing the operator to grep audit logs.
       errorMessage?: string;
+      // True when the tool capped its own output (bash `max_bytes`,
+      // grep / glob `max_results`, the read_file window). The TUI
+      // shows a `… output truncated` hint on the finished card so
+      // the operator knows the result has more behind `ctrl+o`.
+      // Absent for failures (a ToolError carries no `truncated`)
+      // and for tools whose output shape has no truncation notion.
+      outputTruncated?: boolean;
+      // Non-zero exit code of a command tool (bash). The tool itself
+      // succeeded (`failed: false`); this is the command's own exit.
+      // The TUI shows `exit N` so a failed command doesn't read as a
+      // success. Absent for exit 0 and tools with no exit code.
+      exitCode?: number;
     }
   | {
       type: 'compaction_started';

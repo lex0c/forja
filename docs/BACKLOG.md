@@ -2,6 +2,204 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(tui) — restyle the permission modal preview
+
+Several changes to the permission modal's preview block:
+
+- The action row (the command line) was a `{ tone: 'bold' }` line; it's now a plain `dim` string. The modal title (`accent + bold`) stays the only bold element.
+- The `$ ` shell prefix is dropped — the command renders verbatim. `BASH_FAMILY`, whose only use was that prefix, is removed.
+- The `cwd:` line is removed.
+- Source attribution (`matched rule: …` / `no rule matched in … policy`) now sits directly under the action — no blank line between — at the action's 4-space indent.
+
+`state.test.ts` + `modal-integration.test.ts` cases updated. Note: dropping `cwd:` loses the worktree-path cue for subagent-proxied asks, and `event.cwd` on the `permission:ask` event is now unused by the reducer — a follow-up could drop it from the event + adapter.
+
+## [2026-05-21] fix(tui) — Markdown autolink no longer duplicates the URL under formatting
+
+The link renderer compared `node.url` against the *styled* label string. Under color, surrounding formatting (a link inside `**…**`) adds SGR to the label, so an autolink — `[https://x.io](https://x.io)` — compared unequal and rendered as `https://x.io (https://x.io)`, duplicating the URL. The comparison now runs against the raw label text (rendered with color off), so the "show the URL only when it adds information" rule holds regardless of formatting. 2 new `markdown.test.ts` cases.
+
+## [2026-05-21] fix(tui) — subagent tool handling catches up to the top-level path
+
+The subagent tool-event translation (`harness-adapter.ts`, `subagent_progress.lastEvent`) lagged two recent top-level changes:
+
+- `tool_execution_started` was never translated for nested tools, so a subagent tool waiting at a permission modal kept counting from `tool:start` — nested durations stayed inflated while top-level ones rebased.
+- the nested `tool:end` dropped `outputTruncated` and `exitCode`, hiding truncated output and non-zero command exits inside subagent runs (and letting a non-zero nested exit blend into a coalesced "done" batch).
+
+Both now mirror the top-level handling. 2 new adapter tests.
+
+## [2026-05-21] fix(harness) — synthetic orphan tool_results keep the tool name
+
+`repairOrphanedToolUses` synthesized `tool_result` blocks carrying `tool_use_id` but not `name`. The Google adapter (`google/index.ts`) correlates `tool_result` to `tool_use` by function name — not id — and throws when `name` is absent, so an interrupted tool round was unrecoverable on resume for Gemini-backed sessions. The synthetic blocks now carry `tool_use.name`, matching every other `tool_result` producer in the harness. `resume.test.ts` repair case asserts the name.
+
+## [2026-05-21] fix(tui) — header-only Markdown table no longer overflows a narrow terminal
+
+A header-only GFM table (no data rows) always took the grid branch — the `|| body.length === 0` bypass skipped the fit check — so a header wider than the frame emitted an over-long line and leaned on terminal soft-wrap, misaligning scrollback. The bypass is gone; an oversized header-only table now degrades like any other. But the stack path's `body.forEach` emits nothing for a header-only table, so removing the bypass alone would have dropped the header entirely — the degrade path gained a dedicated branch: the column headers, one per line, wrapped to width. 2 new `markdown.test.ts` cases.
+
+## [2026-05-20] fix(tui) — propagate outputTruncated on the non-zero-exit tool-end path
+
+The exit-code slice made a non-zero `exitCode` bypass the coalescing buffer (immediate `tool-end` emission). That branch copied `exitCode` but dropped `outputTruncated` — so a failing command whose output was capped lost the `… output truncated` hint, exactly when partial failing output most needs noticing. The immediate-emission `item` now carries `outputTruncated` too. One new `state.test.ts` case (non-zero exit + truncated → both on the card).
+
+## [2026-05-20] feat(tui) — the init banner's env line renders uniformly secondary
+
+The banner's env line mixed two tones — `success` for flags (`✓ name`) and `dim` for meta (`key: value`). It now renders as a single `secondary` run: the env line reads as one quiet block of boot context, no per-entry color. `permanent.test.ts` palette case updated.
+
+## [2026-05-20] feat(tui) — trim the init banner to three stacked lines
+
+The session banner had a 2-line identity block (`{model} · {ctx} · max {out}` + cwd) and a blank line between each of its three blocks. The model+limits line is removed (redundant — the footer carries the model — and noisy at boot), and the blank separators are removed too. The banner is now three stacked lines: title (bold), cwd (`secondary`, was `dim`), env. `permanent.test.ts` banner cases updated.
+
+The `model` / `contextWindow` / `maxOutputTokens` fields on `SessionBannerEvent` and the `session-banner` item are now unused by the renderer — a follow-up should drop them from the event + the REPL emit.
+
+## [2026-05-20] feat(tui) — `? for help` footer hint in dark blue
+
+The `? for help` cue read in `secondary` grey, indistinguishable from the rest of the footer meta. It now uses a new `accentDark` palette token (SGR 34 — non-bright blue), a quieter blue than `accent` (94m): enough to read as interactive without a structural anchor's brightness. `\+Enter newline` and the interrupt cue stay `secondary`. Operator-authorized like `accent`; `UI.md §6.4` owes the amendment.
+
+## [2026-05-20] fix — orphaned tool_use after a mid-round abort bricked the session
+
+A `maxToolErrors` abort on the serial tool path returned from inside the `for (const tu of collected.tool_uses)` loop: the tool_uses after the failing one never got a `tool_result`, and the persisted `user` message answered only the partial set. The provider contract requires every `tool_use` to have a matching `tool_result` in the next message — so from then on every request 400'd ("tool_use ids without tool_result") and the session was unrecoverable.
+
+Two-part fix:
+
+- **Root (`loop.ts`).** The `maxToolErrors` serial bail now synthesizes an `is_error` `tool_result` for every `collected.tool_uses` entry it never reached, before persisting the user message — the history it writes is valid.
+- **Net (`resume.ts`).** `messagesToProviderMessages` gained `repairOrphanedToolUses`: any `tool_use` with no `tool_result` in the following message gets a synthetic one before the history reaches the provider. This recovers already-corrupted sessions and backstops any abort path that still escapes. It runs before the user→user repair, since a synthetic result message can land just before a real prompt.
+
+Tests: 5 new — 4 in `resume.test.ts` (partial answer completed, no answer inserted, orphan-before-prompt bridged, full round untouched) and 1 in `loop.test.ts` (the serial maxToolErrors bail answers every tool_use, asserted against the persisted history).
+
+Known gap: the `signal.aborted` / `softAborted` returns in the same serial loop discard `toolResults` entirely — they orphan too. The net repairs them on resume; fixing their origin (persisting on Ctrl+C) is a separate change. `FAILURE_MODES.md` still has no entry for mid-round abort integrity.
+
+## [2026-05-20] feat(tui) — the live tool card joins the shimmer chip family
+
+The live tool card (`tool-card.ts` — `Executing…`, `Reading file…`) painted its head in flat `warn`. It now matches the awaiting / assistant / thinking chips: the active verb runs the `renderShimmer` sweep, and the spinner + verb + `[elapsed]` all sit in `secondary`. The shimmer — not a loud tone — is what signals the card is live. Still EXPERIMENTAL pending the `UI.md §13` decision.
+
+## [2026-05-20] fix(tui) — denied tool card uses the error tone, not warn
+
+The `tool-end` head painted a `denied` status in `warn` (amber). A denied call never ran — it reads as a failure, not a caution — and `warn` now also carries the new `exit N` marker. The head shares the `error` tone (red) with `error` status; the verb ('Denied' vs 'Failed') is the only distinguisher. `exit N` keeps `warn` — a command that ran but exited non-zero is a genuinely lighter signal.
+
+## [2026-05-20] feat — the tool card surfaces a command's non-zero exit code
+
+A `bash` that exits non-zero — `npm test` red, a failed build — returns a normal result (`{exit_code, stdout, stderr}`), so the tool call is `status: done` and the card rendered `● Executed`, indistinguishable from a command that succeeded. The failure was invisible in the scrollback unless the model happened to mention it.
+
+The card now shows `exit N` for a non-zero exit. The code travels the same path as `outputTruncated`:
+
+- **`invoke-tool.ts`** — `readNonZeroExit` reads `exit_code` structurally; `InvokeToolResult.exitCode?` is set only for a non-zero exit (the tool itself stays `failed: false`).
+- **`harness/types.ts` + `loop.ts`** — `tool_finished` carries `exitCode?`.
+- **`events.ts` + `harness-adapter.ts`** — `tool:end` carries `exitCode?`.
+- **`state.ts`** — the `tool-end` PermanentItem gains `exitCode?`; the `tool:end` reducer treats a non-zero exit like a non-`done` status — it bypasses the coalescing buffer, so a failed command surfaces as its own card instead of vanishing into an "Executed N commands" batch.
+- **`permanent.ts`** — the head shows `exit N`, `warn`-colored: exit ≠ 0 is also the normal "no match" of grep or a failed `test`, so it flags without the red alarm of `error`.
+
+`tool-end-batch` has no `exitCode` — a non-zero exit never coalesces. 3 new tests; `tests/tui/` + `tests/harness/` green.
+
+## [2026-05-20] feat — tool duration measures execution, not the permission-modal wait
+
+A tool's `durationMs` was timed from the top of `invokeTool` (`start`) — spanning the permission engine, the confirmation modal (the human wait), and the PreToolUse hooks. A `bash` that ran 2s but sat 30s in an approval modal reported `[32s]`: the metric mixed machine time with human-decision time and was not comparable across runs.
+
+The duration clock now starts at `startToolCall` (post-permission, post-hooks):
+
+- **`invoke-tool.ts`** — captures `execStart` after `startToolCall`; the execution-path `durationMs` is `now − execStart`. The top-of-function `start` still scopes the deny/block early returns. New optional `InvokeToolDeps.onExecutionStart` callback, fired at the same point.
+- **`harness/types.ts` + `loop.ts`** — new `tool_execution_started` HarnessEvent; the loop wires `onExecutionStart` to emit it.
+- **`events.ts` + `harness-adapter.ts`** — `tool:execution-started` UIEvent + its translation.
+- **`state.ts`** — the reducer rebases `ActiveTool.startedAt` to that event, so the live card's `[Xs]` excludes the modal wait too — no live↔permanent jump.
+
+Tests: 5 new (reducer rebase, adapter translate, `onExecutionStart` fires on the allow path / not for an unknown tool). `tests/tui/` + `tests/harness/` green; typecheck + lint clean.
+
+## [2026-05-20] feat(tui) — shimmer on the live-region verb chips (EXPERIMENTAL)
+
+The verb chips — awaiting / assistant / thinking / critique — carry a shimmer: a highlight slides left-to-right across the verb, `accent` (blue) at the centre, `default` on its neighbours, the chip's base token elsewhere. New `src/tui/render/shimmer.ts` (`renderShimmer`, base-parametrized); the position derives from `now`, so the frame scheduler that already redraws for the spinner animates it.
+
+Base color per chip: awaiting / assistant / thinking → `secondary` (grey), the uniform "model is working" family (assistant and thinking dropped their old `warn` to join it); critique keeps `error` / `warn` — there the color is the writes-vs-text safety signal, not decoration.
+
+**EXPERIMENTAL** — collides with `UI.md §13` ("Animações. Só spinner. Nada de fade, slide, transition."); the spec is NOT amended (the `shimmer.ts` comment carries the note). If the shimmer stays, `§13` needs a deliberate revision — tracked in `docs/TODO.md`. New `shimmer.test.ts` (4 tests); `critique-chip.test.ts` adjusted (the verb splits per-char under color). `tests/tui/` 830 green.
+
+## [2026-05-20] feat(tui) — markdown slice C: table grid + stack degradation
+
+`renderTable` (`render/markdown.ts`) replaces the slice-A fallback (cells joined by a separator) with a measured renderer. Columns are measured via `visualWidth` (`string-width`); if the aligned grid — bold header + rule + padded rows — fits the available width it renders the grid, otherwise it degrades to a **stack**: one `header: value` block per data row, fitting any width (a long value wraps). `renderBlock` plumbs `width` into `renderTable`.
+
+Tests: the slice-A fallback test replaced by two — aligned grid (fits) and stack degradation (`cols 7` forces it); `markdown.test.ts` 17 green, `tests/tui/` 830 green, typecheck + lint clean. `UI.md §4.11` table line updated; the `docs/TODO.md` markdown entry trimmed to its one remaining follow-up — code-fence syntax highlighting.
+
+## [2026-05-20] decision — markdown slice B (streaming) dropped
+
+Slice B rested on a wrong premise: that the assistant's prose shows plain while streaming and flips to Markdown at turn end. It does not — the live region shows only the progress chip (`renderAssistantChip`) while streaming; the prose is never displayed until `assistant:end`, where `renderMarkdown` runs once. No flip, so no incremental render to add. The `UI.md §4.11` "Streaming" paragraph (committed in `1f0ad04` with that wrong claim) is corrected to match. Showing streaming prose would be a new live-region feature against `§6.5` (the live region is summary, not detail) — the operator's call was to keep the current chip behavior. Slice A stays complete; slice C (table degradation) stays open.
+
+## [2026-05-20] docs(spec) — markdown rendering + density rule aligned into the spec
+
+The slice-A markdown work landed code-first (operator's call — iterate, align the spec after); the spec now catches up. `UI.md` gains `§4.11` "Markdown rendering" — the `renderMarkdown` pipeline, the GFM subset, the render-only invariant, the streaming / Fatia-B deferral, and "Markdown does not govern critical layout". `§6` reconciled: `italic` / `strikethrough` tokens in the palette, `accent` re-scoped to also cover inline code, `§6.4` allows the `bold + accent` nesting. `AGENTIC_CLI §3` drops "deps mínimas" and lists `remark` + `remark-gfm`. `CONTEXT_TUNING §1.5` + the §1.8 canonical prompt carry the density line. `§13` / `§14` reviewed, left as-is — the renderer respects the non-goals and the inline / no-framework thesis. All `docs/spec/` edits in PT-BR, per the spec's language.
+
+## [2026-05-20] feat(cli) — per-sentence density rule in the response-surface prompt
+
+`RESPONSE_FORMAT_PROMPT` (`src/cli/response-format.ts`) gains the density principle the operator asked for — *"every sentence should change what the reader knows or does next"* — prepended to the one-sentence-answer / no-pad bullet, framed as the principle those measurable rules derive from. New presence test in `response-format.test.ts`. The matching `CONTEXT_TUNING §1.5` spec line stays parked with the rest of the markdown-render spec alignment (`docs/TODO.md`).
+
+## [2026-05-20] feat(tui) — inline code rendered in accent blue
+
+`renderMarkdown` paints `inlineCode` spans with the `accent` token (blue, SGR 94) instead of `secondary` (grey). Inline code is the prose's most frequent technical anchor — flags, paths, identifiers — and blue lifts it off the greyscale. Reuses the `accent` token, which `term.ts` reserves for layout chrome (the modal rule today); the `§6` palette alignment revisits accent-vs-own-token. Commit `d3191cb`; `markdown.test.ts` colored-SGR assertion updated.
+
+## [2026-05-20] feat(tui) — markdown rendering slice A: GFM render on the assistant block
+
+The model's prose now renders as GitHub-flavored Markdown in the TUI instead of raw text — output "like Claude Code". The dep (`remark` + `remark-gfm`) and the render both collide with set spec decisions — `AGENTIC_CLI §3` ("deps mínimas: string-width, wrap-ansi"), `§2.6` output design, `UI.md §13`/`§14`; the operator's call was to iterate in code and align the spec afterwards. Roadmap + the deferred slices live in `docs/TODO.md` under "Markdown rendering".
+
+**Render-only, contained.** Markdown is a render concern: the `assistant` `PermanentItem` keeps `text: string` (raw markdown), the reducer is untouched. `formatPermanent`'s `assistant` case stopped doing `text.split('\n')` and delegates to a new `renderMarkdown(src, caps)`.
+
+**`src/tui/render/markdown.ts`** (new) — `remark().use(remarkGfm).parse()` → an `mdast` tree; a recursive walk maps each node onto `term.ts` palette primitives, returning `string[]` (no frame margin — the caller pads). Block: heading (bold), paragraph (word-wrapped via `wrap-ansi`, a dep the TUI already had), bullet / ordered / task list (`•` / `N.` / `[x]` markers, nesting indents, tight — no blank between an item's blocks), code fence (dim, indented two columns, no syntax highlighting), blockquote (`│` prefix), thematic break (rule), GFM table (slice-A fallback: cells joined by a dim separator, no column alignment). Inline: bold, italic, inline code, strikethrough, link (label + dimmed URL). The walk threads an attribute stack rather than nesting `paint()` — a nested `\x1b[0m` would reset the outer attribute (bold lost after an inline-code span inside `**…**`); each leaf run paints itself whole via `paintMulti`.
+
+**`term.ts`** gains `italic` (`CSI 3m`) and `strikethrough` (`CSI 9m`) SGR tokens — Markdown emphasis needs them; text attributes, not colors, degrade gracefully where unsupported.
+
+**Deferred (`docs/TODO.md`):** slice B (streaming render — later dropped; see the decision entry above), slice C (table degradation for narrow terminals), syntax highlighting (fights the `§6.1` palette), and the spec alignment (`UI.md` markdown section + `§6` evolution, `§3` deps, `§13`/`§14` reconciled).
+
+**Tests.** New `markdown.test.ts` (16 — every block + inline element, the GFM-table fallback, word-wrap, ASCII fallback, the colored SGR runs, empty input). `permanent.test.ts` — the trailing-newline test re-pinned: the parser normalizes a trailing `\n` away, so it no longer leaves a spurious empty line. `bun test tests/tui/` 828 green, `tests/cli/` 1822 green; `typecheck` + `lint` clean.
+
+## [2026-05-20] decision — slice 3 (per-tool token count) dropped
+
+The card roadmap pencilled a token count onto the grouped chip (`[4ms · 330 tokens]`). Exploration ruled it out: the provider reports real token usage only per-turn (`assistant:usage`), never per tool_result, so a per-tool figure could only be a `chars/4` estimate. The project already took the opposite stance — the `assistant-chip` deliberately shows no token count until the real `usage` lands ("show no number when we don't have one"), and `TOKEN_TUNING §8` directs callers to the provider's real `countTokens` where exactness matters. Tool results are code-heavy, the worst case for `chars/4`. A fabricated number that doesn't reconcile with the turn total is worse than none — so the chip stays at `[duration]`. The slice-2 truncation hint already flags an oversized result where it matters. Revisit only if Forja grows real per-message tokenization.
+
+## [2026-05-20] test(harness) — wire the bash parser in invoke-tool.test.ts
+
+The slice-2 review surfaced two `plan mode: planSafe …` tests failing in `tests/harness/invoke-tool.test.ts` — `planSafe` tools refused when they should execute. Root cause was a setup gap, not a production bug: the plan-safe tests use a `bash`-category tool, so they reach `engine.check`, and the bash resolver needs the tree-sitter parser (`initBashParser()`) ready to decompose the command. Production wires that in `bootstrap-engine.ts`; this test file never did — the resolver refused with `parser unavailable` and the engine fell through to strict default-deny. The `planSafe`-blocks test passed only because the plan-mode block short-circuits it before `engine.check` ever runs.
+
+Fix: `await initBashParser()` in the file's `beforeEach`, mirroring `dispatch-rewrite-audit.test.ts` and the `tests/permissions/` suites. Test-only — no production code touched. `bun test tests/harness/invoke-tool.test.ts` 40 green.
+
+## [2026-05-20] feat(tui) — compact tool cards (slice 2): output-truncation hint
+
+Slice 2 of the card line. A tool whose result was capped — bash `max_bytes`, grep / glob `max_results`, the read_file window — now shows a `… output truncated (ctrl+o to expand)` line under its finished card, so the operator sees the model's view of the result has more behind it.
+
+The roadmap pencilled this as `+N lines`, but exploring the harness ruled out an exact count: the `tool_result` the model consumes is JSON-stringified (newlines escaped — a line count of it reads `1`), there is no uniform "output text" across tools, and `tool:delta` is never emitted in production. The operator picked the cheaper honest path — surface the `truncated: boolean` every capped tool result already carries, no per-tool line counting.
+
+**Plumbing.** One boolean, `outputTruncated`, rides the layers it must cross: `result.truncated` (read structurally in `invoke-tool.ts` — only some output shapes carry the field) → `InvokeToolResult` → the `tool_finished` HarnessEvent → `loop.ts` emit → `harness-adapter.ts` → the `tool:end` UIEvent → the reducer. The `tool-end` PermanentItem carries it; `PendingToolEndBatchItem` too, and `tool-end-batch` aggregates with `some` — one hint for the group when any child capped.
+
+**Render.** `permanent.ts` gains `truncationHint`: a `secondary` line indented 3 cols under the card body, for `tool-end` and `tool-end-batch` alike. The `ctrl+o` key stays unwired — `UI.md §4.10.5` defers the expansion panel to a later slice; this entry is the hint only.
+
+**Tests.** `permanent.test.ts` (render with / without the flag, ASCII fallback, batch), `state.test.ts` (the flag rides onto `tool-end`, aggregates onto the batch, absent leaves it unset), `harness-adapter.test.ts` (passes through), `invoke-tool.test.ts` (a `truncated: true` result surfaces as `InvokeToolResult.outputTruncated`). `bun test tests/tui/` 813 green; `typecheck` + `lint` clean.
+
+**Pre-existing failure, unrelated.** Running `tests/harness/invoke-tool.test.ts` surfaced two failing `plan mode: planSafe …` tests — `planSafe` tools blocked in plan mode when they should execute. Not slice 2: the diff to `invoke-tool.ts` is three hunks (the `InvokeToolResult` field, the `readOutputTruncated` helper, the success-return spread), none of which touch the plan-mode block (lines 249-338) — and the two tests fail under a `plan mode`-only filter, before any slice-2 test runs. Flagged for a separate fix.
+
+## [2026-05-20] feat(tui) — unify the operation-chip duration metric
+
+Follow-up from the compact-tool-cards review (entry below). The slice-1 card restyle put the tool card on a bracketed `[5s]` metric, but the review found the live region still mixed three duration shapes — `(5s)` on the assistant / thinking / critique / awaiting chips, `in 5s` on the `subagent_summary` line. A wider look found the rot underneath: **five** near-identical copies of `formatElapsed` (one per chip file) plus three `formatDuration` copies, already drifted (`0s` vs `0ms` clamp; decimal vs integer seconds).
+
+**Canonical formatter.** New `src/tui/render/duration.ts` exports `formatChipDuration` — one source of truth: `< 1s → 850ms`, `< 1min → 8.2s` (one decimal), `≥ 1min → 1m23s` (`2m` when the seconds are zero). Negative input (clock skew) clamps to `0ms`, not `0s`, so a single skew tick doesn't jump the chip between units. The minute branch rounds to tenths *before* branching, so the [59 950, 60 000)ms window goes straight to `1m` instead of flashing `60.0s` for a tick. The `≥ 1min` branch is new — the old per-chip `formatElapsed` had no minute case, so a 2-minute tool rendered `120.0s`.
+
+**Bracket metric.** The assistant / thinking / critique / awaiting chips move from `(Xs)` to `[Xs]`; `subagent_summary` from ` in Xs` to a trailing `  [Xs]`. The tool card (live + final / batch) already carried `[Xs]` from slice 1. Every operation chip now reads the metric identically.
+
+**Out of scope, by design.** The live subagent row (`subagent-row.ts`) is a `·`-separated table line, not a `verb… [metric]` chip — it keeps `· Xs`. The turn-end footer (`Cogitated for X`) is prose. Both keep their own duration shape; neither is an operation chip.
+
+**Tests.** New `duration.test.ts` covers both formatters — every branch, the 60s boundary (incl. the no-double-round case), the skew clamp. `tool-card` / `assistant-chip` / `thinking-chip` / `critique-chip` tests updated for `[…]`; `compose.test.ts` verb-matching regex updated; `permanent.test.ts` `subagent_summary` cases updated (`in Xs` → `[Xs]`, decimal seconds). `bun test tests/tui/` 804 green; `typecheck` + `lint` clean.
+
+**Review pass.** Self-review caught two nits, both applied: (1) the minute branch double-rounded (`tenths`, then `tenths / 10`) — `60 450ms` rendered `1m1s` instead of `1m`; it now rounds raw `ms`. (2) The migration left two identical `formatDuration` copies — the turn-end footer and the live subagent row — consolidated into a second `duration.ts` export, `formatCoarseDuration` (the whole-second form for non-chip surfaces); output unchanged. Duration formatters in the tree drop from nine to two, both in `duration.ts`.
+
+## [2026-05-20] feat(tui) — compact tool cards (slice 1): group from 2, bracket metric, tree connectors
+
+Operator-driven UX iteration. Tool-event scrollback is being redesigned into a denser "card" shape so consecutive operations read as one grouped block instead of a stack of gap-separated chips. Direction (card restyle, full scope) and the exact layout were locked with the operator via mockup *before* touching code — the chip format is pinned across ~30 string-exact render tests, so a blind reshape would mean rewriting them twice.
+
+Sliced; this entry is slice 1 — the visual restyle on data the TUI already has (no new plumbing).
+
+1. **Group from 2.** `TOOL_BATCH_COALESCE_THRESHOLD` 3 → 2 (`state.ts`) — two consecutive same-tool `tool:end` items now coalesce into one `tool-end-batch` card. Two items already pay for the summary: one head + two subject rows (3 lines) replaces two gap-separated chips (6 lines incl. blanks). `error`/`denied` still bypass the buffer — a failure stays its own chip.
+2. **Bracket metric.** Chip duration moves from `in 4ms` to a trailing `  [4ms]` field, in both the live card (`tool-card.ts`) and the final/batch cards (`permanent.ts`). The bracket reads as a telemetry slot — room for the token count (slice 3) and `+N lines` (slice 2) without reflowing the head. New `formatChipDuration` helper shared by `tool-end` and `tool-end-batch`.
+3. **Card glyphs.** Final chip glyph `·` → `●` (ASCII stays `*`); the shared `CHIP_FINAL_GLYPH` also re-skins the `subagent_summary` head, keeping every completed-operation line in scrollback on one glyph. The `tool-end-batch` subject list swaps the ad-hoc 2sp-indented `|_` for canonical tree connectors — `├─` mid rows, `└─` last (`glyphs.ts` gains `treeBranchConnector`) — aligned at the head column. A list over `MAX_BATCH_SUBJECTS` (5) shows 4 subjects then a `└─ … +N more` fold, so a large batch can't bury the scrollback.
+
+**Tests.** `permanent.test.ts` — `tool-end` describe updated for `●` + `[…]`; `tool-end-batch` describe rewritten for the tree + new cases (single-subject `└─`, the `+N more` cap, both sides of the `MAX_BATCH_SUBJECTS` boundary, ASCII overflow tail). `tool-card.test.ts` — live metric `(…)` → `[…]`. `state.test.ts` — the threshold-2 behavior change: the old "1-2 items individual" test split into single→`tool-end` and 2→`tool-end-batch`; the warn-flush and `session:end`-flush tests now expect the coalesced batch. `bun test tests/tui/` 795 green, `tests/cli/` 1822 green; `typecheck` + `lint` clean.
+
+**Review pass.** Self-review of the diff found no bugs; three nits applied — dropped the stale `(slice 3)` label from two `state.test.ts` describes, added the `MAX_BATCH_SUBJECTS + 1` overflow-boundary test, and centralized the ellipsis (`…`/`...`) in `glyphs.ts` as `ellipsisGlyph` rather than inlining the fallback.
+
+Known follow-up — **metric format.** Operation chips now carry three duration formats: tool cards `[5s]`, assistant/thinking chips `(5s)` (`assistant-chip.ts`, `thinking-chip.ts`), and `subagent_summary` `in 5s` (the shared `●` glyph reached it but the metric did not). Out of scope here; wants a deliberate unification pass — likely its own slice.
+
+Slices 2-4 (output `+N lines` + `ctrl+o` hint, per-tool token counter, cross-tool "search phase" grouping) need new plumbing through the harness adapter and land separately. Spec PR (UI.md §4.10.5/§4.10.7 for the bracket metric + card head, §6.2 for the `●` glyph) follows once the card UX stabilizes.
+
 ## [2026-05-19] feat(cli) — interactive `--resume`: open the REPL and replay the prior session
 
 Operator-driven feature. `forja --resume <id|last>` with no follow-up prompt now opens the REPL with the prior conversation rebuilt on screen, instead of failing with `--resume requires a follow-up prompt` (which is still the correct error for the *headless* `--resume` path). Built in phases, each validated hands-on before the next; multiple review rounds hardened the interactive path to parity with the headless one.

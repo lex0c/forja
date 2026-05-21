@@ -85,8 +85,7 @@ describe('modal navigation preserves contents', () => {
     // Title is the context label.
     expect(out).toContain('Bash command');
     // Action block.
-    expect(out).toContain('$ rm -rf ./build');
-    expect(out).toContain('cwd: /home/lex/forja');
+    expect(out).toContain('rm -rf ./build');
     expect(out).toContain('matched rule: bash.rm.rf');
     // Options.
     expect(out).toContain('1. Yes');
@@ -114,7 +113,7 @@ describe('modal navigation preserves contents', () => {
     const after = s.rendered() ?? '';
     // All four blocks survive the navigation.
     expect(after).toContain('Bash command');
-    expect(after).toContain('$ rm -rf ./build');
+    expect(after).toContain('rm -rf ./build');
     expect(after).toContain('1. Yes');
     expect(after).toContain('3. No');
     // Cursor moved from option 3 (No) to option 2 (session-allow).
@@ -278,7 +277,6 @@ describe('modal navigation preserves contents', () => {
     // Second modal drained.
     const second = s.rendered() ?? '';
     expect(second).toContain('second');
-    expect(second).toContain('cwd: /b');
     expect(second).not.toContain('first'); // contents replaced cleanly
     s.fs.dispatch(key('escape'));
     await p2;

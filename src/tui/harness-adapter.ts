@@ -450,6 +450,11 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
+      case 'tool_execution_started': {
+        out.push({ type: 'tool:execution-started', ts, toolId: event.toolUseId });
+        return out;
+      }
+
       case 'tool_decided': {
         const tool = state.tools.get(event.toolUseId);
         if (tool !== undefined) tool.decision = event.decision;
@@ -529,6 +534,8 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           status,
           durationMs: event.durationMs,
           ...(summary !== undefined ? { summary } : {}),
+          ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
+          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
         });
         return out;
       }
@@ -811,6 +818,17 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           const tool = state.tools.get(namespacedId);
           if (tool !== undefined) tool.decision = inner.decision;
         }
+        // Rebase the nested card's clock when the child's tool body
+        // starts — mirrors the top-level `tool_execution_started` case
+        // so nested and top-level durations exclude the permission-
+        // modal wait the same way.
+        if (inner.type === 'tool_execution_started' && typeof inner.toolUseId === 'string') {
+          out.push({
+            type: 'tool:execution-started',
+            ts,
+            toolId: `sub:${event.subagentId}:${inner.toolUseId}`,
+          });
+        }
         if (inner.type === 'tool_finished' && typeof inner.toolUseId === 'string') {
           const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
           const tool = state.tools.get(namespacedId);
@@ -845,6 +863,8 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             status,
             durationMs: inner.durationMs,
             ...(summary !== undefined ? { summary } : {}),
+            ...(inner.outputTruncated === true ? { outputTruncated: true } : {}),
+            ...(typeof inner.exitCode === 'number' ? { exitCode: inner.exitCode } : {}),
           });
         }
         return out;

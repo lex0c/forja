@@ -217,6 +217,14 @@ export type ToolStartEvent = BaseEvent & {
   // renderer can read it back at end time without re-deriving.
   parentId?: string;
 };
+// Fired when a tool's body actually starts running — after the
+// permission engine, modal, and PreToolUse hooks. The reducer
+// rebases the active tool's `startedAt` to this event's `ts`, so the
+// card clock measures execution, not the human wait at the modal.
+export type ToolExecutionStartedEvent = BaseEvent & {
+  type: 'tool:execution-started';
+  toolId: string;
+};
 export type ToolDeltaEvent = BaseEvent & {
   type: 'tool:delta';
   toolId: string;
@@ -231,6 +239,15 @@ export type ToolEndEvent = BaseEvent & {
   // One-line summary the final tool card prints (UI.md §4.1). The
   // producer composes this — it knows the tool semantics.
   summary?: string;
+  // True when the tool capped its own output (bash `max_bytes`,
+  // grep / glob `max_results`, the read_file window). Drives the
+  // `… output truncated` hint on the finished card. Absent on
+  // failure / denial and for tools with no truncation notion.
+  outputTruncated?: boolean;
+  // Non-zero exit code of a command tool (bash). Present only when
+  // the command exited non-zero; drives the `exit N` marker on the
+  // card. Absent for exit 0 and tools with no exit code.
+  exitCode?: number;
 };
 
 // Permission/trust/memory write/plan review/critique modals.
@@ -743,6 +760,7 @@ export type UIEvent =
   | CritiqueStartEvent
   | CritiqueEndEvent
   | ToolStartEvent
+  | ToolExecutionStartedEvent
   | ToolDeltaEvent
   | ToolEndEvent
   | PermissionAskEvent

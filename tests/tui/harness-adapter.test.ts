@@ -620,6 +620,14 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.subject).toBe('/a');
   });
 
+  test('tool_execution_started → tool:execution-started', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({ type: 'tool_execution_started', toolUseId: 't1' });
+    expect(types(out)).toEqual(['tool:execution-started']);
+    const e = out[0] as Extract<UIEvent, { type: 'tool:execution-started' }>;
+    expect(e.toolId).toBe('t1');
+  });
+
   test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
@@ -814,6 +822,70 @@ describe('harness-adapter — tool lifecycle', () => {
     const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
     expect(e.status).toBe('error');
     expect(e.summary).toBe('ENOENT: no such file or directory');
+  });
+
+  test('outputTruncated on tool_finished carries onto tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+      outputTruncated: true,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.outputTruncated).toBe(true);
+  });
+
+  test('outputTruncated absent leaves the tool:end flag unset', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.outputTruncated).toBeUndefined();
+  });
+
+  test('exitCode on tool_finished carries onto tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+      exitCode: 1,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.exitCode).toBe(1);
+  });
+
+  test('exitCode absent leaves the tool:end field unset', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });
+    a.translate({ type: 'tool_decided', toolUseId: 't1', decision: { kind: 'allow' } });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 10,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.exitCode).toBeUndefined();
   });
 
   test('errorMessage absent on done outcomes leaves summary unset', () => {
@@ -1294,6 +1366,43 @@ describe('harness-adapter — subagent observability', () => {
     expect(end.toolId).toBe('sub:aaaaaaaa-1111-2222-3333-444444444444:tu-x');
     expect(end.status).toBe('done');
     expect(end.durationMs).toBe(42);
+  });
+
+  test('subagent_progress tool_execution_started → nested tool:execution-started', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'bbbbbbbb-1111-2222-3333-444444444444',
+      lastEvent: { type: 'tool_execution_started', toolUseId: 'tu-e' },
+    });
+    expect(types(out)).toEqual(['subagent:update', 'tool:execution-started']);
+    const ev = out[1] as Extract<UIEvent, { type: 'tool:execution-started' }>;
+    expect(ev.toolId).toBe('sub:bbbbbbbb-1111-2222-3333-444444444444:tu-e');
+  });
+
+  test('subagent_progress tool_finished forwards outputTruncated and exitCode onto tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'cccccccc-1111-2222-3333-444444444444',
+      lastEvent: { type: 'tool_invoking', toolUseId: 'tu-c', toolName: 'bash', args: {} },
+    });
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'cccccccc-1111-2222-3333-444444444444',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu-c',
+        toolName: 'bash',
+        failed: false,
+        durationMs: 12,
+        outputTruncated: true,
+        exitCode: 1,
+      },
+    });
+    const end = out.find((e) => e.type === 'tool:end') as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(end.outputTruncated).toBe(true);
+    expect(end.exitCode).toBe(1);
   });
 
   test('subagent_progress tool_finished with failed=true → tool:end status=error', () => {

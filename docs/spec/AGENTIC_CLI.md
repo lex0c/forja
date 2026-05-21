@@ -686,7 +686,7 @@ XDG Base Dir respeitado. Override por env var (`AGENT_CONFIG_DIR`).
 | Linguagem | **TypeScript** | Melhor SDK Anthropic + MCP TS-first + ecossistema agent denso |
 | Runtime | **Bun** | Single-binary compile, fast startup, fetch nativo, SQLite embutido |
 | Storage | **SQLite (`bun:sqlite`)** | Zero-setup, transacional, suficiente até 100M linhas |
-| TUI | **Interno (raw ANSI + raw stdin)** | Inline render: histórico vai pro scrollback do terminal, só ~3-15 linhas vivas no fundo. Sem framework (sem React/Ink/blessed) — região viva é pequena demais pra justificar reconciliação. Deps mínimas: `string-width`, `wrap-ansi`. Ver [`UI.md`](./UI.md). |
+| TUI | **Interno (raw ANSI + raw stdin)** | Inline render: histórico vai pro scrollback do terminal, só ~3-15 linhas vivas no fundo. Sem framework (sem React/Ink/blessed) — região viva é pequena demais pra justificar reconciliação. Deps: `string-width` + `wrap-ansi` (layout), `remark` + `remark-gfm` (parse de Markdown GFM da prosa do assistant — `UI.md §4.11`). Ver [`UI.md`](./UI.md). |
 | Provider | **Pluggable adapters** | Cada provider em módulo isolado conforme `Provider` interface. v1 inclui: Anthropic, OpenAI, Ollama, llama.cpp. Ver [`PROVIDERS.md`](./PROVIDERS.md). |
 | Local backend | **Ollama** + **llama.cpp** (via HTTP) | Mais maduro pra modelos locais; GBNF grammar nativo no llama.cpp |
 | Constrained gen | **GBNF** (llama.cpp) / **JSON mode** (Ollama) / **tools** (Anthropic) | Force schema adherence em modelo pequeno |

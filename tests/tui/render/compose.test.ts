@@ -6,10 +6,10 @@ import type { ActiveTool, LiveState } from '../../../src/tui/state.ts';
 import { createInitialState } from '../../../src/tui/state.ts';
 import type { Capabilities } from '../../../src/tui/term.ts';
 
-// Match a verb-shaped chip line: "<verb>… (..." — the chip's
+// Match a verb-shaped chip line: "<verb>… [..." — the chip's
 // rotating verb sits before the elapsed counter.
 const verbInLine = (line: string | undefined): string | null => {
-  const m = line?.match(/(\w+)…\s*\(/);
+  const m = line?.match(/(\w+)…\s*\[/);
   return m ? (m[1] ?? null) : null;
 };
 

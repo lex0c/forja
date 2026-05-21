@@ -156,15 +156,11 @@ describe('formatPermanent', () => {
       ],
     };
 
-    test('emits 6 lines: title / blank / model+cwd (2) / blank / env (Unicode)', () => {
-      // Each line padded with the §6.3 frame margin (2sp). Blank
-      // separators get padded too — `'  '` still reads as blank.
+    test('emits title / cwd / env stacked, no blank lines (Unicode)', () => {
+      // Each line padded with the §6.3 frame margin (2sp).
       expect(formatPermanent(baseBanner, unicode)).toEqual([
         pad('forja v0.1.0'),
-        pad(''),
-        pad('anthropic/claude-sonnet-4-6 · 200,000 ctx · max 4096 out'),
         pad('/home/lex/forja'),
-        pad(''),
         pad('subagents: 2 · ✓ checkpoints'),
       ]);
     });
@@ -176,19 +172,13 @@ describe('formatPermanent', () => {
 
     test('falls back to ASCII glyphs (* for ✓, - for ·) when unicode disabled', () => {
       const out = formatPermanent(baseBanner, ascii);
-      expect(out[2]).toBe(pad('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out'));
-      expect(out[5]).toBe(pad('subagents: 2 - * checkpoints'));
+      expect(out[2]).toBe(pad('subagents: 2 - * checkpoints'));
     });
 
-    test('omits env block entirely when env is empty (no trailing blank line)', () => {
+    test('omits env block entirely when env is empty', () => {
       const out = formatPermanent({ ...baseBanner, env: [] }, ascii);
-      // title + blank + model + cwd. Banner ends after identity block.
-      expect(out).toEqual([
-        pad('forja v0.1.0'),
-        pad(''),
-        pad('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out'),
-        pad('/home/lex/forja'),
-      ]);
+      // title + cwd. Banner ends after the cwd line.
+      expect(out).toEqual([pad('forja v0.1.0'), pad('/home/lex/forja')]);
     });
 
     test('flag with count renders as ✓ name (count)', () => {
@@ -199,7 +189,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[5]).toBe(pad('✓ memory (14)'));
+      expect(out[2]).toBe(pad('✓ memory (14)'));
     });
 
     test('mixes flag + meta entries joined by dim · separator', () => {
@@ -215,32 +205,25 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[5]).toBe(
+      expect(out[2]).toBe(
         pad('policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)'),
       );
     });
 
-    test('applies bold to title, dim to identity, success to flags, dim to meta when color enabled', () => {
+    test('applies bold to title, secondary to cwd and to the whole env line', () => {
       const out = formatPermanent(baseBanner, colored);
-      // 0: title (bold), 1: blank, 2-3: identity (dim), 4: blank, 5: env mix
+      // 0: title (bold), 1: cwd (secondary), 2: env (uniformly secondary)
       expect(out[0]).toContain(`${CSI}1m`);
-      expect(out[1]).toBe(pad(''));
-      expect(out[2]).toContain(`${CSI}2m`);
-      expect(out[3]).toContain(`${CSI}2m`);
-      expect(out[4]).toBe(pad(''));
-      // env line: meta entry dim, flag entry success.
-      expect(out[5]).toContain(`${CSI}2m`); // dim runs (meta + separator)
-      expect(out[5]).toContain(`${CSI}32m`); // success run (flag)
+      expect(out[1]).toContain(`${CSI}90m`);
+      expect(out[2]).toContain(`${CSI}90m`);
+      // env line carries no success / dim runs — one secondary run.
+      expect(out[2]).not.toContain(`${CSI}32m`);
+      expect(out[2]).not.toContain(`${CSI}2m`);
     });
 
-    test('emits no SGR (other than the empty blank lines) when color disabled', () => {
+    test('emits no SGR when color disabled', () => {
       const out = formatPermanent(baseBanner, unicode);
       for (const line of out) expect(line).not.toContain(CSI);
-    });
-
-    test('formats large context window with locale-aware thousands separator', () => {
-      const out = formatPermanent({ ...baseBanner, contextWindow: 1_000_000 }, ascii);
-      expect(out[2]).toContain('1,000,000 ctx');
     });
   });
 
@@ -341,16 +324,16 @@ describe('formatPermanent', () => {
     ).toEqual([]);
   });
 
-  test('assistant with trailing newline emits an explicit empty trailing line', () => {
-    // Documents current behavior: text with a trailing `\n` becomes
-    // [content, ''] after split. Provider streams typically don't end
-    // with a newline; if a future producer does, we may want to filter.
+  test('assistant: a trailing newline does not leave a spurious empty line', () => {
+    // The Markdown renderer normalizes a trailing `\n` — it is not a
+    // line. The pre-markdown `text.split('\n')` left an empty `''`
+    // here; this test pinned that, and now pins its absence.
     expect(
       formatPermanent(
         { kind: 'assistant', text: 'foo\n', durationMs: null, outputTokens: null },
         ascii,
       ),
-    ).toEqual([pad(''), pad('foo'), pad('')]);
+    ).toEqual([pad(''), pad('foo')]);
   });
 
   test('assistant ignores durationMs/outputTokens (chip header removed)', () => {
@@ -388,8 +371,24 @@ describe('formatPermanent', () => {
       );
       expect(out).toHaveLength(3);
       expect(out[0]).toBe(pad(''));
-      expect(out[1]).toBe(pad('· Read file in 850ms'));
+      expect(out[1]).toBe(pad('● Read file  [850ms]'));
       expect(out[2]).toBe(pad('└─ /foo.ts'));
+    });
+
+    test('non-zero exitCode renders `exit N` on the head', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'npm test',
+          status: 'done',
+          durationMs: 30,
+          exitCode: 1,
+        },
+        unicode,
+      );
+      expect(out[1]).toBe(pad('● Executed  exit 1  [30ms]'));
     });
 
     test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
@@ -416,7 +415,7 @@ describe('formatPermanent', () => {
       // Indent (2sp) between frame padding and the |_ glyph; subject
       // line keeps the same indent so the connector lines up under
       // the nested head.
-      expect(out[0]).toBe(pad('  |_ Read file in 200ms'));
+      expect(out[0]).toBe(pad('  |_ Read file  [200ms]'));
       expect(out[1]).toBe(pad('  └─ /foo.ts'));
     });
 
@@ -437,7 +436,7 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(out[0]).toBe(pad('  |_ Executed in 5ms'));
+      expect(out[0]).toBe(pad('  |_ Executed  [5ms]'));
     });
 
     test('nested chip with no subject emits ONLY the head line (no orphan connector)', () => {
@@ -453,7 +452,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad('  |_ Updated todos in 5ms')]);
+      expect(out).toEqual([pad('  |_ Updated todos  [5ms]')]);
     });
 
     test('nested error chip keeps the error palette + |_ glyph', () => {
@@ -471,11 +470,13 @@ describe('formatPermanent', () => {
         },
         colored,
       );
-      // Painted output starts with SGR red (palette 'error'). Just
-      // assert the visible substring — exact escape codes are
-      // verified elsewhere; the load-bearing thing here is that the
-      // glyph is `|_` with the indent under the painted segment.
-      expect(out[0]).toContain('|_ Failed in 5ms');
+      // The glyph + verb carry the error palette; the `[Xms]` metric
+      // is split into `secondary` (meta, not status), so it is no
+      // longer contiguous with the verb.
+      expect(out[0]).toContain('|_ Failed');
+      expect(out[0]).toContain('[5ms]');
+      expect(out[0]).toContain('\x1b[31m'); // error palette on the head
+      expect(out[0]).toContain('\x1b[90m'); // secondary on the metric
     });
 
     test('done status with no subject emits blank + chip head only', () => {
@@ -490,7 +491,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('· Updated todos in 50ms')]);
+      expect(out).toEqual([pad(''), pad('● Updated todos  [50ms]')]);
     });
 
     test('error status overrides verb to "Failed" regardless of vocab', () => {
@@ -506,7 +507,7 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out[0]).toBe(pad(''));
-      expect(out[1]).toContain('Failed in 200ms');
+      expect(out[1]).toContain('Failed  [200ms]');
       expect(out[1]).not.toContain('Executed');
       expect(out[2]).toBe(pad('└─ rm -rf /tmp/x'));
     });
@@ -524,7 +525,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toContain('Failed in 2ms');
+      expect(out[1]).toContain('Failed  [2ms]');
       expect(out[2]).toBe(pad('└─ /proj/missing.txt: ENOENT: no such file or directory'));
     });
 
@@ -543,7 +544,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toContain('Failed in 1ms');
+      expect(out[1]).toContain('Failed  [1ms]');
       expect(out[2]).toBe(pad('└─ todo list serialization failed'));
     });
 
@@ -559,7 +560,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toContain('Denied in 1ms');
+      expect(out[1]).toContain('Denied  [1ms]');
     });
 
     test('denied status with summary surfaces the policy reason as sub-content', () => {
@@ -597,7 +598,7 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ 3 items added'));
     });
 
-    test('chip glyph is `·` under Unicode, `*` under ASCII (after frame margin)', () => {
+    test('chip glyph is `●` under Unicode, `*` under ASCII (after frame margin)', () => {
       const u = formatPermanent(
         {
           kind: 'tool-end',
@@ -622,7 +623,7 @@ describe('formatPermanent', () => {
       );
       // Glyph sits at column 2 (after the 2sp frame margin) on the
       // chip head row (out[1] — out[0] is the leading blank).
-      expect(u[1]?.charAt(2)).toBe('·');
+      expect(u[1]?.charAt(2)).toBe('●');
       expect(a[1]?.charAt(2)).toBe('*');
     });
 
@@ -695,12 +696,78 @@ describe('formatPermanent', () => {
       expect(out[1]).toContain(`${CSI}31m`);
     });
 
+    test('denied status applies error palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'denied',
+          durationMs: 1,
+        },
+        colored,
+      );
+      expect(out[1]).toContain(`${CSI}31m`);
+    });
+
     test('done status applies dim palette SGR to chip head when color enabled', () => {
       const out = formatPermanent(
         { kind: 'tool-end', name: 'r', verb: 'Read', subject: null, status: 'done', durationMs: 1 },
         colored,
       );
       expect(out[1]).toContain(`${CSI}2m`);
+    });
+
+    test('outputTruncated appends a `… output truncated` hint under the card', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'cat big.log',
+          status: 'done',
+          durationMs: 50,
+          outputTruncated: true,
+        },
+        unicode,
+      );
+      // blank, head, `└─` subject, hint — the hint indents 3 cols so
+      // it sits under the connector's content.
+      expect(out).toHaveLength(4);
+      expect(out[3]).toBe(pad('   … output truncated (ctrl+o to expand)'));
+    });
+
+    test('no hint line when outputTruncated is absent', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'ls',
+          status: 'done',
+          durationMs: 5,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out.join('\n')).not.toContain('truncated');
+    });
+
+    test('ASCII: the truncation hint uses the ... ellipsis fallback', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'ls',
+          status: 'done',
+          durationMs: 5,
+          outputTruncated: true,
+        },
+        ascii,
+      );
+      expect(out[out.length - 1]).toBe(pad('   ... output truncated (ctrl+o to expand)'));
     });
   });
 
@@ -718,8 +785,8 @@ describe('formatPermanent', () => {
     ]);
   });
 
-  describe('tool-end-batch (slice 3 — coalesced summary chip)', () => {
-    test('top-level batch: blank + chip head with count + |_ continuations per subject', () => {
+  describe('tool-end-batch (coalesced card — UI.md §4.10.5/§4.10.7)', () => {
+    test('top-level batch: blank + card head with count + tree continuations', () => {
       const out = formatPermanent(
         {
           kind: 'tool-end-batch',
@@ -732,22 +799,61 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      // Layout: blank, head, then 3 |_ continuation lines.
-      // Duration crosses 1s threshold → formatted as `4.5s`.
+      // Layout: blank, head, then a 3-row subject tree (├─ ├─ └─).
+      // Duration crosses 1s → bracket metric `[4.5s]`. Connectors
+      // align at the head glyph column — no extra indent top-level.
       expect(out).toEqual([
         pad(''),
-        pad('· Read 3 files in 4.5s'),
-        pad('  |_ src/a.ts'),
-        pad('  |_ src/b.ts'),
-        pad('  |_ src/c.ts'),
+        pad('● Read 3 files  [4.5s]'),
+        pad('├─ src/a.ts'),
+        pad('├─ src/b.ts'),
+        pad('└─ src/c.ts'),
       ]);
     });
 
-    test('nested batch: no leading blank + |_ glyph head + double-indent continuations', () => {
-      // When the batch itself is nested under a subagent (parentId
-      // set), the head uses `|_` and the continuations indent ONE
-      // step deeper so the visual hierarchy reads "subagent >
-      // batch summary > child detail".
+    test('outputTruncated appends one hint line under the batch body', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 80,
+          subjects: ['a.ts', 'b.ts'],
+          status: 'done',
+          outputTruncated: true,
+        },
+        unicode,
+      );
+      // blank, head, ├─ a, └─ b, then a single hint for the group.
+      expect(out).toHaveLength(5);
+      expect(out[4]).toBe(pad('   … output truncated (ctrl+o to expand)'));
+    });
+
+    test('single-subject batch closes the tree with └─ on the only row', () => {
+      // `count` can exceed the subject list when some children had
+      // null subjects (filtered upstream). The lone visible subject
+      // is still the last row → `└─`, never `├─`.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 80,
+          subjects: ['only.ts'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('● Read 2 files  [80ms]'), pad('└─ only.ts')]);
+    });
+
+    test('nested batch: no leading blank + |_ head + single-indent tree', () => {
+      // When the batch is nested under a subagent (parentId set),
+      // the head uses `|_` and the subject tree indents one step so
+      // the hierarchy reads "subagent > batch summary > child". The
+      // tree connectors align under the `|_` head glyph.
       const out = formatPermanent(
         {
           kind: 'tool-end-batch',
@@ -762,10 +868,10 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out).toEqual([
-        pad('  |_ Read 3 files in 6.0s'),
-        pad('    |_ /sub/a.ts'),
-        pad('    |_ /sub/b.ts'),
-        pad('    |_ /sub/c.ts'),
+        pad('  |_ Read 3 files  [6.0s]'),
+        pad('  ├─ /sub/a.ts'),
+        pad('  ├─ /sub/b.ts'),
+        pad('  └─ /sub/c.ts'),
       ]);
     });
 
@@ -784,15 +890,18 @@ describe('formatPermanent', () => {
       );
       // Verb override mirrors the single-chip behavior: error
       // statuses always read "Failed" regardless of the producer's
-      // headline. Operator gets a uniform error verb across single
-      // and batch chips.
-      expect(out[1]).toContain('Failed in 100ms');
+      // headline. The `[Xms]` metric is split into `secondary` —
+      // meta, not status — so it is not contiguous with the verb.
+      expect(out[1]).toContain('Failed');
+      expect(out[1]).toContain('[100ms]');
+      expect(out[1]).toContain('\x1b[31m'); // error palette on the head
+      expect(out[1]).toContain('\x1b[90m'); // secondary on the metric
     });
 
-    test('empty subjects array still emits the head (no orphan |_ lines)', () => {
-      // Defensive: a tool that has no vocab subject extractor (all
+    test('empty subjects array still emits the head (no orphan tree rows)', () => {
+      // Defensive: a tool with no vocab subject extractor (all
       // children produced null subjects, all filtered upstream) can
-      // still surface as a batch chip — count carries the signal.
+      // still surface as a batch card — count carries the signal.
       const out = formatPermanent(
         {
           kind: 'tool-end-batch',
@@ -805,12 +914,94 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('· Echoed ×3 in 30ms')]);
+      expect(out).toEqual([pad(''), pad('● Echoed ×3  [30ms]')]);
     });
 
-    test('ASCII mode: |_ continuations work without unicode', () => {
-      // The nest glyph is intentionally identical in unicode and
-      // ASCII so the affordance survives the no-unicode fallback.
+    test('long subject list caps at MAX_BATCH_SUBJECTS with a +N more tail', () => {
+      // 9 subjects, cap 5 → body shows 4 then a `└─ … +5 more`
+      // fold. The body never exceeds 5 rows; the head count keeps
+      // the true total honest.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 9 files',
+          count: 9,
+          totalDurationMs: 90,
+          subjects: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        pad('● Read 9 files  [90ms]'),
+        pad('├─ a'),
+        pad('├─ b'),
+        pad('├─ c'),
+        pad('├─ d'),
+        pad('└─ … +5 more'),
+      ]);
+    });
+
+    test('exactly MAX_BATCH_SUBJECTS subjects render in full (no fold)', () => {
+      // 5 subjects, cap 5 → `5 > 5` is false, all shown, last row
+      // closes with `└─`. Boundary pinned so an off-by-one in the
+      // overflow check doesn't silently drop a subject.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 5 files',
+          count: 5,
+          totalDurationMs: 50,
+          subjects: ['a', 'b', 'c', 'd', 'e'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        pad('● Read 5 files  [50ms]'),
+        pad('├─ a'),
+        pad('├─ b'),
+        pad('├─ c'),
+        pad('├─ d'),
+        pad('└─ e'),
+      ]);
+    });
+
+    test('MAX_BATCH_SUBJECTS + 1 subjects trips the fold (boundary)', () => {
+      // 6 is the first count that overflows: `6 > 5` → 4 subjects
+      // shown + a `+2 more` tail. Pairs with the exact-MAX case
+      // above to pin both sides of the overflow boundary.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 6 files',
+          count: 6,
+          totalDurationMs: 60,
+          subjects: ['a', 'b', 'c', 'd', 'e', 'f'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        pad('● Read 6 files  [60ms]'),
+        pad('├─ a'),
+        pad('├─ b'),
+        pad('├─ c'),
+        pad('├─ d'),
+        pad('└─ … +2 more'),
+      ]);
+    });
+
+    test('ASCII mode: tree continuations use +- / \\- without unicode', () => {
+      // The tree connectors fall back to `+- ` (mid) and `\\- `
+      // (last); the chip glyph falls back to `*`. The affordance
+      // survives the no-unicode path.
       const out = formatPermanent(
         {
           kind: 'tool-end-batch',
@@ -823,10 +1014,27 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      // ASCII chip glyph is `*`; continuations still `|_`.
-      expect(out[1]).toBe(pad('* Read 2 files in 200ms'));
-      expect(out[2]).toBe(pad('  |_ a.ts'));
-      expect(out[3]).toBe(pad('  |_ b.ts'));
+      expect(out[1]).toBe(pad('* Read 2 files  [200ms]'));
+      expect(out[2]).toBe(pad('+- a.ts'));
+      expect(out[3]).toBe(pad('\\- b.ts'));
+    });
+
+    test('ASCII overflow tail uses ... ellipsis', () => {
+      // `…` falls back to `...` under no-unicode; the tail still
+      // closes the tree with the `\\- ` last-branch.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 8 files',
+          count: 8,
+          totalDurationMs: 80,
+          subjects: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+          status: 'done',
+        },
+        ascii,
+      );
+      expect(out[out.length - 1]).toBe(pad('\\- ... +4 more'));
     });
   });
 
@@ -870,9 +1078,9 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out).toHaveLength(1);
-      expect(out[0]).toContain('· task explore Done');
+      expect(out[0]).toContain('● task explore Done');
       expect(out[0]).toContain('README at /repo/README.md');
-      expect(out[0]).toContain('5s');
+      expect(out[0]).toContain('[5.0s]');
     });
 
     test('error shape uses Error verb and red SGR when colored', () => {
@@ -1063,7 +1271,7 @@ describe('formatPermanent', () => {
       expect(out).toHaveLength(1);
     });
 
-    test('empty summary produces a clean line without double-space', () => {
+    test('empty summary: metric bracket follows the verb with the standard 2-space gap', () => {
       const out = formatPermanent(
         {
           kind: 'subagent_summary',
@@ -1077,8 +1285,11 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[0]).toContain('Done in 100ms');
-      expect(out[0]).not.toContain('Done  in');
+      // Empty summary → `[100ms]` sits right after the verb with the
+      // card's standard 2-space gap, no triple-space hole where the
+      // summary would otherwise have gone.
+      expect(out[0]).toContain('Done  [100ms]');
+      expect(out[0]).not.toContain('Done   [');
     });
   });
 

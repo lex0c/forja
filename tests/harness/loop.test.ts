@@ -479,6 +479,38 @@ describe('runAgent', () => {
     expect(result.reason).toBe('maxToolErrors');
   });
 
+  test('serial maxToolErrors bail answers every tool_use — no orphan persisted', async () => {
+    // Three failing tool_uses in ONE assistant turn. failingTool has no
+    // `parallel_safe`, so the step runs the serial path; maxToolErrors
+    // is 2 → the bail fires on tu2, before tu3 is reached. The persisted
+    // user message must still answer all three, or the history is
+    // invalid (the provider 400s on the next request).
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [
+            { id: 'tu1', name: 'always_fails', input: { n: 1 } },
+            { id: 'tu2', name: 'always_fails', input: { n: 2 } },
+            { id: 'tu3', name: 'always_fails', input: { n: 3 } },
+          ],
+          stop_reason: 'tool_use',
+        },
+      ],
+      { extraTools: [failingTool], budget: { maxToolErrors: 2 } },
+    );
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxToolErrors');
+
+    const { listMessagesBySession } = await import('../../src/storage/repos/messages.ts');
+    const msgs = listMessagesBySession(db, result.sessionId);
+    const toolResultMsg = msgs.find((m) => m.role === 'user' && Array.isArray(m.content));
+    expect(toolResultMsg).toBeDefined();
+    const blocks = toolResultMsg?.content as { tool_use_id: string; is_error?: boolean }[];
+    // tu3 was never reached by the loop — the bail synthesizes its result.
+    expect(blocks.map((b) => b.tool_use_id).sort()).toEqual(['tu1', 'tu2', 'tu3']);
+    expect(blocks.every((b) => b.is_error === true)).toBe(true);
+  });
+
   test('degenerate loop: identical tool calls are caught', async () => {
     const sameStep = (): ScriptedStep => ({
       tool_uses: [{ id: crypto.randomUUID(), name: 'echo', input: { msg: 'same' } }],

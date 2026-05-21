@@ -61,6 +61,73 @@ describe('messagesToProviderMessages', () => {
     expect(r.droppedFromHead).toBe(0);
   });
 
+  test('repairs an assistant tool_use left unanswered by a partial tool_result message', () => {
+    // The maxToolErrors bug: an assistant turn with 3 tool_use blocks
+    // followed by a user message answering only 2 of them.
+    const r = messagesToProviderMessages([
+      msg('user', 'do three things'),
+      msg('assistant', [
+        { type: 'tool_use', id: 'A', name: 'bash', input: {} },
+        { type: 'tool_use', id: 'B', name: 'bash', input: {} },
+        { type: 'tool_use', id: 'C', name: 'bash', input: {} },
+      ]),
+      msg('user', [
+        { type: 'tool_result', tool_use_id: 'A', content: 'ok' },
+        { type: 'tool_result', tool_use_id: 'B', content: 'ok' },
+      ]),
+    ]);
+    const last = r.messages.at(-1);
+    expect(last?.role).toBe('user');
+    const blocks = last?.content as { tool_use_id: string; name?: string; is_error?: boolean }[];
+    expect(blocks.map((b) => b.tool_use_id).sort()).toEqual(['A', 'B', 'C']);
+    const synthetic = blocks.find((b) => b.tool_use_id === 'C');
+    expect(synthetic?.is_error).toBe(true);
+    // The synthetic result carries the tool name — the Google adapter
+    // correlates by function name and throws without it.
+    expect(synthetic?.name).toBe('bash');
+  });
+
+  test('inserts a tool_result message when an aborted assistant turn has no answer', () => {
+    const r = messagesToProviderMessages([
+      msg('user', 'go'),
+      msg('assistant', [
+        { type: 'tool_use', id: 'X', name: 'bash', input: {} },
+        { type: 'tool_use', id: 'Y', name: 'bash', input: {} },
+      ]),
+    ]);
+    expect(r.messages).toHaveLength(3);
+    const last = r.messages.at(-1);
+    expect(last?.role).toBe('user');
+    const blocks = last?.content as { tool_use_id: string }[];
+    expect(blocks.map((b) => b.tool_use_id).sort()).toEqual(['X', 'Y']);
+  });
+
+  test('an orphaned turn before a fresh prompt is answered, and the user gap is bridged', () => {
+    const r = messagesToProviderMessages([
+      msg('user', 'go'),
+      msg('assistant', [{ type: 'tool_use', id: 'Z', name: 'bash', input: {} }]),
+      msg('user', 'a brand new question'),
+    ]);
+    expect(r.messages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+    ]);
+  });
+
+  test('leaves a fully-answered tool round untouched', () => {
+    const r = messagesToProviderMessages([
+      msg('user', 'go'),
+      msg('assistant', [{ type: 'tool_use', id: 'A', name: 'bash', input: {} }]),
+      msg('user', [{ type: 'tool_result', tool_use_id: 'A', content: 'ok' }]),
+      msg('assistant', [{ type: 'text', text: 'done' }]),
+    ]);
+    expect(r.messages).toHaveLength(4);
+    expect(r.messages[3]).toEqual({ role: 'assistant', content: [{ type: 'text', text: 'done' }] });
+  });
+
   test('skips role=tool entries (forward-compat: not currently emitted)', () => {
     // role='tool' exists in the schema but the loop only emits
     // user/assistant. Defensive skip so a future migration that

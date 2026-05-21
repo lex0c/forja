@@ -495,6 +495,71 @@ describe('tool lifecycle', () => {
     ]);
   });
 
+  test('tool:execution-started rebases the active tool clock', () => {
+    // startedAt is set at tool:start (pre-permission); when the body
+    // actually begins it is rebased so the live card's [Xs] excludes
+    // the permission-modal wait.
+    const result = drive([
+      startBash('t1'),
+      { type: 'tool:execution-started', ts: 9000, toolId: 't1' },
+    ]);
+    expect(result.state.activeTools.get('t1')?.startedAt).toBe(9000);
+  });
+
+  test('tool:execution-started for an unknown tool is a no-op', () => {
+    const result = drive([{ type: 'tool:execution-started', ts: 9000, toolId: 'ghost' }]);
+    expect(result.state.activeTools.size).toBe(0);
+  });
+
+  test('tool:end with a non-zero exitCode emits immediately and carries exitCode', () => {
+    // A bash that exited non-zero is status:done but must not coalesce
+    // into a batch — it surfaces as its own card with `exitCode` set.
+    const result = drive([
+      startBash('t1'),
+      { type: 'tool:end', ts: 1500, toolId: 't1', status: 'done', durationMs: 30, exitCode: 1 },
+    ]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 30,
+        exitCode: 1,
+      },
+    ]);
+  });
+
+  test('tool:end with a non-zero exitCode carries outputTruncated too', () => {
+    // A failing command whose output was capped — both `exit N` and the
+    // `… output truncated` hint belong on the immediately-emitted card.
+    const result = drive([
+      startBash('t1'),
+      {
+        type: 'tool:end',
+        ts: 1500,
+        toolId: 't1',
+        status: 'done',
+        durationMs: 30,
+        exitCode: 2,
+        outputTruncated: true,
+      },
+    ]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 30,
+        exitCode: 2,
+        outputTruncated: true,
+      },
+    ]);
+  });
+
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
       {
@@ -642,7 +707,7 @@ describe('tool lifecycle', () => {
   });
 });
 
-describe('tool-end batch coalescing (slice 3)', () => {
+describe('tool-end batch coalescing', () => {
   // Helper: build a tool:start + tool:end pair for read_file with
   // a given subject and toolId. Simulates the simplest "model
   // issued read_file" sequence.
@@ -666,7 +731,7 @@ describe('tool-end batch coalescing (slice 3)', () => {
       },
     ] satisfies UIEvent[];
 
-  test('3+ consecutive same-name tool:end items coalesce into a single tool-end-batch', () => {
+  test('3 consecutive same-name tool:end items coalesce into a single tool-end-batch', () => {
     const result = drive([
       ...readPair('t1', 'src/a.ts', 100),
       ...readPair('t2', 'src/b.ts', 200),
@@ -683,13 +748,94 @@ describe('tool-end batch coalescing (slice 3)', () => {
     expect(item.status).toBe('done');
   });
 
-  test('1-2 same-name tool:end items emit individually (no fold below threshold)', () => {
+  test('a single tool:end below the threshold emits as an individual tool-end', () => {
     // The buffer ALWAYS captures, but flush respects the threshold:
-    // 1-2 items unfold back into individual `tool-end` chips so the
-    // operator gets normal per-tool visibility for small batches
-    // without surprise coalescing.
-    const result = drive([...readPair('t1', 'src/a.ts'), ...readPair('t2', 'src/b.ts')]);
-    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end']);
+    // a lone item has nothing to coalesce with and unfolds back to
+    // a normal per-tool `tool-end` chip.
+    const result = drive([...readPair('t1', 'src/a.ts')]);
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end']);
+  });
+
+  test('2 consecutive same-name tool:end items coalesce (threshold is 2)', () => {
+    // Two same-tool runs are the smallest coalescing unit — one
+    // card head + two subject rows beats two gap-separated chips.
+    const result = drive([...readPair('t1', 'src/a.ts', 100), ...readPair('t2', 'src/b.ts', 200)]);
+    expect(result.permanent).toHaveLength(1);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.count).toBe(2);
+    expect(item.totalDurationMs).toBe(300);
+    expect(item.subjects).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(item.verb).toBe('Read 2 files');
+  });
+
+  test('tool:end outputTruncated carries onto an individual tool-end', () => {
+    // A lone truncated tool (below the coalesce threshold) keeps the
+    // flag on the unfolded `tool-end` item.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: 'cat big',
+      },
+      {
+        type: 'tool:end',
+        ts: 50,
+        toolId: 't1',
+        status: 'done',
+        durationMs: 49,
+        outputTruncated: true,
+      },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.outputTruncated).toBe(true);
+  });
+
+  test('a batch aggregates outputTruncated when any child truncated', () => {
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: 'a',
+      },
+      { type: 'tool:end', ts: 2, toolId: 't1', status: 'done', durationMs: 1 },
+      {
+        type: 'tool:start',
+        ts: 3,
+        toolId: 't2',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: 'b',
+      },
+      {
+        type: 'tool:end',
+        ts: 4,
+        toolId: 't2',
+        status: 'done',
+        durationMs: 1,
+        outputTruncated: true,
+      },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.outputTruncated).toBe(true);
+  });
+
+  test('a batch with no truncated child leaves outputTruncated unset', () => {
+    const result = drive([...readPair('t1', 'a'), ...readPair('t2', 'b')]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.outputTruncated).toBeUndefined();
   });
 
   test('different tool names do NOT merge across the batch', () => {
@@ -892,9 +1038,9 @@ describe('tool-end batch coalescing (slice 3)', () => {
       // Flush trigger: warn (emits a permanent item).
       { type: 'warn', ts: 200, message: 'something' },
     ]);
-    // Order: 2 tool-ends (under threshold so emit individual) +
-    // the warn item. Crucially the tool-ends come FIRST.
-    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end', 'warn']);
+    // Order: the 2 reads coalesce into one tool-end-batch, then the
+    // warn item. Crucially the batch comes FIRST.
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end-batch', 'warn']);
   });
 
   test('batch holds across no-permanent events (status updates do NOT flush)', () => {
@@ -913,7 +1059,7 @@ describe('tool-end batch coalescing (slice 3)', () => {
   });
 });
 
-describe('applyEvent wrapper (flush lifecycle, slice 3)', () => {
+describe('applyEvent wrapper (flush lifecycle)', () => {
   // Direct unit tests for the public `applyEvent` wrapper that
   // sits in front of `applyEventInner`. The integration tests in
   // the batch coalescing block exercise this through `drive`,
@@ -1067,15 +1213,14 @@ describe('session boundary handling of pendingToolEndBatch', () => {
   test('session:end flushes the buffer BEFORE the footer (correct chronology)', () => {
     // The session that emitted the tool calls is the one ending,
     // so the buffer's items DO belong in this session's
-    // scrollback — drained before the footer marker.
+    // scrollback — drained before the footer marker. A single
+    // buffered item is below the coalesce threshold, so it drains
+    // as an individual `tool-end`.
     const dirty: LiveState = {
       ...createInitialState(),
       pendingToolEndBatch: {
         name: 'read_file',
-        items: [
-          { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 },
-          { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 20 },
-        ],
+        items: [{ verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 }],
       },
     };
     const r = applyEvent(dirty, {
@@ -1084,9 +1229,7 @@ describe('session boundary handling of pendingToolEndBatch', () => {
       sessionId: 's1',
       reason: 'done',
     });
-    // Two tool-end items (under the threshold of 3, so each
-    // emits individually) come BEFORE the session-footer.
-    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end', 'tool-end', 'session-footer']);
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end', 'session-footer']);
     expect(r.state.pendingToolEndBatch).toBeNull();
   });
 
@@ -1570,17 +1713,11 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       expect(r.state.modal.subject).toBeNull();
       expect(r.state.modal.question).toBeNull();
       // Action block has blank-line-action-blank-line shape — the
-      // breathing room is what sets the action apart visually.
-      // Action line carries `tone: 'bold'` so the renderer paints
-      // it bold (operator's eye lands on the command first).
+      // breathing room is what sets the action apart visually. The
+      // action line is a plain dim string.
       expect(r.state.modal.preview[0]).toBe('');
-      expect(r.state.modal.preview[1]).toEqual({
-        text: '    $ rm -rf /',
-        tone: 'bold',
-      });
+      expect(r.state.modal.preview[1]).toBe('    rm -rf /');
       expect(r.state.modal.preview[2]).toBe('');
-      // cwd follows the action block.
-      expect(r.state.modal.preview[3]).toBe('cwd: /p');
     }
   });
 
@@ -1634,11 +1771,7 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       cwd: '/p',
     } as UIEvent);
     // Preview action line is the path verbatim, no shell prefix.
-    // Wrapped as a `{text, tone}` object so the renderer paints bold.
-    expect(r.state.modal?.preview[1]).toEqual({
-      text: '    src/foo.ts',
-      tone: 'bold',
-    });
+    expect(r.state.modal?.preview[1]).toBe('    src/foo.ts');
   });
 
   test('subagent attribution becomes a parenthesized title suffix (not a preview row)', () => {
@@ -1662,9 +1795,8 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       // Preview goes straight to the action block — no
       // "subagent: explore (12345678)" prefix line.
       expect(r.state.modal.preview[0]).toBe('');
-      expect(r.state.modal.preview[1]).toEqual({ text: '    $ ls', tone: 'bold' });
+      expect(r.state.modal.preview[1]).toBe('    ls');
       expect(r.state.modal.preview[2]).toBe('');
-      expect(r.state.modal.preview[3]).toBe('cwd: /p');
       // No row contains the old "subagent: <name> (<idTail>)"
       // prefix shape.
       expect(
@@ -1764,12 +1896,12 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     // attribution stays accurate.
     const preview = catchAll.state.modal?.preview ?? [];
     const matchedRuleLine = preview.find((p) =>
-      (typeof p === 'string' ? p : p.text).startsWith('matched rule:'),
+      (typeof p === 'string' ? p : p.text).includes('matched rule:'),
     );
     expect(matchedRuleLine).toBeDefined();
     if (matchedRuleLine !== undefined) {
       const text = typeof matchedRuleLine === 'string' ? matchedRuleLine : matchedRuleLine.text;
-      expect(text).toBe('matched rule: * (project policy)');
+      expect(text).toBe('    matched rule: * (project policy)');
     }
   });
 

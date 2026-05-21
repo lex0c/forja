@@ -22,16 +22,16 @@ const thinking = (overrides: Partial<{ startedAt: number; messageId: string }> =
   ...overrides,
 });
 
-// Match "<word>… (..." — the chip's verb sits before the elapsed
+// Match "<word>… [..." — the chip's verb sits before the elapsed
 // counter. Used by tests that don't pin a specific verb but do
 // need to assert the chip rendered SOME verb from the pool.
-const verbPattern = /(\w+)…\s*\(/;
+const verbPattern = /(\w+)…\s*\[/;
 
 describe('renderThinkingChip', () => {
   test('renders a cognitive verb from the pool with elapsed time', () => {
     const out = renderThinkingChip(thinking({ startedAt: 0 }), caps, 8200);
     expect(out).toHaveLength(1);
-    expect(out[0]).toContain('(8.2s)');
+    expect(out[0]).toContain('[8.2s]');
     const match = out[0]?.match(verbPattern);
     expect(match).not.toBeNull();
     expect(COGNITIVE_VERB_POOL).toContain(match?.[1] ?? '');
@@ -62,7 +62,7 @@ describe('renderThinkingChip', () => {
 
   test('sub-second elapsed renders in ms', () => {
     const out = renderThinkingChip(thinking({ startedAt: 100 }), caps, 450);
-    expect(out[0]).toContain('(350ms)');
+    expect(out[0]).toContain('[350ms]');
   });
 
   test('negative elapsed (clock skew) clamps to 0ms', () => {
@@ -70,7 +70,7 @@ describe('renderThinkingChip', () => {
     // across both family chips so a clock-skew tick doesn't
     // make the counter visually jump units.
     const out = renderThinkingChip(thinking({ startedAt: 5000 }), caps, 1000);
-    expect(out[0]).toContain('(0ms)');
+    expect(out[0]).toContain('[0ms]');
   });
 
   test('ASCII fallback works (spinner falls back, no unicode arrow needed)', () => {
@@ -79,7 +79,7 @@ describe('renderThinkingChip', () => {
     // only in the spinner glyph. Pin that the chip renders
     // cleanly under unicode=false anyway.
     const out = renderThinkingChip(thinking({ startedAt: 0 }), ascii, 1200);
-    expect(out[0]).toContain('(1.2s)');
+    expect(out[0]).toContain('[1.2s]');
     const match = out[0]?.match(verbPattern);
     expect(COGNITIVE_VERB_POOL).toContain(match?.[1] ?? '');
   });

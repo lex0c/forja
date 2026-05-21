@@ -19,18 +19,6 @@ import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 import { buildPermissionOptions } from './modal-manager.ts';
 
-// Bash family — every tool that's gated under `tools.bash` in the
-// policy file. The reducer's permission:ask case routes all four
-// to the same context label ("Bash command") and prefixes the
-// action with "$ ". Single source so a future rename / addition
-// can't drift between the label-decision and the prefix-decision.
-const BASH_FAMILY: ReadonlySet<string> = new Set([
-  'bash',
-  'bash_background',
-  'bash_output',
-  'bash_kill',
-]);
-
 // Map a tool name to the modal's context label. Replaces the older
 // "Run command" / "Subagent permission — <name>" titles with
 // per-category framing that matches reference designs (see
@@ -63,13 +51,14 @@ export interface InputState {
 }
 
 // Threshold below which a pending tool-end batch flushes as
-// individual chips (no visual savings from coalescing 1-2 items).
+// individual chips (a lone tool-end has nothing to coalesce with).
 // At/above the threshold, the batch flushes as a single
-// `tool-end-batch` PermanentItem. Tuned to 3 because that's the
-// smallest count where the operator visibly benefits from the
-// summary chip (Read 3 files reads cleaner than three back-to-back
-// "Read in 0.2s" chips with similar subjects).
-export const TOOL_BATCH_COALESCE_THRESHOLD = 3;
+// `tool-end-batch` PermanentItem. Tuned to 2: two consecutive
+// same-tool runs already pay for the summary — one head + two
+// `├─`/`└─` subject rows (3 lines) replaces two gap-separated
+// chips (blank + head + `└─` each = 6 lines), and the operator
+// reads "Read 2 files" instead of two near-identical chips.
+export const TOOL_BATCH_COALESCE_THRESHOLD = 2;
 
 // Item buffered inside `PendingToolEndBatch.items` — captures
 // what each child child contributed so the flush helper can decide
@@ -83,6 +72,7 @@ export interface PendingToolEndBatchItem {
   status: 'done' | 'error' | 'denied';
   durationMs: number;
   summary?: string;
+  outputTruncated?: boolean;
 }
 
 // Reducer-side buffer for slice 3 (read coalescing). See
@@ -572,13 +562,19 @@ export type PermanentItem =
       // swaps the leading glyph to `|_` so the chip visually
       // belongs to its owner. Absent for top-level tool calls.
       parentId?: string;
+      // True when the tool capped its own output — renderer adds a
+      // `… output truncated (ctrl+o to expand)` line under the card.
+      outputTruncated?: boolean;
+      // Non-zero exit code of a command tool (bash). Renderer shows
+      // `exit N` on the head so a failed command reads as a failure.
+      exitCode?: number;
     }
   | {
       // Coalesced batch of N consecutive same-name + same-parentId
       // tool-end items, emitted by the reducer when the pending
       // batch flushes with `count >= TOOL_BATCH_COALESCE_THRESHOLD`.
-      // Reads as a single chip "Read 3 files in 0.6s" with the N
-      // subjects as `|_` continuation lines underneath.
+      // Reads as a single card "Read 3 files  [0.6s]" with the N
+      // subjects as a `├─`/`└─` tree underneath.
       kind: 'tool-end-batch';
       // Tool name — single value because the batch only forms across
       // matching names.
@@ -610,6 +606,9 @@ export type PermanentItem =
       // tool-end; the field is absent only when all children were
       // top-level.
       parentId?: string;
+      // True when ANY child in the batch capped its output — the
+      // renderer adds one `… output truncated` line for the group.
+      outputTruncated?: boolean;
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
@@ -739,6 +738,7 @@ export const flushPendingToolEndBatch = (
       durationMs: it.durationMs,
       ...(it.summary !== undefined ? { summary: it.summary } : {}),
       ...(batch.parentId !== undefined ? { parentId: batch.parentId } : {}),
+      ...(it.outputTruncated === true ? { outputTruncated: true } : {}),
     }));
     return { state: next, permanent };
   }
@@ -761,6 +761,7 @@ export const flushPendingToolEndBatch = (
     subjects,
     status,
     ...(batch.parentId !== undefined ? { parentId: batch.parentId } : {}),
+    ...(batch.items.some((it) => it.outputTruncated === true) ? { outputTruncated: true } : {}),
   };
   return { state: next, permanent: [summary] };
 };
@@ -1087,6 +1088,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state: { ...state, activeTools: next }, permanent: [] };
     }
 
+    case 'tool:execution-started': {
+      // Rebase the tool's clock to when its body actually started —
+      // execution begins after the permission engine, the modal, and
+      // PreToolUse hooks. Without this the live card's `[Xs]` would
+      // count the human wait at the permission modal.
+      const tool = state.activeTools.get(event.toolId);
+      if (tool === undefined) return { state, permanent: [] };
+      const next = cloneTools(state.activeTools);
+      next.set(event.toolId, { ...tool, startedAt: event.ts });
+      return { state: { ...state, activeTools: next }, permanent: [] };
+    }
+
     case 'tool:delta': {
       const tool = state.activeTools.get(event.toolId);
       // Delta for an unknown tool: drop. Producer error or out-of-order
@@ -1123,7 +1136,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // buffer. That's strictly more honest: operator sees the
       // failure boundary instead of one batch chip with
       // worst-of status.
-      if (event.status !== 'done') {
+      // A non-zero exit code joins the non-`done` bypass: the command
+      // ran fine as a tool call but failed on its own terms, so it
+      // must not vanish into a coalesced "Executed N commands" batch.
+      if (event.status !== 'done' || event.exitCode !== undefined) {
         const flushed = flushPendingToolEndBatch(state);
         const item: PermanentItem = {
           kind: 'tool-end',
@@ -1134,6 +1150,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           durationMs: event.durationMs,
           ...(event.summary !== undefined ? { summary: event.summary } : {}),
           ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
+          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+          ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
         };
         return {
           state: { ...flushed.state, activeTools: nextTools },
@@ -1146,6 +1164,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         status: event.status,
         durationMs: event.durationMs,
         ...(event.summary !== undefined ? { summary: event.summary } : {}),
+        ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
       };
       const pending = state.pendingToolEndBatch;
       const matches =
@@ -1352,31 +1371,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           : baseLabel;
 
       const previewLines: PreviewLine[] = [];
-      // Action block. Bash family carries the "$ " shell prefix; fs/
-      // web tools display the path/url verbatim. The 4-space lead
-      // (this stored line) + the renderer's 2-space indent = 6
-      // visible spaces, matching the design mockup's deeper indent.
-      // Bold paint highlights the command — operator's eye lands
-      // here first when triaging a confirm.
-      const actionPrefix = BASH_FAMILY.has(event.toolName) ? '$ ' : '';
+      // Action block: a blank line, then the command verbatim (no
+      // shell prefix). The 4-space lead (this stored line) + the
+      // renderer's 2-space indent = 6 visible spaces. Rendered as a
+      // plain `dim` line — the modal title stays the only bold one.
       previewLines.push('');
-      previewLines.push({
-        text: `    ${actionPrefix}${event.command}`,
-        tone: 'bold',
-      });
-      previewLines.push('');
+      previewLines.push(`    ${event.command}`);
 
-      // cwd: always shown for now — subagent-proxied asks land in a
-      // worktree path that's worth surfacing, and parent's own asks
-      // historically showed cwd too. Conditional rendering (hide on
-      // session-cwd match) is a future slice once we have access to
-      // the session cwd in the reducer.
-      previewLines.push(`cwd: ${event.cwd}`);
-
-      // Source attribution lifts to the `secondary` paint so it
-      // visually breaks out of the dim baseline. Operator scanning
-      // a sea of confirms during a multi-step turn can find the
-      // YAML-edit hint without re-reading every line.
+      // Source attribution — a `secondary` line sitting directly
+      // under the action, at the same 4-space indent. Tells the
+      // operator which policy rule (or none) gated this ask.
       if (event.rule !== undefined) {
         const layerLabel =
           event.layer === undefined
@@ -1385,12 +1389,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
               ? ' (built-in default)'
               : ` (${event.layer} policy)`;
         previewLines.push({
-          text: `matched rule: ${event.rule}${layerLabel}`,
+          text: `    matched rule: ${event.rule}${layerLabel}`,
           tone: 'secondary',
         });
       } else if (event.layer !== undefined && event.layer !== 'default') {
         previewLines.push({
-          text: `no rule matched in ${event.layer} policy`,
+          text: `    no rule matched in ${event.layer} policy`,
           tone: 'secondary',
         });
       }

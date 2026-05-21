@@ -12,14 +12,19 @@
 
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
+import { formatChipDuration, formatCoarseDuration } from './duration.ts';
 import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
-import { subContentConnector } from './glyphs.ts';
+import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
+import { renderMarkdown } from './markdown.ts';
 import { visualWidth } from './width.ts';
 
-// Final-state chip prefix glyph (UI.md §4.10.5). One glyph for all
-// statuses; status is communicated by the verb ('Failed' vs the
-// per-tool finalVerb) plus color (error / dim).
-const CHIP_FINAL_GLYPH = { unicode: '·', ascii: '*' } as const;
+// Card-head glyph (UI.md §4.10.5). One glyph for all statuses;
+// status is communicated by the verb ('Failed' vs the per-tool
+// finalVerb) plus color (error / denied / dim). The filled `●`
+// landed with the slice-1 card restyle — it gives the head a
+// visible anchor so a stack of cards reads as discrete blocks.
+// ASCII keeps `*`; `●` has no reliable dumb-terminal equivalent.
+const CHIP_FINAL_GLYPH = { unicode: '●', ascii: '*' } as const;
 // Glyph used in place of CHIP_FINAL_GLYPH when a tool-end has a
 // `parentId` — visually marks the chip as nested inside its
 // parent (today: a subagent run). `|_` reads as "branch from
@@ -47,6 +52,25 @@ const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): s
   if (status === 'error') return 'Failed';
   return vocabVerb;
 };
+
+// Cap on subject rows under a `tool-end-batch` head. Above it the
+// body shows MAX-1 subjects and folds the rest into a `… +N more`
+// tail — a large batch must not bury the scrollback. The body
+// therefore never exceeds MAX_BATCH_SUBJECTS rows.
+const MAX_BATCH_SUBJECTS = 5;
+
+// `… output truncated` hint line (slice 2). A tool that capped its
+// own output gets one secondary line under the card body. The
+// `ctrl+o` key stays unwired — UI.md §4.10.5 defers the expansion
+// panel to a later slice; the hint stands on its own until then.
+// Indented 3 cols so it lines up under the `└─ ` connector's
+// content, reading as a footnote of the card rather than a sibling.
+const truncationHint = (caps: Capabilities, indent: string): string =>
+  paint(
+    caps,
+    'secondary',
+    `${indent}   ${ellipsisGlyph(caps)} output truncated (ctrl+o to expand)`,
+  );
 
 export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
   // Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded
@@ -80,19 +104,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // surfacing useful info — wall-clock time the model spent on
       // the turn — which the operator likely wants to see anyway.
       const dur = item.durationMs;
-      const formatDuration = (ms: number): string => {
-        if (ms < 1000) return `${ms}ms`;
-        const totalSec = Math.round(ms / 1000);
-        if (totalSec < 60) return `${totalSec}s`;
-        const m = Math.floor(totalSec / 60);
-        const s = totalSec % 60;
-        return s === 0 ? `${m}m` : `${m}m${s}s`;
-      };
-      const tail = dur !== undefined ? ` ${formatDuration(dur)}` : '';
+      const tail = dur !== undefined ? ` ${formatCoarseDuration(dur)}` : '';
       const verb = (() => {
         switch (item.reason) {
           case 'done':
-            return dur !== undefined ? `Cogitated for ${formatDuration(dur)}` : 'Cogitated.';
+            return dur !== undefined ? `Cogitated for ${formatCoarseDuration(dur)}` : 'Cogitated.';
           case 'aborted': {
             const cause = item.abortCause !== undefined ? ` (${item.abortCause})` : '';
             return dur !== undefined ? `Aborted${cause} after${tail}` : `Aborted${cause}.`;
@@ -118,11 +134,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', paint(caps, 'secondary', verb)].map(padFrame);
     }
     case 'session-banner': {
-      // UI.md §4.10.9. Three blocks separated by blank lines:
+      // UI.md §4.10.9. Three stacked blocks, no blank lines between:
       //   1. title (bold) — `forja v0.0.0`
-      //   2. identity (dim) — model+limits, cwd
-      //   3. env — mixed: `✓ name` (success) for flags, `key: value` (dim)
-      //      for meta, joined by ` · ` (dim). Omitted when env is empty.
+      //   2. cwd (secondary)
+      //   3. env — `✓ name` (flags) + `key: value` (meta) joined by
+      //      ` · `, the whole line in `secondary`. Omitted when empty.
       // Version is prefixed with `v` (semver convention) regardless of
       // what the producer sent — operators read `v0.0.0` as a version
       // string at a glance, `0.0.0` as ambiguous.
@@ -131,25 +147,17 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
       const lines: string[] = [
         paint(caps, 'bold', `${item.app} ${versionDisplay}`),
-        '',
-        paint(
-          caps,
-          'dim',
-          `${item.model} ${sep} ${item.contextWindow.toLocaleString()} ctx ${sep} max ${item.maxOutputTokens} out`,
-        ),
-        paint(caps, 'dim', item.cwd),
+        paint(caps, 'secondary', item.cwd),
       ];
       if (item.env.length > 0) {
-        const dimSep = paint(caps, 'dim', ` ${sep} `);
         const parts = item.env.map((e) => {
           if (e.kind === 'flag') {
             const tail = e.count !== undefined ? ` (${e.count})` : '';
-            return paint(caps, 'success', `${checkGlyph} ${e.name}${tail}`);
+            return `${checkGlyph} ${e.name}${tail}`;
           }
-          return paint(caps, 'dim', `${e.key}: ${e.value}`);
+          return `${e.key}: ${e.value}`;
         });
-        lines.push('');
-        lines.push(parts.join(dimSep));
+        lines.push(paint(caps, 'secondary', parts.join(` ${sep} `)));
       }
       return lines.map(padFrame);
     }
@@ -193,13 +201,18 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // tool_use blocks but no prose) used to surface a header-only
       // chip for cost visibility; the footer cost counter and the
       // tool-end chips already cover that signal.
+      //
+      // The prose is GitHub-flavored Markdown — `renderMarkdown`
+      // parses and walks it (`render/markdown.ts`). Streaming still
+      // shows plain text; the block settles into Markdown here, at
+      // turn end.
       if (item.text.length === 0) return [];
-      return ['', ...item.text.split('\n')].map(padFrame);
+      return ['', ...renderMarkdown(item.text, caps)].map(padFrame);
     }
     case 'tool-end': {
-      // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
-      // `· <verb> in <duration>` for top-level chips,
-      // `  |_ <verb> in <duration>` for nested chips
+      // UI.md §4.10.5 — card head: glyph + status-aware verb + a
+      // trailing `[duration]` metric field. `● <verb>  [<dur>]` for
+      // top-level chips, `  |_ <verb>  [<dur>]` for nested chips
       // (`item.parentId` set, today: tool fired inside a subagent).
       // Color: dim for done, error palette for failed, warn palette
       // for denied — applied identically regardless of nesting.
@@ -214,17 +227,20 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // verb" — the indent IS the attribution signal.
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const ms =
-        item.durationMs >= 1000
-          ? `${(item.durationMs / 1000).toFixed(1)}s`
-          : `${item.durationMs}ms`;
-      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
-      const head =
-        item.status === 'error'
-          ? paint(caps, 'error', headRaw)
-          : item.status === 'denied'
-            ? paint(caps, 'warn', headRaw)
-            : paint(caps, 'dim', headRaw);
+      const headRaw = `${indent}${glyph} ${verb}`;
+      // `denied` takes the `error` tone too — a blocked call didn't
+      // run, which reads as a failure; the verb ('Denied' vs 'Failed')
+      // is what tells the two apart.
+      const headTone = item.status === 'error' || item.status === 'denied' ? 'error' : 'dim';
+      // The duration is meta — always `secondary`, never the head's
+      // status color (a slow error shouldn't paint its `[Xms]` red).
+      const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.durationMs)}]`);
+      // A non-zero exit code — the command ran but failed on its own
+      // terms. `warn`, not `error`: exit ≠ 0 is also the normal "no
+      // match" of grep or a failed `test`, so it flags, not alarms.
+      const exitMark =
+        item.exitCode !== undefined ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '';
+      const head = `${paint(caps, headTone, headRaw)}${exitMark}${metric}`;
       // Leading blank (UI.md §6.3) — each tool finalization is its
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
@@ -270,15 +286,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       if (subText !== null) {
         lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
       }
+      if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
       return lines.map(padFrame);
     }
     case 'tool-end-batch': {
-      // Coalesced summary of N consecutive same-tool tool-end items
-      // (slice 3). Same chip-shape contract as `tool-end`: status
-      // palette (dim / error / warn), nested glyph + indent when
-      // `parentId` is set. The continuation here lists EACH
-      // child's subject under `|_` instead of the single `└─ subject`
-      // that a non-batched chip emits.
+      // Coalesced summary of N consecutive same-tool tool-end items.
+      // Same card-head contract as `tool-end`: status palette (dim /
+      // error / warn), nested glyph + indent when `parentId` is set.
+      // The body lists each child's subject as a tree — `├─` for the
+      // mid rows, `└─` for the last — capped at MAX_BATCH_SUBJECTS so
+      // a large batch can't bury the scrollback.
       const nested = item.parentId !== undefined;
       const glyph = nested
         ? CHIP_NESTED_GLYPH
@@ -287,35 +304,42 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           : CHIP_FINAL_GLYPH.ascii;
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const ms =
-        item.totalDurationMs >= 1000
-          ? `${(item.totalDurationMs / 1000).toFixed(1)}s`
-          : `${item.totalDurationMs}ms`;
-      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
-      const head =
-        item.status === 'error'
-          ? paint(caps, 'error', headRaw)
-          : item.status === 'denied'
-            ? paint(caps, 'warn', headRaw)
-            : paint(caps, 'dim', headRaw);
+      const headRaw = `${indent}${glyph} ${verb}`;
+      // `denied` takes the `error` tone too — a blocked call didn't
+      // run, which reads as a failure; the verb ('Denied' vs 'Failed')
+      // is what tells the two apart.
+      const headTone = item.status === 'error' || item.status === 'denied' ? 'error' : 'dim';
+      const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.totalDurationMs)}]`);
+      const head = `${paint(caps, headTone, headRaw)}${metric}`;
       // Same leading-blank rule as tool-end: top-level chips get a
       // separator, nested ones stay tight under their owner.
       const lines = nested ? [head] : ['', head];
-      // Each child's subject as a `|_` continuation. Reuse the
-      // nest glyph for the per-child connector — visually consistent
-      // with slice 2's nested chip glyph and explicitly different
-      // from the `└─ ` subject connector (which marks "this is the
-      // chip's subject", not "this is a sibling child of the chip
-      // above"). Empty subjects are filtered upstream in
-      // flushPendingToolEndBatch — we don't need to skip here.
-      for (const subj of item.subjects) {
-        // Continuation lines indent ONE deeper than the head when
-        // the chip itself is already nested under a subagent —
-        // visual hierarchy reads "subagent > batch summary >
-        // child detail".
-        const childIndent = nested ? `${CHIP_NESTED_INDENT}${CHIP_NESTED_INDENT}` : '  ';
-        lines.push(paint(caps, 'secondary', `${childIndent}${CHIP_NESTED_GLYPH} ${subj}`));
+      // Subject tree under the head. Connectors align at the head's
+      // glyph column (`indent`) — `├─` while the tree is open, `└─`
+      // on the closing row. Over the cap, the body shows
+      // MAX_BATCH_SUBJECTS - 1 subjects and folds the rest into a
+      // `└─ … +N more` tail; the body never exceeds MAX rows. Empty
+      // `subjects` (every child had a null subject, filtered upstream
+      // in flushPendingToolEndBatch) leaves the head standing alone
+      // — the count in the verb carries it.
+      const branch = treeBranchConnector(caps);
+      const last = subContentConnector(caps);
+      const ellipsis = ellipsisGlyph(caps);
+      const overflow = item.subjects.length > MAX_BATCH_SUBJECTS;
+      const visible = item.subjects.slice(
+        0,
+        overflow ? MAX_BATCH_SUBJECTS - 1 : item.subjects.length,
+      );
+      const bodyLines = visible.map((subj, i) => {
+        const isLastRow = !overflow && i === visible.length - 1;
+        return paint(caps, 'secondary', `${indent}${isLastRow ? last : branch}${subj}`);
+      });
+      lines.push(...bodyLines);
+      if (overflow) {
+        const moreN = item.subjects.length - visible.length;
+        lines.push(paint(caps, 'secondary', `${indent}${last}${ellipsis} +${moreN} more`));
       }
+      if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
       return lines.map(padFrame);
     }
     case 'error':
@@ -353,8 +377,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     }
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
-      // tool-end's compact shape: `· task <name> Done <summary> in 1m2s`
-      // for success, `· task <name> <Verb> <summary> in 1m2s` for
+      // tool-end's compact shape: `● task <name> Done <summary>  [1m2s]`
+      // for success, `● task <name> <Verb> <summary>  [1m2s]` for
       // non-success — Verb is chosen from status + reason so the
       // operator can read the cause at a glance instead of a flat
       // "Failed" that hides whether the cap blew, the user
@@ -408,14 +432,6 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         return 'Failed';
       };
       const verb = verbFor(item.status, item.reason, item.costUsd);
-      const formatDuration = (ms: number): string => {
-        if (ms < 1000) return `${ms}ms`;
-        const totalSec = Math.round(ms / 1000);
-        if (totalSec < 60) return `${totalSec}s`;
-        const m = Math.floor(totalSec / 60);
-        const s = totalSec % 60;
-        return s === 0 ? `${m}m` : `${m}m${s}s`;
-      };
       // Truncate the summary so a verbose child doesn't blow out
       // the line — the renderer's frame width is the operator's
       // budget, not the producer's.
@@ -426,7 +442,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           ? `${trimmedSummary.slice(0, maxSummary - 1)}…`
           : trimmedSummary;
       const head = `${glyph} task ${item.name} ${verb}`;
-      const tail = ` in ${formatDuration(item.durationMs)}`;
+      const tail = `  [${formatChipDuration(item.durationMs)}]`;
       const body = summary.length > 0 ? ` ${summary}` : '';
       const line =
         item.status === 'done'

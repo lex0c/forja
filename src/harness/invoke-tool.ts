@@ -108,6 +108,12 @@ export interface InvokeToolDeps {
   // capturing sink to assert emission shape without polluting
   // stdout/stderr of the test runner.
   errSink?: (line: string) => void;
+  // Called the instant the tool body starts executing — after the
+  // permission engine, the modal, and PreToolUse hooks (i.e. at
+  // `startToolCall`). The loop wires this to a `tool_execution_started`
+  // event so the TUI rebases the tool card's clock, excluding the
+  // human wait at the permission modal from the shown duration.
+  onExecutionStart?: () => void;
 }
 
 export interface InvokeToolResult {
@@ -137,7 +143,42 @@ export interface InvokeToolResult {
   // through `summary` separately). The TUI uses this to show the
   // failure cause on the `└─` connector instead of just the path.
   errorMessage?: string;
+  // True when the successful tool result reported `truncated: true`
+  // — the tool capped its own output. Plumbed to the `tool_finished`
+  // event so the TUI can hint the result has more behind `ctrl+o`.
+  // Absent on failure paths (a ToolError carries no `truncated`) and
+  // for tools whose output shape has no truncation flag.
+  outputTruncated?: boolean;
+  // Non-zero exit code of a command tool (bash). Present only when
+  // the command ran and exited non-zero — the tool itself did not
+  // fail (`failed` stays false), but the TUI surfaces `exit N` so a
+  // failed command does not read as a success. Absent for exit 0
+  // and for tools with no exit code.
+  exitCode?: number;
 }
+
+// A success result is "truncated" when the tool capped its own
+// output (bash `max_bytes`, grep / glob `max_results`, the
+// read_file window). The flag is per-tool — only some output
+// shapes carry it — so this reads it structurally and treats
+// absent / non-boolean as not truncated.
+const readOutputTruncated = (result: unknown): boolean =>
+  typeof result === 'object' &&
+  result !== null &&
+  'truncated' in result &&
+  (result as Record<string, unknown>).truncated === true;
+
+// A non-zero exit code from a command tool (bash). Read structurally
+// — only some result shapes carry `exit_code`. Returns undefined for
+// a zero exit, for tools with no `exit_code`, and for non-numbers,
+// so the field only travels when there is a non-zero code to show.
+const readNonZeroExit = (result: unknown): number | undefined => {
+  if (typeof result !== 'object' || result === null || !('exit_code' in result)) {
+    return undefined;
+  }
+  const code = (result as Record<string, unknown>).exit_code;
+  return typeof code === 'number' && code !== 0 ? code : undefined;
+};
 
 const buildErrorBlock = (
   toolUseId: string,
@@ -761,6 +802,18 @@ export const invokeTool = async (
   // tool_call lifecycle reaches a terminal state via finishToolCall
   // below.
   startToolCall(deps.db, toolCall.id);
+  // The execution clock starts HERE — after permission + hooks — so
+  // the reported duration is the tool's own runtime, not the human
+  // wait at the modal. `start` (top of invokeTool) still scopes the
+  // deny/block paths that never reach execution.
+  const execStart = Date.now();
+  // A notification callback must not break the call: if a future
+  // caller's handler throws, the tool body still runs.
+  try {
+    deps.onExecutionStart?.();
+  } catch {
+    // Swallow — exec-start is a UI signal, not load-bearing.
+  }
 
   // §6.5 wire-up: propagate the planner's chosen sandbox profile
   // (populated by the engine on the Decision) into the tool's
@@ -812,7 +865,7 @@ export const invokeTool = async (
   // invariant 4 requires this layer between tool exec and context.
   const result = sanitizeToolOutput(rawResult);
 
-  const duration = Date.now() - start;
+  const duration = Date.now() - execStart;
 
   // PostToolUse hook chain (spec AGENTIC_CLI.md §10.1, log-only).
   // Fires AFTER tool execution AND AFTER the tool_call row's
@@ -986,6 +1039,7 @@ export const invokeTool = async (
   if (contextParts.length > 0) {
     content = `${content}${contextParts.join('')}`;
   }
+  const exitCode = readNonZeroExit(result);
   return {
     toolResult: {
       type: 'tool_result',
@@ -997,5 +1051,7 @@ export const invokeTool = async (
     durationMs: duration,
     failed: false,
     decision,
+    ...(readOutputTruncated(result) ? { outputTruncated: true } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
   };
 };

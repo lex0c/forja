@@ -17,7 +17,7 @@
 
 export interface ToolVocab {
   // Present-continuous form shown while the tool runs:
-  // `* Reading file… (1.2s)`. No trailing ellipsis here — the renderer
+  // `* Reading file…  [1.2s]`. No trailing ellipsis here — the renderer
   // appends it.
   activeVerb: string;
   // Past-tense form shown after the tool finishes successfully:
