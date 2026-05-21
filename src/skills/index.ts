@@ -32,4 +32,5 @@ export type {
   SkillCatalogEntry,
   SkillFilterReason,
   SkillReadResult,
+  SkillSurfaceAttribution,
 } from './catalog.ts';

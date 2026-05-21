@@ -174,7 +174,7 @@ describe('createSkillCatalog — reload', () => {
   });
 });
 
-describe('createSkillCatalog — recordEvent', () => {
+describe('createSkillCatalog — audit (recordEvent / recordSurface)', () => {
   let db: DB;
   let sessionId: string;
 
@@ -251,5 +251,50 @@ describe('createSkillCatalog — recordEvent', () => {
     expect(() =>
       catalog.recordEvent({ action: 'invoked', scope: 'user', skillName: 'x' }),
     ).not.toThrow();
+  });
+
+  test('recordSurface emits a surfaced row per entry and a filtered row per dropped file', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'good-one', skillDoc('good-one'));
+    writeSkill(roots.projectShared, 'good-two', skillDoc('good-two'));
+    writeSkill(roots.projectShared, 'broken', brokenDoc('broken'));
+    const catalog = createSkillCatalog({ roots, db });
+    catalog.recordSurface({ sessionId });
+    const events = listSkillEventsBySession(db, sessionId);
+    const surfaced = events
+      .filter((e) => e.action === 'surfaced')
+      .map((e) => e.skillName)
+      .sort();
+    const filtered = events.filter((e) => e.action === 'filtered');
+    expect(surfaced).toEqual(['good-one', 'good-two']);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]?.skillName).toBe('broken');
+    expect(filtered[0]?.details?.reason).toBe('malformed');
+    expect(typeof filtered[0]?.details?.error).toBe('string');
+  });
+
+  test('recordSurface is idempotent — a second call for the same session adds no rows', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'good-one', skillDoc('good-one'));
+    writeSkill(roots.projectShared, 'broken', brokenDoc('broken'));
+    const catalog = createSkillCatalog({ roots, db });
+    catalog.recordSurface({ sessionId });
+    catalog.recordSurface({ sessionId });
+    const events = listSkillEventsBySession(db, sessionId);
+    expect(events.filter((e) => e.action === 'surfaced')).toHaveLength(1);
+    expect(events.filter((e) => e.action === 'filtered')).toHaveLength(1);
+  });
+
+  test('recordSurface puts the frontmatter version on the surfaced row', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(
+      roots.projectShared,
+      'versioned',
+      '---\nname: versioned\ndescription: a versioned skill\nversion: 3\n---\n\nBody.\n',
+    );
+    const catalog = createSkillCatalog({ roots, db });
+    catalog.recordSurface({ sessionId });
+    const surfaced = listSkillEventsBySession(db, sessionId).find((e) => e.action === 'surfaced');
+    expect(surfaced?.details?.version).toBe(3);
   });
 });

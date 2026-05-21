@@ -1,6 +1,10 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
-import type { DB } from '../storage/db.ts';
-import { type SkillEventAction, createSkillEvent } from '../storage/repos/skill-events.ts';
+import { type DB, withTransaction } from '../storage/db.ts';
+import {
+  type SkillEventAction,
+  createSkillEvent,
+  listSkillEventsBySession,
+} from '../storage/repos/skill-events.ts';
 import { readSkillByName, scanScope } from './loader.ts';
 import type { SkillScopeRoots } from './paths.ts';
 import type { SkillFile, SkillFrontmatter, SkillScope } from './types.ts';
@@ -24,12 +28,12 @@ import type { SkillFile, SkillFrontmatter, SkillScope } from './types.ts';
 //                  resolution is explicit and auditable, never
 //                  silent — this list is that audit input.
 //
-// No persistence yet: the surfaced / invoked / filtered audit
-// events (§0.7) are wired in a later slice. The catalog caches
-// frontmatter (read at scan time) but NOT bodies — `read` re-reads
-// from disk so an operator hand-edit between scan and invocation is
-// reflected, the same no-body-cache rule the loader and the memory
-// registry follow.
+// Audit (§0.7): `recordEvent` writes one skill_events row and
+// `recordSurface` emits the boot-time surfaced/filtered set. The
+// catalog caches frontmatter (read at scan time) but NOT bodies —
+// `read` re-reads from disk so an operator hand-edit between scan
+// and invocation is reflected, the same no-body-cache rule the
+// loader and the memory registry follow.
 
 // Precedence order (§3.5). Scanning in this order makes the FIRST
 // candidate seen for a name the highest-precedence one.
@@ -73,6 +77,20 @@ export type FilteredSkill =
 
 export type SkillFilterReason = FilteredSkill['reason'];
 
+// Project a `FilteredSkill` onto the JSON `details` payload of a
+// `filtered` skill_events row (§3.4.5): the reason plus its typed
+// per-variant field, flattened for storage.
+const filteredDetails = (filtered: FilteredSkill): Record<string, unknown> => {
+  switch (filtered.reason) {
+    case 'malformed':
+      return { reason: filtered.reason, error: filtered.error };
+    case 'name_mismatch':
+      return { reason: filtered.reason, declaredName: filtered.declaredName };
+    case 'shadowed':
+      return { reason: filtered.reason, shadowedBy: filtered.shadowedBy };
+  }
+};
+
 // Outcome of a lazy body load. `not_found` is only reachable on the
 // no-scope path (the name is in no scope); a strict-scope `read`
 // that misses surfaces as `missing` (no such file in that scope).
@@ -94,6 +112,12 @@ export interface RecordSkillEventInput {
   cwd?: string | null;
   details?: Record<string, unknown>;
 }
+
+// Audit attribution for `recordSurface` — the slice of
+// RecordSkillEventInput a caller overrides per call. The harness
+// loop passes the live session id, which exists only after
+// createSession has run.
+export type SkillSurfaceAttribution = Pick<RecordSkillEventInput, 'sessionId' | 'cwd'>;
 
 export interface SkillCatalog {
   // Scope roots the catalog was built from. Exposed so lifecycle
@@ -124,6 +148,12 @@ export interface SkillCatalog {
   // failure is logged to stderr, never thrown — an audit miss must
   // not break the model's turn or the boot path.
   recordEvent(input: RecordSkillEventInput): void;
+
+  // Emit the boot-time audit: one `surfaced` row per resolved entry
+  // and one `filtered` row per dropped file (§0.7 / RETRIEVAL
+  // §3.4.5). Called once per session, right after the session row
+  // exists, with that session's id. Best-effort, like recordEvent.
+  recordSurface(attribution: SkillSurfaceAttribution): void;
 
   // Count of resolved entries (winners). Does not walk disk.
   count(): number;
@@ -205,6 +235,30 @@ export const createSkillCatalog = (input: CreateSkillCatalogInput): SkillCatalog
 
   refresh();
 
+  // Emit one skill_events row — best-effort: a no-op without a DB,
+  // and a DB failure goes to redacted stderr, never thrown (an audit
+  // miss must not break the model's turn or the boot path).
+  const emitSkillEvent = (event: RecordSkillEventInput): void => {
+    if (db === undefined) return;
+    try {
+      createSkillEvent(db, {
+        action: event.action,
+        scope: event.scope,
+        skillName: event.skillName,
+        sessionId: event.sessionId ?? sessionId ?? null,
+        cwd: event.cwd ?? cwd ?? null,
+        ...(event.details !== undefined ? { details: event.details } : {}),
+      });
+    } catch (err) {
+      // A SQLite error can echo a bound parameter, and `details` is
+      // caller-supplied — redact the stderr line.
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `skills: AUDIT DRIFT: failed to record ${event.action} event for ${event.skillName} (${event.scope}): ${redactSecrets(message)}\n`,
+      );
+    }
+  };
+
   return {
     roots,
 
@@ -254,25 +308,65 @@ export const createSkillCatalog = (input: CreateSkillCatalogInput): SkillCatalog
       return [...filteredEntries];
     },
 
-    recordEvent(input: RecordSkillEventInput): void {
+    recordEvent: emitSkillEvent,
+
+    recordSurface(attribution: SkillSurfaceAttribution): void {
       if (db === undefined) return;
+      // Idempotency gate (mirrors the eager-provenance emit in the
+      // harness loop): a resumed session already carries surfaced /
+      // filtered rows from its prior boot, and skill_events has no
+      // UNIQUE — re-emitting would inflate the surfaced-vs-invoked
+      // ratio §3.4.5 reads. Skip every (action, scope, name) already
+      // recorded for this session; a subagent's first boot has an
+      // empty set and emits normally. A read failure falls through
+      // to "emit everything" — a duplicate row beats a thrown boot.
+      const auditSessionId = attribution.sessionId ?? sessionId ?? null;
+      let recorded: Set<string>;
       try {
-        createSkillEvent(db, {
-          action: input.action,
-          scope: input.scope,
-          skillName: input.skillName,
-          sessionId: input.sessionId ?? sessionId ?? null,
-          cwd: input.cwd ?? cwd ?? null,
-          ...(input.details !== undefined ? { details: input.details } : {}),
+        recorded =
+          auditSessionId === null
+            ? new Set()
+            : new Set(
+                listSkillEventsBySession(db, auditSessionId)
+                  .filter((e) => e.action === 'surfaced' || e.action === 'filtered')
+                  .map((e) => `${e.action}/${e.scope}/${e.skillName}`),
+              );
+      } catch {
+        recorded = new Set();
+      }
+      // One transaction for the whole burst — dozens of best-effort
+      // INSERTs collapse to a single commit. emitSkillEvent still
+      // swallows a per-row failure, so one bad row does not abort
+      // the rest; only a BEGIN/COMMIT failure reaches the catch.
+      try {
+        withTransaction(db, () => {
+          for (const entry of entries) {
+            if (recorded.has(`surfaced/${entry.scope}/${entry.name}`)) continue;
+            emitSkillEvent({
+              action: 'surfaced',
+              scope: entry.scope,
+              skillName: entry.name,
+              ...attribution,
+              ...(entry.frontmatter.version !== undefined
+                ? { details: { version: entry.frontmatter.version } }
+                : {}),
+            });
+          }
+          for (const dropped of filteredEntries) {
+            if (recorded.has(`filtered/${dropped.scope}/${dropped.name}`)) continue;
+            emitSkillEvent({
+              action: 'filtered',
+              scope: dropped.scope,
+              skillName: dropped.name,
+              details: filteredDetails(dropped),
+              ...attribution,
+            });
+          }
         });
       } catch (err) {
-        // Audit failure must not propagate — the row is forensic and
-        // the caller (a tool turn, the boot path) has no recovery.
-        // Surface on stderr, redacted: a SQLite error can echo a
-        // bound parameter, and `details` is caller-supplied text.
         const message = err instanceof Error ? err.message : String(err);
         process.stderr.write(
-          `skills: AUDIT DRIFT: failed to record ${input.action} event for ${input.skillName} (${input.scope}): ${redactSecrets(message)}\n`,
+          `skills: AUDIT DRIFT: recordSurface transaction failed: ${redactSecrets(message)}\n`,
         );
       }
     },

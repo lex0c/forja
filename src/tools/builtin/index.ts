@@ -16,9 +16,9 @@ import { monitorTool } from './monitor.ts';
 // omitted from the default registry.
 import { readFileTool } from './read-file.ts';
 import { retrieveContextTool } from './retrieve-context.ts';
-// skill-invoke / skill-list / skill-show are re-exported below but
-// intentionally not imported here — they are not in BUILTIN_TOOLS
-// yet (see the BUILTIN_TOOLS comment for why).
+import { skillInvokeTool } from './skill-invoke.ts';
+import { skillListTool } from './skill-list.ts';
+import { skillShowTool } from './skill-show.ts';
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
@@ -101,13 +101,6 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // something that always errors. The export below is preserved so the
 // tool test suite still exercises the contract and the harness can
 // re-add to BUILTIN_TOOLS in one line when the modal lands.
-//
-// skillInvokeTool / skillListTool / skillShowTool are likewise
-// exported but NOT in BUILTIN_TOOLS yet: the harness has no
-// skillCatalog wired until the CLI bootstrap builds it, so surfacing
-// them now would give the model three tools that always return
-// `skill.catalog_unavailable`. The slice that wires the catalog into
-// bootstrap adds them here.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
@@ -116,6 +109,9 @@ export const BUILTIN_TOOLS = [
   memoryReadTool,
   memorySearchTool,
   retrieveContextTool,
+  skillListTool,
+  skillShowTool,
+  skillInvokeTool,
   waitForTool,
   monitorTool,
   todoWriteTool,

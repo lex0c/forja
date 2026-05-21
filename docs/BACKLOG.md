@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — slice 5: surface (the subsystem goes live)
+
+The wiring slice — after it the skills subsystem is end-to-end live: the catalog is built at boot, surfaced in the system prompt, the three tools are registered, and surfaced / invoked / filtered are all audited.
+
+- **`cli/skills-prompt.ts`** (new) — `assembleSkillCatalogSection` renders the resolved catalog as a `# Skills` prompt block (name + description + scope per skill, §4.1 "surface eager, body lazy"). A mirror of `memory-prompt.ts:assembleMemorySection` minus the trust / trigger filtering — skills have no per-skill trust field, so the section is `catalog.list()` verbatim, identical to what the `surfaced` audit records. An empty catalog yields an empty string (no section, no scaffolding).
+- **`bootstrap.ts`** — builds `createSkillCatalog({ roots, db })` (same repo-rooted scope resolution as memory; the skills `resolveScopeRoots` is import-aliased to dodge the name clash), composes the catalog section onto the prompt after the memory index, and threads `skillCatalog` into `HarnessConfig`.
+- **`harness/loop.ts`** — after `createSession`, calls `catalog.recordSurface({ sessionId })`: one `surfaced` `skill_events` row per resolved entry and one `filtered` row per dropped file. Mirrors the eager-exposure emit; the session row must exist first for the FK.
+- **`catalog.ts`** — gained `recordSurface` (plus a `filteredDetails` projector mapping the discriminated `FilteredSkill` onto the audit `details` JSON); `recordEvent`'s body is now a shared `emitSkillEvent` closure that both `recordEvent` and `recordSurface` call.
+- **`tools/builtin/index.ts`** — `skill_invoke` / `skill_list` / `skill_show` added to `BUILTIN_TOOLS`; the bootstrap now wires a catalog, so they no longer always-error.
+
+`tests/cli/skills-prompt.test.ts` (new) + a catalog `recordSurface` test; `bootstrap.test.ts`'s tool-list assertion updated for the three new tools.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `recordSurface` gained a per-session idempotency gate — it claimed to mirror the loop's eager-provenance emit but lacked the gate that emit carries because the post-`createSession` region re-runs on resumed and preassigned sessions; without it a resume double-wrote the `surfaced`/`filtered` rows the §3.4.5 surfaced-vs-invoked ratio reads (`skill_events` has no UNIQUE). The boot INSERT burst is now wrapped in one `withTransaction` — dozens of best-effort INSERTs collapse to a single commit. `surfaced` rows carry the frontmatter `version` (symmetry with `invoked`). `assembleSkillCatalogSection` returns a bare `string` — the dropped `entryCount` field had no consumer and `catalog.count()` already provides it. Plus a named `SkillSurfaceAttribution` type and a corrected stale `catalog.ts` header comment.
+
+`typecheck` + `lint` clean; `tests/skills/` + `tests/cli/` + `tests/harness/` — 2214 pass.
+
+Noted, NOT slice 5: running `tests/cli/` surfaced one pre-existing failure — `repl.test.ts` "boot emits welcome banner" — unrelated to skills (a TUI banner-content assertion). Verified still failing at the pre-slice-5 HEAD with the slice stashed away; left for a separate fix.
+
 ## [2026-05-21] feat(skills) — slice 4: tools (skill_invoke / skill_list / skill_show)
 
 The model-facing surface (spec SKILLS.md §5) — three tools in `src/tools/builtin/`, plus the harness plumbing to reach the catalog.

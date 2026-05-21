@@ -51,6 +51,10 @@ import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { scrubEnv } from '../sanitize/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
+import {
+  createSkillCatalog,
+  resolveScopeRoots as resolveSkillScopeRoots,
+} from '../skills/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import {
   GOVERNANCE_PROPOSAL_TTL_MS,
@@ -77,6 +81,7 @@ import { composeWithUserPrompt } from './plan-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
 import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
+import { assembleSkillCatalogSection } from './skills-prompt.ts';
 import { composeWithTaskDiscipline } from './task-discipline.ts';
 import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 
@@ -687,6 +692,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
 
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
+  let skillCatalog: ReturnType<typeof createSkillCatalog>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
   // Eager-load inventory (MEMORY.md §11.2). Lifted out of the
   // try-block so the post-try HarnessConfig builder can read it;
@@ -814,6 +820,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
+    // Skill catalog (spec SKILLS.md §3-§4). Same repo-rooted scope
+    // resolution as memory; the catalog scans every scope at
+    // construction. The `db` lets recordEvent / recordSurface write
+    // skill_events audit rows.
+    skillCatalog = createSkillCatalog({ roots: resolveSkillScopeRoots(repoRoot), db, cwd });
     // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-evicts
     // memories whose `expires:` field is on or before today through
     // the canonical state machine — Phase 2.2 routed this path
@@ -1150,6 +1161,16 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
     eagerExposures = memorySection.eagerLoaded;
+    // Skill catalog section (spec SKILLS.md §4.1: surface eager,
+    // body lazy). An empty catalog yields an empty section that
+    // composeSystemPrompt passes through unchanged. The
+    // surfaced/filtered audit is emitted by the harness loop after
+    // createSession — the session row must exist before a
+    // skill_events row can reference it.
+    resolvedSystemPrompt = composeSystemPrompt(
+      resolvedSystemPrompt,
+      assembleSkillCatalogSection(skillCatalog),
+    );
 
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Resolved inside
     // the same try-block as memory so any throw — TOML parse
@@ -1235,6 +1256,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
     memoryRegistry,
+    skillCatalog,
     // S5 CRIT/H2: thread the scope-offline decision down so the
     // retrieval runner mirrors the eager-load posture. Empty
     // array when scope is online — the harness loop's

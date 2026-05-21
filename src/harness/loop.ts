@@ -1013,6 +1013,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
       }
 
+      // Skills surfaced/filtered audit (SKILLS.md §0.7, RETRIEVAL
+      // §3.4.5): one skill_events row per catalog entry and per
+      // filtered file, attributed to this session. Like the
+      // eager-exposure emit above this runs on every boot — fresh,
+      // preassigned, and resumed — so recordSurface carries its own
+      // per-session idempotency gate. Best-effort: it swallows DB
+      // failures rather than aborting the turn.
+      if (config.skillCatalog !== undefined) {
+        config.skillCatalog.recordSurface({ sessionId, cwd: config.cwd });
+      }
+
       // S2/verify_failed heuristic rolled back per policy:
       // "todo o lifecycle de memória um llm-judge decide; sem
       // heurísticas locais sobre texto". The verify scheduler +
