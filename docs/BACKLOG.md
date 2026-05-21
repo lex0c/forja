@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — slice 2: catalog
+
+`src/skills/catalog.ts` — `createSkillCatalog` scans every scope at construction (the loader's `scanScope`), resolves name conflicts by precedence (`project_local > project_shared > user`, §3.5), and holds the result as an in-memory snapshot. Mirrors the memory registry minus the index file: skills discover by directory glob, so the catalog IS the index.
+
+One scan, two outputs — `entries` (resolved winners: the §4.1 surface — name + description + scope) and `filtered` (every scanned file that did NOT become an entry, with the reason: `malformed` / `name_mismatch` / `shadowed`). §3.5 mandates resolution be explicit and auditable; `filtered()` is that audit input (slice 3 emits it). A frontmatter `name` ≠ filename mismatch is rejected so `skill_invoke(<filename>)` and `<frontmatter.name>` can never disagree about what exists. A malformed skill in a higher scope does NOT shadow a valid lower one — precedence runs over valid candidates only.
+
+API: `list(scope?)` / `lookup(name)` / `read(name, scope?)` / `filtered()` / `count()` / `reload()`. `read` is lazy — the body is re-read fresh from disk every call (no body cache — same rule the loader and memory registry follow); no scope resolves the winner, an explicit scope reads strictly so a shadowed skill stays reachable. No persistence yet — the surfaced/invoked/filtered audit lands in slice 3.
+
+Fixed a slice-1 gap the catalog scan exposed: a non-kebab-case `.md` filename made `skillFilePath`→`validateName` throw, and the throw escaped `scanScope` and crashed the whole catalog build. `readSkillByName` now catches the invalid-name throw and returns `malformed` — the bad file surfaces as a filtered entry instead of taking the scan down.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `FilteredSkill` is now discriminated by `reason` (`error` / `declaredName` / `shadowedBy: SkillScope`) instead of a flattened `detail: string`, so the slice-3 audit consumer gets typed payloads; `SkillCatalogEntry` / `FilteredSkill` fields are `readonly` (the snapshot was leaking mutable entries via `lookup`); the winners `Map` is kept for O(1) `lookup` / `read` instead of being built then discarded; a regression test pins `read()` of a winner whose file was deleted after the scan. Test fixtures (`makeTmp` / `makeRoots` / `skillDoc` / `writeSkill`) hoisted to `tests/skills/_helpers.ts` — they were copy-pasted across the loader + catalog test files, and every later slice would copy them again. Noted follow-up, NOT slice 2: `SkillScope` ≡ `MemoryScope` and the scope-precedence literal are duplicated across memory / skills / subagents — unifying them is a cross-subsystem refactor, tracked separately.
+
+72 tests in `tests/skills/`; `typecheck` + `lint` clean.
+
 ## [2026-05-21] feat(skills) — subsystem kickoff: slice 1 (core storage)
 
 New subsystem (spec `SKILLS.md`): gated, reusable procedures the model invokes when the goal matches — markdown file with frontmatter (`name` + `description`) + a prose body the LLM follows. v1 scope per `SKILLS.md §14`: frontmatter + body, three scopes (user / project_shared / project_local — `imported` is v2), surface eager / body lazy, `skill_invoke|list|show` tools, `surfaced/invoked/filtered` audit. Sliced: (1) core storage, (2) catalog, (3) audit table, (4) tools, (5) prompt surface, (6) `/skill` slash, (7) seed catalog.

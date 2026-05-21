@@ -1,6 +1,6 @@
 import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { SkillFrontmatterError, parseSkillFile } from './frontmatter.ts';
-import { rootForScope, skillFilePath } from './paths.ts';
+import { ScopeError, rootForScope, skillFilePath } from './paths.ts';
 import type { SkillScopeRoots } from './paths.ts';
 import type { SkillFile, SkillScope } from './types.ts';
 
@@ -65,16 +65,30 @@ export type SkillFileResult =
 // (the user scope on a homeless env) yields `missing` — that scope
 // simply holds no files. Otherwise the name is resolved through
 // `skillFilePath`, which validates it and applies the sandbox
-// check — callers may pass model-supplied names without re-
-// validating (a bad name surfaces as a thrown ScopeError /
-// SkillFrontmatterError the tool layer maps to a clean tool error).
+// check — callers may pass model-supplied or directory-listed
+// names without re-validating: an invalid name (non-kebab-case, a
+// path-traversal attempt) surfaces as `malformed`, not a throw.
 export const readSkillByName = (
   roots: SkillScopeRoots,
   scope: SkillScope,
   name: string,
 ): SkillFileResult => {
   if (rootForScope(roots, scope) === null) return { kind: 'missing' };
-  const path = skillFilePath(roots, scope, name);
+  let path: string;
+  try {
+    path = skillFilePath(roots, scope, name);
+  } catch (err) {
+    // `skillFilePath` throws for a name that is not a valid skill
+    // identifier — a non-kebab-case `.md` filename found on disk,
+    // or a model-supplied traversal name. Surface it as `malformed`
+    // rather than letting the throw escape: `scanScope` reads every
+    // filename a directory listing yields, so a stray `Bad Name.md`
+    // must not crash the whole catalog scan.
+    if (err instanceof SkillFrontmatterError || err instanceof ScopeError) {
+      return { kind: 'malformed', error: err.message };
+    }
+    throw err;
+  }
   const fileCheck = checkRegularFile(path);
   if (fileCheck.kind === 'not_found') return { kind: 'missing' };
   if (fileCheck.kind === 'symlink') return { kind: 'malformed', error: SYMLINK_REFUSE_MESSAGE };

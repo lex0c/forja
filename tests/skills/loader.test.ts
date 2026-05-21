@@ -1,48 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { listSkillNames, readSkillByName, scanScope } from '../../src/skills/loader.ts';
 import type { SkillScopeRoots } from '../../src/skills/paths.ts';
+import { brokenDoc, cleanupTmpDirs, makeRoots, makeTmp, skillDoc, writeSkill } from './_helpers.ts';
 
-const tmpDirs: string[] = [];
-
-const makeTmp = (): string => {
-  const dir = mkdtempSync(join(tmpdir(), 'forja-skill-loader-'));
-  tmpDirs.push(dir);
-  return dir;
-};
-
-// All three roots are real strings here — the disk-backed tests
-// need a concrete `user` dir. The inferred all-string shape is
-// still assignable to `SkillScopeRoots` (string ⊆ string | null),
-// so it passes straight to the loader functions.
-const makeRoots = (repo: string) => ({
-  user: join(repo, 'user'),
-  projectShared: join(repo, 'shared'),
-  projectLocal: join(repo, 'local'),
-});
-
-// A well-formed skill document. `desc` defaults short so callers can
-// override it only when a test exercises the description rules.
-const skillDoc = (name: string, desc = 'A valid skill description.'): string =>
-  `---\nname: ${name}\ndescription: ${desc}\n---\n\nBody for ${name}.\n`;
-
-// A skill file with structurally-invalid frontmatter — the required
-// `description` is missing. The canonical "malformed" fixture.
-const brokenDoc = (name: string): string => `---\nname: ${name}\n---\n\nno description\n`;
-
-const writeSkill = (dir: string, name: string, content: string): void => {
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${name}.md`), content);
-};
-
-afterEach(() => {
-  while (tmpDirs.length > 0) {
-    const dir = tmpDirs.pop();
-    if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
-  }
-});
+afterEach(cleanupTmpDirs);
 
 describe('readSkillByName', () => {
   test('reads and parses a present skill', () => {
@@ -86,6 +49,11 @@ describe('readSkillByName', () => {
       expect(result.error).toContain('symlink');
     }
   });
+
+  test('returns malformed for a name that is not a valid skill identifier', () => {
+    const roots = makeRoots(makeTmp());
+    expect(readSkillByName(roots, 'user', 'Bad Name').kind).toBe('malformed');
+  });
 });
 
 describe('listSkillNames', () => {
@@ -116,6 +84,15 @@ describe('scanScope', () => {
 
   test('returns an empty array for an absent scope directory', () => {
     expect(scanScope(makeRoots(makeTmp()), 'user')).toEqual([]);
+  });
+
+  test('surfaces a bad-named .md file as malformed without crashing the scan', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'good-skill', skillDoc('good-skill'));
+    writeSkill(roots.projectShared, 'Bad Name', skillDoc('placeholder'));
+    const scanned = scanScope(roots, 'project_shared');
+    expect(scanned.find((s) => s.name === 'good-skill')?.kind).toBe('present');
+    expect(scanned.find((s) => s.name === 'Bad Name')?.kind).toBe('malformed');
   });
 });
 

@@ -22,3 +22,13 @@ export type { SkillScopeRoots } from './paths.ts';
 
 export { listSkillNames, readSkillByName, scanScope } from './loader.ts';
 export type { ScannedSkill, SkillFileResult } from './loader.ts';
+
+export { createSkillCatalog } from './catalog.ts';
+export type {
+  CreateSkillCatalogInput,
+  FilteredSkill,
+  SkillCatalog,
+  SkillCatalogEntry,
+  SkillFilterReason,
+  SkillReadResult,
+} from './catalog.ts';
