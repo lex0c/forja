@@ -1,0 +1,26 @@
+name: skill_list reports the resolved skill catalog
+prompt: |
+  Call the skill_list tool to enumerate every skill available, then
+  reply with each skill's name.
+setup:
+  files:
+    '.agent/skills/shared/file-summary.md': |
+      ---
+      name: file-summary
+      description: Summarize a source file in the team's required two-part format.
+      ---
+      Read the file, then reply with a PURPOSE: line and a LINECOUNT: line.
+    '.agent/skills/shared/changelog-entry.md': |
+      ---
+      name: changelog-entry
+      description: Draft a changelog entry from a diff in the Keep a Changelog style.
+      ---
+      Draft one changelog line under the correct heading.
+expect:
+  - tool_called: skill_list
+  - output_contains: file-summary
+  - output_contains: changelog-entry
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.15

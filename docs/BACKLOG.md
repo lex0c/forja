@@ -2,6 +2,15 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] test(skills) — eval coverage
+
+`evals/smoke/11-skill-invoke.yaml` + `12-skill-list.yaml` — the skills subsystem's first eval cases, closing the principle-4 gap (a subsystem without eval doesn't ship). The eval harness runs every case through `bootstrap`, which builds the skill catalog over the case's fixture cwd — so a `setup.files` entry under `.agent/skills/shared/` is picked up with no executor change.
+
+- **`11-skill-invoke`** exercises the model-behavior loop end-to-end: a `file-summary` skill is surfaced in the prompt catalog, the model invokes it via `skill_invoke`, and follows the injected body — the body's `PURPOSE:` / `LINECOUNT:` format (a sentinel the model would not emit otherwise) reaching the output proves the body was followed, not just loaded.
+- **`12-skill-list`** proves the `skill_list` tool executes and returns the resolved catalog (both seeded skills named back).
+
+Both land in `evals/smoke/`, so `bun run eval:smoke` exercises them as part of the routine suite rather than orphaning them in an unscripted directory.
+
 ## [2026-05-21] docs(skills) — operator guide
 
 `docs/SKILLS.md` — the English operator / implementation reference for the skills subsystem, in the shape of `docs/MEMORY.md` / `docs/HOOKS.md`: what a skill is, the file format + frontmatter table, the three scopes and disk layout, the precedence-resolving catalog, the eager `# Skills` prompt surface, the `skill_invoke` / `skill_list` / `skill_show` tools, the `/skill` lifecycle command, the `skill_events` audit, the `<skill>` trust marker, the seed catalog `agent init` installs, and the v2-deferred scope. The canonical spec stays `docs/spec/SKILLS.md` (PT-BR); this is the operational companion — spec wins on divergence.

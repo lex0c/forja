@@ -1,0 +1,37 @@
+name: skill_invoke loads a skill and the model follows its body
+prompt: |
+  Summarize the file widget.ts for me. We keep a skill that defines
+  our team's required file-summary format — use it.
+setup:
+  files:
+    '.agent/skills/shared/file-summary.md': |
+      ---
+      name: file-summary
+      description: Summarize a source file in the team's required two-part format.
+      ---
+      When asked to summarize a file, follow this format exactly:
+
+      1. Read the file with read_file.
+      2. Reply with these two lines, the labels written verbatim:
+         PURPOSE: <one sentence on what the file does>
+         LINECOUNT: <number of lines in the file>
+    '.agent/skills/shared/changelog-entry.md': |
+      ---
+      name: changelog-entry
+      description: Draft a changelog entry from a diff in the Keep a Changelog style.
+      ---
+      Draft one changelog line under the correct heading — Added,
+      Changed, Fixed, or Removed. One user-facing sentence.
+    'widget.ts': |
+      export const widget = (label: string): string => {
+        return `[${label}]`;
+      };
+expect:
+  - tool_called: skill_invoke
+  - tool_called: read_file
+  - output_contains: 'PURPOSE:'
+  - output_contains: 'LINECOUNT:'
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.15
