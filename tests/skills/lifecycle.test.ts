@@ -128,4 +128,17 @@ describe('deleteSkill', () => {
     if (result.ok) return;
     expect(result.reason).toBe('not_found');
   });
+
+  test('removes a file whose filename is not kebab-case', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'Upper', skillDoc('upper'));
+    const result = deleteSkill(roots, 'project_shared', 'Upper');
+    expect(result.ok).toBe(true);
+    expect(existsSync(join(roots.projectShared, 'Upper.md'))).toBe(false);
+  });
+
+  test('still refuses a traversal name with the format gate skipped', () => {
+    const result = deleteSkill(makeRoots(makeTmp()), 'project_shared', '../escape');
+    expect(result.ok).toBe(false);
+  });
 });

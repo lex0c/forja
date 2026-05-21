@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(skills) — deleteSkill removes a file whose filename is malformed
+
+`deleteSkill` resolved its path through `resolvePath` → `validateName`, which rejects a non-kebab name before any filesystem check. So `/skill delete` could not remove a filtered file whose FILENAME itself is invalid (`Bad Name.md`, `Upper.md`) — even though `/skill list` surfaces those as actionable cleanup targets and `deleteSkill` already deletes a file whose *contents* are malformed. `validateName` conflates two things: the kebab-case FORMAT rule and (incidentally) traversal-blocking; only the format rule is wrong when deleting an already-on-disk file. `skillFilePath` gains an `allowAnyName` option that skips the format gate while the `isUnderRoot` sandbox runs unconditionally; `resolvePath` threads it; `deleteSkill` passes it. A traversal name stays refused — tested.
+
 ## [2026-05-21] fix(skills) — /skill delete reaches filtered skills
 
 `/skill delete` resolved its target only through `catalog.lookup` (winners), so a malformed / name-mismatched / shadowed file — which `/skill list` *does* surface via `catalog.filtered()` — could not be removed through the command and needed a manual `rm`. `deleteSkill` itself already deletes a malformed file; only the command's lookup-gating blocked it. `handleDelete` now collects every scope holding a `<name>.md` (the winner plus any filtered copy) and deletes from it; when a name sits in more than one scope it asks for an explicit `/skill delete <name> <user|shared|local>` instead of guessing. The slice-6 review (Agent 2) flagged this as a `[scope]`-arg gap — deferred then as an edge case, closed now.

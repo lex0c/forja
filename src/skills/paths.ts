@@ -10,8 +10,9 @@ import type { SkillScope } from './types.ts';
 // project_shared (committed), project_local (gitignored). This
 // module maps (scope, repoRoot) → absolute filesystem root and
 // enforces the sandbox: a resolved skill path must sit strictly
-// under its scope root, and the `name` must pass `validateName`
-// (no path separators, no `..`, no leading dot) before joining.
+// under its scope root. `skillFilePath` also validates the `name`
+// format (kebab-case) — skippable via `allowAnyName` for deleting an
+// already-on-disk file; the under-root sandbox applies either way.
 //
 // The `imported` scope (§3.4) is v2 — not modeled here.
 //
@@ -109,13 +110,24 @@ const isUnderRoot = (candidate: string, root: string): boolean => {
 
 // Absolute path of a skill `name` in `scope`: `<root>/<name>.md`.
 // Throws `ScopeError` when the scope has no root (the user scope on
-// a homeless env). `name` is validated first — `validateName`
-// already makes a traversal name (a `/`, a `..`, a leading dot)
-// structurally impossible, so the `isUnderRoot` re-check below is
-// pure defense-in-depth: it is unreachable with the current
-// `NAME_RE` and exists only to fail closed if that regex regresses.
-export const skillFilePath = (roots: SkillScopeRoots, scope: SkillScope, name: string): string => {
-  validateName(name);
+// a homeless env) or when the resolved path escapes the scope root.
+//
+// `name` is validated first — for a name a caller is about to create
+// or address as a skill, a non-kebab name is rejected up front.
+// `opts.allowAnyName` skips that format gate: `deleteSkill` must
+// resolve the path of a file ALREADY on disk whose filename is not
+// kebab (a malformed `Bad Name.md` / `Upper.md`, surfaced by `/skill
+// list` as a cleanup target). The `isUnderRoot` sandbox below runs
+// either way — a traversal name is refused regardless of the gate.
+export const skillFilePath = (
+  roots: SkillScopeRoots,
+  scope: SkillScope,
+  name: string,
+  opts?: { allowAnyName?: boolean },
+): string => {
+  if (opts?.allowAnyName !== true) {
+    validateName(name);
+  }
   const root = rootForScope(roots, scope);
   if (root === null) {
     throw new ScopeError(`skill scope ${scope} has no root (no home directory derivable)`);

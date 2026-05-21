@@ -43,14 +43,26 @@ type ResolvedPath =
 // verbatim. A null scope root (user scope on a host with no
 // resolvable config dir) and a traversal-shaped name both surface
 // here, before any disk write.
-const resolvePath = (roots: SkillScopeRoots, scope: SkillScope, name: string): ResolvedPath => {
-  try {
-    validateName(name);
-  } catch (err) {
-    if (err instanceof SkillFrontmatterError) {
-      return { ok: false, reason: 'invalid_name', message: err.message };
+//
+// `allowAnyName` skips the kebab-case `validateName` gate — for
+// `deleteSkill`, which removes a file ALREADY on disk whose filename
+// may not be kebab (`Bad Name.md`, `Upper.md`). The path sandbox in
+// `skillFilePath` still runs, so a traversal name is still refused.
+const resolvePath = (
+  roots: SkillScopeRoots,
+  scope: SkillScope,
+  name: string,
+  allowAnyName = false,
+): ResolvedPath => {
+  if (!allowAnyName) {
+    try {
+      validateName(name);
+    } catch (err) {
+      if (err instanceof SkillFrontmatterError) {
+        return { ok: false, reason: 'invalid_name', message: err.message };
+      }
+      throw err;
     }
-    throw err;
   }
   if (rootForScope(roots, scope) === null) {
     return {
@@ -60,7 +72,7 @@ const resolvePath = (roots: SkillScopeRoots, scope: SkillScope, name: string): R
     };
   }
   try {
-    return { ok: true, path: skillFilePath(roots, scope, name) };
+    return { ok: true, path: skillFilePath(roots, scope, name, { allowAnyName }) };
   } catch (err) {
     if (err instanceof ScopeError || err instanceof SkillFrontmatterError) {
       return { ok: false, reason: 'scope_unavailable', message: err.message };
@@ -186,14 +198,18 @@ export const moveSkill = (
 };
 
 // Delete a skill file (spec §6.5). A malformed file IS deletable —
-// removing a broken skill is exactly what the operator wants — so
-// this checks only that the file exists, not that it parses.
+// removing a broken skill is what the operator wants — so this
+// checks only that the file exists, not that it parses, and resolves
+// the path with `allowAnyName`: a file whose FILENAME is itself
+// malformed (`Bad Name.md`, `Upper.md`) is surfaced by `/skill list`
+// as a cleanup target, so delete must reach it. The path sandbox
+// still holds — a traversal name is refused.
 export const deleteSkill = (
   roots: SkillScopeRoots,
   scope: SkillScope,
   name: string,
 ): SkillLifecycleResult => {
-  const resolved = resolvePath(roots, scope, name);
+  const resolved = resolvePath(roots, scope, name, true);
   if (!resolved.ok) return resolved;
   if (!existsSync(resolved.path)) {
     return { ok: false, reason: 'not_found', message: `no skill '${name}' in scope '${scope}'` };

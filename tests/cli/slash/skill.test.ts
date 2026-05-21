@@ -153,6 +153,18 @@ describe('/skill', () => {
     expect(catalog.lookup('dup')?.scope).toBe('project_local');
   });
 
+  test('delete removes a file whose filename is not kebab-case', async () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'Upper', skillDoc('upper'));
+    const catalog = createSkillCatalog({ roots });
+    // A non-kebab filename is filtered (malformed) and surfaced by
+    // /skill list — delete must reach it.
+    expect(catalog.filtered().some((f) => f.name === 'Upper')).toBe(true);
+    const result = await skillCommand.exec(['delete', 'Upper', '--confirm'], makeCtx(catalog));
+    expect(result.kind).toBe('ok');
+    expect(catalog.filtered().some((f) => f.name === 'Upper')).toBe(false);
+  });
+
   test('rejects an unknown subcommand', async () => {
     const result = await skillCommand.exec(
       ['frobnicate'],
