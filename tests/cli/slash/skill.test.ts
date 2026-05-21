@@ -128,6 +128,31 @@ describe('/skill', () => {
     expect(catalog.lookup('old')).toBeNull();
   });
 
+  test('delete removes a malformed skill the catalog filtered out', async () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'broken', brokenDoc('broken'));
+    const catalog = createSkillCatalog({ roots });
+    // The broken file is filtered, not a resolved winner — but
+    // /skill list surfaces it, so delete must reach it.
+    expect(catalog.lookup('broken')).toBeNull();
+    expect(catalog.filtered().some((f) => f.name === 'broken')).toBe(true);
+    const result = await skillCommand.exec(['delete', 'broken', '--confirm'], makeCtx(catalog));
+    expect(result.kind).toBe('ok');
+    expect(catalog.filtered().some((f) => f.name === 'broken')).toBe(false);
+  });
+
+  test('delete disambiguates by scope when a name is in more than one', async () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectLocal, 'dup', skillDoc('dup'));
+    writeSkill(roots.user, 'dup', skillDoc('dup'));
+    const catalog = createSkillCatalog({ roots });
+    const ambiguous = await skillCommand.exec(['delete', 'dup', '--confirm'], makeCtx(catalog));
+    expect(ambiguous.kind).toBe('error');
+    const done = await skillCommand.exec(['delete', 'dup', 'user', '--confirm'], makeCtx(catalog));
+    expect(done.kind).toBe('ok');
+    expect(catalog.lookup('dup')?.scope).toBe('project_local');
+  });
+
   test('rejects an unknown subcommand', async () => {
     const result = await skillCommand.exec(
       ['frobnicate'],

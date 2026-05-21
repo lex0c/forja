@@ -34,6 +34,18 @@ const splitConfirm = (rest: string[]): { positionals: string[]; confirmed: boole
   confirmed: rest.includes('--confirm'),
 });
 
+// Short scope tokens an operator types ↔ the SkillScope union.
+const SCOPE_FROM_TOKEN: Record<string, SkillScope> = {
+  user: 'user',
+  shared: 'project_shared',
+  local: 'project_local',
+};
+const TOKEN_FROM_SCOPE: Record<SkillScope, string> = {
+  user: 'user',
+  project_shared: 'shared',
+  project_local: 'local',
+};
+
 const handleList = (catalog: SkillCatalog): SlashResult => {
   const entries = catalog.list();
   const filtered = catalog.filtered();
@@ -214,36 +226,79 @@ const handleDelete = (
 ): SlashResult => {
   const name = positionals[0];
   if (name === undefined) {
-    return { kind: 'error', message: '/skill delete: usage — /skill delete <name>' };
+    return {
+      kind: 'error',
+      message: '/skill delete: usage — /skill delete <name> [user|shared|local]',
+    };
   }
-  const entry = catalog.lookup(name);
-  if (entry === null) {
-    return { kind: 'error', message: `/skill delete: no resolved skill named '${name}'` };
+  // A <name>.md may be the resolved winner AND/OR a filtered file
+  // (malformed, name-mismatched, or shadowed). `/skill list` surfaces
+  // the filtered ones — delete has to reach them too, or a broken
+  // file the operator was just told about is removable only by hand.
+  const scopeSet = new Set<SkillScope>();
+  const winner = catalog.lookup(name);
+  if (winner !== null) scopeSet.add(winner.scope);
+  for (const dropped of catalog.filtered()) {
+    if (dropped.name === name) scopeSet.add(dropped.scope);
   }
+  const scopes = [...scopeSet];
+  if (scopes.length === 0) {
+    return { kind: 'error', message: `/skill delete: no skill file named '${name}'` };
+  }
+
+  // Pick the scope to delete from — the optional second arg, or the
+  // sole scope when there is no ambiguity.
+  const scopeArg = positionals[1];
+  let scope: SkillScope;
+  if (scopeArg !== undefined) {
+    const parsed = SCOPE_FROM_TOKEN[scopeArg];
+    if (parsed === undefined) {
+      return {
+        kind: 'error',
+        message: `/skill delete: '${scopeArg}' is not a scope — use user, shared, or local`,
+      };
+    }
+    if (!scopes.includes(parsed)) {
+      const where = scopes.map((s) => TOKEN_FROM_SCOPE[s]).join(', ');
+      return {
+        kind: 'error',
+        message: `/skill delete: no '${name}' in scope ${scopeArg} (it is in: ${where})`,
+      };
+    }
+    scope = parsed;
+  } else if (scopes.length > 1) {
+    const where = scopes.map((s) => TOKEN_FROM_SCOPE[s]).join(', ');
+    return {
+      kind: 'error',
+      message: `/skill delete: '${name}' is in more than one scope (${where}) — re-run as /skill delete ${name} <scope>`,
+    };
+  } else {
+    scope = scopes[0] as SkillScope;
+  }
+
   if (!confirmed) {
     return {
       kind: 'ok',
       notes: [
-        `/skill delete '${name}': removes [${entry.scope}] ${name} from disk.`,
-        `re-run as: /skill delete ${name} --confirm`,
+        `/skill delete '${name}': removes [${scope}] ${name} from disk.`,
+        `re-run as: /skill delete ${name} ${TOKEN_FROM_SCOPE[scope]} --confirm`,
       ],
     };
   }
-  const result = deleteSkill(catalog.roots, entry.scope, name);
+
+  const result = deleteSkill(catalog.roots, scope, name);
   if (!result.ok) {
     return { kind: 'error', message: `/skill delete: ${result.message}` };
   }
   catalog.reload();
-  const notes = [`deleted [${entry.scope}] ${name}`];
-  // A same-name skill in a lower-precedence scope was shadowed by the
-  // one just deleted and is now the resolved skill. Say so — deleting
-  // 'x' and leaving 'x' resolvable is exactly the silent surprise
-  // §6.3 argues against.
+  const notes = [`deleted [${scope}] ${name}`];
+  // If the name still resolves after the delete, say so — deleting
+  // the winner can unshadow a lower-scope copy, and deleting a
+  // shadowed / filtered copy leaves the winner in place. §6.3: a
+  // delete that leaves the name resolvable must not be silent.
   const remaining = catalog.lookup(name);
   if (remaining !== null) {
-    notes.push(
-      `note: '${name}' still resolves — a shadowed copy in [${remaining.scope}] is now active`,
-    );
+    notes.push(`note: '${name}' still resolves — a copy remains in [${remaining.scope}]`);
   }
   return { kind: 'ok', notes };
 };

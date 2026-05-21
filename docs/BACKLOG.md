@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(skills) — /skill delete reaches filtered skills
+
+`/skill delete` resolved its target only through `catalog.lookup` (winners), so a malformed / name-mismatched / shadowed file — which `/skill list` *does* surface via `catalog.filtered()` — could not be removed through the command and needed a manual `rm`. `deleteSkill` itself already deletes a malformed file; only the command's lookup-gating blocked it. `handleDelete` now collects every scope holding a `<name>.md` (the winner plus any filtered copy) and deletes from it; when a name sits in more than one scope it asks for an explicit `/skill delete <name> <user|shared|local>` instead of guessing. The slice-6 review (Agent 2) flagged this as a `[scope]`-arg gap — deferred then as an edge case, closed now.
+
 ## [2026-05-21] fix(skills) — moveSkill rolls back a partial move
 
 `moveSkill` (`src/skills/lifecycle.ts`, behind `/skill promote` / `demote`) copies the source to the destination, then deletes the source — but a `rmSync(source)` failure returned `io_error` while leaving the just-written destination on disk. The skill then existed in BOTH scopes — silently shifting precedence / shadowing — and a retry failed with `already_exists`. The destination write is now rolled back on any post-write failure (`rmSync(target, { force: true })` in the catch), so a failed move mutates nothing. The source read is split into its own try so a read failure is cleanly distinguished from a post-write failure. Regression test forces the source-delete failure with a read-only source directory and asserts the destination was rolled back and the source still resolves.
