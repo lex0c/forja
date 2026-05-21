@@ -2,6 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(tui) — restyle the permission modal preview
+
+Several changes to the permission modal's preview block:
+
+- The action row (the command line) was a `{ tone: 'bold' }` line; it's now a plain `dim` string. The modal title (`accent + bold`) stays the only bold element.
+- The `$ ` shell prefix is dropped — the command renders verbatim. `BASH_FAMILY`, whose only use was that prefix, is removed.
+- The `cwd:` line is removed.
+- Source attribution (`matched rule: …` / `no rule matched in … policy`) now sits directly under the action — no blank line between — at the action's 4-space indent.
+
+`state.test.ts` + `modal-integration.test.ts` cases updated. Note: dropping `cwd:` loses the worktree-path cue for subagent-proxied asks, and `event.cwd` on the `permission:ask` event is now unused by the reducer — a follow-up could drop it from the event + adapter.
+
 ## [2026-05-21] fix(tui) — Markdown autolink no longer duplicates the URL under formatting
 
 The link renderer compared `node.url` against the *styled* label string. Under color, surrounding formatting (a link inside `**…**`) adds SGR to the label, so an autolink — `[https://x.io](https://x.io)` — compared unequal and rendered as `https://x.io (https://x.io)`, duplicating the URL. The comparison now runs against the raw label text (rendered with color off), so the "show the URL only when it adds information" rule holds regardless of formatting. 2 new `markdown.test.ts` cases.

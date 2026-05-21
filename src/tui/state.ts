@@ -19,18 +19,6 @@ import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 import { buildPermissionOptions } from './modal-manager.ts';
 
-// Bash family — every tool that's gated under `tools.bash` in the
-// policy file. The reducer's permission:ask case routes all four
-// to the same context label ("Bash command") and prefixes the
-// action with "$ ". Single source so a future rename / addition
-// can't drift between the label-decision and the prefix-decision.
-const BASH_FAMILY: ReadonlySet<string> = new Set([
-  'bash',
-  'bash_background',
-  'bash_output',
-  'bash_kill',
-]);
-
 // Map a tool name to the modal's context label. Replaces the older
 // "Run command" / "Subagent permission — <name>" titles with
 // per-category framing that matches reference designs (see
@@ -1383,31 +1371,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           : baseLabel;
 
       const previewLines: PreviewLine[] = [];
-      // Action block. Bash family carries the "$ " shell prefix; fs/
-      // web tools display the path/url verbatim. The 4-space lead
-      // (this stored line) + the renderer's 2-space indent = 6
-      // visible spaces, matching the design mockup's deeper indent.
-      // Bold paint highlights the command — operator's eye lands
-      // here first when triaging a confirm.
-      const actionPrefix = BASH_FAMILY.has(event.toolName) ? '$ ' : '';
+      // Action block: a blank line, then the command verbatim (no
+      // shell prefix). The 4-space lead (this stored line) + the
+      // renderer's 2-space indent = 6 visible spaces. Rendered as a
+      // plain `dim` line — the modal title stays the only bold one.
       previewLines.push('');
-      previewLines.push({
-        text: `    ${actionPrefix}${event.command}`,
-        tone: 'bold',
-      });
-      previewLines.push('');
+      previewLines.push(`    ${event.command}`);
 
-      // cwd: always shown for now — subagent-proxied asks land in a
-      // worktree path that's worth surfacing, and parent's own asks
-      // historically showed cwd too. Conditional rendering (hide on
-      // session-cwd match) is a future slice once we have access to
-      // the session cwd in the reducer.
-      previewLines.push(`cwd: ${event.cwd}`);
-
-      // Source attribution lifts to the `secondary` paint so it
-      // visually breaks out of the dim baseline. Operator scanning
-      // a sea of confirms during a multi-step turn can find the
-      // YAML-edit hint without re-reading every line.
+      // Source attribution — a `secondary` line sitting directly
+      // under the action, at the same 4-space indent. Tells the
+      // operator which policy rule (or none) gated this ask.
       if (event.rule !== undefined) {
         const layerLabel =
           event.layer === undefined
@@ -1416,12 +1389,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
               ? ' (built-in default)'
               : ` (${event.layer} policy)`;
         previewLines.push({
-          text: `matched rule: ${event.rule}${layerLabel}`,
+          text: `    matched rule: ${event.rule}${layerLabel}`,
           tone: 'secondary',
         });
       } else if (event.layer !== undefined && event.layer !== 'default') {
         previewLines.push({
-          text: `no rule matched in ${event.layer} policy`,
+          text: `    no rule matched in ${event.layer} policy`,
           tone: 'secondary',
         });
       }

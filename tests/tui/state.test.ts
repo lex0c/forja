@@ -1713,17 +1713,11 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       expect(r.state.modal.subject).toBeNull();
       expect(r.state.modal.question).toBeNull();
       // Action block has blank-line-action-blank-line shape — the
-      // breathing room is what sets the action apart visually.
-      // Action line carries `tone: 'bold'` so the renderer paints
-      // it bold (operator's eye lands on the command first).
+      // breathing room is what sets the action apart visually. The
+      // action line is a plain dim string.
       expect(r.state.modal.preview[0]).toBe('');
-      expect(r.state.modal.preview[1]).toEqual({
-        text: '    $ rm -rf /',
-        tone: 'bold',
-      });
+      expect(r.state.modal.preview[1]).toBe('    rm -rf /');
       expect(r.state.modal.preview[2]).toBe('');
-      // cwd follows the action block.
-      expect(r.state.modal.preview[3]).toBe('cwd: /p');
     }
   });
 
@@ -1777,11 +1771,7 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       cwd: '/p',
     } as UIEvent);
     // Preview action line is the path verbatim, no shell prefix.
-    // Wrapped as a `{text, tone}` object so the renderer paints bold.
-    expect(r.state.modal?.preview[1]).toEqual({
-      text: '    src/foo.ts',
-      tone: 'bold',
-    });
+    expect(r.state.modal?.preview[1]).toBe('    src/foo.ts');
   });
 
   test('subagent attribution becomes a parenthesized title suffix (not a preview row)', () => {
@@ -1805,9 +1795,8 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       // Preview goes straight to the action block — no
       // "subagent: explore (12345678)" prefix line.
       expect(r.state.modal.preview[0]).toBe('');
-      expect(r.state.modal.preview[1]).toEqual({ text: '    $ ls', tone: 'bold' });
+      expect(r.state.modal.preview[1]).toBe('    ls');
       expect(r.state.modal.preview[2]).toBe('');
-      expect(r.state.modal.preview[3]).toBe('cwd: /p');
       // No row contains the old "subagent: <name> (<idTail>)"
       // prefix shape.
       expect(
@@ -1907,12 +1896,12 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     // attribution stays accurate.
     const preview = catchAll.state.modal?.preview ?? [];
     const matchedRuleLine = preview.find((p) =>
-      (typeof p === 'string' ? p : p.text).startsWith('matched rule:'),
+      (typeof p === 'string' ? p : p.text).includes('matched rule:'),
     );
     expect(matchedRuleLine).toBeDefined();
     if (matchedRuleLine !== undefined) {
       const text = typeof matchedRuleLine === 'string' ? matchedRuleLine : matchedRuleLine.text;
-      expect(text).toBe('matched rule: * (project policy)');
+      expect(text).toBe('    matched rule: * (project policy)');
     }
   });
 
