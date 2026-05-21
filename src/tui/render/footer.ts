@@ -33,8 +33,8 @@ const isRunning = (state: LiveState): boolean =>
 //
 // Token used to be `dim` (SGR 2, faint), but xterm with default
 // config renders SGR 2 identical to the default foreground —
-// operators couldn't tell the footer cue from primary content,
-// and the `? for help` hint visually disappeared. `secondary`
+// operators couldn't tell the footer cues from primary content
+// and they visually disappeared. `secondary`
 // renders as visible grey on every terminal. Local helper name
 // stayed `dim` for prose-readability — every line below `dim(...)`
 // is the footer's "secondary" token applied to one token.
@@ -79,7 +79,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     left = leftParts.join(sep);
   } else {
     const leftParts = [
-      dim(caps, '? for help'),
+      paint(caps, 'accentDark', '? for help'),
       // `\+Enter` newline hint pairs with the input editor's
       // backslash-continuation feature (UI.md §5.4): operators on
       // terminals/WMs that eat Shift+Enter need a discoverable way

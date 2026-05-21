@@ -128,6 +128,11 @@ export const SGR = {
   // requires a spec amendment to UI.md §6.4; keep this scope tight
   // until then.
   accent: `${CSI}94m`,
+  // `accentDark` (SGR 34 = blue, non-bright) — a quieter blue than
+  // `accent`, for footer cues (`? for help`) that should read as
+  // interactive without a structural anchor's brightness.
+  // Operator-authorized like `accent`; same UI.md §6.4 amendment owed.
+  accentDark: `${CSI}34m`,
   bold: `${CSI}1m`,
   // Text attributes (not colors) for inline Markdown — `emphasis`
   // and `~~delete~~`. Landed with the markdown-render slice; they

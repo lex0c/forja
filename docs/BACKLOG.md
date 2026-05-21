@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — `? for help` footer hint in dark blue
+
+The `? for help` cue read in `secondary` grey, indistinguishable from the rest of the footer meta. It now uses a new `accentDark` palette token (SGR 34 — non-bright blue), a quieter blue than `accent` (94m): enough to read as interactive without a structural anchor's brightness. `\+Enter newline` and the interrupt cue stay `secondary`. Operator-authorized like `accent`; `UI.md §6.4` owes the amendment.
+
 ## [2026-05-20] fix — orphaned tool_use after a mid-round abort bricked the session
 
 A `maxToolErrors` abort on the serial tool path returned from inside the `for (const tu of collected.tool_uses)` loop: the tool_uses after the failing one never got a `tool_result`, and the persisted `user` message answered only the partial set. The provider contract requires every `tool_use` to have a matching `tool_result` in the next message — so from then on every request 400'd ("tool_use ids without tool_result") and the session was unrecoverable.

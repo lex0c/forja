@@ -47,6 +47,12 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
+  test('the `? for help` hint is painted in accentDark when color is enabled', () => {
+    const out = renderFooter(startedSession(), { ...caps, color: 'basic' });
+    // accentDark = CSI 34 m — a distinct blue from the secondary (90m) cues.
+    expect(out).toContain(`${CSI}34m? for help${CSI}0m`);
+  });
+
   test('running state: adds esc to interrupt to the left column', () => {
     const s = startedSession();
     const tool: ActiveTool = {
