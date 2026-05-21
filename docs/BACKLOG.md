@@ -2,6 +2,15 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(tui) — subagent tool handling catches up to the top-level path
+
+The subagent tool-event translation (`harness-adapter.ts`, `subagent_progress.lastEvent`) lagged two recent top-level changes:
+
+- `tool_execution_started` was never translated for nested tools, so a subagent tool waiting at a permission modal kept counting from `tool:start` — nested durations stayed inflated while top-level ones rebased.
+- the nested `tool:end` dropped `outputTruncated` and `exitCode`, hiding truncated output and non-zero command exits inside subagent runs (and letting a non-zero nested exit blend into a coalesced "done" batch).
+
+Both now mirror the top-level handling. 2 new adapter tests.
+
 ## [2026-05-21] fix(harness) — synthetic orphan tool_results keep the tool name
 
 `repairOrphanedToolUses` synthesized `tool_result` blocks carrying `tool_use_id` but not `name`. The Google adapter (`google/index.ts`) correlates `tool_result` to `tool_use` by function name — not id — and throws when `name` is absent, so an interrupted tool round was unrecoverable on resume for Gemini-backed sessions. The synthetic blocks now carry `tool_use.name`, matching every other `tool_result` producer in the harness. `resume.test.ts` repair case asserts the name.

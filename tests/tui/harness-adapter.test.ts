@@ -1368,6 +1368,43 @@ describe('harness-adapter — subagent observability', () => {
     expect(end.durationMs).toBe(42);
   });
 
+  test('subagent_progress tool_execution_started → nested tool:execution-started', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'bbbbbbbb-1111-2222-3333-444444444444',
+      lastEvent: { type: 'tool_execution_started', toolUseId: 'tu-e' },
+    });
+    expect(types(out)).toEqual(['subagent:update', 'tool:execution-started']);
+    const ev = out[1] as Extract<UIEvent, { type: 'tool:execution-started' }>;
+    expect(ev.toolId).toBe('sub:bbbbbbbb-1111-2222-3333-444444444444:tu-e');
+  });
+
+  test('subagent_progress tool_finished forwards outputTruncated and exitCode onto tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'cccccccc-1111-2222-3333-444444444444',
+      lastEvent: { type: 'tool_invoking', toolUseId: 'tu-c', toolName: 'bash', args: {} },
+    });
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'cccccccc-1111-2222-3333-444444444444',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu-c',
+        toolName: 'bash',
+        failed: false,
+        durationMs: 12,
+        outputTruncated: true,
+        exitCode: 1,
+      },
+    });
+    const end = out.find((e) => e.type === 'tool:end') as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(end.outputTruncated).toBe(true);
+    expect(end.exitCode).toBe(1);
+  });
+
   test('subagent_progress tool_finished with failed=true → tool:end status=error', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({
