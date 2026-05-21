@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] review(skills) — robustness / reliability / coherence pass
+
+Three-agent max-effort review of `21076d6..HEAD` (the eval, the §14 reconciliation, the three lifecycle/command fixes), focused on robustness, reliability, and coherent flow. Findings fixed:
+
+- **Sandbox** (`paths.ts`): `allowAnyName` skipped `validateName` entirely, leaving `isUnderRoot` — a prefix test that blocks a climb-out but not a *descent* — as the sole guard, so `skillFilePath` could resolve `subdir/x` or a separator-bearing name. `allowAnyName` now drops only the kebab FORMAT rule; a single-flat-component check (no `/`, `\`, NUL, `.` / `..`) still runs.
+- **Error reason** (`lifecycle.ts`): a traversal/unsafe name reaching `deleteSkill` reported `scope_unavailable`; now `invalid_name` — the null-root case already returns earlier, so a `ScopeError` at the resolve step is always a bad name. `createSkill` and `deleteSkill` now agree on the reason.
+- **Failed-move signalling** (`lifecycle.ts`): when a `moveSkill` rollback itself failed, the skill was silently left in both scopes. The catch now probes `existsSync` on both paths and, when the copy is stranded, says so in the message so a retry does not blind-walk into `already_exists`. The "mutates nothing" claim softened to "leaves no skill file behind" (a `mkdirSync`'d empty dir can remain).
+- **Reload guard** (`skill.ts`): a post-mutation `catalog.reload()` that threw turned an already-succeeded delete/move/new into a reported crash. `reloadCatalog` swallows a scan fault; the handler notes the in-session catalog is stale instead.
+- **Scope-token consistency** (`skill.ts`): `/skill delete` parsed its scope arg via a map while `promote` / `demote` hard-coded theirs — three subcommands, three parsers. All three now share `parseScopeToken`.
+- Minor: the `moveSkill` / `deleteSkill` `allowAnyName` asymmetry is documented; the `/skill delete` ambiguity prompt punctuation is aligned; the rollback regression test now `skipIf` root (a 0o555 dir does not stop root, so it passed vacuously); added negative coverage for nested/traversal delete names.
+
+Left for a spec decision (not patched): lifecycle mutation (`promote` / `demote` / `delete`) records no `skill_events` row — §6.5 implies a delete trail but §14 v1 audit is `surfaced` / `invoked` / `filtered` only.
+
 ## [2026-05-21] fix(skills) — deleteSkill removes a file whose filename is malformed
 
 `deleteSkill` resolved its path through `resolvePath` → `validateName`, which rejects a non-kebab name before any filesystem check. So `/skill delete` could not remove a filtered file whose FILENAME itself is invalid (`Bad Name.md`, `Upper.md`) — even though `/skill list` surfaces those as actionable cleanup targets and `deleteSkill` already deletes a file whose *contents* are malformed. `validateName` conflates two things: the kebab-case FORMAT rule and (incidentally) traversal-blocking; only the format rule is wrong when deleting an already-on-disk file. `skillFilePath` gains an `allowAnyName` option that skips the format gate while the `isUnderRoot` sandbox runs unconditionally; `resolvePath` threads it; `deleteSkill` passes it. A traversal name stays refused — tested.

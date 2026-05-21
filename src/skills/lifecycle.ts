@@ -74,8 +74,11 @@ const resolvePath = (
   try {
     return { ok: true, path: skillFilePath(roots, scope, name, { allowAnyName }) };
   } catch (err) {
+    // The null-root case already returned above, so a ScopeError
+    // here is `skillFilePath` rejecting the NAME — an escape or an
+    // unsafe component — not the scope being unavailable.
     if (err instanceof ScopeError || err instanceof SkillFrontmatterError) {
-      return { ok: false, reason: 'scope_unavailable', message: err.message };
+      return { ok: false, reason: 'invalid_name', message: err.message };
     }
     throw err;
   }
@@ -130,6 +133,11 @@ export const createSkill = (
 // clobber a same-name skill in the target scope. Copy-then-delete,
 // not rename: the project and user scopes can sit on different
 // filesystems, where `rename` fails with EXDEV.
+//
+// Unlike `deleteSkill`, the source goes through `resolvePath` WITHOUT
+// `allowAnyName`: a non-kebab name is rejected (`invalid_name`). You
+// clean up a broken file but only move a well-formed one, and the
+// destination must itself be a valid skill id.
 export const moveSkill = (
   roots: SkillScopeRoots,
   name: string,
@@ -173,25 +181,33 @@ export const moveSkill = (
     };
   }
   // Copy-then-delete. Any failure past the destination write may
-  // have left the target file on disk — roll it back so a failed
-  // move mutates nothing. Without the rollback a `rmSync(source)`
-  // failure leaves the skill in BOTH scopes (silently shifting
-  // resolution / shadowing) and a retry fails with `already_exists`.
+  // leave the target file on disk — roll it back so a failed move
+  // leaves no skill file behind. (The `already_exists` check above
+  // and this write are not atomic; in the single-process REPL
+  // nothing runs between them, and a concurrent external writer is
+  // out of scope — the same assumption the loader's scan makes.)
   try {
     mkdirSync(dirname(target.path), { recursive: true });
     writeFileSync(target.path, raw, 'utf8');
     rmSync(source.path);
   } catch (err) {
+    // Best-effort rollback. If it fails AND the source survived, the
+    // skill now sits in both scopes — the silent shadowing this
+    // rollback exists to prevent — so the message must say so, or a
+    // blind retry walks into `already_exists`.
     try {
       rmSync(target.path, { force: true });
     } catch {
-      // Best-effort rollback; the original io_error below is what
-      // the caller acts on.
+      // swallowed — the existsSync probe below reports the outcome
     }
+    const base = err instanceof Error ? err.message : String(err);
+    const stranded = existsSync(target.path) && existsSync(source.path);
     return {
       ok: false,
       reason: 'io_error',
-      message: err instanceof Error ? err.message : String(err),
+      message: stranded
+        ? `${base} — could not roll back the copy at ${target.path}; '${name}' now exists in both '${from}' and '${to}', remove one manually`
+        : base,
     };
   }
   return { ok: true, path: target.path };

@@ -110,22 +110,36 @@ const isUnderRoot = (candidate: string, root: string): boolean => {
 
 // Absolute path of a skill `name` in `scope`: `<root>/<name>.md`.
 // Throws `ScopeError` when the scope has no root (the user scope on
-// a homeless env) or when the resolved path escapes the scope root.
+// a homeless env) or when `name` is unsafe / escapes the scope root.
 //
-// `name` is validated first — for a name a caller is about to create
-// or address as a skill, a non-kebab name is rejected up front.
-// `opts.allowAnyName` skips that format gate: `deleteSkill` must
-// resolve the path of a file ALREADY on disk whose filename is not
-// kebab (a malformed `Bad Name.md` / `Upper.md`, surfaced by `/skill
-// list` as a cleanup target). The `isUnderRoot` sandbox below runs
-// either way — a traversal name is refused regardless of the gate.
+// The default gate is `validateName` (kebab-case) — for a name a
+// caller is about to create or address as a skill. `opts.allowAnyName`
+// swaps it for a narrower check: `deleteSkill` must resolve the path
+// of a file ALREADY on disk whose filename is not kebab (`Bad
+// Name.md`, `Upper.md` — surfaced by `/skill list` as cleanup
+// targets), so the FORMAT rule is dropped — but `name` must still be
+// one flat filename component, or the join could descend into a
+// subdir or climb out. `isUnderRoot` then confirms the result.
 export const skillFilePath = (
   roots: SkillScopeRoots,
   scope: SkillScope,
   name: string,
   opts?: { allowAnyName?: boolean },
 ): string => {
-  if (opts?.allowAnyName !== true) {
+  if (opts?.allowAnyName === true) {
+    // isUnderRoot below is a prefix test — it blocks a climb-out but
+    // not a descent — so this single-component check is load-bearing.
+    if (
+      name === '' ||
+      name === '.' ||
+      name === '..' ||
+      name.includes('/') ||
+      name.includes('\\') ||
+      name.includes('\0')
+    ) {
+      throw new ScopeError(`unsafe skill name: ${JSON.stringify(name)}`);
+    }
+  } else {
     validateName(name);
   }
   const root = rootForScope(roots, scope);

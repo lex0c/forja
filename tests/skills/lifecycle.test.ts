@@ -92,7 +92,9 @@ describe('moveSkill', () => {
     expect(result.reason).toBe('malformed');
   });
 
-  test('rolls back the destination when the source delete fails', () => {
+  // skipIf root: a 0o555 dir does not stop root from unlinking, so as
+  // root rmSync(source) would succeed and the test pass vacuously.
+  test.skipIf(process.getuid?.() === 0)('rolls back the destination on a failed move', () => {
     const roots = makeRoots(makeTmp());
     writeSkill(roots.projectLocal, 'stuck', skillDoc('stuck'));
     // Read-only source dir makes rmSync(source) fail — unlink needs
@@ -103,8 +105,8 @@ describe('moveSkill', () => {
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.reason).toBe('io_error');
-      // A failed move must mutate nothing: the destination is rolled
-      // back, the source still resolves.
+      // A failed move leaves no skill file behind: the destination is
+      // rolled back, the source still resolves.
       expect(existsSync(join(roots.projectShared, 'stuck.md'))).toBe(false);
       expect(existsSync(join(roots.projectLocal, 'stuck.md'))).toBe(true);
     } finally {
@@ -137,8 +139,14 @@ describe('deleteSkill', () => {
     expect(existsSync(join(roots.projectShared, 'Upper.md'))).toBe(false);
   });
 
-  test('still refuses a traversal name with the format gate skipped', () => {
-    const result = deleteSkill(makeRoots(makeTmp()), 'project_shared', '../escape');
-    expect(result.ok).toBe(false);
+  test('refuses a traversal or nested name even with the format gate skipped', () => {
+    // allowAnyName drops the kebab gate but not the single-component
+    // check — a separator or `..` must still be refused.
+    for (const bad of ['../escape', 'subdir/nested', 'a/b']) {
+      const result = deleteSkill(makeRoots(makeTmp()), 'project_shared', bad);
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      expect(result.reason).toBe('invalid_name');
+    }
   });
 });

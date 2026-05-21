@@ -46,6 +46,33 @@ const TOKEN_FROM_SCOPE: Record<SkillScope, string> = {
   project_local: 'local',
 };
 
+// Parse a short scope token (`user` / `shared` / `local`) the
+// operator typed, restricted to a subcommand's allowed set. Returns
+// null for an unknown or out-of-set token — the single parsing path
+// every `/skill` subcommand that takes a scope shares.
+const parseScopeToken = (
+  token: string | undefined,
+  allowed: readonly SkillScope[],
+): SkillScope | null => {
+  if (token === undefined) return null;
+  const scope = SCOPE_FROM_TOKEN[token];
+  return scope !== undefined && allowed.includes(scope) ? scope : null;
+};
+
+// Refresh the in-memory catalog after a disk mutation. A scan fault
+// (e.g. an unreadable sibling skill file) must not turn a mutation
+// that already succeeded on disk into a reported crash — swallow it
+// and return a note so the caller can tell the operator the
+// in-session view is stale until next launch.
+const reloadCatalog = (catalog: SkillCatalog): string | null => {
+  try {
+    catalog.reload();
+    return null;
+  } catch {
+    return 'in-session catalog could not refresh — change applies next launch';
+  }
+};
+
 const handleList = (catalog: SkillCatalog): SlashResult => {
   const entries = catalog.list();
   const filtered = catalog.filtered();
@@ -106,14 +133,13 @@ const handleNew = (catalog: SkillCatalog, positionals: string[]): SlashResult =>
   if (!result.ok) {
     return { kind: 'error', message: `/skill new: ${result.message}` };
   }
-  catalog.reload();
-  return {
-    kind: 'ok',
-    notes: [
-      `created ${result.path}`,
-      'edit it to fill in the description + body; /skill promote shared to share it',
-    ],
-  };
+  const notes = [
+    `created ${result.path}`,
+    'edit it to fill in the description + body; /skill promote shared to share it',
+  ];
+  const stale = reloadCatalog(catalog);
+  if (stale !== null) notes.push(stale);
+  return { kind: 'ok', notes };
 };
 
 // Run a move, reload the catalog, and report. Shared by promote and
@@ -132,8 +158,10 @@ const applyMove = (
   if (!result.ok) {
     return { kind: 'error', message: `/skill ${label}: ${result.message}` };
   }
-  catalog.reload();
-  return { kind: 'ok', notes: [okNote, `→ ${result.path}`] };
+  const notes = [okNote, `→ ${result.path}`];
+  const stale = reloadCatalog(catalog);
+  if (stale !== null) notes.push(stale);
+  return { kind: 'ok', notes };
 };
 
 const handlePromote = (
@@ -141,9 +169,9 @@ const handlePromote = (
   positionals: string[],
   confirmed: boolean,
 ): SlashResult => {
-  const target = positionals[0];
+  const target = parseScopeToken(positionals[0], ['project_shared', 'user']);
   const name = positionals[1];
-  if (name === undefined || (target !== 'shared' && target !== 'user')) {
+  if (target === null || name === undefined) {
     return {
       kind: 'error',
       message: '/skill promote: usage — /skill promote <shared|user> <name>',
@@ -153,7 +181,7 @@ const handlePromote = (
   if (entry === null) {
     return { kind: 'error', message: `/skill promote: no resolved skill named '${name}'` };
   }
-  if (target === 'shared') {
+  if (target === 'project_shared') {
     if (entry.scope !== 'project_local') {
       return {
         kind: 'error',
@@ -194,9 +222,9 @@ const handlePromote = (
 };
 
 const handleDemote = (catalog: SkillCatalog, positionals: string[]): SlashResult => {
-  const target = positionals[0];
+  const target = parseScopeToken(positionals[0], ['project_local']);
   const name = positionals[1];
-  if (name === undefined || target !== 'local') {
+  if (target === null || name === undefined) {
     return { kind: 'error', message: '/skill demote: usage — /skill demote local <name>' };
   }
   const entry = catalog.lookup(name);
@@ -251,8 +279,8 @@ const handleDelete = (
   const scopeArg = positionals[1];
   let scope: SkillScope;
   if (scopeArg !== undefined) {
-    const parsed = SCOPE_FROM_TOKEN[scopeArg];
-    if (parsed === undefined) {
+    const parsed = parseScopeToken(scopeArg, ['user', 'project_shared', 'project_local']);
+    if (parsed === null) {
       return {
         kind: 'error',
         message: `/skill delete: '${scopeArg}' is not a scope — use user, shared, or local`,
@@ -270,7 +298,7 @@ const handleDelete = (
     const where = scopes.map((s) => TOKEN_FROM_SCOPE[s]).join(', ');
     return {
       kind: 'error',
-      message: `/skill delete: '${name}' is in more than one scope (${where}) — re-run as /skill delete ${name} <scope>`,
+      message: `/skill delete: '${name}' is in more than one scope (${where}) — re-run as: /skill delete ${name} <scope>`,
     };
   } else {
     scope = scopes[0] as SkillScope;
@@ -290,15 +318,20 @@ const handleDelete = (
   if (!result.ok) {
     return { kind: 'error', message: `/skill delete: ${result.message}` };
   }
-  catalog.reload();
   const notes = [`deleted [${scope}] ${name}`];
-  // If the name still resolves after the delete, say so — deleting
-  // the winner can unshadow a lower-scope copy, and deleting a
-  // shadowed / filtered copy leaves the winner in place. §6.3: a
-  // delete that leaves the name resolvable must not be silent.
-  const remaining = catalog.lookup(name);
-  if (remaining !== null) {
-    notes.push(`note: '${name}' still resolves — a copy remains in [${remaining.scope}]`);
+  const stale = reloadCatalog(catalog);
+  if (stale !== null) {
+    notes.push(stale);
+  } else {
+    // Fresh-catalog only: deleting the winner can unshadow a
+    // lower-scope copy, and deleting a shadowed / filtered copy
+    // leaves the winner in place. §6.3 — a delete that leaves the
+    // name resolvable must not be silent. A stale catalog can't be
+    // trusted for this, so the stale note above stands in.
+    const remaining = catalog.lookup(name);
+    if (remaining !== null) {
+      notes.push(`note: '${name}' still resolves — a copy remains in [${remaining.scope}]`);
+    }
   }
   return { kind: 'ok', notes };
 };
