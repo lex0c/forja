@@ -228,6 +228,20 @@ export const createSkillCatalog = (input: CreateSkillCatalogInput): SkillCatalog
       const result = readSkillByName(roots, target, name);
       switch (result.kind) {
         case 'present':
+          // The filename is the canonical id; a file whose
+          // frontmatter declares a different `name` is the
+          // `name_mismatch` case `refresh()` filters out of the
+          // snapshot. A strict-scope read — or a no-scope read after
+          // an operator hand-edit — can still reach such a file;
+          // reject it so `read` honors the same identity invariant
+          // the catalog enforces everywhere else.
+          if (result.file.frontmatter.name !== name) {
+            return {
+              kind: 'malformed',
+              scope: target,
+              error: `frontmatter declares name ${JSON.stringify(result.file.frontmatter.name)}, not ${JSON.stringify(name)}`,
+            };
+          }
           return { kind: 'present', scope: target, file: result.file };
         case 'missing':
           return { kind: 'missing', scope: target };

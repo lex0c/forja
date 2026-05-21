@@ -3144,6 +3144,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.contextPinsStore !== undefined
             ? { contextPinsStore: config.contextPinsStore }
             : {}),
+          ...(config.skillCatalog !== undefined ? { skillCatalog: config.skillCatalog } : {}),
           // Trust state — required on ToolContext, optional on
           // HarnessConfig. Default-false at the harness layer is
           // the fail-closed answer when bootstrap (or a test

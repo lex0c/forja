@@ -152,6 +152,13 @@ describe('createSkillCatalog — read', () => {
     rmSync(join(roots.projectShared, 'transient.md'));
     expect(catalog.read('transient').kind).toBe('missing');
   });
+
+  test('read(name, scope) rejects a file whose frontmatter name differs from the filename', () => {
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.projectShared, 'git-bisect', skillDoc('something-else'));
+    const result = createSkillCatalog({ roots }).read('git-bisect', 'project_shared');
+    expect(result.kind).toBe('malformed');
+  });
 });
 
 describe('createSkillCatalog — reload', () => {

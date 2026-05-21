@@ -16,6 +16,9 @@ import { monitorTool } from './monitor.ts';
 // omitted from the default registry.
 import { readFileTool } from './read-file.ts';
 import { retrieveContextTool } from './retrieve-context.ts';
+// skill-invoke / skill-list / skill-show are re-exported below but
+// intentionally not imported here — they are not in BUILTIN_TOOLS
+// yet (see the BUILTIN_TOOLS comment for why).
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
@@ -58,6 +61,12 @@ export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
 export { retrieveContextTool } from './retrieve-context.ts';
+export { skillInvokeTool } from './skill-invoke.ts';
+export type { SkillInvokeInput, SkillInvokeOutput } from './skill-invoke.ts';
+export { skillListTool } from './skill-list.ts';
+export type { SkillListEntry, SkillListInput, SkillListOutput } from './skill-list.ts';
+export { skillShowTool } from './skill-show.ts';
+export type { SkillShowInput, SkillShowOutput } from './skill-show.ts';
 export { taskTool, taskSyncTool } from './task.ts';
 export type { TaskInput, TaskOutput } from './task.ts';
 export { taskAsyncTool } from './task-async.ts';
@@ -92,6 +101,13 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // something that always errors. The export below is preserved so the
 // tool test suite still exercises the contract and the harness can
 // re-add to BUILTIN_TOOLS in one line when the modal lands.
+//
+// skillInvokeTool / skillListTool / skillShowTool are likewise
+// exported but NOT in BUILTIN_TOOLS yet: the harness has no
+// skillCatalog wired until the CLI bootstrap builds it, so surfacing
+// them now would give the model three tools that always return
+// `skill.catalog_unavailable`. The slice that wires the catalog into
+// bootstrap adds them here.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,

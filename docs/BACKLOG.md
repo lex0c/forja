@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — slice 4: tools (skill_invoke / skill_list / skill_show)
+
+The model-facing surface (spec SKILLS.md §5) — three tools in `src/tools/builtin/`, plus the harness plumbing to reach the catalog.
+
+- **`skill_invoke`** — resolves a skill (precedence, or a pinned scope), returns the body wrapped in the `<skill name scope>…</skill>` trust marker (§4.2 / §7.2: the model treats the delimited text as a procedure to follow, not as system instruction), and records an `invoked` audit row via `catalog.recordEvent`. A body that itself contains a literal `</skill>` is refused as malformed — it could break out of the marker. `tools` / `requires` / `version` / `expires` from the frontmatter are surfaced in the output; the opaque `args` (§5.2) is echoed back.
+- **`skill_list`** — the resolved catalog as name + description + scope (§5.1), optional scope filter.
+- **`skill_show`** — a skill's raw body for inspection, NO marker and NO audit — §5.1: list / show are read-only. The catalog's `read()` stays pure (no auto-emit) precisely so `skill_show` can load a body without it counting as an invocation; `invoked` is `skill_invoke`'s explicit `recordEvent` call.
+- Shared `_skills.ts` — `validateSkillScope`, `wrapSkillBody`, `SKILL_MARKER_CLOSE`.
+- Wiring: `ToolContext.skillCatalog?` + `HarnessConfig.skillCatalog?` + the loop's `buildCtx` spread. The three tools are exported but deliberately NOT in `BUILTIN_TOOLS` yet — the bootstrap has no catalog to wire until slice 5, and surfacing always-`catalog_unavailable` tools to the model would waste turns (same treatment `pin_context` gets). Slice 5 adds them.
+
+v1 deferral, noted: `skill_invoke` surfaces `tools` / `requires` but does NOT gate on them. The §5.4 `requires`-missing hard error needs a subsystem-capability registry that does not exist; the §8 `tools` pre-flight cannot be a strict tool-name match (the seed catalog declares loose names like `edit`). Both are v2 — alongside the §6.4 decay sweep, the other `expires`-driven v2 piece.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: the byte-identical `skill_invoke` / `skill_show` resolution prelude (catalog check → name/scope validation → `catalog.read` → not_found/missing/malformed mapping, ~40 lines) extracted into `_skills.ts:resolveSkillForTool`; `skill_invoke` now honors §5.4's expired-skill warn (`emitWarn` + an `expired` flag in the audit `details`) rather than only surfacing the date; the `args` input-schema property dropped its `type: 'object'` — §5.2: `args` is opaque and un-validated, and a typed schema would invite the provider to reject a non-object before the tool runs; and `catalog.read` now rejects a file whose `frontmatter.name` differs from the requested name — the `name_mismatch` identity invariant `refresh()` already enforces, which a strict-scope read previously bypassed. Plus coverage for `body_missing`, the malformed path, and unknown-scope rejection.
+
+26 skill-tool tests (`tests/tools/skill-{invoke,list,show}.test.ts`) + a `catalog.read` name-mismatch test; `typecheck` + `lint` clean; `tests/skills/` + the skill-tool suites green (105). The harness wiring is additive — `tests/tools/` + `tests/harness/` were green at build (729).
+
 ## [2026-05-21] feat(skills) — slice 3: audit (skill_events)
 
 The audit storage for the subsystem (spec SKILLS.md §0.7, §14; RETRIEVAL.md §3.4.5). Without it there is no trail to tune a skill's `description` against — surfaced-often-but-never-invoked is the signal §3.4.5 names, and that needs the events recorded.
