@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — subsystem kickoff: slice 1 (core storage)
+
+New subsystem (spec `SKILLS.md`): gated, reusable procedures the model invokes when the goal matches — markdown file with frontmatter (`name` + `description`) + a prose body the LLM follows. v1 scope per `SKILLS.md §14`: frontmatter + body, three scopes (user / project_shared / project_local — `imported` is v2), surface eager / body lazy, `skill_invoke|list|show` tools, `surfaced/invoked/filtered` audit. Sliced: (1) core storage, (2) catalog, (3) audit table, (4) tools, (5) prompt surface, (6) `/skill` slash, (7) seed catalog.
+
+`RETRIEVAL.md` gained `§3.4 Skills gating` — the surface/gate mechanism `SKILLS.md` cross-references (the doc previously stopped at §3.3). Section authored by the architect; applied verbatim except one "Claude Code" mention generalized to "CLIs agênticos" per the no-Claude-Code-in-docs rule.
+
+**Slice 1 — `src/skills/{types,frontmatter,paths,loader,index}.ts`.** Pure core storage, no harness coupling:
+
+- `frontmatter.ts` — parse / serialize / validate skill `.md` files. `name` + `description` required (kebab-case name; single-line description hard-capped at the spec's 120 chars); `version` / `trigger_keywords` / `tools` / `requires` / `source` / `created_at` / `updated_at` / `expires` optional. Snake_case field names mirror the YAML keys 1:1 — no case-translation layer. `expires: null` (the seed-catalog idiom) collapses to absent. Unknown fields rejected. Strict `---` fence detection, CRLF normalized, one leading body blank stripped — modeled on `memory/frontmatter.ts`.
+- `paths.ts` — scope roots: user via the shared `config/agent-paths.ts:agentConfigDir` (XDG + Windows `APPDATA`; `null` when no home is derivable, so `SkillScopeRoots.user` is `string | null`), project `.agent/skills/{shared,local}/`. `skillFilePath` validates the name then re-checks the resolved path under the scope root — defense-in-depth, unreachable with the current `NAME_RE`. Repo-root resolution stays the caller's job — no skills→memory coupling.
+- `loader.ts` — glob-based discovery (skills have no `MEMORY.md`-style index): `listSkillNames` / `readSkillByName` / `scanScope`. Symlinked + non-regular `.md` files refused — a skill body is injected into model context, so a symlink could exfiltrate an out-of-scope file.
+
+55 tests in `tests/skills/` (frontmatter / paths / loader); `typecheck` + `lint` clean.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `userScopeRoot` switched to the shared `config/agent-paths.ts:agentConfigDir` — it was a fourth hand-rolled XDG copy that missed Windows user paths, the exact drift `agent-paths.ts` exists to end (a homeless env now yields no user scope rather than a cwd-relative path; this also makes `ScopeError` reachable + tested); a `SKILL_FIELD_ORDER` tuple replaced three hand-synced field lists (interface / unknown-field gate / serializer); plus comment-honesty and coverage fixes (`source: imported` + `version: null` round-trips, null-scope-root paths). Noted follow-up, NOT slice 1: `checkRegularFile` is byte-identical with `memory/loader.ts` — extracting it to a shared `src/lib/` is a cross-subsystem change (migrates memory too), tracked separately. The skills↔memory frontmatter/sandbox helper duplication is deliberate per-subsystem (error-class coupling; signatures already divergent across 5 subsystems) — left as-is.
+
+Deferred, raised when load-bearing: seed-catalog placement (the 20 `docs/spec/skills/` files → `.agent/skills/shared/`?) at slice 7; branch at first commit. `requires:` is parsed and will surface in `skill_show` but gets no hard pre-flight in v1 — no subsystem-capability registry exists; `tools:` will be registry-checked at slice 4.
+
 ## [2026-05-21] feat(tui) — restyle the permission modal preview
 
 Several changes to the permission modal's preview block:
