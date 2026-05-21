@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] docs(skills) — operator guide
+
+`docs/SKILLS.md` — the English operator / implementation reference for the skills subsystem, in the shape of `docs/MEMORY.md` / `docs/HOOKS.md`: what a skill is, the file format + frontmatter table, the three scopes and disk layout, the precedence-resolving catalog, the eager `# Skills` prompt surface, the `skill_invoke` / `skill_list` / `skill_show` tools, the `/skill` lifecycle command, the `skill_events` audit, the `<skill>` trust marker, the seed catalog `agent init` installs, and the v2-deferred scope. The canonical spec stays `docs/spec/SKILLS.md` (PT-BR); this is the operational companion — spec wins on divergence.
+
 ## [2026-05-21] feat(skills) — slice 7: seed catalog (agent init installs 20 skills)
 
 The last slice. `agent init` now scaffolds a fifth artifact — the seed skill catalog — so a freshly-initialized project starts with 20 vetted skills.
