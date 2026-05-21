@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(tui) — skills count in the boot banner
+
+The boot banner's env block surfaced `subagents` and `memory` counts but not `skills`, even though skills and memory are sibling catalogs both surfaced to the model. `repl.ts` now pushes a `skills: N` meta entry, omitted at zero like `memory` — the operator gets the at-a-glance count the model already had via its `# Skills` prompt block. `repl.test.ts` gains a `skillCount` stub seam plus includes / omits coverage mirroring the memory banner tests.
+
 ## [2026-05-21] chore(skills) — trim the seed catalog from 20 to 15
 
 Removed five seed skills judged too niche or role-specific for a catalog installed onto every project: `git-split-commit`, `restrict-proc-hidepid`, `ssh-tunnel`, `diagnose-network`, `python-executable-script`. The remaining 15 stay weighted toward broadly-useful procedures — git recovery / conflict / bisect / rewrite, the debug/test/perf family, forensics, the two Postgres skills, bulk file operations. The `.md` assets and their `CANONICAL_SKILLS` entries are gone, `profile-hotspot`'s dangling `diagnose-network` cross-reference reworded, and the `init-skills` count assertions + `docs/SKILLS.md` updated to 15. The seed still installs into `project_shared` — install location unchanged.
