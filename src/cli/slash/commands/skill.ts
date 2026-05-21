@@ -252,11 +252,20 @@ const handleDelete = (
   positionals: string[],
   confirmed: boolean,
 ): SlashResult => {
-  const name = positionals[0];
-  if (name === undefined) {
+  // The slash parser splits on whitespace with no quoting, so a
+  // multi-word filename (`Bad Name.md` — exactly the malformed file
+  // `/skill list` surfaces and delete must reach) arrives as several
+  // positionals. Join them back into the name; the scope, when
+  // needed, is the `--scope=<x>` flag — a positional scope would be
+  // indistinguishable from a word of the name. A name with runs of
+  // whitespace cannot be reconstructed (the parser already collapsed
+  // them), but a normal single-spaced name can.
+  const scopeFlags = positionals.filter((p) => p.startsWith('--scope='));
+  const name = positionals.filter((p) => !p.startsWith('--scope=')).join(' ');
+  if (name === '') {
     return {
       kind: 'error',
-      message: '/skill delete: usage — /skill delete <name> [user|shared|local]',
+      message: '/skill delete: usage — /skill delete <name> [--scope=user|shared|local]',
     };
   }
   // A <name>.md may be the resolved winner AND/OR a filtered file
@@ -274,16 +283,16 @@ const handleDelete = (
     return { kind: 'error', message: `/skill delete: no skill file named '${name}'` };
   }
 
-  // Pick the scope to delete from — the optional second arg, or the
-  // sole scope when there is no ambiguity.
-  const scopeArg = positionals[1];
+  // Pick the scope to delete from — the `--scope=` flag, or the sole
+  // scope when there is no ambiguity.
   let scope: SkillScope;
-  if (scopeArg !== undefined) {
+  if (scopeFlags.length > 0) {
+    const scopeArg = (scopeFlags[scopeFlags.length - 1] ?? '').slice('--scope='.length);
     const parsed = parseScopeToken(scopeArg, ['user', 'project_shared', 'project_local']);
     if (parsed === null) {
       return {
         kind: 'error',
-        message: `/skill delete: '${scopeArg}' is not a scope — use user, shared, or local`,
+        message: `/skill delete: '${scopeArg}' is not a scope — use --scope=user, shared, or local`,
       };
     }
     if (!scopes.includes(parsed)) {
@@ -298,7 +307,7 @@ const handleDelete = (
     const where = scopes.map((s) => TOKEN_FROM_SCOPE[s]).join(', ');
     return {
       kind: 'error',
-      message: `/skill delete: '${name}' is in more than one scope (${where}) — re-run as: /skill delete ${name} <scope>`,
+      message: `/skill delete: '${name}' is in more than one scope (${where}) — add --scope=<scope> to pick one`,
     };
   } else {
     scope = scopes[0] as SkillScope;
@@ -309,7 +318,7 @@ const handleDelete = (
       kind: 'ok',
       notes: [
         `/skill delete '${name}': removes [${scope}] ${name} from disk.`,
-        `re-run as: /skill delete ${name} ${TOKEN_FROM_SCOPE[scope]} --confirm`,
+        `re-run as: /skill delete ${name} --scope=${TOKEN_FROM_SCOPE[scope]} --confirm`,
       ],
     };
   }

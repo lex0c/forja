@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] fix(skills) — /skill delete targets multi-word filenames
+
+The slash parser splits on whitespace with no quoting, so `/skill delete Bad Name` reached `handleDelete` as positionals `['Bad', 'Name']` — name `'Bad'`, scope `'Name'` — and could never target `Bad Name.md`, exactly the malformed file `/skill list` surfaces and delete exists to clean up. `handleDelete` now joins all positionals into the name; the optional scope moved from a positional (which a multi-word name made ambiguous) to a `--scope=<user|shared|local>` flag, extracted like `--confirm`. A name with collapsed runs of whitespace still can't be reconstructed — a parser limitation — but a normal single-spaced name works.
+
 ## [2026-05-21] feat(tui) — skills count in the boot banner
 
 The boot banner's env block surfaced `subagents` and `memory` counts but not `skills`, even though skills and memory are sibling catalogs both surfaced to the model. `repl.ts` now pushes a `skills: N` meta entry, omitted at zero like `memory` — the operator gets the at-a-glance count the model already had via its `# Skills` prompt block. `repl.test.ts` gains a `skillCount` stub seam plus includes / omits coverage mirroring the memory banner tests.

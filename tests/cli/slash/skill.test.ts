@@ -148,7 +148,10 @@ describe('/skill', () => {
     const catalog = createSkillCatalog({ roots });
     const ambiguous = await skillCommand.exec(['delete', 'dup', '--confirm'], makeCtx(catalog));
     expect(ambiguous.kind).toBe('error');
-    const done = await skillCommand.exec(['delete', 'dup', 'user', '--confirm'], makeCtx(catalog));
+    const done = await skillCommand.exec(
+      ['delete', 'dup', '--scope=user', '--confirm'],
+      makeCtx(catalog),
+    );
     expect(done.kind).toBe('ok');
     expect(catalog.lookup('dup')?.scope).toBe('project_local');
   });
@@ -163,6 +166,22 @@ describe('/skill', () => {
     const result = await skillCommand.exec(['delete', 'Upper', '--confirm'], makeCtx(catalog));
     expect(result.kind).toBe('ok');
     expect(catalog.filtered().some((f) => f.name === 'Upper')).toBe(false);
+  });
+
+  test('delete targets a multi-word skill filename', async () => {
+    const roots = makeRoots(makeTmp());
+    // The slash parser splits 'Bad Name' into two args; delete must
+    // rejoin them — a non-kebab filename like this is what /skill
+    // list surfaces as a malformed cleanup target.
+    writeSkill(roots.projectShared, 'Bad Name', skillDoc('whatever'));
+    const catalog = createSkillCatalog({ roots });
+    expect(catalog.filtered().some((f) => f.name === 'Bad Name')).toBe(true);
+    const result = await skillCommand.exec(
+      ['delete', 'Bad', 'Name', '--confirm'],
+      makeCtx(catalog),
+    );
+    expect(result.kind).toBe('ok');
+    expect(catalog.filtered().some((f) => f.name === 'Bad Name')).toBe(false);
   });
 
   test('rejects an unknown subcommand', async () => {
