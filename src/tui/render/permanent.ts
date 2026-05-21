@@ -134,9 +134,9 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', paint(caps, 'secondary', verb)].map(padFrame);
     }
     case 'session-banner': {
-      // UI.md §4.10.9. Three blocks separated by blank lines:
+      // UI.md §4.10.9. Three stacked blocks, no blank lines between:
       //   1. title (bold) — `forja v0.0.0`
-      //   2. identity (dim) — model+limits, cwd
+      //   2. cwd (secondary)
       //   3. env — mixed: `✓ name` (success) for flags, `key: value` (dim)
       //      for meta, joined by ` · ` (dim). Omitted when env is empty.
       // Version is prefixed with `v` (semver convention) regardless of
@@ -147,13 +147,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
       const lines: string[] = [
         paint(caps, 'bold', `${item.app} ${versionDisplay}`),
-        '',
-        paint(
-          caps,
-          'dim',
-          `${item.model} ${sep} ${item.contextWindow.toLocaleString()} ctx ${sep} max ${item.maxOutputTokens} out`,
-        ),
-        paint(caps, 'dim', item.cwd),
+        paint(caps, 'secondary', item.cwd),
       ];
       if (item.env.length > 0) {
         const dimSep = paint(caps, 'dim', ` ${sep} `);
@@ -164,7 +158,6 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           }
           return paint(caps, 'dim', `${e.key}: ${e.value}`);
         });
-        lines.push('');
         lines.push(parts.join(dimSep));
       }
       return lines.map(padFrame);

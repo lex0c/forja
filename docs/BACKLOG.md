@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-20] feat(tui) — trim the init banner to three stacked lines
+
+The session banner had a 2-line identity block (`{model} · {ctx} · max {out}` + cwd) and a blank line between each of its three blocks. The model+limits line is removed (redundant — the footer carries the model — and noisy at boot), and the blank separators are removed too. The banner is now three stacked lines: title (bold), cwd (`secondary`, was `dim`), env. `permanent.test.ts` banner cases updated.
+
+The `model` / `contextWindow` / `maxOutputTokens` fields on `SessionBannerEvent` and the `session-banner` item are now unused by the renderer — a follow-up should drop them from the event + the REPL emit.
+
 ## [2026-05-20] feat(tui) — `? for help` footer hint in dark blue
 
 The `? for help` cue read in `secondary` grey, indistinguishable from the rest of the footer meta. It now uses a new `accentDark` palette token (SGR 34 — non-bright blue), a quieter blue than `accent` (94m): enough to read as interactive without a structural anchor's brightness. `\+Enter newline` and the interrupt cue stay `secondary`. Operator-authorized like `accent`; `UI.md §6.4` owes the amendment.
