@@ -188,6 +188,19 @@ export type {
 } from './repos/memory-events.ts';
 
 export {
+  createSkillEvent,
+  listRecentSkillEvents,
+  listSkillEventsByName,
+  listSkillEventsBySession,
+} from './repos/skill-events.ts';
+export type {
+  CreateSkillEventInput,
+  SkillEvent,
+  SkillEventAction,
+  SkillEventScope,
+} from './repos/skill-events.ts';
+
+export {
   DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD,
   GOVERNANCE_PROPOSAL_KINDS,
   GOVERNANCE_PROPOSAL_STATUSES,

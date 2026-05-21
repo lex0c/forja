@@ -1,3 +1,6 @@
+import { redactSecrets } from '../sanitize/secrets.ts';
+import type { DB } from '../storage/db.ts';
+import { type SkillEventAction, createSkillEvent } from '../storage/repos/skill-events.ts';
 import { readSkillByName, scanScope } from './loader.ts';
 import type { SkillScopeRoots } from './paths.ts';
 import type { SkillFile, SkillFrontmatter, SkillScope } from './types.ts';
@@ -79,6 +82,19 @@ export type SkillReadResult =
   | { kind: 'missing'; scope: SkillScope }
   | { kind: 'malformed'; scope: SkillScope; error: string };
 
+// Input to `SkillCatalog.recordEvent`. `sessionId` / `cwd` override
+// the catalog's constructor-captured attribution for this one row —
+// the tool layer passes the live `ctx.sessionId`, which does not
+// exist yet when bootstrap builds the catalog.
+export interface RecordSkillEventInput {
+  action: SkillEventAction;
+  scope: SkillScope;
+  skillName: string;
+  sessionId?: string | null;
+  cwd?: string | null;
+  details?: Record<string, unknown>;
+}
+
 export interface SkillCatalog {
   // Scope roots the catalog was built from. Exposed so lifecycle
   // callers (the `/skill` slash command in a later slice) act
@@ -103,6 +119,12 @@ export interface SkillCatalog {
   // or shadowed. The §3.5 "resolution is explicit" audit input.
   filtered(): readonly FilteredSkill[];
 
+  // Emit a `skill_events` audit row (surfaced / invoked / filtered,
+  // §0.7). Best-effort: a no-op when no DB was wired, and a DB
+  // failure is logged to stderr, never thrown — an audit miss must
+  // not break the model's turn or the boot path.
+  recordEvent(input: RecordSkillEventInput): void;
+
   // Count of resolved entries (winners). Does not walk disk.
   count(): number;
 
@@ -112,10 +134,18 @@ export interface SkillCatalog {
 
 export interface CreateSkillCatalogInput {
   roots: SkillScopeRoots;
+  // When provided, `recordEvent` writes a `skill_events` audit row;
+  // omitted, `recordEvent` is a no-op (unit tests, headless callers
+  // with no DB). `sessionId` / `cwd` are audit-attribution defaults
+  // — per-call overrides on `recordEvent` win, since the live
+  // session id does not exist when bootstrap builds the catalog.
+  db?: DB;
+  sessionId?: string;
+  cwd?: string;
 }
 
 export const createSkillCatalog = (input: CreateSkillCatalogInput): SkillCatalog => {
-  const { roots } = input;
+  const { roots, db, sessionId, cwd } = input;
   let entries: SkillCatalogEntry[] = [];
   // Winners keyed by name — `lookup` / `read` index O(1) instead of
   // scanning `entries`. Built once per `refresh`; `entries` is the
@@ -208,6 +238,29 @@ export const createSkillCatalog = (input: CreateSkillCatalogInput): SkillCatalog
 
     filtered(): readonly FilteredSkill[] {
       return [...filteredEntries];
+    },
+
+    recordEvent(input: RecordSkillEventInput): void {
+      if (db === undefined) return;
+      try {
+        createSkillEvent(db, {
+          action: input.action,
+          scope: input.scope,
+          skillName: input.skillName,
+          sessionId: input.sessionId ?? sessionId ?? null,
+          cwd: input.cwd ?? cwd ?? null,
+          ...(input.details !== undefined ? { details: input.details } : {}),
+        });
+      } catch (err) {
+        // Audit failure must not propagate — the row is forensic and
+        // the caller (a tool turn, the boot path) has no recovery.
+        // Surface on stderr, redacted: a SQLite error can echo a
+        // bound parameter, and `details` is caller-supplied text.
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `skills: AUDIT DRIFT: failed to record ${input.action} event for ${input.skillName} (${input.scope}): ${redactSecrets(message)}\n`,
+        );
+      }
     },
 
     count(): number {

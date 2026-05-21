@@ -1,7 +1,11 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSkillCatalog } from '../../src/skills/catalog.ts';
+import { type DB, openMemoryDb } from '../../src/storage/db.ts';
+import { migrate } from '../../src/storage/migrate.ts';
+import { createSession } from '../../src/storage/repos/sessions.ts';
+import { listSkillEventsBySession } from '../../src/storage/repos/skill-events.ts';
 import { brokenDoc, cleanupTmpDirs, makeRoots, makeTmp, skillDoc, writeSkill } from './_helpers.ts';
 
 afterEach(cleanupTmpDirs);
@@ -160,5 +164,85 @@ describe('createSkillCatalog — reload', () => {
     expect(catalog.count()).toBe(1);
     catalog.reload();
     expect(catalog.count()).toBe(2);
+  });
+});
+
+describe('createSkillCatalog — recordEvent', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('writes a skill_events row when a db is wired', () => {
+    const catalog = createSkillCatalog({ roots: makeRoots(makeTmp()), db, sessionId });
+    catalog.recordEvent({ action: 'invoked', scope: 'project_shared', skillName: 'git-bisect' });
+    const events = listSkillEventsBySession(db, sessionId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('invoked');
+    expect(events[0]?.skillName).toBe('git-bisect');
+    expect(events[0]?.scope).toBe('project_shared');
+    expect(events[0]?.sessionId).toBe(sessionId);
+  });
+
+  test('a per-call sessionId overrides the constructor default', () => {
+    const liveSession = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const catalog = createSkillCatalog({ roots: makeRoots(makeTmp()), db, sessionId });
+    catalog.recordEvent({
+      action: 'surfaced',
+      scope: 'user',
+      skillName: 'x',
+      sessionId: liveSession,
+    });
+    expect(listSkillEventsBySession(db, liveSession)).toHaveLength(1);
+    expect(listSkillEventsBySession(db, sessionId)).toHaveLength(0);
+  });
+
+  test('resolves cwd from the constructor default and the per-call override', () => {
+    const catalog = createSkillCatalog({
+      roots: makeRoots(makeTmp()),
+      db,
+      sessionId,
+      cwd: '/boot',
+    });
+    catalog.recordEvent({ action: 'surfaced', scope: 'user', skillName: 'a' });
+    catalog.recordEvent({ action: 'invoked', scope: 'user', skillName: 'b', cwd: '/live' });
+    const events = listSkillEventsBySession(db, sessionId);
+    expect(events.find((e) => e.skillName === 'a')?.cwd).toBe('/boot');
+    expect(events.find((e) => e.skillName === 'b')?.cwd).toBe('/live');
+  });
+
+  test('carries details through to the row', () => {
+    const catalog = createSkillCatalog({ roots: makeRoots(makeTmp()), db, sessionId });
+    catalog.recordEvent({
+      action: 'filtered',
+      scope: 'project_local',
+      skillName: 'dup',
+      details: { reason: 'shadowed', shadowedBy: 'project_shared' },
+    });
+    expect(listSkillEventsBySession(db, sessionId)[0]?.details).toEqual({
+      reason: 'shadowed',
+      shadowedBy: 'project_shared',
+    });
+  });
+
+  test('swallows a DB failure instead of throwing (the audit-drift contract)', () => {
+    const catalog = createSkillCatalog({ roots: makeRoots(makeTmp()), db, sessionId });
+    // Drop the table so the INSERT inside recordEvent throws — the
+    // catch must keep the failure off the caller's path.
+    db.query('DROP TABLE skill_events').run();
+    expect(() =>
+      catalog.recordEvent({ action: 'invoked', scope: 'user', skillName: 'x' }),
+    ).not.toThrow();
+  });
+
+  test('recordEvent is a no-op (no throw) when no db is wired', () => {
+    const catalog = createSkillCatalog({ roots: makeRoots(makeTmp()) });
+    expect(() =>
+      catalog.recordEvent({ action: 'invoked', scope: 'user', skillName: 'x' }),
+    ).not.toThrow();
   });
 });

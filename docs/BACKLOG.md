@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — slice 3: audit (skill_events)
+
+The audit storage for the subsystem (spec SKILLS.md §0.7, §14; RETRIEVAL.md §3.4.5). Without it there is no trail to tune a skill's `description` against — surfaced-often-but-never-invoked is the signal §3.4.5 names, and that needs the events recorded.
+
+- **Migration `067-skill-events`** — `skill_events` table mirroring `memory_events`: `id` (UUID), `scope` + `action` CHECK-constrained, `skill_name`, nullable `session_id` (FK `ON DELETE SET NULL`), `cwd`, `created_at`, JSON `details`. `action` ∈ `surfaced` / `invoked` / `filtered` (§0.7). No `source` column — skills have no inferred-vs-explicit provenance axis in v1; `scope` is the only provenance. Partial index on `session_id`, composite `(skill_name, created_at DESC)` — the same index pair as `memory_events`.
+- **`src/storage/repos/skill-events.ts`** — `createSkillEvent` + `listSkillEventsBySession` / `listSkillEventsByName` / `listRecentSkillEvents`, re-exported from `storage/index.ts`. Mirrors the `memory-events` repo.
+- **`createSkillCatalog` gains `db?` / `sessionId?` / `cwd?` + `recordEvent`** — best-effort emit (no-op without a db; a DB failure goes to redacted stderr, never throws — an audit miss must not break a turn or the boot path). The catalog's `read()` stays pure: `invoked` is an explicit `recordEvent` call by the (slice-4) `skill_invoke` tool, NOT an auto-emit on body load — `skill_show` reads a body without invoking and must not emit.
+
+The `surfaced` / `invoked` / `filtered` rows are emitted by later slices: `invoked` by the `skill_invoke` tool (slice 4), `surfaced` / `filtered` at boot once the session exists (slice 5). Slice 3 is the storage + emit API those callers use.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: the repo's hand-rolled `parseDetails` was a sixth copy of a `JSON.parse → object|null` swallow helper — replaced by a new shared `parseJsonObject` in `storage/json-safe.ts` (the established storage-JSON home; the five other pre-existing copies are a tracked cross-cutting cleanup, out of scope here). Test coverage closed on the slice's own guarantees: `recordEvent` swallowing a DB failure (the "audit miss must not break a turn" contract — previously only the no-db early-return was covered), the `cwd` attribution fallback, a corrupt-`details` round-trip, and direct `parseJsonObject` unit tests; the catalog `recordEvent` tests moved onto a describe-local `beforeEach`.
+
+`tests/skills/` + `tests/storage/` green (875), `typecheck` + `lint` clean.
+
+Follow-up, NOT slice 3: a retention sweep (`pruneSkillEvents` + `agent gc` wiring) — `skill_events` grows unbounded until then. It is an audit-subsystem change, tracked separately rather than shipped as a dead function here.
+
 ## [2026-05-21] feat(skills) — slice 2: catalog
 
 `src/skills/catalog.ts` — `createSkillCatalog` scans every scope at construction (the loader's `scanScope`), resolves name conflicts by precedence (`project_local > project_shared > user`, §3.5), and holds the result as an in-memory snapshot. Mirrors the memory registry minus the index file: skills discover by directory glob, so the catalog IS the index.

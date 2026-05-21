@@ -27,6 +27,7 @@ export { createSkillCatalog } from './catalog.ts';
 export type {
   CreateSkillCatalogInput,
   FilteredSkill,
+  RecordSkillEventInput,
   SkillCatalog,
   SkillCatalogEntry,
   SkillFilterReason,
