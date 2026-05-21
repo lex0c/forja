@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — slice 7: seed catalog (agent init installs 20 skills)
+
+The last slice. `agent init` now scaffolds a fifth artifact — the seed skill catalog — so a freshly-initialized project starts with 20 vetted skills.
+
+- The 20 seed skills moved from `docs/spec/skills/` (the architect's draft staging) to `src/cli/init-skills/`, their canonical home — bundled into the binary as `with { type: 'text' }` imports, mirroring `init-playbooks/`. `docs/spec/skills/` is removed: seed content lives in `src/cli/init-*`, never `docs/spec/` (there is no `docs/spec/playbooks/` either). One seed (`profile-hotspot`) shipped a 126-char description — trimmed to 111 so the catalog admits it (the 120-char cap, slice 1).
+- **`src/cli/init-skills/index.ts`** (new) — `CANONICAL_SKILLS`, the bundled array.
+- **`init.ts`** — a `skills` step writes the catalog into `<cwd>/.agent/skills/shared/`. The playbooks + skills copy/skip/force loop is extracted into one `scaffoldAssetDir`; `scaffoldPlaybooks` / `scaffoldSkills` are thin wrappers over it.
+- The new step rippled through the drift-guarded surfaces: `args.ts` (`--only` / `--force` step lists) and `purge.ts` (`INIT_MARKERS` — `.agent/skills/` now gates `agent purge` and is recognized by it). The drift-guard tests pairing those to `DEFAULT_STEPS` caught each omission.
+- `memory/gitignore.ts` — `.agent/.gitignore` now ignores `skills/local/` (spec §2: the local scope is gitignored, like `memory/local/`).
+- Forja's own `.agent/skills/shared/` is populated with the 20 skills — its dev sessions now boot with the catalog surfaced in the prompt.
+
+`tests/cli/init-skills.test.ts` (new) validates every seed parses + `agent init` installs a catalog all 20 resolve into; `init.test.ts` / `purge.test.ts` updated for the fifth step. `typecheck` + `lint` clean; `tests/cli/` + `tests/memory/` green (the one pre-existing `repl.test.ts` banner failure aside).
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort; efficiency confirmed the 20 bundled text assets load only in the `agent init` process, never on a normal `agent` boot — type-only + dynamic-gated import). Fixes folded in: `parseCsvSubset` now derives its `valid: …` hint from the step array it is already passed instead of a hand-maintained string copy — that copy had silently kept the pre-skills list, so `agent init --force=typo` advised a valid set without `skills`; the `--force=` / `--only=` empty-value messages and the `--help` text were corrected the same way. Plus the stale `four`→`five` comments the fifth step left behind.
+
+The skills subsystem (slices 1–7) is feature-complete for v1: storage + scopes, the precedence-resolving catalog, the `skill_events` audit, the `skill_invoke` / `skill_list` / `skill_show` tools, the eager prompt surface, the `/skill` lifecycle command, and the installed seed catalog. `capture` / `import` / the §6.4 decay sweep remain the noted v2 scope.
+
 ## [2026-05-21] feat(skills) — slice 6: /skill slash command
 
 The operator surface for the skills lifecycle (spec SKILLS.md §6) — `list` / `show` / `new` / `promote` / `demote` / `delete`. `capture` (turn a session into a skill) and `import` (the `imported` scope) stay v2.

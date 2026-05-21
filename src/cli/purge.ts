@@ -16,8 +16,8 @@
 //
 // Hard-coded safeties:
 //   1. Init marker required. <repoRoot>/.agent/ must exist AND
-//      contain at least one of the 4 init-canonical artifacts
-//      (permissions.yaml, config.toml, agents/, .gitignore).
+//      contain at least one of the 5 init-canonical artifacts
+//      (permissions.yaml, config.toml, agents/, skills/, .gitignore).
 //      Without this gate, `agent purge` typed in $HOME by accident
 //      would happily destroy any `.agent/` that happens to be
 //      sitting there.
@@ -51,11 +51,12 @@ import { defaultDbPath } from '../storage/index.ts';
 import { insertPurgeEvent } from '../storage/repos/purge-events.ts';
 import { VERSION } from './version.ts';
 
-// The four artifacts `agent init` scaffolds. Their presence (any
+// The five artifacts `agent init` scaffolds. Their presence (any
 // one of them) gates the purge. Order is the same as the init
 // orchestrator's DEFAULT_STEPS so the failure message lists them
-// in a stable order operators can grep for in docs.
-const INIT_MARKERS = ['permissions.yaml', '.gitignore', 'config.toml', 'agents'] as const;
+// in a stable order operators can grep for in docs. `skills` is the
+// project_shared/local skill catalog under `.agent/skills/`.
+const INIT_MARKERS = ['permissions.yaml', '.gitignore', 'config.toml', 'agents', 'skills'] as const;
 
 // Top-level categories rendered in the dry-run output. Order is
 // chosen for operator legibility: configs first (what `init`
@@ -633,7 +634,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
 
   // Gate 3: init marker. Avoids "operator typed `agent purge` in
   // $HOME by accident" and "this .agent/ was planted by another
-  // tool". Permissive: any ONE of the four markers is enough.
+  // tool". Permissive: any ONE of the five markers is enough.
   if (!hasInitMarker(agentDir)) {
     err(
       `forja purge: ${agentDir} has no init markers — run 'agent init' first or remove .agent/ manually if you didn't initialize this project\n`,

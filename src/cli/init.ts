@@ -1,14 +1,16 @@
 // `agent init` handler. Spec: AGENTIC_CLI.md §2.1 (init mode) +
 // §2.1.1 (config.toml schema) + §8 (permission engine bootstrap
 // path) + MEMORY.md §2.5 (gitignore ownership) + PLAYBOOKS.md §12
-// (canonical playbooks distribution).
+// (canonical playbooks distribution) + SKILLS.md §6 (seed skill
+// catalog distribution).
 //
-// Scaffolds the four bootstrap artifacts under .agent/:
+// Scaffolds the five bootstrap artifacts under .agent/:
 //
-//   1. permissions.yaml — strict default-deny baseline (mode tunable)
-//   2. .gitignore       — runtime data exclusion (operator-owned post-creation)
-//   3. config.toml      — schema documentation (every key commented)
-//   4. agents/*.md      — 10 canonical playbooks
+//   1. permissions.yaml   — strict default-deny baseline (mode tunable)
+//   2. .gitignore         — runtime data exclusion (operator-owned post-creation)
+//   3. config.toml        — schema documentation (every key commented)
+//   4. agents/*.md        — 10 canonical playbooks
+//   5. skills/shared/*.md — 20 canonical skills
 //
 // Each step is idempotent — skips files that already exist so a
 // re-run after partial failure is safe and an operator's hand edits
@@ -36,24 +38,27 @@ import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { ensureAgentGitignore } from '../memory/gitignore.ts';
 import { projectPolicyPath } from '../permissions/index.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
+import { projectScopeRoots } from '../skills/index.ts';
 import { projectAgentsDir } from '../subagents/paths.ts';
 import { renderInitConfigTemplate } from './init-config-template.ts';
 import { CANONICAL_PLAYBOOKS, type CanonicalPlaybook } from './init-playbooks/index.ts';
+import { CANONICAL_SKILLS, type CanonicalSkill } from './init-skills/index.ts';
 import { type InitMode, renderInitTemplate } from './init-template.ts';
 
 // Discrete steps in the scaffold. Order in DEFAULT_STEPS reflects
 // the order they run when no `--only` is passed: permissions first
 // (load-bearing — without it everything denies), gitignore next
 // (so subsequent writes don't pollute the operator's git status),
-// config third (depends only on .agent/ existing), playbooks last
-// (largest payload, longest to walk).
-export type InitStep = 'permissions' | 'gitignore' | 'config' | 'playbooks';
+// config third (depends only on .agent/ existing), then the
+// playbooks + skills catalogs (largest payloads, longest to walk).
+export type InitStep = 'permissions' | 'gitignore' | 'config' | 'playbooks' | 'skills';
 
 export const DEFAULT_STEPS: ReadonlyArray<InitStep> = [
   'permissions',
   'gitignore',
   'config',
   'playbooks',
+  'skills',
 ];
 
 // `gitignore` is excluded — it is operator-owned after creation per
@@ -64,17 +69,19 @@ export type ForceEligibleStep = Exclude<InitStep, 'gitignore'>;
 export interface InitOptions {
   cwd: string;
   mode: InitMode;
-  // Subset of steps to run. Defaults to DEFAULT_STEPS (all four).
+  // Subset of steps to run. Defaults to DEFAULT_STEPS (all five).
   only?: ReadonlyArray<InitStep>;
   // `'all'` overwrites every force-eligible step (permissions,
-  // config, playbooks). An array overwrites only the listed steps.
-  // `undefined` means "no overwrites" — every step is
+  // config, playbooks, skills). An array overwrites only the listed
+  // steps. `undefined` means "no overwrites" — every step is
   // skip-if-exists. `.gitignore` is never force-eligible.
   force?: 'all' | ReadonlyArray<ForceEligibleStep>;
   // Test seam — defaults to the bundled CANONICAL_PLAYBOOKS. Tests
   // pass a fixture array to exercise the copy/skip/force matrix
   // without depending on the full canonical set.
   playbookSource?: ReadonlyArray<CanonicalPlaybook>;
+  // Test seam for the skills step — same role as `playbookSource`.
+  skillSource?: ReadonlyArray<CanonicalSkill>;
   // Sink for the success / error messages. Production wires to
   // stdout/stderr; tests inject collectors.
   out: (s: string) => void;
@@ -252,32 +259,43 @@ const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null
   return { wrote: 1, skipped: 0, overwritten: 0 };
 };
 
-const scaffoldPlaybooks = (options: InitOptions, force: boolean): StepResult | null => {
-  const { cwd, out, err } = options;
-  const targetDir = projectAgentsDir(cwd);
+// Shared copy/skip/force loop for the directory-of-`.md`-assets
+// steps (playbooks, skills). Each entry is written verbatim into
+// `targetDir`; an existing file is skipped unless `force`.
+// `forceLabel` is the step name used in the skip hint
+// (`--force=<label>`).
+const scaffoldAssetDir = (
+  options: InitOptions,
+  force: boolean,
+  asset: {
+    targetDir: string;
+    source: ReadonlyArray<{ filename: string; content: string }>;
+    forceLabel: string;
+  },
+): StepResult | null => {
+  const { out, err } = options;
   try {
-    mkdirSync(targetDir, { recursive: true });
+    mkdirSync(asset.targetDir, { recursive: true });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    err(`forja: failed to create ${targetDir}: ${msg}\n`);
+    err(`forja: failed to create ${asset.targetDir}: ${msg}\n`);
     return null;
   }
-  const source = options.playbookSource ?? CANONICAL_PLAYBOOKS;
   let wrote = 0;
   let skipped = 0;
   let overwritten = 0;
-  for (const playbook of source) {
-    const target = join(targetDir, playbook.filename);
+  for (const file of asset.source) {
+    const target = join(asset.targetDir, file.filename);
     const exists = existsSync(target);
     if (exists && !force) {
       skipped++;
       out(
-        `forja: skip ${target} (already exists; use --force or --force=playbooks to overwrite)\n`,
+        `forja: skip ${target} (already exists; use --force or --force=${asset.forceLabel} to overwrite)\n`,
       );
       continue;
     }
     try {
-      atomicWrite(target, playbook.content);
+      atomicWrite(target, file.content);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       err(`forja: failed to write ${target}: ${msg}\n`);
@@ -294,6 +312,22 @@ const scaffoldPlaybooks = (options: InitOptions, force: boolean): StepResult | n
   return { wrote, skipped, overwritten };
 };
 
+const scaffoldPlaybooks = (options: InitOptions, force: boolean): StepResult | null =>
+  scaffoldAssetDir(options, force, {
+    targetDir: projectAgentsDir(options.cwd),
+    source: options.playbookSource ?? CANONICAL_PLAYBOOKS,
+    forceLabel: 'playbooks',
+  });
+
+// Skills land in the project_shared scope (`.agent/skills/shared/`);
+// the catalog scan picks them up at the next REPL boot.
+const scaffoldSkills = (options: InitOptions, force: boolean): StepResult | null =>
+  scaffoldAssetDir(options, force, {
+    targetDir: projectScopeRoots(options.cwd).shared,
+    source: options.skillSource ?? CANONICAL_SKILLS,
+    forceLabel: 'skills',
+  });
+
 export const runInit = (options: InitOptions): number => {
   const steps = options.only ?? DEFAULT_STEPS;
   const totals: StepResult = { wrote: 0, skipped: 0, overwritten: 0 };
@@ -305,8 +339,10 @@ export const runInit = (options: InitOptions): number => {
       result = scaffoldGitignore(options);
     } else if (step === 'config') {
       result = scaffoldConfig(options, forcedFor(options.force, 'config'));
-    } else {
+    } else if (step === 'playbooks') {
       result = scaffoldPlaybooks(options, forcedFor(options.force, 'playbooks'));
+    } else {
+      result = scaffoldSkills(options, forcedFor(options.force, 'skills'));
     }
     if (result === null) {
       // Exit early with the per-step output already printed.

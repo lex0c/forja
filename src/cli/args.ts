@@ -403,6 +403,7 @@ const VALID_INIT_STEPS: ReadonlyArray<InitStep> = [
   'gitignore',
   'config',
   'playbooks',
+  'skills',
 ];
 
 // Steps eligible for `--force` / `--force=csv`. `gitignore` is
@@ -413,14 +414,17 @@ const FORCE_ELIGIBLE_STEPS: ReadonlyArray<ForceEligibleStep> = [
   'permissions',
   'config',
   'playbooks',
+  'skills',
 ];
 
 const parseCsvSubset = <T extends string>(
   csv: string,
   validValues: ReadonlyArray<T>,
   flagName: string,
-  validList: string,
 ): { ok: true; subset: T[] } | { ok: false; message: string } => {
+  // Derive the "valid: …" hint from validValues so it can never
+  // drift from the actual accepted set.
+  const validList = validValues.join(', ');
   const parts = csv.split(',');
   const seen = new Set<T>();
   const subset: T[] = [];
@@ -479,8 +483,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       if (value.length === 0) {
         return {
           ok: false,
-          message:
-            '--force= requires a value (csv of permissions,config,playbooks) or use --force alone for all',
+          message: `--force= requires a value (csv of ${FORCE_ELIGIBLE_STEPS.join(',')}) or use --force alone for all`,
         };
       }
       // gitignore explicitly rejected — operator-owned after
@@ -493,12 +496,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
             '--force=gitignore is not allowed: .gitignore is operator-owned after creation (MEMORY.md §2.5). To regenerate, delete the file and re-run init.',
         };
       }
-      const parsed = parseCsvSubset(
-        value,
-        FORCE_ELIGIBLE_STEPS,
-        '--force',
-        'permissions, config, playbooks',
-      );
+      const parsed = parseCsvSubset(value, FORCE_ELIGIBLE_STEPS, '--force');
       if (!parsed.ok) return { ok: false, message: parsed.message };
       force = parsed.subset;
       i += 1;
@@ -509,15 +507,10 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       if (value.length === 0) {
         return {
           ok: false,
-          message: '--only= requires a value (csv of permissions,gitignore,config,playbooks)',
+          message: `--only= requires a value (csv of ${VALID_INIT_STEPS.join(',')})`,
         };
       }
-      const parsed = parseCsvSubset(
-        value,
-        VALID_INIT_STEPS,
-        '--only',
-        'permissions, gitignore, config, playbooks',
-      );
+      const parsed = parseCsvSubset(value, VALID_INIT_STEPS, '--only');
       if (!parsed.ok) return { ok: false, message: parsed.message };
       only = parsed.subset;
       i += 1;
@@ -2092,11 +2085,11 @@ export const usage = (): string =>
     '',
     'Subcommands:',
     '  init                   Scaffold the .agent/ bootstrap bundle:',
-    '                           permissions.yaml, .gitignore, config.toml, agents/*.md',
+    '                           permissions.yaml, .gitignore, config.toml, agents/*.md, skills/shared/*.md',
     '                         Each step is idempotent (existing files skipped).',
-    '                         --only=csv    subset to run (permissions,gitignore,config,playbooks)',
+    '                         --only=csv    subset to run (permissions,gitignore,config,playbooks,skills)',
     '                         --force       overwrite all force-eligible steps',
-    '                         --force=csv   overwrite subset (permissions,config,playbooks);',
+    '                         --force=csv   overwrite subset (permissions,config,playbooks,skills);',
     '                                       .gitignore is operator-owned (MEMORY.md §2.5)',
     '                         --mode        permissions.yaml posture (strict|acceptEdits)',
     '',

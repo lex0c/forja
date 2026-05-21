@@ -11,10 +11,10 @@ import { dirname, join } from 'node:path';
 //
 // Default contents are intentionally minimal: the rules cover
 // runtime data (sessions.db, traces, checkpoints), the
-// per-developer memory subtree (`memory/local/`), and generic
-// log noise. Anything else (dotenvs, build artifacts) belongs in
-// the project's top-level `.gitignore` because it isn't agent
-// state.
+// per-developer memory + skills subtrees (`memory/local/` and
+// `skills/local/`), and generic log noise. Anything else (dotenvs,
+// build artifacts) belongs in the project's top-level `.gitignore`
+// because it isn't agent state.
 
 export const DEFAULT_AGENT_GITIGNORE = `# .agent/.gitignore (auto-generated; safe to edit)
 sessions.db
@@ -22,6 +22,7 @@ sessions.db-*
 traces/
 checkpoints/
 memory/local/
+skills/local/
 *.log
 `;
 

@@ -1,6 +1,6 @@
 // `agent purge` handler tests. Pin the operator-facing contracts:
 //   - Init-marker gate: refuses purge when .agent/ has none of the
-//     four canonical artifacts; accepts when any one is present.
+//     five canonical artifacts; accepts when any one is present.
 //   - Symlink defense: refuses when .agent/ is a symlink, never
 //     follows symlink entries beneath it.
 //   - Dry-run vs --force separation: dry-run never mutates FS or DB.
@@ -100,7 +100,7 @@ describe('runPurge — init-marker gate', () => {
 
   test('refuses when .agent/ exists but has no init markers', async () => {
     // Operator-planted .agent/ with content that doesn't match any
-    // of the four canonical artifacts.
+    // of the five canonical artifacts.
     writeFile('.agent/random.txt', 'not from init\n');
     const code = await runPurge({
       cwd,
@@ -114,7 +114,7 @@ describe('runPurge — init-marker gate', () => {
     expect(code).toBe(1);
     const stderr = errBuf.join('');
     expect(stderr).toContain('no init markers');
-    // Lists the four markers it looked for so the operator can
+    // Lists the five markers it looked for so the operator can
     // diagnose without grepping source.
     for (const m of INIT_MARKERS) {
       expect(stderr).toContain(m);
@@ -770,7 +770,7 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
   // pairs the two so the failure surfaces in CI, not in operator
   // surprise.
   // Typed against the readonly INIT_MARKERS tuple so the Record's
-  // VALUE union is exactly the four literal filenames purge knows.
+  // VALUE union is exactly the five literal filenames purge knows.
   // A wider `string` here would let a typo ('permission.yaml')
   // pass the type check and only fail at runtime — defeats the
   // drift-guard intent.
@@ -779,6 +779,7 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
     gitignore: '.gitignore',
     config: 'config.toml',
     playbooks: 'agents',
+    skills: 'skills',
   };
 
   test('every init step has a marker recognized by purge', () => {

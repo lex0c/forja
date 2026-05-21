@@ -1,6 +1,6 @@
 ---
 name:        profile-hotspot
-description: Find and confirm a performance hotspot by measurement — define target, capture a profile, read the flamegraph, verify the fix.
+description: Find and confirm a performance hotspot by measurement — capture a profile, read the flamegraph, verify the fix.
 version:     1
 trigger_keywords: [profiling, performance, slow, latency, flamegraph, perf, hotspot, optimization]
 tools:       [bash]
