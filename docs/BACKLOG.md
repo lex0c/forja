@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-21] feat(skills) — slice 6: /skill slash command
+
+The operator surface for the skills lifecycle (spec SKILLS.md §6) — `list` / `show` / `new` / `promote` / `demote` / `delete`. `capture` (turn a session into a skill) and `import` (the `imported` scope) stay v2.
+
+- **`src/skills/lifecycle.ts`** (new) — `createSkill` / `moveSkill` / `deleteSkill`: the disk mutations, each "measure twice" (validate the name, confirm the scope root resolves, probe the target before writing) and returning a discriminated `SkillLifecycleResult` rather than throwing. Lives in the subsystem so the file ops are testable without the REPL. `moveSkill` copy-then-deletes rather than `rename` — the project and user scopes can sit on different filesystems, where `rename` fails with EXDEV; it also refuses to move a malformed source.
+- **`src/cli/slash/commands/skill.ts`** (new) — the `/skill` command, a thin dispatch + presentation layer over the lifecycle module and the catalog. `new` scaffolds into `project_local` (the lowest scope; `promote` moves a vetted one up). After any mutation it `reload()`s the catalog so the live `skill_list` / `skill_invoke` tools see the change within the session.
+- Destructive ops gate on an explicit `--confirm` token, not a modal: `promote user` crosses into the host-global scope and `delete` removes a file, so each first prints what it will do and asks for a re-run. The within-project moves (`promote shared`, `demote local`) are reversible and just report. A new modal flavor would have dragged modal-manager / state / renderer into the slice for no v1 gain — a re-run token is a complete confirmation, and the UX iterates in code (spec PR after it stabilizes).
+
+`tests/skills/lifecycle.test.ts` + `tests/cli/slash/skill.test.ts` (new); `dispatch.test.ts`'s builtin-registry assertions updated for the 18th command.
+
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort; efficiency cleared the `existsSync` TOCTOU checks and the post-mutation `catalog.reload()` as correct for an operator-paced surface, and confirmed `moveSkill`'s validate-then-copy double read is deliberate). Fixes folded in: `/skill delete` of a name that shadows a same-name skill in a lower scope now reports that the shadowed copy is live again (the silent surprise §6.3 argues against); `--confirm` is split from the positionals so it works in any position — a leading `--confirm` previously hijacked the name slot; `applyMove` failures carry the `/skill promote:` / `/skill demote:` prefix the handlers' own errors use; `resolvePath` got a dedicated `ResolvedPath` type so its "path resolved" `ok` does not blur with the lifecycle result's "op done" `ok`. Plus coverage for `scope_unavailable`, a symlinked-source move refusal, the `/skill list` filtered section, and the `--confirm` prompt content.
+
+`typecheck` + `lint` clean; `tests/skills/` + `tests/cli/` green (the one pre-existing `repl.test.ts` banner failure aside).
+
 ## [2026-05-21] feat(skills) — slice 5: surface (the subsystem goes live)
 
 The wiring slice — after it the skills subsystem is end-to-end live: the catalog is built at boot, surfaced in the system prompt, the three tools are registered, and surfaced / invoked / filtered are all audited.
