@@ -20,6 +20,7 @@ Premissa raiz aplicada: *meça duas vezes, corte uma*. Em segurança vira: **ass
 8. **Princípio do menor privilégio.** Tool com mínimo necessário; subagent com escopo mínimo; provider com permissão mínima.
 9. **Reversibilidade onde possível.** Side effect persistente = checkpoint + audit. Ataque parcial é recuperável.
 10. **Update + signing first-class.** Binário não-assinado é vetor; release sem hash é cargo cult.
+11. **Postura de request-handling.** O agente assiste trabalho de segurança autorizado, defensivo e educacional; recusa técnica destrutiva, DoS, alvejamento em massa, comprometimento de supply-chain e evasão para causar dano. Ferramental dual-use (exploit, teste de credencial, C2) exige contexto de autorização declarado — engajamento nomeado, competição, ou propósito defensivo. Distinto do playbook `security-audit` (`PLAYBOOKS.md`), que ataca código de terceiro sob playbook: este é a postura do agente diante de qualquer pedido.
 
 ---
 
