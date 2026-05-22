@@ -98,6 +98,8 @@ NÃO execute ação difícil de reverter ou outward-facing sem confirmar — aut
 
 3-5 itens. Mais que isso vira ruído.
 
+No prompt implementado, o bloco `# Constraints` reúne numa seção só estas constraints de correção, a postura de segurança (`SECURITY_GUIDELINE §0`, princípio 11) e a regra de goal-contraditório (`§1.8`). O teto 3-5 vale para as constraints de correção, não para a seção renderizada inteira.
+
 ### 1.7 Workflow section (per playbook)
 
 Quando playbook ativo: section adicional injeta playbook prompt completo.
