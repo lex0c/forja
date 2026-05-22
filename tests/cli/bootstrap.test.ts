@@ -437,18 +437,20 @@ Body.`,
     db.close();
   });
 
-  test('layered system prompt: env → discipline → response → parallel → memory', async () => {
+  test('layered system prompt: identity → env → discipline → response → constraints → parallel → memory', async () => {
     // Layered prompt ordering (bootstrap.ts comment). The
     // outermost layer (which lands FIRST in the rendered string)
-    // gives the model situational anchor; each inner layer
-    // narrows toward task-specific framing. A fresh resume
-    // reading the prompt sees:
-    //   1. # Environment — where am I, what date, git context.
-    //   2. # Task discipline — behavioral norms.
-    //   3. # Response surface — render-target rules.
-    //   4. # Parallelism — concurrency mechanics.
-    //   5. (caller / playbook hint / plan-mode wrap when applicable)
-    //   6. # Memory — index of cross-session memories.
+    // states the model's role; each inner layer narrows toward
+    // task-specific framing. A fresh resume reading the prompt
+    // sees:
+    //   1. identity / role marker — what Forja is (CONTEXT_TUNING §1.2).
+    //   2. # Environment — where am I, what date, git context.
+    //   3. # Task discipline — behavioral norms.
+    //   4. # Response surface — render-target rules.
+    //   5. # Constraints — global negative constraints (§1.6).
+    //   6. # Parallelism — concurrency mechanics.
+    //   7. (caller / playbook hint / plan-mode wrap when applicable)
+    //   8. # Memory — index of cross-session memories.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
@@ -461,16 +463,20 @@ Body.`,
       userPolicyPath: null,
     });
     expect(config.systemPrompt).toBeDefined();
-    expect(config.systemPrompt?.startsWith('# Environment')).toBe(true);
+    expect(config.systemPrompt?.startsWith('You are the Forja agent')).toBe(true);
+    const identityIdx = config.systemPrompt?.indexOf('You are the Forja agent') ?? -1;
     const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
     const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
+    const constraintsIdx = config.systemPrompt?.indexOf('# Constraints') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const memoryIdx = config.systemPrompt?.indexOf('# Memory') ?? -1;
-    expect(envIdx).toBe(0);
+    expect(identityIdx).toBe(0);
+    expect(envIdx).toBeGreaterThan(identityIdx);
     expect(disciplineIdx).toBeGreaterThan(envIdx);
     expect(responseIdx).toBeGreaterThan(disciplineIdx);
-    expect(parallelIdx).toBeGreaterThan(responseIdx);
+    expect(constraintsIdx).toBeGreaterThan(responseIdx);
+    expect(parallelIdx).toBeGreaterThan(constraintsIdx);
     expect(memoryIdx).toBeGreaterThan(parallelIdx);
     db.close();
   });
@@ -587,12 +593,12 @@ Body.`,
     db.close();
   });
 
-  test('caller systemPrompt is layered after environment / discipline / response-format / parallelism hints without plan', async () => {
+  test('caller systemPrompt is layered after identity / environment / discipline / response-format / constraints / parallelism without plan', async () => {
     // Caller prompt sits INNERMOST in the layered system prompt.
-    // The outer wrappers (environment, task discipline,
-    // response-format, parallelism) all land before it; the
-    // caller's framing comes last so the operator's specific
-    // instructions read against the established context.
+    // The outer wrappers (identity, environment, task discipline,
+    // response-format, constraints, parallelism) all land before
+    // it; the caller's framing comes last so the operator's
+    // specific instructions read against the established context.
     const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -603,20 +609,25 @@ Body.`,
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt?.startsWith('# Environment')).toBe(true);
+    expect(config.systemPrompt?.startsWith('You are the Forja agent')).toBe(true);
     expect(config.systemPrompt).toContain('# Task discipline');
     expect(config.systemPrompt).toContain('# Response surface');
+    expect(config.systemPrompt).toContain('# Constraints');
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('You are a senior engineer.');
+    const identityIdx = config.systemPrompt?.indexOf('You are the Forja agent') ?? -1;
     const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
     const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
+    const constraintsIdx = config.systemPrompt?.indexOf('# Constraints') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const callerIdx = config.systemPrompt?.indexOf('You are a senior engineer.') ?? -1;
-    expect(envIdx).toBe(0);
+    expect(identityIdx).toBe(0);
+    expect(envIdx).toBeGreaterThan(identityIdx);
     expect(disciplineIdx).toBeGreaterThan(envIdx);
     expect(responseIdx).toBeGreaterThan(disciplineIdx);
-    expect(parallelIdx).toBeGreaterThan(responseIdx);
+    expect(constraintsIdx).toBeGreaterThan(responseIdx);
+    expect(parallelIdx).toBeGreaterThan(constraintsIdx);
     expect(callerIdx).toBeGreaterThan(parallelIdx);
     db.close();
   });

@@ -72,8 +72,10 @@ import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
+import { composeWithConstraints } from './constraints-prompt.ts';
 import { composeWithEnvironment } from './environment-prompt.ts';
 import { probeGitContext } from './git-context.ts';
+import { composeWithIdentity } from './identity-prompt.ts';
 import { localIsoDate } from './local-date.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
@@ -719,53 +721,62 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // receives, so we wrap from the inside out — the LAST
     // wrapper applied lands FIRST in the final string.
     //
-    //   1. Caller's user prompt (input.systemPrompt) — most
-    //      specific, the operator's own framing.
-    //   2. Plan mode prompt — operating-mode framing for
-    //      `--plan` invocations only.
-    //   3. Playbook discovery hint — table of available
-    //      subagents + auto-delegation criteria (PLAYBOOKS.md
-    //      §1.4). Sits between parallel and plan/user because
-    //      the table assumes the model already knows the
-    //      task_async family from the parallel layer.
-    //   4. Tool ergonomics — high-payoff usage rules distilled
-    //      from `TOOL_ERGONOMICS.md` (slice before reading,
-    //      filter before stdout, scope conservatively, prefer
-    //      dedicated tools, do not re-read in session, diagnose
-    //      before retry). Sits BETWEEN parallelism and the
-    //      playbook hint because it teaches "when you make
-    //      tool calls, MAKE THEM WELL" — paired with the
-    //      "you can make several at once" framing right above.
-    //   5. Parallelism hint — universal background that
-    //      surfaces the harness's concurrency affordances
-    //      (multi-tool turns, task_async family) so the
-    //      capability isn't dormant.
-    //   6. Response-format hint — render-target rules
-    //      (CommonMark in monospace ANSI, file:line refs,
-    //      no-emoji default, structural padding bans) per
-    //      ANTI_PATTERNS.md §1.3.
-    //   7. Task discipline — behavioral norms (prefer editing,
-    //      no premature abstractions, WHY-only comments, no
-    //      half-finished work). Most-general operational
-    //      framing; sits above response-format because it
-    //      governs WHAT the model writes, while response-format
-    //      governs HOW it formats output.
-    //   8. Environment block — situational anchor: cwd, OS,
-    //      model, today's date, git context. Sits OUTERMOST so
-    //      it lands first in the prompt — the model reads
-    //      "where am I" before reading any task instructions.
-    //      Date in this section invalidates cache once per
-    //      UTC day (acceptable per CONTEXT_TUNING §3.2; the
-    //      alternative — placeholder + post-cache substitution
-    //      — is not supported by Anthropic's API).
+    //    1. Caller's user prompt (input.systemPrompt) — most
+    //       specific, the operator's own framing.
+    //    2. Plan mode prompt — operating-mode framing for
+    //       `--plan` invocations only.
+    //    3. Playbook discovery hint — table of available
+    //       subagents + auto-delegation criteria (PLAYBOOKS.md
+    //       §1.4). Sits between parallel and plan/user because
+    //       the table assumes the model already knows the
+    //       task_async family from the parallel layer.
+    //    4. Tool ergonomics — high-payoff usage rules distilled
+    //       from `TOOL_ERGONOMICS.md` (slice before reading,
+    //       filter before stdout, scope conservatively, prefer
+    //       dedicated tools, do not re-read in session, diagnose
+    //       before retry). Sits BETWEEN parallelism and the
+    //       playbook hint because it teaches "when you make
+    //       tool calls, MAKE THEM WELL" — paired with the
+    //       "you can make several at once" framing right above.
+    //    5. Parallelism hint — universal background that
+    //       surfaces the harness's concurrency affordances
+    //       (multi-tool turns, task_async family) so the
+    //       capability isn't dormant.
+    //    6. Constraints block — the canonical "constraints
+    //       negativas globais" section (CONTEXT_TUNING §1.1 /
+    //       §1.6): the correctness floor (no inventing symbols,
+    //       evidence over assumption, no silent semantic change)
+    //       plus the security posture, the hard-to-reverse
+    //       confirm rule, and the contradictory-goal rule.
+    //    7. Response-format hint — render-target rules
+    //       (CommonMark in monospace ANSI, file:line refs,
+    //       no-emoji default, structural padding bans) per
+    //       ANTI_PATTERNS.md §1.3.
+    //    8. Task discipline — behavioral norms (prefer editing,
+    //       no premature abstractions, WHY-only comments, no
+    //       half-finished work). Most-general operational
+    //       framing; sits above response-format because it
+    //       governs WHAT the model writes, while response-format
+    //       governs HOW it formats output.
+    //    9. Environment block — situational anchor: cwd, OS,
+    //       model, today's date, git context. Date in this
+    //       section invalidates cache once per UTC day
+    //       (acceptable per CONTEXT_TUNING §3.2; the
+    //       alternative — placeholder + post-cache substitution
+    //       — is not supported by Anthropic's API).
+    //   10. Identity / role marker — sits OUTERMOST so it lands
+    //       first (CONTEXT_TUNING §1.1: identity is the first
+    //       canonical [system] section). Fully static, unlike
+    //       the environment block's date below it.
     const baseDownstream =
       input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
     const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
     const withErgonomics = composeWithToolErgonomics(withPlaybook);
     const withParallel = composeWithParallelHint(withErgonomics);
-    const withResponseFormat = composeWithResponseFormat(withParallel);
+    const withConstraints = composeWithConstraints(withParallel);
+    const withResponseFormat = composeWithResponseFormat(withConstraints);
     const withDiscipline = composeWithTaskDiscipline(withResponseFormat);
-    resolvedSystemPrompt = composeWithEnvironment(withDiscipline, {
+    const withEnvironment = composeWithEnvironment(withDiscipline, {
       cwd,
       platform: process.platform,
       modelId: provider.id,
@@ -789,6 +800,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // git sub-block entirely.
       git: probeGitContext(cwd),
     });
+    // Identity / role marker (CONTEXT_TUNING §1.2) — outermost
+    // layer, prepended last so it lands FIRST in the final
+    // string, ahead of the environment block. Fully static, so
+    // it sits in the most-stable region of cache breakpoint #1.
+    resolvedSystemPrompt = composeWithIdentity(withEnvironment);
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory
