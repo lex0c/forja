@@ -26,6 +26,11 @@ import {
   updateSubagentHeartbeat,
 } from '../storage/index.ts';
 import {
+  hashPromptContent,
+  recordPromptVersion,
+  resolveAuthor,
+} from '../storage/repos/prompt-versions.ts';
+import {
   loadSubagents,
   validateOutput,
   validateSubagentSet,
@@ -927,6 +932,42 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       eagerExposures = memorySection.eagerLoaded;
     }
 
+    // Register the subagent's assembled prompt in `prompt_versions`
+    // (AUDIT.md §1.3.3) as kind 'playbook'. Idempotent by hash so a
+    // re-run of the same playbook with the same composed prompt
+    // dedupes to the original row. The hash flows into
+    // `HarnessConfig.systemPromptHash` below; the child's harness
+    // loop then stamps it on every `messages.prompt_hash` and
+    // `tool_calls.prompt_hash` row exactly as the principal does.
+    // The seed `messages` row written by the parent in
+    // `subagents/runtime.ts` keeps `prompt_hash = NULL` — a known
+    // gap (parent doesn't know the child's prompt yet); subsequent
+    // turns within the child are correctly stamped.
+    let systemPromptHash: string | undefined;
+    if (resolvedSystemPrompt.length > 0) {
+      systemPromptHash = hashPromptContent(resolvedSystemPrompt);
+      recordPromptVersion(db, {
+        hash: systemPromptHash,
+        kind: 'playbook',
+        name: `playbook.${audit.name}`,
+        content: resolvedSystemPrompt,
+        author: resolveAuthor(),
+      });
+    } else {
+      // Empty composed prompt should not happen in production —
+      // `composeWithParallelHint` always returns at least the hint
+      // string — but if a future refactor introduces a path that
+      // yields an empty `resolvedSystemPrompt`, silently skipping
+      // `recordPromptVersion` would make every message and
+      // tool_call for this subagent run write `prompt_hash = NULL`,
+      // dropping it from the §1.3.5 join. Surface the gap loudly
+      // so an operator sees it on stderr rather than discovering it
+      // later from the audit's missing rows.
+      errSink(
+        `forja: subagent-child: empty composed prompt for playbook '${audit.name}'; skipping prompt_versions registration (messages and tool_calls will write prompt_hash=NULL for this run)\n`,
+      );
+    }
+
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Three paths,
     // discriminated by `audit.hooksSnapshot` (nullable per
     // migration 020):
@@ -978,6 +1019,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       db,
       cwd: session.cwd,
       systemPrompt: resolvedSystemPrompt,
+      ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
       userPrompt,
       preassignedSessionId: opts.sessionId,
       // Carry through budget caps from the audit row. Sampling's

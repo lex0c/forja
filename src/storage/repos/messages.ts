@@ -15,6 +15,11 @@ export interface Message {
   cacheCreationTokens: number | null;
   costUsd: number | null;
   createdAt: number;
+  // SHA256 hex of the system prompt active when this message was
+  // persisted — soft FK into `prompt_versions.hash` (AUDIT §1.3.2).
+  // Null for rows persisted before migration 068 and for paths not
+  // yet wired (subagent seed in `subagents/runtime.ts`).
+  promptHash: string | null;
 }
 
 interface MessageRow {
@@ -29,6 +34,7 @@ interface MessageRow {
   cache_creation_tokens: number | null;
   cost_usd: number | null;
   created_at: number;
+  prompt_hash: string | null;
 }
 
 const fromRow = (row: MessageRow): Message => ({
@@ -43,6 +49,7 @@ const fromRow = (row: MessageRow): Message => ({
   cacheCreationTokens: row.cache_creation_tokens,
   costUsd: row.cost_usd,
   createdAt: row.created_at,
+  promptHash: row.prompt_hash,
 });
 
 export interface AppendMessageInput {
@@ -57,6 +64,12 @@ export interface AppendMessageInput {
   cacheCreationTokens?: number | null;
   costUsd?: number | null;
   createdAt?: number;
+  // SHA256 hex of the system prompt active for this message — soft FK
+  // into `prompt_versions.hash` (AUDIT §1.3.2). Caller (the harness
+  // loop) sources it from `HarnessConfig.systemPromptHash`. Nullable
+  // because messages persisted before migration 068 carry no hash and
+  // because subagent paths haven't been wired yet.
+  promptHash?: string | null;
 }
 
 export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
@@ -96,12 +109,13 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
   // breaking resume's tool_use ↔ tool_result pairing. The subquery
   // sees committed state at INSERT time; concurrent writers are
   // serialized by SQLite, so MAX(seq) is always current.
+  const promptHash = input.promptHash ?? null;
   db.query(
     `INSERT INTO messages
      (id, session_id, parent_id, role, content,
-      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, seq)
+      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, seq)
      VALUES (
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
        (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?)
      )`,
   ).run(
@@ -116,6 +130,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     cacheCreationTokens,
     costUsd,
     createdAt,
+    promptHash,
     input.sessionId,
   );
   return {
@@ -130,6 +145,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     cacheCreationTokens,
     costUsd,
     createdAt,
+    promptHash,
   };
 };
 
@@ -137,7 +153,7 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
@@ -154,7 +170,7 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash
        FROM messages
        WHERE session_id = ?
        ORDER BY seq ASC`,
@@ -191,7 +207,7 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash
        FROM (
          SELECT * FROM messages
          WHERE session_id = ?

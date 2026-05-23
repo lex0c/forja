@@ -1,0 +1,85 @@
+# Eval — regression corpus
+#
+# Runs `evals/regression/` against a real provider. **Opt-in only**
+# (manual `workflow_dispatch` or PR labeled `run-eval`) — provider
+# calls cost real money and the corpus is dozens of cases; per-PR
+# auto-run is not justifiable today. The corpus exists to gate
+# system-prompt changes per `CONTEXT_TUNING §1.8.5` step 2; this
+# workflow is the CI hook.
+#
+# The runner's own exit code is the gate: `src/evals/cli.ts`
+# returns 1 when any case fails, 0 when all pass — GitHub surfaces
+# the failure on the PR check.
+#
+# Baseline-comparison (slice C.2) and drift detection — "warn when
+# `prompt_versions` gained a new hash without a recent eval"
+# (slice C.3) — are not in this workflow yet. Today's gate is
+# binary: every case in the corpus must pass at HEAD's prompt.
+
+name: Eval — regression corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Provider/model to evaluate against (e.g. anthropic/claude-sonnet-4-6)'
+        required: false
+        default: 'anthropic/claude-sonnet-4-6'
+  pull_request:
+    # Only fires when a PR receives the `run-eval` label — the
+    # `if` on the job filters everything else out.
+    types: [labeled]
+
+concurrency:
+  group: eval-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    # Skip the labeled-PR branch unless the trigger label is
+    # `run-eval`; workflow_dispatch always runs.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-eval'
+    name: regression corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Provider key, supplied as a repo / org secret. Absence is a
+      # hard fail — the runner cannot proceed without it, and CI
+      # silently passing while no provider was reached would defeat
+      # the gate.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install ripgrep
+        # The `grep` tool wraps `rg`; some eval cases depend on it.
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Verify provider secret is present
+        # Fork PRs cannot read repo secrets (GH security model);
+        # absent / misconfigured secrets would otherwise surface as
+        # ~50 per-case 401s instead of an actionable "secret missing"
+        # diagnostic. Fail loudly at the workflow level instead.
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is unavailable (fork PR? secret not configured on this repo?)"
+            exit 1
+          fi
+
+      - name: Run regression eval
+        # `MODEL` is assigned via `env:` so the value is read as a
+        # shell variable, not interpolated raw into the command line
+        # — defends against an operator (workflow_dispatch) supplying
+        # a model string with shell metacharacters. The fallback
+        # string handles the labeled-PR path (no `inputs`).
+        env:
+          MODEL: ${{ inputs.model || 'anthropic/claude-sonnet-4-6' }}
+        run: bun run eval:regression -- --model "$MODEL"

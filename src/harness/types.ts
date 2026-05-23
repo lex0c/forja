@@ -683,6 +683,14 @@ export interface HarnessConfig {
   bgLogDir?: string;
   cwd: string;
   systemPrompt?: string;
+  // SHA256 hex of the assembled system prompt, recorded in
+  // `prompt_versions` (AUDIT.md §1.3). The loop stamps this on every
+  // `messages.prompt_hash` and `tool_calls.prompt_hash` row so the
+  // §1.3.5 join queries can trace any audit row back to the exact
+  // prompt that produced it. Bootstrap populates from
+  // `recordPromptVersion`; absent only in test fixtures that bypass
+  // composition.
+  systemPromptHash?: string;
   userPrompt: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;

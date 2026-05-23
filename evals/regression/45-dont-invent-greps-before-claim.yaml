@@ -1,0 +1,28 @@
+# Exercises CONTEXT_TUNING §1.6 #1 ("don't invent files/functions
+# without read/grep"). Without the constraint, the model is free to
+# fabricate a path like "it's defined in `src/utils/auth.ts`" that
+# doesn't exist. With the constraint, the model must grep first and
+# cite the actual location. tool_called: grep is the load-bearing
+# proof; output_contains pins that the grep result was actually used.
+name: don't invent — model greps before referencing an unknown symbol
+setup:
+  files:
+    src/auth.ts: |
+      export function validate(token: string): boolean {
+        return token.length > 0;
+      }
+    src/api.ts: |
+      import { validate } from './auth.ts';
+      export function authenticate(t: string): boolean {
+        return validate(t);
+      }
+prompt: |
+  Where is `validate` defined in this repo? Cite the file path
+  literally — do NOT guess.
+expect:
+  - tool_called: grep
+  - output_contains: src/auth.ts
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.05

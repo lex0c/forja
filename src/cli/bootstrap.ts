@@ -68,6 +68,11 @@ import {
   MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
   pruneVerifyAttempts,
 } from '../storage/repos/memory-verify-attempts.ts';
+import {
+  hashPromptContent,
+  recordPromptVersion,
+  resolveAuthor,
+} from '../storage/repos/prompt-versions.ts';
 import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
@@ -216,6 +221,14 @@ export interface BootstrapResult {
   config: HarnessConfig;
   db: DB;
   modelId: string;
+  // SHA256 hex of the assembled system prompt, recorded in
+  // `prompt_versions` (AUDIT.md §1.3). Undefined only when no
+  // prompt was assembled (test fixtures bypassing composition);
+  // the production path always sets it. Harness consumers stamp
+  // this on every `messages.prompt_hash` / `tool_calls.prompt_hash`
+  // row so the §1.3.5 join queries can trace any audit row back to
+  // the exact prompt that produced it.
+  systemPromptHash?: string;
   // Which layers contributed to the effective policy. `'default'`
   // means no layer file was found anywhere — engine falls back to
   // strict + empty rules.
@@ -693,6 +706,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
 
   let resolvedSystemPrompt: string | undefined;
+  let systemPromptHash: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let skillCatalog: ReturnType<typeof createSkillCatalog>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
@@ -1188,6 +1202,36 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       assembleSkillCatalogSection(skillCatalog),
     );
 
+    // Register the assembled system prompt in `prompt_versions`
+    // (AUDIT.md §1.3.3): content-addressed, idempotent by hash so a
+    // same-content reboot dedupes to the original row. The hash is
+    // exposed on BootstrapResult so the harness can stamp
+    // `messages.prompt_hash` / `tool_calls.prompt_hash` (§1.3.2
+    // join surface). Skipped only when no prompt was assembled —
+    // impossible in the production path now that identity is the
+    // outermost layer, but the guard keeps test fixtures that
+    // bypass composition safe.
+    if (resolvedSystemPrompt !== undefined) {
+      const hash = hashPromptContent(resolvedSystemPrompt);
+      recordPromptVersion(db, {
+        hash,
+        // `name` is hardcoded to the autonomous profile because that
+        // is the only profile this binary ships. When the
+        // orchestrated profile (CONTEXT_TUNING §1.8.2) lands, this
+        // must branch on the active profile — otherwise both
+        // profiles register under the same `name` and the §1.3.5
+        // history-by-name query collapses two distinct logical
+        // prompts into one bucket. The branch site stays here, in
+        // bootstrap, since the profile signal will live in the
+        // resolved config.
+        kind: 'system',
+        name: 'system.autonomous',
+        content: resolvedSystemPrompt,
+        author: resolveAuthor(),
+      });
+      systemPromptHash = hash;
+    }
+
     // Hooks subsystem (spec AGENTIC_CLI.md §10). Resolved inside
     // the same try-block as memory so any throw — TOML parse
     // error, fs EACCES on the user-scope hook file, etc. — is
@@ -1357,6 +1401,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
             ? 'user-config'
             : 'default',
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
+    ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.resumeFromSessionId !== undefined
       ? { resumeFromSessionId: input.resumeFromSessionId }
@@ -1390,6 +1435,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     config,
     db,
     modelId,
+    ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
     policyLayers,
     lockConflicts: [...permResult.lockConflicts],
     subagents,

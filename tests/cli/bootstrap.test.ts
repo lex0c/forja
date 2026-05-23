@@ -206,6 +206,32 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  test('records the assembled system prompt in prompt_versions and exposes systemPromptHash', async () => {
+    // AUDIT §1.3.3: every session's assembled prompt is content-
+    // addressed and registered; the hash surfaces on the result so
+    // the harness can stamp messages/tool_calls (§1.3.2 join).
+    const { config, db, systemPromptHash } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(systemPromptHash).toBeDefined();
+    expect(systemPromptHash).toMatch(/^[0-9a-f]{64}$/);
+    const row = db
+      .query<{ kind: string; name: string; content: string }, [string]>(
+        'SELECT kind, name, content FROM prompt_versions WHERE hash = ?',
+      )
+      .get(systemPromptHash ?? '');
+    expect(row).not.toBeNull();
+    expect(row?.kind).toBe('system');
+    expect(row?.name).toBe('system.autonomous');
+    expect(row?.content).toBe(config.systemPrompt);
+    db.close();
+  });
+
   test('plan + caller systemPrompt composes (parallelism hint, then plan, then user)', async () => {
     // Post-D227: three-layer composition. Parallelism hint is
     // the universal background; plan-mode prompt is the

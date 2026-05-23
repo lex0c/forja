@@ -13,6 +13,11 @@ export interface ToolCall {
   durationMs: number | null;
   error: string | null;
   createdAt: number;
+  // SHA256 hex of the system prompt active when this tool call ran
+  // — soft FK into `prompt_versions.hash` (AUDIT §1.3.2). Null for
+  // rows persisted before migration 068 and for paths not yet
+  // wired.
+  promptHash: string | null;
 }
 
 interface ToolCallRow {
@@ -25,6 +30,7 @@ interface ToolCallRow {
   duration_ms: number | null;
   error: string | null;
   created_at: number;
+  prompt_hash: string | null;
 }
 
 const fromRow = (row: ToolCallRow): ToolCall => ({
@@ -37,6 +43,7 @@ const fromRow = (row: ToolCallRow): ToolCall => ({
   durationMs: row.duration_ms,
   error: row.error,
   createdAt: row.created_at,
+  promptHash: row.prompt_hash,
 });
 
 export interface CreateToolCallInput {
@@ -45,16 +52,23 @@ export interface CreateToolCallInput {
   toolName: string;
   input: unknown;
   createdAt?: number;
+  // SHA256 hex of the system prompt active when this tool call ran —
+  // soft FK into `prompt_versions.hash` (AUDIT §1.3.2). Caller sources
+  // it from `InvokeToolDeps.systemPromptHash` (threaded from
+  // `HarnessConfig.systemPromptHash`). Nullable for rows persisted
+  // before migration 068 and for paths that haven't been wired yet.
+  promptHash?: string | null;
 }
 
 export const createToolCall = (db: DB, input: CreateToolCallInput): ToolCall => {
   const id = input.id ?? crypto.randomUUID();
   const inputJson = JSON.stringify(input.input);
   const createdAt = input.createdAt ?? Date.now();
+  const promptHash = input.promptHash ?? null;
   db.query(
-    `INSERT INTO tool_calls (id, message_id, tool_name, input, status, created_at)
-     VALUES (?, ?, ?, ?, 'pending', ?)`,
-  ).run(id, input.messageId, input.toolName, inputJson, createdAt);
+    `INSERT INTO tool_calls (id, message_id, tool_name, input, status, created_at, prompt_hash)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+  ).run(id, input.messageId, input.toolName, inputJson, createdAt, promptHash);
   return {
     id,
     messageId: input.messageId,
@@ -65,6 +79,7 @@ export const createToolCall = (db: DB, input: CreateToolCallInput): ToolCall => 
     durationMs: null,
     error: null,
     createdAt,
+    promptHash,
   };
 };
 
@@ -113,7 +128,7 @@ export const getToolCall = (db: DB, id: string): ToolCall | null => {
   const row = db
     .query(
       `SELECT id, message_id, tool_name, input, output, status,
-              duration_ms, error, created_at
+              duration_ms, error, created_at, prompt_hash
        FROM tool_calls WHERE id = ?`,
     )
     .get(id) as ToolCallRow | null;
@@ -124,7 +139,7 @@ export const listToolCallsByMessage = (db: DB, messageId: string): ToolCall[] =>
   const rows = db
     .query(
       `SELECT id, message_id, tool_name, input, output, status,
-              duration_ms, error, created_at
+              duration_ms, error, created_at, prompt_hash
        FROM tool_calls
        WHERE message_id = ?
        ORDER BY created_at ASC, id ASC`,
