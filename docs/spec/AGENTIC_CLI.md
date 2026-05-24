@@ -1782,6 +1782,10 @@ artifacts(
 
 **Sem ORM.** SQL cru com tipos. ORM em projeto pequeno é imposto sem benefício.
 
+**Durabilidade no shutdown (slice 178 A3).** `openDb` configura `PRAGMA synchronous=NORMAL` — páginas principais sincam mas frames do WAL podem ficar no page cache do kernel após COMMIT, perdíveis em crash do host (kernel panic, power loss). `closeDb(db)` (`src/storage/db.ts`) é o wrapper único de close — força `PRAGMA wal_checkpoint(TRUNCATE)` antes do `db.close()` pra garantir que toda row commitada (incluindo audit) chegou ao arquivo principal. Ambos os passos em try/catch separados que logam-e-suprimem (finally chains do tipo `try { migrate(db); } catch (e) { closeDb(db); throw e; }` preservam o erro original). Todos os entry points do CLI + `evals/executor.ts` usam `closeDb`; chamada interna ao `db.ts` no path de integrity_check fail mantém `db.close()` direto (DB já corrupto — checkpoint pode piorar).
+
+Sites no-op: `:memory:`, handles `{ readonly: true }`, DBs abertos antes de `journal_mode=WAL` rodar. `wal_checkpoint` é no-op nativo nesses casos — não throw, não warn.
+
 ---
 
 ## 14. Provider Layer

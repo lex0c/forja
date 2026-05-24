@@ -219,6 +219,47 @@ Cada falha tem **código** no formato `<classe>.<subtipo>.<detalhe>`, ex: `provi
 2. Step retentado uma vez
 3. Falha persistente: erro fatal
 
+### 4.5 `storage.resume_truncated` — log persistido excedeu MAX_RESUME_MESSAGES (slice 178 M1)
+
+**Detecção:** `messagesToProviderMessages` retorna `droppedFromHead > 0`, indicando que o slice carregado no contexto do modelo é estritamente menor que o log persistido. Emitido apenas no `--resume` path (path preassigned, que sempre injeta exatamente um seed, não conta como truncation legítima).
+
+**Classe:** `storage` · **Recovery action:** `degraded` · **`user_visible: true``
+
+**Payload:**
+```json
+{
+  "kept": 500,
+  "dropped": 137,
+  "dropped_beyond_fetch": 80,
+  "dropped_by_alignment": 57,
+  "max_resume_messages": 500
+}
+```
+
+**Por que existe (vs. só o evento live):** o `resume_truncated` HarnessEvent já reachs TUI / NDJSON renderer; mas uma auditoria post-hoc de uma sessão resumida (queries em `failure_events`, forensics bundle) não tinha evidência DB-side de que o modelo trabalhou com subset do log — o gap aparecia só como "o modelo não lembrou disso" sem trail. A row em `failure_events` torna a truncation queryable junto com tudo mais.
+
+**Recovery:** nenhum — informativo. O harness não tenta carregar o tail dropado; o desenho do MAX_RESUME_MESSAGES é justamente OOM-prevention.
+
+### 4.6 `storage.persist_failed` (subsystem `outcome_signal_dual_write`) — compensação de dual-write (slice 178 M2)
+
+**Detecção:** `failureSink.emit({ code, classe, payload: { approval_seq } })` dispara o dual-write em `outcome_signals`; o INSERT em `outcome_signals` lança throw (sink offline, schema mismatch, disk-full, etc.). A throw é capturada pelo try/catch interno do sink — a row em `failure_events` já foi commitada e essa parte é load-bearing — mas a falha em si vira invisível pra queries que só inspecionam `failure_events`.
+
+**Compensação:** `queueMicrotask(() => emit({ code: 'storage.persist_failed', payload: { subsystem: 'outcome_signal_dual_write', original_failure_id, original_approval_seq, reason } }))` deferre o emit pra fora da transação atual (evita busy_timeout contra o próprio writer lock) e registra um row keyed em `original_failure_id` para correlação forense.
+
+**Payload (compensação):**
+```json
+{
+  "subsystem": "outcome_signal_dual_write",
+  "original_failure_id": "01JD...",
+  "original_approval_seq": 42,
+  "reason": "<scrubbed error message>"
+}
+```
+
+**IMPORTANTE — `original_approval_seq` ≠ `approval_seq`:** o campo é renomeado deliberadamente. O dual-write extractor lê `payload.approval_seq` literal; reusar esse nome faria o emit recursivo disparar OUTRO dual-write em outcome_signals (que ainda está broken) — loop infinito de microtasks. Tests pinam que o campo está renomeado.
+
+**Limite declarado:** se a falha do dual-write ocorre no último emit antes do shutdown (`closeDb()` na sequência síncrona), o microtask drena depois do close — `emit()` rodaria contra DB fechado, captura interna swallow, row de compensação **NÃO** lança. Forensics ainda tem o stderr log (`forja failure_events: outcome_signal dual-write failed for approval_seq=N (...)`) como último recurso. Fix correto é shutdown hook que drena pending microtasks; fora de escopo da slice 178.
+
 ---
 
 ## 5. Hook failures

@@ -478,6 +478,70 @@ Continue? [y/N]
 - Memory writes "esquecidos" em ephemeral. Modelo propõe memory write; harness retorna erro estruturado; modelo deve registrar em `assumptions[]` que houve preferência não persistida.
 - Ephemeral em compliance regulado. Falta audit trail — pode violar requirement. Documenta-se como **incompatível com auditoria forense** (`§10`).
 
+### 8.6 Git subprocess hardening (slice 178 M3 + C2)
+
+> **Razão:** todo `Bun.spawn({ cmd: ['git', ...] })` resolve git por PATH no momento do exec. Um shim de `~/bin/git` plantado mid-sessão (tool comprometido, dotfile malicioso, install hook bugado) é escolhido transparentemente — e roda com privilégios do agent, com o env herdado. Checkpoints rodam a cada step, então a janela de exploração é larga.
+
+**Defesa em duas camadas:**
+
+1. **Pin do binário no startup.** `getGitBinary()` (async) e `getGitBinarySync()` (sync) rodam `which git` UMA vez por processo contra uma PATH canônica controlada e cacheiam o path absoluto. Spawns subsequentes usam o path absoluto resolvido na partida, não a string `'git'` — shadowing pós-startup não tem efeito. Shadowing já presente em PATH na partida é parte do trust boundary do operador (escopo do `§2.1`).
+2. **Env mínimo no spawn.** `safeGitEnv()` retorna apenas:
+   - `LC_ALL=C` (output parseável)
+   - `GIT_TERMINAL_PROMPT=0` (credentials prompt nunca bloqueia)
+   - `PATH` = SAFE_PATH canônica (sem `~/bin`, `~/.local/bin`; inclui `/opt/homebrew/{s,}bin`, `/opt/local/{s,}bin`, `/usr/local/{s,}bin`, `/usr/{s,}bin`, `/{s,}bin`)
+   - `HOME` herdado (git precisa pra `~/.gitconfig` — committer identity, ssh wrapper)
+   - **NÃO** `GIT_LITERAL_PATHSPECS` — `git check-ignore` rejeita com exit 128, fail global silencioso quebraria a detecção de colisão no `restore`. Sites que precisam do literal-pathspec guarantee (skip-worktree em worktrees de subagent, worktree-gc) mergem `GIT_LITERAL_PATHSPECS=1` localmente.
+
+**Sites obrigados a usar o par:**
+
+| Subsistema | Por quê |
+|---|---|
+| `src/checkpoints/git.ts` | Roda a cada step — primary git surface, maior janela de exploração |
+| `src/subagents/worktree.ts` + `worktree-gc.ts` | Manipula worktrees fora do cwd principal; PATH escape escala pra fora da árvore visível |
+| `src/cli/git-context.ts` | Probe síncrono no boot do system prompt (branch, ahead/behind) |
+| `src/memory/paths.ts` | `resolveRepoRoot()` síncrono no bootstrap; sem ele o registry de memória pode escopar errado |
+
+**Não obrigados (escopo de trust diferente):**
+- Tools que o modelo executa via `bash` — já passam pelo permission engine (sandbox plan + capability check). Aplicar PATH-pin lá seria redundante e quebraria `git` em paths legítimos não-canônicos do operador.
+- Test fixtures — usam `git` direto via shell helpers do test runner; não recebem input do modelo.
+
+**Limites declarados:**
+- Operador com PATH já comprometido na partida → fora de escopo (trust boundary).
+- Sistemas onde git mora fora da SAFE_PATH (instalação manual em `/usr/games`, etc) → `which git` retorna null, fallback é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso. Workaround: adicionar o dir à SAFE_PATH (PR contra `src/subagents/git-binary.ts`).
+
+### 8.7 Regex shape guard (slice 178 A2)
+
+> **Razão:** JS não tem timeout per-match em RegExp. Um pattern catastrófico como `(a+)+b` contra input não-matching trava o event loop por segundos a minutos. Tools que recebem pattern do modelo (`wait_for`, `monitor`) precisam rejeitar shapes patológicos **no compile**.
+
+**Detector heurístico (`src/sanitize/regex.ts`):**
+
+Conservador por design — falso positivo (rejeita pattern benigno) é recuperável; o modelo pode retry com shape mais simples. Falso negativo (admite exponencial) trava o harness.
+
+Rejeita:
+- **Pattern over 1024 bytes** (limite arbitrário; cobre backreference attack inflada).
+- **Nested unbounded quantifier**, um e dois níveis: `(a+)+`, `((a+))+`, `((a)*)+`, `(x(a+)y)+`. Três níveis caem no length cap.
+- **Alternation em repeated group**: `(a|ab)+`, `(a|a)*` — branches sobrepostas causam backtracking exponencial.
+- **Large bounded repeat on quantified body**: `(a+){50,}` é tão ruim quanto `(a+)+`.
+
+**Aplicado em:** `process_output.pattern` em `wait_for`, `process_output_pattern.pattern` em `monitor`, somente quando `is_regex=true`. Modo literal (`is_regex=false`) bypassa porque `escapeRegexLiteral` neutraliza todo meta primeiro.
+
+**Limites declarados:**
+- Backreferences com quantifier (`(\w+)\1+`) não são detectados explicitamente — cobertura via length cap apenas.
+- Pattern com quantifier exato `(a+){5}` é incorretamente rejeitado como `large_bounded_repeat_on_group` (`upperRaw=undefined` colapsa pra Infinity). Fix de uma linha pendente; rejeição é safe-but-noisy.
+
+### 8.8 Database durability on shutdown (slice 178 A3)
+
+> **Razão:** `PRAGMA synchronous=NORMAL` (default em `openDb`) mantém o hot path rápido — páginas principais do DB sincam, mas frames do WAL podem ficar no page cache do kernel após COMMIT. Crash do host (kernel panic, power loss) entre o último commit e o próximo checkpoint perde todas as rows de audit escritas desde o último checkpoint, e o chain-verifier não consegue distinguir rows perdidas de rows nunca escritas.
+
+**`closeDb(db)` (`src/storage/db.ts`):** wrapper único pra encerrar handles SQLite, usado por todos os entry points do CLI + `evals/executor.ts`:
+
+1. `PRAGMA wal_checkpoint(TRUNCATE)` força flush + trunca o arquivo WAL pra zero. Custo: um fsync. Em shutdown é desprezível.
+2. `db.close()` libera o handle.
+
+Ambos os passos em try/catch separados que logam-e-suprimem stderr — finally chains do tipo `try { migrate(db); } catch (e) { closeDb(db); throw e; }` preservam o erro original.
+
+**Casos no-op (não throw, não warn):** DBs `:memory:`, handles readonly, DBs abertos antes de `journal_mode=WAL` rodar — `wal_checkpoint` é no-op nativo nesses casos.
+
 ---
 
 ## 9. Network egress control
