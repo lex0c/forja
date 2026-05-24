@@ -7,7 +7,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { type BootstrapInput, bootstrap } from '../cli/bootstrap.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
@@ -70,8 +70,30 @@ const containsPath = (parent: string, child: string): boolean => {
   return resolvedChild.startsWith(resolvedParent + sep);
 };
 
+// Eval sandbox cwd lives under `~/.cache/forja-eval/`, NOT the OS
+// tmpdir, because the runtime sandbox (`src/permissions/sandbox-runner.ts`)
+// adds `--tmpfs /tmp` to its `ro` profile — that overlays the host's
+// /tmp with an empty tmpfs inside the sandbox, masking any eval
+// workspace that was created there. Tools running in `ro`
+// (`grep`, `glob`, `read_file` defaults) would see an empty
+// directory and return zero results, silently failing every case
+// that relies on a fixture or `setup.files`. The home cache dir sits
+// under the `--ro-bind / /` mount and is visible to read-only tools;
+// the `cwd-rw` profile re-binds it writably for write tools. The OS
+// tmpdir is still preferred for the per-run DB path because that's
+// only consumed by the test process (no sandbox traversal). Falling
+// back to tmpdir when `homedir()` returns empty (containers without
+// a HOME env) keeps tests runnable even when the cache path can't be
+// resolved — better-than-nothing degraded mode.
+const EVAL_CACHE_ROOT = (() => {
+  const home = homedir();
+  if (home.length === 0) return tmpdir();
+  return join(home, '.cache', 'forja-eval');
+})();
+
 const setupCwd = (caseDef: EvalCase): string => {
-  const dir = mkdtempSync(join(tmpdir(), 'forja-eval-'));
+  mkdirSync(EVAL_CACHE_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(EVAL_CACHE_ROOT, 'case-'));
   if (caseDef.setup?.fixture !== undefined) {
     const caseDir = dirname(caseDef.sourcePath);
     // Boundary: fixture must resolve under the parent of the

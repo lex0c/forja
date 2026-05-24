@@ -7,6 +7,19 @@
 # system-prompt changes per `CONTEXT_TUNING §1.8.5` step 2; this
 # workflow is the CI hook.
 #
+# Default model is `anthropic/claude-haiku-4-5`. First-run baseline
+# comparison (BACKLOG entry on 2026-05-23) showed haiku and opus-4-7
+# reach the same headline pass rate (40/47, ~85%) but with a
+# DIFFERENT failure composition: opus parallelizes tool calls more
+# aggressively (breaks compaction cases that assume serial reads)
+# while haiku is weaker on multi-step reasoning (breaks cases 45/46/47
+# from slice B). Haiku is ~6× cheaper per run ($0.42 vs $2.42) and
+# ~25% faster (~4min vs ~5:41), which is the right default for an
+# opt-in gate that may run on many PRs. Operators wanting higher
+# fidelity can override via `workflow_dispatch` input — opus is the
+# closest match to the local interactive default pinned in
+# `.agent/config.toml`.
+#
 # The runner's own exit code is the gate: `src/evals/cli.ts`
 # returns 1 when any case fails, 0 when all pass — GitHub surfaces
 # the failure on the PR check.
@@ -22,9 +35,9 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: 'Provider/model to evaluate against (e.g. anthropic/claude-sonnet-4-6)'
+        description: 'Provider/model to evaluate against (e.g. anthropic/claude-opus-4-7 for higher fidelity)'
         required: false
-        default: 'anthropic/claude-sonnet-4-6'
+        default: 'anthropic/claude-haiku-4-5'
   pull_request:
     # Only fires when a PR receives the `run-eval` label — the
     # `if` on the job filters everything else out.
@@ -81,5 +94,5 @@ jobs:
         # a model string with shell metacharacters. The fallback
         # string handles the labeled-PR path (no `inputs`).
         env:
-          MODEL: ${{ inputs.model || 'anthropic/claude-sonnet-4-6' }}
+          MODEL: ${{ inputs.model || 'anthropic/claude-haiku-4-5' }}
         run: bun run eval:regression -- --model "$MODEL"
