@@ -507,6 +507,100 @@ Body.`,
     db.close();
   });
 
+  test('full layered system prompt: identity → env → discipline → response → constraints → parallel → tool-ergonomics → playbook → caller → project-pointer → memory → skills', async () => {
+    // Extends the partial chain test above to assert ALL 13 final
+    // layers in their canonical top-down position. Without this,
+    // a refactor that drops or reorders tool-ergonomics, playbook
+    // hint, project-pointer, or the skill catalog would not be
+    // caught by the existing 7-layer test — those four sit
+    // between `# Parallelism` and `# Memory` (or after `# Memory`,
+    // in the case of `# Skills`) and the partial assertion is
+    // satisfied as long as the parallel→memory anchor holds.
+    // Mirrors the impl chain documented in `docs/SYSTEM_PROMPT.md
+    // §2.1` so a future contributor running this test catches the
+    // doc/impl drift at the same time.
+    const trustPath = join(workdir, 'trusted_dirs.json');
+    writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+    // AGENTS.md at workdir → project-pointer fires (trust-gated).
+    writeFileSync(join(workdir, 'AGENTS.md'), '# project rules\nuse pnpm.\n');
+    // Memory file → memory section fires.
+    const memDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(memDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
+    // Playbook def with when_to_use → playbook hint fires.
+    writePlaybookDef('code-review', 'gate diff before merge');
+    // Skill → skill catalog fires.
+    const skillsDir = join(workdir, '.agent', 'skills', 'shared');
+    mkdirSync(skillsDir, { recursive: true });
+    writeFileSync(
+      join(skillsDir, 'explore.md'),
+      `---
+name: explore
+description: Explore an unfamiliar codebase.
+version: 1
+tools: [bash]
+source: project_shared
+created_at: 2026-05-24
+updated_at: 2026-05-24
+expires: null
+---
+
+## When to use
+When the goal is to orient in a new repo.
+
+## Steps
+1. List files.
+2. Find entry points.
+`,
+    );
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      trustListPathOverride: trustPath,
+      systemPrompt: 'Caller convention: prefer pure functions.',
+    });
+    expect(config.systemPrompt).toBeDefined();
+    const prompt = config.systemPrompt ?? '';
+    const idx = {
+      identity: prompt.indexOf('You are the Forja agent'),
+      environment: prompt.indexOf('# Environment'),
+      discipline: prompt.indexOf('# Task discipline'),
+      response: prompt.indexOf('# Response surface'),
+      constraints: prompt.indexOf('# Constraints'),
+      parallel: prompt.indexOf('# Parallelism'),
+      toolErgo: prompt.indexOf('# Tool ergonomics'),
+      playbook: prompt.indexOf('# Playbook subagents'),
+      caller: prompt.indexOf('Caller convention'),
+      projectPtr: prompt.indexOf('# Project context'),
+      memory: prompt.indexOf('# Memory'),
+      skills: prompt.indexOf('# Skills'),
+    };
+    // Every layer MUST be present; a missing layer collapses the
+    // strict-order chain into a false-positive 0/n comparison
+    // below, so assert presence first with a named failure detail.
+    for (const [name, position] of Object.entries(idx)) {
+      if (position < 0) throw new Error(`layer '${name}' missing from assembled system prompt`);
+    }
+    // Strict top-down order — each layer appears AFTER the previous.
+    expect(idx.identity).toBe(0);
+    expect(idx.environment).toBeGreaterThan(idx.identity);
+    expect(idx.discipline).toBeGreaterThan(idx.environment);
+    expect(idx.response).toBeGreaterThan(idx.discipline);
+    expect(idx.constraints).toBeGreaterThan(idx.response);
+    expect(idx.parallel).toBeGreaterThan(idx.constraints);
+    expect(idx.toolErgo).toBeGreaterThan(idx.parallel);
+    expect(idx.playbook).toBeGreaterThan(idx.toolErgo);
+    expect(idx.caller).toBeGreaterThan(idx.playbook);
+    expect(idx.projectPtr).toBeGreaterThan(idx.caller);
+    expect(idx.memory).toBeGreaterThan(idx.projectPtr);
+    expect(idx.skills).toBeGreaterThan(idx.memory);
+    db.close();
+  });
+
   test('closes DB when memory registry construction throws (regression: C1)', async () => {
     // Seed a project_local MEMORY.md with valid content so the
     // index parser succeeds, then chmod the file 0 so loadScopeIndex

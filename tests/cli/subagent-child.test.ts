@@ -2740,4 +2740,113 @@ describe('runSubagentChild — prompt_versions wiring (slice A.3)', () => {
       db.close();
     }
   });
+
+  test('full layered subagent prompt: parallel → playbook body → references → output-schema → reflection', async () => {
+    // Subagent composer chain order assertion — mirror of the
+    // principal-side full-chain test in bootstrap.test.ts. Pins
+    // parallel / playbook-body / references / output-schema /
+    // reflection positioning so a refactor that drops a composer
+    // or reorders the chain catches here, not at runtime (where a
+    // wrong-order prompt may degrade subagent behavior subtly
+    // without crashing). Mirrors the impl chain documented in
+    // `docs/SYSTEM_PROMPT.md §3.2` AND the in-code comment block
+    // at `src/cli/subagent-child.ts` ~lines 840-872. Memory layer
+    // is excluded — it only fires when audit.toolsWhitelist
+    // contains a memory_* tool AND memoryCwd is forwarded; a
+    // separate test already exercises that surface.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        // Distinctive marker so the indexOf assertion below
+        // can pin the playbook body's position unambiguously
+        // — composer headers can't collide with this.
+        systemPrompt: 'MARKER_PLAYBOOK_BODY_KEPT: explore subagent body.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        // Each of these three triggers a distinct composer layer:
+        // references → composeWithReferenceBlock;
+        // outputSchema → composeWithOutputSchemaBlock;
+        // contextRecipe.stepReflection → composeWithReflectionBlock.
+        // composeWithParallelHint is unconditional.
+        references: ['docs/explore-ref.md'],
+        outputSchema: { type: 'object', properties: { found: { type: 'string' } } },
+        contextRecipe: { stepReflection: 'terse' },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: stubProvider('ok'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+    });
+    expect(exitCode).toBe(0);
+    // The assembled prompt is content-addressed in prompt_versions —
+    // pulling it from there proves the layer order on the prompt the
+    // harness actually ran with, not a reconstruction. (Pulling it
+    // from the assistant message would also work, but the
+    // prompt_versions row is the canonical source.)
+    const db2 = openDb(dbPath);
+    try {
+      const versions = listPromptVersionsByName(db2, 'playbook.explore');
+      expect(versions).toHaveLength(1);
+      const row = versions[0];
+      if (row === undefined) throw new Error('expected one prompt_versions row');
+      const prompt = row.content;
+      const idx = {
+        parallel: prompt.indexOf('# Parallelism'),
+        reflection: prompt.indexOf('## Step reflection'),
+        outputSchema: prompt.indexOf('## Output schema'),
+        references: prompt.indexOf('## References (read on demand)'),
+        playbookBody: prompt.indexOf('MARKER_PLAYBOOK_BODY_KEPT'),
+      };
+      // Presence first — a missing layer collapses the strict-order
+      // chain into false positives below.
+      for (const [name, position] of Object.entries(idx)) {
+        if (position < 0) {
+          throw new Error(`subagent layer '${name}' missing from composed prompt`);
+        }
+      }
+      // Strict top-down order — outermost composer (parallelism)
+      // first, then playbook body, then the appended blocks in
+      // body→refs→schema→reflection order. The reference block
+      // sits "next to the body because it is metadata about the
+      // body's resources" (subagent-child.ts comment); schema
+      // sits after refs so the model reads role → resources →
+      // termination contract; reflection sits last because the
+      // cadence applies to every step.
+      expect(idx.parallel).toBe(0);
+      expect(idx.playbookBody).toBeGreaterThan(idx.parallel);
+      expect(idx.references).toBeGreaterThan(idx.playbookBody);
+      expect(idx.outputSchema).toBeGreaterThan(idx.references);
+      expect(idx.reflection).toBeGreaterThan(idx.outputSchema);
+    } finally {
+      db2.close();
+    }
+  });
 });
