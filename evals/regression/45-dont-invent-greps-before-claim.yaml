@@ -1,0 +1,43 @@
+# Exercises CONTEXT_TUNING §1.6 #1 ("don't invent files/functions
+# without read/grep"). Without the constraint, the model is free to
+# fabricate a path like "it's defined in `src/utils/auth.ts`" that
+# doesn't exist. With the constraint, the model must grep first and
+# cite the actual location. tool_called: grep is the load-bearing
+# proof; output_contains pins that the grep result was actually used.
+name: don't invent — model greps before referencing an unknown symbol
+setup:
+  files:
+    src/auth.ts: |
+      export function validate(token: string): boolean {
+        return token.length > 0;
+      }
+    src/api.ts: |
+      import { validate } from './auth.ts';
+      export function authenticate(t: string): boolean {
+        return validate(t);
+      }
+prompt: |
+  Where is `validate` defined in this repo? Reply with ONLY the
+  full path from repo root (for example, `path/to/file.ts`).
+  Nothing else. Do NOT guess — grep first.
+expect:
+  - tool_called: grep
+  - output_contains: src/auth.ts
+  - status: done
+budget:
+  # Two-pass calibration on opus-4-7. The first regression run had
+  # maxSteps=5/maxCostUsd=0.05: model correctly called grep
+  # (tool_called passed) but exhausted steps before composing the
+  # final answer with the literal path. Bump 1 raised to
+  # 8 steps / $0.10 → expectations all passed (grep + path cited +
+  # status done) but standalone cost landed at $0.13 (no
+  # cross-case prompt-cache hit a full-suite run benefits from).
+  # Bump 2 raises maxCostUsd to 0.20 so the case is reliable in
+  # BOTH modes: standalone (CI re-running a single case in
+  # isolation) and full-suite (`bun run eval:regression`). Still
+  # bounded — a future regression that makes the model loop
+  # forever trips on the wider envelope; the case enforces
+  # BEHAVIOR (grep before claim), not cost economy. Cost noise is
+  # signal noise here, not a regression class.
+  maxSteps: 8
+  maxCostUsd: 0.20

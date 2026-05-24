@@ -18,6 +18,7 @@ const msg = (role: 'user' | 'assistant' | 'tool', content: unknown): Message => 
   cacheCreationTokens: null,
   costUsd: null,
   createdAt: 0,
+  promptHash: null,
 });
 
 describe('messagesToProviderMessages', () => {

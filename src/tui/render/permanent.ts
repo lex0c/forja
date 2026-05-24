@@ -134,19 +134,31 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', paint(caps, 'secondary', verb)].map(padFrame);
     }
     case 'session-banner': {
-      // UI.md §4.10.9. Three stacked blocks, no blank lines between:
+      // UI.md §4.10.9. Three stacked blocks separated by a blank
+      // line (spacing carries hierarchy, §6.4):
       //   1. title (bold) — `forja v0.0.0`
-      //   2. cwd (secondary)
-      //   3. env — `✓ name` (flags) + `key: value` (meta) joined by
-      //      ` · `, the whole line in `secondary`. Omitted when empty.
+      //   2. identity (secondary, 2 lines) — `model · N ctx · max M out` + cwd
+      //   3. env (mixed) — `✓ name` flags + `key: value` meta joined
+      //      by ` · `. Omitted entirely when env is empty.
       // Version is prefixed with `v` (semver convention) regardless of
       // what the producer sent — operators read `v0.0.0` as a version
       // string at a glance, `0.0.0` as ambiguous.
       const sep = caps.unicode ? '·' : '-';
       const checkGlyph = caps.unicode ? '✓' : '*';
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
+      const identityLine = paint(
+        caps,
+        'secondary',
+        [
+          item.model,
+          `${Math.round(item.contextWindow / 1000)}k ctx`,
+          `max ${item.maxOutputTokens} out`,
+        ].join(` ${sep} `),
+      );
       const lines: string[] = [
         paint(caps, 'bold', `${item.app} ${versionDisplay}`),
+        '',
+        identityLine,
         paint(caps, 'secondary', item.cwd),
       ];
       if (item.env.length > 0) {
@@ -157,7 +169,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           }
           return `${e.key}: ${e.value}`;
         });
-        lines.push(paint(caps, 'secondary', parts.join(` ${sep} `)));
+        lines.push('', paint(caps, 'secondary', parts.join(` ${sep} `)));
       }
       return lines.map(padFrame);
     }

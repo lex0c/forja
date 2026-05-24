@@ -156,11 +156,16 @@ describe('formatPermanent', () => {
       ],
     };
 
-    test('emits title / cwd / env stacked, no blank lines (Unicode)', () => {
-      // Each line padded with the §6.3 frame margin (2sp).
+    test('emits title / identity / cwd / env in 3 blocks separated by blank lines (Unicode)', () => {
+      // Each line padded with the §6.3 frame margin (2sp). UI.md §4.10.9
+      // splits the banner into title · identity (model + limits + cwd)
+      // · env, separated by blank lines.
       expect(formatPermanent(baseBanner, unicode)).toEqual([
         pad('forja v0.1.0'),
+        pad(''),
+        pad('anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out'),
         pad('/home/lex/forja'),
+        pad(''),
         pad('subagents: 2 · ✓ checkpoints'),
       ]);
     });
@@ -172,13 +177,21 @@ describe('formatPermanent', () => {
 
     test('falls back to ASCII glyphs (* for ✓, - for ·) when unicode disabled', () => {
       const out = formatPermanent(baseBanner, ascii);
-      expect(out[2]).toBe(pad('subagents: 2 - * checkpoints'));
+      // Block 2 identity uses the same separator.
+      expect(out[2]).toBe(pad('anthropic/claude-sonnet-4-6 - 200k ctx - max 4096 out'));
+      // Block 3 env (after blank at index 4).
+      expect(out[5]).toBe(pad('subagents: 2 - * checkpoints'));
     });
 
     test('omits env block entirely when env is empty', () => {
       const out = formatPermanent({ ...baseBanner, env: [] }, ascii);
-      // title + cwd. Banner ends after the cwd line.
-      expect(out).toEqual([pad('forja v0.1.0'), pad('/home/lex/forja')]);
+      // title + blank + identity + cwd. Banner ends after the cwd line.
+      expect(out).toEqual([
+        pad('forja v0.1.0'),
+        pad(''),
+        pad('anthropic/claude-sonnet-4-6 - 200k ctx - max 4096 out'),
+        pad('/home/lex/forja'),
+      ]);
     });
 
     test('flag with count renders as ✓ name (count)', () => {
@@ -189,7 +202,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[2]).toBe(pad('✓ memory (14)'));
+      expect(out[5]).toBe(pad('✓ memory (14)'));
     });
 
     test('mixes flag + meta entries joined by dim · separator', () => {
@@ -205,20 +218,22 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[2]).toBe(
+      expect(out[5]).toBe(
         pad('policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)'),
       );
     });
 
-    test('applies bold to title, secondary to cwd and to the whole env line', () => {
+    test('applies bold to title, secondary to identity/cwd and to the whole env line', () => {
       const out = formatPermanent(baseBanner, colored);
-      // 0: title (bold), 1: cwd (secondary), 2: env (uniformly secondary)
+      // 0: title (bold), 1: blank, 2: identity (secondary), 3: cwd (secondary),
+      // 4: blank, 5: env (uniformly secondary).
       expect(out[0]).toContain(`${CSI}1m`);
-      expect(out[1]).toContain(`${CSI}90m`);
       expect(out[2]).toContain(`${CSI}90m`);
+      expect(out[3]).toContain(`${CSI}90m`);
+      expect(out[5]).toContain(`${CSI}90m`);
       // env line carries no success / dim runs — one secondary run.
-      expect(out[2]).not.toContain(`${CSI}32m`);
-      expect(out[2]).not.toContain(`${CSI}2m`);
+      expect(out[5]).not.toContain(`${CSI}32m`);
+      expect(out[5]).not.toContain(`${CSI}2m`);
     });
 
     test('emits no SGR when color disabled', () => {

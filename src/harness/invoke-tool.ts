@@ -114,6 +114,11 @@ export interface InvokeToolDeps {
   // event so the TUI rebases the tool card's clock, excluding the
   // human wait at the permission modal from the shown duration.
   onExecutionStart?: () => void;
+  // SHA256 hex of the assembled system prompt, threaded from
+  // `HarnessConfig.systemPromptHash`. Stamped on every
+  // `tool_calls.prompt_hash` row (AUDIT §1.3.2 join surface) when
+  // present.
+  systemPromptHash?: string;
 }
 
 export interface InvokeToolResult {
@@ -338,6 +343,7 @@ export const invokeTool = async (
         messageId: input.messageId,
         toolName: input.toolName,
         input: input.args,
+        promptHash: deps.systemPromptHash ?? null,
       });
       recordApproval(deps.db, {
         toolCallId: tc.id,
@@ -399,6 +405,7 @@ export const invokeTool = async (
       messageId: input.messageId,
       toolName: input.toolName,
       input: input.args,
+      promptHash: deps.systemPromptHash ?? null,
     });
 
     // PERMISSION_ENGINE.md §17 prerequisite: link the audit row's

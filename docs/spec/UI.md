@@ -526,7 +526,7 @@ policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)
 | Bloco | Linhas | Estilo | Pergunta |
 |---|---|---|---|
 | 1 (title) | 1 | `bold` | Qual versão? |
-| 2 (identity) | 2 | `dim` | Qual modelo (limites concretos: context window, max output) e em qual cwd? |
+| 2 (identity) | 2 | `secondary` | Qual modelo (limites concretos: context window, max output) e em qual cwd? |
 | 3 (env) | 0 ou 1 | misto | O que está ligado nesta sessão? |
 
 **Versão prefixada com `v`** (`forja v0.0.0`, não `forja 0.0.0`) — convenção semver, identifica a string como versão à primeira leitura.

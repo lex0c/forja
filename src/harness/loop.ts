@@ -2249,6 +2249,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // appendMessage validates the parent belongs to the
           // same session.
           ...(priorTailId !== null ? { parentId: priorTailId } : {}),
+          promptHash: config.systemPromptHash ?? null,
         });
         lastMessageId = userMsg.id;
         messages.push({ role: 'user', content: effectiveUserPrompt });
@@ -2837,6 +2838,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           cachedTokens: collected.usageSeen ? collected.usage.cache_read : null,
           cacheCreationTokens: collected.usageSeen ? collected.usage.cache_creation : null,
           costUsd: collected.usageSeen ? turnCostUsd : null,
+          promptHash: config.systemPromptHash ?? null,
         });
         lastMessageId = assistantMsg.id;
         if (assistantContent.length > 0) {
@@ -3288,6 +3290,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ...(config.confirmPermission !== undefined
                 ? { confirmPermission: config.confirmPermission }
                 : {}),
+              ...(config.systemPromptHash !== undefined
+                ? { systemPromptHash: config.systemPromptHash }
+                : {}),
               fireHook: dispatchHooks,
               signal,
               onExecutionStart: () => {
@@ -3716,6 +3721,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               role: 'user',
               parentId: lastMessageId,
               content: toolResults,
+              promptHash: config.systemPromptHash ?? null,
             });
             lastMessageId = partialMsg.id;
             messages.push({ role: 'user', content: toolResults });
@@ -3785,6 +3791,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 role: 'user',
                 parentId: lastMessageId,
                 content: toolResults,
+                promptHash: config.systemPromptHash ?? null,
               });
               lastMessageId = partialMsg.id;
               messages.push({ role: 'user', content: toolResults });
@@ -3800,6 +3807,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           role: 'user',
           parentId: lastMessageId,
           content: toolResults,
+          promptHash: config.systemPromptHash ?? null,
         });
         lastMessageId = resultMsg.id;
         messages.push({ role: 'user', content: toolResults });

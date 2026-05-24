@@ -65,6 +65,7 @@ import { migration064MemoryOverrideEvents } from './064-memory-override-events.t
 import { migration065MemoryVerifyOverrideAttempts } from './065-memory-verify-override-attempts.ts';
 import { migration066PurgeEvents } from './066-purge-events.ts';
 import { migration067SkillEvents } from './067-skill-events.ts';
+import { migration068PromptVersions } from './068-prompt-versions.ts';
 
 export interface Migration {
   id: number;
@@ -140,4 +141,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration065MemoryVerifyOverrideAttempts,
   migration066PurgeEvents,
   migration067SkillEvents,
+  migration068PromptVersions,
 ];

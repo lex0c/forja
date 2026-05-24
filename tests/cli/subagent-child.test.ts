@@ -10,8 +10,13 @@ import {
   createSession,
   getSubagentOutput,
   insertSubagentRun,
+  listMessagesBySession,
   migrate,
 } from '../../src/storage/index.ts';
+import {
+  hashPromptContent,
+  listPromptVersionsByName,
+} from '../../src/storage/repos/prompt-versions.ts';
 
 // Cover the canonical happy + error paths for the
 // subagent-child entry. The test injects a `providerOverride`
@@ -2584,5 +2589,264 @@ describe('computeSchemaRetryBudget', () => {
     expect(out.skip).toBe(false);
     if (out.skip) return;
     expect(out.budget.maxWallClockMs).toBeUndefined();
+  });
+});
+
+describe('runSubagentChild — prompt_versions wiring (slice A.3)', () => {
+  // Slice A.3 of the prompt-registry rollout (AUDIT.md §1.3): the
+  // subagent's assembled prompt must land in `prompt_versions` as
+  // `kind='playbook'` with `name='playbook.<audit.name>'`, the hash
+  // must thread through `HarnessConfig.systemPromptHash`, and every
+  // `messages.prompt_hash` / `tool_calls.prompt_hash` row the child
+  // writes must carry that hash. The principal-side equivalent is
+  // covered by `tests/cli/bootstrap.test.ts`; this block closes the
+  // gap on the subagent path that A.3 wired without dedicated
+  // tests.
+  test('registers playbook row keyed by audit.name with hash matching the composed prompt', async () => {
+    const { sessionId } = seedChildSession(dbDir);
+    const errMessages: string[] = [];
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider('ok'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: (s) => errMessages.push(s),
+    });
+    expect(exitCode).toBe(0);
+    expect(errMessages).toEqual([]);
+    const db = openDb(dbPath);
+    try {
+      const versions = listPromptVersionsByName(db, 'playbook.explore');
+      expect(versions).toHaveLength(1);
+      const row = versions[0];
+      if (row === undefined) throw new Error('expected one prompt_versions row');
+      expect(row.kind).toBe('playbook');
+      expect(row.name).toBe('playbook.explore');
+      // Composed prompt is non-empty and incorporates the audit
+      // snapshot's `systemPrompt`. We don't pin to exact composer
+      // output (couples the test to internals); the substring
+      // check is enough to prove the seed text rode through.
+      expect(row.content.length).toBeGreaterThan(0);
+      expect(row.content).toContain('You are explore.');
+      // Content-addressed: row.hash MUST be hashPromptContent(row.content).
+      // Round-trip equality is the §1.3.3 idempotency contract.
+      expect(row.hash).toBe(hashPromptContent(row.content));
+      // Slice A.3 records with no parent / no eval linkage; both
+      // are optional fields filled by later slices (drift detector,
+      // eval baseline). Asserting null guards against accidental
+      // pollution if a future caller forgets to omit them.
+      expect(row.parentHash).toBeNull();
+      expect(row.evalRunId).toBeNull();
+      // Author defaults to git/user/env fallback chain. We don't
+      // pin the value (varies per host) but it must be non-empty —
+      // empty would mean the resolveAuthor chain bottomed out
+      // without hitting the 'ci' sentinel, which is a bug.
+      expect(row.author.length).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('child-written messages carry prompt_hash equal to the registered playbook hash', async () => {
+    // This is the load-bearing assertion: it proves the hash
+    // computed at registration actually flows into the harness
+    // config and from there into every `appendMessage` site. If
+    // the wiring snapped (e.g., a future refactor dropped the
+    // `systemPromptHash` field from HarnessConfig forwarding),
+    // the assistant row would land with `prompt_hash = NULL` and
+    // the §1.3.5 messages⋈prompt_versions join would lose this
+    // subagent's contribution silently.
+    const { sessionId } = seedChildSession(dbDir);
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider('answer'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+    });
+    expect(exitCode).toBe(0);
+    const db = openDb(dbPath);
+    try {
+      const versions = listPromptVersionsByName(db, 'playbook.explore');
+      expect(versions).toHaveLength(1);
+      const registered = versions[0];
+      if (registered === undefined) throw new Error('expected one prompt_versions row');
+      const expectedHash = registered.hash;
+      const msgs = listMessagesBySession(db, sessionId);
+      // Seed user message was written by `seedChildSession`
+      // (mirrors what the parent's `subagents/runtime.ts` does
+      // pre-spawn). The parent doesn't know the child's composed
+      // prompt yet, so per the design comment at the registration
+      // site the seed row carries `prompt_hash = NULL`. Asserting
+      // null here pins that contract — flipping the seed to carry
+      // a hash would require a separate spec decision.
+      const seedUser = msgs.find((m) => m.role === 'user');
+      expect(seedUser).toBeDefined();
+      expect(seedUser?.promptHash).toBeNull();
+      // Child-written assistant message MUST carry the hash.
+      const assistant = msgs.find((m) => m.role === 'assistant');
+      expect(assistant).toBeDefined();
+      expect(assistant?.promptHash).toBe(expectedHash);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('idempotent across re-runs: identical composed prompt collapses to one prompt_versions row', async () => {
+    // §1.3.3 idempotency: same content → same hash → INSERT OR
+    // IGNORE keeps a single row. Two separate child runs with
+    // byte-identical audit snapshots (same systemPrompt, no
+    // references, no schema, no reflection mode, no memoryCwd)
+    // produce the same composed prompt — the composer chain is a
+    // pure function of those inputs. The second run's
+    // recordPromptVersion call MUST no-op, NOT duplicate.
+    const { sessionId: sid1 } = seedChildSession(dbDir);
+    const exit1 = await runSubagentChild({
+      sessionId: sid1,
+      dbPath,
+      providerOverride: stubProvider('first'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+    });
+    expect(exit1).toBe(0);
+    const { sessionId: sid2 } = seedChildSession(dbDir);
+    const exit2 = await runSubagentChild({
+      sessionId: sid2,
+      dbPath,
+      providerOverride: stubProvider('second'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+    });
+    expect(exit2).toBe(0);
+    const db = openDb(dbPath);
+    try {
+      const versions = listPromptVersionsByName(db, 'playbook.explore');
+      expect(versions).toHaveLength(1);
+      // Both runs' assistant messages reference the SAME hash —
+      // proves the second run didn't silently re-register under a
+      // different hash and proves both children threaded the
+      // (same) hash into their harness configs.
+      const shared = versions[0];
+      if (shared === undefined) throw new Error('expected one prompt_versions row');
+      const sharedHash = shared.hash;
+      const msgs1 = listMessagesBySession(db, sid1);
+      const msgs2 = listMessagesBySession(db, sid2);
+      const a1 = msgs1.find((m) => m.role === 'assistant');
+      const a2 = msgs2.find((m) => m.role === 'assistant');
+      expect(a1?.promptHash).toBe(sharedHash);
+      expect(a2?.promptHash).toBe(sharedHash);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('full layered subagent prompt: parallel → playbook body → references → output-schema → reflection', async () => {
+    // Subagent composer chain order assertion — mirror of the
+    // principal-side full-chain test in bootstrap.test.ts. Pins
+    // parallel / playbook-body / references / output-schema /
+    // reflection positioning so a refactor that drops a composer
+    // or reorders the chain catches here, not at runtime (where a
+    // wrong-order prompt may degrade subagent behavior subtly
+    // without crashing). Mirrors the impl chain documented in
+    // `docs/SYSTEM_PROMPT.md §3.2` AND the in-code comment block
+    // at `src/cli/subagent-child.ts` ~lines 840-872. Memory layer
+    // is excluded — it only fires when audit.toolsWhitelist
+    // contains a memory_* tool AND memoryCwd is forwarded; a
+    // separate test already exercises that surface.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        // Distinctive marker so the indexOf assertion below
+        // can pin the playbook body's position unambiguously
+        // — composer headers can't collide with this.
+        systemPrompt: 'MARKER_PLAYBOOK_BODY_KEPT: explore subagent body.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        // Each of these three triggers a distinct composer layer:
+        // references → composeWithReferenceBlock;
+        // outputSchema → composeWithOutputSchemaBlock;
+        // contextRecipe.stepReflection → composeWithReflectionBlock.
+        // composeWithParallelHint is unconditional.
+        references: ['docs/explore-ref.md'],
+        outputSchema: { type: 'object', properties: { found: { type: 'string' } } },
+        contextRecipe: { stepReflection: 'terse' },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: stubProvider('ok'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+    });
+    expect(exitCode).toBe(0);
+    // The assembled prompt is content-addressed in prompt_versions —
+    // pulling it from there proves the layer order on the prompt the
+    // harness actually ran with, not a reconstruction. (Pulling it
+    // from the assistant message would also work, but the
+    // prompt_versions row is the canonical source.)
+    const db2 = openDb(dbPath);
+    try {
+      const versions = listPromptVersionsByName(db2, 'playbook.explore');
+      expect(versions).toHaveLength(1);
+      const row = versions[0];
+      if (row === undefined) throw new Error('expected one prompt_versions row');
+      const prompt = row.content;
+      const idx = {
+        parallel: prompt.indexOf('# Parallelism'),
+        reflection: prompt.indexOf('## Step reflection'),
+        outputSchema: prompt.indexOf('## Output schema'),
+        references: prompt.indexOf('## References (read on demand)'),
+        playbookBody: prompt.indexOf('MARKER_PLAYBOOK_BODY_KEPT'),
+      };
+      // Presence first — a missing layer collapses the strict-order
+      // chain into false positives below.
+      for (const [name, position] of Object.entries(idx)) {
+        if (position < 0) {
+          throw new Error(`subagent layer '${name}' missing from composed prompt`);
+        }
+      }
+      // Strict top-down order — outermost composer (parallelism)
+      // first, then playbook body, then the appended blocks in
+      // body→refs→schema→reflection order. The reference block
+      // sits "next to the body because it is metadata about the
+      // body's resources" (subagent-child.ts comment); schema
+      // sits after refs so the model reads role → resources →
+      // termination contract; reflection sits last because the
+      // cadence applies to every step.
+      expect(idx.parallel).toBe(0);
+      expect(idx.playbookBody).toBeGreaterThan(idx.parallel);
+      expect(idx.references).toBeGreaterThan(idx.playbookBody);
+      expect(idx.outputSchema).toBeGreaterThan(idx.references);
+      expect(idx.reflection).toBeGreaterThan(idx.outputSchema);
+    } finally {
+      db2.close();
+    }
   });
 });
