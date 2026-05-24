@@ -86,6 +86,38 @@ describe('detectRedosShape', () => {
       const rejection = detectRedosShape('(a+){1,16}');
       expect(rejection?.code).not.toBe('large_bounded_repeat_on_group');
     });
+
+    test('rejects a catastrophic bounded group hidden behind a benign one', () => {
+      // Pre-fix bypass: `match` returned the first match only, so a
+      // benign `(a+){1,2}` prefix would mask the catastrophic
+      // `(b+){100,100}` that follows. The fix uses `matchAll` and
+      // walks every quantified group; this test pins the iteration.
+      // The pattern is also caught by NESTED_UNBOUNDED first
+      // (because `(a+){1,2}` matches the regex `\([^()]*[+*][^()]*\)[+*]`
+      // — `{1,2}` is `[+*]`? no, `{` is literal). Let's use a shape
+      // that ONLY trips the bounded-repeat detector for both groups:
+      // (\d){1,2}(b+){100,100} — the first group has no inner
+      // quantifier so NESTED_UNBOUNDED skips it; the second triggers
+      // BOUNDED_REPEAT_ON_GROUP on its body's `+`.
+      const rejection = detectRedosShape('(\\d){1,2}(b+){100,100}');
+      expect(rejection?.code).toBe('large_bounded_repeat_on_group');
+    });
+
+    test('rejects when bad bounded group is in the middle of the pattern', () => {
+      // Defense-in-depth: the bad group is neither first nor last —
+      // detector must walk the whole pattern, not just the head or
+      // tail.
+      const rejection = detectRedosShape('foo (\\d){1,2}(b+){50,}(\\w){1,3} bar');
+      expect(rejection?.code).toBe('large_bounded_repeat_on_group');
+    });
+
+    test('accepts when every bounded group is below threshold', () => {
+      // Multi-group safe pattern: every quantified group under
+      // MAX_BOUNDED_REPEAT. Detector iterates all matches, finds
+      // none above threshold, returns null.
+      const rejection = detectRedosShape('(\\d+){1,5}(\\w+){1,10}(.+){1,3}');
+      expect(rejection?.code).not.toBe('large_bounded_repeat_on_group');
+    });
   });
 
   describe('rejects oversized patterns', () => {

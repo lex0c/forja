@@ -36,7 +36,12 @@ const NESTED_UNBOUNDED = /\([^()]*[+*][^()]*\)[+*]/;
 const NESTED_UNBOUNDED_TWO_LEVEL =
   /\([^()]*\([^()]*[+*][^()]*\)[^()]*\)[+*]|\([^()]*\([^()]*\)[+*][^()]*\)[+*]/;
 const ALT_IN_REPEATED_GROUP = /\([^()]*\|[^()]*\)[+*]/;
-const BOUNDED_REPEAT_ON_GROUP = /\([^()]*[+*][^()]*\)\{(\d+)(?:,(\d*))?\}/;
+// `g` flag is load-bearing: `detectRedosShape` iterates EVERY match
+// via `matchAll`. Without the global flag, only the first quantified
+// group is inspected — an attacker could prepend a benign group
+// (`(a+){1,2}(b+){100,100}`) and slip the catastrophic shape past
+// the guard. Tests pin the multi-match case.
+const BOUNDED_REPEAT_ON_GROUP = /\([^()]*[+*][^()]*\)\{(\d+)(?:,(\d*))?\}/g;
 
 export interface RegexShapeRejection {
   readonly code:
@@ -71,8 +76,13 @@ export const detectRedosShape = (pattern: string): RegexShapeRejection | null =>
     };
   }
 
-  const boundedMatch = pattern.match(BOUNDED_REPEAT_ON_GROUP);
-  if (boundedMatch) {
+  // Iterate EVERY bounded-repeat match — a single bad group anywhere
+  // in the pattern is enough to trigger exponential backtracking at
+  // runtime. Pre-fix this used `pattern.match(...)` which returns
+  // only the FIRST match; a pattern like `(a+){1,2}(b+){100,100}`
+  // would accept (first group is small) while the second was the
+  // exact catastrophic shape the guard exists to block.
+  for (const boundedMatch of pattern.matchAll(BOUNDED_REPEAT_ON_GROUP)) {
     const lower = Number.parseInt(boundedMatch[1] ?? '0', 10);
     const upperRaw = boundedMatch[2];
     const upper =
