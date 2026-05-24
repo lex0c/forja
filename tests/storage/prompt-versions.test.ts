@@ -85,6 +85,63 @@ describe('prompt-versions repo (AUDIT.md §1.3)', () => {
     db.close();
   });
 
+  test('recordPromptVersion throws on hash collision with mismatched (kind, name)', () => {
+    // Spec §1.3 makes `hash` the primary key under the assumption
+    // "same content == same logical prompt". Without this guard,
+    // a second caller passing the same hash with a different
+    // (kind, name) silently aliases to the first row — and the
+    // returned PromptVersion carries the FIRST recorder's
+    // (kind, name), not the second's. Operator queries by name
+    // (§1.3.5 history-by-name) then miss the second logical
+    // prompt entirely; audit attribution under the second name
+    // is wrong. This test pins the "throw loudly" behavior so a
+    // future refactor cannot quietly drop the guard.
+    const db = setupDb();
+    const content = 'identical body';
+    const hash = hashPromptContent(content);
+    recordPromptVersion(db, {
+      hash,
+      kind: 'system',
+      name: 'system.autonomous',
+      content,
+      author: 'alice',
+    });
+    // Same content (same hash), DIFFERENT (kind, name) — collision.
+    expect(() =>
+      recordPromptVersion(db, {
+        hash,
+        kind: 'playbook',
+        name: 'playbook.explore',
+        content,
+        author: 'bob',
+      }),
+    ).toThrow(/hash collision with different metadata/);
+    // Asserting the error message names BOTH sides of the conflict
+    // gives the operator enough context to either differentiate
+    // the content or propose migration 069.
+    expect(() =>
+      recordPromptVersion(db, {
+        hash,
+        kind: 'playbook',
+        name: 'playbook.explore',
+        content,
+        author: 'bob',
+      }),
+    ).toThrow(/system.*system\.autonomous/);
+    // Same hash + same (kind, name) but different name-only? Still
+    // a collision — name change alone shouldn't alias either.
+    expect(() =>
+      recordPromptVersion(db, {
+        hash,
+        kind: 'system',
+        name: 'system.orchestrated',
+        content,
+        author: 'bob',
+      }),
+    ).toThrow(/hash collision with different metadata/);
+    db.close();
+  });
+
   test('getPromptVersion returns null for an unknown hash', () => {
     const db = setupDb();
     expect(getPromptVersion(db, 'deadbeef')).toBeNull();

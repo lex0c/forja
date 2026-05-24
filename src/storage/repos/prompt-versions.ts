@@ -134,6 +134,20 @@ export interface RecordPromptVersionInput {
 // dedupes to the original row — preserving the original `author` /
 // `created_at` / `source_commit` (the first recorder wins, by
 // design; later recorders just attest the same content existed).
+//
+// Metadata-mismatch guard: spec §1.3 makes `hash` the primary key
+// under the assumption "same content == same logical prompt". A
+// caller passing the same hash with a DIFFERENT `(kind, name)`
+// pair is asserting two distinct logical prompts share byte-
+// identical content — which the current schema cannot represent.
+// The bare INSERT OR IGNORE behavior would silently alias the
+// second prompt to the first's (kind, name), corrupting §1.3.5
+// history-by-name and audit attribution. We throw instead, surfacing
+// the conflict and forcing the caller to either (a) differentiate
+// the content (a distinguishing header / marker breaks the hash
+// collision) or (b) propose schema migration 069 changing the key
+// to a composite (hash, kind, name). Matches the "surface loudly,
+// don't fabricate" pattern of the row-vanished guard below.
 export const recordPromptVersion = (db: DB, input: RecordPromptVersionInput): PromptVersion => {
   const createdAt = input.createdAt ?? Date.now();
   const parentHash = input.parentHash ?? null;
@@ -166,6 +180,12 @@ export const recordPromptVersion = (db: DB, input: RecordPromptVersionInput): Pr
     // null here means a concurrent DELETE, which §1.3.4 forbids.
     // Surface loudly rather than fabricate.
     throw new Error(`prompt_versions: row vanished after upsert (hash=${input.hash})`);
+  }
+  if (row.kind !== input.kind || row.name !== input.name) {
+    // Metadata mismatch on hash collision — see header comment.
+    throw new Error(
+      `prompt_versions: hash collision with different metadata (hash=${input.hash}; existing kind='${row.kind}' name='${row.name}', requested kind='${input.kind}' name='${input.name}'). Two logical prompts with byte-identical content but different (kind, name) cannot coexist under the current schema (AUDIT §1.3 makes hash the primary key). Either differentiate the content (a distinguishing header or marker breaks the hash collision) or land migration 069 changing the schema to a composite (hash, kind, name) key.`,
+    );
   }
   return fromRow(row);
 };
