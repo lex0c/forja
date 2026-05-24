@@ -73,34 +73,43 @@ export const hashPromptContent = (content: string): string =>
 // the load-bearing data; author is provenance the operator can lose
 // without breaking the registry.
 //
-// Memoized for the lifetime of the process: the git config and the
-// OS-user env vars don't change mid-run, and `execSync` blocks the
-// event loop ~5-50ms per call. With one bootstrap + N subagent
-// spawns per session, the memoization drops the cost to one call
-// instead of (1 + N). `INSERT OR IGNORE` then discards the value
-// on idempotent collisions anyway — preserving the first
-// recorder's author per §1.3.3.
+// NOT memoized. Each Forja process calls this exactly once in
+// practice — the principal calls it during `bootstrap.ts`'s
+// single `recordPromptVersion`, and the subagent calls it during
+// `subagent-child.ts`'s single `recordPromptVersion`. Subagents
+// are SUBPROCESSES with fresh module state (not shared cache via
+// IPC), so a process-wide cache here saves zero calls in the
+// production CLI shape. Earlier versions did memoize on the
+// (incorrect) premise that "1 bootstrap + N subagent spawns
+// share the cache" — they do not.
+//
+// The defensive case for dropping the cache: a long-lived
+// process embedding Forja for multiple projects (hypothetical
+// daemon, future REPL with "switch project", any service-style
+// caller) would otherwise stamp the FIRST project's git config
+// onto every subsequent project's `prompt_versions.author`,
+// silently corrupting provenance metadata. `execSync` blocking
+// 5-50ms per once-per-boot call is acceptable cost for that
+// safety.
+//
+// `INSERT OR IGNORE` semantics still apply: idempotent collisions
+// preserve the FIRST recorder's author per §1.3.3, so re-running
+// the same prompt content from a different operator does not
+// overwrite the original attribution.
 //
 // Windows `USERNAME` is in the env fallback chain (it's the
 // canonical user-id var on Windows; `USER`/`LOGNAME` are POSIX).
-let cachedAuthor: string | undefined;
-
 export const resolveAuthor = (): string => {
-  if (cachedAuthor !== undefined) return cachedAuthor;
   try {
     const out = execSync('git config user.email', {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    if (out.length > 0) {
-      cachedAuthor = out;
-      return cachedAuthor;
-    }
+    if (out.length > 0) return out;
   } catch {
     // git absent, no config, or any other failure — fall through.
   }
-  cachedAuthor = process.env.USER ?? process.env.LOGNAME ?? process.env.USERNAME ?? 'ci';
-  return cachedAuthor;
+  return process.env.USER ?? process.env.LOGNAME ?? process.env.USERNAME ?? 'ci';
 };
 
 export interface RecordPromptVersionInput {
