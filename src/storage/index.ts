@@ -1,4 +1,5 @@
 export {
+  closeDb,
   MEMORY_DB,
   openDb,
   openMemoryDb,

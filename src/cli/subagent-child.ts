@@ -13,6 +13,7 @@ import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../pe
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
   type DB,
+  closeDb,
   completeSession,
   defaultDbPath,
   getMessage,
@@ -372,7 +373,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
           migrate(db);
           completeSession(db, opts.sessionId, 'error', 0, true);
         } finally {
-          db.close();
+          closeDb(db);
         }
       } catch {
         // Best-effort: if the DB is unhealthy or migration
@@ -1422,6 +1423,6 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       }
       ipcChannel.close();
     }
-    db.close();
+    closeDb(db);
   }
 };

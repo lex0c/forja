@@ -179,4 +179,54 @@ describe('failure_events dual-write outcome_signal', () => {
     expect(failureRows.length).toBe(1);
     expect(listOutcomeSignalsByApproval(db, seq).length).toBe(0);
   });
+
+  test('slice 178 (hardening M2): dual-write failure emits a compensation row', async () => {
+    // Compensation runs on a microtask after the current emit's
+    // transaction commits. Two failure_events rows persist:
+    //   1. the original (the user's emit call)
+    //   2. the compensation (storage.persist_failed with the
+    //      original failure_id and approval_seq in payload)
+    // Without the compensation, the dual-write gap is only
+    // visible in stderr — forensics queries that scan
+    // failure_events miss it entirely.
+    const seq = seedApproval(db);
+    const brokenOutcomeSink = {
+      emit: () => {
+        throw new Error('outcome sink boom');
+      },
+    };
+    const failureSink = createSqliteFailureSink({ db, outcomeSink: brokenOutcomeSink });
+    const originalRow = failureSink.emit({
+      code: 'storage.lock_contention',
+      classe: 'storage',
+      recovery_action: 'ignored',
+      user_visible: false,
+      session_id: 's',
+      payload: { approval_seq: seq },
+    });
+    // queueMicrotask defers the compensation past the current
+    // call; flush the microtask queue by awaiting a resolved
+    // promise. Bun + Node both drain microtasks at the next
+    // await point.
+    await Promise.resolve();
+    const allRows = db
+      .query("SELECT id, code, payload_json FROM failure_events WHERE session_id = 's'")
+      .all() as Array<{ id: string; code: string; payload_json: string }>;
+    expect(allRows.length).toBe(2);
+    const original = allRows.find((r) => r.id === originalRow.id);
+    const compensation = allRows.find((r) => r.id !== originalRow.id);
+    expect(original?.code).toBe('storage.lock_contention');
+    expect(compensation?.code).toBe('storage.persist_failed');
+    const compPayload = JSON.parse(compensation?.payload_json ?? '{}') as Record<string, unknown>;
+    expect(compPayload.subsystem).toBe('outcome_signal_dual_write');
+    expect(compPayload.original_failure_id).toBe(originalRow.id);
+    // Field is `original_approval_seq`, NOT `approval_seq` — using
+    // the bare `approval_seq` key would re-trigger the dual-write
+    // path on the compensation row itself, looping forever against
+    // the still-broken outcomeSink. Pin the rename so a future
+    // refactor doesn't undo it.
+    expect(compPayload.original_approval_seq).toBe(seq);
+    expect(compPayload.approval_seq).toBeUndefined();
+    expect(typeof compPayload.reason).toBe('string');
+  });
 });

@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { detectRedosShape } from '../../sanitize/index.ts';
 import {
   type MonitorCondition,
   type MonitorEvent,
@@ -88,6 +89,20 @@ const buildCondition = (
         };
       }
       const isRegex = raw.is_regex === true;
+      if (isRegex) {
+        // JS regex has no per-match timeout — reject obvious
+        // catastrophic-backtracking shapes at compile time so a
+        // pathological pattern can't freeze the monitor loop.
+        // Literal mode bypasses this check because
+        // escapeRegexLiteral neutralizes every meta first.
+        const rejection = detectRedosShape(raw.pattern as string);
+        if (rejection !== null) {
+          return {
+            ok: false,
+            message: `process_output_pattern.pattern rejected (${rejection.code}): ${rejection.message}`,
+          };
+        }
+      }
       let regex: RegExp;
       try {
         // Always /g for monitor — we want EVERY match in the

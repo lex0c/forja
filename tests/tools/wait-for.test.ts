@@ -569,6 +569,51 @@ describe('wait_for tool: process_* conditions', () => {
     expect(r.error_message).toContain('not a valid regex');
   });
 
+  test('rejects ReDoS-prone pattern when is_regex=true', async () => {
+    // JS regex has no per-match timeout, so `(a+)+b` against a
+    // non-matching chunk would freeze the harness. The shape
+    // detector must reject before `new RegExp` compiles it.
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'process_output',
+          process_id: 'x',
+          pattern: '(a+)+b',
+          is_regex: true,
+        },
+        timeout_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('nested_unbounded_quantifier');
+  });
+
+  test('does not apply ReDoS guard when is_regex=false', async () => {
+    // Literal mode escapes every meta — `(a+)+b` matches the
+    // string `(a+)+b` verbatim and is safe to compile. The guard
+    // would be a false positive here.
+    const spawned = await mgr.spawn({ command: 'printf "(a+)+b\\n"; sleep 0.05' });
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'process_output',
+          process_id: spawned.id,
+          pattern: '(a+)+b',
+          // is_regex omitted → literal
+        },
+        timeout_ms: 2000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected error: ${r.error_message}`);
+    expect(r.matched).toBe(true);
+  });
+
   test('rejects empty pattern', async () => {
     const ctx = makeCtx({ sessionId, bgManager: mgr });
     const r = await waitForTool.execute(

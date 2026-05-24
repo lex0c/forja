@@ -45,7 +45,7 @@ import {
 import { installIdPath } from '../permissions/paths.ts';
 import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
-import { defaultDbPath, openDb } from '../storage/index.ts';
+import { closeDb, defaultDbPath, openDb } from '../storage/index.ts';
 import { type DoctorCheckCache, getSharedDoctorCache, withDoctorCache } from './doctor-cache.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
@@ -457,7 +457,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
   } catch (e) {
     if (db !== null) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore — primary error already in flight
       }
@@ -480,7 +480,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
   } finally {
     if (db !== null) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore — close errors on a readonly handle indicate
         // a low-level issue; the verifyChain result we just

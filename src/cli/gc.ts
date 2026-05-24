@@ -22,7 +22,13 @@ import type { GcReport, TableReport } from '../audit/gc.ts';
 import { runGc } from '../audit/gc.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import type { DB } from '../storage/index.ts';
-import { countPendingMigrations, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import {
+  closeDb,
+  countPendingMigrations,
+  defaultDbPath,
+  migrate,
+  openDb,
+} from '../storage/index.ts';
 
 export interface RunGcCliOptions {
   cwd: string;
@@ -330,7 +336,7 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
   } finally {
     if (db !== null) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore — sweep already committed
       }

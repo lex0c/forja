@@ -45,7 +45,7 @@ import {
 import { dirname, join } from 'node:path';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
-import { migrate, openDb } from '../storage/index.ts';
+import { closeDb, migrate, openDb } from '../storage/index.ts';
 import type { DB } from '../storage/index.ts';
 import { defaultDbPath } from '../storage/index.ts';
 import { insertPurgeEvent } from '../storage/repos/purge-events.ts';
@@ -454,7 +454,7 @@ const probeAuditWritabilityMutating = (dbPath: string): AuditWritability => {
   } finally {
     if (db !== null) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore close error after probe — we got our answer
       }
@@ -868,7 +868,7 @@ const writeAuditRow = (input: WriteAuditRowInput): number => {
   } finally {
     if (db !== null) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore close error — the insert (if it succeeded) is
         // already committed; the close failure is informational

@@ -11,6 +11,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { type BootstrapInput, bootstrap } from '../cli/bootstrap.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
+import { closeDb } from '../storage/db.ts';
 import type { EvalCase, EvalCaseResult, EvalSummary, ExpectationOutcome } from './types.ts';
 
 // Test seam: caller can pre-build a provider (mock for unit tests,
@@ -449,7 +450,7 @@ export const executeCase = async (
       };
       result = await runAgent(cfg);
     } finally {
-      db.close();
+      closeDb(db);
     }
   } catch (e) {
     failure = e instanceof Error ? e.message || e.name || String(e) : String(e);

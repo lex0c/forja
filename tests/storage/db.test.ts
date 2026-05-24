@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb, openMemoryDb, withTransaction } from '../../src/storage/db.ts';
+import { closeDb, openDb, openMemoryDb, withTransaction } from '../../src/storage/db.ts';
 
 describe('openDb', () => {
   let tmpDir: string;
@@ -189,5 +189,88 @@ describe('openDb — file permissions (slice 163 SEC §8.3)', () => {
     openDb(path, { readonly: true }).close();
     // Readonly path didn't chmod — operator's 0644 stays.
     expect(statSync(path).mode & 0o777).toBe(0o644);
+  });
+});
+
+describe('closeDb — WAL durability (slice 174 hardening A3)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'forja-closedb-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  test('checkpoints the WAL and truncates -wal/-shm to zero', () => {
+    const path = join(tmpRoot, 'ck.db');
+    const db = openDb(path);
+    db.exec('CREATE TABLE t(x INTEGER);');
+    db.exec('INSERT INTO t(x) VALUES (1), (2), (3);');
+    // Before close: WAL file should have content from the writes.
+    const walSizeBefore = statSync(`${path}-wal`).size;
+    expect(walSizeBefore).toBeGreaterThan(0);
+    closeDb(db);
+    // After closeDb: TRUNCATE checkpoint mode resizes the WAL
+    // file to zero (committed pages went back to the main DB).
+    // The -wal and -shm files may persist as empty siblings or
+    // be removed entirely depending on SQLite version; either
+    // way, no bytes remain to be lost.
+    const walSizeAfter = existsSync(`${path}-wal`) ? statSync(`${path}-wal`).size : 0;
+    expect(walSizeAfter).toBe(0);
+  });
+
+  test('rows committed before closeDb are visible on reopen', () => {
+    const path = join(tmpRoot, 'persist.db');
+    const db = openDb(path);
+    db.exec('CREATE TABLE audit(id INTEGER PRIMARY KEY, msg TEXT);');
+    db.exec("INSERT INTO audit(id, msg) VALUES (1, 'committed before close');");
+    closeDb(db);
+    const reopened = openDb(path);
+    const row = reopened.query('SELECT msg FROM audit WHERE id = 1').get() as { msg: string };
+    expect(row.msg).toBe('committed before close');
+    closeDb(reopened);
+  });
+
+  test('is a no-op-equivalent for :memory: DBs (no checkpoint, no throw)', () => {
+    const db = openMemoryDb();
+    db.exec('CREATE TABLE x(y INTEGER);');
+    db.exec('INSERT INTO x(y) VALUES (1);');
+    // Should not throw — wal_checkpoint is harmless on a DB
+    // that's not in WAL mode.
+    expect(() => closeDb(db)).not.toThrow();
+  });
+
+  test('still closes the DB even if the checkpoint fails', () => {
+    // Simulate a failing checkpoint by closing the DB before
+    // calling closeDb — bun:sqlite throws on exec against a
+    // closed connection. closeDb must swallow the throw and
+    // not propagate it (finally blocks would otherwise mask
+    // their original error).
+    const path = join(tmpRoot, 'precosed.db');
+    const db = openDb(path);
+    db.close();
+    expect(() => closeDb(db)).not.toThrow();
+  });
+
+  test('a throwing db.close() is swallowed so finally-block errors are preserved', () => {
+    // Production shape: `try { migrate(db); } catch (e) {
+    // closeDb(db); throw e; }`. If db.close() also throws (already-
+    // closed handle, double-close from a prior cleanup, FS error),
+    // a propagating throw from inside closeDb would replace the
+    // caller's `e` — the operator would see the close error and
+    // lose the migration error. Pin that the close-side throw is
+    // logged and suppressed, matching the checkpoint posture.
+    const fakeDb = {
+      exec: () => {
+        // No-op checkpoint (succeeds) — isolate the test to
+        // db.close()'s catch path.
+      },
+      close: () => {
+        throw new Error('database is not open');
+      },
+    } as unknown as Parameters<typeof closeDb>[0];
+    expect(() => closeDb(fakeDb)).not.toThrow();
   });
 });

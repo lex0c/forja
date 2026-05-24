@@ -1,0 +1,112 @@
+import { describe, expect, test } from 'bun:test';
+import { detectRedosShape } from '../../src/sanitize/regex.ts';
+
+describe('detectRedosShape', () => {
+  describe('accepts safe shapes', () => {
+    test.each([
+      ['plain literal', 'READY'],
+      ['anchored literal', '^READY$'],
+      ['alternation without outer quantifier', 'error|warn|info'],
+      ['simple character class', '[a-zA-Z0-9_]+'],
+      ['single-level quantifier', 'a+'],
+      ['bounded repeat under threshold', 'a{1,16}'],
+      ['nested group without inner unbounded', '(foo)+'],
+      ['escaped meta in literal', '\\(a\\+\\)\\+'],
+      ['lookahead', '(?=foo)bar'],
+      ['non-capturing single-level', '(?:abc)+'],
+    ])('%s — %s', (_, pattern) => {
+      expect(detectRedosShape(pattern)).toBeNull();
+    });
+  });
+
+  describe('rejects catastrophic-backtracking shapes', () => {
+    test('nested unbounded: (a+)+', () => {
+      const result = detectRedosShape('(a+)+');
+      expect(result?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('nested unbounded: (a*)*', () => {
+      expect(detectRedosShape('(a*)*')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('nested unbounded: (.+)*', () => {
+      expect(detectRedosShape('(.+)*')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('nested unbounded: (\\d+)+', () => {
+      expect(detectRedosShape('(\\d+)+')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('nested unbounded: classic (a+)+b', () => {
+      expect(detectRedosShape('(a+)+b')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('two-level nested: ((a+))+', () => {
+      expect(detectRedosShape('((a+))+')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('two-level nested: ((a))+ with outer quantifier', () => {
+      expect(detectRedosShape('((a)+)+')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('two-level nested with surrounding chars: (x(a+)y)+', () => {
+      expect(detectRedosShape('(x(a+)y)+')?.code).toBe('nested_unbounded_quantifier');
+    });
+
+    test('two-level nested with inner star: ((a)*)+', () => {
+      expect(detectRedosShape('((a)*)+')?.code).toBe('nested_unbounded_quantifier');
+    });
+  });
+
+  describe('rejects alternation in repeated group', () => {
+    test('(a|a)*', () => {
+      expect(detectRedosShape('(a|a)*')?.code).toBe('alternation_in_repeated_group');
+    });
+
+    test('(a|ab)+', () => {
+      expect(detectRedosShape('(a|ab)+')?.code).toBe('alternation_in_repeated_group');
+    });
+  });
+
+  describe('rejects large bounded repeats on quantified groups', () => {
+    test('(a+){50,}', () => {
+      expect(detectRedosShape('(a+){50,}')?.code).toBe('large_bounded_repeat_on_group');
+    });
+
+    test('(a+){1,100}', () => {
+      expect(detectRedosShape('(a+){1,100}')?.code).toBe('large_bounded_repeat_on_group');
+    });
+
+    test('admits modest bounded repeats', () => {
+      // (a+){1,16} stays under MAX_BOUNDED_REPEAT and is rejected
+      // by the OTHER guard (nested unbounded), which is fine —
+      // the outer (a+) is still pathological. This test pins
+      // that the bounded-repeat detector itself doesn't fire on
+      // small upper limits.
+      const rejection = detectRedosShape('(a+){1,16}');
+      expect(rejection?.code).not.toBe('large_bounded_repeat_on_group');
+    });
+  });
+
+  describe('rejects oversized patterns', () => {
+    test('over 1024 bytes', () => {
+      const huge = 'a'.repeat(1500);
+      const result = detectRedosShape(huge);
+      expect(result?.code).toBe('pattern_too_long');
+      expect(result?.message).toContain('1024');
+    });
+
+    test('exactly at threshold passes', () => {
+      const onLimit = 'a'.repeat(1024);
+      expect(detectRedosShape(onLimit)).toBeNull();
+    });
+  });
+
+  describe('rejection includes diagnostic message', () => {
+    test('message names the offending shape category', () => {
+      const result = detectRedosShape('(x+)+');
+      expect(result).not.toBeNull();
+      expect(result?.message).toContain('repeated group');
+    });
+  });
+});

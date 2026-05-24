@@ -1185,6 +1185,109 @@ describe('invokeTool', () => {
       expect(receivedArgs).toEqual({ path: 'mutated.txt' });
     });
 
+    test('slice 178 (hardening M4): successful updatedInput records hook approval row with hash diff', async () => {
+      // Audit trail for silent rewrites: the original
+      // tool_calls.input stays as the model emitted, and a
+      // dedicated approvals_log row records (decidedBy='hook',
+      // decision='allow') so forensics can answer "did a hook
+      // rewrite this call's args?" without parsing hook_runs
+      // stdout. Without this row the rewrite is invisible to
+      // every approvals_log query.
+      const passthroughTool: Tool = {
+        name: 'write_file',
+        description: 'noop',
+        inputSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+        metadata: { category: 'fs.write', writes: true, idempotent: false },
+        async execute() {
+          return { ok: true };
+        },
+      };
+      const deps = {
+        ...buildDeps(passthroughTool, { tools: { write_file: { allow_paths: ['**'] } } }),
+        fireHook: makeFireHook({ path: 'mutated.txt' }),
+      };
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'original.txt' }, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+      const hookAllow = approvals.find((a) => a.decidedBy === 'hook');
+      expect(hookAllow).toBeDefined();
+      expect(hookAllow?.decision).toBe('allow');
+      expect(hookAllow?.reason).toContain('hook updatedInput applied');
+      expect(hookAllow?.reason).toMatch(/args_hash [0-9a-f]{16} → [0-9a-f]{16}/);
+    });
+
+    test('updatedInput that re-emits identical args produces NO audit row (hash unchanged)', async () => {
+      // Hooks that read updatedInput from the tool's own input
+      // verbatim shouldn't pollute the approvals_log with
+      // no-op "rewrite" rows. The hash equality check filters
+      // those out — only real mutations are recorded.
+      const passthroughTool: Tool = {
+        name: 'write_file',
+        description: 'noop',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+        metadata: { category: 'fs.write', writes: true, idempotent: false },
+        async execute() {
+          return { ok: true };
+        },
+      };
+      const deps = {
+        ...buildDeps(passthroughTool, { tools: { write_file: { allow_paths: ['**'] } } }),
+        fireHook: makeFireHook({ path: 'original.txt' }),
+      };
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'original.txt' }, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+      const hookRows = approvals.filter((a) => a.decidedBy === 'hook');
+      expect(hookRows).toHaveLength(0);
+    });
+
+    test('updatedInput with different key order produces NO audit row (canonical hash)', async () => {
+      // External hooks (Python/Go/jq) re-serialize through maps
+      // whose iteration order may differ from V8. Without
+      // canonicalization, `{a:1,b:2}` and `{b:2,a:1}` would
+      // produce different hashes and synthesize a spurious
+      // "rewrite" row even though the input is semantically
+      // identical. canonicalHash sorts object keys.
+      const passthroughTool: Tool = {
+        name: 'write_file',
+        description: 'noop',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+        metadata: { category: 'fs.write', writes: true, idempotent: false },
+        async execute() {
+          return { ok: true };
+        },
+      };
+      const deps = {
+        ...buildDeps(passthroughTool, { tools: { write_file: { allow_paths: ['**'] } } }),
+        // Hook returns the same logical object with reversed key
+        // order (mode before path).
+        fireHook: makeFireHook({ mode: 'r', path: 'original.txt' }),
+      };
+      const inv = await invokeTool(
+        {
+          toolUseId: 'tu1',
+          toolName: 'write_file',
+          args: { path: 'original.txt', mode: 'r' },
+          messageId,
+        },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+      const hookRows = approvals.filter((a) => a.decidedBy === 'hook');
+      expect(hookRows).toHaveLength(0);
+    });
+
     test('updatedInput that would be denied → refused with re-check error', async () => {
       // Policy: allow `safe.txt`, deny everything else. Original
       // args pass (allow); hook mutates to denied path; re-check

@@ -11,7 +11,7 @@
 //                         the plan only; --force lifts the
 //                         skip on dirty preserved + orphans
 
-import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import {
   type WorktreeGcEntry,
   type WorktreeGcPlan,
@@ -171,7 +171,7 @@ export const runWorktreesCli = async (input: WorktreesCliInput): Promise<number>
   } finally {
     if (input.dbOverride === undefined) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore
       }

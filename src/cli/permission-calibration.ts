@@ -20,7 +20,7 @@ import {
   extractCalibrationTriples,
 } from '../outcomes/calibration.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { MIGRATIONS, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
 export interface RunPermissionCalibrationExportOptions {
   json?: boolean;
@@ -136,7 +136,7 @@ export const runPermissionCalibrationExport = async (
     // one signal-lookup query per approval. At the 100k retention
     // ceiling that doubles to ~200k SQL round-trips per CLI call.
     triples = extractCalibrationTriples(db, extractOpts);
-    db.close();
+    closeDb(db);
   } catch (e) {
     err(`forja permission calibration-export: db: ${e instanceof Error ? e.message : String(e)}\n`);
     return 1;

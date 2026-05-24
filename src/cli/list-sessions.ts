@@ -7,6 +7,7 @@
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
+  closeDb,
   countSessions,
   defaultDbPath,
   getSubagentRun,
@@ -329,6 +330,6 @@ export const runListSessions = (options: ListSessionsOptions): number => {
     }
     return 0;
   } finally {
-    if (ownsDb) db.close();
+    if (ownsDb) closeDb(db);
   }
 };

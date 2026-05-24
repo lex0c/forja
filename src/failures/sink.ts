@@ -328,6 +328,50 @@ export const createSqliteFailureSink = (options: {
           process.stderr.write(
             `forja failure_events: outcome_signal dual-write failed for approval_seq=${approval_seq} (${redactSecrets(msg)}); failure row persisted\n`,
           );
+          // Slice 178 (hardening M2). A swallowed dual-write
+          // failure is invisible to queries that only inspect
+          // failure_events — calibration silently misses the
+          // outcome signal and operators can't tell whether the
+          // gap is a real "no failure here" or "the failure was
+          // observed but the signal sink choked." Emit a
+          // compensation row keyed on the original failure_id
+          // so forensics can correlate "where did the outcome
+          // signal go" without scanning stderr.
+          //
+          // queueMicrotask defers the emit until the current
+          // withImmediateTransaction has committed and released
+          // the writer lock — otherwise the compensation would
+          // queue on busy_timeout against its own transaction,
+          // costing ~5s of wall clock and risking double-rollback
+          // semantics if the compensation also throws.
+          queueMicrotask(() => {
+            try {
+              emit({
+                code: 'storage.persist_failed',
+                classe: 'storage',
+                recovery_action: 'degraded',
+                user_visible: false,
+                session_id,
+                // IMPORTANT: payload key is `original_approval_seq`,
+                // NOT `approval_seq`. The dual-write extractor keys
+                // on the literal `approval_seq` field; reusing that
+                // name here would re-enter the same broken dual-
+                // write path and loop infinitely. The rename keeps
+                // the data accessible to forensics while opting the
+                // compensation row out of dual-write.
+                payload: {
+                  subsystem: 'outcome_signal_dual_write',
+                  original_failure_id: id,
+                  original_approval_seq: approval_seq,
+                  reason: redactSecrets(msg),
+                },
+              });
+            } catch (e2) {
+              process.stderr.write(
+                `forja failure_events: dual-write compensation also failed (${e2 instanceof Error ? e2.message : String(e2)}); audit gap is permanent for failure_id=${id}\n`,
+              );
+            }
+          });
         }
       }
 

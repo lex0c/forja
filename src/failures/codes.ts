@@ -99,6 +99,16 @@ export const CODE_VOCABULARY: ReadonlyMap<string, FailureClass> = new Map<string
   // Payload carries the original error message; operator drills
   // in via the failure_events table for forensics.
   ['storage.persist_failed', 'storage'],
+  // Slice 178 (hardening M1). storage.resume_truncated: the
+  // persisted message log for a resumed session exceeded
+  // MAX_RESUME_MESSAGES and the harness loaded the most-recent
+  // slice only. The model sees fewer turns than were persisted;
+  // a replayed audit of the run is not identical to the run.
+  // Payload carries `kept` + `dropped` counts so forensics can
+  // reconcile "the operator saw 612 turns in scrollback but the
+  // model only acted on the last 500" — without this row that
+  // discrepancy is invisible to any post-hoc query.
+  ['storage.resume_truncated', 'storage'],
 ]);
 
 export const isFailureCode = (code: string): boolean => CODE_VOCABULARY.has(code);

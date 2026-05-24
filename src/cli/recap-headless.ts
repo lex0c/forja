@@ -22,7 +22,7 @@ import { createRegistry } from '../providers/registry.ts';
 import type { Provider } from '../providers/types.ts';
 import { redactSecretsInIntermediate } from '../recap/format.ts';
 import type { DB } from '../storage/db.ts';
-import { openDb } from '../storage/db.ts';
+import { closeDb, openDb } from '../storage/db.ts';
 import { migrate } from '../storage/migrate.ts';
 import { defaultDbPath } from '../storage/paths.ts';
 import { createBus } from '../tui/bus.ts';
@@ -194,6 +194,6 @@ export const runRecapHeadless = async (options: RunRecapHeadlessOptions): Promis
     }
     return 0;
   } finally {
-    if (ownsDb) db.close();
+    if (ownsDb) closeDb(db);
   }
 };

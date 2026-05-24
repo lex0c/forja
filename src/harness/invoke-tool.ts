@@ -1,5 +1,6 @@
 import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import { scanForInjection } from '../memory/index.ts';
+import { canonicalHash } from '../permissions/canonical.ts';
 import type { Decision, PermissionEngine, PolicySource, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
 import { sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
@@ -800,6 +801,47 @@ export const invokeTool = async (
           };
         }
         effectiveArgs = chain.updatedInput;
+        // Slice 178 (hardening M4). Audit the args mutation. The
+        // hook_runs row carries the hook's stdout (including the
+        // updatedInput JSON) and the original tool_calls.input
+        // is immutable, but neither surface answers the forensic
+        // question "did this tool execute with the args the model
+        // emitted, or did a hook silently rewrite them?" without
+        // a JSON-output parse. A dedicated approval row with a
+        // before/after hash makes the rewrite queryable directly:
+        //   SELECT * FROM approvals_log WHERE reason LIKE
+        //   'allow: hook updatedInput applied%'
+        // would list every silent rewrite across history.
+        try {
+          // canonicalHash sorts object keys + canonicalizes
+          // numbers/strings so semantically-equal inputs produce
+          // identical hashes regardless of the serialization order
+          // an external hook happens to emit. Same primitive the
+          // failure_events chain uses for content-addressing.
+          // Without canonicalization, a hook re-serializing the
+          // input through a language whose map iteration order
+          // differs from V8 would synthesize a spurious "rewrite"
+          // audit row on every call.
+          const hashArgs = (a: unknown): string => canonicalHash(a).slice(0, 16);
+          const preHash = hashArgs(input.args);
+          const postHash = hashArgs(chain.updatedInput);
+          if (preHash !== postHash) {
+            recordApproval(deps.db, {
+              toolCallId: toolCall.id,
+              decision: 'allow',
+              decidedBy: 'hook',
+              reason: `allow: hook updatedInput applied; args_hash ${preHash} → ${postHash}`,
+            });
+          }
+        } catch {
+          // Best-effort audit; a hashing or DB error here must
+          // not stop the tool execution that was already
+          // authorized by the engine re-check. Diagnostic on
+          // stderr keeps the failure visible without escalating.
+          process.stderr.write(
+            `forja: failed to audit hook updatedInput for ${input.toolName} (toolCallId=${toolCall.id})\n`,
+          );
+        }
       }
     }
   }

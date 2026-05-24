@@ -122,6 +122,50 @@ const PERMISSION_DECISIONS: ReadonlySet<PermissionDecision> = new Set(['allow', 
 // unambiguous — no extra scanning needed by the framer.
 export const encodeMessage = (msg: IpcMessage): string => `${JSON.stringify(msg)}\n`;
 
+// Slice 178 (hardening A4). Classify an IPC send/transport throw
+// as either expected teardown (channel torn down during normal
+// shutdown — the peer process exited, the pipe was closed, the
+// stream was destroyed) or a real error (serialization bug,
+// backpressure crossing the queue cap, transport-internal
+// invariant violation). Catch sites for `channel.send` had been
+// swallowing ALL throws under a `// teardown race` comment, which
+// is correct for the dominant case but masks bugs that would
+// surface as silent subagent hangs when something unexpected
+// goes wrong (the peer never gets its expected message, the
+// parent never observes the failure).
+//
+// Returns true when the throw matches a known teardown signature.
+// Callers should silence those and log+escalate everything else.
+export const isExpectedIpcTeardown = (err: unknown): boolean => {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  if (
+    code === 'EPIPE' ||
+    code === 'ECONNRESET' ||
+    code === 'EBADF' ||
+    code === 'ERR_STREAM_DESTROYED' ||
+    code === 'ERR_STREAM_WRITE_AFTER_END' ||
+    code === 'ERR_IPC_CHANNEL_CLOSED'
+  ) {
+    return true;
+  }
+  // Substring fallback for transports that surface errors with
+  // descriptive messages but no code (Bun streams, in-memory
+  // queue closes). Match is case-insensitive against canonical
+  // phrasings — anything outside this list is treated as a real
+  // error so the diagnostic surfaces.
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes('channel closed') ||
+    msg.includes('channel is closed') ||
+    msg.includes('write after end') ||
+    msg.includes('broken pipe') ||
+    msg.includes('stream destroyed') ||
+    msg.includes('already destroyed') ||
+    msg.includes('cannot write to closed')
+  );
+};
+
 export type ParseResult = { ok: true; msg: IpcMessage } | { ok: false; reason: string };
 
 // Defensive — never throws. Spec §4.5 mandates the channel

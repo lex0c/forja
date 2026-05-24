@@ -37,6 +37,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
+import { closeDb } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { listCritiqueRunsBySession } from '../storage/repos/critique-runs.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
@@ -861,7 +862,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (baseConfig.broker !== undefined) {
         await baseConfig.broker.close();
       }
-      db.close();
+      closeDb(db);
       return 1;
     }
     resumedSessionId = resolved.id;
@@ -1637,7 +1638,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (baseConfig.broker !== undefined) {
       await baseConfig.broker.close();
     }
-    db.close();
+    closeDb(db);
     // Resume hint. Printed AFTER renderer.close() (no live region to
     // fight) and AFTER db.close() (any teardown diagnostics that
     // would also use errSink land first). Gated on a real session

@@ -178,6 +178,25 @@ describe('monitor tool: validation', () => {
     expect(r.error_message).toContain('not a valid regex');
   });
 
+  test('rejects ReDoS-prone pattern when is_regex=true', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await monitorTool.execute(
+      {
+        condition: {
+          kind: 'process_output_pattern',
+          process_id: 'x',
+          pattern: '(a|ab)+',
+          is_regex: true,
+        },
+        duration_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('alternation_in_repeated_group');
+  });
+
   test("rejects '..' in file_changes path", async () => {
     const ctx = makeCtx({ sessionId, cwd: mktemp() });
     const r = await monitorTool.execute(

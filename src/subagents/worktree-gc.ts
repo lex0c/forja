@@ -31,6 +31,7 @@ import {
   listSubagentWorktreesWithParentCwd,
   markSubagentWorktreeCleaned,
 } from '../storage/index.ts';
+import { getGitBinary, safeGitEnv } from './git-binary.ts';
 import { defaultWorktreeRoot } from './worktree.ts';
 
 // One entry per worktree the gc considered. The `kind`
@@ -128,15 +129,10 @@ export interface BuildGcPlanOptions {
 }
 
 const defaultRunGitWorktreeList = async (parentCwd: string): Promise<string> => {
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', '-C', parentCwd, 'worktree', 'list', '--porcelain'],
-    env: {
-      LC_ALL: 'C',
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_LITERAL_PATHSPECS: '1',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    cmd: [git, '-C', parentCwd, 'worktree', 'list', '--porcelain'],
+    env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -146,15 +142,10 @@ const defaultRunGitWorktreeList = async (parentCwd: string): Promise<string> => 
 };
 
 const defaultWorktreeStatus = async (path: string): Promise<'clean' | 'dirty' | 'unreadable'> => {
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', '-C', path, 'status', '--porcelain'],
-    env: {
-      LC_ALL: 'C',
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_LITERAL_PATHSPECS: '1',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    cmd: [git, '-C', path, 'status', '--porcelain'],
+    env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -170,15 +161,10 @@ const defaultWorktreeStatus = async (path: string): Promise<'clean' | 'dirty' | 
 // and returns an empty plan rather than risking unscoped
 // removal).
 const defaultResolveRepoRoot = async (parentCwd: string): Promise<string | null> => {
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', '-C', parentCwd, 'rev-parse', '--show-toplevel'],
-    env: {
-      LC_ALL: 'C',
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_LITERAL_PATHSPECS: '1',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    cmd: [git, '-C', parentCwd, 'rev-parse', '--show-toplevel'],
+    env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -631,15 +617,10 @@ const defaultRunRemove: RunRemoveFn = async (
   // entry. We follow with `git branch -D <branch>` for the
   // agent/* branch — best-effort because the branch may already
   // be gone, or the operator may have intentionally kept it.
+  const git = await getGitBinary();
   const remove = Bun.spawn({
-    cmd: ['git', '-C', parentCwd, 'worktree', 'remove', '--force', path],
-    env: {
-      LC_ALL: 'C',
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_LITERAL_PATHSPECS: '1',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    cmd: [git, '-C', parentCwd, 'worktree', 'remove', '--force', path],
+    env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -675,14 +656,8 @@ const defaultRunRemove: RunRemoveFn = async (
   let branchDeleted = false;
   if (removed && branch !== null) {
     const del = Bun.spawn({
-      cmd: ['git', '-C', parentCwd, 'branch', '-D', branch],
-      env: {
-        LC_ALL: 'C',
-        GIT_TERMINAL_PROMPT: '0',
-        GIT_LITERAL_PATHSPECS: '1',
-        PATH: process.env.PATH ?? '',
-        HOME: process.env.HOME ?? '',
-      },
+      cmd: [git, '-C', parentCwd, 'branch', '-D', branch],
+      env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
       stdout: 'pipe',
       stderr: 'pipe',
     });

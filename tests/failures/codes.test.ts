@@ -56,6 +56,11 @@ describe('isFailureCode (vocabulary)', () => {
     expect(isFailureCode('storage.persist_failed')).toBe(true);
   });
 
+  test('slice 178 (hardening M1) storage.resume_truncated is registered', () => {
+    expect(isFailureCode('storage.resume_truncated')).toBe(true);
+    expect(CODE_VOCABULARY.get('storage.resume_truncated')).toBe('storage');
+  });
+
   test('format-valid but unregistered code is rejected', () => {
     // Reserved for future slices — emit must hard-fail until the
     // owning subsystem adds the entry.

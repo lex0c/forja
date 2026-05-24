@@ -1487,6 +1487,110 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
   });
 });
 
+// Slice 178 (hardening A1). Symlink that stays out of any protected
+// zone but escapes cwd into an arbitrary external location. The
+// protected-path classifier returns null for both ends, so slice 176
+// doesn't refuse or escalate. But a `<cwd>/**` glob policy authorizes
+// the lexical capability while the kernel follows the symlink to a
+// target the operator never scoped. Defense: degrade confidence to
+// low so the engine forces confirm.
+describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', () => {
+  test('read of /work/proj/data/x → /tmp/exfil drops confidence to low', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/data/x') return '/tmp/exfil';
+        return p;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat data/x' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('write redirect /work/proj/log → /tmp/leak drops confidence to low', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/log') return '/tmp/leak';
+        return p;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'echo data > log' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('input redirect via cwd-escape symlink drops confidence to low', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/source') return '/var/log/secret';
+        return p;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat < source' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('symlink that stays inside cwd preserves confidence high', () => {
+    // node_modules → ./packages/node_modules (legit yarn workspace
+    // shape). Both ends inside cwd: no escape, no escalation.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/node_modules') return '/work/proj/packages/node_modules';
+        return p;
+      },
+    };
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'cat node_modules/foo/index.js' },
+      ctxWithRealpath,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('parent-dir symlink that escapes cwd via parent realpath fallback drops to low', () => {
+    // Leaf doesn't exist, parent is a symlink to an external path.
+    // Mirrors the slice-176 deny-tier fallback shape but the target
+    // isn't a protected zone — it's just outside cwd.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/cwd_alias') return '/tmp/external';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'echo data > cwd_alias/new.txt' },
+      ctxWithRealpath,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+});
+
 // Slice 174 — info-leak flag-decoding batch. Four resolvers
 // previously consumed file-path operands without emitting the
 // corresponding read/write capability. Each test exercises ONE

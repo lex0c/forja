@@ -27,7 +27,7 @@ import {
   resolveScopeRoots,
   validateName,
 } from '../memory/index.ts';
-import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
 export interface MemoryCliInput {
   verb: 'list' | 'show';
@@ -247,7 +247,7 @@ export const runMemoryCli = async (input: MemoryCliInput): Promise<number> => {
   } finally {
     if (input.dbOverride === undefined) {
       try {
-        db.close();
+        closeDb(db);
       } catch {
         // ignore
       }

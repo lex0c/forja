@@ -55,7 +55,7 @@ import {
   createSkillCatalog,
   resolveScopeRoots as resolveSkillScopeRoots,
 } from '../skills/index.ts';
-import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import {
   GOVERNANCE_PROPOSAL_TTL_MS,
   expirePendingProposals,
@@ -582,7 +582,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   try {
     migrate(db);
   } catch (e) {
-    db.close();
+    closeDb(db);
     throw e;
   }
 
@@ -1268,7 +1268,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       }
     }
   } catch (e) {
-    db.close();
+    closeDb(db);
     throw e;
   }
 

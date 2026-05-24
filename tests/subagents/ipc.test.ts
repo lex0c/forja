@@ -7,6 +7,7 @@ import {
   createChannel,
   encodeMessage,
   fakeTransportPair,
+  isExpectedIpcTeardown,
   makeEvent,
   makeInterruptHard,
   makeInterruptSoft,
@@ -893,5 +894,61 @@ describe('subprocessTransport — real Bun.spawn child (slice 135 P0-9)', () => 
     // — checking it's not 0 is the portable assertion).
     const code = await child.exited;
     expect(code).not.toBe(0);
+  });
+});
+
+describe('isExpectedIpcTeardown — slice 178 hardening A4', () => {
+  describe('recognizes teardown by errno code', () => {
+    test.each([
+      'EPIPE',
+      'ECONNRESET',
+      'EBADF',
+      'ERR_STREAM_DESTROYED',
+      'ERR_STREAM_WRITE_AFTER_END',
+      'ERR_IPC_CHANNEL_CLOSED',
+    ])('%s', (code) => {
+      const err = new Error('boom') as NodeJS.ErrnoException;
+      err.code = code;
+      expect(isExpectedIpcTeardown(err)).toBe(true);
+    });
+  });
+
+  describe('recognizes teardown by message substring', () => {
+    test.each([
+      ['channel closed', 'Channel closed'],
+      ['channel is closed', 'IPC channel is closed'],
+      ['write after end', 'write after end'],
+      ['broken pipe', 'broken pipe: write failed'],
+      ['stream destroyed', 'stream destroyed'],
+      ['already destroyed', 'Cannot call write — already destroyed'],
+      ['cannot write to closed', 'cannot write to closed stream'],
+    ])('%s', (_, message) => {
+      expect(isExpectedIpcTeardown(new Error(message))).toBe(true);
+    });
+  });
+
+  describe('refuses to mask real errors', () => {
+    test('a TypeError from JSON.stringify is not teardown', () => {
+      expect(isExpectedIpcTeardown(new TypeError('Converting circular structure to JSON'))).toBe(
+        false,
+      );
+    });
+
+    test('an unrelated runtime error is not teardown', () => {
+      expect(isExpectedIpcTeardown(new Error('Permission queue overflow'))).toBe(false);
+    });
+
+    test('an Error with an unknown errno code is not teardown', () => {
+      const err = new Error('boom') as NodeJS.ErrnoException;
+      err.code = 'ESOMETHING';
+      expect(isExpectedIpcTeardown(err)).toBe(false);
+    });
+
+    test('a non-Error value is not teardown', () => {
+      expect(isExpectedIpcTeardown('Channel closed')).toBe(false);
+      expect(isExpectedIpcTeardown(null)).toBe(false);
+      expect(isExpectedIpcTeardown(undefined)).toBe(false);
+      expect(isExpectedIpcTeardown({ message: 'Channel closed' })).toBe(false);
+    });
   });
 });

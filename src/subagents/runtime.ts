@@ -25,6 +25,7 @@ import {
   IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcMessage,
   type PermissionDecision,
+  isExpectedIpcTeardown,
   makeInterruptHard,
   makePermissionAnswer,
 } from './ipc.ts';
@@ -924,9 +925,15 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       ipcVersionMismatch = msg.protocolVersion;
       try {
         handle.ipc?.send(makeInterruptHard());
-      } catch {
-        // Channel may already be torn down; SIGTERM below
-        // covers the dead-pipe case.
+      } catch (e) {
+        // SIGTERM below covers the channel-broken case; an
+        // unexpected throw should not hide behind the OS-
+        // fallback safety net.
+        if (!isExpectedIpcTeardown(e)) {
+          process.stderr.write(
+            `subagent ${childSession.id}: ipc send (version-mismatch interrupt:hard) failed unexpectedly: ${e instanceof Error ? e.message : String(e)}\n`,
+          );
+        }
       }
       handle.kill('SIGTERM');
       // Belt-and-suspenders SIGKILL escalation. A child that
@@ -1090,11 +1097,21 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         if (hook === undefined || args === null) {
           try {
             handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
-          } catch {
+          } catch (e) {
             // Channel may already be torn down (child died
             // mid-ask). The child's bridge drains pending as
             // denied on its onClose, so the verdict here is
-            // moot in that case.
+            // moot in that case. Anything that isn't a known
+            // teardown signature is surfaced — silently
+            // swallowing a serialization or backpressure error
+            // would manifest as the child hanging on a
+            // permission answer that never arrived, with no
+            // forensic trail to diagnose from.
+            if (!isExpectedIpcTeardown(e)) {
+              process.stderr.write(
+                `subagent ${childSession.id}: ipc send (deny for unhooked ask) failed unexpectedly (promptId=${promptId}): ${e instanceof Error ? e.message : String(e)}\n`,
+              );
+            }
           }
           return;
         }
@@ -1114,8 +1131,12 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
           );
           try {
             handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
-          } catch {
-            // ignored — same teardown race
+          } catch (e) {
+            if (!isExpectedIpcTeardown(e)) {
+              process.stderr.write(
+                `subagent ${childSession.id}: ipc send (rate-limit deny) failed unexpectedly (promptId=${promptId}): ${e instanceof Error ? e.message : String(e)}\n`,
+              );
+            }
           }
           return;
         }
@@ -1187,8 +1208,12 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
             }
             try {
               handle.ipc?.send(makePermissionAnswer({ promptId, decision: safeDecision }));
-            } catch {
-              // Channel teardown race — same as above.
+            } catch (e) {
+              if (!isExpectedIpcTeardown(e)) {
+                process.stderr.write(
+                  `subagent ${childSession.id}: ipc send (permission answer) failed unexpectedly (promptId=${promptId}, decision=${safeDecision}): ${e instanceof Error ? e.message : String(e)}\n`,
+                );
+              }
             }
           })
           .catch(() => {
@@ -1197,8 +1222,12 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
             // hang waiting for an answer that will never come.
             try {
               handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
-            } catch {
-              // ignored
+            } catch (e) {
+              if (!isExpectedIpcTeardown(e)) {
+                process.stderr.write(
+                  `subagent ${childSession.id}: ipc send (hook-threw deny) failed unexpectedly (promptId=${promptId}): ${e instanceof Error ? e.message : String(e)}\n`,
+                );
+              }
             }
           });
       });

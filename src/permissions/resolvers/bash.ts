@@ -3010,6 +3010,45 @@ const classifyArgWithCanonical = (
   return tierRank(canonicalTier) > tierRank(lexicalTier) ? canonicalTier : lexicalTier;
 };
 
+// Slice 178 (hardening A1, audit follow-up to slice 176). The
+// canonical-aware classifier above catches symlinks escaping into
+// well-known protected zones (/etc, /proc, ~/.ssh, ...) but NOT
+// symlinks escaping cwd into arbitrary external locations the
+// operator's policy may scope by `<cwd>/**` glob. Example:
+//   cwd = /work/proj
+//   /work/proj/data/x → /tmp/exfil-target
+//   policy: allow read-fs:/work/proj/**
+// classifyProtectedPath returns null for both ends (neither in a
+// classifier zone); the engine matches the lexical capability against
+// the glob and authorizes. The kernel then follows the symlink and
+// the read lands on /tmp/exfil-target — outside the operator's
+// intended scope but never visible to the policy match.
+//
+// Returns true when lexical stays inside cwd but canonical does not.
+// Callers degrade confidence to 'low' (engine forces confirm). Hard-
+// refusal would break legitimate use (yarn workspaces sometimes have
+// symlinks pointing outside the project root); low-confidence funnels
+// the call through the operator's modal, which is the right trade.
+const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean => {
+  if (ctx.realpath === undefined) return false;
+  let canonical: string;
+  try {
+    canonical = ctx.realpath(lexicalAbs);
+  } catch {
+    try {
+      const parentReal = ctx.realpath(dirname(lexicalAbs));
+      canonical = joinPath(parentReal, basename(lexicalAbs));
+    } catch {
+      return false;
+    }
+  }
+  if (canonical === lexicalAbs) return false;
+  const cwdPrefix = ctx.cwd.endsWith('/') ? ctx.cwd : `${ctx.cwd}/`;
+  const lexicalInside = lexicalAbs === ctx.cwd || lexicalAbs.startsWith(cwdPrefix);
+  const canonicalInside = canonical === ctx.cwd || canonical.startsWith(cwdPrefix);
+  return lexicalInside && !canonicalInside;
+};
+
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
@@ -3110,6 +3149,12 @@ const analyzeCommand = (
           };
         }
         if (tier === 'escalate') escalated = true;
+        // Slice 178: cwd-scope symlink escape. Lexical inside cwd
+        // but canonical outside means a glob policy like
+        // `<cwd>/**` would authorize lexically while the kernel
+        // follows the symlink to whatever target the operator
+        // never scoped. Degrade confidence to force confirm.
+        if (detectCwdScopeEscape(abs, ctx)) escalated = true;
       }
     }
   }
@@ -3137,6 +3182,8 @@ const analyzeCommand = (
         };
       }
       if (tier === 'escalate') finalConf = 'low';
+      // Slice 178: cwd-scope escape on write redirect.
+      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
       redirectCaps.push(writeFs(tgtAbs));
     }
     // Slice 128 (R4 P0-Launder-3): input redirects `<` ALSO pass
@@ -3159,6 +3206,8 @@ const analyzeCommand = (
           refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
         };
       }
+      // Slice 178: cwd-scope escape on read redirect.
+      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
       // Add read-fs to capabilities — the shell will read from
       // this path, the resolver should honestly admit so.
       redirectCaps.push(readFs(tgtAbs));
