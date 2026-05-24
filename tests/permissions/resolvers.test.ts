@@ -1589,6 +1589,148 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       expect(r.confidence).toBe('low');
     }
   });
+
+  test('dangling symlink leaf with absolute outside-cwd target drops to low', () => {
+    // /work/proj/outlink → /tmp/exfil where /tmp/exfil was removed
+    // (dangling symlink). Pre-fix the parent-realpath fallback
+    // collapsed canonical to /work/proj/outlink === lexicalAbs and
+    // returned "no escape". Post-fix: ctx.readlink reads the
+    // stored target /tmp/exfil even though realpath fails, the
+    // escape is detected, confidence drops.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        // /work/proj/outlink: realpath fails (dangling).
+        // Parent /work/proj realpaths to itself.
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/outlink') return '/tmp/exfil';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat outlink' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('dangling symlink on write redirect with absolute target drops to low', () => {
+    // Same shape but on a write redirect (`> outlink`). The kernel
+    // creates the file at the symlink target /tmp/x even though
+    // /tmp/x didn't exist when the symlink was made — defense must
+    // catch this BEFORE the engine matches the policy.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/outlink') return '/tmp/new-target';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'echo data > outlink' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('dangling symlink with RELATIVE target inside cwd preserves confidence', () => {
+    // Relative target ../sibling resolves against the symlink's
+    // parent dir /work/proj — stays inside cwd, no escape.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        // Symlink at /work/proj/innerlink → ./missing-but-inside
+        if (p === '/work/proj/innerlink') return 'missing-but-inside';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat innerlink' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('dangling symlink with RELATIVE target that escapes cwd drops to low', () => {
+    // /work/proj/exfil-link → ../../../tmp/x — relative target
+    // walks up past cwd. Resolved against the symlink's parent dir,
+    // canonicalizes outside cwd; detector fires.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/exfil-link') return '../../../tmp/x';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat exfil-link' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('readlink omitted (legacy ctx) keeps old parent-realpath fallback', () => {
+    // When readlink isn't wired (test ctx without the seam, or a
+    // future caller path), the helper falls through to the
+    // parent-realpath + basename rejoin. Same behavior as before
+    // the fix — pinned to ensure the readlink branch is purely
+    // additive, not a behavior change for callers that didn't
+    // opt in.
+    const ctxWithoutReadlink: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      // readlink intentionally omitted
+    };
+    // Without readlink, the dangling-symlink case collapses to
+    // lexical (the pre-fix behavior). Test pins that explicitly so
+    // a future refactor doesn't accidentally restore the bug.
+    const r = resolveCapabilities('bash', { command: 'cat outlink' }, ctxWithoutReadlink);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
 });
 
 // Slice 174 — info-leak flag-decoding batch. Four resolvers

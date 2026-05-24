@@ -35,6 +35,17 @@ export interface ResolverContext {
   // paths fall back to the lexical form (correct for write-creates-
   // new-file).
   realpath?: (p: string) => string;
+  // Slice 178 (review). Optional readlink seam for the dangling-
+  // symlink fallback path: when `realpath(lexicalAbs)` throws
+  // (target removed or never existed) but the lexical path is
+  // itself a symlink, `readlink` still returns the stored target.
+  // Without this seam the resolver's parent-realpath fallback
+  // rejoins basename and concludes "no escape" — the kernel,
+  // however, follows the symlink at exec time and the read/write
+  // lands at the (possibly outside-cwd) target. Same optional
+  // posture as `realpath`: tests omit and stay on the lexical-
+  // only path; production wiring passes `fs.readlinkSync`.
+  readlink?: (p: string) => string;
 }
 
 export type Resolver = (args: Record<string, unknown>, ctx: ResolverContext) => ResolverResult;

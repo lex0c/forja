@@ -1,4 +1,4 @@
-import { realpathSync } from 'node:fs';
+import { readlinkSync, realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
@@ -1477,6 +1477,15 @@ export const createPermissionEngine = (
         // only — tests that build ResolverContext directly omit
         // `realpath` and stay on the lexical-only path.
         realpath: realpathSync,
+        // Slice 178 (review). Paired with `realpath` so the
+        // resolver's dangling-symlink fallback can read the stored
+        // target literal when the full realpath walk fails.
+        // Without this, a broken symlink at `<cwd>/outlink → /tmp/x`
+        // would collapse to `<cwd>/outlink` (parent realpath +
+        // basename rejoin) and the cwd-scope-escape detector would
+        // miss it — but the kernel still follows the symlink at
+        // exec time.
+        readlink: readlinkSync,
       });
       if (resolverResult.kind === 'refuse') {
         const decision: Decision = {
