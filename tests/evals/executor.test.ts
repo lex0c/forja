@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { executeCase, summarize } from '../../src/evals/executor.ts';
+import { executeCase, resolveEvalCacheRoot, summarize } from '../../src/evals/executor.ts';
 import type { EvalCase } from '../../src/evals/types.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 
@@ -435,6 +435,61 @@ describe('executeCase', () => {
     });
     expect(r.costUsd).toBe(0);
     expect(r.passed).toBe(true);
+  });
+});
+
+describe('resolveEvalCacheRoot', () => {
+  // Resolution precedence guarded here so the production code's
+  // env-var escape hatch + degraded-fallback semantics survive
+  // future refactors. The function is pure (takes env + home,
+  // returns path) so each branch tests cleanly without process-
+  // env churn.
+  test('FORJA_EVAL_CACHE_DIR env override wins over HOME', () => {
+    // Operator in a constrained CI / container with read-only
+    // home points the env var at any writable path the sandbox
+    // can see. Override MUST take precedence — otherwise the
+    // operator has no escape hatch when the default ~/.cache
+    // path is unwritable.
+    const out = resolveEvalCacheRoot({ FORJA_EVAL_CACHE_DIR: '/srv/forja-eval' }, '/home/op');
+    expect(out).toBe('/srv/forja-eval');
+  });
+
+  test('falls back to ~/.cache/forja-eval when no env override', () => {
+    // Default path for normal dev + CI environments. Joined
+    // explicitly so platform differences (POSIX `/` vs Windows
+    // `\`) round-trip through node:path/join correctly.
+    const out = resolveEvalCacheRoot({}, '/home/op');
+    expect(out).toBe(join('/home/op', '.cache', 'forja-eval'));
+  });
+
+  test('falls back to tmpdir when HOME is empty AND no env override', () => {
+    // Degraded mode: fixture-backed cases will return zero
+    // matches inside the sandbox (the runtime sandbox masks
+    // /tmp), but the run starts cleanly instead of crashing at
+    // import time. Operators landing here should set the
+    // override; this branch keeps `bun test` runnable in
+    // pathological CI shapes that strip HOME entirely.
+    const out = resolveEvalCacheRoot({}, '');
+    expect(out).toBe(tmpdir());
+  });
+
+  test('empty FORJA_EVAL_CACHE_DIR is treated as unset (falls through to HOME)', () => {
+    // `length > 0` guard catches the operator who exported the
+    // var without a value (`export FORJA_EVAL_CACHE_DIR=`).
+    // Falling through to HOME beats writing into the process
+    // cwd or `/` — both would be silent corruption surfaces.
+    const out = resolveEvalCacheRoot({ FORJA_EVAL_CACHE_DIR: '' }, '/home/op');
+    expect(out).toBe(join('/home/op', '.cache', 'forja-eval'));
+  });
+
+  test('env override wins even when HOME is also empty', () => {
+    // Combination: container with HOME stripped but operator
+    // provides override. Must still honor the override —
+    // priority chain is "env > home > tmpdir" and HOME being
+    // empty cannot shift priority back to tmpdir over an
+    // explicit operator choice.
+    const out = resolveEvalCacheRoot({ FORJA_EVAL_CACHE_DIR: '/var/cache/forja-eval' }, '');
+    expect(out).toBe('/var/cache/forja-eval');
   });
 });
 
