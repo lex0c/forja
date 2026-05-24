@@ -14,10 +14,11 @@
 // is part of the trust boundary.
 //
 // PATH-on-subprocess: paired with `safeGitEnv()`, the spawned
-// git also runs with a minimal canonical PATH so any subprocess
-// git itself fork-execs (credential helpers, hooks, pagers) is
-// resolved against the canonical set, not the operator's
-// possibly-tainted login PATH.
+// git also runs with a controlled PATH so any subprocess git
+// itself fork-execs (credential helpers, hooks, pagers) is
+// resolved against the canonical set first; the operator's
+// boot PATH appended as fallback covers Nix-style profile bins
+// and asdf shims that don't live under canonical prefixes.
 
 // Conservative canonical PATH. Excludes per-user dirs (~/bin,
 // ~/.local/bin) by design — see threat model above. Includes:
@@ -26,79 +27,145 @@
 //   - /opt/local/{s,}bin — MacPorts.
 //   - /usr/local/{s,}bin — Intel Homebrew + many Linux distros.
 //   - /usr/{s,}bin + /{s,}bin — POSIX baseline.
-// Without /opt/homebrew, `which git` on a stock Apple Silicon
-// workstation returns null and `safeGitEnv()`'s PATH cannot find
-// git at exec time either — every worktree-gc spawn would
-// silently fail. The directories are well-known and operator-
-// installed; including them does not expose the per-user shim
-// surface the threat model is concerned with.
-const SAFE_PATH =
+// Per-user shims (~/bin, ~/.local/bin) and the operator's full
+// boot PATH (Nix profile, asdf shims, ad-hoc /opt/custom/bin)
+// are NOT in this set — those land in the fallback path on
+// `safeGitEnv()` only when canonical resolution fails.
+const CANONICAL_SAFE_PATH =
   '/opt/homebrew/sbin:/opt/homebrew/bin:/opt/local/sbin:/opt/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
-// `undefined` = not yet probed; `null` = probed and not found.
+// `undefined` = not yet probed; `null` = probed and not found
+// on any PATH we tried (canonical OR fallback).
 let cachedGitPath: string | null | undefined;
+// PATH string to ship in safeGitEnv(). Starts as canonical;
+// when fallback resolution succeeded against the operator's
+// boot PATH, we append the operator's PATH so subprocess of
+// git (hooks, credential helpers, ssh) can still resolve
+// their own tools on systems whose binaries live outside the
+// canonical set (NixOS, ad-hoc /opt). Canonical entries come
+// FIRST so shim resolution on names that ALSO exist in the
+// canonical set picks the canonical copy (defense-in-depth
+// against mid-session shadowing of git's siblings).
+let cachedSpawnPath: string = CANONICAL_SAFE_PATH;
 
-const resolveGitOnce = async (): Promise<string | null> => {
-  // `which` itself goes through PATH. Use the safe PATH so a
-  // shim of `which` doesn't poison the resolution. POSIX `which`
-  // (or its shell builtin) lives in /usr/bin or /bin on every
-  // supported platform — the canonical PATH includes both.
-  const proc = Bun.spawn({
-    cmd: ['which', 'git'],
-    env: { PATH: SAFE_PATH },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-  if (exitCode !== 0) return null;
-  const candidate = stdout.trim();
-  return candidate.length > 0 ? candidate : null;
+// Run `which git` against a specific PATH. Pure helper used by
+// both the async and sync entry points. Returns the trimmed
+// stdout when which exits 0 with non-empty output; null
+// otherwise. Never throws.
+const whichGitAsync = async (path: string): Promise<string | null> => {
+  try {
+    const proc = Bun.spawn({
+      cmd: ['which', 'git'],
+      env: { PATH: path },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (exitCode !== 0) return null;
+    const candidate = stdout.trim();
+    return candidate.length > 0 ? candidate : null;
+  } catch {
+    return null;
+  }
+};
+
+const whichGitSync = (path: string): string | null => {
+  try {
+    const proc = Bun.spawnSync({
+      cmd: ['which', 'git'],
+      env: { PATH: path },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    if (proc.exitCode !== 0) return null;
+    const candidate = new TextDecoder().decode(proc.stdout).trim();
+    return candidate.length > 0 ? candidate : null;
+  } catch {
+    return null;
+  }
+};
+
+// Augment `cachedSpawnPath` with the operator's boot PATH when
+// fallback resolution succeeded. Logs once to stderr so an
+// operator running on an non-canonical layout sees the partial
+// defense (PATH-pinning defends against mid-session shadowing
+// of git itself, not against shadowing of git's subprocess
+// tools — the operator's PATH at boot is part of the trust
+// boundary as documented in SECURITY_GUIDELINE §8.6).
+const applyFallbackSpawnPath = (resolvedGitPath: string): void => {
+  const operatorPath = process.env.PATH;
+  if (operatorPath === undefined || operatorPath.length === 0) return;
+  if (operatorPath === CANONICAL_SAFE_PATH) return;
+  // Append unconditionally; the canonical prefix wins on any
+  // name that exists in both (PATH lookup is left-to-right).
+  cachedSpawnPath = `${CANONICAL_SAFE_PATH}:${operatorPath}`;
+  process.stderr.write(
+    `forja: git resolved via operator PATH fallback (${resolvedGitPath}); canonical SAFE_PATH lookup did not match — PATH-shadowing defense for git itself remains, but git's subprocess tools resolve through operator PATH\n`,
+  );
 };
 
 // Returns the absolute path to git when resolution succeeded;
-// falls back to the bare command `'git'` when `which` failed
-// (no git on PATH, or which itself missing). Callers should
-// treat the fallback as best-effort — Bun.spawn will still try
-// PATH lookup at exec time, with whatever PATH the caller
-// supplies in `env`. `safeGitEnv()` keeps that PATH controlled.
+// falls back to the bare command `'git'` when both canonical
+// and operator-PATH lookups failed. Callers should treat the
+// bare fallback as best-effort — Bun.spawn will still try PATH
+// lookup at exec time, with the PATH `safeGitEnv()` supplies.
 export const getGitBinary = async (): Promise<string> => {
-  if (cachedGitPath === undefined) cachedGitPath = await resolveGitOnce();
-  return cachedGitPath ?? 'git';
+  if (cachedGitPath !== undefined) return cachedGitPath ?? 'git';
+  // First: canonical SAFE_PATH (defense against mid-session
+  // ~/bin/git shadowing — that's the whole point of the helper).
+  const canonical = await whichGitAsync(CANONICAL_SAFE_PATH);
+  if (canonical !== null) {
+    cachedGitPath = canonical;
+    return canonical;
+  }
+  // Fallback: operator's boot PATH. Required for Nix profile
+  // bins (/run/current-system/sw/bin, ~/.nix-profile/bin), asdf
+  // shims, /run/wrappers/bin, ad-hoc /opt/custom layouts. The
+  // boot PATH is part of the trust boundary, so a `which git`
+  // against it is no weaker than the v0 inline `cmd: ['git']`
+  // path the helper was designed to harden.
+  const operatorPath = process.env.PATH;
+  if (operatorPath !== undefined && operatorPath !== CANONICAL_SAFE_PATH) {
+    const fallback = await whichGitAsync(operatorPath);
+    if (fallback !== null) {
+      cachedGitPath = fallback;
+      applyFallbackSpawnPath(fallback);
+      return fallback;
+    }
+  }
+  cachedGitPath = null;
+  return 'git';
 };
 
 // Synchronous variant for callers that run before the event loop
 // is available or in contexts where awaiting is impractical
-// (memory/paths.ts:resolveRepoRoot, cli/git-context.ts). Uses
-// `Bun.spawnSync` against the canonical PATH the async resolver
-// uses, populates the same shared cache so a subsequent async
-// caller reuses the result, and never throws. Returns the bare
-// command `'git'` when sync resolution fails (matches the async
-// fallback shape).
+// (memory/paths.ts:resolveRepoRoot, cli/git-context.ts). Same
+// two-stage resolution shape as the async variant; populates
+// the shared cache so a subsequent async caller reuses the
+// result. Never throws.
 export const getGitBinarySync = (): string => {
   if (cachedGitPath !== undefined) return cachedGitPath ?? 'git';
-  try {
-    const proc = Bun.spawnSync({
-      cmd: ['which', 'git'],
-      env: { PATH: SAFE_PATH },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    if (proc.exitCode !== 0) {
-      cachedGitPath = null;
-      return 'git';
-    }
-    const candidate = new TextDecoder().decode(proc.stdout).trim();
-    cachedGitPath = candidate.length > 0 ? candidate : null;
-    return cachedGitPath ?? 'git';
-  } catch {
-    cachedGitPath = null;
-    return 'git';
+  const canonical = whichGitSync(CANONICAL_SAFE_PATH);
+  if (canonical !== null) {
+    cachedGitPath = canonical;
+    return canonical;
   }
+  const operatorPath = process.env.PATH;
+  if (operatorPath !== undefined && operatorPath !== CANONICAL_SAFE_PATH) {
+    const fallback = whichGitSync(operatorPath);
+    if (fallback !== null) {
+      cachedGitPath = fallback;
+      applyFallbackSpawnPath(fallback);
+      return fallback;
+    }
+  }
+  cachedGitPath = null;
+  return 'git';
 };
 
 // Minimal env for `Bun.spawn`-ing git. Pairs with `getGitBinary()`:
 // the binary is pinned to an absolute path resolved at first use;
-// the env is locked to a canonical PATH plus the standard scrubs
+// the env is locked to a controlled PATH plus the standard scrubs
 // every git call wants (LC_ALL=C for parseable output,
 // GIT_TERMINAL_PROMPT=0 so a creds prompt never blocks).
 //
@@ -109,6 +176,19 @@ export const getGitBinarySync = (): string => {
 // lower than mid-session PATH shadowing because $HOME is set at
 // boot and rarely mutated.
 //
+// PATH semantics:
+//   - When canonical resolution succeeded, PATH = CANONICAL_SAFE_PATH
+//     (no per-user dirs).
+//   - When fallback resolution succeeded against operator PATH,
+//     PATH = `${CANONICAL_SAFE_PATH}:${operator_boot_PATH}` —
+//     canonical entries win on duplicate names, but operator
+//     dirs are reachable for subprocess git might fork (hooks,
+//     credential helpers, ssh wrapper). Necessary for NixOS,
+//     /run/wrappers/bin, asdf, ad-hoc layouts.
+//   - When BOTH lookups failed, cachedSpawnPath stays canonical
+//     and `git` itself is the bare command — exec will fail
+//     visibly with ENOENT rather than silently picking a shim.
+//
 // NOTE: GIT_LITERAL_PATHSPECS is intentionally NOT set here.
 // Some git subcommands (notably `check-ignore`) reject the
 // `literal` pathspec magic with exit 128 — making it a global
@@ -118,14 +198,15 @@ export const getGitBinarySync = (): string => {
 export const safeGitEnv = (): Record<string, string> => ({
   LC_ALL: 'C',
   GIT_TERMINAL_PROMPT: '0',
-  PATH: SAFE_PATH,
+  PATH: cachedSpawnPath,
   HOME: process.env.HOME ?? '',
 });
 
-// Test seam: reset the cached git path. Production callers never
-// need this — the path is stable for the process lifetime — but
-// tests that exercise the resolution path need to start from a
-// clean cache state.
+// Test seam: reset the cached git path AND the spawn PATH.
+// Production callers never need this — both are stable for the
+// process lifetime — but tests that exercise the resolution
+// path need to start from a clean cache state.
 export const __resetGitBinaryCacheForTest = (): void => {
   cachedGitPath = undefined;
+  cachedSpawnPath = CANONICAL_SAFE_PATH;
 };

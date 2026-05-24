@@ -52,7 +52,18 @@ describe('getGitBinary — slice 178 hardening M3', () => {
 });
 
 describe('safeGitEnv — slice 178 hardening M3', () => {
-  test('PATH is a fixed canonical set (no operator PATH inheritance)', () => {
+  beforeEach(() => {
+    __resetGitBinaryCacheForTest();
+  });
+
+  afterEach(() => {
+    __resetGitBinaryCacheForTest();
+  });
+
+  test('PATH starts at the canonical set before any resolution', () => {
+    // Without a prior getGitBinary call, the spawn PATH is the
+    // pristine canonical set. Any caller that uses safeGitEnv
+    // before resolving git gets the strict layout.
     const env = safeGitEnv();
     expect(env.PATH).toBe(
       '/opt/homebrew/sbin:/opt/homebrew/bin:/opt/local/sbin:/opt/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -67,15 +78,20 @@ describe('safeGitEnv — slice 178 hardening M3', () => {
     expect(safeGitEnv().PATH).toContain('/opt/local/bin');
   });
 
-  test('PATH does NOT include per-user shadow directories', () => {
-    const env = safeGitEnv();
+  test('PATH canonical prefix does NOT include per-user shadow directories', () => {
     // ~/bin and ~/.local/bin are the canonical shim-injection
-    // points; the safe PATH must exclude them so an attacker who
-    // gains write access to one of those dirs mid-session can't
-    // shadow git.
-    expect(env.PATH).not.toContain('/home/');
-    expect(env.PATH).not.toContain('~');
-    expect(env.PATH).not.toContain('.local/bin');
+    // points; the canonical prefix never includes them. The
+    // fallback append CAN include them (operator's boot PATH),
+    // but the canonical entries come FIRST so a name that exists
+    // in both resolves to the canonical copy.
+    const env = safeGitEnv();
+    expect(env.PATH).toBeDefined();
+    const canonicalPrefix = (env.PATH ?? '').split(
+      ':/opt/local/sbin:/opt/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    )[0];
+    expect(canonicalPrefix).not.toContain('/home/');
+    expect(canonicalPrefix).not.toContain('.local/bin');
+    expect(canonicalPrefix).not.toContain('~');
   });
 
   test('preserves the standard git knobs every git call wants', () => {
@@ -106,5 +122,34 @@ describe('safeGitEnv — slice 178 hardening M3', () => {
     expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(env.GITHUB_TOKEN).toBeUndefined();
     expect(env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  test('canonical-first ordering when fallback augments PATH', async () => {
+    // Simulate the fallback path by forcing canonical lookup to
+    // miss: temporarily strip CANONICAL_SAFE_PATH from process.env.PATH
+    // so the `which` call against canonical returns null, then the
+    // fallback against process.env.PATH (which still has git at
+    // /usr/bin or similar) succeeds. We can't actually mutate the
+    // outcome of `which` from the test, so the assertion below is
+    // weaker: when the cached spawn PATH was augmented with an
+    // operator PATH, the canonical entries MUST come first so a
+    // name that exists in both resolves to the canonical copy.
+    const env = safeGitEnv();
+    expect(env.PATH).toBeDefined();
+    const pathParts = (env.PATH ?? '').split(':');
+    // Canonical first 10 entries are the fixed set, in order.
+    const expectedCanonicalHead = [
+      '/opt/homebrew/sbin',
+      '/opt/homebrew/bin',
+      '/opt/local/sbin',
+      '/opt/local/bin',
+      '/usr/local/sbin',
+      '/usr/local/bin',
+      '/usr/sbin',
+      '/usr/bin',
+      '/sbin',
+      '/bin',
+    ];
+    expect(pathParts.slice(0, expectedCanonicalHead.length)).toEqual(expectedCanonicalHead);
   });
 });

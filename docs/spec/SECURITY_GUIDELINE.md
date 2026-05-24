@@ -484,11 +484,17 @@ Continue? [y/N]
 
 **Defesa em duas camadas:**
 
-1. **Pin do binário no startup.** `getGitBinary()` (async) e `getGitBinarySync()` (sync) rodam `which git` UMA vez por processo contra uma PATH canônica controlada e cacheiam o path absoluto. Spawns subsequentes usam o path absoluto resolvido na partida, não a string `'git'` — shadowing pós-startup não tem efeito. Shadowing já presente em PATH na partida é parte do trust boundary do operador (escopo do `§2.1`).
-2. **Env mínimo no spawn.** `safeGitEnv()` retorna apenas:
+1. **Pin do binário no startup (two-stage resolution).** `getGitBinary()` (async) e `getGitBinarySync()` (sync) rodam `which git` UMA vez por processo:
+   - **Stage 1 — canônico:** lookup contra SAFE_PATH (`/opt/homebrew/{s,}bin:/opt/local/{s,}bin:/usr/local/{s,}bin:/usr/{s,}bin:/{s,}bin`). Cobre macOS Homebrew/MacPorts + POSIX Linux. Quando resolve, `safeGitEnv().PATH` permanece canônica — defesa completa contra `~/bin/git` mid-session.
+   - **Stage 2 — fallback:** quando canônico não resolve, retry contra `process.env.PATH` do boot. Cobre NixOS (`/run/current-system/sw/bin`, `~/.nix-profile/bin`), asdf shims, `/run/wrappers/bin`, layouts ad-hoc (`/opt/custom/bin`). Quando o fallback resolve, **`safeGitEnv().PATH` vira `${CANONICAL_SAFE_PATH}:${operator_boot_PATH}`** — canônico FIRST (defesa contra shadowing de tools que TAMBÉM existem no canônico), dirs do operador APPEND (subprocess de git como hooks/credential helpers/ssh resolvem). Stderr logga uma linha avisando que a defesa de PATH ficou parcial (operador's boot PATH é parte do trust boundary, mesmo posture do `§2.1`).
+   - **Stage 3 — sem git em lugar nenhum:** cacheia null, retorna a string literal `'git'`. Spawn vai falhar com ENOENT visível.
+
+   Spawns subsequentes usam o path absoluto resolvido, não a string `'git'` — shadowing pós-startup não tem efeito (não há PATH lookup quando `cmd[0]` é absoluto).
+
+2. **Env controlado no spawn.** `safeGitEnv()` retorna apenas:
    - `LC_ALL=C` (output parseável)
    - `GIT_TERMINAL_PROMPT=0` (credentials prompt nunca bloqueia)
-   - `PATH` = SAFE_PATH canônica (sem `~/bin`, `~/.local/bin`; inclui `/opt/homebrew/{s,}bin`, `/opt/local/{s,}bin`, `/usr/local/{s,}bin`, `/usr/{s,}bin`, `/{s,}bin`)
+   - `PATH` = canônica OU `canônica:operator_boot_PATH` (per resolution stage acima)
    - `HOME` herdado (git precisa pra `~/.gitconfig` — committer identity, ssh wrapper)
    - **NÃO** `GIT_LITERAL_PATHSPECS` — `git check-ignore` rejeita com exit 128, fail global silencioso quebraria a detecção de colisão no `restore`. Sites que precisam do literal-pathspec guarantee (skip-worktree em worktrees de subagent, worktree-gc) mergem `GIT_LITERAL_PATHSPECS=1` localmente.
 
@@ -507,7 +513,8 @@ Continue? [y/N]
 
 **Limites declarados:**
 - Operador com PATH já comprometido na partida → fora de escopo (trust boundary).
-- Sistemas onde git mora fora da SAFE_PATH (instalação manual em `/usr/games`, etc) → `which git` retorna null, fallback é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso. Workaround: adicionar o dir à SAFE_PATH (PR contra `src/subagents/git-binary.ts`).
+- Quando o fallback foi acionado (resolução via operator PATH), o PATH-shadowing defense para **git em si** permanece (path absoluto cacheado), mas **subprocess de git** (credential helpers, ssh, hooks) resolvem através do operator PATH — defesa parcial. Operador vê a stderr line do fallback e pode decidir se aceita o trade-off ou adiciona o dir certo à SAFE_PATH (PR contra `src/subagents/git-binary.ts`).
+- Sistemas onde git não está em SAFE_PATH NEM em `process.env.PATH` (instalação manual em `/usr/games` sem PATH augment) → `which git` retorna null em ambos stages, fallback final é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso.
 
 ### 8.7 Regex shape guard (slice 178 A2)
 
