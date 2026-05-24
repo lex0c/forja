@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-24] design note — `prompt_versions` daily inflation accepted, deferred to consumer-side dedup
+
+`prompt_versions.content` includes the `# Environment` block's `- today: YYYY-MM-DD` line, which rotates daily. That field minted ~1 fresh row per day per operator/project even when no semantic prompt content changed — visible in the `§1.3.5` audit queries as ~30 hashes/month for one logical prompt. Two design alternatives were prototyped and reverted:
+
+1. **Ephemeral `<environment>` channel** (date moved out of `[system]` into a prefixed block on the first user message). Implementation worked, but a code-review pass surfaced 15 findings, 3 critical: the block leaked into `recap/projection.ts` (slack/PR/mini titles literally rendered as `<environment>`), into `resume-replay.ts` (TUI scrollback showed the harness scaffolding above every recalled operator turn), and into `harness/compaction.ts` `goalText()` (env tag permanently baked into the post-compaction model-visible "original goal"). Reverted: moving date into `messages.content` cross-cuts 6 downstream surfaces that all treat user content as operator-typed.
+
+2. **Hash canonicalization** (`bootstrap.ts` regex-replaces `- today: \d{4}-\d{2}-\d{2}` with `- today: <DATE>` before hashing + storing in `prompt_versions.content`). Smaller blast — 4 files instead of 11, no downstream pollution. Code-review still surfaced 15 findings, the top one fatal: the new "cross-day hash equality" test was tautological (both boots ran on the same calendar day so the assertion held trivially even WITHOUT canonicalization — no evidence the canonicalization works at all). Other top findings: no migration story for pre-canonicalization rows that would coexist with new canonical rows during the upgrade window; regex implicitly coupled to `environment-prompt.ts:118` format with no test guarding the coupling; git status fields (`- status: 5 modified, 2 untracked`) also rotate per-boot during active editing and would need the same treatment for full coverage; the `<DATE>` placeholder is itself an operator-writable token. Reverted: the fix needed another iteration of substantive engineering to be honest, and the underlying problem isn't biting yet.
+
+**Decision**: accept the daily inflation as a known cost. Storage budget is small (~1-2MB/year/project at ~3-5KB per row). `§1.3.5` audit queries return noisy results today but no consumer queries `prompt_versions` at volume yet — slice C.2 (baseline-per-prompt-hash + threshold) hasn't shipped. When C.2 lands, dedup belongs in the **consumer side** (the eval matrix builder) where it can canonicalize at query time without breaking content-addressing semantics or requiring write-time regex coupling. Sketch:
+
+```sql
+-- Matrix builder dedup query (slice C.2 prep):
+SELECT
+  -- in-process canonicalize content → hash for semantic bucketing
+  canonical_hash(content) AS semantic_hash,
+  MIN(created_at) AS first_seen,
+  COUNT(*) AS daily_rotations,
+  COUNT(DISTINCT m.session_id) AS sessions
+FROM prompt_versions pv
+JOIN messages m ON m.prompt_hash = pv.hash
+WHERE m.created_at > unixepoch('now', '-30 days')
+GROUP BY semantic_hash
+ORDER BY sessions DESC;
+```
+
+This keeps `prompt_versions.content` as "exactly what the model saw" (canonical content-addressing intact), `messages.prompt_hash` as a stable forensic key, and lets the rare consumer that needs semantic dedup compute it once at query time. The two alternatives prototyped above moved the cost from "occasional consumer query" to "every write path" — wrong direction for an audit subsystem that retains forever and is touched on every model turn. Re-evaluate the trade-off if/when the daily-rotation noise materially blocks an actual product surface (currently none).
+
 ## [2026-05-24] evals — sandbox fix in the executor + corpus pruned to 41/41 green
 
 Two follow-ups after today's earlier cross-model investigation revealed the gate was red on haiku:
