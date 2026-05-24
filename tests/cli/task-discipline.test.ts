@@ -34,6 +34,7 @@ describe('composeWithTaskDiscipline', () => {
     const out = composeWithTaskDiscipline(undefined);
     expect(out).toContain('Prefer editing');
     expect(out).toContain('Prefer parallel and delegated');
+    expect(out).toContain('Decompose before executing');
     expect(out).toContain("Don't introduce abstractions");
     expect(out).toContain('Default to writing no comments');
     expect(out).toContain('the WHY is non-obvious');
@@ -60,17 +61,17 @@ describe('composeWithTaskDiscipline', () => {
     expect(out).toContain('`in_progress`');
   });
 
-  test('section size is reasonable (~300 tokens / ~2.5k chars)', () => {
+  test('section size is reasonable (~370 tokens / ~3k chars)', () => {
     // Section sits inside cache breakpoint #1 — bigger means
     // more cached input but also more attention budget consumed
-    // before the model gets to task-specific instructions. The
-    // close-todos bullet pushed us past the prior 1500-char
-    // ceiling; the parallel-and-delegated bullet then pushed past
-    // 2000. 2500 chars stays under ~310 tokens which is still a
-    // small fraction of the 200k context window. Each bump should
-    // be paired with a check that the new bullet is content-rich
-    // enough to justify the extra attention budget.
+    // before the model gets to task-specific instructions. Bump
+    // history: 1500 → 2000 (close-todos), 2000 → 2500
+    // (parallel-and-delegated), 2500 → 3000 (decompose-before-
+    // executing). 3000 chars stays under ~370 tokens which is
+    // still a small fraction of the 200k context window. Each
+    // bump should be paired with a check that the new bullet is
+    // content-rich enough to justify the extra attention budget.
     const out = composeWithTaskDiscipline(undefined);
-    expect(out.length).toBeLessThan(2500);
+    expect(out.length).toBeLessThan(3000);
   });
 });
