@@ -244,7 +244,7 @@ Cada falha tem **código** no formato `<classe>.<subtipo>.<detalhe>`, ex: `provi
 
 **Detecção:** `failureSink.emit({ code, classe, payload: { approval_seq } })` dispara o dual-write em `outcome_signals`; o INSERT em `outcome_signals` lança throw (sink offline, schema mismatch, disk-full, etc.). A throw é capturada pelo try/catch interno do sink — a row em `failure_events` já foi commitada e essa parte é load-bearing — mas a falha em si vira invisível pra queries que só inspecionam `failure_events`.
 
-**Compensação:** `queueMicrotask(() => emit({ code: 'storage.persist_failed', payload: { subsystem: 'outcome_signal_dual_write', original_failure_id, original_approval_seq, reason } }))` deferre o emit pra fora da transação atual (evita busy_timeout contra o próprio writer lock) e registra um row keyed em `original_failure_id` para correlação forense.
+**Compensação:** o emit é capturado em closure dentro da transação outer (`pendingCompensation` variável) e drenado **sincronicamente** depois de `withImmediateTransaction` retornar (writer lock liberado, recursive `emit()` pode tomar seu próprio BEGIN IMMEDIATE sem contention/deadlock) mas **antes** de o emit outer retornar pro caller — mesma call stack. Garante que um caller que faz `closeDb()` na próxima linha já vê a compensação row persisted.
 
 **Payload (compensação):**
 ```json
@@ -256,9 +256,13 @@ Cada falha tem **código** no formato `<classe>.<subtipo>.<detalhe>`, ex: `provi
 }
 ```
 
-**IMPORTANTE — `original_approval_seq` ≠ `approval_seq`:** o campo é renomeado deliberadamente. O dual-write extractor lê `payload.approval_seq` literal; reusar esse nome faria o emit recursivo disparar OUTRO dual-write em outcome_signals (que ainda está broken) — loop infinito de microtasks. Tests pinam que o campo está renomeado.
+**IMPORTANTE — `original_approval_seq` ≠ `approval_seq`:** o campo é renomeado deliberadamente. O dual-write extractor lê `payload.approval_seq` literal; reusar esse nome faria o emit recursivo disparar OUTRO dual-write em outcome_signals (que ainda está broken) — loop infinito sincrônico. Tests pinam que o campo está renomeado.
 
-**Limite declarado:** se a falha do dual-write ocorre no último emit antes do shutdown (`closeDb()` na sequência síncrona), o microtask drena depois do close — `emit()` rodaria contra DB fechado, captura interna swallow, row de compensação **NÃO** lança. Forensics ainda tem o stderr log (`forja failure_events: outcome_signal dual-write failed for approval_seq=N (...)`) como último recurso. Fix correto é shutdown hook que drena pending microtasks; fora de escopo da slice 178.
+**Limite declarado:** se o INSERT da própria compensação row falhar (sink triply-broken: outcome falhou, e o segundo `appendFailureEvent` também falha — disco cheio mid-operação, schema corrupto, etc.), o catch fall-back para stderr é o último recurso. Operador vê:
+```
+forja failure_events: dual-write compensation also failed (<reason>); audit gap is permanent for failure_id=<id>
+```
+Esse caso é fundamentalmente irrecuperável (o próprio audit sink quebrou); o gap em `failure_events` é o sinal honesto de que algo grave aconteceu com o storage.
 
 ---
 

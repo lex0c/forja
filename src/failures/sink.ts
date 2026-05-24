@@ -208,6 +208,13 @@ export const createSqliteFailureSink = (options: {
     const approval_seq = extractApprovalSeq(input.payload);
     const { json: payload_json } = scrubFailurePayload(input.payload);
 
+    // Captured by the inner transaction body when the dual-write
+    // sink throws; drained AFTER the outer transaction commits
+    // (writer lock released) but BEFORE this `emit()` returns to
+    // the caller. Synchronous-in-same-call-stack — see the
+    // post-commit block below.
+    let pendingCompensation: EmitFailureEventInput | null = null;
+
     // Slice 130 fixup #2: read-last + insert wrapped in a single
     // BEGIN IMMEDIATE transaction, mirroring approvals_log
     // (slice 127 R3 P0-A). Pre-fixup the read and write were
@@ -220,7 +227,7 @@ export const createSqliteFailureSink = (options: {
     // gap). IMMEDIATE acquires the writer lock at transaction
     // start; concurrent emits queue on busy_timeout=5000 (set in
     // openDb) and serialize cleanly.
-    return withImmediateTransaction(db, (): EmittedFailureRow => {
+    const result = withImmediateTransaction(db, (): EmittedFailureRow => {
       const last = getLastFailureEventBySession(db, session_id);
       const prev_chain_hash = last?.this_chain_hash ?? computeSessionGenesisHash(session_id);
 
@@ -333,50 +340,71 @@ export const createSqliteFailureSink = (options: {
           // failure_events — calibration silently misses the
           // outcome signal and operators can't tell whether the
           // gap is a real "no failure here" or "the failure was
-          // observed but the signal sink choked." Emit a
+          // observed but the signal sink choked." Capture a
           // compensation row keyed on the original failure_id
           // so forensics can correlate "where did the outcome
           // signal go" without scanning stderr.
           //
-          // queueMicrotask defers the emit until the current
-          // withImmediateTransaction has committed and released
-          // the writer lock — otherwise the compensation would
-          // queue on busy_timeout against its own transaction,
-          // costing ~5s of wall clock and risking double-rollback
-          // semantics if the compensation also throws.
-          queueMicrotask(() => {
-            try {
-              emit({
-                code: 'storage.persist_failed',
-                classe: 'storage',
-                recovery_action: 'degraded',
-                user_visible: false,
-                session_id,
-                // IMPORTANT: payload key is `original_approval_seq`,
-                // NOT `approval_seq`. The dual-write extractor keys
-                // on the literal `approval_seq` field; reusing that
-                // name here would re-enter the same broken dual-
-                // write path and loop infinitely. The rename keeps
-                // the data accessible to forensics while opting the
-                // compensation row out of dual-write.
-                payload: {
-                  subsystem: 'outcome_signal_dual_write',
-                  original_failure_id: id,
-                  original_approval_seq: approval_seq,
-                  reason: redactSecrets(msg),
-                },
-              });
-            } catch (e2) {
-              process.stderr.write(
-                `forja failure_events: dual-write compensation also failed (${e2 instanceof Error ? e2.message : String(e2)}); audit gap is permanent for failure_id=${id}\n`,
-              );
-            }
-          });
+          // The emit is DEFERRED via a closure capture (not
+          // executed here): we're inside `withImmediateTransaction`
+          // holding the writer lock, and a recursive `emit()`
+          // would queue on busy_timeout against its own BEGIN
+          // IMMEDIATE — at best a 5s stall, at worst a deadlock
+          // depending on the SQLite library's nested-transaction
+          // semantics. The post-commit drain below runs after
+          // `withImmediateTransaction` returns (lock released),
+          // but BEFORE this `emit()` returns to the caller, so
+          // a caller that closes the DB on the next statement
+          // still sees the compensation row persisted. The v0
+          // fix used `queueMicrotask` for the deferral, which
+          // drained AFTER caller-side cleanup (closeDb in the
+          // same call stack); the compensation row never landed
+          // for the last-emit-before-shutdown case.
+          //
+          // IMPORTANT: payload key is `original_approval_seq`,
+          // NOT `approval_seq`. The dual-write extractor keys
+          // on the literal `approval_seq` field; reusing that
+          // name here would re-enter the same broken dual-write
+          // path and loop infinitely. The rename keeps the data
+          // accessible to forensics while opting the compensation
+          // row out of dual-write.
+          pendingCompensation = {
+            code: 'storage.persist_failed',
+            classe: 'storage',
+            recovery_action: 'degraded',
+            user_visible: false,
+            session_id,
+            payload: {
+              subsystem: 'outcome_signal_dual_write',
+              original_failure_id: id,
+              original_approval_seq: approval_seq,
+              reason: redactSecrets(msg),
+            },
+          };
         }
       }
 
       return { id, this_chain_hash };
     });
+
+    // Post-commit drain: writer lock released by withImmediateTransaction,
+    // recursive emit can take its own BEGIN IMMEDIATE without
+    // contention. Still synchronous in the original caller's stack
+    // — when this returns, the compensation row is queryable.
+    if (pendingCompensation !== null) {
+      try {
+        emit(pendingCompensation);
+      } catch (e2) {
+        // Triply-broken sink (compensation INSERT failed too).
+        // Fall back to stderr — this is the worst-case audit gap
+        // the spec admits as out of scope (FAILURE_MODES §4.6).
+        process.stderr.write(
+          `forja failure_events: dual-write compensation also failed (${e2 instanceof Error ? e2.message : String(e2)}); audit gap is permanent for failure_id=${result.id}\n`,
+        );
+      }
+    }
+
+    return result;
   };
 
   const verifyChain = (session_id: string): VerifyFailureChainResult => {
