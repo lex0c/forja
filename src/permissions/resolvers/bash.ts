@@ -3005,21 +3005,35 @@ const canonicalizeForClassification = (lexicalAbs: string, ctx: ResolverContext)
     // (2) Dangling-symlink probe: even if the leaf's TARGET is
     // gone, the symlink itself still exists and the kernel will
     // open the stored target at exec time. `readlink` reads the
-    // stored target without recursive resolution.
+    // stored target without recursive resolution. ALWAYS normalize
+    // before returning — both the absolute and the relative branch.
+    // Without normalization, an absolute target like
+    // `/work/proj/../tmp/x` looks like it's inside `/work/proj`
+    // by string-prefix tests downstream (detectCwdScopeEscape,
+    // classifyProtectedPath) but the kernel resolves it to
+    // `/work/tmp/x` — a real cwd-scope bypass on the dangling-
+    // symlink path. `resolvePath(target)` collapses `..` and `.`
+    // components for absolute paths; `resolvePath(dirname, target)`
+    // does the same for relative ones.
     if (ctx.readlink !== undefined) {
       try {
         const target = ctx.readlink(lexicalAbs);
-        return isAbsolute(target) ? target : resolvePath(dirname(lexicalAbs), target);
+        return isAbsolute(target) ? resolvePath(target) : resolvePath(dirname(lexicalAbs), target);
       } catch {
         // Not a symlink, or readlink failed for other reasons —
         // fall through to (3).
       }
     }
     // (3) Parent-realpath + basename for fresh-leaf-under-existing-
-    // parent (where the parent may itself be a symlink).
+    // parent (where the parent may itself be a symlink). basename
+    // strips any path separators, so the rejoin can't smuggle `..`
+    // — but normalize defensively so a future change to either
+    // input shape (parent realpath returning a path that needs
+    // collapsing, basename behavior change in a runtime upgrade)
+    // doesn't reopen the same bypass.
     try {
       const parentReal = ctx.realpath(dirname(lexicalAbs));
-      return joinPath(parentReal, basename(lexicalAbs));
+      return resolvePath(joinPath(parentReal, basename(lexicalAbs)));
     } catch {
       return null;
     }

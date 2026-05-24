@@ -1704,6 +1704,65 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     }
   });
 
+  test('absolute symlink target with `..` is normalized before scope check', () => {
+    // /work/proj/out → /work/proj/../tmp/secret. The raw target
+    // is absolute and string-prefix-tests as "inside /work/proj/"
+    // (it literally begins with that string), but the kernel
+    // resolves it to /work/tmp/secret at exec time — OUTSIDE cwd.
+    // The canonicalize helper must normalize via resolvePath
+    // before returning, collapsing the `..` so downstream cwd-
+    // scope detection sees the kernel's view, not the literal.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/out') return '/work/proj/../tmp/secret';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('absolute symlink target with `..` that NORMALIZES inside cwd preserves high', () => {
+    // /work/proj/loop → /work/proj/data/../shared. After
+    // normalization the target is /work/proj/shared — still inside
+    // cwd, no escape. Mirror case of the above; pins that the
+    // normalization isn't biased toward false positives.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/loop') return '/work/proj/data/../shared';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat loop' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
   test('readlink omitted (legacy ctx) keeps old parent-realpath fallback', () => {
     // When readlink isn't wired (test ctx without the seam, or a
     // future caller path), the helper falls through to the
