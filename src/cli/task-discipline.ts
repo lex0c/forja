@@ -24,6 +24,7 @@ const TASK_DISCIPLINE_HEADER = `# Task discipline
 When working on the task, default to the simplest change that does what was asked.
 
 - Prefer editing existing files over creating new ones. Reach for write_file only when the file truly does not exist yet or a complete rewrite is the right move.
+- Prefer parallel and delegated over sequential and inline. Before running N reads one at a time, check whether they're independent and batch them in a single turn — the harness dispatches concurrently. Before doing a structured workflow inline, check whether a playbook matches and delegate via \`task_sync\` / \`task_async\`. Default to sequential or inline only after that check, not before it.
 - Don't introduce abstractions, helpers, or refactors beyond what the task requires. Three similar lines is better than a premature abstraction. No half-finished implementations either.
 - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Validate at system boundaries (user input, external APIs), not between trusted internal modules.
 - Default to writing no comments. Add a comment only when the WHY is non-obvious — a hidden constraint, a subtle invariant, a workaround for a specific bug, behavior that would surprise a reader. Don't explain WHAT well-named identifiers already convey, and don't reference the current task ("added for X", "used by Y") — those belong in the PR description and rot as the codebase evolves.
