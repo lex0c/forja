@@ -118,6 +118,41 @@ describe('detectRedosShape', () => {
       const rejection = detectRedosShape('(\\d+){1,5}(\\w+){1,10}(.+){1,3}');
       expect(rejection?.code).not.toBe('large_bounded_repeat_on_group');
     });
+
+    test('accepts exact-count `{n}` on a quantified body when n is small', () => {
+      // `(a+){5}` is bounded to 5 outer iterations of `a+` — outer
+      // count fixed, no exponential search space. Pre-fix this
+      // collapsed undefined upper to Infinity and rejected. Post-
+      // fix `{n}` means exactly n, so upper = lower = 5 < 32 ⇒ OK.
+      expect(detectRedosShape('(a+){5}')?.code).not.toBe('large_bounded_repeat_on_group');
+      expect(detectRedosShape('(\\d+){10}')?.code).not.toBe('large_bounded_repeat_on_group');
+      expect(detectRedosShape('(\\w+){32}')?.code).not.toBe('large_bounded_repeat_on_group');
+    });
+
+    test('rejects exact-count `{n}` when n exceeds threshold', () => {
+      // `(a+){50}` is bounded but the bound itself exceeds the
+      // threshold — still a problem (50 outer iterations × inner
+      // backtrack is too much work in the worst case).
+      expect(detectRedosShape('(a+){50}')?.code).toBe('large_bounded_repeat_on_group');
+      expect(detectRedosShape('(\\d+){100}')?.code).toBe('large_bounded_repeat_on_group');
+    });
+
+    test('still rejects `{n,}` unbounded upper as catastrophic', () => {
+      // `(a+){1,}` is the unbounded shape — upper Infinity > 32 ⇒
+      // reject. This is the case the pre-fix code WAS catching
+      // correctly; the test pins the contract survives the
+      // undefined-vs-empty distinction the fix introduces.
+      expect(detectRedosShape('(a+){1,}')?.code).toBe('large_bounded_repeat_on_group');
+      expect(detectRedosShape('(\\d+){5,}')?.code).toBe('large_bounded_repeat_on_group');
+    });
+
+    test('accepts `{n,m}` when both bounds are below threshold', () => {
+      // `(a+){5,10}` — outer iterations bounded to a small range,
+      // safe. Pin the explicit bounded-bounded case which the pre-
+      // fix code already handled correctly.
+      expect(detectRedosShape('(a+){5,10}')?.code).not.toBe('large_bounded_repeat_on_group');
+      expect(detectRedosShape('(\\d+){1,32}')?.code).not.toBe('large_bounded_repeat_on_group');
+    });
   });
 
   describe('rejects oversized patterns', () => {

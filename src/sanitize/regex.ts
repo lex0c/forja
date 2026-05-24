@@ -85,10 +85,20 @@ export const detectRedosShape = (pattern: string): RegexShapeRejection | null =>
   for (const boundedMatch of pattern.matchAll(BOUNDED_REPEAT_ON_GROUP)) {
     const lower = Number.parseInt(boundedMatch[1] ?? '0', 10);
     const upperRaw = boundedMatch[2];
+    // Three shapes the regex's optional second capture distinguishes:
+    //   `{n}`     → upperRaw === undefined (exact count; upper = lower)
+    //   `{n,}`    → upperRaw === ''        (unbounded;   upper = Infinity)
+    //   `{n,m}`   → upperRaw === 'm'       (bounded;     upper = parseInt(m))
+    // Pre-fix this branch collapsed undefined and '' to Infinity,
+    // wrongly rejecting `(a+){5}` (bounded to 5 outer reps, NOT
+    // exponential) as large_bounded_repeat_on_group. The fix only
+    // treats the `{n,}` shape as unbounded.
     const upper =
-      upperRaw === undefined || upperRaw === ''
-        ? Number.POSITIVE_INFINITY
-        : Number.parseInt(upperRaw, 10);
+      upperRaw === undefined
+        ? lower
+        : upperRaw === ''
+          ? Number.POSITIVE_INFINITY
+          : Number.parseInt(upperRaw, 10);
     if (lower > MAX_BOUNDED_REPEAT || upper > MAX_BOUNDED_REPEAT) {
       return {
         code: 'large_bounded_repeat_on_group',
