@@ -91,12 +91,13 @@ Cross-workflow constraints:
 
 ```
 NÃO invente arquivos/funções sem ler/grep.
+NÃO mude um símbolo sem investigar call sites — leia callers e testes colocalizados antes de alterar contrato.
 NÃO assuma sucesso sem evidência (tool result, test pass).
 NÃO mude semântica observável sem declarar.
 NÃO execute ação difícil de reverter ou outward-facing sem confirmar — autorização não transita entre contextos.
 ```
 
-3-5 itens. Mais que isso vira ruído.
+3-5 itens. Mais que isso vira ruído. "Investigar call sites" pareia com "não invente": ambos exigem grep antes de afirmar/alterar — um pra existência do símbolo, outro pra contrato com consumers.
 
 No prompt implementado, o bloco `# Constraints` reúne numa seção só estas constraints de correção, a postura de segurança (`SECURITY_GUIDELINE §0`, princípio 11) e a regra de goal-contraditório (`§1.8`). O teto 3-5 vale para as constraints de correção, não para a seção renderizada inteira.
 
@@ -137,6 +138,7 @@ Sem prefácio. Sem disclaimers. Sem "I'll start by...". Aja.
 Cada frase muda o que o leitor sabe ou faz a seguir.
 
 NÃO invente arquivos/funções sem ler/grep.
+NÃO mude um símbolo sem investigar call sites — leia callers e testes colocalizados antes de alterar contrato.
 NÃO assuma sucesso sem evidência (tool result, test pass).
 NÃO mude semântica observável sem declarar.
 NÃO execute ação difícil de reverter ou outward-facing sem confirmar.
@@ -182,6 +184,7 @@ Output formato: **APENAS tool_use OU output estruturado conforme schema.**
 **Sem prosa fora do output.** Sem prefácio. Sem disclaimers. Aja.
 
 NÃO invente arquivos/funções sem ler/grep.
+NÃO mude um símbolo sem investigar call sites — leia callers e testes colocalizados antes de alterar contrato.
 NÃO assuma sucesso sem evidência (tool result, test pass).
 NÃO mude semântica observável sem declarar.
 NÃO execute ação difícil de reverter ou outward-facing sem confirmar.

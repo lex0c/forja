@@ -2,12 +2,15 @@ import { describe, expect, test } from 'bun:test';
 import { CONSTRAINTS_PROMPT, composeWithConstraints } from '../../src/cli/constraints-prompt.ts';
 
 describe('constraints-prompt', () => {
-  test('CONSTRAINTS_PROMPT carries the three §1.6 correctness constraints', () => {
-    // The correctness floor: no inventing symbols, evidence over
+  test('CONSTRAINTS_PROMPT carries the §1.6 correctness constraints', () => {
+    // The correctness floor: no inventing symbols, investigate
+    // call sites before changing a contract, evidence over
     // assumption, no silent semantic change. Anchored so a future
     // edit cannot quietly drop one.
     expect(CONSTRAINTS_PROMPT).toContain('# Constraints');
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('grep');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('investigate');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('call sites');
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('evidence');
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('semantic');
   });
