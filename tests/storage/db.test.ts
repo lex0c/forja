@@ -203,7 +203,7 @@ describe('closeDb — WAL durability (slice 174 hardening A3)', () => {
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  test('checkpoints the WAL and truncates -wal/-shm to zero', () => {
+  test('PASSIVE checkpoint flushes WAL frames to the main DB before close', () => {
     const path = join(tmpRoot, 'ck.db');
     const db = openDb(path);
     db.exec('CREATE TABLE t(x INTEGER);');
@@ -212,11 +212,14 @@ describe('closeDb — WAL durability (slice 174 hardening A3)', () => {
     const walSizeBefore = statSync(`${path}-wal`).size;
     expect(walSizeBefore).toBeGreaterThan(0);
     closeDb(db);
-    // After closeDb: TRUNCATE checkpoint mode resizes the WAL
-    // file to zero (committed pages went back to the main DB).
-    // The -wal and -shm files may persist as empty siblings or
-    // be removed entirely depending on SQLite version; either
-    // way, no bytes remain to be lost.
+    // After closeDb: PASSIVE checkpoint flushes pages to the main
+    // DB file and syncs it. PASSIVE doesn't truncate the WAL by
+    // itself, but with no concurrent readers (test scenario) the
+    // subsequent db.close() removes the now-empty -wal and -shm
+    // siblings — SQLite cleans them up when the last connection
+    // closes and no frames remain unchecked. In production with
+    // concurrent readers, frames they hold stay in the WAL and
+    // get recovered on the next open instead of being lost.
     const walSizeAfter = existsSync(`${path}-wal`) ? statSync(`${path}-wal`).size : 0;
     expect(walSizeAfter).toBe(0);
   });
@@ -252,6 +255,35 @@ describe('closeDb — WAL durability (slice 174 hardening A3)', () => {
     const db = openDb(path);
     db.close();
     expect(() => closeDb(db)).not.toThrow();
+  });
+
+  test('PASSIVE checkpoint does not block on concurrent readers', () => {
+    // The whole point of choosing PASSIVE over TRUNCATE: a
+    // concurrent open holding a reader snapshot does NOT cause
+    // closeDb to wait on busy_timeout (5s with our openDb config).
+    // Test: open the DB twice, hold a reader on the second
+    // connection across the closeDb of the first. The closeDb
+    // must complete quickly — pin a generous-but-still-bounded
+    // timing to catch a regression to a blocking mode.
+    const path = join(tmpRoot, 'concurrent.db');
+    const writer = openDb(path);
+    writer.exec('CREATE TABLE t(x INTEGER);');
+    writer.exec('INSERT INTO t(x) VALUES (1), (2), (3);');
+    // Hold a reader on a second connection. SQLite's WAL allows
+    // concurrent reads while a checkpoint runs — but TRUNCATE
+    // mode waits for the reader to drop its snapshot. PASSIVE
+    // does not.
+    const reader = openDb(path, { readonly: true });
+    const snapshot = reader.query('SELECT COUNT(*) AS n FROM t').get() as { n: number };
+    expect(snapshot.n).toBe(3);
+    const t0 = Date.now();
+    closeDb(writer);
+    const elapsed = Date.now() - t0;
+    // Bound on a CI/dev machine: PASSIVE returns in low ms. Pin a
+    // ceiling well under the busy_timeout (5000ms) so a regression
+    // to TRUNCATE or FULL surfaces immediately.
+    expect(elapsed).toBeLessThan(500);
+    reader.close();
   });
 
   test('a throwing db.close() is swallowed so finally-block errors are preserved', () => {

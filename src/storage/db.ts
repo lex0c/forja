@@ -141,21 +141,45 @@ export const openDb = (path: string, options: OpenDbOptions = {}): DB => {
 
 export const openMemoryDb = (): DB => openDb(MEMORY_DB);
 
-// Slice 174 (hardening A3): durable close. `PRAGMA synchronous =
-// NORMAL` (set in openDb) keeps the hot path fast — main-DB pages
-// fsync, but WAL frames can sit in the kernel page cache after
-// COMMIT. The window is small in normal operation but real: a
-// host crash (kernel panic, power loss) between the last commit
-// and the next checkpoint loses every audit row written since
-// the last checkpoint, and the chain-verifier can't tell the
-// missing rows from rows that were never written. On graceful
-// shutdown we have the opportunity to force a checkpoint and
-// guarantee everything committed is durable on disk.
+// Slice 174 (hardening A3): durable-best-effort close. `PRAGMA
+// synchronous = NORMAL` (set in openDb) keeps the hot path fast —
+// main-DB pages fsync, but WAL frames can sit in the kernel page
+// cache after COMMIT. The window is small in normal operation but
+// real: a host crash (kernel panic, power loss) between the last
+// commit and the next checkpoint loses every audit row written
+// since the last checkpoint, and the chain-verifier can't tell
+// the missing rows from rows that were never written.
 //
-// TRUNCATE is the most aggressive mode: checkpoint, then truncate
-// the WAL file to zero. Costs one fsync. RESTART would leave the
-// WAL file size intact so the next open can reuse it; the
-// truncate cost is negligible at process shutdown.
+// CHECKPOINT MODE CHOICE — PASSIVE, not TRUNCATE.
+//
+// The v0 fix used `wal_checkpoint(TRUNCATE)` which:
+//   - waits for ALL readers to finish snapshotting (busy-handler
+//     invoked, controlled by `busy_timeout=5000` set in openDb),
+//   - waits until every reader is reading from the main DB only,
+//   - then checkpoints + truncates the WAL file to zero.
+// Result: every closeDb call could block up to 5 SECONDS waiting
+// for concurrent readers (parent + subagent + readonly inspector
+// overlap is the canonical case the project's parallelism
+// architecture creates). Since closeDb runs in finally blocks
+// across 16 cli/* entry points, this introduced user-visible
+// exit latency under normal operation.
+//
+// PASSIVE:
+//   - checkpoints as many frames as possible without waiting,
+//   - busy-handler is NEVER invoked,
+//   - syncs the main DB file when all frames were checkpointed,
+//   - frames with active readers stay in the WAL — they're
+//     recovered automatically on next open (the WAL file is the
+//     recovery mechanism, not a transient buffer).
+// Trade-off: a host crash AFTER closeDb but BEFORE next open
+// loses any frames that PASSIVE couldn't checkpoint because a
+// reader held them. Mitigation: those frames are committed —
+// the WAL file persists on disk between processes, and the
+// next `openDb` automatically checkpoints during the first
+// write. The window where data is genuinely at risk is
+// "graceful shutdown + host crash + WAL file lost (e.g. tmpfs)
+// before next open" — much narrower than the v0 promise but
+// the right balance against the 5s-blocking-per-close cost.
 //
 // Best-effort: a failed checkpoint must NOT block close — the
 // close itself frees the file handle and any blocked connection
@@ -166,7 +190,7 @@ export const openMemoryDb = (): DB => openDb(MEMORY_DB);
 // wal_checkpoint is itself a no-op there.
 export const closeDb = (db: DB): void => {
   try {
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    db.exec('PRAGMA wal_checkpoint(PASSIVE);');
   } catch (e) {
     process.stderr.write(
       `forja: WAL checkpoint failed on close: ${e instanceof Error ? e.message : String(e)}\n`,

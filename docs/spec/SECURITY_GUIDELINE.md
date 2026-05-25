@@ -544,10 +544,12 @@ Rejeita:
 
 **`closeDb(db)` (`src/storage/db.ts`):** wrapper único pra encerrar handles SQLite, usado por todos os entry points do CLI + `evals/executor.ts`:
 
-1. `PRAGMA wal_checkpoint(TRUNCATE)` força flush + trunca o arquivo WAL pra zero. Custo: um fsync. Em shutdown é desprezível.
-2. `db.close()` libera o handle.
+1. `PRAGMA wal_checkpoint(PASSIVE)` — checkpoint best-effort: copia frames pro main DB sem esperar readers, sync do main file. Frames com active reader ficam no WAL (recovered automaticamente no próximo open).
+2. `db.close()` libera o handle. Em close limpo sem readers, SQLite remove `-wal`/`-shm` siblings automaticamente.
 
 Ambos os passos em try/catch separados que logam-e-suprimem stderr — finally chains do tipo `try { migrate(db); } catch (e) { closeDb(db); throw e; }` preservam o erro original.
+
+**Por que PASSIVE, não TRUNCATE/FULL:** TRUNCATE espera todos readers darem snapshot fresh do main DB (busy-handler invocado, controlled pelo `busy_timeout=5000` do `openDb`). Em deployments com parent + subagent + readonly inspector overlap (canonical Forja parallelism shape), cada `closeDb` poderia bloquear 5 SEGUNDOS — UX inaceitável pra finally blocks que rodam em todos entry points do CLI. PASSIVE retorna em ms; o trade-off é que pages com active reader ficam no WAL, recovered no próximo open. Window de risco genuíno: graceful shutdown + host crash + WAL file perdido (tmpfs, etc) antes do próximo open — narrower que a promessa v0 mas o balance certo contra latência de close.
 
 **Casos no-op (não throw, não warn):** DBs `:memory:`, handles readonly, DBs abertos antes de `journal_mode=WAL` rodar — `wal_checkpoint` é no-op nativo nesses casos.
 
