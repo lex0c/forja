@@ -1763,6 +1763,100 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     }
   });
 
+  test('relative readlink target resolves against CANONICAL parent (parent-is-symlink case)', () => {
+    // /work/proj/alias → /tmp/ext (parent is a symlink to outside cwd)
+    // /work/proj/alias/out → ../secret (relative dangling target)
+    // Lexical resolution: dirname('/work/proj/alias/out') is
+    // '/work/proj/alias', resolvePath(..., '../secret') =
+    // '/work/proj/secret' — inside cwd, NO escape flagged.
+    // Kernel resolution: parent realpath is '/tmp/ext', the
+    // relative '../secret' resolves against THAT to '/tmp/secret'
+    // — OUTSIDE cwd. Fix uses realpath(dirname) to canonicalize
+    // the parent before walking the relative target.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        if (p === '/work/proj/alias') return '/tmp/ext';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/alias/out') return '../secret';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat alias/out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('relative readlink target with canonical parent still inside cwd preserves high', () => {
+    // /work/proj/alias → /work/proj/packages (parent symlink stays
+    // inside cwd, common yarn workspace shape).
+    // /work/proj/alias/out → ../shared.
+    // Canonical parent /work/proj/packages, relative '../shared'
+    // = /work/proj/shared — inside cwd, no escape.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        if (p === '/work/proj/alias') return '/work/proj/packages';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/alias/out') return '../shared';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat alias/out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('relative readlink falls back to lexical dirname when parent realpath also fails', () => {
+    // Deeply-dangling chain: parent realpath fails too. Documented
+    // residual gap — the resolver falls back to lexical dirname.
+    // Pin the fallback explicitly so a future change knows it's a
+    // known limitation, not an oversight. In this case the target
+    // happens to escape via `..` even from the lexical dirname, so
+    // the test still asserts the escape IS caught — but the
+    // canonical parent's actual identity is unverified.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (_) => {
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/data/out') return '../../../tmp/x';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat data/out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
   test('readlink omitted (legacy ctx) keeps old parent-realpath fallback', () => {
     // When readlink isn't wired (test ctx without the seam, or a
     // future caller path), the helper falls through to the

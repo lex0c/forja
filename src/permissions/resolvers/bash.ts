@@ -3007,18 +3007,36 @@ const canonicalizeForClassification = (lexicalAbs: string, ctx: ResolverContext)
     // open the stored target at exec time. `readlink` reads the
     // stored target without recursive resolution. ALWAYS normalize
     // before returning — both the absolute and the relative branch.
-    // Without normalization, an absolute target like
-    // `/work/proj/../tmp/x` looks like it's inside `/work/proj`
-    // by string-prefix tests downstream (detectCwdScopeEscape,
-    // classifyProtectedPath) but the kernel resolves it to
-    // `/work/tmp/x` — a real cwd-scope bypass on the dangling-
-    // symlink path. `resolvePath(target)` collapses `..` and `.`
-    // components for absolute paths; `resolvePath(dirname, target)`
-    // does the same for relative ones.
+    //
+    // For absolute targets: an `/work/proj/../tmp/x` literal looks
+    // like it's inside `/work/proj` by string-prefix tests
+    // downstream but the kernel resolves it to `/work/tmp/x` —
+    // `resolvePath(target)` collapses `..`/`.` to give the kernel
+    // view.
+    //
+    // For relative targets: resolve against the CANONICAL parent
+    // (`realpath(dirname)`), NOT the lexical dirname. If a parent
+    // segment is itself a symlink (`/work/proj/alias → /tmp/ext`,
+    // then `/work/proj/alias/out → ../secret`), the relative walk
+    // happens in `/tmp/ext`, not `/work/proj/alias`. Using lexical
+    // dirname here would compute `/work/proj/secret` while the
+    // kernel ends up at `/tmp/secret` — escape masked. When the
+    // parent's own realpath fails (deeply dangling chain), fall
+    // back to the lexical dirname; that case is the worst-case
+    // residual gap, documented below in stage (3)'s caveat.
     if (ctx.readlink !== undefined) {
       try {
         const target = ctx.readlink(lexicalAbs);
-        return isAbsolute(target) ? resolvePath(target) : resolvePath(dirname(lexicalAbs), target);
+        if (isAbsolute(target)) {
+          return resolvePath(target);
+        }
+        let canonicalParent: string;
+        try {
+          canonicalParent = ctx.realpath(dirname(lexicalAbs));
+        } catch {
+          canonicalParent = dirname(lexicalAbs);
+        }
+        return resolvePath(canonicalParent, target);
       } catch {
         // Not a symlink, or readlink failed for other reasons —
         // fall through to (3).
