@@ -484,10 +484,12 @@ Continue? [y/N]
 
 **Defesa em duas camadas:**
 
-1. **Pin do binário no startup (two-stage resolution).** `getGitBinary()` (async) e `getGitBinarySync()` (sync) rodam `which git` UMA vez por processo:
+1. **Pin do binário no startup (two-stage resolution).** `getGitBinary()` (async) e `getGitBinarySync()` (sync) procuram git UMA vez por processo **in-process** (walk dos entries do PATH via `fs.access(.., X_OK)` — sem spawn de `which`, que está ausente em imagens minimalistas como busybox/distroless/scratch+static):
    - **Stage 1 — canônico:** lookup contra SAFE_PATH (`/opt/homebrew/{s,}bin:/opt/local/{s,}bin:/usr/local/{s,}bin:/usr/{s,}bin:/{s,}bin`). Cobre macOS Homebrew/MacPorts + POSIX Linux. Quando resolve, `safeGitEnv().PATH` permanece canônica — defesa completa contra `~/bin/git` mid-session.
    - **Stage 2 — fallback:** quando canônico não resolve, retry contra `process.env.PATH` do boot. Cobre NixOS (`/run/current-system/sw/bin`, `~/.nix-profile/bin`), asdf shims, `/run/wrappers/bin`, layouts ad-hoc (`/opt/custom/bin`). Quando o fallback resolve, **`safeGitEnv().PATH` vira `${CANONICAL_SAFE_PATH}:${operator_boot_PATH}`** — canônico FIRST (defesa contra shadowing de tools que TAMBÉM existem no canônico), dirs do operador APPEND (subprocess de git como hooks/credential helpers/ssh resolvem). Stderr logga uma linha avisando que a defesa de PATH ficou parcial (operador's boot PATH é parte do trust boundary, mesmo posture do `§2.1`).
    - **Stage 3 — sem git em lugar nenhum:** cacheia null, retorna a string literal `'git'`. Spawn vai falhar com ENOENT visível.
+
+   Resolução é zero-dependência externa (não spawn `which`, `command`, ou shell builtin) — funciona em qualquer image que tenha git instalado e exposto em alguma entry do PATH, mesmo as que omitem utilitários POSIX (distroless, scratch + static-linked binaries).
 
    Spawns subsequentes usam o path absoluto resolvido, não a string `'git'` — shadowing pós-startup não tem efeito (não há PATH lookup quando `cmd[0]` é absoluto).
 

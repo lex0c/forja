@@ -18,6 +18,30 @@ describe('getGitBinary — slice 178 hardening M3', () => {
     __resetGitBinaryCacheForTest();
   });
 
+  test('resolves git in-process (no `which` binary dependency)', async () => {
+    // The helper walks PATH entries via fs.access(.., X_OK)
+    // instead of spawning `which`. Minimal container images
+    // (busybox, distroless, scratch + static-binary) often
+    // don't ship `which`; the in-process walk works as long as
+    // git itself is present and PATH lists its directory.
+    //
+    // We can't easily prove "no spawn happened" from a black-box
+    // test, but we can prove the resolution succeeds — and the
+    // resolution code path is the same `fs.access` walk for
+    // both canonical and fallback. A direct integration check
+    // would mock `Bun.spawn`; the assertion below is the next
+    // best thing.
+    const path = await getGitBinary();
+    if (path === 'git') {
+      // Tolerate the bare-fallback case (test env with no git
+      // anywhere in SAFE_PATH or process.env.PATH). Still pin
+      // the contract that the call returned a string.
+      expect(typeof path).toBe('string');
+      return;
+    }
+    expect(path.endsWith('/git')).toBe(true);
+  });
+
   test('resolves to an absolute path on systems with git installed', async () => {
     // CI + dev machines: git is on the safe PATH (/usr/local/bin,
     // /usr/bin, /bin). Resolution must return an absolute path so

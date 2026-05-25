@@ -1,3 +1,7 @@
+import { constants, accessSync } from 'node:fs';
+import { access } from 'node:fs/promises';
+import { delimiter, join } from 'node:path';
+
 // Slice 178 (hardening M3). Pin the absolute path to `git` once
 // per process so subsequent worktree-gc subprocess spawns aren't
 // vulnerable to mid-session PATH shadowing.
@@ -48,41 +52,48 @@ let cachedGitPath: string | null | undefined;
 // against mid-session shadowing of git's siblings).
 let cachedSpawnPath: string = CANONICAL_SAFE_PATH;
 
-// Run `which git` against a specific PATH. Pure helper used by
-// both the async and sync entry points. Returns the trimmed
-// stdout when which exits 0 with non-empty output; null
-// otherwise. Never throws.
-const whichGitAsync = async (path: string): Promise<string | null> => {
-  try {
-    const proc = Bun.spawn({
-      cmd: ['which', 'git'],
-      env: { PATH: path },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (exitCode !== 0) return null;
-    const candidate = stdout.trim();
-    return candidate.length > 0 ? candidate : null;
-  } catch {
-    return null;
+// Find `git` in a specific PATH string by walking entries with
+// `fs.access(.., X_OK)`. Pre-fix used `Bun.spawn(['which', 'git'])`
+// which broke on minimal images (busybox-based, distroless,
+// scratch + statically-linked binaries) that don't ship a `which`
+// executable — both canonical and fallback probes returned null
+// even when git was installed in a discoverable dir. In-process
+// resolution removes the external-binary dependency: we have the
+// PATH string already and the FS access check is a single syscall
+// per candidate. Returns the first executable hit or null.
+//
+// `path.delimiter` keeps the split portable (`:` on POSIX, `;` on
+// Windows — though Forja targets POSIX). The X_OK check filters
+// non-executable files with the same name; same semantics as
+// `which`.
+const findGitInPathSync = (path: string): string | null => {
+  if (path.length === 0) return null;
+  for (const dir of path.split(delimiter)) {
+    if (dir.length === 0) continue;
+    const candidate = join(dir, 'git');
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Not executable / doesn't exist — try next entry.
+    }
   }
+  return null;
 };
 
-const whichGitSync = (path: string): string | null => {
-  try {
-    const proc = Bun.spawnSync({
-      cmd: ['which', 'git'],
-      env: { PATH: path },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    if (proc.exitCode !== 0) return null;
-    const candidate = new TextDecoder().decode(proc.stdout).trim();
-    return candidate.length > 0 ? candidate : null;
-  } catch {
-    return null;
+const findGitInPathAsync = async (path: string): Promise<string | null> => {
+  if (path.length === 0) return null;
+  for (const dir of path.split(delimiter)) {
+    if (dir.length === 0) continue;
+    const candidate = join(dir, 'git');
+    try {
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Not executable / doesn't exist — try next entry.
+    }
   }
+  return null;
 };
 
 // Augment `cachedSpawnPath` with the operator's boot PATH when
@@ -113,7 +124,7 @@ export const getGitBinary = async (): Promise<string> => {
   if (cachedGitPath !== undefined) return cachedGitPath ?? 'git';
   // First: canonical SAFE_PATH (defense against mid-session
   // ~/bin/git shadowing — that's the whole point of the helper).
-  const canonical = await whichGitAsync(CANONICAL_SAFE_PATH);
+  const canonical = await findGitInPathAsync(CANONICAL_SAFE_PATH);
   if (canonical !== null) {
     cachedGitPath = canonical;
     return canonical;
@@ -121,12 +132,12 @@ export const getGitBinary = async (): Promise<string> => {
   // Fallback: operator's boot PATH. Required for Nix profile
   // bins (/run/current-system/sw/bin, ~/.nix-profile/bin), asdf
   // shims, /run/wrappers/bin, ad-hoc /opt/custom layouts. The
-  // boot PATH is part of the trust boundary, so a `which git`
-  // against it is no weaker than the v0 inline `cmd: ['git']`
-  // path the helper was designed to harden.
+  // boot PATH is part of the trust boundary, so searching it for
+  // git is no weaker than the v0 inline `cmd: ['git']` path the
+  // helper was designed to harden.
   const operatorPath = process.env.PATH;
   if (operatorPath !== undefined && operatorPath !== CANONICAL_SAFE_PATH) {
-    const fallback = await whichGitAsync(operatorPath);
+    const fallback = await findGitInPathAsync(operatorPath);
     if (fallback !== null) {
       cachedGitPath = fallback;
       applyFallbackSpawnPath(fallback);
@@ -145,14 +156,14 @@ export const getGitBinary = async (): Promise<string> => {
 // result. Never throws.
 export const getGitBinarySync = (): string => {
   if (cachedGitPath !== undefined) return cachedGitPath ?? 'git';
-  const canonical = whichGitSync(CANONICAL_SAFE_PATH);
+  const canonical = findGitInPathSync(CANONICAL_SAFE_PATH);
   if (canonical !== null) {
     cachedGitPath = canonical;
     return canonical;
   }
   const operatorPath = process.env.PATH;
   if (operatorPath !== undefined && operatorPath !== CANONICAL_SAFE_PATH) {
-    const fallback = whichGitSync(operatorPath);
+    const fallback = findGitInPathSync(operatorPath);
     if (fallback !== null) {
       cachedGitPath = fallback;
       applyFallbackSpawnPath(fallback);
