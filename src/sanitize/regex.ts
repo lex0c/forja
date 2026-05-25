@@ -36,6 +36,13 @@ const NESTED_UNBOUNDED = /\([^()]*[+*][^()]*\)[+*]/;
 const NESTED_UNBOUNDED_TWO_LEVEL =
   /\([^()]*\([^()]*[+*][^()]*\)[^()]*\)[+*]|\([^()]*\([^()]*\)[+*][^()]*\)[+*]/;
 const ALT_IN_REPEATED_GROUP = /\([^()]*\|[^()]*\)[+*]/;
+// Alternation group with a BRACE quantifier (vs `[+*]`). Same
+// catastrophic-backtracking shape as ALT_IN_REPEATED_GROUP when
+// the count is large or unbounded: `(a|aa){30,}b` against a
+// non-matching input hangs for seconds. Walked with matchAll so a
+// benign-prefix bypass (`(x|y){1,2}(a|aa){100,}`) doesn't slip
+// past the first match. Threshold reused from BOUNDED_REPEAT_ON_GROUP.
+const ALT_IN_BOUNDED_GROUP = /\([^()]*\|[^()]*\)\{(\d+)(?:,(\d*))?\}/g;
 // `g` flag is load-bearing: `detectRedosShape` iterates EVERY match
 // via `matchAll`. Without the global flag, only the first quantified
 // group is inspected — an attacker could prepend a benign group
@@ -74,6 +81,30 @@ export const detectRedosShape = (pattern: string): RegexShapeRejection | null =>
       message:
         'pattern contains alternation inside a repeated group (shapes like `(a|ab)+`); overlapping branches cause exponential backtracking',
     };
+  }
+
+  // Same threat as ALT_IN_REPEATED_GROUP, but with brace quantifiers
+  // — `(a|aa){30,}b` hangs identically to `(a|aa)+b`. Iterate every
+  // match so a benign-prefix bypass doesn't slip past. Same shape
+  // logic as BOUNDED_REPEAT_ON_GROUP below: `{n}` is exact (upper =
+  // lower), `{n,}` is unbounded (upper = Infinity), `{n,m}` is
+  // bounded; reject when either bound exceeds MAX_BOUNDED_REPEAT.
+  for (const altBoundedMatch of pattern.matchAll(ALT_IN_BOUNDED_GROUP)) {
+    const lower = Number.parseInt(altBoundedMatch[1] ?? '0', 10);
+    const upperRaw = altBoundedMatch[2];
+    const upper =
+      upperRaw === undefined
+        ? lower
+        : upperRaw === ''
+          ? Number.POSITIVE_INFINITY
+          : Number.parseInt(upperRaw, 10);
+    if (lower > MAX_BOUNDED_REPEAT || upper > MAX_BOUNDED_REPEAT) {
+      return {
+        code: 'alternation_in_repeated_group',
+        message:
+          'pattern contains alternation inside a brace-quantified group with a large or unbounded count (shapes like `(a|aa){30,}`); same exponential backtracking as `(a|aa)+`',
+      };
+    }
   }
 
   // Iterate EVERY bounded-repeat match — a single bad group anywhere

@@ -66,6 +66,41 @@ describe('detectRedosShape', () => {
     test('(a|ab)+', () => {
       expect(detectRedosShape('(a|ab)+')?.code).toBe('alternation_in_repeated_group');
     });
+
+    test('(a|aa){30,}b — unbounded upper on alt group', () => {
+      // Same catastrophic shape as (a|aa)+b. Pre-fix only `[+*]`
+      // after the alt group was caught; brace quantifiers with
+      // large/unbounded counts slipped through and could hang
+      // the harness for seconds on a non-matching input like
+      // `'a'.repeat(60) + 'c'`.
+      expect(detectRedosShape('(a|aa){30,}b')?.code).toBe('alternation_in_repeated_group');
+    });
+
+    test('(a|aa){50} — exact-count above threshold', () => {
+      expect(detectRedosShape('(a|aa){50}')?.code).toBe('alternation_in_repeated_group');
+    });
+
+    test('(a|ab){10,100} — bounded but upper exceeds threshold', () => {
+      expect(detectRedosShape('(a|ab){10,100}')?.code).toBe('alternation_in_repeated_group');
+    });
+
+    test('multi-group: benign prefix does NOT mask catastrophic alt-bounded later', () => {
+      // matchAll on ALT_IN_BOUNDED_GROUP — first match is fine
+      // (small bounds), second match is the catastrophic one.
+      // Without iteration, pre-fix bypass.
+      expect(detectRedosShape('(x|y){1,2}(a|aa){100,}')?.code).toBe(
+        'alternation_in_repeated_group',
+      );
+    });
+
+    test('admits (a|b){1,5} — small bounded count', () => {
+      // Both bounds under MAX_BOUNDED_REPEAT; not exponential.
+      expect(detectRedosShape('(a|b){1,5}')).toBeNull();
+    });
+
+    test('admits (a|b){3} — small exact count', () => {
+      expect(detectRedosShape('(a|b){3}')).toBeNull();
+    });
   });
 
   describe('rejects large bounded repeats on quantified groups', () => {
