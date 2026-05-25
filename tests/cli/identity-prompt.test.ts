@@ -6,7 +6,7 @@ describe('identity-prompt', () => {
     // Role-as-tool, not persona: the marker must name the tool
     // and its operating policy — the load-bearing facts §1.2
     // asks for — not personality or tone.
-    expect(IDENTITY_PROMPT).toContain('Forja');
+    expect(IDENTITY_PROMPT).toContain('Hephaestus');
     expect(IDENTITY_PROMPT.toLowerCase()).toContain('declarative policy');
     expect(IDENTITY_PROMPT.toLowerCase()).toContain('verified');
     expect(IDENTITY_PROMPT.toLowerCase()).toContain('auditable');

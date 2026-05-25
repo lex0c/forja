@@ -489,8 +489,8 @@ Body.`,
       userPolicyPath: null,
     });
     expect(config.systemPrompt).toBeDefined();
-    expect(config.systemPrompt?.startsWith('You are the Forja agent')).toBe(true);
-    const identityIdx = config.systemPrompt?.indexOf('You are the Forja agent') ?? -1;
+    expect(config.systemPrompt?.startsWith('You are the Hephaestus agent')).toBe(true);
+    const identityIdx = config.systemPrompt?.indexOf('You are the Hephaestus agent') ?? -1;
     const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
     const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
@@ -566,7 +566,7 @@ When the goal is to orient in a new repo.
     expect(config.systemPrompt).toBeDefined();
     const prompt = config.systemPrompt ?? '';
     const idx = {
-      identity: prompt.indexOf('You are the Forja agent'),
+      identity: prompt.indexOf('You are the Hephaestus agent'),
       environment: prompt.indexOf('# Environment'),
       discipline: prompt.indexOf('# Task discipline'),
       response: prompt.indexOf('# Response surface'),
@@ -729,13 +729,13 @@ When the goal is to orient in a new repo.
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt?.startsWith('You are the Forja agent')).toBe(true);
+    expect(config.systemPrompt?.startsWith('You are the Hephaestus agent')).toBe(true);
     expect(config.systemPrompt).toContain('# Task discipline');
     expect(config.systemPrompt).toContain('# Response surface');
     expect(config.systemPrompt).toContain('# Constraints');
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('You are a senior engineer.');
-    const identityIdx = config.systemPrompt?.indexOf('You are the Forja agent') ?? -1;
+    const identityIdx = config.systemPrompt?.indexOf('You are the Hephaestus agent') ?? -1;
     const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
     const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;

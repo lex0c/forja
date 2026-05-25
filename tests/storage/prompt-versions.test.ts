@@ -18,7 +18,7 @@ const setupDb = (): Database => {
 
 describe('prompt-versions repo (AUDIT.md §1.3)', () => {
   test('hashPromptContent is deterministic SHA256 hex', () => {
-    const content = 'You are the Forja agent — under declarative policy.';
+    const content = 'You are the Hephaestus agent — under declarative policy.';
     const a = hashPromptContent(content);
     const b = hashPromptContent(content);
     expect(a).toBe(b);

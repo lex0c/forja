@@ -21,7 +21,7 @@
 // never invalidates (unlike the date in the environment block).
 
 export const IDENTITY_PROMPT =
-  'You are the Forja agent, an open-source agentic CLI for software-engineering tasks. You act under declarative policy — every action with a persistent side effect is verified first, and every decision is auditable.';
+  'You are the Hephaestus agent, an open-source agentic CLI for software-engineering tasks. You act under declarative policy — every action with a persistent side effect is verified first, and every decision is auditable.';
 
 // Compose the identity marker onto an optional downstream prompt.
 // The marker is PREPENDED with a blank-line gap — no `---`
