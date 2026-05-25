@@ -1,5 +1,5 @@
 import { type DB, getSubagentOutput } from '../storage/index.ts';
-import { makeInterruptHard, makeInterruptSoft } from './ipc.ts';
+import { isExpectedIpcTeardown, makeInterruptHard, makeInterruptSoft } from './ipc.ts';
 import type { ChildProcessHandle } from './spawn-factory.ts';
 
 // Default wall-clock for a subagent run when the definition
@@ -282,9 +282,16 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
       if (handle.ipc !== undefined) {
         try {
           handle.ipc.send(makeInterruptSoft());
-        } catch {
+        } catch (e) {
           // Channel may be torn down; the OS-level kill path
-          // below picks up the slack on grace expiry.
+          // below picks up the slack on grace expiry. Only
+          // surface unexpected errors so a serialization or
+          // transport bug doesn't get masked as a normal race.
+          if (!isExpectedIpcTeardown(e)) {
+            process.stderr.write(
+              `subagent ${sessionId}: ipc send (interrupt:soft) failed unexpectedly: ${e instanceof Error ? e.message : String(e)}\n`,
+            );
+          }
         }
       }
       // No SIGKILL scheduled here: soft is patient by design.
@@ -315,8 +322,15 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
       if (handle.ipc !== undefined) {
         try {
           handle.ipc.send(makeInterruptHard());
-        } catch {
-          // ignore — SIGTERM below covers the channel-broken case
+        } catch (e) {
+          // SIGTERM below covers the channel-broken case; only
+          // surface unexpected throws so a serialization bug
+          // doesn't hide behind the OS-fallback safety net.
+          if (!isExpectedIpcTeardown(e)) {
+            process.stderr.write(
+              `subagent ${sessionId}: ipc send (interrupt:hard) failed unexpectedly: ${e instanceof Error ? e.message : String(e)}\n`,
+            );
+          }
         }
       }
       handle.kill('SIGTERM');

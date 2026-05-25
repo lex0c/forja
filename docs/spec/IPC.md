@@ -138,6 +138,19 @@ Espelho dos `HarnessEvent` que o harness do filho já emite via `config.onEvent`
 - **JSON malformado do filho**: pai loga warning, descarta a linha. Não derruba o canal — uma linha ruim não invalida a próxima.
 - **Pai morreu (filho órfão)**: filho recebe SIGHUP/EOF no stdin; encerra via path normal.
 
+### 4.6 Classificação de teardown vs erro real (slice 178 A4)
+
+Catch sites em volta de `channel.send` distinguem **teardown esperado** (canal já fechado pelo peer — race comum em encerramento gracioso) de **erro real** (serialização bug, transport invariant, backpressure). Pré-slice todos os catches eram bare (`catch {}` com comentário "// teardown race") — correto pro caso dominante mas mascarava bugs reais como subagent hangs sem trail forense.
+
+`isExpectedIpcTeardown(err)` em `src/subagents/ipc.ts` retorna true quando:
+
+- `err.code` ∈ {`EPIPE`, `ECONNRESET`, `EBADF`, `ERR_STREAM_DESTROYED`, `ERR_STREAM_WRITE_AFTER_END`, `ERR_IPC_CHANNEL_CLOSED`}, OU
+- `err.message` (case-insensitive) contém uma das frases canônicas: `channel closed`, `channel is closed`, `write after end`, `broken pipe`, `stream destroyed`, `already destroyed`, `cannot write to closed`.
+
+Qualquer outro throw é tratado como erro real: stderr structured line `subagent <id>: ipc send (<context>) failed unexpectedly: <message>` com o contexto do send (`deny for unhooked ask`, `rate-limit deny`, `permission answer`, `hook-threw deny`, `interrupt:soft`, `interrupt:hard`, `version-mismatch interrupt:hard`).
+
+**Sites wirados:** 4 catches do permission-bridge em `runtime.ts`, 2 catches do interrupt-send em `wait-loop.ts`, 1 catch do IPC-version-mismatch em `runtime.ts`. Todos os 7 usam o mesmo classifier — bare-catch swallowing de bugs reais está fechado em toda a superfície subagent.
+
 ---
 
 ## 5. Backwards compatibility

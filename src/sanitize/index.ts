@@ -5,4 +5,5 @@ export {
   stripAnsi,
 } from './ansi.ts';
 export { scrubEnv } from './env.ts';
+export { detectRedosShape, type RegexShapeRejection } from './regex.ts';
 export { redactSecrets } from './secrets.ts';

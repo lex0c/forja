@@ -32,7 +32,7 @@
 //      escalate-tier drops confidence to low so the engine forces
 //      a confirm via slice-3 wiring.
 
-import { basename, dirname, join as joinPath, resolve as resolvePath } from 'node:path';
+import { basename, dirname, isAbsolute, join as joinPath, resolve as resolvePath } from 'node:path';
 import type { Node } from 'web-tree-sitter';
 import { parseBash } from '../bash-parser.ts';
 import type { Capability } from '../capabilities.ts';
@@ -2970,6 +2970,94 @@ const couldGlobReachProtected = (
 const tierRank = (t: 'deny' | 'escalate' | null): number =>
   t === 'deny' ? 2 : t === 'escalate' ? 1 : 0;
 
+// Resolve a lexical absolute path to its canonical form for
+// classification, with three sequential fallbacks. Used by BOTH
+// `classifyArgWithCanonical` (protected-path tier check) and
+// `detectCwdScopeEscape` (cwd-scope check) — both helpers need
+// identical canonicalization semantics, including the dangling-
+// symlink case the parent-realpath fallback alone gets wrong.
+//
+// Strategy:
+//   1. `realpath(lexicalAbs)` — fast path; succeeds when every
+//      component exists. Throws ENOENT for write-creates-new-file
+//      or for a dangling symlink leaf.
+//   2. `readlink(lexicalAbs)` — when (1) throws, check if the leaf
+//      is itself a symlink. `readlink` returns the STORED target
+//      (no recursive resolution) even when that target was
+//      removed. Absolute target = use as-is. Relative target =
+//      resolve against `dirname(lexicalAbs)`. This is the case
+//      a dangling outlink → /tmp/x exhibits: realpath fails but
+//      the symlink itself still exists and points OUTSIDE cwd.
+//      Pre-fix this case fell through to (3), which collapses
+//      to lexical and misses the escape.
+//   3. `realpath(dirname) + basename` — when neither (1) nor (2)
+//      worked, the leaf is a fresh file under an existing parent
+//      (write-creates-new-file). Catches parent-is-symlink shapes
+//      (cwd_alias/leaf where cwd_alias → /etc, write `> leaf`
+//      creates /etc/leaf).
+//   4. Give up — return null and the caller falls back to the
+//      lexical classification.
+const canonicalizeForClassification = (lexicalAbs: string, ctx: ResolverContext): string | null => {
+  if (ctx.realpath === undefined) return null;
+  try {
+    return ctx.realpath(lexicalAbs);
+  } catch {
+    // (2) Dangling-symlink probe: even if the leaf's TARGET is
+    // gone, the symlink itself still exists and the kernel will
+    // open the stored target at exec time. `readlink` reads the
+    // stored target without recursive resolution. ALWAYS normalize
+    // before returning — both the absolute and the relative branch.
+    //
+    // For absolute targets: an `/work/proj/../tmp/x` literal looks
+    // like it's inside `/work/proj` by string-prefix tests
+    // downstream but the kernel resolves it to `/work/tmp/x` —
+    // `resolvePath(target)` collapses `..`/`.` to give the kernel
+    // view.
+    //
+    // For relative targets: resolve against the CANONICAL parent
+    // (`realpath(dirname)`), NOT the lexical dirname. If a parent
+    // segment is itself a symlink (`/work/proj/alias → /tmp/ext`,
+    // then `/work/proj/alias/out → ../secret`), the relative walk
+    // happens in `/tmp/ext`, not `/work/proj/alias`. Using lexical
+    // dirname here would compute `/work/proj/secret` while the
+    // kernel ends up at `/tmp/secret` — escape masked. When the
+    // parent's own realpath fails (deeply dangling chain), fall
+    // back to the lexical dirname; that case is the worst-case
+    // residual gap, documented below in stage (3)'s caveat.
+    if (ctx.readlink !== undefined) {
+      try {
+        const target = ctx.readlink(lexicalAbs);
+        if (isAbsolute(target)) {
+          return resolvePath(target);
+        }
+        let canonicalParent: string;
+        try {
+          canonicalParent = ctx.realpath(dirname(lexicalAbs));
+        } catch {
+          canonicalParent = dirname(lexicalAbs);
+        }
+        return resolvePath(canonicalParent, target);
+      } catch {
+        // Not a symlink, or readlink failed for other reasons —
+        // fall through to (3).
+      }
+    }
+    // (3) Parent-realpath + basename for fresh-leaf-under-existing-
+    // parent (where the parent may itself be a symlink). basename
+    // strips any path separators, so the rejoin can't smuggle `..`
+    // — but normalize defensively so a future change to either
+    // input shape (parent realpath returning a path that needs
+    // collapsing, basename behavior change in a runtime upgrade)
+    // doesn't reopen the same bypass.
+    try {
+      const parentReal = ctx.realpath(dirname(lexicalAbs));
+      return resolvePath(joinPath(parentReal, basename(lexicalAbs)));
+    } catch {
+      return null;
+    }
+  }
+};
+
 const classifyArgWithCanonical = (
   lexicalAbs: string,
   op: 'read' | 'write',
@@ -2985,20 +3073,7 @@ const classifyArgWithCanonical = (
   // it cannot relax. Skip the realpath roundtrip in the hot path.
   if (lexicalTier === 'deny' || ctx.realpath === undefined) return lexicalTier;
 
-  let canonical: string | null = null;
-  try {
-    canonical = ctx.realpath(lexicalAbs);
-  } catch {
-    // Path doesn't exist (ENOENT) or can't be canonicalized
-    // (EACCES). Try parent-dir + basename: catches the case where
-    // a parent component is a symlink and the leaf is a new write.
-    try {
-      const parentReal = ctx.realpath(dirname(lexicalAbs));
-      canonical = joinPath(parentReal, basename(lexicalAbs));
-    } catch {
-      canonical = null;
-    }
-  }
+  const canonical = canonicalizeForClassification(lexicalAbs, ctx);
   if (canonical === null || canonical === lexicalAbs) return lexicalTier;
 
   const canonicalTier = classifyProtectedPath({
@@ -3008,6 +3083,35 @@ const classifyArgWithCanonical = (
     cwd: ctx.cwd,
   });
   return tierRank(canonicalTier) > tierRank(lexicalTier) ? canonicalTier : lexicalTier;
+};
+
+// Slice 178 (hardening A1, audit follow-up to slice 176). The
+// canonical-aware classifier above catches symlinks escaping into
+// well-known protected zones (/etc, /proc, ~/.ssh, ...) but NOT
+// symlinks escaping cwd into arbitrary external locations the
+// operator's policy may scope by `<cwd>/**` glob. Example:
+//   cwd = /work/proj
+//   /work/proj/data/x → /tmp/exfil-target
+//   policy: allow read-fs:/work/proj/**
+// classifyProtectedPath returns null for both ends (neither in a
+// classifier zone); the engine matches the lexical capability against
+// the glob and authorizes. The kernel then follows the symlink and
+// the read lands on /tmp/exfil-target — outside the operator's
+// intended scope but never visible to the policy match.
+//
+// Returns true when lexical stays inside cwd but canonical does not.
+// Callers degrade confidence to 'low' (engine forces confirm). Hard-
+// refusal would break legitimate use (yarn workspaces sometimes have
+// symlinks pointing outside the project root); low-confidence funnels
+// the call through the operator's modal, which is the right trade.
+const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean => {
+  if (ctx.realpath === undefined) return false;
+  const canonical = canonicalizeForClassification(lexicalAbs, ctx);
+  if (canonical === null || canonical === lexicalAbs) return false;
+  const cwdPrefix = ctx.cwd.endsWith('/') ? ctx.cwd : `${ctx.cwd}/`;
+  const lexicalInside = lexicalAbs === ctx.cwd || lexicalAbs.startsWith(cwdPrefix);
+  const canonicalInside = canonical === ctx.cwd || canonical.startsWith(cwdPrefix);
+  return lexicalInside && !canonicalInside;
 };
 
 const analyzeCommand = (
@@ -3110,6 +3214,12 @@ const analyzeCommand = (
           };
         }
         if (tier === 'escalate') escalated = true;
+        // Slice 178: cwd-scope symlink escape. Lexical inside cwd
+        // but canonical outside means a glob policy like
+        // `<cwd>/**` would authorize lexically while the kernel
+        // follows the symlink to whatever target the operator
+        // never scoped. Degrade confidence to force confirm.
+        if (detectCwdScopeEscape(abs, ctx)) escalated = true;
       }
     }
   }
@@ -3137,6 +3247,8 @@ const analyzeCommand = (
         };
       }
       if (tier === 'escalate') finalConf = 'low';
+      // Slice 178: cwd-scope escape on write redirect.
+      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
       redirectCaps.push(writeFs(tgtAbs));
     }
     // Slice 128 (R4 P0-Launder-3): input redirects `<` ALSO pass
@@ -3159,6 +3271,8 @@ const analyzeCommand = (
           refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
         };
       }
+      // Slice 178: cwd-scope escape on read redirect.
+      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
       // Add read-fs to capabilities — the shell will read from
       // this path, the resolver should honestly admit so.
       redirectCaps.push(readFs(tgtAbs));

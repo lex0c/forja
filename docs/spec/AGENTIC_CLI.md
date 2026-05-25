@@ -1782,6 +1782,10 @@ artifacts(
 
 **Sem ORM.** SQL cru com tipos. ORM em projeto pequeno é imposto sem benefício.
 
+**Durabilidade no shutdown (slice 178 A3).** `openDb` configura `PRAGMA synchronous=NORMAL` — páginas principais sincam mas frames do WAL podem ficar no page cache do kernel após COMMIT, perdíveis em crash do host (kernel panic, power loss). `closeDb(db)` (`src/storage/db.ts`) é o wrapper único de close — roda `PRAGMA wal_checkpoint(PASSIVE)` antes do `db.close()` pra flushar frames sem block readers (TRUNCATE/FULL invocam busy handler, podem hangar até 5s com `busy_timeout=5000` em overlap parent+subagent+inspector). Frames com active reader ficam no WAL e são recovered automaticamente no próximo open — o WAL é o mecanismo de recovery, não um buffer transiente. Ambos os passos em try/catch separados que logam-e-suprimem (finally chains do tipo `try { migrate(db); } catch (e) { closeDb(db); throw e; }` preservam o erro original). Todos os entry points do CLI + `evals/executor.ts` usam `closeDb`; chamada interna ao `db.ts` no path de integrity_check fail mantém `db.close()` direto (DB já corrupto — checkpoint pode piorar).
+
+Sites no-op: `:memory:`, handles `{ readonly: true }`, DBs abertos antes de `journal_mode=WAL` rodar. `wal_checkpoint` é no-op nativo nesses casos — não throw, não warn.
+
 ---
 
 ## 14. Provider Layer

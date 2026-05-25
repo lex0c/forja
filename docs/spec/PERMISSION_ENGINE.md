@@ -190,6 +190,16 @@ Operator que precisa de cwd diferente: usa `cd <dir>` dentro do command (o resol
 
 Defese em camadas com slice 155 (canonicalization do sandbox runner): slice 155 protege a wrap layer pós-engine; slice 160 protege a tool-handler entry pré-engine. Os dois fecham diferentes pontos de symlink-escape no fluxo do bash.
 
+**Cwd-scope symlink escape detection (slice 178 A1).** O canonical-aware classifier do slice 176 cobre symlinks que escapam pra zonas bem-conhecidas (`/etc`, `/proc`, `~/.ssh`...) e refuse/escalate na engine. Mas um symlink que aponta pra um path arbitrário **fora do cwd da sessão e fora dos protected paths** (`/work/proj/data/exfil → /tmp/exfil-target`) escapa de uma policy `allow read-fs:<cwd>/**` típica: o classifier de protected paths retorna null, o engine vê só `read-fs:/work/proj/data/exfil` (literal), matcha o glob e autoriza — o kernel segue o symlink em runtime e a leitura cai em `/tmp/exfil-target`. `detectCwdScopeEscape` em `src/permissions/resolvers/bash.ts` flagga lexical-inside-cwd-mas-canonical-fora-do-cwd e **degrada confidence para `low`** (força confirm) sem hard-refuse — yarn workspaces às vezes symlinkam pra siblings legítimos; hard-refuse quebraria. Confidence low funnela a call pelo modal do operador, que decide.
+
+Canonicalização compartilhada entre `classifyArgWithCanonical` (protected paths) e `detectCwdScopeEscape` (cwd scope) via helper `canonicalizeForClassification` com três fallbacks sequenciais:
+
+1. **`realpath(lexicalAbs)`** — fast path; sucesso quando todo componente existe.
+2. **`readlink(lexicalAbs)`** — quando (1) lança ENOENT mas o leaf é symlink (target removido OU nunca existiu). `readlink` retorna o target literal sem resolução recursiva. Target absoluto = usa direto; target relativo = resolve contra `dirname(lexicalAbs)`. Sem essa probe, um dangling symlink `<cwd>/outlink → /tmp/x` colapsa pro lexical e o detector retorna "no escape" — mas o kernel segue o symlink em runtime (`> outlink` cria `/tmp/x`).
+3. **`realpath(dirname) + basename`** — fresh file sob parent existente; cobre parent-é-symlink (`<cwd>/alias/leaf` onde `alias → /etc`).
+
+Production wiring em `src/permissions/engine.ts` passa `fs.realpathSync` + `fs.readlinkSync`. Tests podem omitir o seam de `readlink` (comportamento idêntico ao pre-fix — defesa aditiva, sem regressão).
+
 ### 4.4 Compilação e validação
 
 Policy carrega → compila glob → falha de compilação = policy inválida = engine vai pra `refusing`. Erros comuns:
@@ -720,6 +730,33 @@ Replay id:      ap_01H3K5...
 ```
 
 Sem preview legível, sem aprovação. Modal opaco é débito de segurança.
+
+### 6.7 Audit row para hook-rewritten args (slice 178 M4)
+
+Quando uma chain de hooks `PreToolUse` retorna `updatedInput` que **passa** o engine re-check (`§6.6` aplicado contra os args mutados), o harness aplica `effectiveArgs = chain.updatedInput` e prossegue para execução. O `tool_calls.input` da row primária permanece com os args originais (audit baseline imutável); a row de approval primária (decided_by='policy') foi gravada antes do hook rodar.
+
+Pra que a rewrite seja visível em queries forenses, o harness grava uma **segunda row em `approvals`** com:
+
+- `decided_by = 'hook'`
+- `decision = 'allow'`
+- `reason = 'allow: hook updatedInput applied; args_hash <preHash> → <postHash>'`
+
+`preHash` / `postHash` são os primeiros 16 chars de `canonicalHash(args)` (mesma primitiva que `failure_events` usa pro chain) — sort de chaves antes de hashar para que hooks que re-serializam o input com ordem de chaves diferente (Python dict, Go map) **não** sintetizem rewrite spuriosa. Quando `preHash == postHash` nenhuma row é escrita (hook re-emite verbatim, no-op).
+
+Query forense canônica:
+
+```sql
+SELECT a.tool_call_id, a.reason, t.tool_name, m.session_id
+FROM approvals a
+JOIN tool_calls t ON a.tool_call_id = t.id
+JOIN messages m ON t.message_id = m.id
+WHERE a.decided_by = 'hook'
+  AND a.decision = 'allow'
+  AND a.reason LIKE 'allow: hook updatedInput applied%'
+ORDER BY a.decided_at DESC;
+```
+
+Aggregações que esperam UMA approval row por toolCallId precisam contar `decided_by` separadamente; a row de hook não substitui a row primária, complementa.
 
 ---
 

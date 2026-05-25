@@ -2144,6 +2144,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             kept: restored.messages.length,
             dropped: totalDropped,
           });
+          // Slice 178 (hardening M1). The event above goes to the
+          // live renderer / NDJSON stream; this row in
+          // failure_events makes the truncation queryable
+          // post-hoc. Without it a forensic audit of a resumed
+          // run can't tell that the model worked from a subset of
+          // the persisted log — the gap shows up only as a
+          // surprising "model didn't remember that" report from
+          // the operator, with no DB-side evidence.
+          if (config.failureSink !== undefined) {
+            try {
+              config.failureSink.emit({
+                code: 'storage.resume_truncated',
+                classe: 'storage',
+                recovery_action: 'degraded',
+                user_visible: true,
+                session_id: sessionId,
+                payload: {
+                  kept: restored.messages.length,
+                  dropped: totalDropped,
+                  dropped_beyond_fetch: droppedBeyondFetch,
+                  dropped_by_alignment: restored.droppedFromHead,
+                  max_resume_messages: MAX_RESUME_MESSAGES,
+                },
+              });
+            } catch (e) {
+              // Best-effort: failure_events sink should not block
+              // the resume itself. Diagnostic to stderr so the
+              // sink-write failure has a trail of its own.
+              process.stderr.write(
+                `forja: failed to persist storage.resume_truncated event: ${e instanceof Error ? e.message : String(e)}\n`,
+              );
+            }
+          }
         }
         // Stranded-turn handling. If the last restored message is
         // `user` (either the original prompt that never got an

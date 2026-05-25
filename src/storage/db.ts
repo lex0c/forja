@@ -141,6 +141,78 @@ export const openDb = (path: string, options: OpenDbOptions = {}): DB => {
 
 export const openMemoryDb = (): DB => openDb(MEMORY_DB);
 
+// Slice 174 (hardening A3): durable-best-effort close. `PRAGMA
+// synchronous = NORMAL` (set in openDb) keeps the hot path fast —
+// main-DB pages fsync, but WAL frames can sit in the kernel page
+// cache after COMMIT. The window is small in normal operation but
+// real: a host crash (kernel panic, power loss) between the last
+// commit and the next checkpoint loses every audit row written
+// since the last checkpoint, and the chain-verifier can't tell
+// the missing rows from rows that were never written.
+//
+// CHECKPOINT MODE CHOICE — PASSIVE, not TRUNCATE.
+//
+// The v0 fix used `wal_checkpoint(TRUNCATE)` which:
+//   - waits for ALL readers to finish snapshotting (busy-handler
+//     invoked, controlled by `busy_timeout=5000` set in openDb),
+//   - waits until every reader is reading from the main DB only,
+//   - then checkpoints + truncates the WAL file to zero.
+// Result: every closeDb call could block up to 5 SECONDS waiting
+// for concurrent readers (parent + subagent + readonly inspector
+// overlap is the canonical case the project's parallelism
+// architecture creates). Since closeDb runs in finally blocks
+// across 16 cli/* entry points, this introduced user-visible
+// exit latency under normal operation.
+//
+// PASSIVE:
+//   - checkpoints as many frames as possible without waiting,
+//   - busy-handler is NEVER invoked,
+//   - syncs the main DB file when all frames were checkpointed,
+//   - frames with active readers stay in the WAL — they're
+//     recovered automatically on next open (the WAL file is the
+//     recovery mechanism, not a transient buffer).
+// Trade-off: a host crash AFTER closeDb but BEFORE next open
+// loses any frames that PASSIVE couldn't checkpoint because a
+// reader held them. Mitigation: those frames are committed —
+// the WAL file persists on disk between processes, and the
+// next `openDb` automatically checkpoints during the first
+// write. The window where data is genuinely at risk is
+// "graceful shutdown + host crash + WAL file lost (e.g. tmpfs)
+// before next open" — much narrower than the v0 promise but
+// the right balance against the 5s-blocking-per-close cost.
+//
+// Best-effort: a failed checkpoint must NOT block close — the
+// close itself frees the file handle and any blocked connection
+// waiting for the writer lock. Throws are logged to stderr and
+// swallowed so the original error in a finally block isn't
+// masked. Common no-op cases (readonly DBs, :memory:, DBs opened
+// before journal_mode=WAL ran) succeed silently because
+// wal_checkpoint is itself a no-op there.
+export const closeDb = (db: DB): void => {
+  try {
+    db.exec('PRAGMA wal_checkpoint(PASSIVE);');
+  } catch (e) {
+    process.stderr.write(
+      `forja: WAL checkpoint failed on close: ${e instanceof Error ? e.message : String(e)}\n`,
+    );
+  }
+  // db.close() can also throw — rare in practice (Bun returns
+  // void on a clean close, throws on already-closed or on FS
+  // error releasing the WAL fd), but a throw here would
+  // propagate out of finally blocks (`try { migrate(db); }
+  // catch (e) { closeDb(db); throw e; }`) and replace the
+  // original error the caller meant to surface. Mirror the
+  // checkpoint posture: log and swallow so the finally-block
+  // chain stays honest about which error was the root cause.
+  try {
+    db.close();
+  } catch (e) {
+    process.stderr.write(
+      `forja: db.close() failed on close: ${e instanceof Error ? e.message : String(e)}\n`,
+    );
+  }
+};
+
 // Bun's Database.transaction wraps `fn` in a function that opens a SAVEPOINT,
 // runs the body, and commits or rolls back. This helper exposes that as a
 // single call so callers don't need to know about the curried form.

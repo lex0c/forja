@@ -2,6 +2,7 @@ import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { matchSensitivePath } from '../permissions/sensitive-paths.ts';
+import { getGitBinary, safeGitEnv } from '../subagents/git-binary.ts';
 
 // Low-level git plumbing for the checkpoint subsystem.
 //
@@ -51,21 +52,33 @@ interface RunGitOptions {
 const RUN_GIT_DEFAULT_TIMEOUT_MS = 30_000;
 
 const runGit = async (args: string[], opts: RunGitOptions): Promise<SpawnGitResult> => {
+  // Pin the absolute git path + a canonical PATH so a mid-session
+  // shim of `~/bin/git` cannot hijack a checkpoint commit (slice
+  // 178 hardening C2). safeGitEnv provides the standard scrubs
+  // checkpoints already wanted (LC_ALL=C, GIT_TERMINAL_PROMPT=0,
+  // PATH=canonical, HOME=inherited). GIT_LITERAL_PATHSPECS is
+  // intentionally NOT set — `git check-ignore` (used by
+  // hasIgnoredCheckpointCollision below) rejects it with exit
+  // 128, and the checkpoint write-path doesn't pass user-typed
+  // pathspecs anyway (all paths are NUL-separated from `git
+  // ls-tree` output, which check-ignore reads via --stdin -z).
+  // Caller's `opts.env` overrides anything we set (commit
+  // identity, GIT_INDEX_FILE).
+  //
+  // ORDER MATTERS: getGitBinary() may augment cachedSpawnPath via
+  // the operator-PATH fallback (NixOS, asdf, etc.). safeGitEnv()
+  // reads that cache, so it must run AFTER the first getGitBinary
+  // call in the process. Constructing `env` before resolving the
+  // binary captures the pre-fallback canonical PATH and leaves
+  // checkpoint subprocesses blind to whatever bin dir actually
+  // hosts git's siblings (credential helpers, ssh wrapper, hooks).
+  const git = await getGitBinary();
   const env: Record<string, string> = {
-    // Strip locale-dependent output so parsing stays stable across
-    // environments. `LC_ALL=C` is the standard scrub.
-    LC_ALL: 'C',
-    // Avoid prompting for credentials / GPG passphrases under any
-    // circumstance — checkpoint creation must never block on stdin.
-    GIT_TERMINAL_PROMPT: '0',
-    // Inherit minimal environment by default; caller's env overrides
-    // anything we specified (commit identity, GIT_INDEX_FILE).
-    PATH: process.env.PATH ?? '',
-    HOME: process.env.HOME ?? '',
+    ...safeGitEnv(),
     ...(opts.env ?? {}),
   };
   const proc = Bun.spawn({
-    cmd: ['git', ...args],
+    cmd: [git, ...args],
     cwd: opts.cwd,
     env,
     stdin: opts.stdin !== undefined ? 'pipe' : 'ignore',
@@ -159,10 +172,11 @@ export const getHeadSha = async (cwd: string): Promise<string | null> => {
 export const resolveRef = async (cwd: string, ref: string): Promise<string | null> => {
   // `git rev-parse --verify <ref>` exits 128 with "fatal: bad revision"
   // when the ref is missing; that's what we want to treat as "null".
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', 'rev-parse', '--verify', '--quiet', ref],
+    cmd: [git, 'rev-parse', '--verify', '--quiet', ref],
     cwd,
-    env: { LC_ALL: 'C', PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+    env: safeGitEnv(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -425,14 +439,11 @@ const hasIgnoredCheckpointCollision = async (cwd: string, commitSha: string): Pr
   // `git check-ignore --stdin -z` reads NUL-separated paths and emits
   // matched ones on stdout. Exit code 0 = at least one matched, 1 =
   // none matched, 128 = error (no .gitignore at all is fine, returns 1).
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', 'check-ignore', '--stdin', '-z'],
+    cmd: [git, 'check-ignore', '--stdin', '-z'],
     cwd,
-    env: {
-      LC_ALL: 'C',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    env: safeGitEnv(),
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',

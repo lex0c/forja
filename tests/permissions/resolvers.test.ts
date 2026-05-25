@@ -1487,6 +1487,405 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
   });
 });
 
+// Slice 178 (hardening A1). Symlink that stays out of any protected
+// zone but escapes cwd into an arbitrary external location. The
+// protected-path classifier returns null for both ends, so slice 176
+// doesn't refuse or escalate. But a `<cwd>/**` glob policy authorizes
+// the lexical capability while the kernel follows the symlink to a
+// target the operator never scoped. Defense: degrade confidence to
+// low so the engine forces confirm.
+describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', () => {
+  test('read of /work/proj/data/x → /tmp/exfil drops confidence to low', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/data/x') return '/tmp/exfil';
+        return p;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat data/x' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('write redirect /work/proj/log → /tmp/leak drops confidence to low', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/log') return '/tmp/leak';
+        return p;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'echo data > log' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('input redirect via cwd-escape symlink drops confidence to low', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/source') return '/var/log/secret';
+        return p;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat < source' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('symlink that stays inside cwd preserves confidence high', () => {
+    // node_modules → ./packages/node_modules (legit yarn workspace
+    // shape). Both ends inside cwd: no escape, no escalation.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/node_modules') return '/work/proj/packages/node_modules';
+        return p;
+      },
+    };
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'cat node_modules/foo/index.js' },
+      ctxWithRealpath,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('parent-dir symlink that escapes cwd via parent realpath fallback drops to low', () => {
+    // Leaf doesn't exist, parent is a symlink to an external path.
+    // Mirrors the slice-176 deny-tier fallback shape but the target
+    // isn't a protected zone — it's just outside cwd.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj/cwd_alias') return '/tmp/external';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'echo data > cwd_alias/new.txt' },
+      ctxWithRealpath,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('dangling symlink leaf with absolute outside-cwd target drops to low', () => {
+    // /work/proj/outlink → /tmp/exfil where /tmp/exfil was removed
+    // (dangling symlink). Pre-fix the parent-realpath fallback
+    // collapsed canonical to /work/proj/outlink === lexicalAbs and
+    // returned "no escape". Post-fix: ctx.readlink reads the
+    // stored target /tmp/exfil even though realpath fails, the
+    // escape is detected, confidence drops.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        // /work/proj/outlink: realpath fails (dangling).
+        // Parent /work/proj realpaths to itself.
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/outlink') return '/tmp/exfil';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat outlink' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('dangling symlink on write redirect with absolute target drops to low', () => {
+    // Same shape but on a write redirect (`> outlink`). The kernel
+    // creates the file at the symlink target /tmp/x even though
+    // /tmp/x didn't exist when the symlink was made — defense must
+    // catch this BEFORE the engine matches the policy.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/outlink') return '/tmp/new-target';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'echo data > outlink' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('dangling symlink with RELATIVE target inside cwd preserves confidence', () => {
+    // Relative target ../sibling resolves against the symlink's
+    // parent dir /work/proj — stays inside cwd, no escape.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        // Symlink at /work/proj/innerlink → ./missing-but-inside
+        if (p === '/work/proj/innerlink') return 'missing-but-inside';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat innerlink' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('dangling symlink with RELATIVE target that escapes cwd drops to low', () => {
+    // /work/proj/exfil-link → ../../../tmp/x — relative target
+    // walks up past cwd. Resolved against the symlink's parent dir,
+    // canonicalizes outside cwd; detector fires.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/exfil-link') return '../../../tmp/x';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat exfil-link' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('absolute symlink target with `..` is normalized before scope check', () => {
+    // /work/proj/out → /work/proj/../tmp/secret. The raw target
+    // is absolute and string-prefix-tests as "inside /work/proj/"
+    // (it literally begins with that string), but the kernel
+    // resolves it to /work/tmp/secret at exec time — OUTSIDE cwd.
+    // The canonicalize helper must normalize via resolvePath
+    // before returning, collapsing the `..` so downstream cwd-
+    // scope detection sees the kernel's view, not the literal.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/out') return '/work/proj/../tmp/secret';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('absolute symlink target with `..` that NORMALIZES inside cwd preserves high', () => {
+    // /work/proj/loop → /work/proj/data/../shared. After
+    // normalization the target is /work/proj/shared — still inside
+    // cwd, no escape. Mirror case of the above; pins that the
+    // normalization isn't biased toward false positives.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/loop') return '/work/proj/data/../shared';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat loop' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('relative readlink target resolves against CANONICAL parent (parent-is-symlink case)', () => {
+    // /work/proj/alias → /tmp/ext (parent is a symlink to outside cwd)
+    // /work/proj/alias/out → ../secret (relative dangling target)
+    // Lexical resolution: dirname('/work/proj/alias/out') is
+    // '/work/proj/alias', resolvePath(..., '../secret') =
+    // '/work/proj/secret' — inside cwd, NO escape flagged.
+    // Kernel resolution: parent realpath is '/tmp/ext', the
+    // relative '../secret' resolves against THAT to '/tmp/secret'
+    // — OUTSIDE cwd. Fix uses realpath(dirname) to canonicalize
+    // the parent before walking the relative target.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        if (p === '/work/proj/alias') return '/tmp/ext';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/alias/out') return '../secret';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat alias/out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('relative readlink target with canonical parent still inside cwd preserves high', () => {
+    // /work/proj/alias → /work/proj/packages (parent symlink stays
+    // inside cwd, common yarn workspace shape).
+    // /work/proj/alias/out → ../shared.
+    // Canonical parent /work/proj/packages, relative '../shared'
+    // = /work/proj/shared — inside cwd, no escape.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        if (p === '/work/proj/alias') return '/work/proj/packages';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/alias/out') return '../shared';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat alias/out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+
+  test('relative readlink falls back to lexical dirname when parent realpath also fails', () => {
+    // Deeply-dangling chain: parent realpath fails too. Documented
+    // residual gap — the resolver falls back to lexical dirname.
+    // Pin the fallback explicitly so a future change knows it's a
+    // known limitation, not an oversight. In this case the target
+    // happens to escape via `..` even from the lexical dirname, so
+    // the test still asserts the escape IS caught — but the
+    // canonical parent's actual identity is unverified.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (_) => {
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      readlink: (p) => {
+        if (p === '/work/proj/data/out') return '../../../tmp/x';
+        const err = new Error('EINVAL');
+        (err as NodeJS.ErrnoException).code = 'EINVAL';
+        throw err;
+      },
+    };
+    const r = resolveCapabilities('bash', { command: 'cat data/out' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('low');
+    }
+  });
+
+  test('readlink omitted (legacy ctx) keeps old parent-realpath fallback', () => {
+    // When readlink isn't wired (test ctx without the seam, or a
+    // future caller path), the helper falls through to the
+    // parent-realpath + basename rejoin. Same behavior as before
+    // the fix — pinned to ensure the readlink branch is purely
+    // additive, not a behavior change for callers that didn't
+    // opt in.
+    const ctxWithoutReadlink: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => {
+        if (p === '/work/proj') return '/work/proj';
+        const err = new Error('ENOENT');
+        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        throw err;
+      },
+      // readlink intentionally omitted
+    };
+    // Without readlink, the dangling-symlink case collapses to
+    // lexical (the pre-fix behavior). Test pins that explicitly so
+    // a future refactor doesn't accidentally restore the bug.
+    const r = resolveCapabilities('bash', { command: 'cat outlink' }, ctxWithoutReadlink);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(r.confidence).toBe('high');
+    }
+  });
+});
+
 // Slice 174 — info-leak flag-decoding batch. Four resolvers
 // previously consumed file-path operands without emitting the
 // corresponding read/write capability. Each test exercises ONE

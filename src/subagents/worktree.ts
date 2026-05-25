@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { getGitBinary, safeGitEnv } from './git-binary.ts';
 import { type ValidationResult, validateWorktreeContents } from './worktree-validation.ts';
 
 // Subagent worktree lifecycle (spec §11.2). When a definition
@@ -84,32 +85,25 @@ interface RunGitResult {
 const RUN_GIT_TIMEOUT_MS = 30_000;
 
 const runGit = async (args: string[], cwd: string): Promise<RunGitResult> => {
+  // Pinned git binary + canonical PATH closes the `~/bin/git`
+  // shim vector (slice 178 hardening C2). safeGitEnv carries
+  // LC_ALL=C and GIT_TERMINAL_PROMPT=0; GIT_LITERAL_PATHSPECS=1
+  // is merged locally (NOT in safeGitEnv globally because it
+  // breaks `git check-ignore` with exit 128) and is load-bearing
+  // here: the skip-worktree flow passes deny-listed paths to
+  // `git ls-files` and `git update-index`, both of which parse
+  // positional arguments as pathspecs by default; a deny-listed
+  // file like `[abc].pem` (legal Linux filename, matches `*.pem`
+  // in the deny-list) would be interpreted as a bracket character
+  // class matching `a.pem`/`b.pem`/`c.pem`, the literal file
+  // would not be marked, and unrelated tracked files would be —
+  // masking any real child edits to those files. Setting it
+  // globally for THIS helper is inert for the path-typed args of
+  // `git worktree add` / `branch -D`.
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', '-C', cwd, ...args],
-    env: {
-      LC_ALL: 'C',
-      GIT_TERMINAL_PROMPT: '0',
-      // Force every pathspec argument to be taken as a literal
-      // pathname rather than a glob. The skip-worktree flow
-      // passes deny-listed paths to `git ls-files` and
-      // `git update-index`, both of which parse positional
-      // arguments as pathspecs by default — so a deny-listed
-      // file like `[abc].pem` (legal Linux filename, matches
-      // `*.pem` in the deny-list) would be interpreted as a
-      // bracket character class matching `a.pem`/`b.pem`/`c.pem`.
-      // The literal file would not be marked, and unrelated
-      // tracked files might be — the latter silently masks any
-      // real child edits to those files, which then disappear
-      // from `git status` and cause cleanupWorktree to discard
-      // the run output. Setting this env var globally for the
-      // helper is inert for the path-typed args of `git worktree
-      // add` / `branch -D` (they don't go through the pathspec
-      // engine) and matches our requirement everywhere we DO
-      // pass paths.
-      GIT_LITERAL_PATHSPECS: '1',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    cmd: [git, '-C', cwd, ...args],
+    env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -385,19 +379,10 @@ const markValidatorDeletionsSkipWorktree = async (
   if (tracked.length === 0) return;
   // `--stdin` + `-z` so paths with spaces / newlines work
   // unchanged from `ls-files -z` output.
+  const git = await getGitBinary();
   const proc = Bun.spawn({
-    cmd: ['git', '-C', worktreePath, 'update-index', '--skip-worktree', '-z', '--stdin'],
-    env: {
-      LC_ALL: 'C',
-      GIT_TERMINAL_PROMPT: '0',
-      // Same rationale as runGit: paths fed to update-index are
-      // pathspecs by default. A literal `[abc].pem` would be
-      // parsed as a bracket class, marking unrelated tracked
-      // files and missing the actual deny-listed entry.
-      GIT_LITERAL_PATHSPECS: '1',
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
-    },
+    cmd: [git, '-C', worktreePath, 'update-index', '--skip-worktree', '-z', '--stdin'],
+    env: { ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' },
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',

@@ -1,6 +1,7 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
 import {
   type DB,
+  closeDb,
   defaultDbPath,
   getSession,
   listSessions,
@@ -157,7 +158,7 @@ const resolveResumeId = (
     migrate(db);
     return resolveResumeIdOnDb(db, resume, cwd);
   } finally {
-    db.close();
+    closeDb(db);
   }
 };
 
@@ -502,7 +503,7 @@ export const run = async (options: RunOptions): Promise<number> => {
         const result = await bootstrap(bootstrapInput);
         provider = result.config.provider;
         dbOverride = result.db;
-        bootstrappedDbCloser = () => result.db.close();
+        bootstrappedDbCloser = () => closeDb(result.db);
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
         // Whitelist for the deterministic-fallback path: ONLY a
@@ -702,7 +703,7 @@ export const run = async (options: RunOptions): Promise<number> => {
             );
           }
         } finally {
-          db.close();
+          closeDb(db);
         }
       } catch (e) {
         // Non-fatal: resume can still proceed even if the
@@ -782,7 +783,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           '  (the override is itself audited — a `chain-break-accepted` row lands before any new decisions)\n',
         );
       }
-      db.close();
+      closeDb(db);
       return 2;
     }
 
@@ -908,7 +909,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       if (cfg.broker !== undefined) {
         await cfg.broker.close();
       }
-      db.close();
+      closeDb(db);
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);

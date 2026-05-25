@@ -28,6 +28,8 @@
 // controlled at checkout time. Numeric fields (modified,
 // untracked, ahead, behind) carry zero injection surface.
 
+import { getGitBinarySync, safeGitEnv } from '../subagents/git-binary.ts';
+
 export interface GitContext {
   // Current branch, e.g. "feat/m4-context-tuning". Falls back
   // to undefined for detached HEAD or probe failure — the env
@@ -46,9 +48,15 @@ export interface GitContext {
 
 const runGit = (cwd: string, args: string[]): string | null => {
   try {
+    // Pinned git path + canonical PATH closes the `~/bin/git`
+    // shim vector (slice 178 hardening C2). spawnSync because
+    // git-context is built synchronously before the harness
+    // event loop is up.
+    const git = getGitBinarySync();
     const result = Bun.spawnSync({
-      cmd: ['git', ...args],
+      cmd: [git, ...args],
       cwd,
+      env: safeGitEnv(),
       stdout: 'pipe',
       stderr: 'ignore',
     });

@@ -478,6 +478,80 @@ Continue? [y/N]
 - Memory writes "esquecidos" em ephemeral. Modelo propõe memory write; harness retorna erro estruturado; modelo deve registrar em `assumptions[]` que houve preferência não persistida.
 - Ephemeral em compliance regulado. Falta audit trail — pode violar requirement. Documenta-se como **incompatível com auditoria forense** (`§10`).
 
+### 8.6 Git subprocess hardening (slice 178 M3 + C2)
+
+> **Razão:** todo `Bun.spawn({ cmd: ['git', ...] })` resolve git por PATH no momento do exec. Um shim de `~/bin/git` plantado mid-sessão (tool comprometido, dotfile malicioso, install hook bugado) é escolhido transparentemente — e roda com privilégios do agent, com o env herdado. Checkpoints rodam a cada step, então a janela de exploração é larga.
+
+**Defesa em duas camadas:**
+
+1. **Pin do binário no startup (two-stage resolution).** `getGitBinary()` (async) e `getGitBinarySync()` (sync) procuram git UMA vez por processo **in-process** (walk dos entries do PATH via `fs.access(.., X_OK)` — sem spawn de `which`, que está ausente em imagens minimalistas como busybox/distroless/scratch+static):
+   - **Stage 1 — canônico:** lookup contra SAFE_PATH (`/opt/homebrew/{s,}bin:/opt/local/{s,}bin:/usr/local/{s,}bin:/usr/{s,}bin:/{s,}bin`). Cobre macOS Homebrew/MacPorts + POSIX Linux. Quando resolve, `safeGitEnv().PATH` permanece canônica — defesa completa contra `~/bin/git` mid-session.
+   - **Stage 2 — fallback:** quando canônico não resolve, retry contra `process.env.PATH` do boot. Cobre NixOS (`/run/current-system/sw/bin`, `~/.nix-profile/bin`), asdf shims, `/run/wrappers/bin`, layouts ad-hoc (`/opt/custom/bin`). Quando o fallback resolve, **`safeGitEnv().PATH` vira `${CANONICAL_SAFE_PATH}:${operator_boot_PATH}`** — canônico FIRST (defesa contra shadowing de tools que TAMBÉM existem no canônico), dirs do operador APPEND (subprocess de git como hooks/credential helpers/ssh resolvem). Stderr logga uma linha avisando que a defesa de PATH ficou parcial (operador's boot PATH é parte do trust boundary, mesmo posture do `§2.1`).
+   - **Stage 3 — sem git em lugar nenhum:** cacheia null, retorna a string literal `'git'`. Spawn vai falhar com ENOENT visível.
+
+   Resolução é zero-dependência externa (não spawn `which`, `command`, ou shell builtin) — funciona em qualquer image que tenha git instalado e exposto em alguma entry do PATH, mesmo as que omitem utilitários POSIX (distroless, scratch + static-linked binaries).
+
+   Spawns subsequentes usam o path absoluto resolvido, não a string `'git'` — shadowing pós-startup não tem efeito (não há PATH lookup quando `cmd[0]` é absoluto).
+
+2. **Env controlado no spawn.** `safeGitEnv()` retorna apenas:
+   - `LC_ALL=C` (output parseável)
+   - `GIT_TERMINAL_PROMPT=0` (credentials prompt nunca bloqueia)
+   - `PATH` = `canônica:operator_boot_PATH` (canônica primeiro, operator boot PATH apêndice) em todos os branches de resolução bem-sucedida. O apêndice é necessário pra que subprocess de git (hooks `post-checkout` em `git worktree add`, `pre-commit`, credential helpers, ssh wrapper) encontrem ferramentas user-level (nvm, asdf, poetry, `~/bin` utilities). Sem o apêndice, hooks que dependem dessas ferramentas falhariam com "command not found" e operações de git inteiras (worktree add, commit) abortariam — regressão funcional vs o spawn inline pre-hardening. O prefixo canônico mantém a defesa: PATH lookup left-to-right, então um `~/bin/git` shim em operator PATH NÃO ganha sobre `/usr/bin/git` canônico.
+   - `HOME` herdado (git precisa pra `~/.gitconfig` — committer identity, ssh wrapper)
+   - **NÃO** `GIT_LITERAL_PATHSPECS` — `git check-ignore` rejeita com exit 128, fail global silencioso quebraria a detecção de colisão no `restore`. Sites que precisam do literal-pathspec guarantee (skip-worktree em worktrees de subagent, worktree-gc) mergem `GIT_LITERAL_PATHSPECS=1` localmente.
+
+**Sites obrigados a usar o par:**
+
+| Subsistema | Por quê |
+|---|---|
+| `src/checkpoints/git.ts` | Roda a cada step — primary git surface, maior janela de exploração |
+| `src/subagents/worktree.ts` + `worktree-gc.ts` | Manipula worktrees fora do cwd principal; PATH escape escala pra fora da árvore visível |
+| `src/cli/git-context.ts` | Probe síncrono no boot do system prompt (branch, ahead/behind) |
+| `src/memory/paths.ts` | `resolveRepoRoot()` síncrono no bootstrap; sem ele o registry de memória pode escopar errado |
+
+**Não obrigados (escopo de trust diferente):**
+- Tools que o modelo executa via `bash` — já passam pelo permission engine (sandbox plan + capability check). Aplicar PATH-pin lá seria redundante e quebraria `git` em paths legítimos não-canônicos do operador.
+- Test fixtures — usam `git` direto via shell helpers do test runner; não recebem input do modelo.
+
+**Limites declarados:**
+- Operador com PATH já comprometido na partida → fora de escopo (trust boundary). Subprocess de git (hooks) sempre rodam com operator PATH apêndice — o canônico-first ordering garante que git em si nunca resolve via shim, mas tools que git fork-execs (credential helpers, hooks customizados) podem.
+- Sistemas onde git não está em SAFE_PATH NEM em `process.env.PATH` (instalação manual em `/usr/games` sem PATH augment) → in-process walk retorna null em ambos stages, fallback final é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso.
+
+### 8.7 Regex shape guard (slice 178 A2)
+
+> **Razão:** JS não tem timeout per-match em RegExp. Um pattern catastrófico como `(a+)+b` contra input não-matching trava o event loop por segundos a minutos. Tools que recebem pattern do modelo (`wait_for`, `monitor`) precisam rejeitar shapes patológicos **no compile**.
+
+**Detector heurístico (`src/sanitize/regex.ts`):**
+
+Conservador por design — falso positivo (rejeita pattern benigno) é recuperável; o modelo pode retry com shape mais simples. Falso negativo (admite exponencial) trava o harness.
+
+Rejeita:
+- **Pattern over 1024 bytes** (limite arbitrário; cobre backreference attack inflada).
+- **Nested unbounded quantifier**, um e dois níveis: `(a+)+`, `((a+))+`, `((a)*)+`, `(x(a+)y)+`. Três níveis caem no length cap.
+- **Alternation em repeated group**: `(a|ab)+`, `(a|a)*` — branches sobrepostas causam backtracking exponencial.
+- **Large bounded repeat on quantified body**: `(a+){50,}` é tão ruim quanto `(a+)+`.
+
+**Aplicado em:** `process_output.pattern` em `wait_for`, `process_output_pattern.pattern` em `monitor`, somente quando `is_regex=true`. Modo literal (`is_regex=false`) bypassa porque `escapeRegexLiteral` neutraliza todo meta primeiro.
+
+**Limites declarados:**
+- Backreferences com quantifier (`(\w+)\1+`) não são detectados explicitamente — cobertura via length cap apenas.
+- Pattern com quantifier exato `(a+){5}` é incorretamente rejeitado como `large_bounded_repeat_on_group` (`upperRaw=undefined` colapsa pra Infinity). Fix de uma linha pendente; rejeição é safe-but-noisy.
+
+### 8.8 Database durability on shutdown (slice 178 A3)
+
+> **Razão:** `PRAGMA synchronous=NORMAL` (default em `openDb`) mantém o hot path rápido — páginas principais do DB sincam, mas frames do WAL podem ficar no page cache do kernel após COMMIT. Crash do host (kernel panic, power loss) entre o último commit e o próximo checkpoint perde todas as rows de audit escritas desde o último checkpoint, e o chain-verifier não consegue distinguir rows perdidas de rows nunca escritas.
+
+**`closeDb(db)` (`src/storage/db.ts`):** wrapper único pra encerrar handles SQLite, usado por todos os entry points do CLI + `evals/executor.ts`:
+
+1. `PRAGMA wal_checkpoint(PASSIVE)` — checkpoint best-effort: copia frames pro main DB sem esperar readers, sync do main file. Frames com active reader ficam no WAL (recovered automaticamente no próximo open).
+2. `db.close()` libera o handle. Em close limpo sem readers, SQLite remove `-wal`/`-shm` siblings automaticamente.
+
+Ambos os passos em try/catch separados que logam-e-suprimem stderr — finally chains do tipo `try { migrate(db); } catch (e) { closeDb(db); throw e; }` preservam o erro original.
+
+**Por que PASSIVE, não TRUNCATE/FULL:** TRUNCATE espera todos readers darem snapshot fresh do main DB (busy-handler invocado, controlled pelo `busy_timeout=5000` do `openDb`). Em deployments com parent + subagent + readonly inspector overlap (canonical Forja parallelism shape), cada `closeDb` poderia bloquear 5 SEGUNDOS — UX inaceitável pra finally blocks que rodam em todos entry points do CLI. PASSIVE retorna em ms; o trade-off é que pages com active reader ficam no WAL, recovered no próximo open. Window de risco genuíno: graceful shutdown + host crash + WAL file perdido (tmpfs, etc) antes do próximo open — narrower que a promessa v0 mas o balance certo contra latência de close.
+
+**Casos no-op (não throw, não warn):** DBs `:memory:`, handles readonly, DBs abertos antes de `journal_mode=WAL` rodar — `wal_checkpoint` é no-op nativo nesses casos.
+
 ---
 
 ## 9. Network egress control

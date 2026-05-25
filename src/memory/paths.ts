@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
+import { getGitBinarySync, safeGitEnv } from '../subagents/git-binary.ts';
 import { validateName } from './frontmatter.ts';
 import type { MemoryScope } from './types.ts';
 
@@ -52,14 +53,13 @@ export interface ScopeRoots {
 // (at `~/.config/agent/memory/` or `$XDG_CONFIG_HOME/agent/memory/`).
 export const resolveRepoRoot = (cwd: string): string => {
   try {
+    // Pinned git binary + canonical PATH (slice 178 hardening C2).
+    // Spawned sync because resolveRepoRoot is called during bootstrap
+    // before the event loop owns dispatching.
+    const git = getGitBinarySync();
     const proc = Bun.spawnSync({
-      cmd: ['git', '-C', cwd, 'rev-parse', '--show-toplevel'],
-      env: {
-        LC_ALL: 'C',
-        GIT_TERMINAL_PROMPT: '0',
-        PATH: process.env.PATH ?? '',
-        HOME: process.env.HOME ?? '',
-      },
+      cmd: [git, '-C', cwd, 'rev-parse', '--show-toplevel'],
+      env: safeGitEnv(),
       stdout: 'pipe',
       stderr: 'pipe',
     });

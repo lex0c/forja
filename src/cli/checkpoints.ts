@@ -21,6 +21,7 @@ import { type OutcomeSink, createSqliteOutcomeSink } from '../outcomes/index.ts'
 import {
   type Checkpoint,
   type DB,
+  closeDb,
   defaultDbPath,
   getLatestCheckpointBySession,
   getSession,
@@ -430,6 +431,6 @@ export const runCheckpointsCli = async (input: CheckpointsCliInput): Promise<num
         return await runUndo(effectiveInput, db);
     }
   } finally {
-    if (ownsDb) db.close();
+    if (ownsDb) closeDb(db);
   }
 };

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb, openMemoryDb, withTransaction } from '../../src/storage/db.ts';
+import { closeDb, openDb, openMemoryDb, withTransaction } from '../../src/storage/db.ts';
 
 describe('openDb', () => {
   let tmpDir: string;
@@ -189,5 +189,120 @@ describe('openDb — file permissions (slice 163 SEC §8.3)', () => {
     openDb(path, { readonly: true }).close();
     // Readonly path didn't chmod — operator's 0644 stays.
     expect(statSync(path).mode & 0o777).toBe(0o644);
+  });
+});
+
+describe('closeDb — WAL durability (slice 174 hardening A3)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'forja-closedb-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  test('PASSIVE checkpoint flushes WAL frames to the main DB before close', () => {
+    const path = join(tmpRoot, 'ck.db');
+    const db = openDb(path);
+    db.exec('CREATE TABLE t(x INTEGER);');
+    db.exec('INSERT INTO t(x) VALUES (1), (2), (3);');
+    // Before close: WAL file should have content from the writes.
+    const walSizeBefore = statSync(`${path}-wal`).size;
+    expect(walSizeBefore).toBeGreaterThan(0);
+    closeDb(db);
+    // After closeDb: PASSIVE checkpoint flushes pages to the main
+    // DB file and syncs it. PASSIVE doesn't truncate the WAL by
+    // itself, but with no concurrent readers (test scenario) the
+    // subsequent db.close() removes the now-empty -wal and -shm
+    // siblings — SQLite cleans them up when the last connection
+    // closes and no frames remain unchecked. In production with
+    // concurrent readers, frames they hold stay in the WAL and
+    // get recovered on the next open instead of being lost.
+    const walSizeAfter = existsSync(`${path}-wal`) ? statSync(`${path}-wal`).size : 0;
+    expect(walSizeAfter).toBe(0);
+  });
+
+  test('rows committed before closeDb are visible on reopen', () => {
+    const path = join(tmpRoot, 'persist.db');
+    const db = openDb(path);
+    db.exec('CREATE TABLE audit(id INTEGER PRIMARY KEY, msg TEXT);');
+    db.exec("INSERT INTO audit(id, msg) VALUES (1, 'committed before close');");
+    closeDb(db);
+    const reopened = openDb(path);
+    const row = reopened.query('SELECT msg FROM audit WHERE id = 1').get() as { msg: string };
+    expect(row.msg).toBe('committed before close');
+    closeDb(reopened);
+  });
+
+  test('is a no-op-equivalent for :memory: DBs (no checkpoint, no throw)', () => {
+    const db = openMemoryDb();
+    db.exec('CREATE TABLE x(y INTEGER);');
+    db.exec('INSERT INTO x(y) VALUES (1);');
+    // Should not throw — wal_checkpoint is harmless on a DB
+    // that's not in WAL mode.
+    expect(() => closeDb(db)).not.toThrow();
+  });
+
+  test('still closes the DB even if the checkpoint fails', () => {
+    // Simulate a failing checkpoint by closing the DB before
+    // calling closeDb — bun:sqlite throws on exec against a
+    // closed connection. closeDb must swallow the throw and
+    // not propagate it (finally blocks would otherwise mask
+    // their original error).
+    const path = join(tmpRoot, 'precosed.db');
+    const db = openDb(path);
+    db.close();
+    expect(() => closeDb(db)).not.toThrow();
+  });
+
+  test('PASSIVE checkpoint does not block on concurrent readers', () => {
+    // The whole point of choosing PASSIVE over TRUNCATE: a
+    // concurrent open holding a reader snapshot does NOT cause
+    // closeDb to wait on busy_timeout (5s with our openDb config).
+    // Test: open the DB twice, hold a reader on the second
+    // connection across the closeDb of the first. The closeDb
+    // must complete quickly — pin a generous-but-still-bounded
+    // timing to catch a regression to a blocking mode.
+    const path = join(tmpRoot, 'concurrent.db');
+    const writer = openDb(path);
+    writer.exec('CREATE TABLE t(x INTEGER);');
+    writer.exec('INSERT INTO t(x) VALUES (1), (2), (3);');
+    // Hold a reader on a second connection. SQLite's WAL allows
+    // concurrent reads while a checkpoint runs — but TRUNCATE
+    // mode waits for the reader to drop its snapshot. PASSIVE
+    // does not.
+    const reader = openDb(path, { readonly: true });
+    const snapshot = reader.query('SELECT COUNT(*) AS n FROM t').get() as { n: number };
+    expect(snapshot.n).toBe(3);
+    const t0 = Date.now();
+    closeDb(writer);
+    const elapsed = Date.now() - t0;
+    // Bound on a CI/dev machine: PASSIVE returns in low ms. Pin a
+    // ceiling well under the busy_timeout (5000ms) so a regression
+    // to TRUNCATE or FULL surfaces immediately.
+    expect(elapsed).toBeLessThan(500);
+    reader.close();
+  });
+
+  test('a throwing db.close() is swallowed so finally-block errors are preserved', () => {
+    // Production shape: `try { migrate(db); } catch (e) {
+    // closeDb(db); throw e; }`. If db.close() also throws (already-
+    // closed handle, double-close from a prior cleanup, FS error),
+    // a propagating throw from inside closeDb would replace the
+    // caller's `e` — the operator would see the close error and
+    // lose the migration error. Pin that the close-side throw is
+    // logged and suppressed, matching the checkpoint posture.
+    const fakeDb = {
+      exec: () => {
+        // No-op checkpoint (succeeds) — isolate the test to
+        // db.close()'s catch path.
+      },
+      close: () => {
+        throw new Error('database is not open');
+      },
+    } as unknown as Parameters<typeof closeDb>[0];
+    expect(() => closeDb(fakeDb)).not.toThrow();
   });
 });

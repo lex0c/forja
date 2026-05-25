@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { detectRedosShape } from '../../sanitize/index.ts';
 import {
   type WaitCondition,
   type WaitConditionMet,
@@ -198,6 +199,20 @@ const buildCondition = (
         return { ok: false, message: 'process_output.pattern must be a non-empty string' };
       }
       const isRegex = raw.is_regex === true;
+      if (isRegex) {
+        // JS regex has no per-match timeout, so an exponential
+        // pattern like `(a+)+b` against a non-matching chunk would
+        // freeze the harness for seconds. Reject obvious ReDoS
+        // shapes at compile time (literal mode is already safe —
+        // escapeRegexLiteral neutralizes every meta).
+        const rejection = detectRedosShape(raw.pattern as string);
+        if (rejection !== null) {
+          return {
+            ok: false,
+            message: `process_output.pattern rejected (${rejection.code}): ${rejection.message}`,
+          };
+        }
+      }
       let regex: RegExp;
       try {
         // Literal mode escapes regex meta so "1.0" doesn't match
