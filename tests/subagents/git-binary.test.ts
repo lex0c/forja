@@ -97,6 +97,57 @@ describe('safeGitEnv — slice 178 hardening M3', () => {
     );
   });
 
+  test('after canonical resolution, PATH augments with operator boot PATH for hooks', async () => {
+    // Pin the regression fix: even when git is found in the
+    // canonical set, the spawn PATH must include the operator's
+    // boot PATH so git's subprocess hooks (post-checkout,
+    // pre-commit, etc.) can find user-level tools (nvm, asdf,
+    // poetry, ~/bin utilities). Pre-fix only the fallback branch
+    // augmented; canonical hits left hooks blind to user PATH and
+    // `git worktree add` exit-coded any repo whose hooks called
+    // missing tools.
+    //
+    // Skip if process.env.PATH equals the canonical set verbatim
+    // (rare test env where there's nothing to augment with).
+    const operatorPath = process.env.PATH;
+    if (
+      operatorPath === undefined ||
+      operatorPath ===
+        '/opt/homebrew/sbin:/opt/homebrew/bin:/opt/local/sbin:/opt/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    ) {
+      return;
+    }
+    await getGitBinary();
+    const env = safeGitEnv();
+    expect(env.PATH).toBe(
+      `/opt/homebrew/sbin:/opt/homebrew/bin:/opt/local/sbin:/opt/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${operatorPath}`,
+    );
+  });
+
+  test('canonical entries still come FIRST in the augmented PATH (shadowing defense)', async () => {
+    // Pin: even after augment, `git` resolved by a fork-exec from
+    // git's subprocess (e.g., a hook that calls bare `git`)
+    // resolves to the canonical /usr/bin/git, NOT a `~/bin/git`
+    // shim in operator PATH. PATH lookup is left-to-right.
+    await getGitBinary();
+    const env = safeGitEnv();
+    const pathParts = (env.PATH ?? '').split(':');
+    // First 10 entries are the canonical set in order.
+    const expectedCanonicalHead = [
+      '/opt/homebrew/sbin',
+      '/opt/homebrew/bin',
+      '/opt/local/sbin',
+      '/opt/local/bin',
+      '/usr/local/sbin',
+      '/usr/local/bin',
+      '/usr/sbin',
+      '/usr/bin',
+      '/sbin',
+      '/bin',
+    ];
+    expect(pathParts.slice(0, expectedCanonicalHead.length)).toEqual(expectedCanonicalHead);
+  });
+
   test('PATH includes /opt/homebrew/bin (Apple Silicon Homebrew default)', () => {
     expect(safeGitEnv().PATH).toContain('/opt/homebrew/bin');
   });

@@ -496,7 +496,7 @@ Continue? [y/N]
 2. **Env controlado no spawn.** `safeGitEnv()` retorna apenas:
    - `LC_ALL=C` (output parseável)
    - `GIT_TERMINAL_PROMPT=0` (credentials prompt nunca bloqueia)
-   - `PATH` = canônica OU `canônica:operator_boot_PATH` (per resolution stage acima)
+   - `PATH` = `canônica:operator_boot_PATH` (canônica primeiro, operator boot PATH apêndice) em todos os branches de resolução bem-sucedida. O apêndice é necessário pra que subprocess de git (hooks `post-checkout` em `git worktree add`, `pre-commit`, credential helpers, ssh wrapper) encontrem ferramentas user-level (nvm, asdf, poetry, `~/bin` utilities). Sem o apêndice, hooks que dependem dessas ferramentas falhariam com "command not found" e operações de git inteiras (worktree add, commit) abortariam — regressão funcional vs o spawn inline pre-hardening. O prefixo canônico mantém a defesa: PATH lookup left-to-right, então um `~/bin/git` shim em operator PATH NÃO ganha sobre `/usr/bin/git` canônico.
    - `HOME` herdado (git precisa pra `~/.gitconfig` — committer identity, ssh wrapper)
    - **NÃO** `GIT_LITERAL_PATHSPECS` — `git check-ignore` rejeita com exit 128, fail global silencioso quebraria a detecção de colisão no `restore`. Sites que precisam do literal-pathspec guarantee (skip-worktree em worktrees de subagent, worktree-gc) mergem `GIT_LITERAL_PATHSPECS=1` localmente.
 
@@ -514,9 +514,8 @@ Continue? [y/N]
 - Test fixtures — usam `git` direto via shell helpers do test runner; não recebem input do modelo.
 
 **Limites declarados:**
-- Operador com PATH já comprometido na partida → fora de escopo (trust boundary).
-- Quando o fallback foi acionado (resolução via operator PATH), o PATH-shadowing defense para **git em si** permanece (path absoluto cacheado), mas **subprocess de git** (credential helpers, ssh, hooks) resolvem através do operator PATH — defesa parcial. Operador vê a stderr line do fallback e pode decidir se aceita o trade-off ou adiciona o dir certo à SAFE_PATH (PR contra `src/subagents/git-binary.ts`).
-- Sistemas onde git não está em SAFE_PATH NEM em `process.env.PATH` (instalação manual em `/usr/games` sem PATH augment) → `which git` retorna null em ambos stages, fallback final é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso.
+- Operador com PATH já comprometido na partida → fora de escopo (trust boundary). Subprocess de git (hooks) sempre rodam com operator PATH apêndice — o canônico-first ordering garante que git em si nunca resolve via shim, mas tools que git fork-execs (credential helpers, hooks customizados) podem.
+- Sistemas onde git não está em SAFE_PATH NEM em `process.env.PATH` (instalação manual em `/usr/games` sem PATH augment) → in-process walk retorna null em ambos stages, fallback final é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso.
 
 ### 8.7 Regex shape guard (slice 178 A2)
 

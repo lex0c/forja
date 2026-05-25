@@ -96,22 +96,37 @@ const findGitInPathAsync = async (path: string): Promise<string | null> => {
   return null;
 };
 
-// Augment `cachedSpawnPath` with the operator's boot PATH when
-// fallback resolution succeeded. Logs once to stderr so an
-// operator running on an non-canonical layout sees the partial
-// defense (PATH-pinning defends against mid-session shadowing
-// of git itself, not against shadowing of git's subprocess
-// tools — the operator's PATH at boot is part of the trust
-// boundary as documented in SECURITY_GUIDELINE §8.6).
-const applyFallbackSpawnPath = (resolvedGitPath: string): void => {
+// Compose the spawn PATH: canonical prefix FIRST, operator boot
+// PATH appended. Canonical-first means a tool name that exists in
+// BOTH paths (e.g., `git` itself if a `~/bin/git` shim was planted)
+// resolves to the canonical copy — PATH lookup is left-to-right.
+// The operator PATH suffix is what makes git's subprocess hooks
+// (post-checkout for `git worktree add`, pre-commit, etc.) find
+// user-level tools that legitimately live outside canonical dirs:
+// nvm shims, asdf, poetry, ~/.local/bin, custom ~/bin utilities.
+// Pre-fix this only ran on the fallback branch (canonical lookup
+// missed); the canonical-hit path returned with `cachedSpawnPath`
+// still canonical-only, which made `git worktree add` fail on any
+// repo with hooks that depend on operator-level tools — a
+// functional regression from the v0 inline-spawn behavior. The
+// operator's boot PATH was always trusted (it's the boundary the
+// process started in) so appending it doesn't weaken the
+// defense; the defense is that `git ITSELF` is pinned absolute
+// and can't be shadowed mid-session.
+const composeSpawnPath = (): string => {
   const operatorPath = process.env.PATH;
-  if (operatorPath === undefined || operatorPath.length === 0) return;
-  if (operatorPath === CANONICAL_SAFE_PATH) return;
-  // Append unconditionally; the canonical prefix wins on any
-  // name that exists in both (PATH lookup is left-to-right).
-  cachedSpawnPath = `${CANONICAL_SAFE_PATH}:${operatorPath}`;
+  if (operatorPath === undefined || operatorPath.length === 0) return CANONICAL_SAFE_PATH;
+  if (operatorPath === CANONICAL_SAFE_PATH) return CANONICAL_SAFE_PATH;
+  return `${CANONICAL_SAFE_PATH}:${operatorPath}`;
+};
+
+// Emit the stderr warning on the fallback branch only (canonical
+// lookup missed, operator PATH made the resolution work). The
+// operator should see that defense is partial — git binary
+// resolves through their PATH, not from the canonical set.
+const warnFallback = (resolvedGitPath: string): void => {
   process.stderr.write(
-    `forja: git resolved via operator PATH fallback (${resolvedGitPath}); canonical SAFE_PATH lookup did not match — PATH-shadowing defense for git itself remains, but git's subprocess tools resolve through operator PATH\n`,
+    `forja: git resolved via operator PATH fallback (${resolvedGitPath}); canonical SAFE_PATH lookup did not match — PATH-shadowing defense for git itself remains, but git was found outside the canonical set\n`,
   );
 };
 
@@ -120,6 +135,13 @@ const applyFallbackSpawnPath = (resolvedGitPath: string): void => {
 // and operator-PATH lookups failed. Callers should treat the
 // bare fallback as best-effort — Bun.spawn will still try PATH
 // lookup at exec time, with the PATH `safeGitEnv()` supplies.
+//
+// IN BOTH SUCCESS BRANCHES (canonical and fallback), the cached
+// spawn PATH is composed from `canonical:operator_path`. Hooks
+// that git fork-execs need the operator PATH to find user-level
+// tools (nvm, asdf, poetry); the canonical prefix keeps the
+// shadowing defense intact for git itself and its siblings that
+// happen to be in canonical dirs.
 export const getGitBinary = async (): Promise<string> => {
   if (cachedGitPath !== undefined) return cachedGitPath ?? 'git';
   // First: canonical SAFE_PATH (defense against mid-session
@@ -127,6 +149,7 @@ export const getGitBinary = async (): Promise<string> => {
   const canonical = await findGitInPathAsync(CANONICAL_SAFE_PATH);
   if (canonical !== null) {
     cachedGitPath = canonical;
+    cachedSpawnPath = composeSpawnPath();
     return canonical;
   }
   // Fallback: operator's boot PATH. Required for Nix profile
@@ -140,7 +163,8 @@ export const getGitBinary = async (): Promise<string> => {
     const fallback = await findGitInPathAsync(operatorPath);
     if (fallback !== null) {
       cachedGitPath = fallback;
-      applyFallbackSpawnPath(fallback);
+      cachedSpawnPath = composeSpawnPath();
+      warnFallback(fallback);
       return fallback;
     }
   }
@@ -159,6 +183,7 @@ export const getGitBinarySync = (): string => {
   const canonical = findGitInPathSync(CANONICAL_SAFE_PATH);
   if (canonical !== null) {
     cachedGitPath = canonical;
+    cachedSpawnPath = composeSpawnPath();
     return canonical;
   }
   const operatorPath = process.env.PATH;
@@ -166,7 +191,8 @@ export const getGitBinarySync = (): string => {
     const fallback = findGitInPathSync(operatorPath);
     if (fallback !== null) {
       cachedGitPath = fallback;
-      applyFallbackSpawnPath(fallback);
+      cachedSpawnPath = composeSpawnPath();
+      warnFallback(fallback);
       return fallback;
     }
   }
