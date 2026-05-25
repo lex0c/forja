@@ -189,6 +189,15 @@ export const getGitBinarySync = (): string => {
 //     and `git` itself is the bare command — exec will fail
 //     visibly with ENOENT rather than silently picking a shim.
 //
+// ORDER MATTERS: getGitBinary() is what populates the fallback
+// PATH branch. A caller that runs `const env = safeGitEnv();
+// const git = await getGitBinary();` captures the env BEFORE the
+// resolution can augment cachedSpawnPath — checkpoint subprocesses
+// then see the canonical-only PATH even when git was found via
+// fallback (NixOS, asdf). Always resolve the binary FIRST. Tests
+// pin the ordering invariant; `getGitBinaryWithEnv` below couples
+// the two so callers don't need to remember.
+//
 // NOTE: GIT_LITERAL_PATHSPECS is intentionally NOT set here.
 // Some git subcommands (notably `check-ignore`) reject the
 // `literal` pathspec magic with exit 128 — making it a global
@@ -201,6 +210,28 @@ export const safeGitEnv = (): Record<string, string> => ({
   PATH: cachedSpawnPath,
   HOME: process.env.HOME ?? '',
 });
+
+// Combinator that pairs `getGitBinary()` + `safeGitEnv()` in the
+// correct order. Callers that don't need finer control should use
+// this — it removes the ordering footgun where running the env
+// builder first captures the pre-fallback canonical PATH and
+// leaves subprocesses blind to whatever dir actually hosts git's
+// siblings.
+export const getGitBinaryWithEnv = async (): Promise<{
+  git: string;
+  env: Record<string, string>;
+}> => {
+  const git = await getGitBinary();
+  return { git, env: safeGitEnv() };
+};
+
+// Synchronous variant of the combinator. Same rationale; use in
+// boot-path probes (memory/paths.ts, cli/git-context.ts) that
+// can't await.
+export const getGitBinaryWithEnvSync = (): { git: string; env: Record<string, string> } => {
+  const git = getGitBinarySync();
+  return { git, env: safeGitEnv() };
+};
 
 // Test seam: reset the cached git path AND the spawn PATH.
 // Production callers never need this — both are stable for the

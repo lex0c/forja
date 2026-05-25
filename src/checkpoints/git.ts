@@ -64,11 +64,19 @@ const runGit = async (args: string[], opts: RunGitOptions): Promise<SpawnGitResu
   // ls-tree` output, which check-ignore reads via --stdin -z).
   // Caller's `opts.env` overrides anything we set (commit
   // identity, GIT_INDEX_FILE).
+  //
+  // ORDER MATTERS: getGitBinary() may augment cachedSpawnPath via
+  // the operator-PATH fallback (NixOS, asdf, etc.). safeGitEnv()
+  // reads that cache, so it must run AFTER the first getGitBinary
+  // call in the process. Constructing `env` before resolving the
+  // binary captures the pre-fallback canonical PATH and leaves
+  // checkpoint subprocesses blind to whatever bin dir actually
+  // hosts git's siblings (credential helpers, ssh wrapper, hooks).
+  const git = await getGitBinary();
   const env: Record<string, string> = {
     ...safeGitEnv(),
     ...(opts.env ?? {}),
   };
-  const git = await getGitBinary();
   const proc = Bun.spawn({
     cmd: [git, ...args],
     cwd: opts.cwd,

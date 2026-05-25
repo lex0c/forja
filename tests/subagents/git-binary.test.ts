@@ -3,6 +3,9 @@ import { isAbsolute } from 'node:path';
 import {
   __resetGitBinaryCacheForTest,
   getGitBinary,
+  getGitBinarySync,
+  getGitBinaryWithEnv,
+  getGitBinaryWithEnvSync,
   safeGitEnv,
 } from '../../src/subagents/git-binary.ts';
 
@@ -151,5 +154,68 @@ describe('safeGitEnv — slice 178 hardening M3', () => {
       '/bin',
     ];
     expect(pathParts.slice(0, expectedCanonicalHead.length)).toEqual(expectedCanonicalHead);
+  });
+});
+
+describe('getGitBinaryWithEnv — slice 178 ordering combinator', () => {
+  beforeEach(() => {
+    __resetGitBinaryCacheForTest();
+  });
+
+  afterEach(() => {
+    __resetGitBinaryCacheForTest();
+  });
+
+  test('async combinator returns { git, env } with both populated together', async () => {
+    const { git, env } = await getGitBinaryWithEnv();
+    expect(typeof git).toBe('string');
+    expect(git.length).toBeGreaterThan(0);
+    expect(env.PATH).toBeDefined();
+    expect(env.LC_ALL).toBe('C');
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  test('sync combinator mirrors the async shape', () => {
+    const { git, env } = getGitBinaryWithEnvSync();
+    expect(typeof git).toBe('string');
+    expect(git.length).toBeGreaterThan(0);
+    expect(env.PATH).toBeDefined();
+    expect(env.LC_ALL).toBe('C');
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  test('combinator output uses the same cache as the standalone calls', async () => {
+    const { git: gitCombo, env: envCombo } = await getGitBinaryWithEnv();
+    const gitStandalone = await getGitBinary();
+    const envStandalone = safeGitEnv();
+    expect(gitCombo).toBe(gitStandalone);
+    expect(envCombo.PATH).toBe(envStandalone.PATH);
+  });
+
+  test('async + sync combinators share the same cache', async () => {
+    const asyncResult = await getGitBinaryWithEnv();
+    const syncResult = getGitBinaryWithEnvSync();
+    expect(asyncResult.git).toBe(syncResult.git);
+    expect(asyncResult.env.PATH).toBe(syncResult.env.PATH);
+  });
+
+  test('sync standalone populates cache for subsequent async safeGitEnv', () => {
+    // The bug the combinator exists to prevent: safeGitEnv()
+    // captured BEFORE getGitBinary() resolution would see the
+    // pre-fallback canonical PATH. After resolution (sync or
+    // async), safeGitEnv() returns the potentially-augmented
+    // PATH. Pin the cache-sharing invariant explicitly.
+    const initialEnv = safeGitEnv();
+    const initialPath = initialEnv.PATH;
+    getGitBinarySync();
+    const afterEnv = safeGitEnv();
+    // Either the resolution kept PATH canonical (test env has git
+    // under SAFE_PATH) or augmented it — but it MUST NOT be
+    // different in a way that changes the canonical prefix order.
+    // Pin: PATH still STARTS with the canonical entries.
+    expect(afterEnv.PATH?.startsWith('/opt/homebrew/sbin')).toBe(true);
+    // And: if augmentation happened, the post-resolution PATH is
+    // a strict superset (or equal) — never a different prefix.
+    expect(afterEnv.PATH?.startsWith(initialPath ?? '')).toBe(true);
   });
 });
