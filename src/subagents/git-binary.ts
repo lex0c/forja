@@ -1,6 +1,6 @@
-import { constants, accessSync } from 'node:fs';
-import { access } from 'node:fs/promises';
-import { delimiter, join } from 'node:path';
+import { constants, accessSync, statSync } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
+import { delimiter, isAbsolute, join } from 'node:path';
 
 // Slice 178 (hardening M3). Pin the absolute path to `git` once
 // per process so subsequent worktree-gc subprocess spawns aren't
@@ -53,29 +53,42 @@ let cachedGitPath: string | null | undefined;
 let cachedSpawnPath: string = CANONICAL_SAFE_PATH;
 
 // Find `git` in a specific PATH string by walking entries with
-// `fs.access(.., X_OK)`. Pre-fix used `Bun.spawn(['which', 'git'])`
-// which broke on minimal images (busybox-based, distroless,
-// scratch + statically-linked binaries) that don't ship a `which`
-// executable — both canonical and fallback probes returned null
-// even when git was installed in a discoverable dir. In-process
-// resolution removes the external-binary dependency: we have the
-// PATH string already and the FS access check is a single syscall
-// per candidate. Returns the first executable hit or null.
+// `fs.access(.., X_OK)` paired with `fs.statSync().isFile()`.
+// Pre-fix used `Bun.spawn(['which', 'git'])` which broke on minimal
+// images (busybox-based, distroless, scratch + statically-linked
+// binaries) that don't ship a `which` executable. In-process
+// resolution removes the external-binary dependency.
+//
+// Validation that goes beyond `which`:
+//   - PATH entry must be ABSOLUTE. A relative entry (`.`, `./bin`,
+//     `bin`) would resolve `git` relative to the agent's cwd at
+//     spawn time — but `Bun.spawn` is called from many cwds across
+//     the codebase (worktree-gc with parentCwd, checkpoints with
+//     opts.cwd, etc.), so a relative cached path would resolve
+//     differently each call. POSIX `which` also typically skips
+//     relative entries; matching that behavior keeps the cache
+//     deterministic.
+//   - Candidate must be a REGULAR FILE. `accessSync(.., X_OK)`
+//     succeeds for searchable directories too — a dir named `git`
+//     in a PATH entry would slip through and later spawn calls
+//     would fail with EACCES/EISDIR or worse, attempt to execute
+//     something unexpected. statSync().isFile() filters those out.
 //
 // `path.delimiter` keeps the split portable (`:` on POSIX, `;` on
-// Windows — though Forja targets POSIX). The X_OK check filters
-// non-executable files with the same name; same semantics as
-// `which`.
+// Windows — though Forja targets POSIX).
 const findGitInPathSync = (path: string): string | null => {
   if (path.length === 0) return null;
   for (const dir of path.split(delimiter)) {
     if (dir.length === 0) continue;
+    if (!isAbsolute(dir)) continue;
     const candidate = join(dir, 'git');
     try {
+      const st = statSync(candidate);
+      if (!st.isFile()) continue;
       accessSync(candidate, constants.X_OK);
       return candidate;
     } catch {
-      // Not executable / doesn't exist — try next entry.
+      // Not executable / doesn't exist / not a regular file — try next.
     }
   }
   return null;
@@ -85,12 +98,15 @@ const findGitInPathAsync = async (path: string): Promise<string | null> => {
   if (path.length === 0) return null;
   for (const dir of path.split(delimiter)) {
     if (dir.length === 0) continue;
+    if (!isAbsolute(dir)) continue;
     const candidate = join(dir, 'git');
     try {
+      const st = await stat(candidate);
+      if (!st.isFile()) continue;
       await access(candidate, constants.X_OK);
       return candidate;
     } catch {
-      // Not executable / doesn't exist — try next entry.
+      // Not executable / doesn't exist / not a regular file — try next.
     }
   }
   return null;

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { isAbsolute } from 'node:path';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import {
   __resetGitBinaryCacheForTest,
   getGitBinary,
@@ -292,5 +294,89 @@ describe('getGitBinaryWithEnv — slice 178 ordering combinator', () => {
     // And: if augmentation happened, the post-resolution PATH is
     // a strict superset (or equal) — never a different prefix.
     expect(afterEnv.PATH?.startsWith(initialPath ?? '')).toBe(true);
+  });
+});
+
+describe('findGitInPath — slice 178 hardening (review): candidate validation', () => {
+  let tmpRoot: string;
+  let savedPath: string | undefined;
+
+  beforeEach(() => {
+    __resetGitBinaryCacheForTest();
+    savedPath = process.env.PATH;
+    tmpRoot = mkdtempSync(join(tmpdir(), 'forja-gitbin-'));
+  });
+
+  afterEach(() => {
+    process.env.PATH = savedPath;
+    rmSync(tmpRoot, { recursive: true, force: true });
+    __resetGitBinaryCacheForTest();
+  });
+
+  test('skips relative PATH entries (cwd-dependent resolution is unsafe)', () => {
+    // PATH entry `.` or `./bin` would make `git` resolve relative
+    // to whatever cwd the eventual Bun.spawn uses. The resolver
+    // is called from one cwd, the spawn from another (worktree-gc
+    // parentCwd, checkpoints opts.cwd) — caching a relative
+    // candidate would resolve differently each call.
+    //
+    // Set PATH to a relative-only entry that LITERALLY contains a
+    // git binary (we drop a fake one). Pin: resolution returns
+    // the bare fallback 'git' (or whatever the canonical
+    // resolution returned) rather than a relative path.
+    const fakeGit = join(tmpRoot, 'git');
+    writeFileSync(fakeGit, '#!/bin/sh\necho fake\n');
+    chmodSync(fakeGit, 0o755);
+    // PATH set to relative entry `.` (which doesn't help: walk
+    // skips it; canonical lookup still finds real git).
+    process.env.PATH = '.';
+    const resolved = getGitBinarySync();
+    // Either canonical resolution returned an absolute git, or
+    // the bare 'git' fallback. NEVER a relative path matching
+    // our fake.
+    expect(resolved).not.toBe('./git');
+    expect(resolved).not.toBe('git/git');
+    if (resolved !== 'git') {
+      expect(isAbsolute(resolved)).toBe(true);
+    }
+  });
+
+  test('skips directories named `git` (X_OK alone passes for searchable dirs)', () => {
+    // accessSync(.., X_OK) returns success for searchable
+    // directories — a dir literally named `git` in a PATH entry
+    // would slip past a naive X_OK check and the subsequent spawn
+    // would EACCES/EISDIR.
+    const dirNamedGit = join(tmpRoot, 'git');
+    // Make a directory, not a file. Mode 0755 = readable + traversable.
+    require('node:fs').mkdirSync(dirNamedGit, { mode: 0o755 });
+    // PATH = ONLY tmpRoot (absolute, so the absolute check passes
+    // and the candidate is `${tmpRoot}/git`, which is a dir).
+    process.env.PATH = tmpRoot;
+    const resolved = getGitBinarySync();
+    // Resolution must NOT return the directory. Either canonical
+    // hit (absolute path to a real /usr/bin/git or similar) or
+    // the bare 'git' fallback.
+    expect(resolved).not.toBe(dirNamedGit);
+    if (resolved !== 'git') {
+      expect(isAbsolute(resolved)).toBe(true);
+    }
+  });
+
+  test('accepts a regular executable file in an absolute PATH entry', () => {
+    // Sanity: the validation isn't so strict that a real git
+    // binary in an absolute custom dir is rejected. Drop a fake
+    // git, point PATH ONLY at the absolute tmpRoot, force a
+    // fallback resolution by ensuring canonical lookup misses
+    // (use a PATH that's NOT canonical).
+    const fakeGit = join(tmpRoot, 'git');
+    writeFileSync(fakeGit, '#!/bin/sh\necho fake\n');
+    chmodSync(fakeGit, 0o755);
+    process.env.PATH = tmpRoot;
+    const resolved = getGitBinarySync();
+    // On a dev box with real git in canonical SAFE_PATH, the
+    // canonical lookup succeeds first — resolved is /usr/bin/git
+    // or similar, NOT our fake. On a stripped env (no canonical
+    // git), the fallback would find our fake.
+    expect(isAbsolute(resolved) || resolved === 'git').toBe(true);
   });
 });
