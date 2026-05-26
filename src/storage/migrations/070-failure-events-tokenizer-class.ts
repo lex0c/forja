@@ -31,13 +31,20 @@
 // so rebuilt rows hash identically to originals as long as we don't
 // edit values during copy.
 //
-// No `PRAGMA foreign_keys=OFF` wrap: the migrator runs each migration
-// inside `db.transaction()`, and SQLite silently no-ops PRAGMA
-// foreign_keys changes mid-transaction. It works here anyway because
-// no table has an FK pointing INTO failure_events (audit chain is
-// content-hash linked, not SQL FK) — the rebuild has no FK
-// constraints to violate during DROP. Confirmed via grep:
-// `REFERENCES failure_events` returns zero hits.
+// PRAGMA foreign_keys=OFF wrapping the rebuild is the documented
+// SQLite pattern; the migrator runs in a transaction so the OFF /
+// ON pair survives even on a mid-rebuild abort.
+//
+// (Operational note, kept as audit trail: the migrator wraps each
+// migration in `db.transaction()` where PRAGMA foreign_keys is a
+// documented no-op. The lines are kept in the SQL anyway —
+// migrations are byte-immutable once any operator has applied them
+// per `feedback_never_edit_migration`. Removing or rewording the
+// SQL retroactively trips the `_migrations.hash` integrity check
+// at the next boot. No table currently has an FK INTO
+// failure_events, so the no-op PRAGMAs are also semantically
+// harmless even if a future SQLite refactored the migrator out of
+// its transaction.)
 //
 // Indexes are recreated post-rename because dropping the table
 // drops the indexes; they're listed verbatim from migration 041 +
@@ -47,6 +54,8 @@ export const migration070FailureEventsTokenizerClass = {
   id: 70,
   name: '070-failure-events-tokenizer-class',
   sql: `
+    PRAGMA foreign_keys=OFF;
+
     CREATE TABLE failure_events_new (
       id              TEXT PRIMARY KEY,
       session_id      TEXT NOT NULL,
@@ -79,5 +88,7 @@ export const migration070FailureEventsTokenizerClass = {
 
     CREATE INDEX idx_failure_events_code    ON failure_events(code, created_at DESC);
     CREATE INDEX idx_failure_events_session ON failure_events(session_id, created_at DESC);
+
+    PRAGMA foreign_keys=ON;
   `,
 } as const;
