@@ -131,6 +131,44 @@ describe('harness-adapter — session lifecycle', () => {
     expect(out.map((e) => e.type)).not.toContain('provider:waiting:end');
   });
 
+  test('step_start propagates promptTokensEstimate as ctxUsedTokens + ctx.contextWindowTokens as ctxWindowTokens on step:budget', () => {
+    // Slice 3 of the 3-layer token plan: the footer's `ctx N%`
+    // segment reads from status.ctx{Used,Window}Tokens, which the
+    // reducer captures from `step:budget` events. The adapter is
+    // the bridge that combines the per-step estimate (from
+    // `step_start.promptTokensEstimate`) with the per-run cap (from
+    // `HarnessAdapterCtx.contextWindowTokens`). Pin both transit.
+    const a = createHarnessAdapter({ ...baseCtx(), contextWindowTokens: 200_000 });
+    const out = a.translate({
+      type: 'step_start',
+      stepN: 1,
+      promptTokensEstimate: 12_345,
+    });
+    const budget = out.find((e) => e.type === 'step:budget');
+    if (budget?.type !== 'step:budget') throw new Error('expected step:budget');
+    expect(budget.ctxUsedTokens).toBe(12_345);
+    expect(budget.ctxWindowTokens).toBe(200_000);
+  });
+
+  test('step_start without contextWindowTokens omits ctxWindowTokens on step:budget', () => {
+    // Provider whose `capabilities.context_window` is 0 (shim,
+    // mock) means we don't have a cap — the footer is supposed to
+    // suppress the segment in that case. The adapter must NOT
+    // forward `ctxWindowTokens: 0`; the type allows omission and the
+    // reducer's latch-only-positive rule depends on absence to
+    // distinguish "unknown" from "explicitly zeroed".
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'step_start',
+      stepN: 1,
+      promptTokensEstimate: 5000,
+    });
+    const budget = out.find((e) => e.type === 'step:budget');
+    if (budget?.type !== 'step:budget') throw new Error('expected step:budget');
+    expect(budget.ctxWindowTokens).toBeUndefined();
+    expect(budget.ctxUsedTokens).toBe(5000);
+  });
+
   test('step_start stashes promptTokensEstimate; first provider start forwards as assistant:start.inputEstimated', () => {
     // 3-layer token accounting (TOKEN_TUNING.md §8): the harness
     // computes a chars/4 estimate of the outbound payload BEFORE the

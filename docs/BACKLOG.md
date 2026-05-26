@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-26] feat(tui/footer) — `ctx N%` context saturation segment
+
+Footer right column gained a `ctx N%` segment between the cost cell and the bg counter. Operator now has live visibility into how saturated the context window is at the moment of each provider call — closes one of the deferred items from the 3-layer token telemetry roadmap.
+
+**Plumbing.** The harness already computed `promptTokensEstimate` at every step_start (slice 2). Adapter now forwards that estimate as `step:budget.ctxUsedTokens` AND merges in `step:budget.ctxWindowTokens` from `HarnessAdapterCtx.contextWindowTokens` (sourced at boot from `baseConfig.provider.capabilities.context_window`). Reducer latches both fields onto `StatusState` with a positives-only rule: a later `step:budget` that omits or zero-sets the fields does NOT wipe a previously-known cap — defends against producers that emit the event from a code path unaware of the new fields.
+
+**Footer rendering.** `ctx N%` computed live from `status.ctxUsedTokens / status.ctxWindowTokens` on every redraw. Color thresholds mirror UI.md §4.4's steps/cost convention: `secondary` (grey) under 80%, `warn` (yellow) at 80-89%, `error` (red) at 90%+. Sub-1% reading floors at `ctx 1%` (a near-empty pre-flight shouldn't render as `ctx 0%` which reads as a regression). Segment positioned between cost-with-projection and bg/subagents — both `cost` and `ctx` are "session economy" signals, while bg/subagents/mem are in-flight counters.
+
+**Suppression rule.** Both `ctxUsedTokens` and `ctxWindowTokens` must be positive for the segment to render. Either being 0 means "no measurement yet" (early-session, mock providers, shim with `capabilities.context_window === 0`) and the segment is omitted entirely — same null-vs-zero convention as the chip's `↑ ~N`.
+
+**Spec posture.** Per memory `feedback_ui_iterate_before_spec`, this is a TUI/UX change so code lands first; UI.md §4.10.6 and CONTEXT_TUNING.md updates wait until operator validates the rendering via `bun run dev`. Once the format stabilizes (positioning, thresholds, color tones), a spec PR documents the canonical layout.
+
+**Files touched.** `src/tui/events.ts` (StepBudgetEvent grew ctxUsedTokens / ctxWindowTokens optionals), `src/tui/state.ts` (StatusState fields + reducer latch), `src/tui/harness-adapter.ts` (HarnessAdapterCtx.contextWindowTokens + step_start case forwards), `src/cli/repl.ts` (wires `baseConfig.provider.capabilities.context_window` into the adapter ctx), `src/tui/render/footer.ts` (segment rendering with thresholds). New tests: 6 footer pins (render, suppression on either zero, floor at 1%, warn/error tones via SGR, positioning), 3 state pins (latch + positives-only override semantics), 2 adapter pins (forward + omit-when-cap-absent).
+
 ## [2026-05-26] feat(tokens) — 3-layer live token telemetry across chip + footer
 
 Implemented the spec's 3-layer token-accounting plan (TOKEN_TUNING.md §8) for the live assistant chip and the status-line footer. Operator now sees an honest token signal from frame 1 of every turn, with a clear distinction between estimate (`~N`) and provider-official numbers, plus a forensic trail when the local estimator drifts.

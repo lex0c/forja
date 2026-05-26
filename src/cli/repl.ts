@@ -941,6 +941,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       model: baseConfig.provider.id,
       maxSteps: budget.maxSteps,
       ...(budget.maxCostUsd !== undefined ? { maxCostUsd: budget.maxCostUsd } : {}),
+      // Forward the provider's context-window cap so the footer can
+      // render the `ctx N%` saturation segment. Computed once per
+      // adapter construction (per-turn in REPL); the cap doesn't
+      // change mid-session. Suppressed in the adapter when 0 (mock
+      // / shim providers without a real cap).
+      ...(baseConfig.provider.capabilities.context_window > 0
+        ? { contextWindowTokens: baseConfig.provider.capabilities.context_window }
+        : {}),
       ...(baseConfig.planMode === true ? { planMode: true } : {}),
       // Distinct-name memory count for the footer's `mem N` segment.
       // Snapshot at adapter-construction time (per-turn) — if a

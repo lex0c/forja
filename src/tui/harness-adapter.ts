@@ -56,6 +56,12 @@ export interface HarnessAdapterCtx {
   // The harness has the same value internally but never echoes it; we
   // accept it from the caller (CLI bootstrap knows the budget).
   maxSteps: number;
+  // Provider's context-window cap (tokens). Forwarded into
+  // `step:budget.ctxWindowTokens` so the footer can compute the
+  // `ctx N%` saturation ratio. Optional: legacy callers or one-shot
+  // SDK without a fully-wired provider object omit it; the footer
+  // segment is suppressed in that case (no `ctx ?` token).
+  contextWindowTokens?: number;
   // Optional spend cap. Mirrored into `step:budget.maxCostUsd`. Absent
   // means no cap — renderer shows steps/cost without budget shading.
   maxCostUsd?: number;
@@ -295,6 +301,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           maxSteps: ctx.maxSteps,
           costUsd: state.costUsd,
           ...(ctx.maxCostUsd !== undefined ? { maxCostUsd: ctx.maxCostUsd } : {}),
+          // Forward ctx saturation pair when both ends are known.
+          // Used = the same `promptTokensEstimate` the chip stamps
+          // (so chip and footer agree on the same number); cap =
+          // adapter ctx's provider context_window. The reducer
+          // latches positives, so a later step:budget without these
+          // fields doesn't zero out the footer mid-session.
+          ...(event.promptTokensEstimate !== undefined && event.promptTokensEstimate > 0
+            ? { ctxUsedTokens: event.promptTokensEstimate }
+            : {}),
+          ...(ctx.contextWindowTokens !== undefined && ctx.contextWindowTokens > 0
+            ? { ctxWindowTokens: ctx.contextWindowTokens }
+            : {}),
         });
         // Defensive close before re-opening: a malformed event
         // stream (two step_starts back to back without a

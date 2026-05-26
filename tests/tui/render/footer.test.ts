@@ -526,6 +526,70 @@ describe('renderFooter', () => {
     });
   });
 
+  // Context saturation segment `ctx N%`. Sourced from
+  // `status.ctxUsedTokens / status.ctxWindowTokens`. Color thresholds:
+  // warn @ 80%, error @ 90% (matches steps/cost convention per
+  // UI.md §4.4). Suppressed when either side is 0.
+  describe('ctx N% saturation segment', () => {
+    test('renders `ctx N%` when both ctx fields are positive', () => {
+      const s = startedSession({ ctxUsedTokens: 50_000, ctxWindowTokens: 200_000 });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('ctx 25%');
+    });
+
+    test('omitted when ctxWindowTokens is 0 (provider cap unknown)', () => {
+      const s = startedSession({ ctxUsedTokens: 50_000, ctxWindowTokens: 0 });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).not.toContain('ctx ');
+    });
+
+    test('omitted when ctxUsedTokens is 0 (no estimate landed yet)', () => {
+      const s = startedSession({ ctxUsedTokens: 0, ctxWindowTokens: 200_000 });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).not.toContain('ctx ');
+    });
+
+    test('sub-1% reading floors at 1% (no `ctx 0%` regression read)', () => {
+      // Very small prompt at session start would round to 0% under
+      // naive Math.round. The renderer floors at 1 so the segment
+      // signals "present, just tiny" instead of "absent / errored".
+      const s = startedSession({ ctxUsedTokens: 100, ctxWindowTokens: 200_000 });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('ctx 1%');
+    });
+
+    test('80% threshold triggers warn tone (visible cue for budget pressure)', () => {
+      // Render WITH color so the ANSI escape can be asserted. The
+      // exact escape is `\x1b[33m` for warn per term.ts SGR map.
+      const s = startedSession({ ctxUsedTokens: 160_000, ctxWindowTokens: 200_000 });
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain('ctx 80%');
+      // Color cue: warn (SGR 33) somewhere on the line.
+      expect(out).toContain('\x1b[33m');
+    });
+
+    test('90%+ triggers error tone (red, critical)', () => {
+      const s = startedSession({ ctxUsedTokens: 190_000, ctxWindowTokens: 200_000 });
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain('ctx 95%');
+      // SGR 31 = red / error.
+      expect(out).toContain('\x1b[31m');
+    });
+
+    test('positions after cost and before bg', () => {
+      const s = startedSession({ ctxUsedTokens: 50_000, ctxWindowTokens: 200_000 });
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'x' });
+      const out = renderFooter(s, caps) ?? '';
+      const costIdx = out.indexOf('$0.0120');
+      const ctxIdx = out.indexOf('ctx 25%');
+      const bgIdx = out.indexOf('bg 1');
+      expect(costIdx).toBeLessThan(ctxIdx);
+      expect(ctxIdx).toBeLessThan(bgIdx);
+    });
+  });
+
   // Cost projection (slice 8). The footer's cost cell grows a
   // `→ ~$X.XX` tail when steps/maxSteps allow a linear projection of
   // session-end cost. Suppressed in degenerate cases (no horizon, no

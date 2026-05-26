@@ -150,6 +150,24 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
         ? `${formatCost(status.costUsd)} ${projection}`
         : formatCost(status.costUsd);
     rightParts.push(dim(caps, costCell));
+    // Context saturation `ctx N%`. Sits after cost (both are
+    // session-economy signals) and before bg/subagents (in-flight
+    // counters). The pct is computed live from the latched
+    // status.ctxUsedTokens / status.ctxWindowTokens pair (updated on
+    // every `step:budget` event from the harness). Color thresholds
+    // mirror the steps/cost convention in UI.md §4.4: warn @ 80%,
+    // error @ 90%. Suppressed entirely when either component is 0
+    // ("no measurement yet" — same null-vs-zero convention as the
+    // assistant chip's `↑ ~N` rule).
+    if (status.ctxWindowTokens > 0 && status.ctxUsedTokens > 0) {
+      const pct = (status.ctxUsedTokens / status.ctxWindowTokens) * 100;
+      const tone = pct >= 90 ? 'error' : pct >= 80 ? 'warn' : 'secondary';
+      // Floor at 1% so a sub-1% pre-flight (very short first turn)
+      // doesn't render `ctx 0%` and read as a regression. The pct
+      // itself is locale-neutral integer.
+      const displayPct = Math.max(1, Math.round(pct));
+      rightParts.push(paint(caps, tone, `ctx ${displayPct}%`));
+    }
     if (state.bgProcesses.size > 0) {
       rightParts.push(dim(caps, `bg ${state.bgProcesses.size}`));
     }

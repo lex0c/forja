@@ -375,6 +375,76 @@ describe('assistant streaming', () => {
     expect(r.state.pendingAssistant?.outputEstimated).toBe(0);
   });
 
+  test('step:budget latches ctx fields into status (slice 3)', () => {
+    // ctx N% in the footer reads from status.ctx{Used,Window}Tokens.
+    // The reducer captures from `step:budget` events the adapter
+    // emits on every step_start.
+    const r = drive([
+      {
+        type: 'step:budget',
+        ts: 1,
+        steps: 1,
+        maxSteps: 10,
+        costUsd: 0.01,
+        ctxUsedTokens: 50_000,
+        ctxWindowTokens: 200_000,
+      },
+    ]);
+    expect(r.state.status.ctxUsedTokens).toBe(50_000);
+    expect(r.state.status.ctxWindowTokens).toBe(200_000);
+  });
+
+  test('step:budget without ctx fields does NOT zero out a prior known cap', () => {
+    // Legacy / replay events may omit ctx fields. The reducer
+    // latches positives so a footer that already shows `ctx 25%`
+    // doesn't collapse to blank just because a later step:budget
+    // was emitted from a code path that didn't carry the fields.
+    const r = drive([
+      {
+        type: 'step:budget',
+        ts: 1,
+        steps: 1,
+        maxSteps: 10,
+        costUsd: 0,
+        ctxUsedTokens: 50_000,
+        ctxWindowTokens: 200_000,
+      },
+      // Second event omits ctx fields.
+      { type: 'step:budget', ts: 2, steps: 2, maxSteps: 10, costUsd: 0.01 },
+    ]);
+    expect(r.state.status.ctxUsedTokens).toBe(50_000);
+    expect(r.state.status.ctxWindowTokens).toBe(200_000);
+  });
+
+  test('step:budget with explicit ctx=0 leaves a prior positive value latched', () => {
+    // Same reason as the omission test: a producer that explicitly
+    // sets 0 (defensive defaults in a future adapter) shouldn't
+    // accidentally wipe a known value. The latch ignores 0; only a
+    // fresh positive number overrides.
+    const r = drive([
+      {
+        type: 'step:budget',
+        ts: 1,
+        steps: 1,
+        maxSteps: 10,
+        costUsd: 0,
+        ctxUsedTokens: 50_000,
+        ctxWindowTokens: 200_000,
+      },
+      {
+        type: 'step:budget',
+        ts: 2,
+        steps: 2,
+        maxSteps: 10,
+        costUsd: 0.01,
+        ctxUsedTokens: 0,
+        ctxWindowTokens: 0,
+      },
+    ]);
+    expect(r.state.status.ctxUsedTokens).toBe(50_000);
+    expect(r.state.status.ctxWindowTokens).toBe(200_000);
+  });
+
   test('assistant:start carries inputEstimated onto pendingAssistant', () => {
     // Pre-flight estimate path: the harness adapter forwards
     // `step_start.promptTokensEstimate` via `assistant:start.inputEstimated`.

@@ -129,6 +129,14 @@ export interface StatusState {
   // null = no cap configured. Renderer shows steps/cost without budget
   // shading when cap absent.
   maxCostUsd: number | null;
+  // Context-window saturation. `ctxUsedTokens` is the most recent
+  // pre-flight prompt-size estimate; `ctxWindowTokens` is the provider's
+  // hard cap. Footer renders `ctx N%` when both are positive — falls
+  // back to omission (no fake `ctx ?` token) when either is 0,
+  // matching the renderer's convention of "show no number when we
+  // don't have one".
+  ctxUsedTokens: number;
+  ctxWindowTokens: number;
   // Plan mode (read-only profile). Surfaced in the footer's right
   // column as a `plan` token between model and budget. Default false
   // on createInitialState; flipped by `session:start.planMode`.
@@ -496,6 +504,8 @@ export const createInitialState = (): LiveState => ({
     maxCostUsd: null,
     planMode: false,
     memoryCount: 0,
+    ctxUsedTokens: 0,
+    ctxWindowTokens: 0,
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
@@ -1246,6 +1256,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         maxSteps: event.maxSteps,
         costUsd: event.costUsd,
         maxCostUsd: event.maxCostUsd ?? null,
+        // Latched: a step:budget that omits ctx fields (legacy /
+        // replay) shouldn't zero out a previously-known cap or
+        // estimate. The footer reads from status, so once a real
+        // value lands it sticks until a producer explicitly overrides
+        // with a fresh non-zero number. 0 means "not yet populated"
+        // and the footer suppresses the segment in that case.
+        ...(event.ctxUsedTokens !== undefined && event.ctxUsedTokens > 0
+          ? { ctxUsedTokens: event.ctxUsedTokens }
+          : {}),
+        ...(event.ctxWindowTokens !== undefined && event.ctxWindowTokens > 0
+          ? { ctxWindowTokens: event.ctxWindowTokens }
+          : {}),
       };
       return { state: { ...state, status }, permanent: [] };
     }

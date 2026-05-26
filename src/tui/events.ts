@@ -608,6 +608,17 @@ export type StepBudgetEvent = BaseEvent & {
   maxSteps: number;
   costUsd: number;
   maxCostUsd?: number;
+  // Context-window saturation. `ctxUsedTokens` is the harness's
+  // pre-flight estimate of the OUTBOUND payload for this step
+  // (forwarded from `step_start.promptTokensEstimate`); `ctxWindowTokens`
+  // is the provider's hard cap from `capabilities.context_window`.
+  // Together they drive the footer's `ctx N%` segment. Both optional:
+  // legacy emitters (replay, headless) omit them, the renderer falls
+  // back to suppressing the segment when either is missing or zero.
+  // No truth in `ctxUsedTokens` alone — without the cap a percent
+  // can't be computed.
+  ctxUsedTokens?: number;
+  ctxWindowTokens?: number;
 };
 
 // Provider call lifecycle bracket — covers the gap between
