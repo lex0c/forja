@@ -2,6 +2,48 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-26] feat(tokens) — per-tool attribution storage + capture (slice 7a)
+
+Implementation pass following the just-drafted `docs/spec/TOKEN_ATTRIBUTION.md`. Storage + capture only; the CLI surface (`agent stats --tools`) is deferred to slice 7b — the DB starts collecting data immediately so any future session has attribution rows ready to query.
+
+**Migration 069** (`src/storage/migrations/069-tool-token-attributions.ts`): new table `tool_token_attributions` with `UNIQUE(tool_use_id)`, `ON DELETE CASCADE` via session_id, + two indexes (session_step / session_tool) per the AGENTIC_CLI §13 update.
+
+**Repo** (`src/storage/repos/tool-token-attributions.ts`): four entry points — `appendToolAttribution` (INSERT OR IGNORE), `listToolAttributionsBySession`, `aggregateToolAttributionsByName` (per-session GROUP BY), `aggregateToolAttributionsGlobal` (cross-session with optional `--since` + `--limit`). Plus `countToolAttributions` for "any data?" guards in future CLI surfaces. Public types expose camelCase, row mapping handles the snake_case translation; standard pattern in this tree.
+
+**Capture site** (`src/harness/loop.ts`, after `emitToolCallOutcome`): one `appendToolAttribution` per tool call. Both estimates use `estimateTextTokensFor(family, ...)` — the same family-aware tokenizer feeding the chip and the discrepancy detector, so a turn's chip number and that turn's tool attribution numbers reconcile cleanly. `estimatedCostUsd` deferred to NULL (reader on-the-fly compute via `sessions.model` → capability lookup); avoids forging a per-call cost without provider pricing context at hand. Best-effort try/catch — INSERT failure logs stderr, loop prossegue. UNIQUE constraint handles retry-path re-entries silently.
+
+**Pins** (`tests/storage/tool-token-attributions.test.ts`): 12 tests covering write + read + UNIQUE defense + null-cost preservation + deterministic ordering + per-session aggregation (cost-driver sort, rows_without_cost counter) + global aggregation (DISTINCT sessions, sinceMs filter, limit) + CASCADE retention + count shapes + FK violation throws.
+
+**Deferred** (slice 7b): `agent stats --tools` CLI subcommand. New file in `src/cli/`, integration with `args.ts`, output formatting (TTY table + `--json` NDJSON), filter flags (`--session`, `--all`, `--since`, `--step`, `--by`). Spec is complete (§4 do TOKEN_ATTRIBUTION.md); only the wiring remains.
+
+**Files touched.** New: `src/storage/migrations/069-tool-token-attributions.ts`, `src/storage/repos/tool-token-attributions.ts`, `tests/storage/tool-token-attributions.test.ts`. Updated: `src/storage/migrations/index.ts` (register), `src/harness/loop.ts` (capture site + 2 imports). Total: 1144 storage+harness tests pass, 0 fail; typecheck + lint clean.
+
+## [2026-05-26] spec(token-attribution) — draft TOKEN_ATTRIBUTION.md + AGENTIC_CLI §13 table
+
+Spec-first PR for the last deferred slice of the token telemetry roadmap (per-tool attribution). No code yet — per CLAUDE.md root rule ("Diverging from the spec requires a PR against the spec first, code after") and the explicit "Never edit `docs/spec/` without an explicit user request" — this is the spec landing ahead of `invoke-tool.ts` instrumentation.
+
+**Scope.** Operator needs `agent stats --tools` to answer "which tool calls drove cost in this session?". Direct, not compounding: each row carries `result_input_tokens` (what the tool_result added to context) + `call_output_tokens` (what the assistant spent emitting the tool_use block) + optional `estimated_cost_usd`. Aggregation by tool name / step is a VIEW on top, not the storage shape.
+
+**Design decisions documented.**
+- Best-effort, not load-bearing — INSERT failure logs to stderr, tool prossegue.
+- Estimates via the same `estimateTextTokensFor(family, content)` that feeds the live chip and the discrepancy detector; honest about provenance, not billing-grade.
+- No content stored — `tool_result.content` already lives in `messages`; replicate viraria duplication util-zero.
+- Append-only, `UNIQUE(tool_use_id)` defends retry paths.
+- Cascade via `session_id` — sessão purgada → attributions descem.
+- Subagent attribution: linha vai pra session do PAI quando `task` tool é invocado; subagent INTERNO produz attributions na sua session (cross-correlation via `subagent_handles.parent_session_id`).
+
+**Não-objetivos explícitos** (§8 do doc):
+- Não substitui `messages.tokens_in/out` (billing).
+- Não rastreia retrievals como tool (cobertura em `RETRIEVAL.md`).
+- Não atribui memory por turno (cobertura em `MEMORY.md §provenance`).
+- Não faz forecasting (chip live já tem cost projection no footer).
+
+**UI defer.** Live tool cards permanecem sem attribution inline; expansão via `Ctrl+O` é candidata natural mas decisão pós validação operacional do `agent stats --tools` CLI.
+
+**Files touched.** New: `docs/spec/TOKEN_ATTRIBUTION.md` (~250 linhas, princípios + schema + capture + API + CLI surface + privacy + non-goals + cross-refs). Updated: `CLAUDE.md` (new row in the implementation→spec table), `docs/spec/AGENTIC_CLI.md` §13 (new table `tool_token_attributions` in the canonical schema + 2 indexes), `docs/spec/TOKEN_TUNING.md` §8.5 (downstream cross-ref to the attribution doc inheriting accuracy from `estimateTextTokensFor`).
+
+**Code lands next slice** — implementation PR will follow this spec edit per the project's spec-first rule for new subsystems. Concrete touch points already mapped: new migration in `src/storage/migrations/`, new repo in `src/storage/repos/tool-token-attributions.ts`, instrumentation in `src/harness/invoke-tool.ts`, new `agent stats --tools` subcommand in `src/cli/`.
+
 ## [2026-05-26] feat(tui/footer) — `ctx N%` context saturation segment
 
 Footer right column gained a `ctx N%` segment between the cost cell and the bg counter. Operator now has live visibility into how saturated the context window is at the moment of each provider call — closes one of the deferred items from the 3-layer token telemetry roadmap.

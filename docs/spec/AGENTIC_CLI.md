@@ -1770,6 +1770,22 @@ artifacts(
   path_or_blob TEXT NOT NULL,
   sha256 TEXT NOT NULL
 );
+
+tool_token_attributions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  step_n INTEGER NOT NULL,
+  tool_use_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  result_input_tokens INTEGER NOT NULL,   -- estimativa via tokenizer da família
+  call_output_tokens INTEGER NOT NULL,    -- estimativa do bloco tool_use (name + args)
+  estimated_cost_usd REAL,                -- opcional; preenche quando reconcilia
+  created_at INTEGER NOT NULL,
+  UNIQUE(tool_use_id)
+);
+-- Forma resolvida em TOKEN_ATTRIBUTION.md. Best-effort (falha de
+-- INSERT não falha o tool); cascade via session_id; uniqueness por
+-- tool_use_id defende re-execução em retry path.
 ```
 
 Índices só onde dói:
@@ -1779,6 +1795,8 @@ artifacts(
 - `sessions(started_at DESC)` — list-sessions ordenada por data
 - `sessions(cwd, started_at DESC)` — list-sessions filtrado por projeto
 - `sessions(status, started_at DESC)` — filter por status
+- `tool_token_attributions(session_id, step_n)` — drill-down per step em `agent stats --tools`
+- `tool_token_attributions(session_id, tool_name)` — aggregate por tool
 
 **Sem ORM.** SQL cru com tipos. ORM em projeto pequeno é imposto sem benefício.
 

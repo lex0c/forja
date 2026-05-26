@@ -26,6 +26,7 @@ The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a
 | Storage / schema / audit | `AGENTIC_CLI` §13, `AUDIT` |
 | Context engine, compaction | `AGENTIC_CLI` §6, `CONTEXT_TUNING` |
 | Sampling, output budgets | `TOKEN_TUNING` |
+| Per-tool token attribution (`agent stats --tools`) | `TOKEN_ATTRIBUTION`, `AGENTIC_CLI` §13 |
 | TUI (inline render, event bus, microcopy, palette/glyphs) | `AGENTIC_CLI` §17, `UI` |
 | Cross-session memory | `MEMORY` |
 | REPL input history (↑/↓, Ctrl+R reverse search, /history) | `HISTORY`, `UI` §5.1/§5.4 |

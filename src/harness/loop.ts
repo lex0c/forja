@@ -45,7 +45,7 @@ import type {
   ProviderToolResultBlock,
   ProviderToolUseBlock,
 } from '../providers/index.ts';
-import { estimatePromptTokensFor } from '../providers/tokens.ts';
+import { estimatePromptTokensFor, estimateTextTokensFor } from '../providers/tokens.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
@@ -67,6 +67,7 @@ import {
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
+import { appendToolAttribution } from '../storage/repos/tool-token-attributions.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
@@ -3490,6 +3491,55 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // H1 from the branch review).
             scopeChain: buildScopeChain({ sessionId, repoCwd: repoRoot }),
           });
+          // Per-tool token attribution (TOKEN_ATTRIBUTION.md). One
+          // INSERT per tool call carrying token estimates so
+          // `agent stats --tools` can answer "which tool drove cost
+          // in this session?". Both estimates use the family-aware
+          // tokenizer that already feeds the chip and the
+          // discrepancy detector — honest about provenance, not
+          // billing-grade.
+          //
+          //   result_input_tokens — content of the tool_result block
+          //                          that just landed in messages.
+          //                          Tokens this call ADDED to the
+          //                          context history.
+          //   call_output_tokens  — the tool_use block the assistant
+          //                          turn emitted (name + JSON args).
+          //                          Approximates the call's share
+          //                          of the assistant's output.
+          //
+          // Best-effort: INSERT failure logs stderr and the loop
+          // prossegue. UNIQUE(tool_use_id) means a retry path that
+          // re-enters here silently no-ops.
+          try {
+            const family = config.provider.family;
+            // ProviderToolResultBlock.content is a single string —
+            // already serialized at this point in the loop.
+            const resultInputTokens = estimateTextTokensFor(family, inv.toolResult.content);
+            const argsJson = JSON.stringify(tu.input);
+            const callOutputTokens =
+              estimateTextTokensFor(family, tu.name) + estimateTextTokensFor(family, argsJson);
+            appendToolAttribution(config.db, {
+              sessionId,
+              stepN: steps,
+              toolUseId: tu.id,
+              toolName: tu.name,
+              resultInputTokens,
+              callOutputTokens,
+              // Cost compute deferred: the provider's per-token
+              // pricing lives in `computeCost(capabilities, usage)`,
+              // which expects a UsageInfo shape. Synthesizing one
+              // from these two estimates here would be honest but
+              // tedious; reader can join sessions.model → provider
+              // registry → capabilities and compute on-the-fly.
+              estimatedCostUsd: null,
+            });
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            process.stderr.write(
+              `forja: failed to persist tool_token_attribution for ${tu.id} (${msg})\n`,
+            );
+          }
           // §13.6 degraded banner heartbeat (slice 92). Fires after
           // every tool call; emitter is cheap + queries engine state
           // internally. Emits a `sandbox_degraded_active` harness

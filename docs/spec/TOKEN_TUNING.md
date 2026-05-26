@@ -416,6 +416,10 @@ Modelo recente sem suporte tiktoken: usuário pode declarar:
 tokenizer_override = "cl100k_base"   # se não-detectado automatic
 ```
 
+### 8.5 Per-tool attribution downstream
+
+A mesma `estimateTextTokensFor(family, content)` deste capítulo alimenta o subsistema de attribution per-tool (`TOKEN_ATTRIBUTION.md`). Ali, o estimate é gravado por `tool_use_id` em `tool_token_attributions` com mesma tolerância de erro (~0.5% OpenAI, ~5% Anthropic) — a accuracy é herdada, não recalibrada por subsistema. Trade-off explícito: attribution é forensic-grade, não billing-grade; quando o operador quer billing exato, a fonte é `messages.tokens_in/tokens_out` agregada pelo provider.
+
 ---
 
 ## 9. Per-workflow defaults (canonical)
