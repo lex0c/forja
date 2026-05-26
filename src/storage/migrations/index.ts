@@ -67,6 +67,7 @@ import { migration066PurgeEvents } from './066-purge-events.ts';
 import { migration067SkillEvents } from './067-skill-events.ts';
 import { migration068PromptVersions } from './068-prompt-versions.ts';
 import { migration069ToolTokenAttributions } from './069-tool-token-attributions.ts';
+import { migration070FailureEventsTokenizerClass } from './070-failure-events-tokenizer-class.ts';
 
 export interface Migration {
   id: number;
@@ -144,4 +145,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration067SkillEvents,
   migration068PromptVersions,
   migration069ToolTokenAttributions,
+  migration070FailureEventsTokenizerClass,
 ];

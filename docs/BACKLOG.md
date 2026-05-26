@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-26] fix(failures) — widen `failure_events.classe` CHECK to include `tokenizer`
+
+Live regression from commit 0cc9021. Slice 9 added the `tokenizer` failure class + two codes to the TS vocabulary in `src/failures/codes.ts`, but migration 041 (where the `failure_events` table was created) has a `CHECK (classe IN (...))` listing only the original 10 values. Every `tokenizer.discrepancy.*` emit hits the constraint and throws; the harness's best-effort try/catch swallows it but stderr fills with `CHECK constraint failed` lines on every step where the local estimate drifts >10% from billed — operator surfaced this in real session output (`anthropic/claude-opus-4-7 · 2/200 · $0.0000 · ctx 6%` footer with the failed-persist line above).
+
+Migration 070 rebuilds the table with the widened CHECK (now 11 classes incl. `tokenizer`). Standard SQLite rebuild pattern: CREATE new + INSERT SELECT verbatim + DROP old + RENAME + recreate indexes. No FK pointed INTO failure_events (audit chain is content-hash linked, not SQL FK), so no `PRAGMA foreign_keys` dance needed. Pin set covers: tokenizer class now accepts, all 10 pre-existing classes still accepted, invalid class still rejected, indexes survive the rebuild, payload + chain hashes preserved byte-identical (load-bearing — chain verification depends on no copy-time value mutation).
+
 ## [2026-05-26] feat(tokens) — per-tool attribution storage + capture (slice 7a)
 
 Implementation pass following the just-drafted `docs/spec/TOKEN_ATTRIBUTION.md`. Storage + capture only; the CLI surface (`agent stats --tools`) is deferred to slice 7b — the DB starts collecting data immediately so any future session has attribution rows ready to query.
