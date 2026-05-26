@@ -95,7 +95,16 @@ export const checkTokenizerDiscrepancy = (
   input: TokenizerDiscrepancyCheckInput,
 ): TokenizerDiscrepancyCheckResult => {
   const outputEstimated = estimateTextTokensFor(input.providerFamily, input.collectedText);
-  const inputRatio = ratio(input.inputEstimated, input.usage.input);
+  // Compare against the FULL up-the-wire payload, not `usage.input` alone.
+  // Anthropic's `usage.input` is the FRESH-ONLY portion (non-cached); the
+  // cached prefix lives in `cache_read` / `cache_creation`. Our pre-flight
+  // estimator walks the full payload (messages + system + tools, all of
+  // them — cached or not), so comparing to `usage.input` alone would
+  // generate a structural false-positive on every cached-prefix turn:
+  // estimate ≈ 10000, usage.input = 200 → ratio = 49.0, well over the 10%
+  // threshold, on a session whose chars/4 heuristic is perfectly healthy.
+  const officialInput = input.usage.input + input.usage.cache_read + input.usage.cache_creation;
+  const inputRatio = ratio(input.inputEstimated, officialInput);
   const outputRatio = ratio(outputEstimated, input.usage.output);
 
   let emittedInput = false;
@@ -130,7 +139,12 @@ export const checkTokenizerDiscrepancy = (
           ...basePayload,
           kind: 'input',
           estimated: input.inputEstimated,
-          official: input.usage.input,
+          // `official` is the FULL billed payload (matches the ratio's
+          // denominator), not `usage.input` alone — keeps the payload's
+          // numerator/denominator pair self-consistent. The fresh /
+          // cached split is recoverable from `messages.tokens_in`
+          // joins if forensics ever needs the breakdown.
+          official: officialInput,
           ratio: inputRatio,
         },
       });

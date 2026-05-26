@@ -51,10 +51,10 @@ describe('tool_token_attributions repo', () => {
     });
   });
 
-  test('UNIQUE(tool_use_id) — second INSERT for the same call is silently ignored', () => {
-    // Spec §1.1: `INSERT OR IGNORE` defends retry paths. First
-    // emission wins; a re-entry for the same toolUseId must be
-    // a no-op, not an error.
+  test('UNIQUE(session_id, tool_use_id) — second INSERT in the SAME session is silently ignored', () => {
+    // Retry path defense: a re-entry of the capture site for the
+    // same call within ONE session is a no-op, not an error. First
+    // emission wins.
     seedSession('s1');
     appendToolAttribution(db, {
       sessionId: 's1',
@@ -67,16 +67,43 @@ describe('tool_token_attributions repo', () => {
     appendToolAttribution(db, {
       sessionId: 's1',
       stepN: 2, // different step
-      toolUseId: 'tu_dup', // same tool_use_id
+      toolUseId: 'tu_dup', // same tool_use_id in the same session
       toolName: 'bash',
       resultInputTokens: 999, // different content
       callOutputTokens: 99,
     });
     const rows = listToolAttributionsBySession(db, 's1');
     expect(rows).toHaveLength(1);
-    // First emission's values persist.
     expect(rows[0]?.resultInputTokens).toBe(100);
     expect(rows[0]?.stepN).toBe(1);
+  });
+
+  test('cross-session id collisions DO NOT silently drop rows (migration 071)', () => {
+    // The pre-071 bug: `UNIQUE(tool_use_id)` was database-wide, so
+    // two distinct sessions with the same toolUseId (test fixtures,
+    // replay traces, provider id recycling) silently dropped the
+    // second. Per-session uniqueness lets both rows live.
+    seedSession('sA');
+    seedSession('sB');
+    appendToolAttribution(db, {
+      sessionId: 'sA',
+      stepN: 1,
+      toolUseId: 'toolu_test_1', // common fixture id shape
+      toolName: 'bash',
+      resultInputTokens: 100,
+      callOutputTokens: 10,
+    });
+    appendToolAttribution(db, {
+      sessionId: 'sB',
+      stepN: 1,
+      toolUseId: 'toolu_test_1', // same id, different session
+      toolName: 'bash',
+      resultInputTokens: 500,
+      callOutputTokens: 50,
+    });
+    expect(listToolAttributionsBySession(db, 'sA')).toHaveLength(1);
+    expect(listToolAttributionsBySession(db, 'sB')).toHaveLength(1);
+    expect(listToolAttributionsBySession(db, 'sB')[0]?.resultInputTokens).toBe(500);
   });
 
   test('estimatedCostUsd null is preserved (caller defers cost compute to reader)', () => {

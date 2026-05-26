@@ -221,7 +221,13 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           ...(ctx.memoryCount !== undefined ? { memoryCount: ctx.memoryCount } : {}),
         });
         // Initial step:budget so the status line shows "0/N · $0" from
-        // the very first frame instead of waiting on step_start.
+        // the very first frame instead of waiting on step_start. We
+        // forward `ctxWindowTokens` here too (when known) so the
+        // footer's `ctx N%` segment has at least the cap latched
+        // before any step fires — the segment still suppresses
+        // because `ctxUsedTokens` stays at 0 until step_start, but
+        // surfacing the cap early avoids a 1-step lag where the
+        // segment pops in mid-render right after the first prompt.
         out.push({
           type: 'step:budget',
           ts,
@@ -229,6 +235,9 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           maxSteps: ctx.maxSteps,
           costUsd: 0,
           ...(ctx.maxCostUsd !== undefined ? { maxCostUsd: ctx.maxCostUsd } : {}),
+          ...(ctx.contextWindowTokens !== undefined && ctx.contextWindowTokens > 0
+            ? { ctxWindowTokens: ctx.contextWindowTokens }
+            : {}),
         });
         return out;
       }

@@ -130,25 +130,34 @@ export const renderAssistantChip = (
   const wireTotal = inputVal + cacheReadVal + cacheCreateVal;
   const cacheRatio = wireTotal > 0 && cacheReadVal > 0 ? cacheReadVal / wireTotal : null;
   // Resolve the received-tokens cell across the 3-layer hierarchy:
-  // official `outputTokens` wins; absent that, fall back to the local
-  // `outputEstimated` accumulator with a `~` prefix so the operator
-  // can tell estimate from measurement. Estimate of 0 (turn just
-  // started, no deltas yet) is suppressed — `~0` reads as noise.
+  // a POSITIVE official `outputTokens` wins; otherwise fall back to
+  // the local `outputEstimated` accumulator with a `~` prefix. The
+  // `> 0` filter (not `!== null`) is load-bearing: Anthropic now emits
+  // a `usage` event at `message_start` that carries `output_tokens=0`
+  // — without the positivity gate, the reducer's `Math.max` merge
+  // sets `outputTokens=0` (non-null) on frame 1 and the chip would
+  // render `↓ 0` for the entire streaming turn, shadowing the
+  // accumulating estimate. The live chip is only rendered while the
+  // message is in flight (`pendingAssistant !== null`); a "tool-only
+  // turn whose final output_tokens is genuinely 0" can't reach the
+  // chip — that case lives in the post-message scrollback path,
+  // which is governed by `formatPermanent`, not here.
   let recvCell: string | null = null;
-  if (pending.outputTokens !== null) {
+  if (pending.outputTokens !== null && pending.outputTokens > 0) {
     recvCell = `${down} ${formatTokens(pending.outputTokens)}`;
   } else if (pending.outputEstimated > 0) {
     recvCell = `${down} ~${formatTokens(pending.outputEstimated)}`;
   }
   // Throughput cell: model-output tokens per second since the chip
-  // anchored. Uses official `outputTokens` when present, falls back
-  // to `outputEstimated` so the readout starts ticking from the
-  // first delta (waiting for `assistant:usage` would mean only seeing
-  // throughput on the very last frame, where it stops being useful).
-  // The throughput is per-turn, not session-cumulative — operator
-  // wants to know "is this current turn slow", not "what was the
-  // average across the session".
-  const tputBasis = pending.outputTokens ?? pending.outputEstimated;
+  // anchored. Uses POSITIVE official `outputTokens` when present,
+  // falls back to `outputEstimated`. Same `> 0` rationale as the
+  // recvCell branch above — `outputTokens=0` from the Anthropic
+  // early-emit must NOT shadow the estimate (the `??` operator
+  // doesn't coalesce on 0, only on null/undefined).
+  const tputBasis =
+    pending.outputTokens !== null && pending.outputTokens > 0
+      ? pending.outputTokens
+      : pending.outputEstimated;
   const tput = tputBasis > 0 ? formatThroughput(tputBasis, now - pending.startedAt) : null;
   // Drop on null (no usage event yet), keep on 0 — `↓ 0` is the
   // honest rendering for "provider said zero output", distinct from

@@ -163,9 +163,15 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
       const pct = (status.ctxUsedTokens / status.ctxWindowTokens) * 100;
       const tone = pct >= 90 ? 'error' : pct >= 80 ? 'warn' : 'secondary';
       // Floor at 1% so a sub-1% pre-flight (very short first turn)
-      // doesn't render `ctx 0%` and read as a regression. The pct
-      // itself is locale-neutral integer.
-      const displayPct = Math.max(1, Math.round(pct));
+      // doesn't render `ctx 0%` and read as a regression. Ceiling
+      // at 99% so an over-budget step (pre-flight estimate exceeded
+      // the cap BEFORE compaction had a chance to fire in this loop
+      // iteration) renders as `ctx 99%` in the error tone instead of
+      // `ctx 250%`, which reads as a UI bug rather than as the
+      // intended over-budget alarm. The error tone (>= 90%) is what
+      // signals criticality; the number is a magnitude cue, not a
+      // precise meter past the cap.
+      const displayPct = Math.min(99, Math.max(1, Math.round(pct)));
       rightParts.push(paint(caps, tone, `ctx ${displayPct}%`));
     }
     if (state.bgProcesses.size > 0) {

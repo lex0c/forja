@@ -64,6 +64,56 @@ describe('checkTokenizerDiscrepancy', () => {
     expect(result.outputRatio).toBe(0);
   });
 
+  test('input ratio compares against FULL billed payload (input + cache_read + cache_creation), not fresh input alone', () => {
+    // Anthropic's `usage.input` is the FRESH-ONLY portion; cached
+    // prefix lives in `cache_read`/`cache_creation`. Our pre-flight
+    // estimator walks the full payload, so a naive `estimated vs
+    // usage.input` comparison would fire a false-positive on every
+    // cached-prefix turn (estimate=10200 vs usage.input=200 → ratio
+    // 49 → emit). The fix sums all three on the official side so
+    // the comparison is like-to-like.
+    const { emits, sink } = captureSink();
+    const result = checkTokenizerDiscrepancy({
+      sessionId: 's-cache',
+      stepN: 1,
+      providerId: 'claude-sonnet-4-5',
+      providerFamily: 'anthropic',
+      // Full payload estimate ~ 10200 tokens.
+      inputEstimated: 10_200,
+      collectedText: '',
+      // Provider bills: 200 fresh + 10000 cache hit + 0 creation = 10200 total.
+      usage: usage({ input: 200, output: 0, cache_read: 10_000, cache_creation: 0 }),
+      failureSink: sink,
+    });
+    // Estimate matches the total payload → ratio ≈ 0 → no emit.
+    expect(result.inputRatio).toBeCloseTo(0, 4);
+    expect(result.emittedInput).toBe(false);
+    expect(emits).toHaveLength(0);
+  });
+
+  test('input ratio still fires when the estimator drifts vs the full payload', () => {
+    // Sanity: the fix didn't accidentally suppress all input emits.
+    // Same cached-prefix shape but the estimator returns 2× the
+    // billed total → 100% drift → emit.
+    const { emits, sink } = captureSink();
+    const result = checkTokenizerDiscrepancy({
+      sessionId: 's-drift',
+      stepN: 1,
+      providerId: 'claude-sonnet-4-5',
+      providerFamily: 'anthropic',
+      inputEstimated: 20_400, // 2x the billed total
+      collectedText: '',
+      usage: usage({ input: 200, output: 0, cache_read: 10_000, cache_creation: 0 }),
+      failureSink: sink,
+    });
+    expect(result.emittedInput).toBe(true);
+    expect(emits).toHaveLength(1);
+    // `official` payload pin: matches the FULL billed sum, not
+    // `usage.input` alone — keeps the persisted payload's
+    // numerator/denominator pair self-consistent.
+    expect((emits[0]?.payload as { official: number } | undefined)?.official).toBe(10_200);
+  });
+
   test('emit input discrepancy when ratio crosses threshold', () => {
     // 2000 estimated vs 1000 official → 100% drift, well over the
     // 10% threshold. Forensic emit must carry both numbers, the

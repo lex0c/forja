@@ -131,6 +131,37 @@ describe('harness-adapter — session lifecycle', () => {
     expect(out.map((e) => e.type)).not.toContain('provider:waiting:end');
   });
 
+  test('session_start emit forwards ctxWindowTokens when ctx carries it (no 1-step lag for the footer segment)', () => {
+    // The initial step:budget at session_start used to omit
+    // `ctxWindowTokens` entirely, so the reducer left
+    // `status.ctxWindowTokens` at 0 until the first step_start. The
+    // footer's `ctx N%` gate (`ctxWindowTokens > 0 && ctxUsedTokens > 0`)
+    // suppressed the segment during idle, then it popped in
+    // mid-render right after the first prompt. The fix forwards
+    // the cap up-front so it's latched before any step fires —
+    // the segment is still suppressed at idle (ctxUsedTokens=0),
+    // but the cap is ready the moment step_start lands.
+    const a = createHarnessAdapter({ ...baseCtx(), contextWindowTokens: 200_000 });
+    const out = a.translate({ type: 'session_start', sessionId: 'sess-x' });
+    const budget = out.find((e) => e.type === 'step:budget');
+    if (budget?.type !== 'step:budget') throw new Error('expected step:budget');
+    expect(budget.ctxWindowTokens).toBe(200_000);
+    // No ctxUsedTokens at this point — measurement hasn't happened.
+    expect(budget.ctxUsedTokens).toBeUndefined();
+  });
+
+  test('session_start emit omits ctxWindowTokens when ctx omits it', () => {
+    // Mocks / shim providers (capabilities.context_window === 0)
+    // don't forward the field via the CLI bootstrap, so the
+    // adapter's session_start emit must also omit — keeps the
+    // reducer's latch-only-positive rule from triggering on a 0.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({ type: 'session_start', sessionId: 'sess-y' });
+    const budget = out.find((e) => e.type === 'step:budget');
+    if (budget?.type !== 'step:budget') throw new Error('expected step:budget');
+    expect(budget.ctxWindowTokens).toBeUndefined();
+  });
+
   test('step_start propagates promptTokensEstimate as ctxUsedTokens + ctx.contextWindowTokens as ctxWindowTokens on step:budget', () => {
     // Slice 3 of the 3-layer token plan: the footer's `ctx N%`
     // segment reads from status.ctx{Used,Window}Tokens, which the

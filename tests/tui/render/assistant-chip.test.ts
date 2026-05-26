@@ -101,8 +101,9 @@ describe('renderAssistantChip', () => {
   });
 
   test('official output wins over estimate when both present', () => {
-    // The moment `assistant:usage` lands, the chip switches to the
-    // authoritative count — no `~` prefix, no mixing of the two.
+    // The moment `assistant:usage` lands with a POSITIVE output count,
+    // the chip switches to the authoritative number — no `~` prefix,
+    // no mixing of the two.
     const out = renderAssistantChip(
       pending({ startedAt: 0, outputTokens: 234, outputEstimated: 309 }),
       caps,
@@ -111,6 +112,24 @@ describe('renderAssistantChip', () => {
     expect(out[0]).toContain('[8.2s · ↓ 234');
     expect(out[0]).not.toContain('~');
     expect(out[0]).not.toContain('309');
+  });
+
+  test('Anthropic early-emit (outputTokens=0) does NOT shadow accumulating estimate', () => {
+    // The bug pin: Anthropic now emits `usage` at message_start with
+    // `output_tokens=0`. Reducer merges null → 0 via Math.max. The
+    // chip must NOT render `↓ 0` for the rest of the streaming turn
+    // — the estimate accumulator is the better signal in this window.
+    // Throughput must also fall back so the `N t/s` cell ticks from
+    // the first delta, not just from message_stop.
+    const out = renderAssistantChip(
+      pending({ startedAt: 0, outputTokens: 0, outputEstimated: 200 }),
+      caps,
+      8000,
+    );
+    expect(out[0]).toContain('↓ ~200');
+    expect(out[0]).not.toContain('↓ 0');
+    // Throughput from estimate: 200 / 8s = 25 t/s.
+    expect(out[0]).toContain('25.0 t/s');
   });
 
   test('outputEstimated of 0 is suppressed (no `↓ ~0` noise)', () => {
@@ -287,13 +306,29 @@ describe('renderAssistantChip', () => {
     expect(out[0]).not.toContain('↓');
   });
 
-  test('outputTokens of 0 still renders the clause (provider said zero, not unknown)', () => {
-    // null = "no usage event yet"; 0 = "usage event arrived, output is zero".
-    // The distinction matters for honesty: a tool-only turn that ended
-    // with zero output tokens should still surface `↓ 0` rather than
-    // hide the counter (which would read as "no measurement").
+  test('outputTokens of 0 is treated as `no signal` mid-stream; estimate path takes over', () => {
+    // Updated semantic after the Anthropic early-emit landed: every
+    // `message_start` now yields a `usage` event with `output_tokens=0`,
+    // and the reducer's Math.max merge sets `pendingAssistant.outputTokens=0`
+    // from frame 1 of the turn. The chip is only rendered while the
+    // message is in flight, so the "final output is genuinely 0"
+    // case (tool-only turn) lives in the scrollback path, not here.
+    // The chip must therefore treat outputTokens=0 as no-signal and
+    // prefer the estimate accumulator.
+    const out = renderAssistantChip(
+      pending({ startedAt: 0, outputTokens: 0, outputEstimated: 50 }),
+      caps,
+      1200,
+    );
+    expect(out[0]).toContain('↓ ~50');
+    expect(out[0]).not.toContain('↓ 0');
+  });
+
+  test('outputTokens=0 + outputEstimated=0 suppresses the cell entirely (no `↓ 0` noise)', () => {
+    // Defensive: when neither signal is positive, omit the recv cell
+    // rather than render `↓ 0` (would read as "0 tokens" mid-stream).
     const out = renderAssistantChip(pending({ startedAt: 0, outputTokens: 0 }), caps, 1200);
-    expect(out[0]).toContain('↓ 0');
+    expect(out[0]).not.toContain('↓');
   });
 
   test('negative elapsed (clock went backwards) clamps to 0ms', () => {

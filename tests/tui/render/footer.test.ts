@@ -549,6 +549,20 @@ describe('renderFooter', () => {
       expect(out).not.toContain('ctx ');
     });
 
+    test('over-100% reading clamps to `ctx 99%` (over-budget step, error tone)', () => {
+      // Pre-flight estimate exceeded the cap before compaction fired
+      // in the same loop iteration. The error tone (>= 90% branch)
+      // is the criticality signal; the number is clamped so
+      // `ctx 250%` doesn't read as a UI bug.
+      const s = startedSession({ ctxUsedTokens: 20_000, ctxWindowTokens: 8000 });
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain('ctx 99%');
+      // Error tone (SGR 31) for >= 90%.
+      expect(out).toContain('\x1b[31m');
+      expect(out).not.toContain('ctx 250%');
+    });
+
     test('sub-1% reading floors at 1% (no `ctx 0%` regression read)', () => {
       // Very small prompt at session start would round to 0% under
       // naive Math.round. The renderer floors at 1 so the segment
